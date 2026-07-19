@@ -24,13 +24,17 @@ param(
     [string]$MeasurementLockPath = "",
     [switch]$SkipBuild,
     [switch]$ReportOnly,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$DirectQuakeCampaign,
+    [ValidateSet("Noise", "Screen", "Proof")]
+    [string]$CampaignStage = "Proof"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $acceptedBaselineTree = "88ac6f20cde853c9c8497cd634f3e8fa8a1ec067"
+$highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 $minimumDirectCoverage = 0.90
 $maximumDirectExitsPer100 = 5.0
 $minimumFloorPasses = 4
@@ -641,6 +645,25 @@ function Get-PairOrder(
     return @($Roles[1], $Roles[0])
 }
 
+function Get-DirectQuakePairOrder(
+    [int]$PairNumber,
+    [string[]]$Roles = @("candidate", "parent")
+) {
+    if ($Roles.Count -ne 2 -or $Roles[0] -eq $Roles[1]) {
+        throw "Direct Quake campaign measurements require two distinct role names."
+    }
+    if ($PairNumber -lt 1 -or $PairNumber -gt 12) {
+        throw "Direct Quake campaign pair numbers must be from 1 through 12."
+    }
+    $candidateFirst = @($true, $false, $false, $true, $true, $false)[
+        ($PairNumber - 1) % 6
+    ]
+    if ($candidateFirst) {
+        return @($Roles[0], $Roles[1])
+    }
+    return @($Roles[1], $Roles[0])
+}
+
 function Get-Median([double[]]$Values) {
     $ordered = @($Values | Sort-Object)
     $middle = [Math]::Floor($ordered.Count / 2)
@@ -774,6 +797,37 @@ function Get-DirectoryTreeSha256([string]$Root, [string[]]$ExcludedRelativePaths
         "$($file.relative)`0$($file.length)`0$hash`n"
     }
     return Get-BytesSha256 ([Text.Encoding]::UTF8.GetBytes(($records -join "")))
+}
+
+function Get-HddTreeSnapshotV1([string]$Root) {
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $files = @(Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force | ForEach-Object {
+        $relative = [IO.Path]::GetRelativePath($rootPath, $_.FullName).Replace("\", "/")
+        if ($relative.Contains([char]0) -or $relative.Contains("`n") -or
+            $relative.Contains("`r") -or $relative.StartsWith("../", [StringComparison]::Ordinal)) {
+            throw "The final HDD tree contains an invalid relative path."
+        }
+        [pscustomobject][ordered]@{
+            path = $relative
+            byte_length = $_.Length
+            sha256 = Get-FileSha256 $_.FullName
+        }
+    })
+    [Array]::Sort($files, [Comparison[object]]{
+        param($left, $right)
+        [StringComparer]::Ordinal.Compare($left.path, $right.path)
+    })
+    $records = foreach ($file in $files) {
+        "$($file.path)`0$($file.byte_length)`0$($file.sha256)`n"
+    }
+    return [pscustomobject][ordered]@{
+        schema = "izarra-hdd-tree-snapshot-v1"
+        path_order = "ordinal relative path"
+        host_metadata_excluded = $true
+        file_count = $files.Count
+        tree_sha256 = Get-BytesSha256 ([Text.Encoding]::UTF8.GetBytes(($records -join "")))
+        files = [object[]]$files
+    }
 }
 
 function Set-BackendQuakeCompletionFixture(
@@ -956,6 +1010,12 @@ function Get-EqualWorkRecord([string]$WorkloadName, $Sample) {
         result_block_identity = "$resultStatus|$resultHash"
         measurement_fixture_identity = Get-MeasurementFixtureIdentityKey $Sample
         quake_completion_identity = Get-QuakeCompletionIdentityKey $WorkloadName $Sample
+        hdd_tree_identity = if ($null -ne $Sample.PSObject.Properties["gate_hdd_tree"]) {
+            [string]$Sample.gate_hdd_tree.tree_sha256
+        } else { "not_recorded" }
+        argv_identity = if ($null -ne $Sample.PSObject.Properties["gate_argv_sha256"]) {
+            [string]$Sample.gate_argv_sha256
+        } else { "not_recorded" }
     }
 }
 
@@ -1098,9 +1158,24 @@ $explicitJit = $PSBoundParameters.ContainsKey("Jit")
 $explicitRuns = $PSBoundParameters.ContainsKey("Runs")
 $explicitBaseline = $PSBoundParameters.ContainsKey("BaselineRevision")
 $explicitExecutionRole = $PSBoundParameters.ContainsKey("ExecutionRole")
+$explicitPairSeed = $PSBoundParameters.ContainsKey("PairSeed")
+$explicitCampaignStage = $PSBoundParameters.ContainsKey("CampaignStage")
 $trackMExecutionPolicy = $null
 $pollSkipExecutionPolicies = $null
-if ($PollSkipComparison) {
+$directQuakeExecutionPolicy = $null
+if (-not $DirectQuakeCampaign -and $explicitCampaignStage) {
+    throw "CampaignStage is only valid with DirectQuakeCampaign."
+}
+if ($DirectQuakeCampaign) {
+    $CampaignStage = Get-NormalizedDirectQuakeCampaignStage $CampaignStage
+    Assert-DirectQuakeCampaignMode `
+        ([bool]$BackendBakeoff) ([bool]$TrackMComparison) ([bool]$PollSkipComparison) `
+        ([bool]$ReportOnly) $explicitBaseline $explicitJit $explicitExecutable `
+        ([bool]$SkipBuild) $explicitExecutionRole ([bool]$Screening) `
+        $explicitPairSeed $CampaignStage $Runs $Workload $ProcessorIndex `
+        $MeasurementLockPath
+    $directQuakeExecutionPolicy = Get-DirectQuakeExecutionPolicy
+} elseif ($PollSkipComparison) {
     Assert-PollSkipComparisonMode `
         ([bool]$BackendBakeoff) ([bool]$TrackMComparison) ([bool]$ReportOnly) `
         $explicitBaseline $explicitJit $explicitExecutable ([bool]$SkipBuild) `
@@ -1143,7 +1218,8 @@ if ($BackendBakeoff) {
     if ($Workload -ne "Both") {
         throw "Backend bakeoff requires all three workloads."
     }
-} elseif (-not $TrackMComparison -and -not $PollSkipComparison) {
+} elseif (-not $TrackMComparison -and -not $PollSkipComparison -and
+    -not $DirectQuakeCampaign) {
     if ($Runs -lt 1) {
         throw "Runs must be at least one."
     }
@@ -1163,9 +1239,16 @@ if ($BackendBakeoff) {
         throw "Paired report-only measurements require at least two pairs."
     }
 }
-$captureProofArtifacts = [bool]($BackendBakeoff -or $TrackMComparison -or $PollSkipComparison)
+$captureProofArtifacts = [bool]($BackendBakeoff -or $TrackMComparison -or
+    $PollSkipComparison -or $DirectQuakeCampaign)
+$revisionProofComparison = [bool]($TrackMComparison -or $DirectQuakeCampaign)
+$revisionExecutionPolicy = if ($DirectQuakeCampaign) {
+    $directQuakeExecutionPolicy
+} else {
+    $trackMExecutionPolicy
+}
 $artifactSelection = Get-ArtifactSelectionPolicy ([bool]$ReportOnly) $explicitExecutable ([bool]$SkipBuild)
-if ($PairSeed -eq 0) {
+if (-not $DirectQuakeCampaign -and $PairSeed -eq 0) {
     $PairSeed = [Security.Cryptography.RandomNumberGenerator]::GetInt32(1, [int]::MaxValue)
 }
 if ($HostTimeoutSeconds -lt 1) {
@@ -1227,7 +1310,6 @@ if ($isWindowsHost) {
     }
     $activePowerScheme = Get-ActivePowerScheme
 }
-$highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 $pollSkipPowerSchemeEligible = -not $PollSkipComparison -or
     ([string]$activePowerScheme).Contains(
         $highPerformancePowerSchemeGuid,
@@ -1235,6 +1317,14 @@ $pollSkipPowerSchemeEligible = -not $PollSkipComparison -or
     )
 if ($PollSkipComparison -and -not $pollSkipPowerSchemeEligible) {
     throw "POLL-SKIP comparison requires the High Performance power scheme."
+}
+$directQuakePowerSchemeEligible = -not $DirectQuakeCampaign -or
+    ([string]$activePowerScheme).Contains(
+        $highPerformancePowerSchemeGuid,
+        [StringComparison]::OrdinalIgnoreCase
+    )
+if ($DirectQuakeCampaign -and -not $directQuakePowerSchemeEligible) {
+    throw "Direct Quake campaign mode requires the High Performance power scheme."
 }
 $hostIdentity = [ordered]@{
     os_description = $runtimeInformation::OSDescription
@@ -1307,7 +1397,7 @@ $revision = $repositoryAtSelection.head_commit
 $shortRevision = $revision.Substring(0, 12)
 $baselineCommit = $null
 $baselineTree = $null
-if ($TrackMComparison) {
+if ($revisionProofComparison) {
     $baselineCommit = Get-TrackMImmediateParent $repositoryRoot $revision
     $baselineTree = (& git -C $repositoryRoot rev-parse --verify "$baselineCommit^{tree}").Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($baselineTree)) {
@@ -1820,7 +1910,7 @@ $candidateArtifact = if ($artifactSelection -eq "isolated_build") {
 }
 $baselineArtifact = $null
 if ($null -ne $baselineCommit) {
-    $artifactLabel = if ($TrackMComparison) { "parent" } else { "baseline" }
+    $artifactLabel = if ($revisionProofComparison) { "parent" } else { "baseline" }
     $baselineArtifact = Invoke-IsolatedRevisionBuild $repositoryRoot $baselineCommit $artifactLabel $ResultsDirectory
 }
 $revisionPairedRun = $null -ne $baselineArtifact
@@ -1832,6 +1922,15 @@ if ($revisionPairedRun -and $candidateArtifact.verified -and $baselineArtifact.v
     $candidateArtifact.build.recipe_fingerprint_sha256 -ne
         $baselineArtifact.build.recipe_fingerprint_sha256) {
     throw "Candidate and baseline were not built with the same isolated recipe and toolchain."
+}
+if ($DirectQuakeCampaign) {
+    $sameExecutableBytes = $candidateArtifact.sha256 -ceq $baselineArtifact.sha256
+    if ($CampaignStage -ceq "Noise" -and -not $sameExecutableBytes) {
+        throw "Direct Quake Noise requires byte-identical candidate and retained-parent builds."
+    }
+    if ($CampaignStage -cne "Noise" -and $sameExecutableBytes) {
+        throw "Direct Quake Screen and Proof require different candidate and retained-parent binaries."
+    }
 }
 
 function Quote-ProcessArgument([string]$Value) {
@@ -1855,6 +1954,9 @@ function Invoke-IzarraProcess(
     if ($TrackMComparison -and $BackendRole -notin @("candidate", "parent")) {
         throw "Unknown Track M revision role '$BackendRole'."
     }
+    if ($DirectQuakeCampaign -and $BackendRole -notin @("candidate", "parent")) {
+        throw "Unknown Direct Quake campaign role '$BackendRole'."
+    }
     if ($PollSkipComparison -and $BackendRole -notin @("skip_off", "skip_on")) {
         throw "Unknown POLL-SKIP comparison role '$BackendRole'."
     }
@@ -1865,8 +1967,8 @@ function Invoke-IzarraProcess(
         [ordered]@{
             IZARRAVM_JIT = if ($BackendRole -eq "automatic") { "1" } else { "0" }
         }
-    } elseif ($TrackMComparison) {
-        $trackMExecutionPolicy.environment
+    } elseif ($revisionProofComparison) {
+        $revisionExecutionPolicy.environment
     } else {
         [ordered]@{ IZARRAVM_JIT = $Jit }
     }
@@ -1996,6 +2098,31 @@ $exitVmHash = Get-BytesSha256 $exitVmBytes
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("izarravm-gate-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 
+function Copy-CampaignObservationFixture([string]$Source, [string]$Destination) {
+    $sourcePath = [IO.Path]::GetFullPath($Source)
+    $destinationPath = [IO.Path]::GetFullPath($Destination)
+    $privateRoot = [IO.Path]::GetFullPath($temporaryRoot).
+        TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $privatePrefix = $privateRoot + [IO.Path]::DirectorySeparatorChar
+    if (-not $destinationPath.StartsWith($privatePrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $destinationPath -ceq $privateRoot) {
+        throw "Refusing to create a campaign fixture outside its private temporary root."
+    }
+    if (Test-Path -LiteralPath $destinationPath) {
+        throw "A campaign observation fixture path was reused."
+    }
+    $robocopy = Get-Command robocopy.exe -CommandType Application -ErrorAction Stop
+    $output = @(& $robocopy.Source $sourcePath $destinationPath /E /COPY:DAT /DCOPY:DAT `
+        /R:1 /W:1 /NFL /NDL /NJH /NJS /NP 2>&1)
+    $code = $LASTEXITCODE
+    if ($code -lt 0 -or $code -gt 7) {
+        throw "robocopy failed for a campaign observation fixture with code ${code}: $($output -join ' ')"
+    }
+    if (-not (Test-Path -LiteralPath $destinationPath -PathType Container)) {
+        throw "robocopy did not create the campaign observation fixture."
+    }
+}
+
 function Remove-GateTemporaryRoot([string]$Path) {
     $resolvedTemporaryRoot = [IO.Path]::GetFullPath($Path)
     $resolvedSystemTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
@@ -2083,21 +2210,44 @@ try {
     throw
 }
 
+$observationSerial = 0
+
 function Invoke-Observation(
     $Policy,
     [string]$SourceFolder,
     [string]$Role,
     [string]$ObservationId,
-    [string]$ExecutablePath
+    [string]$ExecutablePath,
+    [ValidateSet("production", "correctness")]
+    [string]$ObservationClass = "production"
 ) {
     $context = "$($Policy.name) $Role $ObservationId"
-    $fixture = Join-Path $temporaryRoot "$($Policy.name)-$Role-$ObservationId"
-    $observationHome = Join-Path $temporaryRoot "home-$($Policy.name)-$Role-$ObservationId"
-    Copy-Item -LiteralPath $SourceFolder -Destination $fixture -Recurse
+    $serialName = $null
+    if ($DirectQuakeCampaign) {
+        $script:observationSerial++
+        $serialName = "observation-{0:D4}" -f $script:observationSerial
+        $fixture = Join-Path $temporaryRoot "$serialName-fixture"
+        $observationHome = Join-Path $temporaryRoot "$serialName-home"
+        Copy-CampaignObservationFixture $SourceFolder $fixture
+    } else {
+        $fixture = Join-Path $temporaryRoot "$($Policy.name)-$Role-$ObservationId"
+        $observationHome = Join-Path $temporaryRoot `
+            "home-$($Policy.name)-$Role-$ObservationId"
+        Copy-Item -LiteralPath $SourceFolder -Destination $fixture -Recurse
+    }
     New-Item -ItemType Directory -Path $observationHome | Out-Null
     $qconsole = Join-Path $fixture "QUAKE/ID1/QCONSOLE.LOG"
+    if ($DirectQuakeCampaign) {
+        $copiedCanonicalTree = Get-DirectoryTreeSha256 `
+            $fixture $quakeCanonicalTreeExclusions
+        if ($copiedCanonicalTree -cne $workloadCanonicalTreeHashes.quake) {
+            throw "$context robocopy fixture does not match the frozen Quake tree."
+        }
+    }
+    $campaignCorrectness = $DirectQuakeCampaign -and $ObservationClass -ceq "correctness"
+    $campaignProduction = $DirectQuakeCampaign -and $ObservationClass -ceq "production"
     $useBackendQuakeCompletion = Test-BackendQuakeCompletionOverride `
-        $captureProofArtifacts $Policy.name
+        ($captureProofArtifacts -and -not $campaignProduction) $Policy.name
     $fixtureEvidence = $null
     if ($useBackendQuakeCompletion) {
         $fixtureEvidence = Set-BackendQuakeCompletionFixture `
@@ -2108,13 +2258,15 @@ function Invoke-Observation(
             Remove-Item -LiteralPath $qconsole
         }
     }
-    $measurementFixtureHash = if ($TrackMComparison -or $PollSkipComparison) {
+    $measurementFixtureHash = if ($revisionProofComparison -or $PollSkipComparison) {
         Get-DirectoryTreeSha256 $fixture
     } else {
         $null
     }
 
-    $fileStem = "$($Policy.name)-$Role-$ObservationId"
+    $fileStem = if ($DirectQuakeCampaign) { $serialName } else {
+        "$($Policy.name)-$Role-$ObservationId"
+    }
     $jsonPath = Join-Path $ResultsDirectory "$fileStem.json"
     $stdoutPath = Join-Path $ResultsDirectory "$fileStem.stdout.log"
     $stderrPath = Join-Path $ResultsDirectory "$fileStem.stderr.log"
@@ -2128,16 +2280,34 @@ function Invoke-Observation(
         "--dump-result",
         "--profile-json", $jsonPath
     )
-    if (Test-ObservationRequiresTestExit $captureProofArtifacts $Policy.name) {
+    if (Test-ObservationRequiresTestExit `
+        ($captureProofArtifacts -and -not $campaignProduction) $Policy.name) {
         $processArguments += "--expect-test-exit"
     }
     if ($PollSkipComparison -or
         ($BackendBakeoff -and $Role -eq "interpreter") -or
-        ($TrackMComparison -and $trackMExecutionPolicy.name -eq "interpreter")) {
+        ($TrackMComparison -and $revisionExecutionPolicy.name -eq "interpreter")) {
         $processArguments += "--interpreter"
+    }
+    $powerSchemeBefore = if ($DirectQuakeCampaign) { Get-ActivePowerScheme } else { $null }
+    if ($DirectQuakeCampaign -and
+        -not ([string]$powerSchemeBefore).Contains(
+            $highPerformancePowerSchemeGuid,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "$context did not start under the High Performance power scheme."
     }
     $processResult = Invoke-IzarraProcess `
         $ExecutablePath $processArguments $stdoutPath $stderrPath $observationHome $Role
+    $powerSchemeAfter = if ($DirectQuakeCampaign) { Get-ActivePowerScheme } else { $null }
+    if ($DirectQuakeCampaign -and
+        ($powerSchemeAfter -cne $powerSchemeBefore -or
+         -not ([string]$powerSchemeAfter).Contains(
+             $highPerformancePowerSchemeGuid,
+             [StringComparison]::OrdinalIgnoreCase
+         ))) {
+        throw "$context did not keep the High Performance power scheme."
+    }
     if ($processResult.exit_code -ne 0 -and -not $captureProofArtifacts) {
         throw "$context failed with exit code $($processResult.exit_code). See $stdoutPath and $stderrPath."
     }
@@ -2159,6 +2329,14 @@ function Invoke-Observation(
         ($sample.stop.kind -ne "cycle_limit" -or
          [uint64]$sample.stop.requested -ne $Policy.cycle_budget)) {
         throw "$context did not reach its fixed cycle limit."
+    } elseif ($campaignCorrectness -and
+        ($processResult.exit_code -ne 0 -or $sample.stop.kind -ne "test_exit" -or
+         $sample.stop.code -ne 0)) {
+        throw "$context did not complete through TestExit code 0."
+    } elseif ($campaignProduction -and
+        ($processResult.exit_code -ne 0 -or $sample.stop.kind -ne "cycle_limit" -or
+         [uint64]$sample.stop.requested -ne $Policy.cycle_budget)) {
+        throw "$context did not reach the production fixed-cycle limit."
     }
     $wallSeconds = Get-FiniteNumber $sample.wall_seconds "wall_seconds"
     $guestSeconds = Get-FiniteNumber $sample.guest_seconds "guest_seconds"
@@ -2211,7 +2389,7 @@ function Invoke-Observation(
                 $qconsoleHash = Get-FileSha256 $preservedQconsole
             }
         }
-        if ($captureProofArtifacts) {
+        if ($captureProofArtifacts -and -not $campaignProduction) {
             $quakeCompletion = Read-BackendQuakeCompletion `
                 $preservedQconsole @($stdoutPath, $stderrPath)
             $quakeIdentity = $quakeCompletion.timedemo
@@ -2225,9 +2403,33 @@ function Invoke-Observation(
         } else {
             $quakeIdentity = Read-QuakeTimedemoIdentity $preservedQconsole
             $sample | Add-Member -NotePropertyName quake_timedemo -NotePropertyValue $quakeIdentity
+            if ($campaignProduction) {
+                $sample | Add-Member -NotePropertyName gate_quake_completion -NotePropertyValue $null
+            }
         }
     }
     if ($captureProofArtifacts) {
+        $hddTree = $null
+        $hddTreePath = $null
+        $argvIdentity = $null
+        if ($DirectQuakeCampaign) {
+            $hddTree = Get-HddTreeSnapshotV1 $fixture
+            $hddTreePath = Join-Path $ResultsDirectory "$fileStem-hdd-tree.json"
+            $hddTree | ConvertTo-Json -Depth 6 |
+                Set-Content -LiteralPath $hddTreePath -Encoding utf8
+            $normalizedArguments = [string[]]@($processArguments)
+            for ($argumentIndex = 0; $argumentIndex -lt $normalizedArguments.Count - 1;
+                $argumentIndex++) {
+                if ($normalizedArguments[$argumentIndex] -ceq "--hdd-folder") {
+                    $normalizedArguments[$argumentIndex + 1] = "<fresh-hdd-fixture>"
+                } elseif ($normalizedArguments[$argumentIndex] -ceq "--profile-json") {
+                    $normalizedArguments[$argumentIndex + 1] = "<profile-json>"
+                }
+            }
+            $argvIdentity = Get-BytesSha256 (
+                [Text.Encoding]::UTF8.GetBytes(($normalizedArguments -join "`0"))
+            )
+        }
         $resultBlock = Get-NormalizedResultBlock $stdoutPath
         $sample | Add-Member `
             -NotePropertyName gate_process_exit_code `
@@ -2244,23 +2446,45 @@ function Invoke-Observation(
                 -NotePropertyValue $measurementFixtureHash
         } elseif ($BackendBakeoff) {
             $sample | Add-Member -NotePropertyName gate_backend_policy -NotePropertyValue $Role
-        } else {
+        } elseif ($revisionProofComparison) {
             $sample | Add-Member -NotePropertyName gate_execution_role `
-                -NotePropertyValue $trackMExecutionPolicy.name
+                -NotePropertyValue $revisionExecutionPolicy.name
             $sample | Add-Member -NotePropertyName gate_execution_cli `
-                -NotePropertyValue $trackMExecutionPolicy.cli
+                -NotePropertyValue $revisionExecutionPolicy.cli
             $sample | Add-Member -NotePropertyName gate_execution_jit `
-                -NotePropertyValue $trackMExecutionPolicy.environment.IZARRAVM_JIT
+                -NotePropertyValue $revisionExecutionPolicy.environment.IZARRAVM_JIT
             $sample | Add-Member -NotePropertyName gate_poll_skip `
-                -NotePropertyValue $trackMExecutionPolicy.environment.IZARRAVM_POLL_SKIP
+                -NotePropertyValue $revisionExecutionPolicy.environment.IZARRAVM_POLL_SKIP
             $sample | Add-Member -NotePropertyName gate_measurement_fixture_sha256 `
                 -NotePropertyValue $measurementFixtureHash
+        } else {
+            throw "Proof artifact capture received an unknown execution policy."
         }
         $sample | Add-Member `
             -NotePropertyName gate_termination_policy `
-            -NotePropertyValue "lotura_test_exit"
+            -NotePropertyValue $(if ($campaignProduction) {
+                "fixed_cycle_production"
+            } else {
+                "lotura_test_exit"
+            })
+        if ($DirectQuakeCampaign) {
+            $sample | Add-Member -NotePropertyName gate_observation_class `
+                -NotePropertyValue $ObservationClass
+            $sample | Add-Member -NotePropertyName gate_power_scheme_before `
+                -NotePropertyValue $powerSchemeBefore
+            $sample | Add-Member -NotePropertyName gate_power_scheme_after `
+                -NotePropertyValue $powerSchemeAfter
+            $sample | Add-Member -NotePropertyName gate_argv `
+                -NotePropertyValue ([object[]]$processArguments)
+            $sample | Add-Member -NotePropertyName gate_argv_sha256 `
+                -NotePropertyValue $argvIdentity
+            $sample | Add-Member -NotePropertyName gate_executable_sha256 `
+                -NotePropertyValue (Get-FileSha256 $ExecutablePath)
+            $sample | Add-Member -NotePropertyName gate_hdd_tree `
+                -NotePropertyValue $hddTree
+        }
         $sample | Add-Member -NotePropertyName gate_fixture -NotePropertyValue $fixtureEvidence
-        $sample | Add-Member -NotePropertyName gate_artifacts -NotePropertyValue ([pscustomobject][ordered]@{
+        $artifactEvidence = [pscustomobject][ordered]@{
             profile_json_file = [IO.Path]::GetFileName($jsonPath)
             profile_json_sha256 = $profileHash
             stdout_file = [IO.Path]::GetFileName($stdoutPath)
@@ -2277,7 +2501,14 @@ function Invoke-Observation(
             result_block_count = $resultBlock.block_count
             result_block_sha256 = $resultBlock.sha256
             result_block_normalized_bytes = $resultBlock.normalized_bytes
-        })
+        }
+        if ($DirectQuakeCampaign) {
+            $artifactEvidence | Add-Member -NotePropertyName hdd_tree_file `
+                -NotePropertyValue ([IO.Path]::GetFileName($hddTreePath))
+            $artifactEvidence | Add-Member -NotePropertyName hdd_tree_sha256 `
+                -NotePropertyValue (Get-FileSha256 $hddTreePath)
+        }
+        $sample | Add-Member -NotePropertyName gate_artifacts -NotePropertyValue $artifactEvidence
     }
     $sample | Add-Member -NotePropertyName gate_role -NotePropertyValue $Role
     $sample | Add-Member -NotePropertyName gate_observation -NotePropertyValue $ObservationId
@@ -2330,13 +2561,14 @@ try {
         @("skip_on", "skip_off")
     } elseif ($BackendBakeoff) {
         @("automatic", "interpreter")
-    } elseif ($TrackMComparison) {
+    } elseif ($revisionProofComparison) {
         @("candidate", "parent")
     } else {
         @("candidate", "baseline")
     }
     $observations = [ordered]@{}
     $discardedWarmups = [ordered]@{}
+    $correctnessObservations = [ordered]@{}
     foreach ($policy in $policies) {
         $roleBuckets = [ordered]@{}
         $warmupBuckets = [ordered]@{}
@@ -2346,6 +2578,13 @@ try {
         }
         $observations[$policy.name] = $roleBuckets
         $discardedWarmups[$policy.name] = $warmupBuckets
+        if ($DirectQuakeCampaign) {
+            $correctnessBuckets = [ordered]@{}
+            foreach ($role in $pairRoles) {
+                $correctnessBuckets[$role] = @()
+            }
+            $correctnessObservations[$policy.name] = $correctnessBuckets
+        }
     }
 
     if ($pairedRun) {
@@ -2355,14 +2594,30 @@ try {
             } else {
                 $quakeSnapshot.frozen_path
             }
+            if ($DirectQuakeCampaign) {
+                foreach ($role in @(Get-DirectQuakePairOrder 1 $pairRoles)) {
+                    $artifact = if ($CampaignStage -ceq "Noise" -or $role -eq "parent") {
+                        $baselineArtifact
+                    } else {
+                        $candidateArtifact
+                    }
+                    $correctness = Invoke-Observation `
+                        $policy $sourceFolder $role "correctness" `
+                        $artifact.executed_copy_path "correctness"
+                    $correctnessObservations[$policy.name][$role] += $correctness
+                }
+            }
             $warmupOrder = if ($PollSkipComparison) {
                 Get-PollSkipWarmupOrder
+            } elseif ($DirectQuakeCampaign) {
+                Get-DirectQuakePairOrder 1 $pairRoles
             } else {
                 Get-PairOrder 1 $PairSeed $pairRoles
             }
             foreach ($role in $warmupOrder) {
-                $artifact = if ($BackendBakeoff -or $PollSkipComparison -or
-                    $role -eq "candidate") {
+                $artifact = if ($DirectQuakeCampaign -and $CampaignStage -ceq "Noise") {
+                    $baselineArtifact
+                } elseif ($BackendBakeoff -or $PollSkipComparison -or $role -eq "candidate") {
                     $candidateArtifact
                 } else {
                     $baselineArtifact
@@ -2383,7 +2638,11 @@ try {
             }
         }
         for ($pair = 1; $pair -le $Runs; $pair++) {
-            $roleOrder = Get-PairOrder $pair $PairSeed $pairRoles
+            $roleOrder = if ($DirectQuakeCampaign) {
+                Get-DirectQuakePairOrder $pair $pairRoles
+            } else {
+                Get-PairOrder $pair $PairSeed $pairRoles
+            }
             for ($workloadOffset = 0; $workloadOffset -lt $policies.Count; $workloadOffset++) {
                 $policy = $policies[($workloadOffset + $pair - 1) % $policies.Count]
                 $sourceFolder = if ($policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
@@ -2393,8 +2652,9 @@ try {
                 }
                 $pollSkipPairSamples = [ordered]@{}
                 foreach ($role in $roleOrder) {
-                    $artifact = if ($BackendBakeoff -or $PollSkipComparison -or
-                        $role -eq "candidate") {
+                    $artifact = if ($DirectQuakeCampaign -and $CampaignStage -ceq "Noise") {
+                        $baselineArtifact
+                    } elseif ($BackendBakeoff -or $PollSkipComparison -or $role -eq "candidate") {
                         $candidateArtifact
                     } else {
                         $baselineArtifact
@@ -2438,6 +2698,12 @@ try {
             $workloads += Get-PollSkipWorkloadSummary `
                 $policy $bucket.skip_on $bucket.skip_off `
                 $discardedWarmups[$policy.name]
+        } elseif ($DirectQuakeCampaign) {
+            $workloads += Get-DirectQuakeCampaignWorkloadSummary `
+                $policy $bucket.candidate $bucket.parent `
+                $discardedWarmups[$policy.name] $correctnessObservations[$policy.name] `
+                $directQuakeExecutionPolicy $CampaignStage `
+                $candidateArtifact.sha256 $baselineArtifact.sha256
         } elseif ($TrackMComparison) {
             $workloads += Get-TrackMWorkloadSummary `
                 $policy $bucket.candidate $bucket.parent `
@@ -2484,10 +2750,10 @@ try {
         (Get-DirectoryTreeSha256 $doomSnapshot.frozen_path) -eq $doomSnapshot.frozen_sha256
     $quakeFrozenStable = $null -eq $quakeSnapshot -or
         (Get-DirectoryTreeSha256 $quakeSnapshot.frozen_path) -eq $quakeSnapshot.frozen_sha256
-    if (-not $TrackMComparison -and -not $doomFrozenStable) {
+    if (-not $revisionProofComparison -and -not $doomFrozenStable) {
         throw "The frozen Doom workload changed during the gate."
     }
-    if (-not $TrackMComparison -and -not $quakeFrozenStable) {
+    if (-not $revisionProofComparison -and -not $quakeFrozenStable) {
         throw "The frozen Quake workload changed during the gate."
     }
 } catch {
@@ -2524,31 +2790,31 @@ if ($null -ne $measurementFailure) {
     }
     throw $measurementFailure
 }
-if ($null -ne $outerAffinityRestoreFailure -and -not $TrackMComparison) {
+if ($null -ne $outerAffinityRestoreFailure -and -not $revisionProofComparison) {
     throw $outerAffinityRestoreFailure
 }
 
 $verifiedChildAffinityStable = $true
 if ($ProcessorIndex -ge 0) {
     $expectedVerifiedChildren = if ($pairedRun) {
-        $policies.Count * (2 + 2 * $Runs)
+        $policies.Count * ($(if ($DirectQuakeCampaign) { 4 } else { 2 }) + 2 * $Runs)
     } else {
         $policies.Count * $Runs
     }
     $verifiedChildAffinityStable = $verifiedChildAffinityMasks.Count -eq $expectedVerifiedChildren
-    if (-not $TrackMComparison -and -not $verifiedChildAffinityStable) {
+    if (-not $revisionProofComparison -and -not $verifiedChildAffinityStable) {
         throw "Not every warmup and measured child received a verified processor affinity."
     }
 }
 
 $candidateExecutableStable = $candidateHashAfter -eq $candidateArtifact.sha256
-if (-not $TrackMComparison -and -not $candidateExecutableStable) {
+if (-not $revisionProofComparison -and -not $candidateExecutableStable) {
     throw "The frozen candidate executable changed during the gate."
 }
 $parentExecutableStable = $true
 if ($revisionPairedRun) {
     $parentExecutableStable = $baselineHashAfter -eq $baselineArtifact.sha256
-    if (-not $TrackMComparison -and -not $parentExecutableStable) {
+    if (-not $revisionProofComparison -and -not $parentExecutableStable) {
         throw "The frozen baseline executable changed during the gate."
     }
 }
@@ -2556,22 +2822,22 @@ $doomSourceStable = $null -eq $doomSnapshot -or
     (Get-DirectoryTreeSha256 $DoomFolder) -eq $doomSnapshot.source_initial_sha256
 $quakeSourceStable = $null -eq $quakeSnapshot -or
     (Get-DirectoryTreeSha256 $QuakeFolder) -eq $quakeSnapshot.source_initial_sha256
-if (-not $TrackMComparison -and -not $doomSourceStable) {
+if (-not $revisionProofComparison -and -not $doomSourceStable) {
     throw "The Doom workload tree changed during the gate."
 }
-if (-not $TrackMComparison -and -not $quakeSourceStable) {
+if (-not $revisionProofComparison -and -not $quakeSourceStable) {
     throw "The Quake workload tree changed during the gate."
 }
 $gateSourceClosureAtCompletion = Get-GateSourceClosureIdentity `
     $gateMainScriptPath $gateSelfTestScriptPath $gateSummaryScriptPath
 $gateSourceClosureStable = @(Get-GateSourceClosureMismatches `
     $gateSourceClosureAtEntry $gateSourceClosureAtCompletion).Count -eq 0
-if (-not $TrackMComparison) {
+if (-not $revisionProofComparison) {
     Assert-GateSourceClosureUnchanged `
         $gateSourceClosureAtEntry $gateSourceClosureAtCompletion "during the measurement"
 }
 $gateScriptHashAfter = $gateSourceClosureAtCompletion.members[0].sha256
-if (-not $TrackMComparison -and $gateScriptHashAfter -ne $gateScriptHash) {
+if (-not $revisionProofComparison -and $gateScriptHashAfter -ne $gateScriptHash) {
     throw "The throughput gate script changed during the measurement."
 }
 $gateSourceClosureEvidence = [ordered]@{
@@ -2581,13 +2847,13 @@ $gateSourceClosureEvidence = [ordered]@{
 }
 $fixtureManifestHashAfter = (Get-FileHash -LiteralPath $fixtureManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $fixtureManifestStable = $fixtureManifestHashAfter -eq $fixtureManifestHash
-if (-not $TrackMComparison -and -not $fixtureManifestStable) {
+if (-not $revisionProofComparison -and -not $fixtureManifestStable) {
     throw "The accepted workload manifest changed during the measurement."
 }
 $repositoryAtCompletion = Get-RepositoryState $repositoryRoot
 $repositoryStable = $repositoryAtCompletion.head_commit -eq $repositoryAtSelection.head_commit -and
     ($repositoryAtCompletion.status -join "`n") -eq ($repositoryAtSelection.status -join "`n")
-if (-not $TrackMComparison -and -not $ReportOnly -and -not $repositoryStable) {
+if (-not $revisionProofComparison -and -not $ReportOnly -and -not $repositoryStable) {
     throw "The candidate repository changed during the formal gate."
 }
 $activePowerSchemeAtCompletion = if ($isWindowsHost) {
@@ -2602,6 +2868,8 @@ $powerSchemeStable = $powerSchemeRecorded -and
 
 if ($PollSkipComparison) {
     $summary = New-PollSkipComparisonSummary $workloads
+} elseif ($DirectQuakeCampaign) {
+    $summary = New-DirectQuakeCampaignSummary $workloads
 } elseif ($TrackMComparison) {
     $summary = New-TrackMComparisonSummary $workloads
 } elseif ($BackendBakeoff) {
@@ -2929,7 +3197,13 @@ $summary = [ordered]@{
 $summaryPath = Join-Path $ResultsDirectory "summary.json"
 $summary | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $summaryPath -Encoding utf8
 $trackMEvidence = $null
-if ($TrackMComparison) {
+$directQuakeEvidence = $null
+if ($DirectQuakeCampaign) {
+    $directQuakeEvidence = Write-DirectQuakeCampaignEvidencePackage `
+        $ResultsDirectory $summaryPath $summary $candidateArtifact $baselineArtifact `
+        $gateSourceClosureAtCompletion $gateMainScriptPath $gateSelfTestScriptPath `
+        $gateSummaryScriptPath $fixtureManifestPath
+} elseif ($TrackMComparison) {
     $trackMEvidence = Write-TrackMEvidencePackage `
         $ResultsDirectory $summaryPath $summary $candidateArtifact $baselineArtifact `
         $gateSourceClosureAtCompletion $gateMainScriptPath $gateSelfTestScriptPath `
@@ -2964,7 +3238,11 @@ foreach ($workloadResult in $summary.workloads) {
     }
 }
 Write-Host "Summary: $summaryPath"
-if ($TrackMComparison) {
+if ($DirectQuakeCampaign) {
+    Write-Host "Evidence manifest: $($directQuakeEvidence.manifest_path)"
+    Write-Host "Evidence manifest SHA-256: $($directQuakeEvidence.manifest_sha256)"
+    Write-Host "Result log: $($directQuakeEvidence.result_log_path)"
+} elseif ($TrackMComparison) {
     Write-Host "Evidence manifest: $($trackMEvidence.manifest_path)"
     Write-Host "Evidence manifest SHA-256: $($trackMEvidence.manifest_sha256)"
     Write-Host "Result log: $($trackMEvidence.result_log_path)"
@@ -2972,12 +3250,25 @@ if ($TrackMComparison) {
 
 if ($PollSkipComparison -and $summary.verdict -cne "improved") {
     throw "The POLL-SKIP comparison did not demonstrate a speedup: $($summary.verdict)."
+} elseif ($DirectQuakeCampaign -and -not $summary.evidence_valid) {
+    throw "The Direct Quake campaign evidence is invalid: $($summary.failure_reasons -join ' | ')."
+} elseif ($DirectQuakeCampaign -and $CampaignStage -ceq "Screen" -and
+    $summary.verdict -cne "screen_positive") {
+    throw "The Direct Quake campaign screen did not reach its 2% median triage threshold."
+} elseif ($DirectQuakeCampaign -and $CampaignStage -ceq "Proof" -and
+    $summary.verdict -notin @(
+        "normal_promotion_threshold_met",
+        "narrow_requires_mechanism_evidence",
+        "twelve_pair_extension_eligible"
+    )) {
+    throw "The Direct Quake campaign proof did not reach a provisional promotion class."
 } elseif ($TrackMComparison -and $summary.verdict -ne "passed") {
     throw "The Track M comparison did not pass: $($summary.failure_reasons -join ' | ')."
 } elseif ($BackendBakeoff -and -not $Screening -and $summary.track_a_survival -ne "pass") {
     throw "The backend bakeoff did not meet its survival gate: $($summary.failure_reasons -join ' | ')."
 }
 if (-not $PollSkipComparison -and -not $TrackMComparison -and -not $BackendBakeoff -and
+    -not $DirectQuakeCampaign -and
     -not $ReportOnly -and $verdict -ne "passed") {
     throw "The paired throughput gate did not pass: $($formalFailures -join ' | ')."
 }

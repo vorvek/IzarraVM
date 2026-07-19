@@ -393,6 +393,81 @@ function Assert-TrackMComparisonMode(
     }
 }
 
+function Assert-DirectQuakeCampaignMode(
+    [bool]$IsBackendBakeoff,
+    [bool]$IsTrackMComparison,
+    [bool]$IsPollSkipComparison,
+    [bool]$IsReportOnly,
+    [bool]$HasExplicitBaseline,
+    [bool]$HasExplicitJit,
+    [bool]$HasExplicitExecutable,
+    [bool]$SkipRequested,
+    [bool]$HasExplicitExecutionRole,
+    [bool]$IsScreening,
+    [bool]$HasExplicitPairSeed,
+    [string]$Stage,
+    [int]$RunCount,
+    [string]$WorkloadSelection,
+    [int]$RequestedProcessorIndex,
+    [string]$LockPath
+) {
+    if ($IsBackendBakeoff -or $IsTrackMComparison -or $IsPollSkipComparison -or
+        $IsReportOnly) {
+        throw "Direct Quake campaign mode cannot be combined with another comparison mode or ReportOnly."
+    }
+    if ($HasExplicitBaseline -or $HasExplicitJit -or $HasExplicitExecutable -or
+        $SkipRequested -or $HasExplicitExecutionRole -or $IsScreening -or
+        $HasExplicitPairSeed) {
+        throw "Direct Quake campaign mode derives its parent, fixes its order, builds both revisions, and forces Direct execution."
+    }
+    if ($WorkloadSelection -cne "Quake") {
+        throw "Direct Quake campaign mode requires the Quake workload."
+    }
+    if ($RequestedProcessorIndex -ne 8) {
+        throw "Direct Quake campaign mode requires ProcessorIndex 8."
+    }
+    if ([string]::IsNullOrWhiteSpace($LockPath) -or
+        -not [IO.Path]::IsPathFullyQualified($LockPath)) {
+        throw "Direct Quake campaign mode requires an absolute MeasurementLockPath."
+    }
+    $expectedRuns = switch ($Stage) {
+        "Noise" { @(6) }
+        "Screen" { @(2) }
+        "Proof" { @(6, 12) }
+        default { throw "Unknown Direct Quake campaign stage '$Stage'." }
+    }
+    if ($RunCount -notin $expectedRuns) {
+        throw "Direct Quake campaign stage $Stage received an invalid measured-pair count."
+    }
+}
+
+function Get-NormalizedDirectQuakeCampaignStage([string]$Stage) {
+    switch ($Stage.Trim().ToLowerInvariant()) {
+        "noise" { return "Noise" }
+        "screen" { return "Screen" }
+        "proof" { return "Proof" }
+        default { throw "Unknown Direct Quake campaign stage '$Stage'." }
+    }
+}
+
+function Get-DirectQuakeExecutionPolicy {
+    return [pscustomobject][ordered]@{
+        name = "direct"
+        cli = "default Direct backend"
+        environment = [ordered]@{
+            IZARRAVM_JIT = "1"
+            IZARRAVM_POLL_SKIP = "0"
+        }
+        required_zero_counters = [object[]]@(
+            "poll_skip_spans", "poll_skip_iterations",
+            "jit_region_entries", "jit_region_insns", "jit_native_insns",
+            "jit_helper_exits", "jit_native_memory_helpers",
+            "jit_clif_compile_attempts", "jit_clif_units_installed",
+            "jit_clif_entries", "jit_clif_side_exits"
+        )
+    }
+}
+
 function Get-TrackMExecutionPolicy([string]$RequestedExecutionRole) {
     switch ($RequestedExecutionRole.Trim().ToLowerInvariant()) {
         "automatic" {
@@ -972,6 +1047,10 @@ function Get-TrackMSampleProvenanceReasons(
         if ($Sample.perf.jit_direct_entries -le 0 -or $Sample.perf.jit_direct_insns -le 0) {
             $reasons += "$label did not execute the automatic direct backend"
         }
+    } elseif ($ExecutionPolicy.name -ceq "direct") {
+        if ($Sample.perf.jit_direct_entries -le 0 -or $Sample.perf.jit_direct_insns -le 0) {
+            $reasons += "$label did not execute the Direct backend"
+        }
     } else {
         foreach ($property in $Sample.perf.PSObject.Properties) {
             if ($property.Name.StartsWith("jit_", [StringComparison]::Ordinal) -and
@@ -1129,6 +1208,311 @@ function Get-TrackMWorkloadSummary(
             @($semanticReasons) + @($exactWorkReasons) +
             @($provenanceReasons) + @($performanceReasons)
         )
+    }
+}
+
+function Get-DirectQuakeCampaignMetric([double[]]$Ratios, [string]$Stage) {
+    $metric = Get-PairedMetric $Ratios
+    $improvedPairs = @($Ratios | Where-Object { $_ -gt 1.0 }).Count
+    $classification = switch ($Stage) {
+        "Noise" { "noise_only" }
+        "Screen" {
+            if ($metric.median_ratio -ge 1.02) { "screen_positive" } else { "screen_reject" }
+        }
+        "Proof" {
+            if ($metric.median_ratio -ge 1.02 -and $metric.lower_95_ratio -gt 1.0) {
+                "normal_promotion_threshold_met"
+            } elseif ($metric.median_ratio -ge 1.01 -and $metric.lower_95_ratio -gt 1.0 -and
+                $improvedPairs -ge $Ratios.Count - 1) {
+                "narrow_requires_mechanism_evidence"
+            } elseif ($Ratios.Count -eq 6 -and $metric.median_ratio -ge 1.01 -and
+                $metric.lower_95_ratio -le 1.0) {
+                "twelve_pair_extension_eligible"
+            } else {
+                "reject"
+            }
+        }
+        default { throw "Unknown Direct Quake campaign stage '$Stage'." }
+    }
+    return [pscustomobject][ordered]@{
+        median_ratio = $metric.median_ratio
+        geometric_mean_ratio = [Math]::Exp((@($Ratios | ForEach-Object {
+            [Math]::Log($_)
+        }) | Measure-Object -Average).Average)
+        lower_95_ratio = $metric.lower_95_ratio
+        lower_bound_confidence = $metric.lower_bound_confidence
+        improved_pairs = $improvedPairs
+        total_pairs = $Ratios.Count
+        classification = $classification
+    }
+}
+
+function Get-DirectQuakeSampleReasons(
+    $Policy,
+    [string]$RevisionRole,
+    [string]$ExpectedObservation,
+    [string]$ExpectedClass,
+    $Sample,
+    $ExecutionPolicy,
+    [string]$ExpectedExecutableSha256
+) {
+    $label = "$RevisionRole $ExpectedObservation"
+    $reasons = @()
+    foreach ($property in @(
+        "gate_role", "gate_observation", "gate_observation_class",
+        "gate_processor_index", "gate_processor_affinity_mask",
+        "gate_processor_affinity_verified", "gate_execution_role",
+        "gate_execution_cli", "gate_execution_jit", "gate_poll_skip",
+        "gate_measurement_fixture_sha256", "gate_termination_policy",
+        "gate_process_exit_code", "gate_power_scheme_before",
+        "gate_power_scheme_after", "gate_argv", "gate_argv_sha256",
+        "gate_executable_sha256", "gate_hdd_tree", "gate_artifacts"
+    )) {
+        if ($null -eq $Sample.PSObject.Properties[$property]) {
+            $reasons += "$label is missing $property"
+        }
+    }
+    if ($reasons.Count -ne 0) {
+        return [object[]]$reasons
+    }
+    if ($Sample.gate_role -cne $RevisionRole -or
+        $Sample.gate_observation -cne $ExpectedObservation -or
+        $Sample.gate_observation_class -cne $ExpectedClass) {
+        $reasons += "$label has the wrong role, observation, or observation class"
+    }
+    $expectedMask = Format-AffinityMask ([int64]1 -shl 8)
+    if ($Sample.gate_processor_index -ne 8 -or
+        $Sample.gate_processor_affinity_mask -cne $expectedMask -or
+        -not $Sample.gate_processor_affinity_verified) {
+        $reasons += "$label is missing verified processor 8 affinity"
+    }
+    foreach ($powerScheme in @(
+        [string]$Sample.gate_power_scheme_before,
+        [string]$Sample.gate_power_scheme_after
+    )) {
+        if (-not $powerScheme.Contains(
+            $highPerformancePowerSchemeGuid,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            $reasons += "$label was not measured under the High Performance power scheme"
+            break
+        }
+    }
+    if ($Sample.gate_power_scheme_before -cne $Sample.gate_power_scheme_after) {
+        $reasons += "$label changed power schemes during the child observation"
+    }
+    if ($Sample.gate_execution_role -cne $ExecutionPolicy.name -or
+        $Sample.gate_execution_cli -cne $ExecutionPolicy.cli -or
+        [string]$Sample.gate_execution_jit -cne $ExecutionPolicy.environment.IZARRAVM_JIT -or
+        [string]$Sample.gate_poll_skip -cne $ExecutionPolicy.environment.IZARRAVM_POLL_SKIP) {
+        $reasons += "$label did not use the forced Direct execution policy"
+    }
+    if ([string]$Sample.gate_executable_sha256 -cne $ExpectedExecutableSha256) {
+        $reasons += "$label executed the wrong frozen binary"
+    }
+    if ([string]$Sample.gate_measurement_fixture_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$Sample.gate_argv_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        @($Sample.gate_argv).Count -eq 0) {
+        $reasons += "$label is missing its fixture or argv identity"
+    }
+    if ($null -eq $Sample.gate_hdd_tree -or
+        $Sample.gate_hdd_tree.schema -cne "izarra-hdd-tree-snapshot-v1" -or
+        [string]$Sample.gate_hdd_tree.tree_sha256 -notmatch '^[0-9a-f]{64}$') {
+        $reasons += "$label is missing its final HDD tree identity"
+    }
+    $artifacts = $Sample.gate_artifacts
+    foreach ($property in @(
+        "profile_json_file", "profile_json_sha256", "stdout_file", "stdout_sha256",
+        "stderr_file", "stderr_sha256", "qconsole_file", "qconsole_sha256",
+        "result_block_status", "result_block_count", "result_block_sha256",
+        "result_block_normalized_bytes", "hdd_tree_file", "hdd_tree_sha256"
+    )) {
+        if ($null -eq $artifacts.PSObject.Properties[$property]) {
+            $reasons += "$label artifact evidence is missing $property"
+        }
+    }
+    if ([string]$artifacts.qconsole_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$artifacts.hdd_tree_sha256 -notmatch '^[0-9a-f]{64}$') {
+        $reasons += "$label is missing hashed QCONSOLE or HDD evidence"
+    }
+    if ($ExpectedClass -ceq "correctness") {
+        if ($Sample.gate_termination_policy -cne "lotura_test_exit" -or
+            $Sample.gate_process_exit_code -ne 0 -or $Sample.stop.kind -cne "test_exit" -or
+            $Sample.stop.code -ne 0) {
+            $reasons += "$label did not complete through Lotura TestExit code 0"
+        }
+        $reasons += @(Get-BackendQuakeCompletionReasons $Sample.gate_quake_completion $label)
+        $reasons += @(Get-BackendQuakeFixtureReasons $Sample.gate_fixture $label)
+        if ($artifacts.result_block_status -cne "valid" -or
+            $artifacts.result_block_count -ne 1 -or
+            [string]$artifacts.result_block_sha256 -notmatch '^[0-9a-f]{64}$') {
+            $reasons += "$label is missing one valid semantic result block"
+        }
+    } else {
+        if ($Sample.gate_termination_policy -cne "fixed_cycle_production" -or
+            $Sample.gate_process_exit_code -ne 0 -or $Sample.stop.kind -cne "cycle_limit" -or
+            [uint64]$Sample.stop.requested -ne [uint64]$Policy.cycle_budget) {
+            $reasons += "$label did not reach the fixed 6.2B-cycle production endpoint"
+        }
+        if ($null -ne $Sample.gate_fixture -or $null -ne $Sample.gate_quake_completion) {
+            $reasons += "$label used semantic-completion overrides in a production observation"
+        }
+        if ($null -eq $Sample.quake_timedemo -or $Sample.quake_timedemo.frames -ne 969) {
+            $reasons += "$label did not produce one 969-frame production timedemo line"
+        }
+    }
+    foreach ($field in @($ExecutionPolicy.required_zero_counters)) {
+        if ($null -eq $Sample.perf.PSObject.Properties[$field] -or $Sample.perf.$field -ne 0) {
+            $reasons += "$label required zero counter $field was missing or nonzero"
+        }
+    }
+    foreach ($property in $Sample.perf.PSObject.Properties) {
+        if ($property.Name.StartsWith("jit_clif_", [StringComparison]::Ordinal) -and
+            $property.Value -ne 0) {
+            $reasons += "$label reported legacy Clif activity in $($property.Name)"
+        }
+    }
+    if ($Sample.perf.jit_direct_entries -le 0 -or $Sample.perf.jit_direct_insns -le 0) {
+        $reasons += "$label did not execute Direct native blocks"
+    }
+    return [object[]]$reasons
+}
+
+function Get-DirectQuakeCampaignWorkloadSummary(
+    $Policy,
+    [object[]]$Candidate,
+    [object[]]$Parent,
+    $WarmupBucket,
+    $CorrectnessBucket,
+    $ExecutionPolicy,
+    [string]$Stage,
+    [string]$CandidateExecutableSha256,
+    [string]$ParentExecutableSha256
+) {
+    if ($Candidate.Count -ne $Parent.Count -or $Candidate.Count -ne $Runs) {
+        throw "Direct Quake campaign observations do not match the requested pair count."
+    }
+    $candidateWarmups = @($WarmupBucket.candidate)
+    $parentWarmups = @($WarmupBucket.parent)
+    $candidateCorrectness = @($CorrectnessBucket.candidate)
+    $parentCorrectness = @($CorrectnessBucket.parent)
+    if ($candidateWarmups.Count -ne 1 -or $parentWarmups.Count -ne 1 -or
+        $candidateCorrectness.Count -ne 1 -or $parentCorrectness.Count -ne 1) {
+        throw "Direct Quake campaign mode requires one warmup and one correctness observation per role."
+    }
+    $candidateExpectedHash = if ($Stage -ceq "Noise") {
+        $ParentExecutableSha256
+    } else {
+        $CandidateExecutableSha256
+    }
+    $provenanceReasons = @()
+    foreach ($entry in @(
+        @("candidate", "correctness", "correctness", $candidateCorrectness[0], $candidateExpectedHash),
+        @("parent", "correctness", "correctness", $parentCorrectness[0], $ParentExecutableSha256),
+        @("candidate", "warmup", "production", $candidateWarmups[0], $candidateExpectedHash),
+        @("parent", "warmup", "production", $parentWarmups[0], $ParentExecutableSha256)
+    )) {
+        $provenanceReasons += @(Get-DirectQuakeSampleReasons `
+            $Policy $entry[0] $entry[1] $entry[2] $entry[3] $ExecutionPolicy $entry[4])
+    }
+    for ($index = 0; $index -lt $Candidate.Count; $index++) {
+        $observation = "pair$($index + 1)"
+        $provenanceReasons += @(Get-DirectQuakeSampleReasons `
+            $Policy "candidate" $observation "production" $Candidate[$index] `
+            $ExecutionPolicy $candidateExpectedHash)
+        $provenanceReasons += @(Get-DirectQuakeSampleReasons `
+            $Policy "parent" $observation "production" $Parent[$index] `
+            $ExecutionPolicy $ParentExecutableSha256)
+    }
+
+    $exactReasons = @()
+    $correctnessComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord $Policy.name $candidateCorrectness[0]) `
+        (Get-EqualWorkRecord $Policy.name $parentCorrectness[0])
+    if (-not $correctnessComparison.matches) {
+        $exactReasons += "correctness: $($correctnessComparison.mismatched_fields -join ', ')"
+    }
+    $warmupComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord $Policy.name $candidateWarmups[0]) `
+        (Get-EqualWorkRecord $Policy.name $parentWarmups[0])
+    if (-not $warmupComparison.matches) {
+        $exactReasons += "warmup: $($warmupComparison.mismatched_fields -join ', ')"
+    }
+    $ipsRatios = @()
+    $rtfRatios = @()
+    $pairs = for ($index = 0; $index -lt $Candidate.Count; $index++) {
+        $comparison = Compare-EqualWorkRecords `
+            (Get-EqualWorkRecord $Policy.name $Candidate[$index]) `
+            (Get-EqualWorkRecord $Policy.name $Parent[$index])
+        if (-not $comparison.matches) {
+            $exactReasons += "pair $($index + 1): $($comparison.mismatched_fields -join ', ')"
+        }
+        $ipsRatio = $Candidate[$index].instructions_per_host_second /
+            $Parent[$index].instructions_per_host_second
+        $rtfRatio = $Candidate[$index].real_time_factor /
+            $Parent[$index].real_time_factor
+        $ipsRatios += $ipsRatio
+        $rtfRatios += $rtfRatio
+        [ordered]@{
+            pair = $index + 1
+            instructions_per_host_second_ratio = $ipsRatio
+            real_time_factor_ratio = $rtfRatio
+            exact_work = $comparison
+        }
+    }
+    $candidateDeterminism = Get-RoleExactDeterminism `
+        $Policy.name @($candidateWarmups + $Candidate)
+    $parentDeterminism = Get-RoleExactDeterminism `
+        $Policy.name @($parentWarmups + $Parent)
+    if (-not $candidateDeterminism.deterministic) {
+        $exactReasons += "candidate production role: $($candidateDeterminism.mismatched_fields -join ', ')"
+    }
+    if (-not $parentDeterminism.deterministic) {
+        $exactReasons += "parent production role: $($parentDeterminism.mismatched_fields -join ', ')"
+    }
+    return [ordered]@{
+        name = $Policy.name
+        mode = $Policy.mode
+        observation_classes = [ordered]@{
+            correctness = [ordered]@{
+                candidate = $candidateCorrectness[0]
+                parent = $parentCorrectness[0]
+                exact_work = $correctnessComparison
+                included_in_wall_statistics = $false
+            }
+            production = [ordered]@{
+                endpoint = "fixed 6.2B-cycle canonical Quake fixture"
+                candidate = Get-RoleSummary "candidate" $Policy.mode $Candidate $false
+                parent = Get-RoleSummary "parent" $Policy.mode $Parent $false
+                discarded_warmups = [ordered]@{
+                    candidate = $candidateWarmups[0]
+                    parent = $parentWarmups[0]
+                }
+            }
+        }
+        candidate = Get-RoleSummary "candidate" $Policy.mode $Candidate $false
+        parent = Get-RoleSummary "parent" $Policy.mode $Parent $false
+        discarded_warmups = [ordered]@{
+            candidate = [object[]]$candidateWarmups
+            parent = [object[]]$parentWarmups
+        }
+        pairs = [object[]]$pairs
+        paired_metrics = [ordered]@{
+            instructions_per_host_second = Get-DirectQuakeCampaignMetric `
+                ([double[]]$ipsRatios) $Stage
+            real_time_factor = Get-DirectQuakeCampaignMetric ([double[]]$rtfRatios) $Stage
+        }
+        exact_work = [ordered]@{
+            verdict = if ($exactReasons.Count -eq 0) { "pass" } else { "fail" }
+            failure_reasons = [object[]]$exactReasons
+            candidate_production_determinism = $candidateDeterminism
+            parent_production_determinism = $parentDeterminism
+        }
+        provenance = [ordered]@{
+            verdict = if ($provenanceReasons.Count -eq 0) { "pass" } else { "fail" }
+            failure_reasons = [object[]]$provenanceReasons
+        }
+        failure_reasons = [object[]]@($exactReasons + $provenanceReasons)
     }
 }
 
@@ -1747,6 +2131,179 @@ function New-TrackMComparisonSummary([object[]]$Workloads) {
     }
 }
 
+function New-DirectQuakeCampaignSummary([object[]]$Workloads) {
+    $globalReasons = @()
+    if ($Workloads.Count -ne 1 -or $Workloads[0].name -cne "quake-586") {
+        $globalReasons += "the campaign did not contain exactly one Quake/586 workload"
+    }
+    if (-not $candidateArtifact.verified -or -not $candidateArtifact.built_this_invocation -or
+        -not $baselineArtifact.verified -or -not $baselineArtifact.built_this_invocation) {
+        $globalReasons += "candidate and retained parent were not freshly built from isolated revisions"
+    }
+    if ($candidateArtifact.build.recipe_fingerprint_sha256 -cne
+        $baselineArtifact.build.recipe_fingerprint_sha256) {
+        $globalReasons += "candidate and retained-parent build recipes differ"
+    }
+    $sameBinary = $candidateArtifact.sha256 -ceq $baselineArtifact.sha256
+    if ($CampaignStage -ceq "Noise" -and -not $sameBinary) {
+        $globalReasons += "Noise did not produce byte-identical candidate and parent builds"
+    }
+    if ($CampaignStage -cne "Noise" -and $sameBinary) {
+        $globalReasons += "Screen or Proof compared byte-identical builds"
+    }
+    if ($repositoryAtSelection.dirty -or -not $repositoryStable) {
+        $globalReasons += "the candidate repository was dirty or changed during measurement"
+    }
+    if (-not $candidateExecutableStable -or -not $parentExecutableStable) {
+        $globalReasons += "a frozen revision executable changed during measurement"
+    }
+    if (-not $quakeFrozenStable -or -not $quakeSourceStable) {
+        $globalReasons += "the Quake source or frozen fixture changed during measurement"
+    }
+    if (-not $gateSourceClosureStable -or $gateScriptHashAfter -cne $gateScriptHash -or
+        -not $fixtureManifestStable) {
+        $globalReasons += "the proof source closure or workload manifest changed during measurement"
+    }
+    $expectedChildren = 4 + 2 * $Runs
+    if (-not $verifiedChildAffinityStable -or
+        $verifiedChildAffinityMasks.Count -ne $expectedChildren) {
+        $globalReasons += "not every campaign child used verified processor 8 affinity"
+    }
+    if ($null -ne $outerAffinityRestoreFailure) {
+        $globalReasons += "the gate process affinity did not restore after measurement"
+    }
+    if (-not $powerSchemeStable -or
+        -not ([string]$activePowerScheme).Contains(
+            $highPerformancePowerSchemeGuid,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not ([string]$activePowerSchemeAtCompletion).Contains(
+            $highPerformancePowerSchemeGuid,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        $globalReasons += "the High Performance power scheme was not active and stable"
+    }
+    if ($null -eq $measurementLockEvidence -or
+        $measurementLockEvidence.path -cne [IO.Path]::GetFullPath($MeasurementLockPath)) {
+        $globalReasons += "the exclusive measurement lock is missing or wrong"
+    }
+    if ($detectedBuildEnvironmentOverrides.Count -ne 0) {
+        $globalReasons += "build environment overrides were present"
+    }
+
+    $workload = if ($Workloads.Count -eq 1) { $Workloads[0] } else { $null }
+    $workloadValid = $null -ne $workload -and
+        $workload.exact_work.verdict -ceq "pass" -and
+        $workload.provenance.verdict -ceq "pass"
+    $validity = $workloadValid -and $globalReasons.Count -eq 0
+    $performanceClassification = if ($null -eq $workload) {
+        "not_available"
+    } else {
+        $workload.paired_metrics.real_time_factor.classification
+    }
+    $verdict = if (-not $validity) {
+        "invalid"
+    } elseif ($CampaignStage -ceq "Noise") {
+        "valid_noise_study"
+    } elseif ($CampaignStage -ceq "Screen") {
+        $performanceClassification
+    } else {
+        $performanceClassification
+    }
+    $workloadReasons = if ($null -eq $workload) { @() } else {
+        @($workload.failure_reasons | ForEach-Object { "quake-586: $_" })
+    }
+    $quakeOverrides = Get-BackendQuakeCompletionOverrides
+    return [ordered]@{
+        schema = "izarravm-direct-quake-campaign-partial-proof-v1"
+        comparison_class = "direct_quake_immediate_parent_revision_pair"
+        proof_completeness = "partial"
+        stage = $CampaignStage.ToLowerInvariant()
+        verdict = $verdict
+        evidence_valid = $validity
+        retention_eligible = $false
+        retention_blockers = [object[]]@(
+            "StateSnapshotV1 is not yet captured",
+            "scaled bus-clock total is not yet exposed",
+            "the per-slice deterministic counter allowlist is not yet implemented"
+        )
+        revision_pair = [ordered]@{
+            candidate_commit = $revision
+            candidate_tree = $candidateArtifact.artifact_source.head_tree
+            parent_commit = $baselineCommit
+            parent_tree = $baselineTree
+            derivation = "unique immediate parent of candidate commit"
+        }
+        executables = [ordered]@{
+            candidate = $candidateArtifact
+            retained_parent = $baselineArtifact
+            byte_identical = $sameBinary
+            noise_executed_path = if ($CampaignStage -ceq "Noise") {
+                $baselineArtifact.executed_copy_path
+            } else { $null }
+        }
+        execution = [ordered]@{
+            role = "direct"
+            environment = $directQuakeExecutionPolicy.environment
+            required_zero_counters = $directQuakeExecutionPolicy.required_zero_counters
+        }
+        observation_contract = [ordered]@{
+            correctness = "one semantic-completion observation per role, excluded from wall statistics"
+            production = "one discarded warmup per role, then canonical fixed-cycle measurements"
+            fresh_hdd_copy = "robocopy per observation"
+            exact_argv_recorded = $true
+            final_hdd_tree_recorded = $true
+        }
+        semantic_completion_fixture = [ordered]@{
+            autoexec_override_sha256 = $quakeOverrides.autoexec_sha256
+            bench_cfg_override_sha256 = $quakeOverrides.bench_cfg_sha256
+            wait_marker = $quakeOverrides.wait_marker
+            required_stop = "Lotura TestExit code 0"
+        }
+        measurement_lock = $measurementLockEvidence
+        gate_source_closure = $gateSourceClosureEvidence
+        workload_manifest_sha256 = [ordered]@{
+            at_entry = $fixtureManifestHash
+            at_completion = $fixtureManifestHashAfter
+        }
+        workload_inputs_sha256 = $workloadInputHashes
+        workload_trees_sha256 = $workloadTreeHashes
+        workload_canonical_trees_sha256 = $workloadCanonicalTreeHashes
+        generated_utc = [DateTime]::UtcNow.ToString("o")
+        host = [ordered]@{
+            identity = $hostIdentity
+            active_power_scheme_at_completion = $activePowerSchemeAtCompletion
+            active_power_scheme_stable = $powerSchemeStable
+        }
+        processor_affinity = [ordered]@{
+            requested_processor_index = $ProcessorIndex
+            requested_mask = Format-AffinityMask $requestedProcessorMask
+            verified_child_processes = $verifiedChildAffinityMasks.Count
+            expected_child_processes = $expectedChildren
+            verified_child_masks = @($verifiedChildAffinityMasks | Sort-Object -Unique)
+        }
+        measured_pairs = $Runs
+        discarded_warmups_per_role = 1
+        correctness_observations_per_role = 1
+        pair_seed = $null
+        pair_order = @(1..$Runs | ForEach-Object {
+            [ordered]@{
+                pair = $_
+                roles = @(Get-DirectQuakePairOrder $_ @("candidate", "parent"))
+            }
+        })
+        acceptance = [ordered]@{
+            proof_minimum_median_ratio = 1.02
+            proof_minimum_lower_95_ratio_exclusive = 1.0
+            narrow_minimum_improved_pairs_of_six = 5
+            screen_is_retention_eligible = $false
+            correctness_and_production_exact_work_required = $true
+        }
+        workloads = $Workloads
+        failure_reasons = [object[]]@($workloadReasons + $globalReasons)
+    }
+}
+
 function Add-TrackMExpectedResultArtifact(
     [Collections.Generic.Dictionary[string, object]]$Expected,
     [Collections.Generic.List[string]]$Failures,
@@ -2063,6 +2620,189 @@ function Write-TrackMEvidencePackage(
     }
     if ($failures.Count -ne 0) {
         throw "Track M evidence integrity failed after packaging: $($failures -join '; ')"
+    }
+    return [pscustomobject][ordered]@{
+        manifest_path = $manifestPath
+        manifest_sha256 = $manifestHash
+        result_log_path = $resultLogPath
+        summary_sha256 = $summaryHash
+    }
+}
+
+function Write-DirectQuakeCampaignEvidencePackage(
+    [string]$ResultsRoot,
+    [string]$SummaryPath,
+    $Summary,
+    $CandidateArtifact,
+    $ParentArtifact,
+    $GateSourceClosure,
+    [string]$MainPath,
+    [string]$SelfTestPath,
+    [string]$SummaryScriptPath,
+    [string]$FixtureManifestPath
+) {
+    $root = [IO.Path]::GetFullPath($ResultsRoot)
+    $summaryFullPath = [IO.Path]::GetFullPath($SummaryPath)
+    $rootPrefix = $root.TrimEnd([IO.Path]::DirectorySeparatorChar) +
+        [IO.Path]::DirectorySeparatorChar
+    if (-not $summaryFullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $summaryFullPath -PathType Leaf)) {
+        throw "Direct Quake campaign summary is outside the evidence directory or missing."
+    }
+    $manifestPath = Join-Path $root "evidence-manifest.json"
+    $resultLogPath = Join-Path $root "result.log"
+    if ((Test-Path -LiteralPath $manifestPath) -or (Test-Path -LiteralPath $resultLogPath)) {
+        throw "Direct Quake campaign evidence requires a new results directory."
+    }
+
+    $failures = [Collections.Generic.List[string]]::new()
+    $expected = [Collections.Generic.Dictionary[string, object]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    Add-TrackMExpectedResultArtifact $expected $failures `
+        ([IO.Path]::GetFileName($CandidateArtifact.executed_copy_path)) `
+        $CandidateArtifact.sha256 "candidate_executable" "candidate executable"
+    Add-TrackMExpectedResultArtifact $expected $failures `
+        ([IO.Path]::GetFileName($ParentArtifact.executed_copy_path)) `
+        $ParentArtifact.sha256 "parent_executable" "retained-parent executable"
+    $summaryHash = Get-FileSha256 $summaryFullPath
+    Add-TrackMExpectedResultArtifact $expected $failures `
+        ([IO.Path]::GetFileName($summaryFullPath)) $summaryHash "summary" "final summary"
+
+    foreach ($workload in @($Summary.workloads)) {
+        $samplesByRole = [ordered]@{
+            candidate = [object[]]@(
+                $workload.observation_classes.correctness.candidate,
+                $workload.discarded_warmups.candidate[0]
+            ) + [object[]]@($workload.candidate.runs)
+            parent = [object[]]@(
+                $workload.observation_classes.correctness.parent,
+                $workload.discarded_warmups.parent[0]
+            ) + [object[]]@($workload.parent.runs)
+        }
+        foreach ($role in @("candidate", "parent")) {
+            foreach ($sample in @($samplesByRole[$role])) {
+                $context = "$($workload.name) $role $($sample.gate_observation)"
+                $artifacts = $sample.gate_artifacts
+                foreach ($name in @("profile_json", "stdout", "stderr", "qconsole", "hdd_tree")) {
+                    $fileProperty = "${name}_file"
+                    $hashProperty = "${name}_sha256"
+                    Add-TrackMExpectedResultArtifact $expected $failures `
+                        ([string]$artifacts.$fileProperty) ([string]$artifacts.$hashProperty) `
+                        $name "$context $name"
+                }
+            }
+        }
+    }
+
+    $resultRecords = @()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Recurse -Force |
+        Sort-Object FullName)) {
+        $relativeName = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
+        $entry = if ($expected.ContainsKey($relativeName)) { $expected[$relativeName] } else { $null }
+        $record = Get-TrackMResultFileRecord $root $file $entry
+        $resultRecords += $record
+        $null = $seen.Add($relativeName)
+        if ($null -eq $entry) {
+            $failures.Add("unexpected result artifact $relativeName")
+        } elseif ($record.sha256 -cne $entry.expected_sha256) {
+            $failures.Add("$($entry.context) SHA-256 does not match its recorded value")
+        }
+    }
+    foreach ($entry in $expected.GetEnumerator()) {
+        if (-not $seen.Contains($entry.Key)) {
+            $failures.Add("missing result artifact $($entry.Key)")
+        }
+    }
+
+    $sourcePaths = [ordered]@{
+        "scripts/run-realtime-gate.ps1" = $MainPath
+        "scripts/run-realtime-gate-self-test.ps1" = $SelfTestPath
+        "scripts/run-realtime-gate-summary.ps1" = $SummaryScriptPath
+    }
+    $sourceRecords = @()
+    foreach ($source in $sourcePaths.GetEnumerator()) {
+        $identity = Get-GateSourceMemberIdentity $source.Key $source.Value
+        $recorded = @($GateSourceClosure.members | Where-Object { $_.label -ceq $source.Key })
+        if ($recorded.Count -ne 1 -or $recorded[0].byte_length -ne $identity.byte_length -or
+            $recorded[0].sha256 -cne $identity.sha256) {
+            $failures.Add("gate source member $($source.Key) does not match the closed source identity")
+        }
+        $sourceRecords += [pscustomobject][ordered]@{
+            path = $source.Key
+            artifact_class = "gate_source"
+            byte_length = $identity.byte_length
+            sha256 = $identity.sha256
+        }
+    }
+    $fixtureFile = Get-Item -LiteralPath $FixtureManifestPath
+    $fixtureRecord = [pscustomobject][ordered]@{
+        path = "scripts/realtime-gate-inputs.json"
+        artifact_class = "workload_manifest"
+        byte_length = $fixtureFile.Length
+        sha256 = Get-FileSha256 $fixtureFile.FullName
+    }
+    if ($fixtureRecord.sha256 -cne $Summary.workload_manifest_sha256.at_completion) {
+        $failures.Add("workload manifest SHA-256 does not match the final summary")
+    }
+    $resultRecords = @($resultRecords | Sort-Object path)
+    $sourceRecords = @($sourceRecords | Sort-Object path)
+    $manifest = [ordered]@{
+        schema = "izarravm-direct-quake-campaign-evidence-manifest-v1"
+        comparison_schema = $Summary.schema
+        stage = $Summary.stage
+        verdict = $Summary.verdict
+        retention_eligible = $Summary.retention_eligible
+        revision_pair = $Summary.revision_pair
+        summary = [ordered]@{
+            path = [IO.Path]::GetFileName($summaryFullPath)
+            byte_length = (Get-Item -LiteralPath $summaryFullPath).Length
+            sha256 = $summaryHash
+        }
+        result_directory_files = [object[]]$resultRecords
+        gate_source_members = [object[]]$sourceRecords
+        workload_manifest = $fixtureRecord
+        coverage = [ordered]@{
+            expected_result_files = $expected.Count
+            observed_result_files = $resultRecords.Count
+            all_expected_present = @($expected.Keys | Where-Object {
+                -not $seen.Contains($_)
+            }).Count -eq 0
+            no_unexpected_files = @($resultRecords | Where-Object {
+                $_.artifact_class -ceq "unexpected"
+            }).Count -eq 0
+        }
+        integrity_verdict = if ($failures.Count -eq 0) { "pass" } else { "fail" }
+        integrity_failures = [object[]]@($failures)
+    }
+    $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+    $manifestHash = Get-FileSha256 $manifestPath
+    $logLines = @(
+        "schema=izarravm-direct-quake-campaign-result-v1",
+        "stage=$($Summary.stage)",
+        "verdict=$($Summary.verdict)",
+        "retention_eligible=false",
+        "candidate_commit=$($Summary.revision_pair.candidate_commit)",
+        "parent_commit=$($Summary.revision_pair.parent_commit)",
+        "summary_sha256=$summaryHash",
+        "evidence_manifest_sha256=$manifestHash",
+        "evidence_integrity=$($manifest.integrity_verdict)"
+    )
+    [IO.File]::WriteAllText(
+        $resultLogPath,
+        ($logLines -join "`n") + "`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $resultLogHash = Get-FileSha256 $resultLogPath
+    $finalFailures = @(Get-TrackMEvidenceFinalVerificationFailures `
+        $root $resultRecords $sourceRecords $sourcePaths $fixtureRecord `
+        $FixtureManifestPath $manifestPath $manifestHash $resultLogPath $resultLogHash)
+    if ($finalFailures.Count -ne 0) {
+        throw "Direct Quake campaign evidence changed during final verification: $($finalFailures -join '; ')"
+    }
+    if ($failures.Count -ne 0) {
+        throw "Direct Quake campaign evidence integrity failed: $($failures -join '; ')"
     }
     return [pscustomobject][ordered]@{
         manifest_path = $manifestPath
