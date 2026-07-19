@@ -1185,11 +1185,16 @@ impl CpuGsw {
                     jit.smc_heat.bump(key.physical, 1, heat_epoch);
                     jit.clif_units.park_dormant(key);
                     self.perf.smc_heat_demotions += 1;
+                    self.jit_clif.park_heat_chunk += 1;
                     return Ok(ClifContinuation::Interpret);
                 }
                 let Some(layout) = jit::clif::cache::walk_unit(self, key.linear, d) else {
                     // A cold or structurally unclassifiable entry: nothing to admit yet, try
                     // again once the decode cache has warmed enough lines to walk one unit.
+                    // Track C1f: this bail stays Seen and is NOT parked Dormant, so it is
+                    // attributable as a `Seen` re-attempt-without-install cause (see
+                    // `JitClifCounters::retry_incomplete_walk`).
+                    self.jit_clif.retry_incomplete_walk += 1;
                     return Ok(ClifContinuation::Interpret);
                 };
                 // The unit executes its leading run of lowerable slots natively (Track C
@@ -1199,6 +1204,7 @@ impl CpuGsw {
                 let plan = jit::clif::lower::plan_unit(&layout.kinds, true);
                 if plan.leading == 0 {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_no_lowerable += 1;
                     return Ok(ClifContinuation::Interpret);
                 }
                 self.jit_clif.compile_attempts += 1;
@@ -1215,6 +1221,7 @@ impl CpuGsw {
                 });
                 if !code_page_covers_unit {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_no_code_cover += 1;
                     return Ok(ClifContinuation::Interpret);
                 }
                 // C1e: the certified code page's host pointer, kept on the descriptor so
@@ -1233,6 +1240,7 @@ impl CpuGsw {
                     jit.smc_heat.bump(key.physical, 1, heat_epoch);
                     jit.clif_units.park_dormant(key);
                     self.perf.smc_heat_demotions += 1;
+                    self.jit_clif.park_heat_span += 1;
                     return Ok(ClifContinuation::Interpret);
                 }
                 let Some(segment_layout) = jit::direct::SegmentLayout::capture(
@@ -1241,6 +1249,7 @@ impl CpuGsw {
                     layout.write_segments,
                 ) else {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_segment_capture_failed += 1;
                     return Ok(ClifContinuation::Interpret);
                 };
                 let memory_cpl3 = self.current_privilege_level() == 3;
@@ -1253,6 +1262,10 @@ impl CpuGsw {
                 let has_memory = !plan.access_total.is_zero();
                 let map = if has_memory {
                     let Some(map) = self.jit_fast_map.native_bases() else {
+                        // Track C1f: this bail stays Seen and is NOT parked Dormant (the C0
+                        // review's MINOR-2 suspect), so it is separately attributable as
+                        // `JitClifCounters::retry_no_fast_map`.
+                        self.jit_clif.retry_no_fast_map += 1;
                         return Ok(ClifContinuation::Interpret);
                     };
                     Some(map)
@@ -1280,6 +1293,7 @@ impl CpuGsw {
                 }
                 let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_backend_unavailable += 1;
                     return Ok(ClifContinuation::Interpret);
                 };
                 // C1d: the sentinel descriptor and portal exist before any cell is
@@ -1292,6 +1306,7 @@ impl CpuGsw {
                     .map(|sentinel| std::ptr::from_ref(sentinel) as usize)
                 else {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_backend_unavailable += 1;
                     return Ok(ClifContinuation::Interpret);
                 };
                 let sentinel_portal = self.jit_direct.clif_units.sentinel_portal(sentinel_addr);
@@ -1308,15 +1323,20 @@ impl CpuGsw {
                 };
                 let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_backend_unavailable += 1;
                     return Ok(ClifContinuation::Interpret);
                 };
                 let compile_start = std::time::Instant::now();
                 let compiled =
                     jit::clif::lower::compile_unit(backend, &layout, &plan, entry_eip, mem_context);
-                self.perf.jit_direct_compile_ns +=
+                // Track C1f: a dedicated clif-only compile timer (see `JitClifCounters::
+                // compile_ns`'s doc comment for why this used to be folded into
+                // `PerfCounters::jit_direct_compile_ns`, mislabeling clif's cost as Direct's).
+                self.jit_clif.compile_ns +=
                     compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                 let Some(entry) = compiled else {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_compile_failed += 1;
                     return Ok(ClifContinuation::Interpret);
                 };
                 let descriptor = jit::clif::cache::ClifUnitDescriptor {
@@ -1353,6 +1373,7 @@ impl CpuGsw {
                     .clif_install(descriptor, cells, sentinel_addr)
                 else {
                     self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_install_failed += 1;
                     return Ok(ClifContinuation::Interpret);
                 };
                 self.jit_clif.units_installed += 1;

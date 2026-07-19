@@ -665,7 +665,28 @@ impl CpuGsw {
     /// `CpuGsw` tail (see `JitClifCounters` for why). Reset alongside the
     /// other counters by `reset_perf_counters`.
     pub fn jit_clif_counters(&self) -> JitClifCounters {
-        self.jit_clif
+        #[cfg_attr(
+            not(all(
+                feature = "jit",
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            )),
+            allow(unused_mut)
+        )]
+        let mut counters = self.jit_clif;
+        // Track C1f: `entries_len` is a live gauge, not an accumulator, so it is filled in
+        // here at read time rather than incremented at a `run.rs` call site.
+        #[cfg(all(
+            feature = "jit",
+            feature = "clif-backend",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        {
+            counters.entries_len = self.jit_direct.clif_entries_len() as u64;
+        }
+        counters
     }
 
     /// Zero the host-side performance counters, including the memory-poll and

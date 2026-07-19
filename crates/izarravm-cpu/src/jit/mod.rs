@@ -280,6 +280,18 @@ impl JitState {
         self.clif_units
             .invalidate_physical_range(&mut self.code_watch, physical, width)
     }
+
+    /// Track C1f diagnostic gauge: `ClifUnitCache::entries_len`, exposed through the
+    /// hoisted `JitState` for `CpuGsw::jit_clif_counters` to read (mirrors the accessor
+    /// pattern of the other `clif_*` wrappers on this impl).
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn clif_entries_len(&self) -> usize {
+        self.clif_units.entries_len()
+    }
 }
 
 impl std::fmt::Debug for JitState {
