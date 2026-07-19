@@ -2,8 +2,34 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+use thiserror::Error;
 
-use crate::{CpuGsw, GswMode, SegmentIndex, SegmentRegister};
+use crate::{
+    CR0_AM, CpuGsw, FLAG_AC, GswMode, PREFETCH_WINDOW_BYTES, SegmentIndex, SegmentRegister,
+    TLB_ENTRIES, Tlb, TlbEntry,
+};
+
+/// A CPU boundary that cannot be represented by the compare-only execution payload.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum CpuCanonicalCaptureError {
+    #[error("a budgeted REP continuation is still active")]
+    ActiveRepContinuation,
+    #[error("the cached alignment-check state disagrees with CR0 and EFLAGS")]
+    InconsistentAlignmentCache,
+    #[error("the prefetch window length {length} exceeds its storage")]
+    InvalidPrefetchLength { length: u8 },
+    #[error("the pending write-page tracker is inconsistent")]
+    InvalidWriteTracker,
+}
+
+/// An immutable, validated view of CPU execution state for canonical comparison.
+///
+/// This is not a restorable microarchitectural save state. Host pointers and transparent
+/// execution caches are deliberately absent.
+#[must_use]
+pub struct CanonicalCpuExecution<'a> {
+    cpu: &'a CpuGsw,
+}
 
 const fn mode_tag(mode: GswMode) -> u32 {
     match mode {
@@ -25,7 +51,112 @@ fn write_segment(
     out.write_bool(segment.default_size_32)
 }
 
+fn live_tlb_entries(cpu: &CpuGsw) -> [Option<TlbEntry>; TLB_ENTRIES] {
+    let mut live = [None; TLB_ENTRIES];
+    for (slot, entry) in cpu.tlb.entries.iter().copied().enumerate() {
+        if entry.generation == cpu.tlb.generation && Tlb::slot(entry.tag) == slot {
+            live[slot] = Some(entry);
+        }
+    }
+    live.sort_unstable_by_key(|entry| match entry {
+        Some(entry) => (false, entry.tag),
+        None => (true, 0),
+    });
+    live
+}
+
+impl CanonicalCpuExecution<'_> {
+    /// Writes version 1 of the validated CPU execution payload.
+    pub fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        let cpu = self.cpu;
+        out.write_u32(cpu.registers.eflags)?;
+        out.write_u32(cpu.pending_flags.tag)?;
+        out.write_u32(cpu.pending_flags.a)?;
+        out.write_u32(cpu.pending_flags.b)?;
+        out.write_u32(cpu.pending_flags.result)?;
+        out.write_u64(cpu.elapsed_clocks)?;
+        out.write_u64(cpu.timing_rem)?;
+        out.write_u64(cpu.fp_rem)?;
+        out.write_bool(cpu.halted)?;
+        out.write_bool(cpu.interrupt_shadow)?;
+
+        let live_tlb = live_tlb_entries(cpu);
+        out.write_count(live_tlb.iter().flatten().count() as u64)?;
+        for entry in live_tlb.into_iter().flatten() {
+            out.write_u32(entry.tag)?;
+            out.write_u32(entry.phys)?;
+            out.write_bool(entry.writable)?;
+            out.write_bool(entry.user)?;
+            out.write_bool(entry.dirty)?;
+        }
+
+        let cs = cpu.registers.cs();
+        let current_linear =
+            (cpu.registers.eip <= cs.limit).then(|| cs.base.wrapping_add(cpu.registers.eip));
+        let prefetch_can_serve = current_linear
+            .and_then(|linear| cpu.prefetch.get(cs, linear))
+            .is_some();
+        let pending_prefetch_invalidation = prefetch_can_serve
+            && (cpu.written_pages_overflow
+                || cpu.written_pages[..usize::from(cpu.written_count)]
+                    .iter()
+                    .flatten()
+                    .any(|page| *page == cpu.prefetch.physical_base >> 12));
+        let prefetch_present = prefetch_can_serve && !pending_prefetch_invalidation;
+        out.write_bool(pending_prefetch_invalidation)?;
+        out.write_bool(prefetch_present)?;
+        if prefetch_present {
+            write_segment(out, cpu.prefetch.cs)?;
+            out.write_u32(cpu.prefetch.linear_base)?;
+            out.write_u32(cpu.prefetch.physical_base)?;
+            out.write_count(u64::from(cpu.prefetch.len))?;
+            out.write_raw_bytes(&cpu.prefetch.bytes[..usize::from(cpu.prefetch.len)])?;
+        }
+        Ok(())
+    }
+}
+
 impl CpuGsw {
+    /// Validates and borrows the CPU state used by the compare-only execution payload.
+    pub fn canonical_execution_capture(
+        &self,
+    ) -> Result<CanonicalCpuExecution<'_>, CpuCanonicalCaptureError> {
+        if self.rep_resume_active
+            || self.rep_execution.resume.is_some()
+            || self.rep_execution.budget.is_some()
+            || self.rep_execution.yielded
+        {
+            return Err(CpuCanonicalCaptureError::ActiveRepContinuation);
+        }
+        let expected_alignment =
+            self.control.cr0 & CR0_AM != 0 && self.registers.eflags & FLAG_AC != 0;
+        if self.alignment_armed != expected_alignment {
+            return Err(CpuCanonicalCaptureError::InconsistentAlignmentCache);
+        }
+        if usize::from(self.prefetch.len) > PREFETCH_WINDOW_BYTES {
+            return Err(CpuCanonicalCaptureError::InvalidPrefetchLength {
+                length: self.prefetch.len,
+            });
+        }
+        let written_count = usize::from(self.written_count);
+        let packed_write_pages = written_count <= self.written_pages.len()
+            && self.written_pages[..written_count]
+                .iter()
+                .all(Option::is_some)
+            && self.written_pages[written_count..]
+                .iter()
+                .all(Option::is_none);
+        let valid_overflow =
+            !self.written_pages_overflow || written_count == self.written_pages.len();
+        if !packed_write_pages || !valid_overflow {
+            return Err(CpuCanonicalCaptureError::InvalidWriteTracker);
+        }
+        Ok(CanonicalCpuExecution { cpu: self })
+    }
+
     /// Writes version 1 of the CPU architectural payload without changing CPU state.
     /// Hidden execution representations and x87 state use separate payloads.
     pub fn write_canonical_arch_payload(
@@ -85,7 +216,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Msrs, PendingFlags};
+    use crate::{
+        AddressSize, DecodeGroup, DecodedInsn, Msrs, OperandSize, PendingFlags, Prefixes,
+        RepBudget, RepResume, TRACKED_WRITE_PAGES,
+    };
 
     const ARCH_PAYLOAD_LEN: usize = 217;
     const EFLAGS_RANGE: Range<usize> = 108..112;
@@ -105,6 +239,67 @@ mod tests {
         let bytes = state.finish().unwrap();
         let view = CanonicalStateView::parse(&bytes).unwrap();
         view.sections()[0].payload().to_vec()
+    }
+
+    fn execution_payload(cpu: &CpuGsw) -> Result<Vec<u8>, CpuCanonicalCaptureError> {
+        let capture = cpu.canonical_execution_capture()?;
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(2).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        Ok(view.sections()[0].payload().to_vec())
+    }
+
+    fn live_prefetch_cpu(length: u8) -> CpuGsw {
+        let mut cpu = CpuGsw::default();
+        let cs = SegmentRegister {
+            selector: 0x1234,
+            base: 0x0001_0000,
+            limit: 0x0000_ffff,
+            access: 0x9b,
+            default_size_32: true,
+        };
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        cpu.registers.eip = 0x101;
+        cpu.prefetch.cs = cs;
+        cpu.prefetch.linear_base = cs.base + 0x100;
+        cpu.prefetch.physical_base = 0x0008_0000;
+        cpu.prefetch.len = length;
+        for (index, byte) in cpu.prefetch.bytes.iter_mut().enumerate() {
+            *byte = 0x80u8.wrapping_add(index as u8);
+        }
+        cpu
+    }
+
+    fn dummy_rep_resume() -> RepResume {
+        RepResume {
+            insn: DecodedInsn {
+                len: 1,
+                prefixes: Prefixes::default(),
+                opcode: 0x90,
+                operand_size: OperandSize::Word,
+                address_size: AddressSize::Word,
+                modrm: None,
+                operand: None,
+                imm: 0,
+                imm2: 0,
+                group: DecodeGroup::Misc,
+                continuable: false,
+                disp_len: 0,
+                imm_len: 0,
+            },
+            start_eip: 0x100,
+            post_eip: 0x101,
+            cs: SegmentRegister::default(),
+            precharged_core: 1,
+        }
     }
 
     fn append_segment(expected: &mut Vec<u8>, segment: SegmentRegister) {
@@ -421,6 +616,421 @@ mod tests {
         changed.alignment_armed = true;
         changed.perf.instructions = 5;
         assert_eq!(arch_payload(&changed), expected);
+    }
+
+    #[test]
+    fn execution_payload_has_exact_minimum_golden() {
+        let payload = execution_payload(&CpuGsw::default()).unwrap();
+        let mut expected = vec![0; 56];
+        expected[..4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn execution_payload_has_exact_maximum_golden() {
+        let mut cpu = live_prefetch_cpu(PREFETCH_WINDOW_BYTES as u8);
+        cpu.registers.eflags = 0x8000_0202;
+        cpu.pending_flags = PendingFlags {
+            tag: 0x8123_4567,
+            a: 0x1020_3040,
+            b: 0x5060_7080,
+            result: 0x90a0_b0c0,
+        };
+        cpu.elapsed_clocks = 0x0102_0304_0506_0708;
+        cpu.timing_rem = 0x1112_1314_1516_1718;
+        cpu.fp_rem = 0x2122_2324_2526_2728;
+        cpu.halted = true;
+        cpu.interrupt_shadow = true;
+        for slot in (0..TLB_ENTRIES).rev() {
+            let page = 0x4000 + slot as u32;
+            cpu.tlb.insert(
+                page,
+                0x0400_0000 + (slot as u32) * 0x1000,
+                slot % 2 == 0,
+                slot % 3 == 0,
+                slot % 5 == 0,
+            );
+        }
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0x8000_0202u32.to_le_bytes());
+        expected.extend_from_slice(&0x8123_4567u32.to_le_bytes());
+        expected.extend_from_slice(&0x1020_3040u32.to_le_bytes());
+        expected.extend_from_slice(&0x5060_7080u32.to_le_bytes());
+        expected.extend_from_slice(&0x90a0_b0c0u32.to_le_bytes());
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.extend_from_slice(&0x1112_1314_1516_1718u64.to_le_bytes());
+        expected.extend_from_slice(&0x2122_2324_2526_2728u64.to_le_bytes());
+        expected.extend_from_slice(&[1, 1]);
+        expected.extend_from_slice(&(TLB_ENTRIES as u64).to_le_bytes());
+        for slot in 0..TLB_ENTRIES {
+            let page = 0x4000 + slot as u32;
+            expected.extend_from_slice(&page.to_le_bytes());
+            expected.extend_from_slice(&(0x0400_0000 + (slot as u32) * 0x1000).to_le_bytes());
+            expected.push(u8::from(slot % 2 == 0));
+            expected.push(u8::from(slot % 3 == 0));
+            expected.push(u8::from(slot % 5 == 0));
+        }
+        expected.extend_from_slice(&[0, 1]);
+        append_segment(&mut expected, cpu.prefetch.cs);
+        expected.extend_from_slice(&cpu.prefetch.linear_base.to_le_bytes());
+        expected.extend_from_slice(&cpu.prefetch.physical_base.to_le_bytes());
+        expected.extend_from_slice(&(PREFETCH_WINDOW_BYTES as u64).to_le_bytes());
+        expected.extend_from_slice(&cpu.prefetch.bytes);
+
+        assert_eq!(expected.len(), 820);
+        assert_eq!(execution_payload(&cpu).unwrap(), expected);
+    }
+
+    fn assert_only_execution_span_changes<F>(cpu: &CpuGsw, span: Range<usize>, mutate: F)
+    where
+        F: FnOnce(&mut CpuGsw),
+    {
+        let before = execution_payload(cpu).unwrap();
+        let mut changed = cpu.clone();
+        mutate(&mut changed);
+        let after = execution_payload(&changed).unwrap();
+        assert_eq!(before.len(), after.len());
+        let changed_offsets: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter_map(|(index, (left, right))| (left != right).then_some(index))
+            .collect();
+        assert!(
+            !changed_offsets.is_empty(),
+            "mutation did not change execution payload"
+        );
+        assert!(
+            changed_offsets.iter().all(|offset| span.contains(offset)),
+            "changed offsets {changed_offsets:?} escaped {span:?}"
+        );
+    }
+
+    #[test]
+    fn every_fixed_execution_field_has_one_declared_span() {
+        let cpu = CpuGsw::default();
+        let checks: [SpanMutation; 10] = [
+            (0..4, |cpu| cpu.registers.eflags ^= 1),
+            (4..8, |cpu| cpu.pending_flags.tag ^= 1),
+            (8..12, |cpu| cpu.pending_flags.a ^= 1),
+            (12..16, |cpu| cpu.pending_flags.b ^= 1),
+            (16..20, |cpu| cpu.pending_flags.result ^= 1),
+            (20..28, |cpu| cpu.elapsed_clocks ^= 1),
+            (28..36, |cpu| cpu.timing_rem ^= 1),
+            (36..44, |cpu| cpu.fp_rem ^= 1),
+            (44..45, |cpu| cpu.halted = true),
+            (45..46, |cpu| cpu.interrupt_shadow = true),
+        ];
+        for (span, mutate) in checks {
+            assert_only_execution_span_changes(&cpu, span, mutate);
+        }
+    }
+
+    #[test]
+    fn every_tlb_entry_field_has_one_declared_span() {
+        const PAGE: u32 = 5;
+        let mut cpu = CpuGsw::default();
+        cpu.tlb.insert(PAGE, 0x1234_5000, false, false, false);
+        let slot = Tlb::slot(PAGE);
+        assert_only_execution_span_changes(&cpu, 54..58, move |changed| {
+            changed.tlb.entries[slot].tag += TLB_ENTRIES as u32;
+        });
+        assert_only_execution_span_changes(&cpu, 58..62, move |changed| {
+            changed.tlb.entries[slot].phys ^= 0x1000;
+        });
+        assert_only_execution_span_changes(&cpu, 62..63, move |changed| {
+            changed.tlb.entries[slot].writable = true;
+        });
+        assert_only_execution_span_changes(&cpu, 63..64, move |changed| {
+            changed.tlb.entries[slot].user = true;
+        });
+        assert_only_execution_span_changes(&cpu, 64..65, move |changed| {
+            changed.tlb.entries[slot].dirty = true;
+        });
+    }
+
+    #[test]
+    fn execution_payload_preserves_raw_lazy_flag_representation() {
+        let mut lazy = CpuGsw::default();
+        lazy.registers.eflags = 0x202;
+        lazy.pending_flags = PendingFlags {
+            tag: (1 << 31) | (2 << 8),
+            a: 0xffff_ffff,
+            b: 1,
+            result: 0,
+        };
+        let mut materialized = lazy.clone();
+        materialized.registers.eflags = lazy.eflags();
+        materialized.pending_flags = PendingFlags::default();
+        assert_eq!(arch_payload(&lazy), arch_payload(&materialized));
+        assert_ne!(
+            execution_payload(&lazy).unwrap(),
+            execution_payload(&materialized).unwrap()
+        );
+
+        let mut stale_none = CpuGsw::default();
+        stale_none.pending_flags.a = 1;
+        stale_none.pending_flags.b = 2;
+        stale_none.pending_flags.result = 3;
+        assert_ne!(
+            execution_payload(&CpuGsw::default()).unwrap(),
+            execution_payload(&stale_none).unwrap()
+        );
+    }
+
+    #[test]
+    fn logical_tlb_projection_normalizes_generation_order_and_dead_residue() {
+        let mut first = CpuGsw::default();
+        first.tlb.insert(3, 0x3000, true, false, true);
+        first.tlb.insert(68, 0x44000, false, true, false);
+
+        let mut second = CpuGsw::default();
+        second.tlb.flush();
+        second.tlb.insert(68, 0x44000, false, true, false);
+        second.tlb.insert(3, 0x3000, true, false, true);
+        let dead_slot = Tlb::slot(10);
+        second.tlb.entries[dead_slot] = TlbEntry {
+            tag: 10,
+            phys: 0xdead_0000,
+            generation: second.tlb.generation.wrapping_sub(1),
+            writable: true,
+            user: true,
+            dirty: true,
+        };
+        second.tlb.entries[12] = TlbEntry {
+            tag: 13,
+            phys: 0xbeef_0000,
+            generation: second.tlb.generation,
+            writable: true,
+            user: true,
+            dirty: true,
+        };
+        assert_eq!(
+            execution_payload(&first).unwrap(),
+            execution_payload(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn logical_tlb_projection_observes_replacement_invalidation_and_entry_bits() {
+        const PAGE: u32 = 5;
+        let mut baseline = CpuGsw::default();
+        baseline.tlb.insert(PAGE, 0x5000, false, false, false);
+        let expected = execution_payload(&baseline).unwrap();
+        let slot = Tlb::slot(PAGE);
+
+        let mut changed = baseline.clone();
+        changed
+            .tlb
+            .insert(PAGE + TLB_ENTRIES as u32, 0x69000, false, false, false);
+        assert_ne!(execution_payload(&changed).unwrap(), expected);
+        changed = baseline.clone();
+        changed.tlb.invalidate(PAGE);
+        assert_ne!(execution_payload(&changed).unwrap(), expected);
+        for mutate in [
+            |entry: &mut TlbEntry| entry.phys ^= 0x1000,
+            |entry: &mut TlbEntry| entry.writable = true,
+            |entry: &mut TlbEntry| entry.user = true,
+            |entry: &mut TlbEntry| entry.dirty = true,
+        ] {
+            changed = baseline.clone();
+            mutate(&mut changed.tlb.entries[slot]);
+            assert_ne!(execution_payload(&changed).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn logical_prefetch_projection_keeps_only_live_bytes() {
+        let baseline = live_prefetch_cpu(4);
+        let expected = execution_payload(&baseline).unwrap();
+        let mut changed = baseline.clone();
+        changed.prefetch.bytes[0] ^= 1;
+        assert_ne!(execution_payload(&changed).unwrap(), expected);
+        changed = baseline.clone();
+        changed.prefetch.bytes[4] ^= 1;
+        assert_eq!(execution_payload(&changed).unwrap(), expected);
+
+        let mut stale_cs = baseline.clone();
+        stale_cs.prefetch.cs.selector ^= 1;
+        assert_eq!(
+            execution_payload(&stale_cs).unwrap(),
+            execution_payload(&CpuGsw::default()).unwrap()
+        );
+        let mut stale_eip = baseline;
+        stale_eip.registers.eip = 0x200;
+        assert_eq!(
+            execution_payload(&stale_eip).unwrap(),
+            execution_payload(&CpuGsw::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn pending_prefetch_invalidation_is_canonical() {
+        let baseline = live_prefetch_cpu(4);
+        let expected = execution_payload(&baseline).unwrap();
+        assert_eq!(&expected[54..56], &[0, 1]);
+
+        let target_page = baseline.prefetch.physical_base >> 12;
+        let mut same_page = baseline.clone();
+        same_page.written_pages[0] = Some(target_page);
+        same_page.written_count = 1;
+        let pending = execution_payload(&same_page).unwrap();
+        assert_eq!(pending.len(), 56);
+        assert_eq!(&pending[54..56], &[1, 0]);
+
+        let mut unrelated = baseline.clone();
+        unrelated.written_pages[0] = Some(target_page + 1);
+        unrelated.written_count = 1;
+        assert_eq!(execution_payload(&unrelated).unwrap(), expected);
+
+        let mut overflow = baseline.clone();
+        for (index, page) in overflow.written_pages.iter_mut().enumerate() {
+            *page = Some(target_page + index as u32 + 1);
+        }
+        overflow.written_count = TRACKED_WRITE_PAGES as u8;
+        overflow.written_pages_overflow = true;
+        assert_eq!(execution_payload(&overflow).unwrap(), pending);
+
+        let mut reordered = same_page.clone();
+        reordered.written_pages[1] = Some(target_page + 1);
+        reordered.written_count = 2;
+        let mut reverse = reordered.clone();
+        reverse.written_pages.swap(0, 1);
+        assert_eq!(
+            execution_payload(&reordered).unwrap(),
+            execution_payload(&reverse).unwrap()
+        );
+
+        let mut duplicate = same_page;
+        duplicate.written_pages[1] = Some(target_page);
+        duplicate.written_count = 2;
+        assert_eq!(execution_payload(&duplicate).unwrap(), pending);
+    }
+
+    #[test]
+    fn capture_accepts_decode_residue_and_excludes_boundary_scratch() {
+        let baseline = CpuGsw::default();
+        let expected = execution_payload(&baseline).unwrap();
+        let mut changed = baseline;
+        changed.decode_tail_start = 0x1234_5678;
+        changed.decode_disp_len = 4;
+        changed.core_clocks_so_far = 0x1122_3344_5566_7788;
+        assert_eq!(execution_payload(&changed).unwrap(), expected);
+    }
+
+    #[test]
+    fn capture_rejects_every_rep_residual() {
+        let mut cases = Vec::new();
+        let active = CpuGsw {
+            rep_resume_active: true,
+            ..CpuGsw::default()
+        };
+        cases.push(active);
+        let mut budget = CpuGsw::default();
+        budget.rep_execution.budget = Some(RepBudget {
+            bus_at_entry: 1,
+            cap: 2,
+        });
+        cases.push(budget);
+        let mut yielded = CpuGsw::default();
+        yielded.rep_execution.yielded = true;
+        cases.push(yielded);
+        let mut resume = CpuGsw::default();
+        resume.rep_execution.resume = Some(dummy_rep_resume());
+        cases.push(resume);
+
+        for cpu in cases {
+            assert_eq!(
+                cpu.canonical_execution_capture().err(),
+                Some(CpuCanonicalCaptureError::ActiveRepContinuation)
+            );
+        }
+    }
+
+    #[test]
+    fn capture_validates_alignment_prefetch_and_write_tracking() {
+        let mut alignment = CpuGsw {
+            alignment_armed: true,
+            ..CpuGsw::default()
+        };
+        assert_eq!(
+            alignment.canonical_execution_capture().err(),
+            Some(CpuCanonicalCaptureError::InconsistentAlignmentCache)
+        );
+        alignment.control.cr0 |= CR0_AM;
+        alignment.registers.eflags |= FLAG_AC;
+        assert!(alignment.canonical_execution_capture().is_ok());
+
+        let mut prefetch = CpuGsw::default();
+        prefetch.prefetch.len = PREFETCH_WINDOW_BYTES as u8 + 1;
+        assert_eq!(
+            prefetch.canonical_execution_capture().err(),
+            Some(CpuCanonicalCaptureError::InvalidPrefetchLength {
+                length: PREFETCH_WINDOW_BYTES as u8 + 1,
+            })
+        );
+
+        let too_many = CpuGsw {
+            written_count: TRACKED_WRITE_PAGES as u8 + 1,
+            ..CpuGsw::default()
+        };
+        assert_eq!(
+            too_many.canonical_execution_capture().err(),
+            Some(CpuCanonicalCaptureError::InvalidWriteTracker)
+        );
+        let mut nonpacked = CpuGsw::default();
+        nonpacked.written_pages[1] = Some(1);
+        nonpacked.written_count = 1;
+        assert_eq!(
+            nonpacked.canonical_execution_capture().err(),
+            Some(CpuCanonicalCaptureError::InvalidWriteTracker)
+        );
+        let mut short_overflow = CpuGsw::default();
+        short_overflow.written_pages[0] = Some(1);
+        short_overflow.written_count = 1;
+        short_overflow.written_pages_overflow = true;
+        assert_eq!(
+            short_overflow.canonical_execution_capture().err(),
+            Some(CpuCanonicalCaptureError::InvalidWriteTracker)
+        );
+    }
+
+    #[test]
+    fn transparent_execution_caches_do_not_enter_payload() {
+        let baseline = CpuGsw::default();
+        let expected = execution_payload(&baseline).unwrap();
+        let mut changed = baseline;
+        changed.code_page.valid = true;
+        changed.code_page.linear_page = 1;
+        changed.code_page.physical_page = 2;
+        changed.fetch_page.entries[0].valid = true;
+        changed.fetch_page.entries[0].linear_page = 3;
+        changed.fetch_page.entries[0].physical_page = 4;
+        changed.fetch_page.entries[0].ptr = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        changed.fetch_page.entries[0].len = 4096;
+        changed.data_read_pages.entries[0].physical_page = 5;
+        changed.data_write_pages.entries[0].physical_page = 6;
+        changed.decode_cache.generation = changed.decode_cache.generation.wrapping_add(1);
+        changed.perf.instructions = 7;
+        changed.profile.enabled = true;
+        assert_eq!(execution_payload(&changed).unwrap(), expected);
+        changed.invalidate_code_caches();
+        assert_eq!(execution_payload(&changed).unwrap(), expected);
+    }
+
+    #[test]
+    fn execution_serialization_does_not_mutate_cpu() {
+        let cpu = live_prefetch_cpu(8);
+        let before = execution_payload(&cpu).unwrap();
+        let raw_eflags = cpu.registers.eflags;
+        let pending = cpu.pending_flags;
+        let prefetch = cpu.prefetch.bytes;
+        let after = execution_payload(&cpu).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(cpu.registers.eflags, raw_eflags);
+        assert_eq!(cpu.pending_flags, pending);
+        assert_eq!(cpu.prefetch.bytes, prefetch);
     }
 
     #[test]
