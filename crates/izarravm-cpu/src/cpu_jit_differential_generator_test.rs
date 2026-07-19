@@ -5498,3 +5498,256 @@ fn clif_dormant_structural_failure_survives_unrelated_same_page_writes() {
         "B must never re-enter the compile pipeline once Dormant: {settled:#?}"
     );
 }
+
+// ===== Cause-B (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md section 1):
+// the `retry_incomplete_walk` un-parked `Seen` re-attempt loop. Distinct from the battery
+// above (which forces `SegmentLayout::capture` to fail): here `walk_unit` itself declines
+// the ENTRY instruction (a structurally unclassifiable opcode), the OTHER un-parked bail the
+// design document names, measured as the dominant re-attempt-by-count cause (4,455,782 on one
+// Quake/586 1200M-cycle run). The fix parks Dormant with the plain no-lift `dormant()`,
+// recoverable only through a wholesale `clif_clear()`, exactly like the structural parks
+// above -- NOT a heat-cooldown or SMC-triggered lift (adversarial review MAJOR-3).
+
+/// An unclassifiable entry sitting directly at a routine's entry: `walk_unit` fails on its
+/// very first iteration, every single time, a permanent property of these bytes. Repeatedly
+/// re-entering it must park Dormant after exactly one failed walk and never re-walk again.
+///
+/// `ADD AL, imm8` (opcode 0x04) is the chosen opcode: it decodes into `DecodeGroup::Alu`, so
+/// `block_continuable` (`decode.rs`) admits it as a mid-batch continuation (unlike `hlt`,
+/// which is a terminator and would never even reach `try_clif_continuation`) -- but
+/// `classify::classify` (`jit/direct/classify.rs`) only handles ALU forms 1/3/5
+/// (`(opcode & 7)`, the dword reg/r-m and eAX,imm32 shapes); form 4 (`AL, imm8`) falls
+/// through every arm and returns `None`, so `direct::unit_growth_classify` -- and therefore
+/// `walk_unit` on its very first iteration -- declines it unconditionally.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_dormant_incomplete_walk_parks_once_and_never_re_walks() {
+    use crate::jit::clif::cache::{ClifUnitKey, ClifUnitState};
+
+    // 0x1000: nop (starter -- the walker's own convention: the unit under test is keyed at
+    // the instruction AFTER the pass entry); 0x1001: `add al, 1` (the unclassifiable entry,
+    // 2 bytes); 0x1003: hlt (routine's own halt, retired by the interpreter every pass
+    // regardless of clif's admission outcome for 0x1001).
+    let code = vec![0x90, 0x04, 0x01, 0xf4];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+
+    const UNCLASSIFIABLE_ENTRY: u32 = 0x1001;
+    const STARTER: u32 = 0x1000;
+    let key = ClifUnitKey {
+        linear: UNCLASSIFIABLE_ENTRY,
+        physical: UNCLASSIFIABLE_ENTRY,
+        mode_key: harness.clif.jit_mode_key(),
+    };
+
+    // Warm the address through several full to-halt passes. `pass_from` asserts full
+    // register/memory/clock equality between the interp and clif arms on every single call,
+    // so this loop is itself the guest-invisibility proof: clif's admission bookkeeping
+    // around a permanently-unclassifiable entry never perturbs guest-observable state.
+    for _ in 0..6 {
+        harness.pass_from(STARTER);
+    }
+    assert_eq!(
+        harness.clif.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Dormant),
+        "an entry `walk_unit` declines must park Dormant, not stay Seen forever"
+    );
+    let warmed = harness.clif.jit_clif_counters();
+    assert_eq!(
+        warmed.retry_incomplete_walk, 1,
+        "exactly one failed walk should have occurred before the park: {warmed:#?}"
+    );
+    assert_eq!(
+        warmed.compile_attempts, 0,
+        "an unclassifiable entry never reaches compile: {warmed:#?}"
+    );
+
+    // Further revisits: Dormant is a cheap lookup (`lift_cold_dormant`'s epoch check) and
+    // must never re-enter `walk_unit`.
+    for _ in 0..20 {
+        harness.pass_from(STARTER);
+    }
+    let settled = harness.clif.jit_clif_counters();
+    assert_eq!(
+        settled.retry_incomplete_walk, warmed.retry_incomplete_walk,
+        "a parked Dormant entry must never re-walk: {settled:#?}"
+    );
+    assert_eq!(
+        harness.clif.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Dormant),
+        "must still be Dormant after further revisits"
+    );
+}
+
+// ===== A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md section 3.7): the
+// sticky arena-exhausted short-circuit, exercised through the real admission path
+// (`try_clif_continuation`) rather than `ClifBackend` directly (`cpu_clif_unit_test.rs`'s
+// `clif_arena_exhausted_sets_only_on_capacity_not_on_relocation_reject` covers the
+// capacity-vs-relocation distinction at that lower level). A run of otherwise-identical,
+// independent, non-linked register-only routines share one code page; the harness's arena is
+// shrunk via the `with_len_for_test` seam small enough that some routine part-way through the
+// run genuinely compiles and fails at install (the pre-fix "storm" shape -- the ONE admission
+// that discovers the arena is full and sets the sticky flag), after which every LATER
+// routine's admission must reject in O(1) -- no walk, no plan, no Cranelift call -- instead
+// of repeating the same compile-then-fail. The exact page budget the per-backend sentinel/
+// resolver-trampoline descriptor and the shared callout adapter consume before the first
+// real unit is an implementation detail this test does not hardcode: it runs enough distinct
+// routines to be certain to observe both transitions, then locates them from the counters.
+
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_arena_exhausted_short_circuits_every_admission_after_the_first_failure() {
+    use crate::jit::clif::ClifBackend;
+    use crate::jit::clif::cache::{ClifUnitKey, ClifUnitState};
+
+    // `UNIT_COUNT` copies of one identical 3-byte routine (nop starter; inc eax; hlt), each in
+    // its own `UNIT_STRIDE`-byte slot on the same guest page: identical bytes, but each
+    // slot's own linear address makes it a DISTINCT, independent `ClifUnitKey`, so every
+    // slot's admission is its own fresh compile attempt. Deliberately only ONE classifiable
+    // instruction (`inc eax`) before the routine's own `hlt`: `hlt` is a batch TERMINATOR
+    // (`decode.rs`'s `block_continuable`), so it ends the `run_budgeted` continuation loop
+    // before generating any key of its own -- unlike a second ALU instruction, which would
+    // silently mint a SECOND, unrelated `ClifUnitKey` per routine (at the `add`'s own
+    // address) and confuse this test's one-key-per-routine accounting.
+    const UNIT_STRIDE: u32 = 0x10;
+    const UNIT_COUNT: u32 = 16;
+    const UNIT_PATTERN: [u8; 3] = [0x90, 0x40, 0xf4];
+    let mut code = vec![0x90u8; (UNIT_COUNT * UNIT_STRIDE) as usize];
+    for i in 0..UNIT_COUNT {
+        let base = (i * UNIT_STRIDE) as usize;
+        code[base..base + UNIT_PATTERN.len()].copy_from_slice(&UNIT_PATTERN);
+    }
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+
+    // Shrink the clif arena small BEFORE any admission attempt runs: a handful of pages is
+    // enough that the per-backend sentinel/adapter infrastructure (built lazily into this
+    // SAME arena on the first admission and the first native run) plus a couple of real
+    // units already exhaust it, well within `UNIT_COUNT` distinct attempts.
+    let small_arena = 4 * crate::jit::exec_mem::host_page_len();
+    harness.clif.jit_direct.clif_backend = ClifBackend::with_arena_len_for_test(small_arena);
+    assert!(
+        harness.clif.jit_direct.clif_backend.is_some(),
+        "the small test arena must allocate on a supported host"
+    );
+
+    let mode_key = harness.clif.jit_mode_key();
+    // The starter nop at each slot's base: `try_clif_continuation` is only ever consulted for
+    // the SECOND and later instructions of a `run_budgeted` batch (`run.rs`'s `first` flag
+    // takes the plain single-step path for the very first one, unconditionally, JIT or not),
+    // so every pass must begin at the starter, one byte BEFORE the keyed entry.
+    let starter = |i: u32| 0x1000 + i * UNIT_STRIDE;
+    let entry = |i: u32| starter(i) + 1;
+    let key = |i: u32| ClifUnitKey {
+        linear: entry(i),
+        physical: entry(i),
+        mode_key,
+    };
+
+    // Warm each slot in turn, snapshotting the counters and the resulting state after each.
+    let mut steps: Vec<(ClifUnitState, JitClifCounters)> = Vec::new();
+    for i in 0..UNIT_COUNT {
+        for _ in 0..6 {
+            harness.pass_from(starter(i));
+        }
+        let state = harness
+            .clif
+            .jit_direct
+            .clif_units
+            .state(key(i))
+            .expect("every slot must reach at least Seen after six warm passes");
+        steps.push((state, harness.clif.jit_clif_counters()));
+    }
+
+    // Locate the FIRST slot whose admission genuinely compiled and failed only at install
+    // (`park_compile_failed` grew relative to the previous step -- `compile_ns` grew too,
+    // proving a real Cranelift call happened, not a short-circuited one).
+    let fail_idx = (0..UNIT_COUNT as usize)
+        .find(|&i| {
+            let prev_failed = if i == 0 {
+                0
+            } else {
+                steps[i - 1].1.park_compile_failed
+            };
+            steps[i].1.park_compile_failed > prev_failed
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the {small_arena}-byte arena must exhaust within {UNIT_COUNT} distinct units; \
+                 final counters: {:#?}",
+                steps.last().unwrap().1
+            )
+        });
+    assert_eq!(
+        steps[fail_idx].0,
+        ClifUnitState::Dormant,
+        "the exhausting unit must still park Dormant, exactly as any other compile failure does"
+    );
+    assert!(
+        fail_idx + 1 < UNIT_COUNT as usize,
+        "need at least one more distinct unit after the exhausting one to prove the \
+         short-circuit; raise UNIT_COUNT"
+    );
+    let before = if fail_idx == 0 {
+        JitClifCounters::default()
+    } else {
+        steps[fail_idx - 1].1
+    };
+    let at_fail = steps[fail_idx].1;
+    assert_eq!(
+        at_fail.compile_attempts,
+        before.compile_attempts + 1,
+        "{at_fail:#?}"
+    );
+    assert!(
+        at_fail.compile_ns > before.compile_ns,
+        "the exhausting unit must pay a real Cranelift compile before failing at install: \
+         {at_fail:#?}"
+    );
+    assert_eq!(
+        at_fail.park_arena_exhausted, before.park_arena_exhausted,
+        "the exhausting unit itself DISCOVERS exhaustion, it does not short-circuit: {at_fail:#?}"
+    );
+
+    // THE FIX under test: every slot AFTER the exhausting one must reject in O(1) -- no
+    // walk, no plan, no Cranelift call -- via the sticky short-circuit, never repeating the
+    // compile-then-fail. Check the very next slot precisely, then every remaining slot stays
+    // flat on the compile-side counters too (the flag never clears within this run).
+    let after = steps[fail_idx + 1].1;
+    assert_eq!(
+        steps[fail_idx + 1].0,
+        ClifUnitState::Dormant,
+        "the next unit must also park Dormant, via the sticky short-circuit"
+    );
+    assert_eq!(
+        after.park_arena_exhausted,
+        at_fail.park_arena_exhausted + 1,
+        "the next unit's admission must hit the sticky short-circuit exactly once: {after:#?}"
+    );
+    assert_eq!(
+        after.compile_attempts, at_fail.compile_attempts,
+        "the next unit must never reach the compile_attempts increment: {after:#?}"
+    );
+    assert_eq!(
+        after.compile_ns, at_fail.compile_ns,
+        "the next unit must NOT pay for a wasted Cranelift compile: {after:#?}"
+    );
+    assert_eq!(
+        after.park_compile_failed, at_fail.park_compile_failed,
+        "the next unit must never reach install_span at all: {after:#?}"
+    );
+    for &(state, counters) in &steps[fail_idx + 2..] {
+        assert_eq!(state, ClifUnitState::Dormant, "{counters:#?}");
+        assert_eq!(
+            counters.compile_attempts, at_fail.compile_attempts,
+            "{counters:#?}"
+        );
+        assert_eq!(counters.compile_ns, at_fail.compile_ns, "{counters:#?}");
+    }
+}

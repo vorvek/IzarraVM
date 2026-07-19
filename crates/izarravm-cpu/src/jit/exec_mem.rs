@@ -147,6 +147,35 @@ impl ExecutableArena {
         Some(slot)
     }
 
+    /// Whether a same-sized `install_span(code)` call would fail purely because the arena
+    /// lacks remaining capacity for a span that large -- as opposed to `install_span`'s other
+    /// `None` causes (empty code, a pending unsealed prefix, or an OS page-protection
+    /// failure), none of which mean the arena itself is full. Track C-second-cause A1
+    /// (`dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md` section 3.7): the
+    /// clif backend calls this AFTER a successful Cranelift compile to distinguish "this
+    /// specific unit doesn't fit anymore" from every other `finalize` failure, so only the
+    /// former sets its sticky arena-exhausted flag. Mirrors `install_span`'s own capacity
+    /// check exactly (`rounded > self.len - offset`, `offset` there being `self.used`, which
+    /// this type's only clif-side caller never diverges from since it never calls
+    /// `append_unsealed`/`seal_used_prefix`).
+    #[cfg_attr(
+        not(all(
+            feature = "clif-backend",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn would_exceed_capacity(&self, code_len: usize) -> bool {
+        if code_len == 0 {
+            return false;
+        }
+        let Some(rounded) = code_len.div_ceil(self.page_len).checked_mul(self.page_len) else {
+            return true;
+        };
+        rounded > self.len - self.used
+    }
+
     /// Copy one block into the next slot without making it executable. This is allowed only in a
     /// fresh arena whose used prefix is still wholly writable. The returned token cannot expose an
     /// entry pointer until `seal_used_prefix` succeeds.

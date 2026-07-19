@@ -13,7 +13,8 @@ use super::super::*;
 
 use crate::jit::clif::ClifBackend;
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlagsData, Signature, UserFuncName, types,
+    AbiParam, ExtFuncData, ExternalName, Function, InstBuilder, MemFlagsData, Signature,
+    UserExternalName, UserFuncName, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -176,6 +177,104 @@ fn clif_register_unit_matches_the_interpreter_state() {
     assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.registers.eip, interpreter.registers.eip);
     assert_eq!(native.registers.eip, ENTRY + GUEST_BYTES.len() as u32);
+}
+
+/// A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md section 3.7): the
+/// sticky arena-exhausted flag must set ONLY when a finalized unit fails to install for lack
+/// of remaining arena capacity, never for a codegen error or the zero-relocation install
+/// invariant's own reject (adversarial review MINOR-5 -- those are per-unit failures, not
+/// evidence the arena itself is full). A codegen error returns via `finalize`'s very first
+/// `ctx.compile(..).ok()?`, before the capacity check ever runs, so only the relocation
+/// reject needs a runtime proof here; the codegen-error case is structurally excluded by the
+/// early return alone.
+#[test]
+fn clif_arena_exhausted_sets_only_on_capacity_not_on_relocation_reject() {
+    // A backend whose arena holds exactly one rounded-up unit span (the `with_len_for_test`
+    // seam, `exec_mem.rs`): the first `finalize` fills it completely, so a second unit's
+    // `finalize` fails purely for lack of capacity, never for any other reason.
+    let page = crate::jit::exec_mem::host_page_len();
+    let mut backend =
+        ClifBackend::with_arena_len_for_test(page).expect("small test arena on a supported host");
+    assert!(
+        !backend.arena_exhausted(),
+        "a fresh backend starts unexhausted"
+    );
+
+    let first = backend
+        .finalize(build_add_unit())
+        .expect("the first unit fits the one-page arena exactly");
+    assert!(!first.is_null());
+    assert!(
+        !backend.arena_exhausted(),
+        "installing the first unit must not itself set the flag"
+    );
+
+    // A second, otherwise-identical unit: compiles fine, but the one-page arena has no room
+    // left at all (the first install rounded up to and consumed the whole page).
+    assert!(
+        backend.finalize(build_add_unit()).is_none(),
+        "the second unit must fail: the one-page arena is already full"
+    );
+    assert!(
+        backend.arena_exhausted(),
+        "a capacity failure must set the sticky flag"
+    );
+
+    // A FRESH backend, ample room, but a function whose body makes a genuine external call
+    // (not the `call_indirect`-through-a-baked-constant shape the real lowering always uses):
+    // the compiled buffer carries a real relocation, so the zero-relocation install invariant
+    // rejects it -- a per-unit failure, NOT arena exhaustion.
+    let mut fresh = ClifBackend::new().expect("pinned host ISA on a supported host");
+    assert_eq!(fresh.relocation_fallbacks(), 0);
+    let external_call_fn = build_function_with_external_call(&fresh);
+    assert!(
+        fresh.finalize(external_call_fn).is_none(),
+        "a function with an unresolved external call must be rejected for its relocation"
+    );
+    assert_eq!(
+        fresh.relocation_fallbacks(),
+        1,
+        "the reject must be attributed to the relocation invariant"
+    );
+    assert!(
+        !fresh.arena_exhausted(),
+        "a relocation reject must NEVER set the arena-exhausted flag (MINOR-5)"
+    );
+
+    // The ample-room backend still admits a real, relocation-free unit normally afterward --
+    // proof the relocation reject didn't wrongly poison later admissions either.
+    assert!(fresh.finalize(build_add_unit()).is_some());
+    assert!(!fresh.arena_exhausted());
+}
+
+/// Build a minimal function whose body makes a genuine external `call` -- referencing an
+/// unresolved user external symbol rather than the `call_indirect`-through-a-baked-pointer
+/// shape the real unit/adapter lowering always uses -- so the compiled buffer carries a real
+/// relocation the linker would need to patch: the zero-relocation install invariant's OTHER
+/// rejection reason, distinct from arena exhaustion.
+fn build_function_with_external_call(backend: &ClifBackend) -> Function {
+    let call_conv = backend.isa().default_call_conv();
+    let mut sig = Signature::new(call_conv);
+    sig.returns.push(AbiParam::new(types::I64));
+    let mut func = Function::with_name_signature(UserFuncName::user(0, 30), sig.clone());
+    let callee_name = func.declare_imported_user_function(UserExternalName::new(0, 999));
+    let callee_sig_ref = func.import_signature(sig);
+    let callee = func.import_function(ExtFuncData {
+        name: ExternalName::user(callee_name),
+        signature: callee_sig_ref,
+        colocated: false,
+        patchable: false,
+    });
+    let mut fbc = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut func, &mut fbc);
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    let call = builder.ins().call(callee, &[]);
+    let result = builder.inst_results(call)[0];
+    builder.ins().return_(&[result]);
+    builder.finalize();
+    func
 }
 
 use crate::jit::clif::cache::{ClifUnitState, clif_key_for, walk_unit};

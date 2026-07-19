@@ -53,12 +53,37 @@ pub(crate) struct ClifBackend {
     /// could name it and is torn down only with the backend itself (the N1(b) drop
     /// discipline). Every other field is inert filler, never read.
     sentinel: Option<Box<cache::ClifUnitDescriptor>>,
+    /// Track C-second-cause A1 (`dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md`
+    /// section 3.7): sticky once the arena has failed to fit a finalized unit for lack of
+    /// remaining capacity. Deliberately set ONLY by that one cause -- a Cranelift codegen
+    /// error or the zero-relocation install invariant's own rejection are per-unit failures,
+    /// not evidence the arena is full, and must never latch this flag (MINOR-5). NOTE: this
+    /// slice does not clear the flag anywhere; only a reset arena (A2, a separate deferred
+    /// redesign) or a rebuilt backend would. Concretely: once this latches, EVERY future
+    /// `Seen` admission on this backend short-circuits Dormant without compiling, for the
+    /// rest of this backend's lifetime -- including across a wholesale `clif_clear()`, which
+    /// clears the unit cache but never touches `clif_backend` today. That is deliberate scope
+    /// for this slice (it only removes the wasted compile attempts); restoring clif's ability
+    /// to install new units after a fill is A2's job, not this one's.
+    arena_exhausted: bool,
 }
 
 impl ClifBackend {
     /// Pin the host ISA once. `None` on an unsupported host or an arena allocation failure,
     /// exactly like the other native machinery: compile nothing, interpret.
     pub(crate) fn new() -> Option<Self> {
+        Self::with_arena(ExecutableArena::new()?)
+    }
+
+    /// Test seam: a backend whose arena is deliberately small
+    /// (`ExecutableArena::with_len_for_test`), so a test can fill it in a handful of installs
+    /// instead of 32 MiB of them.
+    #[cfg(test)]
+    pub(crate) fn with_arena_len_for_test(total_len: usize) -> Option<Self> {
+        Self::with_arena(ExecutableArena::with_len_for_test(total_len)?)
+    }
+
+    fn with_arena(arena: ExecutableArena) -> Option<Self> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").ok()?;
         flags.set("unwind_info", "false").ok()?;
@@ -75,10 +100,11 @@ impl ClifBackend {
             .ok()?;
         Some(Self {
             isa,
-            arena: ExecutableArena::new()?,
+            arena,
             relocation_fallbacks: 0,
             callout_adapter_entry: None,
             sentinel: None,
+            arena_exhausted: false,
         })
     }
 
@@ -99,6 +125,13 @@ impl ClifBackend {
             return None;
         }
         let code = compiled.buffer.data();
+        // A1: distinguish "the arena is full" from every other `install_span` failure BEFORE
+        // calling it, so the sticky flag latches only on the one cause it means to name (a
+        // codegen error or a relocation reject already returned above without reaching here).
+        if self.arena.would_exceed_capacity(code.len()) {
+            self.arena_exhausted = true;
+            return None;
+        }
         self.arena.install_span(code)
     }
 
@@ -106,6 +139,13 @@ impl ClifBackend {
     #[cfg(test)]
     pub(crate) fn relocation_fallbacks(&self) -> u64 {
         self.relocation_fallbacks
+    }
+
+    /// Track C-second-cause A1: whether this backend's arena has ever failed to fit a
+    /// finalized unit for lack of remaining capacity. `try_clif_continuation` checks this
+    /// before paying for a walk/plan/compile that would fail at install anyway.
+    pub(crate) fn arena_exhausted(&self) -> bool {
+        self.arena_exhausted
     }
 
     /// The per-backend unresolved-sentinel descriptor (design section 3.3b), built lazily

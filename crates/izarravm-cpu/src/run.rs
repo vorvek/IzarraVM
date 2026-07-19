@@ -1177,6 +1177,28 @@ impl CpuGsw {
                 index
             }
             Some(jit::clif::cache::ClifUnitState::Seen) => {
+                // A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md section
+                // 3.7): once this backend's arena has failed to fit a unit for lack of
+                // remaining capacity, EVERY future Seen admission would otherwise walk, plan,
+                // and pay the ~680 microsecond Cranelift compile only to fail at
+                // `install_span`'s own capacity check and park Dormant anyway -- an O(1)
+                // reject here skips all of that. NOTE: the flag is sticky for this backend's
+                // lifetime (cleared only by A2, a separate deferred redesign that resets the
+                // arena on a wholesale clear, or a rebuilt backend) -- so after the first
+                // arena fill, and especially after the first wholesale `clif_clear()`
+                // thereafter, clif parks every Seen entry Dormant here and runs the
+                // interpreter for all of them. That durability gap is intentionally NOT this
+                // slice's job; this fix only removes the wasted compile attempts.
+                if self
+                    .jit_direct
+                    .clif_backend
+                    .as_ref()
+                    .is_some_and(jit::clif::ClifBackend::arena_exhausted)
+                {
+                    self.jit_direct.clif_units.dormant(key);
+                    self.jit_clif.park_arena_exhausted += 1;
+                    return Ok(ClifContinuation::Interpret);
+                }
                 // G1 pre-compile gate (entry chunk only, cheap).
                 let heat_epoch = self.smc_heat_epoch();
                 self.sync_smc_heat();
@@ -1189,11 +1211,20 @@ impl CpuGsw {
                     return Ok(ClifContinuation::Interpret);
                 }
                 let Some(layout) = jit::clif::cache::walk_unit(self, key.linear, d) else {
-                    // A cold or structurally unclassifiable entry: nothing to admit yet, try
-                    // again once the decode cache has warmed enough lines to walk one unit.
-                    // Track C1f: this bail stays Seen and is NOT parked Dormant, so it is
-                    // attributable as a `Seen` re-attempt-without-install cause (see
-                    // `JitClifCounters::retry_incomplete_walk`).
+                    // Cause-B (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md
+                    // section 1): a structurally unclassifiable entry (`direct::
+                    // unit_growth_classify` declines it, or an unsupported prefix form) is a
+                    // property of the STATIC BYTES at this address, not of cache occupancy,
+                    // so it can never resolve on its own. Park it Dormant with the plain
+                    // no-lift `dormant()`, byte-identical to the structural-failure parks
+                    // below (`plan.leading == 0`, the code-cover check, segment capture):
+                    // recoverable only via a wholesale `clif_clear()`. Previously this bail
+                    // stayed `Seen` and re-ran the ENTIRE admission pipeline on every single
+                    // revisit (4,455,782 times in one Quake run) -- deliberately NOT given a
+                    // heat-cooldown or SMC-triggered lift (adversarial review MAJOR-3): an
+                    // unclassifiable opcode stays unclassifiable until the bytes change, and
+                    // a code change already triggers `clif_clear()`.
+                    self.jit_direct.clif_units.dormant(key);
                     self.jit_clif.retry_incomplete_walk += 1;
                     return Ok(ClifContinuation::Interpret);
                 };

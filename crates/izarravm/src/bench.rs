@@ -1068,6 +1068,9 @@ pub(super) fn perf_counters_json(
         "jit_clif_compile_ns": jit_clif.compile_ns,
         "jit_clif_retry_incomplete_walk": jit_clif.retry_incomplete_walk,
         "jit_clif_retry_no_fast_map": jit_clif.retry_no_fast_map,
+        // Track C-second-cause A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-
+        // design.md section 3.7): the sticky arena-exhausted short-circuit's own counter.
+        "jit_clif_park_arena_exhausted": jit_clif.park_arena_exhausted,
         "jit_clif_park_no_lowerable": jit_clif.park_no_lowerable,
         "jit_clif_park_heat_chunk": jit_clif.park_heat_chunk,
         "jit_clif_park_heat_span": jit_clif.park_heat_span,
