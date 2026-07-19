@@ -1122,6 +1122,62 @@ impl CpuGsw {
         }
     }
 
+    /// Track C3(b): a phase-timing clock read, `Some` only when `IZARRAVM_CLIF_PHASE_PROFILE`
+    /// is set (checked once, then cached). `None` (the default) makes every timing site a
+    /// branch on a cached bool, keeping the hot path free of `Instant::now()` reads.
+    #[cfg(all(
+        feature = "jit",
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn clif_phase_now() -> Option<std::time::Instant> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("IZARRAVM_CLIF_PHASE_PROFILE").is_some()) {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// Add `since.elapsed()` nanoseconds to `dst` (Track C3(b) phase timing; a no-op when the
+    /// profile flag is unset, so `since` is `None`).
+    #[cfg(all(
+        feature = "jit",
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn clif_phase_add(dst: &mut u64, since: Option<std::time::Instant>) {
+        if let Some(t) = since {
+            *dst = dst.wrapping_add(t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
+    }
+
+    /// Add the `from..to` span nanoseconds to `dst` (Track C3(b) phase timing).
+    #[cfg(all(
+        feature = "jit",
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn clif_phase_delta(
+        dst: &mut u64,
+        from: Option<std::time::Instant>,
+        to: Option<std::time::Instant>,
+    ) {
+        if let (Some(a), Some(b)) = (from, to) {
+            *dst = dst.wrapping_add(
+                b.saturating_duration_since(a)
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+        }
+    }
+
     /// Track C C1a admission: the clif analogue of `try_direct_continuation`. A C1a unit is a
     /// SIDE-EXIT-PER-INSTRUCTION shell (review finding F-A1, option B), so this never returns
     /// a run/prefix outcome; every path, guard-reject or guard-pass, ends with the interpreter
@@ -1148,6 +1204,12 @@ impl CpuGsw {
         // only native-entry site (`run_clif_unit`'s `adapter(..)` call) sits strictly AFTER
         // this check within the same synchronous call, and no call-out re-enters this
         // function, so nothing on the host stack can return into arena bytes this reclaims.
+        // Track C3(b) phase timing: `t_entry` clocks the dispatch-resolution prologue a hot
+        // cache would replace (`clif_hot` + `clif_key_for` + `clif_units.state` + the
+        // descriptor clone below). Only accumulated on `from_compiled` (an already-Compiled
+        // hot repeat), so a fresh install's Cranelift `compile_ns` never contaminates it.
+        let t_entry = Self::clif_phase_now();
+        let mut from_compiled = false;
         self.jit_direct.apply_deferred_clif_arena_reset();
         if !self
             .decode_cache
@@ -1181,6 +1243,7 @@ impl CpuGsw {
                 if self.jit_direct.clif_units.take_interp_once(index) {
                     return Ok(ClifContinuation::Interpret);
                 }
+                from_compiled = true;
                 index
             }
             Some(jit::clif::cache::ClifUnitState::Seen) => {
@@ -1417,9 +1480,18 @@ impl CpuGsw {
                 index
             }
         };
+        let t_preclone = if from_compiled {
+            Self::clif_phase_now()
+        } else {
+            None
+        };
         let Some(unit) = self.jit_direct.clif_units.unit(unit_index).cloned() else {
             return Ok(ClifContinuation::Interpret);
         };
+        if from_compiled {
+            Self::clif_phase_add(&mut self.jit_clif.resolve_clone_ns, t_preclone);
+            Self::clif_phase_add(&mut self.jit_clif.resolve_ns, t_entry);
+        }
         self.run_clif_unit(bus, &unit, unit_index, budget)
     }
 
@@ -1452,6 +1524,10 @@ impl CpuGsw {
         unit_index: u32,
         budget: ContinuationBudget,
     ) -> Result<ClifContinuation, CpuError> {
+        // Track C3(b) phase timing: `t_guard` spans the entry guards + quota + snapshot writes
+        // (up to the adapter). Only paths that reach the post-adapter accumulator below record
+        // it, so guard REJECTS (which return `Interpret` without running) never contribute.
+        let t_guard = Self::clif_phase_now();
         if self.profile.enabled || diff_trace_enabled() {
             self.jit_clif.reject_observer += 1;
             return Ok(ClifContinuation::Interpret);
@@ -1634,6 +1710,7 @@ impl CpuGsw {
         // slice outlive the call (the table is this frame's local, the immediates this
         // frame's descriptor copy), and the bus pointer is dereferenced only by the
         // identically-monomorphized shim during this call (design section 1.4).
+        let t_native = Self::clif_phase_now();
         let disposition = unsafe {
             adapter(
                 self as *mut CpuGsw,
@@ -1644,6 +1721,7 @@ impl CpuGsw {
                 entry_ptr,
             )
         };
+        let t_post = Self::clif_phase_now();
 
         // m1: a panic caught by the shim's belt resumes here, now that the disposition has
         // crossed back through the compiled frames (which carry no unwind info).
@@ -1934,6 +2012,7 @@ impl CpuGsw {
         let charged = self.scale_clocks_batch(raw_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += lowered_retired;
+        self.jit_clif.clif_retired += lowered_retired;
         if self.is_ring0_protected() {
             self.perf.monitor_resident_core_clocks += charged;
         }
@@ -1943,6 +2022,12 @@ impl CpuGsw {
         if unresolved_hop {
             self.jit_clif.unresolved_transfers += 1;
         }
+        // Track C3(b) phase timing: `guard_ns` = guards+quota+snapshot, `native_ns` = the
+        // adapter call, `post_ns` = chain resolution + the whole native-aggregate charge path.
+        // Together with `resolve_ns` this is the full per-entry cost split (all no-ops off-flag).
+        Self::clif_phase_delta(&mut self.jit_clif.guard_ns, t_guard, t_native);
+        Self::clif_phase_delta(&mut self.jit_clif.native_ns, t_native, t_post);
+        Self::clif_phase_add(&mut self.jit_clif.post_ns, t_post);
         let outcome = CycleOutcome {
             core_clocks: (charged
                 .saturating_add(u64::from(self.jit_direct.clif_run.callout_core_clocks)))
