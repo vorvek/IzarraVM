@@ -1056,6 +1056,36 @@ pub struct JitClifCounters {
     /// (`entries: HashMap<ClifUnitKey, ClifUnitState>`) at read time, the requested
     /// "entries-map size" gauge; zero on a non-clif-backend build.
     pub entries_len: u64,
+    /// Track C3(b) per-entry phase timing (nanoseconds), flag-gated by the
+    /// `IZARRAVM_CLIF_PHASE_PROFILE` env var and ZERO when it is unset (the timers add
+    /// four `Instant::now()` reads per native unit run, too costly to leave always-on).
+    /// This partitions the ~11.4 microsecond-per-entry clif cost the residency finding
+    /// measured, to bound a hot-transfer cache's ceiling BEFORE building it: a cache can
+    /// only shrink `resolve_ns` (the dispatch resolution a cached `(key -> unit_index)`
+    /// replaces: `clif_hot` + `clif_key_for` + `clif_units.state` + the per-entry
+    /// descriptor `unit(index).cloned()`); `guard_ns` (the `run_clif_unit` entry guards +
+    /// quota + snapshot writes), `native_ns` (the compiled adapter call itself), and
+    /// `post_ns` (chain resolution + the whole native-aggregate charge path) are paid per
+    /// unit REGARDLESS, because clif's native code always returns to the Rust dispatcher
+    /// (only C1d's static link cells hop native-to-native). Sum over a run; divide by
+    /// `entries` for the per-entry split.
+    pub resolve_ns: u64,
+    pub guard_ns: u64,
+    pub native_ns: u64,
+    pub post_ns: u64,
+    /// The subset of `resolve_ns` spent in the per-entry descriptor clone
+    /// (`clif_units.unit(index).cloned()`), split out because the clone is clif overhead
+    /// Direct does not pay and is a standalone win to remove regardless of any cache;
+    /// `resolve_ns - resolve_clone_ns` is the pure lookup (clif_hot + key + state).
+    pub resolve_clone_ns: u64,
+    /// Track C3(b) coverage: guest instructions clif retired NATIVELY (sum of each entry's
+    /// `lowered_retired`). `PerfCounters::instructions` is the guest total and ALSO includes
+    /// these, so `perf.instructions - clif_retired` is the interpreter-retired remainder; that
+    /// fraction times the pure-interpreter ns/instruction estimates the
+    /// interpreter-between-side-exits time, which no hot cache can reduce. This is the number
+    /// that decides whether the residency lever is a cache (churn-bound) or linking
+    /// (coverage-bound).
+    pub clif_retired: u64,
 }
 
 impl PartialEq for JitClifCounters {

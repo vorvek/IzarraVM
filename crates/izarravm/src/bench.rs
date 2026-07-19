@@ -1080,6 +1080,12 @@ pub(super) fn perf_counters_json(
         "jit_clif_park_compile_failed": jit_clif.park_compile_failed,
         "jit_clif_park_install_failed": jit_clif.park_install_failed,
         "jit_clif_entries_len": jit_clif.entries_len,
+        "jit_clif_resolve_ns": jit_clif.resolve_ns,
+        "jit_clif_guard_ns": jit_clif.guard_ns,
+        "jit_clif_native_ns": jit_clif.native_ns,
+        "jit_clif_post_ns": jit_clif.post_ns,
+        "jit_clif_resolve_clone_ns": jit_clif.resolve_clone_ns,
+        "jit_clif_retired": jit_clif.clif_retired,
     })
 }
 
