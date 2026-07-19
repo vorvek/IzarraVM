@@ -973,28 +973,38 @@ pub struct JitClifCounters {
     /// with `jit_direct_compile_ns` in the tens of seconds); this field is the clif-only
     /// source of truth.
     pub compile_ns: u64,
-    /// `Seen`-branch visits that bail WITHOUT installing and WITHOUT parking Dormant, so
-    /// the key stays `Seen` and the very next visit re-runs the ENTIRE admission pipeline
-    /// (heat checks, `walk_unit`, `plan_unit`, the code-page cover check,
-    /// `SegmentLayout::capture`) from scratch. Two distinct un-parked bail points exist in
-    /// `try_clif_continuation` today, each counted individually so the treadmill's source
-    /// is attributable instead of inferred:
-    /// - `retry_no_fast_map` (run.rs:1253-1261, the C0 review's MINOR-2 suspect): a
-    ///   memory-bearing unit whose `FastMap` storage has not been allocated yet
-    ///   (`jit::fast_map::FastMap::native_bases` returns `None` only before the very first
-    ///   population anywhere, so this should be a narrow startup-window cost, not a
-    ///   sustained one, UNLESS FastMap population is not actually active under the
-    ///   running policy — see `memory.rs::fast_map_population_enabled`).
-    /// - `retry_incomplete_walk` (run.rs:1190-1194): `walk_unit` returned no admittable
-    ///   layout (`instructions == 0`), which given `clif_hot` already confirmed the
-    ///   decode-cache line at this exact `(lin, d)` moments earlier, can only mean the
-    ///   entry instruction itself is structurally unclassifiable
-    ///   (`direct::unit_growth_classify` declines it, or its prefixes are unsupported) —
-    ///   a PERMANENT, deterministic condition for that address, so once `clif_hot` latches
-    ///   (frozen at threshold, never reset while the line survives), this bail can repeat
-    ///   on literally every loop iteration of that address.
-    pub retry_incomplete_walk: u64,
+    /// `retry_no_fast_map` (run.rs, the `has_memory`/`FastMap::native_bases` bail, the C0
+    /// review's MINOR-2 suspect): a
+    /// `Seen`-branch bail for a memory-bearing unit whose `FastMap` storage has not been
+    /// allocated yet (`jit::fast_map::FastMap::native_bases` returns `None` only before the
+    /// very first population anywhere, so this should be a narrow startup-window cost, not a
+    /// sustained one, UNLESS FastMap population is not actually active under the running
+    /// policy — see `memory.rs::fast_map_population_enabled`). Measured ZERO on a full
+    /// Quake/586 1200M-cycle run
+    /// (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md section 0): this bail
+    /// is proven not to fire in practice, so per the adversarial review's MAJOR-4 it is left
+    /// exactly as-is (WITHOUT parking Dormant, so the key stays `Seen` and the very next
+    /// visit would re-run the entire admission pipeline from scratch) — no machinery is
+    /// added for a bail that never fires.
     pub retry_no_fast_map: u64,
+    /// `retry_incomplete_walk` (the `walk_unit` bail in the `Seen` arm, `run.rs`): `walk_unit`
+    /// returned no admittable layout (`instructions == 0`), which given `clif_hot` already
+    /// confirmed the decode-cache line at this exact `(lin, d)` moments earlier, can only
+    /// mean the entry instruction itself is structurally unclassifiable
+    /// (`direct::unit_growth_classify` declines it, or its prefixes are unsupported) — a
+    /// PERMANENT, deterministic condition for that address. Measured 4,455,782 on the same
+    /// Quake run (the dominant re-attempt-by-COUNT cause; section 0 of the design doc
+    /// above). FIXED (Cause-B): this bail now parks the key `Dormant` with the plain no-lift
+    /// `dormant()`, byte-identical to the structural-failure parks below (`park_no_lowerable`,
+    /// `park_no_code_cover`, `park_segment_capture_failed`) — recoverable only via a
+    /// wholesale `clif_clear()`, never a heat-cooldown or SMC-triggered lift (adversarial
+    /// review MAJOR-3: an unclassifiable opcode stays unclassifiable until the bytes change,
+    /// and a code change already triggers `clif_clear()`). This field's name and its
+    /// "un-parked retry" framing are kept (not renamed to a `park_*` name) exactly as
+    /// `smc_unit_kills_no_layout` was kept after PR #598: it is now a permanent
+    /// one-per-distinct-address tripwire, not deleted, so a regression that reopens the
+    /// treadmill is still named by an existing counter.
+    pub retry_incomplete_walk: u64,
     /// `Seen`-branch visits parked Dormant for a heat or structural admission reason,
     /// broken out by the exact guard that fired (mirroring the `jit_direct_reject_*`
     /// per-reason pattern already used for `run_clif_unit`'s entry guards), so a churn
@@ -1003,13 +1013,31 @@ pub struct JitClifCounters {
     /// counter but isolate clif's own two heat-gate sites specifically.
     ///
     /// Invariant (checkable in a regression test, since `compile_attempts` increments
-    /// unconditionally once the leading-run gate passes, `run.rs:1204`, strictly before
+    /// unconditionally once the leading-run gate passes (`run.rs`, the `plan.leading == 0`
+    /// check's `else` branch), strictly before
     /// every field below fires): `compile_attempts` equals the sum of `units_installed`,
     /// `park_no_code_cover`, `park_heat_span`, `park_segment_capture_failed`,
     /// `retry_no_fast_map`, `park_backend_unavailable`, `park_compile_failed`, and
-    /// `park_install_failed`. `park_no_lowerable`, `park_heat_chunk`, and
-    /// `retry_incomplete_walk` all fire BEFORE the `compile_attempts` increment and are
-    /// deliberately excluded from that sum.
+    /// `park_install_failed`. `park_arena_exhausted`, `park_no_lowerable`,
+    /// `park_heat_chunk`, and `retry_incomplete_walk` all fire BEFORE the
+    /// `compile_attempts` increment and are deliberately excluded from that sum.
+    ///
+    /// Track C-second-cause A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md
+    /// section 3.7): the sticky arena-exhausted short-circuit. Once `ClifBackend::
+    /// arena_exhausted()` latches — the FIRST time a finalized unit fails to install for
+    /// lack of remaining arena capacity, as opposed to a Cranelift codegen error or the
+    /// zero-relocation invariant's own reject, which are per-unit failures and must never
+    /// set it (adversarial review MINOR-5) — every later `Seen` admission on this backend
+    /// rejects HERE, before `walk_unit`/`plan_unit`/the ~680 microsecond Cranelift compile
+    /// that would only fail at install anyway. This is what collapses the pre-fix
+    /// `park_compile_failed = 108,293` (73.5 s of `compile_ns`, one Quake/586 1200M-cycle
+    /// run, design doc section 0) down to O(1) rejects: only the handful of units that fill
+    /// the arena for the FIRST time ever pay a genuine compile-then-fail; every later
+    /// admission — including every wholesale-`clif_clear()`-resurrected re-attempt of the
+    /// same working set, since this slice does not reset the arena (that is A2, a separate
+    /// deferred redesign) — counts here instead. Counted, not left inferred, exactly like
+    /// the other `park_*` reasons above.
+    pub park_arena_exhausted: u64,
     pub park_no_lowerable: u64,
     pub park_heat_chunk: u64,
     pub park_heat_span: u64,
