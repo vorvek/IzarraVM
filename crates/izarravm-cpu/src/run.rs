@@ -1142,6 +1142,13 @@ impl CpuGsw {
         d: bool,
         budget: ContinuationBudget,
     ) -> Result<ClifContinuation, CpuError> {
+        // Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`): consume a
+        // pending arena reset FIRST, before `clif_hot` and before any admission or adapter
+        // call. This is the provably frame-free point design section 5 establishes -- the
+        // only native-entry site (`run_clif_unit`'s `adapter(..)` call) sits strictly AFTER
+        // this check within the same synchronous call, and no call-out re-enters this
+        // function, so nothing on the host stack can return into arena bytes this reclaims.
+        self.jit_direct.apply_deferred_clif_arena_reset();
         if !self
             .decode_cache
             .clif_hot(lin, d, jit::clif::cache::CLIF_DEFAULT_ADMISSION_HEAT)
@@ -1182,13 +1189,12 @@ impl CpuGsw {
                 // remaining capacity, EVERY future Seen admission would otherwise walk, plan,
                 // and pay the ~680 microsecond Cranelift compile only to fail at
                 // `install_span`'s own capacity check and park Dormant anyway -- an O(1)
-                // reject here skips all of that. NOTE: the flag is sticky for this backend's
-                // lifetime (cleared only by A2, a separate deferred redesign that resets the
-                // arena on a wholesale clear, or a rebuilt backend) -- so after the first
-                // arena fill, and especially after the first wholesale `clif_clear()`
-                // thereafter, clif parks every Seen entry Dormant here and runs the
-                // interpreter for all of them. That durability gap is intentionally NOT this
-                // slice's job; this fix only removes the wasted compile attempts.
+                // reject here skips all of that. The flag is cleared by A2's deferred
+                // `reset_arena` (dev_docs/plans/2026-07-19-clif-arena-reset-design.md), which
+                // runs at the top of this function (`apply_deferred_clif_arena_reset`, above)
+                // on the next admission after a wholesale `clif_clear()` -- so a Seen entry
+                // parked here by a stale exhausted flag re-walks and compiles normally on its
+                // next visit instead of staying dormant for the backend's whole lifetime.
                 if self
                     .jit_direct
                     .clif_backend
@@ -1610,6 +1616,18 @@ impl CpuGsw {
             x87: jit::clif::callout::clif_x87_callout_shim::<B>,
         };
         let entry_ptr = unit.entry as *const u8;
+        // Track C A2 (design section 6): mark one clif native frame live for the dynamic
+        // extent of the adapter call below. The guard decrements on every exit from this
+        // scope, including the `resume_unwind` a few lines down, so `apply_deferred_clif_
+        // arena_reset` never observes a live frame as gone prematurely.
+        // SAFETY: the pointer is a live field of `self`, valid for reads/writes for the
+        // guard's lifetime; guest execution is single-threaded and design section 5 proves
+        // at most one clif native frame is ever live.
+        let _native_frame = unsafe {
+            jit::NativeFrameGuard::enter(std::ptr::from_mut(
+                &mut self.jit_direct.native_frame_depth,
+            ))
+        };
         // SAFETY: the entry and adapter were installed by this backend's zero-relocation
         // compile-and-install path at exactly the five-parameter/four-live-parameter
         // signatures and stay live for the backend's lifetime; the table and the immediate
