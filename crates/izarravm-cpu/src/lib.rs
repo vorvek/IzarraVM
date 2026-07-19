@@ -945,6 +945,15 @@ pub struct JitClifCounters {
     /// that landed in the resolver trampoline (the unresolved split).
     pub linked_transfers: u64,
     pub unresolved_transfers: u64,
+    /// C1d graceful-abandon safety valve (design
+    /// `dev_docs/plans/2026-07-19-clif-chain-resolver-generation-guard-design.md`, A2
+    /// section 13): a mid-chain hop's x87 call-out fired a wholesale `clif_units_clear`
+    /// (a page-straddling / aliased SMC store into watched code), dropping the descriptors
+    /// the completed transfers recorded in `chain.trace`. The resolver detects the
+    /// `generation` bump and abandons trace resolution instead of `.expect()`-panicking on
+    /// the dropped descriptors. Expected to stay zero in practice; a nonzero value only
+    /// means the rare self-modifying-code-during-an-x87-chain path was hit and handled.
+    pub chain_abandoned_cleared: u64,
     /// C1e: clif-only recompile-churn diagnostics (D3). `smc_unit_restamps` and
     /// `smc_unit_kills` partition every SMC write that hit a COMPILED clif unit's span;
     /// `smc_unit_kills_multi_slot` is the subset of kills escalated by the coarse

@@ -2032,6 +2032,203 @@ fn clif_arena_reset_a2_x87_smc_wholesale_clear_mid_frame_is_safe() {
     );
 }
 
+/// FALSIFICATION-FIRST regression test, design section 13 / task_68a42409: the C1d chain
+/// resolver panic the A2 test just above deliberately leaves unexercised ("a chained x87
+/// unit taking this path mid-chain hits a distinct, pre-existing C1d resolver panic ...
+/// deliberately not exercised here").
+///
+/// Mechanism: A --x87,jmp--> B, both x87-bearing (`x87_mask != 0` on both), which the N2
+/// parity clause at `cache.rs:324-329` (`(self.x87_mask != 0) == (target.x87_mask != 0)`)
+/// PERMITS as a link even though the chain has never actually been exercised end to end.
+/// After enough warm-up passes A's jmp resolves through `resolve_waiting` and every entry
+/// transfers NATIVELY from A into B: one real transfer, `chain.trace[0]` recording B's
+/// live descriptor address (`run.rs:1670`).
+///
+/// B's own body is a single x87 store, `fstp dword [ebx]` (opcode D9 /3, `NativeX87Insn::
+/// StoreF32{pop:true}`) -- the SAME shape the A2 reproducer above uses. It is in fact the
+/// ONLY x87 memory-store form `NativeX87Insn::classify` (`native_x87.rs:207-218`) admits
+/// into a lowered unit slot at all: DB /7 (`FSTP m80`) and DF /6 (`FBSTP m80`) fall through
+/// classify's `_ => None` arm entirely, so they can never occupy a compiled unit slot in
+/// the first place (a leaner falsification path than the design notes' original DB/DF
+/// straddling-store hypothesis, discovered while trying to assemble one).
+///
+/// On the trigger pass EBX points at B's OWN resident bytes (0x1010), and B/A's shared
+/// physical code page has been ALIASED first -- verbatim the A2 test's own technique above
+/// (a second `DecodeCache::put` linear mapping onto the same physical page via the
+/// crate-internal seam, no real page tables needed) -- so `note_code_write_hit`'s per-byte
+/// narrow fold (`core.rs:358-364`) refuses (the physical-to-linear reconstruction is now
+/// ambiguous) and the store falls back to the WHOLESALE `clif_units_clear()`
+/// (`core.rs:389`), fired from INSIDE the x87 shim's `cycle_no_interrupt_check` re-entry
+/// while B's compiled native frame -- the chain's already-recorded landing target -- is
+/// live on the host stack below it. `ClifUnitCache::clear` (`cache.rs:1032`) empties
+/// `self.units` outright, so back in `run_clif_unit`'s post-chain resolver
+/// (`run.rs:1679-1680`), `unit_index_by_descriptor_addr(chain.trace[0])` scans an empty
+/// Vec, returns `None`, and `.expect("a chain trace entry names a live descriptor")`
+/// panics.
+///
+/// The fix (design
+/// `dev_docs/plans/2026-07-19-clif-chain-resolver-generation-guard-design.md`) makes the
+/// resolver notice the `generation` bump the wholesale clear caused -- the same signal the
+/// call-out latch (`callout.rs:191-201`) already acts on -- and ABANDON trace resolution
+/// gracefully (charge the call-out core clocks that ran, resume on the interpreter) instead
+/// of `.expect()`-panicking on the dropped descriptors. This test asserts that graceful
+/// outcome: the trigger pass no longer panics; the clif run's architectural state and guest
+/// memory match a pure-interpreter run of the same program (the guest runs correctly on the
+/// interpreter for the cleared units); and the `chain_abandoned_cleared` safety-valve
+/// counter fired. Timing is approximate on this path by design -- the dropped units' native
+/// prefix charge is unrecoverable once the descriptors are gone (only the interpreter's own
+/// x87 call-out clocks survive), so clocks are deliberately not asserted equal.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_x87_wholesale_clear_mid_hop_abandons_gracefully() {
+    let entry = 0x1000u32;
+    // 0x1000: nop (interpreted starter).
+    // A at 0x1001: fld st(0) (x87 register form -- sets A's x87_mask with no memory
+    // call-out to track); jmp +11 -> B at 0x1010.
+    // B at 0x1010: fstp dword [ebx] (x87 D9/3 memory-store form -- the SAME shape the A2
+    // reproducer above uses; sets B's x87_mask too, so N2 parity permits A's jmp to link).
+    let mut code = vec![0x90, 0xd9, 0xc0, 0xeb, 0x0b];
+    code.resize(0x10, 0x90);
+    code.extend_from_slice(&[0xd9, 0x1b]);
+    assert_eq!(code.len(), 0x12, "B must land exactly at 0x1010");
+
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+
+    fn arm(cpu: &mut CpuGsw, entry: u32, ebx: u32) {
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.registers.gpr = [0, 0, 0, ebx, 0x1_f000, 0, 0, 0];
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.set_eip(entry);
+        cpu.elapsed_clocks = 0;
+        cpu.core_clocks_so_far = 0;
+        cpu.timing_rem = 0;
+        cpu.fp_rem = 0;
+        cpu.fpu.finit();
+        cpu.fpu.push(1.25);
+    }
+
+    fn run_to_halt_local(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        for _ in 0..64 {
+            let outcome = bus_run(cpu, bus);
+            if outcome {
+                return;
+            }
+        }
+        panic!("run never halted");
+    }
+    fn bus_run(cpu: &mut CpuGsw, bus: &mut TestBus) -> bool {
+        cpu.run_budgeted(bus, 20_000)
+            .expect("run reaches hlt without a hard error")
+            .halted
+    }
+
+    // The trigger store targets unit A's watched bytes (0x1001, the `fld` A already retired
+    // this pass) rather than B's own bytes: it must self-modify WATCHED code to fire the
+    // wholesale clear, but must NOT clobber the HLT at 0x1012 that ends the run -- once the
+    // resolver abandons gracefully, the guest RESUMES there on the interpreter, so it has to
+    // stay a HLT. (A store to 0x1010 would overwrite 0x1012 and the resumed guest would run
+    // off into garbage.)
+    let store_target = 0x1001u32;
+
+    // Reference: a pure-interpreter run of the identical program from the trigger state, so
+    // its fstp self-modifies code exactly as the clif run will. Clif and Direct
+    // auto-admission both off, so this is the canonical architectural truth the abandoned
+    // clif run must reproduce.
+    let mut reference = generated_cpu(GswMode::Gsw586);
+    reference.set_clif_backend_enabled(false);
+    reference.set_jit_auto_admit(false);
+    let mut reference_bus = TestBus::with_memory(memory.clone());
+    reference_bus.direct_pages_enabled = true;
+    reference_bus.direct_page_clocks = true;
+    arm(&mut reference, entry, store_target);
+    run_to_halt_local(&mut reference, &mut reference_bus);
+
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    clif_bus.direct_pages_enabled = true;
+    clif_bus.direct_page_clocks = true;
+
+    // Warm-up passes: EBX parked in harmless scratch RAM so B's store never touches code.
+    // A generous cap (the x87 per-hop quota bound, `MAX_X87_BLOCK_CORE_CLOCKS`, is much
+    // larger than the integer one) so the chain actually gets quota >= 2 and transfers.
+    for _ in 0..8 {
+        arm(&mut clif, entry, 0x8000);
+        run_to_halt_local(&mut clif, &mut clif_bus);
+    }
+    let warmed = clif.jit_clif_counters();
+    assert!(
+        warmed.linked_transfers > 0,
+        "A's jmp into B must link and transfer natively before the trigger pass (an \
+         all-x87 chain, permitted by the N2 parity clause): {warmed:#?}"
+    );
+    assert_eq!(
+        warmed.chain_abandoned_cleared, 0,
+        "the abandon path must not have fired during the harmless warm-up"
+    );
+
+    // The aliasing injection (verbatim from the A2 reproducer above): a second linear
+    // mapping onto A/B's own physical code page makes `narrow_invalidate`'s
+    // physical-to-linear reconstruction ambiguous, so the trigger store's per-byte narrow
+    // fold must refuse and fall back to the wholesale clear.
+    let insn = clif
+        .decode_cache
+        .get(entry, true)
+        .expect("the entry line must be resident after warm-up");
+    assert!(
+        clif.decode_cache.put(0x5_0000, insn, true, entry).inserted,
+        "a second linear mapping onto the same physical page must register"
+    );
+
+    // Trigger pass: EBX now targets watched code (0x1001), so B's fstp interpreter re-entry
+    // retires an SMC write into the now-ALIASED code page while B's native frame -- the
+    // chain's already-recorded landing target -- is live on the host stack below the shim.
+    // Before the fix this panicked at run.rs:1680; now the resolver detects the generation
+    // bump and abandons the chain gracefully.
+    restore_bus(&mut clif_bus, &memory);
+    arm(&mut clif, entry, store_target);
+    run_to_halt_local(&mut clif, &mut clif_bus);
+
+    // The safety valve fired exactly once, and the guest state + memory match the
+    // pure-interpreter reference (state exact; the interpreter ran the cleared units).
+    assert!(
+        clif.jit_clif_counters().chain_abandoned_cleared > 0,
+        "the mid-chain wholesale clear must have driven the resolver's graceful-abandon \
+         path: {:#?}",
+        clif.jit_clif_counters()
+    );
+    // State exact: every ARCHITECTURAL field matches the interpreter (GPRs, segments, EIP,
+    // EFLAGS, x87, control registers, halt, guest memory). Whole-`CpuGsw` equality is NOT
+    // asserted on purpose -- `elapsed_clocks`/`timing_rem`/perf counters legitimately differ
+    // (timing is approximate on the abandon path: the dropped units' native prefix charge is
+    // unrecoverable, so the clif run charged 1 core clock where the full interpreter charged
+    // 2), and the jit bookkeeping differs (clif enabled vs not).
+    assert_eq!(
+        clif.registers, reference.registers,
+        "abandoned clif run must reproduce the interpreter's GPRs/segments/EIP/EFLAGS"
+    );
+    assert_eq!(
+        clif.fpu, reference.fpu,
+        "abandoned clif run must reproduce the interpreter's x87 state"
+    );
+    assert_eq!(
+        clif.control, reference.control,
+        "abandoned clif run must reproduce the interpreter's control registers"
+    );
+    assert_eq!(clif.halted, reference.halted, "both runs must halt");
+    assert_eq!(
+        clif_bus.memory, reference_bus.memory,
+        "abandoned clif run must reproduce the interpreter's guest memory"
+    );
+}
+
 /// M1: the compile-outcome clif arm. A walkable unit whose ENTRY slot is not lowerable
 /// (a memory form) parks Dormant instead of compiling a no-op body; a compiled unit killed
 /// by an SMC write is dropped from the cache entirely (generation bumped) and the next
