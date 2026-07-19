@@ -57,14 +57,12 @@ pub(crate) struct ClifBackend {
     /// section 3.7): sticky once the arena has failed to fit a finalized unit for lack of
     /// remaining capacity. Deliberately set ONLY by that one cause -- a Cranelift codegen
     /// error or the zero-relocation install invariant's own rejection are per-unit failures,
-    /// not evidence the arena is full, and must never latch this flag (MINOR-5). NOTE: this
-    /// slice does not clear the flag anywhere; only a reset arena (A2, a separate deferred
-    /// redesign) or a rebuilt backend would. Concretely: once this latches, EVERY future
-    /// `Seen` admission on this backend short-circuits Dormant without compiling, for the
-    /// rest of this backend's lifetime -- including across a wholesale `clif_clear()`, which
-    /// clears the unit cache but never touches `clif_backend` today. That is deliberate scope
-    /// for this slice (it only removes the wasted compile attempts); restoring clif's ability
-    /// to install new units after a fill is A2's job, not this one's.
+    /// not evidence the arena is full, and must never latch this flag (MINOR-5). Concretely:
+    /// once this latches, EVERY future `Seen` admission on this backend short-circuits
+    /// Dormant without compiling, until either A2's deferred `reset_arena` (design section 9,
+    /// `dev_docs/plans/2026-07-19-clif-arena-reset-design.md`) clears it on the next
+    /// frame-free admission after a wholesale `clif_clear()`, or the backend is rebuilt from
+    /// scratch.
     arena_exhausted: bool,
 }
 
@@ -141,6 +139,22 @@ impl ClifBackend {
         self.relocation_fallbacks
     }
 
+    /// Test seam for A2's durability proof: the arena's occupied page count, so a test can
+    /// assert the arena is genuinely full before a reset and genuinely empty afterward
+    /// without reaching into `ExecutableArena` directly.
+    #[cfg(test)]
+    pub(crate) fn arena_used_slots_for_test(&self) -> usize {
+        self.arena.used_slots()
+    }
+
+    /// Test seam for A2's durability proof: whether the cached adapter/sentinel handles have
+    /// been invalidated (both `None`), as `reset_arena` must leave them so they rebuild on
+    /// next use (design section 8).
+    #[cfg(test)]
+    pub(crate) fn callout_adapter_and_sentinel_are_unset_for_test(&self) -> bool {
+        self.callout_adapter_entry.is_none() && self.sentinel.is_none()
+    }
+
     /// Track C-second-cause A1: whether this backend's arena has ever failed to fit a
     /// finalized unit for lack of remaining capacity. `try_clif_continuation` checks this
     /// before paying for a walk/plan/compile that would fail at install anyway.
@@ -160,6 +174,39 @@ impl ClifBackend {
             self.sentinel = Some(Box::new(cache::ClifUnitDescriptor::sentinel(entry)));
         }
         self.sentinel.as_deref()
+    }
+
+    /// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`, sections 7-8):
+    /// reclaim the arena on a wholesale clear and invalidate the two arena-resident handles
+    /// this backend caches, forcing both to rebuild lazily on next use. Returns false when the
+    /// OS protection change fails, telling the caller to drop and rebuild the whole backend
+    /// instead (section 7.3's self-healing fallback) rather than trust a half-reset arena.
+    ///
+    /// SINGLE-CALL-SITE DISCIPLINE (MINOR-5, section 7.4): this is called from EXACTLY ONE
+    /// place -- `JitState::apply_deferred_clif_arena_reset` (`jit/mod.rs`), itself called
+    /// from EXACTLY ONE place, the top of `try_clif_continuation` (`run.rs`), the one point
+    /// the design's section 5 proof establishes as provably frame-free. `native_frame_depth`
+    /// is threaded in (rather than read from a field this type doesn't own) purely so a
+    /// second, careless caller trips the assert below immediately instead of silently
+    /// reopening the use-after-free the deferred-reset design closes; the sole real caller
+    /// already checked this and never reaches here with a nonzero depth.
+    #[track_caller]
+    pub(crate) fn reset_arena(&mut self, native_frame_depth: u32) -> bool {
+        debug_assert_eq!(
+            native_frame_depth, 0,
+            "ClifBackend::reset_arena called with a native clif frame live on the stack; \
+             see dev_docs/plans/2026-07-19-clif-arena-reset-design.md section 7.4"
+        );
+        if !self.arena.reset() {
+            return false;
+        }
+        // Both handles name arena-resident code the reset just wiped: force each to
+        // recompile lazily (design section 8) rather than call through stale bytes.
+        self.callout_adapter_entry = None;
+        self.sentinel = None;
+        // A1 interaction (design section 9): the arena is no longer exhausted post-reset.
+        self.arena_exhausted = false;
+        true
     }
 }
 
