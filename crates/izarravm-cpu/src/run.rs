@@ -1659,6 +1659,39 @@ impl CpuGsw {
         // unit can stop mid-run, and its stop decodes from the disposition exactly as a
         // single unit's always has.
         let transfers = self.jit_direct.clif_run.chain.transfers as usize;
+        // A2 section 13 (design
+        // `dev_docs/plans/2026-07-19-clif-chain-resolver-generation-guard-design.md`):
+        // graceful abandon when a mid-chain hop's x87 call-out fired a WHOLESALE
+        // `clif_units_clear` (a page-straddling / aliased SMC store into watched code that
+        // missed the narrow-invalidate path, `core.rs:389`). That drops every descriptor
+        // the completed transfers already recorded in `chain.trace`, so the descriptor-
+        // address lookups below would `.expect()`-panic on a now-empty `units` Vec. The
+        // `generation` bump is the exact signal the call-out latch (`callout.rs:191-201`)
+        // already acts on to stop native execution mid-hop, leaving the guest state and
+        // resume EIP materialized by the shim's exit -- the same snapshot captured before
+        // the adapter call (`snapshot_cache_generation`). Only the descriptor-address
+        // lookups can fault, so this is gated on `transfers > 0`: a `transfers == 0` entry
+        // resolves through the OWNED `unit` clone (`run.rs`'s `.cloned()` at the call site),
+        // which survives a clear, and must keep its exact behavior. On abandon, relay any
+        // pending hard error, else charge only the call-out core clocks tallied live (the
+        // native prefix charge is unrecoverable once the descriptors are gone; the
+        // interpreter already applied its own bus charges and the resolver's bulk bus
+        // charging is skipped, so nothing is double-counted) and resume on the interpreter,
+        // which runs the cleared code regions correctly. State exact, timing approximate on
+        // this astronomically rare path.
+        if transfers > 0
+            && self.jit_direct.clif_units.generation
+                != self.jit_direct.clif_run.snapshot_cache_generation
+        {
+            self.jit_clif.chain_abandoned_cleared += 1;
+            if let Some(error) = self.jit_direct.clif_run.pending_hard_error.take() {
+                return Err(error);
+            }
+            return Ok(ClifContinuation::Run(CycleOutcome {
+                core_clocks: self.jit_direct.clif_run.callout_core_clocks,
+                halted: false,
+            }));
+        }
         debug_assert!(
             (transfers as u64) < quota,
             "the run.rs:1897 invariant shape"
