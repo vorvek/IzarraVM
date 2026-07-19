@@ -9,6 +9,8 @@
 //! exactness, so the ceiling is that transcendental and denormal edge cases are
 //! not bit-accurate. Upgrade path if a title ever needs it: a soft float80.
 
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+
 /// Control word after FINIT: all exceptions masked, round-to-nearest, 64-bit
 /// precision (0x037F is the 387 reset value).
 const CONTROL_INIT: u16 = 0x037f;
@@ -84,6 +86,24 @@ impl Default for X87 {
 }
 
 impl X87 {
+    /// Writes version 1 of the canonical x87 payload without changing FPU state.
+    /// Registers use physical storage order so TOP remains solely in the status word.
+    pub fn write_canonical_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        out.write_u16(self.control)?;
+        out.write_u16(self.status)?;
+        out.write_u16(self.tag)?;
+        for value in self.st {
+            out.write_f64(value)?;
+        }
+        for value in self.mm {
+            out.write_u64(value)?;
+        }
+        Ok(())
+    }
+
     /// Return offsets into this exact Rust layout without exposing its fields.
     #[cfg(all(
         feature = "jit",
