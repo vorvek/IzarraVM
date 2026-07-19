@@ -43,6 +43,12 @@ function Invoke-RealtimeGateSelfTest {
         (Get-NormalizedDirectQuakeCampaignStage "Proof") -cne "Proof") {
         throw "Direct Quake campaign stage normalization is not canonical."
     }
+    Assert-DirectQuakeExecutableRelation "Noise" ("1" * 64) ("2" * 64)
+    foreach ($stage in @("Screen", "Proof")) {
+        Assert-SelfTestThrows {
+            Assert-DirectQuakeExecutableRelation $stage ("1" * 64) ("1" * 64)
+        } "require different candidate and retained-parent binaries"
+    }
     Assert-SelfTestThrows {
         Assert-DirectQuakeCampaignMode `
             $false $true $false $false $false $false $false $false $false $false $false `
@@ -1332,6 +1338,44 @@ function Invoke-RealtimeGateSelfTest {
                 "normal_promotion_threshold_met") {
             throw "The Direct Quake campaign synthetic proof was rejected."
         }
+        $noiseCandidate = @()
+        $noiseParent = @()
+        foreach ($pair in 1..6) {
+            $noiseCandidate += & $newDirectQuakeSample `
+                "candidate" "pair$pair" "production" 1.0 $parentSha
+            $noiseParent += & $newDirectQuakeSample `
+                "parent" "pair$pair" "production" 1.0 $parentSha
+        }
+        $noiseWarmups = [pscustomobject][ordered]@{
+            candidate = [object[]]@(& $newDirectQuakeSample `
+                "candidate" "warmup" "production" 1.0 $parentSha)
+            parent = [object[]]@(& $newDirectQuakeSample `
+                "parent" "warmup" "production" 1.0 $parentSha)
+        }
+        $noiseCorrectness = [pscustomobject][ordered]@{
+            candidate = [object[]]@(& $newDirectQuakeSample `
+                "candidate" "correctness" "correctness" 1.0 $parentSha)
+            parent = [object[]]@(& $newDirectQuakeSample `
+                "parent" "correctness" "correctness" 1.0 $parentSha)
+        }
+        $noiseWorkload = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $noiseCandidate $noiseParent `
+            $noiseWarmups $noiseCorrectness $directPolicy "Noise" $candidateSha $parentSha
+        if ($noiseWorkload.exact_work.verdict -cne "pass" -or
+            $noiseWorkload.provenance.verdict -cne "pass" -or
+            $noiseWorkload.paired_metrics.real_time_factor.classification -cne "noise_only") {
+            throw "The Direct Quake single-executable noise study was rejected."
+        }
+        $noiseCandidate[0].gate_executable_sha256 = $candidateSha
+        $escapedNoiseWorkload = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $noiseCandidate $noiseParent `
+            $noiseWarmups $noiseCorrectness $directPolicy "Noise" $candidateSha $parentSha
+        if ($escapedNoiseWorkload.provenance.verdict -cne "fail" -or
+            ($escapedNoiseWorkload.provenance.failure_reasons -join " ") -notmatch
+                "wrong frozen binary") {
+            throw "The Direct Quake noise study accepted a candidate-binary observation."
+        }
+        $noiseCandidate[0].gate_executable_sha256 = $parentSha
         $directCandidate[0].gate_hdd_tree.tree_sha256 = "e" * 64
         $hddMismatch = Get-DirectQuakeCampaignWorkloadSummary `
             (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
@@ -1699,6 +1743,7 @@ function Invoke-RealtimeGateSelfTest {
         masks = $verifiedChildAffinityMasks
         candidate_sha256 = $candidateArtifact.sha256
         parent_sha256 = $baselineArtifact.sha256
+        campaign_stage = $CampaignStage
         active_power_scheme_at_completion = $activePowerSchemeAtCompletion
     }
     try {
@@ -1725,6 +1770,30 @@ function Invoke-RealtimeGateSelfTest {
             $directCampaignSummary.retention_blockers.Count -ne 3) {
             throw "The Direct Quake campaign top-level partial-proof summary is wrong."
         }
+        $CampaignStage = "Noise"
+        $noiseCampaignSummary = New-DirectQuakeCampaignSummary @($noiseWorkload)
+        $noiseExecution = $noiseCampaignSummary.executables.noise_execution
+        if ($noiseCampaignSummary.verdict -cne "valid_noise_study" -or
+            -not $noiseCampaignSummary.evidence_valid -or
+            $noiseCampaignSummary.comparison_class -cne
+                "direct_quake_retained_parent_single_executable_aa" -or
+            $noiseCampaignSummary.executables.byte_identical -or
+            $noiseCampaignSummary.executables.candidate_build_executed -or
+            $noiseExecution.sha256 -cne $parentSha -or
+            -not $noiseExecution.same_frozen_executable_for_all_roles) {
+            throw "The Direct Quake top-level noise evidence is not a single-executable A/A study."
+        }
+        $candidateArtifact.sha256 = $parentSha
+        foreach ($stage in @("Screen", "Proof")) {
+            $CampaignStage = $stage
+            $equalBuildSummary = New-DirectQuakeCampaignSummary @($directWorkload)
+            if ($equalBuildSummary.evidence_valid -or
+                ($equalBuildSummary.failure_reasons -join " ") -notmatch
+                    "compared byte-identical builds") {
+                throw "Direct Quake $stage accepted byte-identical revision builds."
+            }
+        }
+        $candidateArtifact.sha256 = $candidateSha
     } finally {
         $Runs = $savedDirectSummaryState.runs
         $Screening = $savedDirectSummaryState.screening
@@ -1732,6 +1801,7 @@ function Invoke-RealtimeGateSelfTest {
         $verifiedChildAffinityMasks = $savedDirectSummaryState.masks
         $candidateArtifact.sha256 = $savedDirectSummaryState.candidate_sha256
         $baselineArtifact.sha256 = $savedDirectSummaryState.parent_sha256
+        $CampaignStage = $savedDirectSummaryState.campaign_stage
         $activePowerSchemeAtCompletion = `
             $savedDirectSummaryState.active_power_scheme_at_completion
     }

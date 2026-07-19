@@ -1924,13 +1924,8 @@ if ($revisionPairedRun -and $candidateArtifact.verified -and $baselineArtifact.v
     throw "Candidate and baseline were not built with the same isolated recipe and toolchain."
 }
 if ($DirectQuakeCampaign) {
-    $sameExecutableBytes = $candidateArtifact.sha256 -ceq $baselineArtifact.sha256
-    if ($CampaignStage -ceq "Noise" -and -not $sameExecutableBytes) {
-        throw "Direct Quake Noise requires byte-identical candidate and retained-parent builds."
-    }
-    if ($CampaignStage -cne "Noise" -and $sameExecutableBytes) {
-        throw "Direct Quake Screen and Proof require different candidate and retained-parent binaries."
-    }
+    Assert-DirectQuakeExecutableRelation `
+        $CampaignStage $candidateArtifact.sha256 $baselineArtifact.sha256
 }
 
 function Quote-ProcessArgument([string]$Value) {

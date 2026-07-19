@@ -468,6 +468,16 @@ function Get-DirectQuakeExecutionPolicy {
     }
 }
 
+function Assert-DirectQuakeExecutableRelation(
+    [string]$Stage,
+    [string]$CandidateSha256,
+    [string]$ParentSha256
+) {
+    if ($Stage -cne "Noise" -and $CandidateSha256 -ceq $ParentSha256) {
+        throw "Direct Quake Screen and Proof require different candidate and retained-parent binaries."
+    }
+}
+
 function Get-TrackMExecutionPolicy([string]$RequestedExecutionRole) {
     switch ($RequestedExecutionRole.Trim().ToLowerInvariant()) {
         "automatic" {
@@ -2145,9 +2155,6 @@ function New-DirectQuakeCampaignSummary([object[]]$Workloads) {
         $globalReasons += "candidate and retained-parent build recipes differ"
     }
     $sameBinary = $candidateArtifact.sha256 -ceq $baselineArtifact.sha256
-    if ($CampaignStage -ceq "Noise" -and -not $sameBinary) {
-        $globalReasons += "Noise did not produce byte-identical candidate and parent builds"
-    }
     if ($CampaignStage -cne "Noise" -and $sameBinary) {
         $globalReasons += "Screen or Proof compared byte-identical builds"
     }
@@ -2216,7 +2223,11 @@ function New-DirectQuakeCampaignSummary([object[]]$Workloads) {
     $quakeOverrides = Get-BackendQuakeCompletionOverrides
     return [ordered]@{
         schema = "izarravm-direct-quake-campaign-partial-proof-v1"
-        comparison_class = "direct_quake_immediate_parent_revision_pair"
+        comparison_class = if ($CampaignStage -ceq "Noise") {
+            "direct_quake_retained_parent_single_executable_aa"
+        } else {
+            "direct_quake_immediate_parent_revision_pair"
+        }
         proof_completeness = "partial"
         stage = $CampaignStage.ToLowerInvariant()
         verdict = $verdict
@@ -2238,8 +2249,18 @@ function New-DirectQuakeCampaignSummary([object[]]$Workloads) {
             candidate = $candidateArtifact
             retained_parent = $baselineArtifact
             byte_identical = $sameBinary
+            candidate_build_executed = $CampaignStage -cne "Noise"
             noise_executed_path = if ($CampaignStage -ceq "Noise") {
                 $baselineArtifact.executed_copy_path
+            } else { $null }
+            noise_execution = if ($CampaignStage -ceq "Noise") {
+                [ordered]@{
+                    artifact = "retained_parent"
+                    path = $baselineArtifact.executed_copy_path
+                    sha256 = $baselineArtifact.sha256
+                    same_frozen_executable_for_all_roles = $true
+                    candidate_build_executed = $false
+                }
             } else { $null }
         }
         execution = [ordered]@{
