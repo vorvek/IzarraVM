@@ -961,6 +961,71 @@ pub struct JitClifCounters {
     pub smc_unit_restamps: u64,
     pub smc_unit_kills_no_layout: u64,
     pub smc_unit_kills_multi_slot: u64,
+    /// Track C1f (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md): the
+    /// second compile-treadmill diagnosis, committing the counters the C0 review's
+    /// MINOR-2 asked for so a future re-diagnosis never again depends on reverted local
+    /// instrumentation (see the track-c1f-postfix summary's "BLIND SPOT" note). Time spent
+    /// inside the ONE `jit::clif::lower::compile_unit` Cranelift call per `Seen`-branch
+    /// visit that reaches it (`run.rs`, immediately before `units_installed` or
+    /// `park_compile_failed`). Previously this nanosecond total was folded into
+    /// `PerfCounters::jit_direct_compile_ns`, mislabeling clif's own compile cost as
+    /// Direct's (confirmed live: a clif-only run showed `jit_direct_compile_attempts == 0`
+    /// with `jit_direct_compile_ns` in the tens of seconds); this field is the clif-only
+    /// source of truth.
+    pub compile_ns: u64,
+    /// `Seen`-branch visits that bail WITHOUT installing and WITHOUT parking Dormant, so
+    /// the key stays `Seen` and the very next visit re-runs the ENTIRE admission pipeline
+    /// (heat checks, `walk_unit`, `plan_unit`, the code-page cover check,
+    /// `SegmentLayout::capture`) from scratch. Two distinct un-parked bail points exist in
+    /// `try_clif_continuation` today, each counted individually so the treadmill's source
+    /// is attributable instead of inferred:
+    /// - `retry_no_fast_map` (run.rs:1253-1261, the C0 review's MINOR-2 suspect): a
+    ///   memory-bearing unit whose `FastMap` storage has not been allocated yet
+    ///   (`jit::fast_map::FastMap::native_bases` returns `None` only before the very first
+    ///   population anywhere, so this should be a narrow startup-window cost, not a
+    ///   sustained one, UNLESS FastMap population is not actually active under the
+    ///   running policy — see `memory.rs::fast_map_population_enabled`).
+    /// - `retry_incomplete_walk` (run.rs:1190-1194): `walk_unit` returned no admittable
+    ///   layout (`instructions == 0`), which given `clif_hot` already confirmed the
+    ///   decode-cache line at this exact `(lin, d)` moments earlier, can only mean the
+    ///   entry instruction itself is structurally unclassifiable
+    ///   (`direct::unit_growth_classify` declines it, or its prefixes are unsupported) —
+    ///   a PERMANENT, deterministic condition for that address, so once `clif_hot` latches
+    ///   (frozen at threshold, never reset while the line survives), this bail can repeat
+    ///   on literally every loop iteration of that address.
+    pub retry_incomplete_walk: u64,
+    pub retry_no_fast_map: u64,
+    /// `Seen`-branch visits parked Dormant for a heat or structural admission reason,
+    /// broken out by the exact guard that fired (mirroring the `jit_direct_reject_*`
+    /// per-reason pattern already used for `run_clif_unit`'s entry guards), so a churn
+    /// regression names its own cause instead of hiding in one lump. `park_heat_chunk` and
+    /// `park_heat_span` duplicate a subset of the shared (Direct+clif) `smc_heat_demotions`
+    /// counter but isolate clif's own two heat-gate sites specifically.
+    ///
+    /// Invariant (checkable in a regression test, since `compile_attempts` increments
+    /// unconditionally once the leading-run gate passes, `run.rs:1204`, strictly before
+    /// every field below fires): `compile_attempts` equals the sum of `units_installed`,
+    /// `park_no_code_cover`, `park_heat_span`, `park_segment_capture_failed`,
+    /// `retry_no_fast_map`, `park_backend_unavailable`, `park_compile_failed`, and
+    /// `park_install_failed`. `park_no_lowerable`, `park_heat_chunk`, and
+    /// `retry_incomplete_walk` all fire BEFORE the `compile_attempts` increment and are
+    /// deliberately excluded from that sum.
+    pub park_no_lowerable: u64,
+    pub park_heat_chunk: u64,
+    pub park_heat_span: u64,
+    pub park_no_code_cover: u64,
+    pub park_segment_capture_failed: u64,
+    /// The clif compile/install infrastructure itself was unavailable (backend allocation
+    /// failed after `ClifBackend::new()`, the sentinel descriptor was unavailable, or the
+    /// backend vanished on the second borrow): three merged `run.rs` sites, expected near
+    /// zero on any supported host.
+    pub park_backend_unavailable: u64,
+    pub park_compile_failed: u64,
+    pub park_install_failed: u64,
+    /// A snapshot (not an accumulator) of `ClifUnitCache`'s admission map size
+    /// (`entries: HashMap<ClifUnitKey, ClifUnitState>`) at read time, the requested
+    /// "entries-map size" gauge; zero on a non-clif-backend build.
+    pub entries_len: u64,
 }
 
 impl PartialEq for JitClifCounters {

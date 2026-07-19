@@ -660,6 +660,15 @@ impl ClifUnitCache {
         self.entries.get(&key).copied()
     }
 
+    /// Track C1f diagnostic gauge: the admission map's current size (`Seen` + `Dormant` +
+    /// `Compiled` entries combined), a live snapshot rather than an accumulator. Never
+    /// pruned by SMC (the C1f page-eviction fix removed the only path that shrank it), so
+    /// this is expected to grow monotonically over a long run; exposed to distinguish
+    /// "many distinct never-installing units" from "few units retried endlessly".
+    pub(crate) fn entries_len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(crate) fn note_seen(&mut self, key: ClifUnitKey) {
         self.entries.entry(key).or_insert(ClifUnitState::Seen);
     }
