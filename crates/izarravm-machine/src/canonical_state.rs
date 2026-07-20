@@ -14,6 +14,7 @@ use crate::{
     dma::{CanonicalDma8237Pair, CanonicalDmaEventTotalsV1},
     pic::CanonicalPic8259Pair,
     pit::CanonicalPit,
+    rtc::CanonicalRtc,
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
 };
 
@@ -33,7 +34,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 10] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 11] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -84,6 +85,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0007,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -125,6 +131,10 @@ const _: () = {
         sections[9].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[10].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -134,6 +144,7 @@ const _: () = {
     assert!(sections[6].id < sections[7].id);
     assert!(sections[7].id < sections[8].id);
     assert!(sections[8].id < sections[9].id);
+    assert!(sections[9].id < sections[10].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -446,6 +457,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     pit: CanonicalPit<'a>,
     dma: CanonicalDma8237Pair<'a>,
     dma_event_totals: CanonicalDmaEventTotalsV1<'a>,
+    rtc: CanonicalRtc<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -531,6 +543,18 @@ impl CanonicalMachineStateCapture<'_> {
         out: &mut CanonicalFieldWriter<'_>,
     ) -> Result<(), CanonicalStateError> {
         self.dma_event_totals.write_payload(out)
+    }
+
+    /// Writes the required RTC and CMOS owner payload.
+    ///
+    /// The projection keeps guest-visible register and timing continuation
+    /// state while excluding host seeding and persistence notifications.
+    #[allow(dead_code)]
+    pub(crate) fn write_rtc_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.rtc.write_payload(out)
     }
 }
 
@@ -622,6 +646,7 @@ impl Machine {
         let pit = self.pit.canonical_projection();
         let dma = self.dma.canonical_projection();
         let dma_event_totals = self.dma.canonical_event_totals_v1();
+        let rtc = self.rtc.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -678,6 +703,7 @@ impl Machine {
             pit,
             dma,
             dma_event_totals,
+            rtc,
         })
     }
 }
@@ -687,7 +713,7 @@ mod tests {
     use izarravm_bus::{BusAccessKind, BusWidth, CpuBus, TracingMode};
     use izarravm_core::{
         CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion,
-        CanonicalStateView, CanonicalStateWriter, GswMode, VideoCard,
+        CanonicalStateView, CanonicalStateWriter, GswMode, MASTER_CLOCK_HZ, VideoCard,
     };
     use izarravm_cpu::CpuCanonicalCaptureError;
     #[cfg(all(
@@ -708,6 +734,7 @@ mod tests {
     const PIT_PAYLOAD_LEN: usize = 60;
     const DMA_PAYLOAD_LEN: usize = 152;
     const DMA_EVENT_TOTALS_V1_PAYLOAD_LEN: usize = 64;
+    const RTC_PAYLOAD_LEN: usize = 82;
     const TEST_DMA_EVENT_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
     const TEST_MEMORY_MIB: u16 = 2;
 
@@ -741,6 +768,12 @@ mod tests {
 
     fn machine_control_timing_payload(machine: &Machine) -> Vec<u8> {
         let capture = machine.canonical_state_capture().unwrap();
+        machine_control_timing_payload_from_capture(&capture)
+    }
+
+    fn machine_control_timing_payload_from_capture(
+        capture: &CanonicalMachineStateCapture<'_>,
+    ) -> Vec<u8> {
         let mut state = CanonicalStateWriter::new().unwrap();
         state
             .section(
@@ -789,6 +822,10 @@ mod tests {
 
     fn pic_payload(machine: &Machine) -> Vec<u8> {
         let capture = machine.canonical_state_capture().unwrap();
+        pic_payload_from_capture(&capture)
+    }
+
+    fn pic_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
         let mut state = CanonicalStateWriter::new().unwrap();
         state
             .section(
@@ -861,6 +898,26 @@ mod tests {
         view.sections()[0].payload().to_vec()
     }
 
+    fn rtc_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        rtc_payload_from_capture(&capture)
+    }
+
+    fn rtc_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0007).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_rtc_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
     fn write_pit_port(machine: &mut Machine, port: u16, value: u8) {
         let mut bus = machine.make_bus();
         bus.write_io(port, BusWidth::Byte, u32::from(value), false)
@@ -879,6 +936,17 @@ mod tests {
     }
 
     fn read_pic_port(machine: &mut Machine, port: u16) -> u8 {
+        let mut bus = machine.make_bus();
+        u8::try_from(bus.read_io(port, BusWidth::Byte, 0, false).unwrap()).unwrap()
+    }
+
+    fn write_rtc_port(machine: &mut Machine, port: u16, value: u8) {
+        let mut bus = machine.make_bus();
+        bus.write_io(port, BusWidth::Byte, u32::from(value), false)
+            .unwrap();
+    }
+
+    fn read_rtc_port(machine: &mut Machine, port: u16) -> u8 {
         let mut bus = machine.make_bus();
         u8::try_from(bus.read_io(port, BusWidth::Byte, 0, false).unwrap()).unwrap()
     }
@@ -1002,6 +1070,7 @@ mod tests {
                 (0x0002_0004, 1),
                 (0x0002_0005, 1),
                 (0x0002_0006, 1),
+                (0x0002_0007, 1),
             ]
         );
         assert!(
@@ -1039,6 +1108,10 @@ mod tests {
         );
         assert_eq!(
             sections[9].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+        assert_eq!(
+            sections[10].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
     }
@@ -1810,6 +1883,121 @@ mod tests {
     }
 
     #[test]
+    fn rtc_pic_and_timeline_payloads_share_one_read_only_capture() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        machine.seed_rtc(2026, 7, 19, 1, 23, 58, 41);
+        initialize_pic_pair(&mut machine, false);
+        write_rtc_port(&mut machine, 0x70, 0x0b);
+        write_rtc_port(&mut machine, 0x71, 0x40);
+        let deadline = machine.rtc.ticks_until_periodic_irq().unwrap();
+        machine.advance_devices_ticks(deadline / 3);
+
+        let capture = machine.canonical_state_capture().unwrap();
+        let first_rtc = rtc_payload_from_capture(&capture);
+        let first_pic = pic_payload_from_capture(&capture);
+        let first_timeline = machine_control_timing_payload_from_capture(&capture);
+        let second_timeline = machine_control_timing_payload_from_capture(&capture);
+        let second_pic = pic_payload_from_capture(&capture);
+        let second_rtc = rtc_payload_from_capture(&capture);
+
+        assert_eq!(first_rtc.len(), RTC_PAYLOAD_LEN);
+        assert_eq!(first_rtc, second_rtc);
+        assert_eq!(first_pic, second_pic);
+        assert_eq!(first_timeline, second_timeline);
+        assert_eq!(
+            machine.rtc.ticks_until_periodic_irq(),
+            Some(deadline - deadline / 3)
+        );
+    }
+
+    #[test]
+    fn guest_cmos_dirty_notification_is_captureable_and_normalized() {
+        let mut machine = test_machine();
+        machine.rtc.write_port(0x70, 0x10);
+        let value = machine.cmos_byte(0x10);
+        let clean = rtc_payload(&machine);
+
+        machine.rtc.write_port(0x71, value);
+        let capture = machine.canonical_state_capture().unwrap();
+        assert_eq!(rtc_payload_from_capture(&capture), clean);
+        drop(capture);
+
+        assert!(machine.take_cmos_dirty());
+        assert_eq!(rtc_payload(&machine), clean);
+        assert!(!machine.take_cmos_dirty());
+    }
+
+    #[test]
+    fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
+        let mut whole = test_machine();
+        let mut split = test_machine();
+        for machine in [&mut whole, &mut split] {
+            machine.set_mode(GswMode::Gsw586);
+            machine.seed_rtc(2026, 7, 19, 1, 10, 30, 44);
+            initialize_pic_pair(machine, false);
+            for (index, value) in [
+                (0x0a, 0x2f),
+                (0x01, 45),
+                (0x03, 30),
+                (0x05, 10),
+                (0x0b, 0x70),
+            ] {
+                write_rtc_port(machine, 0x70, index);
+                write_rtc_port(machine, 0x71, value);
+            }
+        }
+
+        whole.advance_devices_ticks(MASTER_CLOCK_HZ);
+        let first_split = MASTER_CLOCK_HZ * 2 / 3;
+        split.advance_devices_ticks(first_split);
+        assert_eq!(rtc_payload(&split)[0x0c] & 0xf0, 0xc0);
+        assert!(split.pic.irr_bit(8));
+        let pic_after_periodic = pic_payload(&split);
+        split.advance_devices_ticks(MASTER_CLOCK_HZ - first_split);
+        assert_eq!(pic_payload(&split), pic_after_periodic);
+
+        assert_eq!(rtc_payload(&whole), rtc_payload(&split));
+        assert_eq!(pic_payload(&whole), pic_payload(&split));
+        assert_eq!(
+            machine_control_timing_payload(&whole),
+            machine_control_timing_payload(&split)
+        );
+        assert_eq!(whole.rtc.clock(), split.rtc.clock());
+        assert_eq!(rtc_payload(&whole)[0x0c] & 0xf0, 0xf0);
+        assert!(whole.pic.irr_bit(8));
+        assert!(split.pic.irr_bit(8));
+    }
+
+    #[test]
+    fn rtc_and_pic_commit_the_irq8_deadline_at_one_capture_boundary() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        initialize_pic_pair(&mut machine, false);
+        write_rtc_port(&mut machine, 0x70, 0x0b);
+        write_rtc_port(&mut machine, 0x71, 0x40);
+        let deadline = machine.rtc.ticks_until_periodic_irq().unwrap();
+
+        machine.advance_devices_ticks(deadline - 1);
+        let before = machine.canonical_state_capture().unwrap();
+        assert_eq!(rtc_payload_from_capture(&before)[0x0c] & 0xc0, 0);
+        assert_eq!(pic_payload_from_capture(&before)[17] & 0x01, 0);
+        drop(before);
+
+        machine.advance_devices_ticks(1);
+        let at_edge = machine.canonical_state_capture().unwrap();
+        assert_eq!(rtc_payload_from_capture(&at_edge)[0x0c] & 0xc0, 0xc0);
+        assert_eq!(pic_payload_from_capture(&at_edge)[17] & 0x01, 0x01);
+        drop(at_edge);
+
+        write_rtc_port(&mut machine, 0x70, 0x0c);
+        assert_eq!(read_rtc_port(&mut machine, 0x71) & 0xc0, 0xc0);
+        assert_eq!(rtc_payload(&machine)[0x0c], 0);
+        assert!(machine.pic.irr_bit(8));
+        assert_eq!(pic_payload(&machine)[17] & 0x01, 0x01);
+    }
+
+    #[test]
     fn batch_scratch_and_pending_semantic_state_remain_captureable() {
         let mut machine = test_machine();
         machine.io_touched = true;
@@ -1826,6 +2014,7 @@ mod tests {
         assert_eq!(payload[0] & (1 << 5), 1 << 5);
         assert_eq!(pit_payload(&machine).len(), PIT_PAYLOAD_LEN);
         assert_eq!(dma_payload(&machine).len(), DMA_PAYLOAD_LEN);
+        assert_eq!(rtc_payload(&machine).len(), RTC_PAYLOAD_LEN);
         assert_eq!(
             dma_event_totals_v1_payload(&machine).len(),
             DMA_EVENT_TOTALS_V1_PAYLOAD_LEN
@@ -2619,6 +2808,10 @@ mod tests {
         assert_eq!(first_dma_totals.len(), DMA_EVENT_TOTALS_V1_PAYLOAD_LEN);
         assert_eq!(first_dma_totals, second_dma_totals);
         assert_eq!(first_dma_totals, vec![0; DMA_EVENT_TOTALS_V1_PAYLOAD_LEN]);
+        let first_rtc = rtc_payload(&machine);
+        let second_rtc = rtc_payload(&machine);
+        assert_eq!(first_rtc.len(), RTC_PAYLOAD_LEN);
+        assert_eq!(first_rtc, second_rtc);
         let payload = ram_rom_payload(&machine);
         let mut cursor = 0;
         assert_eq!(

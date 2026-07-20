@@ -2,7 +2,248 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use izarravm_core::MASTER_CLOCK_HZ;
+use izarravm_core::{
+    CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateView,
+    CanonicalStateWriter, MASTER_CLOCK_HZ,
+};
+
+const RTC_PAYLOAD_LEN: usize = 82;
+
+fn canonical_payload(rtc: &Rtc) -> Vec<u8> {
+    let projection = rtc.canonical_projection();
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_0007).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| projection.write_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn assert_only_offsets_changed(before: &[u8], after: &[u8], expected: &[usize]) {
+    let actual: Vec<_> = before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter_map(|(offset, (left, right))| (left != right).then_some(offset))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+fn assert_time_offset(
+    baseline: &Rtc,
+    expected: &[u8],
+    offset: usize,
+    change: impl FnOnce(&mut Time),
+) {
+    let mut changed = baseline.clone();
+    change(&mut changed.time);
+    assert_only_offsets_changed(expected, &canonical_payload(&changed), &[offset]);
+}
+
+#[test]
+fn canonical_payload_layout_is_exact() {
+    let mut rtc = Rtc::new();
+    for (offset, byte) in rtc.ram.iter_mut().enumerate() {
+        *byte = (offset as u8).wrapping_mul(3).wrapping_add(1);
+    }
+    rtc.index = 0x4c;
+    rtc.nmi_disabled = true;
+    rtc.time = Time {
+        year: 0x1234,
+        month: 5,
+        day: 6,
+        weekday: 7,
+        hour: 8,
+        minute: 9,
+        second: 10,
+    };
+    rtc.seeded = true;
+    rtc.nvram_dirty = true;
+    rtc.periodic_phase = RatePhase::with_remainder(0x0012_3456);
+
+    let mut expected = rtc.ram.to_vec();
+    expected.extend_from_slice(&[
+        0x4c, 1, 0x34, 0x12, 5, 6, 7, 8, 9, 10, 0x56, 0x34, 0x12, 0, 0, 0, 0, 0,
+    ]);
+
+    let payload = canonical_payload(&rtc);
+    assert_eq!(payload.len(), RTC_PAYLOAD_LEN);
+    assert_eq!(payload, expected);
+}
+
+#[test]
+fn canonical_payload_pins_every_behavioral_field_offset() {
+    let baseline = Rtc::new();
+    let expected = canonical_payload(&baseline);
+
+    for offset in 0..baseline.ram.len() {
+        let mut changed = baseline.clone();
+        changed.ram[offset] ^= 0x80;
+        assert_only_offsets_changed(&expected, &canonical_payload(&changed), &[offset]);
+    }
+
+    let mut changed = baseline.clone();
+    changed.index = 0x40;
+    assert_only_offsets_changed(&expected, &canonical_payload(&changed), &[64]);
+
+    let mut changed = baseline.clone();
+    changed.nmi_disabled = true;
+    assert_only_offsets_changed(&expected, &canonical_payload(&changed), &[65]);
+
+    assert_time_offset(&baseline, &expected, 66, |time| time.year ^= 0x0001);
+    assert_time_offset(&baseline, &expected, 67, |time| time.year ^= 0x0100);
+    assert_time_offset(&baseline, &expected, 68, |time| {
+        time.month = time.month.wrapping_add(1);
+    });
+    assert_time_offset(&baseline, &expected, 69, |time| {
+        time.day = time.day.wrapping_add(1);
+    });
+    assert_time_offset(&baseline, &expected, 70, |time| {
+        time.weekday = time.weekday.wrapping_add(1);
+    });
+    assert_time_offset(&baseline, &expected, 71, |time| {
+        time.hour = time.hour.wrapping_add(1);
+    });
+    assert_time_offset(&baseline, &expected, 72, |time| {
+        time.minute = time.minute.wrapping_add(1);
+    });
+    assert_time_offset(&baseline, &expected, 73, |time| {
+        time.second = time.second.wrapping_add(1);
+    });
+
+    for byte in 0..=4 {
+        let mut changed = baseline.clone();
+        changed.periodic_phase = RatePhase::with_remainder(1 << (byte * 8));
+        assert_only_offsets_changed(&expected, &canonical_payload(&changed), &[74 + byte]);
+    }
+    assert_eq!(&expected[79..82], &[0, 0, 0]);
+}
+
+#[test]
+fn raw_clock_bytes_and_authoritative_time_are_independent() {
+    let baseline = Rtc::new();
+    let expected = canonical_payload(&baseline);
+
+    let mut raw_changed = baseline.clone();
+    raw_changed.set_nvram(usize::from(REG_SECONDS), 0x5a);
+    assert_eq!(raw_changed.clock(), baseline.clock());
+    assert_only_offsets_changed(&expected, &canonical_payload(&raw_changed), &[0]);
+
+    let mut time_changed = baseline.clone();
+    time_changed.time.second = 17;
+    assert_eq!(time_changed.ram, baseline.ram);
+    assert_only_offsets_changed(&expected, &canonical_payload(&time_changed), &[73]);
+}
+
+#[test]
+fn host_bookkeeping_is_normalized_without_being_consumed() {
+    let mut baseline = Rtc::new();
+    baseline.write_port(0x70, REG_B);
+    baseline.write_port(0x71, REG_B_PIE);
+    baseline.advance_master_ticks(123_457, 0);
+
+    let expected = canonical_payload(&baseline);
+    for (seeded, dirty) in [(true, false), (false, true), (true, true)] {
+        let mut changed = baseline.clone();
+        changed.seeded = seeded;
+        changed.nvram_dirty = dirty;
+        assert_eq!(canonical_payload(&changed), expected);
+        assert_eq!(
+            changed.ticks_until_periodic_irq(),
+            baseline.ticks_until_periodic_irq()
+        );
+        let delta = changed.ticks_until_periodic_irq().unwrap();
+        let mut reference = baseline.clone();
+        assert_eq!(
+            changed.advance_master_ticks(delta, 0),
+            reference.advance_master_ticks(delta, 0)
+        );
+        assert_eq!(changed.clock(), reference.clock());
+        assert_eq!(changed.ram, reference.ram);
+        assert_eq!(canonical_payload(&changed), canonical_payload(&reference));
+    }
+
+    let mut dirty = baseline.clone();
+    dirty.seeded = true;
+    dirty.nvram_dirty = true;
+    let before_take = canonical_payload(&dirty);
+    assert_eq!(canonical_payload(&dirty), before_take);
+    assert!(dirty.is_seeded());
+    assert!(dirty.take_nvram_dirty());
+    assert_eq!(canonical_payload(&dirty), before_take);
+    assert!(!dirty.take_nvram_dirty());
+}
+
+#[test]
+fn canonical_capture_preserves_register_c_and_full_index_latches() {
+    let mut rtc = Rtc::new();
+    rtc.write_port(0x70, REG_B);
+    rtc.write_port(0x71, REG_B_PIE);
+    let deadline = rtc.ticks_until_periodic_irq().unwrap();
+    assert!(rtc.advance_master_ticks(deadline, 0));
+    rtc.write_port(0x70, 0x80 | 0x4c);
+
+    let first = canonical_payload(&rtc);
+    let second = canonical_payload(&rtc);
+    assert_eq!(first, second);
+    assert_eq!(first[64], 0x4c);
+    assert_eq!(first[65], 1);
+    assert_eq!(first[usize::from(REG_C)] & (REG_C_IRQF | REG_C_PF), 0xc0);
+    assert_eq!(rtc.read_port(0x70), Some(0xcc));
+
+    let aliased = rtc.read_port(0x71).unwrap();
+    assert_eq!(aliased & (REG_C_IRQF | REG_C_PF), 0xc0);
+    assert_eq!(canonical_payload(&rtc)[usize::from(REG_C)] & 0xc0, 0xc0);
+
+    rtc.write_port(0x70, REG_C);
+    assert_eq!(rtc.read_port(0x71).unwrap() & 0xc0, 0xc0);
+    assert_eq!(canonical_payload(&rtc)[usize::from(REG_C)], 0);
+}
+
+#[test]
+fn periodic_phase_reset_and_preservation_rules_are_canonical() {
+    let mut rtc = Rtc::new();
+    rtc.advance_master_ticks(123_457, 0);
+    let partial = canonical_payload(&rtc);
+    assert_ne!(&partial[74..82], &[0; 8]);
+
+    rtc.write_port(0x70, REG_A);
+    rtc.write_port(0x71, REG_A_DEFAULT);
+    assert_eq!(&canonical_payload(&rtc)[74..82], &partial[74..82]);
+
+    rtc.write_port(0x70, REG_B);
+    rtc.write_port(0x71, REG_B_PIE);
+    assert_eq!(&canonical_payload(&rtc)[74..82], &partial[74..82]);
+
+    rtc.write_port(0x70, REG_A);
+    rtc.write_port(0x71, 0x2f);
+    assert_eq!(&canonical_payload(&rtc)[74..82], &[0; 8]);
+
+    rtc.advance_master_ticks(7, 0);
+    let image = rtc.nvram();
+    rtc.load_nvram(&image);
+    assert_eq!(&canonical_payload(&rtc)[74..82], &[0; 8]);
+}
+
+#[test]
+fn current_format_bits_and_uip_model_are_pinned() {
+    let mut rtc = Rtc::new();
+    rtc.write_port(0x70, REG_A);
+    rtc.write_port(0x71, 0xff);
+    assert_eq!(rtc.nvram_byte(usize::from(REG_A)) & 0x80, 0);
+
+    rtc.write_port(0x70, REG_B);
+    rtc.write_port(0x71, 0x80);
+    let register_b = rtc.nvram_byte(usize::from(REG_B));
+    assert_eq!(register_b & 0x80, 0x80, "SET remains a stored bit");
+    assert_eq!(register_b & REG_B_DEFAULT, REG_B_DEFAULT);
+}
 
 #[test]
 fn rtc_register_round_trip() {
