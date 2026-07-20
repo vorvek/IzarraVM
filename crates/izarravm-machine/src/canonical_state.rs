@@ -12,6 +12,7 @@ use crate::{
         cache_level_config, code_fetch_ws, tier_cost,
     },
     dma::{CanonicalDma8237Pair, CanonicalDmaEventTotalsV1},
+    pci::CanonicalPciConfig,
     pic::CanonicalPic8259Pair,
     pit::CanonicalPit,
     rtc::CanonicalRtc,
@@ -36,7 +37,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 13] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 14] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -102,6 +103,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_000a,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -155,6 +161,10 @@ const _: () = {
         sections[12].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[13].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -167,6 +177,7 @@ const _: () = {
     assert!(sections[9].id < sections[10].id);
     assert!(sections[10].id < sections[11].id);
     assert!(sections[11].id < sections[12].id);
+    assert!(sections[12].id < sections[13].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -482,6 +493,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     rtc: CanonicalRtc<'a>,
     unit_tester: CanonicalUnitTester<'a>,
     speaker: CanonicalSpeaker<'a>,
+    pci: CanonicalPciConfig<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -604,6 +616,18 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.speaker.write_payload(out)
     }
+
+    /// Writes the required mechanism-1 selector and PIIX IDE owner payload.
+    ///
+    /// Distira configuration and BMIDE transfer continuation remain in their
+    /// respective device owners rather than being duplicated here.
+    #[allow(dead_code)]
+    pub(crate) fn write_pci_config_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.pci.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -697,6 +721,7 @@ impl Machine {
         let rtc = self.rtc.canonical_projection();
         let unit_tester = self.unittester.canonical_projection();
         let speaker = self.speaker.canonical_projection();
+        let pci = self.pci.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -756,6 +781,7 @@ impl Machine {
             rtc,
             unit_tester,
             speaker,
+            pci,
         })
     }
 }
@@ -789,8 +815,10 @@ mod tests {
     const RTC_PAYLOAD_LEN: usize = 82;
     const UNIT_TESTER_PAYLOAD_LEN: usize = 33;
     const SPEAKER_PAYLOAD_LEN: usize = 1;
+    const PCI_CONFIG_PAYLOAD_LEN: usize = 9;
     const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
     const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
+    const PIIX_IDE_DEVFN: u8 = 7 << 3 | 1;
     const TEST_DMA_EVENT_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
     const TEST_MEMORY_MIB: u16 = 2;
 
@@ -816,6 +844,19 @@ mod tests {
         rom[0xf000] = 0xcf;
         rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
         rom
+    }
+
+    fn push_out_dx_eax(code: &mut Vec<u8>, port: u16, value: u32) {
+        code.extend_from_slice(&[0xba, port as u8, (port >> 8) as u8]);
+        code.extend_from_slice(&[
+            0x66,
+            0xb8,
+            value as u8,
+            (value >> 8) as u8,
+            (value >> 16) as u8,
+            (value >> 24) as u8,
+        ]);
+        code.extend_from_slice(&[0x66, 0xef]);
     }
 
     fn capture_error(machine: &Machine) -> MachineCanonicalCaptureError {
@@ -1018,6 +1059,26 @@ mod tests {
         view.sections()[0].payload().to_vec()
     }
 
+    fn pci_config_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        pci_config_payload_from_capture(&capture)
+    }
+
+    fn pci_config_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_000a).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_pci_config_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
     fn write_speaker_port(machine: &mut Machine, value: u8) {
         let mut bus = machine.make_bus();
         bus.write_io(0x61, BusWidth::Byte, u32::from(value), false)
@@ -1027,6 +1088,29 @@ mod tests {
     fn read_speaker_port(machine: &mut Machine) -> u8 {
         let mut bus = machine.make_bus();
         u8::try_from(bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap()).unwrap()
+    }
+
+    fn write_pci_port(machine: &mut Machine, port: u16, width: BusWidth, value: u32) {
+        let mut bus = machine.make_bus();
+        bus.write_io(port, width, value, false).unwrap();
+    }
+
+    fn read_pci_port(machine: &mut Machine, port: u16, width: BusWidth) -> u32 {
+        let mut bus = machine.make_bus();
+        bus.read_io(port, width, 0, false).unwrap()
+    }
+
+    fn write_pci_bdf(
+        machine: &mut Machine,
+        bus: u8,
+        devfn: u8,
+        offset: u8,
+        width: BusWidth,
+        value: u32,
+    ) {
+        machine
+            .pci
+            .write_bdf(bus, devfn, offset, width, value, &mut machine.vega);
     }
 
     fn write_pit_port(machine: &mut Machine, port: u16, value: u8) {
@@ -1184,6 +1268,7 @@ mod tests {
                 (0x0002_0007, 1),
                 (0x0002_0008, 1),
                 (0x0002_0009, 1),
+                (0x0002_000a, 1),
             ]
         );
         assert!(
@@ -1233,6 +1318,10 @@ mod tests {
         );
         assert_eq!(
             sections[12].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+        assert_eq!(
+            sections[13].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
     }
@@ -2230,6 +2319,319 @@ mod tests {
     }
 
     #[test]
+    fn pci_config_payload_pins_default_and_asymmetric_bytes() {
+        assert_eq!(
+            pci_config_payload(&test_machine()),
+            [0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0xf0, 0x00, 0x00]
+        );
+
+        let mut machine = test_machine();
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT,
+            BusWidth::Dword,
+            0xd5b3_a69d,
+        );
+        write_pci_bdf(&mut machine, 0, PIIX_IDE_DEVFN, 0x04, BusWidth::Byte, 0x04);
+        write_pci_bdf(
+            &mut machine,
+            0,
+            PIIX_IDE_DEVFN,
+            0x20,
+            BusWidth::Dword,
+            0x1234_e10f,
+        );
+
+        assert_eq!(
+            pci_config_payload(&machine),
+            [0x9d, 0xa6, 0xb3, 0xd5, 0x04, 0x00, 0xe1, 0x34, 0x12]
+        );
+    }
+
+    #[test]
+    fn pci_config_payload_normalizes_every_piix_command_write() {
+        let mut machine = test_machine();
+        for value in u8::MIN..=u8::MAX {
+            write_pci_bdf(
+                &mut machine,
+                0,
+                PIIX_IDE_DEVFN,
+                0x04,
+                BusWidth::Byte,
+                u32::from(value),
+            );
+            let payload = pci_config_payload(&machine);
+            assert_eq!(payload[4], value & 0x05);
+            assert_eq!(machine.pci.ide_io_enabled(), value & 0x01 != 0);
+            assert_eq!(machine.pci.ide_bus_master_enabled(), value & 0x04 != 0);
+        }
+
+        let expected = pci_config_payload(&machine);
+        for offset in [0x05, 0x06, 0x07] {
+            write_pci_bdf(
+                &mut machine,
+                0,
+                PIIX_IDE_DEVFN,
+                offset,
+                BusWidth::Byte,
+                0xff,
+            );
+            assert_eq!(pci_config_payload(&machine), expected);
+        }
+    }
+
+    #[test]
+    fn pci_config_address_partial_cycles_preserve_raw_selection() {
+        let mut machine = test_machine();
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT,
+            BusWidth::Dword,
+            0x1122_3344,
+        );
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT + 1,
+            BusWidth::Byte,
+            0xaa,
+        );
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT + 2,
+            BusWidth::Word,
+            0xbbcc,
+        );
+        assert_eq!(
+            &pci_config_payload(&machine)[..4],
+            &0xbbcc_aa44_u32.to_le_bytes()
+        );
+        assert_eq!(
+            read_pci_port(
+                &mut machine,
+                crate::PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword
+            ),
+            0xbbcc_aa44
+        );
+
+        let disabled_bar = 0x0000_3923;
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT,
+            BusWidth::Dword,
+            disabled_bar,
+        );
+        let before = pci_config_payload(&machine);
+        assert_eq!(
+            read_pci_port(&mut machine, crate::PCI_CONFIG_DATA_PORT, BusWidth::Dword),
+            u32::MAX
+        );
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT,
+            BusWidth::Dword,
+            0x1234_e10f,
+        );
+        assert_eq!(pci_config_payload(&machine), before);
+
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT + 3,
+            BusWidth::Byte,
+            0x80,
+        );
+        assert_eq!(
+            read_pci_port(
+                &mut machine,
+                crate::PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword
+            ),
+            0x8000_3923
+        );
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT,
+            BusWidth::Dword,
+            0x1234_e10f,
+        );
+        assert_eq!(
+            &pci_config_payload(&machine)[5..],
+            &0x1234_e100_u32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn pci_config_bar_partial_writes_preserve_probe_and_decode_state() {
+        let mut machine = test_machine();
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT,
+            BusWidth::Dword,
+            0x8000_3920,
+        );
+
+        for (lane, value) in [(0, 0xaf), (1, 0xe1), (2, 0x34), (3, 0x12)] {
+            write_pci_port(
+                &mut machine,
+                crate::PCI_CONFIG_DATA_PORT + lane,
+                BusWidth::Byte,
+                value,
+            );
+        }
+        assert_eq!(
+            &pci_config_payload(&machine)[5..],
+            &0x1234_e1a0_u32.to_le_bytes()
+        );
+        assert_eq!(machine.pci.ide_bus_master_io_base(), None);
+
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT,
+            BusWidth::Dword,
+            u32::MAX,
+        );
+        assert_eq!(
+            &pci_config_payload(&machine)[5..],
+            &0xffff_fff0_u32.to_le_bytes()
+        );
+        assert_eq!(
+            read_pci_port(&mut machine, crate::PCI_CONFIG_DATA_PORT, BusWidth::Dword),
+            0xffff_fff1
+        );
+        assert_eq!(machine.pci.ide_bus_master_io_base(), None);
+
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT,
+            BusWidth::Dword,
+            0x0000_e007,
+        );
+        assert_eq!(
+            &pci_config_payload(&machine)[5..],
+            &0x0000_e000_u32.to_le_bytes()
+        );
+        assert_eq!(machine.pci.ide_bus_master_io_base(), Some(0xe000));
+
+        write_pci_port(&mut machine, 0xe000, BusWidth::Byte, 0x08);
+        assert_eq!(read_pci_port(&mut machine, 0xe000, BusWidth::Byte), 0x08);
+        {
+            let mut bus = machine.make_bus();
+            assert!(bus.read_io(0xf000, BusWidth::Byte, 0, false).is_err());
+        }
+
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT,
+            BusWidth::Dword,
+            0x8000_3904,
+        );
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT,
+            BusWidth::Byte,
+            0x04,
+        );
+        assert_eq!(read_pci_port(&mut machine, 0xe000, BusWidth::Byte), 0xff);
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT,
+            BusWidth::Byte,
+            0x05,
+        );
+        assert_eq!(read_pci_port(&mut machine, 0xe000, BusWidth::Byte), 0x08);
+    }
+
+    #[test]
+    fn enabled_pci_config_word_lanes_merge_and_read_exact_bar_bytes() {
+        const VALUE: u32 = 0xa1b2;
+
+        for lane in 0_u16..=2 {
+            let mut machine = test_machine();
+            write_pci_port(
+                &mut machine,
+                crate::PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword,
+                0x8000_3920,
+            );
+            write_pci_port(
+                &mut machine,
+                crate::PCI_CONFIG_DATA_PORT + lane,
+                BusWidth::Word,
+                VALUE,
+            );
+
+            let shift = u32::from(lane) * 8;
+            let mask = 0xffff_u32 << shift;
+            let expected_base = ((0x0000_f000 & !mask) | (VALUE << shift)) & !0x0f;
+            assert_eq!(
+                &pci_config_payload(&machine)[5..],
+                &expected_base.to_le_bytes()
+            );
+            assert_eq!(
+                read_pci_port(
+                    &mut machine,
+                    crate::PCI_CONFIG_DATA_PORT + lane,
+                    BusWidth::Word
+                ),
+                ((expected_base | 1) >> shift) & 0xffff
+            );
+        }
+    }
+
+    #[test]
+    fn pci_config_capture_is_read_only_and_excludes_connected_device_state() {
+        let mut machine = test_machine();
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_ADDRESS_PORT,
+            BusWidth::Dword,
+            0x8123_4567,
+        );
+        let expected = pci_config_payload(&machine);
+
+        write_pci_bdf(
+            &mut machine,
+            0,
+            crate::DISTIRA_PCI_SLOT << 3,
+            0x40,
+            BusWidth::Dword,
+            0xa55a_3cc3,
+        );
+        write_pci_port(&mut machine, 0xf000, BusWidth::Byte, 0x08);
+        assert_eq!(read_pci_port(&mut machine, 0xf000, BusWidth::Byte), 0x08);
+        assert_eq!(pci_config_payload(&machine), expected);
+        assert_eq!(
+            machine.pci.read_bdf(
+                0,
+                crate::DISTIRA_PCI_SLOT << 3,
+                0x40,
+                BusWidth::Dword,
+                &machine.vega
+            ),
+            0xa55a_3cc3
+        );
+
+        let capture = machine.canonical_state_capture().unwrap();
+        let first_pci = pci_config_payload_from_capture(&capture);
+        let speaker = speaker_payload_from_capture(&capture);
+        let second_pci = pci_config_payload_from_capture(&capture);
+        drop(capture);
+
+        assert_eq!(first_pci, expected);
+        assert_eq!(first_pci, second_pci);
+        assert_eq!(speaker.len(), SPEAKER_PAYLOAD_LEN);
+        assert_eq!(read_pci_port(&mut machine, 0xf000, BusWidth::Byte), 0x08);
+        assert_eq!(
+            read_pci_port(
+                &mut machine,
+                crate::PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword
+            ),
+            0x8123_4567
+        );
+    }
+
+    #[test]
     fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
         let mut whole = test_machine();
         let mut split = test_machine();
@@ -2318,6 +2720,7 @@ mod tests {
         assert_eq!(rtc_payload(&machine).len(), RTC_PAYLOAD_LEN);
         assert_eq!(unit_tester_payload(&machine).len(), UNIT_TESTER_PAYLOAD_LEN);
         assert_eq!(speaker_payload(&machine).len(), SPEAKER_PAYLOAD_LEN);
+        assert_eq!(pci_config_payload(&machine).len(), PCI_CONFIG_PAYLOAD_LEN);
         assert_eq!(
             dma_event_totals_v1_payload(&machine).len(),
             DMA_EVENT_TOTALS_V1_PAYLOAD_LEN
@@ -2632,6 +3035,7 @@ mod tests {
             write_speaker_port(&mut unit, 0x03);
             let speaker_before = speaker_payload(&unit);
             let pit_before = pit_payload(&unit);
+            let pci_before = pci_config_payload(&unit);
             assert!(
                 unit.unittester
                     .write_port(unittester::PORT_COMMAND, command)
@@ -2647,6 +3051,7 @@ mod tests {
             assert_eq!(unit_tester_payload(&unit).len(), UNIT_TESTER_PAYLOAD_LEN);
             assert_eq!(speaker_payload(&unit), speaker_before);
             assert_eq!(pit_payload(&unit), pit_before);
+            assert_eq!(pci_config_payload(&unit), pci_before);
         }
 
         let mut mode = test_machine();
@@ -3138,6 +3543,10 @@ mod tests {
         assert_eq!(first_unit_tester, second_unit_tester);
         assert_eq!(first_unit_tester[0], unittester::REG_EXIT as u8 + 1);
         assert_eq!(first_unit_tester[1 + unittester::REG_EXIT], 0);
+        let first_pci = pci_config_payload(&machine);
+        let second_pci = pci_config_payload(&machine);
+        assert_eq!(first_pci.len(), PCI_CONFIG_PAYLOAD_LEN);
+        assert_eq!(first_pci, second_pci);
         let payload = ram_rom_payload(&machine);
         let mut cursor = 0;
         assert_eq!(
@@ -3173,5 +3582,37 @@ mod tests {
         assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
         assert_eq!(read_speaker_port(&mut machine) & 0x03, 3);
         assert_eq!(speaker_payload(&machine), [3]);
+    }
+
+    #[test]
+    fn pci_config_state_survives_a_real_586_test_exit_boundary() {
+        let mut code = Vec::new();
+        push_out_dx_eax(&mut code, crate::PCI_CONFIG_ADDRESS_PORT, 0x8000_3904);
+        push_out_dx_eax(&mut code, crate::PCI_CONFIG_DATA_PORT, 0x0000_0004);
+        push_out_dx_eax(&mut code, crate::PCI_CONFIG_ADDRESS_PORT, 0x8000_3920);
+        push_out_dx_eax(&mut code, crate::PCI_CONFIG_DATA_PORT, 0x1234_e10f);
+        push_out_dx_eax(&mut code, crate::PCI_CONFIG_ADDRESS_PORT, 0xd5b3_a69d);
+        code.extend_from_slice(&[
+            0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
+            0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
+            0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
+            0xf4, // must not execute
+        ]);
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Vega),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw586);
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(reason, StopReason::TestExit { code: 0 });
+        assert_eq!(machine.cpu.registers.eip, 67);
+        assert!(!machine.cpu.halted);
+        assert_eq!(machine.unittester.pending_command(), None);
+        let expected = [0x9d, 0xa6, 0xb3, 0xd5, 0x04, 0x00, 0xe1, 0x34, 0x12];
+        assert_eq!(pci_config_payload(&machine), expected);
+        assert_eq!(pci_config_payload(&machine), expected);
     }
 }

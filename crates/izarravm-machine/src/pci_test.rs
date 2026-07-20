@@ -172,3 +172,107 @@ fn distira_memory_command_and_zero_bar_disable_decode() {
     assert_eq!(rig.read_dword(DISTIRA_PCI_SLOT, 0, 0x10), 0);
     assert_eq!(rig.vega.memory_decode_key(), None);
 }
+
+#[test]
+fn mechanism_one_port_spans_preserve_partial_address_cycles() {
+    const INITIAL: u32 = 0x1234_5678;
+    const VALUE: u32 = 0xa1b2_c3d4;
+
+    for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+        let last_valid = 4 - width.bytes() as u16;
+        for offset in 0..=last_valid {
+            let mut rig = PciRig::new();
+            assert!(rig.config.write_io(
+                PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword,
+                INITIAL,
+                &mut rig.vega,
+            ));
+            assert!(rig.config.write_io(
+                PCI_CONFIG_ADDRESS_PORT + offset,
+                width,
+                VALUE,
+                &mut rig.vega,
+            ));
+            assert_eq!(
+                rig.config
+                    .read_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, &rig.vega),
+                Some(write_register_bytes(INITIAL, offset, width, VALUE))
+            );
+        }
+
+        if last_valid < 3 {
+            let mut rig = PciRig::new();
+            assert!(rig.config.write_io(
+                PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword,
+                INITIAL,
+                &mut rig.vega,
+            ));
+            assert!(!rig.config.write_io(
+                PCI_CONFIG_ADDRESS_PORT + last_valid + 1,
+                width,
+                VALUE,
+                &mut rig.vega,
+            ));
+            assert_eq!(
+                rig.config
+                    .read_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, &rig.vega),
+                Some(INITIAL)
+            );
+        }
+    }
+}
+
+#[test]
+fn disabled_mechanism_one_data_cycles_are_lane_exact_and_inert() {
+    let mut rig = PciRig::new();
+    assert!(rig.config.write_io(
+        PCI_CONFIG_ADDRESS_PORT,
+        BusWidth::Dword,
+        0x0000_3923,
+        &mut rig.vega,
+    ));
+
+    for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+        let last_valid = 4 - width.bytes() as u16;
+        let expected = match width {
+            BusWidth::Byte => 0xff,
+            BusWidth::Word => 0xffff,
+            BusWidth::Dword => u32::MAX,
+        };
+        for offset in 0..=last_valid {
+            assert_eq!(
+                rig.config
+                    .read_io(PCI_CONFIG_DATA_PORT + offset, width, &rig.vega),
+                Some(expected)
+            );
+            assert!(rig.config.write_io(
+                PCI_CONFIG_DATA_PORT + offset,
+                width,
+                0xa1b2_c3d4,
+                &mut rig.vega,
+            ));
+        }
+        if last_valid < 3 {
+            assert_eq!(
+                rig.config
+                    .read_io(PCI_CONFIG_DATA_PORT + last_valid + 1, width, &rig.vega),
+                None
+            );
+            assert!(!rig.config.write_io(
+                PCI_CONFIG_DATA_PORT + last_valid + 1,
+                width,
+                0xa1b2_c3d4,
+                &mut rig.vega,
+            ));
+        }
+    }
+
+    assert_eq!(rig.config.address, 0x0000_3923);
+    assert_eq!(
+        rig.config.piix_ide_command,
+        PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER
+    );
+    assert_eq!(rig.config.piix_ide_bm_base, PIIX4_BMIDE_POWER_ON_BASE);
+}
