@@ -6,7 +6,11 @@ use izarravm_cpu::{CanonicalCpuExecution, CpuCanonicalCaptureError, bus_timing};
 use thiserror::Error;
 
 use crate::{
-    Machine,
+    CacheModel, Machine,
+    cache_config::{
+        CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK,
+        cache_level_config, code_fetch_ws, tier_cost,
+    },
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
 };
 
@@ -26,7 +30,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 5] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 6] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -52,6 +56,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0002,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -73,10 +82,15 @@ const _: () = {
         sections[4].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[5].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
     assert!(sections[3].id < sections[4].id);
+    assert!(sections[4].id < sections[5].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -131,6 +145,25 @@ pub enum MachineCanonicalCaptureError {
     },
     #[error("bus-scaler remainder {remainder} is not below denominator {denominator}")]
     InvalidBusRemainder { remainder: u64, denominator: u32 },
+    #[error("modeled-cache {tier} storage has {actual} entries, expected {expected}")]
+    InvalidModeledCacheStorageLength {
+        tier: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error(
+        "modeled-cache masks are L1 {actual_l1:#010x}, L2 {actual_l2:#010x}; expected L1 {expected_l1:#010x}, L2 {expected_l2:#010x}"
+    )]
+    InconsistentModeledCacheConfiguration {
+        expected_l1: u32,
+        actual_l1: u32,
+        expected_l2: u32,
+        actual_l2: u32,
+    },
+    #[error("modeled-cache costs are {actual:?}; expected {expected:?} for L1, L2, and RAM")]
+    InconsistentModeledCacheCosts { expected: [u8; 3], actual: [u8; 3] },
+    #[error("modeled code-fetch wait states are {actual}, expected {expected}")]
+    InconsistentModeledCodeFetchWaitStates { expected: u8, actual: u8 },
 }
 
 impl From<CanonicalTimelineError> for MachineCanonicalCaptureError {
@@ -202,6 +235,134 @@ impl CanonicalMachineControl {
     }
 }
 
+const MAX_MODELED_CACHE_LINE: u32 = u32::MAX / CACHE_LINE_BYTES;
+
+#[derive(Debug, Clone, Copy)]
+struct CanonicalModeledCacheProjection<'a> {
+    cache: &'a CacheModel,
+    l1_mask: u32,
+    l2_mask: u32,
+    flat_data_cost: bool,
+}
+
+fn effective_modeled_cache_tags(tags: &[u32], mask: u32) -> Result<Vec<u32>, CanonicalStateError> {
+    if mask == CACHE_TIER_DISABLED_MASK {
+        return Ok(Vec::new());
+    }
+    let active_len = usize::try_from(mask)
+        .ok()
+        .and_then(|mask| mask.checked_add(1))
+        .ok_or(CanonicalStateError::LengthOverflow)?;
+    let mut effective = Vec::new();
+    effective
+        .try_reserve_exact(active_len)
+        .map_err(|_| CanonicalStateError::AllocationFailed)?;
+    for (slot, &tag) in tags[..active_len].iter().enumerate() {
+        if tag != super::CACHE_EMPTY_TAG
+            && tag <= MAX_MODELED_CACHE_LINE
+            && tag & mask == slot as u32
+        {
+            effective.push(tag);
+        }
+    }
+    effective.sort_unstable();
+    Ok(effective)
+}
+
+impl CanonicalModeledCacheProjection<'_> {
+    fn write_payload(&self, out: &mut CanonicalFieldWriter<'_>) -> Result<(), CanonicalStateError> {
+        if self.flat_data_cost {
+            out.write_count(0)?;
+            return out.write_count(0);
+        }
+
+        let l1_tags = effective_modeled_cache_tags(&self.cache.l1_tags, self.l1_mask)?;
+        let l2_tags = effective_modeled_cache_tags(&self.cache.l2_tags, self.l2_mask)?;
+        out.write_count(
+            u64::try_from(l1_tags.len()).map_err(|_| CanonicalStateError::LengthOverflow)?,
+        )?;
+        for tag in l1_tags {
+            out.write_u32(tag)?;
+        }
+        out.write_count(
+            u64::try_from(l2_tags.len()).map_err(|_| CanonicalStateError::LengthOverflow)?,
+        )?;
+        for tag in l2_tags {
+            out.write_u32(tag)?;
+        }
+        Ok(())
+    }
+}
+
+impl CacheModel {
+    fn canonical_projection(
+        &self,
+        mode: izarravm_core::GswMode,
+    ) -> Result<CanonicalModeledCacheProjection<'_>, MachineCanonicalCaptureError> {
+        if self.l1_tags.len() != CACHE_L1_MAX_LINES {
+            return Err(
+                MachineCanonicalCaptureError::InvalidModeledCacheStorageLength {
+                    tier: "L1",
+                    expected: CACHE_L1_MAX_LINES,
+                    actual: self.l1_tags.len(),
+                },
+            );
+        }
+        if self.l2_tags.len() != CACHE_L2_MAX_LINES {
+            return Err(
+                MachineCanonicalCaptureError::InvalidModeledCacheStorageLength {
+                    tier: "L2",
+                    expected: CACHE_L2_MAX_LINES,
+                    actual: self.l2_tags.len(),
+                },
+            );
+        }
+
+        let expected_config = cache_level_config(mode);
+        if self.config.l1_mask != expected_config.l1_mask
+            || self.config.l2_mask != expected_config.l2_mask
+        {
+            return Err(
+                MachineCanonicalCaptureError::InconsistentModeledCacheConfiguration {
+                    expected_l1: expected_config.l1_mask,
+                    actual_l1: self.config.l1_mask,
+                    expected_l2: expected_config.l2_mask,
+                    actual_l2: self.config.l2_mask,
+                },
+            );
+        }
+
+        let expected_cost = tier_cost(mode);
+        let expected_costs = [expected_cost.l1, expected_cost.l2, expected_cost.ram];
+        let actual_costs = [self.cost.l1, self.cost.l2, self.cost.ram];
+        if actual_costs != expected_costs {
+            return Err(
+                MachineCanonicalCaptureError::InconsistentModeledCacheCosts {
+                    expected: expected_costs,
+                    actual: actual_costs,
+                },
+            );
+        }
+
+        let expected_code_fetch_ws = code_fetch_ws(mode);
+        if self.code_fetch_ws != expected_code_fetch_ws {
+            return Err(
+                MachineCanonicalCaptureError::InconsistentModeledCodeFetchWaitStates {
+                    expected: expected_code_fetch_ws,
+                    actual: self.code_fetch_ws,
+                },
+            );
+        }
+
+        Ok(CanonicalModeledCacheProjection {
+            cache: self,
+            l1_mask: expected_config.l1_mask,
+            l2_mask: expected_config.l2_mask,
+            flat_data_cost: mode.uses_approximate_timing(),
+        })
+    }
+}
+
 /// Immutable proof that the machine is structurally ready for canonical capture.
 ///
 /// This token does not attest semantic completion or a particular stop reason.
@@ -215,6 +376,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     _machine: &'a Machine,
     _cpu_execution: CanonicalCpuExecution<'a>,
     machine_control: CanonicalMachineControl,
+    modeled_cache: CanonicalModeledCacheProjection<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -228,6 +390,19 @@ impl CanonicalMachineStateCapture<'_> {
         out: &mut CanonicalFieldWriter<'_>,
     ) -> Result<(), CanonicalStateError> {
         self.machine_control.write_payload(out)
+    }
+
+    /// Writes the required Machine modeled-cache owner payload.
+    ///
+    /// Only tag state that can change future guest timing is represented. The
+    /// complete StateSnapshotV1 composer remains unavailable until every
+    /// required owner section has landed.
+    #[allow(dead_code)]
+    pub(crate) fn write_modeled_cache_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.modeled_cache.write_payload(out)
     }
 }
 
@@ -289,6 +464,7 @@ impl Machine {
                 cpu: cpu_mode,
             });
         }
+        let modeled_cache = self.cache_model.canonical_projection(self.active_mode)?;
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -339,13 +515,14 @@ impl Machine {
             _machine: self,
             _cpu_execution: cpu_execution,
             machine_control,
+            modeled_cache,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use izarravm_bus::TracingMode;
+    use izarravm_bus::{BusAccessKind, BusWidth, CpuBus, TracingMode};
     use izarravm_core::{
         CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion,
         CanonicalStateView, CanonicalStateWriter, GswMode, VideoCard,
@@ -358,6 +535,7 @@ mod tests {
     };
 
     const MACHINE_CONTROL_TIMING_PAYLOAD_LEN: usize = 163;
+    const EMPTY_MODELED_CACHE_PAYLOAD_LEN: usize = 16;
 
     fn test_machine() -> Machine {
         Machine::new(
@@ -395,6 +573,97 @@ mod tests {
         view.sections()[0].payload().to_vec()
     }
 
+    fn modeled_cache_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0002).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_modeled_cache_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
+    fn warm_modeled_cache_line(machine: &mut Machine, mode: GswMode, line: u32) {
+        let _ = machine.cache_model.data_tier(mode, line * CACHE_LINE_BYTES);
+    }
+
+    fn raw_word_read_clocks(machine: &mut Machine, address: u32) -> (u16, u64) {
+        let before = machine.trace.elapsed_clocks();
+        let value = machine.read_physical_u16(address);
+        (value, machine.trace.elapsed_clocks() - before)
+    }
+
+    fn approximate_cpu_bus_cost_contract(machine: &mut Machine) -> Vec<Option<u64>> {
+        let bus = machine.make_bus();
+        let mut values = Vec::new();
+        for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+            for kind in [BusAccessKind::DataRead, BusAccessKind::DataWrite] {
+                values.push(bus.jit_direct_memory_max_clocks(width, kind));
+            }
+        }
+        values.push(bus.jit_cached_fetch_run_clocks(0x0002_0000, 16));
+        values.push(bus.jit_projected_batch_scaled_bus_clocks(37));
+        values.push(Some(bus.jit_fetch_cost_clocks()));
+        values.push(Some(u64::from(u8::from(bus.native_fetches_are_uniform()))));
+        values.push(Some(u64::from(u8::from(
+            bus.native_aggregate_accounting_allowed(),
+        ))));
+        values.push(Some(bus.jit_data_byte_cost_clocks()));
+        for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+            values.push(Some(bus.jit_data_cost_clocks(width)));
+            values.push(Some(bus.jit_mode13_data_cost_clocks(width)));
+        }
+        values.push(Some(bus.jit_scale_bus_cost_upper(41)));
+        values.push(Some(bus.rep_data_byte_cost_upper()));
+        values.push(bus.rep_page_walk_cost_upper());
+        values
+    }
+
+    fn direct_charge_delta(machine: &mut Machine) -> u64 {
+        let before = machine.trace.elapsed_clocks();
+        {
+            let mut bus = machine.make_bus();
+            bus.charge_direct_memory(0x0002_0000, BusWidth::Dword, BusAccessKind::DataRead)
+                .unwrap();
+        }
+        machine.trace.elapsed_clocks() - before
+    }
+
+    fn direct_bulk_read(machine: &mut Machine) -> (usize, [u8; 16], u64) {
+        let before = machine.trace.elapsed_clocks();
+        let mut bytes = [0; 16];
+        let read = {
+            let mut bus = machine.make_bus();
+            bus.read_memory_bytes_direct(
+                0x0002_0000,
+                &mut bytes,
+                BusWidth::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap()
+        };
+        (read, bytes, machine.trace.elapsed_clocks() - before)
+    }
+
+    fn native_fetch_charge_delta(machine: &mut Machine) -> (bool, u64) {
+        let before = machine.trace.elapsed_clocks();
+        let charged = {
+            let mut bus = machine.make_bus();
+            bus.charge_native_cached_fetches(0x0002_0000, 0x0002_0000, &[1, 2, 3], 4)
+        };
+        (charged, machine.trace.elapsed_clocks() - before)
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
     fn push_u64(bytes: &mut Vec<u8>, value: u64) {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -410,6 +679,7 @@ mod tests {
                 (0x0001_0002, 1),
                 (0x0001_0003, 1),
                 (0x0002_0001, 1),
+                (0x0002_0002, 1),
             ]
         );
         assert!(
@@ -429,6 +699,352 @@ mod tests {
             sections[4].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
+        assert_eq!(
+            sections[5].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+    }
+
+    #[test]
+    fn fresh_modeled_cache_payload_is_exact_in_every_mode() {
+        for mode in [
+            GswMode::Gsw386Slow,
+            GswMode::Gsw386,
+            GswMode::Gsw486,
+            GswMode::Gsw586,
+        ] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+
+            assert_eq!(
+                modeled_cache_payload(&machine),
+                vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn populated_modeled_cache_payload_sorts_full_tags_numerically() {
+        let mut expected = Vec::new();
+        push_u64(&mut expected, 0);
+        push_u64(&mut expected, 3);
+        push_u32(&mut expected, 0x0000_0002);
+        push_u32(&mut expected, 0x0000_0401);
+        push_u32(&mut expected, 0x0000_0800);
+        assert_eq!(expected.len(), 28);
+
+        for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
+            let mut forward = test_machine();
+            forward.set_mode(mode);
+            for line in [0x0800, 0x0002, 0x0401] {
+                warm_modeled_cache_line(&mut forward, mode, line);
+            }
+
+            let mut reverse = test_machine();
+            reverse.set_mode(mode);
+            for line in [0x0401, 0x0002, 0x0800] {
+                warm_modeled_cache_line(&mut reverse, mode, line);
+            }
+
+            assert_eq!(modeled_cache_payload(&forward), expected, "{mode:?}");
+            assert_eq!(modeled_cache_payload(&reverse), expected, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn accurate_cache_hit_and_collision_preserve_next_access_timing() {
+        const TARGET_LINE: u32 = 0x0500;
+        const COLLIDING_LINE: u32 = TARGET_LINE + 0x0400;
+        const TARGET_ADDRESS: u32 = TARGET_LINE * CACHE_LINE_BYTES;
+
+        for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
+            let mut hot = test_machine();
+            hot.set_mode(mode);
+            warm_modeled_cache_line(&mut hot, mode, TARGET_LINE);
+
+            let mut displaced = test_machine();
+            displaced.set_mode(mode);
+            warm_modeled_cache_line(&mut displaced, mode, COLLIDING_LINE);
+
+            assert_eq!(hot.cache_tier_lookups(), displaced.cache_tier_lookups());
+            assert_ne!(
+                modeled_cache_payload(&hot),
+                modeled_cache_payload(&displaced),
+                "{mode:?}"
+            );
+
+            let hot_read = raw_word_read_clocks(&mut hot, TARGET_ADDRESS);
+            let displaced_read = raw_word_read_clocks(&mut displaced, TARGET_ADDRESS);
+            assert_eq!(hot_read.0, displaced_read.0, "{mode:?}");
+            assert_eq!(hot_read.1, 2, "{mode:?} L2 hit");
+            assert_eq!(displaced_read.1, 5, "{mode:?} RAM miss");
+            assert_eq!(
+                modeled_cache_payload(&hot),
+                modeled_cache_payload(&displaced),
+                "{mode:?} caches must converge after the same access"
+            );
+        }
+    }
+
+    #[test]
+    fn inert_modeled_cache_residue_is_payload_and_continuation_neutral() {
+        let mut clean = test_machine();
+        let mut residue = test_machine();
+        clean.set_mode(GswMode::Gsw386);
+        residue.set_mode(GswMode::Gsw386);
+
+        residue.cache_model.l1_tags[0] = 0;
+        residue.cache_model.l2_tags[3] = 2;
+        residue.cache_model.l2_tags[0] = MAX_MODELED_CACHE_LINE + 1;
+        residue.cache_model.l2_tags[1024] = 0x0400;
+        residue.cache_model.l2_tags[4] = crate::CACHE_EMPTY_TAG;
+
+        assert_eq!(
+            modeled_cache_payload(&clean),
+            modeled_cache_payload(&residue)
+        );
+
+        for address in [2 * CACHE_LINE_BYTES, 0] {
+            let clean_read = raw_word_read_clocks(&mut clean, address);
+            let residue_read = raw_word_read_clocks(&mut residue, address);
+            assert_eq!(clean_read, residue_read, "address {address:#010x}");
+        }
+        assert_eq!(
+            modeled_cache_payload(&clean),
+            modeled_cache_payload(&residue)
+        );
+    }
+
+    #[test]
+    fn modeled_cache_capture_is_read_only_and_excludes_lookup_count() {
+        const LINE: u32 = 0x0123;
+        let mut once = test_machine();
+        let mut repeated = test_machine();
+        warm_modeled_cache_line(&mut once, GswMode::Gsw386, LINE);
+        for _ in 0..4 {
+            warm_modeled_cache_line(&mut repeated, GswMode::Gsw386, LINE);
+        }
+        assert_ne!(once.cache_tier_lookups(), repeated.cache_tier_lookups());
+        assert_eq!(
+            modeled_cache_payload(&once),
+            modeled_cache_payload(&repeated)
+        );
+
+        let before_l1 = repeated.cache_model.l1_tags.to_vec();
+        let before_l2 = repeated.cache_model.l2_tags.to_vec();
+        let before_config = (
+            repeated.cache_model.config.l1_mask,
+            repeated.cache_model.config.l2_mask,
+        );
+        let before_cost = (
+            repeated.cache_model.cost.l1,
+            repeated.cache_model.cost.l2,
+            repeated.cache_model.cost.ram,
+        );
+        let before_code_fetch_ws = repeated.cache_model.code_fetch_ws;
+        let before_lookups = repeated.cache_tier_lookups();
+        let first = modeled_cache_payload(&repeated);
+        let second = modeled_cache_payload(&repeated);
+
+        assert_eq!(first, second);
+        assert_eq!(repeated.cache_model.l1_tags.as_ref(), before_l1);
+        assert_eq!(repeated.cache_model.l2_tags.as_ref(), before_l2);
+        assert_eq!(
+            (
+                repeated.cache_model.config.l1_mask,
+                repeated.cache_model.config.l2_mask,
+            ),
+            before_config
+        );
+        assert_eq!(
+            (
+                repeated.cache_model.cost.l1,
+                repeated.cache_model.cost.l2,
+                repeated.cache_model.cost.ram,
+            ),
+            before_cost
+        );
+        assert_eq!(repeated.cache_model.code_fetch_ws, before_code_fetch_ws);
+        assert_eq!(repeated.cache_tier_lookups(), before_lookups);
+
+        let once_read = raw_word_read_clocks(&mut once, LINE * CACHE_LINE_BYTES);
+        let repeated_read = raw_word_read_clocks(&mut repeated, LINE * CACHE_LINE_BYTES);
+        assert_eq!(once_read, repeated_read);
+    }
+
+    #[test]
+    fn approximate_modes_ignore_all_tag_residue_on_normal_bus_accesses() {
+        const ADDRESS: u32 = 0x0002_0000;
+        for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+            let mut clean = test_machine();
+            let mut residue = test_machine();
+            clean.set_mode(mode);
+            residue.set_mode(mode);
+
+            residue.cache_model.l1_tags[0] = 0;
+            residue.cache_model.l1_tags[1] = MAX_MODELED_CACHE_LINE + 1;
+            residue.cache_model.l2_tags[3] = 2;
+            residue.cache_model.l2_tags[CACHE_L2_MAX_LINES - 1] = 0x1fff;
+            warm_modeled_cache_line(&mut residue, mode, ADDRESS / CACHE_LINE_BYTES);
+            let lookups = residue.cache_tier_lookups();
+            let l1_tags = residue.cache_model.l1_tags.to_vec();
+            let l2_tags = residue.cache_model.l2_tags.to_vec();
+
+            assert_eq!(
+                modeled_cache_payload(&clean),
+                vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
+                "{mode:?}"
+            );
+            assert_eq!(
+                modeled_cache_payload(&residue),
+                vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
+                "{mode:?}"
+            );
+
+            let clean_read = raw_word_read_clocks(&mut clean, ADDRESS);
+            let residue_read = raw_word_read_clocks(&mut residue, ADDRESS);
+            assert_eq!(clean_read, residue_read, "{mode:?} read");
+            assert_eq!(residue.cache_tier_lookups(), lookups, "{mode:?} read");
+
+            let clean_before = clean.trace.elapsed_clocks();
+            let residue_before = residue.trace.elapsed_clocks();
+            clean.write_physical_u16(ADDRESS, 0x5aa5);
+            residue.write_physical_u16(ADDRESS, 0x5aa5);
+            assert_eq!(
+                clean.trace.elapsed_clocks() - clean_before,
+                residue.trace.elapsed_clocks() - residue_before,
+                "{mode:?} write"
+            );
+            assert_eq!(residue.cache_tier_lookups(), lookups, "{mode:?} write");
+            assert_eq!(residue.cache_model.l1_tags.as_ref(), l1_tags, "{mode:?}");
+            assert_eq!(residue.cache_model.l2_tags.as_ref(), l2_tags, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn approximate_direct_and_native_bus_contract_ignores_tag_residue() {
+        for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+            let mut clean = test_machine();
+            let mut residue = test_machine();
+            clean.set_mode(mode);
+            residue.set_mode(mode);
+
+            residue.cache_model.l1_tags.fill(0);
+            residue.cache_model.l2_tags.fill(0);
+            residue.cache_model.l1_tags[1] = MAX_MODELED_CACHE_LINE + 1;
+            residue.cache_model.l2_tags[3] = 2;
+            warm_modeled_cache_line(&mut residue, mode, 0x0800);
+            let lookups = residue.cache_tier_lookups();
+            let l1_tags = residue.cache_model.l1_tags.to_vec();
+            let l2_tags = residue.cache_model.l2_tags.to_vec();
+
+            assert_eq!(
+                approximate_cpu_bus_cost_contract(&mut clean),
+                approximate_cpu_bus_cost_contract(&mut residue),
+                "{mode:?} cost contract"
+            );
+            assert_eq!(
+                direct_charge_delta(&mut clean),
+                direct_charge_delta(&mut residue),
+                "{mode:?} direct charge"
+            );
+            assert_eq!(
+                direct_bulk_read(&mut clean),
+                direct_bulk_read(&mut residue),
+                "{mode:?} direct bulk read"
+            );
+            assert_eq!(
+                native_fetch_charge_delta(&mut clean),
+                native_fetch_charge_delta(&mut residue),
+                "{mode:?} native fetch charge"
+            );
+
+            assert_eq!(residue.cache_tier_lookups(), lookups, "{mode:?}");
+            assert_eq!(residue.cache_model.l1_tags.as_ref(), l1_tags, "{mode:?}");
+            assert_eq!(residue.cache_model.l2_tags.as_ref(), l2_tags, "{mode:?}");
+            assert_eq!(
+                modeled_cache_payload(&residue),
+                vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_tags_do_not_depend_on_current_a20_or_device_decode() {
+        const DEVICE_LINE: u32 = 0x000a_0000 / CACHE_LINE_BYTES;
+        const HIGH_LINE: u32 = 0x0010_0040 / CACHE_LINE_BYTES;
+        let mut machine = test_machine();
+        warm_modeled_cache_line(&mut machine, GswMode::Gsw386, DEVICE_LINE);
+        warm_modeled_cache_line(&mut machine, GswMode::Gsw386, HIGH_LINE);
+        let expected = modeled_cache_payload(&machine);
+
+        machine.set_a20_gate(false);
+
+        assert_eq!(modeled_cache_payload(&machine), expected);
+        assert!(
+            expected
+                .windows(4)
+                .any(|bytes| bytes == DEVICE_LINE.to_le_bytes())
+        );
+        assert!(
+            expected
+                .windows(4)
+                .any(|bytes| bytes == HIGH_LINE.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn every_mode_change_resets_raw_and_effective_cache_state() {
+        let modes = [
+            GswMode::Gsw386Slow,
+            GswMode::Gsw386,
+            GswMode::Gsw486,
+            GswMode::Gsw586,
+        ];
+        for source in modes {
+            for target in modes {
+                let mut machine = test_machine();
+                machine.set_mode(source);
+                machine.cache_model.l1_tags.fill(0);
+                machine.cache_model.l2_tags.fill(0);
+                warm_modeled_cache_line(&mut machine, source, 0x0123);
+                let lookups = machine.cache_tier_lookups();
+
+                machine.set_mode(target);
+
+                assert!(
+                    machine
+                        .cache_model
+                        .l1_tags
+                        .iter()
+                        .all(|tag| *tag == crate::CACHE_EMPTY_TAG),
+                    "{source:?} -> {target:?} L1"
+                );
+                assert!(
+                    machine
+                        .cache_model
+                        .l2_tags
+                        .iter()
+                        .all(|tag| *tag == crate::CACHE_EMPTY_TAG),
+                    "{source:?} -> {target:?} L2"
+                );
+                assert_eq!(machine.cache_tier_lookups(), lookups);
+                assert_eq!(
+                    modeled_cache_payload(&machine),
+                    vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
+                    "{source:?} -> {target:?}"
+                );
+                if !target.uses_approximate_timing() {
+                    assert_eq!(
+                        raw_word_read_clocks(&mut machine, 0x0123 * CACHE_LINE_BYTES).1,
+                        5,
+                        "{source:?} -> {target:?} must resume cold"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -773,6 +1389,99 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_modeled_cache_state_is_rejected_independently() {
+        let mut l1_storage = test_machine();
+        l1_storage.cache_model.l1_tags =
+            vec![crate::CACHE_EMPTY_TAG; CACHE_L1_MAX_LINES - 1].into_boxed_slice();
+        assert_eq!(
+            capture_error(&l1_storage),
+            MachineCanonicalCaptureError::InvalidModeledCacheStorageLength {
+                tier: "L1",
+                expected: CACHE_L1_MAX_LINES,
+                actual: CACHE_L1_MAX_LINES - 1,
+            }
+        );
+
+        let mut l2_storage = test_machine();
+        l2_storage.cache_model.l2_tags =
+            vec![crate::CACHE_EMPTY_TAG; CACHE_L2_MAX_LINES - 1].into_boxed_slice();
+        assert_eq!(
+            capture_error(&l2_storage),
+            MachineCanonicalCaptureError::InvalidModeledCacheStorageLength {
+                tier: "L2",
+                expected: CACHE_L2_MAX_LINES,
+                actual: CACHE_L2_MAX_LINES - 1,
+            }
+        );
+
+        let expected_config = cache_level_config(GswMode::Gsw386);
+        let mut l1_mask = test_machine();
+        l1_mask.cache_model.config.l1_mask = 0;
+        assert_eq!(
+            capture_error(&l1_mask),
+            MachineCanonicalCaptureError::InconsistentModeledCacheConfiguration {
+                expected_l1: expected_config.l1_mask,
+                actual_l1: 0,
+                expected_l2: expected_config.l2_mask,
+                actual_l2: expected_config.l2_mask,
+            }
+        );
+
+        let mut l2_mask = test_machine();
+        l2_mask.cache_model.config.l2_mask = 0x01ff;
+        assert_eq!(
+            capture_error(&l2_mask),
+            MachineCanonicalCaptureError::InconsistentModeledCacheConfiguration {
+                expected_l1: expected_config.l1_mask,
+                actual_l1: expected_config.l1_mask,
+                expected_l2: expected_config.l2_mask,
+                actual_l2: 0x01ff,
+            }
+        );
+
+        let expected_cost = tier_cost(GswMode::Gsw386);
+        for (index, actual) in [[1, 0, 3], [0, 1, 3], [0, 0, 4]].into_iter().enumerate() {
+            let mut machine = test_machine();
+            machine.cache_model.cost.l1 = actual[0];
+            machine.cache_model.cost.l2 = actual[1];
+            machine.cache_model.cost.ram = actual[2];
+            assert_eq!(
+                capture_error(&machine),
+                MachineCanonicalCaptureError::InconsistentModeledCacheCosts {
+                    expected: [expected_cost.l1, expected_cost.l2, expected_cost.ram],
+                    actual,
+                },
+                "cost component {index}"
+            );
+        }
+
+        let mut code_fetch = test_machine();
+        code_fetch.cache_model.code_fetch_ws = 1;
+        assert_eq!(
+            capture_error(&code_fetch),
+            MachineCanonicalCaptureError::InconsistentModeledCodeFetchWaitStates {
+                expected: code_fetch_ws(GswMode::Gsw386),
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn cpu_mode_mismatch_precedes_modeled_cache_validation() {
+        let mut machine = test_machine();
+        machine.cpu.set_mode(GswMode::Gsw586);
+        machine.cache_model.config.l2_mask = 0;
+
+        assert_eq!(
+            capture_error(&machine),
+            MachineCanonicalCaptureError::InconsistentCpuMode {
+                machine: GswMode::Gsw386,
+                cpu: GswMode::Gsw586,
+            }
+        );
+    }
+
+    #[test]
     fn cpu_capture_errors_keep_their_identity() {
         assert_eq!(
             MachineCanonicalCaptureError::from(CpuCanonicalCaptureError::ActiveRepContinuation),
@@ -799,6 +1508,10 @@ mod tests {
         assert_eq!(
             machine_control_timing_payload(&machine).len(),
             MACHINE_CONTROL_TIMING_PAYLOAD_LEN
+        );
+        assert_eq!(
+            modeled_cache_payload(&machine),
+            vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN]
         );
     }
 }
