@@ -30,7 +30,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 6] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 7] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -61,6 +61,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0003,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -86,11 +91,16 @@ const _: () = {
         sections[5].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[6].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
     assert!(sections[3].id < sections[4].id);
     assert!(sections[4].id < sections[5].id);
+    assert!(sections[5].id < sections[6].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -164,6 +174,14 @@ pub enum MachineCanonicalCaptureError {
     InconsistentModeledCacheCosts { expected: [u8; 3], actual: [u8; 3] },
     #[error("modeled code-fetch wait states are {actual}, expected {expected}")]
     InconsistentModeledCodeFetchWaitStates { expected: u8, actual: u8 },
+    #[error("RAM byte length overflowed for a {memory_mib} MiB machine")]
+    RamLengthOverflow { memory_mib: u16 },
+    #[error("RAM backing has {actual} bytes, expected {expected}")]
+    InconsistentRamLength { expected: usize, actual: usize },
+    #[error("system ROM backing has {actual} bytes, expected {expected}")]
+    InconsistentSystemRomLength { expected: usize, actual: usize },
+    #[error("the derived RAM page lookup is inconsistent with RAM and video decode")]
+    InconsistentRamPageLookup,
 }
 
 impl From<CanonicalTimelineError> for MachineCanonicalCaptureError {
@@ -294,6 +312,19 @@ impl CanonicalModeledCacheProjection<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CanonicalRamRomProjection<'a> {
+    ram: &'a [u8],
+    rom: &'a [u8],
+}
+
+impl CanonicalRamRomProjection<'_> {
+    fn write_payload(&self, out: &mut CanonicalFieldWriter<'_>) -> Result<(), CanonicalStateError> {
+        out.write_len_prefixed_bytes(self.ram)?;
+        out.write_len_prefixed_bytes(self.rom)
+    }
+}
+
 impl CacheModel {
     fn canonical_projection(
         &self,
@@ -377,6 +408,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     _cpu_execution: CanonicalCpuExecution<'a>,
     machine_control: CanonicalMachineControl,
     modeled_cache: CanonicalModeledCacheProjection<'a>,
+    ram_rom: CanonicalRamRomProjection<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -403,6 +435,19 @@ impl CanonicalMachineStateCapture<'_> {
         out: &mut CanonicalFieldWriter<'_>,
     ) -> Result<(), CanonicalStateError> {
         self.modeled_cache.write_payload(out)
+    }
+
+    /// Writes the required Machine RAM and system-ROM owner payload.
+    ///
+    /// Both authoritative stores are copied in raw backing order. Bus aliases,
+    /// device apertures, and derived host mappings are represented by their own
+    /// owners rather than projected into this payload.
+    #[allow(dead_code)]
+    pub(crate) fn write_ram_rom_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.ram_rom.write_payload(out)
     }
 }
 
@@ -465,6 +510,31 @@ impl Machine {
             });
         }
         let modeled_cache = self.cache_model.canonical_projection(self.active_mode)?;
+        let expected_ram_len = usize::from(self.profile.memory_mib)
+            .checked_mul(1024 * 1024)
+            .ok_or(MachineCanonicalCaptureError::RamLengthOverflow {
+                memory_mib: self.profile.memory_mib,
+            })?;
+        let actual_ram_len = self.memory.len();
+        if actual_ram_len != expected_ram_len {
+            return Err(MachineCanonicalCaptureError::InconsistentRamLength {
+                expected: expected_ram_len,
+                actual: actual_ram_len,
+            });
+        }
+        if self.rom.len() != super::BIOS_ROM_SIZE {
+            return Err(MachineCanonicalCaptureError::InconsistentSystemRomLength {
+                expected: super::BIOS_ROM_SIZE,
+                actual: self.rom.len(),
+            });
+        }
+        if !self.ram_lookup.is_consistent(actual_ram_len, &self.vega) {
+            return Err(MachineCanonicalCaptureError::InconsistentRamPageLookup);
+        }
+        let ram_rom = CanonicalRamRomProjection {
+            ram: self.memory.as_slice(),
+            rom: self.rom.as_slice(),
+        };
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -516,6 +586,7 @@ impl Machine {
             _cpu_execution: cpu_execution,
             machine_control,
             modeled_cache,
+            ram_rom,
         })
     }
 }
@@ -528,6 +599,12 @@ mod tests {
         CanonicalStateView, CanonicalStateWriter, GswMode, VideoCard,
     };
     use izarravm_cpu::CpuCanonicalCaptureError;
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    use izarravm_cpu::SegmentIndex;
 
     use super::*;
     use crate::{
@@ -536,10 +613,19 @@ mod tests {
 
     const MACHINE_CONTROL_TIMING_PAYLOAD_LEN: usize = 163;
     const EMPTY_MODELED_CACHE_PAYLOAD_LEN: usize = 16;
+    const TEST_MEMORY_MIB: u16 = 2;
 
     fn test_machine() -> Machine {
         Machine::new(
             MachineProfile::gsw_386(16, VideoCard::Vega),
+            vec![0; BIOS_ROM_SIZE],
+        )
+        .unwrap()
+    }
+
+    fn memory_test_machine() -> Machine {
+        Machine::new(
+            MachineProfile::gsw_386(TEST_MEMORY_MIB, VideoCard::Vega),
             vec![0; BIOS_ROM_SIZE],
         )
         .unwrap()
@@ -582,6 +668,22 @@ mod tests {
                 CanonicalSectionVersion::new(1).unwrap(),
                 CanonicalSectionRequirement::Required,
                 |out| capture.write_modeled_cache_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
+    fn ram_rom_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0003).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_ram_rom_payload(out),
             )
             .unwrap();
         let bytes = state.finish().unwrap();
@@ -668,6 +770,19 @@ mod tests {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn take_len_prefixed_bytes<'a>(payload: &'a [u8], cursor: &mut usize) -> &'a [u8] {
+        let length_end = *cursor + 8;
+        let length = usize::try_from(u64::from_le_bytes(
+            payload[*cursor..length_end].try_into().unwrap(),
+        ))
+        .unwrap();
+        *cursor = length_end;
+        let data_end = *cursor + length;
+        let data = &payload[*cursor..data_end];
+        *cursor = data_end;
+        data
+    }
+
     #[test]
     fn foundation_sections_pin_ids_versions_order_and_namespaces() {
         let sections = STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS;
@@ -680,6 +795,7 @@ mod tests {
                 (0x0001_0003, 1),
                 (0x0002_0001, 1),
                 (0x0002_0002, 1),
+                (0x0002_0003, 1),
             ]
         );
         assert!(
@@ -703,6 +819,288 @@ mod tests {
             sections[5].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
+        assert_eq!(
+            sections[6].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+    }
+
+    #[test]
+    fn ram_rom_projection_payload_layout_is_exact() {
+        let projection = CanonicalRamRomProjection {
+            ram: &[0x10, 0x20, 0x30],
+            rom: &[0xa0, 0xb0],
+        };
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0003).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| projection.write_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+
+        assert_eq!(
+            view.sections()[0].payload(),
+            &[
+                3, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x20, 0x30, 2, 0, 0, 0, 0, 0, 0, 0, 0xa0, 0xb0,
+            ]
+        );
+    }
+
+    #[test]
+    fn ram_rom_payload_covers_both_authoritative_stores_in_raw_order() {
+        let mut machine = memory_test_machine();
+        let ram_len = machine.memory.len();
+        for (address, value) in [
+            (0x0000_0000, 0x11),
+            (0x0009_ffff, 0x22),
+            (0x000a_0000, 0x33),
+            (0x000c_0000, 0x44),
+            (0x000c_8000, 0x55),
+            (0x000f_0000, 0x66),
+            (0x0010_0000, 0x77),
+            (ram_len - 1, 0x88),
+        ] {
+            machine.memory.as_mut_slice()[address] = value;
+        }
+        machine.rom[0] = 0x91;
+        machine.rom[BIOS_ROM_SIZE / 2] = 0x92;
+        machine.rom[BIOS_ROM_SIZE - 1] = 0x93;
+
+        let payload = ram_rom_payload(&machine);
+        let mut cursor = 0;
+        let ram = take_len_prefixed_bytes(&payload, &mut cursor);
+        let rom = take_len_prefixed_bytes(&payload, &mut cursor);
+
+        assert_eq!(ram, machine.memory.as_slice());
+        assert_eq!(rom, machine.rom.as_slice());
+        assert_eq!(cursor, payload.len());
+        assert_eq!(payload.len(), 16 + ram_len + BIOS_ROM_SIZE);
+    }
+
+    #[test]
+    fn system_rom_aliases_share_one_store_and_ignore_guest_writes() {
+        const ROM_OFFSET: usize = 0x8123;
+        const ROM_VALUE: u8 = 0x5a;
+        const HIDDEN_RAM_VALUE: u8 = 0xa5;
+
+        let mut machine = memory_test_machine();
+        machine.rom[ROM_OFFSET] = ROM_VALUE;
+        machine.memory.as_mut_slice()[crate::LOW_BIOS_BASE as usize + ROM_OFFSET] =
+            HIDDEN_RAM_VALUE;
+        let expected = ram_rom_payload(&machine);
+
+        {
+            let mut bus = machine.make_bus();
+            assert_eq!(
+                CpuBus::read_memory(
+                    &mut bus,
+                    crate::LOW_BIOS_BASE + ROM_OFFSET as u32,
+                    BusWidth::Byte,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap(),
+                u32::from(ROM_VALUE)
+            );
+            assert_eq!(
+                CpuBus::read_memory(
+                    &mut bus,
+                    crate::HIGH_ROM_BASE + ROM_OFFSET as u32,
+                    BusWidth::Byte,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap(),
+                u32::from(ROM_VALUE)
+            );
+            CpuBus::write_memory(
+                &mut bus,
+                crate::LOW_BIOS_BASE + ROM_OFFSET as u32,
+                BusWidth::Byte,
+                0x10,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+            CpuBus::write_memory(
+                &mut bus,
+                crate::HIGH_ROM_BASE + ROM_OFFSET as u32,
+                BusWidth::Byte,
+                0x20,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(machine.rom[ROM_OFFSET], ROM_VALUE);
+        assert_eq!(
+            machine.memory.as_slice()[crate::LOW_BIOS_BASE as usize + ROM_OFFSET],
+            HIDDEN_RAM_VALUE
+        );
+        assert_eq!(ram_rom_payload(&machine), expected);
+    }
+
+    #[test]
+    fn discarded_flash_prefix_is_not_canonical_state() {
+        let mut first = vec![0; BIOS_ROM_SIZE * 2];
+        let mut second = first.clone();
+        first[0] = 0x11;
+        second[0] = 0x22;
+        let profile = MachineProfile::gsw_386(TEST_MEMORY_MIB, VideoCard::Vega);
+        let first = Machine::new(profile.clone(), first).unwrap();
+        let second = Machine::new(profile, second).unwrap();
+
+        assert_eq!(first.rom, second.rom);
+        assert_eq!(ram_rom_payload(&first), ram_rom_payload(&second));
+    }
+
+    #[test]
+    fn a20_routing_changes_raw_cells_without_projecting_an_alias() {
+        const LOW: usize = 0x0000_1234;
+        const HIGH: u32 = 0x0010_1234;
+
+        let mut machine = memory_test_machine();
+        let unchanged = ram_rom_payload(&machine);
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x0092, BusWidth::Byte, 0, false).unwrap();
+        }
+        assert_eq!(ram_rom_payload(&machine), unchanged);
+
+        {
+            let mut bus = machine.make_bus();
+            CpuBus::write_memory(
+                &mut bus,
+                HIGH,
+                BusWidth::Byte,
+                0x41,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+        }
+        assert_eq!(machine.memory.as_slice()[LOW], 0x41);
+        assert_eq!(machine.memory.as_slice()[HIGH as usize], 0);
+
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x0092, BusWidth::Byte, 0x02, false).unwrap();
+            CpuBus::write_memory(
+                &mut bus,
+                HIGH,
+                BusWidth::Byte,
+                0x52,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+        }
+        assert_eq!(machine.memory.as_slice()[LOW], 0x41);
+        assert_eq!(machine.memory.as_slice()[HIGH as usize], 0x52);
+
+        let payload = ram_rom_payload(&machine);
+        let mut cursor = 0;
+        let ram = take_len_prefixed_bytes(&payload, &mut cursor);
+        assert_eq!(ram[LOW], 0x41);
+        assert_eq!(ram[HIGH as usize], 0x52);
+    }
+
+    #[test]
+    fn live_pci_decode_rebuilds_and_publishes_the_excluded_ram_lookup() {
+        const RAM_BAR: u32 = 0x0100_0000;
+        const BAR_REGISTER: u32 = 0x10;
+        const COMMAND_REGISTER: u32 = 0x04;
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(32, VideoCard::Vega),
+            rom_with_code(&[0xf4]),
+        )
+        .unwrap();
+        let expected = ram_rom_payload(&machine);
+        assert!(
+            machine
+                .ram_lookup
+                .is_consistent(machine.memory.len(), &machine.vega)
+        );
+
+        {
+            let mut bus = machine.make_bus();
+            assert!(
+                CpuBus::direct_page(&mut bus, RAM_BAR, BusAccessKind::DataRead)
+                    .unwrap()
+                    .is_some()
+            );
+            let config_address =
+                0x8000_0000 | (u32::from(crate::DISTIRA_PCI_SLOT) << 11) | COMMAND_REGISTER;
+            bus.write_io(
+                crate::PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword,
+                config_address,
+                false,
+            )
+            .unwrap();
+            bus.write_io(crate::PCI_CONFIG_DATA_PORT, BusWidth::Dword, 0, false)
+                .unwrap();
+            let config_address =
+                0x8000_0000 | (u32::from(crate::DISTIRA_PCI_SLOT) << 11) | BAR_REGISTER;
+            bus.write_io(
+                crate::PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword,
+                config_address,
+                false,
+            )
+            .unwrap();
+            bus.write_io(crate::PCI_CONFIG_DATA_PORT, BusWidth::Dword, RAM_BAR, false)
+                .unwrap();
+            assert!(
+                CpuBus::direct_page(&mut bus, RAM_BAR, BusAccessKind::DataRead)
+                    .unwrap()
+                    .is_some()
+            );
+            let config_address =
+                0x8000_0000 | (u32::from(crate::DISTIRA_PCI_SLOT) << 11) | COMMAND_REGISTER;
+            bus.write_io(
+                crate::PCI_CONFIG_ADDRESS_PORT,
+                BusWidth::Dword,
+                config_address,
+                false,
+            )
+            .unwrap();
+            bus.write_io(
+                crate::PCI_CONFIG_DATA_PORT,
+                BusWidth::Dword,
+                0x0000_0002,
+                false,
+            )
+            .unwrap();
+            assert!(
+                CpuBus::direct_page(&mut bus, RAM_BAR, BusAccessKind::DataRead)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert_eq!(
+            capture_error(&machine),
+            MachineCanonicalCaptureError::PendingDirectMapChange
+        );
+        assert!(
+            machine
+                .ram_lookup
+                .is_consistent(machine.memory.len(), &machine.vega)
+        );
+
+        assert_eq!(
+            machine.run_until_halt_or_cycles(100_000).unwrap(),
+            StopReason::Halted
+        );
+        assert!(!machine.direct_map_changed);
+        assert!(
+            machine
+                .ram_lookup
+                .is_consistent(machine.memory.len(), &machine.vega)
+        );
+        assert_eq!(ram_rom_payload(&machine), expected);
     }
 
     #[test]
@@ -1490,6 +1888,213 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_ram_rom_and_lookup_state_is_rejected_independently() {
+        let expected_ram_len = usize::from(TEST_MEMORY_MIB) * 1024 * 1024;
+
+        let mut ram = memory_test_machine();
+        ram.profile.memory_mib += 1;
+        assert_eq!(
+            capture_error(&ram),
+            MachineCanonicalCaptureError::InconsistentRamLength {
+                expected: expected_ram_len + 1024 * 1024,
+                actual: expected_ram_len,
+            }
+        );
+
+        let mut rom = memory_test_machine();
+        rom.rom.pop();
+        assert_eq!(
+            capture_error(&rom),
+            MachineCanonicalCaptureError::InconsistentSystemRomLength {
+                expected: BIOS_ROM_SIZE,
+                actual: BIOS_ROM_SIZE - 1,
+            }
+        );
+
+        let mut lookup = memory_test_machine();
+        lookup.ram_lookup = crate::RamPageLookup::new(
+            lookup.memory.len() - crate::video_params::RAM_LOOKUP_PAGE_SIZE,
+            &lookup.vega,
+        );
+        assert_eq!(
+            capture_error(&lookup),
+            MachineCanonicalCaptureError::InconsistentRamPageLookup
+        );
+    }
+
+    #[test]
+    fn ram_rom_capture_and_serialization_are_read_only() {
+        let mut machine = memory_test_machine();
+        machine.memory.as_mut_slice()[0x1234] = 0xa5;
+        machine.rom[0x4321] = 0x5a;
+        machine.direct_mapping_epoch = 0x1234_5678;
+        machine.trace.set_tracing_mode(TracingMode::Counts);
+        let _ = machine
+            .cache_model
+            .data_tier(machine.active_mode, 0x0010_0000);
+
+        let before_ram = machine.memory.as_slice().to_vec();
+        let before_rom = machine.rom.clone();
+        let before_cache = (
+            machine.cache_model.l1_tags.clone(),
+            machine.cache_model.l2_tags.clone(),
+            machine.cache_model.lookups,
+        );
+        let before_mechanism = (
+            machine.direct_mapping_epoch,
+            machine.direct_map_changed,
+            machine.direct_data_map_changed,
+            machine.pending_device_memory_write_range,
+            machine.device_wrote_memory,
+        );
+        let before_timing = (
+            machine.elapsed_clocks,
+            machine.scaled_bus_clocks,
+            machine.trace.elapsed_clocks(),
+        );
+
+        let first = ram_rom_payload(&machine);
+        let second = ram_rom_payload(&machine);
+
+        assert_eq!(first, second);
+        assert_eq!(machine.memory.as_slice(), before_ram);
+        assert_eq!(machine.rom, before_rom);
+        assert_eq!(
+            (
+                machine.cache_model.l1_tags.clone(),
+                machine.cache_model.l2_tags.clone(),
+                machine.cache_model.lookups,
+            ),
+            before_cache
+        );
+        assert_eq!(
+            (
+                machine.direct_mapping_epoch,
+                machine.direct_map_changed,
+                machine.direct_data_map_changed,
+                machine.pending_device_memory_write_range,
+                machine.device_wrote_memory,
+            ),
+            before_mechanism
+        );
+        assert_eq!(
+            (
+                machine.elapsed_clocks,
+                machine.scaled_bus_clocks,
+                machine.trace.elapsed_clocks(),
+            ),
+            before_timing
+        );
+        assert!(
+            machine
+                .ram_lookup
+                .is_consistent(machine.memory.len(), &machine.vega)
+        );
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn scalar_and_direct_native_stores_share_the_ram_owner() {
+        const OFFSET: u32 = 0x6000;
+        const VALUE: u32 = 0x1122_3344;
+        const PROGRAM: &[u8] = &[
+            0xb9, 0x64, 0x00, 0x00, 0x00, // mov ecx,100
+            0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,11223344h
+            0xa3, 0x00, 0x60, 0x00, 0x00, // store: mov [00006000h],eax
+            0x83, 0xe9, 0x01, // sub ecx,1
+            0x75, 0xf6, // jnz store
+            0xf4, // hlt
+        ];
+
+        if !izarravm_cpu::native_backend_available() {
+            return;
+        }
+
+        fn store_machine(program: &[u8], native: bool) -> Machine {
+            let mut profile = MachineProfile::gsw_386(TEST_MEMORY_MIB, VideoCard::Vega);
+            profile.cpu = GswMode::Gsw586;
+            let mut machine = Machine::new_raw_program(profile, program).unwrap();
+            let mut cs = machine.cpu.registers.cs();
+            cs.default_size_32 = true;
+            cs.limit = u32::MAX;
+            machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+            machine.cpu.set_clif_backend_enabled(false);
+            machine.cpu.set_native_backend_enabled(native);
+            machine.set_jit_auto_admit(native);
+            machine.trace.set_tracing_mode(TracingMode::Off);
+            machine.poll_skip_enabled = false;
+            machine
+        }
+
+        let mut scalar = store_machine(PROGRAM, false);
+        let mut bulk_direct = store_machine(PROGRAM, false);
+        let mut direct = store_machine(PROGRAM, true);
+        let target = direct.cpu.registers.segment(SegmentIndex::Ds).base + OFFSET;
+        assert_eq!(
+            scalar.cpu.registers.segment(SegmentIndex::Ds).base + OFFSET,
+            target
+        );
+        assert_eq!(
+            bulk_direct.cpu.registers.segment(SegmentIndex::Ds).base + OFFSET,
+            target
+        );
+
+        {
+            let mut bus = scalar.make_bus();
+            CpuBus::write_memory(
+                &mut bus,
+                target,
+                BusWidth::Dword,
+                VALUE,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+        }
+        {
+            let mut bus = bulk_direct.make_bus();
+            assert_eq!(
+                CpuBus::write_memory_bytes_direct(
+                    &mut bus,
+                    target,
+                    &VALUE.to_le_bytes(),
+                    BusWidth::Dword,
+                    BusAccessKind::DataWrite,
+                )
+                .unwrap(),
+                4
+            );
+        }
+
+        let installed = direct.cpu.perf_counters().jit_direct_blocks_installed;
+        let native_stores = direct.cpu.perf_counters().jit_native_store_hits;
+        for _ in 0..4 {
+            direct.cpu.halted = false;
+            direct.cpu.registers.eip = 0x100;
+            assert_eq!(
+                direct.run_until_halt_or_cycles(100_000).unwrap(),
+                StopReason::Halted
+            );
+        }
+
+        assert!(direct.cpu.perf_counters().jit_direct_blocks_installed > installed);
+        assert!(direct.cpu.perf_counters().jit_native_store_hits > native_stores);
+        assert_eq!(
+            &direct.memory.as_slice()[target as usize..target as usize + 4],
+            &VALUE.to_le_bytes()
+        );
+        assert_eq!(direct.memory.as_slice(), scalar.memory.as_slice());
+        assert_eq!(bulk_direct.memory.as_slice(), scalar.memory.as_slice());
+        assert_eq!(direct.rom, scalar.rom);
+        assert_eq!(bulk_direct.rom, scalar.rom);
+        assert_eq!(ram_rom_payload(&direct), ram_rom_payload(&scalar));
+        assert_eq!(ram_rom_payload(&bulk_direct), ram_rom_payload(&scalar));
+    }
+
+    #[test]
     fn unit_tester_exit_zero_is_a_captureable_batch_boundary() {
         let rom = rom_with_code(&[
             0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
@@ -1513,5 +2118,16 @@ mod tests {
             modeled_cache_payload(&machine),
             vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN]
         );
+        let payload = ram_rom_payload(&machine);
+        let mut cursor = 0;
+        assert_eq!(
+            take_len_prefixed_bytes(&payload, &mut cursor),
+            machine.memory.as_slice()
+        );
+        assert_eq!(
+            take_len_prefixed_bytes(&payload, &mut cursor),
+            machine.rom.as_slice()
+        );
+        assert_eq!(cursor, payload.len());
     }
 }
