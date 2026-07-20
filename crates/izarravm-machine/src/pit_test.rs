@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_core::{
+    CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateView,
+    CanonicalStateWriter,
+};
 
 // Control words: counter 0, LSB-then-MSB, binary, mode in bits 3..1.
 const CW_MODE0: u8 = 0x30;
@@ -15,6 +19,476 @@ fn program_ch0(pit: &mut Pit, control: u8, count: u16) {
     pit.write_port(0x43, control);
     pit.write_port(0x40, (count & 0xff) as u8);
     pit.write_port(0x40, (count >> 8) as u8);
+}
+
+fn canonical_payload(pit: &Pit) -> Vec<u8> {
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_0005).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| pit.canonical_projection().write_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn pit_with_counter(channel: usize, counter: Counter) -> Pit {
+    let mut counters = std::array::from_fn(|_| Counter::default());
+    counters[channel] = counter;
+    Pit { counters }
+}
+
+fn assert_counter_offsets(
+    channel: usize,
+    before: Counter,
+    after: Counter,
+    local_offsets: &[usize],
+) {
+    let before = canonical_payload(&pit_with_counter(channel, before));
+    let after = canonical_payload(&pit_with_counter(channel, after));
+    let changed = before
+        .iter()
+        .zip(&after)
+        .enumerate()
+        .filter_map(|(index, (left, right))| (left != right).then_some(index))
+        .collect::<Vec<_>>();
+    let expected = local_offsets
+        .iter()
+        .map(|offset| channel * 20 + offset)
+        .collect::<Vec<_>>();
+    assert_eq!(changed, expected, "channel {channel}");
+}
+
+fn layout_counter() -> Counter {
+    Counter {
+        mode: 2,
+        rw: RwMode::LsbThenMsb,
+        bcd: false,
+        count: 0x0000_1234,
+        reload: 0x5678,
+        out: false,
+        gate: true,
+        state: CounterState::Counting,
+        null_count: false,
+        latch: Some(0x9abc),
+        status_latch: Some(0xde),
+        write_msb_next: false,
+        read_msb_next: false,
+    }
+}
+
+#[test]
+fn canonical_pit_payload_layout_is_exact() {
+    let pit = Pit {
+        counters: [
+            Counter {
+                mode: 2,
+                rw: RwMode::LsbThenMsb,
+                bcd: true,
+                count: 0x0403_0201,
+                reload: 0x0605,
+                out: false,
+                gate: true,
+                state: CounterState::Counting,
+                null_count: true,
+                latch: Some(0x0807),
+                status_latch: Some(0x09),
+                write_msb_next: true,
+                read_msb_next: false,
+            },
+            Counter {
+                mode: 4,
+                rw: RwMode::Lsb,
+                bcd: false,
+                count: 0x1413_1211,
+                reload: 0x1615,
+                out: true,
+                gate: false,
+                state: CounterState::WaitGate,
+                null_count: false,
+                latch: Some(0x1817),
+                status_latch: None,
+                write_msb_next: true,
+                read_msb_next: true,
+            },
+            Counter {
+                mode: 5,
+                rw: RwMode::Msb,
+                bcd: true,
+                count: 0x2423_2221,
+                reload: 0x2625,
+                out: false,
+                gate: true,
+                state: CounterState::LoadDelay,
+                null_count: true,
+                latch: Some(0x2827),
+                status_latch: Some(0x29),
+                write_msb_next: true,
+                read_msb_next: true,
+            },
+        ],
+    };
+
+    assert_eq!(
+        canonical_payload(&pit),
+        [
+            0x02, 0x02, 0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x00, 0x01, 0x02, 0x01, 0x01,
+            0x07, 0x08, 0x01, 0x09, 0x01, 0x00, 0x04, 0x00, 0x00, 0x11, 0x12, 0x00, 0x00, 0x15,
+            0x16, 0x01, 0x00, 0x00, 0x00, 0x01, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01,
+            0x01, 0x21, 0x22, 0x00, 0x00, 0x25, 0x26, 0x00, 0x01, 0x01, 0x01, 0x01, 0x00, 0x28,
+            0x01, 0x29, 0x00, 0x00,
+        ]
+    );
+}
+
+#[test]
+fn canonical_pit_tags_are_explicit() {
+    assert_eq!(rw_mode_tag(RwMode::Lsb), 0);
+    assert_eq!(rw_mode_tag(RwMode::Msb), 1);
+    assert_eq!(rw_mode_tag(RwMode::LsbThenMsb), 2);
+    assert_eq!(counter_state_tag(CounterState::Inactive), 0);
+    assert_eq!(counter_state_tag(CounterState::WaitGate), 0);
+    assert_eq!(counter_state_tag(CounterState::LoadDelay), 1);
+    assert_eq!(counter_state_tag(CounterState::Counting), 2);
+
+    for mode in 0..=5 {
+        let mut counter = layout_counter();
+        counter.mode = mode;
+        assert_eq!(canonical_payload(&pit_with_counter(0, counter))[0], mode);
+    }
+}
+
+#[test]
+fn canonical_pit_field_offsets_are_exact_for_every_channel() {
+    for channel in 0..3 {
+        let base = layout_counter();
+
+        let mut changed = base.clone();
+        changed.mode = 3;
+        assert_counter_offsets(channel, base.clone(), changed, &[0]);
+
+        let mut before = base.clone();
+        before.latch = None;
+        let mut changed = before.clone();
+        changed.rw = RwMode::Lsb;
+        assert_counter_offsets(channel, before.clone(), changed, &[1]);
+        let mut changed = before.clone();
+        changed.rw = RwMode::Msb;
+        assert_counter_offsets(channel, before, changed, &[1]);
+
+        let mut changed = base.clone();
+        changed.bcd = true;
+        assert_counter_offsets(channel, base.clone(), changed, &[2]);
+
+        let mut changed = base.clone();
+        changed.count = 0x4433_2211;
+        assert_counter_offsets(channel, base.clone(), changed, &[3, 4, 5, 6]);
+
+        let mut changed = base.clone();
+        changed.reload = 0x3412;
+        assert_counter_offsets(channel, base.clone(), changed, &[7, 8]);
+
+        let mut changed = base.clone();
+        changed.out = true;
+        assert_counter_offsets(channel, base.clone(), changed, &[9]);
+
+        let mut changed = base.clone();
+        changed.gate = false;
+        assert_counter_offsets(channel, base.clone(), changed, &[10]);
+
+        let mut state_base = base.clone();
+        state_base.count &= 0xffff;
+        let mut changed = state_base.clone();
+        changed.state = CounterState::LoadDelay;
+        assert_counter_offsets(channel, state_base.clone(), changed, &[11]);
+        let mut changed = state_base.clone();
+        changed.state = CounterState::Inactive;
+        assert_counter_offsets(channel, state_base, changed, &[11]);
+
+        let mut changed = base.clone();
+        changed.null_count = true;
+        assert_counter_offsets(channel, base.clone(), changed, &[12]);
+
+        let mut before = base.clone();
+        before.latch = None;
+        let mut changed = before.clone();
+        changed.latch = Some(0x3412);
+        assert_counter_offsets(channel, before, changed, &[13, 14, 15]);
+        let mut changed = base.clone();
+        changed.latch = Some(0x3412);
+        assert_counter_offsets(channel, base.clone(), changed, &[14, 15]);
+
+        let mut before = base.clone();
+        before.status_latch = None;
+        let mut changed = before.clone();
+        changed.status_latch = Some(0x5a);
+        assert_counter_offsets(channel, before, changed, &[16, 17]);
+        let mut changed = base.clone();
+        changed.status_latch = Some(0x5a);
+        assert_counter_offsets(channel, base.clone(), changed, &[17]);
+
+        let mut changed = base.clone();
+        changed.write_msb_next = true;
+        assert_counter_offsets(channel, base.clone(), changed, &[18]);
+
+        let mut changed = base.clone();
+        changed.read_msb_next = true;
+        assert_counter_offsets(channel, base, changed, &[14, 19]);
+    }
+}
+
+#[test]
+fn canonical_pit_normalizes_unobservable_count_history() {
+    let scenarios = [
+        (0, false, CounterState::Inactive),
+        (1, true, CounterState::WaitGate),
+        (2, true, CounterState::LoadDelay),
+        (0, true, CounterState::Counting),
+        (1, true, CounterState::Counting),
+        (4, false, CounterState::Counting),
+        (5, false, CounterState::Counting),
+    ];
+    for (mode, out, state) in scenarios {
+        let counter = Counter {
+            mode,
+            rw: RwMode::Lsb,
+            count: 0x0000_3456,
+            reload: 0x1234,
+            out,
+            gate: true,
+            state,
+            ..Counter::default()
+        };
+        let mut low = pit_with_counter(0, counter.clone());
+        let mut high_counter = counter;
+        high_counter.count = 0xabcd_3456;
+        let mut high = pit_with_counter(0, high_counter);
+
+        assert_eq!(canonical_payload(&low), canonical_payload(&high));
+        assert_eq!(low.read_port(0x40), high.read_port(0x40));
+        low.write_port(0x43, 0x00);
+        high.write_port(0x43, 0x00);
+        assert_eq!(low.read_port(0x40), high.read_port(0x40));
+        assert_eq!(low.tick(3), high.tick(3));
+        assert_eq!(canonical_payload(&low), canonical_payload(&high));
+        low.set_gate(0, false);
+        high.set_gate(0, false);
+        low.set_gate(0, true);
+        high.set_gate(0, true);
+        assert_eq!(canonical_payload(&low), canonical_payload(&high));
+        program_ch0(&mut low, CW_MODE2, 7);
+        program_ch0(&mut high, CW_MODE2, 7);
+        assert_eq!(low.tick(20), high.tick(20));
+        assert_eq!(canonical_payload(&low), canonical_payload(&high));
+    }
+}
+
+#[test]
+fn canonical_pit_collapses_inactive_and_wait_gate_continuation() {
+    for control in [CW_MODE1, CW_MODE5] {
+        let mut inactive = Pit::default();
+        inactive.write_port(0x43, control);
+        let mut waiting = inactive.clone();
+        waiting.write_port(0x40, 0);
+        waiting.write_port(0x40, 0);
+
+        assert_eq!(inactive.counters[0].state, CounterState::Inactive);
+        assert_eq!(waiting.counters[0].state, CounterState::WaitGate);
+        assert_eq!(canonical_payload(&inactive), canonical_payload(&waiting));
+        assert_eq!(inactive.tick(10), waiting.tick(10));
+        inactive.write_port(0x43, 0x00);
+        waiting.write_port(0x43, 0x00);
+        assert_eq!(inactive.read_port(0x40), waiting.read_port(0x40));
+        inactive.write_port(0x40, 0x34);
+        waiting.write_port(0x40, 0x34);
+        assert_eq!(canonical_payload(&inactive), canonical_payload(&waiting));
+        inactive.write_port(0x40, 0x12);
+        waiting.write_port(0x40, 0x12);
+        inactive.set_gate(0, false);
+        waiting.set_gate(0, false);
+        inactive.set_gate(0, true);
+        waiting.set_gate(0, true);
+        assert_eq!(inactive.tick(0x1235), waiting.tick(0x1235));
+        assert_eq!(canonical_payload(&inactive), canonical_payload(&waiting));
+    }
+}
+
+#[test]
+fn canonical_pit_normalizes_unread_latch_bytes_and_inactive_phases() {
+    let cases = [
+        (RwMode::Lsb, false, 0x12aa, 0x34aa),
+        (RwMode::Msb, false, 0xbb12, 0xbb34),
+        (RwMode::LsbThenMsb, true, 0xcc12, 0xcc34),
+    ];
+    for (rw, read_msb_next, left_latch, right_latch) in cases {
+        let left_counter = Counter {
+            rw,
+            latch: Some(left_latch),
+            read_msb_next,
+            ..Counter::default()
+        };
+        let mut right_counter = left_counter.clone();
+        right_counter.latch = Some(right_latch);
+        let mut left = pit_with_counter(0, left_counter);
+        let mut right = pit_with_counter(0, right_counter);
+        assert_eq!(canonical_payload(&left), canonical_payload(&right));
+        assert_eq!(left.read_port(0x40), right.read_port(0x40));
+        assert_eq!(canonical_payload(&left), canonical_payload(&right));
+    }
+
+    for rw in [RwMode::Lsb, RwMode::Msb] {
+        let left_counter = Counter {
+            rw,
+            write_msb_next: false,
+            read_msb_next: false,
+            ..Counter::default()
+        };
+        let mut right_counter = left_counter.clone();
+        right_counter.write_msb_next = true;
+        right_counter.read_msb_next = true;
+        let mut left = pit_with_counter(0, left_counter);
+        let mut right = pit_with_counter(0, right_counter);
+        assert_eq!(canonical_payload(&left), canonical_payload(&right));
+        assert_eq!(left.read_port(0x40), right.read_port(0x40));
+        left.write_port(0x40, 0x5a);
+        right.write_port(0x40, 0x5a);
+        assert_eq!(canonical_payload(&left), canonical_payload(&right));
+    }
+}
+
+#[test]
+fn canonical_pit_preserves_full_range_counting_element() {
+    for mode in 0..=5 {
+        for bcd in [false, true] {
+            let mut pit = Pit::default();
+            program_ch0(&mut pit, 0x30 | (mode << 1) | u8::from(bcd), 0);
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, false);
+                pit.set_gate(0, true);
+            } else {
+                pit.tick(1);
+            }
+            assert_eq!(pit.counters[0].state, CounterState::Counting);
+            assert_eq!(pit.counters[0].count, 0x1_0000);
+            assert_eq!(
+                &canonical_payload(&pit)[3..7],
+                &[0x00, 0x00, 0x01, 0x00],
+                "mode {mode}, bcd {bcd}"
+            );
+
+            let deadline = pit.clocks_until_channel0_irq();
+            let mut captured = pit.clone();
+            let before = canonical_payload(&captured);
+            assert_eq!(before, canonical_payload(&captured));
+            assert_eq!(pit.tick(1), captured.tick(1));
+            assert_eq!(
+                pit.clocks_until_channel0_irq(),
+                captured.clocks_until_channel0_irq()
+            );
+            assert_eq!(canonical_payload(&pit), canonical_payload(&captured));
+            assert!(deadline.is_some(), "mode {mode}, bcd {bcd}");
+        }
+    }
+}
+
+#[test]
+fn canonical_pit_capture_preserves_half_writes_in_one_shot_and_periodic_modes() {
+    let mut mode0 = Pit::default();
+    let mut mode0_twin = Pit::default();
+    for pit in [&mut mode0, &mut mode0_twin] {
+        pit.write_port(0x43, CW_MODE0);
+        pit.write_port(0x40, 0x34);
+    }
+    let mode0_mid = canonical_payload(&mode0);
+    assert_eq!(mode0_mid, canonical_payload(&mode0));
+    assert_eq!(mode0_mid[18], 1);
+    assert_eq!(&mode0_mid[7..9], &[0x34, 0x00]);
+    assert_eq!(mode0_mid[9], 0);
+    assert_eq!(mode0_mid[11], 0);
+    mode0.write_port(0x40, 0x12);
+    mode0_twin.write_port(0x40, 0x12);
+    assert_eq!(mode0.tick(0x1235), mode0_twin.tick(0x1235));
+    assert_eq!(canonical_payload(&mode0), canonical_payload(&mode0_twin));
+
+    let mut periodic = Pit::default();
+    program_ch0(&mut periodic, CW_MODE2, 7);
+    periodic.tick(1);
+    let mut periodic_twin = periodic.clone();
+    periodic.write_port(0x40, 0x0b);
+    periodic_twin.write_port(0x40, 0x0b);
+    let periodic_mid = canonical_payload(&periodic);
+    assert_eq!(periodic_mid, canonical_payload(&periodic));
+    assert_eq!(periodic_mid[18], 1);
+    assert_eq!(periodic_mid[11], 2);
+    periodic.write_port(0x40, 0x00);
+    periodic_twin.write_port(0x40, 0x00);
+    assert_eq!(periodic.tick(50), periodic_twin.tick(50));
+    assert_eq!(
+        canonical_payload(&periodic),
+        canonical_payload(&periodic_twin)
+    );
+}
+
+#[test]
+fn canonical_pit_capture_preserves_an_unlatched_live_half_read() {
+    let mut captured = Pit::default();
+    program_ch0(&mut captured, CW_MODE0, 0x0101);
+    captured.tick(1);
+    let mut twin = captured.clone();
+
+    assert_eq!(captured.read_port(0x40), Some(0x01));
+    assert_eq!(twin.read_port(0x40), Some(0x01));
+    let half_read = canonical_payload(&captured);
+    assert_eq!(half_read, canonical_payload(&captured));
+    assert_eq!(half_read[13], 0);
+    assert_eq!(half_read[19], 1);
+
+    captured.tick(2);
+    twin.tick(2);
+    assert_eq!(captured.read_port(0x40), Some(0x00));
+    assert_eq!(twin.read_port(0x40), Some(0x00));
+    assert_eq!(canonical_payload(&captured), canonical_payload(&twin));
+}
+
+#[test]
+fn canonical_pit_matches_split_continuation_across_modes_radices_and_gates() {
+    for mode in 0..=5 {
+        for bcd in [false, true] {
+            let control = 0x30 | (mode << 1) | u8::from(bcd);
+            let count = if bcd { 0x0050 } else { 50 };
+            let mut whole = Pit::default();
+            program_ch0(&mut whole, control, count);
+            if matches!(mode, 1 | 5) {
+                whole.set_gate(0, false);
+                whole.set_gate(0, true);
+            }
+            let mut split = whole.clone();
+
+            assert_eq!(canonical_payload(&whole), canonical_payload(&split));
+            whole.tick(1);
+            split.tick(1);
+            whole.set_gate(0, false);
+            split.set_gate(0, false);
+            let whole_paused_edges = whole.tick(7);
+            let split_paused_edges = split.tick(2) + split.tick(5);
+            assert_eq!(whole_paused_edges, split_paused_edges);
+            whole.set_gate(0, true);
+            split.set_gate(0, true);
+            let whole_edges = whole.tick(130);
+            let split_edges = split.tick(1) + split.tick(17) + split.tick(41) + split.tick(71);
+
+            assert_eq!(whole_edges, split_edges, "mode {mode}, bcd {bcd}");
+            assert_eq!(
+                canonical_payload(&whole),
+                canonical_payload(&split),
+                "mode {mode}, bcd {bcd}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -12,6 +12,7 @@ use crate::{
         cache_level_config, code_fetch_ws, tier_cost,
     },
     pic::CanonicalPic8259Pair,
+    pit::CanonicalPit,
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
 };
 
@@ -31,7 +32,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 8] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 9] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -72,6 +73,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0005,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -105,6 +111,10 @@ const _: () = {
         sections[7].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[8].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -112,6 +122,7 @@ const _: () = {
     assert!(sections[4].id < sections[5].id);
     assert!(sections[5].id < sections[6].id);
     assert!(sections[6].id < sections[7].id);
+    assert!(sections[7].id < sections[8].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -421,6 +432,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     modeled_cache: CanonicalModeledCacheProjection<'a>,
     ram_rom: CanonicalRamRomProjection<'a>,
     pic: CanonicalPic8259Pair<'a>,
+    pit: CanonicalPit<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -472,6 +484,18 @@ impl CanonicalMachineStateCapture<'_> {
         out: &mut CanonicalFieldWriter<'_>,
     ) -> Result<(), CanonicalStateError> {
         self.pic.write_payload(out)
+    }
+
+    /// Writes the required Machine PIT owner payload.
+    ///
+    /// The three fixed counter records preserve live timing and destructive
+    /// read state without duplicating the PIT clock phase owned by the timeline.
+    #[allow(dead_code)]
+    pub(crate) fn write_pit_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.pit.write_payload(out)
     }
 }
 
@@ -560,6 +584,7 @@ impl Machine {
             rom: self.rom.as_slice(),
         };
         let pic = self.pic.canonical_projection();
+        let pit = self.pit.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -613,6 +638,7 @@ impl Machine {
             modeled_cache,
             ram_rom,
             pic,
+            pit,
         })
     }
 }
@@ -640,6 +666,7 @@ mod tests {
     const MACHINE_CONTROL_TIMING_PAYLOAD_LEN: usize = 163;
     const EMPTY_MODELED_CACHE_PAYLOAD_LEN: usize = 16;
     const PIC_PAYLOAD_LEN: usize = 34;
+    const PIT_PAYLOAD_LEN: usize = 60;
     const TEST_MEMORY_MIB: u16 = 2;
 
     fn test_machine() -> Machine {
@@ -732,6 +759,33 @@ mod tests {
         let bytes = state.finish().unwrap();
         let view = CanonicalStateView::parse(&bytes).unwrap();
         view.sections()[0].payload().to_vec()
+    }
+
+    fn pit_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0005).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_pit_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
+    fn write_pit_port(machine: &mut Machine, port: u16, value: u8) {
+        let mut bus = machine.make_bus();
+        bus.write_io(port, BusWidth::Byte, u32::from(value), false)
+            .unwrap();
+    }
+
+    fn read_pit_port(machine: &mut Machine, port: u16) -> u8 {
+        let mut bus = machine.make_bus();
+        u8::try_from(bus.read_io(port, BusWidth::Byte, 0, false).unwrap()).unwrap()
     }
 
     fn write_pic_port(machine: &mut Machine, port: u16, value: u8) {
@@ -862,6 +916,7 @@ mod tests {
                 (0x0002_0002, 1),
                 (0x0002_0003, 1),
                 (0x0002_0004, 1),
+                (0x0002_0005, 1),
             ]
         );
         assert!(
@@ -891,6 +946,10 @@ mod tests {
         );
         assert_eq!(
             sections[7].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+        assert_eq!(
+            sections[8].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
     }
@@ -1641,6 +1700,7 @@ mod tests {
         assert_eq!(machine.pending_soft_int, Some(0x21));
         assert!(machine.pic.irr_bit(5));
         assert_eq!(payload[0] & (1 << 5), 1 << 5);
+        assert_eq!(pit_payload(&machine).len(), PIT_PAYLOAD_LEN);
     }
 
     #[test]
@@ -1707,6 +1767,158 @@ mod tests {
         assert_eq!(settled[17] & (1 << 2), 0);
         assert_eq!(settled[18] & (1 << 2), 0);
         assert_eq!(settled[19] & (1 << 2), 0);
+    }
+
+    #[test]
+    fn pit_capture_preserves_status_and_count_latch_read_order() {
+        fn configured() -> Machine {
+            let mut machine = test_machine();
+            write_pit_port(&mut machine, 0x43, 0x36);
+            write_pit_port(&mut machine, 0x40, 0x34);
+            write_pit_port(&mut machine, 0x40, 0x12);
+            machine.advance_devices_clocks(1_000);
+            write_pit_port(&mut machine, 0x43, 0xc2);
+            machine.advance_devices_clocks(1_000);
+            machine
+        }
+
+        let mut captured = configured();
+        let mut twin = configured();
+        assert_eq!(captured.pit, twin.pit);
+        assert_eq!(captured.timeline, twin.timeline);
+
+        let frozen = pit_payload(&captured);
+        assert_eq!(frozen.len(), PIT_PAYLOAD_LEN);
+        assert_eq!(frozen, pit_payload(&captured));
+        assert_eq!(frozen[13], 1);
+        assert_eq!(frozen[16], 1);
+
+        assert_eq!(read_pit_port(&mut captured, 0x40), frozen[17]);
+        assert_eq!(read_pit_port(&mut twin, 0x40), frozen[17]);
+        let after_status = pit_payload(&captured);
+        assert_eq!(after_status[13], 1);
+        assert_eq!(&after_status[16..18], &[0, 0]);
+        assert_eq!(captured.pit, twin.pit);
+
+        assert_eq!(read_pit_port(&mut captured, 0x40), frozen[14]);
+        assert_eq!(read_pit_port(&mut twin, 0x40), frozen[14]);
+        let half_read = pit_payload(&captured);
+        assert_eq!(half_read, pit_payload(&captured));
+        assert_eq!(half_read[13], 1);
+        assert_eq!(half_read[14], 0);
+        assert_eq!(half_read[15], frozen[15]);
+        assert_eq!(half_read[19], 1);
+
+        assert_eq!(read_pit_port(&mut captured, 0x40), frozen[15]);
+        assert_eq!(read_pit_port(&mut twin, 0x40), frozen[15]);
+        let consumed = pit_payload(&captured);
+        assert_eq!(&consumed[13..16], &[0, 0, 0]);
+        assert_eq!(consumed[19], 0);
+        assert_eq!(captured.pit, twin.pit);
+        assert_eq!(captured.timeline, twin.timeline);
+        assert_eq!(captured.pic, twin.pic);
+    }
+
+    #[test]
+    fn pit_capture_preserves_the_exact_586_irq0_deadline() {
+        fn configured() -> Machine {
+            let mut machine = test_machine();
+            machine.set_mode(GswMode::Gsw586);
+            initialize_pic_pair(&mut machine, false);
+            write_pit_port(&mut machine, 0x43, 0x34);
+            write_pit_port(&mut machine, 0x40, 4);
+            write_pit_port(&mut machine, 0x40, 0);
+            machine
+        }
+
+        let mut captured = configured();
+        let mut twin = configured();
+        let pit_clocks = captured.clocks_until_timer0_irq().unwrap();
+        let deadline = captured
+            .timeline
+            .cpu_clocks_until(
+                crate::timeline::DeviceClock::Pit,
+                pit_clocks,
+                u64::from(crate::PIT_INPUT_HZ),
+            )
+            .unwrap();
+        assert!(deadline > 1);
+
+        let before = pit_payload(&captured);
+        assert_eq!(before, pit_payload(&captured));
+        assert_eq!(captured.pit, twin.pit);
+        assert_eq!(captured.timeline, twin.timeline);
+        assert_eq!(captured.pic, twin.pic);
+
+        captured.advance_devices_clocks(deadline - 1);
+        twin.advance_devices_clocks(deadline - 1);
+        assert!(!captured.pic.irr_bit(0));
+        assert!(!twin.pic.irr_bit(0));
+        assert_eq!(pit_payload(&captured), pit_payload(&twin));
+        assert_eq!(
+            machine_control_timing_payload(&captured),
+            machine_control_timing_payload(&twin)
+        );
+        assert_eq!(pic_payload(&captured), pic_payload(&twin));
+
+        captured.advance_devices_clocks(1);
+        twin.advance_devices_clocks(1);
+        assert!(captured.pic.irr_bit(0));
+        assert!(twin.pic.irr_bit(0));
+        assert_eq!(captured.pit, twin.pit);
+        assert_eq!(captured.timeline, twin.timeline);
+        assert_eq!(captured.pic, twin.pic);
+        assert_eq!(pit_payload(&captured), pit_payload(&twin));
+        assert_eq!(
+            machine_control_timing_payload(&captured),
+            machine_control_timing_payload(&twin)
+        );
+        assert_eq!(pic_payload(&captured), pic_payload(&twin));
+        assert_eq!(captured.pic.acknowledge(), Some(0x20));
+        assert_eq!(twin.pic.acknowledge(), Some(0x20));
+    }
+
+    #[test]
+    fn pit_timeline_and_pic_payloads_match_split_586_advancement() {
+        fn configured() -> Machine {
+            let mut machine = test_machine();
+            machine.set_mode(GswMode::Gsw586);
+            initialize_pic_pair(&mut machine, false);
+            write_pit_port(&mut machine, 0x43, 0x34);
+            write_pit_port(&mut machine, 0x40, 7);
+            write_pit_port(&mut machine, 0x40, 0);
+            machine
+        }
+
+        let mut whole = configured();
+        let mut split = configured();
+        let pit_clocks = whole.clocks_until_timer0_irq().unwrap();
+        let first_deadline = whole
+            .timeline
+            .cpu_clocks_until(
+                crate::timeline::DeviceClock::Pit,
+                pit_clocks,
+                u64::from(crate::PIT_INPUT_HZ),
+            )
+            .unwrap();
+        let total = first_deadline * 5 + 17;
+        whole.advance_devices_clocks(total);
+        let parts = [1, 17, first_deadline, first_deadline * 2];
+        for clocks in parts {
+            split.advance_devices_clocks(clocks);
+        }
+        split.advance_devices_clocks(total - parts.into_iter().sum::<u64>());
+
+        assert!(whole.pic.irr_bit(0));
+        assert_eq!(whole.pit, split.pit);
+        assert_eq!(whole.timeline, split.timeline);
+        assert_eq!(whole.pic, split.pic);
+        assert_eq!(pit_payload(&whole), pit_payload(&split));
+        assert_eq!(
+            machine_control_timing_payload(&whole),
+            machine_control_timing_payload(&split)
+        );
+        assert_eq!(pic_payload(&whole), pic_payload(&split));
     }
 
     #[test]
@@ -2257,6 +2469,18 @@ mod tests {
             vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN]
         );
         assert_eq!(pic_payload(&machine).len(), PIC_PAYLOAD_LEN);
+        let pit_before = machine.pit.clone();
+        let timeline_before = machine.timeline;
+        let pic_before = machine.pic.clone();
+        let trace_before = machine.trace.elapsed_clocks();
+        let first_pit = pit_payload(&machine);
+        let second_pit = pit_payload(&machine);
+        assert_eq!(first_pit.len(), PIT_PAYLOAD_LEN);
+        assert_eq!(first_pit, second_pit);
+        assert_eq!(machine.pit, pit_before);
+        assert_eq!(machine.timeline, timeline_before);
+        assert_eq!(machine.pic, pic_before);
+        assert_eq!(machine.trace.elapsed_clocks(), trace_before);
         let payload = ram_rom_payload(&machine);
         let mut cursor = 0;
         assert_eq!(

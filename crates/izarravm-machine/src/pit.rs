@@ -10,6 +10,8 @@
 //! BCD counting decrements in decimal (reload 0 means 10000). Channel 1 and 2 OUT
 //! are exposed through channel_out; the nanosecond AC timing is out of scope.
 
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+
 /// One 8254 counter. The counting element `count` decrements on each input CLK;
 /// `reload` is the programmed count (0 means 65536). All six modes are modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,6 +665,102 @@ pub(crate) struct Pit {
     counters: [Counter; 3],
 }
 
+/// Borrowed, behaviorally effective PIT state for canonical comparison.
+///
+/// Counter order is fixed by the 8254 channel numbering. The projection keeps
+/// live timing state while removing history that no later port read, counter
+/// transition, or deadline can observe.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalPit<'a> {
+    pit: &'a Pit,
+}
+
+const fn rw_mode_tag(rw: RwMode) -> u8 {
+    match rw {
+        RwMode::Lsb => 0,
+        RwMode::Msb => 1,
+        RwMode::LsbThenMsb => 2,
+    }
+}
+
+const fn counter_state_tag(state: CounterState) -> u8 {
+    match state {
+        // Both states hold OUT and ignore input clocks. Every port, GATE, and
+        // prediction path treats them identically until the next programming
+        // operation or trigger.
+        CounterState::Inactive | CounterState::WaitGate => 0,
+        CounterState::LoadDelay => 1,
+        CounterState::Counting => 2,
+    }
+}
+
+fn canonical_count(counter: &Counter) -> u32 {
+    let retain_full_count = counter.state == CounterState::Counting
+        && match counter.mode {
+            0 | 1 => !counter.out,
+            2 | 3 => true,
+            4 | 5 => counter.out,
+            _ => false,
+        };
+    if retain_full_count {
+        counter.count
+    } else {
+        counter.count & 0xffff
+    }
+}
+
+fn canonical_latch(counter: &Counter) -> (bool, u16) {
+    let Some(value) = counter.latch else {
+        return (false, 0);
+    };
+    let value = match counter.rw {
+        RwMode::Lsb => value & 0x00ff,
+        RwMode::Msb => value & 0xff00,
+        RwMode::LsbThenMsb if counter.read_msb_next => value & 0xff00,
+        RwMode::LsbThenMsb => value,
+    };
+    (true, value)
+}
+
+fn write_canonical_counter(
+    out: &mut CanonicalFieldWriter<'_>,
+    counter: &Counter,
+) -> Result<(), CanonicalStateError> {
+    let (latch_present, latch) = canonical_latch(counter);
+    let (status_present, status) = counter
+        .status_latch
+        .map_or((false, 0), |value| (true, value));
+    let dual_byte = counter.rw == RwMode::LsbThenMsb;
+    out.write_u8(counter.mode)?;
+    out.write_u8(rw_mode_tag(counter.rw))?;
+    out.write_bool(counter.bcd)?;
+    out.write_u32(canonical_count(counter))?;
+    out.write_u16(counter.reload)?;
+    out.write_bool(counter.out)?;
+    out.write_bool(counter.gate)?;
+    out.write_u8(counter_state_tag(counter.state))?;
+    out.write_bool(counter.null_count)?;
+    out.write_bool(latch_present)?;
+    out.write_u16(latch)?;
+    out.write_bool(status_present)?;
+    out.write_u8(status)?;
+    out.write_bool(dual_byte && counter.write_msb_next)?;
+    out.write_bool(dual_byte && counter.read_msb_next)
+}
+
+impl CanonicalPit<'_> {
+    /// Writes version 1 of the fixed 60-byte three-counter PIT payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        for counter in &self.pit.counters {
+            write_canonical_counter(out, counter)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutTransition {
     pub(crate) tick: u64,
@@ -687,6 +785,10 @@ impl Default for Pit {
 }
 
 impl Pit {
+    pub(crate) fn canonical_projection(&self) -> CanonicalPit<'_> {
+        CanonicalPit { pit: self }
+    }
+
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
         match port {
             0x40..=0x42 => self.counters[(port - 0x40) as usize].write_count(value),
