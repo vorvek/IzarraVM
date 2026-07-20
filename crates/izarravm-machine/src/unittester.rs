@@ -121,6 +121,11 @@ impl UnitTester {
         self.pending.take()
     }
 
+    /// Return the deferred command without consuming it.
+    pub(crate) const fn pending_command(&self) -> Option<u8> {
+        self.pending
+    }
+
     /// The rectangle the guest programmed, as `(x, y, w, h)`.
     pub fn rect(&self) -> (u16, u16, u16, u16) {
         (

@@ -36,6 +36,7 @@ mod atapi;
 mod bios;
 mod bmide;
 mod bus;
+mod canonical_state;
 mod cdimage;
 mod dma;
 mod dos;
@@ -116,6 +117,8 @@ mod speaker;
 mod storage;
 mod uart;
 mod unittester;
+
+pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
 
 pub use cdimage::CdImage;
 pub use iso9660::{MAX_IMAGE_BYTES as CD_FOLDER_MAX_BYTES, build as build_cd_folder};
