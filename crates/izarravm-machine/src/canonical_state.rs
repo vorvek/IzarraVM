@@ -11,6 +11,7 @@ use crate::{
         CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK,
         cache_level_config, code_fetch_ws, tier_cost,
     },
+    dma::{CanonicalDma8237Pair, CanonicalDmaEventTotalsV1},
     pic::CanonicalPic8259Pair,
     pit::CanonicalPit,
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
@@ -32,7 +33,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 9] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 10] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -78,6 +79,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0006,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -115,6 +121,10 @@ const _: () = {
         sections[8].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[9].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -123,6 +133,7 @@ const _: () = {
     assert!(sections[5].id < sections[6].id);
     assert!(sections[6].id < sections[7].id);
     assert!(sections[7].id < sections[8].id);
+    assert!(sections[8].id < sections[9].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -433,6 +444,8 @@ pub struct CanonicalMachineStateCapture<'a> {
     ram_rom: CanonicalRamRomProjection<'a>,
     pic: CanonicalPic8259Pair<'a>,
     pit: CanonicalPit<'a>,
+    dma: CanonicalDma8237Pair<'a>,
+    dma_event_totals: CanonicalDmaEventTotalsV1<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -496,6 +509,28 @@ impl CanonicalMachineStateCapture<'_> {
         out: &mut CanonicalFieldWriter<'_>,
     ) -> Result<(), CanonicalStateError> {
         self.pit.write_payload(out)
+    }
+
+    /// Writes the required Machine DMA semantic-state owner payload.
+    #[allow(dead_code)]
+    pub(crate) fn write_dma_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.dma.write_payload(out)
+    }
+
+    /// Writes version 1 of the exact DMA event totals for CorrectnessOracle.
+    ///
+    /// This record is not a StateSnapshotV1 section and is never allowlisted as
+    /// a JIT mechanism counter. The future oracle composer will enclose it in
+    /// its own versioned deterministic-evidence artifact.
+    #[allow(dead_code)]
+    pub(crate) fn write_dma_event_totals_v1_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.dma_event_totals.write_payload(out)
     }
 }
 
@@ -585,6 +620,8 @@ impl Machine {
         };
         let pic = self.pic.canonical_projection();
         let pit = self.pit.canonical_projection();
+        let dma = self.dma.canonical_projection();
+        let dma_event_totals = self.dma.canonical_event_totals_v1();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -639,6 +676,8 @@ impl Machine {
             ram_rom,
             pic,
             pit,
+            dma,
+            dma_event_totals,
         })
     }
 }
@@ -667,6 +706,9 @@ mod tests {
     const EMPTY_MODELED_CACHE_PAYLOAD_LEN: usize = 16;
     const PIC_PAYLOAD_LEN: usize = 34;
     const PIT_PAYLOAD_LEN: usize = 60;
+    const DMA_PAYLOAD_LEN: usize = 152;
+    const DMA_EVENT_TOTALS_V1_PAYLOAD_LEN: usize = 64;
+    const TEST_DMA_EVENT_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
     const TEST_MEMORY_MIB: u16 = 2;
 
     fn test_machine() -> Machine {
@@ -770,6 +812,48 @@ mod tests {
                 CanonicalSectionVersion::new(1).unwrap(),
                 CanonicalSectionRequirement::Required,
                 |out| capture.write_pit_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
+    fn dma_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        dma_payload_from_capture(&capture)
+    }
+
+    fn dma_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0006).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_dma_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
+    fn dma_event_totals_v1_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        dma_event_totals_v1_payload_from_capture(&capture)
+    }
+
+    fn dma_event_totals_v1_payload_from_capture(
+        capture: &CanonicalMachineStateCapture<'_>,
+    ) -> Vec<u8> {
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(TEST_DMA_EVENT_TOTALS_ENVELOPE_ID).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_dma_event_totals_v1_payload(out),
             )
             .unwrap();
         let bytes = state.finish().unwrap();
@@ -917,6 +1001,7 @@ mod tests {
                 (0x0002_0003, 1),
                 (0x0002_0004, 1),
                 (0x0002_0005, 1),
+                (0x0002_0006, 1),
             ]
         );
         assert!(
@@ -950,6 +1035,10 @@ mod tests {
         );
         assert_eq!(
             sections[8].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+        assert_eq!(
+            sections[9].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
     }
@@ -1686,6 +1775,41 @@ mod tests {
     }
 
     #[test]
+    fn dma_semantic_state_and_event_totals_share_one_read_only_capture() {
+        let mut machine = test_machine();
+        machine.dma.write_port(0x0c, 0);
+        machine.dma.write_port(0x00, 0x34);
+        machine.dma.master.channels[0].transfer_cycles = 17;
+        machine.dma.master.channels[2].transfer_cycles = 29;
+
+        let capture = machine.canonical_state_capture().unwrap();
+        let first_state = dma_payload_from_capture(&capture);
+        let first_totals = dma_event_totals_v1_payload_from_capture(&capture);
+        let second_totals = dma_event_totals_v1_payload_from_capture(&capture);
+        let second_state = dma_payload_from_capture(&capture);
+
+        assert_eq!(first_state.len(), DMA_PAYLOAD_LEN);
+        assert_eq!(first_totals.len(), DMA_EVENT_TOTALS_V1_PAYLOAD_LEN);
+        assert_eq!(first_state, second_state);
+        assert_eq!(first_totals, second_totals);
+        assert_eq!(first_state[0], 1, "half-write continuation is retained");
+        assert_eq!(
+            u64::from_le_bytes(first_totals[0..8].try_into().unwrap()),
+            17
+        );
+        assert_eq!(
+            u64::from_le_bytes(first_totals[16..24].try_into().unwrap()),
+            29
+        );
+        drop(capture);
+
+        machine.dma.write_port(0x00, 0x12);
+        assert_eq!(machine.dma.master.channels[0].base_addr, 0x1234);
+        assert_eq!(dma_event_totals_v1_payload(&machine), first_totals);
+        assert_ne!(dma_payload(&machine), first_state);
+    }
+
+    #[test]
     fn batch_scratch_and_pending_semantic_state_remain_captureable() {
         let mut machine = test_machine();
         machine.io_touched = true;
@@ -1701,6 +1825,11 @@ mod tests {
         assert!(machine.pic.irr_bit(5));
         assert_eq!(payload[0] & (1 << 5), 1 << 5);
         assert_eq!(pit_payload(&machine).len(), PIT_PAYLOAD_LEN);
+        assert_eq!(dma_payload(&machine).len(), DMA_PAYLOAD_LEN);
+        assert_eq!(
+            dma_event_totals_v1_payload(&machine).len(),
+            DMA_EVENT_TOTALS_V1_PAYLOAD_LEN
+        );
     }
 
     #[test]
@@ -2481,6 +2610,15 @@ mod tests {
         assert_eq!(machine.timeline, timeline_before);
         assert_eq!(machine.pic, pic_before);
         assert_eq!(machine.trace.elapsed_clocks(), trace_before);
+        let first_dma = dma_payload(&machine);
+        let first_dma_totals = dma_event_totals_v1_payload(&machine);
+        let second_dma_totals = dma_event_totals_v1_payload(&machine);
+        let second_dma = dma_payload(&machine);
+        assert_eq!(first_dma.len(), DMA_PAYLOAD_LEN);
+        assert_eq!(first_dma, second_dma);
+        assert_eq!(first_dma_totals.len(), DMA_EVENT_TOTALS_V1_PAYLOAD_LEN);
+        assert_eq!(first_dma_totals, second_dma_totals);
+        assert_eq!(first_dma_totals, vec![0; DMA_EVENT_TOTALS_V1_PAYLOAD_LEN]);
         let payload = ram_rom_payload(&machine);
         let mut cursor = 0;
         assert_eq!(

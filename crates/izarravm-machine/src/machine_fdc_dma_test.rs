@@ -2,7 +2,39 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use izarravm_core::MASTER_CLOCK_HZ;
+use izarravm_core::{
+    CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateView,
+    CanonicalStateWriter, MASTER_CLOCK_HZ,
+};
+
+fn canonical_dma_records(machine: &Machine) -> (Vec<u8>, Vec<u8>) {
+    fn finish(writer: CanonicalStateWriter) -> Vec<u8> {
+        let bytes = writer.finish().unwrap();
+        CanonicalStateView::parse(&bytes).unwrap().sections()[0]
+            .payload()
+            .to_vec()
+    }
+
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_0006).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| machine.dma.canonical_projection().write_payload(out),
+        )
+        .unwrap();
+    let mut totals = CanonicalStateWriter::new().unwrap();
+    totals
+        .section(
+            CanonicalSectionId::new(0x7ffe_0001).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| machine.dma.canonical_event_totals_v1().write_payload(out),
+        )
+        .unwrap();
+    (finish(state), finish(totals))
+}
 
 fn clear_reset_interrupt(bus: &mut MachineBus<'_>) {
     bus.write_io(0x3F5, BusWidth::Byte, 0x08, false).unwrap();
@@ -158,6 +190,15 @@ fn fdc_and_dma_results_are_invariant_to_advance_batch_size() {
     assert_eq!(whole_bytes, split_bytes);
     assert_eq!(whole.dma.master.channels[2], split.dma.master.channels[2]);
     assert_eq!(whole.dma.master.channels[2].transfer_cycles, 512);
+    let whole_records = canonical_dma_records(&whole);
+    let split_records = canonical_dma_records(&split);
+    assert_eq!(whole_records, split_records);
+    assert_eq!(whole_records.0.len(), 152);
+    assert_eq!(whole_records.1.len(), 64);
+    assert_eq!(
+        u64::from_le_bytes(whole_records.1[16..24].try_into().unwrap()),
+        512
+    );
     assert_eq!(drain_fdc_result(&mut whole), drain_fdc_result(&mut split));
     assert!(whole.pic.interrupt_pending());
     assert!(split.pic.interrupt_pending());
