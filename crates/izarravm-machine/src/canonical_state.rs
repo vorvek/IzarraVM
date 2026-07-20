@@ -11,6 +11,7 @@ use crate::{
         CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK,
         cache_level_config, code_fetch_ws, tier_cost,
     },
+    pic::CanonicalPic8259Pair,
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
 };
 
@@ -30,7 +31,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 7] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 8] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -66,6 +67,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0004,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -95,12 +101,17 @@ const _: () = {
         sections[6].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[7].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
     assert!(sections[3].id < sections[4].id);
     assert!(sections[4].id < sections[5].id);
     assert!(sections[5].id < sections[6].id);
+    assert!(sections[6].id < sections[7].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -409,6 +420,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     machine_control: CanonicalMachineControl,
     modeled_cache: CanonicalModeledCacheProjection<'a>,
     ram_rom: CanonicalRamRomProjection<'a>,
+    pic: CanonicalPic8259Pair<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -448,6 +460,18 @@ impl CanonicalMachineStateCapture<'_> {
         out: &mut CanonicalFieldWriter<'_>,
     ) -> Result<(), CanonicalStateError> {
         self.ram_rom.write_payload(out)
+    }
+
+    /// Writes the required Machine PIC-pair owner payload.
+    ///
+    /// The payload retains every behaviorally effective interrupt-controller
+    /// latch while projecting out ICW bits that this model never consumes.
+    #[allow(dead_code)]
+    pub(crate) fn write_pic_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.pic.write_payload(out)
     }
 }
 
@@ -535,6 +559,7 @@ impl Machine {
             ram: self.memory.as_slice(),
             rom: self.rom.as_slice(),
         };
+        let pic = self.pic.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -587,6 +612,7 @@ impl Machine {
             machine_control,
             modeled_cache,
             ram_rom,
+            pic,
         })
     }
 }
@@ -613,6 +639,7 @@ mod tests {
 
     const MACHINE_CONTROL_TIMING_PAYLOAD_LEN: usize = 163;
     const EMPTY_MODELED_CACHE_PAYLOAD_LEN: usize = 16;
+    const PIC_PAYLOAD_LEN: usize = 34;
     const TEST_MEMORY_MIB: u16 = 2;
 
     fn test_machine() -> Machine {
@@ -689,6 +716,44 @@ mod tests {
         let bytes = state.finish().unwrap();
         let view = CanonicalStateView::parse(&bytes).unwrap();
         view.sections()[0].payload().to_vec()
+    }
+
+    fn pic_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0004).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_pic_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
+    fn write_pic_port(machine: &mut Machine, port: u16, value: u8) {
+        let mut bus = machine.make_bus();
+        bus.write_io(port, BusWidth::Byte, u32::from(value), false)
+            .unwrap();
+    }
+
+    fn read_pic_port(machine: &mut Machine, port: u16) -> u8 {
+        let mut bus = machine.make_bus();
+        u8::try_from(bus.read_io(port, BusWidth::Byte, 0, false).unwrap()).unwrap()
+    }
+
+    fn initialize_pic_pair(machine: &mut Machine, level_triggered: bool) {
+        let icw1 = if level_triggered { 0x19 } else { 0x11 };
+        for (command, data, vector, cascade) in [(0x20, 0x21, 0x20, 0x04), (0xa0, 0xa1, 0x70, 0x02)]
+        {
+            write_pic_port(machine, command, icw1);
+            write_pic_port(machine, data, vector);
+            write_pic_port(machine, data, cascade);
+            write_pic_port(machine, data, 0x01);
+        }
     }
 
     fn warm_modeled_cache_line(machine: &mut Machine, mode: GswMode, line: u32) {
@@ -796,6 +861,7 @@ mod tests {
                 (0x0002_0001, 1),
                 (0x0002_0002, 1),
                 (0x0002_0003, 1),
+                (0x0002_0004, 1),
             ]
         );
         assert!(
@@ -821,6 +887,10 @@ mod tests {
         );
         assert_eq!(
             sections[6].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+        assert_eq!(
+            sections[7].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
     }
@@ -1565,10 +1635,78 @@ mod tests {
 
         let capture = machine.canonical_state_capture().unwrap();
         drop(capture);
+        let payload = pic_payload(&machine);
 
         assert!(machine.io_touched);
         assert_eq!(machine.pending_soft_int, Some(0x21));
         assert!(machine.pic.irr_bit(5));
+        assert_eq!(payload[0] & (1 << 5), 1 << 5);
+    }
+
+    #[test]
+    fn pic_capture_preserves_an_armed_destructive_poll_read() {
+        let mut machine = test_machine();
+        initialize_pic_pair(&mut machine, false);
+        machine.pic.request(3);
+        write_pic_port(&mut machine, 0x20, 0x0c);
+
+        let first = pic_payload(&machine);
+        let second = pic_payload(&machine);
+
+        assert_eq!(first.len(), PIC_PAYLOAD_LEN);
+        assert_eq!(first, second);
+        assert_eq!(first[12], 1);
+        assert_eq!(read_pic_port(&mut machine, 0x20), 0x83);
+        let consumed = pic_payload(&machine);
+        assert_eq!(consumed[12], 0);
+        assert_eq!(consumed[2] & (1 << 3), 1 << 3);
+    }
+
+    #[test]
+    fn pic_payload_preserves_held_master_and_slave_level_continuation() {
+        let mut machine = test_machine();
+        initialize_pic_pair(&mut machine, true);
+
+        machine.pic.set_irq_level(3, true);
+        let master_pending = pic_payload(&machine);
+        assert_eq!(master_pending[0] & (1 << 3), 1 << 3);
+        assert_eq!(master_pending[1] & (1 << 3), 1 << 3);
+        assert_eq!(machine.pic.acknowledge(), Some(0x23));
+        let master_in_service = pic_payload(&machine);
+        assert_eq!(master_in_service[0] & (1 << 3), 0);
+        assert_eq!(master_in_service[2] & (1 << 3), 1 << 3);
+        write_pic_port(&mut machine, 0x20, 0x20);
+        let master_reasserted = pic_payload(&machine);
+        assert_eq!(master_reasserted[0] & (1 << 3), 1 << 3);
+        assert_eq!(master_reasserted[2] & (1 << 3), 0);
+        machine.pic.set_irq_level(3, false);
+
+        machine.pic.set_irq_level(10, true);
+        let slave_pending = pic_payload(&machine);
+        assert_eq!(slave_pending[17] & (1 << 2), 1 << 2);
+        assert_eq!(slave_pending[18] & (1 << 2), 1 << 2);
+        assert_eq!(machine.pic.acknowledge(), Some(0x72));
+        let slave_in_service = pic_payload(&machine);
+        assert_eq!(slave_in_service[17] & (1 << 2), 0);
+        assert_eq!(slave_in_service[19] & (1 << 2), 1 << 2);
+        write_pic_port(&mut machine, 0xa0, 0x20);
+        write_pic_port(&mut machine, 0x20, 0x20);
+        let slave_reasserted = pic_payload(&machine);
+        assert_eq!(slave_reasserted[0] & (1 << 2), 1 << 2);
+        assert_eq!(slave_reasserted[1] & (1 << 2), 1 << 2);
+        assert_eq!(slave_reasserted[17] & (1 << 2), 1 << 2);
+        assert_eq!(slave_reasserted[19] & (1 << 2), 0);
+        assert_eq!(machine.pic.acknowledge(), Some(0x72));
+        machine.pic.set_irq_level(10, false);
+        write_pic_port(&mut machine, 0xa0, 0x20);
+        write_pic_port(&mut machine, 0x20, 0x20);
+        let settled = pic_payload(&machine);
+        assert_eq!(settled[0] & (1 << 2), 0);
+        assert_eq!(settled[1] & (1 << 2), 0);
+        assert_eq!(settled[2] & (1 << 2), 0);
+        assert_eq!(settled[17] & (1 << 2), 0);
+        assert_eq!(settled[18] & (1 << 2), 0);
+        assert_eq!(settled[19] & (1 << 2), 0);
     }
 
     #[test]
@@ -2118,6 +2256,7 @@ mod tests {
             modeled_cache_payload(&machine),
             vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN]
         );
+        assert_eq!(pic_payload(&machine).len(), PIC_PAYLOAD_LEN);
         let payload = ram_rom_payload(&machine);
         let mut cursor = 0;
         assert_eq!(

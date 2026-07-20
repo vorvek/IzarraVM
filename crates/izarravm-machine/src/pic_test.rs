@@ -2,6 +2,45 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_core::{
+    CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateView,
+    CanonicalStateWriter,
+};
+
+fn canonical_payload(pic: &Pic8259Pair) -> Vec<u8> {
+    let projection = pic.canonical_projection();
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_0004).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| projection.write_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn projection_equivalence_pair(
+    master_base: u8,
+    master_icw4: u8,
+    slave_base: u8,
+    slave_id: u8,
+    slave_icw4: u8,
+) -> Pic8259Pair {
+    let mut pic = Pic8259Pair::default();
+    pic.write_port(0x20, 0x11);
+    pic.write_port(0x21, master_base);
+    pic.write_port(0x21, 0x04);
+    pic.write_port(0x21, master_icw4);
+    pic.write_port(0xa0, 0x11);
+    pic.write_port(0xa1, slave_base);
+    pic.write_port(0xa1, slave_id);
+    pic.write_port(0xa1, slave_icw4);
+    pic
+}
 
 fn master_initialized() -> Pic8259Pair {
     let mut pic = Pic8259Pair::default();
@@ -32,6 +71,177 @@ fn level_pair() -> Pic8259Pair {
     pic.write_port(0xa1, 0x02);
     pic.write_port(0xa1, 0x01);
     pic
+}
+
+#[test]
+fn canonical_payload_pins_every_effective_field_for_both_chips() {
+    let pic = Pic8259Pair {
+        master: Pic {
+            irr: 0x11,
+            asserted: 0x12,
+            isr: 0x13,
+            imr: 0x14,
+            icw2: 0x1f,
+            icw3: 0x16,
+            init: InitStage::ExpectIcw2,
+            expect_icw4: true,
+            single: false,
+            level_triggered: true,
+            auto_eoi: false,
+            buffered: true,
+            is_master: false,
+            read_isr: true,
+            poll_pending: false,
+            special_mask: true,
+            sfnm: false,
+            lowest: 0x07,
+            auto_rotate: true,
+        },
+        slave: Pic {
+            irr: 0x21,
+            asserted: 0x22,
+            isr: 0x23,
+            imr: 0x24,
+            icw2: 0x2f,
+            icw3: 0xea,
+            init: InitStage::ExpectIcw4,
+            expect_icw4: false,
+            single: true,
+            level_triggered: false,
+            auto_eoi: true,
+            buffered: false,
+            is_master: true,
+            read_isr: false,
+            poll_pending: true,
+            special_mask: false,
+            sfnm: true,
+            lowest: 0x05,
+            auto_rotate: false,
+        },
+    };
+
+    let expected = vec![
+        0x11, 0x12, 0x13, 0x14, 0x18, 0x16, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x07, 0x00, 0x21, 0x22, 0x23, 0x24, 0x28, 0x02, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+        0x00, 0x00, 0x05, 0x00,
+    ];
+    let payload = canonical_payload(&pic);
+
+    assert_eq!(payload.len(), 34);
+    assert_eq!(payload, expected);
+}
+
+#[test]
+fn canonical_payload_pins_each_effective_boolean_offset_independently() {
+    for (slave, base) in [(false, 0), (true, 17)] {
+        let offsets: &[usize] = if slave {
+            &[7, 8, 9, 10, 11, 12, 13, 16]
+        } else {
+            &[7, 8, 9, 10, 11, 12, 13, 14, 16]
+        };
+        for &offset in offsets {
+            let mut pic = Pic8259Pair::default();
+            {
+                let target = if slave {
+                    &mut pic.slave
+                } else {
+                    &mut pic.master
+                };
+                if matches!(offset, 7 | 8) {
+                    target.init = InitStage::ExpectIcw2;
+                }
+                if offset == 16 {
+                    target.auto_eoi = true;
+                }
+            }
+            let before = canonical_payload(&pic);
+            let target = if slave {
+                &mut pic.slave
+            } else {
+                &mut pic.master
+            };
+            match offset {
+                7 => target.expect_icw4 = true,
+                8 => target.single = true,
+                9 => target.level_triggered = true,
+                10 => target.auto_eoi = true,
+                11 => target.read_isr = true,
+                12 => target.poll_pending = true,
+                13 => target.special_mask = true,
+                14 => target.sfnm = true,
+                16 => target.auto_rotate = true,
+                _ => unreachable!(),
+            }
+            let after = canonical_payload(&pic);
+            let changed: Vec<_> = before
+                .iter()
+                .zip(&after)
+                .enumerate()
+                .filter_map(|(index, (left, right))| (left != right).then_some(index))
+                .collect();
+
+            assert_eq!(changed, [base + offset]);
+            assert_eq!(before[base + offset], 0);
+            assert_eq!(after[base + offset], 1);
+        }
+    }
+}
+
+#[test]
+fn canonical_projection_normalizes_ready_initialization_residue() {
+    for (command, data, vector) in [(0x20, 0x21, 0x20), (0xa0, 0xa1, 0x70)] {
+        let mut full = Pic8259Pair::default();
+        full.write_port(command, 0x11);
+        full.write_port(data, vector);
+        full.write_port(data, 0x00);
+        full.write_port(data, 0x01);
+
+        let mut single = Pic8259Pair::default();
+        single.write_port(command, 0x12);
+        single.write_port(data, vector);
+
+        assert_ne!(full, single);
+        assert_eq!(canonical_payload(&full), canonical_payload(&single));
+        assert_eq!(full.read_port(data), single.read_port(data));
+
+        for pic in [&mut full, &mut single] {
+            pic.write_port(command, 0x11);
+            pic.write_port(data, vector);
+            pic.write_port(data, 0x00);
+            pic.write_port(data, 0x01);
+        }
+        assert_eq!(full, single);
+    }
+}
+
+#[test]
+fn canonical_projection_ignores_bits_that_cannot_change_continuation() {
+    let mut plain = projection_equivalence_pair(0x20, 0x01, 0x28, 0x02, 0x01);
+    let mut residue = projection_equivalence_pair(0x27, 0x0d, 0x2f, 0xfa, 0x19);
+    residue.write_port(0x20, 0x80);
+    residue.write_port(0xa0, 0x80);
+
+    assert_ne!(plain, residue);
+    assert_eq!(canonical_payload(&plain), canonical_payload(&residue));
+
+    plain.request(3);
+    residue.request(3);
+    assert_eq!(plain.acknowledge(), Some(0x23));
+    assert_eq!(residue.acknowledge(), Some(0x23));
+    plain.write_port(0x20, 0x20);
+    residue.write_port(0x20, 0x20);
+
+    plain.request(10);
+    residue.request(10);
+    assert_eq!(plain.acknowledge(), Some(0x2a));
+    assert_eq!(residue.acknowledge(), Some(0x2a));
+    plain.write_port(0xa0, 0x20);
+    residue.write_port(0xa0, 0x20);
+    plain.write_port(0x20, 0x20);
+    residue.write_port(0x20, 0x20);
+
+    assert_eq!(plain.interrupt_pending(), residue.interrupt_pending());
+    assert_eq!(canonical_payload(&plain), canonical_payload(&residue));
 }
 
 #[test]

@@ -8,6 +8,8 @@
 //! lowest-priority pointer), and ICW4 special fully nested mode is decoded and
 //! honored in the cascade decision.
 
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+
 /// One 8259A. The pair owns two of these plus the cascade routing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Pic {
@@ -291,7 +293,70 @@ pub(crate) struct Pic8259Pair {
     slave: Pic,
 }
 
+/// Borrowed, behaviorally effective PIC state for canonical comparison.
+///
+/// The buffered-controller role bits are stored by ICW4 but never affect this
+/// model. The ignored ICW2 and slave ICW3 bits are projected out for the same
+/// reason. Everything retained here can affect a later port read, interrupt
+/// decision, acknowledge, EOI, or edge transition.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalPic8259Pair<'a> {
+    pair: &'a Pic8259Pair,
+}
+
+const fn init_stage_tag(stage: InitStage) -> u8 {
+    match stage {
+        InitStage::Ready => 0,
+        InitStage::ExpectIcw2 => 1,
+        InitStage::ExpectIcw3 => 2,
+        InitStage::ExpectIcw4 => 3,
+    }
+}
+
+fn write_canonical_pic(
+    out: &mut CanonicalFieldWriter<'_>,
+    pic: &Pic,
+    cascade: u8,
+    master: bool,
+) -> Result<(), CanonicalStateError> {
+    let expect_icw4 =
+        matches!(pic.init, InitStage::ExpectIcw2 | InitStage::ExpectIcw3) && pic.expect_icw4;
+    let single = pic.init == InitStage::ExpectIcw2 && pic.single;
+    out.write_u8(pic.irr)?;
+    out.write_u8(pic.asserted)?;
+    out.write_u8(pic.isr)?;
+    out.write_u8(pic.imr)?;
+    out.write_u8(pic.icw2 & 0xf8)?;
+    out.write_u8(cascade)?;
+    out.write_u8(init_stage_tag(pic.init))?;
+    out.write_bool(expect_icw4)?;
+    out.write_bool(single)?;
+    out.write_bool(pic.level_triggered)?;
+    out.write_bool(pic.auto_eoi)?;
+    out.write_bool(pic.read_isr)?;
+    out.write_bool(pic.poll_pending)?;
+    out.write_bool(pic.special_mask)?;
+    out.write_bool(master && pic.sfnm)?;
+    out.write_u8(pic.lowest)?;
+    out.write_bool(pic.auto_eoi && pic.auto_rotate)
+}
+
+impl CanonicalPic8259Pair<'_> {
+    /// Writes version 1 of the fixed 34-byte PIC-pair payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        write_canonical_pic(out, &self.pair.master, self.pair.master.icw3, true)?;
+        write_canonical_pic(out, &self.pair.slave, self.pair.slave.icw3 & 0x07, false)
+    }
+}
+
 impl Pic8259Pair {
+    pub(crate) fn canonical_projection(&self) -> CanonicalPic8259Pair<'_> {
+        CanonicalPic8259Pair { pair: self }
+    }
+
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
         match port {
             0x20 | 0x21 => self.master.write_port(port, value),
