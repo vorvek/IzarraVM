@@ -15,6 +15,7 @@ use crate::{
     pic::CanonicalPic8259Pair,
     pit::CanonicalPit,
     rtc::CanonicalRtc,
+    speaker::CanonicalSpeaker,
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
     unittester::CanonicalUnitTester,
 };
@@ -35,7 +36,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 12] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 13] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -96,6 +97,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0009,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -145,6 +151,10 @@ const _: () = {
         sections[11].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[12].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -156,6 +166,7 @@ const _: () = {
     assert!(sections[8].id < sections[9].id);
     assert!(sections[9].id < sections[10].id);
     assert!(sections[10].id < sections[11].id);
+    assert!(sections[11].id < sections[12].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -470,6 +481,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     dma_event_totals: CanonicalDmaEventTotalsV1<'a>,
     rtc: CanonicalRtc<'a>,
     unit_tester: CanonicalUnitTester<'a>,
+    speaker: CanonicalSpeaker<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -580,6 +592,18 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.unit_tester.write_payload(out)
     }
+
+    /// Writes the required PC speaker control-latch owner payload.
+    ///
+    /// PIT channel 2 owns the live OUT and GATE lines. This byte retains the
+    /// two low port 0x61 bits exactly as the guest reads them back.
+    #[allow(dead_code)]
+    pub(crate) fn write_speaker_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.speaker.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -672,6 +696,7 @@ impl Machine {
         let dma_event_totals = self.dma.canonical_event_totals_v1();
         let rtc = self.rtc.canonical_projection();
         let unit_tester = self.unittester.canonical_projection();
+        let speaker = self.speaker.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -730,6 +755,7 @@ impl Machine {
             dma_event_totals,
             rtc,
             unit_tester,
+            speaker,
         })
     }
 }
@@ -762,6 +788,9 @@ mod tests {
     const DMA_EVENT_TOTALS_V1_PAYLOAD_LEN: usize = 64;
     const RTC_PAYLOAD_LEN: usize = 82;
     const UNIT_TESTER_PAYLOAD_LEN: usize = 33;
+    const SPEAKER_PAYLOAD_LEN: usize = 1;
+    const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
+    const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
     const TEST_DMA_EVENT_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
     const TEST_MEMORY_MIB: u16 = 2;
 
@@ -869,6 +898,10 @@ mod tests {
 
     fn pit_payload(machine: &Machine) -> Vec<u8> {
         let capture = machine.canonical_state_capture().unwrap();
+        pit_payload_from_capture(&capture)
+    }
+
+    fn pit_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
         let mut state = CanonicalStateWriter::new().unwrap();
         state
             .section(
@@ -963,6 +996,37 @@ mod tests {
         let bytes = state.finish().unwrap();
         let view = CanonicalStateView::parse(&bytes).unwrap();
         view.sections()[0].payload().to_vec()
+    }
+
+    fn speaker_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        speaker_payload_from_capture(&capture)
+    }
+
+    fn speaker_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0009).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_speaker_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
+    fn write_speaker_port(machine: &mut Machine, value: u8) {
+        let mut bus = machine.make_bus();
+        bus.write_io(0x61, BusWidth::Byte, u32::from(value), false)
+            .unwrap();
+    }
+
+    fn read_speaker_port(machine: &mut Machine) -> u8 {
+        let mut bus = machine.make_bus();
+        u8::try_from(bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap()).unwrap()
     }
 
     fn write_pit_port(machine: &mut Machine, port: u16, value: u8) {
@@ -1119,6 +1183,7 @@ mod tests {
                 (0x0002_0006, 1),
                 (0x0002_0007, 1),
                 (0x0002_0008, 1),
+                (0x0002_0009, 1),
             ]
         );
         assert!(
@@ -1164,6 +1229,10 @@ mod tests {
         );
         assert_eq!(
             sections[11].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+        assert_eq!(
+            sections[12].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
     }
@@ -2057,6 +2126,110 @@ mod tests {
     }
 
     #[test]
+    fn speaker_payload_pins_every_port_61_latch_value() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+
+        for value in u8::MIN..=u8::MAX {
+            write_speaker_port(&mut machine, value);
+            let expected = value & 0x03;
+
+            assert_eq!(speaker_payload(&machine), [expected]);
+            assert_eq!(read_speaker_port(&mut machine) & 0x03, expected);
+            assert_eq!(
+                pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET],
+                u8::from(expected & 1 != 0)
+            );
+        }
+    }
+
+    #[test]
+    fn speaker_latch_and_pit_gate_remain_independent_owners() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+
+        write_speaker_port(&mut machine, 0x00);
+        machine.set_timer_gate(2, true);
+        assert_eq!(speaker_payload(&machine), [0]);
+        assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
+        assert_eq!(read_speaker_port(&mut machine) & 0x03, 0);
+
+        write_speaker_port(&mut machine, 0x01);
+        machine.set_timer_gate(2, false);
+        assert_eq!(speaker_payload(&machine), [1]);
+        assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 0);
+        assert_eq!(read_speaker_port(&mut machine) & 0x03, 1);
+    }
+
+    #[test]
+    fn pit_advancement_changes_pit_without_changing_the_speaker_latch() {
+        let mut machine = test_machine();
+        write_pit_port(&mut machine, 0x43, 0xb6);
+        write_pit_port(&mut machine, 0x42, 4);
+        write_pit_port(&mut machine, 0x42, 0);
+        write_speaker_port(&mut machine, 0x03);
+        let speaker_before = speaker_payload(&machine);
+        let pit_before = pit_payload(&machine);
+
+        let pit_ticks = MASTER_CLOCK_HZ / u64::from(crate::PIT_INPUT_HZ) * 16;
+        machine.advance_devices_ticks(pit_ticks);
+
+        assert_ne!(pit_payload(&machine), pit_before);
+        assert_eq!(speaker_payload(&machine), speaker_before);
+    }
+
+    #[test]
+    fn speaker_capture_is_read_only_and_excludes_host_audio_history() {
+        let mut machine = test_machine();
+        write_speaker_port(&mut machine, 0x03);
+        machine
+            .speaker
+            .accumulate(MASTER_CLOCK_HZ / 100, true, [(17, false), (31, true)]);
+        machine.speaker_transitions.push(crate::pit::OutTransition {
+            tick: 7,
+            level: false,
+        });
+        let mut expected_speaker = machine.speaker.clone();
+        let transitions_before = machine.speaker_transitions.clone();
+        let pit_before = machine.pit.clone();
+        let timeline_before = machine.timeline;
+
+        let capture = machine.canonical_state_capture().unwrap();
+        let first_speaker = speaker_payload_from_capture(&capture);
+        let captured_pit = pit_payload_from_capture(&capture);
+        let second_speaker = speaker_payload_from_capture(&capture);
+        drop(capture);
+
+        assert_eq!(first_speaker, [3]);
+        assert_eq!(first_speaker, second_speaker);
+        assert_eq!(captured_pit, pit_payload(&machine));
+        assert_eq!(machine.speaker_transitions, transitions_before);
+        assert_eq!(machine.pit, pit_before);
+        assert_eq!(machine.timeline, timeline_before);
+        assert_eq!(machine.speaker.drain(64), expected_speaker.drain(64));
+
+        let mut baseline = test_machine();
+        let mut history = test_machine();
+        history.speaker.write_control(0x03);
+        history
+            .speaker
+            .accumulate(MASTER_CLOCK_HZ / 50, true, [(23, false), (71, true)]);
+        let _ = history.speaker.drain(11);
+        history.speaker_transitions.push(crate::pit::OutTransition {
+            tick: 5,
+            level: true,
+        });
+        history.set_speaker_volume(0.25);
+        history.speaker.write_control(0x00);
+        baseline.speaker.write_control(0x00);
+
+        assert!(history.speaker.ever_enabled());
+        assert!(!history.speaker_transitions.is_empty());
+        assert_ne!(history.speaker_volume, baseline.speaker_volume);
+        assert_eq!(speaker_payload(&history), speaker_payload(&baseline));
+    }
+
+    #[test]
     fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
         let mut whole = test_machine();
         let mut split = test_machine();
@@ -2144,6 +2317,7 @@ mod tests {
         assert_eq!(dma_payload(&machine).len(), DMA_PAYLOAD_LEN);
         assert_eq!(rtc_payload(&machine).len(), RTC_PAYLOAD_LEN);
         assert_eq!(unit_tester_payload(&machine).len(), UNIT_TESTER_PAYLOAD_LEN);
+        assert_eq!(speaker_payload(&machine).len(), SPEAKER_PAYLOAD_LEN);
         assert_eq!(
             dma_event_totals_v1_payload(&machine).len(),
             DMA_EVENT_TOTALS_V1_PAYLOAD_LEN
@@ -2455,6 +2629,9 @@ mod tests {
             0x7f,
         ] {
             let mut unit = test_machine();
+            write_speaker_port(&mut unit, 0x03);
+            let speaker_before = speaker_payload(&unit);
+            let pit_before = pit_payload(&unit);
             assert!(
                 unit.unittester
                     .write_port(unittester::PORT_COMMAND, command)
@@ -2464,9 +2641,12 @@ mod tests {
                     capture_error(&unit),
                     MachineCanonicalCaptureError::PendingUnitTesterCommand { command }
                 );
+                assert_eq!(unit.speaker.control_bits(), 3);
             }
             assert_eq!(unit.unittester.take_pending(), Some(command));
             assert_eq!(unit_tester_payload(&unit).len(), UNIT_TESTER_PAYLOAD_LEN);
+            assert_eq!(speaker_payload(&unit), speaker_before);
+            assert_eq!(pit_payload(&unit), pit_before);
         }
 
         let mut mode = test_machine();
@@ -2969,5 +3149,29 @@ mod tests {
             machine.rom.as_slice()
         );
         assert_eq!(cursor, payload.len());
+    }
+
+    #[test]
+    fn speaker_latch_survives_a_real_586_test_exit_boundary() {
+        let rom = rom_with_code(&[
+            0xb0, 0xff, 0xe6, 0x61, // latch both speaker bits; upper bits normalize
+            0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
+            0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
+            0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
+            0xf4, // must not execute
+        ]);
+        let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+        machine.set_mode(GswMode::Gsw586);
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(reason, StopReason::TestExit { code: 0 });
+        assert_eq!(machine.cpu.registers.eip, 16);
+        assert!(!machine.cpu.halted);
+        assert_eq!(machine.unittester.pending_command(), None);
+        assert_eq!(speaker_payload(&machine), [3]);
+        assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
+        assert_eq!(read_speaker_port(&mut machine) & 0x03, 3);
+        assert_eq!(speaker_payload(&machine), [3]);
     }
 }
