@@ -27,6 +27,8 @@
 //!   [8..12] CRC result    [12] exit code (set before Exit)
 //!   [16] benchmark selector  [17..21] iterations  [21..25] aux  [25] status
 
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+
 /// I/O ports. 0xE0-0xE3 are the other Lotura registers; this device owns the
 /// next three.
 pub const PORT_INDEX: u16 = 0xE4;
@@ -55,6 +57,7 @@ pub const CMD_SNAPSHOT: u8 = 2;
 pub const CMD_EXIT: u8 = 3;
 
 const REG_FILE_SIZE: usize = 32;
+const _: () = assert!(REG_FILE_SIZE <= 256);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitTester {
@@ -63,6 +66,15 @@ pub struct UnitTester {
     /// A command written this cycle, awaiting the run loop (which needs &mut
     /// Machine to read the framebuffer / touch the host filesystem / stop).
     pending: Option<u8>,
+}
+
+/// Borrowed guest-visible UnitTester state for canonical comparison.
+///
+/// Deferred commands are rejected at the Machine capture boundary, before a
+/// projection can be serialized.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalUnitTester<'a> {
+    device: &'a UnitTester,
 }
 
 impl Default for UnitTester {
@@ -76,6 +88,10 @@ impl Default for UnitTester {
 }
 
 impl UnitTester {
+    pub(crate) fn canonical_projection(&self) -> CanonicalUnitTester<'_> {
+        CanonicalUnitTester { device: self }
+    }
+
     /// Handle a port read; `None` if the port is not ours.
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
@@ -162,6 +178,17 @@ impl UnitTester {
     pub fn reg_u32(&self, offset: usize) -> u32 {
         let byte = |i: usize| self.regs.get(offset + i).copied().unwrap_or(0);
         u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)])
+    }
+}
+
+impl CanonicalUnitTester<'_> {
+    /// Writes version 1 of the fixed 33-byte UnitTester payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        out.write_u8(self.device.index as u8)?;
+        out.write_raw_bytes(&self.device.regs)
     }
 }
 

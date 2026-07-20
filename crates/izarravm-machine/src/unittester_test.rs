@@ -2,6 +2,111 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_core::{
+    CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateView,
+    CanonicalStateWriter,
+};
+
+const UNIT_TESTER_PAYLOAD_LEN: usize = 33;
+
+fn canonical_payload(device: &UnitTester) -> Vec<u8> {
+    let projection = device.canonical_projection();
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_0008).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| projection.write_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn assert_only_offset_changed(before: &[u8], after: &[u8], expected: usize) {
+    let actual: Vec<_> = before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter_map(|(offset, (left, right))| (left != right).then_some(offset))
+        .collect();
+    assert_eq!(actual, [expected]);
+}
+
+#[test]
+fn canonical_payload_layout_is_exact() {
+    let mut device = UnitTester::default();
+    for offset in 0..REG_FILE_SIZE {
+        device.set_reg_u8(offset, (offset as u8).wrapping_mul(7).wrapping_add(3));
+    }
+    device.write_port(PORT_INDEX, 0xff);
+
+    let mut expected = vec![0xff];
+    expected
+        .extend((0..REG_FILE_SIZE).map(|offset| (offset as u8).wrapping_mul(7).wrapping_add(3)));
+
+    let payload = canonical_payload(&device);
+    assert_eq!(payload.len(), UNIT_TESTER_PAYLOAD_LEN);
+    assert_eq!(payload, expected);
+}
+
+#[test]
+fn canonical_payload_pins_every_offset() {
+    let baseline = UnitTester::default();
+    let expected = canonical_payload(&baseline);
+
+    let mut changed = baseline.clone();
+    changed.write_port(PORT_INDEX, 0xff);
+    assert_only_offset_changed(&expected, &canonical_payload(&changed), 0);
+
+    for offset in 0..REG_FILE_SIZE {
+        let mut changed = baseline.clone();
+        changed.set_reg_u8(offset, 0x80 | offset as u8);
+        assert_only_offset_changed(&expected, &canonical_payload(&changed), offset + 1);
+    }
+}
+
+#[test]
+fn high_index_read_and_write_keep_their_exact_continuations() {
+    let mut first_out_of_range = UnitTester::default();
+    first_out_of_range.write_port(PORT_INDEX, REG_FILE_SIZE as u8);
+    assert_eq!(first_out_of_range.read_port(PORT_DATA), Some(0));
+    assert_eq!(first_out_of_range.read_port(PORT_INDEX), Some(1));
+
+    let mut read = UnitTester::default();
+    read.set_reg_u8(0, 0x5a);
+    read.write_port(PORT_INDEX, 0xff);
+    assert_eq!(canonical_payload(&read)[0], 0xff);
+    assert_eq!(read.read_port(PORT_DATA), Some(0));
+    assert_eq!(read.read_port(PORT_INDEX), Some(0));
+    assert_eq!(read.reg_u8(0), 0x5a);
+
+    let mut write = UnitTester::default();
+    write.set_reg_u8(0, 0x5a);
+    write.write_port(PORT_INDEX, 0xff);
+    assert!(write.write_port(PORT_DATA, 0xa5));
+    assert_eq!(write.read_port(PORT_INDEX), Some(0));
+    assert_eq!(write.reg_u8(0), 0x5a);
+}
+
+#[test]
+fn canonical_serialization_is_read_only_across_an_armed_data_read() {
+    let mut device = UnitTester::default();
+    device.set_reg_u8(REG_W, 0x40);
+    device.write_port(PORT_INDEX, REG_W as u8);
+
+    let first = canonical_payload(&device);
+    let second = canonical_payload(&device);
+    assert_eq!(first, second);
+    assert_eq!(first[0], REG_W as u8);
+
+    assert_eq!(device.read_port(PORT_DATA), Some(0x40));
+    let advanced = canonical_payload(&device);
+    assert_eq!(advanced[0], REG_W as u8 + 1);
+    assert_eq!(&advanced[1..], &first[1..]);
+}
 
 #[test]
 fn crc32_matches_the_zlib_check_value() {

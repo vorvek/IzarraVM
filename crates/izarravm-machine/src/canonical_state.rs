@@ -16,6 +16,7 @@ use crate::{
     pit::CanonicalPit,
     rtc::CanonicalRtc,
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
+    unittester::CanonicalUnitTester,
 };
 
 const STATE_SNAPSHOT_V1_SCHEMA_NAMESPACE: u32 = 0x0000_0000;
@@ -34,7 +35,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 11] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 12] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -90,6 +91,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_0008,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -135,6 +141,10 @@ const _: () = {
         sections[10].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[11].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -145,6 +155,7 @@ const _: () = {
     assert!(sections[7].id < sections[8].id);
     assert!(sections[8].id < sections[9].id);
     assert!(sections[9].id < sections[10].id);
+    assert!(sections[10].id < sections[11].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -458,6 +469,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     dma: CanonicalDma8237Pair<'a>,
     dma_event_totals: CanonicalDmaEventTotalsV1<'a>,
     rtc: CanonicalRtc<'a>,
+    unit_tester: CanonicalUnitTester<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -556,6 +568,18 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.rtc.write_payload(out)
     }
+
+    /// Writes the required UnitTester register-file owner payload.
+    ///
+    /// Deferred commands are rejected before capture, so this projection holds
+    /// only the guest-visible index and register bytes.
+    #[allow(dead_code)]
+    pub(crate) fn write_unit_tester_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.unit_tester.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -647,6 +671,7 @@ impl Machine {
         let dma = self.dma.canonical_projection();
         let dma_event_totals = self.dma.canonical_event_totals_v1();
         let rtc = self.rtc.canonical_projection();
+        let unit_tester = self.unittester.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -704,6 +729,7 @@ impl Machine {
             dma,
             dma_event_totals,
             rtc,
+            unit_tester,
         })
     }
 }
@@ -735,6 +761,7 @@ mod tests {
     const DMA_PAYLOAD_LEN: usize = 152;
     const DMA_EVENT_TOTALS_V1_PAYLOAD_LEN: usize = 64;
     const RTC_PAYLOAD_LEN: usize = 82;
+    const UNIT_TESTER_PAYLOAD_LEN: usize = 33;
     const TEST_DMA_EVENT_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
     const TEST_MEMORY_MIB: u16 = 2;
 
@@ -918,6 +945,26 @@ mod tests {
         view.sections()[0].payload().to_vec()
     }
 
+    fn unit_tester_payload(machine: &Machine) -> Vec<u8> {
+        let capture = machine.canonical_state_capture().unwrap();
+        unit_tester_payload_from_capture(&capture)
+    }
+
+    fn unit_tester_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+        let mut state = CanonicalStateWriter::new().unwrap();
+        state
+            .section(
+                CanonicalSectionId::new(0x0002_0008).unwrap(),
+                CanonicalSectionVersion::new(1).unwrap(),
+                CanonicalSectionRequirement::Required,
+                |out| capture.write_unit_tester_payload(out),
+            )
+            .unwrap();
+        let bytes = state.finish().unwrap();
+        let view = CanonicalStateView::parse(&bytes).unwrap();
+        view.sections()[0].payload().to_vec()
+    }
+
     fn write_pit_port(machine: &mut Machine, port: u16, value: u8) {
         let mut bus = machine.make_bus();
         bus.write_io(port, BusWidth::Byte, u32::from(value), false)
@@ -1071,6 +1118,7 @@ mod tests {
                 (0x0002_0005, 1),
                 (0x0002_0006, 1),
                 (0x0002_0007, 1),
+                (0x0002_0008, 1),
             ]
         );
         assert!(
@@ -1112,6 +1160,10 @@ mod tests {
         );
         assert_eq!(
             sections[10].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+            STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+        );
+        assert_eq!(
+            sections[11].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
             STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
         );
     }
@@ -1929,6 +1981,82 @@ mod tests {
     }
 
     #[test]
+    fn serviced_unit_tester_crc_changes_only_the_result_registers() {
+        let program_rectangle = [
+            0xb0, 0x00, 0xe6, 0xe4, // select rectangle register zero
+            0xb0, 0x00, 0xe6, 0xe5, // X low
+            0xb0, 0x00, 0xe6, 0xe5, // X high
+            0xb0, 0x00, 0xe6, 0xe5, // Y low
+            0xb0, 0x00, 0xe6, 0xe5, // Y high
+            0xb0, 0x02, 0xe6, 0xe5, // W low
+            0xb0, 0x00, 0xe6, 0xe5, // W high
+            0xb0, 0x02, 0xe6, 0xe5, // H low
+            0xb0, 0x00, 0xe6, 0xe5, // H high
+        ];
+        let mut baseline_code = program_rectangle.to_vec();
+        baseline_code.push(0xf4);
+        let mut serviced_code = program_rectangle.to_vec();
+        serviced_code.extend_from_slice(&[
+            0xb0,
+            unittester::CMD_CRC,
+            0xe6,
+            0xe6, // issue deferred CRC command
+            0xf4,
+        ]);
+        let mut baseline = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Vega),
+            rom_with_code(&baseline_code),
+        )
+        .unwrap();
+        let mut serviced = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Vega),
+            rom_with_code(&serviced_code),
+        )
+        .unwrap();
+
+        assert_eq!(
+            baseline.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(
+            serviced.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(serviced.unittester.pending_command(), None);
+
+        let before = unit_tester_payload(&baseline);
+        let after = unit_tester_payload(&serviced);
+        let crc = serviced.screen_crc32(0, 0, 2, 2).to_le_bytes();
+        let mut expected = before.clone();
+        expected[1 + unittester::REG_CRC..1 + unittester::REG_CRC + 4].copy_from_slice(&crc);
+
+        assert_eq!(before[0], 8);
+        assert_eq!(after[0], 8);
+        assert_eq!(after, expected);
+        assert_ne!(crc, [0; 4]);
+    }
+
+    #[test]
+    fn serviced_unit_tester_noop_commands_leave_the_payload_stable() {
+        let expected = unit_tester_payload(&test_machine());
+        for command in [unittester::CMD_SNAPSHOT, 0x7f] {
+            let rom = rom_with_code(&[
+                0xb0, command, 0xe6, 0xe6, // issue deferred command
+                0xf4,
+            ]);
+            let mut machine =
+                Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+            assert_eq!(
+                machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+                StopReason::Halted
+            );
+            assert_eq!(machine.unittester.pending_command(), None);
+            assert_eq!(unit_tester_payload(&machine), expected);
+        }
+    }
+
+    #[test]
     fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
         let mut whole = test_machine();
         let mut split = test_machine();
@@ -2015,6 +2143,7 @@ mod tests {
         assert_eq!(pit_payload(&machine).len(), PIT_PAYLOAD_LEN);
         assert_eq!(dma_payload(&machine).len(), DMA_PAYLOAD_LEN);
         assert_eq!(rtc_payload(&machine).len(), RTC_PAYLOAD_LEN);
+        assert_eq!(unit_tester_payload(&machine).len(), UNIT_TESTER_PAYLOAD_LEN);
         assert_eq!(
             dma_event_totals_v1_payload(&machine).len(),
             DMA_EVENT_TOTALS_V1_PAYLOAD_LEN
@@ -2319,17 +2448,26 @@ mod tests {
 
     #[test]
     fn deferred_services_are_rejected_independently() {
-        let mut unit = test_machine();
-        assert!(
-            unit.unittester
-                .write_port(unittester::PORT_COMMAND, unittester::CMD_CRC)
-        );
-        assert_eq!(
-            capture_error(&unit),
-            MachineCanonicalCaptureError::PendingUnitTesterCommand {
-                command: unittester::CMD_CRC
+        for command in [
+            unittester::CMD_CRC,
+            unittester::CMD_SNAPSHOT,
+            unittester::CMD_EXIT,
+            0x7f,
+        ] {
+            let mut unit = test_machine();
+            assert!(
+                unit.unittester
+                    .write_port(unittester::PORT_COMMAND, command)
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    capture_error(&unit),
+                    MachineCanonicalCaptureError::PendingUnitTesterCommand { command }
+                );
             }
-        );
+            assert_eq!(unit.unittester.take_pending(), Some(command));
+            assert_eq!(unit_tester_payload(&unit).len(), UNIT_TESTER_PAYLOAD_LEN);
+        }
 
         let mut mode = test_machine();
         mode.pending_mode = Some(GswMode::Gsw586);
@@ -2775,6 +2913,8 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
         assert_eq!(reason, StopReason::TestExit { code: 0 });
+        assert_eq!(machine.cpu.registers.eip, 12);
+        assert!(!machine.cpu.halted);
         assert!(machine.io_touched);
         assert!(!machine.cpu.is_ring0_protected());
         assert_eq!(machine.dos_screen_shown, machine.program_output.len());
@@ -2812,6 +2952,12 @@ mod tests {
         let second_rtc = rtc_payload(&machine);
         assert_eq!(first_rtc.len(), RTC_PAYLOAD_LEN);
         assert_eq!(first_rtc, second_rtc);
+        let first_unit_tester = unit_tester_payload(&machine);
+        let second_unit_tester = unit_tester_payload(&machine);
+        assert_eq!(first_unit_tester.len(), UNIT_TESTER_PAYLOAD_LEN);
+        assert_eq!(first_unit_tester, second_unit_tester);
+        assert_eq!(first_unit_tester[0], unittester::REG_EXIT as u8 + 1);
+        assert_eq!(first_unit_tester[1 + unittester::REG_EXIT], 0);
         let payload = ram_rom_payload(&machine);
         let mut cursor = 0;
         assert_eq!(
