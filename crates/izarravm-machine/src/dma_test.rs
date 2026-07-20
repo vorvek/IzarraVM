@@ -3,6 +3,519 @@
 
 use super::*;
 use izarravm_bus::Memory;
+use izarravm_core::{
+    CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateView,
+    CanonicalStateWriter,
+};
+
+const TEST_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
+
+fn canonical_dma_payload(dma: &DmaController) -> Vec<u8> {
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_0006).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| dma.canonical_projection().write_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn canonical_dma_event_totals(dma: &DmaController) -> Vec<u8> {
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(TEST_TOTALS_ENVELOPE_ID).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| dma.canonical_event_totals_v1().write_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn canonical_dma_event_total(dma: &DmaController, channel: usize) -> u64 {
+    let totals = canonical_dma_event_totals(dma);
+    let offset = channel * 8;
+    u64::from_le_bytes(totals[offset..offset + 8].try_into().unwrap())
+}
+
+fn channel_mut(dma: &mut DmaController, channel: usize) -> &mut DmaChannel {
+    if channel < 4 {
+        &mut dma.master.channels[channel]
+    } else {
+        &mut dma.slave.channels[channel - 4]
+    }
+}
+
+fn channel_payload_offset(channel: usize) -> usize {
+    if channel < 4 {
+        4 + channel * 17
+    } else {
+        76 + (channel - 4) * 17
+    }
+}
+
+fn assert_channel_offsets(
+    channel: usize,
+    before: DmaController,
+    after: DmaController,
+    local_offsets: &[usize],
+) {
+    let before_totals = canonical_dma_event_totals(&before);
+    let after_totals = canonical_dma_event_totals(&after);
+    assert_eq!(before_totals, after_totals, "channel {channel} totals");
+    let before = canonical_dma_payload(&before);
+    let after = canonical_dma_payload(&after);
+    let changed = before
+        .iter()
+        .zip(&after)
+        .enumerate()
+        .filter_map(|(index, (left, right))| (left != right).then_some(index))
+        .collect::<Vec<_>>();
+    let base = channel_payload_offset(channel);
+    let expected = local_offsets
+        .iter()
+        .map(|offset| base + offset)
+        .collect::<Vec<_>>();
+    assert_eq!(changed, expected, "channel {channel}");
+}
+
+fn golden_channel(index: u8) -> DmaChannel {
+    DmaChannel {
+        base_addr: 0x1000 | u16::from(index),
+        cur_addr: 0x2000 | u16::from(index),
+        base_count: 0x3000 | u16::from(index),
+        cur_count: 0x4000 | u16::from(index),
+        page: 0x50 | index,
+        addr_decrement: index & 1 != 0,
+        auto_init: index & 2 != 0,
+        transfer_kind: index & 3,
+        transfer_mode: 3 - (index & 3),
+        mask: index & 1 == 0,
+        reached_tc: index & 2 == 0,
+        dreq: index & 4 != 0,
+        active: index & 1 != 0,
+        transfer_cycles: 0x0102_0304_0506_0708 + u64::from(index),
+    }
+}
+
+fn golden_dma() -> DmaController {
+    let mut page_scratch = [0; 16];
+    for (port, value) in [
+        (0x84usize, 0xa4),
+        (0x85, 0xa5),
+        (0x86, 0xa6),
+        (0x88, 0xa8),
+        (0x8c, 0xac),
+        (0x8d, 0xad),
+        (0x8e, 0xae),
+    ] {
+        page_scratch[port & 0x0f] = value;
+    }
+    DmaController {
+        master: DmaChip {
+            channels: std::array::from_fn(|index| golden_channel(index as u8)),
+            hi_lo: true,
+            command: 0xfb,
+            status: 0xa5,
+            request_reg: 0xca,
+        },
+        slave: DmaChip {
+            channels: std::array::from_fn(|index| golden_channel((index + 4) as u8)),
+            hi_lo: false,
+            command: 0xff,
+            status: 0x5a,
+            request_reg: 0x35,
+        },
+        page_scratch,
+        refresh_page: 0xaf,
+    }
+}
+
+#[test]
+fn canonical_dma_payload_layout_is_exact() {
+    assert_eq!(
+        canonical_dma_payload(&golden_dma()),
+        [
+            0x01, 0x03, 0x05, 0x0a, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40, 0x50, 0x00,
+            0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x00, 0x01, 0x10, 0x01, 0x20, 0x01, 0x30, 0x01,
+            0x40, 0x51, 0x01, 0x00, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0x02, 0x10, 0x02, 0x20,
+            0x02, 0x30, 0x02, 0x40, 0x52, 0x00, 0x01, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x03,
+            0x10, 0x03, 0x20, 0x03, 0x30, 0x03, 0x40, 0x53, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x04, 0x0a, 0x05, 0x04, 0x10, 0x04, 0x20, 0x04, 0x30, 0x04, 0x40,
+            0x54, 0x00, 0x00, 0x00, 0x03, 0x01, 0x01, 0x01, 0x00, 0x05, 0x10, 0x05, 0x20, 0x05,
+            0x30, 0x05, 0x40, 0x55, 0x01, 0x00, 0x01, 0x02, 0x00, 0x01, 0x01, 0x01, 0x06, 0x10,
+            0x06, 0x20, 0x06, 0x30, 0x06, 0x40, 0x56, 0x00, 0x01, 0x02, 0x01, 0x01, 0x00, 0x01,
+            0x00, 0x07, 0x10, 0x07, 0x20, 0x07, 0x30, 0x07, 0x40, 0x57, 0x01, 0x01, 0x03, 0x00,
+            0x00, 0x00, 0x01, 0x01, 0xa4, 0xa5, 0xa6, 0xa8, 0xac, 0xad, 0xae, 0xaf,
+        ]
+    );
+}
+
+#[test]
+fn canonical_dma_event_totals_layout_is_exact() {
+    assert_eq!(
+        canonical_dma_event_totals(&golden_dma()),
+        [
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x09, 0x07, 0x06, 0x05, 0x04, 0x03,
+            0x02, 0x01, 0x0a, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0b, 0x07, 0x06, 0x05,
+            0x04, 0x03, 0x02, 0x01, 0x0c, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0d, 0x07,
+            0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0e, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+            0x0f, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        ]
+    );
+}
+
+#[test]
+fn canonical_dma_channel_fields_and_event_lanes_are_exact() {
+    for channel in 0..8 {
+        let base = DmaController::default();
+        for (local_offsets, mutate) in [
+            (&[0, 1][..], 0usize),
+            (&[2, 3], 1),
+            (&[4, 5], 2),
+            (&[6, 7], 3),
+        ] {
+            let mut changed = base.clone();
+            let target = channel_mut(&mut changed, channel);
+            match mutate {
+                0 => target.base_addr = 0x3412,
+                1 => target.cur_addr = 0x3412,
+                2 => target.base_count = 0x3412,
+                _ => target.cur_count = 0x3412,
+            }
+            assert_channel_offsets(channel, base.clone(), changed, local_offsets);
+        }
+        for local_offset in 8usize..=16 {
+            let mut changed = base.clone();
+            let target = channel_mut(&mut changed, channel);
+            let mutate = local_offset - 8;
+            match mutate {
+                0 => target.page = 0x5a,
+                1 => target.addr_decrement = true,
+                2 => target.auto_init = true,
+                3 => target.transfer_kind = 3,
+                4 => target.transfer_mode = 3,
+                5 => target.mask = false,
+                6 => target.reached_tc = true,
+                7 => target.dreq = true,
+                _ => target.active = true,
+            }
+            assert_channel_offsets(channel, base.clone(), changed, &[local_offset]);
+        }
+
+        let mut changed = base.clone();
+        channel_mut(&mut changed, channel).transfer_cycles = 0x8877_6655_4433_2211;
+        assert_eq!(
+            canonical_dma_payload(&base),
+            canonical_dma_payload(&changed)
+        );
+        let before = canonical_dma_event_totals(&base);
+        let after = canonical_dma_event_totals(&changed);
+        let changed_offsets = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter_map(|(index, (left, right))| (left != right).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed_offsets,
+            (channel * 8..channel * 8 + 8).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn canonical_dma_shared_and_page_offsets_are_exact() {
+    let base = DmaController::default();
+    for (offset, mutate) in [(0usize, 0usize), (1, 1), (2, 2), (3, 3)] {
+        let mut changed = base.clone();
+        match mutate {
+            0 => changed.master.hi_lo = true,
+            1 => changed.master.command = 1,
+            2 => changed.master.status = 1,
+            _ => changed.master.request_reg = 1,
+        }
+        let before = canonical_dma_payload(&base);
+        let after = canonical_dma_payload(&changed);
+        assert_eq!(
+            before
+                .iter()
+                .zip(&after)
+                .enumerate()
+                .filter_map(|(index, (left, right))| (left != right).then_some(index))
+                .collect::<Vec<_>>(),
+            vec![offset]
+        );
+        assert_eq!(
+            canonical_dma_event_totals(&base),
+            canonical_dma_event_totals(&changed)
+        );
+    }
+    for (offset, mutate) in [(72usize, 0usize), (73, 1), (74, 2), (75, 3)] {
+        let mut changed = base.clone();
+        match mutate {
+            0 => changed.slave.hi_lo = true,
+            1 => changed.slave.command = 4,
+            2 => changed.slave.status = 1,
+            _ => changed.slave.request_reg = 1,
+        }
+        let before = canonical_dma_payload(&base);
+        let after = canonical_dma_payload(&changed);
+        assert_eq!(
+            before
+                .iter()
+                .zip(&after)
+                .enumerate()
+                .filter_map(|(index, (left, right))| (left != right).then_some(index))
+                .collect::<Vec<_>>(),
+            vec![offset]
+        );
+    }
+    for (payload_offset, port) in [
+        (144usize, 0x84usize),
+        (145, 0x85),
+        (146, 0x86),
+        (147, 0x88),
+        (148, 0x8c),
+        (149, 0x8d),
+        (150, 0x8e),
+    ] {
+        let mut changed = base.clone();
+        changed.page_scratch[port & 0x0f] = 0x5a;
+        let before = canonical_dma_payload(&base);
+        let after = canonical_dma_payload(&changed);
+        assert_eq!(
+            before
+                .iter()
+                .zip(&after)
+                .enumerate()
+                .filter_map(|(index, (left, right))| (left != right).then_some(index))
+                .collect::<Vec<_>>(),
+            vec![payload_offset]
+        );
+    }
+    let mut changed = base.clone();
+    changed.refresh_page = 0x5a;
+    assert_ne!(
+        canonical_dma_payload(&base)[151],
+        canonical_dma_payload(&changed)[151]
+    );
+}
+
+#[test]
+fn canonical_dma_normalizes_only_unconsumed_storage() {
+    let mut left = DmaController::default();
+    let mut right = left.clone();
+    right.master.command = 0xfa;
+    right.slave.command = 0xfb;
+    right.master.status = 0xf0;
+    right.slave.status = 0xf0;
+    right.master.request_reg = 0xf0;
+    right.slave.request_reg = 0xf0;
+    for index in [0usize, 1, 2, 3, 7, 9, 10, 11, 15] {
+        right.page_scratch[index] = 0x80 | index as u8;
+    }
+    assert_eq!(canonical_dma_payload(&left), canonical_dma_payload(&right));
+
+    for dma in [&mut left, &mut right] {
+        dma.write_port(0x0b, 0x49);
+        dma.write_port(0x02, 0x10);
+        dma.write_port(0x02, 0x00);
+        dma.write_port(0x03, 0x00);
+        dma.write_port(0x03, 0x00);
+        dma.write_port(0x0a, 0x01);
+    }
+    let mut left_memory = mem_with(0x10, &[0x5a]);
+    let mut right_memory = mem_with(0x10, &[0x5a]);
+    assert_eq!(
+        left.read_byte(1, &mut left_memory),
+        right.read_byte(1, &mut right_memory)
+    );
+    assert_eq!(left.read_port(0x08), right.read_port(0x08));
+    assert_eq!(canonical_dma_payload(&left), canonical_dma_payload(&right));
+    assert_eq!(
+        canonical_dma_event_totals(&left),
+        canonical_dma_event_totals(&right)
+    );
+
+    let mut no_mem_to_mem = DmaController::default();
+    no_mem_to_mem.master.command = 2;
+    assert_eq!(
+        canonical_dma_payload(&DmaController::default()),
+        canonical_dma_payload(&no_mem_to_mem)
+    );
+    no_mem_to_mem.master.command = 3;
+    assert_ne!(
+        canonical_dma_payload(&DmaController::default()),
+        canonical_dma_payload(&no_mem_to_mem)
+    );
+}
+
+#[test]
+fn canonical_dma_capture_preserves_destructive_shared_state() {
+    let mut dma = DmaController::default();
+    dma.master.hi_lo = true;
+    dma.master.status = 0x01;
+    dma.master.request_reg = 0x02;
+    dma.master.channels[0].reached_tc = true;
+    dma.slave.hi_lo = true;
+    dma.slave.status = 0x04;
+    dma.slave.request_reg = 0x08;
+    dma.slave.channels[2].reached_tc = true;
+
+    let first = canonical_dma_payload(&dma);
+    let second = canonical_dma_payload(&dma);
+    assert_eq!(first, second);
+    assert_eq!(&first[0..4], &[1, 0, 1, 2]);
+    assert_eq!(&first[72..76], &[1, 0, 4, 8]);
+
+    assert_eq!(dma.read_port(0x08), Some(0x21));
+    assert_eq!(dma.read_port(0xd0), Some(0x84));
+    let consumed = canonical_dma_payload(&dma);
+    assert_eq!(consumed[2], 0, "master status is read-clear");
+    assert_eq!(consumed[74], 0, "slave status is read-clear");
+    assert_eq!(consumed[3], 2, "master request persists");
+    assert_eq!(consumed[75], 8, "slave request persists");
+    assert_eq!(consumed[18], 1, "master channel TC state persists");
+    assert_eq!(consumed[124], 1, "slave channel TC state persists");
+}
+
+#[test]
+fn canonical_dma_preserves_half_read_and_write_continuations_on_both_chips() {
+    let mut dma = DmaController::default();
+
+    dma.write_port(0x0c, 0);
+    dma.write_port(0x00, 0x34);
+    assert_eq!(canonical_dma_payload(&dma)[0], 1);
+    assert_eq!(canonical_dma_payload(&dma)[0], 1);
+    dma.write_port(0x00, 0x12);
+    assert_eq!(dma.master.channels[0].base_addr, 0x1234);
+    assert_eq!(canonical_dma_payload(&dma)[0], 0);
+
+    dma.master.channels[0].cur_addr = 0xabcd;
+    dma.write_port(0x0c, 0);
+    assert_eq!(dma.read_port(0x00), Some(0xcd));
+    assert_eq!(canonical_dma_payload(&dma)[0], 1);
+    assert_eq!(dma.read_port(0x00), Some(0xab));
+
+    dma.write_port(0xd8, 0);
+    dma.write_port(0xc4, 0x78);
+    assert_eq!(canonical_dma_payload(&dma)[72], 1);
+    assert_eq!(canonical_dma_payload(&dma)[72], 1);
+    dma.write_port(0xc4, 0x56);
+    assert_eq!(dma.slave.channels[1].base_addr, 0x5678);
+    assert_eq!(canonical_dma_payload(&dma)[72], 0);
+
+    dma.slave.channels[1].cur_addr = 0xef90;
+    dma.write_port(0xd8, 0);
+    assert_eq!(dma.read_port(0xc4), Some(0x90));
+    assert_eq!(canonical_dma_payload(&dma)[72], 1);
+    assert_eq!(dma.read_port(0xc4), Some(0xef));
+}
+
+#[test]
+fn canonical_dma_event_totals_count_completed_cycles_in_transfer_units() {
+    let mut dma = DmaController::default();
+    let mut byte_memory = mem_with(0x10, &[0x5a]);
+    dma.master.channels[0] = DmaChannel {
+        cur_addr: 0x10,
+        cur_count: 0,
+        transfer_kind: 2,
+        mask: false,
+        ..Default::default()
+    };
+    assert_eq!(dma.read_byte(0, &mut byte_memory), Some(0x5a));
+
+    let mut word_memory = mem_with(0x20, &[0x34, 0x12]);
+    dma.slave.channels[1] = DmaChannel {
+        cur_addr: 0x10,
+        cur_count: 0,
+        transfer_kind: 2,
+        mask: false,
+        ..Default::default()
+    };
+    assert_eq!(dma.read_word(5, &mut word_memory), Some(0x1234));
+
+    dma.master.channels[1] = DmaChannel {
+        cur_count: 0,
+        mask: false,
+        ..Default::default()
+    };
+    dma.master.set_hardware_request(1, true);
+    assert_eq!(dma.master.verify(1), Some(()));
+    dma.master.set_hardware_request(1, false);
+
+    let mut write_memory = Memory::new(0x40).unwrap();
+    dma.slave.channels[2] = DmaChannel {
+        cur_addr: 0x10,
+        cur_count: 0,
+        transfer_kind: 1,
+        mask: false,
+        ..Default::default()
+    };
+    dma.slave.set_hardware_request(2, true);
+    assert_eq!(dma.slave.write_word(2, &mut write_memory, 0xbeef), Some(()));
+    dma.slave.set_hardware_request(2, false);
+
+    assert_eq!(canonical_dma_event_total(&dma, 0), 1);
+    assert_eq!(canonical_dma_event_total(&dma, 1), 1);
+    assert_eq!(canonical_dma_event_total(&dma, 5), 1, "a word is one cycle");
+    assert_eq!(canonical_dma_event_total(&dma, 6), 1, "a word is one cycle");
+
+    dma.master.channels[3] = DmaChannel {
+        cur_count: 1,
+        mask: false,
+        transfer_cycles: u64::MAX,
+        ..Default::default()
+    };
+    dma.master.set_hardware_request(3, true);
+    assert_eq!(dma.master.verify(3), Some(()));
+    assert_eq!(canonical_dma_event_total(&dma, 3), u64::MAX);
+}
+
+#[test]
+fn canonical_dma_event_totals_reject_incomplete_cycles() {
+    let mut memory = Memory::new(1).unwrap();
+
+    let mut masked = DmaController::default();
+    masked.master.channels[0].transfer_kind = 2;
+    assert_eq!(masked.read_byte(0, &mut memory), None);
+
+    let mut wrong_kind = DmaController::default();
+    wrong_kind.master.channels[0].mask = false;
+    wrong_kind.master.channels[0].transfer_kind = 1;
+    assert_eq!(wrong_kind.read_byte(0, &mut memory), None);
+
+    let mut cascade = DmaController::default();
+    cascade.master.channels[0].mask = false;
+    cascade.master.channels[0].transfer_kind = 2;
+    cascade.master.channels[0].transfer_mode = 3;
+    assert_eq!(cascade.read_byte(0, &mut memory), None);
+
+    let mut disabled = DmaController::default();
+    disabled.master.channels[0].mask = false;
+    disabled.master.channels[0].transfer_kind = 2;
+    disabled.master.command = 4;
+    assert_eq!(disabled.read_byte(0, &mut memory), None);
+
+    let mut failed_memory = DmaController::default();
+    failed_memory.master.channels[0].mask = false;
+    failed_memory.master.channels[0].transfer_kind = 2;
+    failed_memory.master.channels[0].cur_addr = 1;
+    assert_eq!(failed_memory.read_byte(0, &mut memory), None);
+
+    for dma in [&masked, &wrong_kind, &cascade, &disabled, &failed_memory] {
+        assert_eq!(canonical_dma_event_totals(dma), vec![0; 64]);
+    }
+}
 
 fn mem_with(addr: u32, bytes: &[u8]) -> Memory {
     let mut m = Memory::new((addr as usize) + bytes.len()).unwrap();
@@ -542,6 +1055,8 @@ fn mem_to_mem_copies_a_block_from_ch0_to_ch1() {
     // Both address counters advanced past the block.
     assert_eq!(dma.master.channels[0].cur_addr, 0x0104, "source advanced");
     assert_eq!(dma.master.channels[1].cur_addr, 0x0204, "dest advanced");
+    assert_eq!(canonical_dma_event_total(&dma, 0), 4);
+    assert_eq!(canonical_dma_event_total(&dma, 1), 4);
 }
 
 #[test]
@@ -599,6 +1114,8 @@ fn mem_to_mem_address_hold_turns_the_copy_into_a_fill() {
     // The held source address never moved; only the count drained.
     assert_eq!(dma.master.channels[0].cur_addr, 0x0040, "source held");
     assert_eq!(dma.master.channels[1].cur_addr, 0x0054, "dest advanced");
+    assert_eq!(canonical_dma_event_total(&dma, 0), 4);
+    assert_eq!(canonical_dma_event_total(&dma, 1), 4);
 }
 
 #[test]
@@ -621,6 +1138,28 @@ fn mem_to_mem_is_gated_by_enable_and_disable_bits() {
     dma.write_port(0x08, 0x01);
     dma.write_port(0x0A, 0x04); // mask ch0
     assert_eq!(dma.mem_to_mem(&mut mem), None, "masked channel 0");
+    assert_eq!(canonical_dma_event_totals(&dma), vec![0; 64]);
+}
+
+#[test]
+fn failed_mem_to_mem_cycle_does_not_change_event_totals() {
+    let mut dma = DmaController::default();
+    dma.write_port(0x00, 0x01); // source address 1, outside one-byte memory
+    dma.write_port(0x00, 0x00);
+    dma.write_port(0x02, 0x00);
+    dma.write_port(0x02, 0x00);
+    dma.write_port(0x03, 0x00);
+    dma.write_port(0x03, 0x00);
+    dma.write_port(0x0a, 0x00);
+    dma.write_port(0x08, 0x01);
+    let before_state = canonical_dma_payload(&dma);
+    let before_totals = canonical_dma_event_totals(&dma);
+    let mut memory = Memory::new(1).unwrap();
+
+    assert_eq!(dma.mem_to_mem(&mut memory), None);
+    assert_eq!(canonical_dma_event_totals(&dma), before_totals);
+    let after_state = canonical_dma_payload(&dma);
+    assert_eq!(after_state[4..72], before_state[4..72]);
 }
 
 #[test]

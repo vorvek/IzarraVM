@@ -13,6 +13,7 @@
 //! datapath.
 
 use izarravm_bus::Memory;
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DmaChannel {
@@ -538,7 +539,7 @@ pub(crate) struct DmaController {
     pub(crate) master: DmaChip,
     slave: DmaChip,
     /// Scratch latches for the page ports that the PC/AT decodes but does not
-    /// wire to a DMA channel (0x80, 0x84, 0x85, 0x86, 0x88, 0x8C, 0x8D, 0x8E).
+    /// wire to a DMA channel (0x84, 0x85, 0x86, 0x88, 0x8C, 0x8D, 0x8E).
     /// Software reads them back as plain R/W bytes; indexed by port low nibble.
     page_scratch: [u8; 16],
     /// Refresh page register at 0x8F; a read/write latch unrelated to any DMA
@@ -546,7 +547,111 @@ pub(crate) struct DmaController {
     refresh_page: u8,
 }
 
+/// Borrowed, guest-continuation state for the master/slave 8237A pair.
+///
+/// Completed-transfer totals are intentionally separate. They are deterministic
+/// proof accounting and cannot affect a later DMA decision or guest observation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalDma8237Pair<'a> {
+    controller: &'a DmaController,
+}
+
+/// Borrowed version-1 DMA event totals for the correctness oracle.
+///
+/// One cycle is one completed byte or word transfer. These values are exact
+/// deterministic evidence, not StateSnapshotV1 semantic state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalDmaEventTotalsV1<'a> {
+    controller: &'a DmaController,
+}
+
+fn effective_command(chip: &DmaChip, master: bool) -> u8 {
+    let disabled = chip.command & 0x04;
+    if !master {
+        return disabled;
+    }
+    let mem_to_mem = chip.command & 0x01;
+    let address_hold = if mem_to_mem != 0 {
+        chip.command & 0x02
+    } else {
+        0
+    };
+    disabled | mem_to_mem | address_hold
+}
+
+fn write_canonical_dma_channel(
+    out: &mut CanonicalFieldWriter<'_>,
+    channel: &DmaChannel,
+) -> Result<(), CanonicalStateError> {
+    out.write_u16(channel.base_addr)?;
+    out.write_u16(channel.cur_addr)?;
+    out.write_u16(channel.base_count)?;
+    out.write_u16(channel.cur_count)?;
+    out.write_u8(channel.page)?;
+    out.write_bool(channel.addr_decrement)?;
+    out.write_bool(channel.auto_init)?;
+    out.write_u8(channel.transfer_kind)?;
+    out.write_u8(channel.transfer_mode)?;
+    out.write_bool(channel.mask)?;
+    out.write_bool(channel.reached_tc)?;
+    out.write_bool(channel.dreq)?;
+    out.write_bool(channel.active)
+}
+
+fn write_canonical_dma_chip(
+    out: &mut CanonicalFieldWriter<'_>,
+    chip: &DmaChip,
+    master: bool,
+) -> Result<(), CanonicalStateError> {
+    out.write_bool(chip.hi_lo)?;
+    out.write_u8(effective_command(chip, master))?;
+    out.write_u8(chip.status & 0x0f)?;
+    out.write_u8(chip.request_reg & 0x0f)?;
+    for channel in &chip.channels {
+        write_canonical_dma_channel(out, channel)?;
+    }
+    Ok(())
+}
+
+impl CanonicalDma8237Pair<'_> {
+    /// Writes version 1 of the fixed 152-byte semantic DMA payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        write_canonical_dma_chip(out, &self.controller.master, true)?;
+        write_canonical_dma_chip(out, &self.controller.slave, false)?;
+        for port in [0x84usize, 0x85, 0x86, 0x88, 0x8c, 0x8d, 0x8e] {
+            out.write_u8(self.controller.page_scratch[port & 0x0f])?;
+        }
+        out.write_u8(self.controller.refresh_page)
+    }
+}
+
+impl CanonicalDmaEventTotalsV1<'_> {
+    /// Writes eight little-endian completed-cycle totals in global channel order.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        for chip in [&self.controller.master, &self.controller.slave] {
+            for channel in &chip.channels {
+                out.write_u64(channel.transfer_cycles)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DmaController {
+    pub(crate) fn canonical_projection(&self) -> CanonicalDma8237Pair<'_> {
+        CanonicalDma8237Pair { controller: self }
+    }
+
+    pub(crate) fn canonical_event_totals_v1(&self) -> CanonicalDmaEventTotalsV1<'_> {
+        CanonicalDmaEventTotalsV1 { controller: self }
+    }
+
     /// Translate a slave-controller port to a local register index, or None.
     fn slave_local(port: u16) -> Option<u8> {
         match port {
@@ -567,8 +672,9 @@ impl DmaController {
 
     /// IBM PC/AT page-register wiring. Note the address order is NOT channel
     /// order: 0x83->ch1, 0x81->ch2, 0x82->ch3, 0x87->ch0 (and the slave set).
-    /// 0x8F is the refresh page and 0x84-0x86/0x8C-0x8E/0x80/0x88 are scratch,
-    /// so neither appears here. Returns ("master"|"slave", local channel 0..3).
+    /// 0x8F is the refresh page, 0x84-0x86/0x88/0x8C-0x8E are DMA scratch,
+    /// and 0x80 belongs to the machine's POST latch, so none appears here.
+    /// Returns ("master"|"slave", local channel 0..3).
     fn page_target(port: u16) -> Option<(&'static str, usize)> {
         match port {
             0x83 => Some(("master", 1)),

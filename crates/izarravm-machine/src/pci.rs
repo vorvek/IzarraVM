@@ -4,6 +4,7 @@
 //! PCI configuration routing and the PIIX4-compatible southbridge.
 
 use izarravm_bus::BusWidth;
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
 use crate::vega::Vega;
 use crate::video_params::{
@@ -26,6 +27,14 @@ pub(crate) struct PciConfig {
     piix_ide_bm_base: u32,
 }
 
+/// Borrowed mechanism-1 selector and PIIX IDE state for canonical comparison.
+///
+/// Distira configuration belongs to the Vega owner, not this projection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalPciConfig<'a> {
+    pci: &'a PciConfig,
+}
+
 impl PciConfig {
     pub(crate) fn new() -> Self {
         Self {
@@ -35,6 +44,10 @@ impl PciConfig {
             piix_ide_command: PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER,
             piix_ide_bm_base: PIIX4_BMIDE_POWER_ON_BASE,
         }
+    }
+
+    pub(crate) fn canonical_projection(&self) -> CanonicalPciConfig<'_> {
+        CanonicalPciConfig { pci: self }
     }
 
     pub(crate) fn read_io(&self, port: u16, width: BusWidth, vega: &Vega) -> Option<u32> {
@@ -217,6 +230,20 @@ impl PciConfig {
             }
             _ => {}
         }
+    }
+}
+
+impl CanonicalPciConfig<'_> {
+    /// Writes version 1 of the fixed nine-byte PciConfig payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        out.write_u32(self.pci.address)?;
+        out.write_u8(
+            (self.pci.piix_ide_command & (PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER)) as u8,
+        )?;
+        out.write_u32(self.pci.piix_ide_bm_base)
     }
 }
 

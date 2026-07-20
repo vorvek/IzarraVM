@@ -36,6 +36,7 @@ mod atapi;
 mod bios;
 mod bmide;
 mod bus;
+mod canonical_state;
 mod cdimage;
 mod dma;
 mod dos;
@@ -116,6 +117,8 @@ mod speaker;
 mod storage;
 mod uart;
 mod unittester;
+
+pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
 
 pub use cdimage::CdImage;
 pub use iso9660::{MAX_IMAGE_BYTES as CD_FOLDER_MAX_BYTES, build as build_cd_folder};
@@ -690,6 +693,9 @@ pub struct Machine {
     // mode is not rounded to zero (mirrors the CPU's `timing_rem` for instruction
     // clocks). Reset on a mode switch (the per-mode ratio changes).
     bus_rem: u64,
+    // Cumulative scaled bus clocks committed by successful CPU batches. This is
+    // proof timing, separate from the mode-local fractional carry above.
+    scaled_bus_clocks: u64,
     #[cfg(feature = "jit")]
     poll_skip_enabled: bool,
     #[cfg(feature = "jit")]
@@ -1051,6 +1057,7 @@ impl Machine {
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
+            scaled_bus_clocks: 0,
             #[cfg(feature = "jit")]
             poll_skip_enabled: run::poll_skip_default(execution_backend),
             #[cfg(feature = "jit")]
@@ -1352,6 +1359,11 @@ impl Machine {
     /// The machine timeline applies the active mode's bus ratio separately.
     pub fn raw_bus_clocks(&self) -> u64 {
         self.trace.elapsed_clocks()
+    }
+
+    /// Scaled bus clocks committed by successful CPU batches since reset.
+    pub fn scaled_bus_clocks(&self) -> u64 {
+        self.scaled_bus_clocks
     }
 
     pub fn memory(&self) -> &Memory {

@@ -2,6 +2,166 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_core::{
+    CanonicalSectionId, CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateView,
+    CanonicalStateWriter,
+};
+
+fn canonical_dma_records(machine: &Machine) -> (Vec<u8>, Vec<u8>) {
+    fn finish(writer: CanonicalStateWriter) -> Vec<u8> {
+        let bytes = writer.finish().unwrap();
+        CanonicalStateView::parse(&bytes).unwrap().sections()[0]
+            .payload()
+            .to_vec()
+    }
+
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_0006).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| machine.dma.canonical_projection().write_payload(out),
+        )
+        .unwrap();
+    let mut totals = CanonicalStateWriter::new().unwrap();
+    totals
+        .section(
+            CanonicalSectionId::new(0x7ffe_0001).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| machine.dma.canonical_event_totals_v1().write_payload(out),
+        )
+        .unwrap();
+    (finish(state), finish(totals))
+}
+
+fn prepare_sb8_dma_canonical_proof() -> Machine {
+    let mut machine = test_machine();
+    for (index, byte) in (0..16u8).map(|value| value.wrapping_mul(16)).enumerate() {
+        machine.write_physical_u8(0x1_0000 + index as u32, byte);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0b, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x0f, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0a, BusWidth::Byte, 0x01, false).unwrap();
+        for byte in [0x41u8, 0x2b, 0x11, 0xc0, 0x00, 0x0f, 0x00] {
+            bus.write_io(0x22c, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    machine
+}
+
+fn prepare_sb16_dma_canonical_proof() -> Machine {
+    let mut machine = test_machine();
+    for index in 0..16u32 {
+        let bytes = (index as u16).wrapping_mul(0x111).to_le_bytes();
+        machine.write_physical_u8(0x2_0000 + index * 2, bytes[0]);
+        machine.write_physical_u8(0x2_0001 + index * 2, bytes[1]);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0xd6, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0xc4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xc4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xc6, BusWidth::Byte, 0x0f, false).unwrap();
+        bus.write_io(0xc6, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x8b, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0xd4, BusWidth::Byte, 0x01, false).unwrap();
+        for byte in [0x41u8, 0x56, 0x22, 0xb0, 0x30, 0x0f, 0x00] {
+            bus.write_io(0x22c, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    machine
+}
+
+fn prepare_wss_dma_canonical_proof() -> Machine {
+    let mut machine = test_machine();
+    let frame = [0x01u8, 0x00, 0xfe, 0xff];
+    for index in 0..8u32 {
+        for (offset, byte) in frame.into_iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + index * 4 + offset as u32, byte);
+        }
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0b, BusWidth::Byte, 0x48, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x1f, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0a, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x48, false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x5c, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap();
+        wss_write_indirect(bus, 10, 0x02);
+        wss_write_indirect(bus, 15, 0x07);
+        wss_write_indirect(bus, 14, 0x00);
+        wss_write_indirect(bus, 9, 0x09);
+    });
+    machine
+}
+
+#[test]
+fn sb_dma_canonical_records_are_invariant_to_advance_batch_size() {
+    for prepare in [
+        prepare_sb8_dma_canonical_proof as fn() -> Machine,
+        prepare_sb16_dma_canonical_proof,
+    ] {
+        let mut whole = prepare();
+        let mut split = prepare();
+        whole.advance_devices_clocks(200_000);
+        for _ in 0..200 {
+            split.advance_devices_clocks(1_000);
+        }
+        assert_eq!(canonical_dma_records(&whole), canonical_dma_records(&split));
+    }
+
+    let mut byte = prepare_sb8_dma_canonical_proof();
+    byte.advance_devices_clocks(200_000);
+    let byte_records = canonical_dma_records(&byte);
+    assert_eq!(byte_records.0.len(), 152);
+    assert_eq!(byte_records.1.len(), 64);
+    assert_eq!(
+        u64::from_le_bytes(byte_records.1[8..16].try_into().unwrap()),
+        16
+    );
+
+    let mut word = prepare_sb16_dma_canonical_proof();
+    word.advance_devices_clocks(200_000);
+    let word_records = canonical_dma_records(&word);
+    assert_eq!(
+        u64::from_le_bytes(word_records.1[40..48].try_into().unwrap()),
+        16,
+        "sixteen 16-bit transfers are sixteen cycles"
+    );
+}
+
+#[test]
+fn wss_dma_canonical_records_are_invariant_to_advance_batch_size() {
+    let mut whole = prepare_wss_dma_canonical_proof();
+    let mut split = prepare_wss_dma_canonical_proof();
+    whole.advance_devices_clocks(200_000);
+    for _ in 0..200 {
+        split.advance_devices_clocks(1_000);
+    }
+
+    let whole_records = canonical_dma_records(&whole);
+    assert_eq!(whole_records, canonical_dma_records(&split));
+    assert_eq!(whole_records.0.len(), 152);
+    assert_eq!(whole_records.1.len(), 64);
+    assert_eq!(
+        u64::from_le_bytes(whole_records.1[0..8].try_into().unwrap()),
+        32
+    );
+}
 
 #[test]
 fn passive_target_ports_allow_capability_probes_to_fail_cleanly() {

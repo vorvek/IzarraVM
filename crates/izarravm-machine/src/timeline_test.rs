@@ -2,6 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::{BIOS_ROM_SIZE, Machine, MachineCanonicalCaptureError, MachineProfile};
+use izarravm_core::VideoCard;
+
+fn test_machine() -> Machine {
+    Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0; BIOS_ROM_SIZE],
+    )
+    .unwrap()
+}
 
 #[test]
 fn timeline_uses_the_exact_quantum_for_every_mode() {
@@ -51,6 +61,170 @@ fn tsc_clock_is_batch_invariant_and_resets_fraction_on_mode_change() {
     assert_eq!(whole.tsc_clocks(), 100);
     whole.advance_master_ticks(99, DeviceRates::default());
     assert_eq!(whole.tsc_clocks(), 101);
+}
+
+#[test]
+fn canonical_projection_pins_every_timeline_word() {
+    let mut timeline = Timeline::new(GswMode::Gsw586);
+    timeline.advance_io_stall_ticks(
+        34,
+        DeviceRates {
+            dsp_hz: 2,
+            wss_hz: 3,
+            cd_playing: true,
+            vga_dot_hz: 4,
+        },
+    );
+
+    let projection = timeline.canonical_projection(GswMode::Gsw586).unwrap();
+
+    assert_eq!(
+        projection.words,
+        [
+            34,
+            34,
+            1,
+            34_000_000,
+            40_568_188,
+            68,
+            102,
+            2_550,
+            34,
+            1_000_000_000,
+            2_040,
+            1_071_000,
+            136,
+        ]
+    );
+}
+
+#[test]
+fn absolute_tsc_origin_is_transparent_under_continuation() {
+    let rates = DeviceRates {
+        dsp_hz: 22_050,
+        wss_hz: 48_000,
+        cd_playing: true,
+        vga_dot_hz: 25_175_000,
+    };
+    let mut left = Timeline::new(GswMode::Gsw386);
+    let mut right = left;
+    right.tsc_clocks = 0xd00d_f00d_dead_beef;
+
+    left.set_mode(GswMode::Gsw586);
+    right.set_mode(GswMode::Gsw586);
+    assert_eq!(
+        left.advance_master_ticks(1_003, rates),
+        right.advance_master_ticks(1_003, rates)
+    );
+    assert_eq!(
+        left.advance_io_stall_ticks(2_009, rates),
+        right.advance_io_stall_ticks(2_009, rates)
+    );
+    assert_eq!(
+        left.advance_master_ticks(3_007, rates),
+        right.advance_master_ticks(3_007, rates)
+    );
+
+    left.now_ticks = u64::MAX - 7;
+    right.now_ticks = u64::MAX - 7;
+    assert_eq!(
+        left.advance_master_ticks(19, rates),
+        right.advance_master_ticks(19, rates)
+    );
+
+    assert_eq!(
+        left.canonical_projection(GswMode::Gsw586),
+        right.canonical_projection(GswMode::Gsw586)
+    );
+    left.tsc_clocks = 0;
+    right.tsc_clocks = 0;
+    assert_eq!(left, right);
+}
+
+#[test]
+fn absolute_tsc_origin_cannot_change_machine_or_cpu_continuation() {
+    let mut left = test_machine();
+    let mut right = test_machine();
+    right.timeline.tsc_clocks = 0xd00d_f00d_dead_beef;
+
+    left.set_mode(GswMode::Gsw586);
+    right.set_mode(GswMode::Gsw586);
+    left.advance_cpu_work(7, 3);
+    right.advance_cpu_work(7, 3);
+    left.stall_for_master_ticks(101);
+    right.stall_for_master_ticks(101);
+    left.advance_halted_cpu_clocks(3);
+    right.advance_halted_cpu_clocks(3);
+    left.timeline.now_ticks = u64::MAX - 7;
+    right.timeline.now_ticks = u64::MAX - 7;
+    left.advance_halted_ticks(19);
+    right.advance_halted_ticks(19);
+
+    assert_eq!(
+        left.cpu, right.cpu,
+        "CPU state includes the architectural TSC"
+    );
+    assert_eq!(left.pic, right.pic);
+    assert_eq!(left.pit, right.pit);
+    assert_eq!(left.dsp, right.dsp);
+    assert_eq!(left.wss, right.wss);
+    assert_eq!(left.opl, right.opl);
+    assert_eq!(left.elapsed_clocks, right.elapsed_clocks);
+    assert_eq!(left.io_stall_clocks, right.io_stall_clocks);
+    assert_eq!(left.halted_ticks, right.halted_ticks);
+    let mut left_timeline = left.timeline;
+    let mut right_timeline = right.timeline;
+    left_timeline.tsc_clocks = 0;
+    right_timeline.tsc_clocks = 0;
+    assert_eq!(left_timeline, right_timeline);
+}
+
+#[test]
+fn canonical_projection_rejects_each_invalid_timeline_invariant() {
+    let mut quantum = test_machine();
+    quantum.timeline.ticks_per_cpu_clock = 301;
+    assert_eq!(
+        quantum.canonical_state_capture().err().unwrap(),
+        MachineCanonicalCaptureError::InconsistentTimelineQuantum {
+            expected: 300,
+            actual: 301,
+        }
+    );
+
+    let mut tsc = test_machine();
+    tsc.timeline.tsc_phase_ticks = 300;
+    assert_eq!(
+        tsc.canonical_state_capture().err().unwrap(),
+        MachineCanonicalCaptureError::InvalidTimelineRemainder {
+            phase: "tsc",
+            remainder: 300,
+            limit: 300,
+        }
+    );
+
+    let mut rate = test_machine();
+    rate.timeline.dsp = RatePhase {
+        remainder: MASTER_CLOCK_HZ,
+    };
+    assert_eq!(
+        rate.canonical_state_capture().err().unwrap(),
+        MachineCanonicalCaptureError::InvalidTimelineRemainder {
+            phase: "dsp",
+            remainder: MASTER_CLOCK_HZ,
+            limit: MASTER_CLOCK_HZ,
+        }
+    );
+
+    let mut totals = test_machine();
+    totals.timeline.now_ticks = 3;
+    totals.timeline.io_stall_ticks = 4;
+    assert_eq!(
+        totals.canonical_state_capture().err().unwrap(),
+        MachineCanonicalCaptureError::InvalidTimelineTotals {
+            now_ticks: 3,
+            io_stall_ticks: 4,
+        }
+    );
 }
 
 #[test]
@@ -160,6 +334,10 @@ fn device_events_and_phases_are_batch_invariant() {
     assert_eq!(actual.distira_lines, expected.distira_lines);
     assert_eq!(actual.vga_dots, expected.vga_dots);
     assert_eq!(split, whole);
+    assert_eq!(
+        split.canonical_projection(GswMode::Gsw386),
+        whole.canonical_projection(GswMode::Gsw386)
+    );
 }
 
 #[test]

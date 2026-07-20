@@ -13,6 +13,8 @@
 //! seeds the time once at startup and the device self-advances on the machine
 //! clock; there is no live host resync.
 
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+
 use crate::timeline::RatePhase;
 
 /// Register index of the seconds byte; the rest follow the standard offsets.
@@ -125,6 +127,15 @@ pub struct Rtc {
     periodic_phase: RatePhase,
 }
 
+/// Borrowed RTC state that can affect later guest behavior.
+///
+/// Host seeding and persistence-notification flags are outside this projection.
+/// They do not change port behavior, clock advancement, deadlines, or IRQs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalRtc<'a> {
+    rtc: &'a Rtc,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Time {
     year: u16,   // full year, e.g. 2026
@@ -143,6 +154,10 @@ impl Default for Rtc {
 }
 
 impl Rtc {
+    pub(crate) fn canonical_projection(&self) -> CanonicalRtc<'_> {
+        CanonicalRtc { rtc: self }
+    }
+
     /// A fresh device: clock at the epoch start until seeded, status registers
     /// at their power-on values, and a defaulted NVRAM area with a valid
     /// checksum.
@@ -600,6 +615,27 @@ impl Rtc {
             minute: self.ram[usize::from(REG_MINUTES)].min(59),
             second: self.ram[usize::from(REG_SECONDS)].min(59),
         };
+    }
+}
+
+impl CanonicalRtc<'_> {
+    /// Writes version 1 of the fixed 82-byte RTC and CMOS payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        let rtc = self.rtc;
+        out.write_raw_bytes(&rtc.ram)?;
+        out.write_u8(rtc.index)?;
+        out.write_bool(rtc.nmi_disabled)?;
+        out.write_u16(rtc.time.year)?;
+        out.write_u8(rtc.time.month)?;
+        out.write_u8(rtc.time.day)?;
+        out.write_u8(rtc.time.weekday)?;
+        out.write_u8(rtc.time.hour)?;
+        out.write_u8(rtc.time.minute)?;
+        out.write_u8(rtc.time.second)?;
+        out.write_u64(rtc.periodic_phase.remainder())
     }
 }
 

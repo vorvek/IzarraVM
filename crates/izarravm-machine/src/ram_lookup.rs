@@ -39,10 +39,25 @@ impl RamPageLookup {
         for (page, base) in self.page_bases.iter_mut().enumerate() {
             let start = page * RAM_LOOKUP_PAGE_SIZE;
             let end = (start + RAM_LOOKUP_PAGE_SIZE).min(memory_len);
-            if ram_lookup_page_is_direct(start, end, vega) {
-                *base = start;
-            }
+            *base = ram_lookup_page_base(start, end, vega);
         }
+    }
+
+    /// Checks that this acceleration table is the exact derivation of the
+    /// authoritative RAM length and live video-memory decode.
+    ///
+    /// Canonical capture excludes the table itself, but a stale direct entry
+    /// could route a later CPU access to RAM instead of a device. Keep this
+    /// allocation-free and share the same page derivation as `rebuild`.
+    pub(crate) fn is_consistent(&self, memory_len: usize, vega: &Vega) -> bool {
+        let page_count = memory_len.div_ceil(RAM_LOOKUP_PAGE_SIZE);
+        self.memory_len == memory_len
+            && self.page_bases.len() == page_count
+            && self.page_bases.iter().enumerate().all(|(page, &base)| {
+                let start = page * RAM_LOOKUP_PAGE_SIZE;
+                let end = (start + RAM_LOOKUP_PAGE_SIZE).min(memory_len);
+                base == ram_lookup_page_base(start, end, vega)
+            })
     }
 
     #[inline]
@@ -72,6 +87,14 @@ impl RamPageLookup {
     }
 }
 
+fn ram_lookup_page_base(start: usize, end: usize, vega: &Vega) -> usize {
+    if ram_lookup_page_is_direct(start, end, vega) {
+        start
+    } else {
+        RAM_LOOKUP_SLOW
+    }
+}
+
 fn ram_lookup_page_is_direct(start: usize, end: usize, vega: &Vega) -> bool {
     if end <= 0x000A_0000 {
         return true;
@@ -80,4 +103,35 @@ fn ram_lookup_page_is_direct(start: usize, end: usize, vega: &Vega) -> bool {
         return false;
     }
     !vega.memory_bar_overlaps(start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MEMORY_LEN: usize = 2 * 1024 * 1024;
+
+    #[test]
+    fn consistency_checks_length_page_count_and_every_page_base() {
+        let vega = Vega::default();
+        let mut lookup = RamPageLookup::new(MEMORY_LEN, &vega);
+        assert!(lookup.is_consistent(MEMORY_LEN, &vega));
+
+        lookup.memory_len -= 1;
+        assert!(!lookup.is_consistent(MEMORY_LEN, &vega));
+        lookup.memory_len = MEMORY_LEN;
+
+        let expected_pages = MEMORY_LEN.div_ceil(RAM_LOOKUP_PAGE_SIZE);
+        lookup.page_bases = vec![RAM_LOOKUP_SLOW; expected_pages - 1].into_boxed_slice();
+        assert!(!lookup.is_consistent(MEMORY_LEN, &vega));
+
+        lookup = RamPageLookup::new(MEMORY_LEN, &vega);
+        lookup.page_bases[0] = RAM_LOOKUP_SLOW;
+        assert!(!lookup.is_consistent(MEMORY_LEN, &vega));
+
+        lookup = RamPageLookup::new(MEMORY_LEN, &vega);
+        let extended_page = 0x0010_0000 / RAM_LOOKUP_PAGE_SIZE;
+        lookup.page_bases[extended_page] = RAM_LOOKUP_SLOW;
+        assert!(!lookup.is_consistent(MEMORY_LEN, &vega));
+    }
 }

@@ -7,6 +7,8 @@ use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
+mod canonical_state;
+pub use canonical_state::{CanonicalCpuExecution, CpuCanonicalCaptureError};
 mod control;
 #[path = "core.rs"]
 mod cpu_core;

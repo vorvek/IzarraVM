@@ -166,6 +166,121 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
     }
 }
 
+fn scaled_bus_loop_machine(mode: GswMode) -> Machine {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xeb, 0xfe])
+            .expect("raw loop machine");
+    machine.set_mode(mode);
+    machine
+}
+
+fn expected_scaled_bus_delta(raw: u64, remainder: u64, mode: GswMode) -> (u64, u64) {
+    let (num, den) = bus_timing(mode.persona());
+    let numerator = u128::from(raw) * u128::from(num) + u128::from(remainder);
+    (
+        u64::try_from(numerator / u128::from(den)).unwrap(),
+        u64::try_from(numerator % u128::from(den)).unwrap(),
+    )
+}
+
+#[test]
+fn committed_scaled_bus_total_is_split_invariant() {
+    let mode = GswMode::Gsw586;
+    let mut machine = scaled_bus_loop_machine(mode);
+    let raw_before = machine.raw_bus_clocks();
+    let scaled_before = machine.scaled_bus_clocks();
+    let remainder_before = machine.bus_rem;
+
+    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
+    let _ = machine.run_until_halt_or_cycles(30_000).unwrap();
+
+    let raw_delta = machine.raw_bus_clocks() - raw_before;
+    let (expected_delta, expected_remainder) =
+        expected_scaled_bus_delta(raw_delta, remainder_before, mode);
+    assert!(raw_delta > 0);
+    assert_eq!(machine.scaled_bus_clocks() - scaled_before, expected_delta);
+    assert_eq!(machine.bus_rem, expected_remainder);
+}
+
+#[test]
+fn scaled_bus_mode_switch_preserves_total_and_discards_only_old_carry() {
+    let mut machine = scaled_bus_loop_machine(GswMode::Gsw586);
+    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
+    let total_before_switch = machine.scaled_bus_clocks();
+    assert!(total_before_switch > 0);
+    machine.bus_rem = 29;
+
+    machine.set_mode(GswMode::Gsw386);
+    assert_eq!(machine.scaled_bus_clocks(), total_before_switch);
+    assert_eq!(machine.bus_rem, 0);
+
+    let raw_before = machine.raw_bus_clocks();
+    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
+    let raw_delta = machine.raw_bus_clocks() - raw_before;
+    let (expected_delta, expected_remainder) =
+        expected_scaled_bus_delta(raw_delta, 0, GswMode::Gsw386);
+    assert_eq!(
+        machine.scaled_bus_clocks() - total_before_switch,
+        expected_delta
+    );
+    assert_eq!(machine.bus_rem, expected_remainder);
+}
+
+#[test]
+fn bandwidth_probe_does_not_commit_scaled_bus_clocks() {
+    let mut machine = scaled_bus_loop_machine(GswMode::Gsw586);
+    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
+    let scaled_before = machine.scaled_bus_clocks();
+    let raw_before = machine.raw_bus_clocks();
+    machine.bus_rem = 29;
+
+    let sample = machine.measure_read_bandwidth(0x10_0000, 4 * 1024, 64 * 1024);
+
+    assert!(sample.clocks > 0);
+    assert!(machine.raw_bus_clocks() > raw_before);
+    assert_eq!(machine.scaled_bus_clocks(), scaled_before);
+    let raw_delta = machine.raw_bus_clocks() - raw_before;
+    let (_, expected_remainder) = expected_scaled_bus_delta(raw_delta, 0, GswMode::Gsw586);
+    assert_eq!(machine.bus_rem, expected_remainder);
+}
+
+#[test]
+fn device_and_halted_advances_do_not_commit_scaled_bus_clocks() {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4])
+            .expect("raw hlt machine");
+    machine.set_mode(GswMode::Gsw586);
+    let raw_before = machine.raw_bus_clocks();
+    let remainder_before = machine.bus_rem;
+    assert_eq!(
+        machine.run_until_halt_or_cycles(20_000).unwrap(),
+        StopReason::Halted
+    );
+    let raw_delta = machine.raw_bus_clocks() - raw_before;
+    let (expected_delta, expected_remainder) =
+        expected_scaled_bus_delta(raw_delta, remainder_before, GswMode::Gsw586);
+    let after_hlt = machine.scaled_bus_clocks();
+    assert!(raw_delta > 0);
+    assert_eq!(after_hlt, expected_delta);
+    assert_eq!(machine.bus_rem, expected_remainder);
+
+    machine.advance_devices_ticks(1_000);
+    machine.advance_devices_clocks(1_000);
+    machine.advance_halted_ticks(1_000);
+
+    assert_eq!(machine.scaled_bus_clocks(), after_hlt);
+}
+
+#[test]
+fn committed_scaled_bus_total_saturates() {
+    let mut machine = scaled_bus_loop_machine(GswMode::Gsw586);
+    machine.scaled_bus_clocks = u64::MAX;
+
+    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
+
+    assert_eq!(machine.scaled_bus_clocks(), u64::MAX);
+}
+
 #[test]
 fn approximate_class_bypasses_cache_tiering_accurate_class_does_not() {
     use izarravm_core::GswMode;

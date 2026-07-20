@@ -1061,9 +1061,12 @@ impl Machine {
                     // would miss exactly the case that fails. The Accurate class
                     // (386) never accumulates this (see read_io), so it stays
                     // byte-identical; its slower clock already spans the 80 us window.
+                    let scaled_bus_clocks = self.scale_bus(bus_clocks);
                     let step = u64::from(outcome.core_clocks)
-                        + self.scale_bus(bus_clocks)
+                        + scaled_bus_clocks
                         + std::mem::take(&mut self.isa_io_batch_clocks);
+                    self.scaled_bus_clocks =
+                        self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
                     // Advance the OPL timers so AdLib detection's delay loops see
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).

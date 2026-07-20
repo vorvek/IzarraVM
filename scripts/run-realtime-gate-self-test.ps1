@@ -29,6 +29,106 @@ function Invoke-RealtimeGateSelfTest {
         -not (Test-ObservationRequiresTestExit $false "doom-586")) {
         throw "The observation TestExit selection changed a normal or BackendBakeoff policy."
     }
+    Assert-DirectQuakeCampaignMode `
+        $false $false $false $false $false $false $false $false $false $false $false `
+        "Noise" 6 "Quake" 8 "C:\gate.lock"
+    Assert-DirectQuakeCampaignMode `
+        $false $false $false $false $false $false $false $false $false $false $false `
+        "Screen" 2 "Quake" 8 "C:\gate.lock"
+    Assert-DirectQuakeCampaignMode `
+        $false $false $false $false $false $false $false $false $false $false $false `
+        "Proof" 12 "Quake" 8 "C:\gate.lock"
+    if ((Get-NormalizedDirectQuakeCampaignStage "noise") -cne "Noise" -or
+        (Get-NormalizedDirectQuakeCampaignStage "SCREEN") -cne "Screen" -or
+        (Get-NormalizedDirectQuakeCampaignStage "Proof") -cne "Proof") {
+        throw "Direct Quake campaign stage normalization is not canonical."
+    }
+    Assert-DirectQuakeExecutableRelation "Noise" ("1" * 64) ("2" * 64)
+    foreach ($stage in @("Screen", "Proof")) {
+        Assert-SelfTestThrows {
+            Assert-DirectQuakeExecutableRelation $stage ("1" * 64) ("1" * 64)
+        } "require different candidate and retained-parent binaries"
+    }
+    Assert-SelfTestThrows {
+        Assert-DirectQuakeCampaignMode `
+            $false $true $false $false $false $false $false $false $false $false $false `
+            "Proof" 6 "Quake" 8 "C:\gate.lock"
+    } "another comparison mode"
+    Assert-SelfTestThrows {
+        Assert-DirectQuakeCampaignMode `
+            $false $false $false $false $false $false $false $false $false $false $true `
+            "Proof" 6 "Quake" 8 "C:\gate.lock"
+    } "fixes its order"
+    Assert-SelfTestThrows {
+        Assert-DirectQuakeCampaignMode `
+            $false $false $false $false $false $false $false $false $false $false $false `
+            "Screen" 6 "Quake" 8 "C:\gate.lock"
+    } "invalid measured-pair count"
+    Assert-SelfTestThrows {
+        Assert-DirectQuakeCampaignMode `
+            $false $false $false $false $false $false $false $false $false $false $false `
+            "Proof" 6 "Both" 8 "C:\gate.lock"
+    } "requires the Quake workload"
+    $campaignPairs = @(1..6 | ForEach-Object {
+        (Get-DirectQuakePairOrder $_ @("A", "B")) -join ""
+    })
+    if (($campaignPairs -join ",") -cne "AB,BA,BA,AB,AB,BA") {
+        throw "The Direct Quake campaign pair order is not ABBA, BAAB, ABBA."
+    }
+    $campaignPairs12 = @(1..12 | ForEach-Object {
+        (Get-DirectQuakePairOrder $_ @("A", "B")) -join ""
+    })
+    if (($campaignPairs12[0..5] -join ",") -cne
+        ($campaignPairs12[6..11] -join ",")) {
+        throw "The twelve-pair Direct Quake schedule does not repeat the fixed six-pair order."
+    }
+    $directPolicy = Get-DirectQuakeExecutionPolicy
+    if ($directPolicy.environment.IZARRAVM_JIT -cne "1" -or
+        $directPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
+        $directPolicy.required_zero_counters -cnotcontains "jit_clif_entries" -or
+        $directPolicy.required_zero_counters -cnotcontains "jit_region_entries") {
+        throw "The Direct Quake execution policy does not exclude legacy backend activity."
+    }
+    if ((Get-DirectQuakeCampaignMetric ([double[]](1.03) * 6) "Proof").classification -cne
+        "normal_promotion_threshold_met" -or
+        (Get-DirectQuakeCampaignMetric ([double[]](1.015) * 6) "Proof").classification -cne
+            "narrow_requires_mechanism_evidence" -or
+        (Get-DirectQuakeCampaignMetric `
+            ([double[]](1.01, 1.01, 1.01, 1.01, 1.01, 0.99)) "Proof").classification -cne
+            "twelve_pair_extension_eligible" -or
+        (Get-DirectQuakeCampaignMetric ([double[]](0.99) * 6) "Proof").classification -cne
+            "reject" -or
+        (Get-DirectQuakeCampaignMetric `
+            ([double[]](1.019, 1.019, 1.019, 1.019, 0.999, 0.999)) "Proof").classification -cne
+            "reject" -or
+        (Get-DirectQuakeCampaignMetric ([double[]](1.0) * 6) "Noise").classification -cne
+            "noise_only") {
+        throw "The Direct Quake campaign metric classifier is wrong."
+    }
+    $hddTreeSelfTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "izarra-hdd-tree-$([guid]::NewGuid().ToString('N'))"
+    )
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $hddTreeSelfTestRoot "B") -Force |
+            Out-Null
+        [IO.File]::WriteAllBytes((Join-Path $hddTreeSelfTestRoot "z.bin"), [byte[]](1, 2, 3))
+        [IO.File]::WriteAllBytes((Join-Path $hddTreeSelfTestRoot "B/a.bin"), [byte[]](4, 5))
+        $hddTreeFirst = Get-HddTreeSnapshotV1 $hddTreeSelfTestRoot
+        (Get-Item -LiteralPath (Join-Path $hddTreeSelfTestRoot "z.bin")).LastWriteTimeUtc =
+            [DateTime]::UtcNow.AddDays(-2)
+        $hddTreeMetadataOnly = Get-HddTreeSnapshotV1 $hddTreeSelfTestRoot
+        if ($hddTreeFirst.tree_sha256 -cne $hddTreeMetadataOnly.tree_sha256 -or
+            ($hddTreeFirst.files.path -join ",") -cne "B/a.bin,z.bin") {
+            throw "The HDD tree snapshot depends on metadata or non-ordinal enumeration order."
+        }
+        [IO.File]::WriteAllBytes((Join-Path $hddTreeSelfTestRoot "z.bin"), [byte[]](1, 2, 4))
+        if ((Get-HddTreeSnapshotV1 $hddTreeSelfTestRoot).tree_sha256 -ceq
+            $hddTreeFirst.tree_sha256) {
+            throw "The HDD tree snapshot ignored a content change."
+        }
+    } finally {
+        Remove-Item -LiteralPath $hddTreeSelfTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
     $completionOverrides = Get-BackendQuakeCompletionOverrides
     if ($completionOverrides.autoexec_bytes.Length -ne 125 -or
         $completionOverrides.autoexec_sha256 -cne $backendQuakeAutoexecSha256 -or
@@ -641,6 +741,7 @@ function Invoke-RealtimeGateSelfTest {
         elapsed_budget_clocks = 30
         executed_cpu_core_clocks = 11
         raw_bus_clocks = 19
+        scaled_bus_clocks = 17
         stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
         timedemo = [pscustomobject]@{ gametics = 2134; realtics = 830 }
         gate_artifacts = [pscustomobject]@{
@@ -663,6 +764,38 @@ function Invoke-RealtimeGateSelfTest {
         $unequalComparison.mismatched_fields -notcontains "raw_bus_clocks") {
         throw "Equal-work comparison did not preserve a valid negative result."
     }
+    $exactSampleB.raw_bus_clocks = 19
+    $exactSampleB.scaled_bus_clocks = 16
+    $scaledComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if ($scaledComparison.matches -or
+        $scaledComparison.mismatched_fields.Count -ne 1 -or
+        $scaledComparison.mismatched_fields[0] -cne "scaled_bus_clocks") {
+        throw "Equal-work comparison did not enforce scaled bus clocks independently."
+    }
+    $exactSampleA.PSObject.Properties.Remove("scaled_bus_clocks")
+    $exactSampleB.PSObject.Properties.Remove("scaled_bus_clocks")
+    $missingScaledComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if ($missingScaledComparison.matches -or
+        $missingScaledComparison.mismatched_fields.Count -ne 1 -or
+        $missingScaledComparison.mismatched_fields[0] -cne "scaled_bus_clocks") {
+        throw "Equal-work comparison accepted two missing scaled bus totals."
+    }
+    $exactSampleA | Add-Member -NotePropertyName scaled_bus_clocks -NotePropertyValue $null
+    $exactSampleB | Add-Member -NotePropertyName scaled_bus_clocks -NotePropertyValue $null
+    $nullScaledComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if ($nullScaledComparison.matches -or
+        $nullScaledComparison.mismatched_fields.Count -ne 1 -or
+        $nullScaledComparison.mismatched_fields[0] -cne "scaled_bus_clocks") {
+        throw "Equal-work comparison accepted two null scaled bus totals."
+    }
+    $exactSampleA.scaled_bus_clocks = 17
+    $exactSampleB.scaled_bus_clocks = 17
     $pollExactA = $exactSampleA | ConvertTo-Json -Depth 8 | ConvertFrom-Json
     $pollExactA.perf | Add-Member -NotePropertyName poll_skip_spans -NotePropertyValue 0
     $pollExactA.perf | Add-Member -NotePropertyName poll_skip_iterations -NotePropertyValue 0
@@ -1074,6 +1207,8 @@ function Invoke-RealtimeGateSelfTest {
         param($Policy, [string]$RevisionRole, [string]$Observation, $ExecutionPolicy, [double]$Ratio)
         $isQuake = $Policy.name -ceq "quake-586"
         $automatic = $ExecutionPolicy.name -ceq "automatic"
+        $direct = $ExecutionPolicy.name -ceq "direct"
+        $nativeDirect = $automatic -or $direct
         $fixture = if ($isQuake) {
             $syntheticQuakeFixture | ConvertTo-Json -Depth 8 | ConvertFrom-Json
         } else {
@@ -1094,16 +1229,22 @@ function Invoke-RealtimeGateSelfTest {
             guest_seconds = 10.0 * $Ratio
             real_time_factor = $Ratio
             instructions_per_host_second = 100.0 * $Ratio
-            direct_native_coverage = if ($automatic) { 0.9 } else { 0.0 }
+            direct_native_coverage = if ($nativeDirect) { 0.9 } else { 0.0 }
             direct_slow_exits_per_100_instructions = 0.0
             perf = [pscustomobject][ordered]@{
                 instructions = [uint64]1000
                 jit_region_entries = if ($automatic) { 1 } else { 0 }
                 jit_region_insns = if ($automatic) { 100 } else { 0 }
                 jit_native_insns = if ($automatic) { 100 } else { 0 }
-                jit_direct_entries = if ($automatic) { 90 } else { 0 }
-                jit_direct_insns = if ($automatic) { 900 } else { 0 }
+                jit_helper_exits = 0
+                jit_native_memory_helpers = 0
+                jit_direct_entries = if ($nativeDirect) { 90 } else { 0 }
+                jit_direct_insns = if ($nativeDirect) { 900 } else { 0 }
                 jit_direct_side_exits = 0
+                jit_clif_compile_attempts = 0
+                jit_clif_units_installed = 0
+                jit_clif_entries = 0
+                jit_clif_side_exits = 0
                 poll_skip_spans = 0
                 poll_skip_iterations = 0
             }
@@ -1111,6 +1252,7 @@ function Invoke-RealtimeGateSelfTest {
             elapsed_budget_clocks = [uint64]3000
             executed_cpu_core_clocks = [uint64]1100
             raw_bus_clocks = [uint64]1900
+            scaled_bus_clocks = [uint64]1700
             stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
             timedemo = if ($isQuake) { $null } else {
                 [pscustomobject]@{ gametics = 2134; realtics = 830 }
@@ -1150,6 +1292,155 @@ function Invoke-RealtimeGateSelfTest {
                 result_block_normalized_bytes = 128
             }
         }
+    }
+    $newDirectQuakeSample = {
+        param(
+            [string]$RevisionRole,
+            [string]$Observation,
+            [string]$ObservationClass,
+            [double]$Ratio,
+            [string]$ExecutableSha256
+        )
+        $policy = Get-WorkloadPolicy "quake-586"
+        $sample = & $newTrackMSample `
+            $policy $RevisionRole $Observation $directPolicy $Ratio
+        $sample | Add-Member -NotePropertyName gate_observation_class `
+            -NotePropertyValue $ObservationClass
+        $powerScheme = "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c (High performance)"
+        $sample | Add-Member -NotePropertyName gate_power_scheme_before `
+            -NotePropertyValue $powerScheme
+        $sample | Add-Member -NotePropertyName gate_power_scheme_after `
+            -NotePropertyValue $powerScheme
+        $sample | Add-Member -NotePropertyName gate_argv `
+            -NotePropertyValue ([object[]]@("--cpu", "586", "--cycles", "6200000000"))
+        $sample | Add-Member -NotePropertyName gate_argv_sha256 `
+            -NotePropertyValue ("a" * 64)
+        $sample | Add-Member -NotePropertyName gate_executable_sha256 `
+            -NotePropertyValue $ExecutableSha256
+        $sample | Add-Member -NotePropertyName gate_hdd_tree `
+            -NotePropertyValue ([pscustomobject][ordered]@{
+                schema = "izarra-hdd-tree-snapshot-v1"
+                tree_sha256 = "b" * 64
+            })
+        $sample.gate_artifacts | Add-Member -NotePropertyName hdd_tree_file `
+            -NotePropertyValue "$RevisionRole-$Observation-hdd-tree.json"
+        $sample.gate_artifacts | Add-Member -NotePropertyName hdd_tree_sha256 `
+            -NotePropertyValue ("c" * 64)
+        if ($ObservationClass -ceq "production") {
+            $sample.stop = [pscustomobject]@{
+                kind = "cycle_limit"
+                requested = [uint64]6200000000
+            }
+            $sample.gate_termination_policy = "fixed_cycle_production"
+            $sample.gate_fixture = $null
+            $sample.gate_quake_completion = $null
+            $sample.gate_measurement_fixture_sha256 = "d" * 64
+        }
+        return $sample
+    }
+    $savedRunsForDirectSelfTest = $Runs
+    try {
+        $Runs = 6
+        $candidateSha = "1" * 64
+        $parentSha = "2" * 64
+        $directCandidate = @()
+        $directParent = @()
+        foreach ($pair in 1..6) {
+            $directCandidate += & $newDirectQuakeSample `
+                "candidate" "pair$pair" "production" 1.03 $candidateSha
+            $directParent += & $newDirectQuakeSample `
+                "parent" "pair$pair" "production" 1.0 $parentSha
+        }
+        $directWarmups = [pscustomobject][ordered]@{
+            candidate = [object[]]@(& $newDirectQuakeSample `
+                "candidate" "warmup" "production" 1.0 $candidateSha)
+            parent = [object[]]@(& $newDirectQuakeSample `
+                "parent" "warmup" "production" 1.0 $parentSha)
+        }
+        $directCorrectness = [pscustomobject][ordered]@{
+            candidate = [object[]]@(& $newDirectQuakeSample `
+                "candidate" "correctness" "correctness" 1.0 $candidateSha)
+            parent = [object[]]@(& $newDirectQuakeSample `
+                "parent" "correctness" "correctness" 1.0 $parentSha)
+        }
+        $directWorkload = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
+            $directWarmups $directCorrectness $directPolicy "Proof" $candidateSha $parentSha
+        if ($directWorkload.exact_work.verdict -cne "pass" -or
+            $directWorkload.provenance.verdict -cne "pass" -or
+            $directWorkload.paired_metrics.real_time_factor.classification -cne
+                "normal_promotion_threshold_met") {
+            throw "The Direct Quake campaign synthetic proof was rejected."
+        }
+        $noiseCandidate = @()
+        $noiseParent = @()
+        foreach ($pair in 1..6) {
+            $noiseCandidate += & $newDirectQuakeSample `
+                "candidate" "pair$pair" "production" 1.0 $parentSha
+            $noiseParent += & $newDirectQuakeSample `
+                "parent" "pair$pair" "production" 1.0 $parentSha
+        }
+        $noiseWarmups = [pscustomobject][ordered]@{
+            candidate = [object[]]@(& $newDirectQuakeSample `
+                "candidate" "warmup" "production" 1.0 $parentSha)
+            parent = [object[]]@(& $newDirectQuakeSample `
+                "parent" "warmup" "production" 1.0 $parentSha)
+        }
+        $noiseCorrectness = [pscustomobject][ordered]@{
+            candidate = [object[]]@(& $newDirectQuakeSample `
+                "candidate" "correctness" "correctness" 1.0 $parentSha)
+            parent = [object[]]@(& $newDirectQuakeSample `
+                "parent" "correctness" "correctness" 1.0 $parentSha)
+        }
+        $noiseWorkload = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $noiseCandidate $noiseParent `
+            $noiseWarmups $noiseCorrectness $directPolicy "Noise" $candidateSha $parentSha
+        if ($noiseWorkload.exact_work.verdict -cne "pass" -or
+            $noiseWorkload.provenance.verdict -cne "pass" -or
+            $noiseWorkload.paired_metrics.real_time_factor.classification -cne "noise_only") {
+            throw "The Direct Quake single-executable noise study was rejected."
+        }
+        $noiseCandidate[0].gate_executable_sha256 = $candidateSha
+        $escapedNoiseWorkload = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $noiseCandidate $noiseParent `
+            $noiseWarmups $noiseCorrectness $directPolicy "Noise" $candidateSha $parentSha
+        if ($escapedNoiseWorkload.provenance.verdict -cne "fail" -or
+            ($escapedNoiseWorkload.provenance.failure_reasons -join " ") -notmatch
+                "wrong frozen binary") {
+            throw "The Direct Quake noise study accepted a candidate-binary observation."
+        }
+        $noiseCandidate[0].gate_executable_sha256 = $parentSha
+        $directCandidate[0].gate_hdd_tree.tree_sha256 = "e" * 64
+        $hddMismatch = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
+            $directWarmups $directCorrectness $directPolicy "Proof" $candidateSha $parentSha
+        if ($hddMismatch.exact_work.verdict -cne "fail" -or
+            ($hddMismatch.exact_work.failure_reasons -join " ") -notmatch "hdd_tree_identity") {
+            throw "The Direct Quake campaign accepted a final HDD mismatch."
+        }
+        $directCandidate[0].gate_hdd_tree.tree_sha256 = "b" * 64
+        $directCandidate[0].perf.jit_clif_entries = 1
+        $clifMismatch = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
+            $directWarmups $directCorrectness $directPolicy "Proof" $candidateSha $parentSha
+        if ($clifMismatch.provenance.verdict -cne "fail" -or
+            ($clifMismatch.provenance.failure_reasons -join " ") -notmatch "Clif activity") {
+            throw "The Direct Quake campaign accepted legacy Clif activity."
+        }
+        $directCandidate[0].perf.jit_clif_entries = 0
+        $directCandidate[0].PSObject.Properties.Remove("scaled_bus_clocks")
+        $missingScaledBus = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
+            $directWarmups $directCorrectness $directPolicy "Proof" $candidateSha $parentSha
+        if ($missingScaledBus.provenance.verdict -cne "fail" -or
+            ($missingScaledBus.provenance.failure_reasons -join " ") -notmatch
+                "scaled_bus_clocks") {
+            throw "The Direct Quake campaign accepted a missing scaled bus total."
+        }
+        $directCandidate[0] | Add-Member `
+            -NotePropertyName scaled_bus_clocks -NotePropertyValue ([uint64]1700)
+    } finally {
+        $Runs = $savedRunsForDirectSelfTest
     }
     $newTrackMScreen = {
         param($Policy, $ExecutionPolicy, [int]$Pairs, [double[]]$Ratios)
@@ -1197,6 +1488,7 @@ function Invoke-RealtimeGateSelfTest {
         elapsed_budget_clocks = { param($sample) $sample.elapsed_budget_clocks++ }
         executed_cpu_core_clocks = { param($sample) $sample.executed_cpu_core_clocks++ }
         raw_bus_clocks = { param($sample) $sample.raw_bus_clocks++ }
+        scaled_bus_clocks = { param($sample) $sample.scaled_bus_clocks++ }
         stop = { param($sample) $sample.stop.code = 1 }
         timedemo_identity = { param($sample) $sample.quake_timedemo.line = "969 frames  22.7 seconds  42.6 fps" }
         result_block_identity = { param($sample) $sample.gate_artifacts.result_block_sha256 = "9" * 64 }
@@ -1222,6 +1514,34 @@ function Invoke-RealtimeGateSelfTest {
         $warmupMismatchScreen.warmups $automaticPolicy
     if ($warmupMismatchResult.verdicts.exact_work -ne "fail") {
         throw "Track M accepted unequal discarded warmups."
+    }
+    $missingScaledScreen = & $newTrackMScreen `
+        $trackMPolicies[0] $automaticPolicy 3 ([double[]](1, 1, 1))
+    foreach ($sample in @(
+        $missingScaledScreen.candidate + $missingScaledScreen.parent +
+        $missingScaledScreen.warmups.candidate + $missingScaledScreen.warmups.parent
+    )) {
+        $sample.PSObject.Properties.Remove("scaled_bus_clocks")
+    }
+    $missingScaledResult = Get-TrackMWorkloadSummary `
+        $trackMPolicies[0] $missingScaledScreen.candidate $missingScaledScreen.parent `
+        $missingScaledScreen.warmups $automaticPolicy
+    if ($missingScaledResult.verdicts.exact_work -ne "fail") {
+        throw "Track M accepted scaled bus totals missing from both roles."
+    }
+    $nullScaledScreen = & $newTrackMScreen `
+        $trackMPolicies[0] $automaticPolicy 3 ([double[]](1, 1, 1))
+    foreach ($sample in @(
+        $nullScaledScreen.candidate + $nullScaledScreen.parent +
+        $nullScaledScreen.warmups.candidate + $nullScaledScreen.warmups.parent
+    )) {
+        $sample.scaled_bus_clocks = $null
+    }
+    $nullScaledResult = Get-TrackMWorkloadSummary `
+        $trackMPolicies[0] $nullScaledScreen.candidate $nullScaledScreen.parent `
+        $nullScaledScreen.warmups $automaticPolicy
+    if ($nullScaledResult.verdicts.exact_work -ne "fail") {
+        throw "Track M accepted null scaled bus totals from both roles."
     }
 
     $semanticMutations = [ordered]@{
@@ -1490,6 +1810,82 @@ function Invoke-RealtimeGateSelfTest {
         }
     }
 
+    $savedDirectSummaryState = [ordered]@{
+        runs = $Runs
+        screening = $Screening
+        policies = $policies
+        masks = $verifiedChildAffinityMasks
+        candidate_sha256 = $candidateArtifact.sha256
+        parent_sha256 = $baselineArtifact.sha256
+        campaign_stage = $CampaignStage
+        active_power_scheme_at_completion = $activePowerSchemeAtCompletion
+    }
+    try {
+        $Runs = 6
+        $Screening = $false
+        $CampaignStage = "Proof"
+        $policies = @((Get-WorkloadPolicy "quake-586"))
+        $directQuakeExecutionPolicy = $directPolicy
+        $candidateArtifact.sha256 = $candidateSha
+        $baselineArtifact.sha256 = $parentSha
+        $activePowerScheme = `
+            "Power Scheme GUID: $highPerformancePowerSchemeGuid (High performance)"
+        $activePowerSchemeAtCompletion = $activePowerScheme
+        $verifiedChildAffinityMasks = [Collections.Generic.List[string]]::new()
+        foreach ($child in 1..16) {
+            $verifiedChildAffinityMasks.Add("0x0000000000000100")
+        }
+        $directCampaignSummary = New-DirectQuakeCampaignSummary @($directWorkload)
+        if ($directCampaignSummary.schema -cne
+                "izarravm-direct-quake-campaign-partial-proof-v1" -or
+            $directCampaignSummary.verdict -cne "normal_promotion_threshold_met" -or
+            -not $directCampaignSummary.evidence_valid -or
+            $directCampaignSummary.retention_eligible -or
+            $directCampaignSummary.retention_blockers.Count -ne 2 -or
+            $directCampaignSummary.retention_blockers -notcontains
+                "StateSnapshotV1 is not yet captured" -or
+            $directCampaignSummary.retention_blockers -notcontains
+                "the per-slice deterministic counter allowlist is not yet implemented" -or
+            ($directCampaignSummary.retention_blockers -join " ") -match
+                "scaled bus-clock") {
+            throw "The Direct Quake campaign top-level partial-proof summary is wrong."
+        }
+        $CampaignStage = "Noise"
+        $noiseCampaignSummary = New-DirectQuakeCampaignSummary @($noiseWorkload)
+        $noiseExecution = $noiseCampaignSummary.executables.noise_execution
+        if ($noiseCampaignSummary.verdict -cne "valid_noise_study" -or
+            -not $noiseCampaignSummary.evidence_valid -or
+            $noiseCampaignSummary.comparison_class -cne
+                "direct_quake_retained_parent_single_executable_aa" -or
+            $noiseCampaignSummary.executables.byte_identical -or
+            $noiseCampaignSummary.executables.candidate_build_executed -or
+            $noiseExecution.sha256 -cne $parentSha -or
+            -not $noiseExecution.same_frozen_executable_for_all_roles) {
+            throw "The Direct Quake top-level noise evidence is not a single-executable A/A study."
+        }
+        $candidateArtifact.sha256 = $parentSha
+        foreach ($stage in @("Screen", "Proof")) {
+            $CampaignStage = $stage
+            $equalBuildSummary = New-DirectQuakeCampaignSummary @($directWorkload)
+            if ($equalBuildSummary.evidence_valid -or
+                ($equalBuildSummary.failure_reasons -join " ") -notmatch
+                    "compared byte-identical builds") {
+                throw "Direct Quake $stage accepted byte-identical revision builds."
+            }
+        }
+        $candidateArtifact.sha256 = $candidateSha
+    } finally {
+        $Runs = $savedDirectSummaryState.runs
+        $Screening = $savedDirectSummaryState.screening
+        $policies = $savedDirectSummaryState.policies
+        $verifiedChildAffinityMasks = $savedDirectSummaryState.masks
+        $candidateArtifact.sha256 = $savedDirectSummaryState.candidate_sha256
+        $baselineArtifact.sha256 = $savedDirectSummaryState.parent_sha256
+        $CampaignStage = $savedDirectSummaryState.campaign_stage
+        $activePowerSchemeAtCompletion = `
+            $savedDirectSummaryState.active_power_scheme_at_completion
+    }
+
     $evidenceRoot = Join-Path ([IO.Path]::GetTempPath()) (
         "izarravm-track-m-evidence-$([guid]::NewGuid().ToString('N'))"
     )
@@ -1673,6 +2069,111 @@ function Invoke-RealtimeGateSelfTest {
         } "unexpected result artifact"
     } finally {
         Remove-Item -LiteralPath $evidenceRoot -Recurse -Force
+    }
+
+    $directEvidenceRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "izarravm-direct-evidence-$([guid]::NewGuid().ToString('N'))"
+    )
+    $directEvidenceResults = Join-Path $directEvidenceRoot "results"
+    $directEvidenceSources = Join-Path $directEvidenceRoot "sources"
+    New-Item -ItemType Directory -Path $directEvidenceResults, $directEvidenceSources |
+        Out-Null
+    try {
+        $directCandidatePath = Join-Path $directEvidenceResults "candidate-izarravm.exe"
+        $directParentPath = Join-Path $directEvidenceResults "parent-izarravm.exe"
+        [IO.File]::WriteAllText($directCandidatePath, "candidate executable`n")
+        [IO.File]::WriteAllText($directParentPath, "parent executable`n")
+        $directEvidenceCandidate = [pscustomobject]@{
+            executed_copy_path = $directCandidatePath
+            sha256 = Get-FileSha256 $directCandidatePath
+        }
+        $directEvidenceParent = [pscustomobject]@{
+            executed_copy_path = $directParentPath
+            sha256 = Get-FileSha256 $directParentPath
+        }
+        $directEvidenceSummary = [pscustomobject][ordered]@{
+            schema = "izarravm-direct-quake-campaign-partial-proof-v1"
+            stage = "proof"
+            verdict = "normal_promotion_threshold_met"
+            retention_eligible = $false
+            revision_pair = [pscustomobject]@{
+                candidate_commit = $revision
+                candidate_tree = $candidateTree
+                parent_commit = $baselineCommit
+                parent_tree = $baselineTree
+            }
+            workload_manifest_sha256 = [pscustomobject]@{ at_completion = $null }
+            workloads = [object[]]@($directWorkload)
+        }
+        $directSamples = [object[]]@(
+            $directWorkload.observation_classes.correctness.candidate,
+            $directWorkload.observation_classes.correctness.parent,
+            $directWorkload.discarded_warmups.candidate[0],
+            $directWorkload.discarded_warmups.parent[0]
+        ) + [object[]]@($directWorkload.candidate.runs) +
+            [object[]]@($directWorkload.parent.runs)
+        foreach ($sample in $directSamples) {
+            foreach ($name in @("profile_json", "stdout", "stderr", "qconsole", "hdd_tree")) {
+                $fileProperty = "${name}_file"
+                $hashProperty = "${name}_sha256"
+                $path = Join-Path $directEvidenceResults $sample.gate_artifacts.$fileProperty
+                [IO.File]::WriteAllText(
+                    $path,
+                    "$($sample.gate_role) $($sample.gate_observation) $name`n"
+                )
+                $sample.gate_artifacts.$hashProperty = Get-FileSha256 $path
+            }
+        }
+        $directEvidenceMain = Join-Path $directEvidenceSources "run-realtime-gate.ps1"
+        $directEvidenceSelfTest = Join-Path $directEvidenceSources `
+            "run-realtime-gate-self-test.ps1"
+        $directEvidenceSummaryScript = Join-Path $directEvidenceSources `
+            "run-realtime-gate-summary.ps1"
+        Copy-Item -LiteralPath $gateMainScriptPath -Destination $directEvidenceMain
+        Copy-Item -LiteralPath $gateSelfTestScriptPath -Destination $directEvidenceSelfTest
+        Copy-Item -LiteralPath $gateSummaryScriptPath -Destination $directEvidenceSummaryScript
+        $directEvidenceClosure = Get-GateSourceClosureIdentity `
+            $directEvidenceMain $directEvidenceSelfTest $directEvidenceSummaryScript
+        $directEvidenceFixtureManifest = Join-Path $directEvidenceSources `
+            "realtime-gate-inputs.json"
+        [IO.File]::WriteAllText(
+            $directEvidenceFixtureManifest,
+            "{`"schema`":`"self-test`"}`n"
+        )
+        $directEvidenceSummary.workload_manifest_sha256.at_completion =
+            Get-FileSha256 $directEvidenceFixtureManifest
+        $directEvidenceSummaryPath = Join-Path $directEvidenceResults "summary.json"
+        $directEvidenceSummary | ConvertTo-Json -Depth 20 |
+            Set-Content -LiteralPath $directEvidenceSummaryPath -Encoding utf8
+        $directPackage = Write-DirectQuakeCampaignEvidencePackage `
+            $directEvidenceResults $directEvidenceSummaryPath $directEvidenceSummary `
+            $directEvidenceCandidate $directEvidenceParent $directEvidenceClosure `
+            $directEvidenceMain $directEvidenceSelfTest $directEvidenceSummaryScript `
+            $directEvidenceFixtureManifest
+        $directManifest = Get-Content -LiteralPath $directPackage.manifest_path -Raw |
+            ConvertFrom-Json
+        $directResultLog = Get-Content -LiteralPath $directPackage.result_log_path -Raw
+        if ($directManifest.schema -cne
+                "izarravm-direct-quake-campaign-evidence-manifest-v1" -or
+            $directManifest.integrity_verdict -cne "pass" -or
+            $directManifest.retention_eligible -or
+            $directManifest.result_directory_files.Count -ne 83 -or
+            $directResultLog -notlike "*retention_eligible=false*") {
+            throw "The Direct Quake evidence package is incomplete or retainable."
+        }
+        Remove-Item -LiteralPath $directPackage.manifest_path, $directPackage.result_log_path -Force
+        $directTamperPath = Join-Path $directEvidenceResults `
+            $directWorkload.candidate.runs[0].gate_artifacts.hdd_tree_file
+        [IO.File]::WriteAllText($directTamperPath, "tampered HDD manifest`n")
+        Assert-SelfTestThrows {
+            Write-DirectQuakeCampaignEvidencePackage `
+                $directEvidenceResults $directEvidenceSummaryPath $directEvidenceSummary `
+                $directEvidenceCandidate $directEvidenceParent $directEvidenceClosure `
+                $directEvidenceMain $directEvidenceSelfTest $directEvidenceSummaryScript `
+                $directEvidenceFixtureManifest
+        } "evidence integrity failed"
+    } finally {
+        Remove-Item -LiteralPath $directEvidenceRoot -Recurse -Force
     }
 
     $pollPolicy = Get-WorkloadPolicy "doom-586"

@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use izarravm_core::{GswMode, MASTER_CLOCK_HZ};
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, GswMode, MASTER_CLOCK_HZ};
 
 use crate::timing::PIT_INPUT_HZ;
 
@@ -117,6 +117,41 @@ pub(crate) struct Timeline {
     vga: RatePhase,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalTimelineError {
+    CpuQuantum {
+        expected: u64,
+        actual: u64,
+    },
+    PhaseRemainder {
+        phase: &'static str,
+        remainder: u64,
+        limit: u64,
+    },
+    Totals {
+        now_ticks: u64,
+        io_stall_ticks: u64,
+    },
+}
+
+/// Validated timing state whose absolute TSC origin has been projected out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CanonicalTimelineProjection {
+    words: [u64; 13],
+}
+
+impl CanonicalTimelineProjection {
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        for value in self.words {
+            out.write_u64(value)?;
+        }
+        Ok(())
+    }
+}
+
 impl Timeline {
     pub(crate) fn new(mode: GswMode) -> Self {
         Self {
@@ -148,6 +183,69 @@ impl Timeline {
 
     pub(crate) const fn tsc_clocks(self) -> u64 {
         self.tsc_clocks
+    }
+
+    pub(crate) fn canonical_projection(
+        self,
+        mode: GswMode,
+    ) -> Result<CanonicalTimelineProjection, CanonicalTimelineError> {
+        let expected_quantum = exact_cpu_quantum(mode);
+        if self.ticks_per_cpu_clock != expected_quantum {
+            return Err(CanonicalTimelineError::CpuQuantum {
+                expected: expected_quantum,
+                actual: self.ticks_per_cpu_clock,
+            });
+        }
+        if self.tsc_phase_ticks >= self.ticks_per_cpu_clock {
+            return Err(CanonicalTimelineError::PhaseRemainder {
+                phase: "tsc",
+                remainder: self.tsc_phase_ticks,
+                limit: self.ticks_per_cpu_clock,
+            });
+        }
+        for (phase, remainder) in [
+            ("microseconds", self.microseconds.remainder()),
+            ("pit", self.pit.remainder()),
+            ("dsp", self.dsp.remainder()),
+            ("wss", self.wss.remainder()),
+            ("cd", self.cd.remainder()),
+            ("rtc", self.rtc.remainder()),
+            ("margo", self.margo.remainder()),
+            ("margo_frame", self.margo_frame.remainder()),
+            ("distira", self.distira.remainder()),
+            ("vga", self.vga.remainder()),
+        ] {
+            if remainder >= MASTER_CLOCK_HZ {
+                return Err(CanonicalTimelineError::PhaseRemainder {
+                    phase,
+                    remainder,
+                    limit: MASTER_CLOCK_HZ,
+                });
+            }
+        }
+        if self.io_stall_ticks > self.now_ticks {
+            return Err(CanonicalTimelineError::Totals {
+                now_ticks: self.now_ticks,
+                io_stall_ticks: self.io_stall_ticks,
+            });
+        }
+        Ok(CanonicalTimelineProjection {
+            words: [
+                self.now_ticks,
+                self.io_stall_ticks,
+                self.tsc_phase_ticks,
+                self.microseconds.remainder(),
+                self.pit.remainder(),
+                self.dsp.remainder(),
+                self.wss.remainder(),
+                self.cd.remainder(),
+                self.rtc.remainder(),
+                self.margo.remainder(),
+                self.margo_frame.remainder(),
+                self.distira.remainder(),
+                self.vga.remainder(),
+            ],
+        })
     }
 
     #[cfg(test)]

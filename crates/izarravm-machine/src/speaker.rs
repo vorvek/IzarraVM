@@ -7,6 +7,8 @@
 
 use std::collections::VecDeque;
 
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+
 /// Output level for an enabled membrane. Audible, with headroom against the OPL
 /// and DSP sums. Bipolar so a toggling square wave carries no DC bias.
 const SPEAKER_AMPLITUDE: i64 = 8000;
@@ -205,6 +207,12 @@ pub(crate) struct Speaker {
     ever_enabled: bool,  // sticky: set the first time data enable goes high
 }
 
+/// Borrowed guest-visible PC speaker state for canonical comparison.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalSpeaker<'a> {
+    speaker: &'a Speaker,
+}
+
 impl Default for Speaker {
     fn default() -> Self {
         let fs = DAC_HZ as f64;
@@ -225,6 +233,10 @@ impl Default for Speaker {
 }
 
 impl Speaker {
+    pub(crate) fn canonical_projection(&self) -> CanonicalSpeaker<'_> {
+        CanonicalSpeaker { speaker: self }
+    }
+
     /// Apply a write to port 0x61: bit 0 is GATE2 (the caller drives the PIT
     /// gate), bit 1 is the speaker data enable. Other bits are ignored.
     pub(crate) fn write_control(&mut self, value: u8) {
@@ -324,6 +336,16 @@ impl Speaker {
             out.push(self.ring.pop_front().unwrap_or(0));
         }
         out
+    }
+}
+
+impl CanonicalSpeaker<'_> {
+    /// Writes version 1 of the one-byte port 0x61 latch payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        out.write_u8(self.speaker.control_bits())
     }
 }
 
