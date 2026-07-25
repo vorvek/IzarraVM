@@ -2125,14 +2125,46 @@ struct RepExecution {
 /// earlier 2048 knee was derived from) showed 78% of run breaks were decode-cache misses on
 /// continuations at 2048 lines: the pmode code footprint thrashes a 2048-entry direct-mapped
 /// cache. Doubling to 4096 cut those misses by 53% (227M -> 106M breaks), boosted insns/run from
-/// 14.5 to 23.2 (+60%), and lifted decode_hit from 94.85% to 97.66%. 8192 gave diminishing
-/// returns (24.9 insns/run, +7% over 4096). At ~52 bytes per line (DecodeLine = tag + generation +
-/// DecodedInsn; DecodedInsn grew 36 -> 40 bytes when C1e added the recorded
-/// {disp_len, imm_len} pair) 4096 lines is ~208 KB, still inside L2 on a normal (8-32 MB L3)
-/// machine.
-/// Purely microarchitectural: the decode cache is transparent to CpuGsw equality, so this needs
-/// no conformance/regolden work.
-const DECODE_CACHE_LINES: usize = 4096;
+/// 14.5 to 23.2 (+60%), and lifted decode_hit from 94.85% to 97.66%.
+///
+/// READ THE INDEX BEFORE READING THE SIZE. The index is `lin & (lines - 1)`, so at 4096 lines it
+/// is exactly the byte offset inside a 4 KiB page and the page number contributes NOTHING: every
+/// page aliases onto the same lines at identical offsets. That is why the 2048 -> 4096 step looked
+/// like a capacity knee. It was not. 2048 indexed half a page, so a single page self-collided at
+/// offsets 0x800 apart, and 4096 removed that intra-page conflict exactly. Every doubling past
+/// 4096 buys one bit of page discrimination, which is why 8192 measured only +7%: one bit is
+/// almost nothing when the hot code spans dozens of pages.
+///
+/// A size sweep on Quake/586 (6.2B cycles, determinism gated, one observation per size) measured
+/// decode misses, the hidden-portal rate, and native coverage:
+///
+///   lines    misses      portals hidden/entry   static-hidden exits   coverage
+///    4096    46,795,081        0.0391                14,377,406        77.07%
+///   16384    17,993,827        0.0170                 5,089,363        79.69%
+///   32768    11,201,424        0.0067                 1,784,587        80.32%
+///   65536     9,511,922        0.0033                   732,871        80.44%
+///  262144     8,615,694        0.0001                    30,870        80.56%
+///
+/// 32768 is the knee. Past it, 65536 costs double the memory for another 1.7M misses and 0.12
+/// coverage points. The hidden-portal column is the reason this matters beyond decode cost: a
+/// decode eviction clears the portal of every compiled block registered on that line (see
+/// `fetch_decoded` and `suspend_decode_slot`), so decode conflicts turn directly into dark native
+/// blocks. That population only reaches zero at conflict-free sizes, so the residual 1.78M here is
+/// what a hashed index could still claim at a fraction of the memory.
+///
+/// At ~56 bytes per line (DecodeLine = tag + generation + DecodedInsn; DecodedInsn grew 36 -> 40
+/// bytes when C1e added the recorded {disp_len, imm_len} pair) 32768 lines is ~1.75 MB, against
+/// ~0.22 MB at 4096. That no longer fits a small L2, which is the real cost of this change and the
+/// reason not to go further without evidence.
+///
+/// NOT purely microarchitectural, despite what this comment said before. Guest STATE is untouched
+/// (the decode cache is transparent to CpuGsw equality), but a decode hit charges one collapsed
+/// I-cache access where a miss charges per fetched byte, so changing which addresses hit changes
+/// charged guest bus clocks, master ticks, and in-guest fps. The Quake 42.7 fps and Doom
+/// 3042/843 realtics anchors move with this constant and have to be re-anchored, exactly as they
+/// were for the 2048 -> 4096 step. That is the "timing approx" half of the campaign contract, not
+/// a correctness change.
+const DECODE_CACHE_LINES: usize = 32768;
 
 /// Sweep knob: `IZARRAVM_DECODE_CACHE_LINES=<power of two>` overrides the decode-cache size at
 /// construction. Decode replacement changes cold-fetch timing, so performance comparisons must

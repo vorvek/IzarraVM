@@ -409,9 +409,12 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
     const SOURCE: u32 = 0x101;
     const TARGET: u32 = 0x1200;
     const HLT: u32 = 0x120a;
-    const COLLISION: u32 = 0x2200;
+    // One decode-cache line above TARGET, so the two share a line whatever the cache is sized to.
+    // A hardcoded collision would silently stop colliding the next time DECODE_CACHE_LINES moves,
+    // and this test would then pass while proving nothing: no eviction, no hidden portal.
+    let collision = TARGET + crate::decode_cache_lines() as u32;
 
-    let mut memory = vec![0; COLLISION as usize + 1];
+    let mut memory = vec![0; collision as usize + 1];
     memory[ENTRY as usize] = 0x90;
     memory[SOURCE as usize..SOURCE as usize + 13].copy_from_slice(&[
         0xb8, 1, 0, 0, 0, // mov eax,1
@@ -424,12 +427,15 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
         0xeb, 0, // jmp HLT
     ]);
     memory[HLT as usize] = 0xf4;
-    memory[COLLISION as usize] = 0x90;
+    memory[collision as usize] = 0x90;
 
     let mut native = fresh();
     let mut interp = fresh();
-    native.decode_cache = DecodeCache::new(0x1000);
-    interp.decode_cache = DecodeCache::new(0x1000);
+    // Keep the default decode-cache size. Installing a smaller one here would leave jit_direct's
+    // decode-slot count at the default, and the eviction path only reports a slot to the JIT when
+    // the two counts agree (see fetch_decoded and the guard in try_direct_continuation). Mismatched
+    // counts take the wholesale invalidate_translation path instead, which hides the portal for a
+    // different reason and makes this test prove the wrong thing.
     let mut native_bus = TestBus::with_memory(memory.clone());
     let mut interp_bus = TestBus::with_memory(memory);
     native_bus.direct_pages_enabled = true;
@@ -476,13 +482,13 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
         .expect("source remains live");
     assert!(native.jit_direct.has_linked_successor(source));
 
-    decode_at(&mut native, &mut native_bus, COLLISION);
-    decode_at(&mut interp, &mut interp_bus, COLLISION);
+    decode_at(&mut native, &mut native_bus, collision);
+    decode_at(&mut interp, &mut interp_bus, collision);
     assert!(native.decode_cache.line_live(SOURCE, true));
     assert!(!native.decode_cache.line_live(TARGET, true));
     assert!(native.decode_cache.line_live(TARGET + 5, true));
     assert!(native.decode_cache.line_live(TARGET + 8, true));
-    assert!(native.decode_cache.line_live(COLLISION, true));
+    assert!(native.decode_cache.line_live(collision, true));
     assert!(
         !native.jit_direct.has_linked_successor(source),
         "evicting the target slot must hide its portal from the source edge"
