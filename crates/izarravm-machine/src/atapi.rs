@@ -20,6 +20,7 @@
 //! since it is an ATA command, not a packet command.
 
 use crate::cdimage::{CdImage, DATA_SECTOR, FRAMES_PER_SEC, lba_to_msf, msf_to_lba};
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
 /// 12x CD-ROM transfer ceiling reported by MODE SENSE: about 1800 KB/s.
 pub const CD_BYTES_PER_SEC: f64 = 1_800.0 * 1024.0;
@@ -1043,6 +1044,46 @@ fn write_ascii(field: &mut [u8], text: &str) {
     }
     for (slot, b) in field.iter_mut().zip(text.bytes()) {
         *slot = b;
+    }
+}
+
+/// Borrowed ATAPI device state for canonical comparison: sense latches,
+/// removal/spin/attention flags, the interrupt-reason byte, MODE SELECT
+/// volumes, and the guest-deterministic playback record. The host-mixer
+/// streaming cursor (`mixer_lba`) and its discontinuity signal
+/// (`playback_epoch`) advance with host audio drain, not guest time, and are
+/// excluded as host-presentation state; guest-visible position reporting uses
+/// `play.current_lba`, which the fixed timeline advances.
+pub(crate) struct CanonicalAtapiDevice<'a> {
+    device: &'a AtapiDevice,
+}
+
+impl AtapiDevice {
+    pub(crate) fn canonical_projection(&self) -> CanonicalAtapiDevice<'_> {
+        CanonicalAtapiDevice { device: self }
+    }
+}
+
+impl CanonicalAtapiDevice<'_> {
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        out.write_u8(self.device.sense_key)?;
+        out.write_u8(self.device.asc)?;
+        out.write_u8(self.device.ascq)?;
+        out.write_bool(self.device.sense_information.is_some())?;
+        out.write_u32(self.device.sense_information.unwrap_or(0))?;
+        out.write_bool(self.device.media_changed)?;
+        out.write_bool(self.device.prevent_removal)?;
+        out.write_bool(self.device.started)?;
+        out.write_u8(self.device.interrupt_reason)?;
+        out.write_u8(self.device.audio_volume[0])?;
+        out.write_u8(self.device.audio_volume[1])?;
+        out.write_bool(self.device.play.playing)?;
+        out.write_bool(self.device.play.paused)?;
+        out.write_u32(self.device.play.current_lba)?;
+        out.write_u32(self.device.play.end_lba)
     }
 }
 

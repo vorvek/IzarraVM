@@ -14,6 +14,7 @@ use crate::{
         cache_level_config, code_fetch_ws, tier_cost,
     },
     dma::{CanonicalDma8237Pair, CanonicalDmaEventTotalsV1},
+    ide::CanonicalIdeChannel,
     pci::CanonicalPciConfig,
     pic::CanonicalPic8259Pair,
     pit::CanonicalPit,
@@ -40,7 +41,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 17] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 18] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -126,6 +127,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_000e,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -195,6 +201,10 @@ const _: () = {
         sections[16].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[17].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -211,6 +221,7 @@ const _: () = {
     assert!(sections[13].id < sections[14].id);
     assert!(sections[14].id < sections[15].id);
     assert!(sections[15].id < sections[16].id);
+    assert!(sections[16].id < sections[17].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -300,6 +311,8 @@ pub enum MachineCanonicalCaptureError {
     InconsistentAtaGeometry { cylinders: u32, expected: u32 },
     #[error("a BMIDE primary transfer is active without an armed ATA DMA request")]
     DanglingBmideTransfer,
+    #[error("the test-only ATAPI packet stall seam is armed")]
+    TestStallPacketEnabled,
 }
 
 impl From<CanonicalTimelineError> for MachineCanonicalCaptureError {
@@ -538,6 +551,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     vega: CanonicalVega<'a>,
     ata: CanonicalAtaDisk<'a>,
     bmide: CanonicalBusMasterIde<'a>,
+    atapi_channel: CanonicalIdeChannel<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -713,6 +727,21 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.bmide.write_payload(out)
     }
+
+    /// Writes the required secondary-channel ATAPI owner payload.
+    ///
+    /// Channel registers, packet/data continuation, and the device latches.
+    /// Disc content belongs to the future CD-content owner, and the host
+    /// mixer cursors are presentation state, not guest state. Capture
+    /// rejects the test-only packet stall seam before this payload can be
+    /// written.
+    #[allow(dead_code)]
+    pub(crate) fn write_atapi_channel_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.atapi_channel.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -825,6 +854,9 @@ impl Machine {
         {
             return Err(MachineCanonicalCaptureError::DanglingBmideTransfer);
         }
+        if self.ide.test_stall_packet_enabled() {
+            return Err(MachineCanonicalCaptureError::TestStallPacketEnabled);
+        }
         let ram_rom = CanonicalRamRomProjection {
             ram: self.memory.as_slice(),
             rom: self.rom.as_slice(),
@@ -840,6 +872,7 @@ impl Machine {
         let vega = self.vega.canonical_projection();
         let ata = CanonicalAtaDisk::new(self.ata.as_ref());
         let bmide = self.bmide.canonical_projection();
+        let atapi_channel = self.ide.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -903,6 +936,7 @@ impl Machine {
             vega,
             ata,
             bmide,
+            atapi_channel,
         })
     }
 }
