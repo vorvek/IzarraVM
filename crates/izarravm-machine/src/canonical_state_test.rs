@@ -30,6 +30,8 @@ const PCI_CONFIG_PAYLOAD_LEN: usize = 9;
 const VEGA_ROUTING_PAYLOAD_LEN: usize = 14;
 const ATA_IDLE_PAYLOAD_LEN: usize = 66;
 const ATA_MID_SECTOR_PAYLOAD_LEN: usize = ATA_IDLE_PAYLOAD_LEN + crate::ata::SECTOR;
+const BMIDE_IDLE_PAYLOAD_LEN: usize = 60;
+const BMIDE_BASE: u16 = 0xf000;
 const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
 const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
 const PIIX_IDE_DEVFN: u8 = 7 << 3 | 1;
@@ -373,6 +375,50 @@ fn ata_idle_golden() -> Vec<u8> {
     expected
 }
 
+fn bmide_payload(machine: &Machine) -> Vec<u8> {
+    let capture = machine.canonical_state_capture().unwrap();
+    bmide_payload_from_capture(&capture)
+}
+
+fn bmide_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_000d).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| capture.write_bmide_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+/// Arm a primary bus-master transfer: PRD table at 0x1000 from the given
+/// descriptor dwords, then the BM command, then the ATA DMA command.
+fn arm_bmide_transfer(
+    machine: &mut Machine,
+    descriptors: &[(u32, u32)],
+    bm_command: u32,
+    ata_command: u32,
+) {
+    for (index, (address, control)) in descriptors.iter().enumerate() {
+        machine.write_physical_u32(0x1000 + index as u32 * 8, *address);
+        machine.write_physical_u32(0x1004 + index as u32 * 8, *control);
+    }
+    write_pci_port(machine, BMIDE_BASE + 4, BusWidth::Dword, 0x1000);
+    write_pci_port(machine, BMIDE_BASE, BusWidth::Byte, bm_command);
+    let base = crate::ata::PRIMARY_CMD_BASE;
+    write_pci_port(machine, base + 2, BusWidth::Byte, 1);
+    write_pci_port(machine, base + 3, BusWidth::Byte, 2);
+    write_pci_port(machine, base + 4, BusWidth::Byte, 0);
+    write_pci_port(machine, base + 5, BusWidth::Byte, 0);
+    write_pci_port(machine, base + 6, BusWidth::Byte, 0x40);
+    write_pci_port(machine, base + 7, BusWidth::Byte, ata_command);
+    publish_pending_coherence(machine);
+}
+
 fn write_speaker_port(machine: &mut Machine, value: u8) {
     let mut bus = machine.make_bus();
     bus.write_io(0x61, BusWidth::Byte, u32::from(value), false)
@@ -564,6 +610,7 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
             (0x0002_000a, 1),
             (0x0002_000b, 1),
             (0x0002_000c, 1),
+            (0x0002_000d, 1),
         ]
     );
     assert!(
@@ -625,6 +672,10 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
     );
     assert_eq!(
         sections[15].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+        STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
+    assert_eq!(
+        sections[16].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
         STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
 }
@@ -1964,6 +2015,107 @@ fn ata_capture_is_read_only_and_excludes_content_and_telemetry() {
 }
 
 #[test]
+fn bmide_payload_pins_default_golden_and_register_writes() {
+    assert_eq!(
+        bmide_payload(&test_machine()),
+        [0u8; BMIDE_IDLE_PAYLOAD_LEN]
+    );
+    assert_eq!(
+        bmide_payload(&ata_machine(8)),
+        [0u8; BMIDE_IDLE_PAYLOAD_LEN]
+    );
+
+    // Register writes only, both channels; the PRD pointer stores its
+    // 4-byte-aligned value and the secondary bank is a real register file.
+    let mut machine = ata_machine(8);
+    write_pci_port(&mut machine, BMIDE_BASE, BusWidth::Byte, 0x08);
+    write_pci_port(&mut machine, BMIDE_BASE + 2, BusWidth::Byte, 0x60);
+    write_pci_port(&mut machine, BMIDE_BASE + 4, BusWidth::Dword, 0x2003);
+    write_pci_port(&mut machine, BMIDE_BASE + 12, BusWidth::Dword, 0x3000);
+    let payload = bmide_payload(&machine);
+    let mut expected = [0u8; BMIDE_IDLE_PAYLOAD_LEN];
+    expected[0] = 0x08;
+    expected[1] = 0x60;
+    expected[2..6].copy_from_slice(&0x2000u32.to_le_bytes());
+    expected[32..36].copy_from_slice(&0x3000u32.to_le_bytes());
+    assert_eq!(payload, expected);
+
+    let capture = machine.canonical_state_capture().unwrap();
+    let first = bmide_payload_from_capture(&capture);
+    let second = bmide_payload_from_capture(&capture);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn bmide_payload_captures_a_multi_span_write_transfer() {
+    let mut machine = ata_machine(8);
+    // Two 256-byte PRD entries; addresses carry the A1 bit set so the
+    // payload must hold the parsed, masked span addresses.
+    arm_bmide_transfer(
+        &mut machine,
+        &[(0x2002, 0x100), (0x2102, 0x8000_0100)],
+        0x01,
+        0xca,
+    );
+    let ticks = machine.bmide.ticks_until_completion().unwrap();
+    let payload = bmide_payload(&machine);
+    assert_eq!(payload.len(), BMIDE_IDLE_PAYLOAD_LEN + 16);
+    assert_eq!(payload[0], 0x01); // START
+    assert_eq!(payload[1] & 0x01, 0x01); // ACTIVE
+    assert_eq!(payload[2..6], 0x1000u32.to_le_bytes());
+    assert_eq!(payload[7], 1); // transfer present
+    assert_eq!(payload[8], 1); // MemoryToDevice
+    assert_eq!(payload[9..17], ticks.to_le_bytes());
+    assert_eq!(payload[17..21], 512u32.to_le_bytes());
+    assert_eq!(payload[21], 1); // retires at EOT
+    assert_eq!(payload[22..30], 2u64.to_le_bytes());
+    assert_eq!(payload[30..34], 0x2000u32.to_le_bytes());
+    assert_eq!(payload[34..38], 0x100u32.to_le_bytes());
+    assert_eq!(payload[38..42], 0x2100u32.to_le_bytes());
+    assert_eq!(payload[42..46], 0x100u32.to_le_bytes());
+    assert_eq!(&payload[46..], &[0u8; 30]); // secondary untouched
+
+    machine.advance_devices_ticks(ticks);
+    publish_pending_coherence(&mut machine);
+    let done = bmide_payload(&machine);
+    assert_eq!(done.len(), BMIDE_IDLE_PAYLOAD_LEN);
+    assert_eq!(done[1] & 0x01, 0); // ACTIVE retired at EOT
+    assert_ne!(done[1] & 0x04, 0); // INTERRUPT latched
+}
+
+#[test]
+fn bmide_payload_captures_the_waits_for_stop_window() {
+    let mut machine = ata_machine(8);
+    // One descriptor larger than the transfer: completion must hold ACTIVE
+    // and wait for the guest's STOP write instead of retiring at EOT.
+    arm_bmide_transfer(&mut machine, &[(0x2000, 0x8000_0400)], 0x09, 0xc8);
+    let ticks = machine.bmide.ticks_until_completion().unwrap();
+    machine.advance_devices_ticks(ticks);
+    publish_pending_coherence(&mut machine);
+    let payload = bmide_payload(&machine);
+    assert_eq!(payload.len(), BMIDE_IDLE_PAYLOAD_LEN);
+    assert_eq!(payload[1] & 0x01, 0x01); // ACTIVE held
+    assert_eq!(payload[6], 1); // completion waits for stop
+    assert_eq!(payload[7], 0); // transfer already consumed
+
+    write_pci_port(&mut machine, BMIDE_BASE, BusWidth::Byte, 0);
+    let stopped = bmide_payload(&machine);
+    assert_eq!(stopped[1] & 0x01, 0);
+    assert_eq!(stopped[6], 0);
+}
+
+#[test]
+fn capture_rejects_a_dangling_bmide_transfer() {
+    let mut machine = ata_machine(8);
+    arm_bmide_transfer(&mut machine, &[(0x2000, 0x8000_0200)], 0x09, 0xc8);
+    machine.ata.as_mut().unwrap().abort_dma();
+    assert_eq!(
+        capture_error(&machine),
+        MachineCanonicalCaptureError::DanglingBmideTransfer
+    );
+}
+
+#[test]
 fn capture_rejects_a_drifted_distira_init_enable_mirror() {
     let mut machine = test_machine();
     machine.vega.distira_mut().set_init_enable(0xdead_beef);
@@ -3253,6 +3405,40 @@ fn ata_state_survives_a_real_586_test_exit_boundary() {
     expected[11] = 1; // nIEN
     assert_eq!(ata_payload(&machine), expected);
     assert_eq!(ata_payload(&machine), expected);
+}
+
+#[test]
+fn bmide_state_survives_a_real_586_test_exit_boundary() {
+    let mut code = Vec::new();
+    // BM command (read direction, no START), scratch status bits, PRD.
+    code.extend_from_slice(&[0xba, 0x00, 0xf0, 0xb0, 0x08, 0xee]);
+    code.extend_from_slice(&[0xba, 0x02, 0xf0, 0xb0, 0x20, 0xee]);
+    push_out_dx_eax(&mut code, BMIDE_BASE + 4, 0x0000_4000);
+    code.extend_from_slice(&[
+        0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
+        0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
+        0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
+        0xf4, // must not execute
+    ]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        rom_with_code(&code),
+    )
+    .unwrap();
+    machine.set_mode(GswMode::Gsw586);
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::TestExit { code: 0 });
+    assert_eq!(machine.cpu.registers.eip, 35);
+    assert!(!machine.cpu.halted);
+    assert_eq!(machine.unittester.pending_command(), None);
+    let mut expected = [0u8; BMIDE_IDLE_PAYLOAD_LEN];
+    expected[0] = 0x08;
+    expected[1] = 0x20;
+    expected[2..6].copy_from_slice(&0x4000u32.to_le_bytes());
+    assert_eq!(bmide_payload(&machine), expected);
+    assert_eq!(bmide_payload(&machine), expected);
 }
 
 #[test]
