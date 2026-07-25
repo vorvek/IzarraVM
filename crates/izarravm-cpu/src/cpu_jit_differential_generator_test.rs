@@ -6,6 +6,29 @@ use super::*;
 const CASES_PER_MODE: u32 = 32;
 const MEMORY_LEN: usize = 0x20_000;
 
+// The number of instructions `generated_case` emits into the native block, from the first
+// register/immediate MOV after the leading NOP up through the terminal Jcc, inclusive, when
+// every one of them retires natively. Kept as a named count (instead of just checking
+// `jit_direct_insns > before`) because a plain greater-than check cannot tell the failure mode we
+// care about apart from success: a slot that stops being classifiable loses exactly one native
+// retirement (the interpreter takes that one instruction instead), and a bare ">" check would
+// still pass on the reduced count, silently accepting a dropped terminal-Jcc slot or a wrong
+// raw_clocks on it. Note this counts instructions RETIRED, not block shape: it cannot distinguish
+// "one 27-instruction block" from "two admitted blocks whose retirements happen to sum to 27", so
+// a truncation that lost no net retirements (its tail re-admitted as a second block covering
+// everything the first one missed) would not be caught here. It is a check on retirement count,
+// not a general truncation detector.
+//
+// `index & 15 == 0` and `== 1` deliberately aim the first `0x8b` load at a cold or page-
+// straddling target (see `memory_target` below), so that ONE load takes a genuine, pre-existing
+// unresolved-static-unbound exit and re-enters through a second native block instead of
+// continuing the first. That is a real split, not a truncation, so it costs one instruction off
+// the fully-native count; `GeneratedCase::cold_memory_target` records which cases hit it so the
+// comparison below can expect the right number instead of a single constant.
+const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 27;
+const GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY: u64 =
+    GENERATED_BLOCK_NATIVE_INSTRUCTIONS - 1;
+
 #[derive(Debug)]
 struct GeneratedCase {
     seed: u64,
@@ -14,6 +37,7 @@ struct GeneratedCase {
     gpr: [u32; 8],
     eflags: u32,
     cap: u64,
+    cold_memory_target: bool,
 }
 
 struct Rng(u64);
@@ -49,6 +73,7 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     let data = 0x1_0000 + index * 0x40;
     let op = ((index + mode_offset) & 7) as u8;
     let byte_lane = ((index + mode_offset) & 7) as u8;
+    let cold_memory_target = matches!(index & 15, 0 | 1);
     let memory_target = match index & 15 {
         0 => 0x1_8001, // isolated, unaligned page: the native map is deliberately cold
         1 => 0x1_8fff, // dword straddles two pages
@@ -91,6 +116,7 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
 
     bytes.extend_from_slice(&[0x85, 0xc0 | (rng.reg() << 3) | rng.reg()]);
     bytes.extend_from_slice(&[0x84, 0xc0 | (rng.reg() << 3) | rng.reg()]);
+    bytes.extend_from_slice(&[0x0f, 0xaf, 0xc0 | (rng.reg() << 3) | rng.reg()]);
     let shift = [4, 5, 7][(rng.u32() % 3) as usize];
     bytes.extend_from_slice(&[
         0xc1,
@@ -154,6 +180,7 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
         gpr,
         eflags,
         cap: 256 + u64::from(rng.u32() & 3) * 128,
+        cold_memory_target,
     }
 }
 
@@ -297,9 +324,17 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) {
             interpreter_bus.trace.elapsed_clocks(),
             "bus clocks differ: {case:#?}"
         );
-        assert!(
-            direct.perf_counters().jit_direct_insns > before.jit_direct_insns,
-            "accepted seed retired no native instructions: {case:#?}, perf={:#?}",
+        let expected_native_instructions = if case.cold_memory_target {
+            GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY
+        } else {
+            GENERATED_BLOCK_NATIVE_INSTRUCTIONS
+        };
+        assert_eq!(
+            direct.perf_counters().jit_direct_insns - before.jit_direct_insns,
+            expected_native_instructions,
+            "native instructions retired differ from the expected count, meaning a slot lost its \
+             classification (or raw_clocks/MAX_BLOCK_INSTRUCTIONS moved) somewhere in the run: \
+             {case:#?}, perf={:#?}",
             direct.perf_counters()
         );
     }
@@ -617,6 +652,7 @@ fn paging_alias_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
+        cold_memory_target: false,
     }
 }
 
@@ -701,6 +737,7 @@ fn linked_successor_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 4096,
+        cold_memory_target: false,
     }
 }
 
@@ -768,6 +805,7 @@ fn unaligned_cross_page_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
+        cold_memory_target: false,
     }
 }
 
@@ -834,6 +872,7 @@ fn faulting_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
+        cold_memory_target: false,
     }
 }
 
@@ -929,6 +968,7 @@ fn watched_store_case(value: u32, target: u32) -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
+        cold_memory_target: false,
     }
 }
 
@@ -1134,6 +1174,7 @@ fn a20_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 128,
+        cold_memory_target: false,
     }
 }
 

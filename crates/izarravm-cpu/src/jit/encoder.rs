@@ -368,6 +368,19 @@ impl Encoder {
         self.modrm(0b11, dst.low3(), src.low3());
     }
 
+    /// `imul dst, src` (0F AF /r, IMUL r32, r/m32: dst *= src, signed, truncated to 32 bits).
+    /// Deliberately NOT built on `imul_r64_r64`: that helper always sets REX.W, which multiplies
+    /// at 64 bits and reports overflow against the 64-bit product instead of the 32-bit one. The
+    /// guest's two-operand IMUL defines CF/OF from whether the 32-bit truncated result sign-
+    /// extends back to the full product, so 0x0001_0000 * 0x0001_0000 must set CF=OF=1 here,
+    /// while the REX.W form reports 0 for the same inputs.
+    pub(crate) fn imul_r32_r32(&mut self, dst: Reg, src: Reg) {
+        self.optional_rex(false, dst.ext(), false, src.ext());
+        self.bytes.push(0x0F);
+        self.bytes.push(0xAF);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
     /// `imul dst, imm32` (REX.W + 69 /r id, the three-operand IMUL r64, r/m64, imm32 form: dst =
     /// dst * imm32). Used by the native cap check to multiply the bus delta by the scale
     /// denominator (a small compile-time constant like 12 for 586).

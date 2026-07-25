@@ -1787,6 +1787,10 @@ pub(crate) enum DirectKind {
         a: u8,
         b: u8,
     },
+    Imul {
+        dst: u8,
+        src: u8,
+    },
     TestImmReg {
         dst: u8,
         imm: u32,
@@ -1910,6 +1914,9 @@ impl DirectKind {
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
             Self::Load { raw_clocks, .. } | Self::Store { raw_clocks, .. } => u32::from(raw_clocks),
             Self::X87 { .. } => 0,
+            // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
+            // arm below returns 2, which would under-charge this instruction by 7.
+            Self::Imul { .. } => 9,
             _ => 2,
         }
     }
