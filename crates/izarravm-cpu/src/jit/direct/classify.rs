@@ -159,6 +159,13 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     }),
                 };
             }
+            0x84 => {
+                let m = insn.modrm?;
+                let DecodedOperand::Reg(a) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::TestByte { a, b: m.reg });
+            }
             0x85 => {
                 let m = insn.modrm?;
                 let DecodedOperand::Reg(a) = insn.operand? else {

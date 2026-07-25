@@ -326,6 +326,225 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     fixture
 }
 
+// 0x84 TEST r/m8, r8 register-form battery (Direct backend Slice A). The dword sibling 0x85
+// (DirectKind::Test) is already covered elsewhere; this exercises the byte-width primitives
+// (emit_read_store_value's AH/CH/DH/BH shift-right-8 lane, emit_test_preloaded's alu_r8_r8,
+// and emit_logic_live_af) that opcode 0x84 newly reaches. Register form only: mod == 3.
+
+fn test_byte_reg_code(rm: u8, reg: u8) -> Vec<u8> {
+    vec![0x84, 0xc0 | (reg << 3) | rm]
+}
+
+fn arm_test_byte_reg(cpu: &mut CpuGsw, gpr: [u32; 4], eflags: u32, pending: Option<(u32, u32)>) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.set_eax(gpr[0]);
+    cpu.registers.set_ecx(gpr[1]);
+    cpu.registers.set_edx(gpr[2]);
+    cpu.registers.set_ebx(gpr[3]);
+    cpu.registers.set_esi(0x1234_5678);
+    cpu.registers.set_edi(0x89ab_cdef);
+    cpu.registers.set_esp(0xc000);
+    cpu.registers.eflags = eflags;
+    cpu.pending_flags = PendingFlags::default();
+    if let Some((a, b)) = pending {
+        // Leaves a pending ADD descriptor whose materialized AF is derived from a/b/result,
+        // not from the raw eflags bit just set above: the two can be made to agree or disagree.
+        let _ = cpu.alu(0, a, b, BusWidth::Dword);
+    }
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+}
+
+fn prepare_test_byte_reg(
+    mode: GswMode,
+    rm: u8,
+    reg: u8,
+    gpr: [u32; 4],
+    eflags: u32,
+    pending: Option<(u32, u32)>,
+) -> Fixture {
+    let insn = test_byte_reg_code(rm, reg);
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [
+        ENTRY,
+        ENTRY + insn.len() as u32,
+        ENTRY + insn.len() as u32 + 2,
+    ];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    let block = install_block(&mut native);
+    arm_test_byte_reg(&mut native, gpr, eflags, pending);
+    arm_test_byte_reg(&mut interpreter, gpr, eflags, pending);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn test_byte_register_lanes_match_the_interpreter_in_586_mode() {
+    // All 64 (rm, reg) byte lane pairs (AL/CL/DL/BL/AH/CH/DH/BH on both sides) at one
+    // distinguishing value pattern. This is the only genuinely new code path: the high-byte
+    // lane (AH/CH/DH/BH) through emit_read_store_value's shift-right-8 arm.
+    let gpr = [0xaaaa_aa11, 0xbbbb_bb22, 0xcccc_cc33, 0xdddd_dd44];
+    for rm in 0..8u8 {
+        for reg in 0..8u8 {
+            let context = format!("rm={rm} reg={reg}");
+            finish_and_compare(
+                prepare_test_byte_reg(GswMode::Gsw586, rm, reg, gpr, 0x202, None),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_byte_value_corners_and_af_pass_through_states() {
+    // BL against AL, with the AF-carrying incoming states chosen so raw eflags.AF and the
+    // pending descriptor's materialized AF agree in two states and disagree in the other two.
+    // emit_logic_live_af must read the LIVE (materialized) AF, not the stale raw bit, so a
+    // battery that only ever seeds an agreeing pair (as the existing arm() above does) cannot
+    // tell a correct read from an accidentally dropped one.
+    let states: [(u32, Option<(u32, u32)>); 4] = [
+        (0x202, None),                   // AF=0 raw, no pending: agree at 0.
+        (0x8d7, Some((0x7fff_ffff, 1))), // AF=1 raw, pending ADD materializes AF=1: agree at 1.
+        (0x8d7, Some((0, 0))),           // AF=1 raw, pending ADD materializes AF=0: disagree.
+        (0x8c7, Some((0x7fff_ffff, 1))), // AF=0 raw, pending ADD materializes AF=1: disagree.
+    ];
+    for (rm_value, reg_value) in [(0x80u32, 0xffu32), (0x7f, 0xff)] {
+        // rm_value/reg_value also double as the SF boundary corner: with the high 24 bits
+        // zeroed, a dword-width AND (the M5 mutation) reads SF from bit 31, which is always 0
+        // here, while the correct byte-width AND reads bit 7, which differs between the two
+        // pairs (0x80 sets it, 0x7f clears it).
+        let gpr = [reg_value, 0, 0, rm_value];
+        for (eflags, pending) in states {
+            let context = format!(
+                "rm_value={rm_value:#x} reg_value={reg_value:#x} eflags={eflags:#x} pending={pending:?}"
+            );
+            finish_and_compare(
+                prepare_test_byte_reg(GswMode::Gsw586, 3, 0, gpr, eflags, pending),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_byte_register_form_smoke_in_486_mode() {
+    let gpr = [0xaaaa_aa80, 0, 0, 0xdddd_ddff];
+    finish_and_compare(
+        prepare_test_byte_reg(GswMode::Gsw486, 3, 0, gpr, 0x202, None),
+        "486 smoke rm=BL reg=AL",
+    );
+}
+
+// The differential generator's only guard against a mis-widened byte TEST is that its
+// terminal Jcc reads the flags 0x84 just defined (cpu_jit_differential_generator_test.rs).
+// That invariant is enforced by comment only; nothing stops a later edit from inserting a
+// flag-defining instruction between the two. This fixture puts the same shape (byte TEST
+// immediately followed by the Jcc consuming its flags) directly next to emit_test_byte, as
+// its own two-instruction block, so it cannot be dropped by an edit made anywhere else.
+
+fn prepare_test_byte_terminal_jcc(mode: GswMode, gpr: [u32; 4]) -> Fixture {
+    // rm=BL, reg=AL, same SF-boundary corner as test_byte_value_corners_and_af_pass_through_states:
+    // AL & BL sets bit 7 of the byte result, while a dword-width AND (the M5 mutation) would
+    // read SF from bit 31, which stays 0 here. JS reads that SF.
+    let insn = test_byte_reg_code(3, 0);
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x78, 1, 0xf4, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + insn.len() as u32];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("direct-eligible key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("TEST+Jcc block compiles");
+    assert_eq!(
+        compilation.span.instructions, 2,
+        "block must end at the Jcc terminal, not run past it"
+    );
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("TEST+Jcc block installs");
+    let block = native.jit_direct.block(id).unwrap();
+
+    arm_test_byte_reg(&mut native, gpr, 0x202, None);
+    arm_test_byte_reg(&mut interpreter, gpr, 0x202, None);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn test_byte_terminal_jcc_reads_the_last_flag_producer() {
+    let gpr = [0xff, 0, 0, 0x80];
+    let mut fixture = prepare_test_byte_terminal_jcc(GswMode::Gsw586, gpr);
+    assert!(
+        fixture
+            .native
+            .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
+            .unwrap(),
+        "native block did not run"
+    );
+    fixture
+        .interpreter
+        .cycle(&mut fixture.interpreter_bus)
+        .unwrap();
+    fixture
+        .interpreter
+        .cycle(&mut fixture.interpreter_bus)
+        .unwrap();
+    assert_eq!(
+        fixture.native.registers.eip, fixture.interpreter.registers.eip,
+        "branch outcome differs: byte TEST must set SF from bit 7, not bit 31"
+    );
+}
+
 #[test]
 fn immediate_test_forms_match_the_interpreter_in_486_and_586_modes() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {

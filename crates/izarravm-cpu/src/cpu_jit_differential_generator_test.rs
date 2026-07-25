@@ -90,6 +90,7 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     ]);
 
     bytes.extend_from_slice(&[0x85, 0xc0 | (rng.reg() << 3) | rng.reg()]);
+    bytes.extend_from_slice(&[0x84, 0xc0 | (rng.reg() << 3) | rng.reg()]);
     let shift = [4, 5, 7][(rng.u32() % 3) as usize];
     bytes.extend_from_slice(&[
         0xc1,
@@ -125,8 +126,10 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     bytes.push(0xa3);
     push_u32(&mut bytes, data + 36);
 
-    // TEST defines every flag the terminal condition can consume.
+    // TEST defines every flag the terminal condition can consume. The byte form runs last,
+    // so it is the actual flag producer the terminal condition reads.
     bytes.extend_from_slice(&[0x85, 0xc0]);
+    bytes.extend_from_slice(&[0x84, 0xc0]);
     let condition = ((index + mode_offset) & 15) as u8;
     if index & 1 == 0 {
         bytes.extend_from_slice(&[0x70 | condition, 1]);
