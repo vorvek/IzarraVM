@@ -5,6 +5,7 @@
 
 use izarravm_bus::{BusWidth, Memory};
 use izarravm_core::MASTER_CLOCK_HZ;
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
 use crate::ata::{AtaDisk, AtaDmaDirection, AtaDmaRequest};
 
@@ -392,6 +393,75 @@ fn gather_read(memory: &Memory, spans: &[PrdSpan], byte_len: usize) -> Vec<u8> {
         payload.extend_from_slice(&memory.as_slice()[span.address..span.address + span.len]);
     }
     payload
+}
+
+/// Borrowed two-channel bus-master IDE state for canonical comparison.
+///
+/// Each channel serializes its raw registers, the mid-protocol
+/// completion-waits-for-stop latch, and the transfer continuation with its
+/// parsed PRD spans (already A1-masked for memory-to-device). Both channels
+/// use the same record shape even though only the primary ever carries a
+/// transfer in this model, so offsets stay uniform and a future ATAPI DMA
+/// extension changes no layout. Capture rejects a primary transfer whose
+/// armed ATA DMA request has vanished, since every reconcile seam
+/// (task-file, BMIDE, and PCI command writes) otherwise keeps the pair in
+/// step at run-loop boundaries; the INT 13h HLE never touches either side,
+/// and its synchronous stall runs the ordinary device advance, which is the
+/// BMIDE completion path itself.
+pub(crate) struct CanonicalBusMasterIde<'a> {
+    bmide: &'a BusMasterIde,
+}
+
+impl BusMasterIde {
+    pub(crate) fn canonical_projection(&self) -> CanonicalBusMasterIde<'_> {
+        CanonicalBusMasterIde { bmide: self }
+    }
+}
+
+impl CanonicalBusMasterIde<'_> {
+    /// Writes version 1 of the BMIDE payload: 30 fixed bytes per channel
+    /// (primary then secondary) plus 8 bytes per parsed PRD span. The span
+    /// count is written even when no transfer is in flight so fixed offsets
+    /// never move.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        for channel in [&self.bmide.primary, &self.bmide.secondary] {
+            out.write_u8(channel.command)?;
+            out.write_u8(channel.status)?;
+            out.write_u32(channel.prd_address)?;
+            out.write_bool(channel.completion_waits_for_stop)?;
+            let (present, direction, ticks, byte_len, retires_eot) = match &channel.transfer {
+                None => (false, 0u8, 0, 0, false),
+                Some(transfer) => (
+                    true,
+                    match transfer.direction {
+                        AtaDmaDirection::DeviceToMemory => 0,
+                        AtaDmaDirection::MemoryToDevice => 1,
+                    },
+                    transfer.ticks_remaining,
+                    transfer.byte_len as u32,
+                    transfer.retires_eot,
+                ),
+            };
+            out.write_bool(present)?;
+            out.write_u8(direction)?;
+            out.write_u64(ticks)?;
+            out.write_u32(byte_len)?;
+            out.write_bool(retires_eot)?;
+            let spans: &[PrdSpan] = channel
+                .transfer
+                .as_ref()
+                .map_or(&[], |transfer| transfer.spans.as_slice());
+            out.write_count(spans.len() as u64)?;
+            for span in spans {
+                out.write_u32(span.address as u32)?;
+                out.write_u32(span.len as u32)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

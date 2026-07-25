@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::{
     CacheModel, Machine,
     ata::CanonicalAtaDisk,
+    bmide::CanonicalBusMasterIde,
     cache_config::{
         CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK,
         cache_level_config, code_fetch_ws, tier_cost,
@@ -39,7 +40,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 16] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 17] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -120,6 +121,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_000d,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -185,6 +191,10 @@ const _: () = {
         sections[15].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[16].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -200,6 +210,7 @@ const _: () = {
     assert!(sections[12].id < sections[13].id);
     assert!(sections[13].id < sections[14].id);
     assert!(sections[14].id < sections[15].id);
+    assert!(sections[15].id < sections[16].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -287,6 +298,8 @@ pub enum MachineCanonicalCaptureError {
     InconsistentDistiraInitEnableMirror { latch: u32, mirror: u32 },
     #[error("ATA cylinder count {cylinders} disagrees with derived geometry {expected}")]
     InconsistentAtaGeometry { cylinders: u32, expected: u32 },
+    #[error("a BMIDE primary transfer is active without an armed ATA DMA request")]
+    DanglingBmideTransfer,
 }
 
 impl From<CanonicalTimelineError> for MachineCanonicalCaptureError {
@@ -524,6 +537,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     pci: CanonicalPciConfig<'a>,
     vega: CanonicalVega<'a>,
     ata: CanonicalAtaDisk<'a>,
+    bmide: CanonicalBusMasterIde<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -686,6 +700,19 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.ata.write_payload(out)
     }
+
+    /// Writes the required BMIDE bus-master owner payload.
+    ///
+    /// Raw channel registers plus the parsed transfer continuation. Capture
+    /// rejects a primary transfer whose armed ATA DMA request has vanished
+    /// before this payload can be written.
+    #[allow(dead_code)]
+    pub(crate) fn write_bmide_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.bmide.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -789,6 +816,15 @@ impl Machine {
                 });
             }
         }
+        if self.bmide.ticks_until_completion().is_some()
+            && self
+                .ata
+                .as_ref()
+                .and_then(crate::ata::AtaDisk::pending_dma)
+                .is_none()
+        {
+            return Err(MachineCanonicalCaptureError::DanglingBmideTransfer);
+        }
         let ram_rom = CanonicalRamRomProjection {
             ram: self.memory.as_slice(),
             rom: self.rom.as_slice(),
@@ -803,6 +839,7 @@ impl Machine {
         let pci = self.pci.canonical_projection();
         let vega = self.vega.canonical_projection();
         let ata = CanonicalAtaDisk::new(self.ata.as_ref());
+        let bmide = self.bmide.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -865,6 +902,7 @@ impl Machine {
             pci,
             vega,
             ata,
+            bmide,
         })
     }
 }
