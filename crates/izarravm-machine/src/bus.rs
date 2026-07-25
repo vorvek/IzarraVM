@@ -1601,6 +1601,8 @@ impl CpuBus for MachineBus<'_> {
             self.wait_states.io,
         );
 
+        // Keep in step with the PCI BIOS write arm in bios.rs handle_pci_bios,
+        // which mirrors this post-write block for the HLE path.
         let pci_decode = self.vega.memory_decode_key();
         if self.pci.write_io(port, width, value, self.vega) {
             if self.vega.memory_decode_key() != pci_decode {

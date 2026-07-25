@@ -1034,7 +1034,7 @@ impl Machine {
                     _ => BusWidth::Dword,
                 };
                 let size = width.bytes() as u16;
-                if offset + size > 0x100 || offset & (size - 1) != 0 {
+                if u32::from(offset) + u32::from(size) > 0x100 || offset & (size - 1) != 0 {
                     status = BAD_REGISTER;
                 } else if self.pci.read_bdf(bus, devfn, 0, BusWidth::Word, &self.vega) == 0xffff {
                     status = DEVICE_NOT_FOUND;
@@ -1048,9 +1048,26 @@ impl Machine {
                         BusWidth::Dword => self.cpu.registers.set_ecx(value),
                     }
                 } else {
+                    // Keep in step with the post-PCI block in MachineBus::write_io:
+                    // a config write can retarget Distira memory decode (rebuild the
+                    // RAM lookup, invalidate Direct maps) or the PIIX IDE
+                    // command/BAR (resynchronize BMIDE). The HLE path stays
+                    // traceless and charges no I/O wait states, like the reads.
                     let value = self.cpu.registers.ecx();
+                    let pci_decode = self.vega.memory_decode_key();
                     self.pci
                         .write_bdf(bus, devfn, offset as u8, width, value, &mut self.vega);
+                    if self.vega.memory_decode_key() != pci_decode {
+                        self.ram_lookup.rebuild(self.memory.len(), &self.vega);
+                        self.mark_direct_map_changed();
+                    }
+                    if let Some(disk) = self.ata.as_mut() {
+                        self.bmide.synchronize(
+                            self.pci.ide_bus_master_enabled(),
+                            &self.memory,
+                            disk,
+                        );
+                    }
                 }
             }
             _ => status = FUNC_NOT_SUPPORTED,
