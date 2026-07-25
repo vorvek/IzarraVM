@@ -27,9 +27,11 @@ const RTC_PAYLOAD_LEN: usize = 82;
 const UNIT_TESTER_PAYLOAD_LEN: usize = 33;
 const SPEAKER_PAYLOAD_LEN: usize = 1;
 const PCI_CONFIG_PAYLOAD_LEN: usize = 9;
+const VEGA_ROUTING_PAYLOAD_LEN: usize = 14;
 const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
 const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
 const PIIX_IDE_DEVFN: u8 = 7 << 3 | 1;
+const DISTIRA_DEVFN: u8 = 0x10 << 3;
 const TEST_DMA_EVENT_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
 const TEST_MEMORY_MIB: u16 = 2;
 
@@ -288,6 +290,44 @@ fn pci_config_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -
     view.sections()[0].payload().to_vec()
 }
 
+fn vega_routing_payload(machine: &Machine) -> Vec<u8> {
+    let capture = machine.canonical_state_capture().unwrap();
+    vega_routing_payload_from_capture(&capture)
+}
+
+fn vega_routing_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_000b).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| capture.write_vega_routing_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+/// Model the run loop publishing deferred coherence work (direct-map and
+/// device-memory flags) so a capture can proceed after a direct HLE or
+/// port-path write inside a unit test.
+fn publish_pending_coherence(machine: &mut Machine) {
+    machine.direct_map_changed = false;
+    machine.direct_data_map_changed = false;
+    machine.device_wrote_memory = false;
+    machine.pending_device_memory_write_range = None;
+}
+
+fn int10(machine: &mut Machine, eax: u32, ebx: u32, edx: u32) {
+    machine.cpu.registers.set_eax(eax);
+    machine.cpu.registers.set_ebx(ebx);
+    machine.cpu.registers.set_edx(edx);
+    machine.handle_int10();
+    publish_pending_coherence(machine);
+}
+
 fn write_speaker_port(machine: &mut Machine, value: u8) {
     let mut bus = machine.make_bus();
     bus.write_io(0x61, BusWidth::Byte, u32::from(value), false)
@@ -477,6 +517,7 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
             (0x0002_0008, 1),
             (0x0002_0009, 1),
             (0x0002_000a, 1),
+            (0x0002_000b, 1),
         ]
     );
     assert!(
@@ -530,6 +571,10 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
     );
     assert_eq!(
         sections[13].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+        STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
+    assert_eq!(
+        sections[14].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
         STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
 }
@@ -1584,6 +1629,169 @@ fn pci_config_payload_normalizes_every_piix_command_write() {
         );
         assert_eq!(pci_config_payload(&machine), expected);
     }
+}
+
+#[test]
+fn vega_routing_payload_pins_default_and_asymmetric_bytes() {
+    assert_eq!(
+        vega_routing_payload(&test_machine()),
+        [0, 0, 0, 0, 0x02, 0x00, 0x00, 0x00, 0x00, 0xe1, 0, 0, 0, 0]
+    );
+
+    // A banked VBE mode with a bank selected, a moved BAR high byte, and an
+    // init-enable latch: every payload field lands asymmetric.
+    let mut machine = test_machine();
+    int10(&mut machine, 0x4f02, 0x0101, 0);
+    int10(&mut machine, 0x4f05, 0x0000, 0x00ab);
+    write_pci_port(
+        &mut machine,
+        crate::PCI_CONFIG_ADDRESS_PORT,
+        BusWidth::Dword,
+        0x8000_8010,
+    );
+    write_pci_port(
+        &mut machine,
+        crate::PCI_CONFIG_DATA_PORT,
+        BusWidth::Dword,
+        0x5634_1200,
+    );
+    write_pci_bdf(
+        &mut machine,
+        0,
+        DISTIRA_DEVFN,
+        0x40,
+        BusWidth::Dword,
+        0xa55a_1234,
+    );
+    publish_pending_coherence(&mut machine);
+    assert_eq!(
+        vega_routing_payload(&machine),
+        [
+            1, 0, 0xab, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x56, 0x34, 0x12, 0x5a, 0xa5
+        ]
+    );
+}
+
+#[test]
+fn vega_routing_legacy_mode_set_retains_stale_margo_latches() {
+    let mut machine = test_machine();
+    int10(&mut machine, 0x4f02, 0x0101, 0);
+    int10(&mut machine, 0x4f05, 0x0000, 0x00ab);
+    assert_eq!(vega_routing_payload(&machine)[..4], [1, 0, 0xab, 0x00]);
+
+    // select_legacy clears only margo_active; the bank latch deliberately
+    // stays stale across the legacy mode set.
+    int10(&mut machine, 0x0003, 0, 0);
+    assert_eq!(vega_routing_payload(&machine)[..4], [0, 0, 0xab, 0x00]);
+
+    // A linear mode set flips the aperture latch and resets the bank.
+    int10(&mut machine, 0x4f02, 0x4101, 0);
+    assert_eq!(vega_routing_payload(&machine)[..4], [1, 1, 0x00, 0x00]);
+
+    // Leaving for legacy again keeps the stale linear latch.
+    int10(&mut machine, 0x0003, 0, 0);
+    assert_eq!(vega_routing_payload(&machine)[..4], [0, 1, 0x00, 0x00]);
+}
+
+#[test]
+fn vega_routing_payload_normalizes_every_distira_command_write() {
+    let mut machine = test_machine();
+    write_pci_port(
+        &mut machine,
+        crate::PCI_CONFIG_ADDRESS_PORT,
+        BusWidth::Dword,
+        0x8000_8004,
+    );
+    for value in u8::MIN..=u8::MAX {
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT,
+            BusWidth::Byte,
+            u32::from(value),
+        );
+        publish_pending_coherence(&mut machine);
+        let payload = vega_routing_payload(&machine);
+        assert_eq!(payload[4], value & 0x02);
+        assert_eq!(payload[5], 0);
+    }
+
+    // The high command byte discards every write.
+    let expected = vega_routing_payload(&machine);
+    write_pci_port(
+        &mut machine,
+        crate::PCI_CONFIG_DATA_PORT + 1,
+        BusWidth::Byte,
+        0xff,
+    );
+    publish_pending_coherence(&mut machine);
+    assert_eq!(vega_routing_payload(&machine), expected);
+}
+
+#[test]
+fn vega_routing_bar_partial_writes_land_only_the_high_byte() {
+    let mut machine = test_machine();
+    write_pci_port(
+        &mut machine,
+        crate::PCI_CONFIG_ADDRESS_PORT,
+        BusWidth::Dword,
+        0x8000_8010,
+    );
+    for lane in 0..3u16 {
+        write_pci_port(
+            &mut machine,
+            crate::PCI_CONFIG_DATA_PORT + lane,
+            BusWidth::Byte,
+            0xff,
+        );
+        publish_pending_coherence(&mut machine);
+        assert_eq!(
+            vega_routing_payload(&machine)[6..10],
+            [0x00, 0x00, 0x00, 0xe1]
+        );
+    }
+    write_pci_port(
+        &mut machine,
+        crate::PCI_CONFIG_DATA_PORT + 3,
+        BusWidth::Byte,
+        0x25,
+    );
+    publish_pending_coherence(&mut machine);
+    assert_eq!(
+        vega_routing_payload(&machine)[6..10],
+        [0x00, 0x00, 0x00, 0x25]
+    );
+}
+
+#[test]
+fn vega_routing_capture_is_read_only_and_excludes_device_internals() {
+    let mut machine = test_machine();
+    let baseline = vega_routing_payload(&machine);
+
+    // Legacy VGA register and Margo VRAM churn is other-owner state and must
+    // not perturb the routing payload.
+    write_pci_port(&mut machine, 0x3c2, BusWidth::Byte, 0x67);
+    machine.vega.margo_mut().vram_mut()[0] = 0x5a;
+    publish_pending_coherence(&mut machine);
+    assert_eq!(vega_routing_payload(&machine), baseline);
+
+    let capture = machine.canonical_state_capture().unwrap();
+    let first = vega_routing_payload_from_capture(&capture);
+    let second = vega_routing_payload_from_capture(&capture);
+    assert_eq!(first, second);
+    assert_eq!(first.len(), VEGA_ROUTING_PAYLOAD_LEN);
+}
+
+#[test]
+fn capture_rejects_a_drifted_distira_init_enable_mirror() {
+    let mut machine = test_machine();
+    machine.vega.distira_mut().set_init_enable(0xdead_beef);
+    assert_eq!(
+        capture_error(&machine),
+        MachineCanonicalCaptureError::InconsistentDistiraInitEnableMirror {
+            latch: 0,
+            mirror: 0xdead_beef,
+        }
+    );
 }
 
 #[test]
@@ -2820,4 +3028,41 @@ fn pci_config_state_survives_a_real_586_test_exit_boundary() {
     let expected = [0x9d, 0xa6, 0xb3, 0xd5, 0x04, 0x00, 0xe1, 0x34, 0x12];
     assert_eq!(pci_config_payload(&machine), expected);
     assert_eq!(pci_config_payload(&machine), expected);
+}
+
+#[test]
+fn vega_routing_state_survives_a_real_586_test_exit_boundary() {
+    // OUT-driven writes cover the Distira half of the payload; the Margo
+    // latches are covered through the INT 10h HLE in the direct tests above.
+    let mut code = Vec::new();
+    push_out_dx_eax(&mut code, crate::PCI_CONFIG_ADDRESS_PORT, 0x8000_8010);
+    push_out_dx_eax(&mut code, crate::PCI_CONFIG_DATA_PORT, 0x5634_1200);
+    push_out_dx_eax(&mut code, crate::PCI_CONFIG_ADDRESS_PORT, 0x8000_8040);
+    push_out_dx_eax(&mut code, crate::PCI_CONFIG_DATA_PORT, 0xa55a_1234);
+    push_out_dx_eax(&mut code, crate::PCI_CONFIG_ADDRESS_PORT, 0x8000_8004);
+    push_out_dx_eax(&mut code, crate::PCI_CONFIG_DATA_PORT, 0x0000_0000);
+    code.extend_from_slice(&[
+        0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
+        0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
+        0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
+        0xf4, // must not execute
+    ]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        rom_with_code(&code),
+    )
+    .unwrap();
+    machine.set_mode(GswMode::Gsw586);
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::TestExit { code: 0 });
+    assert_eq!(machine.cpu.registers.eip, 78);
+    assert!(!machine.cpu.halted);
+    assert_eq!(machine.unittester.pending_command(), None);
+    let expected = [
+        0, 0, 0, 0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x56, 0x34, 0x12, 0x5a, 0xa5,
+    ];
+    assert_eq!(vega_routing_payload(&machine), expected);
+    assert_eq!(vega_routing_payload(&machine), expected);
 }

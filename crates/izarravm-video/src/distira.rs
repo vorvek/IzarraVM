@@ -370,6 +370,13 @@ impl Distira {
         self.init_enable = value;
     }
 
+    /// The init-enable mirror. The Vega outer-routing latch is the canonical
+    /// owner of this value; a future Distira-internals canonical section must
+    /// exclude it, and capture verifies the mirror has not drifted.
+    pub fn init_enable(&self) -> u32 {
+        self.init_enable
+    }
+
     fn init_writes_enabled(&self) -> bool {
         self.init_enable & INIT_ENABLE_WRITE != 0
     }

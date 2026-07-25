@@ -4,6 +4,7 @@
 //! VEGA video-card ownership and guest-visible routing.
 
 use izarravm_bus::{BusWidth, Memory};
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 use izarravm_video::{
     CGA_FB_SIZE, DAC_ENTRIES, Distira, HGC_FB_SIZE, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, Margo,
     MargoDisplay, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE,
@@ -64,6 +65,11 @@ impl Vega {
     #[cfg(test)]
     pub(crate) fn margo_mut(&mut self) -> &mut Margo {
         &mut self.margo
+    }
+
+    #[cfg(test)]
+    pub(crate) fn distira_mut(&mut self) -> &mut Distira {
+        &mut self.distira
     }
 
     pub(crate) fn select_legacy(&mut self) {
@@ -127,6 +133,19 @@ impl Vega {
                 vram[y * pitch + x] = ((x + y) & 0xff) as u8;
             }
         }
+    }
+
+    /// Borrows the six outer routing/configuration latches for canonical
+    /// comparison. Vga, Margo, and Distira internals belong to their own
+    /// future owners.
+    pub(crate) fn canonical_projection(&self) -> CanonicalVega<'_> {
+        CanonicalVega { vega: self }
+    }
+
+    /// The Vega-owned init-enable latch and the mirror Distira keeps of it.
+    /// Capture rejects a snapshot when the two have drifted apart.
+    pub(crate) fn distira_init_enable_mirror(&self) -> (u32, u32) {
+        (self.distira_init_enable, self.distira.init_enable())
     }
 
     pub(crate) fn active_display(&self) -> ActiveDisplay {
@@ -925,5 +944,34 @@ fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {
         Some((address - MARGO_MMIO_BASE) as usize)
     } else {
         None
+    }
+}
+
+/// Borrowed outer routing/configuration latches for canonical comparison.
+///
+/// These six scalars are the authoritative guest-programmed routing state the
+/// Vega owner holds directly: the Margo personality, aperture, and bank
+/// latches plus the Distira PCI command, BAR0, and init-enable latches. The
+/// Margo linear and bank latches deliberately retain stale values across a
+/// legacy mode set (select_legacy clears only margo_active). Routing-outcome
+/// parity for active_display() additionally requires Distira's own
+/// display_enabled state, which belongs to the future Distira owner; this
+/// section is necessary but not sufficient on its own.
+pub(crate) struct CanonicalVega<'a> {
+    vega: &'a Vega,
+}
+
+impl CanonicalVega<'_> {
+    /// Writes version 1 of the fixed 14-byte Vega outer-routing payload.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        out.write_bool(self.vega.margo_active)?;
+        out.write_bool(self.vega.margo_linear)?;
+        out.write_u16(self.vega.margo_bank)?;
+        out.write_u16(self.vega.distira_command)?;
+        out.write_u32(self.vega.distira_mem_base)?;
+        out.write_u32(self.vega.distira_init_enable)
     }
 }
