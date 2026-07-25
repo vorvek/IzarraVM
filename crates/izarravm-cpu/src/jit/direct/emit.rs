@@ -258,6 +258,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 ));
             }
             DirectKind::Test { a, b } => emit_test(&mut e, a, b),
+            DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::TestImmReg { dst, imm, width } => {
                 emit_test_imm_reg(&mut e, dst, imm, width);
             }
@@ -2584,6 +2585,12 @@ fn emit_test(e: &mut Encoder, a: u8, b: u8) {
     emit_capture_flags(e, LOGIC_FLAGS);
     emit_pending(e, 0x8000_0202, None, None, Reg::RDX);
     emit_logic_live_af(e);
+}
+
+fn emit_test_byte(e: &mut Encoder, a: u8, b: u8) {
+    emit_read_store_value(e, StoreSource::Reg(a), MemoryWidth::Byte, Reg::RAX);
+    emit_read_store_value(e, StoreSource::Reg(b), MemoryWidth::Byte, Reg::RCX);
+    emit_test_preloaded(e, MemoryWidth::Byte);
 }
 
 fn emit_test_imm_reg(e: &mut Encoder, dst: u8, imm: u32, width: MemoryWidth) {

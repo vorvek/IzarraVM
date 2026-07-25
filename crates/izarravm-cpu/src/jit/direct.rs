@@ -1783,6 +1783,10 @@ pub(crate) enum DirectKind {
         a: u8,
         b: u8,
     },
+    TestByte {
+        a: u8,
+        b: u8,
+    },
     TestImmReg {
         dst: u8,
         imm: u32,
