@@ -19,6 +19,7 @@ use crate::{
     speaker::CanonicalSpeaker,
     timeline::{CanonicalTimelineError, CanonicalTimelineProjection},
     unittester::CanonicalUnitTester,
+    vega::CanonicalVega,
 };
 
 const STATE_SNAPSHOT_V1_SCHEMA_NAMESPACE: u32 = 0x0000_0000;
@@ -37,7 +38,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 14] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 15] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -108,6 +109,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_000b,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -165,6 +171,10 @@ const _: () = {
         sections[13].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[14].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -178,6 +188,7 @@ const _: () = {
     assert!(sections[10].id < sections[11].id);
     assert!(sections[11].id < sections[12].id);
     assert!(sections[12].id < sections[13].id);
+    assert!(sections[13].id < sections[14].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -259,6 +270,10 @@ pub enum MachineCanonicalCaptureError {
     InconsistentSystemRomLength { expected: usize, actual: usize },
     #[error("the derived RAM page lookup is inconsistent with RAM and video decode")]
     InconsistentRamPageLookup,
+    #[error(
+        "the Distira init-enable mirror {mirror:#010x} disagrees with the Vega latch {latch:#010x}"
+    )]
+    InconsistentDistiraInitEnableMirror { latch: u32, mirror: u32 },
 }
 
 impl From<CanonicalTimelineError> for MachineCanonicalCaptureError {
@@ -494,6 +509,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     unit_tester: CanonicalUnitTester<'a>,
     speaker: CanonicalSpeaker<'a>,
     pci: CanonicalPciConfig<'a>,
+    vega: CanonicalVega<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -628,6 +644,20 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.pci.write_payload(out)
     }
+
+    /// Writes the required Vega outer-routing owner payload.
+    ///
+    /// The six latches are the guest-programmed routing state Vega owns
+    /// directly. Vga, Margo, and Distira internals, including the init-enable
+    /// mirror Distira keeps, belong to their own future owners; capture
+    /// rejects a drifted mirror before this payload can be written.
+    #[allow(dead_code)]
+    pub(crate) fn write_vega_routing_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.vega.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -710,6 +740,15 @@ impl Machine {
         if !self.ram_lookup.is_consistent(actual_ram_len, &self.vega) {
             return Err(MachineCanonicalCaptureError::InconsistentRamPageLookup);
         }
+        let (init_enable_latch, init_enable_mirror) = self.vega.distira_init_enable_mirror();
+        if init_enable_latch != init_enable_mirror {
+            return Err(
+                MachineCanonicalCaptureError::InconsistentDistiraInitEnableMirror {
+                    latch: init_enable_latch,
+                    mirror: init_enable_mirror,
+                },
+            );
+        }
         let ram_rom = CanonicalRamRomProjection {
             ram: self.memory.as_slice(),
             rom: self.rom.as_slice(),
@@ -722,6 +761,7 @@ impl Machine {
         let unit_tester = self.unittester.canonical_projection();
         let speaker = self.speaker.canonical_projection();
         let pci = self.pci.canonical_projection();
+        let vega = self.vega.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -782,6 +822,7 @@ impl Machine {
             unit_tester,
             speaker,
             pci,
+            vega,
         })
     }
 }
