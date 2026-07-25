@@ -105,6 +105,46 @@ fn piix4_ide_function_exposes_bar4_and_honors_io_decode() {
 }
 
 #[test]
+fn pci_bios_bus_master_disable_fails_inflight_dma_like_the_port_path() {
+    // Dropping the PIIX bus-master enable with a DMA transfer in flight must
+    // fail the transfer identically whether the config write arrives through
+    // CF8/CFC or through the PCI BIOS service.
+    let mut port_m = machine_with_hdd(8);
+    let mut bios_m = machine_with_hdd(8);
+    arm_dma(&mut port_m, 0x2000, 2, true);
+    arm_dma(&mut bios_m, 0x2000, 2, true);
+    assert!(port_m.bmide.ticks_until_completion().is_some());
+    assert!(bios_m.bmide.ticks_until_completion().is_some());
+
+    out(&mut port_m, 0xcf8, BusWidth::Dword, 0x8000_3904);
+    out(&mut port_m, 0xcfc, BusWidth::Word, 0x0001);
+
+    bios_m.cpu.registers.set_ebx(0x0039);
+    bios_m.cpu.registers.set_edi(4);
+    bios_m.cpu.registers.set_ecx(0x0001);
+    bios_m.cpu.registers.set_eax(0xB10C);
+    bios_m.handle_pci_bios(true);
+    assert_eq!(bios_m.cpu.registers.eflags & 1, 0);
+
+    assert!(!port_m.pci.ide_bus_master_enabled());
+    assert!(!bios_m.pci.ide_bus_master_enabled());
+    assert!(port_m.bmide.ticks_until_completion().is_none());
+    assert!(bios_m.bmide.ticks_until_completion().is_none());
+    assert_eq!(
+        bios_m
+            .pci
+            .read_bdf(0, 0x39, 4, BusWidth::Word, &bios_m.vega),
+        port_m
+            .pci
+            .read_bdf(0, 0x39, 4, BusWidth::Word, &port_m.vega),
+    );
+    assert_eq!(
+        input(&mut port_m, BM_STATUS, BusWidth::Byte),
+        input(&mut bios_m, BM_STATUS, BusWidth::Byte),
+    );
+}
+
+#[test]
 fn secondary_pio_interrupt_latches_in_the_bmide_status_bank() {
     let mut machine = machine_with_hdd(8);
     out(

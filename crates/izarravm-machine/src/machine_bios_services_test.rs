@@ -90,6 +90,85 @@ fn pci_bios_reports_search_register_and_function_errors() {
 }
 
 #[test]
+fn pci_bios_distira_decode_write_matches_the_port_path() {
+    // The same logical Distira configuration (BAR0 high byte, then the
+    // memory-space enable bit) must publish identically whether it arrives
+    // through the PCI BIOS service or through CF8/CFC port I/O: same decode
+    // key, a consistent RAM lookup, and a pending direct-map invalidation.
+    let mut bios_m = int15_machine(16);
+    let mut port_m = int15_machine(16);
+    let default_key = bios_m.vega.memory_decode_key();
+    assert!(default_key.is_some());
+    assert_eq!(port_m.vega.memory_decode_key(), default_key);
+    assert!(!bios_m.direct_map_changed);
+    assert!(!port_m.direct_map_changed);
+
+    // Disable memory decode. The key flips to None, so both paths must
+    // rebuild the lookup and schedule a direct-map invalidation.
+    bios_m.cpu.registers.set_ebx(0x0080);
+    bios_m.cpu.registers.set_edi(4);
+    bios_m.cpu.registers.set_ecx(0);
+    assert_eq!(pci_bios_call(&mut bios_m, 0xB10C), (0, false));
+    with_bus(&mut port_m, |bus| {
+        bus.write_io(0xcf8, BusWidth::Dword, 0x8000_8004, false)
+            .unwrap();
+        bus.write_io(0xcfc, BusWidth::Word, 0, false).unwrap();
+    });
+    for m in [&bios_m, &port_m] {
+        assert_eq!(m.vega.memory_decode_key(), None);
+        assert!(m.direct_map_changed);
+        assert!(m.ram_lookup.is_consistent(m.memory.len(), &m.vega));
+    }
+    bios_m.direct_map_changed = false;
+    port_m.direct_map_changed = false;
+
+    // Moving the BAR while decode is disabled keeps the key at None, so
+    // neither path may schedule a spurious invalidation.
+    bios_m.cpu.registers.set_ebx(0x0080);
+    bios_m.cpu.registers.set_edi(0x10);
+    bios_m.cpu.registers.set_ecx(0x0100_0000);
+    assert_eq!(pci_bios_call(&mut bios_m, 0xB10D), (0, false));
+    with_bus(&mut port_m, |bus| {
+        bus.write_io(0xcf8, BusWidth::Dword, 0x8000_8010, false)
+            .unwrap();
+        bus.write_io(0xcfc, BusWidth::Dword, 0x0100_0000, false)
+            .unwrap();
+    });
+    assert_eq!(bios_m.vega.memory_decode_key(), None);
+    assert_eq!(port_m.vega.memory_decode_key(), None);
+    assert!(!bios_m.direct_map_changed);
+    assert!(!port_m.direct_map_changed);
+
+    // Re-enable at the new base: the key appears at the moved BAR and the
+    // invalidation fires again on both paths.
+    bios_m.cpu.registers.set_ebx(0x0080);
+    bios_m.cpu.registers.set_edi(4);
+    bios_m.cpu.registers.set_ecx(0x0002);
+    assert_eq!(pci_bios_call(&mut bios_m, 0xB10C), (0, false));
+    with_bus(&mut port_m, |bus| {
+        bus.write_io(0xcf8, BusWidth::Dword, 0x8000_8004, false)
+            .unwrap();
+        bus.write_io(0xcfc, BusWidth::Word, 0x0002, false).unwrap();
+    });
+
+    for m in [&bios_m, &port_m] {
+        assert_eq!(m.vega.memory_decode_key(), Some(0x0100_0000));
+        assert!(m.direct_map_changed);
+        assert!(m.ram_lookup.is_consistent(m.memory.len(), &m.vega));
+    }
+    for offset in [0x04u8, 0x10, 0x13] {
+        assert_eq!(
+            bios_m
+                .pci
+                .read_bdf(0, 0x80, offset, BusWidth::Byte, &bios_m.vega),
+            port_m
+                .pci
+                .read_bdf(0, 0x80, offset, BusWidth::Byte, &port_m.vega),
+        );
+    }
+}
+
+#[test]
 fn bios32_header_and_far_call_stubs_resolve_pci() {
     let prog = [
         0x66, 0xB8, b'$', b'P', b'C', b'I', // mov eax,'$PCI'
