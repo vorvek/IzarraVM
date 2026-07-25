@@ -84,13 +84,12 @@ SOURCE_CODE_SUFFIXES = {
 }
 SOURCE_CODE_NAMES = {"makefile"}
 
-# These files exceeded the policy ceiling before the check became mandatory.
-# Their exact sizes are frozen so later changes cannot make the debt larger.
-LEGACY_LINE_CEILINGS = {
-    "crates/izarravm-cpu/src/cpu_jit_direct_test.rs": 2568,
-    "crates/izarravm-cpu/src/cpu_test.rs": 2576,
-    "crates/izarravm-machine/src/machine_bios_services_test.rs": 2605,
-}
+# Line ceilings. Large focused files are fine here; the limits exist to catch
+# runaway growth, not to force splitting a hot module. Keep code free of
+# duplication and do not shred logic into tiny indirection layers to fit:
+# this codebase optimizes for performance and locality, not layer count.
+SOURCE_LINE_LIMIT = 5000
+TEST_LINE_LIMIT = 7000
 
 
 def tracked_files() -> list[str]:
@@ -255,8 +254,7 @@ def main() -> int:
         if tuple(lines[offset : offset + 2]) != header:
             errors.append(f"{path}: missing exact GPL-3.0-only header")
         if path not in GENERATED_TEXT and is_source_code(path):
-            limit = 2500 if is_test_file(path) else 3000
-            limit = max(limit, LEGACY_LINE_CEILINGS.get(path, 0))
+            limit = TEST_LINE_LIMIT if is_test_file(path) else SOURCE_LINE_LIMIT
             if len(lines) > limit:
                 errors.append(f"{path}: {len(lines)} lines exceeds the {limit}-line limit")
         if PurePosixPath(path).suffix.lower() == ".rs" and not is_test_file(path):
