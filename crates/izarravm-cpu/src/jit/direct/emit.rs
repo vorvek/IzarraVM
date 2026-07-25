@@ -259,6 +259,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             }
             DirectKind::Test { a, b } => emit_test(&mut e, a, b),
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
+            DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
             DirectKind::TestImmReg { dst, imm, width } => {
                 emit_test_imm_reg(&mut e, dst, imm, width);
             }
@@ -2591,6 +2592,21 @@ fn emit_test_byte(e: &mut Encoder, a: u8, b: u8) {
     emit_read_store_value(e, StoreSource::Reg(a), MemoryWidth::Byte, Reg::RAX);
     emit_read_store_value(e, StoreSource::Reg(b), MemoryWidth::Byte, Reg::RCX);
     emit_test_preloaded(e, MemoryWidth::Byte);
+}
+
+fn emit_imul(e: &mut Encoder, dst: u8, src: u8) {
+    e.imul_r32_r32(home(dst), home(src));
+    // Two-operand IMUL defines CF and OF together and otherwise leaves SF/ZF/AF/PF exactly as
+    // they were. The interpreter reaches that through set_flag(FLAG_CF | FLAG_OF, ...): the mask
+    // has more than one bit set, so it cannot take the single-bit CF-override shortcut and
+    // instead materializes whatever flags were pending before writing just those two bits, which
+    // is what leaves the rest untouched. Here that means capturing only CF/OF from the host
+    // multiply and writing the whole flags word back in one go: emit_logic_live_af is not needed
+    // the way TEST needs it, because TEST leaves its own descriptor live for a later read while
+    // IMUL clears pending_flags and commits the full word right away.
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
 }
 
 fn emit_test_imm_reg(e: &mut Encoder, dst: u8, imm: u32, width: MemoryWidth) {

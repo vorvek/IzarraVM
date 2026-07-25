@@ -28,6 +28,23 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     {
         return None;
     }
+    // IMUL r32, r/m32, register form only. Must stay below the Word-size gate above: a
+    // 66-prefixed IMUL decodes with OperandSize::Word and is not in that gate's allowlist, so it
+    // already falls through to `None` there. Moving this arm above the gate, or adding 0x0faf to
+    // the allowlist, would silently lower a 16-bit IMUL as a 32-bit multiply instead: the
+    // destination's high 16 bits would be clobbered rather than preserved, and CF/OF would be
+    // computed against the wrong width.
+    if insn.opcode == 0x0faf {
+        // Keyed on the full u16 opcode rather than the u8 truncation further down: that
+        // truncation (`u8::try_from(insn.opcode).ok()`) returns None for every two-byte opcode,
+        // so the u8 arms below are unreachable for 0x0faf regardless. Matching the full u16 here
+        // keeps that explicit and local instead of relying on the truncation's behavior.
+        let m = insn.modrm?;
+        let DecodedOperand::Reg(src) = insn.operand? else {
+            return None;
+        };
+        return Some(DirectKind::Imul { dst: m.reg, src });
+    }
     if matches!(insn.opcode, 0x0fa4 | 0x0fa5 | 0x0fac | 0x0fad) {
         let m = insn.modrm?;
         let count = if matches!(insn.opcode, 0x0fa4 | 0x0fac) {

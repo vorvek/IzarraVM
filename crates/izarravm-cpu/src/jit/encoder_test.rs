@@ -991,6 +991,35 @@ fn imul_r64_r64_known_bytes() {
 }
 
 #[test]
+fn imul_r32_r32_known_bytes() {
+    // imul eax, ecx -- no REX at all: neither register is extended.
+    // opcode 0F AF; modrm mod=11,reg=eax&7=0,rm=ecx&7=1 -> 11_000_001 = 0xC1.
+    let mut e = Encoder::new();
+    e.imul_r32_r32(Reg::RAX, Reg::RCX);
+    assert_eq!(e.finish(), vec![0x0F, 0xAF, 0xC1]);
+
+    // imul r8d, eax -- R=1(r8 is reg/ext),B=0(eax not ext) = 0100_0100 = 0x44;
+    // opcode 0F AF; modrm mod=11,reg=r8&7=0,rm=eax&7=0 -> 11_000_000 = 0xC0.
+    let mut e = Encoder::new();
+    e.imul_r32_r32(Reg::R8, Reg::RAX);
+    assert_eq!(e.finish(), vec![0x44, 0x0F, 0xAF, 0xC0]);
+
+    // imul eax, r8d -- R=0(eax not ext),B=1(r8 is rm/ext) = 0100_0001 = 0x41;
+    // opcode 0F AF; modrm mod=11,reg=eax&7=0,rm=r8&7=0 -> 11_000_000 = 0xC0.
+    let mut e = Encoder::new();
+    e.imul_r32_r32(Reg::RAX, Reg::R8);
+    assert_eq!(e.finish(), vec![0x41, 0x0F, 0xAF, 0xC0]);
+
+    // imul r14d, r9d -- REX.W=0 here (unlike imul_r64_r64): R=1(r14),B=1(r9) = 0100_0101 = 0x45;
+    // opcode 0F AF; modrm mod=11,reg=r14&7=6,rm=r9&7=1 -> 11_110_001 = 0xF1. This is the pair
+    // that would be silently wrong if imul_r32_r32 forwarded to imul_r64_r64 (REX.W would be
+    // forced to 1 instead of staying 0).
+    let mut e = Encoder::new();
+    e.imul_r32_r32(Reg::R14, Reg::R9);
+    assert_eq!(e.finish(), vec![0x45, 0x0F, 0xAF, 0xF1]);
+}
+
+#[test]
 fn imul_r64_imm32_known_bytes() {
     // imul rax, rax, 12 -- REX.W=1, 69 /r id. modrm mod=11,reg=0(rax),rm=0(rax) = 0xC0.
     let mut e = Encoder::new();

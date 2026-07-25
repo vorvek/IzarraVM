@@ -545,6 +545,325 @@ fn test_byte_terminal_jcc_reads_the_last_flag_producer() {
     );
 }
 
+// 0x0FAF IMUL r32, r/m32 register-form battery (Direct backend Slice A companion). Register
+// form only: mod == 3. dst is ModRM.reg, src is the r/m register. Unlike TEST, IMUL DEFINES
+// CF/OF and PRESERVES SF/ZF/AF/PF exactly as they were, so the states below exist to catch a
+// capture mask that is too wide (leaking the host multiply's own, guest-irrelevant SF/ZF/PF into
+// the preserved flags) rather than one that is too narrow.
+
+fn imul_reg_code(dst: u8, src: u8) -> Vec<u8> {
+    vec![0x0f, 0xaf, 0xc0 | (dst << 3) | src]
+}
+
+fn arm_imul_reg(cpu: &mut CpuGsw, gpr: [u32; 8], eflags: u32, pending: Option<(u32, u32)>) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    cpu.registers.gpr = gpr;
+    cpu.registers.eflags = eflags;
+    cpu.pending_flags = PendingFlags::default();
+    if let Some((a, b)) = pending {
+        // Leaves a pending ADD descriptor whose materialized SF/ZF/AF/PF come from a/b/result,
+        // not from the raw eflags bits just set above: the two can be made to agree or disagree,
+        // and IMUL must preserve whichever is live rather than recomputing from the product.
+        let _ = cpu.alu(0, a, b, BusWidth::Dword);
+    }
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+}
+
+fn prepare_imul_reg(
+    mode: GswMode,
+    dst: u8,
+    src: u8,
+    gpr: [u32; 8],
+    eflags: u32,
+    pending: Option<(u32, u32)>,
+) -> Fixture {
+    let insn = imul_reg_code(dst, src);
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [
+        ENTRY,
+        ENTRY + insn.len() as u32,
+        ENTRY + insn.len() as u32 + 2,
+    ];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    let block = install_block(&mut native);
+    arm_imul_reg(&mut native, gpr, eflags, pending);
+    arm_imul_reg(&mut interpreter, gpr, eflags, pending);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn imul_register_lanes_match_the_interpreter_in_586_mode() {
+    // All 64 (dst, src) register pairs (EAX..EDI on both sides) at one value pattern mixing
+    // overflowing and non-overflowing products, including same-register pairs (dst == src).
+    let gpr = [
+        0x0000_0002,
+        0x7fff_ffff,
+        0xffff_ffff,
+        0x8000_0000,
+        0x0001_0000,
+        0x0000_0000,
+        0x1234_5678,
+        0x0001_0000,
+    ];
+    for dst in 0..8u8 {
+        for src in 0..8u8 {
+            let context = format!("dst={dst} src={src}");
+            finish_and_compare(
+                prepare_imul_reg(GswMode::Gsw586, dst, src, gpr, 0x202, None),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn imul_overflow_corners_and_af_pass_through_states() {
+    // Overflow boundary corners: the REX.W killer (0x1_0000 * 0x1_0000, which sets CF=OF=1 at 32
+    // bits but 0 at 64 bits: the mutation this whole battery exists to catch), the signed-max
+    // boundary, -1 * -1 (must NOT set CF/OF), INT_MIN * -1, a zero operand, and 1 * INT_MIN.
+    // Paired with the same AF-carrying incoming states test_byte uses (agree/disagree twice),
+    // so a wrong (too-wide) flags-capture mask is caught by SF/ZF/PF as well as by AF.
+    let corners: [(u32, u32); 6] = [
+        (0x0001_0000, 0x0001_0000),
+        (0x7fff_ffff, 2),
+        (0xffff_ffff, 0xffff_ffff),
+        (0x8000_0000, 0xffff_ffff),
+        (0, 0x1234_5678),
+        (1, 0x8000_0000),
+    ];
+    let states: [(u32, Option<(u32, u32)>); 4] = [
+        (0x202, None),                   // no pending: eflags read live.
+        (0x8d7, Some((0x7fff_ffff, 1))), // pending materializes AF=1: agrees with raw AF=1.
+        (0x8d7, Some((0, 0))),           // pending materializes AF=0: disagrees with raw AF=1.
+        (0x8c7, Some((0x7fff_ffff, 1))), // pending materializes AF=1: disagrees with raw AF=0.
+    ];
+    for (dst_value, src_value) in corners {
+        let gpr = [dst_value, src_value, 0, 0, 0, 0, 0x1234_5678, 0x89ab_cdef];
+        for (eflags, pending) in states {
+            let context = format!(
+                "dst_value={dst_value:#x} src_value={src_value:#x} eflags={eflags:#x} pending={pending:?}"
+            );
+            finish_and_compare(
+                prepare_imul_reg(GswMode::Gsw586, 0, 1, gpr, eflags, pending),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn imul_register_form_smoke_in_486_mode() {
+    let gpr = [
+        0x0001_0000,
+        0x0001_0000,
+        0,
+        0,
+        0,
+        0,
+        0x1234_5678,
+        0x89ab_cdef,
+    ];
+    finish_and_compare(
+        prepare_imul_reg(GswMode::Gsw486, 0, 1, gpr, 0x202, None),
+        "486 smoke dst=EAX src=ECX overflow corner",
+    );
+}
+
+// A fixed two-instruction fixture, next to the IMUL battery above, that compiles nothing but
+// IMUL immediately followed by the JO consuming its overflow flag. The differential generator's
+// only guard against a mis-widened IMUL is that its terminal Jcc reads the flags 0x0FAF just
+// defined; that invariant is enforced by comment only there, so this fixture puts the same shape
+// directly under test as its own two-instruction block, immune to an edit made anywhere else.
+
+fn prepare_imul_terminal_jo(mode: GswMode, gpr: [u32; 8]) -> Fixture {
+    // dst=EAX, src=ECX, values chosen so the product overflows and JO is taken.
+    let insn = imul_reg_code(0, 1);
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x70, 1, 0xf4, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + insn.len() as u32];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("direct-eligible key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("IMUL+Jcc block compiles");
+    assert_eq!(
+        compilation.span.instructions, 2,
+        "block must end at the Jcc terminal, not run past it"
+    );
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("IMUL+Jcc block installs");
+    let block = native.jit_direct.block(id).unwrap();
+
+    arm_imul_reg(&mut native, gpr, 0x202, None);
+    arm_imul_reg(&mut interpreter, gpr, 0x202, None);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn imul_terminal_jcc_reads_the_last_flag_producer() {
+    let gpr = [0x7fff_ffff, 2, 0, 0, 0, 0, 0x1234_5678, 0x89ab_cdef];
+    let mut fixture = prepare_imul_terminal_jo(GswMode::Gsw586, gpr);
+    assert!(
+        fixture
+            .native
+            .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
+            .unwrap(),
+        "native block did not run"
+    );
+    fixture
+        .interpreter
+        .cycle(&mut fixture.interpreter_bus)
+        .unwrap();
+    fixture
+        .interpreter
+        .cycle(&mut fixture.interpreter_bus)
+        .unwrap();
+    assert_eq!(
+        fixture.native.registers.eip, fixture.interpreter.registers.eip,
+        "branch outcome differs: IMUL must set OF from the 32-bit truncated product, not the \
+         64-bit one"
+    );
+}
+
+// Guard rails for classify's IMUL arm: it must stay narrow to exactly mod==3, dword-operand-size
+// 0x0FAF. Neither the differential generator nor the battery above ever emits a 0x66-prefixed or
+// memory-form 0x0FAF, so nothing else catches either of these arms being widened by a later edit.
+
+fn assert_imul_form_falls_to_interpreter(mode: GswMode, insn: &[u8], context: &str) {
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.to_vec();
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine);
+    native_bus.direct_pages_enabled = true;
+    native_bus.direct_page_clocks = true;
+    // Warm every instruction boundary, not just the entry. Warming only the entry makes the walk
+    // stop at a decode miss on slot 1 and return Retry, so the refusal assert below would pass
+    // for the wrong reason no matter what classify does.
+    let tail = ENTRY + insn.len() as u32;
+    decode_fixture(
+        &mut native,
+        &mut native_bus,
+        &[ENTRY, tail, tail + 2, tail + 4],
+    );
+
+    // classify must return None for the leading slot, so the whole leading run stays empty and
+    // the block is unadmittable (design section 3: "slots.is_empty() is not relaxable"). If a
+    // later edit widened the arm to accept this form, `compile` would start succeeding here.
+    assert!(
+        jit::direct::compile(&mut native, ENTRY, true).is_none(),
+        "{context}: must fall to the interpreter, not compile as a native IMUL"
+    );
+
+    // Positive control. Without it the assertion above passes vacuously whenever the harness
+    // stops compiling anything at all, which would silently retire both guard rails. The same
+    // fixture with the accepted register form must still compile.
+    assert_imul_register_form_still_compiles(mode, context);
+}
+
+/// Companion to `assert_imul_form_falls_to_interpreter`: proves the fixture can compile an IMUL
+/// at all, so a refusal above is attributable to the operand form and not to a broken harness.
+fn assert_imul_register_form_still_compiles(mode: GswMode, context: &str) {
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    // 0F AF C1 is IMUL EAX, ECX, the accepted mod==3 dword form.
+    let code = [0x0f, 0xaf, 0xc1, 0x89, 0xf6, 0x89, 0xff, 0xf4];
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine);
+    native_bus.direct_pages_enabled = true;
+    native_bus.direct_page_clocks = true;
+    decode_fixture(
+        &mut native,
+        &mut native_bus,
+        &[ENTRY, ENTRY + 3, ENTRY + 5, ENTRY + 7],
+    );
+
+    assert!(
+        jit::direct::compile(&mut native, ENTRY, true).is_some(),
+        "{context}: positive control failed, the register form must still compile here"
+    );
+}
+
+#[test]
+fn imul_word_operand_size_falls_to_the_interpreter() {
+    // 66 0F AF C1: IMUL AX, CX. If the arm above the Word gate ever moved, or 0x0faf were added
+    // to the gate's allowlist, this would silently lower as a 32-bit multiply: the destination's
+    // high 16 bits would be clobbered instead of preserved, and CF/OF would be computed against
+    // the wrong width. Must stay below the Word gate at classify.rs:26-30.
+    assert_imul_form_falls_to_interpreter(
+        GswMode::Gsw586,
+        &[0x66, 0x0f, 0xaf, 0xc1],
+        "word IMUL (66 0F AF /r)",
+    );
+}
+
+#[test]
+fn imul_memory_source_form_falls_to_the_interpreter() {
+    // 0F AF 05 <disp32>: IMUL EAX, [disp32]. Register form only (mod == 3) is implemented; the
+    // memory source form is unclaimed until a later slice adds it.
+    let mut insn = vec![0x0f, 0xaf, 0x05];
+    insn.extend_from_slice(&0x1234u32.to_le_bytes());
+    assert_imul_form_falls_to_interpreter(GswMode::Gsw586, &insn, "memory-source IMUL (0F AF /r)");
+}
+
 #[test]
 fn immediate_test_forms_match_the_interpreter_in_486_and_586_modes() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
