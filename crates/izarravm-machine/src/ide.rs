@@ -20,6 +20,7 @@
 use crate::atapi::{self, AtapiDevice, CmdResult};
 use crate::cdimage::DATA_SECTOR;
 use izarravm_core::MASTER_CLOCK_HZ;
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
 /// Secondary-channel command-block base (0x170-0x177).
 pub const SECONDARY_CMD_BASE: u16 = 0x170;
@@ -766,6 +767,115 @@ fn put_string(words: &mut [u16], text: &str) {
         let hi = byte_at(i * 2);
         let lo = byte_at(i * 2 + 1);
         *w = (u16::from(hi) << 8) | u16::from(lo);
+    }
+}
+
+/// Borrowed secondary-channel ATAPI state for canonical comparison.
+///
+/// The payload holds the channel register file, the packet/data continuation
+/// with its cursors, the pending command as a fixed 22-byte record, and the
+/// embedded ATAPI device block. The in-flight data buffers are serialized
+/// verbatim, unbounded: the byte-compare contract cannot see through a cap,
+/// and the bytes already exist in host memory at capture time.
+///
+/// Producers beyond the port protocol, by design: the ICDEX HLE drives
+/// PLAY/STOP/RESUME through `AtapiDevice::execute` directly (rewriting the
+/// interrupt reason and sense latches without the register handshake), HLE
+/// disc reads bypass the device entirely, and the front-panel play/stop and
+/// mount/eject calls are host-input events that count as part of history.
+/// Media scoping matches the ATA owner: payload bytes are deterministic given
+/// identical guest history AND identical media; disc content reaches captured
+/// bytes through prior command results in the data buffer, sense state, and
+/// the play range, and a folder-backed image is host-referencing. The
+/// El Torito latches live on the machine and belong to a future owner.
+pub(crate) struct CanonicalIdeChannel<'a> {
+    channel: &'a IdeChannel,
+}
+
+impl IdeChannel {
+    pub(crate) fn canonical_projection(&self) -> CanonicalIdeChannel<'_> {
+        CanonicalIdeChannel { channel: self }
+    }
+
+    /// True when the test-only PACKET stall seam is armed. Capture rejects
+    /// this state: the seam changes future dispatch and is not real hardware.
+    pub(crate) fn test_stall_packet_enabled(&self) -> bool {
+        self.test_stall_packet
+    }
+}
+
+impl CanonicalIdeChannel<'_> {
+    /// Writes version 1 of the ATAPI channel payload: 130 fixed bytes plus
+    /// the verbatim data-in and data-out buffers.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        let channel = self.channel;
+        out.write_u8(channel.features)?;
+        out.write_u8(channel.sector_count)?;
+        out.write_u8(channel.lba_low)?;
+        out.write_u8(channel.lba_mid)?;
+        out.write_u8(channel.lba_high)?;
+        out.write_u8(channel.drive_select)?;
+        out.write_u8(channel.status)?;
+        out.write_u8(channel.error)?;
+        out.write_bool(channel.interrupts_disabled)?;
+        out.write_u8(match channel.phase {
+            Phase::Idle => 0,
+            Phase::AwaitPacket => 1,
+            Phase::DataIn => 2,
+            Phase::DataOut => 3,
+        })?;
+        for byte in channel.packet {
+            out.write_u8(byte)?;
+        }
+        out.write_u8(channel.packet_filled as u8)?;
+        out.write_len_prefixed_bytes(&channel.data_in)?;
+        out.write_u64(channel.data_in_pos as u64)?;
+        out.write_u64(channel.data_in_block_end as u64)?;
+        out.write_u64(channel.data_in_ready_end as u64)?;
+        out.write_len_prefixed_bytes(&channel.data_out)?;
+        out.write_u32(channel.data_out_expected as u32)?;
+        out.write_u32(channel.data_out_block_end as u32)?;
+        out.write_u32(channel.byte_count_limit as u32)?;
+        out.write_bool(channel.irq_pending)?;
+        // Fixed 22-byte pending record: presence, ticks, tag, then a 12-byte
+        // zero-filled payload arm sized for the largest variant (the CDB).
+        let (present, ticks, tag, arg) = match channel.pending_command {
+            None => (false, 0, 0u8, [0u8; 12]),
+            Some(PendingCommand {
+                ticks_remaining,
+                action,
+            }) => {
+                let (tag, arg) = match action {
+                    PendingAction::AcceptPacket => (0, [0u8; 12]),
+                    PendingAction::ExecutePacket(cdb) => (1, cdb),
+                    PendingAction::CompleteDataOut => (2, [0u8; 12]),
+                    PendingAction::PresentReadSector => (3, [0u8; 12]),
+                    PendingAction::CompleteSeek { lba } => {
+                        let mut arg = [0u8; 12];
+                        arg[..4].copy_from_slice(&lba.to_le_bytes());
+                        (4, arg)
+                    }
+                    PendingAction::PrepareIdentify => (5, [0u8; 12]),
+                    PendingAction::DeviceReset => (6, [0u8; 12]),
+                    PendingAction::IdentifyNak => (7, [0u8; 12]),
+                    PendingAction::Diagnostic => (8, [0u8; 12]),
+                    PendingAction::Abort => (9, [0u8; 12]),
+                };
+                (true, ticks_remaining, tag, arg)
+            }
+        };
+        out.write_bool(present)?;
+        out.write_u64(ticks)?;
+        out.write_u8(tag)?;
+        for byte in arg {
+            out.write_u8(byte)?;
+        }
+        out.write_u32(channel.head_lba)?;
+        out.write_u32(channel.read_lba)?;
+        channel.device.canonical_projection().write_payload(out)
     }
 }
 

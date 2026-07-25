@@ -32,6 +32,7 @@ const ATA_IDLE_PAYLOAD_LEN: usize = 66;
 const ATA_MID_SECTOR_PAYLOAD_LEN: usize = ATA_IDLE_PAYLOAD_LEN + crate::ata::SECTOR;
 const BMIDE_IDLE_PAYLOAD_LEN: usize = 60;
 const BMIDE_BASE: u16 = 0xf000;
+const ATAPI_IDLE_PAYLOAD_LEN: usize = 130;
 const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
 const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
 const PIIX_IDE_DEVFN: u8 = 7 << 3 | 1;
@@ -419,6 +420,65 @@ fn arm_bmide_transfer(
     publish_pending_coherence(machine);
 }
 
+fn atapi_payload(machine: &Machine) -> Vec<u8> {
+    let capture = machine.canonical_state_capture().unwrap();
+    atapi_payload_from_capture(&capture)
+}
+
+fn atapi_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_000e).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| capture.write_atapi_channel_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn atapi_idle_golden() -> Vec<u8> {
+    // Fresh channel after soft reset: the ATAPI signature in the task file,
+    // DRDY|DSC status, diagnostic-pass error, and full MODE SELECT volumes.
+    let mut expected = vec![0u8; ATAPI_IDLE_PAYLOAD_LEN];
+    expected[1] = 0x01;
+    expected[2] = 0x01;
+    expected[3] = 0x14;
+    expected[4] = 0xeb;
+    expected[6] = 0x50;
+    expected[7] = 0x01;
+    expected[118] = 0xff;
+    expected[119] = 0xff;
+    expected
+}
+
+fn advance_ide_deadline(machine: &mut Machine) {
+    let ticks = machine.ide.ticks_until_completion().unwrap();
+    machine.advance_devices_ticks(ticks);
+}
+
+fn atapi_send_cdb(machine: &mut Machine, cdb: [u8; 12]) {
+    write_pci_port(
+        machine,
+        crate::ide::SECONDARY_CMD_BASE + 7,
+        BusWidth::Byte,
+        0xa0,
+    );
+    advance_ide_deadline(machine);
+    read_pci_port(machine, crate::ide::SECONDARY_CMD_BASE + 7, BusWidth::Byte);
+    for byte in cdb {
+        write_pci_port(
+            machine,
+            crate::ide::SECONDARY_CMD_BASE,
+            BusWidth::Byte,
+            u32::from(byte),
+        );
+    }
+}
+
 fn write_speaker_port(machine: &mut Machine, value: u8) {
     let mut bus = machine.make_bus();
     bus.write_io(0x61, BusWidth::Byte, u32::from(value), false)
@@ -611,6 +671,7 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
             (0x0002_000b, 1),
             (0x0002_000c, 1),
             (0x0002_000d, 1),
+            (0x0002_000e, 1),
         ]
     );
     assert!(
@@ -676,6 +737,10 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
     );
     assert_eq!(
         sections[16].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+        STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
+    assert_eq!(
+        sections[17].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
         STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
 }
@@ -2105,6 +2170,110 @@ fn bmide_payload_captures_the_waits_for_stop_window() {
 }
 
 #[test]
+fn atapi_payload_pins_default_golden_and_task_file_writes() {
+    let machine = test_machine();
+    let payload = atapi_payload(&machine);
+    assert_eq!(payload.len(), ATAPI_IDLE_PAYLOAD_LEN);
+    assert_eq!(payload, atapi_idle_golden());
+    let capture = machine.canonical_state_capture().unwrap();
+    assert_eq!(
+        atapi_payload_from_capture(&capture),
+        atapi_payload_from_capture(&capture)
+    );
+
+    let mut machine = test_machine();
+    let base = crate::ide::SECONDARY_CMD_BASE;
+    write_pci_port(&mut machine, base + 1, BusWidth::Byte, 0x55);
+    write_pci_port(&mut machine, base + 4, BusWidth::Byte, 0x34);
+    write_pci_port(&mut machine, base + 5, BusWidth::Byte, 0x12);
+    write_pci_port(
+        &mut machine,
+        crate::ide::SECONDARY_CTRL,
+        BusWidth::Byte,
+        0x02,
+    );
+    let payload = atapi_payload(&machine);
+    assert_eq!(payload[0], 0x55); // features
+    assert_eq!(payload[3], 0x34); // byte-count low
+    assert_eq!(payload[4], 0x12); // byte-count high
+    assert_eq!(payload[8], 1); // nIEN latched
+}
+
+#[test]
+fn atapi_payload_captures_a_mid_cdb_packet() {
+    let mut machine = test_machine();
+    let base = crate::ide::SECONDARY_CMD_BASE;
+    write_pci_port(&mut machine, base + 7, BusWidth::Byte, 0xa0);
+    advance_ide_deadline(&mut machine);
+    read_pci_port(&mut machine, base + 7, BusWidth::Byte);
+    for byte in [0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc] {
+        write_pci_port(&mut machine, base, BusWidth::Byte, u32::from(byte));
+    }
+    let payload = atapi_payload(&machine);
+    assert_eq!(payload[9], 1); // AwaitPacket
+    assert_eq!(&payload[10..16], &[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
+    assert_eq!(&payload[16..22], &[0; 6]); // unfilled CDB tail
+    assert_eq!(payload[22], 6); // packet_filled
+}
+
+#[test]
+fn atapi_payload_captures_the_present_read_sector_window() {
+    let mut machine = test_machine();
+    let mut bytes = vec![0u8; 8 * crate::cdimage::DATA_SECTOR];
+    for (sector, chunk) in bytes.chunks_mut(crate::cdimage::DATA_SECTOR).enumerate() {
+        chunk[0] = 0x60u8.wrapping_add(sector as u8);
+    }
+    machine.mount_cd(crate::cdimage::CdImage::from_iso(bytes).unwrap());
+    publish_pending_coherence(&mut machine);
+    // Clear the mount's UNIT ATTENTION with a TEST UNIT READY round trip.
+    atapi_send_cdb(&mut machine, [0u8; 12]);
+    advance_ide_deadline(&mut machine);
+    read_pci_port(
+        &mut machine,
+        crate::ide::SECONDARY_CMD_BASE + 7,
+        BusWidth::Byte,
+    );
+
+    let base = crate::ide::SECONDARY_CMD_BASE;
+    write_pci_port(&mut machine, base + 4, BusWidth::Byte, 0x00);
+    write_pci_port(&mut machine, base + 5, BusWidth::Byte, 0x08);
+    let mut cdb = [0u8; 12];
+    cdb[0] = 0x28; // READ(10)
+    cdb[5] = 1; // LBA 1
+    cdb[8] = 1; // one sector
+    atapi_send_cdb(&mut machine, cdb);
+    advance_ide_deadline(&mut machine);
+
+    // The least intuitive legal state: the sector data is fully staged while
+    // the phase is back at Idle and the DRQ presentation is still pending.
+    let payload = atapi_payload(&machine);
+    let sector = crate::cdimage::DATA_SECTOR;
+    assert_eq!(payload.len(), ATAPI_IDLE_PAYLOAD_LEN + sector);
+    assert_eq!(payload[9], 0); // phase Idle
+    assert_eq!(payload[23..31], (sector as u64).to_le_bytes());
+    assert_eq!(payload[31], 0x61); // first byte of LBA 1
+    assert_eq!(payload[47 + sector..55 + sector], 0u64.to_le_bytes()); // ready_end
+    assert_eq!(payload[76 + sector], 1); // pending present
+    assert_eq!(payload[85 + sector], 3); // PresentReadSector
+
+    advance_ide_deadline(&mut machine);
+    read_pci_port(&mut machine, base, BusWidth::Word);
+    let payload = atapi_payload(&machine);
+    assert_eq!(payload[9], 2); // DataIn
+    assert_eq!(payload[31 + sector..39 + sector], 2u64.to_le_bytes()); // data_in_pos
+}
+
+#[test]
+fn capture_rejects_the_armed_test_stall_packet_seam() {
+    let mut machine = test_machine();
+    machine.set_test_cd_packet_stall(true);
+    assert_eq!(
+        capture_error(&machine),
+        MachineCanonicalCaptureError::TestStallPacketEnabled
+    );
+}
+
+#[test]
 fn capture_rejects_a_dangling_bmide_transfer() {
     let mut machine = ata_machine(8);
     arm_bmide_transfer(&mut machine, &[(0x2000, 0x8000_0200)], 0x09, 0xc8);
@@ -3439,6 +3608,46 @@ fn bmide_state_survives_a_real_586_test_exit_boundary() {
     expected[2..6].copy_from_slice(&0x4000u32.to_le_bytes());
     assert_eq!(bmide_payload(&machine), expected);
     assert_eq!(bmide_payload(&machine), expected);
+}
+
+#[test]
+fn atapi_state_survives_a_real_586_test_exit_boundary() {
+    let base = crate::ide::SECONDARY_CMD_BASE;
+    let mut code = Vec::new();
+    for (port, value) in [
+        (base + 1, 0x55u8),
+        (base + 4, 0x34),
+        (base + 5, 0x12),
+        (crate::ide::SECONDARY_CTRL, 0x02),
+    ] {
+        code.extend_from_slice(&[0xba, port as u8, (port >> 8) as u8, 0xb0, value, 0xee]);
+    }
+    code.extend_from_slice(&[
+        0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
+        0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
+        0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
+        0xf4, // must not execute
+    ]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        rom_with_code(&code),
+    )
+    .unwrap();
+    machine.set_mode(GswMode::Gsw586);
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::TestExit { code: 0 });
+    assert_eq!(machine.cpu.registers.eip, 36);
+    assert!(!machine.cpu.halted);
+    assert_eq!(machine.unittester.pending_command(), None);
+    let mut expected = atapi_idle_golden();
+    expected[0] = 0x55;
+    expected[3] = 0x34;
+    expected[4] = 0x12;
+    expected[8] = 1;
+    assert_eq!(atapi_payload(&machine), expected);
+    assert_eq!(atapi_payload(&machine), expected);
 }
 
 #[test]
