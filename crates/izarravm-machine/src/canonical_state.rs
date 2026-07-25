@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::{
     CacheModel, Machine,
+    ata::CanonicalAtaDisk,
     cache_config::{
         CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK,
         cache_level_config, code_fetch_ws, tier_cost,
@@ -38,7 +39,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 15] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 16] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -114,6 +115,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_000c,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -175,6 +181,10 @@ const _: () = {
         sections[14].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[15].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -189,6 +199,7 @@ const _: () = {
     assert!(sections[11].id < sections[12].id);
     assert!(sections[12].id < sections[13].id);
     assert!(sections[13].id < sections[14].id);
+    assert!(sections[14].id < sections[15].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -274,6 +285,8 @@ pub enum MachineCanonicalCaptureError {
         "the Distira init-enable mirror {mirror:#010x} disagrees with the Vega latch {latch:#010x}"
     )]
     InconsistentDistiraInitEnableMirror { latch: u32, mirror: u32 },
+    #[error("ATA cylinder count {cylinders} disagrees with derived geometry {expected}")]
+    InconsistentAtaGeometry { cylinders: u32, expected: u32 },
 }
 
 impl From<CanonicalTimelineError> for MachineCanonicalCaptureError {
@@ -510,6 +523,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     speaker: CanonicalSpeaker<'a>,
     pci: CanonicalPciConfig<'a>,
     vega: CanonicalVega<'a>,
+    ata: CanonicalAtaDisk<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -658,6 +672,20 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.vega.write_payload(out)
     }
+
+    /// Writes the required ATA primary-channel controller owner payload.
+    ///
+    /// Task-file registers, latches, and the transfer continuation only.
+    /// Media content belongs to the future HDD-content owner, and BMIDE
+    /// transfer continuation to the BMIDE owner. Capture cross-checks the
+    /// mount-derived cylinder count instead of serializing it.
+    #[allow(dead_code)]
+    pub(crate) fn write_ata_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.ata.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -749,6 +777,18 @@ impl Machine {
                 },
             );
         }
+        if let Some(disk) = self.ata.as_ref() {
+            // total_sectors() caps at 2^28-1 while mount derived cylinders
+            // from the uncapped count, so images of 128 GiB or more fail
+            // here; that pathological case is rejected on purpose.
+            let expected = (disk.total_sectors() / (16 * 63)).max(1);
+            if disk.cylinders() != expected {
+                return Err(MachineCanonicalCaptureError::InconsistentAtaGeometry {
+                    cylinders: disk.cylinders(),
+                    expected,
+                });
+            }
+        }
         let ram_rom = CanonicalRamRomProjection {
             ram: self.memory.as_slice(),
             rom: self.rom.as_slice(),
@@ -762,6 +802,7 @@ impl Machine {
         let speaker = self.speaker.canonical_projection();
         let pci = self.pci.canonical_projection();
         let vega = self.vega.canonical_projection();
+        let ata = CanonicalAtaDisk::new(self.ata.as_ref());
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -823,6 +864,7 @@ impl Machine {
             speaker,
             pci,
             vega,
+            ata,
         })
     }
 }

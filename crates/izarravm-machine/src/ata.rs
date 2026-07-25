@@ -28,6 +28,7 @@
 //! commands and the high-order LBA bytes.
 
 use izarravm_core::MASTER_CLOCK_HZ;
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
 /// Primary-channel command-block base (0x1F0-0x1F7).
 pub const PRIMARY_CMD_BASE: u16 = 0x1F0;
@@ -1009,6 +1010,125 @@ fn put_string(words: &mut [u16], text: &str) {
         let hi = byte_at(i * 2);
         let lo = byte_at(i * 2 + 1);
         *w = (u16::from(hi) << 8) | u16::from(lo);
+    }
+}
+
+/// Borrowed ATA primary-channel controller state for canonical comparison.
+///
+/// The payload holds the guest-visible task-file registers, latches, and the
+/// transfer continuation (PIO buffer, cursors, pending command, armed DMA
+/// request). Media content (`Backing`), the host flush flag, GUI telemetry,
+/// and the mount-derived cylinder count stay out; capture cross-checks the
+/// cylinder count against the derived geometry instead.
+///
+/// Two producers mutate the disk and never observe each other's register
+/// state, by design. The port path drives the task-file protocol. The INT 13h
+/// HLE reads and writes content directly through `read_lba`/`write_lba` and
+/// charges its time through a synchronous master-clock stall, which can
+/// complete an in-flight task-file command mid-service; it never touches the
+/// registers, phase, or pending command. Mount, eject, and the BMIDE primary
+/// reset are host-side producers that replace the whole device.
+///
+/// Determinism scope: payload bytes are deterministic given identical guest
+/// history AND identical backing. A host-folder (Katea) facade makes the
+/// whole machine host-referencing, this section included: sector reads fill
+/// the PIO buffer from host files and IDENTIFY bakes host-derived geometry.
+pub(crate) struct CanonicalAtaDisk<'a> {
+    disk: Option<&'a AtaDisk>,
+}
+
+impl<'a> CanonicalAtaDisk<'a> {
+    pub(crate) fn new(disk: Option<&'a AtaDisk>) -> Self {
+        Self { disk }
+    }
+
+    /// Writes version 1 of the ATA controller payload: 66 bytes idle, 578
+    /// mid-sector. The buffer is serialized unconditionally, independent of
+    /// phase: in the CommitWrite window the guest's not-yet-committed sector
+    /// lives only here, with phase already back at Idle.
+    pub(crate) fn write_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        let Some(disk) = self.disk else {
+            return out.write_bool(false);
+        };
+        out.write_bool(true)?;
+        out.write_u8(disk.features)?;
+        out.write_u8(disk.sector_count)?;
+        out.write_u8(disk.lba_low)?;
+        out.write_u8(disk.lba_mid)?;
+        out.write_u8(disk.lba_high)?;
+        out.write_u8(disk.drive_head)?;
+        out.write_u8(disk.status)?;
+        out.write_u8(disk.error)?;
+        out.write_u8(disk.logical_sectors)?;
+        out.write_u8(disk.logical_heads)?;
+        out.write_bool(disk.interrupts_disabled)?;
+        let (dma_tag, dma_value) = match disk.dma_mode {
+            DmaMode::None => (0u8, 0u8),
+            DmaMode::Multiword(mode) => (1, mode),
+            DmaMode::Ultra(mode) => (2, mode),
+        };
+        out.write_u8(dma_tag)?;
+        out.write_u8(dma_value)?;
+        out.write_bool(disk.irq_pending)?;
+        out.write_u8(match disk.phase {
+            Phase::Idle => 0,
+            Phase::DataIn => 1,
+            Phase::DataOut => 2,
+        })?;
+        out.write_len_prefixed_bytes(&disk.buffer)?;
+        out.write_u32(disk.buffer_pos as u32)?;
+        out.write_u32(disk.pio_lba)?;
+        out.write_u32(disk.pio_sectors_remaining)?;
+        // Fixed 12-byte pending-command record: zeros when absent or when a
+        // variant carries no arguments, so golden offsets never move.
+        let (present, ticks, action, arg0, arg1) = match disk.pending_command {
+            None => (false, 0, 0u8, 0u8, 0u8),
+            Some(PendingCommand {
+                ticks_remaining,
+                action,
+            }) => {
+                let (tag, arg0, arg1) = match action {
+                    PendingAction::PrepareIdentify => (0, 0, 0),
+                    PendingAction::PrepareRead => (1, 0, 0),
+                    PendingAction::PrepareWrite => (2, 0, 0),
+                    PendingAction::CommitWrite => (3, 0, 0),
+                    PendingAction::CompleteOk => (4, 0, 0),
+                    PendingAction::Abort => (5, 0, 0),
+                    PendingAction::Initialize { sectors, heads } => (6, sectors, heads),
+                    PendingAction::SetFeatures { feature, mode } => (7, feature, mode),
+                    PendingAction::Diagnostic => (8, 0, 0),
+                    PendingAction::CheckPower => (9, 0, 0),
+                };
+                (true, ticks_remaining, tag, arg0, arg1)
+            }
+        };
+        out.write_bool(present)?;
+        out.write_u64(ticks)?;
+        out.write_u8(action)?;
+        out.write_u8(arg0)?;
+        out.write_u8(arg1)?;
+        // Fixed 18-byte armed-DMA record, same zero-fill convention.
+        let (present, direction, lba, sectors, rate) = match disk.dma_request {
+            None => (false, 0u8, 0, 0, 0),
+            Some(request) => (
+                true,
+                match request.direction {
+                    AtaDmaDirection::DeviceToMemory => 0,
+                    AtaDmaDirection::MemoryToDevice => 1,
+                },
+                request.lba,
+                request.sectors,
+                request.bytes_per_second,
+            ),
+        };
+        out.write_bool(present)?;
+        out.write_u8(direction)?;
+        out.write_u32(lba)?;
+        out.write_u32(sectors)?;
+        out.write_u64(rate)
     }
 }
 

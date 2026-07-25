@@ -28,6 +28,8 @@ const UNIT_TESTER_PAYLOAD_LEN: usize = 33;
 const SPEAKER_PAYLOAD_LEN: usize = 1;
 const PCI_CONFIG_PAYLOAD_LEN: usize = 9;
 const VEGA_ROUTING_PAYLOAD_LEN: usize = 14;
+const ATA_IDLE_PAYLOAD_LEN: usize = 66;
+const ATA_MID_SECTOR_PAYLOAD_LEN: usize = ATA_IDLE_PAYLOAD_LEN + crate::ata::SECTOR;
 const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
 const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
 const PIIX_IDE_DEVFN: u8 = 7 << 3 | 1;
@@ -328,6 +330,49 @@ fn int10(machine: &mut Machine, eax: u32, ebx: u32, edx: u32) {
     publish_pending_coherence(machine);
 }
 
+fn ata_payload(machine: &Machine) -> Vec<u8> {
+    let capture = machine.canonical_state_capture().unwrap();
+    ata_payload_from_capture(&capture)
+}
+
+fn ata_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec<u8> {
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_000c).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| capture.write_ata_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
+fn ata_machine(sectors: usize) -> Machine {
+    let mut machine = test_machine();
+    let mut bytes = vec![0u8; sectors * crate::ata::SECTOR];
+    for (index, chunk) in bytes.chunks_mut(crate::ata::SECTOR).enumerate() {
+        chunk[0] = (index as u8).wrapping_add(0x10);
+    }
+    machine.mount_hdd(bytes);
+    publish_pending_coherence(&mut machine);
+    machine
+}
+
+fn ata_idle_golden() -> Vec<u8> {
+    // present, task file (status DRDY|DSC, sector_count/lba_low power on at
+    // 1), CHS latch 63/16, nIEN off, Ultra DMA mode 2, no IRQ, phase Idle,
+    // then the empty buffer and zeroed cursor/pending/DMA records.
+    let mut expected = vec![1, 0, 1, 1, 0, 0, 0, 0x50, 0, 63, 16, 0, 2, 2, 0, 0];
+    expected.extend_from_slice(&0u64.to_le_bytes());
+    expected.extend_from_slice(&[0; 12]);
+    expected.extend_from_slice(&[0; 12]);
+    expected.extend_from_slice(&[0; 18]);
+    expected
+}
+
 fn write_speaker_port(machine: &mut Machine, value: u8) {
     let mut bus = machine.make_bus();
     bus.write_io(0x61, BusWidth::Byte, u32::from(value), false)
@@ -518,6 +563,7 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
             (0x0002_0009, 1),
             (0x0002_000a, 1),
             (0x0002_000b, 1),
+            (0x0002_000c, 1),
         ]
     );
     assert!(
@@ -575,6 +621,10 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
     );
     assert_eq!(
         sections[14].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
+        STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
+    assert_eq!(
+        sections[15].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
         STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
 }
@@ -1779,6 +1829,138 @@ fn vega_routing_capture_is_read_only_and_excludes_device_internals() {
     let second = vega_routing_payload_from_capture(&capture);
     assert_eq!(first, second);
     assert_eq!(first.len(), VEGA_ROUTING_PAYLOAD_LEN);
+}
+
+#[test]
+fn ata_payload_pins_no_disk_and_fresh_mount_bytes() {
+    assert_eq!(ata_payload(&test_machine()), [0]);
+
+    let machine = ata_machine(8);
+    let payload = ata_payload(&machine);
+    assert_eq!(payload.len(), ATA_IDLE_PAYLOAD_LEN);
+    assert_eq!(payload, ata_idle_golden());
+}
+
+#[test]
+fn ata_payload_tracks_task_file_and_set_features_writes() {
+    let mut machine = ata_machine(8);
+    let base = crate::ata::PRIMARY_CMD_BASE;
+    for (port, value) in [
+        (base + 1, 0x55u32),
+        (base + 2, 3),
+        (base + 3, 0x11),
+        (base + 4, 0x22),
+        (base + 5, 0x33),
+        (base + 6, 0x4f),
+        (crate::ata::PRIMARY_CTRL, 0x02),
+    ] {
+        write_pci_port(&mut machine, port, BusWidth::Byte, value);
+    }
+    let payload = ata_payload(&machine);
+    assert_eq!(&payload[1..7], &[0x55, 3, 0x11, 0x22, 0x33, 0x4f]);
+    assert_eq!(payload[11], 1); // nIEN latched
+
+    // SET FEATURES: transfer mode Multiword DMA 1, completed on the timeline.
+    write_pci_port(&mut machine, base + 1, BusWidth::Byte, 0x03);
+    write_pci_port(&mut machine, base + 2, BusWidth::Byte, 0x21);
+    write_pci_port(&mut machine, base + 7, BusWidth::Byte, 0xef);
+    let pending = ata_payload(&machine);
+    assert_eq!(pending[36], 1); // pending command present
+    assert_eq!(&pending[45..48], &[7, 0x03, 0x21]); // SetFeatures{feature, mode}
+    let deadline = machine
+        .ata
+        .as_ref()
+        .and_then(crate::ata::AtaDisk::ticks_until_completion)
+        .unwrap();
+    machine.advance_devices_ticks(deadline);
+    let applied = ata_payload(&machine);
+    assert_eq!(&applied[12..14], &[1, 1]); // Multiword(1)
+    assert_eq!(applied[36], 0); // pending consumed
+}
+
+#[test]
+fn ata_payload_captures_the_commit_write_window_buffer() {
+    let mut machine = ata_machine(8);
+    let base = crate::ata::PRIMARY_CMD_BASE;
+    write_pci_port(&mut machine, base + 2, BusWidth::Byte, 1);
+    write_pci_port(&mut machine, base + 3, BusWidth::Byte, 2);
+    write_pci_port(&mut machine, base + 4, BusWidth::Byte, 0);
+    write_pci_port(&mut machine, base + 5, BusWidth::Byte, 0);
+    write_pci_port(&mut machine, base + 6, BusWidth::Byte, 0x40);
+    write_pci_port(&mut machine, base + 7, BusWidth::Byte, 0x30);
+    let deadline = machine
+        .ata
+        .as_ref()
+        .and_then(crate::ata::AtaDisk::ticks_until_completion)
+        .unwrap();
+    machine.advance_devices_ticks(deadline);
+
+    // Fill the sector. After the 512th byte the phase is back at Idle and the
+    // guest's not-yet-committed data lives only in the buffer, so the payload
+    // must carry it unconditionally.
+    for word in 0..(crate::ata::SECTOR as u32 / 2) {
+        write_pci_port(&mut machine, base, BusWidth::Word, 0xa000 | word);
+    }
+    let payload = ata_payload(&machine);
+    assert_eq!(payload.len(), ATA_MID_SECTOR_PAYLOAD_LEN);
+    assert_eq!(payload[15], 0); // phase Idle
+    assert_eq!(payload[16..24], (crate::ata::SECTOR as u64).to_le_bytes());
+    assert_eq!(payload[24], 0x00); // first data byte (low byte of word 0xa000)
+    assert_eq!(payload[25], 0xa0);
+    assert_eq!(payload[536..540], (crate::ata::SECTOR as u32).to_le_bytes());
+    assert_eq!(payload[548], 1); // pending present
+    assert_eq!(payload[557], 3); // CommitWrite
+
+    let deadline = machine
+        .ata
+        .as_ref()
+        .and_then(crate::ata::AtaDisk::ticks_until_completion)
+        .unwrap();
+    machine.advance_devices_ticks(deadline);
+    let committed = ata_payload(&machine);
+    assert_eq!(committed.len(), ATA_IDLE_PAYLOAD_LEN); // buffer drained
+    assert_eq!(committed[36], 0); // pending consumed
+}
+
+#[test]
+fn ata_payload_captures_an_armed_dma_request() {
+    let mut machine = ata_machine(8);
+    let base = crate::ata::PRIMARY_CMD_BASE;
+    write_pci_port(&mut machine, base + 2, BusWidth::Byte, 2);
+    write_pci_port(&mut machine, base + 3, BusWidth::Byte, 3);
+    write_pci_port(&mut machine, base + 4, BusWidth::Byte, 0);
+    write_pci_port(&mut machine, base + 5, BusWidth::Byte, 0);
+    write_pci_port(&mut machine, base + 6, BusWidth::Byte, 0x40);
+    write_pci_port(&mut machine, base + 7, BusWidth::Byte, 0xc8);
+    let payload = ata_payload(&machine);
+    assert_eq!(payload[48], 1); // request present
+    assert_eq!(payload[49], 0); // DeviceToMemory
+    assert_eq!(payload[50..54], 3u32.to_le_bytes());
+    assert_eq!(payload[54..58], 2u32.to_le_bytes());
+    assert_eq!(payload[58..66], 33_300_000u64.to_le_bytes());
+}
+
+#[test]
+fn ata_capture_is_read_only_and_excludes_content_and_telemetry() {
+    let mut machine = ata_machine(8);
+    let baseline = ata_payload(&machine);
+
+    // Content writes, the host flush flag, and BMIDE state belong to other
+    // owners and must not perturb this payload.
+    machine
+        .ata
+        .as_mut()
+        .unwrap()
+        .write_lba(1, &[0x5a; crate::ata::SECTOR]);
+    machine.ata.as_mut().unwrap().dirty = false;
+    machine.bmide.note_ide_irq(false);
+    assert_eq!(ata_payload(&machine), baseline);
+
+    let capture = machine.canonical_state_capture().unwrap();
+    let first = ata_payload_from_capture(&capture);
+    let second = ata_payload_from_capture(&capture);
+    assert_eq!(first, second);
+    assert_eq!(first, baseline);
 }
 
 #[test]
@@ -3028,6 +3210,49 @@ fn pci_config_state_survives_a_real_586_test_exit_boundary() {
     let expected = [0x9d, 0xa6, 0xb3, 0xd5, 0x04, 0x00, 0xe1, 0x34, 0x12];
     assert_eq!(pci_config_payload(&machine), expected);
     assert_eq!(pci_config_payload(&machine), expected);
+}
+
+#[test]
+fn ata_state_survives_a_real_586_test_exit_boundary() {
+    fn push_out_dx_al(code: &mut Vec<u8>, port: u16, value: u8) {
+        code.extend_from_slice(&[0xba, port as u8, (port >> 8) as u8]);
+        code.extend_from_slice(&[0xb0, value]);
+        code.push(0xee);
+    }
+    let base = crate::ata::PRIMARY_CMD_BASE;
+    let mut code = Vec::new();
+    push_out_dx_al(&mut code, base + 1, 0x55);
+    push_out_dx_al(&mut code, base + 2, 3);
+    push_out_dx_al(&mut code, base + 3, 0x11);
+    push_out_dx_al(&mut code, base + 4, 0x22);
+    push_out_dx_al(&mut code, base + 5, 0x33);
+    push_out_dx_al(&mut code, base + 6, 0x4f);
+    push_out_dx_al(&mut code, crate::ata::PRIMARY_CTRL, 0x02);
+    code.extend_from_slice(&[
+        0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
+        0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
+        0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
+        0xf4, // must not execute
+    ]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        rom_with_code(&code),
+    )
+    .unwrap();
+    machine.mount_hdd(vec![0u8; 8 * crate::ata::SECTOR]);
+    machine.set_mode(GswMode::Gsw586);
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::TestExit { code: 0 });
+    assert_eq!(machine.cpu.registers.eip, 54);
+    assert!(!machine.cpu.halted);
+    assert_eq!(machine.unittester.pending_command(), None);
+    let mut expected = ata_idle_golden();
+    expected[1..7].copy_from_slice(&[0x55, 3, 0x11, 0x22, 0x33, 0x4f]);
+    expected[11] = 1; // nIEN
+    assert_eq!(ata_payload(&machine), expected);
+    assert_eq!(ata_payload(&machine), expected);
 }
 
 #[test]
