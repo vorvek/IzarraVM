@@ -15,7 +15,49 @@ use crate::SegmentRegister;
 // The types below are pub(crate) so CpuGsw in lib.rs can name the fields.
 
 // --- Constants ---
-pub(crate) const TLB_ENTRIES: usize = 64;
+/// READ THE CONSUMER BEFORE READING THE SIZE. This is not only a translation cache. With paging
+/// on, `fast_map_permissions` (memory.rs) refuses to publish a page into the JIT's linear fast map
+/// unless `Tlb::lookup` hits, and every insert that displaces a non-same-residency entry unpublishes
+/// the victim's fast-map page. So the set of pages the Direct backend can reach natively is bounded
+/// by this constant, direct-mapped: `slot` is `page & (TLB_ENTRIES - 1)`, which at 64 entries
+/// discriminates only linear address bits 12 through 17, and pages 256 KiB apart collide. A native
+/// access to an unpublished page takes a side exit and a full round trip back into Rust.
+///
+/// A size sweep on Quake/586 (6.2B cycles, one discarded warmup and one observation per size,
+/// each self-consistent) measured that coupling directly:
+///
+///   entries   unavailable-or-kind exits   side exits    direct entries   insns/entry   coverage
+///        64                 39,830,978    40,708,403      157,638,200         17.80     80.54%
+///       256                  3,671,362     4,548,908      125,604,995         22.71     81.56%
+///      1024                    421,795     1,298,782      122,581,197         23.31     81.66%
+///      4096                    184,740     1,062,059      122,216,774         23.39     81.67%
+///
+/// 1024 is the knee: 4096 buys 0.08 instructions per entry and 0.01 coverage points for four times
+/// the memory. Removing 39.4M of the 40.7M native side exits is worth more than every opcode
+/// lowering merged into this backend so far, which together moved instructions per entry 12.16 to
+/// 17.80.
+///
+/// NOT free, and not purely microarchitectural. Guest ARCHITECTURAL state is untouched for a
+/// correctly flushing guest: a hit and a walk resolve the same physical address. Two caveats keep
+/// that from being the flat claim it looks like. A hit skips charged `PageWalkRead` bus cycles, so
+/// charged clocks, retired instructions inside a fixed cycle budget, and in-guest frame rate all
+/// move. And a walk writes the PDE and PTE accessed bit, plus the dirty bit on a write, back into
+/// guest RAM, which a hit skips, so those bytes are refreshed on a different schedule at a
+/// different size. That only diverges for a guest that clears A or D without an INVLPG or a CR3
+/// reload, which is the undefined-behaviour case the `Tlb` caveat below describes.
+///
+/// Measured: Quake/586 43.2 to 43.5 fps and Doom/586 833 to 828 realtics, both still inside the
+/// gate's existing bands, with frames and gametics unchanged. That is the "timing approx" half of
+/// the contract, not a correctness change.
+///
+/// Two costs to know before raising this further. `Tlb` is an inline array inside `CpuGsw`, which is
+/// itself inline in `Machine` and threaded by value, so 8192 entries overflows the main thread's
+/// stack during construction (4096 was measured working). And the canonical execution payload
+/// serializes every live entry, so its maximum grows with this constant.
+pub const TLB_ENTRIES: usize = 1024;
+// `Tlb::slot` masks with `TLB_ENTRIES - 1`, and jit/block.rs emits that same mask into native code.
+// Both are silently wrong for a non-power-of-two, and the sweep table above invites tuning this.
+const _: () = assert!(TLB_ENTRIES.is_power_of_two());
 pub(crate) const PREFETCH_WINDOW_BYTES: usize = 32;
 pub(crate) const TRACKED_WRITE_PAGES: usize = 8;
 pub(crate) const DIRECT_PAGE_CACHE_LINES: usize = 64;
@@ -57,6 +99,15 @@ impl TlbEntry {
 /// microarchitectural, so the TLB is transparent to CpuGsw equality and prints
 /// terse. Non-snooping, which matches real x86: a guest must INVLPG or reload CR3
 /// after editing a page-table entry, and IzarraVM flushes on exactly those events.
+///
+/// Size caveat on that last sentence. The POLICY matches real x86; the CAPACITY does not. A 386 or
+/// 486 has on the order of 32 entries and a Pentium 64, set-associative, while this models 1024
+/// direct-mapped for the reason in `TLB_ENTRIES` above. A guest that edits a page-table entry and
+/// omits the required INVLPG is already relying on undefined behaviour, but on real hardware it
+/// often survives because the small TLB evicts the stale entry within a few hundred pages. Here it
+/// may not. If a paged title regresses in a way that looks like stale translations, this is the
+/// first place to look; the corpus pass for this constant covered Quake under CWSDPMI and Doom
+/// under JEMMEX.
 #[derive(Clone)]
 pub(crate) struct Tlb {
     pub(crate) entries: [TlbEntry; TLB_ENTRIES],

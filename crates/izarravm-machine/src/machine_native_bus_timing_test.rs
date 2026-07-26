@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+// Both uses sit inside `#[cfg(feature = "jit")]` items, so the import has to be gated too or a
+// no-default-features build of the test targets trips unused_imports.
+#[cfg(feature = "jit")]
+use izarravm_cpu::TLB_ENTRIES;
 
 #[cfg(feature = "jit")]
 fn poll_skip_test_machine(enabled: bool, tracing: TracingMode, mode: GswMode, mask: u8) -> Machine {
@@ -1388,20 +1392,37 @@ fn direct_large_self_loop_bulk_fetch_uses_physical_paging_alias_timing() {
 fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     const PAGE_DIRECTORY: u32 = 0x1000;
     const PAGE_TABLE: u32 = 0x2000;
+    // The collision stride is TLB_ENTRIES pages, which is one whole page-directory entry once the
+    // TLB has 1024 slots, so B cannot live in A's page table and needs a second one.
+    const PAGE_TABLE_B: u32 = 0x3000;
     const WARM_CODE_LINEAR: u32 = 0x000f_4000;
     const WARM_CODE_PHYSICAL: u32 = 0x5000;
     const MEASURE_CODE_LINEAR: u32 = 0x000f_5000;
     const MEASURE_CODE_PHYSICAL: u32 = 0x8000;
     const LINEAR_A: u32 = 0x3000;
-    const LINEAR_B: u32 = LINEAR_A + 64 * 0x1000;
+    const LINEAR_B: u32 = LINEAR_A + TLB_ENTRIES as u32 * 0x1000;
     const FRAME_A: u32 = 0x6000;
     const FRAME_B: u32 = 0x7000;
     const VALUE_A: u32 = 0x1020_3040;
     const VALUE_B: u32 = 0x5566_7788;
+    const PDE_B: u32 = PAGE_DIRECTORY + (LINEAR_B >> 22) * 4;
     const PTE_A: u32 = PAGE_TABLE + ((LINEAR_A >> 12) & 0x3ff) * 4;
-    const PTE_B: u32 = PAGE_TABLE + ((LINEAR_B >> 12) & 0x3ff) * 4;
+    const PTE_B: u32 = PAGE_TABLE_B + ((LINEAR_B >> 12) & 0x3ff) * 4;
 
-    assert_eq!((LINEAR_A >> 12) & 63, (LINEAR_B >> 12) & 63);
+    // A COUPLING check between the stride and the slot function, not an independent one: while
+    // LINEAR_B is defined as one TLB_ENTRIES stride above LINEAR_A it cannot fail. That is still
+    // worth having, because the previous form compared `(LINEAR >> 12) & 63` against a stride
+    // hardcoded to 64, so both sides were literals from the same wrong assumption; they agreed
+    // with each other while agreeing with nothing, and kept passing after the pages had stopped
+    // colliding. Tying both sides to TLB_ENTRIES makes a reintroduced literal fail here, at the
+    // cause, instead of downstream on an empty page-walk list. The real teeth are PTE_A != PTE_B
+    // and the per-PTE walk assertions below.
+    assert_ne!(LINEAR_A, LINEAR_B);
+    assert_eq!(
+        (LINEAR_A >> 12) as usize % TLB_ENTRIES,
+        (LINEAR_B >> 12) as usize % TLB_ENTRIES
+    );
+    assert_ne!(PTE_A, PTE_B);
 
     let mut warm_program = vec![0xa1];
     warm_program.extend_from_slice(&LINEAR_A.to_le_bytes());
@@ -1421,6 +1442,7 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw486);
         machine.write_physical_u32(PAGE_DIRECTORY, PAGE_TABLE | 7);
+        machine.write_physical_u32(PDE_B, PAGE_TABLE_B | 7);
         machine.write_physical_u32(
             PAGE_TABLE + ((WARM_CODE_LINEAR >> 12) & 0x3ff) * 4,
             WARM_CODE_PHYSICAL | 7,
@@ -1923,6 +1945,11 @@ const PAGED_CELL_LINEAR: u32 = 0x5000;
 const PAGED_CELL_FRAME: u32 = 0x9000;
 #[cfg(feature = "jit")]
 const PAGED_HEAD: u32 = PAGED_CODE + 5;
+/// Second page table, for the TLB-eviction alias once the collision stride reaches a whole
+/// page-directory entry. Placed above the identity-mapped low pages so it cannot be confused with
+/// guest data.
+#[cfg(feature = "jit")]
+const PAGED_PT_ALIAS: u32 = 0x2_0000;
 
 #[cfg(feature = "jit")]
 fn paged_memory_poll_machine(identity_alias_value: u32, mapped_frame_value: u32) -> Machine {
@@ -1942,8 +1969,19 @@ fn paged_memory_poll_machine(identity_alias_value: u32, mapped_frame_value: u32)
         };
         machine.write_physical_u32(PAGED_PT + page * 4, pte);
     }
-    // The TLB-eviction alias (linear page 5 + 64 shares TLB slot 5).
-    machine.write_physical_u32(PAGED_PT + (5 + 64) * 4, 0x6000 | 7);
+    // The TLB-eviction alias: linear page 5 + TLB_ENTRIES shares TLB slot 5. Derived from the live
+    // entry count, because a hardcoded stride stops evicting (and this test stops testing anything)
+    // the moment the TLB is resized. Once the stride reaches 1024 pages the alias sits one
+    // page-directory entry higher and needs its own page table.
+    let alias_page = 5 + TLB_ENTRIES as u32;
+    let alias_dir = alias_page >> 10;
+    let alias_table = if alias_dir == 0 {
+        PAGED_PT
+    } else {
+        machine.write_physical_u32(PAGED_PD + alias_dir * 4, PAGED_PT_ALIAS | 7);
+        PAGED_PT_ALIAS
+    };
+    machine.write_physical_u32(alias_table + (alias_page & 0x3ff) * 4, 0x6000 | 7);
 
     let mut program = vec![0xb8];
     program.extend_from_slice(&MEMORY_POLL_COMPARAND.to_le_bytes());
@@ -1954,7 +1992,7 @@ fn paged_memory_poll_machine(identity_alias_value: u32, mapped_frame_value: u32)
         machine.write_physical_u8(PAGED_CODE + offset as u32, byte);
     }
     // TLB-eviction snippet at identity page 4: mov ebx,[alias]; hlt.
-    let alias_linear: u32 = (5 + 64) << 12;
+    let alias_linear: u32 = alias_page << 12;
     let mut snippet = vec![0x8b, 0x1d];
     snippet.extend_from_slice(&alias_linear.to_le_bytes());
     snippet.push(0xf4);

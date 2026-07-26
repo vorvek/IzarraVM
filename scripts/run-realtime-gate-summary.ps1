@@ -226,9 +226,13 @@ function Get-PollSkipSampleFailureReasons(
         $Sample.gate_artifacts.result_block_normalized_bytes -le 0) {
         $reasons += "semantic result block is invalid"
     }
+    # 828 realtics, measured on both poll-skip roles after the TLB went to 1024 entries. This was
+    # 843 until now, which stopped being true when the decode cache moved to 32768 lines and took
+    # the anchor to 833; nothing updated it, so this gate had been unrunnable since. Any change to
+    # charged page-walk or fetch clocks moves this number, so re-measure it rather than nudging it.
     if ($null -eq $Sample.timedemo -or $Sample.timedemo.gametics -ne 2134 -or
-        $Sample.timedemo.realtics -ne 843) {
-        $reasons += "Doom/586 anchor is not exactly 2134 gametics and 843 realtics"
+        $Sample.timedemo.realtics -ne 828) {
+        $reasons += "Doom/586 anchor is not exactly 2134 gametics and 828 realtics"
     }
     foreach ($field in @(
         "jit_region_entries", "jit_region_insns", "jit_native_insns",
@@ -1588,8 +1592,8 @@ function Get-PollSkipWorkloadSummary(
     )
     foreach ($sample in @($skipOnWarmups + $SkipOn + $skipOffWarmups + $SkipOff)) {
         if ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
-            $sample.timedemo.realtics -ne 843) {
-            $semanticReasons += "$($sample.gate_role) $($sample.gate_observation) missed the exact 843 anchor"
+            $sample.timedemo.realtics -ne 828) {
+            $semanticReasons += "$($sample.gate_role) $($sample.gate_observation) missed the exact 828 anchor"
         }
     }
 
@@ -1684,7 +1688,7 @@ function Get-PollSkipWorkloadSummary(
             memory_mib = 24
             video = "vega"
             cycle_budget = $Policy.cycle_budget
-            required_timedemo = "2134 gametics and exactly 843 realtics"
+            required_timedemo = "2134 gametics and exactly 828 realtics"
         }
         skip_on = Get-RoleSummary "skip_on" $Policy.mode $SkipOn $false
         skip_off = Get-RoleSummary "skip_off" $Policy.mode $SkipOff $false

@@ -2208,7 +2208,7 @@ function Invoke-RealtimeGateSelfTest {
             executed_cpu_core_clocks = [uint64]1100
             raw_bus_clocks = [uint64]1900
             stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
-            timedemo = [pscustomobject]@{ gametics = 2134; realtics = 843 }
+            timedemo = [pscustomobject]@{ gametics = 2134; realtics = 828 }
             gate_process_exit_code = 0
             gate_role = $Role
             gate_observation = $Observation

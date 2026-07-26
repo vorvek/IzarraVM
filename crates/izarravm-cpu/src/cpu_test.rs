@@ -599,12 +599,38 @@ fn active_fast_map_tracks_tlb_collision_and_rewalks_canonically() {
     const FRAME_A: u32 = 0x0000_5000;
     const FRAME_B: u32 = 0x0000_6000;
 
+    // A COUPLING check, not an independent one: while LINEAR_B is defined as one TLB_ENTRIES
+    // stride above LINEAR_A this cannot fail, because slot() masks with TLB_ENTRIES - 1. It earns
+    // its place by failing the moment the stride and the slot function stop agreeing, which is the
+    // exact regression this fixture suffered before: a stride hardcoded to 64 stopped colliding
+    // and the test then failed far downstream on a consequence instead of here on the cause.
+    // The teeth against a vacuous pass are lower down: PTE_A != PTE_B, the eviction of A, the
+    // survival of B, and the exactly-two-PageWalkRead re-walk.
+    assert_ne!(LINEAR_A, LINEAR_B);
+    assert_eq!(Tlb::slot(LINEAR_A >> 12), Tlb::slot(LINEAR_B >> 12));
+
     let mut memory = vec![0; 0x8000];
-    memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
-    let pte_a = 0x2000 + ((LINEAR_A >> 12) as usize * 4);
-    let pte_b = 0x2000 + ((LINEAR_B >> 12) as usize * 4);
-    memory[pte_a..pte_a + 4].copy_from_slice(&(FRAME_A | 7).to_le_bytes());
-    memory[pte_b..pte_b + 4].copy_from_slice(&(FRAME_B | 7).to_le_bytes());
+    // Two directory entries, one page table each. At 1024 entries the collision stride is exactly
+    // 4 MiB, which is one page-directory entry, so a colliding pair CANNOT share a page table and
+    // the single hardcoded PDE this fixture used to install is not enough. Derived from the two
+    // linear addresses so it keeps working at any TLB_ENTRIES.
+    let mut next_table = 0x2000usize;
+    let mut map_page = |memory: &mut Vec<u8>, linear: u32, frame: u32| {
+        let pde = 0x1000 + ((linear >> 22) as usize * 4);
+        let existing = u32::from_le_bytes(memory[pde..pde + 4].try_into().unwrap());
+        let table = if existing & 1 != 0 {
+            (existing & !0xfff) as usize
+        } else {
+            let table = next_table;
+            next_table += 0x1000;
+            memory[pde..pde + 4].copy_from_slice(&((table as u32) | 7).to_le_bytes());
+            table
+        };
+        let pte = table + (((linear >> 12) & 0x3ff) as usize * 4);
+        memory[pte..pte + 4].copy_from_slice(&(frame | 7).to_le_bytes());
+    };
+    map_page(&mut memory, LINEAR_A, FRAME_A);
+    map_page(&mut memory, LINEAR_B, FRAME_B);
     memory[FRAME_A as usize] = 0xa5;
     memory[FRAME_B as usize] = 0x5a;
 
@@ -637,7 +663,11 @@ fn active_fast_map_tracks_tlb_collision_and_rewalks_canonically() {
         .unwrap(),
         0x5a
     );
+    // A was evicted BY B, so B must be the entry that survived. Pinning both directions stops a
+    // degenerate fixture (A == B, or a fault that re-walked A away) from satisfying the negative
+    // assertion for the wrong reason.
     assert!(cpu.tlb.lookup(LINEAR_A >> 12).is_none());
+    assert!(cpu.tlb.lookup(LINEAR_B >> 12).is_some());
     assert!(!cpu.jit_fast_map.has_read_mapping(LINEAR_A, FRAME_A));
 
     bus.trace.clear();
