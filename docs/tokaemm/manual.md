@@ -36,11 +36,15 @@ memory-size argument.
 | `NOEMS` | Keep XMS, UMBs, and HMA, but disable the EMS page frame and page pool. `INT 67h` still reports the manager as present with zero EMS pages. |
 
 On the Izarra 3000's 24 MiB memory map, Toka-DOS reports 640 KiB of
-conventional memory, a 384 KiB upper region, a 20 MiB XMS category, and a
-separate 3 MiB EMS partition at the top of RAM. XMS allocations and VCPI pages
-share the allocation arena inside the 20 MiB category. EMS does not share that
-arena. Under `NOEMS`, the EMS category is zero and its 3 MiB returns to the
-shared XMS/VCPI arena, making the XMS category 23 MiB.
+conventional memory, a 384 KiB upper region, a 20 MiB extended-memory
+category, and a separate 3 MiB EMS partition at the top of RAM. The first
+2 MiB of allocatable extended memory is reserved for XMS blocks. VCPI owns the
+rest. Under `NOEMS`, the EMS category is zero and those 3 MiB are added to the
+VCPI pool, making the extended-memory category 23 MiB.
+
+The Toka-DOS MEM command combines free XMS and VCPI memory in its existing
+`Extended (XMS)` row. MEM and TOKAEMM are shipped as a matched pair. An older
+MEM used with this driver is safe, but it may show free VCPI pages as used.
 
 ## Resident footprint
 
@@ -68,8 +72,8 @@ and drivers rely on:
 - **A20 control**: global and local enable/disable, with nesting, plus a
   query function (03h-07h).
 - **Extended memory blocks**: allocate, free, resize, lock/unlock, and query
-  free space (08h-0Fh), through a 32-handle allocator in the shared XMS/VCPI
-  arena.
+  free space (08h-0Fh), through a 32-handle allocator over the dedicated XMS
+  pool. A normal Izarra 3000 provides up to 2 MiB for these blocks.
 - **Block moves**: the `INT 21h`-style bulk-copy function (0Bh) that moves
   data between conventional and extended memory, or between two extended
   blocks.

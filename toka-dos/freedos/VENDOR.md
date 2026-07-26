@@ -71,9 +71,13 @@ Rebrand: move src/version.h + move.c product-name string; sort src/sort.c banner
   and 20 MiB XMS category sizes through its private XMS query on the 24 MiB
   machine. The upper region includes video memory and ROMs; only 96 KiB is
   available for UMB allocation with the default EMS frame, or 160 KiB under
-  `NOEMS`. EMS has its own top-of-RAM partition. XMS and VCPI share the
-  allocation arena inside the XMS category. Under `NOEMS`, the EMS category
-  becomes zero and the XMS category grows to 23 MiB.
+  `NOEMS`. EMS has its own top-of-RAM partition. Standard XMS blocks use up to
+  2 MiB and VCPI owns the rest of the extended category. Under `NOEMS`, the
+  EMS category becomes zero and the extended category grows to 23 MiB.
+  TOKAEMM's versioned private query returns free VCPI memory so MEM can add it
+  to standard XMS free space. The MEM executable and driver must be rebuilt
+  and shipped together. Pairing an older MEM with the new driver is safe, but
+  the old program may display free VCPI pages as used.
 
 ## Audit items 3+10 external tool batch (ATTRIB, CHOICE, MORE, FIND, DELTREE)
 

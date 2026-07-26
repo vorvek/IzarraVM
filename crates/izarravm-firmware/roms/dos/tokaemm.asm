@@ -70,9 +70,9 @@ vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
 
 ; ---- XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
-xms_pool_base: dd 0               ; first byte in the shared XMS/VCPI arena
-xms_pool_end:  dd 0               ; one past the arena (capped to the 24 MB map)
-xms_category_kb: dw 0             ; whole XMS partition, including HMA/UMB backing
+xms_pool_base: dd 0               ; first byte available to XMS EMBs
+xms_pool_end:  dd 0               ; one past the dedicated XMS EMB pool
+xms_category_kb: dw 0             ; combined extended category for Toka-DOS MEM
 hma_available: db 0               ; fixed HMA lies inside detected physical RAM
 hma_owned: db 0                   ; 1 once a guest (DOS=HIGH) claims the HMA
 a20_count: dw 0                   ; XMS local-A20 enable nesting (fns 05h/06h)
@@ -110,7 +110,7 @@ umb_table: times UMB_SLOTS*UMB_SLOT db 0
 
 ; ---- EMS state (resident; reached via cs: overrides from V86) ----
 ; EMS is on by default and owns the top 3 MB of a 24 MB machine. NOEMS keeps
-; the manager frameless and returns that partition to the shared XMS/VCPI arena.
+; the manager frameless and returns that partition to VCPI.
 EMS_MAX_PAGES equ 192             ; 3 MB pool ceiling (16 KB pages)
 EMS_FRAME_SEG equ 0xE000          ; page frame segment (4 slots x 16 KB)
 EMS_FRAME_LIN equ 0x000E0000
@@ -136,20 +136,21 @@ ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 ems_rm_lin:  dd 0
 ems_rm_phys: dd 0
 
-; ---- Shared XMS/VCPI arena. Both allocators use arena_bmp; vcpi_owner_bmp
-; distinguishes pages DE05 may release. The bitmaps use absolute 4 KB page
-; numbers over the 24 MB map (6144 bits). XMS reserves contiguous page runs;
-; VCPI reserves single pages. EMS owns a separate physical partition.
+; ---- Disjoint XMS and VCPI pools. XMS keeps up to 2 MB for EMBs and VCPI
+; owns the rest of the extended category. The bitmaps use absolute 4 KB page
+; numbers over the 24 MB map (6144 bits). EMS owns a separate partition.
+XMS_EMB_BYTES equ 0x00200000
 align 4
 vcpi_pool_base: dd 0              ; first pool byte (4K-aligned)
 vcpi_pool_end:  dd 0              ; one past the last pool byte (4K-aligned)
-arena_free:     dw 0              ; free 4K pages shared by XMS and VCPI
+xms_free:       dw 0              ; free 4K pages in the XMS EMB pool
+vcpi_free:      dw 0              ; free 4K pages in the VCPI pool
 vcpi_cursor:    dw 0              ; next-fit absolute-page scan cursor
 vcpi_pic_master: dw 8             ; DE0Ah/DE0Bh: current 8259 vector bases
 vcpi_pic_slave:  dw 0x70          ; (the DOS-default mapping until a client
                                   ;  reports a remap; store-and-report only)
 arena_bmp: times 768 db 0         ; one allocation bit per physical 4 KB page
-vcpi_owner_bmp: times 768 db 0    ; set only for VCPI-owned allocated pages
+vcpi_bmp: times 768 db 0          ; one allocation bit per VCPI page
 
 strategy:
     mov [cs:rh_ptr], bx
@@ -352,7 +353,7 @@ init:
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
-    ; Keep at least 1 MB for the shared XMS/VCPI arena when possible, then put
+    ; Keep at least 1 MB for XMS and VCPI when possible, then put
     ; up to 3 MB of EMS at the top. On the 24 MB product profile this makes the
     ; XMS category [1 MB,21 MB) and EMS [21 MB,24 MB).
     mov ebx, edi                  ; default frameless: arena reaches RAM top
@@ -363,7 +364,7 @@ init:
     mov eax, edi
     sub eax, [cs:xms_pool_base]
     jc .ems_disable
-    cmp eax, 0x00100000           ; retain a 1 MB shared arena
+    cmp eax, 0x00100000           ; retain a 1 MB extended-memory category
     jbe .ems_disable
     sub eax, 0x00100000
     and eax, 0xFFFFC000           ; EMS pages are 16 KB
@@ -396,7 +397,8 @@ init:
     shr eax, 10
     mov [cs:xms_category_kb], ax
 
-    ; The shared arena is page-aligned and feeds both XMS EMBs and VCPI pages.
+    ; Page-align the allocatable category, retain up to 2 MB for XMS EMBs,
+    ; and give the remaining pages to VCPI.
     mov eax, [cs:xms_pool_base]
     add eax, 0xFFF
     and eax, 0xFFFFF000
@@ -407,13 +409,26 @@ init:
     mov eax, ebx
 .arena_bounds_ok:
     mov [cs:xms_pool_base], eax
-    mov [cs:xms_pool_end], ebx
-    mov [cs:vcpi_pool_base], eax
+    mov edx, eax
+    add edx, XMS_EMB_BYTES
+    jc .xms_uses_all
+    cmp edx, ebx
+    jbe .xms_split_ok
+.xms_uses_all:
+    mov edx, ebx
+.xms_split_ok:
+    mov [cs:xms_pool_end], edx
+    mov [cs:vcpi_pool_base], edx
     mov [cs:vcpi_pool_end], ebx
-    mov ecx, ebx
+    mov ecx, edx
     sub ecx, eax
     shr ecx, 12
-    mov [cs:arena_free], cx
+    mov [cs:xms_free], cx
+    mov ecx, ebx
+    sub ecx, edx
+    shr ecx, 12
+    mov [cs:vcpi_free], cx
+    mov eax, edx
     shr eax, 12
     mov [cs:vcpi_cursor], ax
 
@@ -2104,13 +2119,19 @@ vcpi_dispatch:
 
 .de02:                            ; max physical memory address: EDX = the
     mov eax, [fs:vcpi_pool_end]   ; highest 4K page DE04 could ever return,
+    cmp eax, [fs:vcpi_pool_base]
+    je .de02_empty
     sub eax, 0x1000               ; 12 LSBs zero (spec: both sides mask)
     mov [esi+20], eax
     mov byte [esi+29], 0
     ret
+.de02_empty:
+    mov dword [esi+20], 0
+    mov byte [esi+29], 0
+    ret
 
 .de03:                            ; free 4K page count -> EDX
-    movzx eax, word [fs:arena_free]
+    movzx eax, word [fs:vcpi_free]
     mov [esi+20], eax
     mov byte [esi+29], 0
     ret
@@ -2294,10 +2315,10 @@ vcpi_dr_buf:
 
 ; Allocate the lowest free pool page from the next-fit cursor. -> EAX = the
 ; page's physical address, CF clear; or CF set (pool exhausted). The scan
-; terminates because arena_free > 0 guarantees a clear bit inside the pool
+; terminates because vcpi_free > 0 guarantees a clear bit inside the pool
 ; range. BT/BTS take the full bit index (bit-string form). Clobbers ecx, edx.
 vcpi_page_alloc:
-    cmp word [fs:arena_free], 0
+    cmp word [fs:vcpi_free], 0
     je .none
     movzx eax, word [fs:vcpi_cursor]
     mov ecx, [fs:vcpi_pool_end]
@@ -2308,14 +2329,13 @@ vcpi_page_alloc:
     mov eax, [fs:vcpi_pool_base]  ; wrap to the pool base
     shr eax, 12
 .test:
-    bt [fs:arena_bmp], eax
+    bt [fs:vcpi_bmp], eax
     jnc .take
     inc eax
     jmp .scan
 .take:
-    bts [fs:arena_bmp], eax
-    bts [fs:vcpi_owner_bmp], eax
-    dec word [fs:arena_free]
+    bts [fs:vcpi_bmp], eax
+    dec word [fs:vcpi_free]
     lea edx, [eax+1]
     mov [fs:vcpi_cursor], dx
     shl eax, 12
@@ -2333,13 +2353,10 @@ vcpi_page_free:
     cmp eax, [fs:vcpi_pool_end]
     jae .bad
     shr eax, 12
-    bt [fs:arena_bmp], eax
+    bt [fs:vcpi_bmp], eax
     jnc .bad
-    bt [fs:vcpi_owner_bmp], eax
-    jnc .bad
-    btr [fs:vcpi_owner_bmp], eax
-    btr [fs:arena_bmp], eax
-    inc word [fs:arena_free]
+    btr [fs:vcpi_bmp], eax
+    inc word [fs:vcpi_free]
     clc
     ret
 .bad:
@@ -2388,7 +2405,7 @@ vcpi_pm_entry:
 .de03:                            ; free 4K page count -> EDX
     pushfd
     cli
-    movzx edx, word [fs:arena_free]
+    movzx edx, word [fs:vcpi_free]
     popfd
     xor ah, ah
     jmp .out

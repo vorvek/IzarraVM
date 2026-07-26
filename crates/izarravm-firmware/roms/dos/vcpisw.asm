@@ -67,6 +67,44 @@ start:
     jnz f_pres
     mov [free_v86], edx
 
+    ; Keep the largest XMS run locked throughout the VCPI mode switch. Its
+    ; allocation must not change the VCPI count or overlap a page from DE04.
+    mov ax, 0x4300
+    int 0x2F
+    cmp al, 0x80
+    jne f_xms
+    mov ax, 0x4310
+    int 0x2F
+    mov [xms_entry], bx
+    mov [xms_entry+2], es
+    mov ah, 0x08
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov [xms_largest], ax
+    mov dx, ax
+    mov ah, 0x09
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov [xms_handle], dx
+    mov ah, 0x0C
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov [xms_base], bx
+    mov [xms_base+2], dx
+    movzx eax, word [xms_largest]
+    shl eax, 10
+    add eax, [xms_base]
+    mov [xms_end], eax
+    mov ax, 0xDE03
+    int 0x67
+    cmp edx, [free_v86]
+    jne f_xms
+    push cs
+    pop es                         ; DE01's page-table buffer lives in this COM
+
     ; ---- 2. DE01: page-table buffer at ES:DI = pt page, GDT trio at gdt+0x20
     mov di, [pt_off]
     mov si, gdt + 0x20
@@ -189,6 +227,11 @@ pm_landing:
     jnz pm_f_alloc
     cmp edx, 0x100000
     jb pm_f_alloc
+    cmp edx, [xms_base]
+    jb .outside_xms
+    cmp edx, [xms_end]
+    jb pm_f_alloc
+.outside_xms:
     mov ax, 0xDE05
     call far dword [entry_ptr]
     or ah, ah
@@ -255,6 +298,16 @@ v86_landing:
     jnz f_bal
     cmp edx, [free_v86]
     jne f_bal
+    mov ah, 0x0D                 ; unlock and release the full XMS run
+    mov dx, [xms_handle]
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov ah, 0x0A
+    mov dx, [xms_handle]
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
     sti                           ; virtualized STI: must trap cleanly
     mov al, OK
     jmp sig
@@ -266,6 +319,8 @@ f_if:     mov al, 0xE2
 f_ret:    mov al, 0xE5
           jmp sig
 f_bal:    mov al, 0xE6
+          jmp sig
+f_xms:    mov al, 0xE7
 
 sig:
     mov ah, al
@@ -283,6 +338,11 @@ lin_base:  dd 0
 pd_phys:   dd 0
 pt_phys:   dd 0
 free_v86:  dd 0
+xms_entry: dd 0
+xms_base:  dd 0
+xms_end:   dd 0
+xms_handle: dw 0
+xms_largest: dw 0
 entry_ptr:                       ; fword: the server PM entry (USE32 far ptr)
 entry_off: dd 0
 entry_sel: dw 0x20               ; server code = first of the DE01 trio

@@ -145,17 +145,18 @@ range, `▓` (CP437 `B2`) marks memory in use and `░` (CP437 `B0`) marks free
 memory.
 
 On the standard 24 MiB Izarra 3000, the map gives conventional memory 8
-cells, upper memory 5, EMS 40, and XMS 263. Each of the 316 cells represents
-about 77.8 KiB. The exact summary categories are 640 KiB conventional memory,
-the full 384 KiB upper region, 3 MiB EMS, and 20 MiB XMS. The upper category
-covers the whole `A0000` to `FFFFF` address region, including video memory and
-ROMs. TOKAEMM can allocate 96 KiB there with its default EMS frame. Under
-`NOEMS`, the EMS category becomes zero, the XMS category grows to 23 MiB, and
-the allocatable UMB space grows to 160 KiB.
+cells, upper memory 5, EMS 40, and extended memory 263. Each of the 316 cells
+represents about 77.8 KiB. The exact summary categories are 640 KiB
+conventional memory, the full 384 KiB upper region, 3 MiB EMS, and 20 MiB in
+the row labelled `Extended (XMS)`. The upper category covers the whole
+`A0000` to `FFFFF` address region, including video memory and ROMs. TOKAEMM
+can allocate 96 KiB there with its default EMS frame. Under `NOEMS`, the EMS
+category becomes zero, the extended category grows to 23 MiB, and the
+allocatable UMB space grows to 160 KiB.
 
-The 3 MiB EMS pool is a separate top-of-RAM partition. XMS allocations and
-VCPI pages share an arena inside the 20 MiB XMS category, so activity from
-either API changes the free part of that category.
+The 3 MiB EMS pool is a separate top-of-RAM partition. Standard XMS blocks
+use a dedicated pool of up to 2 MiB. VCPI owns the rest of the extended
+category. MEM adds the free space from both pools for the existing XMS row.
 
 Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE`, which pauses
 after each screenful. The per-program size and segment listing normally needs

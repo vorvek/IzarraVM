@@ -6,3 +6,4 @@
 # (tokados-hdd.img, gswmode.com, tokaemm.sys) plus the vendored FreeDOS trees'
 # own .gitignore rules under freedos/.
 /build-freedos-tokamous.com
+/build-freedos-izcdex.com

@@ -331,6 +331,8 @@ static void print_toka_summary(unsigned memfree, unsigned umbfree,
     if (ems_free > toka_ems_category_k)
 	ems_free = toka_ems_category_k;
     xms_free = round_kb(xms->free);
+    if (toka_split_pools)
+	xms_free += toka_vcpi_free_k;
     if (xms_free > toka_xms_category_k)
 	xms_free = toka_xms_category_k;
 
@@ -500,6 +502,7 @@ static void normal_list(unsigned memfree, UPPERINFO *upper, int show_hma_free,
     unsigned umbfree = 0, umbtotal = 0;
     unsigned long xms_total_k, xms_free_k;
     int toka_summary = FALSE;
+    unsigned toka_magic = 0;
     XMSINFO *xms;
     EMSINFO *ems;
 
@@ -533,9 +536,12 @@ static void normal_list(unsigned memfree, UPPERINFO *upper, int show_hma_free,
     if ((memory == 639 || memory == 640) && ems != NULL
 	&& xms_available() == XMS_AVAILABLE_RESULT) {
 	xms_drv = get_xms_drv();
-	if (toka_xms_categories() == TOKA_CATEGORY_MAGIC
+	toka_magic = toka_xms_categories();
+	if ((toka_magic == TOKA_CATEGORY_MAGIC
+	     || toka_magic == TOKA_SPLIT_MAGIC)
 	    && (ulong)toka_ems_category_k == (ulong)ems->size * 16UL)
 	    toka_summary = TRUE;
+	toka_split_pools = toka_magic == TOKA_SPLIT_MAGIC;
     }
 
     if (toka_summary) {
