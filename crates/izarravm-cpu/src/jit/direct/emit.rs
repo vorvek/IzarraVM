@@ -252,6 +252,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Test { a, b } => emit_test(&mut e, a, b),
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
+            DirectKind::NegReg { dst } => emit_neg_reg(&mut e, dst),
             DirectKind::TestImmReg { dst, imm, width } => {
                 emit_test_imm_reg(&mut e, dst, imm, width);
             }
@@ -2640,6 +2641,27 @@ fn emit_imul(e: &mut Encoder, dst: u8, src: u8) {
     emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
     emit_clear_pending(e);
+}
+
+fn emit_neg_reg(e: &mut Encoder, dst: u8) {
+    // The interpreter models NEG as `alu_sub(0, value, 0)`, which OVERWRITES pending_flags
+    // wholesale with a Sub descriptor and never reads or materializes whatever was pending
+    // before. So this has to reproduce that descriptor, not merely the resulting flags: the
+    // campaign compares the raw pending_flags word, and materializing eagerly here would agree
+    // on eflags() while differing on every byte of the descriptor.
+    //
+    // a is the constant 0 and b is the OLD destination, which is the reverse of the usual ALU
+    // roles. Passing None for a makes emit_pending store an immediate zero, so the zero is
+    // structural rather than something a later edit could clobber in a register.
+    //
+    // Tag 0x8000_0201 is Sub at Dword: op 1 in bits 0-7, width 2 in bits 8-15, cf_override bits
+    // 16-17 clear, has-pending bit 31. Identical to what PendingFlags::from_legacy builds for
+    // alu_sub, and to the SUB tag emit_alu_preloaded already uses.
+    e.mov_r32_r32(Reg::RCX, home(dst));
+    e.xor_r64_self(home(dst));
+    e.alu_r32_r32(5, home(dst), Reg::RCX);
+    emit_capture_flags(e, ARITH_FLAGS);
+    emit_pending(e, 0x8000_0201, None, Some(Reg::RCX), home(dst));
 }
 
 fn emit_test_imm_reg(e: &mut Encoder, dst: u8, imm: u32, width: MemoryWidth) {

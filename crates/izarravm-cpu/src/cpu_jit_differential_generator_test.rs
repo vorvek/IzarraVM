@@ -25,7 +25,7 @@ const MEMORY_LEN: usize = 0x20_000;
 // continuing the first. That is a real split, not a truncation, so it costs one instruction off
 // the fully-native count; `GeneratedCase::cold_memory_target` records which cases hit it so the
 // comparison below can expect the right number instead of a single constant.
-const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 27;
+const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 28;
 const GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY: u64 =
     GENERATED_BLOCK_NATIVE_INSTRUCTIONS - 1;
 
@@ -117,6 +117,8 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     bytes.extend_from_slice(&[0x85, 0xc0 | (rng.reg() << 3) | rng.reg()]);
     bytes.extend_from_slice(&[0x84, 0xc0 | (rng.reg() << 3) | rng.reg()]);
     bytes.extend_from_slice(&[0x0f, 0xaf, 0xc0 | (rng.reg() << 3) | rng.reg()]);
+    // NEG r32 (0xF7 /3, mod 11). 0xd8 is mod 11 with reg 3, so `| rng.reg()` picks the operand.
+    bytes.extend_from_slice(&[0xf7, 0xd8 | rng.reg()]);
     let shift = [4, 5, 7][(rng.u32() % 3) as usize];
     bytes.extend_from_slice(&[
         0xc1,
