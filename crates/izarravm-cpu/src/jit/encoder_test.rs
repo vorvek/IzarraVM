@@ -822,6 +822,18 @@ fn store_r8_disp8_known_bytes() {
 }
 
 #[test]
+fn test_byte_disp8_imm8_known_bytes() {
+    // test byte [rax+12], 1 -- no REX, no SIB. ModRM mod=01,reg=0,rm=rax(0) = 0x40; disp 12.
+    let mut e = Encoder::new();
+    e.test_byte_disp8_imm8(Reg::RAX, 12, 1);
+    assert_eq!(e.finish(), vec![0xF6, 0x40, 0x0C, 0x01]);
+    // test byte [r12+8], 1 -- REX.B (r12 extended) forces a SIB byte too (r12&7 = 4).
+    let mut e = Encoder::new();
+    e.test_byte_disp8_imm8(Reg::R12, 8, 1);
+    assert_eq!(e.finish(), vec![0x41, 0xF6, 0x44, 0x24, 0x08, 0x01]);
+}
+
+#[test]
 fn movzx_byte_sib_reads_the_right_byte() {
     // End-to-end: fn(base, idx) -> i64 returns the zero-extended byte at [base+idx]. Proves the
     // SIB addressing + zero-extension actually execute, not just the byte shape.

@@ -403,12 +403,60 @@ impl CompiledBlock {
         self.has_x87.then_some(self.x87_entry_top)
     }
 
+    /// Static-successor compatibility (Jmp/Jcc/Call/fallthrough edges). The dynamic RET PIC path
+    /// (`try_link_inner` with a `target_eip`) layers an extra `has_x87` equality on top of this,
+    /// so it stays strict; see the comment there for why.
+    ///
+    /// The has_x87 pair is a real three-case rule now, not a dead clause. It used to read
+    /// `self.has_x87 == target.has_x87 && (!self.has_x87 || self.x87_exit_top ==
+    /// target.x87_entry_top)`, which made the TOP comparison unreachable for a genuinely mixed
+    /// pair: the equality already returned false before the TOP clause could run. Deleting just
+    /// the equality would have made that TOP clause live for mixed pairs instead of dead, and
+    /// wrong: an integer block's `x87_entry_top`/`x87_exit_top` are not "no x87 state", they are
+    /// a snapshot of `cpu.fpu.top()` taken at compile time and stored unconditionally for every
+    /// block (see `compile()`, around the `x87_entry_top`/`x87_exit_top` locals), an arbitrary
+    /// value with no relationship to anything at link time. Comparing a float block's real
+    /// `x87_exit_top` against that snapshot would accept or refuse edges at random.
     fn link_compatible(self, target: Self) -> bool {
-        self.span.key.mode_key == target.span.key.mode_key
-            && self.memory_cpl3 == target.memory_cpl3
-            && self.has_x87 == target.has_x87
-            && (!self.has_x87 || self.x87_exit_top == target.x87_entry_top)
-            && self.segment_layout.link_compatible(target.segment_layout)
+        if self.span.key.mode_key != target.span.key.mode_key
+            || self.memory_cpl3 != target.memory_cpl3
+            || !self.segment_layout.link_compatible(target.segment_layout)
+        {
+            return false;
+        }
+        match (self.has_x87, target.has_x87) {
+            // Both integer: neither side carries x87 state, so there is no TOP to reconcile.
+            (false, false) => true,
+            // Both float: a chained transfer skips the target's own prologue, so the physical
+            // x87 cache and packed status/tag word stay resident in host registers across the
+            // jump. Every native x87 op the target emitted was compiled against its own entry
+            // TOP, so the source's exit TOP must match it exactly, unchanged from before.
+            (true, true) => self.x87_exit_top == target.x87_entry_top,
+            // Float source, integer target: link. The edge is marked spilling (see
+            // `LinkCell::mark_spilling`, set in `try_link_inner`), and the emitted jump flushes
+            // the live x87 cache back to `CpuGsw.fpu` before handing control over. The target
+            // has no TOP of its own to pin against, so there is no TOP condition here.
+            (true, false) => true,
+            // Integer source, float target: refused. A chained entry publishes body_ptr =
+            // entry + body_offset and jumps straight there, so the target's own prologue never
+            // runs. `emit_x87_enter` sits ABOVE body_offset (see `emit()`: body_offset is
+            // captured right after the `x87_entry_top.is_some()` enter block), so skipping the
+            // prologue means the target's XMM4-11 physical cache is never loaded from
+            // `CpuGsw.fpu` and its baked compile-time entry TOP is never pinned to the CPU's
+            // real `top()`. There is no boundary fix-up that helps here, unlike the float-to-
+            // integer case: the missing work happens on the target side, before the jump lands,
+            // not at the jump site.
+            //
+            // This refusal also underwrites the float-to-integer crossing's frame read above.
+            // That crossing reloads RSI from STACK_SAVED_RSI, a slot only an x87 prologue writes;
+            // an integer entry never runs one, so if this arm allowed the edge, an integer-headed
+            // chain could reach that reload with the slot (and the XMM6-11 save area) never
+            // initialized. Uniform frame length alone does not make the crossing's frame read
+            // safe; this refusal is what makes it safe, by induction over the chain: every block
+            // that can reach a float-to-integer crossing was itself entered through an x87
+            // prologue.
+            (false, true) => false,
+        }
     }
 }
 
@@ -1398,9 +1446,18 @@ impl BlockCache {
         let Some(target_index) = self.active_index(target) else {
             return false;
         };
+        let source_block = self.blocks[source_index];
+        let target_block = self.blocks[target_index];
         if self.block_link_epochs.get(source_index).copied() != Some(self.link_epoch)
             || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch)
-            || !self.blocks[source_index].link_compatible(self.blocks[target_index])
+            || !source_block.link_compatible(target_block)
+            // The dynamic RET PIC path resolves a near-RET target at runtime from an arbitrary
+            // return address, not from a compile-time successor shape, and
+            // emit_completed_dynamic_path never emits the boundary spill link_compatible's
+            // float-to-integer case relies on. So RET PIC keeps the strict has_x87 equality on
+            // top of the relaxed rule; static successors (target_eip == None, resolved above by
+            // resolve_successors/resolve_waiting) get the full relaxed rule instead.
+            || (target_eip.is_some() && source_block.has_x87 != target_block.has_x87)
         {
             return false;
         }
@@ -1413,6 +1470,9 @@ impl BlockCache {
             return true;
         }
         self.unlink_outbound(source, slot);
+        if source_block.has_x87 && !target_block.has_x87 {
+            self.link_cells[source_index][slot_index].mark_spilling();
+        }
         if let Some(target_eip) = target_eip {
             self.link_cells[source_index][slot_index]
                 .set_dynamic(target_eip, self.block_portals[target_index].as_ref());
@@ -2367,11 +2427,23 @@ const EXIT_ARG: Reg = Reg::R9;
 #[cfg(not(target_os = "windows"))]
 const EXIT_ARG: Reg = Reg::RCX;
 
-const NATIVE_STACK_LEN: u32 = 160;
+// Base frame: 20 accounting and scratch slots at 8 bytes each, offsets 0 to
+// 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes.
+const BASE_STACK_LEN: u32 = 160;
+// One frame shape for every block, x87-bearing or not. A chained native
+// transfer jumps straight into a target block's body, skipping its
+// prologue, so the target's own epilogue always runs against whatever
+// frame the entering block's prologue built. If the two frame shapes
+// differ, that teardown pops the wrong bytes. On Windows the frame also
+// carries the saved-RSI slot below and the x87 XMM6-11 save area; RSI is
+// callee-saved there and doubles as the x87 tag-cache scratch register, and
+// none of the XMM6-11 registers are. On non-Windows RSI is not
+// callee-saved and there is no non-volatile XMM to save, so the frame is
+// just the base.
 #[cfg(target_os = "windows")]
-const AVX2_X87_STACK_LEN: u32 = NATIVE_STACK_LEN + 8 + 6 * 16;
+const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN + 8 + 6 * 16;
 #[cfg(not(target_os = "windows"))]
-const AVX2_X87_STACK_LEN: u32 = NATIVE_STACK_LEN;
+const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN;
 const STACK_QUOTA: i8 = 0;
 const STACK_ITERATIONS: i8 = 8;
 const STACK_RAM_BYTE_WRITES: i8 = 16;
@@ -2393,6 +2465,25 @@ const STACK_ALU_ADDRESS_KIND: i32 = 128;
 const STACK_ALU_OLD_RESULT: i32 = 136;
 const STACK_ALU_FLAGS: i32 = 144;
 const STACK_SHIFT_COUNT: i32 = 152;
+// Beyond the base frame: the saved host RSI slot, then the x87 XMM6-11
+// save area right after it. Both Windows only, see NATIVE_STACK_LEN above.
+#[cfg(target_os = "windows")]
+const STACK_SAVED_RSI: i32 = BASE_STACK_LEN as i32;
+#[cfg(target_os = "windows")]
+const STACK_X87_XMM_BASE: i32 = STACK_SAVED_RSI + 8;
+// The saved-RSI slot and the XMM6-11 save area must both land inside the frame NATIVE_STACK_LEN
+// actually allocates. A wrong STACK_X87_XMM_BASE (a stale copy of an old constant, say) would
+// make the first XMM save overwrite the saved RSI slot and hand garbage RSI back to the Rust
+// caller, silently, since the frame-size test only checks the sub rsp / add rsp immediates
+// agree, not that the areas inside the frame do not collide.
+#[cfg(target_os = "windows")]
+const _: () = {
+    assert!(STACK_SAVED_RSI as u32 + 8 <= STACK_X87_XMM_BASE as u32);
+    assert!(
+        STACK_X87_XMM_BASE as u32 + emit::X87_NONVOLATILE_XMMS.len() as u32 * 16
+            <= NATIVE_STACK_LEN
+    );
+};
 const COUNTER_RAM_BYTE_WRITE: u16 = 1 << 0;
 const COUNTER_RAM_DWORD_WRITE: u16 = 1 << 1;
 const COUNTER_MODE13_BYTE_WRITE: u16 = 1 << 2;

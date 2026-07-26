@@ -26,7 +26,7 @@
 
 use std::sync::{
     OnceLock,
-    atomic::{AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -94,6 +94,19 @@ pub(crate) fn zero_portal() -> &'static BlockPortal {
 pub(crate) struct LinkCell {
     pub(crate) portal: AtomicUsize,
     pub(crate) target_eip: AtomicU32,
+    /// Direct's own x87 link-relaxation mechanism (not shared with Clif): set when this slot's
+    /// edge is a float source linking to an integer target, so the emitted jump at the link site
+    /// knows to flush the live x87 cache back to `CpuGsw.fpu` before handing control to a target
+    /// that never reads it. Every other edge shape (both integer, both float, or unresolved)
+    /// leaves this at 0. Read with a plain byte test in emitted code (no atomic instruction
+    /// needed there, same as `portal`/`target_eip`); stored with `Release`/loaded with `Acquire`
+    /// on the Rust side, matching the other fields here. Those orderings are a formality for a
+    /// single-owner cache, not a cross-thread guarantee: izarravm-cpu spawns no threads and the
+    /// block cache is mutated only by the thread running native code, so there is no concurrent
+    /// relink for them to guard against. The emitted reader plainly loads `portal` and, many
+    /// instructions later, plainly loads this byte, so if that assumption ever stopped holding,
+    /// a genuinely concurrent relink could still pair a stale `portal` with a fresh flag.
+    pub(crate) spilling: AtomicU8,
 }
 
 impl LinkCell {
@@ -103,6 +116,7 @@ impl LinkCell {
         Self {
             portal: AtomicUsize::new(zero_portal().address()),
             target_eip: AtomicU32::new(0),
+            spilling: AtomicU8::new(0),
         }
     }
 
@@ -110,12 +124,31 @@ impl LinkCell {
         std::ptr::from_ref(self) as usize
     }
 
-    /// Direct's own unlink: repoint this cell at the zero-body sentinel portal (`zero_portal`).
-    /// See `zero_portal`'s doc comment: this default is Direct's mechanism, not a shared
-    /// invariant every backend must reproduce.
+    /// Direct's own unlink: repoint this cell at the zero-body sentinel portal (`zero_portal`)
+    /// and drop the spilling flag back to its default. Every path that rebinds or discards a
+    /// cell's target goes through this (see `unlink_outbound` in `direct.rs`), so this is the
+    /// one place the flag needs resetting; a caller that only ever turns it on (see
+    /// `mark_spilling`) relies on that.
     pub(crate) fn clear(&self) {
         self.portal
             .store(zero_portal().address(), Ordering::Release);
+        self.spilling.store(0, Ordering::Release);
+    }
+
+    /// Mark this slot's edge as needing the x87 boundary spill. Never called with `false`: a
+    /// cell that should NOT spill gets there through `clear` (a fresh link starts unmarked), not
+    /// through this method, so a caller cannot forget to turn the flag back off by skipping a
+    /// call here.
+    pub(crate) fn mark_spilling(&self) {
+        self.spilling.store(1, Ordering::Release);
+    }
+
+    /// Emitted code reads the flag directly with a raw byte test at the link site (see
+    /// `emit_completed_path`); this accessor only exists for tests to assert on the flag from
+    /// the Rust side, so it is test-only.
+    #[cfg(test)]
+    pub(crate) fn is_spilling(&self) -> bool {
+        self.spilling.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn set(&self, portal: &BlockPortal) {

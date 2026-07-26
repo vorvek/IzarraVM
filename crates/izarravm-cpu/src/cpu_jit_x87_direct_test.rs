@@ -218,6 +218,79 @@ fn quake_hot_x87_sequence_matches_interpreter_in_486_and_586_modes() {
     }
 }
 
+fn integer_only_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0x83, 0xc0, 0x02, // add eax,2
+        0x83, 0xc0, 0x03, // add eax,3
+        0xf4, // hlt
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory
+}
+
+// Locates a REX.W 81 /r prologue-or-epilogue immediate (sub rsp is /5, add rsp is /0) and
+// returns the imm32 that follows it. Guest ALU code never targets RSP with a 64-bit
+// immediate op, so this three-byte prefix is unique to the frame setup and teardown.
+fn imm32_after(code: &[u8], prefix: [u8; 3]) -> u32 {
+    let at = code
+        .windows(prefix.len())
+        .position(|window| window == prefix)
+        .unwrap_or_else(|| panic!("prefix {prefix:02x?} not found in emitted code"));
+    let imm_at = at + prefix.len();
+    u32::from_le_bytes(code[imm_at..imm_at + 4].try_into().unwrap())
+}
+
+fn frame_setup_and_teardown_immediates(
+    memory: Vec<u8>,
+    control: u16,
+    expect_x87: bool,
+) -> (u32, u32) {
+    let mut cpu = x87_cpu(GswMode::Gsw586);
+    let mut bus = direct_memory(memory);
+    arm(&mut cpu, control);
+    run_to_halt(&mut cpu, &mut bus);
+
+    arm(&mut cpu, control);
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("block compiles");
+    assert_eq!(
+        compilation.has_x87, expect_x87,
+        "test fixture drifted: this block's x87-bearing-ness no longer matches what the test \
+         means to compare, which would make this test compare two integer (or two x87) frames \
+         against each other and pass trivially"
+    );
+    let sub_rsp = imm32_after(&compilation.code, [0x48, 0x81, 0xec]);
+    let add_rsp = imm32_after(&compilation.code, [0x48, 0x81, 0xc4]);
+    (sub_rsp, add_rsp)
+}
+
+// A chained native transfer jumps straight into a target block's body, skipping its own
+// prologue, so the target's epilogue always tears down whatever frame the entering block's
+// prologue built. That only works if every block, x87-bearing or not, builds the same frame
+// shape: the same sub rsp immediate in the prologue as the add rsp immediate in the
+// epilogue, and that same immediate across both kinds of block.
+#[test]
+fn native_frame_size_matches_between_x87_and_integer_blocks() {
+    let (x87_sub, x87_add) = frame_setup_and_teardown_immediates(quake_hot_program(), 0x0f7f, true);
+    let (int_sub, int_add) =
+        frame_setup_and_teardown_immediates(integer_only_program(), 0x0f7f, false);
+
+    assert_eq!(
+        x87_sub, x87_add,
+        "x87 block: prologue sub rsp must match epilogue add rsp"
+    );
+    assert_eq!(
+        int_sub, int_add,
+        "integer block: prologue sub rsp must match epilogue add rsp"
+    );
+    assert_eq!(
+        x87_sub, int_sub,
+        "x87 and integer blocks must emit the same native frame size"
+    );
+}
+
 #[test]
 fn linked_x87_blocks_keep_stack_state_resident_and_validate_root_top() {
     const SECOND: u32 = ENTRY + 24;
@@ -342,6 +415,305 @@ fn linked_x87_blocks_keep_stack_state_resident_and_validate_root_top() {
         native.perf_counters().jit_direct_reject_x87_top - rejects,
         1
     );
+}
+
+// The x87 link-relaxation slice: a float block statically chained into a pure integer block
+// (no x87 opcodes anywhere in it) must still cross natively, and the boundary spill it triggers
+// must leave CpuGsw.fpu exactly where the interpreter would. Second block never calls
+// emit_x87_enter or emit_x87_spill itself (has_x87 is false for it), so if the source's own
+// jump does not flush the physical x87 cache and packed status/tag first, cpu.fpu stays at
+// whatever it was before this native call started, not what fld1 actually produced.
+#[test]
+fn linked_float_to_integer_chain_spills_the_boundary_and_matches_the_interpreter() {
+    const SECOND: u32 = ENTRY + 24;
+    const END: u32 = SECOND + 6;
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let first = [
+        0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89,
+        0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, // eleven mov eax,eax
+        0xd9, 0xe8, // fld1
+    ];
+    // Pure integer, no x87 opcode anywhere in this block. A non-terminal block needs at least
+    // three instructions to be worth compiling at all (see compile_with_instruction_limit's
+    // `slots.len() < 3` guard), hence three, not one.
+    let second = [
+        0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, // mov ebx,ebx x3
+    ];
+    memory[ENTRY as usize..SECOND as usize].copy_from_slice(&first);
+    memory[SECOND as usize..END as usize].copy_from_slice(&second);
+    memory[END as usize] = 0xf4;
+
+    let mut native = x87_cpu(GswMode::Gsw586);
+    let mut interpreter = x87_cpu(GswMode::Gsw586);
+    let mut native_bus = direct_memory(memory.clone());
+    let mut interpreter_bus = direct_memory(memory.clone());
+    arm(&mut native, 0x0f7f);
+    run_to_halt(&mut native, &mut native_bus);
+    arm(&mut interpreter, 0x0f7f);
+    run_to_halt(&mut interpreter, &mut interpreter_bus);
+
+    arm(&mut native, 0x0f7f);
+    let first_key = jit::direct::key_for(&native, ENTRY, true).expect("first block key");
+    assert!(matches!(
+        native.jit_direct.probe(first_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let first_compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("first x87 block");
+    assert_eq!(first_compilation.span.instructions, 12);
+    assert!(first_compilation.has_x87);
+    assert_eq!(first_compilation.x87_entry_top, 0);
+    assert_eq!(first_compilation.x87_exit_top, 7);
+    let first_id = native
+        .jit_direct
+        .install(&first_compilation)
+        .expect("first x87 block install");
+    let first_block = native
+        .jit_direct
+        .block(first_id)
+        .expect("first x87 block remains live");
+
+    let second_key = jit::direct::key_for(&native, SECOND, true).expect("second block key");
+    assert!(matches!(
+        native.jit_direct.probe(second_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let second_compilation =
+        jit::direct::compile(&mut native, SECOND, true).expect("second integer block");
+    assert!(
+        !second_compilation.has_x87,
+        "second block must stay pure integer for this to test the relaxed edge"
+    );
+    native
+        .jit_direct
+        .install(&second_compilation)
+        .expect("second integer block install");
+
+    arm(&mut native, 0x0f7f);
+    arm(&mut interpreter, 0x0f7f);
+    native.registers.eip = ENTRY;
+    interpreter.registers.eip = ENTRY;
+    native_bus.memory.copy_from_slice(&memory);
+    interpreter_bus.memory.copy_from_slice(&memory);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    let transfers = native.perf_counters().jit_direct_linked_transfers;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, first_block)
+            .unwrap()
+    );
+    for _ in 0..15 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+
+    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        native.fpu, interpreter.fpu,
+        "x87 register file, status and tag words must match: the boundary spill must have run"
+    );
+    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(native.fp_rem, interpreter.fp_rem);
+    assert_eq!(native_bus.memory, interpreter_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.eip, END);
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - transfers,
+        1,
+        "the chain must actually cross natively, not fall back through the interpreter"
+    );
+}
+
+// The differential test above proves CpuGsw.fpu ends up correct after a float-to-integer
+// crossing, but that alone does not prove the crossing restores RSI and XMM6-11 before handing
+// control to the integer target. Deleting that restore while keeping the spill would still pass
+// the differential test, since CpuGsw.fpu does not carry host RSI or XMM6-11, yet it would hand
+// back a corrupted RSI and XMM6-11 to the Rust caller. Those are Windows callee-saved registers,
+// so whether a Rust test would even notice depends on whether rustc happened to keep a live value
+// in them across the call, which a debug build rarely does. Planting sentinel values in RSI and
+// XMM6-11 and checking they survive the call would need those registers to stay live, untouched
+// by rustc, across the call boundary, which is not something safe portable Rust can pin down. So
+// this checks the emitted byte order directly instead: the spill, then the RSI restore, then the
+// XMM6-11 restore, must all precede the jump that hands control to the integer target. It builds
+// each instruction's expected bytes by emitting it in isolation (the load/store instructions with
+// a placeholder displacement, since the frame offset itself is not this test's concern) and
+// searches for that exact byte sequence in the real compiled code.
+#[cfg(target_os = "windows")]
+#[test]
+fn float_to_integer_boundary_restores_rsi_and_xmm_before_the_jump() {
+    const SECOND: u32 = ENTRY + 24;
+    const END: u32 = SECOND + 6;
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let first = [
+        0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89,
+        0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, // eleven mov eax,eax
+        0xd9, 0xe8, // fld1
+    ];
+    let second = [0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb]; // mov ebx,ebx x3, pure integer
+    memory[ENTRY as usize..SECOND as usize].copy_from_slice(&first);
+    memory[SECOND as usize..END as usize].copy_from_slice(&second);
+    memory[END as usize] = 0xf4;
+
+    let mut cpu = x87_cpu(GswMode::Gsw586);
+    let mut bus = direct_memory(memory);
+    arm(&mut cpu, 0x0f7f);
+    run_to_halt(&mut cpu, &mut bus);
+
+    arm(&mut cpu, 0x0f7f);
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("float source compiles");
+    assert!(compilation.has_x87);
+    let code = &compilation.code;
+
+    fn without_trailing_disp32(bytes: Vec<u8>) -> Vec<u8> {
+        bytes[..bytes.len() - 4].to_vec()
+    }
+    fn first_position(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap_or_else(|| panic!("pattern {needle:02x?} not found in emitted code"))
+    }
+
+    let mut probe = jit::encoder::Encoder::new();
+    probe.load_r64_disp32(jit::encoder::Reg::RSI, jit::encoder::Reg::RSP, 0);
+    let rsi_restore = without_trailing_disp32(probe.finish());
+
+    let mut probe = jit::encoder::Encoder::new();
+    probe.vmovupd_xmm_disp32(jit::encoder::Xmm::XMM6, jit::encoder::Reg::RSP, 0);
+    let xmm_restore = without_trailing_disp32(probe.finish());
+
+    let mut probe = jit::encoder::Encoder::new();
+    probe.vzeroupper();
+    let spill_end = probe.finish();
+
+    let mut probe = jit::encoder::Encoder::new();
+    probe.jmp_r64(jit::encoder::Reg::RDX);
+    let transfer_jump = probe.finish();
+
+    let spill_pos = first_position(code, &spill_end);
+    let rsi_pos = first_position(code, &rsi_restore);
+    let xmm_pos = first_position(code, &xmm_restore);
+    let jmp_pos = first_position(code, &transfer_jump);
+    assert!(
+        spill_pos < rsi_pos && rsi_pos < xmm_pos && xmm_pos < jmp_pos,
+        "the float-to-integer boundary must spill the x87 cache, then restore RSI, then restore \
+         XMM6-11, then jump to the integer target, in that order: got spill {spill_pos}, rsi \
+         {rsi_pos}, xmm {xmm_pos}, jmp {jmp_pos}"
+    );
+}
+
+// The reverse edge: an integer source must never chain into a float target. Its own prologue
+// (emit_x87_enter) sits above body_offset, so a chained jump into its body would skip loading
+// the physical x87 cache from CpuGsw.fpu and would run against an unpinned compile-time TOP.
+// This does not assert on has_linked_successor directly: that would catch a permissive mutation
+// before it ever runs, which is a weaker guarantee than proving the actual consequence. Instead
+// it always finishes the guest program (crossing natively if the two blocks turned out to be
+// linked, or through the target's own entry point if not) and compares the resulting fp register
+// file against the interpreter, so a wrongly-permitted link is caught by the corrupted state it
+// produces, not merely by a boolean.
+#[test]
+fn linked_integer_to_float_chain_is_refused_and_the_float_block_still_runs_correctly() {
+    const SECOND: u32 = ENTRY + 6;
+    const END: u32 = SECOND + 6;
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let first = [0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0]; // three mov eax,eax -- pure integer
+    // Three instructions, same reason as the float-to-integer test's second block: a
+    // non-terminal block needs at least three to be worth compiling at all.
+    let second = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc9]; // fld1; fld1; fmulp st(1),st(0)
+    memory[ENTRY as usize..SECOND as usize].copy_from_slice(&first);
+    memory[SECOND as usize..END as usize].copy_from_slice(&second);
+    memory[END as usize] = 0xf4;
+
+    let mut native = x87_cpu(GswMode::Gsw586);
+    let mut interpreter = x87_cpu(GswMode::Gsw586);
+    let mut native_bus = direct_memory(memory.clone());
+    let mut interpreter_bus = direct_memory(memory.clone());
+    arm(&mut native, 0x0f7f);
+    run_to_halt(&mut native, &mut native_bus);
+    arm(&mut interpreter, 0x0f7f);
+    run_to_halt(&mut interpreter, &mut interpreter_bus);
+
+    arm(&mut native, 0x0f7f);
+    let first_key = jit::direct::key_for(&native, ENTRY, true).expect("first block key");
+    assert!(matches!(
+        native.jit_direct.probe(first_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    // Force the split right after the third mov, so the block stays pure integer and its
+    // fallthrough successor lands exactly on the float block that follows. Nothing about this
+    // program would naturally split here: no cap or terminal opcode does it on its own.
+    let first_compilation =
+        jit::direct::compile_with_instruction_limit_for_test(&mut native, ENTRY, true, 3)
+            .expect("first integer block");
+    assert_eq!(first_compilation.span.instructions, 3);
+    assert!(
+        !first_compilation.has_x87,
+        "first block must stay pure integer for this to test the refused edge"
+    );
+    let first_id = native
+        .jit_direct
+        .install(&first_compilation)
+        .expect("first integer block install");
+    let first_block = native
+        .jit_direct
+        .block(first_id)
+        .expect("first integer block remains live");
+
+    let second_key = jit::direct::key_for(&native, SECOND, true).expect("second block key");
+    assert!(matches!(
+        native.jit_direct.probe(second_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let second_compilation =
+        jit::direct::compile(&mut native, SECOND, true).expect("second float block");
+    assert!(second_compilation.has_x87);
+    let second_id = native
+        .jit_direct
+        .install(&second_compilation)
+        .expect("second float block install");
+    let second_block = native
+        .jit_direct
+        .block(second_id)
+        .expect("second float block remains live");
+
+    arm(&mut native, 0x0f7f);
+    arm(&mut interpreter, 0x0f7f);
+    native.registers.eip = ENTRY;
+    interpreter.registers.eip = ENTRY;
+    native_bus.memory.copy_from_slice(&memory);
+    interpreter_bus.memory.copy_from_slice(&memory);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, first_block)
+            .unwrap()
+    );
+    if native.registers.eip == SECOND {
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, second_block)
+                .unwrap()
+        );
+    }
+    for _ in 0..6 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+
+    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        native.fpu, interpreter.fpu,
+        "an integer source must never chain into a float target: skipping its prologue leaves \
+         the physical x87 cache unloaded and its compile-time TOP unpinned"
+    );
+    assert_eq!(native.registers.eip, END);
 }
 
 #[test]

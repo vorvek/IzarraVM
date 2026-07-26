@@ -588,6 +588,128 @@ fn dynamic_ret_pic_requires_matching_x87_chain_top_and_kind() {
     assert!(cache.link_cells[source_id.index()][0].linked());
 }
 
+// Static-successor (Jmp/Jcc/Call/fallthrough) counterpart of the RET PIC test above: unlike the
+// dynamic path, a static float source is allowed to link into an integer target, with the edge
+// marked spilling so the emitted jump flushes x87 state before handing control over.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn static_link_from_float_source_to_integer_target_is_permitted_and_marked_spilling() {
+    let mut cache = BlockCache::default();
+    let source = key(0x1000);
+    let target = key(0x1100);
+
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.has_x87 = true;
+    source_compilation.x87_entry_top = 2;
+    source_compilation.x87_exit_top = 5;
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let source_id = cache
+        .install(&source_compilation)
+        .expect("float source install");
+
+    // Default trivial_compilation is has_x87 = false: an integer target. Its own
+    // x87_entry_top/x87_exit_top stay at their default 0, a compile-time snapshot the
+    // float-to-integer case never reads (see link_compatible's (true, false) arm).
+    let target_id = install_trivial(&mut cache, target, 1);
+
+    assert!(
+        cache.try_link(source_id, 0, target_id),
+        "a float source must be able to link to an integer target"
+    );
+    assert!(
+        cache.link_cells[source_id.index()][0].is_spilling(),
+        "a float-to-integer edge must be marked spilling"
+    );
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn static_link_from_integer_source_to_float_target_is_refused() {
+    let mut cache = BlockCache::default();
+    let source = key(0x1000);
+    let target = key(0x1100);
+
+    let source_id = install_trivial(&mut cache, source, 1);
+
+    let mut target_compilation =
+        trivial_compilation(BlockSpan::new(target, 1, 1).expect("target span"));
+    target_compilation.has_x87 = true;
+    target_compilation.x87_entry_top = 0;
+    target_compilation.x87_exit_top = 0;
+    assert!(matches!(cache.probe(target), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(target), BlockProbe::Compile));
+    let target_id = cache
+        .install(&target_compilation)
+        .expect("float target install");
+
+    assert!(
+        !cache.try_link(source_id, 0, target_id),
+        "an integer source must not link to a float target: its prologue, and the x87 enter \
+         inside it, would never run"
+    );
+    assert!(!cache.link_cells[source_id.index()][0].linked());
+    assert!(!cache.link_cells[source_id.index()][0].is_spilling());
+}
+
+// A stale spilling flag would make a later float-to-float edge on the same slot spill and
+// re-enter incorrectly, since the target-side float block never expects to be re-entered
+// through its own prologue after a spill. This proves relinking clears it.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn relinking_a_spilling_slot_to_a_matching_float_target_clears_the_stale_flag() {
+    let mut cache = BlockCache::default();
+    let source = key(0x1000);
+    let integer_target = key(0x1100);
+    let float_target = key(0x1200);
+
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.has_x87 = true;
+    source_compilation.x87_entry_top = 3;
+    source_compilation.x87_exit_top = 3;
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let source_id = cache
+        .install(&source_compilation)
+        .expect("float source install");
+
+    let integer_target_id = install_trivial(&mut cache, integer_target, 1);
+    assert!(cache.try_link(source_id, 0, integer_target_id));
+    assert!(cache.link_cells[source_id.index()][0].is_spilling());
+
+    let mut float_target_compilation =
+        trivial_compilation(BlockSpan::new(float_target, 1, 1).expect("float target span"));
+    float_target_compilation.has_x87 = true;
+    float_target_compilation.x87_entry_top = 3;
+    float_target_compilation.x87_exit_top = 3;
+    assert!(matches!(cache.probe(float_target), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(float_target), BlockProbe::Compile));
+    let float_target_id = cache
+        .install(&float_target_compilation)
+        .expect("float target install");
+
+    assert!(cache.try_link(source_id, 0, float_target_id));
+    assert!(
+        cache.link_cells[source_id.index()][0].linked(),
+        "the relink to the matching float target must succeed"
+    );
+    assert!(
+        !cache.link_cells[source_id.index()][0].is_spilling(),
+        "relinking to a matching float target must not leave the old spilling flag set"
+    );
+}
+
 #[cfg(any(
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")
