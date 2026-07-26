@@ -339,16 +339,23 @@ fn movzx_memory_forms_match_the_interpreter_and_its_bus_clocks() {
 }
 
 #[test]
-fn movzx_register_and_word_operand_forms_remain_interpreter_only() {
+fn movzx_word_operand_forms_remain_interpreter_only() {
+    // The four plain REGISTER forms used to be listed here as interpreter-only. They are lowered
+    // as of the MovExtendReg slice, so those rows are gone rather than the test being deleted:
+    // what is left is the 66-prefixed guard, which is the only thing this test was ever uniquely
+    // covering. The OperandSize::Word gate is all that stops these, and `write_gpr_sized` at Word
+    // MERGES into the low 16 bits instead of replacing all 32, so lowering one as the 32-bit form
+    // would clobber the destination's high half.
+    //
+    // Both operand forms are covered now. Before this slice only the 66-prefixed MEMORY forms
+    // were here, so the 66-prefixed REGISTER form -- the one the new lowering could actually
+    // reach -- had no guard at all.
     const ENTRY: u32 = 0x101;
     for code in [
-        vec![0x0fu8, 0xb6, 0xd8], // MOVZX ebx, al: REGISTER form, not lowered
-        vec![0x0f, 0xb7, 0xd8],   // MOVZX ebx, ax
-        vec![0x0f, 0xbe, 0xd8],   // MOVSX ebx, al
-        vec![0x0f, 0xbf, 0xd8],   // MOVSX ebx, ax
-        // 66-prefixed memory forms. The OperandSize::Word gate is the only thing stopping these,
-        // and write_gpr_sized at Word MERGES into the low 16 bits instead of replacing all 32, so
-        // lowering one as the 32-bit form would clobber the destination's high half.
+        vec![0x66u8, 0x0f, 0xb6, 0xd8], // 66 MOVZX bx, al: REGISTER form
+        vec![0x66, 0x0f, 0xb7, 0xd8],   // 66 MOVZX bx, ax
+        vec![0x66, 0x0f, 0xbe, 0xd8],   // 66 MOVSX bx, al
+        vec![0x66, 0x0f, 0xbf, 0xd8],   // 66 MOVSX bx, ax
         vec![0x66, 0x0f, 0xb6, 0x1d, 0x00, 0x00, 0x03, 0x00],
         vec![0x66, 0x0f, 0xbf, 0x1d, 0x00, 0x00, 0x03, 0x00],
     ] {
@@ -2716,4 +2723,291 @@ fn roundtrip_unresolved_exit_versus_linked_transfer_ns() {
         unresolved_minus_linked_ns_per_exit > 0.0,
         "an unresolved round-trip must cost more than staying in linked native code"
     );
+}
+
+/// Eight pairwise-distinct byte lanes, one per guest register, so that reading the WRONG register
+/// or the WRONG lane of the right register both produce a value no correct emitter could.
+///
+/// This is not decoration. The natural mutation here is dropping the `src >= 4` lane adjustment,
+/// which makes a high-byte source read `home(4..=7)`, that is guest ESP, EBP, ESI and EDI. The
+/// precedent fixture in this file seeds with `gpr.fill(0xdead_beef)` and overrides only two
+/// registers, under which every register's byte 1 is 0xbe and that mutation SURVIVES. Every lane
+/// below is distinct, and the test asserts that rather than trusting it.
+const LANE_SEEDS: [u32; 8] = [
+    0x1000_2301, // EAX: AL=0x01 AH=0x23
+    0x1100_4502, // ECX: CL=0x02 CH=0x45
+    0x1200_6703, // EDX: DL=0x03 DH=0x67
+    0x1300_8904, // EBX: BL=0x04 BH=0x89
+    0x0000_ab05, // ESP: must stay a usable stack pointer, so the high half is 0
+    0x1500_cd06, // EBP
+    0x1600_ef07, // ESI
+    0x1700_fe08, // EDI
+];
+
+fn seed_lanes(cpu: &mut CpuGsw) {
+    for (index, value) in LANE_SEEDS.into_iter().enumerate() {
+        cpu.registers.gpr[index] = value;
+    }
+}
+
+/// What the guest's byte register `index` holds under LANE_SEEDS: the low byte for 0..=3, the high
+/// byte of `index - 4` for 4..=7, exactly as the interpreter's `read_gpr8` defines it.
+fn lane_byte(index: u8) -> u8 {
+    let value = LANE_SEEDS[usize::from(index & 3)];
+    if index < 4 {
+        value as u8
+    } else {
+        (value >> 8) as u8
+    }
+}
+
+#[test]
+fn lane_seeds_are_pairwise_distinct() {
+    // The discrimination the batteries below rely on, asserted structurally instead of assumed.
+    let bytes: Vec<u8> = (0..8).map(lane_byte).collect();
+    for i in 0..bytes.len() {
+        for j in (i + 1)..bytes.len() {
+            assert_ne!(
+                bytes[i], bytes[j],
+                "byte registers must differ or the high-byte battery cannot distinguish a wrong \
+                 lane from a wrong register"
+            );
+        }
+    }
+    let words: Vec<u32> = LANE_SEEDS.iter().map(|seed| seed & 0xffff).collect();
+    for (i, left) in words.iter().enumerate() {
+        for right in &words[i + 1..] {
+            assert_ne!(left, right, "word lanes must differ");
+        }
+    }
+}
+
+/// `movzx/movsx <dst32>, <src8|src16>`, register form: 0F <op> /r with mod=11.
+fn movzx_reg_case(signed: bool, word: bool, dst: u8, src: u8) -> Vec<u8> {
+    let opcode: u8 = match (signed, word) {
+        (false, false) => 0xb6,
+        (false, true) => 0xb7,
+        (true, false) => 0xbe,
+        (true, true) => 0xbf,
+    };
+    let modrm = 0b1100_0000 | ((dst & 7) << 3) | (src & 7);
+    let mut code = vec![0x0f, opcode, modrm];
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xf6, 0xf4]);
+    code
+}
+
+/// THE HIGH-BYTE BATTERY. Every byte source 0..=7 for both byte opcodes, differential against the
+/// interpreter and pinned against an independently computed expectation.
+#[test]
+fn movzx_register_forms_read_the_right_byte_lane() {
+    const ENTRY: u32 = 0x101;
+    for signed in [false, true] {
+        for src in 0u8..8 {
+            let code = movzx_reg_case(signed, false, 1, src);
+            let mut memory = vec![0; 0x0004_0000];
+            memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+            let mut native = fresh();
+            let mut interp = fresh();
+            make_data_segments_flat(&mut native);
+            make_data_segments_flat(&mut interp);
+            let mut native_bus = TestBus::with_memory(memory.clone());
+            let mut interp_bus = TestBus::with_memory(memory);
+            for bus in [&mut native_bus, &mut interp_bus] {
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                bus.uniform_native_fetches = true;
+            }
+            let starts = [ENTRY, ENTRY + 3, ENTRY + 5];
+            decode_fixture(&mut native, &mut native_bus, &starts);
+            decode_fixture(&mut interp, &mut interp_bus, &starts);
+            let block = install_fixture_block(&mut native, ENTRY);
+
+            for cpu in [&mut native, &mut interp] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                seed_lanes(cpu);
+                cpu.registers.eflags = 0x0296;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.registers.eip = ENTRY;
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.core_clocks_so_far = 0;
+            }
+            let label = format!("signed={signed} src={src}");
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap(),
+                "{label}: must run natively"
+            );
+            for _ in 0..3 {
+                interp.cycle(&mut interp_bus).unwrap();
+            }
+            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                native.eflags(),
+                interp.eflags(),
+                "{label}: eflags untouched"
+            );
+            assert_eq!(
+                native.elapsed_clocks, interp.elapsed_clocks,
+                "{label}: core clocks"
+            );
+            // Pinned independently of the interpreter, so both sides being wrong the same way
+            // still fails.
+            let raw = lane_byte(src);
+            let expected = if signed {
+                raw as i8 as i32 as u32
+            } else {
+                u32::from(raw)
+            };
+            assert_eq!(native.registers.ecx(), expected, "{label}: extended value");
+        }
+    }
+}
+
+/// Word sources, sign polarity, a destination index above 3, and dst == src aliasing including the
+/// high-byte case where the source's base home IS the destination.
+#[test]
+fn movzx_register_forms_cover_widths_polarity_and_aliasing() {
+    const ENTRY: u32 = 0x101;
+    // (word, dst, src). ESP is never a destination: overwriting it mid-block would leave the
+    // fixture without a stack, which is a fixture bug rather than a lowering test.
+    let cases: &[(bool, u8, u8)] = &[
+        (true, 3, 1),  // movzx ebx, cx: the shape that is 90 percent of the measured cell
+        (true, 0, 0),  // dst == src, word
+        (true, 6, 2),  // destination index above 3
+        (false, 0, 4), // movzx eax, ah: dst home IS the high-byte source's base
+        (false, 3, 7), // movzx ebx, bh: same, on a different register
+        (false, 6, 5), // destination above 3 with a high-byte source
+    ];
+    for signed in [false, true] {
+        for &(word, dst, src) in cases {
+            let code = movzx_reg_case(signed, word, dst, src);
+            let mut memory = vec![0; 0x0004_0000];
+            memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+            let mut native = fresh();
+            let mut interp = fresh();
+            make_data_segments_flat(&mut native);
+            make_data_segments_flat(&mut interp);
+            let mut native_bus = TestBus::with_memory(memory.clone());
+            let mut interp_bus = TestBus::with_memory(memory);
+            for bus in [&mut native_bus, &mut interp_bus] {
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                bus.uniform_native_fetches = true;
+            }
+            let starts = [ENTRY, ENTRY + 3, ENTRY + 5];
+            decode_fixture(&mut native, &mut native_bus, &starts);
+            decode_fixture(&mut interp, &mut interp_bus, &starts);
+            let block = install_fixture_block(&mut native, ENTRY);
+            for cpu in [&mut native, &mut interp] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                seed_lanes(cpu);
+                cpu.registers.eflags = 0x0296;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.registers.eip = ENTRY;
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.core_clocks_so_far = 0;
+            }
+            let label = format!("signed={signed} word={word} dst={dst} src={src}");
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap(),
+                "{label}: must run natively"
+            );
+            for _ in 0..3 {
+                interp.cycle(&mut interp_bus).unwrap();
+            }
+            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                native.eflags(),
+                interp.eflags(),
+                "{label}: eflags untouched"
+            );
+
+            let expected = if word {
+                let raw = (LANE_SEEDS[usize::from(src)] & 0xffff) as u16;
+                if signed {
+                    raw as i16 as i32 as u32
+                } else {
+                    u32::from(raw)
+                }
+            } else {
+                let raw = lane_byte(src);
+                if signed {
+                    raw as i8 as i32 as u32
+                } else {
+                    u32::from(raw)
+                }
+            };
+            assert_eq!(
+                native.registers.gpr[usize::from(dst)],
+                expected,
+                "{label}: all 32 destination bits must be replaced, never merged"
+            );
+        }
+    }
+}
+
+/// Registration: this form touches NO memory, so a copy-paste of the memory variant's declarations
+/// is caught here. And raw_clocks is 3, not the DirectKind default of 2.
+#[test]
+fn movzx_register_form_declares_no_memory_and_three_clocks() {
+    const ENTRY: u32 = 0x101;
+    let code = movzx_reg_case(false, true, 3, 1);
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    let starts = [ENTRY, ENTRY + 3, ENTRY + 5];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    let block = install_fixture_block(&mut cpu, ENTRY);
+    assert_eq!(block.span().instructions, 3, "whole block admitted");
+    assert_eq!(block.byte_reads(), 0, "no byte read");
+    assert_eq!(block.word_reads(), 0, "no word read");
+    assert_eq!(block.dword_reads(), 0, "no dword read");
+    assert!(!block.has_wide_accesses(), "no wide access");
+    // clocks(3) for the MOVZX per every interpreter arm, plus 2 each for the two register moves.
+    assert_eq!(block.raw_clocks(), 3 + 2 + 2, "charged core clocks");
+}
+
+#[test]
+fn movzx_register_forms_are_lowered() {
+    // The positive control for the 66-prefixed negative list, and the only test that catches the
+    // classify arm being keyed on the low opcode byte, where the u8 truncation makes it
+    // unreachable for a two-byte opcode.
+    const ENTRY: u32 = 0x101;
+    for (signed, word) in [(false, false), (false, true), (true, false), (true, true)] {
+        let code = movzx_reg_case(signed, word, 3, 1);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let starts = [ENTRY, ENTRY + 3, ENTRY + 5];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        let instructions = outcome
+            .is_some()
+            .then(|| outcome.unwrap().span.instructions);
+        assert_eq!(
+            instructions,
+            Some(3),
+            "signed={signed} word={word} register form must admit and carry the whole block"
+        );
+    }
 }

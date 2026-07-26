@@ -165,6 +165,12 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 emit_read_store_value(&mut e, StoreSource::Reg(src), MemoryWidth::Byte, Reg::RDX);
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
             }
+            DirectKind::MovExtendReg {
+                dst,
+                src,
+                width,
+                signed,
+            } => emit_mov_extend_reg(&mut e, dst, src, width, signed),
             DirectKind::MovImm { dst, imm } => e.mov_r32_imm32(home(dst), imm),
             DirectKind::MovImmByte { dst, imm } => {
                 e.mov_r32_imm32(Reg::RDX, u32::from(imm));
@@ -2459,6 +2465,35 @@ fn emit_code_watch_table_branch(
         e.jcc(2, watched);
     }
     e.jmp(unwatched);
+}
+
+/// MOVZX and MOVSX, register form. No memory access, no flags on any path, so the lazy-flag
+/// descriptor is untouched and there are no side exits.
+fn emit_mov_extend_reg(e: &mut Encoder, dst: u8, src: u8, width: MemoryWidth, signed: bool) {
+    // emit_read_store_value already extracts the byte or word and ZERO-extends it, including the
+    // case that makes this slice dangerous: at Byte width `src` 4..=7 means AH/CH/DH/BH, which is
+    // bits 8-15 of home(src - 4), and no host home's bits 8-15 are addressable as an x86-64
+    // high-byte register. That lane arithmetic is `read_gpr8` transliterated, so reusing it keeps
+    // the two definitions from drifting instead of re-deriving it here.
+    emit_read_store_value(e, StoreSource::Reg(src), width, Reg::RDX);
+    match (width, signed) {
+        (MemoryWidth::Byte, true) => e.movsx_r32_r8(Reg::RDX, Reg::RDX),
+        (MemoryWidth::Word, true) => e.movsx_r32_r16(Reg::RDX, Reg::RDX),
+        (MemoryWidth::Byte | MemoryWidth::Word, false) => {}
+        // classify derives the width from the sub-opcode and can only produce Byte or Word. The
+        // arm covers BOTH polarities on purpose: at Dword, emit_read_store_value falls through to
+        // a plain 32-bit move with no mask, so an unsigned Dword would silently copy the whole
+        // source register instead of failing. Mirrors emit_load_extend's guard.
+        (MemoryWidth::Dword, _) => {
+            unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
+        }
+    }
+    // These instructions define all 32 bits, so the write is the full register home. Narrowing it
+    // the way a MOV r8/r16 has to would preserve the destination's upper bits and be wrong.
+    //
+    // dst == src is safe by construction, including `movzx eax, ah`: the whole value is
+    // materialised into RDX before the single write, and no guest home is RDX.
+    e.mov_r32_r32(home(dst), Reg::RDX);
 }
 
 fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidth, value: Reg) {

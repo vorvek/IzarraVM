@@ -1957,6 +1957,26 @@ pub(crate) enum DirectKind {
         addr: DirectAddr,
         raw_clocks: u8,
     },
+    /// MOVZX/MOVSX r32, r8 or r16, REGISTER form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF, mod == 3).
+    ///
+    /// `width` is the SOURCE width and is only ever Byte or Word; the destination is always the
+    /// full 32-bit register, which is the point of the instruction.
+    ///
+    /// `src` at Byte width is a BYTE-REGISTER index, so 4 to 7 mean AH, CH, DH and BH, the high
+    /// byte of `home(src - 4)`. It is NOT a home index and shared code must never use it as one.
+    /// At Word width it is an ordinary register index. This matches what the interpreter's
+    /// `read_gpr8` does with the same field, which is why `emit_read_store_value` can be reused
+    /// verbatim rather than the lane arithmetic re-derived here.
+    ///
+    /// Separate from `LoadExtend` because that variant carries a `DirectAddr` and the whole
+    /// memory registration set. A register form needs none of it and must not be handed a
+    /// fabricated address.
+    MovExtendReg {
+        dst: u8,
+        src: u8,
+        width: MemoryWidth,
+        signed: bool,
+    },
     Store {
         source: StoreSource,
         width: MemoryWidth,
@@ -2048,6 +2068,11 @@ impl DirectKind {
             Self::Load { raw_clocks, .. }
             | Self::LoadExtend { raw_clocks, .. }
             | Self::Store { raw_clocks, .. } => u32::from(raw_clocks),
+            // All four MOVZX/MOVSX interpreter arms return clocks(3) for BOTH operand forms
+            // (execute.rs, and the hot-cached path in run.rs charges the same), against a default
+            // of 2. The memory forms carry it as a field because Load and Store do; the register
+            // form has no other field worth carrying, so it is a constant arm.
+            Self::MovExtendReg { .. } => 3,
             Self::X87 { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
