@@ -2367,11 +2367,23 @@ const EXIT_ARG: Reg = Reg::R9;
 #[cfg(not(target_os = "windows"))]
 const EXIT_ARG: Reg = Reg::RCX;
 
-const NATIVE_STACK_LEN: u32 = 160;
+// Base frame: 20 accounting and scratch slots at 8 bytes each, offsets 0 to
+// 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes.
+const BASE_STACK_LEN: u32 = 160;
+// One frame shape for every block, x87-bearing or not. A chained native
+// transfer jumps straight into a target block's body, skipping its
+// prologue, so the target's own epilogue always runs against whatever
+// frame the entering block's prologue built. If the two frame shapes
+// differ, that teardown pops the wrong bytes. On Windows the frame also
+// carries the saved-RSI slot below and the x87 XMM6-11 save area; RSI is
+// callee-saved there and doubles as the x87 tag-cache scratch register, and
+// none of the XMM6-11 registers are. On non-Windows RSI is not
+// callee-saved and there is no non-volatile XMM to save, so the frame is
+// just the base.
 #[cfg(target_os = "windows")]
-const AVX2_X87_STACK_LEN: u32 = NATIVE_STACK_LEN + 8 + 6 * 16;
+const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN + 8 + 6 * 16;
 #[cfg(not(target_os = "windows"))]
-const AVX2_X87_STACK_LEN: u32 = NATIVE_STACK_LEN;
+const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN;
 const STACK_QUOTA: i8 = 0;
 const STACK_ITERATIONS: i8 = 8;
 const STACK_RAM_BYTE_WRITES: i8 = 16;
@@ -2393,6 +2405,25 @@ const STACK_ALU_ADDRESS_KIND: i32 = 128;
 const STACK_ALU_OLD_RESULT: i32 = 136;
 const STACK_ALU_FLAGS: i32 = 144;
 const STACK_SHIFT_COUNT: i32 = 152;
+// Beyond the base frame: the saved host RSI slot, then the x87 XMM6-11
+// save area right after it. Both Windows only, see NATIVE_STACK_LEN above.
+#[cfg(target_os = "windows")]
+const STACK_SAVED_RSI: i32 = BASE_STACK_LEN as i32;
+#[cfg(target_os = "windows")]
+const STACK_X87_XMM_BASE: i32 = STACK_SAVED_RSI + 8;
+// The saved-RSI slot and the XMM6-11 save area must both land inside the frame NATIVE_STACK_LEN
+// actually allocates. A wrong STACK_X87_XMM_BASE (a stale copy of an old constant, say) would
+// make the first XMM save overwrite the saved RSI slot and hand garbage RSI back to the Rust
+// caller, silently, since the frame-size test only checks the sub rsp / add rsp immediates
+// agree, not that the areas inside the frame do not collide.
+#[cfg(target_os = "windows")]
+const _: () = {
+    assert!(STACK_SAVED_RSI as u32 + 8 <= STACK_X87_XMM_BASE as u32);
+    assert!(
+        STACK_X87_XMM_BASE as u32 + emit::X87_NONVOLATILE_XMMS.len() as u32 * 16
+            <= NATIVE_STACK_LEN
+    );
+};
 const COUNTER_RAM_BYTE_WRITE: u16 = 1 << 0;
 const COUNTER_RAM_DWORD_WRITE: u16 = 1 << 1;
 const COUNTER_MODE13_BYTE_WRITE: u16 = 1 << 2;

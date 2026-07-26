@@ -218,6 +218,79 @@ fn quake_hot_x87_sequence_matches_interpreter_in_486_and_586_modes() {
     }
 }
 
+fn integer_only_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0x83, 0xc0, 0x02, // add eax,2
+        0x83, 0xc0, 0x03, // add eax,3
+        0xf4, // hlt
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory
+}
+
+// Locates a REX.W 81 /r prologue-or-epilogue immediate (sub rsp is /5, add rsp is /0) and
+// returns the imm32 that follows it. Guest ALU code never targets RSP with a 64-bit
+// immediate op, so this three-byte prefix is unique to the frame setup and teardown.
+fn imm32_after(code: &[u8], prefix: [u8; 3]) -> u32 {
+    let at = code
+        .windows(prefix.len())
+        .position(|window| window == prefix)
+        .unwrap_or_else(|| panic!("prefix {prefix:02x?} not found in emitted code"));
+    let imm_at = at + prefix.len();
+    u32::from_le_bytes(code[imm_at..imm_at + 4].try_into().unwrap())
+}
+
+fn frame_setup_and_teardown_immediates(
+    memory: Vec<u8>,
+    control: u16,
+    expect_x87: bool,
+) -> (u32, u32) {
+    let mut cpu = x87_cpu(GswMode::Gsw586);
+    let mut bus = direct_memory(memory);
+    arm(&mut cpu, control);
+    run_to_halt(&mut cpu, &mut bus);
+
+    arm(&mut cpu, control);
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("block compiles");
+    assert_eq!(
+        compilation.has_x87, expect_x87,
+        "test fixture drifted: this block's x87-bearing-ness no longer matches what the test \
+         means to compare, which would make this test compare two integer (or two x87) frames \
+         against each other and pass trivially"
+    );
+    let sub_rsp = imm32_after(&compilation.code, [0x48, 0x81, 0xec]);
+    let add_rsp = imm32_after(&compilation.code, [0x48, 0x81, 0xc4]);
+    (sub_rsp, add_rsp)
+}
+
+// A chained native transfer jumps straight into a target block's body, skipping its own
+// prologue, so the target's epilogue always tears down whatever frame the entering block's
+// prologue built. That only works if every block, x87-bearing or not, builds the same frame
+// shape: the same sub rsp immediate in the prologue as the add rsp immediate in the
+// epilogue, and that same immediate across both kinds of block.
+#[test]
+fn native_frame_size_matches_between_x87_and_integer_blocks() {
+    let (x87_sub, x87_add) = frame_setup_and_teardown_immediates(quake_hot_program(), 0x0f7f, true);
+    let (int_sub, int_add) =
+        frame_setup_and_teardown_immediates(integer_only_program(), 0x0f7f, false);
+
+    assert_eq!(
+        x87_sub, x87_add,
+        "x87 block: prologue sub rsp must match epilogue add rsp"
+    );
+    assert_eq!(
+        int_sub, int_add,
+        "integer block: prologue sub rsp must match epilogue add rsp"
+    );
+    assert_eq!(
+        x87_sub, int_sub,
+        "x87 and integer blocks must emit the same native frame size"
+    );
+}
+
 #[test]
 fn linked_x87_blocks_keep_stack_state_resident_and_validate_root_top() {
     const SECOND: u32 = ENTRY + 24;
