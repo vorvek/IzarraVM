@@ -51,6 +51,8 @@ pub const VCPIDET_COM: &[u8] = include_bytes!("../roms/dos/vcpidet.com");
 pub const VCPIDET_COM_SOURCE: &str = include_str!("../roms/dos/vcpidet.asm");
 pub const VCPIMEM_COM: &[u8] = include_bytes!("../roms/dos/vcpimem.com");
 pub const VCPIMEM_COM_SOURCE: &str = include_str!("../roms/dos/vcpimem.asm");
+pub const VCPILOW_COM: &[u8] = include_bytes!("../roms/dos/vcpilow.com");
+pub const VCPILOW_COM_SOURCE: &str = include_str!("../roms/dos/vcpilow.asm");
 pub const VCPIIF_COM: &[u8] = include_bytes!("../roms/dos/vcpiif.com");
 pub const VCPIIF_COM_SOURCE: &str = include_str!("../roms/dos/vcpiif.asm");
 pub const VCPISW_COM: &[u8] = include_bytes!("../roms/dos/vcpisw.com");
@@ -265,6 +267,11 @@ pub fn vcpidet_com() -> &'static [u8] {
 /// Signals 0xA5 / 0xEn.
 pub fn vcpimem_com() -> &'static [u8] {
     VCPIMEM_COM
+}
+
+/// Small-memory XMS/VCPI bounds and empty-pool fixture.
+pub fn vcpilow_com() -> &'static [u8] {
+    VCPILOW_COM
 }
 
 /// The VCPI DE01 fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): validates the

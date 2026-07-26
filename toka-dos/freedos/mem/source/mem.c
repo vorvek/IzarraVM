@@ -535,9 +535,12 @@ typedef void far (*xms_drv_t)(void);
 void far (*xms_drv)(void);
 
 #define TOKA_CATEGORY_MAGIC 0x544B
+#define TOKA_SPLIT_MAGIC    0x544C
 
 static ushort toka_xms_category_k;
 static ushort toka_ems_category_k;
+static ushort toka_vcpi_free_k;
+static int toka_split_pools;
 
 /*
  * The last segment address that is in conventional memory.
@@ -700,11 +703,13 @@ parm [ah] [dx] value [dx ax] modify [bx]
 
 unsigned toka_xms_categories(void);
 #pragma aux toka_xms_categories = \
-    "mov ax, 0xf000" \
+    "xor dx, dx" \
+    "mov ax, 0xf001" \
     "call dword ptr [xms_drv]" \
     "mov [toka_xms_category_k], bx" \
     "mov [toka_ems_category_k], cx" \
-value [ax] modify [bx cx]
+    "mov [toka_vcpi_free_k], dx" \
+value [ax] modify [bx cx dx]
 
 unsigned check_8800(void);
 #pragma aux check_8800 =\
@@ -935,11 +940,15 @@ static unsigned toka_xms_categories(void)
 
     asm push bx
     asm push cx
-    asm mov ax, 0f000h
+    asm push dx
+    asm xor dx, dx
+    asm mov ax, 0f001h
     asm call dword ptr xms_drv
     asm mov magic, ax
     asm mov toka_xms_category_k, bx
     asm mov toka_ems_category_k, cx
+    asm mov toka_vcpi_free_k, dx
+    asm pop dx
     asm pop cx
     asm pop bx
 

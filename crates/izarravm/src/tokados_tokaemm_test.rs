@@ -77,9 +77,12 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 #[test]
-#[ignore = "boots three full DOS images in V86 (slow in debug); run with --ignored"]
+#[ignore = "boots six full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_small_ram_layouts_do_not_expose_out_of_range_pools() {
-    for memory_mib in [1, 2, 4] {
+    for (memory_mib, emm_arg) in [1, 2, 4]
+        .into_iter()
+        .flat_map(|memory_mib| [(memory_mib, "RAM"), (memory_mib, "NOEMS")])
+    {
         let dir = std::env::temp_dir().join(format!(
             "tokaemm_small_{memory_mib}_{}_{}",
             std::process::id(),
@@ -89,10 +92,12 @@ fn tokaemm_small_ram_layouts_do_not_expose_out_of_range_pools() {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
-        let config = b"FILES=20\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+        let config = format!(
+            "FILES=20\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
-            .to_vec();
-        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVER\r\n".to_vec();
+        )
+        .into_bytes();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPILOW\r\n".to_vec();
         let profile = MachineProfile::gsw_386(memory_mib, VideoCard::Vega);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
@@ -106,6 +111,10 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
                         "TOKAEMM.SYS".to_string(),
                         izarravm_firmware::tokaemm_sys().to_vec(),
                     ),
+                    (
+                        "VCPILOW.COM".to_string(),
+                        izarravm_firmware::vcpilow_com().to_vec(),
+                    ),
                 ],
             )
             .expect("mount host folder with overrides");
@@ -115,12 +124,11 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
             .expect("machine run");
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
-        if let StopReason::CpuError(msg) = &stop {
-            panic!("TOKAEMM faulted with {memory_mib} MiB: {msg}\n{text}");
-        }
-        assert!(
-            text.to_ascii_lowercase().contains("c:\\>"),
-            "Toka-DOS did not reach a prompt with {memory_mib} MiB (stop={stop:?}).\n{text}"
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "small-memory pool probe failed with {memory_mib} MiB {emm_arg} \
+             (stop={stop:?}); a 0xEn code names the failed step.\n{text}"
         );
     }
 }
@@ -530,62 +538,65 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// VCPI queries and page-pool behavior under DEVICE=TOKAEMM.SYS NOEMS. The
-/// DE02-DE0B set answers — free-page count over a real pool, max-page
+/// VCPI queries and page-pool behavior under RAM and NOEMS at 16 and 24 MiB.
+/// The DE02-DE0B set answers free-page count over a real pool, max-page
 /// query, alloc/free round-trip with 12-LSB masking, bad-free and
 /// double-free rejection, V86 page-table lookups (identity + out-of-range
 /// 8Bh), CR0 with PE|PG, the debug-register array shape, and the 8259
 /// mapping report/record round-trip. VCPIMEM signals 0xA5 / 0xEn.
 #[test]
-#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+#[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m1_queries_and_page_pool() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_vcpi1_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
+    for (memory_mib, emm_arg) in [(16, "RAM"), (16, "NOEMS"), (24, "RAM"), (24, "NOEMS")] {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_vcpi1_{memory_mib}_{emm_arg}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let config = format!(
+            "FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
-        .to_vec();
-    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIMEM\r\n".to_vec();
-
-    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            &dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "VCPIMEM.COM".to_string(),
-                    izarravm_firmware::vcpimem_com().to_vec(),
-                ),
-            ],
         )
-        .expect("mount host folder with overrides");
-
-    let stop = machine
-        .run_until_halt_or_cycles(800_000_000)
-        .expect("machine run");
-    let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
-    assert_eq!(
-        stop,
-        StopReason::TestExit { code: 0xA5 },
-        "VCPI query/page-pool contract did not report success (stop={stop:?}); \
-             a 0xEn code names the failed step.\n{text}"
-    );
+        .into_bytes();
+        let profile = MachineProfile::gsw_386(memory_mib, VideoCard::Vega);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    (
+                        "AUTOEXEC.BAT".to_string(),
+                        b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIMEM\r\n".to_vec(),
+                    ),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "VCPIMEM.COM".to_string(),
+                        izarravm_firmware::vcpimem_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "VCPI query/page-pool contract failed with {memory_mib} MiB {emm_arg} \
+             (stop={stop:?}); a 0xEn code names the failed step.\n{text}"
+        );
+    }
 }
 
 /// Under DEVICE=TOKAEMM.SYS NOEMS, VCPI DE01 Get Protected Mode
@@ -649,7 +660,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 /// A minimal real VCPI client uses DE0C to walk the full extender
-/// lifecycle under DEVICE=TOKAEMM.SYS NOEMS: DE01 interface setup,
+/// lifecycle under RAM and NOEMS at 16 and 24 MiB: DE01 interface setup,
 /// DE0C into 16-bit protected mode under its own CR3/GDT/TSS (the
 /// JEMM-traced switch flow), far-calls to the server PM entry (DE03
 /// equal to the V86 baseline, DE04/DE05 round-trip), DE0C back to V86,
@@ -657,55 +668,58 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// contract across both switches and the pool balanced at the end.
 /// VCPISW signals 0xA5 / 0xEn.
 #[test]
-#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+#[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_vcpi3_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
+    for (memory_mib, emm_arg) in [(16, "RAM"), (16, "NOEMS"), (24, "RAM"), (24, "NOEMS")] {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_vcpi3_{memory_mib}_{emm_arg}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let config = format!(
+            "FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
-        .to_vec();
-    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec();
-
-    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            &dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "VCPISW.COM".to_string(),
-                    izarravm_firmware::vcpisw_com().to_vec(),
-                ),
-            ],
         )
-        .expect("mount host folder with overrides");
-
-    let stop = machine
-        .run_until_halt_or_cycles(800_000_000)
-        .expect("machine run");
-    let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
-    assert_eq!(
-        stop,
-        StopReason::TestExit { code: 0xA5 },
-        "VCPI switch round-trip did not report success (stop={stop:?}); \
-             a 0xEn code names the failed step (0xEF = DE0C returned).\n{text}"
-    );
+        .into_bytes();
+        let profile = MachineProfile::gsw_386(memory_mib, VideoCard::Vega);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    (
+                        "AUTOEXEC.BAT".to_string(),
+                        b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec(),
+                    ),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "VCPISW.COM".to_string(),
+                        izarravm_firmware::vcpisw_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "VCPI switch round-trip failed with {memory_mib} MiB {emm_arg} \
+             (stop={stop:?}); a 0xEn code names the failed step.\n{text}"
+        );
+    }
 }
 
 /// A V86 program hooks INT 0Dh and
@@ -1016,7 +1030,11 @@ struct MemScreen {
     cells: Vec<(u8, u8)>,
 }
 
-fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (MemScreen, StopReason) {
+fn run_mem_autoexec_with_emm(
+    dir_suffix: &str,
+    commands: &str,
+    emm_arg: Option<&str>,
+) -> (MemScreen, StopReason) {
     let dir = std::env::temp_dir().join(format!(
         "tokaemm_mem_{dir_suffix}_{}_{}",
         std::process::id(),
@@ -1032,8 +1050,19 @@ fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (MemScreen, StopReason)
     let profile = MachineProfile::gsw_386(24, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+    let mut overrides = vec![("AUTOEXEC.BAT".to_string(), autoexec)];
+    if let Some(emm_arg) = emm_arg {
+        overrides.push((
+            "CONFIG.SYS".to_string(),
+            format!(
+                "FILES=40\r\nLASTDRIVE=D\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
+DOS=HIGH,UMB\r\nSHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            )
+            .into_bytes(),
+        ));
+    }
     machine
-        .mount_hdd_folder_with(&dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
+        .mount_hdd_folder_with(&dir, overrides)
         .expect("mount host folder with overrides");
 
     // /P retains upstream's /PAGE pausing behavior on top of the Toka-DOS
@@ -1068,8 +1097,25 @@ fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (MemScreen, StopReason)
     (screen, stop)
 }
 
+fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (MemScreen, StopReason) {
+    run_mem_autoexec_with_emm(dir_suffix, commands, None)
+}
+
 fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (MemScreen, StopReason) {
     run_mem_autoexec(dir_suffix, &format!("MEM {mem_args}"))
+}
+
+fn assert_extended_category(screen: &MemScreen, total: &str, free: &str) {
+    let line = screen
+        .text
+        .lines()
+        .find(|line| line.starts_with("Extended (XMS)"))
+        .unwrap_or_else(|| panic!("MEM extended-memory row missing.\n{}", screen.text));
+    assert!(
+        line.contains(total) && line.contains(free),
+        "MEM reported the wrong combined XMS/VCPI total or free space.\n{}",
+        screen.text
+    );
 }
 
 fn memory_map_rows(screen: &MemScreen) -> Vec<&[(u8, u8)]> {
@@ -1134,6 +1180,7 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         conventional.contains("600K"),
         "the high page tables should leave about 600 KiB conventional memory free.\n{text}"
     );
+    assert_extended_category(&screen, "20,480K", "20,132K");
 
     let rows = memory_map_rows(&screen);
     assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
@@ -1153,6 +1200,24 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
             "MEM map range {range:?} should use attribute {attribute:#04x}.\n{text}"
         );
     }
+}
+
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_mem_noems_reports_combined_extended_free() {
+    let (screen, stop) = run_mem_autoexec_with_emm("noems", "MEM", Some("NOEMS"));
+    if let StopReason::CpuError(msg) = &stop {
+        panic!(
+            "CPU fault while running MEM with NOEMS: {msg}\n{}",
+            screen.text
+        );
+    }
+    assert!(
+        screen.text.to_ascii_lowercase().contains("c:\\>"),
+        "no C:\\> prompt after MEM ran with NOEMS (stop={stop:?}).\n{}",
+        screen.text
+    );
+    assert_extended_category(&screen, "23,552K", "23,204K");
 }
 
 #[test]

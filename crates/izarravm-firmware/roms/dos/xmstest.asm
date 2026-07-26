@@ -5,8 +5,9 @@
 ;
 ; Install-check (INT 2Fh 4300) -> get entry (4310) -> version -> alloc 64 KB ->
 ; lock -> move a pattern conventional->EMB -> move EMB->conventional -> verify ->
-; unlock -> free, then signal 0xA5 (success) via the unit-tester exit port. Any
-; other code names the step that broke (0xEn), so a NO-GO localizes the failure.
+; unlock -> free, then repeat the move at the end of a near-full EMB and verify
+; a failed growth leaves the old allocation intact. Success is 0xA5; 0xEn
+; names the step that broke.
 ;
 ; Build: nasm -f bin xmstest.asm -o xmstest.com
 cpu 386
@@ -172,6 +173,101 @@ start:
     or ax, ax
     jz f_free
 
+    ; 12. Allocate the largest free EMB and write the pattern to its last
+    ; 256 bytes. This exercises the dedicated XMS pool at its boundary.
+    mov ah, 0x08
+    call far [entry]
+    or ax, ax
+    jz f_large
+    mov [large_kb], ax
+    mov dx, ax
+    mov ah, 0x09
+    call far [entry]
+    or ax, ax
+    jz f_large
+    mov [handle], dx
+    movzx eax, word [large_kb]
+    shl eax, 10
+    sub eax, 256
+    mov [large_off], eax
+    mov dword [d_len], 256
+    mov word [d_srch], 0
+    mov word [d_srcoff], srcbuf
+    mov ax, cs
+    mov word [d_srcoff+2], ax
+    mov ax, [handle]
+    mov [d_dsth], ax
+    mov eax, [large_off]
+    mov [d_dstoff], eax
+    mov ah, 0x0B
+    mov si, desc
+    call far [entry]
+    or ax, ax
+    jz f_large
+
+    ; A deliberately impossible growth must fail and restore the old handle.
+    mov ah, 0x0F
+    mov bx, 0xFFFF
+    mov dx, [handle]
+    call far [entry]
+    or ax, ax
+    jnz f_large
+    cmp bl, 0xA0
+    jne f_large
+    mov ah, 0x0E
+    mov dx, [handle]
+    call far [entry]
+    or ax, ax
+    jz f_large
+    cmp dx, [large_kb]
+    jne f_large
+
+    ; Lock the restored handle, read the end pattern back, and release it.
+    mov ah, 0x0C
+    mov dx, [handle]
+    call far [entry]
+    or ax, ax
+    jz f_large
+    push es
+    push cs
+    pop es
+    mov di, dstbuf
+    mov cx, 256
+    xor al, al
+    rep stosb
+    pop es
+    mov dword [d_len], 256
+    mov ax, [handle]
+    mov [d_srch], ax
+    mov eax, [large_off]
+    mov [d_srcoff], eax
+    mov word [d_dsth], 0
+    mov word [d_dstoff], dstbuf
+    mov ax, cs
+    mov word [d_dstoff+2], ax
+    mov ah, 0x0B
+    mov si, desc
+    call far [entry]
+    or ax, ax
+    jz f_large
+    mov si, dstbuf
+    mov cx, 256
+.large_verify:
+    lodsb
+    cmp al, 0x5A
+    jne f_large
+    loop .large_verify
+    mov ah, 0x0D
+    mov dx, [handle]
+    call far [entry]
+    or ax, ax
+    jz f_large
+    mov ah, 0x0A
+    mov dx, [handle]
+    call far [entry]
+    or ax, ax
+    jz f_large
+
     mov al, OK
     jmp sig
 
@@ -201,6 +297,8 @@ f_info:     mov al, 0xEC
             jmp sig
 f_resize:   mov al, 0xED
             jmp sig
+f_large:    mov al, 0xEE
+            jmp sig
 f_free:     mov al, 0xE8
 
 sig:
@@ -215,6 +313,8 @@ sig:
 
 entry:   dd 0
 handle:  dw 0
+large_kb: dw 0
+large_off: dd 0
 desc:
 d_len:    dd 0
 d_srch:   dw 0

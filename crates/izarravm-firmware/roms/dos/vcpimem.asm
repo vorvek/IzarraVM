@@ -15,8 +15,7 @@ org 0x100
 %define OK 0xA5
 
 start:
-    ; Reserve one shared-arena page through XMS before VCPI starts. The two
-    ; interfaces must not return or release each other's pages.
+    ; Find the XMS entry and capture the VCPI baseline before either test phase.
     mov ax, 0x4300
     int 0x2F
     cmp al, 0x80
@@ -25,8 +24,23 @@ start:
     int 0x2F
     mov [xms_entry], bx
     mov [xms_entry+2], es
+    mov ax, 0xDE03
+    int 0x67
+    or ah, ah
+    jnz f_count
+    mov [free0], edx
+    cmp edx, 256
+    jb f_count
+
+    ; Allocate and lock the whole largest XMS run. VCPI's free count must not
+    ; change, and its first allocated page must lie outside the XMS range.
+    mov ah, 0x08
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov [xms_largest], ax
     mov ah, 0x09
-    mov dx, 4
+    mov dx, [xms_largest]
     call far [xms_entry]
     or ax, ax
     jz f_xms
@@ -37,17 +51,18 @@ start:
     jz f_xms
     mov [xms_page], bx
     mov [xms_page+2], dx
-
-    ; 1. DE03: free page count >= 256 (a real pool, at least 1 MB on this box)
+    movzx eax, word [xms_largest]
+    shl eax, 10
+    add eax, [xms_page]
+    mov [xms_end], eax
     mov ax, 0xDE03
     int 0x67
     or ah, ah
     jnz f_count
-    mov [free0], edx
-    cmp edx, 256
-    jb f_count
+    cmp edx, [free0]
+    jne f_owner
 
-    ; 2. DE02: highest page: nonzero, 4K-aligned, above 1 MB
+    ; 1. DE02: highest page: nonzero, 4K-aligned, above 1 MB
     mov ax, 0xDE02
     int 0x67
     or ah, ah
@@ -58,8 +73,7 @@ start:
     jb f_max
     mov [maxpg], edx
 
-    ; 3. DE04: allocate a page: 4K-aligned, above 1 MB, <= the DE02 ceiling,
-    ;    and DE03 drops by exactly one
+    ; 2. DE04: allocate a page outside the live XMS range. DE03 drops by one.
     mov ax, 0xDE04
     int 0x67
     or ah, ah
@@ -71,7 +85,10 @@ start:
     cmp edx, [maxpg]
     ja f_alloc
     cmp edx, [xms_page]
-    je f_owner
+    jb .outside_xms
+    cmp edx, [xms_end]
+    jb f_owner
+.outside_xms:
     mov [page1], edx
     mov ax, 0xDE03
     int 0x67
@@ -80,7 +97,7 @@ start:
     cmp edx, ecx
     jne f_alloc
 
-    ; 4. DE05: free it (with junk in the 12 LSBs: the server must mask),
+    ; 3. DE05: free it (with junk in the 12 LSBs: the server must mask),
     ;    and DE03 returns to the starting count
     mov edx, [page1]
     or edx, 0xABC
@@ -93,28 +110,65 @@ start:
     cmp edx, [free0]
     jne f_free
 
-    ; DE05 must reject the page owned by the live XMS handle.
+    ; DE05 must reject a page in the live XMS range.
     mov edx, [xms_page]
     mov ax, 0xDE05
     int 0x67
     or ah, ah
     jz f_owner
 
-    ; 5. DE05 on conventional memory (never a pool page) -> nonzero AH
+    mov ah, 0x0D                 ; unlock and free the full XMS run
+    mov dx, [xms_handle]
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov ah, 0x0A
+    mov dx, [xms_handle]
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+
+    ; Hold a VCPI page and prove both XMS free-space results stay unchanged.
+    mov ah, 0x08
+    call far [xms_entry]
+    mov [xms_largest], ax
+    mov [xms_total], dx
+    mov ax, 0xDE04
+    int 0x67
+    or ah, ah
+    jnz f_alloc
+    mov [page1], edx
+    mov ah, 0x08
+    call far [xms_entry]
+    cmp ax, [xms_largest]
+    jne f_owner
+    cmp dx, [xms_total]
+    jne f_owner
+    mov edx, [page1]
+    mov ax, 0xDE05
+    int 0x67
+    or ah, ah
+    jnz f_free
+    mov ax, 0xDE03
+    int 0x67
+    cmp edx, [free0]
+    jne f_free
+
+    ; 4. DE05 on conventional memory (never a pool page) -> nonzero AH
     mov edx, 0x5000
     mov ax, 0xDE05
     int 0x67
     or ah, ah
     jz f_badfree
 
-    ; 6. DE05 double-free of the already-freed page -> nonzero AH
+    ; 5. DE05 double-free of the already-freed page -> nonzero AH
     mov edx, [page1]
     mov ax, 0xDE05
     int 0x67
     or ah, ah
     jz f_dfree
 
-    ; 7. DE06: V86 page 0 -> phys 0 (identity); page 0xB8 -> 0xB8000 (VGA
+    ; 6. DE06: V86 page 0 -> phys 0 (identity); page 0xB8 -> 0xB8000 (VGA
     ;    text, identity); page 0x1FF (past the furnished window) -> AH=8Bh
     xor cx, cx
     mov ax, 0xDE06
@@ -136,7 +190,7 @@ start:
     cmp ah, 0x8B
     jne f_pt
 
-    ; 8. DE07: CR0 has PE (bit 0) and PG (bit 31) set (we run in V86 under
+    ; 7. DE07: CR0 has PE (bit 0) and PG (bit 31) set (we run in V86 under
     ;    the paging monitor)
     mov ax, 0xDE07
     int 0x67
@@ -147,7 +201,7 @@ start:
     cmp eax, 0x80000001
     jne f_cr0
 
-    ; 9. DE08: read the debug registers into a poisoned buffer; AH=0 and the
+    ; 8. DE08: read the debug registers into a poisoned buffer; AH=0 and the
     ;    DR4/DR5 slots (unused per the interface) come back zero
     mov di, drbuf
     mov cx, 16
@@ -165,7 +219,7 @@ start:
     cmp dword [drbuf+20], 0
     jne f_dr
 
-    ; 10. DE0A: the DOS-default mapping (BX=8, CX=70h); DE0B records a remap
+    ; 9. DE0A: the DOS-default mapping (BX=8, CX=70h); DE0B records a remap
     ;     report and DE0A echoes it back; then restore the defaults
     mov ax, 0xDE0A
     int 0x67
@@ -197,17 +251,6 @@ start:
     sti
     or ah, ah
     jnz f_pic
-
-    mov ah, 0x0D                 ; release the XMS page after the VCPI checks
-    mov dx, [xms_handle]
-    call far [xms_entry]
-    or ax, ax
-    jz f_xms
-    mov ah, 0x0A
-    mov dx, [xms_handle]
-    call far [xms_entry]
-    or ax, ax
-    jz f_xms
 
     mov al, OK
     jmp sig
@@ -252,5 +295,8 @@ maxpg:  dd 0
 page1:  dd 0
 xms_entry: dd 0
 xms_page: dd 0
+xms_end: dd 0
 xms_handle: dw 0
+xms_largest: dw 0
+xms_total: dw 0
 drbuf:  times 32 db 0

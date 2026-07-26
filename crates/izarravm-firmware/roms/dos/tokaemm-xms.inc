@@ -72,12 +72,21 @@ xf_version:
     mov dl, [cs:hma_available]
     retf
 
-; F0h private pool query used by Toka-DOS MEM. AL is ignored. The magic in AX
-; is the success indication; BX/CX are the disjoint XMS/EMS category sizes in KB.
+; F0h private pool query used by Toka-DOS MEM. F000h is the legacy totals
+; query. F001h also returns free VCPI KB in DX and uses a versioned magic.
 xf_toka_pools:
+    cmp al, 1
+    je .split
     mov ax, 0x544B               ; 'TK'
     mov bx, [cs:xms_category_kb]
     mov cx, [cs:ems_category_kb]
+    retf
+.split:
+    mov ax, 0x544C               ; split-pool result
+    mov bx, [cs:xms_category_kb]
+    mov cx, [cs:ems_category_kb]
+    mov dx, [cs:vcpi_free]
+    shl dx, 2                    ; pages -> KB
     retf
 
 ; 01h request HMA / 02h release HMA (a flag; no /HMAMIN gate).
@@ -148,14 +157,14 @@ xf_query_free:
     pushf
     cli
     call arena_longest_clear      ; AX = longest contiguous run in 4 KB pages
-    mov dx, [cs:arena_free]
+    mov dx, [cs:xms_free]
     shl ax, 2                     ; pages -> KB
     shl dx, 2
     xor bl, bl
     popf
     retf
 
-; 09h allocate EMB: DX=KB in -> DX=handle. The shared arena is reserved in
+; 09h allocate EMB: DX=KB in -> DX=handle. The XMS pool is reserved in
 ; 4 KB pages, while the handle retains the exact requested size for bounds.
 xf_alloc:
     push cx
@@ -189,7 +198,7 @@ xf_alloc:
     call arena_find_clear_run     ; CX pages -> AX = absolute start page
     jc .oom
     mov di, ax
-    call arena_mark_xms           ; marks shared bits and clears owner bits
+    call arena_mark_xms
     mov byte [cs:si], 1
     mov byte [cs:si+1], 0
     mov ax, [cs:xms_need_kb]
@@ -199,7 +208,7 @@ xf_alloc:
     mov [cs:si+4], ax             ; base_kb = absolute page * 4
     mov ax, [cs:xms_need_pages]
     mov [cs:si+6], ax
-    sub [cs:arena_free], ax
+    sub [cs:xms_free], ax
     mov dx, bp                    ; handle out
     mov ax, 1
     xor bl, bl
@@ -233,10 +242,8 @@ xf_free:
     mov ax, [cs:si+4]
     shr ax, 2                     ; base_kb -> absolute page
     mov cx, [cs:si+6]
-    call arena_owner_clear
-    jc .owned
     call arena_clear_xms
-    add [cs:arena_free], cx
+    add [cs:xms_free], cx
     mov word [cs:si], 0
     mov word [cs:si+2], 0
     mov word [cs:si+4], 0
@@ -250,8 +257,6 @@ xf_free:
 .locked:
     mov bl, 0xAB
     jmp .fail
-.owned:
-    mov bl, 0xA2                  ; conflicting ownership makes the handle invalid
 .bad:
 .fail:
     xor ax, ax
@@ -351,10 +356,8 @@ xf_resize:
     mov ax, [cs:si+4]
     shr ax, 2                     ; old absolute start page
     mov cx, [cs:si+6]
-    call arena_owner_clear
-    jc .owned
     call arena_clear_xms
-    add [cs:arena_free], cx
+    add [cs:xms_free], cx
     mov [cs:xms_need_kb], bx
     mov ax, bx
     mov cx, ax
@@ -368,7 +371,7 @@ xf_resize:
     jc .restore
     mov di, ax                    ; new absolute start page
     call arena_mark_xms
-    sub [cs:arena_free], cx
+    sub [cs:xms_free], cx
     mov ax, [cs:xms_need_kb]
     mov [cs:si+2], ax
     mov ax, di
@@ -389,11 +392,9 @@ xf_resize:
     shr ax, 2
     mov cx, [cs:si+6]
     call arena_mark_xms
-    sub [cs:arena_free], cx
+    sub [cs:xms_free], cx
     mov bl, 0xA0
     jmp .fail
-.owned:
-    mov bl, 0xA2                  ; do not release a VCPI-owned page
 .fail:
     xor ax, ax
     popf
@@ -502,7 +503,7 @@ slot_of:
     stc
     ret
 
-; First clear run in the shared arena. in: CX = page count. out: AX = absolute
+; First clear run in the XMS pool. in: CX = page count. out: AX = absolute
 ; start page, CF clear; or CF set. Preserves BX/CX/DX/SI/DI.
 arena_find_clear_run:
     push bx
@@ -557,7 +558,7 @@ arena_find_clear_run:
     stc
     ret
 
-; Longest clear run in the shared arena. out: AX = page count. Preserves all
+; Longest clear run in the XMS pool. out: AX = page count. Preserves all
 ; other registers used by the helper.
 arena_longest_clear:
     push bx
@@ -599,8 +600,7 @@ arena_longest_clear:
     pop bx
     ret
 
-; Mark an XMS-owned run. Shared allocation bits are set and VCPI ownership
-; bits are cleared. in: AX = absolute start page, CX = page count.
+; Mark an XMS-owned run. in: AX = absolute start page, CX = page count.
 arena_mark_xms:
     push bx
     push cx
@@ -608,7 +608,6 @@ arena_mark_xms:
     jcxz .done
 .next:
     bts word [cs:arena_bmp], bx
-    btr word [cs:vcpi_owner_bmp], bx
     inc bx
     loop .next
 .done:
@@ -616,7 +615,7 @@ arena_mark_xms:
     pop bx
     ret
 
-; Clear an XMS-owned run from the shared allocation bitmap.
+; Clear an XMS-owned run from the allocation bitmap.
 ; in: AX = absolute start page, CX = page count.
 arena_clear_xms:
     push bx
@@ -630,29 +629,6 @@ arena_clear_xms:
 .done:
     pop cx
     pop bx
-    ret
-
-; Verify that no page in a run is VCPI-owned. in: AX = absolute start page,
-; CX = page count. out: CF clear when all ownership bits are clear.
-arena_owner_clear:
-    push bx
-    push cx
-    mov bx, ax
-    jcxz .clear
-.next:
-    bt word [cs:vcpi_owner_bmp], bx
-    jc .owned
-    inc bx
-    loop .next
-.clear:
-    pop cx
-    pop bx
-    clc
-    ret
-.owned:
-    pop cx
-    pop bx
-    stc
     ret
 
 ; Resolve a move endpoint. in: BX=handle, [cs:xms_rv_off]=32-bit offset,
