@@ -140,6 +140,291 @@ fn mode13_read_self_loop_respects_the_tight_native_deadline() {
     assert_eq!(native.perf_counters().jit_native_load_hits - loads, 1);
 }
 
+/// MOVZX and MOVSX, memory form. `signed` selects MOVSX, `word` the 16-bit source.
+///
+/// The instruction is `movzx/movsx ebx, byte/word [esi + target]`, with ESI held at zero by the
+/// fixture so the effective address is `target` and can be pointed at either plain RAM or the
+/// mode13 aperture. A base register rather than a bare disp32 because `direct_addr` requires
+/// `scale` to be one of 1, 2, 4 or 8 and a no-SIB absolute decodes with scale 0, which it rejects;
+/// `[esi]` is also the form Quake's texture fetch actually uses. Slots 1 and 2 are register moves,
+/// so the block carries exactly ONE memory access and the read counters below are unambiguous.
+fn movzx_case(signed: bool, word: bool, target: u32) -> Vec<u8> {
+    let opcode: u8 = match (signed, word) {
+        (false, false) => 0xb6,
+        (false, true) => 0xb7,
+        (true, false) => 0xbe,
+        (true, true) => 0xbf,
+    };
+    // 0F <op> /r, mod=10 (disp32) rm=110 (esi), reg=ebx(3) -> modrm 0b10_011_110 = 0x9e.
+    let mut code = vec![0x0f, opcode, 0x9e];
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    code
+}
+
+/// THE REGISTRATION TEST. A new memory-bearing DirectKind defaults to zero in `byte_reads`,
+/// `word_reads` and `dword_reads`, and to None in `read_segment`. Nothing in the emitted code
+/// fails when that happens: the block just under-declares its own memory traffic, and the
+/// divergence surfaces as a `raw_bus_clocks` mismatch hours into a timedemo. These assertions read
+/// the counts straight off the compiled block, which is the cheapest place to catch it.
+#[test]
+fn movzx_memory_forms_declare_their_read_width() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    for (signed, word) in [(false, false), (false, true), (true, false), (true, true)] {
+        let code = movzx_case(signed, word, TARGET);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        map_direct_page(
+            &mut cpu,
+            &mut bus,
+            TARGET,
+            TARGET,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            false,
+        );
+        let block = install_fixture_block(&mut cpu, ENTRY);
+        let label = format!("signed={signed} word={word}");
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "{label}: whole block admitted"
+        );
+        assert_eq!(
+            block.byte_reads(),
+            u8::from(!word),
+            "{label}: byte-read declaration"
+        );
+        assert_eq!(
+            block.word_reads(),
+            u8::from(word),
+            "{label}: word-read declaration"
+        );
+        assert_eq!(block.dword_reads(), 0, "{label}: no dword read");
+        // clocks(3) per interpreter arm, three slots, minus the two register moves at 2 each.
+        assert_eq!(
+            block.raw_clocks(),
+            3 + 2 + 2,
+            "{label}: charged core clocks"
+        );
+    }
+}
+
+/// Extension correctness and equal timing against the interpreter, on both a plain-RAM target and
+/// the mode13 aperture. The mode13 half matters for more than coverage: an under-declared byte
+/// read trips a debug_assert in the run loop there, which is a loud failure, whereas the RAM half
+/// only shows up as a bus-clock difference.
+#[test]
+fn movzx_memory_forms_match_the_interpreter_and_its_bus_clocks() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    // 0x80 and 0x8000 have the source's high bit SET, so zero and sign extension disagree; 0x7f
+    // and 0x7f00 have it clear, so they agree. A lowering that used movzx where movsx belongs
+    // passes every non-negative seed, which is why both polarities are here.
+    for (signed, word) in [(false, false), (false, true), (true, false), (true, true)] {
+        for target in [RAM, MODE13] {
+            for raw in [0x80u32, 0x7f, 0xff, 0x00, 0x8000, 0x7f00] {
+                let code = movzx_case(signed, word, target);
+                let mut memory = vec![0; 0x000b_0000];
+                memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+                memory[target as usize] = raw as u8;
+                memory[target as usize + 1] = (raw >> 8) as u8;
+
+                let mut native = fresh();
+                let mut interp = fresh();
+                make_data_segments_flat(&mut native);
+                make_data_segments_flat(&mut interp);
+                native.registers.eip = ENTRY;
+                interp.registers.eip = ENTRY;
+                let mut native_bus = TestBus::with_memory(memory.clone());
+                let mut interp_bus = TestBus::with_memory(memory);
+                for bus in [&mut native_bus, &mut interp_bus] {
+                    bus.direct_pages_enabled = true;
+                    bus.direct_page_clocks = true;
+                    bus.report_batch_clocks = true;
+                    bus.uniform_native_fetches = true;
+                }
+                let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+                decode_fixture(&mut native, &mut native_bus, &starts);
+                decode_fixture(&mut interp, &mut interp_bus, &starts);
+                for (cpu, bus) in [
+                    (&mut native, &mut native_bus),
+                    (&mut interp, &mut interp_bus),
+                ] {
+                    map_direct_page(
+                        cpu,
+                        bus,
+                        target,
+                        target,
+                        jit::fast_map::PagePermissions::UNPAGED,
+                        true,
+                        false,
+                    );
+                }
+                let block = install_fixture_block(&mut native, ENTRY);
+
+                for cpu in [&mut native, &mut interp] {
+                    cpu.halted = false;
+                    cpu.interrupt_shadow = false;
+                    // A non-zero high half in EBX, so a lowering that merged into the low 8 or 16
+                    // bits instead of writing all 32 is caught. That is exactly what the shared
+                    // emit_write_gpr8 path in emit_load would produce.
+                    cpu.registers.gpr.fill(0xdead_beef);
+                    cpu.registers.set_esp(0xc000);
+                    // ESI is the address base and must be zero for the effective address to be
+                    // `target`. Set AFTER the fill, or it keeps the filler and the load reads a
+                    // wild address. The destination EBX deliberately keeps its non-zero high half.
+                    cpu.registers.set_esi(0);
+                    cpu.registers.eflags = 0x202;
+                    cpu.pending_flags = PendingFlags::default();
+                    cpu.registers.eip = ENTRY;
+                    cpu.elapsed_clocks = 0;
+                    cpu.timing_rem = 0;
+                    cpu.core_clocks_so_far = 0;
+                }
+                native_bus.trace = BusTrace::default();
+                interp_bus.trace = BusTrace::default();
+
+                let label =
+                    format!("signed={signed} word={word} target={target:#x} raw={raw:#06x}");
+                assert!(
+                    native
+                        .try_run_direct_block_for_test(&mut native_bus, block)
+                        .unwrap(),
+                    "{label}: must run natively"
+                );
+                for _ in 0..3 {
+                    interp.cycle(&mut interp_bus).unwrap();
+                }
+
+                assert_eq!(native.registers, interp.registers, "{label}: registers");
+                assert_eq!(native.pending_flags, interp.pending_flags, "{label}: flags");
+                assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+                assert_eq!(
+                    native.elapsed_clocks, interp.elapsed_clocks,
+                    "{label}: core clocks"
+                );
+                assert_eq!(
+                    native_bus.trace.elapsed_clocks(),
+                    interp_bus.trace.elapsed_clocks(),
+                    "{label}: BUS clocks, the registration check"
+                );
+
+                // Pin the concrete extension, not only agreement: if both sides were wrong in the
+                // same direction the comparison above would still pass.
+                let source = if word { raw & 0xffff } else { raw & 0xff };
+                let expected = match (signed, word) {
+                    (false, _) => source,
+                    (true, false) => source as u8 as i8 as i32 as u32,
+                    (true, true) => source as u16 as i16 as i32 as u32,
+                };
+                assert_eq!(native.registers.ebx(), expected, "{label}: extended value");
+            }
+        }
+    }
+}
+
+#[test]
+fn movzx_register_and_word_operand_forms_remain_interpreter_only() {
+    const ENTRY: u32 = 0x101;
+    for code in [
+        vec![0x0fu8, 0xb6, 0xd8], // MOVZX ebx, al: REGISTER form, not lowered
+        vec![0x0f, 0xb7, 0xd8],   // MOVZX ebx, ax
+        vec![0x0f, 0xbe, 0xd8],   // MOVSX ebx, al
+        vec![0x0f, 0xbf, 0xd8],   // MOVSX ebx, ax
+        // 66-prefixed memory forms. The OperandSize::Word gate is the only thing stopping these,
+        // and write_gpr_sized at Word MERGES into the low 16 bits instead of replacing all 32, so
+        // lowering one as the 32-bit form would clobber the destination's high half.
+        vec![0x66, 0x0f, 0xb6, 0x1d, 0x00, 0x00, 0x03, 0x00],
+        vec![0x66, 0x0f, 0xbf, 0x1d, 0x00, 0x00, 0x03, 0x00],
+    ] {
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut block = code.clone();
+        block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+        memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        // Three warmed starts, not one. Warming only the entry line makes slot 1 miss, the walk
+        // stops at Retry, and the fewer-than-three-slots gate returns the same None a real reject
+        // would, so the assertion below would pass whether or not the opcode was lowered.
+        let starts = [
+            ENTRY,
+            ENTRY + code.len() as u32,
+            ENTRY + code.len() as u32 + 2,
+        ];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        // Map the target page. WITHOUT this the compile refuses for want of a direct-page
+        // mapping and the assertion below passes for a reason that has nothing to do with the
+        // opcode, which is the vacuous-negative failure class this codebase has already been
+        // bitten by. The positive test above is what proves the mapping is sufficient.
+        map_direct_page(
+            &mut cpu,
+            &mut bus,
+            0x0003_0000,
+            0x0003_0000,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            false,
+        );
+        assert!(
+            jit::direct::compile(&mut cpu, ENTRY, true).is_none(),
+            "{code:02x?} must stay interpreter-only"
+        );
+    }
+}
+
+#[test]
+fn movzx_memory_forms_are_lowered() {
+    // The positive half of the guard above, and the ONLY test that can detect the classify arm
+    // being placed among the u8-keyed arms, where the `u8::try_from(insn.opcode)` truncation makes
+    // it unreachable for a two-byte opcode. Every negative assertion passes when that happens.
+    const ENTRY: u32 = 0x101;
+    for (signed, word) in [(false, false), (false, true), (true, false), (true, true)] {
+        let code = movzx_case(signed, word, 0x0003_0000);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        map_direct_page(
+            &mut cpu,
+            &mut bus,
+            0x0003_0000,
+            0x0003_0000,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            false,
+        );
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        let instructions = outcome
+            .is_some()
+            .then(|| outcome.unwrap().span.instructions);
+        assert_eq!(
+            instructions,
+            Some(3),
+            "signed={signed} word={word} must admit and carry the whole block"
+        );
+    }
+}
+
 struct DirectTimingCase {
     name: &'static str,
     opcode: &'static [u8],

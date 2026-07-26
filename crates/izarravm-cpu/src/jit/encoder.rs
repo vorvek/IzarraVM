@@ -395,6 +395,31 @@ impl Encoder {
         self.modrm(0b11, 4, src.low3());
     }
 
+    /// `movsx dst32, byte [base + disp8]` (0F BE /r, MOVSX r32, r/m8: SIGN-extend). The signed
+    /// sibling of `movzx_r32_byte_disp8`; the two differ only in the second opcode byte, so they
+    /// are written out separately rather than sharing a parameterised helper where picking the
+    /// wrong one would be a one-character edit no encoder test could see.
+    pub(crate) fn movsx_r32_byte_disp8(&mut self, dst: Reg, base: Reg, disp8: i8) {
+        self.optional_rex(false, dst.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xBE]);
+        self.modrm(0b01, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
+    /// `movsx dst32, word [base + disp8]` (0F BF /r, MOVSX r32, r/m16: SIGN-extend).
+    pub(crate) fn movsx_r32_word_disp8(&mut self, dst: Reg, base: Reg, disp8: i8) {
+        self.optional_rex(false, dst.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xBF]);
+        self.modrm(0b01, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
     /// `imul dst, imm32` (REX.W + 69 /r id, the three-operand IMUL r64, r/m64, imm32 form: dst =
     /// dst * imm32). Used by the native cap check to multiply the bus delta by the scale
     /// denominator (a small compile-time constant like 12 for 586).

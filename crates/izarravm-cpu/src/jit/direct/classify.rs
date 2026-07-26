@@ -45,6 +45,40 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         };
         return Some(DirectKind::Imul { dst: m.reg, src });
     }
+    // MOVZX and MOVSX, memory form only. Keyed on the full u16 opcode and placed ABOVE the
+    // `u8::try_from(insn.opcode).ok()` truncation further down, for the same reason 0x0faf is:
+    // that truncation returns None for every two-byte opcode, so an arm added among the u8 arms
+    // below (next to the 0x8a/0x8b MOV forms it most resembles) would be UNREACHABLE. Nothing
+    // would fail; the lowering would simply never fire, and only the pre-flight counter would
+    // notice. It also has to stay BELOW the OperandSize::Word gate above: none of these four is in
+    // that gate's allowlist, so a 66-prefixed form is already rejected there, and it must be,
+    // because `write_gpr_sized` at Word merges into the low 16 bits instead of replacing all 32.
+    //
+    // `width` is the SOURCE width and comes from the sub-opcode, NOT from `operand_width`. That
+    // local reflects the DESTINATION size and is Dword for every admitted form here, so using it
+    // would turn every capture into a dword read.
+    if matches!(insn.opcode, 0x0fb6 | 0x0fb7 | 0x0fbe | 0x0fbf) {
+        let m = insn.modrm?;
+        let DecodedOperand::Mem(addr) = insn.operand? else {
+            return None;
+        };
+        let width = if matches!(insn.opcode, 0x0fb6 | 0x0fbe) {
+            MemoryWidth::Byte
+        } else {
+            MemoryWidth::Word
+        };
+        return Some(DirectKind::LoadExtend {
+            dst: m.reg,
+            width,
+            signed: matches!(insn.opcode, 0x0fbe | 0x0fbf),
+            addr: direct_addr(addr)?,
+            // Every one of the four interpreter arms returns clocks(3) (execute.rs). The
+            // DirectKind::raw_clocks default arm returns 2, which would undercharge each of these
+            // by one clock and break byte identity on executed_cpu_core_clocks without failing any
+            // unit test, so this is carried as a field the way Load and Store carry theirs.
+            raw_clocks: 3,
+        });
+    }
     if matches!(insn.opcode, 0x0fa4 | 0x0fa5 | 0x0fac | 0x0fad) {
         let m = insn.modrm?;
         let count = if matches!(insn.opcode, 0x0fa4 | 0x0fac) {

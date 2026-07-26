@@ -588,6 +588,11 @@ fn slot_immediate(kind: &DirectKind) -> u32 {
 fn slot_displacement(kind: &DirectKind) -> u32 {
     match *kind {
         DirectKind::Load { addr, .. }
+        // Inert today, since LoadExtend is absent from clif's lowerable allowlist and so can never
+        // occupy a lowered slot. Carried anyway rather than left to the `_ => 0` default: that
+        // inertness is an undocumented invariant one allowlist edit away from silently producing a
+        // displacement lane that does not match the instruction it describes.
+        | DirectKind::LoadExtend { addr, .. }
         | DirectKind::Store { addr, .. }
         | DirectKind::AluMemSource { addr, .. }
         | DirectKind::AluMemDest { addr, .. }

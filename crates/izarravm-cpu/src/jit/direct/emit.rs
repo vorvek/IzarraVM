@@ -338,6 +338,36 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
             }
+            DirectKind::LoadExtend {
+                dst,
+                width,
+                signed,
+                addr,
+                ..
+            } => {
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_load_extend(&mut e, dst, width, signed, addr, memory, reasons);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    width.needs_alignment_guard(),
+                    memory.cpl3,
+                    false,
+                );
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
             DirectKind::Store {
                 source,
                 width,
@@ -1182,6 +1212,42 @@ fn emit_load(
     }
 }
 
+fn emit_load_extend(
+    e: &mut Encoder,
+    dst: u8,
+    width: MemoryWidth,
+    signed: bool,
+    addr: DirectAddr,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
+    // The memory half is emit_load's verbatim, including every side exit, the cross-page guard and
+    // the mode13 completion, all of which emit_ram_read_pointer already parameterises by width.
+    // The destination write is what differs. emit_load loads a zero-extended value into RDX and
+    // then NARROWS it back through emit_write_gpr8 or emit_write_gpr16, because a MOV r8, r/m8 has
+    // to preserve the destination's upper bits. MOVZX and MOVSX must not narrow: they define all
+    // 32 bits, so the write is the full home, exactly as emit_load's own Dword arm does it.
+    //
+    // Reading the pointer BEFORE writing the destination is not incidental. Every side exit is
+    // resolved inside emit_ram_read_pointer, so an instruction that faults leaves the destination
+    // register untouched, which is what the interpreter does: it faults inside the read, before
+    // write_gpr_sized runs.
+    emit_ram_read_pointer(e, width, addr, memory, sides);
+    match (width, signed) {
+        (MemoryWidth::Byte, false) => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
+        (MemoryWidth::Byte, true) => e.movsx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
+        (MemoryWidth::Word, false) => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
+        (MemoryWidth::Word, true) => e.movsx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
+        // classify derives the width from the sub-opcode and can only produce Byte or Word. This
+        // arm exists so that a future edit passing `operand_width` (which is Dword for every
+        // admitted form) fails loudly instead of silently emitting a dword read.
+        (MemoryWidth::Dword, _) => {
+            unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
+        }
+    }
+    e.mov_r32_r32(home(dst), Reg::RDX);
+}
+
 #[derive(Clone, Copy)]
 struct X87SlotEmitState {
     eligibility_side: Label,
@@ -1452,6 +1518,22 @@ fn emit_load(
     _: &mut Encoder,
     _: u8,
     _: MemoryWidth,
+    _: DirectAddr,
+    _: MemoryEmitContext,
+    _: MemorySideExits,
+) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_load_extend(
+    _: &mut Encoder,
+    _: u8,
+    _: MemoryWidth,
+    _: bool,
     _: DirectAddr,
     _: MemoryEmitContext,
     _: MemorySideExits,
