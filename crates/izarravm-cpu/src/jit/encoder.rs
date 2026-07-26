@@ -395,6 +395,20 @@ impl Encoder {
         self.modrm(0b11, 4, src.low3());
     }
 
+    /// `imul src` (F7 /5, IMUL r/m32 register form: EDX:EAX = EAX * src, SIGNED). Sets CF and OF
+    /// together to whether the full product fails to sign-extend back from the low half, and
+    /// leaves SF/ZF/AF/PF undefined, which is exactly the guest's one-operand IMUL.
+    ///
+    /// Written out separately from `mul_r32` rather than sharing a helper parameterised on the
+    /// group-3 sub-opcode, for the reason that function's own comment gives: /4 is the UNSIGNED
+    /// sibling with a different overflow rule, so picking the wrong reg field would be a
+    /// one-character edit that a shared helper's test could not see.
+    pub(crate) fn imul_r32(&mut self, src: Reg) {
+        self.optional_rex(false, false, false, src.ext());
+        self.bytes.push(0xF7);
+        self.modrm(0b11, 5, src.low3());
+    }
+
     /// `movsx dst32, byte [base + disp8]` (0F BE /r, MOVSX r32, r/m8: SIGN-extend). The signed
     /// sibling of `movzx_r32_byte_disp8`; the two differ only in the second opcode byte, so they
     /// are written out separately rather than sharing a parameterised helper where picking the

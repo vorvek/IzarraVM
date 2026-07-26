@@ -1892,6 +1892,21 @@ pub(crate) enum DirectKind {
     MulReg {
         src: u8,
     },
+    /// IMUL r/m32, one-operand SIGNED multiply, MEMORY form (0xF7 /5). Writes guest EAX and EDX
+    /// regardless of the address, the same implicit destination `MulReg` has.
+    ///
+    /// **No `raw_clocks` field, and that is deliberate rather than an omission.** The interpreter's
+    /// whole group-3 arm returns `Ok(clocks(2))` for every sub-opcode and both operand forms, which
+    /// IS the `raw_clocks` default below, so carrying a field here would invent a charge. This is
+    /// the exact inverse of `ImulMem`, where 0x0FAF is charged `clocks(9)` and the default
+    /// undercharges by 7, so a reader who has seen only that variant will be tempted to "fix" this
+    /// one. `MulReg` already depends on the same default.
+    ///
+    /// No `width` field either, for the reason `MulReg` has none: the `OperandSize::Word` gate
+    /// excludes 0xF7, so a 66-prefixed form cannot reach the classify arm.
+    ImulMemAcc {
+        addr: DirectAddr,
+    },
     TestImmReg {
         dst: u8,
         imm: u32,
@@ -2112,6 +2127,7 @@ impl DirectKind {
                     ..
                 } | Self::DoubleShiftMem { .. }
                     | Self::ImulMem { .. }
+                    | Self::ImulMemAcc { .. }
                     | Self::TestImmMem {
                         width: MemoryWidth::Dword,
                         ..
@@ -2224,7 +2240,7 @@ impl DirectKind {
                 MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
             },
             // One dword read and nothing else, the same as AluMemSource's Dword arm.
-            Self::ImulMem { .. } => COUNTER_MODE13_DWORD_READ,
+            Self::ImulMem { .. } | Self::ImulMemAcc { .. } => COUNTER_MODE13_DWORD_READ,
             Self::Store {
                 width: MemoryWidth::Byte,
                 ..
@@ -2306,6 +2322,7 @@ impl DirectKind {
             Self::Load { addr, .. }
             | Self::LoadExtend { addr, .. }
             | Self::ImulMem { addr, .. }
+            | Self::ImulMemAcc { addr, .. }
             | Self::AluMemSource { addr, .. }
             | Self::AluMemDest { addr, .. }
             | Self::DoubleShiftMem { addr, .. }
@@ -2366,6 +2383,7 @@ impl DirectKind {
                 ..
             } | Self::DoubleShiftMem { .. }
                 | Self::ImulMem { .. }
+                | Self::ImulMemAcc { .. }
                 | Self::TestImmMem {
                     width: MemoryWidth::Dword,
                     ..

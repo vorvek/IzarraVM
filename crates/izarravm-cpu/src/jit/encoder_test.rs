@@ -1088,6 +1088,34 @@ fn mul_r32_known_bytes() {
 }
 
 #[test]
+fn imul_r32_known_bytes() {
+    // imul ecx -- the SIGNED sibling of mul_r32 above. Every byte is identical except the modrm
+    // reg field, 5 instead of 4: mod=11,reg=5,rm=ecx&7=1 -> 11_101_001 = 0xE9 against MUL's 0xE1.
+    // That single nibble is the difference between "the high half is nonzero" and "the product
+    // does not sign-extend back from the low half" as the CF and OF rule, so it is asserted here
+    // rather than left to a behavioural test that a small positive seed would pass either way.
+    let mut e = Encoder::new();
+    e.imul_r32(Reg::RCX);
+    assert_eq!(e.finish(), vec![0xF7, 0xE9]);
+
+    // imul r9d -- B=1 = 0x41; modrm mod=11,reg=5,rm=r9&7=1 -> 0xE9.
+    let mut e = Encoder::new();
+    e.imul_r32(Reg::R9);
+    assert_eq!(e.finish(), vec![0x41, 0xF7, 0xE9]);
+
+    // imul ebx -- rm=ebx&7=3 -> 11_101_011 = 0xEB, no REX.
+    let mut e = Encoder::new();
+    e.imul_r32(Reg::RBX);
+    assert_eq!(e.finish(), vec![0xF7, 0xEB]);
+
+    // imul r14d -- B=1 = 0x41; rm=r14&7=6 -> 11_101_110 = 0xEE. REX.W stays 0: a REX.W form would
+    // be IMUL r/m64 and would write the whole RDX:RAX pair from a 64-bit multiply.
+    let mut e = Encoder::new();
+    e.imul_r32(Reg::R14);
+    assert_eq!(e.finish(), vec![0x41, 0xF7, 0xEE]);
+}
+
+#[test]
 fn imul_r64_imm32_known_bytes() {
     // imul rax, rax, 12 -- REX.W=1, 69 /r id. modrm mod=11,reg=0(rax),rm=0(rax) = 0xC0.
     let mut e = Encoder::new();

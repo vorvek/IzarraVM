@@ -252,6 +252,32 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Test { a, b } => emit_test(&mut e, a, b),
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
+            DirectKind::ImulMemAcc { addr } => {
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_imul_mem_acc(&mut e, addr, memory, reasons);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    MemoryWidth::Dword.needs_alignment_guard(),
+                    memory.cpl3,
+                    // Read-only. The destination is the implicit EAX and EDX pair, not memory, so
+                    // nothing here writes through the fast map.
+                    false,
+                );
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
             DirectKind::ImulMem { dst, addr } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
@@ -1637,6 +1663,52 @@ fn emit_imul_mem(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+fn emit_imul_mem_acc(
+    e: &mut Encoder,
+    addr: DirectAddr,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
+    // Memory half is emit_imul_mem's verbatim. Every side exit resolves inside
+    // emit_ram_read_pointer, before any guest register or flag is written, so a faulting IMUL
+    // leaves EAX, EDX and the flags untouched, which is what the interpreter does: it faults
+    // inside read_operand_sized, before `mul` runs.
+    //
+    // RCX is loaded AFTER emit_ram_read_pointer because emit_mode13_read_completion clobbers RCX
+    // and RDX while leaving RDI holding the pointer.
+    //
+    // ORDERING INVARIANT, stated as a requirement rather than as an absence. This form has a
+    // LARGER aliasing surface than the register form, not a smaller one: the address base and the
+    // address index are read from guest homes and either may be EAX or EDX, the two registers this
+    // instruction implicitly overwrites. It is safe only because emit_ram_read_pointer resolves
+    // the whole effective address into RAX before anything below writes a home.
+    emit_ram_read_pointer(e, MemoryWidth::Dword, addr, memory, sides);
+    e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
+    // The tail is emit_mul_reg's with the SIGNED primitive. Guest EAX and EDX live in the homes R8
+    // and R10 while the host instruction hardwires RAX and RDX, which are emitter scratch, so the
+    // accumulator is moved in and the two halves are moved back out.
+    //
+    // Host `imul r/m32` sets CF = OF = "the full product does not sign-extend back from the low
+    // half", which is exactly the interpreter's `significant` for the signed case (core.rs). The
+    // UNSIGNED sibling's rule is "the high half is nonzero", a different predicate, which is why
+    // the encoder primitive is not shared with mul_r32.
+    //
+    // The two write-back movs sit between the multiply and emit_capture_flags's pushfq. That is
+    // safe because `mov r32, r32` does not write EFLAGS, and it is emit_mul_reg's shipped ordering
+    // rather than emit_imul_mem's, which has nothing at all in that gap.
+    e.mov_r32_r32(Reg::RAX, home(0));
+    e.imul_r32(Reg::RCX);
+    e.mov_r32_r32(home(0), Reg::RAX);
+    e.mov_r32_r32(home(2), Reg::RDX);
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 fn emit_test_imm_mem(
     e: &mut Encoder,
     imm: u32,
@@ -1869,6 +1941,14 @@ fn emit_alu_mem_source(
     any(target_os = "windows", target_os = "linux")
 )))]
 fn emit_imul_mem(_: &mut Encoder, _: u8, _: DirectAddr, _: MemoryEmitContext, _: MemorySideExits) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_imul_mem_acc(_: &mut Encoder, _: DirectAddr, _: MemoryEmitContext, _: MemorySideExits) {
     unreachable!("direct memory lowering is x86-64-only")
 }
 

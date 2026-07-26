@@ -464,6 +464,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     };
                     return Some(DirectKind::MulReg { src });
                 }
+                // IMUL r/m32, one-operand SIGNED multiply, memory form. `reg == 5`, the signed
+                // sibling of the /4 above, whose overflow rule is different: the product failing to
+                // sign-extend back from the low half, rather than the high half being nonzero.
+                //
+                // ORDERING INVARIANT, and it is load-bearing rather than cosmetic. This arm MUST
+                // stay BELOW the /4 arm. That arm's `else { return None }` returns from `classify`,
+                // not from the arm, so a /4 with a MEMORY operand is already unreachable by the time
+                // control gets here. Move this arm above it and widen either to `4..=5` and an
+                // unsigned `mul dword [mem]` is emitted as a signed multiply, with the wrong EDX and
+                // the wrong CF and OF. `mul_memory_form_stays_interpreter_only` is what catches it.
+                //
+                // `opcode == 0xf7` is equally load-bearing: this arm sits inside the shared
+                // `0xf6 | 0xf7` group arm, and 0xF6 /5 is the BYTE IMUL, which multiplies AL and
+                // writes only AX. Without the test it would be read as a dword and lowered as the
+                // dword multiply. `imul_byte_form_stays_interpreter_only` is what catches that.
+                //
+                // No width field and no raw_clocks field. The OperandSize::Word gate above keeps a
+                // 66-prefixed form out, and the whole group-3 arm returns clocks(2), which is
+                // already the DirectKind::raw_clocks default. This is the opposite of 0x0FAF, where
+                // the interpreter charges clocks(9) and the default undercharges by 7.
+                if opcode == 0xf7 && m.reg == 5 {
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None;
+                    };
+                    return Some(DirectKind::ImulMemAcc {
+                        addr: direct_addr(addr)?,
+                    });
+                }
                 if m.reg != 0 {
                     return None;
                 }

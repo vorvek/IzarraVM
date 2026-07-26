@@ -599,6 +599,7 @@ fn slot_displacement(kind: &DirectKind) -> u32 {
         // `_ => 0` default would make the walk-time lane disagree with what `restamp_slot`
         // recomputes from the guest bytes, and only the allowlist is keeping that unread.
         | DirectKind::ImulMem { addr, .. }
+        | DirectKind::ImulMemAcc { addr, .. }
         | DirectKind::Store { addr, .. }
         | DirectKind::AluMemSource { addr, .. }
         | DirectKind::AluMemDest { addr, .. }
