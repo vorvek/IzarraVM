@@ -527,6 +527,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     Some(link_cell_ptrs[0]),
                     shared_return,
                     full_accounting,
+                    x87_entry_top.is_some(),
                 );
                 terminal = true;
                 break;
@@ -546,6 +547,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     Some(link_cell_ptrs[0]),
                     shared_return,
                     full_accounting,
+                    x87_entry_top.is_some(),
                 );
                 terminal = true;
                 break;
@@ -626,6 +628,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         Some(link_cell_ptrs[0]),
                         shared_return,
                         full_accounting,
+                        x87_entry_top.is_some(),
                     );
                 }
                 e.place(taken);
@@ -647,6 +650,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         Some(link_cell_ptrs[1]),
                         shared_return,
                         full_accounting,
+                        x87_entry_top.is_some(),
                     );
                 }
                 terminal = true;
@@ -669,6 +673,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             Some(link_cell_ptrs[0]),
             shared_return,
             full_accounting,
+            x87_entry_top.is_some(),
         );
     }
     if let Some(self_loop_return) = self_loop_return {
@@ -937,6 +942,7 @@ fn emit_advance_eip(e: &mut Encoder, delta: u32) {
     e.store_r32_disp32(Reg::R15, eip_offset(), Reg::RAX);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_completed_path(
     e: &mut Encoder,
     span: BlockSpan,
@@ -945,6 +951,7 @@ fn emit_completed_path(
     link_cell: Option<usize>,
     shared_return: Label,
     accounting: StaticAccounting,
+    x87_source: bool,
 ) {
     emit_accounting(
         e,
@@ -958,10 +965,14 @@ fn emit_completed_path(
     if let Some(link_cell) = link_cell {
         let unresolved = e.label();
         let returning = e.label();
-        e.mov_r64_imm64(Reg::RAX, link_cell as u64);
+        // The cell address lives in RCX (not RAX) for the whole branch, including past the
+        // quota decrement below, which clobbers RAX. The x87 boundary-spill check further down
+        // needs the cell address again right before the transfer, so it must survive in a
+        // register the quota bookkeeping never touches.
+        e.mov_r64_imm64(Reg::RCX, link_cell as u64);
         e.load_r64_disp8(
             Reg::RDX,
-            Reg::RAX,
+            Reg::RCX,
             core::mem::offset_of!(LinkCell, portal) as i8,
         );
         e.load_r64_disp8(
@@ -978,12 +989,41 @@ fn emit_completed_path(
         emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, linked_transfers));
         e.xor_r64_self(Reg::RDI);
         e.store_r64_disp8(Reg::RSP, STACK_ITERATIONS, Reg::RDI);
+        // Whether THIS edge spills is a per-slot LinkCell property, not something known at
+        // compile time (the same source slot can be relinked from an integer target to a float
+        // one), so it is a runtime check. An integer source never sets x87_source, so the
+        // pure-integer chain pays nothing here: this whole arm does not exist for it.
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if x87_source {
+            let transfer = e.label();
+            e.test_byte_disp8_imm8(Reg::RCX, core::mem::offset_of!(LinkCell, spilling) as i8, 1);
+            e.jz(transfer);
+            // Float-to-integer edge: flush the live x87 physical cache and packed status/tag
+            // back to CpuGsw.fpu, then restore what Windows needs preserved across the call,
+            // before handing control to a body that was never compiled with x87 in mind and so
+            // never does either of these things itself.
+            emit_x87_spill(e, Reg::R15);
+            #[cfg(target_os = "windows")]
+            {
+                e.load_r64_disp32(Reg::RSI, Reg::RSP, STACK_SAVED_RSI);
+                emit_restore_x87_host_xmms(e);
+            }
+            e.place(transfer);
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
+        debug_assert!(!x87_source);
         e.jmp_r64(Reg::RDX);
         e.place(unresolved);
         let hidden = e.label();
         e.load_r64_disp8(
             Reg::RDX,
-            Reg::RAX,
+            Reg::RCX,
             core::mem::offset_of!(LinkCell, portal) as i8,
         );
         e.mov_r64_imm64(Reg::RDI, zero_portal().address() as u64);

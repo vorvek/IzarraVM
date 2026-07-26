@@ -2261,8 +2261,11 @@ impl CpuGsw {
             if !chain_eligible {
                 1
             } else {
-                // x87-bearing blocks link only to other x87-bearing blocks. This keeps the common
-                // integer chain bound tight while covering the 586 FISTP conversion surcharge.
+                // An integer entry never reaches a float block, so its bound only has to cover
+                // integer hops. A float entry may cross into integer blocks partway through the
+                // chain; charging every hop at the x87 rate over-estimates those integer hops but
+                // stays conservative in the safe direction, and it still covers the 586 FISTP
+                // conversion surcharge for the hops that are actually x87.
                 let unscaled_max_core = if block.has_x87() {
                     jit::direct::MAX_X87_BLOCK_CORE_CLOCKS
                 } else {

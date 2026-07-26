@@ -947,6 +947,23 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
+    /// `test byte [base + disp8], imm8` (F6 /0 ib, mod=01 disp8, SIB if `base` is RSP/R12) --
+    /// test a memory byte against an immediate mask, setting ZF for a following `jz`/`jnz`,
+    /// without a register load first. The x87 link-relaxation boundary check reads a LinkCell's
+    /// spilling flag straight out of the cell address already sitting in `base`.
+    pub(crate) fn test_byte_disp8_imm8(&mut self, base: Reg, disp8: i8, imm8: u8) {
+        if base.ext() {
+            self.rex(false, false, false, true);
+        }
+        self.bytes.push(0xF6);
+        self.modrm(0b01, 0, base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+        self.bytes.push(imm8);
+    }
+
     /// `cmp reg16, word [base + disp8]` (66 + 3B /r).
     pub(crate) fn cmp_r16_disp8(&mut self, reg: Reg, base: Reg, disp8: i8) {
         self.bytes.push(0x66);
