@@ -67,18 +67,31 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // would turn every capture into a dword read.
     if matches!(insn.opcode, 0x0fb6 | 0x0fb7 | 0x0fbe | 0x0fbf) {
         let m = insn.modrm?;
-        let DecodedOperand::Mem(addr) = insn.operand? else {
-            return None;
-        };
         let width = if matches!(insn.opcode, 0x0fb6 | 0x0fbe) {
             MemoryWidth::Byte
         } else {
             MemoryWidth::Word
         };
+        let signed = matches!(insn.opcode, 0x0fbe | 0x0fbf);
+        // Both operand forms share ONE arm so the gate placement above cannot come to apply to
+        // one and not the other. For the register form `src` is the raw ModRM rm field, which at
+        // Byte width is a byte-register index where 4..=7 are AH/CH/DH/BH; the emitter reuses the
+        // interpreter's own lane arithmetic rather than repeating it.
+        let DecodedOperand::Mem(addr) = insn.operand? else {
+            let DecodedOperand::Reg(src) = insn.operand? else {
+                return None;
+            };
+            return Some(DirectKind::MovExtendReg {
+                dst: m.reg,
+                src,
+                width,
+                signed,
+            });
+        };
         return Some(DirectKind::LoadExtend {
             dst: m.reg,
             width,
-            signed: matches!(insn.opcode, 0x0fbe | 0x0fbf),
+            signed,
             addr: direct_addr(addr)?,
             // Every one of the four interpreter arms returns clocks(3) (execute.rs). The
             // DirectKind::raw_clocks default arm returns 2, which would undercharge each of these

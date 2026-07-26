@@ -423,6 +423,25 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
+    /// `movsx dst32, src8` (0F BE /r with mod=11, MOVSX r32, r8: SIGN-extend a register).
+    /// Register sibling of `movsx_r32_byte_disp8`. Only ever called with RDX for both operands,
+    /// a legacy register below index 4, so DL is addressable with no REX and there is no
+    /// SPL-versus-AH aliasing hazard. Written out separately from the word form rather than
+    /// parameterised, for the reason the memory pair records: the second opcode byte is the whole
+    /// difference and a shared helper's test could not see it being picked wrongly.
+    pub(crate) fn movsx_r32_r8(&mut self, dst: Reg, src: Reg) {
+        self.optional_rex(false, dst.ext(), false, src.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xBE]);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// `movsx dst32, src16` (0F BF /r with mod=11, MOVSX r32, r16: SIGN-extend a register).
+    pub(crate) fn movsx_r32_r16(&mut self, dst: Reg, src: Reg) {
+        self.optional_rex(false, dst.ext(), false, src.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xBF]);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
     /// `movsx dst32, word [base + disp8]` (0F BF /r, MOVSX r32, r/m16: SIGN-extend).
     pub(crate) fn movsx_r32_word_disp8(&mut self, dst: Reg, base: Reg, disp8: i8) {
         self.optional_rex(false, dst.ext(), false, base.ext());
