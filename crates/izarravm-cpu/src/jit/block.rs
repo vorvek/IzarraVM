@@ -1087,7 +1087,7 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
     e.and_r32_imm32(Reg::RCX, 0x0000_0fff);
     e.shr_r32_imm8(Reg::RAX, 12); // RAX = page_num (tag value)
 
-    // slot = page_num & 63; RDX = &entries[slot]
+    // slot = page_num & (TLB_ENTRIES - 1); RDX = &entries[slot]
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, (crate::TLB_ENTRIES as u32) - 1);
     e.shl_r32_imm8(Reg::RDX, 4);

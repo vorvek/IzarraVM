@@ -73,8 +73,14 @@ pub(crate) use flags::{
 #[allow(unused_imports)]
 pub(crate) use paging::{
     CodePageCache, DIRECT_PAGE_CACHE_LINES, DirectPageCache, DirectPageCacheEntry, FetchPageCache,
-    PREFETCH_WINDOW_BYTES, PrefetchWindow, TLB_ENTRIES, TRACKED_WRITE_PAGES, Tlb, TlbEntry,
+    PREFETCH_WINDOW_BYTES, PrefetchWindow, TRACKED_WRITE_PAGES, Tlb, TlbEntry,
 };
+
+/// The modelled TLB's entry count, and therefore its direct-mapped collision stride in pages.
+/// Public because fixtures in other crates have to build a TLB collision, and a hardcoded stride
+/// silently stops colliding the moment this constant moves, leaving a test that passes while
+/// proving nothing. Derive the stride from this, never from a literal.
+pub use paging::TLB_ENTRIES;
 
 /// Gate for the opt-in `#UD` diagnostic trace (T1.5: making a reflected #UD
 /// observable, see `CpuGsw::trace_ud_if_enabled`). Mirrors

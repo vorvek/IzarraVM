@@ -471,7 +471,13 @@ fn execution_payload_has_exact_maximum_golden() {
     expected.extend_from_slice(&(PREFETCH_WINDOW_BYTES as u64).to_le_bytes());
     expected.extend_from_slice(&cpu.prefetch.bytes);
 
-    assert_eq!(expected.len(), 820);
+    // 54 fixed header bytes through the live-entry count, 11 per TLB entry (tag, phys, three
+    // bools), 62 for the prefetch tail. Spelled out rather than golden-ed to a single number
+    // because the entry count is a tuning knob (see TLB_ENTRIES): a bare literal has to be
+    // re-goldened on every sweep, while reusing the loop's own arithmetic would be a tautology
+    // that could not catch a field width changing. Checks out at every size measured: 64 gives
+    // 820, 256 gives 2932, 1024 gives 11380.
+    assert_eq!(expected.len(), 54 + TLB_ENTRIES * 11 + 62);
     assert_eq!(execution_payload(&cpu).unwrap(), expected);
 }
 
