@@ -1155,18 +1155,370 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
     }
 }
 
+// NEG leaves a LAZY descriptor rather than committing eflags, so the batteries above compare
+// pending_flags and would still pass if the RBP host-flag shadow went stale: nothing in a
+// three-slot block reads it. An in-block Jcc does, through emit_load_host_flags. This fixture
+// pins that shape as its own two-instruction block next to the emitter, so the coverage cannot
+// be lost by an edit elsewhere. JB reads CF, which NEG defines from the operand being non-zero,
+// so this is what catches a capture mask narrowed away from CF. Note it canNOT catch a swapped
+// a/b in the descriptor: the Jcc reads the RBP shadow through emit_load_host_flags, never the
+// descriptor, and the shadow comes from the real host SUB either way.
+fn prepare_neg_terminal_jcc(mode: GswMode, dst: u8, seed: u32) -> Fixture {
+    let insn = vec![0xf7u8, 0xd8 | dst];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x72, 1, 0xf4, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + insn.len() as u32];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("direct-eligible key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("NEG+Jcc block compiles");
+    assert_eq!(
+        compilation.span.instructions, 2,
+        "block must end at the Jcc terminal, not run past it"
+    );
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("NEG+Jcc block installs");
+    let block = native.jit_direct.block(id).unwrap();
+
+    arm_neg_reg(&mut native, dst, seed, 0x202, None);
+    arm_neg_reg(&mut interpreter, dst, seed, 0x202, None);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn neg_terminal_jcc_reads_the_last_flag_producer() {
+    // seed 0 gives CF=0 (JB not taken); any non-zero seed gives CF=1 (taken). Both directions,
+    // so a shadow that is stale in one polarity cannot hide behind the other.
+    for (seed, taken) in [(0x0000_0000u32, false), (0x8000_0000, true)] {
+        let mut fixture = prepare_neg_terminal_jcc(GswMode::Gsw586, 3, seed);
+        assert!(
+            fixture
+                .native
+                .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
+                .unwrap(),
+            "seed {seed:#010x} must run natively"
+        );
+        fixture
+            .interpreter
+            .cycle(&mut fixture.interpreter_bus)
+            .unwrap();
+        fixture
+            .interpreter
+            .cycle(&mut fixture.interpreter_bus)
+            .unwrap();
+        // Pin the concrete destination, not just agreement: two seeds that both fell through
+        // would agree with each other and prove nothing about the branch reading CF at all.
+        let expected = if taken { ENTRY + 5 } else { ENTRY + 4 };
+        assert_eq!(
+            fixture.native.registers.eip,
+            expected,
+            "seed {seed:#010x}: JB must be {} here",
+            if taken { "taken" } else { "not taken" }
+        );
+        assert_eq!(
+            fixture.native.registers.eip, fixture.interpreter.registers.eip,
+            "seed {seed:#010x}: the Jcc must branch on the flags NEG just defined"
+        );
+    }
+}
+
+/// NEG followed by an instruction that COMMITS the RBP flag shadow to eflags.
+///
+/// The batteries above compare pending_flags and cannot see a stale RBP, because nothing in a
+/// block of plain moves ever reads it. IMUL does: it captures only CF/OF and then stores the
+/// whole RBP word to eflags, which is how it reproduces the interpreter's
+/// `set_flag(FLAG_CF|FLAG_OF, ..)` materialize-then-write. So if NEG updates RBP with too narrow
+/// a mask, the AF it failed to refresh is published here as the guest's AF while the interpreter
+/// materializes the correct one from NEG's descriptor.
+///
+/// Seed 0x08 makes NEG produce AF=1 while the incoming eflags carry AF=0, so a stale shadow is
+/// the opposite of the right answer rather than accidentally equal to it.
+fn prepare_neg_then_imul(mode: GswMode, seed: u32) -> Fixture {
+    // neg eax; imul ebx, ecx; mov esi,esi; hlt
+    let insn: Vec<u8> = vec![0xf7, 0xd8];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x0f, 0xaf, 0xd9, 0x89, 0xf6, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + 2, ENTRY + 5];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("direct-eligible key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("NEG+IMUL block compiles");
+    assert_eq!(compilation.span.instructions, 3);
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("NEG+IMUL block installs");
+    let block = native.jit_direct.block(id).unwrap();
+
+    arm_neg_reg(&mut native, 0, seed, 0x202, None);
+    arm_neg_reg(&mut interpreter, 0, seed, 0x202, None);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn neg_refreshes_every_arithmetic_flag_in_the_shadow_for_a_later_committer() {
+    for seed in [0x0000_0008u32, 0x0000_0010, 0x8000_0000, 0xffff_ffff] {
+        let context = format!("seed={seed:#010x}");
+        finish_and_compare(prepare_neg_then_imul(GswMode::Gsw586, seed), &context);
+    }
+}
+
+fn arm_neg_reg(cpu: &mut CpuGsw, dst: u8, seed: u32, eflags: u32, pending: Option<(u32, u32)>) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    // Every register gets a non-zero high half. NEG writes the FULL 32 bits, so a fixture that
+    // zeroed the destination first could not tell a correct lowering from one that merged into
+    // the low 8 or 16 bits, which is the likeliest implementation slip.
+    for index in 0..8usize {
+        cpu.registers.gpr[index] = 0xdead_0000 | index as u32;
+    }
+    // Before the seed, not after. ESP is gpr[4], so setting it afterwards would silently discard
+    // the seed for dst == 4 and collapse all nine of that destination's cases onto one value.
+    // The block touches no stack, so the value here is arbitrary.
+    cpu.registers.set_esp(0xc000);
+    cpu.registers.gpr[usize::from(dst)] = seed;
+    cpu.registers.eflags = eflags;
+    cpu.pending_flags = PendingFlags::default();
+    if let Some((a, b)) = pending {
+        let _ = cpu.alu(0, a, b, BusWidth::Dword);
+    }
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+}
+
+fn prepare_neg_reg(
+    mode: GswMode,
+    dst: u8,
+    seed: u32,
+    eflags: u32,
+    pending: Option<(u32, u32)>,
+) -> Fixture {
+    let insn = vec![0xf7u8, 0xd8 | dst];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [
+        ENTRY,
+        ENTRY + insn.len() as u32,
+        ENTRY + insn.len() as u32 + 2,
+    ];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    let block = install_block(&mut native);
+    arm_neg_reg(&mut native, dst, seed, eflags, pending);
+    arm_neg_reg(&mut interpreter, dst, seed, eflags, pending);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn neg_register_form_matches_the_interpreter_across_destinations_and_corners() {
+    // The seeds are chosen to discriminate, not to cover. 0 and 1 prove almost nothing: 0 gives
+    // a = b = result = 0 with every flag clear, and 1 gives 0xffff_ffff whose ZF/SF read the
+    // same at byte, word and dword width, so neither can catch a wrong width in the descriptor
+    // tag. Each seed below breaks a specific mutation:
+    //   0x0000_0100  a Byte-width tag (0x8000_0001) materializes ZF=1 instead of 0
+    //   0x0001_0000  a Word-width tag (0x8000_0101) does the same
+    //   0x8000_0000  the only OF=1 input; also CF=1, SF=1
+    //   0xffff_ffff  result 1: CF=1, OF=0, SF=0, AF=1
+    //   0x0000_0010  AF=0, the complement of the case above
+    //   0x7fff_ffff / 0x0000_0080 / 0x0000_00ff  PF and SF spread
+    // A swapped a/b in the descriptor inverts CF on every non-zero seed.
+    let seeds = [
+        0x0000_0100u32,
+        0x0001_0000,
+        0x8000_0000,
+        0xffff_ffff,
+        0x0000_0010,
+        0x7fff_ffff,
+        0x0000_0080,
+        0x0000_00ff,
+        0x0000_0000,
+    ];
+    for dst in 0..8u8 {
+        for seed in seeds {
+            let context = format!("dst={dst} seed={seed:#010x}");
+            finish_and_compare(
+                prepare_neg_reg(GswMode::Gsw586, dst, seed, 0x202, None),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn neg_register_form_preserves_an_incoming_pending_descriptor_shape() {
+    // NEG overwrites pending_flags wholesale, so an incoming descriptor must not survive and
+    // must not leak into the outgoing one. Seeded both with and without a live ADD descriptor,
+    // and with raw eflags.AF set, so a lowering that merged rather than replaced would diverge.
+    let states: [(u32, Option<(u32, u32)>); 3] = [
+        (0x202, None),
+        (0x8d7, Some((0x7fff_ffff, 1))),
+        (0x202, Some((0x0000_00ff, 1))),
+    ];
+    for (eflags, pending) in states {
+        for seed in [0x8000_0000u32, 0xffff_ffff, 0x0000_0100] {
+            let context = format!("eflags={eflags:#x} pending={pending:?} seed={seed:#010x}");
+            finish_and_compare(
+                prepare_neg_reg(GswMode::Gsw586, 3, seed, eflags, pending),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn neg_register_form_matches_the_interpreter_in_486_mode() {
+    finish_and_compare(
+        prepare_neg_reg(GswMode::Gsw486, 0, 0x8000_0000, 0x202, None),
+        "486 dst=0",
+    );
+}
+
+/// Compile a group-3 instruction as slot 0 of a three-slot block, with every slot's decode line
+/// warmed. The three-slot shape matters: warming only the entry line makes slot 1 miss, the walk
+/// stops at Retry, and the fewer-than-three-slots gate reports the same `is_none()` as a genuine
+/// structural reject. A negative assertion on that shape passes whether or not the opcode is
+/// lowered, which is exactly how this test would have gone vacuous when NEG was admitted.
+fn compile_group3_block(code: &[u8]) -> Option<u8> {
+    let mut memory = vec![0; 0x5000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    let mut block = code.to_vec();
+    block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
+    let mut cpu = flat_cpu(GswMode::Gsw586);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [
+        ENTRY,
+        ENTRY + code.len() as u32,
+        ENTRY + code.len() as u32 + 2,
+    ];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions)
+}
+
 #[test]
 fn group3_non_test_subops_remain_interpreter_only() {
-    for code in [[0xf6, 0xd3], [0xf7, 0xdb]] {
-        let mut memory = vec![0; 0x1000];
-        memory[(ENTRY - 1) as usize] = 0x90;
-        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
-        let mut cpu = flat_cpu(GswMode::Gsw586);
-        let mut bus = TestBus::with_memory(memory);
-        bus.direct_pages_enabled = true;
-        decode_fixture(&mut cpu, &mut bus, &[ENTRY]);
-        assert!(jit::direct::compile(&mut cpu, ENTRY, true).is_none());
+    // Everything in group 3 except TEST (/0) and the now-lowered dword NEG (/3). The byte group
+    // 0xf6 stays entirely interpreter-only, including its own /3.
+    for code in [
+        vec![0xf7, 0xcb], // /1 TEST alias, undocumented
+        vec![0xf7, 0xd3], // /2 NOT r/m32
+        vec![0xf7, 0xe3], // /4 MUL r/m32
+        vec![0xf7, 0xeb], // /5 IMUL r/m32
+        vec![0xf7, 0xf3], // /6 DIV r/m32
+        vec![0xf7, 0xfb], // /7 IDIV r/m32
+        vec![0xf6, 0xcb], // /1 byte
+        vec![0xf6, 0xd3], // /2 NOT r/m8
+        vec![0xf6, 0xdb], // /3 NEG r/m8, the byte form is NOT lowered
+        vec![0xf6, 0xe3], // /4 MUL r/m8
+        vec![0xf6, 0xeb], // /5 IMUL r/m8
+        vec![0xf6, 0xf3], // /6 DIV r/m8
+        vec![0xf6, 0xfb], // /7 IDIV r/m8
+        // NEG dword [disp32]: the MEMORY form of the very sub-opcode this slice lowers. Without
+        // this case, replacing the register-only `let-else` in classify with a defaulting match
+        // would lower it as `NEG EAX` and survive the whole battery, including the differential
+        // generator, which only ever emits the register encoding.
+        vec![0xf7, 0x1d, 0x00, 0x50, 0x00, 0x00],
+        // 66-prefixed NEG r/m16. The classify comment names the OperandSize::Word allowlist as
+        // the only thing stopping this from being lowered as a 32-bit NEG; this pins it.
+        vec![0x66, 0xf7, 0xdb],
+    ] {
+        assert!(
+            compile_group3_block(&code).is_none(),
+            "group 3 {code:02x?} must stay interpreter-only"
+        );
     }
+}
+
+#[test]
+fn group3_dword_neg_register_form_is_lowered() {
+    // The positive half of the guard above. Without it the negative list cannot distinguish
+    // "rejected because this sub-opcode stayed out" from "rejected for an unrelated reason",
+    // and a fixture that stopped compiling anything at all would still pass.
+    assert_eq!(
+        compile_group3_block(&[0xf7, 0xdb]),
+        Some(3),
+        "NEG EBX must admit and carry the whole three-slot block"
+    );
 }
 
 fn warm_exact_poll(

@@ -1851,6 +1851,10 @@ pub(crate) enum DirectKind {
         dst: u8,
         src: u8,
     },
+    /// NEG r/m32, register form (0xF7 /3). No width field on purpose; see the classify arm.
+    NegReg {
+        dst: u8,
+    },
     TestImmReg {
         dst: u8,
         imm: u32,

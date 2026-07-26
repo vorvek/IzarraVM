@@ -378,6 +378,23 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }
             0xf6 | 0xf7 => {
                 let m = insn.modrm?;
+                // NEG r/m32, register form. Deliberately carries NO width field: this arm sits
+                // below the OperandSize::Word gate at the top of `classify`, and that allowlist
+                // (which does not contain 0xf7) is the ONLY thing stopping a 586-mode `66 F7 /3`
+                // from reaching here, since the persona gate admits word ops on 586 and
+                // `prefixes_supported` accepts the operand-size override. A `width` field would
+                // invite a future edit to pass `operand_width`, which is MemoryWidth::Word in
+                // exactly that case, and a 16-bit NEG would then be lowered as a 32-bit one,
+                // clobbering the destination's high half. Same hazard the 0x0faf comment above
+                // describes. In a 16-bit segment the unprefixed form is Word (gated the same way)
+                // and the 66-prefixed form is rejected earlier for carrying a prefix at all, so
+                // NEG is simply never lowered there.
+                if opcode == 0xf7 && m.reg == 3 {
+                    let DecodedOperand::Reg(dst) = insn.operand? else {
+                        return None;
+                    };
+                    return Some(DirectKind::NegReg { dst });
+                }
                 if m.reg != 0 {
                     return None;
                 }
