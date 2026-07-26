@@ -1032,6 +1032,34 @@ fn imul_r32_r32_known_bytes() {
 }
 
 #[test]
+fn mul_r32_known_bytes() {
+    // mul ecx -- no REX: ecx is not extended. opcode F7; modrm mod=11,reg=4(the /4 sub-opcode),
+    // rm=ecx&7=1 -> 11_100_001 = 0xE1. reg=4 is what makes this MUL rather than NEG (/3) or the
+    // signed IMUL (/5), so this byte is the whole difference between three instructions.
+    let mut e = Encoder::new();
+    e.mul_r32(Reg::RCX);
+    assert_eq!(e.finish(), vec![0xF7, 0xE1]);
+
+    // mul r9d -- B=1 (r9 is the rm operand and is extended) = 0100_0001 = 0x41; modrm
+    // mod=11,reg=4,rm=r9&7=1 -> 0xE1. Same modrm byte as above, which is exactly why the REX
+    // prefix has to be right: without it this would multiply by ECX instead of R9D.
+    let mut e = Encoder::new();
+    e.mul_r32(Reg::R9);
+    assert_eq!(e.finish(), vec![0x41, 0xF7, 0xE1]);
+
+    // mul ebx -- rm=ebx&7=3 -> 11_100_011 = 0xE3, no REX.
+    let mut e = Encoder::new();
+    e.mul_r32(Reg::RBX);
+    assert_eq!(e.finish(), vec![0xF7, 0xE3]);
+
+    // mul r14d -- B=1 = 0x41; rm=r14&7=6 -> 11_100_110 = 0xE6. REX.W stays 0: a REX.W form would
+    // be MUL r/m64 and would write the whole RDX:RAX pair from a 64-bit multiply.
+    let mut e = Encoder::new();
+    e.mul_r32(Reg::R14);
+    assert_eq!(e.finish(), vec![0x41, 0xF7, 0xE6]);
+}
+
+#[test]
 fn imul_r64_imm32_known_bytes() {
     // imul rax, rax, 12 -- REX.W=1, 69 /r id. modrm mod=11,reg=0(rax),rm=0(rax) = 0xC0.
     let mut e = Encoder::new();

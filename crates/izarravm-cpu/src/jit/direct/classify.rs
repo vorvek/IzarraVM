@@ -409,6 +409,19 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     };
                     return Some(DirectKind::NegReg { dst });
                 }
+                // MUL r/m32, register form. `reg == 4` is the UNSIGNED multiply; /5 next to it is
+                // the signed IMUL, whose overflow rule is different (the product not sign-extending
+                // back from the low half rather than the high half being nonzero), so this must not
+                // widen to `4..=5`. Carries no width field for the same reason NegReg does not: the
+                // OperandSize::Word gate above is the only thing keeping a 586-mode `66 F7 /4` out,
+                // and a 16-bit MUL writes DX and AX as halves of the existing EDX and EAX rather
+                // than replacing them.
+                if opcode == 0xf7 && m.reg == 4 {
+                    let DecodedOperand::Reg(src) = insn.operand? else {
+                        return None;
+                    };
+                    return Some(DirectKind::MulReg { src });
+                }
                 if m.reg != 0 {
                     return None;
                 }

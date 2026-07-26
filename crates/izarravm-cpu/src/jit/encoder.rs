@@ -381,6 +381,20 @@ impl Encoder {
         self.modrm(0b11, dst.low3(), src.low3());
     }
 
+    /// `mul src` (F7 /4, MUL r/m32 register form: EDX:EAX = EAX * src, UNSIGNED). Sets CF and OF
+    /// together to whether the high half is nonzero, and leaves SF/ZF/AF/PF undefined, which is
+    /// exactly the guest's one-operand MUL.
+    ///
+    /// Deliberately NOT parameterised on the group-3 sub-opcode. /5 is IMUL, the SIGNED sibling
+    /// with a different overflow rule (the product not sign-extending back from the low half), and
+    /// /6 and /7 are DIV and IDIV, which fault. A shared `group3_r32(op, ..)` helper would make
+    /// picking the wrong one a one-character edit with no encoder-level test able to see it.
+    pub(crate) fn mul_r32(&mut self, src: Reg) {
+        self.optional_rex(false, false, false, src.ext());
+        self.bytes.push(0xF7);
+        self.modrm(0b11, 4, src.low3());
+    }
+
     /// `imul dst, imm32` (REX.W + 69 /r id, the three-operand IMUL r64, r/m64, imm32 form: dst =
     /// dst * imm32). Used by the native cap check to multiply the bus delta by the scale
     /// denominator (a small compile-time constant like 12 for 586).

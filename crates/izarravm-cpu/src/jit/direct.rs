@@ -1868,6 +1868,12 @@ pub(crate) enum DirectKind {
         dst: u8,
         count: u8,
     },
+    /// MUL r/m32, register form (0xF7 /4). Unsigned, and the only DirectKind whose destination is
+    /// implicit: it writes guest EAX and EDX regardless of `src`. No width field, for the same
+    /// reason NegReg has none; see the classify arm.
+    MulReg {
+        src: u8,
+    },
     TestImmReg {
         dst: u8,
         imm: u32,
