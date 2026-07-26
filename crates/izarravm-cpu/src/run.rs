@@ -983,6 +983,29 @@ impl CpuGsw {
         d: bool,
         budget: ContinuationBudget,
     ) -> Result<DirectContinuation, CpuError> {
+        // A 16-bit code segment can NEVER produce a block: `key_for` refuses on `!d`, its very
+        // first test alongside `host_supported`. So on base this function already returned
+        // Interpret for every such boundary, but only after a decode-cache line lookup, a hotness
+        // mutation and the probe itself. Real mode, V86 and 16-bit protected mode are the whole
+        // population, and it is the whole population of a real-mode DOS guest.
+        //
+        // Placed BEFORE `direct_hot` so the bookkeeping goes too. That is observationally
+        // equivalent, and the reason is worth stating because it is the entire correctness case:
+        // `direct_hot` only ever increments a line whose `d` already matches, so a 16-bit boundary
+        // can only heat a line with `d == false`; and `DecodeCache::put` REPLACES the whole
+        // `DecodeLine` with `jit_direct_hotness: 0` rather than merging, so the moment that linear
+        // address is executed as 32-bit code the line is re-inserted and the counter is zeroed.
+        // The heating removed here is therefore write-only state that is always destroyed before
+        // any 32-bit consumer can read it. The one in-place invalidator that preserves the counter,
+        // `narrow_invalidate`, sets `generation = 0`, and the live generation is never 0, so such a
+        // line can only come back through `put`.
+        //
+        // The region backend is deliberately NOT given this early-out. `try_region_continuation`
+        // has no `!d` refusal and genuinely admits 16-bit code, which is why this sits inside the
+        // two continuation functions that provably refuse rather than at their shared call site.
+        if !d {
+            return Ok(DirectContinuation::Interpret);
+        }
         if !self.mode().uses_approximate_timing() {
             return Ok(DirectContinuation::Interpret);
         }
@@ -1211,6 +1234,14 @@ impl CpuGsw {
         let t_entry = Self::clif_phase_now();
         let mut from_compiled = false;
         self.jit_direct.apply_deferred_clif_arena_reset();
+        // Same reasoning as the Direct path: `clif_key_for` refuses on `!d`, so a 16-bit boundary
+        // cannot produce a unit and need not pay `clif_hot`. Placed AFTER the deferred arena reset
+        // above, not before. Deferring that reclaim would only postpone it to the next 32-bit
+        // boundary and is not itself unsafe, but the reset's contract names this as the point it is
+        // consumed, and a real-mode-only stretch should not be allowed to accrue deferral debt.
+        if !d {
+            return Ok(ClifContinuation::Interpret);
+        }
         if !self
             .decode_cache
             .clif_hot(lin, d, jit::clif::cache::CLIF_DEFAULT_ADMISSION_HEAT)
