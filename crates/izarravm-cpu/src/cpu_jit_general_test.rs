@@ -2514,3 +2514,81 @@ fn unit_sim_self_loop_keeps_entry_open() {
         report.retired_in_units
     );
 }
+
+/// A 16-bit code segment can never produce a Direct block, because `key_for` refuses on `!d`.
+/// This asserts the admission path is not merely fruitless there but SKIPPED: the decode line's
+/// `jit_direct_hotness` must stay at 0.
+///
+/// The hotness counter is the only observable difference this change makes, so it is the only
+/// assertion that can detect it. Everything else about a 16-bit boundary is identical before and
+/// after, because `try_direct_continuation` already returned Interpret on every `!d` path.
+///
+/// Three things this fixture must get right, each of which would otherwise make it pass on base
+/// main and prove nothing:
+///   - the decode line must be WARMED first, or `direct_hot` refuses on the tag/generation test
+///     and never increments on either side;
+///   - `set_auto_admit(true)` is required, because auto-admit defaults to false and the function
+///     returns before `direct_hot` without it;
+///   - the base-main expectation is 1, not 8: `DEFAULT_ADMISSION_HEAT` is 1 under `cfg(test)`,
+///     so the counter saturates at 1 immediately.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn sixteen_bit_boundaries_skip_the_direct_admission_path() {
+    fn hotness(cpu: &CpuGsw, lin: u32) -> u8 {
+        let index = (lin & cpu.decode_cache.mask) as usize;
+        cpu.decode_cache.lines[index].jit_direct_hotness
+    }
+
+    // A trivial 16-bit loop that halts, so the decode lines around 0x101 are warmed by a real
+    // run rather than by hand.
+    let program = || {
+        let mut m = vec![0xf4u8; 0x1000];
+        m[0x100] = 0x90; // nop, so 0x101 is reached as a continuation
+        m[0x101] = 0x90;
+        m[0x102] = 0x90;
+        m[0x103] = 0xf4; // hlt
+        m
+    };
+
+    // THE CASE: 16-bit CS. fresh16 leaves default_size_32 false.
+    let mut cpu = fresh16();
+    let mut bus = TestBus::with_memory(program());
+    cpu.registers.eip = 0x100;
+    cpu.registers.set_esp(0x0700);
+    drive_to_halt(&mut cpu, &mut bus);
+    cpu.jit_direct.set_auto_admit(true);
+    assert_eq!(
+        hotness(&cpu, 0x101),
+        0,
+        "warm run must not have heated 0x101"
+    );
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, 0x101, false)
+            .unwrap();
+    }
+    assert_eq!(
+        hotness(&cpu, 0x101),
+        0,
+        "a 16-bit boundary must not reach the decode cache's admission bookkeeping at all"
+    );
+
+    // POSITIVE CONTROL: the same shape in a 32-bit CS must still heat, so the early-out is proven
+    // to be keyed on `!d` and not to have swallowed the 32-bit path. Warmed at d = true, so
+    // `direct_hot`'s own `line.d != d` test cannot be what keeps the counter at 0.
+    let mut wide = fresh();
+    let mut wide_bus = TestBus::with_memory(program());
+    wide.registers.eip = 0x100;
+    wide.registers.set_esp(0x0700);
+    drive_to_halt(&mut wide, &mut wide_bus);
+    wide.jit_direct.set_auto_admit(true);
+    wide.try_direct_continuation_for_test(&mut wide_bus, 0x101, true)
+        .unwrap();
+    assert!(
+        hotness(&wide, 0x101) > 0,
+        "a 32-bit boundary must still heat; the early-out must be keyed on !d only"
+    );
+}
