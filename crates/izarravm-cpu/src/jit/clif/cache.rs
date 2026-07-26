@@ -549,7 +549,9 @@ fn slot_immediate(kind: &DirectKind) -> u32 {
         | DirectKind::TestImmReg { imm, .. }
         | DirectKind::TestImmMem { imm, .. } => imm,
         DirectKind::MovImmByte { imm, .. } | DirectKind::AluByteImm { imm, .. } => u32::from(imm),
-        DirectKind::Shift { count, .. } => u32::from(count),
+        DirectKind::Shift { count, .. } | DirectKind::RotateRightReg { count, .. } => {
+            u32::from(count)
+        }
         DirectKind::DoubleShiftReg {
             count: direct::ShiftCount::Immediate(count),
             ..
