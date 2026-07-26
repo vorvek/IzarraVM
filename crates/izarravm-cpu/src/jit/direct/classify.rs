@@ -364,16 +364,30 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }
             0xc1 | 0xd1 => {
                 let m = insn.modrm?;
-                if !matches!(m.reg, 4..=7) {
+                // reg 1 is ROR and MUST be admitted by this guard, not appended after it: reg 1
+                // fails `matches!(m.reg, 4..=7)`, so a rotate arm placed below the guard would be
+                // unreachable and the whole lowering would be dead code that no negative test
+                // could detect. ROL (/0), RCL (/2) and RCR (/3) stay out. The refreshed attribution
+                // measures zero rejects for all three, and RCL and RCR additionally take the
+                // incoming CF as a rotate INPUT (`shift_rotate` seeds `cf` from `flag(FLAG_CF)`
+                // before its loop), which would need the flags loaded into the host before the
+                // rotate rather than only captured after it.
+                if !matches!(m.reg, 1 | 4..=7) {
                     return None;
                 }
                 let DecodedOperand::Reg(dst) = insn.operand? else {
                     return None;
                 };
+                // The RAW immediate, unmasked, matching what the Shift arm has always stored. The
+                // architectural five-bit mask is applied in the emitter.
+                let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 };
+                if m.reg == 1 {
+                    return Some(DirectKind::RotateRightReg { dst, count });
+                }
                 return Some(DirectKind::Shift {
                     op: m.reg,
                     dst,
-                    count: if opcode == 0xd1 { 1 } else { insn.imm as u8 },
+                    count,
                 });
             }
             0xf6 | 0xf7 => {

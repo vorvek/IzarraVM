@@ -1449,12 +1449,425 @@ fn neg_register_form_matches_the_interpreter_in_486_mode() {
     );
 }
 
-/// Compile a group-3 instruction as slot 0 of a three-slot block, with every slot's decode line
+fn arm_ror_reg(cpu: &mut CpuGsw, dst: u8, seed: u32, eflags: u32, pending: Option<(u32, u32)>) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    for index in 0..8usize {
+        cpu.registers.gpr[index] = 0xdead_0000 | index as u32;
+    }
+    // ESP BEFORE the seed. ESP is gpr[4], so setting it afterwards silently discards the seed for
+    // dst == 4 and collapses that destination's whole case list onto one value. See arm_neg_reg.
+    cpu.registers.set_esp(0xc000);
+    cpu.registers.gpr[usize::from(dst)] = seed;
+    cpu.registers.eflags = eflags;
+    cpu.pending_flags = PendingFlags::default();
+    if let Some((a, b)) = pending {
+        // An ADD, which leaves a live Add descriptor with no CF override.
+        let _ = cpu.alu(0, a, b, BusWidth::Dword);
+    }
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+}
+
+fn prepare_ror_reg(
+    mode: GswMode,
+    dst: u8,
+    count: u8,
+    seed: u32,
+    eflags: u32,
+    pending: Option<(u32, u32)>,
+) -> Fixture {
+    // C1 /1 ib: mod 11, reg 1, rm dst. 0xc8 is mod 11 with reg 1.
+    let insn = vec![0xc1u8, 0xc8 | dst, count];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [
+        ENTRY,
+        ENTRY + insn.len() as u32,
+        ENTRY + insn.len() as u32 + 2,
+    ];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    let block = install_block(&mut native);
+    arm_ror_reg(&mut native, dst, seed, eflags, pending);
+    arm_ror_reg(&mut interpreter, dst, seed, eflags, pending);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+// Counts chosen to hit every compile-time shape and both sides of the five-bit mask:
+//   0  and 32  the no-op shape, 32 only via `& 0x1f`, so a missing mask is caught here
+//   1          the materialising shape, the only count that defines OF
+//   2, 7, 31   the in-place CF-override shape
+//   16         the byte-swap idiom a rasterizer actually emits
+const ROR_COUNTS: [u8; 7] = [0, 1, 2, 7, 16, 31, 32];
+
+// Seeds chosen to discriminate rather than to cover. For a right rotate by n, CF is bit n-1 of the
+// input, and at count 1 OF is the XOR of the result's top two bits:
+//   0x0000_0001  ror 1 -> 0x8000_0000, top two bits 1 and 0, so OF=1 and CF=1
+//   0x0000_0002  ror 1 -> 0x0000_0001, top two bits 0 and 0, so OF=0 and CF=0
+//   0xc000_0000  ror 1 -> 0x6000_0000, top two bits 0 and 1, so OF=1 and CF=0
+//   0x8000_0001  ror 1 -> 0xc000_0000, top two bits 1 and 1, so OF=0 and CF=1
+// All four OF/CF combinations, so a lowering that tied OF to CF cannot pass.
+//   0x0000_8000  bit 15 set, so it flips CF at count 16 against the seed below
+//   0xffff_ffff  every rotate is a fixed point; only the flags can differ
+//   0x1234_5678  an asymmetric value, so a rotate in the wrong DIRECTION is caught
+const ROR_SEEDS: [u32; 8] = [
+    0x0000_0001,
+    0x0000_0002,
+    0xc000_0000,
+    0x8000_0001,
+    0x0000_8000,
+    0xffff_ffff,
+    0x1234_5678,
+    0x0000_0000,
+];
+
+#[test]
+fn ror_register_form_matches_the_interpreter_across_destinations_counts_and_corners() {
+    // eflags 0x202 has CF clear and 0x203 has it set, so the no-descriptor path is exercised in
+    // both polarities: a lowering that never wrote CF passes one and fails the other.
+    for dst in 0..8u8 {
+        for count in ROR_COUNTS {
+            for seed in ROR_SEEDS {
+                for eflags in [0x202u32, 0x203] {
+                    let context =
+                        format!("dst={dst} count={count} seed={seed:#010x} eflags={eflags:#x}");
+                    finish_and_compare(
+                        prepare_ror_reg(GswMode::Gsw586, dst, count, seed, eflags, None),
+                        &context,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ror_register_form_updates_a_live_descriptor_in_place_without_materialising() {
+    // THE case this slice turns on. At counts 2 through 31 the interpreter calls set_flag with a
+    // mask of exactly FLAG_CF, which flips the descriptor's override bits IN PLACE and leaves
+    // SF/ZF/PF/AF deferred. finish_and_compare asserts the raw pending_flags word, so a lowering
+    // that materialised instead, or set the wrong override bit, or cleared the descriptor,
+    // diverges here even though eflags() would still agree in some of those cases.
+    let pendings = [
+        Some((0x7fff_ffffu32, 1u32)),
+        Some((0x0000_00ff, 1)),
+        Some((0xffff_ffff, 1)),
+        Some((0x0000_0000, 0)),
+    ];
+    for pending in pendings {
+        for count in [2u8, 7, 16, 31] {
+            for seed in ROR_SEEDS {
+                for eflags in [0x202u32, 0x203] {
+                    let context = format!(
+                        "count={count} seed={seed:#010x} pending={pending:?} eflags={eflags:#x}"
+                    );
+                    finish_and_compare(
+                        prepare_ror_reg(GswMode::Gsw586, 3, count, seed, eflags, pending),
+                        &context,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ror_register_form_materialises_a_live_descriptor_at_count_one() {
+    // Count 1 is the other side of the compile-time split. Here the CF call sets the override and
+    // the following OF call materialises WITH that override applied, then writes OF live and
+    // clears the descriptor. Getting the order backwards publishes a CF taken from the stale
+    // eflags instead of from the rotate.
+    for pending in [
+        Some((0x7fff_ffffu32, 1u32)),
+        Some((0x0000_00ff, 1)),
+        Some((0xffff_ffff, 1)),
+    ] {
+        for seed in ROR_SEEDS {
+            for eflags in [0x202u32, 0x203] {
+                let context = format!("seed={seed:#010x} pending={pending:?} eflags={eflags:#x}");
+                finish_and_compare(
+                    prepare_ror_reg(GswMode::Gsw586, 3, 1, seed, eflags, pending),
+                    &context,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ror_register_form_count_zero_touches_nothing_at_all() {
+    // A zero count returns before the value write-back and before any flag. Both encodings of it
+    // are checked: a literal 0, and 32, which is only zero after the five-bit mask. Asserted
+    // against the pre-run state directly rather than only against the interpreter, so a lowering
+    // that perturbed the guest identically on both sides could not hide.
+    for count in [0u8, 32] {
+        for pending in [None, Some((0x7fff_ffffu32, 1u32))] {
+            let fixture = prepare_ror_reg(GswMode::Gsw586, 3, count, 0x1234_5678, 0x203, pending);
+            let before_gpr = fixture.native.registers.gpr;
+            let before_eflags = fixture.native.registers.eflags;
+            let before_pending = fixture.native.pending_flags;
+            let context = format!("count={count} pending={pending:?}");
+            let after = finish_and_compare(fixture, &context);
+            assert_eq!(
+                after.native.registers.gpr[3], before_gpr[3],
+                "{context}: a zero count must not touch the destination"
+            );
+            assert_eq!(
+                after.native.registers.eflags, before_eflags,
+                "{context}: a zero count must not touch eflags"
+            );
+            assert_eq!(
+                after.native.pending_flags, before_pending,
+                "{context}: a zero count must not touch the pending descriptor"
+            );
+        }
+    }
+}
+
+#[test]
+fn ror_register_form_matches_the_interpreter_in_486_mode() {
+    for count in [1u8, 16] {
+        finish_and_compare(
+            prepare_ror_reg(GswMode::Gsw486, 0, count, 0x0000_8001, 0x202, None),
+            &format!("486 count={count}"),
+        );
+    }
+}
+
+/// ROR at counts above 1 leaves a LAZY descriptor and only flips its override, so the batteries
+/// above compare pending_flags and would still pass if the RBP host-flag shadow went stale:
+/// nothing in a block of plain moves reads it. An in-block Jcc does, through emit_load_host_flags.
+/// JB reads CF, which is the one flag a rotate defines at every count.
+fn prepare_ror_terminal_jcc(dst: u8, count: u8, seed: u32) -> Fixture {
+    let insn = vec![0xc1u8, 0xc8 | dst, count];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x72, 1, 0xf4, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(GswMode::Gsw586);
+    let mut interpreter = flat_cpu(GswMode::Gsw586);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + insn.len() as u32];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("direct-eligible key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("ROR+Jcc block compiles");
+    assert_eq!(
+        compilation.span.instructions, 2,
+        "block must end at the Jcc terminal"
+    );
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("ROR+Jcc block installs");
+    let block = native.jit_direct.block(id).unwrap();
+
+    arm_ror_reg(&mut native, dst, seed, 0x202, None);
+    arm_ror_reg(&mut interpreter, dst, seed, 0x202, None);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn ror_terminal_jcc_reads_the_carry_the_rotate_just_defined() {
+    // For a right rotate by n, CF is bit n-1 of the input, so these pairs put a 0 and a 1 there at
+    // both a count-1 and a multi-count shape. Both branch directions at both shapes.
+    for (count, seed, taken) in [
+        (1u8, 0x0000_0001u32, true),
+        (1, 0x0000_0002, false),
+        (16, 0x0000_8000, true),
+        (16, 0x0000_0001, false),
+    ] {
+        let mut fixture = prepare_ror_terminal_jcc(3, count, seed);
+        assert!(
+            fixture
+                .native
+                .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
+                .unwrap(),
+            "count {count} seed {seed:#010x} must run natively"
+        );
+        for _ in 0..2 {
+            fixture
+                .interpreter
+                .cycle(&mut fixture.interpreter_bus)
+                .unwrap();
+        }
+        // Pin the concrete destination, not just agreement: two cases that both fell through would
+        // agree with each other and prove nothing about the branch reading CF at all.
+        let expected = if taken { ENTRY + 6 } else { ENTRY + 5 };
+        assert_eq!(
+            fixture.native.registers.eip,
+            expected,
+            "count {count} seed {seed:#010x}: JB must be {} here",
+            if taken { "taken" } else { "not taken" }
+        );
+        assert_eq!(
+            fixture.native.registers.eip, fixture.interpreter.registers.eip,
+            "count {count} seed {seed:#010x}: the Jcc must branch on the carry ROR defined"
+        );
+    }
+}
+
+/// ROR followed by an instruction that COMMITS the whole RBP shadow to eflags. A rotate at counts
+/// above 1 must leave SF, ZF, PF and AF alone in the shadow, which the batteries cannot see
+/// because nothing there reads it. IMUL captures only CF and OF and then stores the entire RBP
+/// word, so a capture mask widened past CF publishes the host rotate's leftovers as guest flags.
+fn prepare_ror_then_imul(count: u8, seed: u32, pending: Option<(u32, u32)>) -> Fixture {
+    // ror eax, count; imul ebx, ecx; mov esi,esi; hlt
+    let insn = vec![0xc1u8, 0xc8, count];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x0f, 0xaf, 0xd9, 0x89, 0xf6, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(GswMode::Gsw586);
+    let mut interpreter = flat_cpu(GswMode::Gsw586);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + 3, ENTRY + 6];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("direct-eligible key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("ROR+IMUL block compiles");
+    assert_eq!(compilation.span.instructions, 3);
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("ROR+IMUL block installs");
+    let block = native.jit_direct.block(id).unwrap();
+
+    arm_ror_reg(&mut native, 0, seed, 0x202, pending);
+    arm_ror_reg(&mut interpreter, 0, seed, 0x202, pending);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn ror_leaves_the_untouched_shadow_flags_alone_for_a_later_committer() {
+    for count in [1u8, 2, 16, 31] {
+        for pending in [None, Some((0x7fff_ffffu32, 1u32)), Some((0x0000_00ff, 1))] {
+            for seed in [0x0000_0001u32, 0x0000_8000, 0xffff_ffff] {
+                let context = format!("count={count} seed={seed:#010x} pending={pending:?}");
+                finish_and_compare(prepare_ror_then_imul(count, seed, pending), &context);
+            }
+        }
+    }
+}
+
+#[test]
+fn group2_non_lowered_rotates_remain_interpreter_only() {
+    for code in [
+        vec![0xc1, 0xc3, 0x05], // /0 ROL r/m32, imm8: zero measured rejects, deliberately out
+        vec![0xc1, 0xd3, 0x05], // /2 RCL: takes the incoming CF as a rotate input
+        vec![0xc1, 0xdb, 0x05], // /3 RCR: same
+        vec![0xd1, 0xc3],       // /0 ROL by 1
+        vec![0xd1, 0xd3],       // /2 RCL by 1
+        vec![0xd1, 0xdb],       // /3 RCR by 1
+        vec![0xc0, 0xcb, 0x05], // the BYTE rotate group, not lowered at any sub-opcode
+        vec![0xd0, 0xcb],       // byte ROR by 1
+        vec![0xd2, 0xcb],       // byte ROR by CL
+        vec![0xd3, 0xcb],       // /1 ROR by CL: a runtime count, deliberately out of this slice
+        // ROR dword [disp32], the MEMORY form of the very sub-opcode this slice lowers. Without
+        // this case, replacing the register-only `let-else` with a defaulting match would rotate
+        // EAX instead and survive every register battery.
+        vec![0xc1, 0x0d, 0x00, 0x50, 0x00, 0x00, 0x05],
+        // 66-prefixed ROR r/m16. The OperandSize::Word allowlist is the only thing stopping this
+        // from being lowered as a 32-bit rotate, which would smear the high half into the low one.
+        vec![0x66, 0xc1, 0xcb, 0x05],
+    ] {
+        assert!(
+            compile_leading_block(&code).is_none(),
+            "group 2 {code:02x?} must stay interpreter-only"
+        );
+    }
+}
+
+#[test]
+fn group2_dword_ror_register_form_is_lowered() {
+    // The positive half of the guard above, and the ONLY test that can detect the new classify arm
+    // being unreachable. Placing it below the existing `matches!(m.reg, 4..=7)` guard would make
+    // it dead code, and every negative assertion above would still pass.
+    for code in [
+        vec![0xc1u8, 0xcb, 0x10], // ror ebx, 16
+        vec![0xc1, 0xcb, 0x01],   // ror ebx, 1
+        vec![0xc1, 0xcb, 0x00],   // ror ebx, 0, the no-op shape still has to ADMIT
+        vec![0xd1, 0xcb],         // ror ebx, 1 via the 0xD1 encoding
+    ] {
+        assert_eq!(
+            compile_leading_block(&code),
+            Some(3),
+            "ROR {code:02x?} must admit and carry the whole three-slot block"
+        );
+    }
+}
+
+/// Compile an instruction as slot 0 of a three-slot block, with every slot's decode line
 /// warmed. The three-slot shape matters: warming only the entry line makes slot 1 miss, the walk
 /// stops at Retry, and the fewer-than-three-slots gate reports the same `is_none()` as a genuine
 /// structural reject. A negative assertion on that shape passes whether or not the opcode is
 /// lowered, which is exactly how this test would have gone vacuous when NEG was admitted.
-fn compile_group3_block(code: &[u8]) -> Option<u8> {
+fn compile_leading_block(code: &[u8]) -> Option<u8> {
     let mut memory = vec![0; 0x5000];
     memory[(ENTRY - 1) as usize] = 0x90;
     let mut block = code.to_vec();
@@ -1503,7 +1916,7 @@ fn group3_non_test_subops_remain_interpreter_only() {
         vec![0x66, 0xf7, 0xdb],
     ] {
         assert!(
-            compile_group3_block(&code).is_none(),
+            compile_leading_block(&code).is_none(),
             "group 3 {code:02x?} must stay interpreter-only"
         );
     }
@@ -1515,7 +1928,7 @@ fn group3_dword_neg_register_form_is_lowered() {
     // "rejected because this sub-opcode stayed out" from "rejected for an unrelated reason",
     // and a fixture that stopped compiling anything at all would still pass.
     assert_eq!(
-        compile_group3_block(&[0xf7, 0xdb]),
+        compile_leading_block(&[0xf7, 0xdb]),
         Some(3),
         "NEG EBX must admit and carry the whole three-slot block"
     );

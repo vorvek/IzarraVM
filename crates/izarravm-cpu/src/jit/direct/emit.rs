@@ -281,6 +281,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 ));
             }
             DirectKind::Shift { op, dst, count } => emit_shift(&mut e, op, dst, count),
+            DirectKind::RotateRightReg { dst, count } => emit_rotate_right_reg(&mut e, dst, count),
             DirectKind::DoubleShiftReg {
                 left,
                 dst,
@@ -2705,6 +2706,82 @@ fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
     emit_capture_flags(e, defined);
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
     emit_clear_pending(e);
+}
+
+fn emit_rotate_right_reg(e: &mut Encoder, dst: u8, raw_count: u8) {
+    // The five-bit mask is applied HERE, on the raw decoded immediate, the same way emit_shift
+    // does it. classify stores the immediate unmasked, so selecting the shape below on the raw
+    // byte would misread `ror eax, 32` as a fourth case instead of the no-op it is.
+    let count = raw_count & 0x1f;
+    if count == 0 {
+        // `shift_rotate` returns before touching the value or any flag, and the interpreter's
+        // write-back stores the unchanged value into the register. A genuine no-op.
+        return;
+    }
+    // Host ROR agrees with the interpreter by construction. CF is the bit rotated into the MSB,
+    // which is what `shift_rotate`'s loop leaves in `cf`, and at count 1 OF is the XOR of the
+    // result's top two bits, which is what its OF arm computes for a right rotate.
+    e.shift_r32_imm8(1, home(dst), count);
+    if count == 1 {
+        // Two set_flag calls, and their ORDER is what makes this branch-free. set_flag(FLAG_CF)
+        // writes the override into the descriptor; set_flag(FLAG_OF) then sees a mask that is not
+        // exactly FLAG_CF, so it materializes WITH that override already applied and writes OF
+        // live, clearing the descriptor. The net final eflags is therefore the materialized word
+        // with CF and OF replaced by this rotate's, which is exactly RBP after capturing those two
+        // bits, because RBP is the running materialized shadow. With no descriptor live the same
+        // three instructions are still right: materialize_flags is a no-op and RBP equals eflags.
+        emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+        e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+        emit_clear_pending(e);
+        return;
+    }
+    // Counts 2 through 31 write ONLY CF, which is the single mask set_flag updates in place
+    // instead of materializing. Nothing else may move: unlike a shift, a rotate architecturally
+    // PRESERVES SF, ZF, PF and AF, so publishing RBP to eflags here (what emit_shift does) would
+    // commit whatever the last deferred op left and destroy a live descriptor's authority.
+    //
+    // Capturing only CF keeps the shadow exact for a later slot in the same block. materialized
+    // CF comes from the override once one is present, and every other bit still comes from the
+    // untouched descriptor, so RBP's other bits must stay frozen at their pre-rotate values. The
+    // host rotate's OF is deliberately NOT captured: at counts above 1 it is undefined on x86, and
+    // the guest's OF is still owned by the descriptor.
+    emit_capture_flags(e, crate::FLAG_CF);
+    let no_descriptor = e.label();
+    let done = e.label();
+    e.load_r32_disp32(Reg::RDI, Reg::R15, pending_offset());
+    e.mov_r32_r32(Reg::RAX, Reg::RDI);
+    // Bit 31 is the has-pending bit. There is no `js` in the encoder, so mask and test for zero.
+    e.and_r32_imm32(Reg::RAX, 1 << 31);
+    e.jz(no_descriptor);
+    // Live descriptor: reproduce PendingFlags::with_cf_override in place. Bit 16 marks an override
+    // present, bit 17 carries its value.
+    e.and_r32_imm32(Reg::RDI, !(1u32 << 17));
+    e.or_r32_imm32(Reg::RDI, 1 << 16);
+    e.mov_r32_r32(Reg::RAX, Reg::RBP);
+    e.and_r32_imm32(Reg::RAX, crate::FLAG_CF);
+    e.shl_r32_imm8(Reg::RAX, 17);
+    e.or_r32_r32(Reg::RDI, Reg::RAX);
+    e.store_r32_disp32(Reg::R15, pending_offset(), Reg::RDI);
+    // set_flag's CF branch also does `eflags |= 0x2` before returning. Bit 1 appears to be set on
+    // every path that writes eflags, so this is expected to be a no-op, but it is reproduced
+    // rather than relied on: `Registers` derives PartialEq and the campaign compares the raw
+    // eflags field, so an assumption that turned out false would be a silent divergence.
+    e.load_r32_disp32(Reg::RAX, Reg::R15, eflags_offset());
+    e.or_r32_imm32(Reg::RAX, 0x2);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RAX);
+    e.jmp(done);
+    e.place(no_descriptor);
+    // No descriptor: set_flag falls through to set_flag_live, which writes CF straight into
+    // eflags. The tag stays zero, which is what materialize_flags leaves behind, so nothing here
+    // touches it.
+    e.load_r32_disp32(Reg::RAX, Reg::R15, eflags_offset());
+    e.and_r32_imm32(Reg::RAX, !crate::FLAG_CF);
+    e.mov_r32_r32(Reg::RDI, Reg::RBP);
+    e.and_r32_imm32(Reg::RDI, crate::FLAG_CF);
+    e.or_r32_r32(Reg::RAX, Reg::RDI);
+    e.or_r32_imm32(Reg::RAX, 0x2);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RAX);
+    e.place(done);
 }
 
 fn emit_double_shift_reg(e: &mut Encoder, left: bool, dst: u8, src: u8, count: ShiftCount) {

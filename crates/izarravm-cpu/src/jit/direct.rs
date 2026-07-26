@@ -1855,6 +1855,19 @@ pub(crate) enum DirectKind {
     NegReg {
         dst: u8,
     },
+    /// ROR r/m32, register form (0xC1 /1 and 0xD1 /1). `count` is the RAW decoded immediate; the
+    /// emitter applies the architectural five-bit mask, exactly as `Shift` does.
+    ///
+    /// Deliberately NOT folded into `Shift`. That variant is in clif's lowerable allowlist and its
+    /// lowering falls through to an arithmetic shift right, so a rotate routed through it would be
+    /// silently emitted as SAR. It also differs in the flag contract that matters here: a shift
+    /// leaves AF, and OF above count 1, architecturally UNDEFINED, which is the only reason
+    /// `emit_shift` may publish a possibly stale RBP to eflags. A rotate PRESERVES SF, ZF, PF and
+    /// AF, so it must not.
+    RotateRightReg {
+        dst: u8,
+        count: u8,
+    },
     TestImmReg {
         dst: u8,
         imm: u32,
