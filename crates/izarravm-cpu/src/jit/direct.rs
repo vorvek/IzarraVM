@@ -1851,6 +1851,24 @@ pub(crate) enum DirectKind {
         dst: u8,
         src: u8,
     },
+    /// IMUL r32, r/m32, MEMORY form (0x0FAF). Same flag contract and the same clocks(9) as
+    /// `Imul`, because the interpreter reaches both through one `imul_truncated` call and one
+    /// `clocks(9)`; the only difference is where the source comes from.
+    ///
+    /// No `width` field, for the reason `NegReg` and `MulReg` have none: the `OperandSize::Word`
+    /// gate excludes 0x0faf, so a 66-prefixed IMUL can never reach the classify arm and the source
+    /// is always a dword.
+    ///
+    /// Deliberately a separate variant rather than a source enum on `Imul`. `Imul` defaults
+    /// CORRECTLY to zero or None in `dword_reads`, `has_dword_read` and `read_segment` precisely
+    /// because it is register-only. Widening it would turn each of those into a guarded pattern
+    /// where writing the bare `Self::Imul { .. }` over-declares the register form's traffic, with
+    /// no compiler assistance either way. Two discriminants keep every one of those arms a
+    /// visible, testable edit.
+    ImulMem {
+        dst: u8,
+        addr: DirectAddr,
+    },
     /// NEG r/m32, register form (0xF7 /3). No width field on purpose; see the classify arm.
     NegReg {
         dst: u8,
@@ -2017,8 +2035,9 @@ impl DirectKind {
             | Self::Store { raw_clocks, .. } => u32::from(raw_clocks),
             Self::X87 { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
-            // arm below returns 2, which would under-charge this instruction by 7.
-            Self::Imul { .. } => 9,
+            // arm below returns 2, which would under-charge this instruction by 7. Both operand
+            // forms share the arm because the interpreter charges them from one `Ok(clocks(9))`.
+            Self::Imul { .. } | Self::ImulMem { .. } => 9,
             _ => 2,
         }
     }
@@ -2092,6 +2111,7 @@ impl DirectKind {
                     width: MemoryWidth::Dword,
                     ..
                 } | Self::DoubleShiftMem { .. }
+                    | Self::ImulMem { .. }
                     | Self::TestImmMem {
                         width: MemoryWidth::Dword,
                         ..
@@ -2203,6 +2223,8 @@ impl DirectKind {
                 MemoryWidth::Byte | MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                 MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
             },
+            // One dword read and nothing else, the same as AluMemSource's Dword arm.
+            Self::ImulMem { .. } => COUNTER_MODE13_DWORD_READ,
             Self::Store {
                 width: MemoryWidth::Byte,
                 ..
@@ -2283,6 +2305,7 @@ impl DirectKind {
         match self {
             Self::Load { addr, .. }
             | Self::LoadExtend { addr, .. }
+            | Self::ImulMem { addr, .. }
             | Self::AluMemSource { addr, .. }
             | Self::AluMemDest { addr, .. }
             | Self::DoubleShiftMem { addr, .. }
@@ -2342,6 +2365,7 @@ impl DirectKind {
                 width: MemoryWidth::Dword,
                 ..
             } | Self::DoubleShiftMem { .. }
+                | Self::ImulMem { .. }
                 | Self::TestImmMem {
                     width: MemoryWidth::Dword,
                     ..

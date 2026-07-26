@@ -252,6 +252,31 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Test { a, b } => emit_test(&mut e, a, b),
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
+            DirectKind::ImulMem { dst, addr } => {
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_imul_mem(&mut e, dst, addr, memory, reasons);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    MemoryWidth::Dword.needs_alignment_guard(),
+                    memory.cpl3,
+                    // Read-only, exactly as AluMemSource and TestImmMem pass it.
+                    false,
+                );
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
             DirectKind::NegReg { dst } => emit_neg_reg(&mut e, dst),
             DirectKind::MulReg { src } => emit_mul_reg(&mut e, src),
             DirectKind::TestImmReg { dst, imm, width } => {
@@ -1212,6 +1237,10 @@ fn emit_load(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 fn emit_load_extend(
     e: &mut Encoder,
     dst: u8,
@@ -1568,6 +1597,46 @@ fn emit_alu_mem_source(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+fn emit_imul_mem(
+    e: &mut Encoder,
+    dst: u8,
+    addr: DirectAddr,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
+    // The memory half is emit_alu_mem_source's Dword arm verbatim. Every side exit, the cross-page
+    // guard and the mode13 completion are resolved inside emit_ram_read_pointer, before anything
+    // here writes a guest register or a flag, so a faulting IMUL leaves the destination and the
+    // flags untouched. That is what the interpreter does: it faults inside read_operand_sized,
+    // before read_gpr_sized and before imul_truncated (execute_extended.rs, the 0x0faf arm).
+    //
+    // RCX is loaded AFTER emit_ram_read_pointer and not before, because
+    // emit_mode13_read_completion clobbers RCX (and RDX). RDI survives it and still holds the
+    // pointer. home(dst) is safe throughout: GUEST_HOMES is R8-R14 and RBX, disjoint from every
+    // scratch register this path uses.
+    emit_ram_read_pointer(e, MemoryWidth::Dword, addr, memory, sides);
+    e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
+    // The tail is emit_imul's verbatim, and it is correct here for the same reason: the
+    // interpreter reaches BOTH operand forms through one imul_truncated (core.rs), which ends in
+    // set_flag(FLAG_CF | FLAG_OF, significant). That mask has more than one bit, so it cannot take
+    // the single-bit CF-override shortcut; it materializes whatever was pending and writes just
+    // those two bits, leaving SF/ZF/AF/PF alone. Capturing CF and OF into the RBP shadow and
+    // storing the whole word is that materialize-then-write in one store.
+    //
+    // Host `imul r32, r32` sets CF = OF = "the 32-bit truncation does not sign-extend back from
+    // the full product", which is `significant` exactly, so the flags are right by construction
+    // rather than by a recomputation that could drift. Nothing may be inserted between the
+    // multiply and emit_capture_flags's pushfq.
+    e.imul_r32_r32(home(dst), Reg::RCX);
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 fn emit_test_imm_mem(
     e: &mut Encoder,
     imm: u32,
@@ -1792,6 +1861,14 @@ fn emit_alu_mem_source(
     _: MemoryEmitContext,
     _: MemorySideExits,
 ) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_imul_mem(_: &mut Encoder, _: u8, _: DirectAddr, _: MemoryEmitContext, _: MemorySideExits) {
     unreachable!("direct memory lowering is x86-64-only")
 }
 

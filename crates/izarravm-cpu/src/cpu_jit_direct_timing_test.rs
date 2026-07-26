@@ -144,10 +144,14 @@ fn mode13_read_self_loop_respects_the_tight_native_deadline() {
 ///
 /// The instruction is `movzx/movsx ebx, byte/word [esi + target]`, with ESI held at zero by the
 /// fixture so the effective address is `target` and can be pointed at either plain RAM or the
-/// mode13 aperture. A base register rather than a bare disp32 because `direct_addr` requires
-/// `scale` to be one of 1, 2, 4 or 8 and a no-SIB absolute decodes with scale 0, which it rejects;
-/// `[esi]` is also the form Quake's texture fetch actually uses. Slots 1 and 2 are register moves,
-/// so the block carries exactly ONE memory access and the read counters below are unambiguous.
+/// mode13 aperture. A base register rather than a bare disp32 because `[reg + disp32]` is the form
+/// Quake's texture fetch actually uses. Slots 1 and 2 are register moves, so the block carries
+/// exactly ONE memory access and the read counters below are unambiguous.
+///
+/// The original note here claimed a bare no-SIB disp32 decodes with scale 0 and is therefore
+/// rejected by `direct_addr`. That is wrong: `decode` seeds `scale` to 1 and only overwrites it in
+/// the SIB branch, so a no-SIB absolute is accepted. Measured directly while adding the IMUL
+/// memory form, whose retired negative test had been resting on that belief.
 fn movzx_case(signed: bool, word: bool, target: u32) -> Vec<u8> {
     let opcode: u8 = match (signed, word) {
         (false, false) => 0xb6,
@@ -423,6 +427,453 @@ fn movzx_memory_forms_are_lowered() {
             "signed={signed} word={word} must admit and carry the whole block"
         );
     }
+}
+
+/// IMUL r32, r/m32, memory form: `imul ebx, [esi + target]`.
+///
+/// ESI is held at zero by every fixture below, so the effective address is `target` and can be
+/// aimed at plain RAM or at the mode13 aperture. A base register rather than a bare disp32 because
+/// `[reg + disp32]` is the form Quake actually uses, and because it lets the aliasing fixture point
+/// the base at the destination. Slots 1 and 2 are register moves that touch neither flags nor ESI,
+/// so the block carries exactly ONE memory access and one flag write.
+///
+/// 0F AF /r, mod=10 (disp32) rm=110 (esi), reg=011 (ebx) -> modrm 0b10_011_110 = 0x9e.
+fn imul_mem_case(target: u32) -> Vec<u8> {
+    let mut code = vec![0x0fu8, 0xaf, 0x9e];
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    code
+}
+
+/// THE REGISTRATION TEST. A new memory-bearing DirectKind defaults to zero in `dword_reads`, to
+/// false in `has_dword_read` and to None in `read_segment`, and nothing in the emitted code fails
+/// when that happens: the block under-declares its own traffic and the divergence surfaces as a
+/// `raw_bus_clocks` mismatch hours into a timedemo. `read_segment` is worse than bookkeeping, so
+/// it gets a release-meaningful assertion of its own below rather than resting on the
+/// `debug_assert` inside `SegmentLayout::descriptor`.
+#[test]
+fn imul_memory_form_declares_its_read_and_its_segment() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    let code = imul_mem_case(TARGET);
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let block = install_fixture_block(&mut cpu, ENTRY);
+
+    assert_eq!(block.span().instructions, 3, "whole block admitted");
+    assert_eq!(block.byte_reads(), 0, "no byte read");
+    assert_eq!(block.word_reads(), 0, "no word read");
+    assert_eq!(block.dword_reads(), 1, "dword-read declaration");
+    // clocks(9) for the IMUL per the interpreter's 0x0faf arm, plus 2 each for the two moves. The
+    // DirectKind default is 2, so a missing raw_clocks arm shows up here as 2 + 2 + 2.
+    assert_eq!(block.raw_clocks(), 9 + 2 + 2, "charged core clocks");
+    // `has_dword_read` feeds the block's `has_wide_accesses`, which run.rs consults before running
+    // a block while #AC is armed at CPL 3. Nothing else in this file reads it.
+    assert!(block.has_wide_accesses(), "wide-access declaration");
+
+    // THE read_segment ASSERTION, and the reason it is written this way. Defaulting to None keeps
+    // DS out of the block's SegmentLayout mask, and `data_matches` SKIPS every segment outside
+    // that mask. So a cached block would keep matching after the guest reloads DS and would go on
+    // reading through a stale base. That is a wrong-memory-read bug, not lost bookkeeping, and it
+    // is invisible to the debug_assert in `SegmentLayout::descriptor` in a release build.
+    assert!(
+        block.data_descriptors_match(&cpu),
+        "the block must match the segments it was compiled under"
+    );
+    let mut reloaded = cpu.registers.segment(SegmentIndex::Ds);
+    reloaded.base = 0x1_0000;
+    cpu.registers.set_segment(SegmentIndex::Ds, reloaded);
+    assert!(
+        !block.data_descriptors_match(&cpu),
+        "reloading DS must invalidate a block that reads through DS"
+    );
+}
+
+/// Value, flag and timing identity against the interpreter, on both a plain-RAM target and the
+/// mode13 aperture. The mode13 half is not just coverage: an under-declared read trips a
+/// debug_assert in the run loop there, which is a loud failure, whereas the RAM half only shows up
+/// as a bus-clock difference.
+#[test]
+fn imul_memory_form_matches_the_interpreter_and_its_bus_clocks() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    // Seeds chosen so every failure mode has a discriminating case: a small product that overflows
+    // nothing, a product that overflows 32 bits (CF/OF set), a negative times a positive (an
+    // unsigned lowering disagrees), and 0x80000000 squared. The overflow cases are also the only
+    // ones that separate `imul r32` from the REX.W form, whose 64-bit product always fits.
+    for (seed_dst, seed_src) in [
+        (3u32, 7u32),
+        (0x0001_0000, 0x0001_0000),
+        (0xffff_fffe, 0x0000_0003),
+        (0x8000_0000, 0x8000_0000),
+        (0x7fff_ffff, 0x0000_0002),
+        (0x0000_0000, 0xdead_beef),
+    ] {
+        for target in [RAM, MODE13] {
+            let code = imul_mem_case(target);
+            let mut memory = vec![0; 0x000b_0000];
+            memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+            memory[target as usize..target as usize + 4].copy_from_slice(&seed_src.to_le_bytes());
+
+            let mut native = fresh();
+            let mut interp = fresh();
+            make_data_segments_flat(&mut native);
+            make_data_segments_flat(&mut interp);
+            native.registers.eip = ENTRY;
+            interp.registers.eip = ENTRY;
+            let mut native_bus = TestBus::with_memory(memory.clone());
+            let mut interp_bus = TestBus::with_memory(memory);
+            for bus in [&mut native_bus, &mut interp_bus] {
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                bus.uniform_native_fetches = true;
+            }
+            let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+            decode_fixture(&mut native, &mut native_bus, &starts);
+            decode_fixture(&mut interp, &mut interp_bus, &starts);
+            for (cpu, bus) in [
+                (&mut native, &mut native_bus),
+                (&mut interp, &mut interp_bus),
+            ] {
+                map_direct_page(
+                    cpu,
+                    bus,
+                    target,
+                    target,
+                    jit::fast_map::PagePermissions::UNPAGED,
+                    true,
+                    false,
+                );
+            }
+            let block = install_fixture_block(&mut native, ENTRY);
+
+            for cpu in [&mut native, &mut interp] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                cpu.registers.gpr.fill(0xdead_beef);
+                cpu.registers.set_esp(0xc000);
+                // ESI is the address base and must be zero for the effective address to be
+                // `target`. Set AFTER the fill, or the load reads a wild address.
+                cpu.registers.set_esi(0);
+                cpu.registers.set_ebx(seed_dst);
+                // AF and the reserved bit are seeded SET so a tail that publishes a stale or
+                // over-wide flag word is visible: IMUL must leave SF, ZF, AF and PF alone.
+                cpu.registers.eflags = 0x0296;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.registers.eip = ENTRY;
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.core_clocks_so_far = 0;
+            }
+            native_bus.trace = BusTrace::default();
+            interp_bus.trace = BusTrace::default();
+
+            let label = format!("dst={seed_dst:#010x} src={seed_src:#010x} target={target:#x}");
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap(),
+                "{label}: must run natively"
+            );
+            for _ in 0..3 {
+                interp.cycle(&mut interp_bus).unwrap();
+            }
+
+            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                native.pending_flags, interp.pending_flags,
+                "{label}: pending"
+            );
+            assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+            assert_eq!(
+                native.elapsed_clocks, interp.elapsed_clocks,
+                "{label}: core clocks"
+            );
+            assert_eq!(
+                native_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks(),
+                "{label}: BUS clocks, the registration check"
+            );
+
+            // Pin the concrete product and the concrete CF/OF, not only agreement: if both sides
+            // were wrong in the same direction the comparisons above would still pass.
+            let product = i64::from(seed_dst as i32) * i64::from(seed_src as i32);
+            assert_eq!(
+                native.registers.ebx(),
+                product as u32,
+                "{label}: truncated product"
+            );
+            let significant = product != i64::from(product as u32 as i32);
+            assert_eq!(
+                native.eflags() & (crate::FLAG_CF | crate::FLAG_OF) != 0,
+                significant,
+                "{label}: CF and OF track the 32-bit truncation, not the 64-bit product"
+            );
+        }
+    }
+}
+
+/// The destination register is also the address base. The source must be read BEFORE the
+/// destination is written, which is what the interpreter does (`read_operand_sized` then
+/// `write_gpr_sized`) and what reading the pointer before the multiply gives here.
+#[test]
+fn imul_memory_form_handles_the_destination_as_its_own_address_base() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    // 0F AF /r, mod=10 rm=110 (esi), reg=110 (esi) -> modrm 0b10_110_110 = 0xb6. `imul esi,
+    // [esi+0]`, with ESI seeded to TARGET so the address is TARGET and the destination is ESI.
+    let mut code = vec![0x0fu8, 0xaf, 0xb6, 0x00, 0x00, 0x00, 0x00];
+    code.extend_from_slice(&[0x89, 0xff, 0x89, 0xff, 0xf4]);
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&7u32.to_le_bytes());
+
+    let mut native = fresh();
+    let mut interp = fresh();
+    make_data_segments_flat(&mut native);
+    make_data_segments_flat(&mut interp);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        bus.report_batch_clocks = true;
+        bus.uniform_native_fetches = true;
+    }
+    let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interp, &mut interp_bus, &starts);
+    for (cpu, bus) in [
+        (&mut native, &mut native_bus),
+        (&mut interp, &mut interp_bus),
+    ] {
+        map_direct_page(
+            cpu,
+            bus,
+            TARGET,
+            TARGET,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            false,
+        );
+    }
+    let block = install_fixture_block(&mut native, ENTRY);
+    for cpu in [&mut native, &mut interp] {
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0xc000);
+        cpu.registers.set_esi(TARGET);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.registers.eip = ENTRY;
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    for _ in 0..3 {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+    assert_eq!(native.registers, interp.registers, "aliased dst/base");
+    assert_eq!(
+        native.registers.esi(),
+        TARGET.wrapping_mul(7),
+        "the source must be read before the destination is written"
+    );
+}
+
+/// The ONLY fixture that exercises the materialize-then-write path. Slot 0 is an ADD, which leaves
+/// a live pending descriptor; the IMUL that follows must materialize it (including any CF
+/// override) and then write only CF and OF, leaving SF, ZF, AF and PF as the ADD computed them.
+/// Without this fixture the whole RBP-shadow argument runs with no descriptor live and is
+/// untested, and `emit_clear_pending` has no catcher at all.
+#[test]
+fn imul_memory_form_materializes_a_live_descriptor_first() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    for (seed_dst, seed_add, seed_src) in [
+        (0x0000_0005u32, 0x0000_0003u32, 0x0000_0007u32),
+        (0xffff_ffffu32, 0x0000_0001u32, 0x0001_0000u32),
+        (0x8000_0000u32, 0x8000_0000u32, 0x0000_0003u32),
+    ] {
+        // 01 cb = add ebx, ecx, then the IMUL, then one register move.
+        let mut code = vec![0x01u8, 0xcb];
+        code.extend_from_slice(&imul_mem_case(TARGET)[..7]);
+        code.extend_from_slice(&[0x89, 0xf6, 0xf4]);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&seed_src.to_le_bytes());
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 9];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                TARGET,
+                TARGET,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                false,
+            );
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_esi(0);
+            cpu.registers.set_ebx(seed_dst);
+            cpu.registers.set_ecx(seed_add);
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        let label = format!("dst={seed_dst:#010x} add={seed_add:#010x} src={seed_src:#010x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        // The raw descriptor, not just eflags(): a tail that materialized eagerly, or that skipped
+        // emit_clear_pending, agrees on eflags() while differing on every byte of this.
+        assert_eq!(
+            native.pending_flags, interp.pending_flags,
+            "{label}: lazy flags"
+        );
+        assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+    }
+}
+
+#[test]
+fn imul_word_operand_memory_form_remains_interpreter_only() {
+    // 66 0F AF 9E <disp32>: IMUL BX, [esi+disp32]. The OperandSize::Word gate is the only thing
+    // stopping this, and `write_gpr_sized` at Word MERGES into the low 16 bits instead of
+    // replacing all 32, so lowering it as the 32-bit form would clobber the destination's high
+    // half and compute CF/OF against the wrong width.
+    //
+    // PAIRED with `imul_memory_form_is_lowered` below. On its own this assertion passes for any
+    // reason the harness stops compiling, including the classify arm being unreachable.
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    let mut code = vec![0x66u8];
+    code.extend_from_slice(&imul_mem_case(TARGET));
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    // Three warmed starts. Warming only the entry makes slot 1 miss, the walk stops at Retry, and
+    // the fewer-than-three-slots gate returns the same None a real reject would.
+    let starts = [ENTRY, ENTRY + 8, ENTRY + 10];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    // Map the target page, or the compile refuses for want of a direct-page mapping and the
+    // assertion below passes for a reason unrelated to the opcode.
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    assert!(
+        jit::direct::compile(&mut cpu, ENTRY, true).is_none(),
+        "66-prefixed memory IMUL must stay interpreter-only"
+    );
+}
+
+#[test]
+fn imul_memory_form_is_lowered() {
+    // The positive half of the guard above, and the ONLY test that can detect the classify arm
+    // being keyed on the low opcode byte, where the `u8::try_from(insn.opcode)` truncation makes it
+    // unreachable for a two-byte opcode. Every negative assertion passes when that happens.
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    let code = imul_mem_case(TARGET);
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    let instructions = outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions);
+    assert_eq!(
+        instructions,
+        Some(3),
+        "the memory IMUL must admit and carry the whole three-slot block"
+    );
 }
 
 struct DirectTimingCase {

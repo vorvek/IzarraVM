@@ -778,9 +778,11 @@ fn imul_terminal_jcc_reads_the_last_flag_producer() {
     );
 }
 
-// Guard rails for classify's IMUL arm: it must stay narrow to exactly mod==3, dword-operand-size
-// 0x0FAF. Neither the differential generator nor the battery above ever emits a 0x66-prefixed or
-// memory-form 0x0FAF, so nothing else catches either of these arms being widened by a later edit.
+// Guard rail for classify's IMUL arm: it must stay narrow to DWORD operand size. The memory form
+// is lowered as of the ImulMem slice, and its guards live beside the other memory forms in
+// cpu_jit_direct_timing_test.rs, which is where the direct-page mapping those fixtures need
+// already exists. Neither the differential generator nor the battery above ever emits a
+// 0x66-prefixed 0x0FAF, so nothing else catches this arm being widened by a later edit.
 
 fn assert_imul_form_falls_to_interpreter(mode: GswMode, insn: &[u8], context: &str) {
     let mut pristine = vec![0; 0x5000];
@@ -853,15 +855,6 @@ fn imul_word_operand_size_falls_to_the_interpreter() {
         &[0x66, 0x0f, 0xaf, 0xc1],
         "word IMUL (66 0F AF /r)",
     );
-}
-
-#[test]
-fn imul_memory_source_form_falls_to_the_interpreter() {
-    // 0F AF 05 <disp32>: IMUL EAX, [disp32]. Register form only (mod == 3) is implemented; the
-    // memory source form is unclaimed until a later slice adds it.
-    let mut insn = vec![0x0f, 0xaf, 0x05];
-    insn.extend_from_slice(&0x1234u32.to_le_bytes());
-    assert_imul_form_falls_to_interpreter(GswMode::Gsw586, &insn, "memory-source IMUL (0F AF /r)");
 }
 
 #[test]
