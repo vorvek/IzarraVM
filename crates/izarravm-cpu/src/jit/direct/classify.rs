@@ -28,7 +28,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     {
         return None;
     }
-    // IMUL r32, r/m32, register form only. Must stay below the Word-size gate above: a
+    // IMUL r32, r/m32, both operand forms. Must stay below the Word-size gate above: a
     // 66-prefixed IMUL decodes with OperandSize::Word and is not in that gate's allowlist, so it
     // already falls through to `None` there. Moving this arm above the gate, or adding 0x0faf to
     // the allowlist, would silently lower a 16-bit IMUL as a 32-bit multiply instead: the
@@ -39,11 +39,19 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         // truncation (`u8::try_from(insn.opcode).ok()`) returns None for every two-byte opcode,
         // so the u8 arms below are unreachable for 0x0faf regardless. Matching the full u16 here
         // keeps that explicit and local instead of relying on the truncation's behavior.
+        //
+        // Both forms share ONE arm so the gate placement above cannot come to apply to one and
+        // not the other. The `?` on `direct_addr` returns None from `classify`, not from the
+        // match, which is what every other memory arm in this file does for an unsupported
+        // address size or scale.
         let m = insn.modrm?;
-        let DecodedOperand::Reg(src) = insn.operand? else {
-            return None;
+        return match insn.operand? {
+            DecodedOperand::Reg(src) => Some(DirectKind::Imul { dst: m.reg, src }),
+            DecodedOperand::Mem(addr) => Some(DirectKind::ImulMem {
+                dst: m.reg,
+                addr: direct_addr(addr)?,
+            }),
         };
-        return Some(DirectKind::Imul { dst: m.reg, src });
     }
     // MOVZX and MOVSX, memory form only. Keyed on the full u16 opcode and placed ABOVE the
     // `u8::try_from(insn.opcode).ok()` truncation further down, for the same reason 0x0faf is:

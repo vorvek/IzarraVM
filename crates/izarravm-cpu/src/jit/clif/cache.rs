@@ -593,6 +593,12 @@ fn slot_displacement(kind: &DirectKind) -> u32 {
         // inertness is an undocumented invariant one allowlist edit away from silently producing a
         // displacement lane that does not match the instruction it describes.
         | DirectKind::LoadExtend { addr, .. }
+        // Same standing as LoadExtend above. ImulMem IS reached by the growth walk, which writes
+        // this lane, but `plan_unit` stops the lowering run at it because it is absent from
+        // `lowerable`, so nothing ever reads the lane back. Carried anyway: leaving it at the
+        // `_ => 0` default would make the walk-time lane disagree with what `restamp_slot`
+        // recomputes from the guest bytes, and only the allowlist is keeping that unread.
+        | DirectKind::ImulMem { addr, .. }
         | DirectKind::Store { addr, .. }
         | DirectKind::AluMemSource { addr, .. }
         | DirectKind::AluMemDest { addr, .. }
