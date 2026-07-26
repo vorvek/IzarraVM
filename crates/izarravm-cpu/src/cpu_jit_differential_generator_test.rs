@@ -25,7 +25,7 @@ const MEMORY_LEN: usize = 0x20_000;
 // continuing the first. That is a real split, not a truncation, so it costs one instruction off
 // the fully-native count; `GeneratedCase::cold_memory_target` records which cases hit it so the
 // comparison below can expect the right number instead of a single constant.
-const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 29;
+const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 30;
 const GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY: u64 =
     GENERATED_BLOCK_NATIVE_INSTRUCTIONS - 1;
 
@@ -119,6 +119,9 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     bytes.extend_from_slice(&[0x0f, 0xaf, 0xc0 | (rng.reg() << 3) | rng.reg()]);
     // NEG r32 (0xF7 /3, mod 11). 0xd8 is mod 11 with reg 3, so `| rng.reg()` picks the operand.
     bytes.extend_from_slice(&[0xf7, 0xd8 | rng.reg()]);
+    // MUL r32 (0xF7 /4, mod 11). 0xe0 is mod 11 with reg 4. This one writes EAX and EDX whatever
+    // the operand is, so it also shuffles the register state the later slots run against.
+    bytes.extend_from_slice(&[0xf7, 0xe0 | rng.reg()]);
     // ROR r32, imm8 (0xC1 /1, mod 11). 0xc8 is mod 11 with reg 1. The count spans all three
     // compile-time shapes: 0 masks to a no-op, 1 is the materialising shape, and the rest take the
     // in-place carry override. Drawn from the same stream as the operand so it varies per case.

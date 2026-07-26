@@ -253,6 +253,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
             DirectKind::NegReg { dst } => emit_neg_reg(&mut e, dst),
+            DirectKind::MulReg { src } => emit_mul_reg(&mut e, src),
             DirectKind::TestImmReg { dst, imm, width } => {
                 emit_test_imm_reg(&mut e, dst, imm, width);
             }
@@ -2663,6 +2664,34 @@ fn emit_neg_reg(e: &mut Encoder, dst: u8) {
     e.alu_r32_r32(5, home(dst), Reg::RCX);
     emit_capture_flags(e, ARITH_FLAGS);
     emit_pending(e, 0x8000_0201, None, Some(Reg::RCX), home(dst));
+}
+
+fn emit_mul_reg(e: &mut Encoder, src: u8) {
+    // One-operand MUL is the same FLAG shape as two-operand IMUL, so the tail below is
+    // emit_imul's verbatim: the interpreter ends in set_flag(FLAG_CF | FLAG_OF, significant)
+    // (core.rs), whose mask has more than one bit and therefore cannot take the single-bit
+    // CF-override shortcut. It materializes whatever was pending and then writes just those two
+    // bits, which is what leaves SF/ZF/AF/PF alone. RBP is a running materialized-eflags shadow,
+    // so capturing CF/OF from the host multiply into it and storing the whole word is that same
+    // materialize-then-write in one store.
+    //
+    // Host `mul` sets CF = OF = (high half nonzero), which is `product >> 32 != 0` exactly. The
+    // flags are right by construction rather than by a recomputation that could drift from the
+    // interpreter's.
+    //
+    // What is NOT shared with IMUL is the operand shuffle. Guest EAX and EDX live in the homes R8
+    // and R10 while the host instruction hardwires RAX and RDX, which are emitter scratch. Reading
+    // the multiplicand out of its home AFTER loading RAX and BEFORE writing either home is what
+    // makes `src == 0` (EAX squared) and `src == 2` (EDX supplying the multiplicand it is about to
+    // be overwritten by) come out right; no home is RAX or RDX, so the source is still intact when
+    // the multiply reads it. The two writes are plain movs and clear no flags.
+    e.mov_r32_r32(Reg::RAX, home(0));
+    e.mul_r32(home(src));
+    e.mov_r32_r32(home(0), Reg::RAX);
+    e.mov_r32_r32(home(2), Reg::RDX);
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
 }
 
 fn emit_test_imm_reg(e: &mut Encoder, dst: u8, imm: u32, width: MemoryWidth) {

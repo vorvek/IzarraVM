@@ -1888,15 +1888,194 @@ fn compile_leading_block(code: &[u8]) -> Option<u8> {
         .then(|| outcome.unwrap().span.instructions)
 }
 
+fn arm_mul_reg(
+    cpu: &mut CpuGsw,
+    src: u8,
+    eax_seed: u32,
+    src_seed: u32,
+    eflags: u32,
+    pending: Option<(u32, u32)>,
+) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    // Distinct non-zero filler everywhere first, so a lowering that forgot to write EDX at all is
+    // caught by EDX still holding filler rather than by it accidentally already being the answer.
+    for index in 0..8usize {
+        cpu.registers.gpr[index] = 0xfeed_0000 | index as u32;
+    }
+    // ESP FIRST, then the seeds. ESP is gpr[4], so setting it afterwards would silently discard
+    // the multiplicand for src == 4 and collapse every one of that source's cases onto one value.
+    // This is the exact ordering bug that voided nine cases of the NEG battery; see arm_neg_reg.
+    // The block touches no stack, so the value here is arbitrary.
+    cpu.registers.set_esp(0xc000);
+    cpu.registers.gpr[0] = eax_seed;
+    // AFTER eax, deliberately. For src == 0 this overwrites the accumulator seed, which is right:
+    // `mul eax` squares one register and there is no second operand to hold. The seeds below are
+    // chosen so the square still discriminates.
+    cpu.registers.gpr[usize::from(src)] = src_seed;
+    cpu.registers.eflags = eflags;
+    cpu.pending_flags = PendingFlags::default();
+    if let Some((a, b)) = pending {
+        let _ = cpu.alu(0, a, b, BusWidth::Dword);
+    }
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+}
+
+fn prepare_mul_reg(
+    mode: GswMode,
+    src: u8,
+    eax_seed: u32,
+    src_seed: u32,
+    eflags: u32,
+    pending: Option<(u32, u32)>,
+) -> Fixture {
+    let insn = vec![0xf7u8, 0xe0 | src];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [
+        ENTRY,
+        ENTRY + insn.len() as u32,
+        ENTRY + insn.len() as u32 + 2,
+    ];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    let block = install_block(&mut native);
+    arm_mul_reg(&mut native, src, eax_seed, src_seed, eflags, pending);
+    arm_mul_reg(&mut interpreter, src, eax_seed, src_seed, eflags, pending);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+#[test]
+fn mul_register_form_matches_the_interpreter_across_sources_and_corners() {
+    // Each pair breaks a specific mutation rather than merely covering the space:
+    //   (0x0001_0000, 0x0001_0000)  product 0x1_0000_0000: EDX=1, EAX=0, CF=OF=1. The only pair
+    //                               whose square ALSO overflows, so it still discriminates at
+    //                               src == 0 where both operands collapse onto the multiplicand.
+    //   (0xffff_ffff, 0x0000_0002)  product 0x1_ffff_fffe: EDX=1, EAX=0xfffffffe, CF=OF=1
+    //                               unsigned. A SIGNED one-operand IMUL (the /5 sibling one modrm
+    //                               bit away) computes -1 * 2 = -2 here, giving EDX=0xffffffff and
+    //                               CF=OF=0, so this pair is what separates MUL from IMUL.
+    //   (0x0000_ffff, 0x0000_0003)  product 0x2fffd: fits, EDX=0, CF=OF=0. The no-overflow case,
+    //                               and EDX=0 differs from the 0xfeed_0002 filler, so a lowering
+    //                               that never wrote EDX fails here rather than passing by luck.
+    //   (0x8000_0000, 0x0000_0002)  product 0x1_0000_0000: EDX=1, EAX=0. Sign-bit input with an
+    //                               unsigned result a signed multiply would get wrong.
+    //   (0x1234_5678, 0x9abc_def0)  a pair whose high and low halves are both non-trivial and
+    //                               unequal, so swapping the EAX and EDX writes cannot pass.
+    let pairs = [
+        (0x0001_0000u32, 0x0001_0000u32),
+        (0xffff_ffff, 0x0000_0002),
+        (0x0000_ffff, 0x0000_0003),
+        (0x8000_0000, 0x0000_0002),
+        (0x1234_5678, 0x9abc_def0),
+    ];
+    for src in 0..8u8 {
+        for (eax_seed, src_seed) in pairs {
+            let context = format!("src={src} eax={eax_seed:#010x} operand={src_seed:#010x}");
+            finish_and_compare(
+                prepare_mul_reg(GswMode::Gsw586, src, eax_seed, src_seed, 0x202, None),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn mul_register_form_materializes_an_incoming_pending_descriptor() {
+    // The battery above runs with no descriptor live, where materialize_flags is a no-op and the
+    // whole RBP-shadow argument is untested. MUL ends in set_flag(FLAG_CF | FLAG_OF, ..), a
+    // multi-bit mask that cannot take the CF-override shortcut, so it MUST materialize whatever
+    // was pending into eflags and then write only those two bits. Seeded with live ADD descriptors
+    // whose SF/ZF/AF/PF disagree with both the raw eflags and with anything a host multiply leaves
+    // behind, so capturing too wide a mask, or failing to commit the shadow, diverges here.
+    let states: [(u32, Option<(u32, u32)>); 4] = [
+        (0x202, Some((0x7fff_ffff, 1))),
+        (0x8d7, Some((0x0000_00ff, 1))),
+        (0x202, Some((0xffff_ffff, 1))),
+        (0x8d7, None),
+    ];
+    for (eflags, pending) in states {
+        // The third pair is the signedness discriminator. Without it this test survives a mutation
+        // that emits the signed one-operand IMUL (/5) instead of MUL (/4), because the first two
+        // pairs are small positives where the two agree. Measured: that mutation failed the other
+        // three MUL tests and passed this one until this pair was added.
+        for (eax_seed, src_seed) in [
+            (0x0001_0000u32, 0x0001_0000u32),
+            (0x0000_ffff, 0x0000_0003),
+            (0xffff_ffff, 0x0000_0002),
+        ] {
+            let context = format!("eflags={eflags:#x} pending={pending:?} eax={eax_seed:#010x}");
+            finish_and_compare(
+                prepare_mul_reg(GswMode::Gsw586, 3, eax_seed, src_seed, eflags, pending),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn mul_register_form_reads_edx_and_esp_sources_before_writing_them() {
+    // src == 2 supplies the multiplicand from EDX, the register MUL is about to overwrite with the
+    // high half, so this pins that the emitted multiply reads the source home before either write.
+    // src == 4 is ESP, the destination index whose seed the NEG battery once silently discarded.
+    // Both use a multiplicand whose product overflows, so EDX genuinely changes rather than
+    // happening to keep its value.
+    for src in [2u8, 4] {
+        for (eax_seed, src_seed) in [(0xffff_ffffu32, 0x0000_0002u32), (0x0001_0000, 0x0001_0000)] {
+            let context = format!("src={src} eax={eax_seed:#010x} operand={src_seed:#010x}");
+            let fixture = prepare_mul_reg(GswMode::Gsw586, src, eax_seed, src_seed, 0x202, None);
+            // Positive control on the fixture itself: if a future edit reordered the seeding so
+            // set_esp clobbered the multiplicand, this asserts at the cause instead of letting the
+            // comparison pass on a collapsed case.
+            assert_eq!(
+                fixture.interpreter.registers.gpr[usize::from(src)],
+                src_seed,
+                "{context}: the multiplicand seed must survive into the source register"
+            );
+            finish_and_compare(fixture, &context);
+        }
+    }
+}
+
+#[test]
+fn mul_register_form_matches_the_interpreter_in_486_mode() {
+    finish_and_compare(
+        prepare_mul_reg(GswMode::Gsw486, 3, 0xffff_ffff, 0x0000_0002, 0x202, None),
+        "486 src=3",
+    );
+}
+
 #[test]
 fn group3_non_test_subops_remain_interpreter_only() {
-    // Everything in group 3 except TEST (/0) and the now-lowered dword NEG (/3). The byte group
-    // 0xf6 stays entirely interpreter-only, including its own /3.
+    // Everything in group 3 except TEST (/0), the lowered dword NEG (/3) and the lowered dword
+    // MUL (/4). The byte group 0xf6 stays entirely interpreter-only, including its own /3 and /4.
     for code in [
         vec![0xf7, 0xcb], // /1 TEST alias, undocumented
         vec![0xf7, 0xd3], // /2 NOT r/m32
-        vec![0xf7, 0xe3], // /4 MUL r/m32
-        vec![0xf7, 0xeb], // /5 IMUL r/m32
+        vec![0xf7, 0xeb], // /5 IMUL r/m32, the SIGNED sibling one modrm bit from the lowered /4
         vec![0xf7, 0xf3], // /6 DIV r/m32
         vec![0xf7, 0xfb], // /7 IDIV r/m32
         vec![0xf6, 0xcb], // /1 byte
@@ -1914,6 +2093,14 @@ fn group3_non_test_subops_remain_interpreter_only() {
         // 66-prefixed NEG r/m16. The classify comment names the OperandSize::Word allowlist as
         // the only thing stopping this from being lowered as a 32-bit NEG; this pins it.
         vec![0x66, 0xf7, 0xdb],
+        // MUL dword [disp32]: the MEMORY form of the sub-opcode this slice lowers. Without it,
+        // replacing the register-only `let-else` in the /4 arm with a defaulting match would
+        // multiply by EAX instead of by the memory operand and survive every register battery.
+        vec![0xf7, 0x25, 0x00, 0x50, 0x00, 0x00],
+        // 66-prefixed MUL r/m16, pinning the same OperandSize::Word allowlist for /4. A 16-bit MUL
+        // writes DX and AX as halves of the existing EDX and EAX rather than replacing them, so
+        // lowering it as the 32-bit form would clobber both high halves.
+        vec![0x66, 0xf7, 0xe3],
     ] {
         assert!(
             compile_leading_block(&code).is_none(),
@@ -1927,6 +2114,11 @@ fn group3_dword_neg_register_form_is_lowered() {
     // The positive half of the guard above. Without it the negative list cannot distinguish
     // "rejected because this sub-opcode stayed out" from "rejected for an unrelated reason",
     // and a fixture that stopped compiling anything at all would still pass.
+    assert_eq!(
+        compile_leading_block(&[0xf7, 0xe3]),
+        Some(3),
+        "MUL EBX must admit and carry the whole three-slot block"
+    );
     assert_eq!(
         compile_leading_block(&[0xf7, 0xdb]),
         Some(3),
