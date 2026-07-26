@@ -806,6 +806,34 @@ fn movzx_r32_byte_disp8_known_bytes() {
 }
 
 #[test]
+fn movsx_r32_byte_disp8_known_bytes() {
+    // movsx edx, byte [rdi] -- no REX. 0F BE; ModRM mod=01,reg=edx(2),rm=rdi(7) = 0x57; disp 0.
+    // The only difference from the movzx sibling is the 0xBE opcode byte against 0xB6, which is
+    // the entire zero-extend versus sign-extend decision.
+    let mut e = Encoder::new();
+    e.movsx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0);
+    assert_eq!(e.finish(), vec![0x0F, 0xBE, 0x57, 0x00]);
+
+    // movsx r9d, byte [r12-4] -- REX.R (r9) + REX.B (r12) = 0x45. r12 as a base forces a SIB byte
+    // 0x24, the case the disp8 form gets wrong if the SIB is omitted.
+    let mut e = Encoder::new();
+    e.movsx_r32_byte_disp8(Reg::R9, Reg::R12, -4);
+    assert_eq!(e.finish(), vec![0x45, 0x0F, 0xBE, 0x4C, 0x24, 0xFC]);
+}
+
+#[test]
+fn movsx_r32_word_disp8_known_bytes() {
+    // movsx edx, word [rdi] -- 0F BF, same ModRM as the byte form.
+    let mut e = Encoder::new();
+    e.movsx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+    assert_eq!(e.finish(), vec![0x0F, 0xBF, 0x57, 0x00]);
+
+    let mut e = Encoder::new();
+    e.movsx_r32_word_disp8(Reg::R9, Reg::R12, -4);
+    assert_eq!(e.finish(), vec![0x45, 0x0F, 0xBF, 0x4C, 0x24, 0xFC]);
+}
+
+#[test]
 fn store_r8_disp8_known_bytes() {
     // mov [r14+8], al -- REX.B (r14 extended). 88; ModRM mod=01,reg=al(0),rm=r14&7=6 = 0x46; disp 8.
     let mut e = Encoder::new();

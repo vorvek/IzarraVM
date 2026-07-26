@@ -1907,6 +1907,23 @@ pub(crate) enum DirectKind {
         addr: DirectAddr,
         raw_clocks: u8,
     },
+    /// MOVZX/MOVSX r32, r/m8 or r/m16, MEMORY form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF).
+    ///
+    /// `width` is the SOURCE width and is only ever Byte or Word. This differs from `Load`, where
+    /// the source and destination widths are the same: here the destination is always the full
+    /// 32-bit register, which is the whole point of the instruction. Any shared code that reads
+    /// this field must treat it as the memory access width, never as the write-back width.
+    ///
+    /// Deliberately NOT a flag on `Load`. `Load` is in clif's lowerable allowlist and `lower_slot`
+    /// would lower an extending load as a plain move, silently and wrongly. A new discriminant is
+    /// absent from that allowlist and so defaults to a growth-run stopper.
+    LoadExtend {
+        dst: u8,
+        width: MemoryWidth,
+        signed: bool,
+        addr: DirectAddr,
+        raw_clocks: u8,
+    },
     Store {
         source: StoreSource,
         width: MemoryWidth,
@@ -1995,7 +2012,9 @@ impl DirectKind {
             Self::Call { .. } | Self::Jmp { .. } => 7,
             Self::Ret { .. } => 10,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
-            Self::Load { raw_clocks, .. } | Self::Store { raw_clocks, .. } => u32::from(raw_clocks),
+            Self::Load { raw_clocks, .. }
+            | Self::LoadExtend { raw_clocks, .. }
+            | Self::Store { raw_clocks, .. } => u32::from(raw_clocks),
             Self::X87 { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7.
@@ -2018,6 +2037,9 @@ impl DirectKind {
             Self::Load {
                 width: MemoryWidth::Byte,
                 ..
+            } | Self::LoadExtend {
+                width: MemoryWidth::Byte,
+                ..
             } | Self::AluMemDest {
                 width: MemoryWidth::Byte,
                 ..
@@ -2032,6 +2054,9 @@ impl DirectKind {
         u8::from(matches!(
             self,
             Self::Load {
+                width: MemoryWidth::Word,
+                ..
+            } | Self::LoadExtend {
                 width: MemoryWidth::Word,
                 ..
             } | Self::AluMemSource {
@@ -2171,6 +2196,13 @@ impl DirectKind {
                 width: MemoryWidth::Dword,
                 ..
             } => COUNTER_MODE13_DWORD_READ,
+            // The extending loads mirror Load's read arms exactly. Only the SOURCE width matters
+            // to the counters, and it is only ever Byte or Word, so both land on the byte-read
+            // counter the way Load's Byte and Word arms do.
+            Self::LoadExtend { width, .. } => match width {
+                MemoryWidth::Byte | MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
+                MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
+            },
             Self::Store {
                 width: MemoryWidth::Byte,
                 ..
@@ -2250,6 +2282,7 @@ impl DirectKind {
     fn read_segment(self) -> Option<SegmentIndex> {
         match self {
             Self::Load { addr, .. }
+            | Self::LoadExtend { addr, .. }
             | Self::AluMemSource { addr, .. }
             | Self::AluMemDest { addr, .. }
             | Self::DoubleShiftMem { addr, .. }
