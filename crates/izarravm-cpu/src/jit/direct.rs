@@ -2758,6 +2758,27 @@ pub(crate) fn unit_growth_classify(
     })
 }
 
+/// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
+/// code segment whose default size is `d`.
+///
+/// The operand-size override is the ONLY prefix the backend supports, and whether it is present
+/// for a given `operand_size` depends on the segment width, because `decode` computes
+/// `operand_size = default_32 XOR operand_size_override`. Deriving the expected override from `d`
+/// keeps this exact in both widths.
+///
+/// Under `d == true` this is byte-identical to the hard-coded form it replaced: Dword expects no
+/// override, Word expects one. Under `d == false` the mapping INVERTS, and the old form rejected
+/// BOTH arms, so every 16-bit instruction was refused here as `PrefixesUnsupported` no matter what
+/// the classifier could lower. Nothing 16-bit reaches this today (`key_for` refuses on `!d`), so
+/// this is a precondition for that work rather than a behaviour change.
+fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool) -> bool {
+    prefixes
+        == Prefixes {
+            operand_size_override: (operand_size == OperandSize::Dword) != d,
+            ..Prefixes::default()
+        }
+}
+
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
     if !super::host_supported()
         || !d
@@ -2912,14 +2933,18 @@ fn compile_with_instruction_limit(
             break;
         }
         let structural_span = RejectedSpan::new(key, next.wrapping_sub(entry_lin) as usize);
-        let word_prefixes = Prefixes {
-            operand_size_override: true,
-            ..Prefixes::default()
-        };
-        let prefixes_supported = match insn.operand_size {
-            OperandSize::Word => insn.prefixes == word_prefixes,
-            OperandSize::Dword => insn.prefixes == Prefixes::default(),
-        };
+        // The only prefix this backend supports is the operand-size override, and whether it is
+        // PRESENT for a given `operand_size` depends on the code segment's default size, because
+        // `decode` computes `operand_size = default_32 XOR operand_size_override`. Deriving the
+        // expected override from `d` rather than hard-coding CS.D = 1 keeps this exact in both
+        // segment widths.
+        //
+        // Under CS.D = 1 this is byte-identical to the previous form: Dword expects no override
+        // and Word expects one. Under CS.D = 0 the mapping inverts, and the old form rejected
+        // BOTH arms, so every 16-bit instruction died here as PrefixesUnsupported regardless of
+        // what the classifier could lower. That is why this has to be fixed before any of the
+        // 16-bit admission work can produce a single native instruction.
+        let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
         if !prefixes_supported || !insn.continuable {
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;

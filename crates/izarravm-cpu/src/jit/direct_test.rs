@@ -1738,3 +1738,46 @@ fn hoisted_code_watch_keeps_the_table_base_and_the_watch_semantics() {
     assert!(moved.range_hits_compiled_code(reinstalled.physical, 4));
     assert_eq!(moved.native_code_watch_table(), base);
 }
+
+/// The backend's prefix gate is relative to the code segment's default size, because `decode`
+/// computes `operand_size = default_32 XOR operand_size_override`.
+///
+/// The first half is a REGRESSION pin: under CS.D = 1 the mode-relative form must agree exactly
+/// with the hard-coded form it replaced, or byte identity on the pinned corpus moves. The second
+/// half is the part that was broken: under CS.D = 0 the old form rejected BOTH arms, so every
+/// 16-bit instruction was refused as PrefixesUnsupported before the classifier was ever asked.
+/// Nothing reaches it today because `key_for` refuses on `!d`; this pins it ahead of that work.
+#[test]
+fn prefix_gate_is_relative_to_the_code_segment_default_size() {
+    let none = Prefixes::default();
+    let oso = Prefixes {
+        operand_size_override: true,
+        ..Prefixes::default()
+    };
+
+    // CS.D = 1: unprefixed is Dword, 0x66 makes it Word. Unchanged from before.
+    assert!(prefixes_supported_for(none, OperandSize::Dword, true));
+    assert!(prefixes_supported_for(oso, OperandSize::Word, true));
+    assert!(!prefixes_supported_for(oso, OperandSize::Dword, true));
+    assert!(!prefixes_supported_for(none, OperandSize::Word, true));
+
+    // CS.D = 0: the mapping inverts. Both of these were false before and are the whole point.
+    assert!(prefixes_supported_for(none, OperandSize::Word, false));
+    assert!(prefixes_supported_for(oso, OperandSize::Dword, false));
+    assert!(!prefixes_supported_for(none, OperandSize::Dword, false));
+    assert!(!prefixes_supported_for(oso, OperandSize::Word, false));
+
+    // Any other prefix is still unsupported in both widths.
+    let seg = Prefixes {
+        segment_override: Some(SegmentIndex::Es),
+        ..Prefixes::default()
+    };
+    for d in [false, true] {
+        for size in [OperandSize::Word, OperandSize::Dword] {
+            assert!(
+                !prefixes_supported_for(seg, size, d),
+                "segment override d={d}"
+            );
+        }
+    }
+}
