@@ -44,6 +44,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             insn.opcode,
             0x39 | 0x3b | 0x40..=0x4f | 0x50..=0x5f | 0x68 | 0x6a | 0x70..=0x7f | 0x89
                 | 0x8b
+                | 0xe8
                 | 0x0f80..=0x0f8f
                 | 0xff
         )

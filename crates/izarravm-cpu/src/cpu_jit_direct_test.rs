@@ -3003,3 +3003,102 @@ fn a_word_pop_into_sp_takes_the_loaded_word_not_the_advanced_pointer() {
         native.perf_counters().jit_direct_compile_attempts
     );
 }
+
+fn word_call_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x10000];
+    memory[0x100..0x10d].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0x66, 0xe8, 0x06, 0x00, // call +6 at Word operand size, target 0x10c
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // skipped
+        0xf4, // hlt at 0x10c
+    ]);
+    memory
+}
+
+/// The end-to-end proof for the 16-bit CALL: the pushed return address is the two-byte IP, only
+/// SP moves, and the target is right.
+///
+/// SP is kept EVEN, because a Word stack access at an odd SP takes the alignment side exit
+/// unconditionally and would hand the whole instruction back to the interpreter, which produces
+/// the correct answer and hides any emitter defect.
+#[test]
+fn direct_block_matches_the_interpreter_across_a_sixteen_bit_call() {
+    const ENTRY: u32 = 0x100;
+
+    let mut interp = sixteen_bit_stack_cpu(ENTRY);
+    let mut native = sixteen_bit_stack_cpu(ENTRY);
+    let mut interp_bus = TestBus::with_memory(word_call_program());
+    let mut native_bus = TestBus::with_memory(word_call_program());
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+    }
+    native.jit_direct.set_fast_map_enabled_for_test(true);
+    for page in [0x0000u32, 0xf000] {
+        map_direct_page(
+            &mut native,
+            &mut native_bus,
+            page,
+            page,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+    }
+
+    let reset = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        cpu.halted = false;
+        cpu.set_eip(ENTRY);
+        cpu.registers.gpr = [0; 8];
+        // SP at 0 so the push BORROWS across bit 16. Anywhere with headroom below it, a 16-bit
+        // and a 32-bit decrement give the same answer and the fixture discriminates nothing;
+        // that gap has now been found by the battery in three consecutive slices.
+        cpu.registers.set_esp(0x1234_0000);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+        bus.memory[0xfff0..0x10000].fill(0);
+        bus.trace = BusTrace::default();
+    };
+
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..2 {
+        reset(&mut native, &mut native_bus);
+        drive(&mut native, &mut native_bus);
+    }
+    reset(&mut native, &mut native_bus);
+    reset(&mut interp, &mut interp_bus);
+    let insns_before = native.perf_counters().jit_direct_insns;
+    let side_before = native.perf_counters().jit_direct_side_exits;
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+
+    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        native_bus.memory, interp_bus.memory,
+        "stack contents differ"
+    );
+    // Two bytes pushed, and only SP moved.
+    assert_eq!(
+        native.registers.esp(),
+        0x1234_fffe,
+        "SP wraps in 16 bits and ESP[31:16] survives"
+    );
+    assert_eq!(
+        &native_bus.memory[0xfffe..0x10000],
+        &[0x06, 0x01],
+        "the pushed return address is the two-byte IP, 0x0106"
+    );
+    assert!(
+        native.perf_counters().jit_direct_insns > insns_before,
+        "the 16-bit call block was not entered natively: {:?}",
+        native.perf_counters()
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits,
+        side_before,
+        "a call that side-exits proves nothing about the emitted form"
+    );
+}
