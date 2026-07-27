@@ -1856,6 +1856,24 @@ fn word_size_control_targets_are_refused_above_the_sixteen_bit_wrap() {
         0x1_0100,
         word
     ));
+    // The 16-bit call rides the same predicate. Without this row the assertion above keeps
+    // passing while covering nothing about the kind that is actually admitted at Word size.
+    assert!(!static_control_target_within_limit(
+        DirectKind::Call16 {
+            return_delta: 0x5,
+            target_delta: 0x40,
+        },
+        0x1_0100,
+        word
+    ));
+    assert!(static_control_target_within_limit(
+        DirectKind::Call16 {
+            return_delta: 0x5,
+            target_delta: 0x40,
+        },
+        0x100,
+        word
+    ));
 
     // A kind with no control target is unaffected in either width.
     assert!(static_control_target_within_limit(

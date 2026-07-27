@@ -739,6 +739,67 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 terminal = true;
                 break;
             }
+            // CALL rel16 on a 16-bit stack: the return IP is pushed as two bytes at
+            // `(SP - 2) & 0xFFFF`, SP alone advances, and the target wraps at 64K.
+            //
+            // The pushed value needs no masking of its own. `StoreSource::EipDelta` loads the
+            // LIVE eip and adds the delta, and the Word store truncates the result, which is
+            // exactly what the interpreter's `push(self.registers.eip, Word)` does.
+            //
+            // The target is NOT masked here either, and does not need to be: the compile loop
+            // refuses this kind unless `entry_eip + target_delta` is at or below 0xFFFF, so the
+            // architectural mask is a no-op on every admitted block. That refusal only happens
+            // because `static_control_target` matches this variant; drop it there and the target
+            // is baked unmasked.
+            DirectKind::Call16 {
+                return_delta,
+                target_delta,
+            } => {
+                let side = e.label();
+                let reasons =
+                    MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(2))));
+                emit_store(
+                    &mut e,
+                    StoreSource::EipDelta(return_delta),
+                    MemoryWidth::Word,
+                    stack_addr(0u32.wrapping_sub(2)),
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                e.alu_r16_imm16(5, home(4), 2);
+                completed += 1;
+                completed_raw += slot.kind.raw_clocks() as u16;
+                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
+                completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
+                completed_dword_reads += slot.kind.dword_reads();
+                emit_completed_path(
+                    &mut e,
+                    span,
+                    false,
+                    target_delta,
+                    Some(link_cell_ptrs[0]),
+                    shared_return,
+                    full_accounting,
+                    x87_entry_top.is_some(),
+                );
+                terminal = true;
+                break;
+            }
             DirectKind::Jmp { target_delta } => {
                 completed += 1;
                 completed_raw += slot.kind.raw_clocks() as u16;
@@ -2719,7 +2780,11 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
             },
         ),
         StoreSource::EipDelta(delta) => {
-            debug_assert!(matches!(width, MemoryWidth::Dword));
+            // Word as well as Dword: a 16-bit CALL pushes the return IP as two bytes. The value
+            // is computed the same way either width, from the LIVE eip plus the delta, and the
+            // caller's `store_r16_disp8` truncates it exactly as `push(.., Word)` does. Byte is
+            // still nonsense and stays refused.
+            debug_assert!(!matches!(width, MemoryWidth::Byte));
             e.load_r32_disp32(value, Reg::R15, eip_offset());
             e.add_r32_imm32(value, delta);
         }

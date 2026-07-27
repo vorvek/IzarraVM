@@ -1056,3 +1056,160 @@ fn word_immediate_pushes_lower_on_a_sixteen_bit_stack() {
     );
     assert_eq!(word_form.word_stores, 1);
 }
+
+/// A 16-bit stack under a FLAT code segment, which `sixteen_bit_stack_fixture` cannot provide.
+///
+/// `fresh()` loads CS in real mode, so its limit is 0xFFFF and `control_target_limit` is the
+/// identity at Word size. Every 16-bit-stack fixture built on it therefore admits a Word control
+/// transfer whether or not the guard is applied at all. This helper is the only thing in the
+/// tree that can tell those two apart.
+fn flat_code_sixteen_bit_stack_fixture(entry: u32, code: &[u8]) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0; 0x1_2000];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = fresh();
+    let mut cs = cpu.registers.segment(SegmentIndex::Cs);
+    cs.limit = u32::MAX;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = false;
+    ss.limit = u32::MAX;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    cpu.registers.set_esp(0x1234_0800);
+    cpu.registers.eip = entry;
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .expect("initialize direct map");
+    (cpu, bus)
+}
+
+/// The anti-vacuity gate for the 16-bit CALL, plus its clock and store-width pins.
+#[test]
+fn a_word_call_on_a_sixteen_bit_stack_enters_the_block() {
+    // inc eax; inc ecx; 66 e8 10 00 (call +0x10 at Word operand size).
+    let (mut cpu, mut bus) =
+        sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0xe8, 0x10, 0x00]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.span.guest_len, 6);
+    // A WORD store of the return address, not a dword one.
+    assert_eq!(compilation.word_stores, 1);
+    assert_eq!(compilation.dword_stores, 0);
+    // Two INC at 2 each plus the call at 7. A missing `raw_clocks` arm shows up here as 6.
+    assert_eq!(compilation.raw_clocks, 11);
+    // The static link edge is the CALL TARGET, not the fall-through. A kind missing from the
+    // successor match lands on the fall-through arm instead, which is a wrong edge rather than
+    // a missing one: the emitted terminal sets EIP to the target and then jumps through this
+    // cell, so a mislinked block transfers into the wrong body. Nothing in guest state or in the
+    // block's shape shows that.
+    let target = compilation.successors[0].expect("a call links its target");
+    assert_eq!(
+        target.linear,
+        ENTRY + 6 + 0x10,
+        "entry + return_delta + rel16"
+    );
+    assert!(
+        compilation.successors[1].is_none(),
+        "a call has no second edge"
+    );
+}
+
+/// THE `is_terminal` CATCHER, and it is the only one.
+///
+/// If `Call16` is missing from `is_terminal` the compile loop does not stop at it, so the block
+/// keeps growing. The emitter still breaks at its own arm, so the trailing slots are never
+/// emitted while the span, the clock total and the successor records are all computed over the
+/// LONGER slot list. The block then ends up with a fall-through link where it should have a call
+/// edge, and control transfers into it after the call while EIP says the target.
+///
+/// The two slots AFTER the call are load-bearing. With the terminal last, a block whose last
+/// slot is terminal is exempt from the three-slot floor, so a mutated build simply produces a
+/// LONGER valid block and any "at least N" assertion still passes. Both counts are exact.
+#[test]
+fn a_word_call_ends_its_block() {
+    // inc eax; inc ecx; 66 e8 10 00 (call); inc edx; inc ebx.
+    let (mut cpu, mut bus) =
+        sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0xe8, 0x10, 0x00, 0x42, 0x43]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 6, ENTRY + 7],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the block must end AT the call, not grow past it"
+    );
+    assert_eq!(compilation.span.guest_len, 6);
+}
+
+/// THE `static_control_target` CATCHER. Nothing else in the tree can see this.
+///
+/// A Word-size call whose target crosses the 16-bit wrap must not be lowered, because the
+/// interpreter masks the target and the emitted form bakes an unmasked delta. The guard is the
+/// clamp merged as #629, and it only applies to a kind that `static_control_target` matches.
+///
+/// It needs a FLAT code segment to be observable at all: under the real-mode limit of 0xFFFF the
+/// clamp is the identity and an unguarded kind is admitted identically. That is why this uses
+/// its own fixture helper.
+#[test]
+fn a_word_call_above_the_wrap_is_refused_while_the_same_block_below_it_compiles() {
+    // inc eax; inc ecx; inc edx; 66 e8 10 00 (call +0x10 at Word operand size).
+    const CODE: [u8; 7] = [0x40, 0x41, 0x42, 0x66, 0xe8, 0x10, 0x00];
+    const HIGH: u32 = 0x1_0100;
+
+    let (mut cpu, mut bus) = flat_code_sixteen_bit_stack_fixture(ENTRY, &CODE);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let low = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(low.span.instructions, 4, "control: the call must lower");
+    assert_eq!(low.span.guest_len, 7);
+
+    let (mut cpu, mut bus) = flat_code_sixteen_bit_stack_fixture(HIGH, &CODE);
+    warm(&mut cpu, &mut bus, &[HIGH, HIGH + 1, HIGH + 2, HIGH + 3]);
+    let high = compiled(jit::direct::compile(&mut cpu, HIGH, true));
+    assert_eq!(
+        high.span.instructions, 3,
+        "a Word call must not be lowered above the 16-bit wrap"
+    );
+    assert_eq!(high.span.guest_len, 3);
+
+    // The Dword form at the same high entry MUST still compile, or the clamp has leaked into
+    // the 32-bit path.
+    const DWORD_CODE: [u8; 8] = [0x40, 0x41, 0x42, 0xe8, 0x10, 0x00, 0x00, 0x00];
+    let (mut cpu, mut bus) = flat_code_sixteen_bit_stack_fixture(HIGH, &DWORD_CODE);
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    warm(&mut cpu, &mut bus, &[HIGH, HIGH + 1, HIGH + 2, HIGH + 3]);
+    let dword = compiled(jit::direct::compile(&mut cpu, HIGH, true));
+    assert_eq!(dword.span.instructions, 4);
+}
+
+/// Matrix row 2 for the call: a Word call on a THIRTY-TWO bit stack is not admitted, because the
+/// shipped kind would push four bytes and decrement four.
+#[test]
+fn a_word_call_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit_one() {
+    const CODE: [u8; 7] = [0x40, 0x41, 0x42, 0x66, 0xe8, 0x10, 0x00];
+    const WARM: [u32; 4] = [ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3];
+
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    warm(&mut cpu, &mut bus, &WARM);
+    let wide = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(wide.span.instructions, 3);
+
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    warm(&mut cpu, &mut bus, &WARM);
+    let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(narrow.span.instructions, 4, "control: the call must lower");
+}

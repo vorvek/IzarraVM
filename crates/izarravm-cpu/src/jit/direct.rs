@@ -1769,7 +1769,10 @@ pub(crate) struct Compilation {
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
     dynamic_successor: bool,
-    successors: [Option<LinkTarget>; 2],
+    /// Readable outside this module so a fixture can pin a terminal's LINK EDGE. A kind missing
+    /// from the successor match falls to the fall-through arm, which is a wrong edge rather than
+    /// a missing one, and nothing observable in guest state or in the block's shape shows it.
+    pub(crate) successors: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
     body_offset: usize,
     pub code: Vec<u8>,
@@ -2020,6 +2023,17 @@ pub(crate) enum DirectKind {
         return_delta: u32,
         target_delta: u32,
     },
+    /// CALL rel16 on a 16-bit stack at Word operand size: the return IP is pushed as two bytes
+    /// at `(SP - 2) & 0xFFFF`, only SP advances, and the target wraps at 64K.
+    ///
+    /// A terminal, so it carries three obligations the 16-bit push and pop did not:
+    /// `is_terminal`, the static successor record, and `static_control_target`. The last is what
+    /// routes the target through `control_target_limit`'s Word clamp; without it this kind is
+    /// admitted with an unmasked target, which is the exact miscompile that clamp exists for.
+    Call16 {
+        return_delta: u32,
+        target_delta: u32,
+    },
     Jmp {
         target_delta: u32,
     },
@@ -2124,7 +2138,7 @@ impl DirectKind {
             // default, an omitted arm here undercharges every pop by 2 core clocks and no test
             // would fail.
             Self::Pop { .. } | Self::Pop16 { .. } => 4,
-            Self::Call { .. } | Self::Jmp { .. } => 7,
+            Self::Call { .. } | Self::Call16 { .. } | Self::Jmp { .. } => 7,
             Self::Ret { .. } => 10,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
             Self::Load { raw_clocks, .. }
@@ -2258,6 +2272,7 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::Push16 { .. }
+                    | Self::Call16 { .. }
             ) || matches!(
                 self,
                 Self::AluMemDest {
@@ -2410,7 +2425,7 @@ impl DirectKind {
             // byte slot. Mirroring the Word store is the rule here rather than reasoning from
             // "the bus ignores width", which is true of `BusCycle::clocks_for` but NOT of these
             // counter lanes.
-            Self::Push16 { .. } => {
+            Self::Push16 { .. } | Self::Call16 { .. } => {
                 COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY
             }
             _ => 0,
@@ -2461,7 +2476,9 @@ impl DirectKind {
             {
                 Some(addr.segment)
             }
-            Self::Push { .. } | Self::Push16 { .. } | Self::Call { .. } => Some(SegmentIndex::Ss),
+            Self::Push { .. } | Self::Push16 { .. } | Self::Call { .. } | Self::Call16 { .. } => {
+                Some(SegmentIndex::Ss)
+            }
             _ => None,
         }
     }
@@ -2527,6 +2544,7 @@ impl DirectKind {
                 | Self::Pop { .. }
                 | Self::Pop16 { .. }
                 | Self::Call { .. }
+                | Self::Call16 { .. }
                 | Self::Ret { .. }
         )
     }
@@ -2534,7 +2552,11 @@ impl DirectKind {
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Call { .. } | Self::Jmp { .. } | Self::Ret { .. } | Self::Jcc { .. }
+            Self::Call { .. }
+                | Self::Call16 { .. }
+                | Self::Jmp { .. }
+                | Self::Ret { .. }
+                | Self::Jcc { .. }
         )
     }
 
@@ -3037,6 +3059,17 @@ fn compile_with_instruction_limit(
                 DirectKind::Push16 { source }
             }
             (DirectKind::Pop { dst }, false, OperandSize::Word) => DirectKind::Pop16 { dst },
+            (
+                DirectKind::Call {
+                    return_delta,
+                    target_delta,
+                },
+                false,
+                OperandSize::Word,
+            ) => DirectKind::Call16 {
+                return_delta,
+                target_delta,
+            },
             _ => {
                 stop = CompileStop::Retry;
                 break;
@@ -3267,7 +3300,11 @@ fn compile_with_instruction_limit(
                 mode_key: key.mode_key,
             }),
         ],
-        Some(DirectKind::Call { target_delta, .. } | DirectKind::Jmp { target_delta }) => [
+        Some(
+            DirectKind::Call { target_delta, .. }
+            | DirectKind::Call16 { target_delta, .. }
+            | DirectKind::Jmp { target_delta },
+        ) => [
             Some(LinkTarget {
                 linear: entry_lin.wrapping_add(target_delta),
                 mode_key: key.mode_key,
@@ -3369,9 +3406,9 @@ fn control_target_limit(operand_size: OperandSize, cs_limit: u32) -> u32 {
 /// second source of truth, and the two could drift as kinds are added.
 fn static_control_target(kind: DirectKind) -> Option<u32> {
     match kind {
-        DirectKind::Call { target_delta, .. } | DirectKind::Jmp { target_delta } => {
-            Some(target_delta)
-        }
+        DirectKind::Call { target_delta, .. }
+        | DirectKind::Call16 { target_delta, .. }
+        | DirectKind::Jmp { target_delta } => Some(target_delta),
         DirectKind::Jcc { taken_delta, .. } => Some(taken_delta),
         _ => None,
     }
