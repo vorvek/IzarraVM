@@ -870,6 +870,106 @@ fn every_de_pop_subtract_and_divide_matches_the_interpreter() {
     }
 }
 
+/// `0xDC` mod=3: ST(1) op ST(0) with the result in ST(1) and NO pop.
+///
+/// The two trailing `fstp`s are load-bearing rather than plumbing. The first pops ST(0), which
+/// is still 2.0 because this form does not pop, and the second stores the result. A `top_delta`
+/// of 1 instead of 0 would make the emitter's running TOP advance after the DC slot, so BOTH
+/// stores would address the wrong physical register and the two memory words would come out
+/// swapped. Without an x87 slot after the DC instruction the field is uncatchable at runtime:
+/// its only other effect is `x87_exit_top`, where a wrong value silently loses a link and fails
+/// no test at all.
+fn dc_sti_program(extension: u8) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9,
+        0x05,
+        0x00,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x200]   ST(0)=6.0
+        0xd9,
+        0x05,
+        0x04,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x204]   ST(0)=2.0, ST(1)=6.0
+        0xdc,
+        0xc1 | (extension << 3), //        ST(1) op= ST(0), no pop
+        0xd9,
+        0x1d,
+        0x08,
+        0x02,
+        0x00,
+        0x00, // fstp dword [0x208]  stores ST(0), still 2.0
+        0xd9,
+        0x1d,
+        0x0c,
+        0x02,
+        0x00,
+        0x00, // fstp dword [0x20c]  stores the result
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&6.0f32.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn every_dc_register_destination_binary_matches_the_interpreter() {
+    // ABSOLUTE expected values, not merely JIT-equals-interpreter. `assert_program_matches`
+    // proves the two agree; these numbers prove they agree with Intel. 6.0 and 2.0 are chosen
+    // so every non-commutative op has a distinct result and no pair collides.
+    let cases = [
+        (0u8, 8.0f32),  // FADD  ST(1),ST(0)  6 + 2
+        (1, 12.0),      // FMUL  ST(1),ST(0)  6 * 2
+        (4, -4.0),      // FSUBR ST(1),ST(0)  2 - 6
+        (5, 4.0),       // FSUB  ST(1),ST(0)  6 - 2
+        (6, 1.0 / 3.0), // FDIVR ST(1),ST(0)  2 / 6
+        (7, 3.0),       // FDIV  ST(1),ST(0)  6 / 2
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (extension, expected) in cases {
+            let (cpu, bus) = assert_program_matches(mode, dc_sti_program(extension), 0x0f7f);
+            let popped = f32::from_bits(u32::from_le_bytes(
+                bus.memory[DATA + 8..DATA + 12].try_into().unwrap(),
+            ));
+            let result = f32::from_bits(u32::from_le_bytes(
+                bus.memory[DATA + 12..DATA + 16].try_into().unwrap(),
+            ));
+            // ST(0) is untouched by a non-popping form. If this reads as the result the stack
+            // position advanced when it should not have.
+            assert_eq!(popped, 2.0, "mode={mode:?} extension={extension} ST(0)");
+            assert_eq!(result, expected, "mode={mode:?} extension={extension}");
+            assert_eq!(cpu.fpu.top(), 0, "mode={mode:?} extension={extension} top");
+            assert_eq!(
+                cpu.perf_counters().jit_direct_side_exits,
+                0,
+                "mode={mode:?} extension={extension}"
+            );
+        }
+    }
+}
+
+/// A divide by zero produces an infinity, which `emit_finite_guard` must catch BEFORE
+/// `emit_store_physical` runs. The interpreter's `fpu_record_exceptions` sets ZE for this case,
+/// and no native arm can write status bits 0 to 5, so the only correct native behaviour is to
+/// leave. Asserting the exit is the point: values alone would match either way, because the
+/// interpreter produces them on the fallback path.
+#[test]
+fn a_dc_divide_by_zero_exits_before_touching_x87_state() {
+    let mut memory = dc_sti_program(7);
+    memory[DATA + 4..DATA + 8].copy_from_slice(&0.0f32.to_bits().to_le_bytes());
+    let (cpu, _) = assert_program_matches(GswMode::Gsw586, memory, 0x0f7f);
+    assert!(
+        cpu.perf_counters().jit_direct_exit_other > 0,
+        "the infinite result must side-exit rather than be stored"
+    );
+    assert_ne!(cpu.fpu.status & 0x04, 0, "the interpreter recorded ZE");
+}
+
 fn compare_pop_pop_program(opcode: u8) -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;

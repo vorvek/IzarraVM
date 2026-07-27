@@ -1840,6 +1840,22 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         // `Self::X87` and the whole x87 cost goes through `weighted_fp_clocks` instead. So this
         // number is the catcher for an ADDED raw_clocks arm (it would read 8), while the
         // 4-versus-14 split between these two instructions is caught by `elapsed_clocks` below.
+        // 0xDC mod=3, ST(1) op ST(0). raw_clocks 4 is the two filler moves; the x87 slot
+        // contributes zero to `DirectKind::raw_clocks` and twenty to `weighted_fp_clocks`, so
+        // this number catches an ADDED raw_clocks arm and `elapsed_clocks` catches a wrong
+        // twenty. The register form declares no memory, so raw_bus_clocks moving at all would
+        // mean the registration leaked a memory property.
+        // rm = 0, so the destination is ST(0) and both operands are the one register this
+        // harness populates. rm = 1 would address an EMPTY ST(1), and `emit_load_physical`'s tag
+        // guard would side-exit at slot 0, leaving the native side retiring nothing and the
+        // comparison meaningless. It also exercises the destination-equals-source case.
+        DirectTimingCase {
+            name: "x87 sti register binary",
+            opcode: &[0xdc, 0xc8],
+            expected_raw_clocks: 4,
+            terminal: false,
+            eflags: 0x202,
+        },
         DirectTimingCase {
             name: "x87 fldcw m16",
             opcode: &[0xd9, 0x2d, 0x00, 0x30, 0x00, 0x00],

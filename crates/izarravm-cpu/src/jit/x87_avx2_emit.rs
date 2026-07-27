@@ -8,7 +8,7 @@
 use super::{
     encoder::{Encoder, Label, Reg, Xmm},
     native_x87::{
-        NativeX87BinaryOp, NativeX87Insn, NativeX87PopOp, X87_CONDITION_MASK, X87_TOP_MASK,
+        NativeX87BinaryOp, NativeX87Insn, NativeX87StiOp, X87_CONDITION_MASK, X87_TOP_MASK,
         X87_TOP_SHIFT, native_x87_layout,
     },
 };
@@ -137,20 +137,13 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             e.store_r32_disp32(memory, 0, Reg::RDX);
             emit_pop(e, top);
         }
+        // 0xDC and 0xDE mod=3 differ by exactly one emitted step. Sharing the body makes that
+        // structural instead of a comment: the interpreter models both with one function.
+        NativeX87Insn::BinaryRegisterDest { op, index } => {
+            emit_sti_binary(e, top, index, op, context.side_exit);
+        }
         NativeX87Insn::PopBinary { op, index } => {
-            let destination = physical(top, index);
-            emit_load_physical(e, destination, VALUE0, context.side_exit);
-            emit_load_physical(e, top, VALUE1, context.side_exit);
-            match op {
-                NativeX87PopOp::Add => e.vaddsd(VALUE0, VALUE0, VALUE1),
-                NativeX87PopOp::Multiply => e.vmulsd(VALUE0, VALUE0, VALUE1),
-                NativeX87PopOp::Subtract => e.vsubsd(VALUE0, VALUE0, VALUE1),
-                NativeX87PopOp::Divide => e.vdivsd(VALUE0, VALUE0, VALUE1),
-                NativeX87PopOp::SubtractReverse => e.vsubsd(VALUE0, VALUE1, VALUE0),
-                NativeX87PopOp::DivideReverse => e.vdivsd(VALUE0, VALUE1, VALUE0),
-            }
-            emit_finite_guard(e, VALUE0, context.side_exit);
-            emit_store_physical(e, destination, VALUE0);
+            emit_sti_binary(e, top, index, op, context.side_exit);
             emit_pop(e, top);
         }
         NativeX87Insn::ComparePopPop => {
@@ -208,6 +201,34 @@ fn emit_gate(e: &mut Encoder, cpu: Reg, side_exit: Label) {
     e.cmp_r32_imm32(Reg::RAX, 0);
     e.jnz(side_exit);
     e.place(ready);
+}
+
+/// ST(i) op ST(0), result to ST(i). The shared body of `0xDC` mod=3 and `0xDE` mod=3; the pop
+/// belongs to the caller.
+///
+/// VALUE0 is `a` and VALUE1 is `b`, matching `fpu_arith(op, a, b)` argument for argument with
+/// `a = fpu.get(i)` and `b = fpu.get(0)`, which is why the six arms transcribe directly. Every
+/// guard fires before `emit_store_physical`, so an exceptional input or result leaves for the
+/// interpreter with no x87 state changed. `index == 0` is safe by construction: destination
+/// equals top, both loads read the same physical cache register into two different scratch
+/// XMMs, and the single store re-derives the tag from the stored value.
+///
+/// `NativeX87StiOp` has six variants and no compare, so this needs no `unreachable!` arm on
+/// either caller's path.
+fn emit_sti_binary(e: &mut Encoder, top: u8, index: u8, op: NativeX87StiOp, side_exit: Label) {
+    let destination = physical(top, index);
+    emit_load_physical(e, destination, VALUE0, side_exit);
+    emit_load_physical(e, top, VALUE1, side_exit);
+    match op {
+        NativeX87StiOp::Add => e.vaddsd(VALUE0, VALUE0, VALUE1),
+        NativeX87StiOp::Multiply => e.vmulsd(VALUE0, VALUE0, VALUE1),
+        NativeX87StiOp::Subtract => e.vsubsd(VALUE0, VALUE0, VALUE1),
+        NativeX87StiOp::Divide => e.vdivsd(VALUE0, VALUE0, VALUE1),
+        NativeX87StiOp::SubtractReverse => e.vsubsd(VALUE0, VALUE1, VALUE0),
+        NativeX87StiOp::DivideReverse => e.vdivsd(VALUE0, VALUE1, VALUE0),
+    }
+    emit_finite_guard(e, VALUE0, side_exit);
+    emit_store_physical(e, destination, VALUE0);
 }
 
 fn emit_binary_st0(e: &mut Encoder, top: u8, op: NativeX87BinaryOp, side_exit: Label) {

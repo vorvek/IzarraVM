@@ -44,6 +44,10 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             | (0xd9, 3, 5, 0 | 6)
             | (0xda, 3, 5, 1)
             | (0xdb, 0..=2, 0 | 3, 0..=7)
+            // 0xDC mod=3, the ST(i)-destination binaries. The ABSENCE of 2 and 3 from this
+            // pattern is the negative assertion that FCOM/FCOMP with an ST(i) destination stay
+            // on the interpreter, where they raise #UD.
+            | (0xdc, 3, 0 | 1 | 4..=7, 0..=7)
             | (0xdd, 3, 2 | 3, 0..=7)
             | (0xde, 3, 0 | 1 | 4 | 5 | 6 | 7, 0..=7)
             | (0xde, 3, 3, 1)
@@ -70,9 +74,9 @@ fn classifier_selects_exact_traced_slice() {
             }
         }
     }
-    // 461 before the control-word pair. The two new sub-opcodes are admitted in all three memory
-    // modes across all eight rm values: 2 * 3 * 8 = 48.
-    assert_eq!(accepted, 509);
+    // 461 before the control-word pair, 509 after it. 0xDC mod=3 adds six sub-opcodes across
+    // eight rm values: 6 * 8 = 48.
+    assert_eq!(accepted, 557);
 }
 
 #[test]
@@ -124,10 +128,49 @@ fn classifier_preserves_operations_indices_and_addresses() {
     assert_eq!(
         NativeX87Insn::classify(&insn(0xde, 3, 6, 2)),
         Some(NativeX87Insn::PopBinary {
-            op: NativeX87PopOp::DivideReverse,
+            op: NativeX87StiOp::DivideReverse,
             index: 2,
         })
     );
+    // 0xDC and 0xDE mod=3 share one classifier and one swap. Pinning the (op, index) PAIR for
+    // every sub-opcode on both encodings, because the exhaustive cube test below only checks
+    // `is_some()` and would survive a reg/rm transposition or a mis-transcribed op.
+    //
+    // The swap is the whole point: Intel's /4 is FSUBR, /5 is FSUB, /6 is FDIVR and /7 is FDIV
+    // when the destination is ST(i), which is the reverse of the D8 forms above. FADD and FMUL
+    // are commutative, so 0 and 1 cannot detect a swap at all and are pinned here instead.
+    for (extension, expected) in [
+        (0u8, NativeX87StiOp::Add),
+        (1, NativeX87StiOp::Multiply),
+        (4, NativeX87StiOp::SubtractReverse),
+        (5, NativeX87StiOp::Subtract),
+        (6, NativeX87StiOp::DivideReverse),
+        (7, NativeX87StiOp::Divide),
+    ] {
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xdc, 3, extension, 3)),
+            Some(NativeX87Insn::BinaryRegisterDest {
+                op: expected,
+                index: 3,
+            }),
+            "dc /{extension}"
+        );
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xde, 3, extension, 3)),
+            Some(NativeX87Insn::PopBinary {
+                op: expected,
+                index: 3,
+            }),
+            "de /{extension}"
+        );
+    }
+    // Sub-opcodes 2 and 3 are FCOM/FCOMP with an ST(i) destination, which `fpu_reg_arith_sti`
+    // answers with `fpu_unsupported`, i.e. #UD. They are not merely unmatched here, they are
+    // unrepresentable in `NativeX87StiOp`.
+    for extension in [2u8, 3] {
+        assert!(NativeX87Insn::classify(&insn(0xdc, 3, extension, 3)).is_none());
+        assert!(NativeX87Insn::classify(&insn(0xde, 3, extension, 3)).is_none());
+    }
     for opcode in [0xda, 0xde] {
         let (reg, rm) = if opcode == 0xda { (5, 1) } else { (3, 1) };
         assert_eq!(
@@ -220,7 +263,7 @@ fn classifier_preserves_16_bit_memory_addressing_for_the_emitter() {
 fn stack_effects_advance_every_top_with_wraparound() {
     let push = NativeX87Insn::LoadOne;
     let pop = NativeX87Insn::PopBinary {
-        op: NativeX87PopOp::Add,
+        op: NativeX87StiOp::Add,
         index: 1,
     };
     let pop_twice = NativeX87Insn::ComparePopPop;
@@ -393,6 +436,30 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // The ST(i)-destination pair. Same twenty clocks and same Register class on both, from
+        // the single `Ok(clocks(20))` in `fpu_reg_arith_sti`. `pops` is the only differing
+        // field and this test is the ONLY reader of it anywhere in the crate, which is why the
+        // case is here rather than resting on a runtime fixture.
+        (
+            insn(0xdc, 3, 7, 1),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xde, 3, 7, 1),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: true,
+                terminates_block: false,
+            },
+        ),
         (
             insn(0xde, 3, 3, 1),
             NativeX87Metadata {
@@ -422,6 +489,34 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
 /// Neither control-word form moves TOP, pushes or pops. That is what lets the pair join an
 /// otherwise integer block, and it is also why such a block ends up TOP-pinned for no
 /// architectural reason (`jit_direct_reject_x87_top`).
+/// THE `top_delta` PIN, and it exists because nothing else catches the field cheaply.
+///
+/// `top_delta` is 0 here where the popping sibling `PopBinary` is 1. A wrong value has two
+/// separate consequences and only one of them is loud: every LATER x87 slot in the block
+/// addresses the wrong physical XMM (a hard state divergence the value battery catches), and
+/// `x87_exit_top` is poisoned so `link_compatible` silently refuses an edge it should accept
+/// (no test failure at all, just lost performance). `metadata().pops` is NOT a cross-check on
+/// this: that field has no readers anywhere in the crate.
+///
+/// Exhaustive over both the sub-opcode and the register index, which the fixture-based catcher
+/// cannot be.
+#[test]
+fn sti_destination_binaries_leave_the_stack_position_alone() {
+    for extension in [0u8, 1, 4, 5, 6, 7] {
+        for rm in 0..=7 {
+            let classified = NativeX87Insn::classify(&insn(0xdc, 3, extension, rm)).unwrap();
+            assert_eq!(classified.top_delta(), 0, "dc /{extension} st({rm})");
+            for top in 0..8 {
+                assert_eq!(classified.advance_top(top), top, "dc /{extension} st({rm})");
+            }
+            // The popping sibling must still move TOP by one, so this pins the pair rather than
+            // just the new arm: a refactor that made them agree would be caught here.
+            let popping = NativeX87Insn::classify(&insn(0xde, 3, extension, rm)).unwrap();
+            assert_eq!(popping.top_delta(), 1, "de /{extension} st({rm})");
+        }
+    }
+}
+
 #[test]
 fn control_word_forms_leave_the_stack_position_alone() {
     for candidate in [insn(0xd9, 0, 5, 0), insn(0xd9, 0, 7, 0)] {
