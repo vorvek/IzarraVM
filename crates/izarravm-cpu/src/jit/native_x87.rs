@@ -70,14 +70,46 @@ impl NativeX87BinaryOp {
     }
 }
 
+/// The six arithmetic operations available when the DESTINATION is ST(i) and the source is
+/// ST(0). That is both `0xDC` mod=3 (no pop) and `0xDE` mod=3 (pop), which the interpreter
+/// serves with ONE function, `fpu_reg_arith_sti(reg, i, pop)`.
+///
+/// Compare and compare-pop are deliberately UNREPRESENTABLE here rather than merely unmatched.
+/// `fpu_reg_arith_sti` returns `fpu_unsupported` for sub-opcodes 2 and 3, which raises #UD, so a
+/// lowered compare would rewrite C0/C2/C3 and, for the pop form, pop the stack, where the guest
+/// takes a fault. Making them unrepresentable means a widened pattern in a caller produces a
+/// clean classification reject instead of a panic inside `direct::compile`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeX87PopOp {
+pub(crate) enum NativeX87StiOp {
     Add,
     Multiply,
     Subtract,
     SubtractReverse,
     Divide,
     DivideReverse,
+}
+
+impl NativeX87StiOp {
+    /// The DC and DE register encodings SWAP subtract with reverse-subtract and divide with
+    /// reverse-divide relative to the D8 forms. Intel: `/4` FSUBR, `/5` FSUB, `/6` FDIVR,
+    /// `/7` FDIV, all writing ST(i).
+    ///
+    /// This mirrors the `match reg { 4 => 5, 5 => 4, 6 => 7, 7 => 6, other => other }` inside
+    /// `fpu_reg_arith_sti`, and it is the ONLY place the swap lives, shared by both encodings
+    /// the way the interpreter shares one function. FADD and FMUL are commutative, so a swap
+    /// applied to sub-opcodes 0 and 1 would be invisible in every value; only 4 through 7
+    /// discriminate.
+    const fn from_sti_extension(extension: u8) -> Option<Self> {
+        Some(match extension {
+            0 => Self::Add,
+            1 => Self::Multiply,
+            4 => Self::SubtractReverse,
+            5 => Self::Subtract,
+            6 => Self::DivideReverse,
+            7 => Self::Divide,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +148,13 @@ pub(crate) enum NativeX87Insn {
         addr: AddrMode,
     },
     PopBinary {
-        op: NativeX87PopOp,
+        op: NativeX87StiOp,
+        index: u8,
+    },
+    /// `0xDC` mod=3. Destination ST(i), source ST(0), no pop. Identical to `PopBinary` in every
+    /// respect except that it does not pop, which is exactly how the interpreter models it.
+    BinaryRegisterDest {
+        op: NativeX87StiOp,
         index: u8,
     },
     ComparePopPop,
@@ -191,7 +229,14 @@ impl NativeX87Insn {
             // also why they pin a block to its compile-time TOP for no architectural reason; see
             // `jit_direct_reject_x87_top` in the campaign log.
             | Self::LoadControlWord { .. }
-            | Self::StoreControlWord { .. } => 0,
+            | Self::StoreControlWord { .. }
+            // 0 where `PopBinary` is 1, and this is the single most dangerous field in the file.
+            // It feeds the emitter's running TOP, so getting it wrong makes every LATER x87 slot
+            // in the block address the wrong physical XMM, and it feeds `x87_exit_top`, where the
+            // only symptom is a link `link_compatible` silently refuses. `metadata().pops` looks
+            // like a redundant cross-check on this and IS NOT: that field has no readers anywhere
+            // in the crate. `top_delta` is the sole live authority for the stack position.
+            | Self::BinaryRegisterDest { .. } => 0,
         }
     }
 
@@ -256,28 +301,24 @@ impl NativeX87Insn {
             (0xda, 5, 1) | (0xde, 3, 1) => Some(Self::ComparePopPop),
             (0xdd, 2, index) => Some(Self::StoreRegister { index, pop: false }),
             (0xdd, 3, index) => Some(Self::StoreRegister { index, pop: true }),
-            (0xde, 0, index) => Some(Self::PopBinary {
-                op: NativeX87PopOp::Add,
+            // 0xDC and 0xDE mod=3 are the same instruction apart from the pop, and the
+            // interpreter dispatches both into one `fpu_reg_arith_sti`. They share one classifier
+            // here for the same reason: the sub-opcode swap has one home rather than two
+            // hand-written copies that can drift.
+            //
+            // `from_sti_extension` returns None for sub-opcodes 2 and 3, and the `?` returns from
+            // `classify` rather than from the match, which is what the 0xd8 arm above already
+            // does. That is the whole reject for DC/DE 2 and 3, and it is structural: those two
+            // are not expressible in `NativeX87StiOp` at all.
+            //
+            // The 0xDE arm MUST stay below the `(0xde, 3, 1)` FCOMPP arm above. It does, and
+            // `from_sti_extension(3)` is None regardless, so the ordering is belt and braces.
+            (0xdc, extension, index) => Some(Self::BinaryRegisterDest {
+                op: NativeX87StiOp::from_sti_extension(extension)?,
                 index,
             }),
-            (0xde, 1, index) => Some(Self::PopBinary {
-                op: NativeX87PopOp::Multiply,
-                index,
-            }),
-            (0xde, 4, index) => Some(Self::PopBinary {
-                op: NativeX87PopOp::SubtractReverse,
-                index,
-            }),
-            (0xde, 5, index) => Some(Self::PopBinary {
-                op: NativeX87PopOp::Subtract,
-                index,
-            }),
-            (0xde, 6, index) => Some(Self::PopBinary {
-                op: NativeX87PopOp::DivideReverse,
-                index,
-            }),
-            (0xde, 7, index) => Some(Self::PopBinary {
-                op: NativeX87PopOp::Divide,
+            (0xde, extension, index) => Some(Self::PopBinary {
+                op: NativeX87StiOp::from_sti_extension(extension)?,
                 index,
             }),
             (0xdf, 4, 0) => Some(Self::StoreStatusAx),
@@ -363,11 +404,23 @@ impl NativeX87Insn {
                 pops: true,
                 terminates_block: false,
             },
+            // Both ST(i)-destination forms are `Ok(clocks(20))` on the same interpreter arm
+            // (`fpu_reg_arith_sti`), and `execute_fpu` assigns FpOpClass::Register to every
+            // mod=3 form. The ONLY field that differs is `pops`, and that field has no readers
+            // anywhere in the crate: it is documentation, and `top_delta` is what actually
+            // carries the stack effect.
             Self::PopBinary { .. } => NativeX87Metadata {
                 raw_clocks: 20,
                 fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
+                terminates_block: false,
+            },
+            Self::BinaryRegisterDest { .. } => NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
                 terminates_block: false,
             },
             Self::ComparePopPop => NativeX87Metadata {
