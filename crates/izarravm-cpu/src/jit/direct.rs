@@ -2962,7 +2962,23 @@ fn compile_with_instruction_limit(
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         };
-        if !static_control_target_within_limit(kind, entry_eip, cs.limit)
+        // A Word-size relative branch masks its target to 16 bits: `relative_jump` computes
+        // `(eip + rel) & operand_size.mask()`. The emitted form bakes an unmasked delta, so it is
+        // only correct where that mask is a no-op. Clamping the limit to 0xFFFF for Word makes
+        // the existing check express exactly that condition, since `x <= a && x <= 0xFFFF` is
+        // `x <= min(a, 0xFFFF)`.
+        //
+        // Nothing reaches this at Word today, because the allowlist in `classify` admits no
+        // control transfer at Word size. It is a precondition for that allowlist opening, and it
+        // is separated so the two are attributable independently.
+        //
+        // In real mode `cs.limit` is already 0xFFFF, so the clamp is a no-op there and the mask
+        // was never observable. The case it exists for is a 66-prefixed branch in 32-bit code,
+        // where the limit is typically 0xFFFFFFFF and the interpreter would wrap while the
+        // emitted form would not. It covers Jmp and Call as well as Jcc, because
+        // `static_control_target_within_limit` matches all three.
+        let control_limit = control_target_limit(insn.operand_size, cs.limit);
+        if !static_control_target_within_limit(kind, entry_eip, control_limit)
             || !kind_segment_access_supported(cpu, kind)
         {
             stop = CompileStop::Retry;
@@ -3225,6 +3241,29 @@ pub(crate) fn compile_with_instruction_limit_for_test(
     match compile_with_instruction_limit(cpu, entry_lin, d, instruction_limit) {
         CompileOutcome::Compiled(compilation) => Some(compilation),
         CompileOutcome::StructuralReject(_) | CompileOutcome::Retry => None,
+    }
+}
+
+/// The limit a static control target must satisfy, given the branch's operand size.
+///
+/// A Word-size relative branch masks its target to 16 bits: `relative_jump` computes
+/// `(eip + rel) & operand_size.mask()`. The emitted form bakes an UNMASKED delta, so it is
+/// correct only where that mask is a no-op. Clamping the limit to 0xFFFF makes the existing
+/// `<=` check express exactly that condition, because `x <= a && x <= 0xFFFF` is
+/// `x <= min(a, 0xFFFF)`.
+///
+/// In real mode `cs.limit` is already 0xFFFF, so the clamp is a no-op and the mask was never
+/// observable, which is why this went unnoticed. The case it exists for is a 66-prefixed branch
+/// in 32-bit code, where the limit is typically `u32::MAX` and the interpreter would wrap while
+/// the emitted form would not.
+///
+/// Nothing reaches this at Word size today: `classify`'s Word allowlist admits no control
+/// transfer. It is a precondition for that allowlist opening, split out so the two are
+/// separately attributable, and it is a free function so it can be tested at all.
+fn control_target_limit(operand_size: OperandSize, cs_limit: u32) -> u32 {
+    match operand_size {
+        OperandSize::Word => cs_limit.min(0xFFFF),
+        OperandSize::Dword => cs_limit,
     }
 }
 

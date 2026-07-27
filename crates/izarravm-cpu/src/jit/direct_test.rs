@@ -1781,3 +1781,106 @@ fn prefix_gate_is_relative_to_the_code_segment_default_size() {
         }
     }
 }
+
+/// A Word-size relative branch masks its target to 16 bits (`relative_jump` computes
+/// `(eip + rel) & operand_size.mask()`), while the emitted form bakes an unmasked delta. The
+/// compile loop expresses "the mask is a no-op" by clamping the limit it hands
+/// `static_control_target_within_limit` to 0xFFFF at Word size.
+///
+/// This pins the predicate itself. The clamp is `cs.limit.min(0xFFFF)`, so the assertions below
+/// are written against the already-clamped value the call site produces.
+///
+/// **The Dword rows are the load-bearing half.** Every Jcc fixture in this crate entries at a
+/// tiny EIP (0x100, 0x101, 0x500), so a clamp wrongly applied at Dword would pass all of them
+/// and reach the pinned corpus undetected. The `entry_eip` above 0xFFFF rows are the only thing
+/// in the tree that would notice.
+#[test]
+fn word_size_control_targets_are_refused_above_the_sixteen_bit_wrap() {
+    let jcc = |taken_delta| DirectKind::Jcc {
+        condition: 0x5,
+        taken_delta,
+    };
+    let flat = control_target_limit(OperandSize::Dword, u32::MAX);
+    let word = control_target_limit(OperandSize::Word, u32::MAX);
+
+    // Dword, flat limit: unchanged behaviour, including well above the wrap. If a clamp leaks
+    // into the Dword path these are what fail.
+    assert!(static_control_target_within_limit(
+        jcc(0x40),
+        0x1_0100,
+        flat
+    ));
+    assert!(static_control_target_within_limit(
+        jcc(0x10_0000),
+        0x20_0000,
+        flat
+    ));
+
+    // Word: refused once the target crosses the wrap, admitted below it.
+    assert!(static_control_target_within_limit(jcc(0x40), 0x100, word));
+    assert!(!static_control_target_within_limit(
+        jcc(0x40),
+        0x1_0100,
+        word
+    ));
+    // Exactly at the boundary, both sides. `<=` is the correct comparison.
+    assert!(static_control_target_within_limit(jcc(0), 0xFFFF, word));
+    assert!(!static_control_target_within_limit(jcc(1), 0xFFFF, word));
+
+    // A backward branch is stored as a wrapped u32. Where the architectural result would have
+    // wrapped below zero the guard refuses it, which is conservative and never wrong; where it
+    // lands at or below the wrap from a high entry it is admitted, and the mask is genuinely a
+    // no-op there.
+    assert!(!static_control_target_within_limit(
+        jcc(0u32.wrapping_sub(0x200)),
+        0x100,
+        word
+    ));
+    assert!(static_control_target_within_limit(
+        jcc(0u32.wrapping_sub(0x1_0000)),
+        0x1_0100,
+        word
+    ));
+
+    // Jmp and Call ride the same predicate, so the allowlist work inherits the guard.
+    assert!(!static_control_target_within_limit(
+        DirectKind::Jmp { target_delta: 0x40 },
+        0x1_0100,
+        word
+    ));
+    assert!(!static_control_target_within_limit(
+        DirectKind::Call {
+            return_delta: 0x5,
+            target_delta: 0x40,
+        },
+        0x1_0100,
+        word
+    ));
+
+    // A kind with no control target is unaffected in either width.
+    assert!(static_control_target_within_limit(
+        DirectKind::Pop { dst: 0 },
+        0x1_0100,
+        word
+    ));
+}
+
+/// In real mode the clamp is a no-op, because `cs.limit` is already 0xFFFF. Recorded so nobody
+/// concludes the guard changes real-mode behaviour: the 16-bit mask was never observable there,
+/// which is why this trap survived until the allowlist was about to open.
+#[test]
+fn the_word_control_clamp_is_a_no_op_at_a_real_mode_limit() {
+    // Real mode: already 0xFFFF, so the clamp changes nothing in either width.
+    assert_eq!(control_target_limit(OperandSize::Word, 0xFFFF), 0xFFFF);
+    assert_eq!(control_target_limit(OperandSize::Dword, 0xFFFF), 0xFFFF);
+
+    // Flat 32-bit: Word narrows to the wrap, Dword is untouched. Both directions are pinned
+    // because a clamp leaking into Dword would pass every Jcc fixture in this crate, all of
+    // which entry far below 0xFFFF.
+    assert_eq!(control_target_limit(OperandSize::Word, u32::MAX), 0xFFFF);
+    assert_eq!(control_target_limit(OperandSize::Dword, u32::MAX), u32::MAX);
+
+    // A limit already below the wrap is never widened.
+    assert_eq!(control_target_limit(OperandSize::Word, 0x0FFF), 0x0FFF);
+    assert_eq!(control_target_limit(OperandSize::Dword, 0x0FFF), 0x0FFF);
+}
