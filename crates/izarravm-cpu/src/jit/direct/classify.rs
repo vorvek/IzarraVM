@@ -170,6 +170,29 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         }),
                     };
                 }
+                // ALU accumulator forms with an imm8: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP AL, imm8
+                // (0x04/0x0c/0x14/0x1c/0x24/0x2c/0x34/0x3c). Semantically this is the 0x80 group
+                // with the destination fixed to AL, so it reuses `AluByteImm` and
+                // `emit_alu_byte_imm` unchanged; `dst: 0` is AL exactly as the interpreter's
+                // `read_gpr8(0)`/`write_gpr8(0)` pair means it, and op 7 CMP suppresses the
+                // writeback inside the emitter.
+                //
+                // This arm must stay inside this `match form`, BELOW the OperandSize::Word gate
+                // near the top of `classify`. `operand_size` is computed from prefixes alone and
+                // is opcode-independent, so a 66-prefixed `3C ib` decodes as Word; 0x3c is not in
+                // that gate's allowlist, so it returns None there and never reaches this arm.
+                // Hoisting this above the gate would lower a 16-bit-prefixed form as a byte op.
+                //
+                // It must not consult `operand_width`: byte width is a property of the form, not
+                // of the prefix. It must not touch `insn.modrm` or `insn.operand` either, which
+                // are None here because `decode` only parses a ModRM for forms below 4.
+                4 => {
+                    return Some(DirectKind::AluByteImm {
+                        op,
+                        dst: 0,
+                        imm: insn.imm as u8,
+                    });
+                }
                 5 => {
                     return Some(DirectKind::AluImm {
                         op,
