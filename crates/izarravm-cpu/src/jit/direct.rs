@@ -15,7 +15,7 @@ use super::code_watch::NativeCodeWatch;
 use super::encoder::Xmm;
 use super::encoder::{Encoder, Label, Reg};
 use super::exec_mem::ExecutableArena;
-use super::native_x87::{NativeX87Insn, NativeX87MemoryDirection};
+use super::native_x87::{NativeX87Insn, NativeX87MemoryAccess, NativeX87MemoryDirection};
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -2014,11 +2014,47 @@ pub(crate) enum DirectKind {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryWidth {
     Byte,
     Word,
     Dword,
+}
+
+/// The `MemoryWidth` of one x87 memory access, and the SINGLE source of truth for it.
+///
+/// Every consumer routes through here: `word_reads`, `dword_reads`, `word_stores`,
+/// `dword_stores`, `has_dword_read`, `has_dword_store`, `dynamic_counter_mask` and the emitter.
+/// That is not tidiness. If the accessors tested `access.width` inline while only the emitter
+/// called this, then breaking this function would move the emitted guard and the emitted dynamic
+/// counter while leaving the static registration correct, and the registration test would pass
+/// through the mutation.
+///
+/// The unknown arm PANICS rather than defaulting to Dword. A silent default is what would let a
+/// future 8-byte access (Tier 2: FLD/FST m64, the m80 forms) be charged as a dword, and the
+/// static-versus-dynamic disagreement that produces underflows `ram_word_reads` in `run.rs`
+/// rather than failing a test.
+fn x87_memory_width(access: NativeX87MemoryAccess) -> MemoryWidth {
+    match access.width {
+        2 => MemoryWidth::Word,
+        4 => MemoryWidth::Dword,
+        other => unreachable!("x87 memory access width {other} has no MemoryWidth"),
+    }
+}
+
+/// True when `kind` is an x87 slot whose memory access runs in `direction` at `width`.
+fn x87_memory_access_is(
+    kind: DirectKind,
+    direction: NativeX87MemoryDirection,
+    width: MemoryWidth,
+) -> bool {
+    let DirectKind::X87 { insn, .. } = kind else {
+        return false;
+    };
+    let Some(access) = insn.metadata().memory else {
+        return false;
+    };
+    access.direction == direction && x87_memory_width(access) == width
 }
 
 impl MemoryWidth {
@@ -2110,28 +2146,30 @@ impl DirectKind {
     }
 
     pub(crate) fn word_reads(self) -> u8 {
-        u8::from(matches!(
-            self,
-            Self::Load {
-                width: MemoryWidth::Word,
-                ..
-            } | Self::LoadExtend {
-                width: MemoryWidth::Word,
-                ..
-            } | Self::AluMemSource {
-                width: MemoryWidth::Word,
-                ..
-            } | Self::AluMemDest {
-                width: MemoryWidth::Word,
-                ..
-            } | Self::RmwIncDec {
-                width: MemoryWidth::Word,
-                ..
-            } | Self::TestImmMem {
-                width: MemoryWidth::Word,
-                ..
-            }
-        ))
+        u8::from(
+            matches!(
+                self,
+                Self::Load {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::LoadExtend {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::AluMemSource {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::AluMemDest {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::RmwIncDec {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::TestImmMem {
+                    width: MemoryWidth::Word,
+                    ..
+                }
+            ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Word),
+        )
     }
 
     pub(crate) fn dword_reads(self) -> u8 {
@@ -2159,14 +2197,7 @@ impl DirectKind {
                     }
                     | Self::Pop { .. }
                     | Self::Ret { .. }
-            ) || matches!(
-                self,
-                Self::X87 { insn, .. }
-                    if matches!(
-                        insn.metadata().memory,
-                        Some(access) if access.direction == NativeX87MemoryDirection::Read
-                    )
-            ),
+            ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword),
         )
     }
 
@@ -2207,7 +2238,7 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 }
-            ),
+            ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Word),
         )
     }
 
@@ -2231,14 +2262,7 @@ impl DirectKind {
                     width: MemoryWidth::Dword,
                     ..
                 }
-            ) || matches!(
-                self,
-                Self::X87 { insn, .. }
-                    if matches!(
-                        insn.metadata().memory,
-                        Some(access) if access.direction == NativeX87MemoryDirection::Write
-                    )
-            ),
+            ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Dword),
         )
     }
 
@@ -2317,10 +2341,23 @@ impl DirectKind {
                 width: MemoryWidth::Dword,
                 ..
             } => COUNTER_MODE13_DWORD_READ,
-            Self::X87 { insn, .. } => match insn.metadata().memory.map(|access| access.direction) {
-                Some(NativeX87MemoryDirection::Read) => COUNTER_MODE13_DWORD_READ,
-                Some(NativeX87MemoryDirection::Write) => {
+            // A Word access lands on the BYTE counter slots, because `emit_dynamic_word_increment`
+            // packs the word count into the upper 32 bits of the byte slot. Same convention as
+            // Load, Store and AluMemSource above.
+            Self::X87 { insn, .. } => match insn
+                .metadata()
+                .memory
+                .map(|access| (access.direction, x87_memory_width(access)))
+            {
+                Some((NativeX87MemoryDirection::Read, MemoryWidth::Dword)) => {
+                    COUNTER_MODE13_DWORD_READ
+                }
+                Some((NativeX87MemoryDirection::Read, _)) => COUNTER_MODE13_BYTE_READ,
+                Some((NativeX87MemoryDirection::Write, MemoryWidth::Dword)) => {
                     COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
+                }
+                Some((NativeX87MemoryDirection::Write, _)) => {
+                    COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY
                 }
                 None => 0,
             },
@@ -2415,14 +2452,7 @@ impl DirectKind {
                 }
                 | Self::Pop { .. }
                 | Self::Ret { .. }
-        ) || matches!(
-            self,
-            Self::X87 { insn, .. }
-                if matches!(
-                    insn.metadata().memory,
-                    Some(access) if access.direction == NativeX87MemoryDirection::Read
-                )
-        )
+        ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword)
     }
 
     fn has_dword_store(self) -> bool {
@@ -2444,14 +2474,7 @@ impl DirectKind {
                 width: MemoryWidth::Dword,
                 ..
             }
-        ) || matches!(
-            self,
-            Self::X87 { insn, .. }
-                if matches!(
-                    insn.metadata().memory,
-                    Some(access) if access.direction == NativeX87MemoryDirection::Write
-                )
-        )
+        ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Dword)
     }
 
     fn has_word_access(self) -> bool {

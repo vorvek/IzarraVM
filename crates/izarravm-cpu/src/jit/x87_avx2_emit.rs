@@ -166,6 +166,26 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             e.and_r32_imm32(Reg::R8, 0xffff_0000);
             e.or_r32_r32(Reg::R8, Reg::RAX);
         }
+        // The control word is NOT part of the resident cache: `emit_enter` loads only ST(0..7)
+        // into XMM4-11 and the packed status/tag word into CACHE_REG. Control lives only in
+        // `CpuGsw.fpu.control`, and both of its readers, `emit_gate` above and
+        // `emit_fistp_chop_guard` below, load it from there at RUNTIME. That is exactly what
+        // makes a lowered FLDCW inside a block safe: a later FISTP slot sees the value this
+        // arm just wrote, in both directions.
+        //
+        // RDX is the scratch register every other arm here uses, and `memory` is RDI, set up by
+        // `emit_x87_memory_pointer` and required to survive the gate. Neither arm touches
+        // CACHE_REG, which is correct: neither instruction changes the status or tag word.
+        NativeX87Insn::LoadControlWord { .. } => {
+            let memory = context.memory.expect("FLDCW needs a host pointer");
+            e.movzx_r32_word_disp32(Reg::RDX, memory, 0);
+            e.store_r16_disp32(context.cpu, control_offset(), Reg::RDX);
+        }
+        NativeX87Insn::StoreControlWord { .. } => {
+            let memory = context.memory.expect("FNSTCW needs a host pointer");
+            e.movzx_r32_word_disp32(Reg::RDX, context.cpu, control_offset());
+            e.store_r16_disp32(memory, 0, Reg::RDX);
+        }
     }
 }
 

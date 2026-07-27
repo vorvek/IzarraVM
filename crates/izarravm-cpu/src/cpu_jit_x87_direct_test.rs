@@ -1079,6 +1079,210 @@ fn nm_and_mf_gates_match_interpreter_without_touching_x87_or_memory() {
     }
 }
 
+/// Quake's float-to-integer bracket, the idiom the control-word pair exists for: save the control
+/// word, set chop mode through the integer registers, convert, restore.
+///
+/// [0x202] is POISONED with 0xbeef. FNSTCW writes two bytes at [0x200]; a four-byte store would
+/// clear it, and nothing else in the fixture would notice. `assert_program_matches` compares the
+/// whole memory image.
+fn control_word_bracket_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9, 0x05, 0x08, 0x02, 0x00, 0x00, // fld dword [0x208]
+        0xd9, 0x3d, 0x00, 0x02, 0x00, 0x00, // fnstcw word [0x200]
+        0x66, 0x8b, 0x05, 0x00, 0x02, 0x00, 0x00, // mov ax,[0x200]
+        0x80, 0xcc, 0x0c, // or ah,0x0c
+        0x66, 0x89, 0x05, 0x04, 0x02, 0x00, 0x00, // mov [0x204],ax
+        0xd9, 0x2d, 0x04, 0x02, 0x00, 0x00, // fldcw word [0x204]
+        0xdb, 0x1d, 0x0c, 0x02, 0x00, 0x00, // fistp dword [0x20c]
+        0xd9, 0x2d, 0x00, 0x02, 0x00, 0x00, // fldcw word [0x200]
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA + 2..DATA + 4].copy_from_slice(&0xbeefu16.to_le_bytes());
+    memory[DATA + 8..DATA + 12].copy_from_slice(&(-3.7f32).to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn quake_control_word_bracket_matches_the_interpreter() {
+    let (cpu, bus) =
+        assert_program_matches(GswMode::Gsw586, control_word_bracket_program(), 0x027f);
+
+    // Saved, modified and restored. 0x027f | 0x0c00 is RC = 11, truncate.
+    assert_eq!(
+        u16::from_le_bytes(bus.memory[DATA..DATA + 2].try_into().unwrap()),
+        0x027f,
+        "FNSTCW stored the live control word"
+    );
+    assert_eq!(
+        u16::from_le_bytes(bus.memory[DATA + 2..DATA + 4].try_into().unwrap()),
+        0xbeef,
+        "FNSTCW wrote two bytes, not four"
+    );
+    assert_eq!(
+        u16::from_le_bytes(bus.memory[DATA + 4..DATA + 6].try_into().unwrap()),
+        0x0e7f,
+        "chop mode was armed through the integer registers"
+    );
+    assert_eq!(
+        cpu.fpu.control, 0x027f,
+        "the bracket restored the entry value"
+    );
+    // -3.7 truncated toward zero, which is what chop mode means and what round-to-nearest would
+    // have made -4.
+    assert_eq!(
+        i32::from_le_bytes(bus.memory[DATA + 12..DATA + 16].try_into().unwrap()),
+        -3
+    );
+}
+
+fn fldcw_then_fistp_program(control_at: u32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xd9u8, 0x05, 0x08, 0x02, 0x00, 0x00]; // fld dword [0x208]
+    code.extend_from_slice(&[0xd9, 0x2d]); // fldcw word [control_at]
+    code.extend_from_slice(&control_at.to_le_bytes());
+    code.extend_from_slice(&[0xdb, 0x1d, 0x0c, 0x02, 0x00, 0x00]); // fistp dword [0x20c]
+    code.extend_from_slice(&[0x89, 0xc0, 0xf4]); // mov eax,eax ; hlt
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[control_at as usize..control_at as usize + 2].copy_from_slice(&0x0f7fu16.to_le_bytes());
+    memory[DATA + 8..DATA + 12].copy_from_slice(&3.7f32.to_bits().to_le_bytes());
+    memory
+}
+
+/// THE SECTION 4a TEST. `emit_fistp_chop_guard` reads the control word from `CpuGsw.fpu.control`
+/// at RUNTIME, so a FISTP compiled after a lowered FLDCW in the SAME block sees the value that
+/// FLDCW just wrote. The CPU enters with round-to-nearest, which the guard refuses, and the FLDCW
+/// switches it to chop.
+///
+/// The assertion is `jit_direct_side_exits == 0`. A stale control word would make the guard exit,
+/// and the truncated result would still be correct because the interpreter would produce it; only
+/// the exit count distinguishes the two.
+#[test]
+fn a_lowered_fldcw_is_visible_to_a_later_fistp_in_the_same_block() {
+    let (cpu, bus) =
+        assert_program_matches(GswMode::Gsw586, fldcw_then_fistp_program(0x200), 0x037f);
+    assert_eq!(cpu.fpu.control, 0x0f7f);
+    assert_eq!(
+        i32::from_le_bytes(bus.memory[DATA + 12..DATA + 16].try_into().unwrap()),
+        3
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_side_exits,
+        0,
+        "the FISTP chop guard must see the control word the FLDCW wrote"
+    );
+}
+
+/// THE ALIGNMENT-WIDTH TEST. `emit_wide_page_guard` refuses any access not aligned to
+/// `width.bytes()`, so a control word pinned at `MemoryWidth::Dword` side-exits at every address
+/// that is 2-aligned but not 4-aligned. Quake keeps the saved and the chop-mode word in adjacent
+/// 2-byte slots, so one of each pair is always in that state.
+///
+/// 0x202 is deliberate. The other x87 fixtures in this file sit at 4-aligned addresses and could
+/// not tell the two widths apart.
+#[test]
+fn a_two_aligned_control_word_runs_natively() {
+    let (_, bus) = assert_program_matches(GswMode::Gsw586, fldcw_then_fistp_program(0x202), 0x037f);
+    assert_eq!(
+        i32::from_le_bytes(bus.memory[DATA + 12..DATA + 16].try_into().unwrap()),
+        3
+    );
+}
+
+#[test]
+fn a_two_aligned_control_word_takes_no_side_exit() {
+    let mut cpu = x87_cpu(GswMode::Gsw586);
+    let memory = fldcw_then_fistp_program(0x202);
+    let mut bus = direct_memory(memory.clone());
+    arm(&mut cpu, 0x037f);
+    run_to_halt(&mut cpu, &mut bus);
+    cpu.set_jit_auto_admit(true);
+    for _ in 0..2 {
+        arm(&mut cpu, 0x037f);
+        bus.memory.copy_from_slice(&memory);
+        run_to_halt(&mut cpu, &mut bus);
+    }
+    let before = cpu.perf_counters().jit_direct_side_exits;
+    let before_insns = cpu.perf_counters().jit_direct_insns;
+    arm(&mut cpu, 0x037f);
+    bus.memory.copy_from_slice(&memory);
+    run_to_halt(&mut cpu, &mut bus);
+    // Growth in the LAST run, not a cumulative total, so the side-exit assertion below cannot
+    // pass by the block never having run.
+    assert!(
+        cpu.perf_counters().jit_direct_insns > before_insns,
+        "the sequence did not run natively"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_side_exits,
+        before,
+        "a 2-aligned control word must not trip the alignment guard"
+    );
+}
+
+fn unmasking_fldcw_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9, 0x2d, 0x00, 0x02, 0x00, 0x00, // fldcw word [0x200]
+        0xd9, 0xe8, // fld1
+        0x89, 0xc0, // mov eax,eax
+        0x89, 0xdb, // mov ebx,ebx
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    // 0x037e clears IM, so it UNMASKS the invalid-operation exception that 0x037f masks.
+    memory[DATA..DATA + 2].copy_from_slice(&0x037eu16.to_le_bytes());
+    memory
+}
+
+/// THE GATE RE-ARM TEST, and the only test of the hazard the standing x87 plan did not name.
+///
+/// The native #MF gate is emitted ONCE per block, on the reasoning that no successful x87
+/// instruction can make an exception pending for a later slot. FLDCW breaks that from the other
+/// side: the gate condition is `status & 0x3f & !(control & 0x3f)`, and FLDCW changes the MASK, so
+/// a status bit set earlier by an INTERPRETED instruction can be masked at block entry and
+/// unmasked mid-block. The interpreter re-checks before every x87 instruction.
+///
+/// Entry: IE set in the status word, IM set in the control word so it is masked, CR0.NE on. The
+/// FLDCW clears IM, and the FLD1 behind it must then trap exactly as it does on the interpreter.
+/// Without the re-arm the native block runs the FLD1 and the two runs diverge completely.
+#[test]
+fn an_unmasking_fldcw_rearms_the_mf_gate_for_the_next_slot() {
+    let memory = unmasking_fldcw_program();
+    let (mut direct, mut direct_bus) =
+        assert_program_matches(GswMode::Gsw586, memory.clone(), 0x037f);
+
+    let mut interpreter = x87_cpu(GswMode::Gsw586);
+    let mut interpreter_bus = direct_memory(memory.clone());
+    arm(&mut interpreter, 0x037f);
+    run_to_halt(&mut interpreter, &mut interpreter_bus);
+
+    for cpu in [&mut direct, &mut interpreter] {
+        arm(cpu, 0x037f);
+        cpu.control.cr0 = CR0_NE;
+        cpu.fpu.raise_exception(1);
+    }
+    direct_bus.memory.copy_from_slice(&memory);
+    direct_bus.trace = BusTrace::default();
+    interpreter_bus.memory.copy_from_slice(&memory);
+    interpreter_bus.trace = BusTrace::default();
+
+    let direct_result = direct.run_straight_line(&mut direct_bus, u64::MAX);
+    let interpreter_result = interpreter.run_straight_line(&mut interpreter_bus, u64::MAX);
+    assert_eq!(direct_result, interpreter_result, "outcome");
+    assert_eq!(direct.registers, interpreter.registers, "registers");
+    assert_eq!(direct.fpu, interpreter.fpu, "x87 state");
+    assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(direct.fp_rem, interpreter.fp_rem);
+    // The FLDCW itself retired on both sides; only the FLD1 behind it must not.
+    assert_eq!(direct.fpu.control, 0x037e, "the FLDCW retired");
+    assert_eq!(direct.fpu.top(), 0, "the FLD1 did not push");
+}
+
 fn conversion_loop_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     let code = [

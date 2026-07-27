@@ -37,7 +37,9 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
     matches!(
         (opcode, mode, reg, rm),
         (0xd8, 0..=3, 0..=7, 0..=7)
-            | (0xd9, 0..=2, 0 | 2 | 3, 0..=7)
+            // reg 5 and 7 in the MEMORY modes are FLDCW and FNSTCW. They are absent from the
+            // register row below, where (0xd9, 3, 5, ..) is FLD1/FLDZ at rm 0 and 6 only.
+            | (0xd9, 0..=2, 0 | 2 | 3 | 5 | 7, 0..=7)
             | (0xd9, 3, 0 | 1, 0..=7)
             | (0xd9, 3, 5, 0 | 6)
             | (0xda, 3, 5, 1)
@@ -68,7 +70,9 @@ fn classifier_selects_exact_traced_slice() {
             }
         }
     }
-    assert_eq!(accepted, 461);
+    // 461 before the control-word pair. The two new sub-opcodes are admitted in all three memory
+    // modes across all eight rm values: 2 * 3 * 8 = 48.
+    assert_eq!(accepted, 509);
 }
 
 #[test]
@@ -303,6 +307,36 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FLDCW. Four clocks, not the fourteen every other 0xd9 memory form charges
+        // (fpu_exec.rs, `execute_fpu_memory`, the 0xd9 reg 5 arm is `Ok(clocks(4))`), and the
+        // first width-2 access in the table.
+        (
+            insn(0xd9, 0, 5, 0),
+            NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::F32Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 2,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        // FNSTCW, `Ok(clocks(14))` on the same arm.
+        (
+            insn(0xd9, 0, 7, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F32Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 2,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
         (
             insn(0xdb, 0, 0, 0),
             NativeX87Metadata {
@@ -382,6 +416,20 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
     ];
     for (insn, expected) in cases {
         assert_eq!(NativeX87Insn::classify(&insn).unwrap().metadata(), expected);
+    }
+}
+
+/// Neither control-word form moves TOP, pushes or pops. That is what lets the pair join an
+/// otherwise integer block, and it is also why such a block ends up TOP-pinned for no
+/// architectural reason (`jit_direct_reject_x87_top`).
+#[test]
+fn control_word_forms_leave_the_stack_position_alone() {
+    for candidate in [insn(0xd9, 0, 5, 0), insn(0xd9, 0, 7, 0)] {
+        let classified = NativeX87Insn::classify(&candidate).unwrap();
+        assert_eq!(classified.top_delta(), 0);
+        for top in 0..8 {
+            assert_eq!(classified.advance_top(top), top);
+        }
     }
 }
 
