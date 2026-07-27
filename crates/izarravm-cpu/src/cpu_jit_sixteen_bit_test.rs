@@ -718,3 +718,96 @@ fn a_sixteen_bit_block_ending_at_the_segment_top_faults_identically() {
     );
     assert_eq!(native.halted, interp.halted);
 }
+
+/// THE ANTI-VACUITY GATE FOR THE TIER 0 ALLOWLIST, and the only fixture that exercises it in a
+/// real 16-bit code segment.
+///
+/// On `main` the continuation early-out still refuses `!d`, so no 16-bit block can be compiled in
+/// production and the pinned corpus reaches the Tier 0 opcodes only through a 0x66 prefix in
+/// 32-bit code. Byte identity there is an inertness claim, not evidence. This is the test that
+/// says the mechanism works.
+///
+/// Every slot is a Tier 0 opcode admitted by that slice, in a segment where each decodes at
+/// `OperandSize::Word` because the size follows CS.D rather than the opcode. Without the
+/// allowlist edit slot 1 fails to classify, the block holds one non-terminal slot, the three-slot
+/// floor returns `Retry`, and `install_sixteen_bit_block` panics. It fails loudly if the
+/// mechanism is absent.
+///
+/// The block ends on a terminal (`0xeb` JMP), so the three-slot floor does not apply and the
+/// count is exact at 7.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn tier_zero_byte_forms_and_near_jmp_form_a_sixteen_bit_block() {
+    let mut memory = vec![0u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + 15].copy_from_slice(&[
+        0x40, // inc ax
+        0x3c, 0x05, // cmp al,5
+        0x84, 0xc0, // test al,al
+        0x88, 0xc4, // mov ah,al
+        0x8a, 0xd8, // mov bl,al
+        0x80, 0xc1, 0x03, // add cl,3
+        0xeb, 0x02, // jmp +2, terminal
+        0x90, // landing pad inside the mapped page
+    ]);
+    let mut bus = sixteen_bit_bus(memory);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000]);
+    warm_sixteen_bit(
+        &mut cpu,
+        &mut bus,
+        &[
+            ENTRY,
+            ENTRY + 1,
+            ENTRY + 3,
+            ENTRY + 5,
+            ENTRY + 7,
+            ENTRY + 9,
+            ENTRY + 12,
+        ],
+    );
+
+    let block = install_sixteen_bit_block(&mut cpu, ENTRY, 7);
+
+    cpu.registers.gpr = [0; 8];
+    cpu.registers.set_eax(0xdead_0004);
+    cpu.registers.set_ecx(0xbeef_0010);
+    cpu.set_eip(ENTRY);
+    let before = counts(&cpu);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+        "the Tier 0 block must run"
+    );
+    let after = counts(&cpu);
+
+    // Byte ops narrow: every one of these writes 8 bits and preserves the rest of the register.
+    // A width leak would clobber the high halves seeded above, which is why they are non-zero.
+    assert_eq!(
+        cpu.registers.eax(),
+        0xdead_0505,
+        "al and ah, high half kept"
+    );
+    assert_eq!(cpu.registers.ebx(), 0x0000_0005, "bl from mov bl,al");
+    assert_eq!(cpu.registers.ecx(), 0xbeef_0013, "cl += 3, high half kept");
+    // The JMP is the terminal, so EIP is its TARGET rather than the fall-through. The target is
+    // end-of-instruction plus displacement: the jmp occupies 0x10c..0x10e and displaces by 2.
+    assert_eq!(cpu.registers.eip, ENTRY + 16);
+
+    assert_eq!(
+        after.insns - before.insns,
+        7,
+        "exact native instruction count"
+    );
+    assert_eq!(
+        after.insns_sixteen_bit - before.insns_sixteen_bit,
+        7,
+        "and all seven are attributed to the 16-bit population"
+    );
+    assert_eq!(
+        after.side_exits, before.side_exits,
+        "a side exit would let the interpreter produce the right answer anyway"
+    );
+}
