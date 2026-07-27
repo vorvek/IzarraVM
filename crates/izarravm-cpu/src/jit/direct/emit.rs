@@ -632,6 +632,71 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
             }
+            // RET near on a 16-bit stack: two bytes read at `SP & 0xFFFF`, the CS limit checked
+            // BEFORE any stack release, then SP alone advances by `2 + release`.
+            //
+            // The order matches `near_return`: the interpreter checks the limit first, then
+            // releases the operand width, sets EIP, and releases the immediate. Nothing between
+            // its two releases is observable, so one 16-bit add of `2 + release` is congruent
+            // mod 2^16 with both of them. `wrapping_add` is what makes that true for a release of
+            // 0xFFFE or more, where the sum overflows a u16.
+            //
+            // The re-load after the completion is not optional, for the reason spelled out in the
+            // 32-bit arm above: the completion clobbers RDX. At Word it would be worse there than
+            // here, because the word increment loads `1 << 32`, whose low half is zero, so the
+            // return address would come out as 0 rather than 1.
+            DirectKind::Ret16 { release } => {
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
+                let limit = memory.segments.cs.limit;
+                let limit_exit = (limit != u32::MAX).then(|| e.label());
+                emit_ram_read_pointer_inner(
+                    &mut e,
+                    MemoryWidth::Word,
+                    stack_addr(0),
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                if let Some(limit_exit) = limit_exit {
+                    e.cmp_r32_imm32(Reg::RDX, limit);
+                    e.jcc(7, limit_exit);
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                }
+                emit_mode13_read_completion(&mut e, MemoryWidth::Word);
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                e.alu_r16_imm16(0, home(4), release.wrapping_add(2));
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                completed += 1;
+                completed_raw += slot.kind.raw_clocks() as u16;
+                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
+                completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
+                completed_dword_reads += slot.kind.dword_reads();
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                );
+                terminal = true;
+                break;
+            }
             DirectKind::X87 { insn, addr } => {
                 let side = e.label();
                 let eligibility = e.label();
@@ -840,6 +905,14 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
                 }
                 emit_mode13_read_completion(&mut e, MemoryWidth::Dword);
+                // Re-load the return target. `emit_mode13_read_completion` clobbers RDX on its
+                // mode13 branch (`emit_dynamic_increment` is `mov RDX, 1` then an add), which the
+                // comments on the load helpers already state. This is the only site that held a
+                // live value in RDX across it, so a near RET whose stack read landed on a mode13
+                // page and whose target passed the CS-limit check jumped to EIP 1. RDI still
+                // holds the pointer; every other read site avoids this by loading RDX after the
+                // completion rather than before, and this one now does the same.
+                e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
                 e.add_r32_imm32(home(4), 4 + u32::from(release));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((

@@ -1768,7 +1768,10 @@ pub(crate) struct Compilation {
     pub has_x87: bool,
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
-    dynamic_successor: bool,
+    /// Readable outside this module for the same reason as `successors` below: a terminal that
+    /// omits it stays correct in guest state and in block shape while never linking, which no
+    /// other assertion can see.
+    pub(crate) dynamic_successor: bool,
     /// Readable outside this module so a fixture can pin a terminal's LINK EDGE. A kind missing
     /// from the successor match falls to the fall-through arm, which is a wrong edge rather than
     /// a missing one, and nothing observable in guest state or in the block's shape shows it.
@@ -2040,6 +2043,16 @@ pub(crate) enum DirectKind {
     Ret {
         release: u16,
     },
+    /// RET near on a 16-bit stack at Word operand size: two bytes read at `SP & 0xFFFF`, the
+    /// CS limit checked BEFORE any stack release, then SP alone advances by `2 + release`.
+    ///
+    /// A terminal with a DYNAMIC successor, so besides `is_terminal` it owes both
+    /// `dynamic_successor` and an explicit `[None, None]` successor pair. Missing the second
+    /// consumes link cell 0 for a static edge that the return path then cannot use, which halves
+    /// the return PIC without changing any guest state.
+    Ret16 {
+        release: u16,
+    },
     Jcc {
         condition: u8,
         taken_delta: u32,
@@ -2139,7 +2152,9 @@ impl DirectKind {
             // would fail.
             Self::Pop { .. } | Self::Pop16 { .. } => 4,
             Self::Call { .. } | Self::Call16 { .. } | Self::Jmp { .. } => 7,
-            Self::Ret { .. } => 10,
+            // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
+            // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
+            Self::Ret { .. } | Self::Ret16 { .. } => 10,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
             Self::Load { raw_clocks, .. }
             | Self::LoadExtend { raw_clocks, .. }
@@ -2205,6 +2220,7 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::Pop16 { .. }
+                    | Self::Ret16 { .. }
                     | Self::TestImmMem {
                         width: MemoryWidth::Word,
                         ..
@@ -2416,7 +2432,7 @@ impl DirectKind {
             Self::Pop { .. } | Self::Ret { .. } => COUNTER_MODE13_DWORD_READ,
             // A Word read lands on the BYTE counter lane, matching `Load { Word }`:
             // `emit_mode13_read_completion` routes Word to the byte-read slot.
-            Self::Pop16 { .. } => COUNTER_MODE13_BYTE_READ,
+            Self::Pop16 { .. } | Self::Ret16 { .. } => COUNTER_MODE13_BYTE_READ,
             Self::Push { .. } | Self::Call { .. } => {
                 COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
             }
@@ -2453,7 +2469,9 @@ impl DirectKind {
             {
                 Some(addr.segment)
             }
-            Self::Pop { .. } | Self::Pop16 { .. } | Self::Ret { .. } => Some(SegmentIndex::Ss),
+            Self::Pop { .. } | Self::Pop16 { .. } | Self::Ret { .. } | Self::Ret16 { .. } => {
+                Some(SegmentIndex::Ss)
+            }
             _ => None,
         }
     }
@@ -2546,6 +2564,7 @@ impl DirectKind {
                 | Self::Call { .. }
                 | Self::Call16 { .. }
                 | Self::Ret { .. }
+                | Self::Ret16 { .. }
         )
     }
 
@@ -2556,6 +2575,7 @@ impl DirectKind {
                 | Self::Call16 { .. }
                 | Self::Jmp { .. }
                 | Self::Ret { .. }
+                | Self::Ret16 { .. }
                 | Self::Jcc { .. }
         )
     }
@@ -3059,6 +3079,9 @@ fn compile_with_instruction_limit(
                 DirectKind::Push16 { source }
             }
             (DirectKind::Pop { dst }, false, OperandSize::Word) => DirectKind::Pop16 { dst },
+            (DirectKind::Ret { release }, false, OperandSize::Word) => {
+                DirectKind::Ret16 { release }
+            }
             (
                 DirectKind::Call {
                     return_delta,
@@ -3290,7 +3313,7 @@ fn compile_with_instruction_limit(
     };
     let dynamic_successor = matches!(
         slots.last().map(|slot| slot.kind),
-        Some(DirectKind::Ret { .. })
+        Some(DirectKind::Ret { .. } | DirectKind::Ret16 { .. })
     );
     let successors = match slots.last().map(|slot| slot.kind) {
         Some(DirectKind::Jcc { taken_delta, .. }) => [
@@ -3311,7 +3334,7 @@ fn compile_with_instruction_limit(
             }),
             None,
         ],
-        Some(DirectKind::Ret { .. }) => [None, None],
+        Some(DirectKind::Ret { .. } | DirectKind::Ret16 { .. }) => [None, None],
         _ => [Some(fallthrough), None],
     };
     let link_cells = [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())];

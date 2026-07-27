@@ -3250,3 +3250,167 @@ fn movzx_register_forms_are_lowered() {
         );
     }
 }
+
+/// The sibling of `finite_cs_ret_limit_exit_case`, and the case that fixture missed by one seed.
+///
+/// That one always seeds a return address ABOVE the CS limit, so the emitted `ja` jumps past the
+/// mode13 read completion every time. This one seeds a VALID return address, so the completion
+/// runs while the return target is still live in a register.
+///
+/// It exists because the completion clobbers RDX: `emit_dynamic_increment` is `mov RDX, 1`
+/// followed by an add. The RET arm was the only emitter site holding a live value in RDX across
+/// it, so before this was fixed a near RET whose stack read landed on a mode13 page returned to
+/// EIP 1. The `stack_physical` loop is what makes the mode13 branch actually taken; on an
+/// ordinary RAM page the completion's guarded body is skipped and the bug is invisible.
+#[test]
+fn ret_through_a_mode13_stack_page_returns_to_the_popped_address() {
+    for stack_physical in [0x7000, 0x000a_0000] {
+        finite_cs_ret_valid_target_case(stack_physical);
+    }
+}
+
+fn finite_cs_ret_valid_target_case(stack_physical: u32) {
+    const ENTRY: u32 = 0x301;
+    const RET: u32 = ENTRY + 7;
+    const INITIAL_ESP: u32 = 0x2000;
+    const RETURN_TO: u32 = 0x4321;
+    let mut memory = vec![0; 0x000b_0000];
+    high_segment_page_tables(&mut memory);
+    memory[0x4008..0x400c].copy_from_slice(&(stack_physical | 0x67).to_le_bytes());
+    memory[0x8301..0x8309].copy_from_slice(&[
+        0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+        0x89, 0xc1, // mov ecx,eax
+        0xc3, // ret
+    ]);
+    let stack = stack_physical as usize;
+    memory[stack..stack + 4].copy_from_slice(&RETURN_TO.to_le_bytes());
+
+    let mut native = quake_segment_cpu(ENTRY, true);
+    let mut interp = quake_segment_cpu(ENTRY, true);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + 5, RET];
+    decode_segmented_fixture(&mut native, &mut native_bus, &starts);
+    decode_segmented_fixture(&mut interp, &mut interp_bus, &starts);
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        QUAKE_SEGMENT_BASE + INITIAL_ESP,
+        stack_physical,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+        true,
+        false,
+    );
+    let block = install_fixture_block(&mut native, QUAKE_SEGMENT_BASE + ENTRY);
+    assert_eq!(block.span().instructions, 3);
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    for _ in 0..3 {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+    assert_eq!(
+        native.registers.eip, RETURN_TO,
+        "the RET must return to the popped address, not to a counter constant"
+    );
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native.registers.esp(), INITIAL_ESP + 4);
+    // No clock comparison here. A COMPLETED block and three interpreter cycles do not present
+    // the same accounting boundary (the block charges its own total, the interpreter charges
+    // per cycle plus the post-RET prefetch), and the difference shows on an ordinary RAM stack
+    // too, where the code this test exists for is not even reached. RET timing on both the
+    // completing and the exiting path is already pinned by the sibling case above and by
+    // `direct_family_core_and_bus_timing_matches_interpreter_in_486_and_586_modes`. This test
+    // is here for the returned ADDRESS.
+}
+
+/// The Word-width twin of `ret_through_a_mode13_stack_page_returns_to_the_popped_address`, and
+/// the only thing that can reach the 16-bit RET's mode13 completion.
+///
+/// The completion clobbers RDX, and at Word the increment loads `1 << 32`, whose low half is
+/// ZERO. So without the re-load a 16-bit RET off a mode13 stack page returns to EIP 0 rather
+/// than to EIP 1 as the 32-bit form did: the same defect with a quieter symptom.
+///
+/// It needs three things at once, which is why no existing helper provides it: a mode13 stack
+/// page, a 16-bit stack, and a return address that PASSES the CS limit so the completion is
+/// reached at all.
+#[test]
+fn word_ret_through_a_mode13_stack_page_returns_to_the_popped_address() {
+    const ENTRY: u32 = 0x301;
+    const RET: u32 = ENTRY + 7;
+    const INITIAL_ESP: u32 = 0x2000;
+    const RETURN_TO: u32 = 0x4321;
+    const STACK_PHYSICAL: u32 = 0x000a_0000;
+    let mut memory = vec![0; 0x000b_0000];
+    high_segment_page_tables(&mut memory);
+    memory[0x4008..0x400c].copy_from_slice(&(STACK_PHYSICAL | 0x67).to_le_bytes());
+    memory[0x8301..0x830a].copy_from_slice(&[
+        0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+        0x89, 0xc1, // mov ecx,eax
+        0x66, 0xc3, // ret at Word operand size
+    ]);
+    let stack = STACK_PHYSICAL as usize;
+    memory[stack..stack + 2].copy_from_slice(&(RETURN_TO as u16).to_le_bytes());
+
+    let sixteen_bit_stack = |cpu: &mut CpuGsw| {
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = false;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    };
+    let mut native = quake_segment_cpu(ENTRY, true);
+    let mut interp = quake_segment_cpu(ENTRY, true);
+    sixteen_bit_stack(&mut native);
+    sixteen_bit_stack(&mut interp);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + 5, RET];
+    decode_segmented_fixture(&mut native, &mut native_bus, &starts);
+    decode_segmented_fixture(&mut interp, &mut interp_bus, &starts);
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        QUAKE_SEGMENT_BASE + INITIAL_ESP,
+        STACK_PHYSICAL,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+        true,
+        false,
+    );
+    let block = install_fixture_block(&mut native, QUAKE_SEGMENT_BASE + ENTRY);
+    assert_eq!(block.span().instructions, 3);
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    for _ in 0..3 {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+    assert_eq!(
+        native.registers.eip, RETURN_TO,
+        "the 16-bit RET must return to the popped word, not to a cleared register"
+    );
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native.registers.esp(), INITIAL_ESP + 2);
+}

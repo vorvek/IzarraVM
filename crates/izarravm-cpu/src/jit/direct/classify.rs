@@ -44,6 +44,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             insn.opcode,
             0x39 | 0x3b | 0x40..=0x4f | 0x50..=0x5f | 0x68 | 0x6a | 0x70..=0x7f | 0x89
                 | 0x8b
+                | 0xc2
+                | 0xc3
                 | 0xe8
                 | 0x0f80..=0x0f8f
                 | 0xff
@@ -573,9 +575,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 };
             }
             0xc2 | 0xc3 => {
-                if !matches!(operand_width, MemoryWidth::Dword) {
-                    return None;
-                }
+                // No width gate here. `OperandSize` has exactly two variants, so the only widths
+                // that reach this arm are Word and Dword, and both are wanted: the Word-size
+                // allowlist above decides admission and the compile loop's stack-width matrix
+                // rewrites the Word form into its own kind. A Byte check would read as live and
+                // be provably unreachable.
                 return Some(DirectKind::Ret {
                     release: if opcode == 0xc2 { insn.imm as u16 } else { 0 },
                 });
