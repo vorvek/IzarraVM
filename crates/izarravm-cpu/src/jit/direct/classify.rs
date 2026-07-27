@@ -643,8 +643,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     None
 }
 
-fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
-    if addr.address_size != AddressSize::Dword || !matches!(addr.scale, 1 | 2 | 4 | 8) {
+pub(super) fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
+    // Both address sizes. The 16-bit modes already arrive in exactly this shape:
+    // `parse_16bit_address` emits the eight register pairs as base/index at scale 1, with the
+    // displacement sign-extended and SS selected for the BP forms. The 64K wrap is applied by the
+    // emitter as a block property, because the address size is a pure function of CS.D.
+    if !matches!(addr.scale, 1 | 2 | 4 | 8) {
         return None;
     }
     Some(DirectAddr {

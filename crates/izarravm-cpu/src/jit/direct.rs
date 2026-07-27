@@ -3124,6 +3124,11 @@ fn compile_with_instruction_limit(
         // once per step of a binary search whenever the emitted block overflows a host page, and
         // a shorter prefix may not reach the branch at all, so counting every pass would both
         // multiply the total and let admitted and refused flip for one block.
+        // The addressing mechanism gate. Zero on a corpus with no 16-bit code IS the inertness
+        // claim for that work, stated positively rather than as an absence of movement.
+        if instruction_limit >= MAX_BLOCK_INSTRUCTIONS && insn.address_size == AddressSize::Word {
+            cpu.perf.jit_direct_word_address_slots += 1;
+        }
         if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
             && insn.operand_size == OperandSize::Word
             && static_control_target(kind).is_some()
@@ -3356,6 +3361,11 @@ fn compile_with_instruction_limit(
             code_watch_tables,
             cpl3: memory_cpl3,
             segments: segment_layout,
+            address_wrap: if d {
+                emit::AddressWrap::None
+            } else {
+                emit::AddressWrap::Word
+            },
         },
         link_cell_ptrs: link_cells.each_ref().map(|cell| cell.address()),
     });
@@ -3478,6 +3488,20 @@ struct MemoryEmitContext {
     code_watch_tables: Option<[usize; 2]>,
     cpl3: bool,
     segments: SegmentLayout,
+    /// Whether a ModRM-derived effective address wraps at 64K.
+    ///
+    /// A BLOCK property, not an address one. `decode` computes
+    /// `address_size = cs.default_size_32 XOR address_size_override`, and `prefixes_supported_for`
+    /// refuses the override outright, so within an admitted block the address size is a pure
+    /// function of CS.D, which the mode key pins.
+    ///
+    /// It lives here rather than on `DirectAddr` because that struct rides inside `Load`,
+    /// `Store`, `AluMemSource` and other kinds in clif's lowerable set, which would lower them
+    /// without the mask.
+    ///
+    /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
+    /// and is keyed separately, so all eight `stack_addr` call sites pass a literal.
+    address_wrap: emit::AddressWrap,
 }
 
 #[cfg(test)]

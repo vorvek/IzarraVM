@@ -631,6 +631,13 @@ pub struct PerfCounters {
     /// `jit_direct_compile_attempts`. Compile-time, not execution traffic.
     pub jit_direct_word_control_admitted: u64,
     pub jit_direct_word_control_refused: u64,
+    /// Slots admitted with a 16-bit effective address, whose EA wraps at 64K.
+    ///
+    /// The mechanism gate for 16-bit addressing, and it exists for the reason the two counters
+    /// above do: the path is unreachable until 16-bit code admission is flipped, so byte
+    /// identity cannot gate it and a zero here IS the inertness claim, stated positively.
+    /// Compile-time, counted once per compile attempt, not execution traffic.
+    pub jit_direct_word_address_slots: u64,
     pub jit_direct_reject_observer: u64,
     pub jit_direct_reject_interrupt_shadow: u64,
     pub jit_direct_reject_aggregate_accounting: u64,

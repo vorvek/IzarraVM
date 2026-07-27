@@ -177,7 +177,11 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
             }
             DirectKind::Lea { dst, addr } => {
-                emit_effective_address(&mut e, addr);
+                // LEA never reaches a segment, so it is the one address consumer that would have
+                // been missed by putting the wrap on the segmented helper. The interpreter writes
+                // `mem.offset`, which a Word `AddrMode` has already masked, while this path adds
+                // the whole 32-bit base register.
+                emit_effective_address(&mut e, addr, memory.address_wrap);
                 e.mov_r32_r32(home(dst), Reg::RAX);
             }
             DirectKind::IncDecReg { dst, is_dec, width } => {
@@ -440,7 +444,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     addr,
                     memory,
                     reasons,
-                    AddressWrap::None,
+                    memory.address_wrap,
                 );
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
@@ -1504,7 +1508,7 @@ fn emit_load(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
+    emit_ram_read_pointer(e, width, addr, memory, sides, memory.address_wrap);
     match width {
         MemoryWidth::Byte => {
             e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0);
@@ -1545,7 +1549,7 @@ fn emit_load_extend(
     // resolved inside emit_ram_read_pointer, so an instruction that faults leaves the destination
     // register untouched, which is what the interpreter does: it faults inside the read, before
     // write_gpr_sized runs.
-    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
+    emit_ram_read_pointer(e, width, addr, memory, sides, memory.address_wrap);
     match (width, signed) {
         (MemoryWidth::Byte, false) => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
         (MemoryWidth::Byte, true) => e.movsx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
@@ -1643,7 +1647,7 @@ fn emit_x87_memory_pointer(
     // `needs_alignment_guard()` the way `emit_ram_read_pointer_inner` gates it.
     debug_assert!(width.needs_alignment_guard());
     let map = memory.map.expect("x87 memory block has fast-map bases");
-    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
+    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap);
     // The width here is what the slice's performance rests on, not its byte identity:
     // `BusCycle::clocks_for` ignores width, so a Word access charged as a Dword costs the same
     // bus clocks. What a Dword guard WOULD do is refuse every 2-aligned-but-not-4-aligned
@@ -1895,7 +1899,7 @@ fn emit_alu_mem_source(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
+    emit_ram_read_pointer(e, width, addr, memory, sides, memory.address_wrap);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RCX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0),
@@ -1932,7 +1936,7 @@ fn emit_imul_mem(
         addr,
         memory,
         sides,
-        AddressWrap::None,
+        memory.address_wrap,
     );
     e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
     // The tail is emit_imul's verbatim, and it is correct here for the same reason: the
@@ -1981,7 +1985,7 @@ fn emit_imul_mem_acc(
         addr,
         memory,
         sides,
-        AddressWrap::None,
+        memory.address_wrap,
     );
     e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
     // The tail is emit_mul_reg's with the SIGNED primitive. Guest EAX and EDX live in the homes R8
@@ -2017,7 +2021,7 @@ fn emit_test_imm_mem(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
+    emit_ram_read_pointer(e, width, addr, memory, sides, memory.address_wrap);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
@@ -2042,7 +2046,7 @@ fn emit_alu_mem_dest(
 ) {
     let map = memory.map.expect("memory ALU has fast-map bases");
     if op == 7 {
-        emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
+        emit_ram_read_pointer(e, width, addr, memory, sides, memory.address_wrap);
         match width {
             MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
             MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
@@ -2059,7 +2063,7 @@ fn emit_alu_mem_dest(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("writing memory ALU has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
+    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -2163,7 +2167,7 @@ fn emit_double_shift_mem(
         MemoryWidth::Dword,
         memory,
         sides,
-        AddressWrap::None,
+        memory.address_wrap,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
@@ -2306,7 +2310,7 @@ fn emit_double_shift_mem(
     unreachable!("direct memory lowering is x86-64-only")
 }
 
-fn emit_effective_address(e: &mut Encoder, addr: DirectAddr) {
+pub(super) fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: AddressWrap) {
     e.mov_r32_imm32(Reg::RAX, addr.disp);
     if let Some(base) = addr.base {
         e.add_r32_r32(Reg::RAX, home(base));
@@ -2320,6 +2324,13 @@ fn emit_effective_address(e: &mut Encoder, addr: DirectAddr) {
             e.add_r32_r32(Reg::RAX, Reg::RCX);
         }
     }
+    // The 64K wrap belongs HERE rather than in the segmented helper, because the effective
+    // address is also consumed raw by LEA, which never goes through a segment at all. Applying
+    // it at the point the address is FORMED makes "mask before the limit compare" a property of
+    // this function instead of an obligation on every caller.
+    if wrap == AddressWrap::Word {
+        e.and_r32_imm32(Reg::RAX, 0xFFFF);
+    }
 }
 
 /// Whether the effective address wraps at 64K before the segment base is added.
@@ -2332,7 +2343,7 @@ fn emit_effective_address(e: &mut Encoder, addr: DirectAddr) {
 /// ride inside kinds that are in clif's `lowerable()` allowlist, such as `Load`, and clif would
 /// lower them without the mask. That is the same trap as putting a width field on `Push`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AddressWrap {
+pub(super) enum AddressWrap {
     None,
     Word,
 }
@@ -2345,13 +2356,10 @@ fn emit_segmented_linear_address(
     sides: MemorySideExits,
     wrap: AddressWrap,
 ) {
-    emit_effective_address(e, addr);
-    // BEFORE the limit compare, not merely before the base add: the compare below sits between
-    // the effective address and the base, so masking afterwards would compare an address the
-    // guest never forms.
-    if wrap == AddressWrap::Word {
-        e.and_r32_imm32(Reg::RAX, 0xFFFF);
-    }
+    // The mask lands inside `emit_effective_address`, which is BEFORE the limit compare below.
+    // That ordering is load-bearing: the compare sits between the effective address and the
+    // segment base, so masking afterwards would compare an address the guest never forms.
+    emit_effective_address(e, addr, wrap);
     let descriptor = memory.segments.descriptor(addr.segment);
     if descriptor.limit != u32::MAX {
         let Some(max_start) = descriptor.limit.checked_sub(width.bytes() - 1) else {
@@ -2460,7 +2468,7 @@ fn emit_rmw_inc_dec(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("native RMW has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
+    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap);
     emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -2579,7 +2587,7 @@ fn emit_rmw_inc_dec_dword(
         MemoryWidth::Dword,
         memory,
         sides,
-        AddressWrap::None,
+        memory.address_wrap,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 

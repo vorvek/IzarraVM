@@ -1902,3 +1902,109 @@ fn the_word_control_clamp_is_a_no_op_at_a_real_mode_limit() {
     assert_eq!(control_target_limit(OperandSize::Word, 0x0FFF), 0x0FFF);
     assert_eq!(control_target_limit(OperandSize::Dword, 0x0FFF), 0x0FFF);
 }
+
+/// The eight 16-bit addressing modes now classify, and they arrive in the shape `DirectAddr`
+/// wants: base/index pairs at scale 1, with SS selected for the BP forms.
+///
+/// This is the classifier half of the slice. It cannot be an end-to-end compile fixture: the
+/// only route to a 16-bit address size in a 32-bit code segment is a 0x67 prefix, which the
+/// prefix gate refuses, so no admitted block can carry one until 16-bit code admission is
+/// flipped.
+#[test]
+fn sixteen_bit_addressing_modes_classify_with_the_interpreter_shape() {
+    let word_addr = |base, index, segment, disp: i32| crate::AddrMode {
+        segment,
+        base,
+        index,
+        scale: 1,
+        disp,
+        address_size: AddressSize::Word,
+    };
+
+    // The eight modes, as `parse_16bit_address` builds them: bx=3, bp=5, si=6, di=7.
+    let cases: [(Option<u8>, Option<u8>, SegmentIndex); 8] = [
+        (Some(3), Some(6), SegmentIndex::Ds), // bx+si
+        (Some(3), Some(7), SegmentIndex::Ds), // bx+di
+        (Some(5), Some(6), SegmentIndex::Ss), // bp+si
+        (Some(5), Some(7), SegmentIndex::Ss), // bp+di
+        (None, Some(6), SegmentIndex::Ds),    // si
+        (None, Some(7), SegmentIndex::Ds),    // di
+        (Some(5), None, SegmentIndex::Ss),    // bp
+        (Some(3), None, SegmentIndex::Ds),    // bx
+    ];
+    for (base, index, segment) in cases {
+        let lowered = classify::direct_addr(word_addr(base, index, segment, -2))
+            .expect("every 16-bit mode must lower");
+        assert_eq!(lowered.base, base);
+        assert_eq!(lowered.index, index);
+        assert_eq!(lowered.scale, 1);
+        assert_eq!(
+            lowered.segment, segment,
+            "a BP form addresses SS, and getting this wrong is a wrong-memory-read"
+        );
+        // The displacement is sign-extended to 32 bits, which is what the interpreter carries
+        // too. Both sides sum in 32 bits and mask, and addition is congruent mod 2^16.
+        assert_eq!(lowered.disp, 0xffff_fffe);
+    }
+
+    // The disp16-only form, and a Dword address for contrast.
+    let disp_only = classify::direct_addr(word_addr(None, None, SegmentIndex::Ds, 0x1234))
+        .expect("disp16-only must lower");
+    assert_eq!(disp_only.base, None);
+    assert_eq!(disp_only.index, None);
+    assert_eq!(disp_only.disp, 0x1234);
+
+    // A scale other than 1, 2, 4 or 8 is still refused, at either address size.
+    let mut bad_scale = word_addr(Some(3), Some(6), SegmentIndex::Ds, 0);
+    bad_scale.scale = 3;
+    assert!(classify::direct_addr(bad_scale).is_none());
+}
+
+/// The emitter masks a ModRM-derived effective address at 64K when the block's address size is
+/// 16-bit, and does not when it is 32-bit.
+///
+/// This is the closest thing to an executed gate S3 can have. No admitted block can carry a
+/// 16-bit address until admission flips, so the address former is exercised directly instead,
+/// with the same operand under both block properties.
+///
+/// The mask lives in THIS function rather than in the segmented helper on purpose: LEA consumes
+/// an effective address without ever reaching a segment, so a mask placed downstream would miss
+/// it. Two callers, one mask, no per-caller obligation.
+#[test]
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
+    let addr = DirectAddr {
+        segment: SegmentIndex::Ds,
+        base: Some(3),
+        index: Some(6),
+        scale: 1,
+        disp: 4,
+    };
+
+    let mut unmasked = Encoder::new();
+    emit::emit_effective_address(&mut unmasked, addr, emit::AddressWrap::None);
+    let unmasked = unmasked.finish();
+
+    let mut masked = Encoder::new();
+    emit::emit_effective_address(&mut masked, addr, emit::AddressWrap::Word);
+    let masked = masked.finish();
+
+    let mut probe = Encoder::new();
+    probe.and_r32_imm32(Reg::RAX, 0xFFFF);
+    let mask = probe.finish();
+
+    assert_eq!(
+        masked.len(),
+        unmasked.len() + mask.len(),
+        "exactly one mask instruction"
+    );
+    assert_eq!(
+        &masked[..unmasked.len()],
+        &unmasked[..],
+        "same address math"
+    );
+    assert_eq!(&masked[unmasked.len()..], &mask[..], "then the 64K mask");
+}
