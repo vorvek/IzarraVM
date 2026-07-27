@@ -1103,6 +1103,12 @@ impl CpuGsw {
                     return Ok(DirectContinuation::Interpret);
                 };
                 self.perf.jit_direct_blocks_installed += 1;
+                // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
+                // segment. Cold path, so a branch is free here; the two hot counterparts at the
+                // block-entry site are written branchlessly.
+                if key.mode_key & 1 == 0 {
+                    self.perf.jit_direct_blocks_installed_sixteen_bit += 1;
+                }
                 self.jit_direct
                     .block(id)
                     .expect("installed direct block must be live")
@@ -2532,6 +2538,13 @@ impl CpuGsw {
         self.perf.instructions += instructions;
         self.perf.jit_direct_entries += 1;
         self.perf.jit_direct_insns += instructions;
+        // The CS.D = 0 split of the two lines above. Mode-key bit 0 is CS.D, so a clear bit is a
+        // 16-bit code segment. Branchless because this is the hottest path in the backend: the
+        // predicate is a compare into a flag and the add is unconditional, so a 32-bit block
+        // pays two arithmetic ops and no misprediction.
+        let sixteen_bit = u64::from(block.span().key.mode_key & 1 == 0);
+        self.perf.jit_direct_entries_sixteen_bit += sixteen_bit;
+        self.perf.jit_direct_insns_sixteen_bit += sixteen_bit * instructions;
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
         match exit.unresolved_reason {
             jit::direct::UnresolvedReason::None => {}

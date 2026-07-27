@@ -2865,10 +2865,22 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 }
 
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
-    if !super::host_supported()
-        || !d
-        || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586)
-    {
+    if !super::host_supported() || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586) {
+        return None;
+    }
+    // A 16-bit code segment is admitted on I586 only, and the persona clause is load-bearing
+    // rather than tidiness. Every instruction in such a segment decodes at `OperandSize::Word`
+    // (the size follows CS.D, not the opcode), and the compile loop structurally rejects Word on
+    // any persona but I586. On I486 the whole population would therefore reach `classify`, fail
+    // on its FIRST slot, and return a `StructuralReject`, which installs a rejected span and a
+    // physical-page watch for every hot 16-bit boundary. That is a real cost for a yield that is
+    // exactly zero. Refusing here keeps a 486 guest byte-identical by construction rather than
+    // by measurement.
+    //
+    // The 16-bit population is real mode, V86 and 16-bit protected mode. V86 is deliberately IN:
+    // no V86-sensitive opcode is classifiable at all (`classify` has no PUSHF/POPF, CLI/STI,
+    // INT/IRET or IN/OUT arm), and V86 blocks are key-separated by mode-key bit 2.
+    if !d && cpu.persona() != CpuPersona::I586 {
         return None;
     }
     if lin.wrapping_sub(0x000f_f000) < 0x400 {

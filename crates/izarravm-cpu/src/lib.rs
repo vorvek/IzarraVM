@@ -631,13 +631,30 @@ pub struct PerfCounters {
     /// `jit_direct_compile_attempts`. Compile-time, not execution traffic.
     pub jit_direct_word_control_admitted: u64,
     pub jit_direct_word_control_refused: u64,
-    /// Slots admitted with a 16-bit effective address, whose EA wraps at 64K.
+    /// Slots the compile loop reached whose decode carries `AddressSize::Word`.
     ///
-    /// The mechanism gate for 16-bit addressing, and it exists for the reason the two counters
-    /// above do: the path is unreachable until 16-bit code admission is flipped, so byte
-    /// identity cannot gate it and a zero here IS the inertness claim, stated positively.
+    /// Read the name literally and do NOT read it as "slots with a 16-bit memory operand". In a
+    /// 16-bit code segment the address size is a property of CS.D rather than of the
+    /// instruction, because the prefix gate refuses `0x67`, so EVERY slot the loop reaches there
+    /// carries it, register forms included. A register-only 16-bit block still counts.
+    ///
+    /// It is also bumped BEFORE the admission tests and before the three-slot floor, so it counts
+    /// slots in compile attempts that install nothing. It answers "was the 16-bit compile path
+    /// reached", and nothing else. For whether 16-bit code actually RAN, use the three
+    /// `_sixteen_bit` counters below, which key on the mode key of an installed or entered block.
     /// Compile-time, counted once per compile attempt, not execution traffic.
     pub jit_direct_word_address_slots: u64,
+    /// The CS.D = 0 split of `jit_direct_blocks_installed`, `_entries` and `_insns`, keyed on
+    /// `BlockKey::mode_key` bit 0 (`jit_mode_key`, `core.rs`).
+    ///
+    /// The campaign's only attribution for whether the 16-bit admission work is reached, and
+    /// there are three rather than one on purpose. A single counter cannot tell "installed but
+    /// never entered" from "never compiled", and a gate that passes while certifying the
+    /// mechanism's own absence is this backend's most-repeated failure. Installed is cold;
+    /// entries and insns are on the hot entry path and are written branchlessly.
+    pub jit_direct_blocks_installed_sixteen_bit: u64,
+    pub jit_direct_entries_sixteen_bit: u64,
+    pub jit_direct_insns_sixteen_bit: u64,
     pub jit_direct_reject_observer: u64,
     pub jit_direct_reject_interrupt_shadow: u64,
     pub jit_direct_reject_aggregate_accounting: u64,
