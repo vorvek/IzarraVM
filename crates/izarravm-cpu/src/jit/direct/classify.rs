@@ -39,15 +39,57 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // unmasked delta. What makes that safe is the compile loop's `control_target_limit` clamp,
     // which refuses any Word control target above the wrap. Admitting a control transfer here
     // WITHOUT that clamp is a silent wrong-branch miscompile, not a missed lowering.
+    // The BYTE-OPERAND opcodes below are admitted at Word size for a reason that is structural
+    // rather than per-opcode, and it is worth stating once here instead of at each arm.
+    //
+    // `operand_size` is computed from CS.D and the 0x66 prefix ALONE and is opcode-independent
+    // (`decode.rs`), so in a 16-bit code segment EVERY unprefixed instruction reports `Word`,
+    // byte-operand forms included. This gate is therefore a blanket filter that catches them as
+    // collateral. Admitting them changes nothing about how they lower, because their width is a
+    // property of the FORM: each produces a kind carrying a literal `MemoryWidth::Byte`, or a
+    // kind with no width at all. Nor can the operand size leak past this function: `DirectInsn`
+    // carries only `lin`, `len`, `weighted_fp_clocks` and `kind`, and `EmitInput` carries no
+    // `OperandSize` either, so every width decision downstream comes from the kind.
+    //
+    // The byte set is CLOSED over its shared classifier arms on purpose. `0x04..=0x3c` step 8 are
+    // all `form == 4` of the ALU group and reach one arm; `0xf6` is the byte half of the
+    // `0xf6 | 0xf7` group arm, whose every Dword-producing path is keyed `opcode == 0xf7`.
+    // Admitting one member of a shared arm while refusing its sibling would be arbitrary, and
+    // what makes 16-bit blocks link is a CONTIGUOUS admissible region rather than any single
+    // opcode.
+    //
+    // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
+    // `0xf7`, `0xa9`, `0xb8..=0xbf`, `0xc7`, `0x81`, `0x83`, `0x85`, `0x8d`, `0xa3`. Every one is
+    // the Dword sibling of an admitted byte form and its kind hard-codes Dword with no width
+    // field. `0x01`/`0x31` are worse still: `AluReg` does carry a width, but
+    // `emit_alu_preloaded`'s Word branch ignores `op`, hard-codes SUB and writes the result to a
+    // scratch register instead of the destination, which is correct only for the CMP forms
+    // `0x39`/`0x3b` already admitted here.
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
-            0x39 | 0x3b | 0x40..=0x4f | 0x50..=0x5f | 0x68 | 0x6a | 0x70..=0x7f | 0x89
+            0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
+                | 0x40..=0x4f
+                | 0x50..=0x5f
+                | 0x68
+                | 0x6a
+                | 0x70..=0x7f
+                | 0x80
+                | 0x84
+                | 0x88
+                | 0x89
+                | 0x8a
                 | 0x8b
+                | 0xa8
+                | 0xb0..=0xb7
                 | 0xc2
                 | 0xc3
+                | 0xc6
                 | 0xe8
+                | 0xe9
+                | 0xeb
                 | 0x0f80..=0x0f8f
+                | 0xf6
                 | 0xff
         )
     {
@@ -195,11 +237,20 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // `read_gpr8(0)`/`write_gpr8(0)` pair means it, and op 7 CMP suppresses the
                 // writeback inside the emitter.
                 //
-                // This arm must stay inside this `match form`, BELOW the OperandSize::Word gate
-                // near the top of `classify`. `operand_size` is computed from prefixes alone and
-                // is opcode-independent, so a 66-prefixed `3C ib` decodes as Word; 0x3c is not in
-                // that gate's allowlist, so it returns None there and never reaches this arm.
-                // Hoisting this above the gate would lower a 16-bit-prefixed form as a byte op.
+                // This arm stays inside this `match form`, BELOW the OperandSize::Word gate near
+                // the top of `classify`, and its placement is still load-bearing. What CHANGED:
+                // the whole `0x04..=0x3c` family is now IN that gate's allowlist, so a Word-size
+                // `3C ib` reaches this arm and is lowered as a byte op.
+                //
+                // That is correct, and it was checked against the interpreter rather than against
+                // the architecture. `decode` fetches this immediate with an unconditional
+                // `fetch_u8` for `form == 4` (only `form == 5` consults `operand_size`), and
+                // `execute`'s matching arm uses `read_gpr8(0)`, `BusWidth::Byte`, `write_gpr8(0)`
+                // and `clocks(2)` without ever reading `operand_size`. So a 66-prefixed `3C ib`
+                // in 32-bit code and an unprefixed one at CS.D = 0 are the same operation on the
+                // same lane for the same clocks. An earlier version of this comment warned that
+                // admitting it "would lower a 16-bit-prefixed form as a byte op": that is true,
+                // and it is what the interpreter does.
                 //
                 // It must not consult `operand_width`: byte width is a property of the form, not
                 // of the prefix. It must not touch `insn.modrm` or `insn.operand` either, which

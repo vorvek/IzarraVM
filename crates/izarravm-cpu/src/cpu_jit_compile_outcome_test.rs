@@ -1303,3 +1303,6 @@ fn a_word_ret_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit
     let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(narrow.span.instructions, 4, "control: the ret must lower");
 }
+
+#[path = "cpu_jit_s5_allowlist_test.rs"]
+mod s5_allowlist;
