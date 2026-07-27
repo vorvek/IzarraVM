@@ -754,3 +754,125 @@ fn same_value_store_churn_accrues_no_heat() {
     assert_eq!(cpu.perf_counters().smc_heat_demotions, 0);
     assert_eq!(cpu.perf_counters().code_invalidations, invalidations);
 }
+
+/// A fixture at an arbitrary entry with a FLAT code-segment limit.
+///
+/// `fresh()` loads CS in real mode, so its limit is 0xFFFF, and the per-slot fetch-limit check
+/// in the compile loop refuses any slot whose last byte is above `cs.limit` BEFORE `classify`
+/// runs. A high-entry case built on the ordinary `fixture()` would therefore be refused for a
+/// reason that has nothing to do with the branch, and every assertion about the branch would
+/// pass vacuously. That is the shape a design review caught before these were written.
+fn flat_fixture(entry: u32, code: &[u8]) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0; 0x1_1000];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = fresh();
+    for segment in [SegmentIndex::Cs, SegmentIndex::Ss] {
+        let mut descriptor = cpu.registers.segment(segment);
+        descriptor.limit = u32::MAX;
+        cpu.registers.set_segment(segment, descriptor);
+    }
+    cpu.registers.eip = entry;
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .expect("initialize direct map");
+    (cpu, bus)
+}
+
+/// `66 0F 8x` in 32-bit code decodes at Word operand size, and the Word allowlist admits it.
+///
+/// Nothing else in the tree has a 66-prefixed Jcc, and nothing pins the Word allowlist as a
+/// closed set, so this test and the short-form one below carry the whole allowlist argument: if
+/// either range is dropped the entry instruction stops classifying, the block has no slots, and
+/// `compiled()` panics on a `Retry`.
+#[test]
+fn a_word_operand_size_near_jcc_is_lowered() {
+    // 66 0f 85 10 00: jnz +0x10 at Word operand size, five bytes.
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &[0x66, 0x0f, 0x85, 0x10, 0x00]);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 1);
+    assert_eq!(compilation.span.guest_len, 5);
+}
+
+/// The short form, `66 7x`, is the other half of the allowlist edit. The two-byte range and the
+/// one-byte range are separate `matches!` arms and separate classifier arms, so dropping either
+/// leaves the other passing.
+#[test]
+fn a_word_operand_size_short_jcc_is_lowered() {
+    // 66 75 10: jnz +0x10 at Word operand size, three bytes.
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &[0x66, 0x75, 0x10]);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 1);
+    assert_eq!(compilation.span.guest_len, 3);
+}
+
+/// A Word-size branch whose target crosses the 16-bit wrap must NOT be lowered, because
+/// `relative_jump` masks it to 16 bits while the emitted form bakes an unmasked delta.
+///
+/// The two halves run the SAME instruction stream and differ only in the entry address, which is
+/// what makes the negative attributable: without the low-entry control the high-entry assertion
+/// would also hold if the block simply failed to form for an unrelated reason.
+///
+/// The three `inc` fillers are load-bearing. The compile loop returns early on
+/// `slots.len() < 3 && !last.is_terminal()`, so with fewer of them the refused case would come
+/// back as `Retry` rather than as a shorter block and there would be nothing to assert.
+#[test]
+fn a_word_jcc_above_the_wrap_is_refused_while_the_same_block_below_it_compiles() {
+    // inc eax; inc ecx; inc edx; 66 0f 85 10 00 (jnz +0x10 at Word operand size).
+    const CODE: [u8; 8] = [0x40, 0x41, 0x42, 0x66, 0x0f, 0x85, 0x10, 0x00];
+    const HIGH: u32 = 0x1_0100;
+
+    // Below the wrap: the branch is lowered and the block is all four instructions.
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &CODE);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let low = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(low.span.instructions, 4, "control: the branch must lower");
+    assert_eq!(low.span.guest_len, 8);
+    // The two mechanism counters are the slice's PRIMARY gate on the pinned corpus, so pin them
+    // here rather than shipping an instrument nothing checks.
+    let low_perf = cpu.perf_counters();
+    assert_eq!(low_perf.jit_direct_word_control_admitted, 1);
+    assert_eq!(low_perf.jit_direct_word_control_refused, 0);
+
+    // Above the wrap: the target is 0x1_0118, the architectural target is 0x0118, and the block
+    // stops at the three fillers.
+    let (mut cpu, mut bus) = flat_fixture(HIGH, &CODE);
+    warm(&mut cpu, &mut bus, &[HIGH, HIGH + 1, HIGH + 2, HIGH + 3]);
+    let high = compiled(jit::direct::compile(&mut cpu, HIGH, true));
+    assert_eq!(
+        high.span.instructions, 3,
+        "the Word branch must not be lowered above the 16-bit wrap"
+    );
+    assert_eq!(high.span.guest_len, 3);
+    let high_perf = cpu.perf_counters();
+    assert_eq!(high_perf.jit_direct_word_control_admitted, 0);
+    assert_eq!(high_perf.jit_direct_word_control_refused, 1);
+}
+
+/// The same block at Dword operand size MUST still compile above 0xFFFF. Every other Jcc
+/// fixture in this crate entries at 0x100, 0x101 or 0x500, so a clamp wrongly applied at Dword
+/// would pass all of them and reach the pinned corpus undetected.
+///
+/// This is an end-to-end confirmation, not the primary catcher: the predicate itself is already
+/// pinned by `the_word_control_clamp_is_a_no_op_at_a_real_mode_limit`.
+#[test]
+fn a_dword_jcc_above_the_wrap_still_compiles() {
+    // inc eax; inc ecx; inc edx; 0f 85 10 00 00 00 (jnz +0x10 at Dword operand size).
+    const CODE: [u8; 9] = [0x40, 0x41, 0x42, 0x0f, 0x85, 0x10, 0x00, 0x00, 0x00];
+    const HIGH: u32 = 0x1_0100;
+
+    let (mut cpu, mut bus) = flat_fixture(HIGH, &CODE);
+    warm(&mut cpu, &mut bus, &[HIGH, HIGH + 1, HIGH + 2, HIGH + 3]);
+    let compilation = compiled(jit::direct::compile(&mut cpu, HIGH, true));
+    assert_eq!(compilation.span.instructions, 4);
+    assert_eq!(compilation.span.guest_len, 9);
+}

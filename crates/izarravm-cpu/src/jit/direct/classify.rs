@@ -30,8 +30,20 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         OperandSize::Word => MemoryWidth::Word,
         OperandSize::Dword => MemoryWidth::Dword,
     };
+    // The Jcc ranges are the only control transfers admitted at Word size. Both are matched on
+    // the FULL u16 opcode here, above the `u8::try_from(insn.opcode)` truncation further down, so
+    // `0x0f80..=0x0f8f` is well-typed and `0x70..=0x7f` cannot alias the two-byte 0x0f7x block the
+    // way it would below the truncation.
+    //
+    // A Word-size relative branch masks its target to 16 bits, and the emitted form bakes an
+    // unmasked delta. What makes that safe is the compile loop's `control_target_limit` clamp,
+    // which refuses any Word control target above the wrap. Admitting a control transfer here
+    // WITHOUT that clamp is a silent wrong-branch miscompile, not a missed lowering.
     if insn.operand_size == OperandSize::Word
-        && !matches!(insn.opcode, 0x39 | 0x3b | 0x40..=0x4f | 0x89 | 0x8b | 0xff)
+        && !matches!(
+            insn.opcode,
+            0x39 | 0x3b | 0x40..=0x4f | 0x70..=0x7f | 0x89 | 0x8b | 0x0f80..=0x0f8f | 0xff
+        )
     {
         return None;
     }

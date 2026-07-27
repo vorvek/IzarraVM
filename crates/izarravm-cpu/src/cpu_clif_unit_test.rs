@@ -1065,3 +1065,43 @@ fn clif_arena_reset_reclaims_after_a_wholesale_clear_and_reinstalls() {
     assert_eq!(cpu.pending_flags, reference.pending_flags);
     assert_eq!(cpu.eflags(), reference.eflags());
 }
+
+/// The walker bakes an UNMASKED taken target, twice: in the successor record and again in
+/// `lower_terminal_jcc`'s spilled EIP. A Word-size relative branch masks its target to 16 bits,
+/// and this walker has no equivalent of Direct's `control_target_limit` clamp, so growth stops
+/// at a Word terminal instead.
+///
+/// The two `inc eax` fillers are load-bearing: `walk_unit` returns `None` at zero instructions,
+/// so with the branch as the entry instruction there would be no layout to assert against.
+///
+/// The Dword control has to terminate on a **Jcc** specifically. A `Jmp` leaves `successors[1]`
+/// unset either way, so it could not tell a Word-keyed stop from a Dword-keyed one.
+#[test]
+fn clif_walker_stops_before_a_word_size_control_transfer() {
+    // inc eax; inc eax; 66 0f 85 10 00 (jnz +0x10 at Word operand size).
+    let code = [0x40, 0x40, 0x66, 0x0f, 0x85, 0x10, 0x00];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    warm_lines(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let layout = walk_unit(&cpu, ENTRY, true).expect("unit layout");
+    assert_eq!(layout.instructions, 2, "the Word branch must not be walked");
+    assert_eq!(layout.kinds.len(), 2);
+    assert_eq!(layout.guest_len, 2);
+    assert!(layout.successors[0].is_none());
+    assert!(layout.successors[1].is_none());
+
+    // Control: unprefixed, so Dword, and the walker takes it as a terminal with both edges.
+    let code = [0x40, 0x40, 0x0f, 0x85, 0x10, 0x00, 0x00, 0x00];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    warm_lines(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let layout = walk_unit(&cpu, ENTRY, true).expect("unit layout");
+    assert_eq!(layout.instructions, 3);
+    assert_eq!(layout.guest_len, 8);
+    assert!(layout.successors[0].is_some(), "taken edge");
+    assert!(layout.successors[1].is_some(), "fall-through edge");
+}

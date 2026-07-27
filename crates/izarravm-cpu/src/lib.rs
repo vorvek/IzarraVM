@@ -622,6 +622,15 @@ pub struct PerfCounters {
     pub jit_direct_unresolved_dynamic_miss_or_unbound: u64,
     pub jit_direct_unresolved_dynamic_hidden: u64,
     pub jit_direct_deferred_short: u64,
+    /// Word-size static control transfers seen by the compile loop, split by the
+    /// `control_target_limit` clamp's verdict. A Word-size relative branch masks its target to
+    /// 16 bits while the emitted form bakes an unmasked delta, so the clamp refuses any target
+    /// above the wrap. These are the mechanism count for that path: byte identity cannot gate
+    /// it, because a corpus with no 66-prefixed branch never reaches it at all. Counted once
+    /// per compile attempt, on the full-length pass only, so they are comparable with
+    /// `jit_direct_compile_attempts`. Compile-time, not execution traffic.
+    pub jit_direct_word_control_admitted: u64,
+    pub jit_direct_word_control_refused: u64,
     pub jit_direct_reject_observer: u64,
     pub jit_direct_reject_interrupt_shadow: u64,
     pub jit_direct_reject_aggregate_accounting: u64,

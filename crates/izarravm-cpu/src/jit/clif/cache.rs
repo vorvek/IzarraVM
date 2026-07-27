@@ -401,9 +401,12 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
     let mut lea_mask = 0u32;
     let mut moffs_mask = 0u32;
     let mode_key = cpu.jit_mode_key();
-    // The word-form prefix acceptance and 586 gate mirror Direct's compile loop exactly
-    // (`compile_with_instruction_limit`'s `prefixes_supported` and persona checks): a word
-    // form is exactly one operand-size override, admitted only on the I586 persona.
+    // The 586 gate mirrors Direct's compile loop. The prefix acceptance NO LONGER does: Direct's
+    // `prefixes_supported_for` derives the expected override from the code segment's default
+    // size, so at CS.D = 0 an unprefixed instruction is the word form. This walker still
+    // hard-codes the CS.D = 1 mapping below. That is unreachable today, because the clif key
+    // refuses a 16-bit decode exactly as `direct::key_for` does, and it is owed by the stage
+    // that flips 16-bit admission rather than by this one.
     let word_prefixes = Prefixes {
         operand_size_override: true,
         ..Prefixes::default()
@@ -430,6 +433,21 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         let Some(step) = direct::unit_growth_classify(&insn, lin, entry_lin) else {
             break;
         };
+        // A Word-size relative branch masks its target to 16 bits (`relative_jump` computes
+        // `(eip + rel) & operand_size.mask()`). This walker bakes an UNMASKED target twice, in
+        // the successor records below and again in `lower_terminal_jcc`'s spilled EIP, and it
+        // has no equivalent of Direct's `control_target_limit` clamp: the guard's only caller is
+        // Direct's compile loop, and porting it here would need the CS limit and an entry EIP
+        // this walker does not use for anything else. Stop growth at the terminal instead, which
+        // is strictly conservative and cannot bake a wrong edge.
+        //
+        // This is the ONE place the two backends deliberately disagree on slot coverage: a Word
+        // terminal makes a clif unit one slot shorter than the Direct block for the same entry.
+        // `clif_plan_access_counts_match_direct_compilation` asserts the two cover an identical
+        // slot list, and no fixture there terminates on a Word branch.
+        if insn.operand_size == OperandSize::Word && step.terminal.is_some() {
+            break;
+        }
         // C1c section 1.4: the stack-width admission gate, identical to Direct's
         // compile-time reject (`direct.rs`'s uses_stack + !stack_is_32bit Retry). A 16-bit
         // stack's SP wrap is a form this design does not build, so growth stops at the
