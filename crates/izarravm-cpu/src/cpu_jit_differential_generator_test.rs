@@ -25,7 +25,7 @@ const MEMORY_LEN: usize = 0x20_000;
 // continuing the first. That is a real split, not a truncation, so it costs one instruction off
 // the fully-native count; `GeneratedCase::cold_memory_target` records which cases hit it so the
 // comparison below can expect the right number instead of a single constant.
-const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 30;
+const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 31;
 const GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY: u64 =
     GENERATED_BLOCK_NATIVE_INSTRUCTIONS - 1;
 
@@ -100,6 +100,15 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     bytes.extend_from_slice(&[(op << 3) | 1, 0xc0 | (rng.reg() << 3) | rng.reg()]);
     bytes.push((op << 3) | 5);
     push_u32(&mut bytes, rng.u32());
+
+    // ALU form 4, `AL, imm8`. The op is offset so that across the generated cases all eight
+    // operations reach this slot, which is what distinguishes it from the form-5 slot above:
+    // a classifier that read the operation out of the low three bits rather than
+    // `(opcode >> 3) & 7` would emit AND every time and only a non-AND case would catch it.
+    // The immediate is a full-range byte so a dropped `as u8` truncation, and any spurious
+    // sign extension on ADC/SBB/CMP, both diverge here.
+    bytes.push((((op + 2) & 7) << 3) | 4);
+    bytes.push(rng.u32() as u8);
 
     bytes.extend_from_slice(&[0x81, 0xc0 | (((op + 3) & 7) << 3) | rng.reg()]);
     push_u32(&mut bytes, rng.u32());
@@ -5931,13 +5940,19 @@ fn clif_dormant_structural_failure_survives_unrelated_same_page_writes() {
 /// very first iteration, every single time, a permanent property of these bytes. Repeatedly
 /// re-entering it must park Dormant after exactly one failed walk and never re-walk again.
 ///
-/// `ADD AL, imm8` (opcode 0x04) is the chosen opcode: it decodes into `DecodeGroup::Alu`, so
-/// `block_continuable` (`decode.rs`) admits it as a mid-batch continuation (unlike `hlt`,
-/// which is a terminator and would never even reach `try_clif_continuation`) -- but
-/// `classify::classify` (`jit/direct/classify.rs`) only handles ALU forms 1/3/5
-/// (`(opcode & 7)`, the dword reg/r-m and eAX,imm32 shapes); form 4 (`AL, imm8`) falls
-/// through every arm and returns `None`, so `direct::unit_growth_classify` -- and therefore
-/// `walk_unit` on its very first iteration -- declines it unconditionally.
+/// `ADD AL, AL` (opcode 0x00, ALU form 0) is the chosen encoding: it decodes into
+/// `DecodeGroup::Alu`, so `block_continuable` (`decode.rs`) admits it as a mid-batch
+/// continuation (unlike `hlt`, which is a terminator and would never even reach
+/// `try_clif_continuation`) -- but `classify::classify` (`jit/direct/classify.rs`) handles
+/// ALU forms 1/3/4/5 only (`(opcode & 7)`, the dword reg/r-m, `AL, imm8` and `eAX, imm32`
+/// shapes); form 0 (`r/m8, r8`) falls through every arm and returns `None`, so
+/// `direct::unit_growth_classify` -- and therefore `walk_unit` on its very first iteration --
+/// declines it unconditionally.
+///
+/// This fixture used to be `ADD AL, imm8` (0x04). That is form 4, which is now lowered, so
+/// the premise moved to form 0. Form 0 is deferred rather than unlowerable (`AluReg` has no
+/// byte shape: `emit_alu_preloaded` asserts Word-CMP or Dword), so a future form-0 slice must
+/// move this fixture again to whatever the classifier still declines.
 #[test]
 #[cfg(all(
     feature = "clif-backend",
@@ -5948,10 +5963,10 @@ fn clif_dormant_incomplete_walk_parks_once_and_never_re_walks() {
     use crate::jit::clif::cache::{ClifUnitKey, ClifUnitState};
 
     // 0x1000: nop (starter -- the walker's own convention: the unit under test is keyed at
-    // the instruction AFTER the pass entry); 0x1001: `add al, 1` (the unclassifiable entry,
+    // the instruction AFTER the pass entry); 0x1001: `add al, al` (the unclassifiable entry,
     // 2 bytes); 0x1003: hlt (routine's own halt, retired by the interpreter every pass
     // regardless of clif's admission outcome for 0x1001).
-    let code = vec![0x90, 0x04, 0x01, 0xf4];
+    let code = vec![0x90, 0x00, 0xc0, 0xf4];
     let mut harness = ChainHarness::new(&code, forced_gpr());
 
     const UNCLASSIFIABLE_ENTRY: u32 = 0x1001;
