@@ -513,6 +513,210 @@ fn imul_memory_form_declares_its_read_and_its_segment() {
     );
 }
 
+/// THE WIDTH REGISTRATION TEST for the x87 control-word pair, and it has to exist because
+/// `raw_bus_clocks` CANNOT see the width. `BusCycle::clocks_for` underscores its width parameter
+/// and returns `2 + wait_states` for Byte, Word and Dword alike, so a word access charged as a
+/// dword produces byte-identical bus clocks, core clocks and master ticks. The end-to-end
+/// differential batteries are blind to it. These four accessors are the only direct evidence.
+///
+/// The block deliberately carries BOTH widths. With only the control word in it, dropping the
+/// x87 word arm would leave every counter at zero, `map_bases` would be None and the emitter's
+/// `memory.map.expect(..)` would panic, which is loud. Mixed with a dword read the same mistake
+/// is silent, and silent is the case worth testing.
+///
+/// `fldcw word [esi+0x30000]`  d9 /5 mod=10 rm=110 -> modrm 0b10_101_110 = 0xae
+/// `fnstcw word [esi+0x30000]` d9 /7 mod=10 rm=110 -> modrm 0b10_111_110 = 0xbe
+/// `mov edx,[esi+0x30004]`     8b /r mod=10 rm=110 reg=010 -> modrm 0b10_010_110 = 0x96
+fn control_word_case(store: bool, target: u32) -> Vec<u8> {
+    let mut code = vec![0xd9u8, if store { 0xbe } else { 0xae }];
+    code.extend_from_slice(&target.to_le_bytes());
+    code.push(0x8b);
+    code.push(0x96);
+    code.extend_from_slice(&(target + 4).to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0xf4]);
+    code
+}
+
+#[test]
+fn control_word_forms_declare_a_word_access_and_their_segment() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    for store in [false, true] {
+        let code = control_word_case(store, TARGET);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        let starts = [ENTRY, ENTRY + 6, ENTRY + 12];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        map_direct_page(
+            &mut cpu,
+            &mut bus,
+            TARGET,
+            TARGET,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+        let block = install_fixture_block(&mut cpu, ENTRY);
+        let label = if store { "fnstcw" } else { "fldcw" };
+
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "{label}: whole block admitted"
+        );
+        assert_eq!(block.byte_reads(), 0, "{label}: no byte read");
+        assert_eq!(
+            block.word_reads(),
+            u8::from(!store),
+            "{label}: word-read declaration"
+        );
+        assert_eq!(block.dword_reads(), 1, "{label}: the MOV's dword read only");
+        assert_eq!(block.byte_stores(), 0, "{label}: no byte store");
+        assert_eq!(
+            block.word_stores(),
+            u8::from(store),
+            "{label}: word-store declaration"
+        );
+        assert_eq!(block.dword_stores(), 0, "{label}: no dword store");
+        // 2 for the MOV and 2 for the register move. The x87 slot contributes ZERO here: its cost
+        // is `weighted_fp_clocks`, and an added `Self::X87` arm in `DirectKind::raw_clocks` would
+        // double-charge it.
+        assert_eq!(block.raw_clocks(), 2 + 2, "{label}: charged core clocks");
+
+        // read_segment / write_segment. Defaulting to None keeps DS out of the block's
+        // SegmentLayout mask, and `data_matches` SKIPS every segment outside that mask, so a
+        // cached block would keep matching after a guest DS reload and read or write through a
+        // stale base. The `debug_assert` in `SegmentLayout::descriptor` is absent from a release
+        // build, so the assertion is made against the live descriptor instead.
+        assert!(
+            block.data_descriptors_match(&cpu),
+            "{label}: compiled state"
+        );
+        let mut reloaded = cpu.registers.segment(SegmentIndex::Ds);
+        reloaded.base = 0x1_0000;
+        cpu.registers.set_segment(SegmentIndex::Ds, reloaded);
+        assert!(
+            !block.data_descriptors_match(&cpu),
+            "{label}: reloading DS must invalidate a block that uses DS"
+        );
+    }
+}
+
+/// THE MODE13 HALF, and for the control-word pair it is the only place a STATIC-versus-DYNAMIC
+/// width disagreement can surface at all.
+///
+/// The static registration names `word_reads`/`word_stores`; the emitted completion increments
+/// the dynamic mode13 counters. `run.rs` then computes `ram_word_reads = word_reads -
+/// mode13_word_reads` with a plain, non-saturating subtraction guarded only by a `debug_assert`.
+/// If the emitter incremented the DWORD mode13 slot while the block declared a word access, the
+/// dword side underflows to a `u64` near 2^64 and is charged straight to the bus. Outside the
+/// aperture the dynamic counters never move and the disagreement is invisible.
+#[test]
+fn control_word_forms_match_the_interpreter_in_ram_and_in_the_aperture() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    for store in [false, true] {
+        for target in [RAM, MODE13] {
+            let code = control_word_case(store, target);
+            let mut memory = vec![0; 0x000b_0000];
+            memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+            memory[target as usize..target as usize + 2].copy_from_slice(&0x0e7fu16.to_le_bytes());
+            memory[target as usize + 2..target as usize + 4]
+                .copy_from_slice(&0xbeefu16.to_le_bytes());
+
+            let mut native = fresh();
+            let mut interp = fresh();
+            make_data_segments_flat(&mut native);
+            make_data_segments_flat(&mut interp);
+            native.registers.eip = ENTRY;
+            interp.registers.eip = ENTRY;
+            let mut native_bus = TestBus::with_memory(memory.clone());
+            let mut interp_bus = TestBus::with_memory(memory);
+            for bus in [&mut native_bus, &mut interp_bus] {
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                bus.uniform_native_fetches = true;
+            }
+            let starts = [ENTRY, ENTRY + 6, ENTRY + 12];
+            decode_fixture(&mut native, &mut native_bus, &starts);
+            decode_fixture(&mut interp, &mut interp_bus, &starts);
+            for (cpu, bus) in [
+                (&mut native, &mut native_bus),
+                (&mut interp, &mut interp_bus),
+            ] {
+                map_direct_page(
+                    cpu,
+                    bus,
+                    target,
+                    target,
+                    jit::fast_map::PagePermissions::UNPAGED,
+                    true,
+                    true,
+                );
+                cpu.fpu = X87::default();
+                cpu.fpu.control = 0x037f;
+            }
+            let block = install_fixture_block(&mut native, ENTRY);
+            for (cpu, bus) in [
+                (&mut native, &mut native_bus),
+                (&mut interp, &mut interp_bus),
+            ] {
+                cpu.set_eip(ENTRY);
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.fp_rem = 3;
+                cpu.core_clocks_so_far = 0;
+                bus.trace = BusTrace::default();
+            }
+            let label = format!("{} at {target:#x}", if store { "fnstcw" } else { "fldcw" });
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap(),
+                "{label}: did not run directly"
+            );
+            for _ in 0..block.span().instructions {
+                interp.cycle(&mut interp_bus).unwrap();
+            }
+
+            assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
+            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
+            assert_eq!(
+                native.elapsed_clocks, interp.elapsed_clocks,
+                "{label}: core clocks"
+            );
+            assert_eq!(native.fp_rem, interp.fp_rem, "{label}: x87 remainder");
+            assert_eq!(
+                native_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks(),
+                "{label}: bus clocks"
+            );
+            if store {
+                assert_eq!(
+                    u16::from_le_bytes(
+                        native_bus.memory[target as usize + 2..target as usize + 4]
+                            .try_into()
+                            .unwrap()
+                    ),
+                    0xbeef,
+                    "{label}: the store stayed two bytes wide"
+                );
+            } else {
+                assert_eq!(native.fpu.control, 0x0e7f, "{label}: loaded control word");
+            }
+        }
+    }
+}
+
 /// Value, flag and timing identity against the interpreter, on both a plain-RAM target and the
 /// mode13 aperture. The mode13 half is not just coverage: an under-declared read trips a
 /// debug_assert in the run loop there, which is a loud failure, whereas the RAM half only shows up
@@ -1627,6 +1831,25 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         DirectTimingCase {
             name: "x87 memory store and pop",
             opcode: &[0xd9, 0x1d, 0x00, 0x30, 0x00, 0x00],
+            expected_raw_clocks: 4,
+            terminal: false,
+            eflags: 0x202,
+        },
+        // The control-word pair. `expected_raw_clocks` is 4 for both because it is 2 + 2 from the
+        // two filler moves and ZERO from the x87 slot: `DirectKind::raw_clocks` returns 0 for
+        // `Self::X87` and the whole x87 cost goes through `weighted_fp_clocks` instead. So this
+        // number is the catcher for an ADDED raw_clocks arm (it would read 8), while the
+        // 4-versus-14 split between these two instructions is caught by `elapsed_clocks` below.
+        DirectTimingCase {
+            name: "x87 fldcw m16",
+            opcode: &[0xd9, 0x2d, 0x00, 0x30, 0x00, 0x00],
+            expected_raw_clocks: 4,
+            terminal: false,
+            eflags: 0x202,
+        },
+        DirectTimingCase {
+            name: "x87 fnstcw m16",
+            opcode: &[0xd9, 0x3d, 0x00, 0x30, 0x00, 0x00],
             expected_raw_clocks: 4,
             terminal: false,
             eflags: 0x202,

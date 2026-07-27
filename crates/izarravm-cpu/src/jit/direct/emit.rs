@@ -536,7 +536,17 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let reasons = MemorySideExits::new(&mut e, memory, addr);
                 let top = current_x87_top.expect("x87 block must carry an entry TOP");
                 // Every exceptional fast-path result exits before changing x87 state, so a
-                // successful x87 instruction cannot make #MF pending for the next slot.
+                // successful x87 instruction cannot make #MF pending for the next slot. No native
+                // arm can write status bits 0..5 either: `emit_set_top` touches the TOP field,
+                // `emit_condition` bits 8/9/10/14, and `emit_store_physical` and `emit_pop` the
+                // tag half above bit 16.
+                //
+                // FLDCW breaks that invariant from the OTHER side, which is why the gate is
+                // re-armed below. The gate condition is `status & 0x3f & !(control & 0x3f)`, and
+                // FLDCW changes the MASK: an exception bit set by an earlier INTERPRETED
+                // instruction can be masked at block entry and unmasked mid-block. The
+                // interpreter re-checks `pending_unmasked_exception` before every x87
+                // instruction; a block that emitted its gate once would not.
                 emit_x87_slot(
                     &mut e,
                     insn,
@@ -550,7 +560,11 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     },
                 );
                 current_x87_top = Some(insn.advance_top(top));
-                x87_gate_emitted = true;
+                // Ordering inside the FLDCW slot is already right: the memory pointer emits only
+                // guards, then the gate, then the load. So the FLDCW's own check runs against the
+                // PRE-FLDCW control word, matching the interpreter, and the next x87 slot rechecks
+                // against the new one.
+                x87_gate_emitted = !matches!(insn, NativeX87Insn::LoadControlWord { .. });
                 if let Some(access) = insn.metadata().memory {
                     reasons.append_stubs(
                         &mut side_exit_reason_stubs,
@@ -1335,6 +1349,7 @@ fn emit_x87_slot(
             addr.expect("x87 memory operation has a direct address"),
             memory,
             sides,
+            x87_memory_width(access),
             access.direction == NativeX87MemoryDirection::Write,
         );
     }
@@ -1353,6 +1368,7 @@ fn emit_x87_slot(
         emit_x87_memory_completion(
             e,
             access.direction,
+            x87_memory_width(access),
             memory.map.expect("x87 memory block has fast-map bases"),
         );
     }
@@ -1382,11 +1398,20 @@ fn emit_x87_memory_pointer(
     addr: DirectAddr,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
+    width: MemoryWidth,
     write: bool,
 ) {
+    // No x87 memory form is byte-wide, so the guard is unconditional here rather than gated on
+    // `needs_alignment_guard()` the way `emit_ram_read_pointer_inner` gates it.
+    debug_assert!(width.needs_alignment_guard());
     let map = memory.map.expect("x87 memory block has fast-map bases");
-    emit_segmented_linear_address(e, addr, MemoryWidth::Dword, memory, sides);
-    emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
+    emit_segmented_linear_address(e, addr, width, memory, sides);
+    // The width here is what the slice's performance rests on, not its byte identity:
+    // `BusCycle::clocks_for` ignores width, so a Word access charged as a Dword costs the same
+    // bus clocks. What a Dword guard WOULD do is refuse every 2-aligned-but-not-4-aligned
+    // control word, and Quake keeps the saved and the chop-mode word in adjacent 2-byte stack
+    // slots, so one of each pair is 4-aligned and the other is not by construction.
+    emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
@@ -1407,7 +1432,7 @@ fn emit_x87_memory_pointer(
         let unwatched = e.label();
         emit_code_watch_branch(
             e,
-            MemoryWidth::Dword,
+            width,
             map,
             memory
                 .code_watch_tables
@@ -1440,8 +1465,14 @@ fn emit_x87_memory_pointer(
 fn emit_x87_memory_completion(
     e: &mut Encoder,
     direction: NativeX87MemoryDirection,
+    width: MemoryWidth,
     map: NativeMapBases,
 ) {
+    // These dynamic counters MUST name the same width the static registration does. `run.rs`
+    // computes `ram_word_reads = word_reads - mode13_word_reads` with a plain subtraction, so a
+    // static dword against a dynamic word underflows to a u64 near 2^64 and is charged straight
+    // to the bus. That, and not the bus-clock cost of the access itself, is how a width mistake
+    // in this pair shows up.
     e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_READ_KIND);
     e.mov_r64_r64(Reg::RCX, Reg::RAX);
     e.shift_r64_imm8(5, Reg::RCX, 32);
@@ -1451,16 +1482,23 @@ fn emit_x87_memory_completion(
     let done = e.label();
     e.jz(mode13);
     if direction == NativeX87MemoryDirection::Write {
-        emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
+        match width {
+            MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
+            _ => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+        }
     }
     e.jmp(done);
     e.place(mode13);
     match direction {
-        NativeX87MemoryDirection::Read => {
-            emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
-        }
+        NativeX87MemoryDirection::Read => match width {
+            MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS),
+            _ => emit_dynamic_increment(e, STACK_MODE13_DWORD_READS),
+        },
         NativeX87MemoryDirection::Write => {
-            emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
+            match width {
+                MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES),
+                _ => emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES),
+            }
             emit_mode13_dirty_bit(e, map);
         }
     }

@@ -14,7 +14,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             | NativeX87Insn::LoadF32 { addr }
             | NativeX87Insn::StoreF32 { addr, .. }
             | NativeX87Insn::LoadI32 { addr }
-            | NativeX87Insn::StoreI32 { addr } => Some(direct_addr(addr)?),
+            | NativeX87Insn::StoreI32 { addr }
+            // Every variant whose `metadata().memory` is Some must appear here. The `_ => None`
+            // below is silent: a missing arm leaves `addr: None`, `emit_x87_slot`'s
+            // `addr.expect(..)` panics at block compilation, and behind that panic
+            // `DirectKind::read_segment` would have dropped the segment from the block's
+            // `SegmentLayout` mask and made `kind_segment_access_supported` trivially true.
+            | NativeX87Insn::LoadControlWord { addr }
+            | NativeX87Insn::StoreControlWord { addr } => Some(direct_addr(addr)?),
             _ => None,
         };
         return Some(DirectKind::X87 { insn: native, addr });

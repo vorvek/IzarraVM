@@ -2098,12 +2098,16 @@ fn clif_arena_reset_a2_x87_smc_wholesale_clear_mid_frame_is_safe() {
 /// live descriptor address (`run.rs:1670`).
 ///
 /// B's own body is a single x87 store, `fstp dword [ebx]` (opcode D9 /3, `NativeX87Insn::
-/// StoreF32{pop:true}`) -- the SAME shape the A2 reproducer above uses. It is in fact the
-/// ONLY x87 memory-store form `NativeX87Insn::classify` (`native_x87.rs:207-218`) admits
-/// into a lowered unit slot at all: DB /7 (`FSTP m80`) and DF /6 (`FBSTP m80`) fall through
-/// classify's `_ => None` arm entirely, so they can never occupy a compiled unit slot in
-/// the first place (a leaner falsification path than the design notes' original DB/DF
-/// straddling-store hypothesis, discovered while trying to assemble one).
+/// StoreF32{pop:true}`) -- the SAME shape the A2 reproducer above uses. DB /7 (`FSTP m80`)
+/// and DF /6 (`FBSTP m80`) fall through classify's `_ => None` arm entirely, so they can
+/// never occupy a compiled unit slot in the first place (a leaner falsification path than
+/// the design notes' original DB/DF straddling-store hypothesis, discovered while trying to
+/// assemble one).
+///
+/// This comment used to claim D9 /3 was the ONLY admitted x87 memory-store form. The
+/// control-word slice added `StoreControlWord` (D9 /7, FNSTCW m16), so it is no longer
+/// unique. The claim was never load-bearing: this fixture builds its own bytes rather than
+/// enumerating classify, so it kept passing.
 ///
 /// On the trigger pass EBX points at B's OWN resident bytes (0x1010), and B/A's shared
 /// physical code page has been ALIASED first -- verbatim the A2 test's own technique above

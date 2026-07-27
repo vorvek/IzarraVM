@@ -121,6 +121,16 @@ pub(crate) enum NativeX87Insn {
     },
     ComparePopPop,
     StoreStatusAx,
+    /// FLDCW m16 (D9 /5 memory). The first 16-bit x87 memory access in the backend, and the
+    /// only lowered form that writes the control word, which `emit_fistp_chop_guard` and
+    /// `emit_gate` both read at runtime.
+    LoadControlWord {
+        addr: AddrMode,
+    },
+    /// FNSTCW m16 (D9 /7 memory).
+    StoreControlWord {
+        addr: AddrMode,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +185,13 @@ impl NativeX87Insn {
             Self::StoreF32 { pop: false, .. }
             | Self::StoreRegister { pop: false, .. }
             | Self::Exchange { .. }
-            | Self::StoreStatusAx => 0,
+            | Self::StoreStatusAx
+            // Neither control-word form touches the register stack, the status word or the tag
+            // word, so both are TOP-insensitive. That is what makes them safe to admit, and it is
+            // also why they pin a block to its compile-time TOP for no architectural reason; see
+            // `jit_direct_reject_x87_top` in the campaign log.
+            | Self::LoadControlWord { .. }
+            | Self::StoreControlWord { .. } => 0,
         }
     }
 
@@ -212,6 +228,13 @@ impl NativeX87Insn {
                 (0xd9, 0) => Some(Self::LoadF32 { addr }),
                 (0xd9, 2) => Some(Self::StoreF32 { addr, pop: false }),
                 (0xd9, 3) => Some(Self::StoreF32 { addr, pop: true }),
+                // The control-word pair. Both arms MUST stay in this `modrm.mode != 3` branch:
+                // (0xd9, 5) also exists in the register branch below, where it is FLD1 (rm 0) and
+                // FLDZ (rm 6), and (0xd9, 7) is FSQRT/FRNDINT territory there. The early return
+                // above is what keeps the two branches disjoint, so an arm placed in the wrong
+                // one would either shadow FLD1/FLDZ or be dead code no negative test could see.
+                (0xd9, 5) => Some(Self::LoadControlWord { addr }),
+                (0xd9, 7) => Some(Self::StoreControlWord { addr }),
                 (0xdb, 0) => Some(Self::LoadI32 { addr }),
                 (0xdb, 3) => Some(Self::StoreI32 { addr }),
                 _ => None,
@@ -272,6 +295,14 @@ impl NativeX87Insn {
         let write_dword = Some(NativeX87MemoryAccess {
             direction: Write,
             width: 4,
+        });
+        let read_word = Some(NativeX87MemoryAccess {
+            direction: Read,
+            width: 2,
+        });
+        let write_word = Some(NativeX87MemoryAccess {
+            direction: Write,
+            width: 2,
         });
         match self {
             Self::BinaryMemory { op, .. } => NativeX87Metadata {
@@ -350,6 +381,26 @@ impl NativeX87Insn {
                 raw_clocks: 3,
                 fp_class: FpOpClass::Register,
                 memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+            // FLDCW is `Ok(clocks(4))` and FNSTCW `Ok(clocks(14))` (fpu_exec.rs, the 0xd9 arm of
+            // `execute_fpu_memory`). Four is the ONLY 0xd9 memory form in this table that is not
+            // 14, so copying its neighbour is the natural mistake here; it is mutation-tested
+            // against the concrete number. `fp_class` is F32Mem for both because `execute_fpu`
+            // derives the class from the OPCODE BYTE for every memory form, not from the operand
+            // width, and 0xd9 maps to F32Mem there.
+            Self::LoadControlWord { .. } => NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::F32Mem,
+                memory: read_word,
+                pops: false,
+                terminates_block: false,
+            },
+            Self::StoreControlWord { .. } => NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F32Mem,
+                memory: write_word,
                 pops: false,
                 terminates_block: false,
             },
