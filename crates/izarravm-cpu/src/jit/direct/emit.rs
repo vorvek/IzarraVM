@@ -563,10 +563,61 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Pop { dst } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
-                emit_ram_read_pointer(&mut e, MemoryWidth::Dword, stack_addr(0), memory, reasons);
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Dword,
+                    stack_addr(0),
+                    memory,
+                    reasons,
+                    AddressWrap::None,
+                );
                 e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
                 e.add_r32_imm32(home(4), 4);
                 e.mov_r32_r32(home(dst), Reg::RDX);
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
+            // POP on a 16-bit stack: two bytes read at `SP & 0xFFFF`, SP alone advances, and the
+            // destination is MERGED into rather than replaced.
+            //
+            // Three things differ from the 32-bit arm above, and each is load-bearing. The read
+            // is Word and its address wraps at 64K, which the read path only gained a parameter
+            // for with this slice; the pointer advance is a 16-bit register op, preserving bits
+            // 31 to 16; and the destination write is `mov r16, r16`, which merges into the low
+            // half exactly as `write_gpr_sized(index, Word, ..)` does, where a 32-bit move would
+            // clobber the high half.
+            //
+            // THE ORDER OF THE LAST TWO IS THE POP SP CASE. When `dst` is 4 the destination IS
+            // the stack pointer, and the interpreter advances first and assigns second
+            // (`memory.rs` advances inside `pop`, `execute.rs` assigns after it returns), so the
+            // final SP is the LOADED WORD, not the advanced pointer. The 32-bit arm above
+            // already has this order and the Dword case is pinned on both backends; reversing
+            // it here would leave POP SP holding loaded + 2.
+            DirectKind::Pop16 { dst } => {
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    stack_addr(0),
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                e.alu_r16_imm16(0, home(4), 2);
+                emit_write_gpr16(&mut e, dst, Reg::RDX);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((
                     side,
@@ -719,6 +770,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     stack_addr(0),
                     memory,
                     reasons,
+                    AddressWrap::None,
                 );
                 e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
                 if let Some(limit_exit) = limit_exit {
@@ -1318,7 +1370,7 @@ fn emit_load(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    emit_ram_read_pointer(e, width, addr, memory, sides);
+    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
     match width {
         MemoryWidth::Byte => {
             e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0);
@@ -1359,7 +1411,7 @@ fn emit_load_extend(
     // resolved inside emit_ram_read_pointer, so an instruction that faults leaves the destination
     // register untouched, which is what the interpreter does: it faults inside the read, before
     // write_gpr_sized runs.
-    emit_ram_read_pointer(e, width, addr, memory, sides);
+    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
     match (width, signed) {
         (MemoryWidth::Byte, false) => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
         (MemoryWidth::Byte, true) => e.movsx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
@@ -1567,8 +1619,9 @@ fn emit_ram_read_pointer(
     addr: DirectAddr,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
+    wrap: AddressWrap,
 ) {
-    emit_ram_read_pointer_inner(e, width, addr, memory, sides);
+    emit_ram_read_pointer_inner(e, width, addr, memory, sides, wrap);
     emit_mode13_read_completion(e, width);
 }
 
@@ -1582,9 +1635,10 @@ fn emit_ram_read_pointer_inner(
     addr: DirectAddr,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
+    wrap: AddressWrap,
 ) {
     let map = memory.map.expect("native read has fast-map bases");
-    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
+    emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -1635,6 +1689,7 @@ fn emit_ram_read_pointer(
     _: DirectAddr,
     _: MemoryEmitContext,
     _: MemorySideExits,
+    _: AddressWrap,
 ) {
     unreachable!("direct memory lowering is x86-64-only")
 }
@@ -1649,6 +1704,7 @@ fn emit_ram_read_pointer_inner(
     _: DirectAddr,
     _: MemoryEmitContext,
     _: MemorySideExits,
+    _: AddressWrap,
 ) {
     unreachable!("direct memory lowering is x86-64-only")
 }
@@ -1705,7 +1761,7 @@ fn emit_alu_mem_source(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    emit_ram_read_pointer(e, width, addr, memory, sides);
+    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RCX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0),
@@ -1736,7 +1792,14 @@ fn emit_imul_mem(
     // emit_mode13_read_completion clobbers RCX (and RDX). RDI survives it and still holds the
     // pointer. home(dst) is safe throughout: GUEST_HOMES is R8-R14 and RBX, disjoint from every
     // scratch register this path uses.
-    emit_ram_read_pointer(e, MemoryWidth::Dword, addr, memory, sides);
+    emit_ram_read_pointer(
+        e,
+        MemoryWidth::Dword,
+        addr,
+        memory,
+        sides,
+        AddressWrap::None,
+    );
     e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
     // The tail is emit_imul's verbatim, and it is correct here for the same reason: the
     // interpreter reaches BOTH operand forms through one imul_truncated (core.rs), which ends in
@@ -1778,7 +1841,14 @@ fn emit_imul_mem_acc(
     // address index are read from guest homes and either may be EAX or EDX, the two registers this
     // instruction implicitly overwrites. It is safe only because emit_ram_read_pointer resolves
     // the whole effective address into RAX before anything below writes a home.
-    emit_ram_read_pointer(e, MemoryWidth::Dword, addr, memory, sides);
+    emit_ram_read_pointer(
+        e,
+        MemoryWidth::Dword,
+        addr,
+        memory,
+        sides,
+        AddressWrap::None,
+    );
     e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
     // The tail is emit_mul_reg's with the SIGNED primitive. Guest EAX and EDX live in the homes R8
     // and R10 while the host instruction hardwires RAX and RDX, which are emitter scratch, so the
@@ -1813,7 +1883,7 @@ fn emit_test_imm_mem(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    emit_ram_read_pointer(e, width, addr, memory, sides);
+    emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
@@ -1838,7 +1908,7 @@ fn emit_alu_mem_dest(
 ) {
     let map = memory.map.expect("memory ALU has fast-map bases");
     if op == 7 {
-        emit_ram_read_pointer(e, width, addr, memory, sides);
+        emit_ram_read_pointer(e, width, addr, memory, sides, AddressWrap::None);
         match width {
             MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
             MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),

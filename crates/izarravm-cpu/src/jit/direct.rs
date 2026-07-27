@@ -2006,6 +2006,16 @@ pub(crate) enum DirectKind {
     Pop {
         dst: u8,
     },
+    /// POP on a 16-bit stack (SS.B = 0) at Word operand size: two bytes read at `SP & 0xFFFF`,
+    /// only SP advances (preserving ESP[31:16]), and the destination is MERGED into rather than
+    /// replaced, exactly as `write_gpr_sized(index, Word, ..)` does.
+    ///
+    /// Separate variant for the same reason as `Push16`: `Pop` is in clif's `lowerable()`
+    /// allowlist and `lower_pop` hard-codes the 32-bit width, the +4 advance AND a full 32-bit
+    /// destination write.
+    Pop16 {
+        dst: u8,
+    },
     Call {
         return_delta: u32,
         target_delta: u32,
@@ -2109,7 +2119,11 @@ impl DirectKind {
     pub(crate) fn raw_clocks(self) -> u32 {
         match self {
             Self::Jcc { .. } => 3,
-            Self::Pop { .. } => 4,
+            // Both widths charge the same: the interpreter returns clocks(4) for 0x58..=0x5f
+            // irrespective of operand size. Unlike Push, which correctly rides the `_ => 2`
+            // default, an omitted arm here undercharges every pop by 2 core clocks and no test
+            // would fail.
+            Self::Pop { .. } | Self::Pop16 { .. } => 4,
             Self::Call { .. } | Self::Jmp { .. } => 7,
             Self::Ret { .. } => 10,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
@@ -2176,10 +2190,11 @@ impl DirectKind {
                 } | Self::RmwIncDec {
                     width: MemoryWidth::Word,
                     ..
-                } | Self::TestImmMem {
-                    width: MemoryWidth::Word,
-                    ..
-                }
+                } | Self::Pop16 { .. }
+                    | Self::TestImmMem {
+                        width: MemoryWidth::Word,
+                        ..
+                    }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Word),
         )
     }
@@ -2384,6 +2399,9 @@ impl DirectKind {
                 MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE,
             },
             Self::Pop { .. } | Self::Ret { .. } => COUNTER_MODE13_DWORD_READ,
+            // A Word read lands on the BYTE counter lane, matching `Load { Word }`:
+            // `emit_mode13_read_completion` routes Word to the byte-read slot.
+            Self::Pop16 { .. } => COUNTER_MODE13_BYTE_READ,
             Self::Push { .. } | Self::Call { .. } => {
                 COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
             }
@@ -2420,7 +2438,7 @@ impl DirectKind {
             {
                 Some(addr.segment)
             }
-            Self::Pop { .. } | Self::Ret { .. } => Some(SegmentIndex::Ss),
+            Self::Pop { .. } | Self::Pop16 { .. } | Self::Ret { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -2507,6 +2525,7 @@ impl DirectKind {
             Self::Push { .. }
                 | Self::Push16 { .. }
                 | Self::Pop { .. }
+                | Self::Pop16 { .. }
                 | Self::Call { .. }
                 | Self::Ret { .. }
         )
@@ -3017,6 +3036,7 @@ fn compile_with_instruction_limit(
             (DirectKind::Push { source }, false, OperandSize::Word) => {
                 DirectKind::Push16 { source }
             }
+            (DirectKind::Pop { dst }, false, OperandSize::Word) => DirectKind::Pop16 { dst },
             _ => {
                 stop = CompileStop::Retry;
                 break;
