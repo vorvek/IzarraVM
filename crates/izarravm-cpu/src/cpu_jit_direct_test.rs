@@ -3102,3 +3102,124 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_call() {
         "a call that side-exits proves nothing about the emitted form"
     );
 }
+
+fn word_ret_program(release: u16) -> Vec<u8> {
+    let mut memory = vec![0; 0x10000];
+    if release == 0 {
+        memory[0x100..0x104].copy_from_slice(&[
+            0x40, // inc eax
+            0x41, // inc ecx
+            0x66, 0xc3, // ret at Word operand size
+        ]);
+    } else {
+        memory[0x100..0x106].copy_from_slice(&[
+            0x40, // inc eax
+            0x41, // inc ecx
+            0x66,
+            0xc2, // ret imm16 at Word operand size
+            release as u8,
+            (release >> 8) as u8,
+        ]);
+    }
+    memory[0x200] = 0xf4; // hlt at the return target
+    // The return address at SP = 0xFFFE. The two bytes ABOVE it are poisoned: a Dword-width read
+    // that somehow avoided the alignment guard would fold them into the target.
+    memory[0xfffe] = 0x00;
+    memory[0xffff] = 0x02; // 0x0200
+    memory[0x0000] = 0xee;
+    memory[0x0001] = 0xee;
+    memory
+}
+
+/// The end-to-end proof for the 16-bit RET.
+///
+/// SP starts at 0xFFFE, which does three jobs. The advance CARRIES out of bit 16, so a 32-bit
+/// add is distinguishable from a 16-bit one. The read address is 2 mod 4, so a Dword-width read
+/// fails the alignment guard. And the read wraps, so an unmasked effective address would land
+/// outside the fixture entirely.
+///
+/// The bytes above the return address are poisoned as well, because the alignment guard turns a
+/// wrong read width into a SIDE EXIT rather than a wrong value: the interpreter then produces
+/// the right answer and every state assertion passes. The side-exit assertion is what catches
+/// that, and the poison is the second line of defence.
+#[test]
+fn direct_block_matches_the_interpreter_across_a_sixteen_bit_ret() {
+    // Both release values. Without the non-zero one, an emitter that dropped the release
+    // entirely is invisible, because a plain RET releases nothing anyway.
+    for release in [0u16, 8] {
+        sixteen_bit_ret_case(release);
+    }
+}
+
+fn sixteen_bit_ret_case(release: u16) {
+    const ENTRY: u32 = 0x100;
+
+    let mut interp = sixteen_bit_stack_cpu(ENTRY);
+    let mut native = sixteen_bit_stack_cpu(ENTRY);
+    let mut interp_bus = TestBus::with_memory(word_ret_program(release));
+    let mut native_bus = TestBus::with_memory(word_ret_program(release));
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+    }
+    native.jit_direct.set_fast_map_enabled_for_test(true);
+    for page in [0x0000u32, 0xf000] {
+        map_direct_page(
+            &mut native,
+            &mut native_bus,
+            page,
+            page,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+    }
+
+    let reset = |cpu: &mut CpuGsw| {
+        cpu.halted = false;
+        cpu.set_eip(ENTRY);
+        cpu.registers.gpr = [0; 8];
+        cpu.registers.set_esp(0x1234_fffe);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    };
+
+    // Reset BEFORE the warming drives too. The helper seeds a stack pointer of its own, and a
+    // RET taken from there pops whatever happens to be at that address and never reaches the
+    // halt, so the drive runs out its iteration budget instead.
+    reset(&mut interp);
+    reset(&mut native);
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..2 {
+        reset(&mut native);
+        drive(&mut native, &mut native_bus);
+    }
+    reset(&mut native);
+    reset(&mut interp);
+    let insns_before = native.perf_counters().jit_direct_insns;
+    let side_before = native.perf_counters().jit_direct_side_exits;
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+
+    assert_eq!(native, interp, "architectural or clock state differs");
+    // The popped word is the return target, and SP advanced by two with the carry staying in
+    // the low half.
+    assert_eq!(
+        native.registers.esp(),
+        0x1234_0000u32.wrapping_add(u32::from(release)),
+        "SP advances by two plus the release and wraps in 16 bits, keeping ESP[31:16]"
+    );
+    assert!(
+        native.perf_counters().jit_direct_insns > insns_before,
+        "the 16-bit ret block was not entered natively: {:?}",
+        native.perf_counters()
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits,
+        side_before,
+        "a ret that side-exits proves nothing about the emitted form, and a Dword-width read at \
+         this SP would side-exit on the alignment guard"
+    );
+}

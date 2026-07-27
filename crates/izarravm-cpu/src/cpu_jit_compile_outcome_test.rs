@@ -1213,3 +1213,93 @@ fn a_word_call_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bi
     let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(narrow.span.instructions, 4, "control: the call must lower");
 }
+
+/// The anti-vacuity gate for the 16-bit RET, plus the two link rows nothing else can see.
+///
+/// `Ret16` is unconstructible unless BOTH the Word allowlist gains `0xc2`/`0xc3` AND the inner
+/// width gate inside that classifier arm is gone. Either one missing and the kind never exists,
+/// every other registration site is dead, and a counter-identity gate on the pinned corpus
+/// passes regardless.
+///
+/// The successor assertions are the other half. A terminal missing from `dynamic_successor`
+/// stays correct in guest state and in block shape while never linking at all; one missing from
+/// the successor match consumes link cell 0 for a static edge the return path then cannot use,
+/// halving the return PIC. Neither shows up anywhere else.
+#[test]
+fn a_word_ret_on_a_sixteen_bit_stack_enters_the_block() {
+    // inc eax; inc ecx; 66 c3 (ret at Word operand size).
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0xc3]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.span.guest_len, 4);
+    assert_eq!(compilation.word_reads, 1);
+    assert_eq!(compilation.dword_reads, 0);
+    // Two INC at 2 each plus the ret at 10. A missing `raw_clocks` arm shows up here as 6.
+    assert_eq!(compilation.raw_clocks, 14);
+    assert!(
+        compilation.dynamic_successor,
+        "a RET links dynamically, and nothing else observes this"
+    );
+    assert!(compilation.successors[0].is_none());
+    assert!(compilation.successors[1].is_none());
+}
+
+/// The `is_terminal` catcher. Two slots AFTER the ret, because a block whose last slot is
+/// terminal is exempt from the minimum-length rule, so a build that failed to stop would produce
+/// a longer VALID block and an "at least N" assertion would still pass.
+#[test]
+fn a_word_ret_ends_its_block() {
+    let (mut cpu, mut bus) =
+        sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0xc3, 0x42, 0x43]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 4, ENTRY + 5],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the block must end AT the ret"
+    );
+    assert_eq!(compilation.span.guest_len, 4);
+}
+
+/// `0xc2` releases its immediate on top of the popped word, and at a 16-bit stack that release
+/// moves SP alone.
+#[test]
+fn a_word_ret_immediate_lowers_and_keeps_its_release() {
+    // inc eax; inc ecx; 66 c2 08 00 (ret 8 at Word operand size).
+    let (mut cpu, mut bus) =
+        sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0xc2, 0x08, 0x00]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.span.guest_len, 6);
+    assert_eq!(compilation.word_reads, 1);
+    assert!(compilation.dynamic_successor);
+}
+
+/// Matrix row 2: a Word ret on a THIRTY-TWO bit stack is not admitted, because the shipped kind
+/// would read four bytes and release four.
+#[test]
+fn a_word_ret_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit_one() {
+    const CODE: [u8; 5] = [0x40, 0x41, 0x42, 0x66, 0xc3];
+    const WARM: [u32; 4] = [ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3];
+
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    warm(&mut cpu, &mut bus, &WARM);
+    let wide = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(wide.span.instructions, 3);
+
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    warm(&mut cpu, &mut bus, &WARM);
+    let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(narrow.span.instructions, 4, "control: the ret must lower");
+}
