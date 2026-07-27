@@ -2978,9 +2978,27 @@ fn compile_with_instruction_limit(
         // emitted form would not. It covers Jmp and Call as well as Jcc, because
         // `static_control_target_within_limit` matches all three.
         let control_limit = control_target_limit(insn.operand_size, cs.limit);
-        if !static_control_target_within_limit(kind, entry_eip, control_limit)
-            || !kind_segment_access_supported(cpu, kind)
+        let control_target_ok = static_control_target_within_limit(kind, entry_eip, control_limit);
+        // Mechanism count for the Word control-transfer path, split by what the clamp decided.
+        // Byte identity cannot gate this slice on its own: if the pinned corpus carries no
+        // 66-prefixed branch the changed path is never reached, every anchor holds, and the run
+        // proves nothing. These two say whether it was reached at all.
+        //
+        // Counted only on the full-length pass. `compile_with_page_len` re-enters this function
+        // once per step of a binary search whenever the emitted block overflows a host page, and
+        // a shorter prefix may not reach the branch at all, so counting every pass would both
+        // multiply the total and let admitted and refused flip for one block.
+        if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+            && insn.operand_size == OperandSize::Word
+            && static_control_target(kind).is_some()
         {
+            if control_target_ok {
+                cpu.perf.jit_direct_word_control_admitted += 1;
+            } else {
+                cpu.perf.jit_direct_word_control_refused += 1;
+            }
+        }
+        if !control_target_ok || !kind_segment_access_supported(cpu, kind) {
             stop = CompileStop::Retry;
             break;
         }
@@ -3267,15 +3285,24 @@ fn control_target_limit(operand_size: OperandSize, cs_limit: u32) -> u32 {
     }
 }
 
-fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u32) -> bool {
-    let target_delta = match kind {
+/// The block-entry-relative delta of `kind`'s static control target, or `None` for a kind that
+/// has no static target.
+///
+/// Extracted so the guard below and the Word mechanism counters read the SAME notion of "this
+/// slot is a control transfer". A second `matches!` at the counter's call site would be a
+/// second source of truth, and the two could drift as kinds are added.
+fn static_control_target(kind: DirectKind) -> Option<u32> {
+    match kind {
         DirectKind::Call { target_delta, .. } | DirectKind::Jmp { target_delta } => {
             Some(target_delta)
         }
         DirectKind::Jcc { taken_delta, .. } => Some(taken_delta),
         _ => None,
-    };
-    target_delta.is_none_or(|delta| entry_eip.wrapping_add(delta) <= limit)
+    }
+}
+
+fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u32) -> bool {
+    static_control_target(kind).is_none_or(|delta| entry_eip.wrapping_add(delta) <= limit)
 }
 
 fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {

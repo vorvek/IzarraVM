@@ -2571,3 +2571,59 @@ mod execution;
 
 #[path = "cpu_jit_direct_timing_test.rs"]
 mod timing;
+
+fn word_jcc_loop_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[0x100..0x10f].copy_from_slice(&[
+        0xb9, 0x05, 0x00, 0x00, 0x00, // mov ecx,5
+        0x83, 0xc0, 0x03, // add eax,3
+        0x83, 0xe9, 0x01, // sub ecx,1
+        0x66, 0x75, 0xf7, // jnz 0x105, at Word operand size
+        0xf4, // hlt
+    ]);
+    memory
+}
+
+/// A 66-prefixed Jcc in 32-bit code decodes at Word operand size and is now lowered. This is
+/// the end-to-end proof that the emitted condition and taken target are right, which the
+/// compile-shape fixtures cannot see.
+///
+/// It does NOT exercise the `control_target_limit` clamp: at this entry `cs.limit` is 0xFFFF, so
+/// the clamp is the identity and the 16-bit mask is a no-op. The clamp's catchers are the
+/// high-entry fixtures in `cpu_jit_compile_outcome_test.rs`.
+#[test]
+fn direct_block_matches_the_interpreter_across_a_word_operand_size_jcc() {
+    let mut interp = fresh();
+    let mut native = fresh();
+    interp.registers.set_eax(1);
+    native.registers.set_eax(1);
+    let mut interp_bus = TestBus::with_memory(word_jcc_loop_program());
+    let mut native_bus = TestBus::with_memory(word_jcc_loop_program());
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.set_eax(1);
+    }
+    native.set_jit_auto_admit(true);
+    let native_before = native.perf_counters().jit_direct_insns;
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(
+        native_outcomes, interp_outcomes,
+        "run-boundary timing differs"
+    );
+    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
+    assert_eq!(native.registers.eax(), 16, "the loop ran five times");
+    assert!(
+        native.perf_counters().jit_direct_insns > native_before,
+        "the Word Jcc block was never entered natively: {:?}",
+        native.perf_counters()
+    );
+}
