@@ -1022,6 +1022,7 @@ pub(super) fn perf_counters_json(
         "jit_direct_deferred_short": perf.jit_direct_deferred_short,
         "jit_direct_word_control_admitted": perf.jit_direct_word_control_admitted,
         "jit_direct_word_control_refused": perf.jit_direct_word_control_refused,
+        "jit_direct_word_address_slots": perf.jit_direct_word_address_slots,
         "jit_direct_reject_observer": perf.jit_direct_reject_observer,
         "jit_direct_reject_interrupt_shadow": perf.jit_direct_reject_interrupt_shadow,
         "jit_direct_reject_aggregate_accounting": perf.jit_direct_reject_aggregate_accounting,
