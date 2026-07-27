@@ -6198,6 +6198,59 @@ fn clif_arena_exhausted_short_circuits_every_admission_after_the_first_failure()
 ///
 /// The unprefixed control beside it is what makes the negative attributable: it proves the stop
 /// is the operand-size arm and not the stack width or anything else about the corpus.
+/// The POP half of the same gate. Adding `0x58..=0x5f` to the Word allowlist makes this walker
+/// cell reachable for the first time, and `lower_pop` hard-codes the 32-bit width, the +4
+/// advance AND a full 32-bit destination write, so reaching it would be a triple miscompile.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_word_operand_pop_stops_admission_on_a_thirty_two_bit_stack() {
+    use crate::jit::clif::cache::walk_unit;
+
+    let entry = 0x1000u32;
+    // nop (starter); inc eax; 66 58 (pop ax at Word operand size); hlt.
+    let code: &[u8] = &[0x90, 0x40, 0x66, 0x58, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    clif.registers
+        .set_segment(SegmentIndex::Ss, SegmentRegister::flat(0x10, 0x93));
+    let mut bus = TestBus::with_memory(memory.clone());
+    bus.direct_pages_enabled = true;
+    for offset in [entry + 1, entry + 2] {
+        clif.set_eip(offset);
+        clif.fetch_decoded(&mut bus, offset).expect("warm decode");
+    }
+    let layout = walk_unit(&clif, entry + 1, true).expect("walked layout");
+    assert_eq!(
+        layout.kinds.len(),
+        1,
+        "a Word-size pop must stop growth even on a 32-bit stack"
+    );
+
+    // Control: unprefixed, so Dword, and the walker admits it.
+    let code: &[u8] = &[0x90, 0x40, 0x58, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    clif.registers
+        .set_segment(SegmentIndex::Ss, SegmentRegister::flat(0x10, 0x93));
+    let mut bus = TestBus::with_memory(memory.clone());
+    bus.direct_pages_enabled = true;
+    for offset in [entry + 1, entry + 2] {
+        clif.set_eip(offset);
+        clif.fetch_decoded(&mut bus, offset).expect("warm decode");
+    }
+    let layout = walk_unit(&clif, entry + 1, true).expect("walked layout");
+    assert_eq!(layout.kinds.len(), 2, "control: the Dword pop is admitted");
+}
+
 #[test]
 #[cfg(all(
     feature = "clif-backend",

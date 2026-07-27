@@ -975,3 +975,84 @@ fn a_dword_push_on_a_sixteen_bit_stack_is_still_refused() {
     assert_eq!(compilation.span.instructions, 3);
     assert_eq!(compilation.span.guest_len, 3);
 }
+
+/// The anti-vacuity gate for the 16-bit POP, the same shape as the push one above.
+///
+/// Without the compile loop's mapping arm `Pop16` is unconstructible: the tuple falls to the
+/// matrix's catch-all, growth stops, every other registration site is dead, and the emit
+/// dispatch is satisfied by an arm nothing reaches. Counter identity on the pinned corpus
+/// cannot see any of that, so this test is the gate.
+///
+/// The clock and width assertions are the other half. A missing `raw_clocks` arm undercharges
+/// by 2 per pop and is invisible to architectural state; a read declared Dword instead of Word
+/// miscounts the bus split and flips `has_wide_accesses`.
+#[test]
+fn a_word_pop_on_a_sixteen_bit_stack_enters_the_block() {
+    // inc eax; inc ecx; 66 58 (pop ax at Word operand size).
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0x58]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the Word pop must be admitted on a 16-bit stack"
+    );
+    assert_eq!(compilation.span.guest_len, 4);
+    // A WORD read, not a dword one.
+    assert_eq!(compilation.word_reads, 1);
+    assert_eq!(compilation.dword_reads, 0);
+    // Two INC at 2 each plus the pop at 4. A missing `raw_clocks` arm shows up here as 6,
+    // because the pop would fall to the `_ => 2` default.
+    assert_eq!(compilation.raw_clocks, 8);
+}
+
+/// Matrix row 2 for the pop: a Word pop on a THIRTY-TWO bit stack is not admitted, because the
+/// shipped kind would read four bytes, advance four, and replace the whole destination.
+#[test]
+fn a_word_pop_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit_one() {
+    // inc eax; inc ecx; inc edx; 66 58 (pop ax at Word operand size).
+    const CODE: [u8; 5] = [0x40, 0x41, 0x42, 0x66, 0x58];
+    const WARM: [u32; 4] = [ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3];
+
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    warm(&mut cpu, &mut bus, &WARM);
+    let wide = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(wide.span.instructions, 3);
+    assert_eq!(wide.span.guest_len, 3);
+
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    warm(&mut cpu, &mut bus, &WARM);
+    let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(narrow.span.instructions, 4, "control: the pop must lower");
+    assert_eq!(narrow.span.guest_len, 5);
+}
+
+/// The two immediate pushes ride the already-merged `Push16` arm, so this slice adds them to
+/// the Word allowlist and nothing else. The test exists because that claim is the entire
+/// argument for their being free.
+#[test]
+fn word_immediate_pushes_lower_on_a_sixteen_bit_stack() {
+    // inc eax; inc ecx; 66 6a 7f (push imm8, sign extended, at Word operand size). The 0x66 is
+    // load-bearing: this fixture's code segment is 32-bit, so an unprefixed 0x6a is Dword and
+    // would take the shipped four-byte arm instead.
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0x6a, 0x7f]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let byte_form = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(byte_form.span.instructions, 3);
+    assert_eq!(byte_form.word_stores, 1);
+
+    // inc eax; inc ecx; 66 68 34 12 (push imm16 at Word operand size).
+    let (mut cpu, mut bus) =
+        sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0x68, 0x34, 0x12]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let word_form = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(word_form.span.instructions, 3);
+    assert_eq!(
+        word_form.span.guest_len, 6,
+        "prefix, opcode and a two-byte immediate"
+    );
+    assert_eq!(word_form.word_stores, 1);
+}

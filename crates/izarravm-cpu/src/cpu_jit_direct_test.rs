@@ -2766,3 +2766,240 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_stack_push() {
         "a push that side-exits proves nothing about the emitted form"
     );
 }
+
+fn word_pop_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x10000];
+    memory[0x100..0x108].copy_from_slice(&[
+        0x66, 0x58, // pop ax
+        0x66, 0x5b, // pop bx
+        0x66, 0x59, // pop cx
+        0x40, // inc eax, so the block is not all pops
+        0xf4, // hlt
+    ]);
+    // The words the pops will read, starting at SP = 0xFFFA. The THIRD pop is the one whose
+    // advance carries out of bit 16, and it is chosen that way deliberately: block admission
+    // takes two passes and the block ends up keyed at the SECOND pop, so a carry placed on the
+    // first one is executed by the interpreter and discriminates nothing. A mutation battery
+    // found exactly that.
+    memory[0xfffa] = 0x11;
+    memory[0xfffb] = 0x22;
+    memory[0xfffc] = 0x33;
+    memory[0xfffd] = 0x44;
+    memory[0xfffe] = 0x55;
+    memory[0xffff] = 0x66;
+    memory
+}
+
+/// The end-to-end proof for the 16-bit stack pop.
+///
+/// SP starts at 0xFFFE, which is doing three jobs at once and each one was named by a review:
+///
+/// - **0xFFFE is 2 mod 4.** A read emitted at Dword width fails the alignment guard there and
+///   side-exits, where a Word read passes. That is the ONLY way the read width is observable:
+///   a Dword read that still narrows its destination write discards the extra two bytes and
+///   leaves register state, memory and clocks identical to the correct form.
+/// - **It carries out of bit 16 on the first advance.** `0xFFFE + 2` wraps SP to 0x0000 and must
+///   leave ESP[31:16] alone; a 32-bit add would carry into it.
+/// - **The reads themselves wrap.** The second pop reads at 0x0000, so an unmasked effective
+///   address would land at 0x1234_0000 rather than 0x0000. The read path only gained a wrap
+///   parameter with this slice; before it, `emit_ram_read_pointer` hard-coded no mask.
+///
+/// The destination registers are seeded with non-zero high halves, so a full 32-bit destination
+/// write is caught rather than merged.
+#[test]
+fn direct_block_matches_the_interpreter_across_a_sixteen_bit_stack_pop() {
+    const ENTRY: u32 = 0x100;
+
+    let mut interp = sixteen_bit_stack_cpu(ENTRY);
+    let mut native = sixteen_bit_stack_cpu(ENTRY);
+    let mut interp_bus = TestBus::with_memory(word_pop_program());
+    let mut native_bus = TestBus::with_memory(word_pop_program());
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+    }
+    native.jit_direct.set_fast_map_enabled_for_test(true);
+    for page in [0x0000u32, 0xf000] {
+        map_direct_page(
+            &mut native,
+            &mut native_bus,
+            page,
+            page,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+    }
+
+    let reset = |cpu: &mut CpuGsw| {
+        cpu.halted = false;
+        cpu.set_eip(ENTRY);
+        // `gpr` is in x86 ENCODING order: EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI. Seeding it
+        // as if it were alphabetical is how the first version of this test named the wrong
+        // register in its expectations.
+        cpu.registers.gpr = [0xaaaa_0000, 0xcccc_0000, 0, 0xbbbb_0000, 0, 0, 0, 0];
+        cpu.registers.set_esp(0x1234_fffa);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    };
+
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    reset(&mut native);
+    drive(&mut native, &mut native_bus);
+    reset(&mut native);
+    reset(&mut interp);
+    let native_before = native.perf_counters().jit_direct_insns;
+    let side_before = native.perf_counters().jit_direct_side_exits;
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(
+        native_outcomes, interp_outcomes,
+        "run-boundary timing differs"
+    );
+    assert_eq!(native, interp, "architectural or clock state differs");
+
+    // Each destination keeps its seeded high half and takes only the popped word.
+    assert_eq!(
+        native.registers.eax(),
+        0xaaaa_2211 + 1,
+        "pop ax, then inc eax"
+    );
+    assert_eq!(native.registers.ebx(), 0xbbbb_4433);
+    assert_eq!(native.registers.ecx(), 0xcccc_6655);
+    assert_eq!(
+        native.registers.edx(),
+        0,
+        "an untouched register stays untouched"
+    );
+    // Three pops of two bytes from 0xFFFE, wrapping in 16 bits only.
+    assert_eq!(
+        native.registers.esp(),
+        0x1234_0000,
+        "SP must wrap in 16 bits and ESP[31:16] must survive"
+    );
+    // Admission keys the block at the SECOND pop, so the first one is interpreted and three
+    // instructions retire natively: pops two and three plus the trailing `inc`. The exact count
+    // matters, because the carry that discriminates a 16-bit pointer advance from a 32-bit one
+    // happens on the THIRD pop, and this is what proves that pop was native.
+    assert_eq!(
+        native.perf_counters().jit_direct_insns,
+        native_before + 3,
+        "pops two and three must retire natively: {:?}",
+        native.perf_counters()
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits,
+        side_before,
+        "a pop that side-exits proves nothing about the emitted form, and a Dword-width read \
+         at this SP would side-exit on the alignment guard"
+    );
+}
+
+fn pop_sp_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x10000];
+    // Shaped like the pop fixture above and for the same reason: admission keys the block at
+    // the SECOND instruction, so leading with a pop is what puts POP SP inside the compiled
+    // block. Leading with an `inc` leaves the block uncompilable in this harness and the whole
+    // test passes on interpreted execution.
+    memory[0x100..0x108].copy_from_slice(&[
+        0x66, 0x58, // pop ax
+        0x66, 0x5b, // pop bx
+        0x66, 0x5c, // pop sp
+        0x40, // inc eax
+        0xf4, // hlt
+    ]);
+    memory[0xfffa] = 0x11;
+    memory[0xfffb] = 0x22;
+    memory[0xfffc] = 0x33;
+    memory[0xfffd] = 0x44;
+    memory[0xfffe] = 0x55;
+    memory[0xffff] = 0x66; // the word POP SP loads is 0x6655
+    memory
+}
+
+/// POP SP is the aliasing case: the destination IS the stack pointer.
+///
+/// The interpreter advances the pointer first and assigns second, so the final SP is the LOADED
+/// word rather than the advanced pointer. The Dword form of this is already pinned on both
+/// backends; the Word form was not covered anywhere, and it is the one where the two writes are
+/// different widths as well as the same register.
+#[test]
+fn a_word_pop_into_sp_takes_the_loaded_word_not_the_advanced_pointer() {
+    const ENTRY: u32 = 0x100;
+
+    let mut interp = sixteen_bit_stack_cpu(ENTRY);
+    let mut native = sixteen_bit_stack_cpu(ENTRY);
+    let mut interp_bus = TestBus::with_memory(pop_sp_program());
+    let mut native_bus = TestBus::with_memory(pop_sp_program());
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+    }
+    native.jit_direct.set_fast_map_enabled_for_test(true);
+    // Both the code page and the stack page. Mapping only the stack page leaves the block
+    // uncompilable, and the test would then pass on interpreted execution.
+    for page in [0x0000u32, 0xf000] {
+        map_direct_page(
+            &mut native,
+            &mut native_bus,
+            page,
+            page,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+    }
+
+    // The GPRs are reset too, not just SP. The native side takes one more pass than the
+    // interpreter (it needs the admission pass), so anything the block accumulates has to be
+    // cleared or the two diverge for a reason that has nothing to do with the pop.
+    let reset = |cpu: &mut CpuGsw| {
+        cpu.halted = false;
+        cpu.set_eip(ENTRY);
+        cpu.registers.gpr = [0; 8];
+        cpu.registers.set_esp(0x1234_fffa);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    };
+
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    // Two admission passes, not one. This block is short enough that a single pass only takes
+    // the key from first-seen to compiled, so the measured run would find nothing installed and
+    // the whole test would pass on interpreted execution.
+    native.set_jit_auto_admit(true);
+    for _ in 0..2 {
+        reset(&mut native);
+        drive(&mut native, &mut native_bus);
+    }
+    reset(&mut native);
+    reset(&mut interp);
+    let side_before = native.perf_counters().jit_direct_side_exits;
+    let insns_before = native.perf_counters().jit_direct_insns;
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+
+    assert_eq!(native, interp, "architectural or clock state differs");
+    // The loaded word wins. Reversing the two writes would leave 0x1234_0000 here.
+    // The loaded word wins over the advance. Reversing the two writes would leave 0x1234_6657
+    // here, and a discarded advance is exactly why this case cannot also pin the pointer width.
+    assert_eq!(
+        native.registers.esp(),
+        0x1234_6655,
+        "POP SP takes the loaded word, and the high half survives"
+    );
+    assert_eq!(native.perf_counters().jit_direct_side_exits, side_before);
+    // Without this the test is vacuous: if the block never compiled, the interpreter would
+    // produce the same correct SP and a reversed emitted order would go unnoticed.
+    assert!(
+        native.perf_counters().jit_direct_insns > insns_before,
+        "the POP SP block was not entered natively: entries={} blocks={} insns={} attempts={}",
+        native.perf_counters().jit_direct_entries,
+        native.jit_direct.len(),
+        native.perf_counters().jit_direct_insns,
+        native.perf_counters().jit_direct_compile_attempts
+    );
+}
