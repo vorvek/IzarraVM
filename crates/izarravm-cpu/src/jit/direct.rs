@@ -1991,6 +1991,18 @@ pub(crate) enum DirectKind {
     Push {
         source: StoreSource,
     },
+    /// PUSH on a 16-bit stack (SS.B = 0) at Word operand size: two bytes written at
+    /// `(SP - 2) & 0xFFFF`, and only SP advances, preserving ESP[31:16].
+    ///
+    /// A SEPARATE variant rather than a width field on `Push`, because `Push` is in clif's
+    /// `lowerable()` allowlist and `lower_push` hard-codes `MemoryWidth::Dword` and
+    /// `iadd_imm(esp, -4)`, so a field would be lowered as a 32-bit push there. The two widths
+    /// it stands for are ORTHOGONAL: SS.B picks the stack-pointer width and `operand_size` picks
+    /// how many bytes move (386 PRM 16.2, restated at `memory.rs:1218`). This variant is the
+    /// (SS.B = 0, Word) cell only; the compile loop refuses the other two new cells.
+    Push16 {
+        source: StoreSource,
+    },
     Pop {
         dst: u8,
     },
@@ -2230,7 +2242,7 @@ impl DirectKind {
                 } | Self::RmwIncDec {
                     width: MemoryWidth::Word,
                     ..
-                }
+                } | Self::Push16 { .. }
             ) || matches!(
                 self,
                 Self::AluMemDest {
@@ -2375,6 +2387,14 @@ impl DirectKind {
             Self::Push { .. } | Self::Call { .. } => {
                 COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
             }
+            // A Word store lands on the BYTE counter slots, matching `Store { Word }` above:
+            // `emit_dynamic_word_increment` packs the word count into the upper 32 bits of the
+            // byte slot. Mirroring the Word store is the rule here rather than reasoning from
+            // "the bus ignores width", which is true of `BusCycle::clocks_for` but NOT of these
+            // counter lanes.
+            Self::Push16 { .. } => {
+                COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY
+            }
             _ => 0,
         }
     }
@@ -2423,7 +2443,7 @@ impl DirectKind {
             {
                 Some(addr.segment)
             }
-            Self::Push { .. } | Self::Call { .. } => Some(SegmentIndex::Ss),
+            Self::Push { .. } | Self::Push16 { .. } | Self::Call { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -2484,7 +2504,11 @@ impl DirectKind {
     fn uses_stack(self) -> bool {
         matches!(
             self,
-            Self::Push { .. } | Self::Pop { .. } | Self::Call { .. } | Self::Ret { .. }
+            Self::Push { .. }
+                | Self::Push16 { .. }
+                | Self::Pop { .. }
+                | Self::Call { .. }
+                | Self::Ret { .. }
         )
     }
 
@@ -2962,6 +2986,42 @@ fn compile_with_instruction_limit(
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         };
+        // The stack-width admission matrix, and it is FIRST on purpose: everything below this
+        // point reads the kind, and the access accessors in particular give different answers
+        // for `Push` and `Push16` (a dword store against a word store). Anything that read the
+        // pre-mapping kind would silently account the wrong width.
+        //
+        // SS.B picks the STACK POINTER width and `operand_size` picks how many bytes move; the
+        // two are orthogonal (386 PRM 16.2, restated at `memory.rs:1218`). Four cells:
+        //
+        //   SS.B=1 + Dword  admit as `Push`   the shipped 32-bit form
+        //   SS.B=1 + Word   STOP              a 2-byte push with a 32-bit SP. `Push` would move
+        //                                     four bytes and decrement four, so admitting it
+        //                                     here is a miscompile, not a missed lowering.
+        //                                     Reachable TODAY through a 66-prefixed push in
+        //                                     32-bit code, which the prefix gate accepts.
+        //   SS.B=0 + Word   admit as `Push16` the new form
+        //   SS.B=0 + Dword  STOP              four bytes on a 16-bit SP, not built yet
+        //
+        // This REPLACES the old `uses_stack() && !stack_is_32bit()` stop rather than joining it.
+        // Left in place, that stop would have refused every `Push16`, because they exist only
+        // when the stack is 16-bit. The slice would have done nothing and a counter-identity
+        // gate would have passed while certifying the mechanism's own absence.
+        //
+        // `classify` cannot make this decision: it has no `cpu`, and SS.B is CPU state. Deciding
+        // it here is safe against block reuse because `jit_mode_key` already carries SS.B, so a
+        // block compiled for one stack width can never be entered with the other.
+        let kind = match (kind, cpu.stack_is_32bit(), insn.operand_size) {
+            (kind, _, _) if !kind.uses_stack() => kind,
+            (kind, true, OperandSize::Dword) => kind,
+            (DirectKind::Push { source }, false, OperandSize::Word) => {
+                DirectKind::Push16 { source }
+            }
+            _ => {
+                stop = CompileStop::Retry;
+                break;
+            }
+        };
         // A Word-size relative branch masks its target to 16 bits: `relative_jump` computes
         // `(eip + rel) & operand_size.mask()`. The emitted form bakes an unmasked delta, so it is
         // only correct where that mask is a no-op. Clamping the limit to 0xFFFF for Word makes
@@ -3012,10 +3072,6 @@ fn compile_with_instruction_limit(
             && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
                 || slots.len() >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS)
         {
-            stop = CompileStop::Retry;
-            break;
-        }
-        if kind.uses_stack() && !cpu.stack_is_32bit() {
             stop = CompileStop::Retry;
             break;
         }

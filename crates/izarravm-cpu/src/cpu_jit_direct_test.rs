@@ -2627,3 +2627,142 @@ fn direct_block_matches_the_interpreter_across_a_word_operand_size_jcc() {
         native.perf_counters()
     );
 }
+
+/// A protected-mode CPU with flat segments except SS, which keeps a 16-bit stack pointer.
+///
+/// SP is seeded at 0 so that every push BORROWS across bit 16. That is what makes the
+/// partial-register update observable at all: at any SP with headroom below it, a 16-bit and a
+/// 32-bit subtract give identical results, and a test built there cannot tell them apart. A
+/// mutation battery found exactly that gap in the first version of this fixture.
+fn sixteen_bit_stack_cpu(entry: u32) -> CpuGsw {
+    let mut cpu = flat_stack_cpu(entry);
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    cpu.registers.set_esp(0x1234_0000);
+    cpu
+}
+
+fn reset_sixteen_bit_stack_run(cpu: &mut CpuGsw, bus: &mut TestBus, entry: u32) {
+    cpu.halted = false;
+    cpu.set_eip(entry);
+    cpu.registers.set_eax(0xbeef);
+    cpu.registers.set_esp(0x1234_0000);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    bus.memory[0xfff0..0x10000].fill(0);
+    bus.trace = BusTrace::default();
+}
+
+fn word_push_loop_program() -> Vec<u8> {
+    // A full 64K, because the stack wraps to 0xFFFE on the first push.
+    let mut memory = vec![0; 0x10000];
+    memory[0x100..0x10d].copy_from_slice(&[
+        0xb9, 0x08, 0x00, 0x00, 0x00, // mov ecx,8
+        0x66, 0x50, // push ax, at Word operand size on a 16-bit stack
+        0x83, 0xe9, 0x01, // sub ecx,1
+        0x75, 0xf9, // jnz 0x105
+        0xf4, // hlt
+    ]);
+    memory
+}
+
+/// The end-to-end proof for the 16-bit stack push. The compile-shape fixtures can only see that
+/// the slot was admitted; this sees whether it was admitted CORRECTLY.
+///
+/// Two mechanisms are load-bearing:
+///
+/// - **The effective address wraps at 64K.** `stack_addr` uses the full ESP home as its base, so
+///   without the mask the address would be 0x1234_FFFE rather than 0x FFFE, on a page this
+///   fixture never maps. The interpreter forms `u32::from(sp - 2)` and never leaves 16 bits.
+/// - **The pointer update preserves ESP[31:16].** A 32-bit subtract would borrow into the high
+///   half and give 0x1233_FFFE, where `write_gpr16` keeps the 0x1234.
+///
+/// The fast map is enabled and the stack page mapped UP FRONT. Without that the block still
+/// compiles but every push takes a side exit into the interpreter, which produces correct guest
+/// state and therefore hides an incorrect emitter entirely. The `jit_direct_side_exits` and
+/// native-instruction assertions below are what keep this test from going vacuous the same way.
+#[test]
+fn direct_block_matches_the_interpreter_across_a_sixteen_bit_stack_push() {
+    const ENTRY: u32 = 0x100;
+    const STACK_PAGE: u32 = 0xf000;
+
+    let mut interp = sixteen_bit_stack_cpu(ENTRY);
+    let mut native = sixteen_bit_stack_cpu(ENTRY);
+    for cpu in [&mut interp, &mut native] {
+        cpu.registers.set_eax(0xbeef);
+    }
+    let mut interp_bus = TestBus::with_memory(word_push_loop_program());
+    let mut native_bus = TestBus::with_memory(word_push_loop_program());
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+    }
+    native.jit_direct.set_fast_map_enabled_for_test(true);
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        STACK_PAGE,
+        STACK_PAGE,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        true,
+    );
+
+    // Three passes, and the third is the measured one. The first warms every decode line; the
+    // second lets the first-seen/second-entry admission policy install the block. Only then is
+    // the state reset, so that the FIRST push of the measured run is native and starts at
+    // SP = 0.
+    //
+    // That ordering is the whole point. Only the first push of a run borrows across bit 16;
+    // every later one starts from 0xFFFE and does not. Measure a run whose first push was
+    // interpreted and a 32-bit subtract is indistinguishable from a 16-bit one, which is
+    // precisely how the first version of this test passed under a mutation that broke it.
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    reset_sixteen_bit_stack_run(&mut native, &mut native_bus, ENTRY);
+    drive(&mut native, &mut native_bus);
+    reset_sixteen_bit_stack_run(&mut native, &mut native_bus, ENTRY);
+    reset_sixteen_bit_stack_run(&mut interp, &mut interp_bus, ENTRY);
+    let native_before = native.perf_counters().jit_direct_insns;
+    let side_before = native.perf_counters().jit_direct_side_exits;
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(
+        native_outcomes, interp_outcomes,
+        "run-boundary timing differs"
+    );
+    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        native_bus.memory, interp_bus.memory,
+        "stack contents differ"
+    );
+
+    // Eight pushes of two bytes each, with only SP moving.
+    assert_eq!(
+        native.registers.esp(),
+        0x1234_fff0,
+        "SP must wrap in 16 bits and ESP[31:16] must survive"
+    );
+    assert_eq!(
+        &native_bus.memory[0xfff0..0x10000],
+        &[0xefu8, 0xbe].repeat(8)[..],
+        "each push writes two bytes at a masked address"
+    );
+    // At least the three pushes plus their block-mates ran natively, and none of them fell back
+    // through a side exit. Both halves matter: without the second, an emitter that computed the
+    // wrong address would side-exit, the interpreter would produce the right answer, and every
+    // assertion above would still pass.
+    assert!(
+        native.perf_counters().jit_direct_insns >= native_before + 6,
+        "the 16-bit stack block was not entered natively: {:?}",
+        native.perf_counters()
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits,
+        side_before,
+        "a push that side-exits proves nothing about the emitted form"
+    );
+}

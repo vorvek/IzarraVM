@@ -433,7 +433,15 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
-                emit_store(&mut e, source, width, addr, memory, reasons);
+                emit_store(
+                    &mut e,
+                    source,
+                    width,
+                    addr,
+                    memory,
+                    reasons,
+                    AddressWrap::None,
+                );
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
@@ -493,6 +501,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     stack_addr(0u32.wrapping_sub(4)),
                     memory,
                     reasons,
+                    AddressWrap::None,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((
@@ -508,6 +517,48 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
                 e.alu_r32_imm32(5, home(4), 4);
+            }
+            // PUSH on a 16-bit stack: two bytes at `(SP - 2) & 0xFFFF`, then SP alone advances.
+            //
+            // Three things differ from the 32-bit arm above and each one is load-bearing. The
+            // displacement is -2 rather than -4 and the width is Word, so the slot matches the
+            // interpreter's `operand_size.bytes()`. The address wraps at 64K, applied inside
+            // `emit_store` before the segment limit compare. And the pointer update is a 16-bit
+            // register operation, which on x86-64 preserves bits 31 to 16 rather than
+            // zero-extending, exactly reproducing `write_gpr16(4, sp)`.
+            //
+            // The store still PRECEDES the pointer update, which is the invariant the 32-bit arm
+            // already carries: a faulting push must leave SP at its pre-instruction value, or a
+            // lazy-commit host that retries the instruction double-decrements it
+            // (`memory.rs:1208-1216`, traced to a real Quake crt1 crash). The side exit is
+            // published between the two for the same reason.
+            DirectKind::Push16 { source } => {
+                let side = e.label();
+                let reasons =
+                    MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(2))));
+                emit_store(
+                    &mut e,
+                    source,
+                    MemoryWidth::Word,
+                    stack_addr(0u32.wrapping_sub(2)),
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                e.alu_r16_imm16(5, home(4), 2);
             }
             DirectKind::Pop { dst } => {
                 let side = e.label();
@@ -602,6 +653,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     stack_addr(0u32.wrapping_sub(4)),
                     memory,
                     reasons,
+                    AddressWrap::None,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((
@@ -1405,7 +1457,7 @@ fn emit_x87_memory_pointer(
     // `needs_alignment_guard()` the way `emit_ram_read_pointer_inner` gates it.
     debug_assert!(width.needs_alignment_guard());
     let map = memory.map.expect("x87 memory block has fast-map bases");
-    emit_segmented_linear_address(e, addr, width, memory, sides);
+    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
     // The width here is what the slice's performance rests on, not its byte identity:
     // `BusCycle::clocks_for` ignores width, so a Word access charged as a Dword costs the same
     // bus clocks. What a Dword guard WOULD do is refuse every 2-aligned-but-not-4-aligned
@@ -1532,7 +1584,7 @@ fn emit_ram_read_pointer_inner(
     sides: MemorySideExits,
 ) {
     let map = memory.map.expect("native read has fast-map bases");
-    emit_segmented_linear_address(e, addr, width, memory, sides);
+    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -1803,7 +1855,7 @@ fn emit_alu_mem_dest(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("writing memory ALU has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides);
+    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -1901,7 +1953,14 @@ fn emit_double_shift_mem(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("memory double shift has code-watch tables");
-    emit_segmented_linear_address(e, addr, MemoryWidth::Dword, memory, sides);
+    emit_segmented_linear_address(
+        e,
+        addr,
+        MemoryWidth::Dword,
+        memory,
+        sides,
+        AddressWrap::None,
+    );
     emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -2059,14 +2118,36 @@ fn emit_effective_address(e: &mut Encoder, addr: DirectAddr) {
     }
 }
 
+/// Whether the effective address wraps at 64K before the segment base is added.
+///
+/// `Word` is the 16-bit stack and (later) 16-bit addressing: the architectural EA is
+/// `(base + index + disp) & 0xFFFF`. Masking the 32-bit sum ONCE is equivalent, because addition
+/// is congruent mod 2^16, and it matches `resolve_memory_addr_mode`'s `(sum as u16)`.
+///
+/// It is a PARAMETER rather than a field on `DirectAddr` deliberately. A `DirectAddr` field would
+/// ride inside kinds that are in clif's `lowerable()` allowlist, such as `Load`, and clif would
+/// lower them without the mask. That is the same trap as putting a width field on `Push`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddressWrap {
+    None,
+    Word,
+}
+
 fn emit_segmented_linear_address(
     e: &mut Encoder,
     addr: DirectAddr,
     width: MemoryWidth,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
+    wrap: AddressWrap,
 ) {
     emit_effective_address(e, addr);
+    // BEFORE the limit compare, not merely before the base add: the compare below sits between
+    // the effective address and the base, so masking afterwards would compare an address the
+    // guest never forms.
+    if wrap == AddressWrap::Word {
+        e.and_r32_imm32(Reg::RAX, 0xFFFF);
+    }
     let descriptor = memory.segments.descriptor(addr.segment);
     if descriptor.limit != u32::MAX {
         let Some(max_start) = descriptor.limit.checked_sub(width.bytes() - 1) else {
@@ -2101,12 +2182,13 @@ fn emit_store(
     addr: DirectAddr,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
+    wrap: AddressWrap,
 ) {
     let map = memory.map.expect("native store has fast-map bases");
     let code_watch_tables = memory
         .code_watch_tables
         .expect("native store has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides);
+    emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -2174,7 +2256,7 @@ fn emit_rmw_inc_dec(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("native RMW has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides);
+    emit_segmented_linear_address(e, addr, width, memory, sides, AddressWrap::None);
     emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -2287,7 +2369,14 @@ fn emit_rmw_inc_dec_dword(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("native RMW has code-watch tables");
-    emit_segmented_linear_address(e, addr, MemoryWidth::Dword, memory, sides);
+    emit_segmented_linear_address(
+        e,
+        addr,
+        MemoryWidth::Dword,
+        memory,
+        sides,
+        AddressWrap::None,
+    );
     emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);

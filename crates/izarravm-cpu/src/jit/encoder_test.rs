@@ -78,6 +78,26 @@ fn word_register_and_memory_forms_have_known_bytes() {
     );
 }
 
+/// The 16-bit register-immediate ALU form, which the 16-bit stack pointer update rides on.
+///
+/// R12 is the case that matters and is pinned first: it is the guest ESP home, and its `low3()`
+/// is `0b100`, the SIB escape. A register-form ModRM must NOT emit a SIB byte, and an encoding
+/// copied from one of the memory forms above would insert a spurious `0x24` and desync every
+/// instruction after it. RAX pins the no-REX path.
+#[test]
+fn word_register_immediate_alu_has_known_bytes() {
+    let mut e = Encoder::new();
+    e.alu_r16_imm16(5, Reg::R12, 2);
+    e.alu_r16_imm16(0, Reg::RAX, 0xFFFF);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x66, 0x41, 0x81, 0xEC, 0x02, 0x00, // sub r12w,2
+            0x66, 0x81, 0xC0, 0xFF, 0xFF, // add ax,0xFFFF
+        ]
+    );
+}
+
 #[test]
 fn scalar_sse_memory_forms_have_known_bytes() {
     let mut e = Encoder::new();
