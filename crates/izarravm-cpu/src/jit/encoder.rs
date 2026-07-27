@@ -831,6 +831,26 @@ impl Encoder {
         self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// A 16-bit register-immediate ALU operation, `66 [REX] 81 /op iw`. The operation numbers
+    /// match `alu_r32_imm32`.
+    ///
+    /// The 16-bit width is the whole point: an x86-64 16-bit register operation writes only the
+    /// low 16 bits and PRESERVES bits 31 to 16, where the 32-bit form would zero-extend. That is
+    /// exactly `write_gpr16`'s `(slot & 0xffff_0000) | value`, so a 16-bit stack pointer update
+    /// needs no masking or merging around it.
+    ///
+    /// The register form uses `modrm(0b11, ..)` and therefore never needs a SIB byte. That
+    /// matters here specifically: the guest ESP home is `Reg::R12`, whose `low3()` is the SIB
+    /// escape, so a memory-form encoding would emit a spurious `0x24` and desync the stream.
+    pub(crate) fn alu_r16_imm16(&mut self, op: u8, dst: Reg, imm: u16) {
+        assert!(op < 8, "ALU group must fit three bits");
+        self.bytes.push(0x66);
+        self.optional_rex(false, false, false, dst.ext());
+        self.bytes.push(0x81);
+        self.modrm(0b11, op, dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// An 8-bit register-register ALU operation using AL, CL, DL, or BL.
     pub(crate) fn alu_r8_r8(&mut self, op: u8, dst: Reg, src: Reg) {
         const OPCODES: [u8; 8] = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];

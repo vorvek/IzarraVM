@@ -448,14 +448,24 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         if insn.operand_size == OperandSize::Word && step.terminal.is_some() {
             break;
         }
-        // C1c section 1.4: the stack-width admission gate, identical to Direct's
-        // compile-time reject (`direct.rs`'s uses_stack + !stack_is_32bit Retry). A 16-bit
-        // stack's SP wrap is a form this design does not build, so growth stops at the
-        // slot exactly as an unclassifiable opcode would (no new stop tag, per the
-        // question ledger). Push/Pop are the only lowered kinds that touch SS implicitly;
-        // Call/Ret are terminals and not lowered at all.
+        // C1c section 1.4: the stack-width admission gate. A 16-bit stack's SP wrap is a form
+        // this design does not build, so growth stops at the slot exactly as an unclassifiable
+        // opcode would (no new stop tag, per the question ledger). Push/Pop are the only lowered
+        // kinds that touch SS implicitly; Call/Ret are terminals and not lowered at all.
+        //
+        // The Word arm is NOT a mirror of Direct's, and cannot be. Direct rewrites a 16-bit-stack
+        // push into a separate `Push16` kind inside its compile loop, which this walker never
+        // runs, so it only ever sees a plain `DirectKind::Push`. `lower_push` hard-codes
+        // `MemoryWidth::Dword` and `iadd_imm(esp, -4)`, so a Word push reaching it would write
+        // four bytes and decrement four where the guest moves two. Keeping the new kinds out of
+        // `lowerable()` protects nothing here, because the new kinds never arrive.
+        //
+        // Both conditions are needed for a different reason each. `!stack_is_32bit()` catches a
+        // 16-bit STACK POINTER; `operand_size == Word` catches a 16-bit DATA width on a 32-bit
+        // stack, which is a 66-prefixed push in 32-bit code and is reachable on ordinary
+        // protected-mode corpora. The two widths are orthogonal (386 PRM 16.2).
         if matches!(step.kind, DirectKind::Push { .. } | DirectKind::Pop { .. })
-            && !cpu.stack_is_32bit()
+            && (!cpu.stack_is_32bit() || insn.operand_size == OperandSize::Word)
         {
             break;
         }

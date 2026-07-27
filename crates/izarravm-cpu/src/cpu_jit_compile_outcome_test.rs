@@ -876,3 +876,102 @@ fn a_dword_jcc_above_the_wrap_still_compiles() {
     assert_eq!(compilation.span.instructions, 4);
     assert_eq!(compilation.span.guest_len, 9);
 }
+
+/// A 16-bit stack under a 32-bit code segment, which is a reachable configuration TODAY and is
+/// what makes this slice testable before 16-bit admission is flipped.
+///
+/// `fresh()` already leaves SS at `default_size_32 == false`, so the only thing owed is a stack
+/// pointer inside the fixture's memory. The high half of ESP is deliberately non-zero: a
+/// 16-bit stack must preserve ESP[31:16], and it must also mask the effective address, so both
+/// mechanisms are load-bearing in every test built on this.
+fn sixteen_bit_stack_fixture(entry: u32, code: &[u8]) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0; 0x2000];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = fresh();
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    cpu.registers.set_esp(0x1234_0800);
+    cpu.registers.eip = entry;
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .expect("initialize direct map");
+    (cpu, bus)
+}
+
+/// THE ANTI-VACUITY GATE for the 16-bit stack slice.
+///
+/// A design review found that leaving the old `uses_stack() && !stack_is_32bit()` stop in place
+/// alongside the new mapping would refuse every `Push16`, so the slice would do nothing while
+/// every counter stayed identical and the pre-registered gate passed. Counter identity cannot
+/// tell a correct inert slice from a broken one. This test can: it fails if the push is not
+/// admitted, for any reason.
+#[test]
+fn a_word_push_on_a_sixteen_bit_stack_enters_the_block() {
+    // inc eax; inc ecx; 66 50 (push ax at Word operand size).
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x66, 0x50]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the Word push must be admitted on a 16-bit stack"
+    );
+    assert_eq!(compilation.span.guest_len, 4);
+    // It is a WORD store, not a dword one. A width mix-up here would be invisible to the
+    // instruction count and would misreport the bus split.
+    assert_eq!(compilation.word_stores, 1);
+    assert_eq!(compilation.dword_stores, 0);
+}
+
+/// Matrix row 2: a Word push on a THIRTY-TWO bit stack must not be admitted, because the
+/// shipped `Push` kind would write four bytes and decrement four where the guest moves two.
+/// Reachable today through a 66-prefixed push in 32-bit code.
+///
+/// The 16-bit-stack control beside it is what makes the negative attributable: without it the
+/// assertion would also hold if the push simply failed to classify.
+#[test]
+fn a_word_push_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit_one() {
+    // inc eax; inc ecx; inc edx; 66 50 (push ax at Word operand size).
+    const CODE: [u8; 5] = [0x40, 0x41, 0x42, 0x66, 0x50];
+    const WARM: [u32; 4] = [ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3];
+
+    // 32-bit stack: the three fillers compile, the push does not.
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    warm(&mut cpu, &mut bus, &WARM);
+    let wide = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        wide.span.instructions, 3,
+        "a two-byte push must not be lowered by the four-byte kind"
+    );
+    assert_eq!(wide.span.guest_len, 3);
+
+    // 16-bit stack, same bytes: the push IS admitted.
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
+    warm(&mut cpu, &mut bus, &WARM);
+    let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(narrow.span.instructions, 4, "control: the push must lower");
+    assert_eq!(narrow.span.guest_len, 5);
+}
+
+/// Matrix row 4: a Dword push on a 16-bit stack stays refused. Four bytes on a 16-bit stack
+/// pointer is a form this slice does not build, and it must not fall through to either kind.
+#[test]
+fn a_dword_push_on_a_sixteen_bit_stack_is_still_refused() {
+    // inc eax; inc ecx; inc edx; 50 (push eax at Dword operand size).
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x42, 0x50]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.span.guest_len, 3);
+}

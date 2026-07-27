@@ -6185,3 +6185,67 @@ fn clif_arena_exhausted_short_circuits_every_admission_after_the_first_failure()
         assert_eq!(counters.compile_ns, at_fail.compile_ns, "{counters:#?}");
     }
 }
+
+/// The OTHER half of the stack-width gate, and the one nothing covered: a Word-size push on a
+/// THIRTY-TWO bit stack.
+///
+/// `clif_sixteen_bit_stack_stops_push_pop_admission` above uses unprefixed bytes, so it only
+/// exercises the 16-bit-stack-pointer arm. A 66-prefixed push in 32-bit code has a 32-bit stack
+/// pointer and a 16-bit DATA width, the two widths being orthogonal (386 PRM 16.2). Direct
+/// rewrites that case into a separate kind inside its compile loop, which this walker never
+/// runs, so the walker sees a plain `Push` and `lower_push` would write four bytes and decrement
+/// four where the guest moves two.
+///
+/// The unprefixed control beside it is what makes the negative attributable: it proves the stop
+/// is the operand-size arm and not the stack width or anything else about the corpus.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_word_operand_push_stops_admission_on_a_thirty_two_bit_stack() {
+    use crate::jit::clif::cache::walk_unit;
+
+    let entry = 0x1000u32;
+    // nop (starter); inc eax; 66 50 (push ax at Word operand size); hlt.
+    let code: &[u8] = &[0x90, 0x40, 0x66, 0x50, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    clif.registers
+        .set_segment(SegmentIndex::Ss, SegmentRegister::flat(0x10, 0x93));
+    let mut bus = TestBus::with_memory(memory.clone());
+    bus.direct_pages_enabled = true;
+    for offset in [entry + 1, entry + 2] {
+        clif.set_eip(offset);
+        clif.fetch_decoded(&mut bus, offset).expect("warm decode");
+    }
+
+    let layout = walk_unit(&clif, entry + 1, true).expect("walked layout");
+    assert_eq!(
+        layout.kinds.len(),
+        1,
+        "a Word-size push must stop growth even on a 32-bit stack"
+    );
+
+    // Control: the unprefixed push at the same entry IS admitted, so the stop above is the
+    // operand-size arm rather than the stack width.
+    let code: &[u8] = &[0x90, 0x40, 0x50, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    clif.registers
+        .set_segment(SegmentIndex::Ss, SegmentRegister::flat(0x10, 0x93));
+    let mut bus = TestBus::with_memory(memory.clone());
+    bus.direct_pages_enabled = true;
+    for offset in [entry + 1, entry + 2] {
+        clif.set_eip(offset);
+        clif.fetch_decoded(&mut bus, offset).expect("warm decode");
+    }
+    let layout = walk_unit(&clif, entry + 1, true).expect("walked layout");
+    assert_eq!(layout.kinds.len(), 2, "control: the Dword push is admitted");
+}
