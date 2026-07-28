@@ -865,35 +865,92 @@ fn cold_straight_line_code_is_seen_but_not_compiled() {
     assert_eq!(cpu.perf_counters().jit_direct_entries, 0);
 }
 
+/// A hot entry whose opcode the Direct backend cannot classify must stay on the interpreter, and
+/// must not fall through to the legacy region backend.
+///
+/// `LOOP_TARGET` is the branch target, so it is probed on every iteration: this is a HOT
+/// unsupported entry rather than a cold one. The tail behind it is ordinary lowerable code and
+/// does compile, which is what makes the rejection mean anything.
 #[test]
 fn hot_unsupported_entries_stay_interpreted_without_legacy_region_fallback() {
+    const LOOP_TARGET: u32 = 0x105;
+    const SECOND_BARRIER: u32 = 0x106;
+    const TAIL: u32 = 0x107;
+
     let mut memory = vec![0; 0x1000];
     memory[0x100..0x10d].copy_from_slice(&[
         0xb9,
         0x05,
         0x00,
         0x00,
-        0x00,           // mov ecx,5
-        DIRECT_BARRIER, // unsupported direct entry
-        DIRECT_BARRIER, // unsupported direct entry
+        0x00,           // 0x100 mov ecx,5
+        DIRECT_BARRIER, // 0x105 unsupported, AND the jnz target
+        DIRECT_BARRIER, // 0x106 unsupported
         0x83,
         0xe9,
-        0x01, // sub ecx,1
+        0x01, // 0x107 sub ecx,1
         0x75,
-        0xf9, // jnz 0x105
-        0xf4, // hlt
+        0xf9, // 0x10a jnz 0x105, rel8 -7 from 0x10c
+        0xf4, // 0x10c hlt
     ]);
     let mut cpu = fresh();
     cpu.set_jit_auto_admit(true);
     let mut bus = TestBus::with_memory(memory);
+    // Load-bearing, and its absence is what made this fixture vacuous. Without a direct page
+    // `code_page_covers_block` parks EVERY block Dormant whatever the bytes are, so the old
+    // assertions (no block installed, no entries) held for a reason with nothing to do with the
+    // barrier: the test passed with no compiled block anywhere in the program.
+    bus.direct_pages_enabled = true;
 
     drive(&mut cpu, &mut bus);
 
-    assert!(cpu.jit_direct.tracked_len() > 0);
-    assert_eq!(cpu.jit_direct.len(), 0);
-    assert_eq!(cpu.perf_counters().jit_direct_entries, 0);
-    assert_eq!(cpu.perf_counters().jit_region_entries, 0);
-    assert_eq!(cpu.registers.ecx(), 0);
+    // Snapshot BEFORE probing. `BlockCache::probe` inserts a `Seen` entry for an absent key and
+    // populates the hot table for a compiled one, so reading these afterwards would be reading
+    // state the assertions themselves created.
+    let installed = cpu.jit_direct.len();
+    let entries = cpu.perf_counters().jit_direct_entries;
+    let insns = cpu.perf_counters().jit_direct_insns;
+    let region_entries = cpu.perf_counters().jit_region_entries;
+
+    assert_eq!(cpu.registers.ecx(), 0, "the guest must still run correctly");
+
+    // The first half of the name. `Rejected` covers both `Dormant` and `Rejected(_)`, which is
+    // what is wanted here: either way the entry can never run natively.
+    for barrier in [LOOP_TARGET, SECOND_BARRIER] {
+        let key = jit::direct::key_for(&cpu, barrier, true).expect("barrier key");
+        assert!(
+            matches!(cpu.jit_direct.probe(key), jit::direct::BlockProbe::Rejected),
+            "the unsupported entry at {barrier:#x} must stay interpreted"
+        );
+    }
+
+    // THE POSITIVE CONTROL, and it is the point of the fixture. Without something that MUST
+    // compile, every rejection above is satisfied by a harness where nothing compiles at all.
+    let tail_key = jit::direct::key_for(&cpu, TAIL, true).expect("tail key");
+    assert!(
+        matches!(
+            cpu.jit_direct.probe(tail_key),
+            jit::direct::BlockProbe::Ready(_)
+        ),
+        "the lowerable tail behind the barriers must compile, or the rejections prove nothing"
+    );
+    assert_eq!(installed, 1, "one block, the tail, and never a barrier");
+    assert!(entries > 0, "the tail block must actually be entered");
+    // Two native instructions per entry is the tail alone. A barrier swallowed into the block
+    // would make it four or more. `entries > 0` above is what stops this holding vacuously at
+    // 0 == 0, which is the shape the old assertions had.
+    assert_eq!(
+        insns,
+        2 * entries,
+        "the block must be the tail and nothing else"
+    );
+
+    // The second half of the name, and it is an INVARIANT here rather than a live gate:
+    // `set_jit_auto_admit(true)` also calls `jit_regions.set_auto_admit(false)`, and the region
+    // path is entered only when direct auto-admit is OFF or under the IZARRAVM_JIT_REGION
+    // override, so this counter cannot move whatever the opcodes are. Kept because it is free and
+    // would catch a change to that admission gate.
+    assert_eq!(region_entries, 0);
 }
 
 /// A lowered NOP must actually EXECUTE inside a native block. Every other NOP fixture in the
