@@ -43,6 +43,10 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             | (0xd9, 0..=2, 0 | 2 | 3 | 5 | 7, 0..=7)
             | (0xd9, 3, 0 | 1, 0..=7)
             | (0xd9, 3, 5, 0 | 6)
+            // 0xDA memory forms: integer m32 arithmetic, all 8 sub-opcodes (`IntBinaryMemory`).
+            // The register row keeps only `(0xda, 3, 5, 1)`, FUCOMPP; every other 0xDA mod=3
+            // encoding is FCMOVcc and unrepresentable here, so it stays rejected.
+            | (0xda, 0..=2, 0..=7, 0..=7)
             | (0xda, 3, 5, 1)
             | (0xdb, 0..=2, 0 | 3, 0..=7)
             // 0xDC mod=3, the ST(i)-destination binaries. The ABSENCE of 2 and 3 from this
@@ -76,8 +80,9 @@ fn classifier_selects_exact_traced_slice() {
         }
     }
     // 461 before the control-word pair, 509 after it. 0xDC mod=3 adds six sub-opcodes across
-    // eight rm values: 6 * 8 = 48.
-    assert_eq!(accepted, 557);
+    // eight rm values: 6 * 8 = 48, landing at 557. 0xDA memory forms add 3 modes x 8 sub-opcodes
+    // x 8 rm values = 192, landing at 749.
+    assert_eq!(accepted, 749);
 }
 
 #[test]
@@ -98,6 +103,28 @@ fn classifier_preserves_operations_indices_and_addresses() {
                 index: 5,
             })
         );
+        // 0xDA memory forms: same op mapping as 0xD8, riding `NativeX87BinaryOp` unchanged.
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xda, 0, extension, 5)),
+            Some(NativeX87Insn::IntBinaryMemory {
+                op: expected,
+                addr: addr(),
+            })
+        );
+    }
+    // 0xDA mod=3 is FCMOVcc territory except for FUCOMPP at reg=5, rm=1 (pinned separately
+    // below); every other register-mode encoding must stay unclassifiable rather than being
+    // misread as IntBinaryMemory.
+    for reg in 0..=7u8 {
+        for rm in 0..=7u8 {
+            if (reg, rm) == (5, 1) {
+                continue;
+            }
+            assert!(
+                NativeX87Insn::classify(&insn(0xda, 3, reg, rm)).is_none(),
+                "0xda mod=3 reg={reg} rm={rm} (FCMOVcc) must stay unclassifiable"
+            );
+        }
     }
     assert_eq!(
         NativeX87Insn::classify(&insn(0xd9, 3, 0, 7)),
@@ -299,6 +326,37 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
+                terminates_block: false,
+            },
+        ),
+        // 0xDA memory forms: integer m32 arithmetic. `IntConvert16` (256 at I586), not
+        // `BinaryMemory`'s `F32Mem` (8), which is the whole point of giving this shape its own
+        // arm rather than joining `BinaryMemory`. FADD is the non-popping representative.
+        (
+            insn(0xda, 0, 0, 0),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::IntConvert16,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 4,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        // FICOMP, the popping representative: `pops` must read true here for the same reason
+        // `top_delta` must join the `BinaryMemory | BinaryRegister` group for this shape.
+        (
+            insn(0xda, 0, 3, 0),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::IntConvert16,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 4,
+                }),
+                pops: true,
                 terminates_block: false,
             },
         ),
@@ -709,6 +767,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
     for extension in 0..=7 {
         let op = NativeX87BinaryOp::from_extension(extension).expect("binary op");
         shapes.push(NativeX87Insn::BinaryMemory { op, addr: addr() });
+        shapes.push(NativeX87Insn::IntBinaryMemory { op, addr: addr() });
         shapes.push(NativeX87Insn::BinaryRegister { op, index: 3 });
     }
     for op in [
@@ -729,6 +788,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
 fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
     match insn {
         NativeX87Insn::BinaryMemory { .. }
+        | NativeX87Insn::IntBinaryMemory { .. }
         | NativeX87Insn::BinaryRegister { .. }
         | NativeX87Insn::LoadF32 { .. }
         | NativeX87Insn::StoreF32 { .. }
@@ -756,12 +816,12 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
 /// to `MAX_CHAIN_BLOCKS` hops inside a device deadline.
 ///
 /// The bound is sized for `FpOpClass::IntConvert16` (raw 20, I586 scale 256, 640 core clocks per
-/// slot, eight slots plus the raw allowance = 5,240 exactly), RAISED AHEAD of that class's first
-/// member (0xDA m32int) by an owner ruling so that slice measures its own effect cleanly. Until
-/// the shape joins the metadata table the derivation below tops out at 3,928 (LoadI32/StoreI32,
-/// IntConvert32) and the bound is deliberately generous by the difference; the moment it joins,
-/// the bound is tight again by construction and this test is what keeps any costlier future
-/// shape from shipping a silent under-estimate of the chain budget.
+/// slot, eight slots plus the raw allowance = 5,240 exactly). It was RAISED AHEAD of that class's
+/// first member (0xDA m32int) by an owner ruling so that slice would measure its own effect
+/// cleanly, and the headroom is now consumed: `IntBinaryMemory` is that first member, the
+/// derivation below lands on exactly 5,240, and the equality assertion pins the bound tight. Any
+/// future costlier shape must raise `MAX_X87_BLOCK_CORE_CLOCKS` in step with adding itself here,
+/// or this test fails instead of shipping a silent under-estimate of the chain budget.
 #[test]
 fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
     let shapes = every_x87_shape();
@@ -791,5 +851,16 @@ fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
          allows a block costing {derived} ({MAX_X87_SLOTS} slots x {worst_fp_slot} core clocks \
          plus {MAX_X87_BLOCK_INSTRUCTIONS} x {WORST_CONSTANT_RAW_CLOCKS} raw). Raise the constant \
          and re-measure: it feeds the chain quota, so widening it changes when devices advance."
+    );
+    // The bound is TIGHT as of this slice (0xDA m32int, `FpOpClass::IntConvert16`, is the worst
+    // admissible slot and its cost was what `MAX_X87_BLOCK_CORE_CLOCKS` was pre-raised for). A
+    // future ahead-of-time raise of the constant, or a costlier shape joining the table, must
+    // adjust both sides of this equality together; without it, mutations that undercharge the new
+    // shape (a wrong `fp_class` or `raw_clocks`) would pass the `<=` above trivially by falling
+    // back under the old IntConvert32 worst case, and this assertion is what catches that.
+    assert_eq!(
+        derived, MAX_X87_BLOCK_CORE_CLOCKS,
+        "the derived bound no longer matches MAX_X87_BLOCK_CORE_CLOCKS exactly; both sides of \
+         this pin must move together"
     );
 }

@@ -64,7 +64,27 @@ fn direct_memory(mut memory: Vec<u8>) -> TestBus {
     bus
 }
 
-fn assert_program_matches(mode: GswMode, memory: Vec<u8>, control: u16) -> (CpuGsw, TestBus) {
+/// How strictly a differential fixture pins the number of instructions the native side actually
+/// retired, on top of the state comparison every fixture already gets.
+///
+/// `AtLeastOne` is the historical behaviour: it only proves SOME prefix of the program ran
+/// natively, which is enough when the state comparison itself is the point. `Exact` is the
+/// stronger MID-BLOCK gate the 0xDA slice fixtures need: a block that silently stopped short of
+/// the instruction under test (a classify regression, say) would still compare correctly against
+/// the interpreter, because both sides would just be running the interpreter for that
+/// instruction. Pinning the exact retirement count catches that the instruction under test
+/// actually went through the native path rather than falling back invisibly.
+enum InsnsExpectation {
+    AtLeastOne,
+    Exact(u64),
+}
+
+fn assert_program_matches_impl(
+    mode: GswMode,
+    memory: Vec<u8>,
+    control: u16,
+    expect_insns: InsnsExpectation,
+) -> (CpuGsw, TestBus) {
     let mut direct = x87_cpu(mode);
     let mut interpreter = x87_cpu(mode);
     let mut direct_bus = direct_memory(memory.clone());
@@ -104,12 +124,43 @@ fn assert_program_matches(mode: GswMode, memory: Vec<u8>, control: u16) -> (CpuG
         interpreter_bus.trace.elapsed_clocks(),
         "bus timing differs"
     );
-    assert!(
-        direct.perf_counters().jit_direct_insns > before,
-        "the x87 sequence did not run natively: {:?}",
-        direct.perf_counters()
-    );
+    let retired = direct.perf_counters().jit_direct_insns - before;
+    match expect_insns {
+        InsnsExpectation::AtLeastOne => assert!(
+            retired > 0,
+            "the x87 sequence did not run natively: {:?}",
+            direct.perf_counters()
+        ),
+        InsnsExpectation::Exact(expected) => assert_eq!(
+            retired,
+            expected,
+            "native instructions retired differ from the expected count, meaning a slot lost \
+             its native retirement (or gained an extra one): {:?}",
+            direct.perf_counters()
+        ),
+    }
     (direct, direct_bus)
+}
+
+fn assert_program_matches(mode: GswMode, memory: Vec<u8>, control: u16) -> (CpuGsw, TestBus) {
+    assert_program_matches_impl(mode, memory, control, InsnsExpectation::AtLeastOne)
+}
+
+/// Like `assert_program_matches`, but also pins the EXACT number of instructions the native side
+/// retired rather than just proving it retired more than zero. See `InsnsExpectation` for why
+/// that distinction matters for a mid-block fixture.
+fn assert_program_matches_exact_insns(
+    mode: GswMode,
+    memory: Vec<u8>,
+    control: u16,
+    expected_insns: u64,
+) -> (CpuGsw, TestBus) {
+    assert_program_matches_impl(
+        mode,
+        memory,
+        control,
+        InsnsExpectation::Exact(expected_insns),
+    )
 }
 
 fn quake_hot_program() -> Vec<u8> {
@@ -1470,4 +1521,197 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     assert_eq!(direct.timing_rem, interpreter.timing_rem);
     assert_eq!(direct.fp_rem, interpreter.fp_rem);
     assert_eq!(direct_bus.memory, interpreter_bus.memory);
+}
+
+// Slice 38: 0xDA m32int arithmetic (`NativeX87Insn::IntBinaryMemory`). Every fixture below places
+// the 0xDA form MID-BLOCK, between plain integer instructions, and pins the EXACT number of
+// native instructions retired rather than merely `> 0`. A classify or emit regression that made
+// the 0xDA slot fall back to the interpreter would otherwise still pass a plain state comparison:
+// both sides would just be running the interpreter for that one instruction, and the fixture
+// would end up certifying the interpreter against itself.
+
+/// Two FLDs and a register FADD warm the block up, deliberately leaving VALUE0's residue (A+B)
+/// different from the true ST(0) (B) the 0xDA op must read. A dropped `emit_load_physical` on the
+/// operand (mutation 5 in the design battery) would then compute against the stale residue
+/// instead of accidentally landing on the right value, which is what makes the divergence
+/// detectable. The 0xDA op itself sits directly between two plain integer MOVs.
+fn fi_arith_program(extension: u8, operand: i32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![
+        0xd9,
+        0x05,
+        0x00,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x200]        ST(0)=A
+        0xd9,
+        0x05,
+        0x04,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x204]        ST(0)=B, ST(1)=A
+        0xdc,
+        0xc1, // fadd st(1),st(0)                                  ST(1)=A+B, ST(0)=B
+        0xb8,
+        0x01,
+        0x00,
+        0x00,
+        0x00, // mov eax,1
+        0xda,
+        (extension << 3) | 5,
+    ];
+    code.extend_from_slice(&(DATA as u32 + 8).to_le_bytes()); // fi<op> dword [0x208], mid-block
+    code.extend_from_slice(&[
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2
+        0xd9, 0x1d, 0x0c, 0x02, 0x00, 0x00, // fstp dword [0x20c]
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&3.0f32.to_bits().to_le_bytes()); // A
+    memory[DATA + 4..DATA + 8].copy_from_slice(&5.0f32.to_bits().to_le_bytes()); // B
+    memory[DATA + 8..DATA + 12].copy_from_slice(&operand.to_le_bytes());
+    memory
+}
+
+/// FIADD, FIMUL and FIDIV against a non-zero m32int operand. Zero is deliberately excluded here:
+/// it converts identically whether the operand is read as an i32 or misread as an f32 bit
+/// pattern reinterpreted some other way, so a zero operand would let a wrong-convert mutation
+/// (swapping `vcvtsi2sd` for `vcvtss2sd`) survive undetected.
+#[test]
+fn fiadd_fimul_and_fidiv_with_a_nonzero_operand_match_the_interpreter() {
+    // (extension, operand, expected ST(0) result). ST(0) entering the 0xDA slot is B = 5.0.
+    let cases = [(0u8, 4i32, 9.0f32), (1, 4, 20.0), (6, 4, 1.25)];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (extension, operand, expected) in cases {
+            let (cpu, bus) = assert_program_matches_exact_insns(
+                mode,
+                fi_arith_program(extension, operand),
+                0x0f7f,
+                7, // fld, fld, fadd, mov, fi<op>, mov, fstp -- hlt never retires natively
+            );
+            assert_eq!(
+                f32::from_bits(u32::from_le_bytes(
+                    bus.memory[DATA + 12..DATA + 16].try_into().unwrap()
+                )),
+                expected,
+                "mode={mode:?} extension={extension}"
+            );
+            assert_eq!(
+                cpu.perf_counters().jit_direct_side_exits,
+                0,
+                "mode={mode:?} extension={extension}"
+            );
+        }
+    }
+}
+
+/// FICOM's three-way condition bits: ST(0) above, equal to and below the m32int operand. FICOM
+/// does not pop, so `top_delta` for this shape stays provably separate from FICOMP's.
+#[test]
+fn ficom_condition_bits_match_the_interpreter_above_equal_and_below() {
+    // ST(0) entering the 0xDA slot is B = 5.0. (operand, expected C3|C2|C0 bits).
+    let cases = [
+        (3i32, 0u16), // ST(0) > operand: above
+        (5, 1 << 14), // ST(0) == operand: equal
+        (7, 1 << 8),  // ST(0) < operand: below
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (operand, expected_bits) in cases {
+            let (cpu, _) = assert_program_matches_exact_insns(
+                mode,
+                fi_arith_program(2, operand), // /2 FICOM
+                0x0f7f,
+                7,
+            );
+            assert_eq!(
+                cpu.fpu.status & 0x4500,
+                expected_bits,
+                "mode={mode:?} operand={operand}"
+            );
+            assert_eq!(cpu.perf_counters().jit_direct_side_exits, 0);
+        }
+    }
+}
+
+/// The `top_delta` trap: FICOMP pops, so the x87 slot immediately behind it must address the
+/// PHYSICAL register the pop left as the new ST(0), not the one that was ST(0) before the pop.
+/// If `top_delta` stayed in the `=> 0` group (the mutation this fixture exists to catch), the
+/// compile-time TOP tracking used for this follow-on FSTP would stay stale, and it would either
+/// address the wrong physical register (corrupting the stored value) or trip the empty-tag guard
+/// on the register the real runtime pop just vacated (an unexpected side exit). Either way the
+/// exact-retirement gate and the state comparison below catch it; a correct compile does neither.
+fn ficomp_followed_by_fstp_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                    integer, before
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]      ST(0)=A
+        0xd9, 0x05, 0x04, 0x02, 0x00, 0x00, // fld dword [0x204]      ST(0)=B, ST(1)=A
+        0xda, 0x1d, 0x08, 0x02, 0x00, 0x00, // ficomp dword [0x208]   pops: ST(0)=A now
+        0xd9, 0x1d, 0x0c, 0x02, 0x00, 0x00, // fstp dword [0x20c]     the top_delta trap
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2                    integer, after
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&3.0f32.to_bits().to_le_bytes()); // A
+    memory[DATA + 4..DATA + 8].copy_from_slice(&5.0f32.to_bits().to_le_bytes()); // B
+    memory[DATA + 8..DATA + 12].copy_from_slice(&5i32.to_le_bytes()); // ties B, condition bits inert
+    memory
+}
+
+#[test]
+fn ficomp_followed_by_another_x87_slot_addresses_the_popped_stack_correctly() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (cpu, bus) = assert_program_matches_exact_insns(
+            mode,
+            ficomp_followed_by_fstp_program(),
+            0x0f7f,
+            6, // mov, fld, fld, ficomp, fstp, mov -- hlt never retires natively
+        );
+        assert_eq!(
+            f32::from_bits(u32::from_le_bytes(
+                bus.memory[DATA + 12..DATA + 16].try_into().unwrap()
+            )),
+            3.0, // A: what the pop left as the new ST(0)
+            "mode={mode:?}"
+        );
+        assert_eq!(cpu.fpu.top(), 0, "mode={mode:?}");
+        assert_eq!(
+            cpu.perf_counters().jit_direct_side_exits,
+            0,
+            "mode={mode:?}"
+        );
+    }
+}
+
+/// FIDIV by an integer zero. The conversion itself is always finite (an integer can never convert
+/// to NaN or infinity), so the division is what produces the infinity, and `emit_finite_guard`
+/// inside `emit_binary_st0` catches it on the RESULT before any x87 state is touched. The native
+/// side exits at that guard; the interpreter re-executes the instruction and records ZE. Only the
+/// two integer instructions before the 0xDA slot retire natively every pass: the FIDIV always
+/// re-takes the same exit, and the two-instruction tail behind it (mov, hlt) never gets hot enough
+/// to compile on its own.
+#[test]
+fn a_fidiv_by_integer_zero_exits_before_touching_x87_state() {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1               integer, before
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200] ST(0)=5.0, mid-block
+        0xda, 0x35, 0x04, 0x02, 0x00, 0x00, // fidiv dword [0x204]  /6, operand=0
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2               integer, after (interpreted)
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&5.0f32.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&0i32.to_le_bytes());
+
+    let (cpu, _) =
+        assert_program_matches_exact_insns(GswMode::Gsw586, memory, 0x0f7f, 2 /* mov, fld */);
+    assert!(
+        cpu.perf_counters().jit_direct_exit_other > 0,
+        "the infinite result must side-exit rather than be stored"
+    );
+    assert_ne!(cpu.fpu.status & 0x04, 0, "the interpreter recorded ZE");
 }
