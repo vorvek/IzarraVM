@@ -3832,7 +3832,11 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
     // The two `inc` fillers put the push at the third slot, per the HLT-is-not-a-terminal note
     // above.
     const PUSH_ENTRY: u32 = 0x100;
-    let mut memory = vec![0; 0x2000];
+    // 0x3000 so the STACK lives in a different PAGE from the source. `flags()` is one table
+    // per page shared by the read and write maps, so a permissive write mapping on the
+    // source's own page silently clears the supervisor bit the read mapping set and the
+    // source stops refusing at all. Source 0x300 is page 0; the stack at 0x1ffc is page 1.
+    let mut memory = vec![0; 0x3000];
     memory[PUSH_ENTRY as usize..PUSH_ENTRY as usize + 9].copy_from_slice(&[
         0x40, // inc eax
         0x41, // inc ecx
@@ -3846,7 +3850,7 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
     bus.direct_pages_enabled = true;
     promote_to_cpl3(&mut cpu);
     cpu.registers.eip = PUSH_ENTRY;
-    cpu.registers.set_esp(0x1000);
+    cpu.registers.set_esp(0x2000);
 
     // Warm the decode cache, exactly as in Phase 1: `key_for` needs a fetched physical start.
     for lin in [PUSH_ENTRY, PUSH_ENTRY + 1, PUSH_ENTRY + 2, PUSH_ENTRY + 8] {
@@ -3880,7 +3884,7 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
     // page as the code. Populating page 0x1000 instead leaves page 0 carrying whatever the code
     // fetch gave it, which is supervisor-only, so the stack lane refuses and the mutation stays
     // invisible. That mistake was made once here already.
-    let stack_addr = 0x1000u32.wrapping_sub(4);
+    let stack_addr = 0x2000u32.wrapping_sub(4);
     let stack_page = bus
         .direct_page(stack_addr, BusAccessKind::DataWrite)
         .unwrap()
