@@ -1064,6 +1064,65 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 terminal = true;
                 break;
             }
+            DirectKind::JmpMem { addr } => {
+                // Modelled on the Ret arm above, minus the ESP adjust: the address is the
+                // operand's own `addr`, not the stack slot, and the wrap is `memory.address_wrap`
+                // (a 66-prefixed Dword form in a CS.D = 0 segment needs the Word wrap), not
+                // `AddressWrap::None`.
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                let limit = memory.segments.cs.limit;
+                let limit_exit = (limit != u32::MAX).then(|| e.label());
+                emit_ram_read_pointer_inner(
+                    &mut e,
+                    MemoryWidth::Dword,
+                    addr,
+                    memory,
+                    reasons,
+                    memory.address_wrap,
+                );
+                e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
+                if let Some(limit_exit) = limit_exit {
+                    e.cmp_r32_imm32(Reg::RDX, limit);
+                    e.jcc(7, limit_exit);
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                }
+                emit_mode13_read_completion(&mut e, MemoryWidth::Dword);
+                // Re-load the target. `emit_mode13_read_completion` clobbers RDX on its mode13
+                // branch, the exact bug the Ret arm shipped once and fixed above: the completion
+                // is emitted AFTER the last side-exit branch, so RDI still holds the pointer and
+                // reloading from it is the only way to get the target back into RDX.
+                e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                completed += 1;
+                completed_raw += slot.kind.raw_clocks() as u16;
+                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
+                completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
+                completed_dword_reads += slot.kind.dword_reads();
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                );
+                terminal = true;
+                break;
+            }
             DirectKind::Jcc {
                 condition,
                 taken_delta,

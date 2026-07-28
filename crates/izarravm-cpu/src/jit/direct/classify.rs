@@ -705,14 +705,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // occurrences of it on this corpus. Refusing it is a missed lowering worth
                 // nothing; mapping it onto `Push` without checking is a timing bug.
                 //
-                // /2 CALL, /3 far CALL, /4 JMP and /5 far JMP are not lowered here. The two near
-                // forms are control transfers with a DYNAMIC target and need the successor
-                // machinery `Ret` uses; the far forms load a descriptor.
+                // /2 CALL, /3 far CALL and /5 far JMP are not lowered here. /2 is a control
+                // transfer with a DYNAMIC target and needs the successor machinery `Ret` uses;
+                // the far forms load a descriptor.
                 if m.reg == 6 {
                     let DecodedOperand::Mem(addr) = insn.operand? else {
                         return None;
                     };
                     return Some(DirectKind::PushMem {
+                        addr: direct_addr(addr)?,
+                    });
+                }
+                // /4 JMP r/m32, MEMORY form only. `0xff` is in the `OperandSize::Word` allowlist
+                // above, so a 66-prefixed `FF /4` in 32-bit code reaches this arm at Word size.
+                // NOTHING downstream refuses that: `uses_stack` is false for a jump, so the
+                // stack-width admission matrix never sees this kind, and `static_control_target`
+                // is `None` for a dynamic target, so the Word control clamp never sees it either.
+                // This check is the only gate, on I586 (every other persona refuses Word before
+                // reaching here). At Word size the interpreter reads TWO bytes and masks EIP to
+                // 16 bits; lowering that as the Dword construction reads four bytes and jumps
+                // unmasked, a miscompile twice over.
+                if m.reg == 4 {
+                    if insn.operand_size != OperandSize::Dword {
+                        return None;
+                    }
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None; // register form: census zero, PUSH-r32-style clock risk
+                    };
+                    return Some(DirectKind::JmpMem {
                         addr: direct_addr(addr)?,
                     });
                 }

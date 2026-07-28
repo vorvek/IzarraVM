@@ -2262,6 +2262,30 @@ pub(crate) enum DirectKind {
     PushMem {
         addr: DirectAddr,
     },
+    /// JMP r/m32, MEMORY form (0xFF /4): one dword read at `addr`, and EIP becomes the value
+    /// read. Nothing else changes: no stack, no push, no flags.
+    ///
+    /// The register form (mod == 3) is deliberately absent. It is architecturally `JMP r32`, and
+    /// the same PUSH-r32-style reasoning that keeps `PushMem`'s register form out applies here:
+    /// its clock charge is unverified against this corpus and the attribution census measures
+    /// zero occurrences of it.
+    ///
+    /// `raw_clocks` carries an explicit 7, joining the `Call`/`Call16`/`Jmp` arm: the
+    /// interpreter's group-5 arm 4 returns `clocks(7)`, and the `_ => 2` default would undercharge
+    /// by 5.
+    ///
+    /// The first non-`Ret` kind with a DYNAMIC successor. That makes the `successors` and
+    /// `dynamic_successor` registrations mutually exclusive on this block by an invariant of
+    /// `LinkCell`, not by convention: `LinkCell::clear` resets the portal, `entry_top` and
+    /// spilling, but not `target_eip`, and a static `set` writes only the portal. So a cell that
+    /// was once dynamically bound to some EIP and is later statically rebound still carries the
+    /// old `target_eip`, and any later jump landing on that stale value transfers natively into
+    /// whatever block the static rebind pointed at, the wrong one. Recording a static successor
+    /// for this kind alongside its dynamic one would set up exactly that trap the next time the
+    /// cell's static edge is retargeted.
+    JmpMem {
+        addr: DirectAddr,
+    },
     X87 {
         insn: NativeX87Insn,
         addr: Option<DirectAddr>,
@@ -2364,7 +2388,7 @@ impl DirectKind {
             // 0F A3 returns clocks(6) irrespective of operand size. Without this arm it rides
             // the `_ => 2` default and undercharges every BT by 4.
             Self::Bt { .. } => 6,
-            Self::Call { .. } | Self::Call16 { .. } | Self::Jmp { .. } => 7,
+            Self::Call { .. } | Self::Call16 { .. } | Self::Jmp { .. } | Self::JmpMem { .. } => 7,
             // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
             // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
             Self::Ret { .. } | Self::Ret16 { .. } => 10,
@@ -2469,6 +2493,7 @@ impl DirectKind {
                     | Self::Leave
                     | Self::Ret { .. }
                     | Self::PushMem { .. }
+                    | Self::JmpMem { .. }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword),
         )
     }
@@ -2645,7 +2670,9 @@ impl DirectKind {
                 }
                 MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE,
             },
-            Self::Pop { .. } | Self::Leave | Self::Ret { .. } => COUNTER_MODE13_DWORD_READ,
+            Self::Pop { .. } | Self::Leave | Self::Ret { .. } | Self::JmpMem { .. } => {
+                COUNTER_MODE13_DWORD_READ
+            }
             // A Word read lands on the BYTE counter lane, matching `Load { Word }`:
             // `emit_mode13_read_completion` routes Word to the byte-read slot.
             Self::Pop16 { .. } | Self::Ret16 { .. } => COUNTER_MODE13_BYTE_READ,
@@ -2684,7 +2711,8 @@ impl DirectKind {
             | Self::DoubleShiftMem { addr, .. }
             | Self::TestImmMem { addr, .. }
             | Self::RmwIncDec { addr, .. }
-            | Self::PushMem { addr, .. } => Some(addr.segment),
+            | Self::PushMem { addr, .. }
+            | Self::JmpMem { addr, .. } => Some(addr.segment),
             Self::X87 {
                 insn,
                 addr: Some(addr),
@@ -2757,6 +2785,7 @@ impl DirectKind {
                 | Self::Leave
                 | Self::Ret { .. }
                 | Self::PushMem { .. }
+                | Self::JmpMem { .. }
         ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword)
     }
 
@@ -2814,6 +2843,7 @@ impl DirectKind {
             Self::Call { .. }
                 | Self::Call16 { .. }
                 | Self::Jmp { .. }
+                | Self::JmpMem { .. }
                 | Self::Ret { .. }
                 | Self::Ret16 { .. }
                 | Self::Jcc { .. }
@@ -3082,6 +3112,7 @@ pub(crate) fn unit_growth_classify(
     let terminal = match kind {
         DirectKind::Jcc { taken_delta, .. } => Some(UnitTerminal::Jcc { taken_delta }),
         DirectKind::Jmp { .. } => Some(UnitTerminal::Jmp),
+        DirectKind::JmpMem { .. } => Some(UnitTerminal::Jmp),
         DirectKind::Call { .. } => Some(UnitTerminal::Call),
         DirectKind::Ret { .. } => Some(UnitTerminal::Ret),
         _ => None,
@@ -3582,7 +3613,7 @@ fn compile_with_instruction_limit(
     };
     let dynamic_successor = matches!(
         slots.last().map(|slot| slot.kind),
-        Some(DirectKind::Ret { .. } | DirectKind::Ret16 { .. })
+        Some(DirectKind::Ret { .. } | DirectKind::Ret16 { .. } | DirectKind::JmpMem { .. })
     );
     let successors = match slots.last().map(|slot| slot.kind) {
         Some(DirectKind::Jcc { taken_delta, .. }) => [
@@ -3603,7 +3634,9 @@ fn compile_with_instruction_limit(
             }),
             None,
         ],
-        Some(DirectKind::Ret { .. } | DirectKind::Ret16 { .. }) => [None, None],
+        Some(DirectKind::Ret { .. } | DirectKind::Ret16 { .. } | DirectKind::JmpMem { .. }) => {
+            [None, None]
+        }
         _ => [Some(fallthrough), None],
     };
     let link_cells = [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())];
