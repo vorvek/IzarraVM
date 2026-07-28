@@ -717,6 +717,108 @@ fn control_word_forms_match_the_interpreter_in_ram_and_in_the_aperture() {
     }
 }
 
+/// The 0xDA m32int aperture fixture, modelled directly on
+/// `control_word_forms_match_the_interpreter_in_ram_and_in_the_aperture` above: drive-based,
+/// `direct_page_clocks` on, comparing the aggregate bus clocks rather than a per-access trace,
+/// because native execution batches the whole compiled window and emits no per-access log.
+///
+/// `esi`-relative addressing (mod=10, rm=110), same shape as the control-word case, so a
+/// `read_segment` that wrongly dropped DS from the block's mask would be caught the same way.
+fn int_binary_memory_case(extension: u8, target: u32) -> Vec<u8> {
+    let mut code = vec![0xdau8, 0x86 | (extension << 3)];
+    code.extend_from_slice(&target.to_le_bytes());
+    code.push(0x8b);
+    code.push(0x96); // mov edx,[esi+disp32]
+    code.extend_from_slice(&(target + 4).to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0xf4]); // mov esi,esi ; hlt
+    code
+}
+
+#[test]
+fn int_binary_memory_matches_the_interpreter_in_ram_and_in_the_aperture() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    const EXTENSION: u8 = 0; // FIADD
+    for target in [RAM, MODE13] {
+        let code = int_binary_memory_case(EXTENSION, target);
+        let mut memory = vec![0; 0x000b_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        memory[target as usize..target as usize + 4].copy_from_slice(&4i32.to_le_bytes());
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        native.registers.eip = ENTRY;
+        interp.registers.eip = ENTRY;
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 6, ENTRY + 12];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                target,
+                target,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                true,
+            );
+            cpu.fpu = X87::default();
+            cpu.fpu.push(5.0);
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            cpu.set_eip(ENTRY);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.fp_rem = 3;
+            cpu.core_clocks_so_far = 0;
+            bus.trace = BusTrace::default();
+        }
+        let label = format!("fiadd at {target:#x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: did not run directly"
+        );
+        for _ in 0..block.span().instructions {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
+        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+        assert_eq!(native.fp_rem, interp.fp_rem, "{label}: x87 remainder");
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "{label}: bus clocks"
+        );
+        assert_eq!(native.fpu.get(0), 9.0, "{label}: FIADD result"); // 5.0 + 4
+    }
+}
+
 /// Value, flag and timing identity against the interpreter, on both a plain-RAM target and the
 /// mode13 aperture. The mode13 half is not just coverage: an under-declared read trips a
 /// debug_assert in the run loop there, which is a loud failure, whereas the RAM half only shows up
