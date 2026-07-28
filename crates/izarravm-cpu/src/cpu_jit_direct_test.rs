@@ -3465,6 +3465,341 @@ fn a_mid_block_push_through_memory_matches_the_interpreter() {
     assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 4);
 }
 
+/// CALL through a register, executed NATIVELY in the middle of a block, and compared against the
+/// interpreter across the whole run, including the code the call lands on.
+///
+/// Modelled on `a_mid_block_jmp_through_memory_matches_the_interpreter` for the terminal/target
+/// shape (a starter so the block's own entry is the filler, not the call; a target too short to
+/// compile on its own) and on `a_mid_block_push_through_memory_matches_the_interpreter` for the
+/// stack write: `CallReg` is both at once, a terminal with a dynamic successor AND a
+/// return-address push.
+#[test]
+fn a_mid_block_call_through_a_register_matches_the_interpreter() {
+    const TARGET: u32 = 0x200;
+    let mut memory = vec![0; 0x2000];
+    memory[0x100..0x104].copy_from_slice(&[
+        0x90, // starter
+        0x40, // inc eax
+        0xff, 0xd3, // call ebx, MID-BLOCK, TERMINAL
+    ]);
+    // The target: two more instructions, too short to compile on its own, then HLT.
+    memory[TARGET as usize..TARGET as usize + 3].copy_from_slice(&[
+        0x41, // inc ecx
+        0x46, // inc esi
+        0xf4, // hlt
+    ]);
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    for cpu in [&mut interp, &mut native] {
+        widen_stack_to_32_bit(cpu);
+        cpu.registers.set_esp(0x1000);
+        cpu.registers.set_ebx(TARGET);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        native.registers.set_esp(0x1000);
+        native.registers.set_ebx(TARGET);
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(
+        native.jit_direct.len(),
+        1,
+        "only the source block should have compiled: the target is two slots, below the minimum"
+    );
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0x1000);
+        cpu.registers.set_ebx(TARGET);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.memory[0x0ffc..0x1000].fill(0);
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    // The AGGREGATE, not `trace.cycles()`, for the same reason as the PushMem and JmpMem mid-block
+    // fixtures: native execution batches the whole compiled window and emits no per-access log.
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.eip, interp.registers.eip);
+    assert_eq!(native.registers.esp(), 0x0ffc, "ESP must fall by exactly 4");
+    assert_eq!(
+        u32::from_le_bytes(native_bus.memory[0x0ffc..0x1000].try_into().unwrap()),
+        0x104,
+        "the pushed return address must be the EIP right after the two-byte call, not the \
+         five-byte E8 form's"
+    );
+    // Anti-vacuity, and the load-bearing assertion. The compiled block is the filler plus the
+    // call (the starter is a single cold visit, never part of the compiled span). Two native
+    // instructions means the call itself retired natively rather than the block silently
+    // stopping before it.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
+}
+
+/// `call esp`, the case the review's B1 resolution made lowerable: the reload of the target moves
+/// BEFORE the ESP adjust, so `home(dst)` delivers the PRE-push value for every `dst`, ESP
+/// included. A reload placed AFTER `sub esp, 4` (the original, wrong construction) would deliver
+/// the POST-adjust ESP, four too low, and land this call four bytes short of where the
+/// interpreter lands it.
+///
+/// Full differential, native against the interpreter, rather than a single-instruction check:
+/// this is the one fixture whose entire point is that placement, so it has to prove the whole
+/// state converges, not just that the exit doesn't panic.
+#[test]
+fn a_mid_block_call_through_esp_matches_the_interpreter() {
+    const TARGET: u32 = 0x300;
+    let mut memory = vec![0; 0x2000];
+    memory[0x100..0x104].copy_from_slice(&[
+        0x90, // starter
+        0x40, // inc eax
+        0xff, 0xd4, // call esp, MID-BLOCK, TERMINAL
+    ]);
+    memory[TARGET as usize..TARGET as usize + 3].copy_from_slice(&[
+        0x41, // inc ecx
+        0x46, // inc esi
+        0xf4, // hlt
+    ]);
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    for cpu in [&mut interp, &mut native] {
+        widen_stack_to_32_bit(cpu);
+        cpu.registers.set_esp(TARGET);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        native.registers.set_esp(TARGET);
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(native.jit_direct.len(), 1);
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(TARGET);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.memory[TARGET as usize - 4..TARGET as usize].fill(0);
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(
+        native.registers.eip, interp.registers.eip,
+        "call esp must land at the PRE-push ESP, and both sides run the same target code onward"
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            native_bus.memory[TARGET as usize - 4..TARGET as usize]
+                .try_into()
+                .unwrap()
+        ),
+        0x104,
+        "the pushed return address"
+    );
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
+}
+
+/// The CS-limit guard on the dynamic target: a register holding a value ABOVE the code segment
+/// limit must side exit before the return address is ever pushed, and the interpreter's own
+/// re-run of the same instruction must agree exactly. `CallReg`'s own interpreter arm performs no
+/// such check at all (`execute_extended.rs:914-918` just reads the register, pushes, and stores),
+/// so the fault surfaces only on the FOLLOWING fetch, not on the call itself: the same shape as
+/// `finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_precisely`
+/// (`cpu_jit_direct_timing_test.rs`).
+///
+/// Real mode, where `cs.limit` is 0xFFFF by construction (`fresh()`'s `load_segment_real`), rather
+/// than the Quake-segmented harness that sibling fixture uses: the check is identical either way,
+/// and real mode is the simplest setting that exercises it.
+#[test]
+fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faults_precisely() {
+    const ENTRY: u32 = 0x100;
+    const CALL: u32 = ENTRY + 2;
+    const INITIAL_ESP: u32 = 0x1000;
+    // Above the real-mode 0xFFFF CS limit.
+    const TARGET: u32 = 0x1_0000;
+    let mut memory = vec![0; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + 4].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xd3, // call ebx
+    ]);
+
+    let mut native = fresh();
+    let mut interp = fresh();
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    for cpu in [&mut native, &mut interp] {
+        widen_stack_to_32_bit(cpu);
+        cpu.registers.set_esp(INITIAL_ESP);
+        cpu.registers.set_ebx(TARGET);
+        cpu.registers.eip = ENTRY;
+    }
+
+    for lin in [ENTRY, ENTRY + 1, CALL] {
+        native.registers.eip = lin;
+        native
+            .fetch_decoded(&mut native_bus, lin)
+            .expect("fixture decode");
+        interp.registers.eip = lin;
+        interp
+            .fetch_decoded(&mut interp_bus, lin)
+            .expect("fixture decode");
+    }
+    native.registers.eip = ENTRY;
+    interp.registers.eip = ENTRY;
+    native.jit_direct.set_fast_map_enabled_for_test(true);
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        0,
+        0,
+        jit::fast_map::PagePermissions::UNPAGED,
+        false,
+        true,
+    );
+
+    let key = jit::direct::key_for(&native, ENTRY, true).unwrap();
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut native, ENTRY, true).unwrap();
+    assert_eq!(compilation.span.instructions, 3);
+    let id = native.jit_direct.install(&compilation).unwrap();
+    let block = native
+        .jit_direct
+        .block(id)
+        .expect("installed block must be live");
+
+    let side_exits = native.perf_counters().jit_direct_side_exits;
+    let other_exits = native.perf_counters().jit_direct_exit_other;
+    let insns_before = native.perf_counters().jit_direct_insns;
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    interp.cycle(&mut interp_bus).unwrap();
+    interp.cycle(&mut interp_bus).unwrap();
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        native.registers.eip, CALL,
+        "the side exit must leave EIP at the call itself: CallReg writes EIP, pushes, and adjusts \
+         ESP only after every guard passes"
+    );
+    assert_eq!(
+        native.registers.esp(),
+        INITIAL_ESP,
+        "the native side exit must leave ESP untouched: the push never happened"
+    );
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.perf_counters().jit_direct_side_exits - side_exits, 1);
+    assert_eq!(
+        native.perf_counters().jit_direct_exit_other - other_exits,
+        1
+    );
+    // Anti-vacuity: only the two fillers retired natively; the call itself never completed.
+    assert_eq!(native.perf_counters().jit_direct_insns - insns_before, 2);
+
+    // The interpreter's own arm has no limit check: both sides must execute the call itself
+    // successfully, pushing the return address and landing EIP on the too-large target.
+    let native_call = native.decode_cache.get(CALL, true).unwrap();
+    let interp_call = interp.decode_cache.get(CALL, true).unwrap();
+    native
+        .execute_decoded(&native_call, &mut native_bus)
+        .unwrap();
+    interp
+        .execute_decoded(&interp_call, &mut interp_bus)
+        .unwrap();
+    assert_eq!(native.registers.eip, TARGET);
+    assert_eq!(interp.registers.eip, TARGET);
+    assert_eq!(native.registers.esp(), INITIAL_ESP - 4);
+    assert_eq!(interp.registers.esp(), INITIAL_ESP - 4);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+
+    // The fault surfaces on the FOLLOWING fetch, exactly as JmpMem's own CS-limit fixture
+    // documents.
+    let native_fault = native.fetch_decoded(&mut native_bus, native.registers.eip);
+    let interp_fault = interp.fetch_decoded(&mut interp_bus, interp.registers.eip);
+    for fault in [native_fault, interp_fault] {
+        assert!(matches!(
+            fault,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            })
+        ));
+    }
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+}
+
 /// PUSH through memory where source and destination are the SAME dword, `push dword [esp-4]`.
 ///
 /// The page guard forces both addresses to 4-byte alignment, so the source and destination are
@@ -4141,6 +4476,140 @@ fn a_jmp_through_memory_links_and_transfers_natively_on_the_second_entry() {
     assert_eq!(cpu.registers.eip, TARGET + 3);
 }
 
+/// The dynamic link cell for `CallReg`, modelled on
+/// `a_jmp_through_memory_links_and_transfers_natively_on_the_second_entry`: run the call once so
+/// the exit reports the MISS (the cell is still unbound), then again so the transfer goes NATIVE.
+///
+/// The target block is installed BEFORE the source ever runs, so the very first native call CAN
+/// bind the cell, but the native code itself still takes the miss path on that call:
+/// `run_direct_block` calls `bind_dynamic_successor` only after the entry function returns and
+/// reports a nonzero `dynamic_link_cell`, so the bind happens in Rust, one call late. The SECOND
+/// call finds the cell bound and a live portal, and jumps `jmp_r64` straight into the target's
+/// body without a dispatcher round-trip.
+#[test]
+fn a_call_through_a_register_links_and_transfers_natively_on_the_second_entry() {
+    const SOURCE: u32 = 0x100;
+    const TARGET: u32 = 0x300;
+    let mut memory = vec![0; 0x2000];
+    memory[SOURCE as usize..SOURCE as usize + 4].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xd3, // call ebx
+    ]);
+    memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&[
+        0x42, // inc edx
+        0x46, // inc esi
+        0x47, // inc edi
+        0xf4, // hlt
+    ]);
+
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    widen_stack_to_32_bit(&mut cpu);
+    // The register CallReg reads its target from, and the stack it pushes onto, must both be
+    // live BEFORE the very first interpreted pass: unlike JmpMem's target dword, which is fixed
+    // up front in memory, `ebx` here is guest state that the warm-up run itself executes `call
+    // ebx` through.
+    cpu.registers.set_ebx(TARGET);
+    cpu.registers.set_esp(0x1000);
+    // A full interpreted run populates the decode cache for both blocks, exactly as the JmpMem
+    // link fixture does before taking manual control. It does NOT populate the native fast map:
+    // plain interpreted reads never touch it. `CallReg`'s return push needs `NativeMapBases` to
+    // exist, AND the stack's own page populated with a WRITE mapping, before `compile`'s emitted
+    // store guard will let the push through rather than side exit at `UnavailableOrKind`. The
+    // stack write lands at 0xffc, page 0, the same page the code sits on.
+    drive(&mut cpu, &mut bus);
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        0,
+        0,
+        jit::fast_map::PagePermissions::UNPAGED,
+        false,
+        true,
+    );
+
+    cpu.halted = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.eip = TARGET;
+    let target_key = jit::direct::key_for(&cpu, TARGET, true).expect("target decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(target_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let target_compilation = jit::direct::compile(&mut cpu, TARGET, true).expect("target block");
+    assert_eq!(target_compilation.span.instructions, 3);
+    cpu.jit_direct
+        .install(&target_compilation)
+        .expect("target install");
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    cpu.registers.set_esp(0x1000);
+    let source_key = jit::direct::key_for(&cpu, SOURCE, true).expect("source decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(source_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let source_compilation = jit::direct::compile(&mut cpu, SOURCE, true).expect("source block");
+    assert_eq!(source_compilation.span.instructions, 3);
+    assert!(source_compilation.dynamic_successor);
+    let source_id = cpu
+        .jit_direct
+        .install(&source_compilation)
+        .expect("source install");
+    let source_block = cpu
+        .jit_direct
+        .block(source_id)
+        .expect("source block remains live");
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source_block)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.registers.eip, TARGET,
+        "the target must be set even on the first, unresolved pass: CallReg writes EIP before \
+         the link-cell check ever runs"
+    );
+    assert_eq!(
+        cpu.registers.esp(),
+        0x0ffc,
+        "the return push and ESP adjust still ran on the unresolved pass"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers,
+        transfers_before,
+        "the first pass cannot be a linked transfer: the cell is unbound when the native call is \
+         made, and it is only bound afterward, in Rust, once the miss is reported"
+    );
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    cpu.registers.set_esp(0x1000);
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source_block)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+        1,
+        "the second pass must find the now-bound cell and its live portal, and jump straight \
+         into the target without a dispatcher round-trip"
+    );
+    // Anti-vacuity. Three from source (two fillers plus the call) and three from target (three
+    // fillers up to its own hlt boundary): six means the chain really crossed into the target
+    // natively, rather than the source call landing back in the dispatcher.
+    assert_eq!(cpu.perf_counters().jit_direct_insns - insns_before, 6);
+    assert_eq!(cpu.registers.eip, TARGET + 3);
+}
+
 /// A ring-3 `JmpMem` whose source page is supervisor-only must side exit at the permission check
 /// before the dword is ever read, rather than completing the jump.
 ///
@@ -4233,5 +4702,113 @@ fn cpl3_jmp_through_memory_permission_side_exit_is_counted() {
         1
     );
     // Anti-vacuity: only the two fillers retired natively; the jump itself never completed.
+    assert_eq!(cpu.perf_counters().jit_direct_insns - insns_before, 2);
+}
+
+/// A ring-3 `CallReg` whose STACK page is supervisor-only must side exit at the write permission
+/// check before the return address is ever pushed, rather than completing the call.
+///
+/// Modelled on `cpl3_jmp_through_memory_permission_side_exit_is_counted`, with the guard moved
+/// from a read (the jump target dword) to a write (the return-address push): `CallReg` has no
+/// memory READ at all, so the stack write is the only access there is to test.
+///
+/// The code page and the stack page are kept SEPARATE, the lesson the PushMem CPL3 fixture's own
+/// history records: `flags()` is one table per page shared by the read and write maps, so a stack
+/// write landing on the same page as the (permissive) code fetch would silently inherit that
+/// page's permissive flags, and the mutation this fixture exists to catch would stay invisible.
+///
+/// `CallReg` is a terminal, so the block ends at the call. There is no HLT to work around (HLT is
+/// CPL0-only and this harness sets up no IDT), because the terminal call never gets that far.
+#[test]
+fn cpl3_call_through_a_register_permission_side_exit_is_counted() {
+    const CALL_ENTRY: u32 = 0x101;
+    const INITIAL_ESP: u32 = 0x2000;
+    let mut cpu = fresh();
+    let mut memory = vec![0; 0x3000];
+    memory[CALL_ENTRY as usize..CALL_ENTRY as usize + 4].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xd3, // call ebx
+    ]);
+
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    promote_to_cpl3(&mut cpu);
+    cpu.registers.eip = CALL_ENTRY;
+    cpu.registers.set_ebx(0x200); // The target is irrelevant: the call never completes.
+    cpu.registers.set_esp(INITIAL_ESP);
+
+    // Warm the decode cache: `key_for` reads the physical start straight out of it.
+    for lin in [CALL_ENTRY, CALL_ENTRY + 1, CALL_ENTRY + 2] {
+        cpu.registers.eip = lin;
+        cpu.fetch_decoded(&mut bus, lin).expect("fixture decode");
+    }
+    cpu.registers.eip = CALL_ENTRY;
+
+    // The STACK page, supervisor-only. INITIAL_ESP - 4 = 0x1ffc, page 1, well away from the code
+    // at page 0.
+    let stack_addr = INITIAL_ESP.wrapping_sub(4);
+    let stack_page = bus
+        .direct_page(stack_addr, BusAccessKind::DataWrite)
+        .unwrap()
+        .unwrap();
+    assert!(cpu.jit_fast_map.populate_write(
+        stack_addr,
+        stack_addr,
+        stack_page,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: false,
+        },
+    ));
+
+    let key = jit::direct::key_for(&cpu, CALL_ENTRY, true).unwrap();
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut cpu, CALL_ENTRY, true).unwrap();
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the block must span inc/inc/call, or this proves nothing about CallReg at CPL3"
+    );
+    let id = cpu.jit_direct.install(&compilation).unwrap();
+    let block = cpu
+        .jit_direct
+        .block(id)
+        .expect("installed block must be live");
+
+    let exits_before = cpu.perf_counters().jit_direct_side_exits;
+    let permissions_before = cpu.perf_counters().jit_direct_exit_permission;
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    // The two fillers run natively before the side exit; only the call, the third slot, refuses.
+    assert_eq!(
+        cpu.registers.eip,
+        CALL_ENTRY + 2,
+        "must exit exactly at the call, EIP untouched: CallReg writes EIP only after every guard \
+         passes"
+    );
+    assert_eq!(
+        cpu.registers.esp(),
+        INITIAL_ESP,
+        "ESP must be untouched: a refused push must not have adjusted it"
+    );
+    assert_eq!(
+        cpu.registers.eax(),
+        1,
+        "the filler before the call ran natively"
+    );
+    assert_eq!(
+        cpu.registers.ecx(),
+        1,
+        "the second filler before the call ran natively"
+    );
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits - exits_before, 1);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_permission - permissions_before,
+        1
+    );
+    // Anti-vacuity: only the two fillers retired natively; the call itself never completed.
     assert_eq!(cpu.perf_counters().jit_direct_insns - insns_before, 2);
 }

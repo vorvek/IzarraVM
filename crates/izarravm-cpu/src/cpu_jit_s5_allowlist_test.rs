@@ -239,6 +239,58 @@ fn word_size_push_through_memory_stays_refused() {
     }
 }
 
+/// A 66-prefixed `FF /2` register form (`call bx`) must stay REFUSED, and nothing else in the
+/// crate can catch it.
+///
+/// `CallReg` IS `uses_stack()`, so unlike `JmpMem` this goes through the stack-width admission
+/// matrix rather than through the classifier's own operand-size check. The matrix has no
+/// `CallReg16` mapping arm, so a Word form falls to the matrix's catch-all `Retry` regardless of
+/// `SS.B`, the same PushMem precedent.
+///
+/// Both cases widen SS to a 32-bit stack explicitly, for the same reason
+/// `word_size_push_through_memory_stays_refused` does: `flat_fixture` leaves `SS.default_size_32`
+/// alone, and on a 16-bit stack (`SS.B` = 0) even the UNPREFIXED Dword control has no matrix arm
+/// (the `(false, Dword)` cell is a stop, four bytes on a 16-bit SP not being built yet) and would
+/// also come out refused, for a reason that has nothing to do with the 0x66 prefix. Widening SS
+/// here makes the prefix the ONLY difference between the two cases.
+///
+/// The assertion is an EXACT count, paired against a POSITIVE CONTROL: the unprefixed `FF /2`
+/// register form at the same entry, on the same stack width, must lower and grow the block to
+/// four instructions.
+#[test]
+fn word_size_call_through_a_register_stays_refused() {
+    let cases: &[(&str, &[u8], u8)] = &[
+        ("unprefixed control", &[0xff, 0xd3], 4),
+        (
+            // 66 ff d3: call bx at Word operand size.
+            "0x66-prefixed",
+            &[0x66, 0xff, 0xd3],
+            3,
+        ),
+    ];
+
+    for &(label, form, expected_instructions) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.registers.set_esp(0x1000);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, expected_instructions,
+            "{label}: the Dword form must lower and the Word form must stay refused"
+        );
+    }
+}
+
 /// A 66-prefixed `FF /4` must stay REFUSED, and nothing else in the crate can catch it.
 ///
 /// `0xff` is in the Word allowlist, so this form reaches the classifier and would otherwise
