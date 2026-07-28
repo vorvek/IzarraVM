@@ -526,15 +526,26 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // and appending twice trips the "label placed twice" assertion instead.
                 //
                 // Both append to the SAME per-slot `side` label. The resolver at the end of this
-                // function chains any number of stubs per target. Unreferenced labels are free:
-                // only a referenced-but-unplaced label panics.
+                // function chains any number of stubs per target.
+                //
+                // The permission flag must be `memory.cpl3` on BOTH sets, not `false` on the read:
+                // `emit_read_permission_check` emits its jump whenever `memory.cpl3` is true, and
+                // `append_stubs` places the target only when told to, so a hardcoded `false` leaves
+                // a referenced-but-unplaced label and panics the encoder on any CPL3 block. The
+                // code-watch flag stays `false` on the read, which is correct: the source performs
+                // no write, so that label is genuinely never referenced, and an unreferenced label
+                // is free.
                 let source_reasons = MemorySideExits::new(&mut e, memory, Some(addr));
                 let stack_reasons =
                     MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(4))));
                 emit_push_mem(&mut e, addr, memory, source_reasons, stack_reasons);
-                // The SOURCE performs no write and no code-watch check, so it contributes neither
-                // stub. The STACK write contributes both.
-                source_reasons.append_stubs(&mut side_exit_reason_stubs, side, true, false, false);
+                source_reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    true,
+                    memory.cpl3,
+                    false,
+                );
                 stack_reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
