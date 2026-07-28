@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::jit::direct::{MAX_X87_BLOCK_CORE_CLOCKS, MAX_X87_BLOCK_INSTRUCTIONS, MAX_X87_SLOTS};
 use crate::{AddressSize, DecodedOperand, OperandSize, Prefixes, RepKind, SegmentIndex};
 
 fn addr() -> AddrMode {
@@ -680,4 +681,114 @@ fn substrate_layout_stays_compact() {
         assert_ne!(layout.control, layout.status);
         assert_ne!(layout.status, layout.tag);
     }
+}
+
+/// Every distinct `NativeX87Insn` shape, for the clock-bound derivation below.
+///
+/// The `match` beneath it is what keeps this honest: it has no wildcard arm, so a new variant is
+/// a compile error here, and whoever fixes that error is standing in the right file to add the
+/// shape to this list. That is the same enforcement the emit dispatch relies on.
+fn every_x87_shape() -> Vec<NativeX87Insn> {
+    let mut shapes = vec![
+        NativeX87Insn::LoadOne,
+        NativeX87Insn::LoadZero,
+        NativeX87Insn::ComparePopPop,
+        NativeX87Insn::StoreStatusAx,
+        NativeX87Insn::LoadF32 { addr: addr() },
+        NativeX87Insn::LoadI32 { addr: addr() },
+        NativeX87Insn::StoreI32 { addr: addr() },
+        NativeX87Insn::LoadControlWord { addr: addr() },
+        NativeX87Insn::StoreControlWord { addr: addr() },
+        NativeX87Insn::LoadRegister { index: 3 },
+        NativeX87Insn::Exchange { index: 3 },
+    ];
+    for pop in [false, true] {
+        shapes.push(NativeX87Insn::StoreF32 { addr: addr(), pop });
+        shapes.push(NativeX87Insn::StoreRegister { index: 3, pop });
+    }
+    for extension in 0..=7 {
+        let op = NativeX87BinaryOp::from_extension(extension).expect("binary op");
+        shapes.push(NativeX87Insn::BinaryMemory { op, addr: addr() });
+        shapes.push(NativeX87Insn::BinaryRegister { op, index: 3 });
+    }
+    for op in [
+        NativeX87StiOp::Add,
+        NativeX87StiOp::Multiply,
+        NativeX87StiOp::Subtract,
+        NativeX87StiOp::SubtractReverse,
+        NativeX87StiOp::Divide,
+        NativeX87StiOp::DivideReverse,
+    ] {
+        shapes.push(NativeX87Insn::PopBinary { op, index: 3 });
+        shapes.push(NativeX87Insn::BinaryRegisterDest { op, index: 3 });
+    }
+    shapes
+}
+
+/// The registration gate for `every_x87_shape`. No wildcard arm, deliberately.
+fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
+    match insn {
+        NativeX87Insn::BinaryMemory { .. }
+        | NativeX87Insn::BinaryRegister { .. }
+        | NativeX87Insn::LoadF32 { .. }
+        | NativeX87Insn::StoreF32 { .. }
+        | NativeX87Insn::LoadRegister { .. }
+        | NativeX87Insn::Exchange { .. }
+        | NativeX87Insn::StoreRegister { .. }
+        | NativeX87Insn::LoadOne
+        | NativeX87Insn::LoadZero
+        | NativeX87Insn::LoadI32 { .. }
+        | NativeX87Insn::StoreI32 { .. }
+        | NativeX87Insn::PopBinary { .. }
+        | NativeX87Insn::BinaryRegisterDest { .. }
+        | NativeX87Insn::ComparePopPop
+        | NativeX87Insn::StoreStatusAx
+        | NativeX87Insn::LoadControlWord { .. }
+        | NativeX87Insn::StoreControlWord { .. } => true,
+    }
+}
+
+/// `MAX_X87_BLOCK_CORE_CLOCKS` must DOMINATE the worst block the compiler can actually build,
+/// derived from the metadata table rather than restated as a literal.
+///
+/// It is the per-hop cost bound for a chain of x87 blocks (`compute_global_block_upper`), and
+/// there is no runtime clock check inside a chain: this static bound is the only thing keeping up
+/// to `MAX_CHAIN_BLOCKS` hops inside a device deadline. It carried no derivation and no test, and
+/// it is TIGHT rather than generous: today's worst slot reproduces it exactly.
+///
+/// That matters because the next opcode-board item, 0xDA m32int arithmetic, would be the first
+/// member of `FpOpClass::IntConvert16`, whose I586 scale is 256 against IntConvert32's 272 but
+/// whose raw clocks are 20 against 14. It costs 640 core clocks per slot against today's worst of
+/// 476, and eight of them plus the raw allowance is 5,240 against a bound of 3,928. Without this
+/// test that ships as a 33 percent under-estimate of the chain budget with nothing failing.
+#[test]
+fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
+    let shapes = every_x87_shape();
+    assert!(shapes.iter().copied().all(shape_is_enumerated));
+
+    // Ceil per slot, then sum, which is at least ceil(sum / den) and is how the bound was built.
+    let worst_fp_slot = shapes
+        .iter()
+        .map(|insn| {
+            insn.metadata()
+                .weighted_fp_clocks(CpuPersona::I586)
+                .div_ceil(u64::from(FP_TIMING_DEN))
+        })
+        .max()
+        .expect("at least one x87 shape");
+
+    // `DirectKind::X87` charges 0 raw clocks, so the raw term comes from the NON-x87 instructions
+    // sharing the block. A block with any x87 slot holds at most MAX_X87_BLOCK_INSTRUCTIONS of
+    // them, and no kind with a constant charge exceeds the 10 a near RET costs.
+    const WORST_CONSTANT_RAW_CLOCKS: u64 = 10;
+    let derived = MAX_X87_SLOTS as u64 * worst_fp_slot
+        + MAX_X87_BLOCK_INSTRUCTIONS as u64 * WORST_CONSTANT_RAW_CLOCKS;
+
+    assert!(
+        derived <= MAX_X87_BLOCK_CORE_CLOCKS,
+        "MAX_X87_BLOCK_CORE_CLOCKS is {MAX_X87_BLOCK_CORE_CLOCKS} but the metadata table now \
+         allows a block costing {derived} ({MAX_X87_SLOTS} slots x {worst_fp_slot} core clocks \
+         plus {MAX_X87_BLOCK_INSTRUCTIONS} x {WORST_CONSTANT_RAW_CLOCKS} raw). Raise the constant \
+         and re-measure: it feeds the chain quota, so widening it changes when devices advance."
+    );
 }
