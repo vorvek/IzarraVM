@@ -3414,3 +3414,34 @@ fn word_ret_through_a_mode13_stack_page_returns_to_the_popped_address() {
     assert_eq!(native.registers, interp.registers);
     assert_eq!(native.registers.esp(), INITIAL_ESP + 2);
 }
+
+/// The chain-quota memo is keyed on `has_x87` and on the bus's cost-dial epoch. Quake cannot
+/// test the invalidation: a single-persona run never changes a dial, so byte identity on the
+/// corpus would hold whether the clear existed or not.
+///
+/// Two independent mechanisms, both pinned here. The eager one is the clear in
+/// `BlockCache::clear`, placed ABOVE its empty-cache early return, which matters because with no
+/// block installed that return is taken and `reset_storage` never runs. The lazy one is the
+/// epoch, which covers a dial moving without the CPU's mode moving at all.
+#[test]
+fn chain_quota_memo_clears_on_a_mode_change_even_when_no_block_is_cached() {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    assert_eq!(cpu.jit_direct.global_block_upper_cached(0, 7), 0);
+
+    cpu.jit_direct.set_global_block_upper_cached(0, 7, 12_345);
+    cpu.jit_direct.set_global_block_upper_cached(1, 7, 67_890);
+    assert_eq!(cpu.jit_direct.global_block_upper_cached(0, 7), 12_345);
+    assert_eq!(cpu.jit_direct.global_block_upper_cached(1, 7), 67_890);
+
+    // A different bus epoch invalidates without any CPU involvement at all.
+    assert_eq!(cpu.jit_direct.global_block_upper_cached(0, 8), 0);
+
+    // And no block was ever installed, so `clear()` takes the empty-cache early return.
+    cpu.set_mode(GswMode::Gsw486);
+    assert_eq!(
+        cpu.jit_direct.global_block_upper_cached(0, 7),
+        0,
+        "a mode change must drop the chain-quota memo even when the block cache is empty"
+    );
+}

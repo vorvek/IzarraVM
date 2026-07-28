@@ -826,7 +826,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
     // Pending flags offset for direct native writes; shifts whenever PerfCounters grows.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4504);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
@@ -2025,6 +2025,15 @@ impl CpuBus for TestBus {
 
     fn jit_fetch_cost_clocks(&self) -> u64 {
         u64::from(self.uniform_native_fetches) * 2
+    }
+
+    /// The two dial flags are plain public fields that fixtures flip between runs, and at least
+    /// one existing fixture flips `uniform_native_fetches` after priming a block
+    /// (`generated_three_block_chain_aggregates_across_event_caps`). Fingerprint both, so the
+    /// Direct backend's memo of the derived worst-case hop cost cannot go stale. Offset by one to
+    /// stay clear of the trait default's 0.
+    fn jit_cost_dial_epoch(&self) -> u64 {
+        1 + u64::from(self.uniform_native_fetches) + 2 * u64::from(self.direct_page_clocks)
     }
 
     fn native_fetches_are_uniform(&self) -> bool {

@@ -812,6 +812,16 @@ pub trait CpuBus {
         0
     }
 
+    /// A value that CHANGES whenever any of the JIT cost dials above could return something
+    /// different: `jit_fetch_cost_clocks`, `jit_data_cost_clocks`, `jit_mode13_data_cost_clocks`
+    /// and the scale applied by `jit_scale_bus_cost_upper`. The Direct backend memoises
+    /// worst-case per-hop costs derived from those dials and keys the memo on this value, so an
+    /// implementation whose dials can move MUST override this. The default is correct only for a
+    /// bus whose dials never change.
+    fn jit_cost_dial_epoch(&self) -> u64 {
+        0
+    }
+
     /// Whether every direct-code block admitted by this bus can charge instruction fetches as
     /// one uniform per-instruction total. The default keeps the address-observing fallback.
     fn native_fetches_are_uniform(&self) -> bool {

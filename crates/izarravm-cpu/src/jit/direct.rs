@@ -524,6 +524,17 @@ pub(crate) struct BlockCache {
     block_link_epochs: Vec<u64>,
     link_epoch: u64,
     block_active: Vec<bool>,
+    /// Memoised `global_block_upper`, the chain-quota divisor, indexed by `has_x87`. 0 is unset
+    /// and cannot collide with a real value, which is at least 1 on every bus. Its inputs are the
+    /// persona timing pair and the bus cost dials, and both move only through
+    /// `CpuGsw::set_mode`, which reaches `clear()` below. Cleared there ABOVE the empty-cache
+    /// early return, so the clear does not depend on an argument about when that return is taken.
+    global_block_upper_cache: [u64; 2],
+    /// The `jit_cost_dial_epoch()` the cache above was computed under. The CPU cannot see a bus
+    /// dial move, so the memo is keyed on the bus's own epoch rather than on an argument about
+    /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
+    /// `max`, three multiplies and a division.
+    global_block_upper_epoch: u64,
     free_block_slots: Vec<u16>,
     next_block_generation: u64,
     live_blocks: usize,
@@ -581,6 +592,8 @@ impl BlockCache {
             link_cells: Vec::new(),
             link_sources: HashMap::new(),
             outbound: Vec::new(),
+            global_block_upper_cache: [0; 2],
+            global_block_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
             inbound: HashMap::new(),
             waiting: HashMap::new(),
@@ -848,6 +861,30 @@ impl BlockCache {
         self.heat_resets
     }
 
+    /// Memoised chain-quota divisor for `has_x87` as 0 or 1, valid only under `epoch`. Returns 0
+    /// for unset, which cannot collide with a real value: `global_block_upper` is at least
+    /// `max_core`, itself at least 1 on every bus including the trait defaults.
+    pub(crate) fn global_block_upper_cached(&self, x87_index: usize, epoch: u64) -> u64 {
+        if self.global_block_upper_epoch == epoch {
+            self.global_block_upper_cache[x87_index]
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn set_global_block_upper_cached(
+        &mut self,
+        x87_index: usize,
+        epoch: u64,
+        value: u64,
+    ) {
+        if self.global_block_upper_epoch != epoch {
+            self.global_block_upper_cache = [0; 2];
+            self.global_block_upper_epoch = epoch;
+        }
+        self.global_block_upper_cache[x87_index] = value;
+    }
+
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
         self.dormant(key);
         let _ = heat.bump(key.physical, 1, epoch);
@@ -891,6 +928,12 @@ impl BlockCache {
     }
 
     pub(crate) fn clear(&mut self, watch: &mut NativeCodeWatch) {
+        // Unconditionally, and above the early return below. The one event that invalidates this
+        // cache is a persona change, which arrives here through `CpuGsw::set_mode`, and an empty
+        // block cache does not imply an unchanged persona. Clearing it here rather than inside
+        // `reset_storage` removes a reachability argument standing between a mode switch and a
+        // miscompiled quota.
+        self.global_block_upper_cache = [0; 2];
         // CS reloads and monitor transitions can invalidate code millions of times while the
         // direct cache is unused. Avoid clearing the 65,536-entry hot table when it is already
         // empty.

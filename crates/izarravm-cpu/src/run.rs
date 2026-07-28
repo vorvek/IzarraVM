@@ -2167,6 +2167,43 @@ impl CpuGsw {
         self.perf.jit_direct_portals_hidden += stats.portals_hidden;
     }
 
+    /// The worst-case cost of one chain hop, used as the divisor that decides how many blocks a
+    /// chain may run before returning to the dispatcher. Depends on the persona timing pair, the
+    /// bus cost dials, and one bit of the block: whether it is an x87 block.
+    ///
+    /// An integer entry never reaches a float block, so its bound only has to cover integer hops.
+    /// A float entry may cross into integer blocks partway through the chain; charging every hop
+    /// at the x87 rate over-estimates those integer hops but stays conservative in the safe
+    /// direction, and it still covers the 586 FISTP conversion surcharge for the hops that really
+    /// are x87.
+    #[cfg(feature = "jit")]
+    fn compute_global_block_upper<B: CpuBus>(bus: &B, num: u32, den: u32, has_x87: bool) -> u64 {
+        let unscaled_max_core = if has_x87 {
+            jit::direct::MAX_X87_BLOCK_CORE_CLOCKS
+        } else {
+            // A block can contain 31 four-clock instructions followed by a ten-clock RET.
+            4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6
+        };
+        let max_core = unscaled_max_core
+            .saturating_mul(u64::from(num))
+            .saturating_add(u64::from(den) - 1)
+            / u64::from(den);
+        let max_read = bus
+            .jit_data_cost_clocks(BusWidth::Dword)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword))
+            .max(bus.jit_data_cost_clocks(BusWidth::Word))
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word))
+            .max(bus.jit_data_cost_clocks(BusWidth::Byte))
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
+        let max_store = max_read;
+        let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(
+            bus.jit_fetch_cost_clocks()
+                .saturating_add(max_read)
+                .saturating_add(max_store),
+        );
+        max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper))
+    }
+
     #[cfg(feature = "jit")]
     fn run_direct_block<B: CpuBus>(
         &mut self,
@@ -2307,32 +2344,37 @@ impl CpuGsw {
                 // chain; charging every hop at the x87 rate over-estimates those integer hops but
                 // stays conservative in the safe direction, and it still covers the 586 FISTP
                 // conversion surcharge for the hops that are actually x87.
-                let unscaled_max_core = if block.has_x87() {
-                    jit::direct::MAX_X87_BLOCK_CORE_CLOCKS
+                self.perf.jit_direct_chain_quota_entries += 1;
+                // `global_block_upper` reads exactly one thing from the block, `has_x87()`, and
+                // otherwise only the persona and the bus cost dials. The dials move only when the
+                // persona does: `CacheModel::set_mode` is their sole writer, its only caller is
+                // `Machine::set_mode`, and that calls `CpuGsw::set_mode` first, which clears this
+                // cache along with every compiled block. So the whole computation collapses to a
+                // two-entry table, and recomputing it on every chain-eligible entry was spending
+                // six bus accessor calls, five `max`, three multiplies and a division to rederive
+                // one of two numbers.
+                //
+                // 0 means unset, and it can never collide with a real value: `global_block_upper`
+                // is at least `max_core`, which is `ceil(unscaled_max_core * num / den)` with
+                // `unscaled_max_core` either 134 or 3,928 and `num >= 1` on every persona, so it
+                // is at least 1 on every bus including the trait defaults.
+                let x87_index = usize::from(block.has_x87());
+                let epoch = bus.jit_cost_dial_epoch();
+                let cached = self.jit_direct.global_block_upper_cached(x87_index, epoch);
+                let global_block_upper = if cached != 0 {
+                    cached
                 } else {
-                    // A block can contain 31 four-clock instructions followed by a ten-clock RET.
-                    4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6
+                    self.perf.jit_direct_chain_quota_cache_misses += 1;
+                    let computed = Self::compute_global_block_upper(bus, num, den, block.has_x87());
+                    self.jit_direct
+                        .set_global_block_upper_cached(x87_index, epoch, computed);
+                    computed
                 };
-                let max_core = unscaled_max_core
-                    .saturating_mul(u64::from(num))
-                    .saturating_add(u64::from(den) - 1)
-                    / u64::from(den);
-                let max_read = bus
-                    .jit_data_cost_clocks(BusWidth::Dword)
-                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword))
-                    .max(bus.jit_data_cost_clocks(BusWidth::Word))
-                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word))
-                    .max(bus.jit_data_cost_clocks(BusWidth::Byte))
-                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
-                let max_store = max_read;
-                let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
-                    .saturating_mul(
-                        bus.jit_fetch_cost_clocks()
-                            .saturating_add(max_read)
-                            .saturating_add(max_store),
-                    );
-                let global_block_upper =
-                    max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
+                debug_assert_eq!(
+                    global_block_upper,
+                    Self::compute_global_block_upper(bus, num, den, block.has_x87()),
+                    "cached global_block_upper went stale"
+                );
                 let additional = available
                     .saturating_sub(iteration_upper)
                     .checked_div(global_block_upper)
