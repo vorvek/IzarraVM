@@ -1846,3 +1846,191 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
         }
     }
 }
+
+/// Run one program natively and interpreted from identical state and require identical
+/// architectural results, INCLUDING the raw `pending_flags` descriptor.
+///
+/// Comparing `eflags()` alone is not enough and that is the whole point of these fixtures: a
+/// single-bit CF write that eagerly materializes agrees with the interpreter on `eflags()` and
+/// differs on every byte of the descriptor, which is exactly the divergence class the campaign's
+/// anchors would surface only on a real corpus run.
+fn assert_native_matches_interpreter(code: &[u8], starts: &[u32], arm: impl Fn(&mut CpuGsw)) {
+    const ENTRY: u32 = 0x101;
+    let mut pristine = vec![0; 0x5000];
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
+
+    let mut native = flat_stack_cpu(ENTRY);
+    let mut interp = flat_stack_cpu(ENTRY);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interp_bus = TestBus::with_memory(pristine.clone());
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    decode_fixture(&mut native, &mut native_bus, starts);
+    decode_fixture(&mut interp, &mut interp_bus, starts);
+
+    let block = install_fixture_block(&mut native, ENTRY);
+    assert_eq!(
+        usize::from(block.span().instructions),
+        starts.len(),
+        "every instruction in the fixture must be lowered, or the comparison proves nothing"
+    );
+
+    native.registers.eip = ENTRY;
+    interp.registers.eip = ENTRY;
+    arm(&mut native);
+    arm(&mut interp);
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    for _ in 0..starts.len() {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+
+    assert_eq!(
+        native.registers, interp.registers,
+        "architectural registers"
+    );
+    assert_eq!(
+        native.pending_flags, interp.pending_flags,
+        "the raw pending-flags descriptor, not just eflags()"
+    );
+    assert_eq!(native.eflags(), interp.eflags(), "materialized eflags");
+}
+
+/// BT with NO live descriptor: `set_flag` falls through to `set_flag_live` and CF goes straight
+/// into eflags.
+#[test]
+fn bt_register_form_matches_interpreter_without_a_live_descriptor() {
+    for (bit, name) in [(3u8, "set"), (2u8, "clear"), (31u8, "top"), (0u8, "zero")] {
+        // mov eax,0x8000_0008 ; mov ecx,bit ; bt eax,ecx ; hlt
+        let code = [
+            0xb8, 0x08, 0x00, 0x00, 0x80, // mov eax,0x80000008
+            0xb9, bit, 0x00, 0x00, 0x00, // mov ecx,bit
+            0x0f, 0xa3, 0xc8, // bt eax,ecx
+        ];
+        assert_native_matches_interpreter(&code, &[0x101, 0x106, 0x10b], |_| {});
+        let _ = name;
+    }
+}
+
+/// BT with a LIVE descriptor, which is the case that distinguishes a correct CF-only publish from
+/// a bare RBP write or from eager materialization. The ADD arms a descriptor; the BT must patch
+/// its CF override in place and leave `a`, `b` and `result` untouched.
+#[test]
+fn bt_register_form_matches_interpreter_with_a_live_descriptor() {
+    // mov eax,0x8000_0008 ; mov edx,1 ; add edx,edx ; mov ecx,3 ; bt eax,ecx
+    let code = [
+        0xb8, 0x08, 0x00, 0x00, 0x80, // mov eax,0x80000008
+        0xba, 0x01, 0x00, 0x00, 0x00, // mov edx,1
+        0x01, 0xd2, // add edx,edx  (arms the descriptor)
+        0xb9, 0x03, 0x00, 0x00, 0x00, // mov ecx,3
+        0x0f, 0xa3, 0xc8, // bt eax,ecx
+    ];
+    assert_native_matches_interpreter(&code, &[0x101, 0x106, 0x10b, 0x10d, 0x112], |_| {});
+}
+
+/// The index mask. A missing `& 31` reads a bit that does not exist; the host takes the offset
+/// modulo 32 for a register operand, which is what makes the guest's mask free.
+#[test]
+fn bt_register_form_masks_the_index_to_five_bits() {
+    // mov eax,2 ; mov ecx,33 ; bt eax,ecx  -> bit 1 of eax, which is set, so CF = 1
+    let code = [
+        0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax,2
+        0xb9, 0x21, 0x00, 0x00, 0x00, // mov ecx,33
+        0x0f, 0xa3, 0xc8, // bt eax,ecx
+    ];
+    assert_native_matches_interpreter(&code, &[0x101, 0x106, 0x10b], |_| {});
+}
+
+/// Byte INC/DEC on the LOW lanes and on the HIGH lanes. AH..BH are the high bytes of eAX..eBX, so
+/// a lowering that treated the index as a home index would reach guest EBP/ESI/EDI instead.
+#[test]
+fn byte_inc_dec_matches_interpreter_on_every_lane() {
+    for (modrm, label) in [
+        (0xc0u8, "inc al"),
+        (0xc4u8, "inc ah"),
+        (0xc3u8, "inc bl"),
+        (0xc7u8, "inc bh"),
+        (0xc8u8, "dec al"),
+        (0xccu8, "dec ah"),
+    ] {
+        // mov eax,0x11223344 ; mov ebx,0x55667788 ; fe /r
+        let code = [
+            0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+            0xbb, 0x88, 0x77, 0x66, 0x55, // mov ebx,0x55667788
+            0xfe, modrm,
+        ];
+        assert_native_matches_interpreter(&code, &[0x101, 0x106, 0x10b], |_| {});
+        let _ = label;
+    }
+}
+
+/// The overflow edge, and the CF-preserved rule. 0x7f + 1 sets OF and SF; CF must come through
+/// the descriptor unchanged from the ADD that armed it.
+#[test]
+fn byte_inc_preserves_carry_across_the_overflow_edge() {
+    // mov eax,0x7f ; stc-equivalent via add ; inc al
+    let code = [
+        0xb8, 0x7f, 0x00, 0x00, 0x00, // mov eax,0x7f
+        0xba, 0xff, 0xff, 0xff, 0xff, // mov edx,0xffffffff
+        0x01, 0xd2, // add edx,edx  (sets CF, arms the descriptor)
+        0xfe, 0xc0, // inc al
+    ];
+    assert_native_matches_interpreter(&code, &[0x101, 0x106, 0x10b, 0x10d], |_| {});
+}
+
+/// Clock pins for both new kinds.
+///
+/// The differential fixtures above compare architectural state, and core clocks are not part of
+/// it, so nothing there catches a wrong charge. A mutation battery confirmed that dropping BT's
+/// `raw_clocks` arm passes every other test in the suite while undercharging by 4 per BT, which
+/// is the same gap the LEAVE slice found a day earlier. This is the test for it.
+#[test]
+fn bt_and_byte_inc_dec_charge_the_interpreter_clocks() {
+    const ENTRY: u32 = 0x101;
+
+    // mov eax,imm32 (2) ; mov ecx,imm32 (2) ; bt eax,ecx (6) = 10.
+    let mut pristine = vec![0; 0x5000];
+    let bt = [
+        0xb8, 0x08, 0x00, 0x00, 0x80, 0xb9, 0x03, 0x00, 0x00, 0x00, 0x0f, 0xa3, 0xc8,
+    ];
+    pristine[ENTRY as usize..ENTRY as usize + bt.len()].copy_from_slice(&bt);
+    let mut cpu = flat_stack_cpu(ENTRY);
+    let mut bus = TestBus::with_memory(pristine.clone());
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[0x101, 0x106, 0x10b]);
+    let block = install_fixture_block(&mut cpu, ENTRY);
+    assert_eq!(block.span().instructions, 3);
+    assert_eq!(
+        block.raw_clocks(),
+        10,
+        "two 2-clock moves plus a 6-clock BT; the `_ => 2` default undercharges BT by 4"
+    );
+
+    // mov eax,imm32 (2) ; mov ebx,imm32 (2) ; inc al (2) = 6. The byte form deliberately has NO
+    // `raw_clocks` arm: the interpreter charges 2 for 0xFE, identical to 0xFF /0 and 0x40..0x4f,
+    // so the default is the right answer. This pins that, so a well-meaning future arm is caught.
+    let mut pristine = vec![0; 0x5000];
+    let inc = [
+        0xb8, 0x44, 0x33, 0x22, 0x11, 0xbb, 0x88, 0x77, 0x66, 0x55, 0xfe, 0xc4,
+    ];
+    pristine[ENTRY as usize..ENTRY as usize + inc.len()].copy_from_slice(&inc);
+    let mut cpu = flat_stack_cpu(ENTRY);
+    let mut bus = TestBus::with_memory(pristine);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[0x101, 0x106, 0x10b]);
+    let block = install_fixture_block(&mut cpu, ENTRY);
+    assert_eq!(block.span().instructions, 3);
+    assert_eq!(
+        block.raw_clocks(),
+        6,
+        "0xFE INC/DEC r8 charges 2, like 0xFF"
+    );
+}

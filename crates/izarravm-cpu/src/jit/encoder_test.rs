@@ -1340,3 +1340,17 @@ fn executes_an_emitted_increment_function() {
     let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(buf.entry_ptr()) };
     assert_eq!(f(41), 42);
 }
+
+#[test]
+fn bt_r32_r32_known_bytes() {
+    // bt eax, ecx -- no REX, 0F A3 /r. ModRM mod=11, reg=1(ecx), rm=0(eax) = 0xC8.
+    let mut e = Encoder::new();
+    e.bt_r32_r32(Reg::RAX, Reg::RCX);
+    assert_eq!(e.finish(), vec![0x0F, 0xA3, 0xC8]);
+    // bt r13d, r12d -- REX.R and REX.B, and NOT REX.W. rm=r13&7=5, reg=r12&7=4 -> 0xE5.
+    // The memory form asserts on an RBP/R13 base; the register form must not, which is why this
+    // case is here.
+    let mut e = Encoder::new();
+    e.bt_r32_r32(Reg::R13, Reg::R12);
+    assert_eq!(e.finish(), vec![0x45, 0x0F, 0xA3, 0xE5]);
+}
