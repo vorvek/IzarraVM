@@ -53,7 +53,18 @@ pub(crate) const MAX_X87_BLOCK_INSTRUCTIONS: usize = 12;
 pub(crate) const MAX_X87_SLOTS: u8 = 8;
 const MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS: usize = 4;
 const MAX_MEMORY_ALU_SLOTS: u8 = 3;
-pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 3_928;
+/// Per-hop chain clock bound for a block with any x87 slot. Derived, not chosen:
+/// the worst ADMISSIBLE slot is an `FpOpClass::IntConvert16` memory arith (raw 20, I586
+/// scale 256, ceil(20 * 256 / 8) = 640 core clocks), MAX_X87_SLOTS of those is 5,120, plus
+/// MAX_X87_BLOCK_INSTRUCTIONS non-x87 slots at the 10-clock worst constant charge is 120.
+/// `max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table` re-derives this
+/// from the metadata table and fails the build if a costlier shape ever joins it.
+///
+/// Raised from 3,928 (the IntConvert32 worst) AHEAD of the first IntConvert16 member, so that
+/// slice measures its own effect cleanly. The raise alone was measured on the pinned corpus:
+/// all six anchors byte-identical, the chain quota shrinks (a chain hop is assumed costlier,
+/// so chains return to the dispatcher earlier), entries up about 136,000, roughly 8 ms of wall.
+pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
 const DEFAULT_ENTRY_CAP: usize = 131_072;
 const DEFAULT_DECODE_SLOT_COUNT: usize = 4_096;
 const BLOCK_PAGE_SHIFT: u32 = 12;

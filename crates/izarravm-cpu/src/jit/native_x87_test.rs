@@ -753,14 +753,15 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
 ///
 /// It is the per-hop cost bound for a chain of x87 blocks (`compute_global_block_upper`), and
 /// there is no runtime clock check inside a chain: this static bound is the only thing keeping up
-/// to `MAX_CHAIN_BLOCKS` hops inside a device deadline. It carried no derivation and no test, and
-/// it is TIGHT rather than generous: today's worst slot reproduces it exactly.
+/// to `MAX_CHAIN_BLOCKS` hops inside a device deadline.
 ///
-/// That matters because the next opcode-board item, 0xDA m32int arithmetic, would be the first
-/// member of `FpOpClass::IntConvert16`, whose I586 scale is 256 against IntConvert32's 272 but
-/// whose raw clocks are 20 against 14. It costs 640 core clocks per slot against today's worst of
-/// 476, and eight of them plus the raw allowance is 5,240 against a bound of 3,928. Without this
-/// test that ships as a 33 percent under-estimate of the chain budget with nothing failing.
+/// The bound is sized for `FpOpClass::IntConvert16` (raw 20, I586 scale 256, 640 core clocks per
+/// slot, eight slots plus the raw allowance = 5,240 exactly), RAISED AHEAD of that class's first
+/// member (0xDA m32int) by an owner ruling so that slice measures its own effect cleanly. Until
+/// the shape joins the metadata table the derivation below tops out at 3,928 (LoadI32/StoreI32,
+/// IntConvert32) and the bound is deliberately generous by the difference; the moment it joins,
+/// the bound is tight again by construction and this test is what keeps any costlier future
+/// shape from shipping a silent under-estimate of the chain budget.
 #[test]
 fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
     let shapes = every_x87_shape();

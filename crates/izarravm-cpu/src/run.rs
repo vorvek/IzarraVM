@@ -2184,10 +2184,13 @@ impl CpuGsw {
     /// instructions of bus traffic the float ENTRY bound charges.
     ///
     /// On both personas the Direct backend runs on this changes nothing: 586 gives an integer
-    /// bound of 1,177 against a true float hop of 765, and 486 gives 1,036 against 712, so the
+    /// bound of 1,177 against a true float hop of 874, and 486 gives 1,036 against 821, so the
     /// `max` returns the integer term unchanged and the slice stays byte-identical here. It is not
-    /// decoration: on a bus whose data dials are all zero the two terms are 12 and 328, the
+    /// decoration: on a bus whose data dials are all zero the two terms are 12 and 437, the
     /// inequality reverses, and an integer-headed chain would under-budget every float hop.
+    /// The float figures move whenever `MAX_X87_BLOCK_CORE_CLOCKS` does (they contain
+    /// `scale_core` of it, ceil(5,240 / 12) = 437 at the 1/12 persona pair); the integer figures
+    /// do not.
     #[cfg(feature = "jit")]
     fn compute_global_block_upper<B: CpuBus>(bus: &B, num: u32, den: u32, has_x87: bool) -> u64 {
         let scale_core = |unscaled: u64| {
@@ -2378,7 +2381,7 @@ impl CpuGsw {
                 //
                 // 0 means unset, and it can never collide with a real value: `global_block_upper`
                 // is at least `max_core`, which is `ceil(unscaled_max_core * num / den)` with
-                // `unscaled_max_core` either 134 or 3,928 and `num >= 1` on every persona, so it
+                // `unscaled_max_core` either 134 or 5,240 and `num >= 1` on every persona, so it
                 // is at least 1 on every bus including the trait defaults.
                 let x87_index = usize::from(block.has_x87());
                 let epoch = bus.jit_cost_dial_epoch();
