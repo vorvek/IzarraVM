@@ -632,7 +632,7 @@ fn static_link_from_float_source_to_integer_target_is_permitted_and_marked_spill
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 #[test]
-fn static_link_from_integer_source_to_float_target_is_refused() {
+fn static_link_from_integer_source_to_float_target_goes_through_the_x87_pad() {
     let mut cache = BlockCache::default();
     let source = key(0x1000);
     let target = key(0x1100);
@@ -642,8 +642,8 @@ fn static_link_from_integer_source_to_float_target_is_refused() {
     let mut target_compilation =
         trivial_compilation(BlockSpan::new(target, 1, 1).expect("target span"));
     target_compilation.has_x87 = true;
-    target_compilation.x87_entry_top = 0;
-    target_compilation.x87_exit_top = 0;
+    target_compilation.x87_entry_top = 3;
+    target_compilation.x87_exit_top = 3;
     assert!(matches!(cache.probe(target), BlockProbe::Interpret));
     assert!(matches!(cache.probe(target), BlockProbe::Compile));
     let target_id = cache
@@ -651,12 +651,59 @@ fn static_link_from_integer_source_to_float_target_is_refused() {
         .expect("float target install");
 
     assert!(
-        !cache.try_link(source_id, 0, target_id),
-        "an integer source must not link to a float target: its prologue, and the x87 enter \
-         inside it, would never run"
+        cache.try_link(source_id, 0, target_id),
+        "an integer source now links to a float target through the shared x87 re-entry pad"
     );
-    assert!(!cache.link_cells[source_id.index()][0].linked());
+    assert!(cache.link_cells[source_id.index()][0].linked());
+    // The edge is integer-into-float, not float-into-integer, so nothing spills at the jump.
     assert!(!cache.link_cells[source_id.index()][0].is_spilling());
+    // The pad guards this against the CPU's live TOP, so the cell must carry the target's baked
+    // value and not the never-set sentinel.
+    assert_eq!(
+        cache.link_cells[source_id.index()][0].entry_top(),
+        3,
+        "the cell must carry the float target's baked entry TOP for the pad to guard against"
+    );
+
+    // The portal must send an INTEGER source to the pad and a FLOAT source to the body. Equal
+    // fields here would mean the integer source jumps straight into a body whose x87 register
+    // cache was never loaded.
+    let index = target_id.index();
+    let body = cache.block_portals[index].body.load(Ordering::Acquire);
+    let integer_entry = cache.block_portals[index]
+        .integer_entry
+        .load(Ordering::Acquire);
+    assert_ne!(body, 0);
+    assert_ne!(
+        integer_entry, body,
+        "a float target must route an integer source through the pad, not into its body"
+    );
+    assert_eq!(
+        Some(integer_entry),
+        cache.x87_pad_address_if_built(),
+        "integer_entry must be the shared pad"
+    );
+}
+
+/// An INTEGER target publishes the same address in both fields, so the compile-time field
+/// selection in `emit_completed_path` costs a pure integer chain nothing.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn an_integer_target_publishes_the_same_address_in_both_portal_fields() {
+    let mut cache = BlockCache::default();
+    let target_id = install_trivial(&mut cache, key(0x2000), 1);
+    let index = target_id.index();
+    let body = cache.block_portals[index].body.load(Ordering::Acquire);
+    assert_ne!(body, 0);
+    assert_eq!(
+        cache.block_portals[index]
+            .integer_entry
+            .load(Ordering::Acquire),
+        body
+    );
 }
 
 // A stale spilling flag would make a later float-to-float edge on the same slot spill and

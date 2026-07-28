@@ -1321,10 +1321,25 @@ fn emit_completed_path(
             Reg::RCX,
             core::mem::offset_of!(LinkCell, portal) as i8,
         );
+        // A FLOAT source loads `body` and lands on the target directly: its x87 register cache is
+        // already live, and a float-to-integer edge is handled by the `spilling` flag below. An
+        // INTEGER source loads `integer_entry`, which equals `body` for an integer target and is
+        // the shared x87 re-entry pad for a float one. Selected at compile time from the source's
+        // own class, so neither class pays a branch, and the 377 M linked transfers of a pure
+        // integer chain are unchanged: `integer_entry == body` for every integer target.
+        //
+        // The zero test still means "unresolved or hidden" for both, because `clear()` zeroes both
+        // fields. It ALSO covers the float target whose pad could not be built: `publish_x87`
+        // stores zero rather than `body` in that case, so an integer source takes the unresolved
+        // path instead of entering an unloaded register cache.
         e.load_r64_disp8(
             Reg::RDX,
             Reg::RDX,
-            core::mem::offset_of!(BlockPortal, body) as i8,
+            if x87_source {
+                core::mem::offset_of!(BlockPortal, body) as i8
+            } else {
+                core::mem::offset_of!(BlockPortal, integer_entry) as i8
+            },
         );
         e.cmp_r64_imm32(Reg::RDX, 0);
         e.jz(unresolved);
@@ -1418,6 +1433,9 @@ fn emit_completed_dynamic_path(
             Reg::RAX,
             core::mem::offset_of!(LinkCell, portal) as i8,
         );
+        // Reads `body`, NOT `integer_entry`, and deliberately: `try_link_inner` keeps strict
+        // has_x87 equality on the RET PIC path, so this can only ever bind a same-class target,
+        // where the two portal fields are equal. See the comment on that check.
         e.load_r64_disp8(
             Reg::RCX,
             Reg::RCX,
@@ -3537,6 +3555,88 @@ fn emit_clear_pending(e: &mut Encoder) {
     for offset in [0, 4, 8, 12] {
         e.store_u32_imm_disp32(Reg::R15, base + offset, 0);
     }
+}
+
+/// Emit the SHARED x87 re-entry pad. One of these exists per `BlockCache`, in its own executable
+/// mapping outside the arena, and every float block's portal points its `integer_entry` at it.
+///
+/// Reached only by `jmp RDX` from `emit_completed_path` in an INTEGER source block, so on entry:
+/// RCX holds the `LinkCell` address (kept out of RAX there precisely so it survives the quota
+/// decrement), R15 holds the `CpuGsw` pointer, RDI was just zeroed, RSP is the source block's
+/// frame, and RAX/RDX are dead. RBP holds guest EFLAGS and RBX/R12-R14/R8-R11 are guest homes;
+/// this pad touches none of them.
+///
+/// What it exists for: a float block's prologue loads the x87 register cache into XMM4-11 and
+/// packs the status/tag word into RSI, and its body addresses that cache relative to the TOP
+/// baked at compile time. A chained entry skips the prologue, so without this pad an integer
+/// source reaching a float body would run against an unloaded cache. The pad performs exactly the
+/// prologue's x87 work, which is also what restores the frame induction that
+/// `SpanMeta::link_compatible`'s refusal used to provide: every block that can later reach a
+/// float-to-integer crossing (which reloads RSI and XMM6-11 from the frame) was entered either
+/// through an x87 prologue or through here, and both write those slots.
+///
+/// The TOP guard runs FIRST, before any save, so the bail has nothing to undo and must NOT spill:
+/// the x87 cache is not live on this path (any earlier float segment was flushed at its own
+/// float-to-integer crossing), and running `emit_x87_spill` would write whatever XMM4-11 happen to
+/// hold into `CpuGsw.fpu.st`. The bail is therefore byte-identical to an integer block's
+/// `shared_return`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_x87_reentry_pad() -> Vec<u8> {
+    let mut e = Encoder::new();
+    let bail = e.label();
+
+    // Guard: the target's baked TOP against the CPU's live TOP. `NO_ENTRY_TOP` is 0xFF, outside
+    // the legal 0..=7 range, so a cell that was never given a TOP always takes the bail rather
+    // than matching a guest that happens to sit at TOP 0.
+    e.movzx_r32_byte_disp8(
+        Reg::RAX,
+        Reg::RCX,
+        core::mem::offset_of!(LinkCell, entry_top) as i8,
+    );
+    e.movzx_r32_word_disp32(
+        Reg::RDX,
+        Reg::R15,
+        crate::jit::x87_avx2_emit::status_offset(),
+    );
+    e.shr_r32_imm8(Reg::RDX, crate::jit::native_x87::X87_TOP_SHIFT as u8);
+    e.and_r32_imm32(Reg::RDX, 7);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jnz(bail);
+
+    // Exactly the prologue's x87 work, in the prologue's order.
+    #[cfg(target_os = "windows")]
+    {
+        e.store_r64_disp32(Reg::RSP, STACK_SAVED_RSI, Reg::RSI);
+        emit_save_x87_host_xmms(&mut e);
+    }
+    crate::jit::x87_avx2_emit::emit_enter(&mut e, Reg::R15);
+
+    // Reload the portal AFTER the enter rather than holding it across: `emit_enter` clobbers only
+    // XMM4-11, RSI and RAX today, but `emit_native_x87`'s memory arms use RDI, so keeping the
+    // portal there would break the moment an RDI scratch appeared in the enter path.
+    e.load_r64_disp8(
+        Reg::RDI,
+        Reg::RCX,
+        core::mem::offset_of!(LinkCell, portal) as i8,
+    );
+    e.load_r64_disp8(
+        Reg::RDX,
+        Reg::RDI,
+        core::mem::offset_of!(BlockPortal, body) as i8,
+    );
+    e.jmp_r64(Reg::RDX);
+
+    e.place(bail);
+    emit_store_unresolved_reason(&mut e, UnresolvedReason::X87TopMismatch);
+    emit_store_homes(&mut e);
+    // `emit_return` already ends with `add rsp`, the reversed pops of SAVED_HOST_REGS, and `ret`.
+    // Guest EFLAGS in RBP needs no store: it is mirrored to `CpuGsw.eflags` at every
+    // flag-producing site, so the memory copy is current at any block boundary.
+    emit_return(&mut e, COUNTER_ALL);
+    e.finish()
 }
 
 fn emit_store_homes(e: &mut Encoder) {

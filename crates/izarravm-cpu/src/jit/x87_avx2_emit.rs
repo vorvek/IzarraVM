@@ -367,7 +367,9 @@ const fn control_offset() -> i32 {
     (fpu_base_offset() + native_x87_layout().control) as i32
 }
 
-const fn status_offset() -> i32 {
+/// Byte offset of `CpuGsw.fpu.status`. Public to the jit module because the shared x87 re-entry
+/// pad reads the live TOP out of it to guard against a target block's baked TOP.
+pub(crate) const fn status_offset() -> i32 {
     (fpu_base_offset() + native_x87_layout().status) as i32
 }
 

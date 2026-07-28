@@ -49,7 +49,7 @@ pub(crate) const HOT_LOOKUP_LEN: usize = 65_536;
 pub(crate) const MAX_CHAIN_BLOCKS: usize = 256;
 pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
 const MAX_BLOCK_STACK_ACCESSES: u8 = 4;
-const MAX_X87_BLOCK_INSTRUCTIONS: usize = 12;
+pub(crate) const MAX_X87_BLOCK_INSTRUCTIONS: usize = 12;
 const MAX_X87_SLOTS: u8 = 8;
 const MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS: usize = 4;
 const MAX_MEMORY_ALU_SLOTS: u8 = 3;
@@ -455,7 +455,18 @@ impl CompiledBlock {
             // safe; this refusal is what makes it safe, by induction over the chain: every block
             // that can reach a float-to-integer crossing was itself entered through an x87
             // prologue.
-            (false, true) => false,
+            // RELAXED. An integer source may now reach a float target, because it lands on the
+            // shared x87 re-entry pad rather than on `body`: the pad does exactly the work the
+            // target's prologue would have done, loading the register cache into XMM4-11 and
+            // packing the status/tag word into RSI, after guarding the target's baked entry TOP
+            // against the CPU's live TOP.
+            //
+            // The frame induction the old refusal provided is restored rather than abandoned. A
+            // float-to-integer crossing reloads RSI and XMM6-11 from slots only an x87 prologue
+            // writes; the pad writes the same slots, so every block that can reach such a
+            // crossing was entered either through a prologue or through the pad. `try_link_inner`
+            // refuses this shape when no pad could be built, which keeps that induction total.
+            (false, true) => true,
         }
     }
 }
@@ -530,6 +541,17 @@ pub(crate) struct BlockCache {
     /// `CpuGsw::set_mode`, which reaches `clear()` below. Cleared there ABOVE the empty-cache
     /// early return, so the clear does not depend on an argument about when that return is taken.
     global_block_upper_cache: [u64; 2],
+    /// The shared x87 re-entry pad, in its OWN executable mapping rather than in the arena.
+    /// Deliberately not a block: `reset_storage` sets `arena = None` and frees it, which would
+    /// dangle every `integer_entry` published at a float block, and `compact_arena` relocates
+    /// arena contents while portals published at the pad must keep one stable address for the
+    /// life of the cache. Built once, lazily, on the first float install, and never replaced.
+    ///
+    /// `None` means no pad: on a host where the executable mapping cannot be made (allocation
+    /// failure, or any target outside x86-64 Windows/Linux), `try_link_inner` REFUSES the
+    /// integer-into-float edge, so the cell stays on the zero portal and the exit reports
+    /// `StaticUnbound` exactly as it did before this mechanism existed.
+    x87_pad: Option<super::exec_mem::ExecutableBuffer>,
     /// The `jit_cost_dial_epoch()` the cache above was computed under. The CPU cannot see a bus
     /// dial move, so the memo is keyed on the bus's own epoch rather than on an argument about
     /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
@@ -593,6 +615,7 @@ impl BlockCache {
             link_sources: HashMap::new(),
             outbound: Vec::new(),
             global_block_upper_cache: [0; 2],
+            x87_pad: None,
             global_block_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
             inbound: HashMap::new(),
@@ -859,6 +882,47 @@ impl BlockCache {
     /// coupling; see the `heat_resets` field).
     pub(crate) fn heat_resets(&self) -> u64 {
         self.heat_resets
+    }
+
+    /// Address of the shared x87 re-entry pad, building it on first use. `None` when the host
+    /// cannot provide an executable mapping; every caller must then refuse the crossing rather
+    /// than fall back to `body`, which would enter a float block with an unloaded register cache.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn x87_pad_address(&mut self) -> Option<usize> {
+        if self.x87_pad.is_none() {
+            self.x87_pad = super::exec_mem::ExecutableBuffer::new(&emit::emit_x87_reentry_pad());
+        }
+        self.x87_pad.as_ref().map(|pad| pad.entry_ptr() as usize)
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    fn x87_pad_address(&mut self) -> Option<usize> {
+        None
+    }
+
+    /// The pad address WITHOUT building it. Used where a build is impossible (no `&mut self`) and
+    /// unnecessary: every visible float portal was published through `publish_x87`, which builds
+    /// the pad, so if none exists then no float block is visible and none needs one.
+    fn x87_pad_address_if_built(&self) -> Option<usize> {
+        self.x87_pad.as_ref().map(|pad| pad.entry_ptr() as usize)
+    }
+
+    /// Publish `index`'s portal, routing an integer source through the shared pad when the block
+    /// is a float one. The single place that decision is made.
+    fn publish_portal(&mut self, index: usize) {
+        let body = self.blocks[index].body_ptr();
+        if self.blocks[index].has_x87 {
+            let pad = self.x87_pad_address();
+            self.block_portals[index].publish_x87(body, pad);
+        } else {
+            self.block_portals[index].publish(body);
+        }
     }
 
     /// Memoised chain-quota divisor for `has_x87` as 0 or 1, valid only under `epoch`. Returns 0
@@ -1368,9 +1432,18 @@ impl BlockCache {
             self.blocks[index].entry = entry;
             self.blocks[index].body_entry = body_entry;
         }
+        // The pad lives outside the arena, so compaction never moves it and this republish only
+        // has to restore the relocated `body`. Read without building: a visible float portal
+        // implies the pad already exists.
+        let pad = self.x87_pad_address_if_built();
         for (index, portal) in self.block_portals.iter().enumerate() {
             if portal_visibility.get(index) == Some(&true) {
-                portal.publish(self.blocks[index].body_ptr());
+                let body = self.blocks[index].body_ptr();
+                if self.blocks[index].has_x87 {
+                    portal.publish_x87(body, pad);
+                } else {
+                    portal.publish(body);
+                }
             }
         }
 
@@ -1500,8 +1573,21 @@ impl BlockCache {
             // float-to-integer case relies on. So RET PIC keeps the strict has_x87 equality on
             // top of the relaxed rule; static successors (target_eip == None, resolved above by
             // resolve_successors/resolve_waiting) get the full relaxed rule instead.
+            //
+            // This equality is ALSO what keeps the shared x87 re-entry pad safe on that path.
+            // `emit_completed_dynamic_path` loads `BlockPortal::body` unconditionally, not
+            // `integer_entry`, so it would bypass the pad. Same class on both ends means the two
+            // fields are equal for every target it can bind, so the bypass is unobservable.
+            // Relaxing this line without teaching that path the pad is a silent wrong-entry bug.
             || (target_eip.is_some() && source_block.has_x87 != target_block.has_x87)
         {
+            return false;
+        }
+        // An integer source reaching a float target goes through the shared pad. Without one there
+        // is no correct address to publish: `body` would enter the target with an unloaded x87
+        // register cache. Refusing here leaves the cell on the zero portal, so the exit reports
+        // `StaticUnbound` exactly as it did before the pad existed.
+        if !source_block.has_x87 && target_block.has_x87 && self.x87_pad_address().is_none() {
             return false;
         }
         let slot_index = usize::from(slot);
@@ -1513,6 +1599,14 @@ impl BlockCache {
             return true;
         }
         self.unlink_outbound(source, slot);
+        // AFTER `unlink_outbound`, which routes through `LinkCell::clear` and resets this to the
+        // never-set sentinel. Setting it earlier leaves every cell at `NO_ENTRY_TOP`, the shared
+        // x87 pad then bails on every crossing, and the mechanism is inert while every counter
+        // gate still passes. Placed beside `mark_spilling`, which has the same ordering
+        // requirement for the same reason.
+        if let Some(top) = target_block.x87_entry_top() {
+            self.link_cells[source_index][slot_index].set_entry_top(top);
+        }
         if source_block.has_x87 && !target_block.has_x87 {
             self.link_cells[source_index][slot_index].mark_spilling();
         }
@@ -1626,7 +1720,7 @@ impl BlockCache {
         };
         if self.block_link_epochs.get(index).copied() == Some(self.link_epoch) {
             if !self.block_portals[index].visible() {
-                self.block_portals[index].publish(self.blocks[index].body_ptr());
+                self.publish_portal(index);
             }
             return;
         }
@@ -1640,7 +1734,7 @@ impl BlockCache {
         self.linear_blocks.insert(target, id);
         self.resolve_successors(id);
         self.resolve_waiting(target, id);
-        self.block_portals[index].publish(self.blocks[index].body_ptr());
+        self.publish_portal(index);
     }
 }
 
@@ -1715,6 +1809,9 @@ pub(crate) enum UnresolvedReason {
     StaticHidden,
     DynamicMissOrUnbound,
     DynamicHidden,
+    /// The shared x87 re-entry pad refused the crossing: the target float block's baked entry TOP
+    /// does not match the CPU's live TOP, so its register cache cannot be entered for it.
+    X87TopMismatch,
 }
 
 /// Fetch replay retained for buses that observe individual code addresses. Production RAM timing
