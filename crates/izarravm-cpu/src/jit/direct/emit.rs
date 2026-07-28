@@ -521,9 +521,9 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // TWO MemorySideExits, one per address, and both wrong ways panic at emit time.
                 // One shared set built from the source addr trips
                 // `expect("finite native segment has a limit side exit")` whenever SS has a finite
-                // limit and the source segment is flat, or the reverse, because
-                // `MemorySideExits::new` derives that Option from a single addr. Reusing one set
-                // and appending twice trips the "label placed twice" assertion instead.
+                // limit and the source segment is flat, because `MemorySideExits::new` derives that
+                // Option from a single addr. Reusing one set and appending twice trips the "label
+                // placed twice" assertion instead.
                 //
                 // Both append to the SAME per-slot `side` label. The resolver at the end of this
                 // function chains any number of stubs per target.
@@ -2789,6 +2789,10 @@ fn emit_rmw_inc_dec_dword(
 /// The caller emits `sub esp, 4` AFTER this returns and after publishing the side exit. That is
 /// the invariant `Push16` records: a faulting push must leave ESP at its pre-instruction value,
 /// or a lazy-commit host that retries the instruction double-decrements it.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 fn emit_push_mem(
     e: &mut Encoder,
     addr: DirectAddr,
@@ -2826,11 +2830,7 @@ fn emit_push_mem(
     // exiting to the page fault. `emit_ram_read_pointer_inner` calls this in exactly this
     // position, between the kind check and the bias lookup.
     emit_read_permission_check(e, memory.cpl3, source_sides.permission);
-    e.mov_r64_imm64(Reg::RDI, map.read_biases() as u64);
-    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
-    e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
-    e.jz(source_sides.unavailable_or_kind);
-    e.add_r64_r64(Reg::RDI, Reg::RAX);
+    emit_read_pointer(e, map, source_sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDI, Reg::RDI, 0);
     // Park it: the stack store's address and kind path clobbers RAX, RCX, RDX and RDI.
     e.store_r64_disp32(Reg::RSP, STACK_PUSH_MEM_VALUE, Reg::RDI);
@@ -2854,20 +2854,18 @@ fn emit_push_mem(
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
     e.jnz(stack_sides.unavailable_or_kind);
     emit_write_permission_check(e, memory.cpl3, stack_sides.permission);
-    let unwatched = e.label();
-    emit_code_watch_branch(
+    emit_watched_store_guard(
         e,
         MemoryWidth::Dword,
         map,
         code_watch_tables,
         stack_sides.code_watch,
-        unwatched,
     );
-    e.place(unwatched);
-    // RCX MUST be recomputed here. `emit_code_watch_branch` clobbers it, leaving
-    // `(RAX & 0xfff) << 4`, while the bias lookup below indexes with `linear >> PAGE_SHIFT`.
-    // Without this the write-bias table is indexed with garbage. `emit_rmw_inc_dec_dword`
-    // recomputes immediately after its own watch join for this exact reason.
+    // RCX MUST be recomputed here. `emit_code_watch_branch` leaves one of three watch-probe
+    // intermediates in it depending on which path reached the join, and none of them is the page
+    // index the bias lookup below needs. Without this the write-bias table is indexed with
+    // whichever intermediate the guest's address happened to produce.
+    // `emit_rmw_inc_dec_dword` recomputes immediately after its own watch join for this reason.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);
@@ -3186,6 +3184,24 @@ fn emit_rmw_inc_dec(
     _: MemoryWidth,
     _: DirectAddr,
     _: MemoryEmitContext,
+    _: MemorySideExits,
+) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+// Unlike `emit_rmw_inc_dec_dword`, whose only call site is inside `emit_rmw_inc_dec`'s own gated
+// body, `emit_push_mem` is called directly from the `DirectKind::PushMem` arm in the ungated
+// `emit` match, the same position `emit_store` and `emit_rmw_inc_dec` are called from. It needs
+// both cfg variants for the same reason those two do.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_push_mem(
+    _: &mut Encoder,
+    _: DirectAddr,
+    _: MemoryEmitContext,
+    _: MemorySideExits,
     _: MemorySideExits,
 ) {
     unreachable!("direct memory lowering is x86-64-only")

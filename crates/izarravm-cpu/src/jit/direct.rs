@@ -3764,7 +3764,7 @@ struct MemoryEmitContext {
     /// without the mask.
     ///
     /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
-    /// and is keyed separately, so all eight `stack_addr` call sites pass a literal.
+    /// and is keyed separately, so all nine `stack_addr` call sites pass a literal.
     address_wrap: emit::AddressWrap,
 }
 
