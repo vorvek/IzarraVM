@@ -3364,3 +3364,575 @@ fn sixteen_bit_ret_case(release: u16) {
          this SP would side-exit on the alignment guard"
     );
 }
+
+/// `fresh()` leaves SS at the plain real-mode default, a 16-bit stack (SS.B=0). `PushMem` only
+/// has a 32-bit form so far (see the `SS.B=0 + Dword` case in the stack-width match in
+/// `compile`), so every fixture below needs SS widened to a 32-bit stack before the push can
+/// admit at all.
+fn widen_stack_to_32_bit(cpu: &mut CpuGsw) {
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+}
+
+/// PUSH through memory, executed natively in the MIDDLE of a block and compared against the
+/// interpreter.
+///
+/// The source is a DS-based absolute operand on purpose. A `read_segment` that wrongly returned
+/// SS is invisible on an ESP or EBP based source; what catches it is the debug assertion in
+/// `SegmentLayout::descriptor`, which fires only when the source segment falls outside the
+/// block's mask.
+#[test]
+fn a_mid_block_push_through_memory_matches_the_interpreter() {
+    let mut memory = vec![0; 0x2000];
+    memory[0x100..0x10b].copy_from_slice(&[
+        0x90, // starter
+        0x40, // inc eax
+        0xff, 0x35, 0x00, 0x08, 0x00, 0x00, // push dword [0x800], MID-BLOCK
+        0x40, // inc eax
+        0x43, // inc ebx
+        0xf4, // hlt
+    ]);
+    // A known value, so the fixture proves the RIGHT dword moved rather than that some dword did.
+    memory[0x800..0x804].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    for cpu in [&mut interp, &mut native] {
+        widen_stack_to_32_bit(cpu);
+        cpu.registers.set_esp(0x1000);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        native.registers.set_esp(0x1000);
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(native.jit_direct.len(), 1);
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0x1000);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.memory[0x0ffc..0x1000].fill(0);
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    // The AGGREGATE, not `trace.cycles()`. Native execution batches the whole compiled window and
+    // emits no per-access DataRead or DataWrite records, so the two per-cycle LOGS differ by
+    // construction and comparing them asserts something false about the design. The aggregate is
+    // what feeds `raw_bus_clocks`, which is a pinned corpus anchor, so it is both the correct and
+    // the load-bearing comparison. `direct_page_clocks` above is what makes it non-trivial:
+    // without it the test bus charges zero for every data width and this compares 0 against 0.
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.esp(), 0x0ffc);
+    assert_eq!(
+        u32::from_le_bytes(native_bus.memory[0x0ffc..0x1000].try_into().unwrap()),
+        0xdead_beef,
+        "the dword at the source address must be what reached the stack"
+    );
+    // Anti-vacuity, and it is the load-bearing assertion. Four native instructions means the
+    // block really spanned the push. Fewer would mean the block stopped at it and every
+    // comparison above is the interpreter against itself.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 4);
+}
+
+/// PUSH through memory where source and destination are the SAME dword, `push dword [esp-4]`.
+///
+/// The page guard forces both addresses to 4-byte alignment, so the source and destination are
+/// either identical or fully disjoint, never partially overlapping. That makes this the one
+/// shape where emitting the stack store BEFORE the source read fails on semantics rather than on
+/// a stale stash alone.
+///
+/// Why the store-before-read mutation fails HERE specifically. Source and destination are the
+/// same dword, so an ordering bug cannot be caught by "the wrong address was read": both
+/// addresses are correct. What catches it is the STASH. `emit_push_mem` parks the loaded value
+/// in the native frame at `STACK_PUSH_MEM_VALUE`, and a store emitted before the read writes
+/// whatever that slot happened to hold, which is host garbage on the first execution and the
+/// garbage it wrote back on every one after. The seeded value is what makes that visible.
+#[test]
+fn a_push_through_memory_of_the_identical_address_matches_the_interpreter() {
+    let mut memory = vec![0; 0x2000];
+    memory[0x100..0x108].copy_from_slice(&[
+        0x90, // starter
+        0x40, // inc eax
+        0xff, 0x74, 0x24, 0xfc, // push dword [esp-4], MID-BLOCK
+        0x40, // inc eax
+        0xf4, // hlt
+    ]);
+    // Seeded once, before any run. The push reads this address and writes it straight back, so
+    // the value never changes across warm-up or measured runs, and the pre-run reset below must
+    // not clear it: clearing it would be clearing the only source the instruction has.
+    memory[0x0ffc..0x1000].copy_from_slice(&0xcafe_f00du32.to_le_bytes());
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    for cpu in [&mut interp, &mut native] {
+        widen_stack_to_32_bit(cpu);
+        cpu.registers.set_esp(0x1000);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        native.registers.set_esp(0x1000);
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(native.jit_direct.len(), 1);
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0x1000);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        // Deliberately not clearing 0x0ffc..0x1000. It is the source for this fixture.
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    // The AGGREGATE, not `trace.cycles()`. Native execution batches the whole compiled window and
+    // emits no per-access DataRead or DataWrite records, so the two per-cycle LOGS differ by
+    // construction and comparing them asserts something false about the design. The aggregate is
+    // what feeds `raw_bus_clocks`, which is a pinned corpus anchor, so it is both the correct and
+    // the load-bearing comparison. `direct_page_clocks` above is what makes it non-trivial:
+    // without it the test bus charges zero for every data width and this compares 0 against 0.
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.esp(), 0x0ffc);
+    assert_eq!(
+        u32::from_le_bytes(native_bus.memory[0x0ffc..0x1000].try_into().unwrap()),
+        0xcafe_f00d,
+        "the push read the dword at its own destination and wrote it straight back, unchanged"
+    );
+    // Anti-vacuity. Three native instructions means the block spanned the push.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 3);
+}
+
+/// A PushMem whose SOURCE address falls in the mode-13 aperture must side exit rather than lower.
+///
+/// This pins the reason `emit_push_mem` refuses every page kind but plain RAM on BOTH accesses.
+/// The alternative construction reads the source through the mode-13 completion path, which
+/// increments a dynamic read counter as soon as the read resolves, while the stack store's guards
+/// can still side exit afterwards. A side exit reports dynamic counters against a static snapshot
+/// taken before the slot, so the RAM read count that `run.rs` derives by subtraction would go
+/// negative there: a debug panic, and in release a wrap that gets saturating-multiplied into the
+/// bus charge. Refusing the source kind outright means that state is never reached.
+#[test]
+fn a_push_through_memory_whose_source_is_the_mode13_aperture_side_exits() {
+    let mut memory = vec![0; 0x000b_1000];
+    memory[0x100..0x10a].copy_from_slice(&[
+        0x90, // starter
+        0x40, // inc eax
+        0xff, 0x35, 0x00, 0x00, 0x0a, 0x00, // push dword [0xa0000], MID-BLOCK
+        0x40, // inc eax
+        0xf4, // hlt
+    ]);
+    // A known value, so the fixture proves the RIGHT dword still reached the stack.
+    memory[0x000a_0000..0x000a_0004].copy_from_slice(&0x1357_9bdfu32.to_le_bytes());
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    // The mode-13 aperture sits at 0xa0000, past the 0xffff real-mode segment limit, so DS (and
+    // SS, for the stack side of the push) must be widened or every access there faults instead of
+    // exercising the refusal this fixture is about.
+    for cpu in [&mut interp, &mut native] {
+        make_data_segments_flat(cpu);
+        widen_stack_to_32_bit(cpu);
+        cpu.registers.set_esp(0x1000);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        native.registers.set_esp(0x1000);
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(native.jit_direct.len(), 1);
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0x1000);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.memory[0x0ffc..0x1000].fill(0);
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+    let unavailable_before = native.perf_counters().jit_direct_exit_unavailable_or_kind;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
+    assert_eq!(native.registers.esp(), 0x0ffc);
+    assert_eq!(
+        u32::from_le_bytes(native_bus.memory[0x0ffc..0x1000].try_into().unwrap()),
+        0x1357_9bdf,
+        "the instruction ran somewhere: the pushed dword reached the stack even though it side \
+         exited"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_exit_unavailable_or_kind - unavailable_before,
+        1,
+        "the source's non-RAM page kind must be what triggers the side exit"
+    );
+    // Anti-vacuity, and it is the point of the fixture. One native instruction is the inc eax
+    // before the push; the push itself never completes natively, so it is never counted.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 1);
+}
+
+/// Promotes an already-constructed CPU to ring 3 with flat protected-mode segments, mirroring
+/// `cpl3_fast_map_permission_side_exit_is_counted`'s setup exactly.
+fn promote_to_cpl3(cpu: &mut CpuGsw) {
+    cpu.control.cr0 |= CR0_PE;
+    cpu.cpl = 3;
+    cpu.registers.set_segment(
+        SegmentIndex::Cs,
+        SegmentRegister {
+            selector: 3,
+            base: 0,
+            limit: u32::MAX,
+            access: 0xfb,
+            default_size_32: true,
+        },
+    );
+    for segment in [SegmentIndex::Ds, SegmentIndex::Ss, SegmentIndex::Es] {
+        cpu.registers.set_segment(
+            segment,
+            SegmentRegister {
+                selector: 3,
+                base: 0,
+                limit: u32::MAX,
+                access: 0xf3,
+                default_size_32: true,
+            },
+        );
+    }
+}
+
+/// A ring-3 `PushMem` block must not panic at emit time, and once compiled it must produce the
+/// same guest state as the interpreter.
+///
+/// `emit_push_mem`'s own comment records that hardcoding the read set's permission flag to
+/// `false` "leaves a referenced-but-unplaced label and panics the encoder on any CPL3 block".
+/// Every OTHER PushMem fixture in this file runs at CPL0, where `memory.cpl3` is false and
+/// neither permission branch is ever taken. Nothing else in the suite compiles a CPL3 PushMem
+/// block, so a regression there has zero coverage before this fixture.
+///
+/// Two phases. The first is an ordinary, permitted access at CPL3: the block must compile, run,
+/// and match the interpreter exactly, proving the CPL3 encoder path works end to end rather than
+/// merely not crashing. The second forces the SOURCE page supervisor-only while the CPU runs at
+/// CPL3, so the runtime read permission check must trip a side exit before the stack write is
+/// ever reached, proving `emit_read_permission_check`'s label is placed correctly and not just
+/// exercised by luck on the happy path above.
+#[test]
+fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
+    // Two things this fixture had to work around, neither of them about CPL3.
+    //
+    // HLT is CPL0-only, and this harness sets up no IDT, so ending a ring-3 program with `hlt`
+    // double faults before any assertion runs. The block is stepped directly and ends on
+    // DIRECT_BARRIER instead.
+    //
+    // HLT is also absent from `classify` entirely, so it is an unclassifiable barrier rather than
+    // a terminal. A lone PushMem followed by `hlt` is one slot, which is under the compiler's
+    // three-slot minimum and is structurally rejected. Two `inc` fillers precede the push.
+
+    // Phase 1: an ordinary CPL3 access, differential against the interpreter. Steps a FIXED
+    // instruction count directly through `try_run_direct_block_for_test` and
+    // `cycle_no_interrupt_check`, rather than driving to HLT, and ends the block on
+    // `DIRECT_BARRIER` at exactly three instructions.
+    const PHASE1_ENTRY: u32 = 0x100;
+    let mut memory = vec![0; 0x2000];
+    memory[PHASE1_ENTRY as usize..PHASE1_ENTRY as usize + 9].copy_from_slice(&[
+        0x40, // inc eax
+        0xff,
+        0x35,
+        0x00,
+        0x08,
+        0x00,
+        0x00,           // push dword [0x800]
+        0x40,           // inc eax
+        DIRECT_BARRIER, // stop the block here
+    ]);
+    memory[0x800..0x804].copy_from_slice(&0x0bad_c0deu32.to_le_bytes());
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+
+    for cpu in [&mut interp, &mut native] {
+        promote_to_cpl3(cpu);
+        cpu.registers.eip = PHASE1_ENTRY;
+        cpu.registers.set_esp(0x1000);
+    }
+
+    // Warm the decode cache. `key_for` reads the physical start straight out of it and returns
+    // `None` if nothing has fetched this line yet.
+    for lin in [
+        PHASE1_ENTRY,
+        PHASE1_ENTRY + 1,
+        PHASE1_ENTRY + 7,
+        PHASE1_ENTRY + 8,
+    ] {
+        native.registers.eip = lin;
+        native
+            .fetch_decoded(&mut native_bus, lin)
+            .expect("fixture decode");
+    }
+    native.registers.eip = PHASE1_ENTRY;
+
+    // Populate the fast map for both accesses with PERMISSIVE flags, so this phase proves the
+    // permitted path works rather than exercising the refusal Phase 2 covers.
+    let source_page = native_bus
+        .direct_page(0x800, BusAccessKind::DataRead)
+        .unwrap()
+        .unwrap();
+    assert!(native.jit_fast_map.populate_read(
+        0x800,
+        0x800,
+        source_page,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+    ));
+    let stack_addr = 0x1000u32.wrapping_sub(4);
+    let stack_page = native_bus
+        .direct_page(stack_addr, BusAccessKind::DataWrite)
+        .unwrap()
+        .unwrap();
+    assert!(native.jit_fast_map.populate_write(
+        stack_addr,
+        stack_addr,
+        stack_page,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+    ));
+
+    let key = jit::direct::key_for(&native, PHASE1_ENTRY, true).unwrap();
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut native, PHASE1_ENTRY, true).unwrap();
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the block must span inc/push/inc, or this proves nothing about PushMem at CPL3"
+    );
+    let id = native.jit_direct.install(&compilation).unwrap();
+    let block = native
+        .jit_direct
+        .block(id)
+        .expect("installed block must be live");
+
+    // Not a panic: a compiled CPL3 PushMem block runs and does not crash the encoder.
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    for _ in 0..3 {
+        interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
+    }
+
+    assert_eq!(native.registers, interp.registers, "registers differ");
+    assert_eq!(
+        native.pending_flags, interp.pending_flags,
+        "pending flags differ"
+    );
+    assert_eq!(native_bus.memory, interp_bus.memory, "memory differs");
+    assert_eq!(native.registers.esp(), 0x0ffc);
+    assert_eq!(
+        u32::from_le_bytes(native_bus.memory[0x0ffc..0x1000].try_into().unwrap()),
+        0x0bad_c0de,
+        "the dword at the source address must be what reached the stack"
+    );
+
+    // Phase 2: a supervisor-only SOURCE page must trip the read permission check and side exit
+    // before the write side is ever reached. Modelled on
+    // `cpl3_fast_map_permission_side_exit_is_counted`: build and install the block directly, force
+    // the source page's fast-map permission to `user: false`, and run it through the raw block
+    // runner so the permission trap is isolated from the write side and from ordinary admission.
+    // The two `inc` fillers put the push at the third slot, per the HLT-is-not-a-terminal note
+    // above.
+    const PUSH_ENTRY: u32 = 0x100;
+    // 0x3000 so the STACK lives in a different PAGE from the source. `flags()` is one table
+    // per page shared by the read and write maps, so a permissive write mapping on the
+    // source's own page silently clears the supervisor bit the read mapping set and the
+    // source stops refusing at all. Source 0x300 is page 0; the stack at 0x1ffc is page 1.
+    let mut memory = vec![0; 0x3000];
+    memory[PUSH_ENTRY as usize..PUSH_ENTRY as usize + 9].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0x35, 0x00, 0x03, 0x00, 0x00, // push dword [0x300]
+        0xf4, // hlt
+    ]);
+    memory[0x300..0x304].copy_from_slice(&0x2468_ace0u32.to_le_bytes());
+
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    promote_to_cpl3(&mut cpu);
+    cpu.registers.eip = PUSH_ENTRY;
+    cpu.registers.set_esp(0x2000);
+
+    // Warm the decode cache, exactly as in Phase 1: `key_for` needs a fetched physical start.
+    for lin in [PUSH_ENTRY, PUSH_ENTRY + 1, PUSH_ENTRY + 2, PUSH_ENTRY + 8] {
+        cpu.registers.eip = lin;
+        cpu.fetch_decoded(&mut bus, lin).expect("fixture decode");
+    }
+    cpu.registers.eip = PUSH_ENTRY;
+
+    let page = bus
+        .direct_page(0x300, BusAccessKind::DataRead)
+        .unwrap()
+        .unwrap();
+    assert!(cpu.jit_fast_map.populate_read(
+        0x300,
+        0x300,
+        page,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: false,
+        },
+    ));
+
+    // The STACK side must be explicitly PERMISSIVE, and this is the load-bearing half of the
+    // fixture rather than setup noise. Without it the stack lane refuses too, so a permission
+    // side exit is counted whichever lane produced it, and the fixture cannot tell them apart.
+    // A mutation battery proved that: deleting `emit_read_permission_check` from the source lane
+    // SURVIVED this fixture until the stack was made permissive, because the exit was still
+    // counted, just from the wrong lane. Now the source is the only thing that can refuse.
+    //
+    // The address is `ESP - 4`, NOT ESP. The write lands at 0x0ffc, which is in page 0, the same
+    // page as the code. Populating page 0x1000 instead leaves page 0 carrying whatever the code
+    // fetch gave it, which is supervisor-only, so the stack lane refuses and the mutation stays
+    // invisible. That mistake was made once here already.
+    let stack_addr = 0x2000u32.wrapping_sub(4);
+    let stack_page = bus
+        .direct_page(stack_addr, BusAccessKind::DataWrite)
+        .unwrap()
+        .unwrap();
+    assert!(cpu.jit_fast_map.populate_write(
+        stack_addr,
+        stack_addr,
+        stack_page,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+    ));
+
+    let key = jit::direct::key_for(&cpu, PUSH_ENTRY, true).unwrap();
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut cpu, PUSH_ENTRY, true).unwrap();
+    let id = cpu.jit_direct.install(&compilation).unwrap();
+    let block = cpu
+        .jit_direct
+        .block(id)
+        .expect("installed block must be live");
+
+    let exits_before = cpu.perf_counters().jit_direct_side_exits;
+    let permissions_before = cpu.perf_counters().jit_direct_exit_permission;
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    // The two fillers run natively before the side exit; only the push, the third slot, refuses.
+    assert_eq!(
+        cpu.registers.eip,
+        PUSH_ENTRY + 2,
+        "must exit exactly at the push"
+    );
+    assert_eq!(
+        cpu.registers.eax(),
+        1,
+        "the filler before the push ran natively"
+    );
+    assert_eq!(
+        cpu.registers.ecx(),
+        1,
+        "the second filler before the push ran natively"
+    );
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits - exits_before, 1);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_permission - permissions_before,
+        1
+    );
+}

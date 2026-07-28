@@ -181,3 +181,60 @@ fn a_word_near_jmp_above_the_wrap_is_refused_while_the_same_block_below_it_compi
         "the clamp must not apply at Dword operand size"
     );
 }
+
+/// A 66-prefixed `FF /6` must stay REFUSED, and nothing else in the crate can catch it.
+///
+/// `0xff` is in the Word allowlist, so this form reaches the classifier and produces a `PushMem`.
+/// What refuses it is the stack-width admission matrix, which is consulted only for kinds whose
+/// `uses_stack()` is true. Admitting it would push two bytes while decrementing ESP by four,
+/// which is a miscompile rather than a missed lowering.
+///
+/// The assertion is an EXACT count, and it is paired against a POSITIVE CONTROL: the unprefixed
+/// `FF /6` at the same entry, on the same stack width, must lower and grow the block to four
+/// instructions. Without the control, "the block is three instructions" is satisfied identically
+/// by the Word form being correctly refused OR by `PushMem` never reaching the classifier at all,
+/// and the fixture cannot tell those apart.
+///
+/// Both cases widen SS to a 32-bit stack explicitly. `flat_fixture` widens the CS and SS LIMITS
+/// but leaves `SS.default_size_32` alone, and the stack-width admission matrix refuses `PushMem`
+/// on a 16-bit stack (`SS.B` = 0) regardless of operand size. Left unwidened, the control would
+/// also come out to 3 instructions, for a reason that has nothing to do with the 0x66 prefix, and
+/// the pairing would prove nothing. Widening SS here makes the prefix the ONLY difference between
+/// the two cases.
+#[test]
+fn word_size_push_through_memory_stays_refused() {
+    let cases: &[(&str, &[u8], u8)] = &[
+        (
+            "unprefixed control",
+            &[0xff, 0x35, 0x00, 0x08, 0x00, 0x00],
+            4,
+        ),
+        (
+            // 66 ff 35 00 08 00 00: push word [0x800] at Word operand size.
+            "0x66-prefixed",
+            &[0x66, 0xff, 0x35, 0x00, 0x08, 0x00, 0x00],
+            3,
+        ),
+    ];
+
+    for &(label, form, expected_instructions) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.registers.set_esp(0x1000);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, expected_instructions,
+            "{label}: the Dword form must lower and the Word form must stay refused"
+        );
+    }
+}

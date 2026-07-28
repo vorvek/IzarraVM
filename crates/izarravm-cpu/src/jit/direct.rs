@@ -2240,6 +2240,28 @@ pub(crate) enum DirectKind {
     /// entry slot is a NOP parks with `plan.leading == 0` and stays on the interpreter, exactly
     /// as it did while the opcode was unclassifiable.
     Nop,
+    /// PUSH r/m32, MEMORY form (0xFF /6): one dword read at `addr`, one dword write at
+    /// `SS:[ESP-4]`, then `ESP -= 4`.
+    ///
+    /// The first kind with two accesses at DIFFERENT addresses. Both refuse every page kind but
+    /// plain RAM, which is what keeps `emit_mode13_read_completion` out of this slot. That
+    /// completion increments the dynamic mode-13 read count as soon as the read resolves, while
+    /// the STORE guards can still side exit afterwards, and a side exit reports the dynamic
+    /// counters against a static snapshot taken before the slot. `run.rs`'s
+    /// `dword_reads - exit.mode13_dword_reads` would then go negative: a debug panic, and in
+    /// release a wrap that is saturating-multiplied into the bus charge.
+    ///
+    /// The register form (mod == 3) is deliberately absent. It is architecturally `PUSH r32`,
+    /// whose clock charge would have to be checked against 0x50..0x57 rather than assumed, and
+    /// the attribution census measures zero occurrences of it.
+    ///
+    /// `raw_clocks` carries NO arm: the interpreter's group-5 arm 6 returns `clocks(2)`, which is
+    /// already the `_ => 2` default. This is the `ImulMemAcc` situation, not the LEAVE one. The
+    /// charge is still pinned in a fixture, because "correctly rides the default" and "nobody
+    /// checked" look identical in a diff.
+    PushMem {
+        addr: DirectAddr,
+    },
     X87 {
         insn: NativeX87Insn,
         addr: Option<DirectAddr>,
@@ -2446,6 +2468,7 @@ impl DirectKind {
                     | Self::Pop { .. }
                     | Self::Leave
                     | Self::Ret { .. }
+                    | Self::PushMem { .. }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword),
         )
     }
@@ -2505,6 +2528,7 @@ impl DirectKind {
                 } | Self::DoubleShiftMem { .. }
                     | Self::Push { .. }
                     | Self::Call { .. }
+                    | Self::PushMem { .. }
             ) || matches!(
                 self,
                 Self::AluMemDest {
@@ -2636,10 +2660,19 @@ impl DirectKind {
             Self::Push16 { .. } | Self::Call16 { .. } => {
                 COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY
             }
+            // No read lane. The source read is RAM-only, and `run.rs` derives RAM reads by
+            // subtracting the mode-13 dynamic count from the static count, so no dynamic read
+            // counter is emitted. `emit_rmw_inc_dec_dword` is the precedent: it reads and writes
+            // and increments only the write lane.
+            Self::PushMem { .. } => COUNTER_RAM_DWORD_WRITE,
             _ => 0,
         }
     }
 
+    /// A correctness site, not bookkeeping. Defaulting a memory kind to `None` here makes
+    /// `kind_segment_access_supported` trivially true AND keeps the segment out of the block's
+    /// `SegmentLayout` mask, and `data_matches` SKIPS unused segments, so a cached block would
+    /// keep matching after a guest DS reload and read through a STALE BASE.
     fn read_segment(self) -> Option<SegmentIndex> {
         match self {
             Self::Load { addr, .. }
@@ -2650,7 +2683,8 @@ impl DirectKind {
             | Self::AluMemDest { addr, .. }
             | Self::DoubleShiftMem { addr, .. }
             | Self::TestImmMem { addr, .. }
-            | Self::RmwIncDec { addr, .. } => Some(addr.segment),
+            | Self::RmwIncDec { addr, .. }
+            | Self::PushMem { addr, .. } => Some(addr.segment),
             Self::X87 {
                 insn,
                 addr: Some(addr),
@@ -2688,9 +2722,11 @@ impl DirectKind {
             {
                 Some(addr.segment)
             }
-            Self::Push { .. } | Self::Push16 { .. } | Self::Call { .. } | Self::Call16 { .. } => {
-                Some(SegmentIndex::Ss)
-            }
+            Self::Push { .. }
+            | Self::Push16 { .. }
+            | Self::Call { .. }
+            | Self::Call16 { .. }
+            | Self::PushMem { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -2720,6 +2756,7 @@ impl DirectKind {
                 | Self::Pop { .. }
                 | Self::Leave
                 | Self::Ret { .. }
+                | Self::PushMem { .. }
         ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword)
     }
 
@@ -2735,6 +2772,7 @@ impl DirectKind {
             } | Self::DoubleShiftMem { .. }
                 | Self::Push { .. }
                 | Self::Call { .. }
+                | Self::PushMem { .. }
         ) || matches!(
             self,
             Self::AluMemDest {
@@ -2749,6 +2787,11 @@ impl DirectKind {
         self.word_reads() != 0 || self.word_stores() != 0
     }
 
+    /// `PushMem` being here is LOAD-BEARING rather than bookkeeping. `0xff` is in the
+    /// `OperandSize::Word` allowlist in `classify.rs`, so a 66-prefixed `FF /6` in 32-bit code
+    /// decodes as Word and reaches the classifier arm. Pushing two bytes while decrementing ESP
+    /// by four is a miscompile. What refuses it is the stack-width admission matrix in the
+    /// compile loop, and that matrix is only consulted for kinds this predicate accepts.
     fn uses_stack(self) -> bool {
         matches!(
             self,
@@ -2761,6 +2804,7 @@ impl DirectKind {
                 | Self::Call16 { .. }
                 | Self::Ret { .. }
                 | Self::Ret16 { .. }
+                | Self::PushMem { .. }
         )
     }
 
@@ -2890,6 +2934,18 @@ const STACK_BYTE_READS: i8 = 112;
 const STACK_DWORD_READS: i8 = 120;
 const STACK_ALU_ADDRESS_KIND: i32 = 128;
 const STACK_ALU_OLD_RESULT: i32 = 136;
+/// Where `emit_push_mem` parks the dword it read from the source operand, across the stack
+/// store's own address and kind path, which clobbers RAX, RCX, RDX and RDI. Those four are the
+/// whole scratch set: `GUEST_HOMES` is R8 to R14 plus RBX, R15 is the CPU pointer, RBP is the
+/// guest flag shadow, and RSI is host callee-saved and spilled only for x87 blocks.
+///
+/// Aliased onto the ALU slot deliberately. `PushMem` is not an ALU kind, the two never appear in
+/// one slot's emission, and every use of either is written and read inside a single slot. It must
+/// NOT be `STACK_READ_KIND`: `emit_code_watch_branch` writes `STACK_WATCH_PAGE`, which is the
+/// same slot, on the store's path.
+///
+/// 136 is outside disp8 range, so this slot is reached with the disp32 load and store forms.
+const STACK_PUSH_MEM_VALUE: i32 = STACK_ALU_OLD_RESULT;
 const STACK_ALU_FLAGS: i32 = 144;
 const STACK_SHIFT_COUNT: i32 = 152;
 // Beyond the base frame: the saved host RSI slot, then the x87 XMM6-11
@@ -3708,7 +3764,7 @@ struct MemoryEmitContext {
     /// without the mask.
     ///
     /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
-    /// and is keyed separately, so all eight `stack_addr` call sites pass a literal.
+    /// and is keyed separately, so all nine `stack_addr` call sites pass a literal.
     address_wrap: emit::AddressWrap,
 }
 

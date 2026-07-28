@@ -699,6 +699,23 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }
             0xff => {
                 let m = insn.modrm?;
+                // /6 PUSH r/m32, memory form only. The REGISTER form is architecturally
+                // `PUSH r32` and is refused: its clock charge would have to be checked against
+                // 0x50..0x57 rather than assumed, and the attribution census measures zero
+                // occurrences of it on this corpus. Refusing it is a missed lowering worth
+                // nothing; mapping it onto `Push` without checking is a timing bug.
+                //
+                // /2 CALL, /3 far CALL, /4 JMP and /5 far JMP are not lowered here. The two near
+                // forms are control transfers with a DYNAMIC target and need the successor
+                // machinery `Ret` uses; the far forms load a descriptor.
+                if m.reg == 6 {
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None;
+                    };
+                    return Some(DirectKind::PushMem {
+                        addr: direct_addr(addr)?,
+                    });
+                }
                 if !matches!(m.reg, 0 | 1) {
                     return None;
                 }
