@@ -2566,6 +2566,23 @@ mod jit_region;
 #[path = "cpu_jit_general_test.rs"]
 mod jit_general;
 
+/// One byte that the Direct classifier refuses, for fixtures that need a block to STOP at a
+/// known offset. CLC: no ModRM, no immediate, continuable, and absent from every arm of
+/// `classify`, so the stop reason is `unclassifiable` and the rejected span is exactly one byte.
+///
+/// It used to be 0x90, until NOP was lowered. Whatever this byte is, it will eventually be
+/// lowered too, and CLC is a likelier candidate than most now that `emit_set_cf_only` exists.
+/// What makes that safe is `direct_barrier_opcode_is_still_unclassifiable`: a fixture whose
+/// barrier quietly stops being a barrier keeps PASSING while certifying nothing, which is worse
+/// than a failure. That test is the only thing standing between this constant and a suite full
+/// of vacuous assertions, so do not delete it when you change the byte.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+const DIRECT_BARRIER: u8 = 0xf8;
+
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",

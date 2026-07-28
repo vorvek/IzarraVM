@@ -314,6 +314,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // refused at compile time by `uses_stack()` feeding the `stack_is_32bit` check,
             // NOT here. The 16-bit OPERAND-size form is refused by the OperandSize::Word
             // gate above, which does not list 0xc9.
+            // NOP. Deliberately NOT added to the OperandSize::Word allowlist above, and that is
+            // a measured decision rather than caution: `try_direct_continuation` returns
+            // Interpret for every `!d` boundary before a key is ever built (`run.rs`), so no
+            // 16-bit block exists on any persona today and the allowlist entry would be dead
+            // code that no counter could gate. Admitting it there belongs to the banked 16-bit
+            // admission work, not here.
+            0x90 => {
+                return Some(DirectKind::Nop);
+            }
             0xc9 => {
                 return Some(DirectKind::Leave);
             }

@@ -203,6 +203,9 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::IncDecReg { dst, is_dec, width } => {
                 emit_inc_dec_reg(&mut e, dst, is_dec, width);
             }
+            // Zero bytes, on purpose. The slot still costs its instruction, its raw clocks and
+            // its EIP advance, all of which the loop tail below charges from the slot list.
+            DirectKind::Nop => {}
             DirectKind::Bt { rm, index } => {
                 emit_bt_reg(&mut e, rm, index);
             }

@@ -2221,6 +2221,25 @@ pub(crate) enum DirectKind {
         condition: u8,
         taken_delta: u32,
     },
+    /// NOP (0x90, architecturally XCHG (E)AX, (E)AX). Emits ZERO bytes.
+    ///
+    /// It exists only so block growth continues through it. The interpreter's arms are
+    /// `Ok(clocks(3))` with no state change at all (`execute.rs`, and the hot-cached path in
+    /// `run.rs`), and neither reads `operand_size`, so there is nothing to emit at either width.
+    ///
+    /// Fieldless for the same reason `Leave` is: the instruction has no operands. Unlike `Leave`
+    /// it is not a stack user and not a terminal, so it rides every default arm in this impl
+    /// except one. `raw_clocks` MUST carry an explicit arm; see the note there.
+    ///
+    /// Zero emit is not a special case. `emit_shift` and `emit_rotate_right_reg` already return
+    /// early at count 0 and write nothing, and the per-slot accounting in `emit_block` is driven
+    /// by the slot list rather than by emitted bytes.
+    ///
+    /// Absent from clif's `lowerable()` allowlist, which does NOT stop unit growth (that is
+    /// `unit_growth_classify`, which shares this classifier): it stops LOWERING, so a unit whose
+    /// entry slot is a NOP parks with `plan.leading == 0` and stays on the interpreter, exactly
+    /// as it did while the opcode was unclassifiable.
+    Nop,
     X87 {
         insn: NativeX87Insn,
         addr: Option<DirectAddr>,
@@ -2309,7 +2328,11 @@ pub(crate) struct DirectAddr {
 impl DirectKind {
     pub(crate) fn raw_clocks(self) -> u32 {
         match self {
-            Self::Jcc { .. } => 3,
+            // NOP joins Jcc at 3. Both interpreter arms charge `clocks(3)` and neither consults
+            // `operand_size`. Without this arm it rides the `_ => 2` default and undercharges
+            // every lowered NOP by one core clock, which NO other assertion in the tree can see:
+            // the same gap shipped twice this campaign and was caught only by a mutation.
+            Self::Jcc { .. } | Self::Nop => 3,
             // Both widths charge the same: the interpreter returns clocks(4) for 0x58..=0x5f
             // irrespective of operand size. Unlike Push, which correctly rides the `_ => 2`
             // default, an omitted arm here undercharges every pop by 2 core clocks and no test

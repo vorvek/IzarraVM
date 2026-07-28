@@ -869,11 +869,18 @@ fn cold_straight_line_code_is_seen_but_not_compiled() {
 fn hot_unsupported_entries_stay_interpreted_without_legacy_region_fallback() {
     let mut memory = vec![0; 0x1000];
     memory[0x100..0x10d].copy_from_slice(&[
-        0xb9, 0x05, 0x00, 0x00, 0x00, // mov ecx,5
-        0x90, // nop: unsupported direct entry
-        0x90, // nop: unsupported direct entry
-        0x83, 0xe9, 0x01, // sub ecx,1
-        0x75, 0xf9, // jnz 0x105
+        0xb9,
+        0x05,
+        0x00,
+        0x00,
+        0x00,           // mov ecx,5
+        DIRECT_BARRIER, // unsupported direct entry
+        DIRECT_BARRIER, // unsupported direct entry
+        0x83,
+        0xe9,
+        0x01, // sub ecx,1
+        0x75,
+        0xf9, // jnz 0x105
         0xf4, // hlt
     ]);
     let mut cpu = fresh();
@@ -889,16 +896,90 @@ fn hot_unsupported_entries_stay_interpreted_without_legacy_region_fallback() {
     assert_eq!(cpu.registers.ecx(), 0);
 }
 
+/// A lowered NOP must actually EXECUTE inside a native block. Every other NOP fixture in the
+/// suite puts it at the block entry, where the block turns out to begin one instruction past it,
+/// so a mutation that made `DirectKind::Nop` emit a guest register write survived the whole
+/// battery. The corpus is full of mid-loop alignment padding, so that shape has to be covered.
+#[test]
+fn a_mid_block_nop_executes_natively_and_changes_nothing() {
+    let mut memory = vec![0; 0x1000];
+    memory[0x100..0x10c].copy_from_slice(&[
+        0x90, // starter
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0x90, // NOP, mid-block: the one under test
+        0x40, // inc eax
+        0x83, 0xc3, 0x02, // add ebx,2
+        0xf4, // hlt
+    ]);
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(native.jit_direct.len(), 1);
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    // The whole state, so an emitted NOP that touched ANY register or flag is caught rather than
+    // only the ones this fixture happens to name.
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
+    assert_eq!(native.registers.eax(), 2);
+    assert_eq!(native.registers.ebx(), 2);
+    // Anti-vacuity, and it is the load-bearing assertion here. Four native instructions means the
+    // block really did span the NOP. Three would mean it stopped at it, and every comparison
+    // above would then be certifying the interpreter against itself.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 4);
+}
+
 #[test]
 fn supported_prefix_compiles_before_an_unsupported_barrier() {
     let mut memory = vec![0; 0x1000];
     memory[0x100..0x112].copy_from_slice(&[
         0x90, // starter
-        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
-        0x89, 0xc3, // mov ebx,eax
-        0x83, 0xc3, 0x02, // add ebx,2
-        0x90, // unsupported barrier
-        0xb9, 0x04, 0x00, 0x00, 0x00, // mov ecx,4
+        0xb8,
+        0x01,
+        0x00,
+        0x00,
+        0x00, // mov eax,1
+        0x89,
+        0xc3, // mov ebx,eax
+        0x83,
+        0xc3,
+        0x02,           // add ebx,2
+        DIRECT_BARRIER, // unsupported barrier
+        0xb9,
+        0x04,
+        0x00,
+        0x00,
+        0x00, // mov ecx,4
         0xf4, // hlt
     ]);
     let mut interp = fresh();

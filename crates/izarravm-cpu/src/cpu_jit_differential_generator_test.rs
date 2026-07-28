@@ -81,7 +81,11 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     };
     let mut bytes = Vec::with_capacity(128);
 
-    // The starter is interpreted. The generated block begins at entry + 1 and ends at Jcc.
+    // A NOP starter, kept as one because every case below is built around its one-byte offset.
+    // It is no longer an interpreted barrier: the Direct backend lowers 0x90, so the generated
+    // block now begins AT entry and covers the starter. Every assertion in this file compares
+    // the native run against the interpreter and none of them names the block boundary, so the
+    // wider block is still the same differential test.
     bytes.push(0x90);
 
     let dst = rng.reg();
