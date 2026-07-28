@@ -1091,6 +1091,17 @@ impl Encoder {
         }
     }
 
+    /// `bt rm32, index32` (0F A3 /r) with a REGISTER destination.
+    ///
+    /// Unlike the memory forms below this takes `mod == 0b11`, so it needs no SIB byte and no
+    /// RBP/R13 displacement guard, and it must NOT set REX.W: the operand is 32-bit and the host
+    /// takes the bit offset modulo 32, which is exactly the guest's `index & 31`.
+    pub(crate) fn bt_r32_r32(&mut self, rm: Reg, index: Reg) {
+        self.optional_rex(false, index.ext(), false, rm.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xA3]);
+        self.modrm(0b11, index.low3(), rm.low3());
+    }
+
     /// `bts qword [base], index64` (REX.W + 0F AB /r).
     pub(crate) fn bts_r64_mem(&mut self, base: Reg, index: Reg) {
         assert!(base.low3() != 0b101, "BTS base RBP/R13 needs a disp form");

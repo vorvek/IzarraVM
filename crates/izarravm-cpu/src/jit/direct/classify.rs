@@ -120,6 +120,27 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }),
         };
     }
+    // BT r/m32, r32, REGISTER form only. Keyed on the full u16 opcode and placed ABOVE the
+    // `u8::try_from(insn.opcode).ok()` truncation for the same reason 0x0faf and the MOVZX/MOVSX
+    // family are: that truncation returns None for every two-byte opcode, so an arm among the u8
+    // arms below would be unreachable and nothing would fail, the lowering would simply never
+    // fire.
+    //
+    // Must stay BELOW the OperandSize::Word gate. A 66-prefixed BT is not in that gate's
+    // allowlist so it is already refused, and it must be: at Word the interpreter masks the bit
+    // index with `& 15`, not `& 31` (`bits = operand_size.bytes() * 8`).
+    //
+    // Only 0xa3 of the four-opcode family, and only the register form. BTS/BTR/BTC (0xab, 0xb3,
+    // 0xbb) WRITE the operand back; this arm's kind does not, and the interpreter skips the
+    // write-back for op 0 alone. The memory form adjusts its effective address by the bit index
+    // at runtime, which a static DirectAddr cannot express.
+    if insn.opcode == 0x0fa3 {
+        let m = insn.modrm?;
+        return match insn.operand? {
+            DecodedOperand::Reg(rm) => Some(DirectKind::Bt { rm, index: m.reg }),
+            DecodedOperand::Mem(_) => None,
+        };
+    }
     // MOVZX and MOVSX, memory form only. Keyed on the full u16 opcode and placed ABOVE the
     // `u8::try_from(insn.opcode).ok()` truncation further down, for the same reason 0x0faf is:
     // that truncation returns None for every two-byte opcode, so an arm added among the u8 arms
@@ -642,6 +663,30 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 return Some(DirectKind::Ret {
                     release: if opcode == 0xc2 { insn.imm as u16 } else { 0 },
                 });
+            }
+            // INC/DEC r/m8, REGISTER form only. The byte sibling of the 0xff group below.
+            //
+            // The memory form is deliberately absent: `emit_rmw_inc_dec` handles Dword and Word
+            // and debug-asserts on the rest, and a Byte path needs its own code-watch width,
+            // counter lane and the fact that a byte access takes NO alignment guard at all.
+            //
+            // `dst` here is a BYTE-REGISTER index, where 4..7 mean AH/CH/DH/BH rather than
+            // ESP/EBP/ESI/EDI. The emitter's byte branch reads and writes through the lane
+            // helpers for exactly that reason; a `home(dst)` on this value would hit the wrong
+            // register entirely.
+            0xfe => {
+                let m = insn.modrm?;
+                if !matches!(m.reg, 0 | 1) {
+                    return None;
+                }
+                return match insn.operand? {
+                    DecodedOperand::Reg(dst) => Some(DirectKind::IncDecReg {
+                        dst,
+                        is_dec: m.reg == 1,
+                        width: MemoryWidth::Byte,
+                    }),
+                    DecodedOperand::Mem(_) => None,
+                };
             }
             0xff => {
                 let m = insn.modrm?;

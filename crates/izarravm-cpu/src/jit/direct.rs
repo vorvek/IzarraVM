@@ -1997,6 +1997,19 @@ pub(crate) enum DirectKind {
         dst: u8,
         src: u8,
     },
+    /// BT r/m32, r32, REGISTER form only (0F A3 with mod == 0b11).
+    ///
+    /// Writes CF alone and architecturally preserves SF, ZF, PF, AF and OF, which is why it
+    /// publishes through `emit_set_cf_only` rather than through the usual capture-and-publish.
+    ///
+    /// The MEMORY form is deliberately absent and is not an oversight: for a memory operand the
+    /// interpreter adjusts the effective address by the bit index at RUNTIME (`bit_string_op`
+    /// with `register_index = true`), and a `DirectAddr` is a static address expression that
+    /// cannot express that.
+    Bt {
+        rm: u8,
+        index: u8,
+    },
     /// IMUL r32, r/m32, MEMORY form (0x0FAF). Same flag contract and the same clocks(9) as
     /// `Imul`, because the interpreter reaches both through one `imul_truncated` call and one
     /// `clocks(9)`; the only difference is where the source comes from.
@@ -2303,6 +2316,9 @@ impl DirectKind {
             // would fail. LEAVE joins them: it is `ESP <- EBP` then POP and the interpreter
             // charges the same clocks(4) for the 0xc9 arm.
             Self::Pop { .. } | Self::Pop16 { .. } | Self::Leave => 4,
+            // 0F A3 returns clocks(6) irrespective of operand size. Without this arm it rides
+            // the `_ => 2` default and undercharges every BT by 4.
+            Self::Bt { .. } => 6,
             Self::Call { .. } | Self::Call16 { .. } | Self::Jmp { .. } => 7,
             // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
             // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
