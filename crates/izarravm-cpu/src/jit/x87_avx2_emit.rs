@@ -72,6 +72,25 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             emit_finite_guard(e, VALUE1, context.side_exit);
             emit_binary_st0(e, top, op, context.side_exit);
         }
+        // No operand finite guard here, and that is deliberate rather than an oversight: the
+        // guard's contract is that no NaN or infinity may reach `emit_compare`
+        // (`emit_binary_st0` has no guard of its own on the compare path). For this variant the
+        // contract holds by construction on BOTH inputs: `emit_load_physical` finite-guards
+        // ST(0) below, and a `cvtsi2sd` result is always finite, an integer can never convert to
+        // NaN or infinity. The arithmetic path guards its own RESULT inside `emit_binary_st0`, so
+        // an FIDIV by integer zero produces an infinity, fails that guard, and side exits, with
+        // the interpreter recording the ZE exception exactly as it does today.
+        //
+        // Tier 2 (m64/m80 memory operands, a later slice) CAN carry a NaN or infinity operand and
+        // must NOT copy this arm's shape without adding the guard back.
+        NativeX87Insn::IntBinaryMemory { op, .. } => {
+            let memory = context
+                .memory
+                .expect("x87 int memory source needs a host pointer");
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.vcvtsi2sd_i32_disp32(VALUE1, VALUE1, memory, 0);
+            emit_binary_st0(e, top, op, context.side_exit);
+        }
         NativeX87Insn::BinaryRegister { op, index } => {
             emit_load_physical(e, top, VALUE0, context.side_exit);
             emit_load_physical(e, physical(top, index), VALUE1, context.side_exit);

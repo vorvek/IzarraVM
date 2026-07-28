@@ -11,6 +11,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         let native = NativeX87Insn::classify(insn)?;
         let addr = match native {
             NativeX87Insn::BinaryMemory { addr, .. }
+            | NativeX87Insn::IntBinaryMemory { addr, .. }
             | NativeX87Insn::LoadF32 { addr }
             | NativeX87Insn::StoreF32 { addr, .. }
             | NativeX87Insn::LoadI32 { addr }

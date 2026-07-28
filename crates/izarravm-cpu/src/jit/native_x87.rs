@@ -118,6 +118,13 @@ pub(crate) enum NativeX87Insn {
         op: NativeX87BinaryOp,
         addr: AddrMode,
     },
+    /// 0xDA memory forms: integer m32 arithmetic against ST(0). The operand is read as an
+    /// i32 and converted; the op set is exactly BinaryMemory's (same /ext mapping), so the
+    /// compare/pop behavior rides `NativeX87BinaryOp` unchanged.
+    IntBinaryMemory {
+        op: NativeX87BinaryOp,
+        addr: AddrMode,
+    },
     BinaryRegister {
         op: NativeX87BinaryOp,
         index: u8,
@@ -208,7 +215,9 @@ impl NativeX87Insn {
             | Self::LoadOne
             | Self::LoadZero
             | Self::LoadI32 { .. } => -1,
-            Self::BinaryMemory { op, .. } | Self::BinaryRegister { op, .. } => {
+            Self::BinaryMemory { op, .. }
+            | Self::IntBinaryMemory { op, .. }
+            | Self::BinaryRegister { op, .. } => {
                 if op.pops() {
                     1
                 } else {
@@ -234,8 +243,10 @@ impl NativeX87Insn {
             // It feeds the emitter's running TOP, so getting it wrong makes every LATER x87 slot
             // in the block address the wrong physical XMM, and it feeds `x87_exit_top`, where the
             // only symptom is a link `link_compatible` silently refuses. `metadata().pops` looks
-            // like a redundant cross-check on this and IS NOT: that field has no readers anywhere
-            // in the crate. `top_delta` is the sole live authority for the stack position.
+            // like a redundant cross-check on this and IS NOT: that field has no NON-TEST readers
+            // in the crate (`metadata_matches_interpreter_timing_and_memory_effects` asserts the
+            // whole struct by equality, so it does read `pops`, but nothing outside a test does).
+            // `top_delta` is the sole live authority for the stack position.
             | Self::BinaryRegisterDest { .. } => 0,
         }
     }
@@ -282,6 +293,10 @@ impl NativeX87Insn {
                 (0xd9, 7) => Some(Self::StoreControlWord { addr }),
                 (0xdb, 0) => Some(Self::LoadI32 { addr }),
                 (0xdb, 3) => Some(Self::StoreI32 { addr }),
+                (0xda, extension) => Some(Self::IntBinaryMemory {
+                    op: NativeX87BinaryOp::from_extension(extension)?,
+                    addr,
+                }),
                 _ => None,
             };
         }
@@ -353,6 +368,17 @@ impl NativeX87Insn {
                 pops: op.pops(),
                 terminates_block: false,
             },
+            // Its own arm rather than joining `BinaryMemory`'s: that arm hard-codes
+            // `FpOpClass::F32Mem`, which is wrong for an integer memory operand and would
+            // undercharge this shape 32x against the interpreter's IntConvert16 timing tail
+            // (`fpu_exec.rs:87`).
+            Self::IntBinaryMemory { op, .. } => NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::IntConvert16,
+                memory: read_dword,
+                pops: op.pops(),
+                terminates_block: false,
+            },
             Self::BinaryRegister { op, .. } => NativeX87Metadata {
                 raw_clocks: 20,
                 fp_class: FpOpClass::Register,
@@ -406,9 +432,9 @@ impl NativeX87Insn {
             },
             // Both ST(i)-destination forms are `Ok(clocks(20))` on the same interpreter arm
             // (`fpu_reg_arith_sti`), and `execute_fpu` assigns FpOpClass::Register to every
-            // mod=3 form. The ONLY field that differs is `pops`, and that field has no readers
-            // anywhere in the crate: it is documentation, and `top_delta` is what actually
-            // carries the stack effect.
+            // mod=3 form. The ONLY field that differs is `pops`, and that field has no
+            // non-test readers: it is documentation for a test to check, and `top_delta` is
+            // what actually carries the stack effect.
             Self::PopBinary { .. } => NativeX87Metadata {
                 raw_clocks: 20,
                 fp_class: FpOpClass::Register,
