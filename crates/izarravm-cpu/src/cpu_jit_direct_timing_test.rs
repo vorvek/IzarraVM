@@ -3445,3 +3445,218 @@ fn chain_quota_memo_clears_on_a_mode_change_even_when_no_block_is_cached() {
         "a mode change must drop the chain-quota memo even when the block cache is empty"
     );
 }
+
+/// `JmpMem`'s source, read from the mode-13 aperture, must LOWER and match the interpreter
+/// exactly, aggregate bus clocks included. This is the corrected shape from the review outcome:
+/// `JmpMem` uses the Ret arm's construction (`emit_ram_read_pointer_inner` plus the mode13
+/// completion), so unlike `PushMem`'s RAM-only source lane, a jump target read from the aperture
+/// LOWERS rather than side-exiting.
+///
+/// This also exercises the re-load bug class Ret shipped once: `emit_mode13_read_completion`
+/// clobbers RDX on its mode13 branch, and the emitter re-loads the target from RDI afterward, the
+/// same fix Ret needed at `emit.rs:1028-1035`. Deleting that re-load leaves EIP at whatever the
+/// clobbered increment left behind rather than the popped target.
+///
+/// Modelled on `a_push_through_memory_whose_source_is_the_mode13_aperture_side_exits`
+/// (`cpu_jit_direct_test.rs`) rather than the RET mode13 fixtures in this file: those install a
+/// block manually and step the interpreter through a fixed instruction count, and their own
+/// comment records that the two accounting boundaries do not line up for a bus-clock comparison
+/// ("a COMPLETED block and three interpreter cycles do not present the same accounting
+/// boundary"). Driving both sides through the SAME `run_straight_line` boundary, as the PushMem
+/// aperture fixture does, is what makes the aggregate bus-clock comparison meaningful here.
+#[test]
+fn a_jmp_through_memory_whose_source_is_the_mode13_aperture_lowers_and_matches_the_interpreter() {
+    let mut memory = vec![0; 0x000b_1000];
+    memory[0x100..0x108].copy_from_slice(&[
+        0x90, // starter
+        0x40, // inc eax
+        0xff, 0x25, 0x00, 0x00, 0x0a, 0x00, // jmp dword [0xa0000], MID-BLOCK, TERMINAL
+    ]);
+    // The target: two more instructions, too short to compile on its own, then HLT.
+    memory[0x200..0x203].copy_from_slice(&[
+        0x43, // inc ebx
+        0x46, // inc esi
+        0xf4, // hlt
+    ]);
+    memory[0x000a_0000..0x000a_0004].copy_from_slice(&0x0000_0200u32.to_le_bytes());
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    // The mode-13 aperture sits at 0xa0000, past the 0xffff real-mode segment limit, so DS must be
+    // widened or the read faults instead of exercising the aperture path this fixture is about.
+    for cpu in [&mut interp, &mut native] {
+        make_data_segments_flat(cpu);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(
+        native.jit_direct.len(),
+        1,
+        "only the source block should have compiled: the target is two slots, below the minimum"
+    );
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.eip, interp.registers.eip);
+    // Anti-vacuity. The compiled block is the filler plus the jump (the starter is a single cold
+    // visit, never part of the compiled span; see the RAM mid-block fixture for the same shape).
+    // Two native instructions means the jump itself retired natively, through the mode13
+    // completion, rather than the block silently stopping before it.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
+}
+
+/// The CS-limit guard on the dynamic target: a source dword ABOVE the code segment limit must
+/// side exit before EIP is ever written, and the interpreter's own re-run of the same instruction
+/// must agree, because `JmpMem`'s own interpreter arm performs no such check at all
+/// (`execute_extended.rs:920-924` just masks and stores). The fault comes from the FOLLOWING
+/// fetch, not from the jump.
+///
+/// Modelled on `finite_cs_ret_limit_exit_case`, with one structural difference `Ret` never has to
+/// deal with: RET's own interpreter arm checks the limit inline and faults immediately on
+/// `execute_decoded`, so that fixture reproduces the fault with one call. `JmpMem`'s arm has no
+/// such check, so the interpreter happily sets EIP to the too-large target and the fault only
+/// appears on the NEXT fetch attempt, which this fixture reproduces as a second, explicit step.
+#[test]
+fn finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_precisely() {
+    const ENTRY: u32 = 0x301;
+    const JMP: u32 = ENTRY + 7;
+    let mut memory = vec![0; 0x000b_0000];
+    high_segment_page_tables(&mut memory);
+    memory[0x4008..0x400c].copy_from_slice(&0x0000_7067u32.to_le_bytes());
+    memory[0x8301..0x830e].copy_from_slice(&[
+        0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+        0x89, 0xc1, // mov ecx,eax
+        0xff, 0x25, 0x00, 0x20, 0x00, 0x00, // jmp dword [0x2000]
+    ]);
+    memory[0x7000..0x7004].copy_from_slice(&(QUAKE_CS_LIMIT + 1).to_le_bytes());
+
+    let mut native = quake_segment_cpu(ENTRY, true);
+    let mut interp = quake_segment_cpu(ENTRY, true);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + 5, JMP];
+    decode_segmented_fixture(&mut native, &mut native_bus, &starts);
+    decode_segmented_fixture(&mut interp, &mut interp_bus, &starts);
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        QUAKE_SEGMENT_BASE + 0x2000,
+        0x7000,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+        true,
+        false,
+    );
+    let block = install_fixture_block(&mut native, QUAKE_SEGMENT_BASE + ENTRY);
+    assert_eq!(block.span().instructions, 3);
+    arm_stack_fixture(&mut native, ENTRY, 0);
+    arm_stack_fixture(&mut interp, ENTRY, 0);
+    let side_exits = native.perf_counters().jit_direct_side_exits;
+    let other_exits = native.perf_counters().jit_direct_exit_other;
+    let insns_before = native.perf_counters().jit_direct_insns;
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    interp.cycle(&mut interp_bus).unwrap();
+    interp.cycle(&mut interp_bus).unwrap();
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        native.registers.eip, JMP,
+        "the side exit must leave EIP at the jump itself: JmpMem writes EIP only after every \
+         guard passes"
+    );
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.perf_counters().jit_direct_side_exits - side_exits, 1);
+    assert_eq!(
+        native.perf_counters().jit_direct_exit_other - other_exits,
+        1
+    );
+    // Anti-vacuity: only the two movs retired natively; the jump itself never completed.
+    assert_eq!(native.perf_counters().jit_direct_insns - insns_before, 2);
+
+    // The interpreter's own arm 4 has no limit check (`execute_extended.rs:920-924`): both sides
+    // must execute the jump itself successfully and land EIP on the too-large target.
+    let native_jmp = native
+        .decode_cache
+        .get(QUAKE_SEGMENT_BASE + JMP, true)
+        .unwrap();
+    let interp_jmp = interp
+        .decode_cache
+        .get(QUAKE_SEGMENT_BASE + JMP, true)
+        .unwrap();
+    native
+        .execute_decoded(&native_jmp, &mut native_bus)
+        .unwrap();
+    interp
+        .execute_decoded(&interp_jmp, &mut interp_bus)
+        .unwrap();
+    assert_eq!(native.registers.eip, QUAKE_CS_LIMIT + 1);
+    assert_eq!(interp.registers.eip, QUAKE_CS_LIMIT + 1);
+
+    // The fault surfaces on the FOLLOWING fetch, exactly as `decode.rs`'s live fetch-limit
+    // recheck documents: "enforces the fault at exactly the byte the fetch would have crossed."
+    let native_fault =
+        native.fetch_decoded(&mut native_bus, QUAKE_SEGMENT_BASE + native.registers.eip);
+    let interp_fault =
+        interp.fetch_decoded(&mut interp_bus, QUAKE_SEGMENT_BASE + interp.registers.eip);
+    for fault in [native_fault, interp_fault] {
+        assert!(matches!(
+            fault,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            })
+        ));
+    }
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+}
