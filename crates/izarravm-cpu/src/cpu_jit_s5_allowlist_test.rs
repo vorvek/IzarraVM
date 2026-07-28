@@ -238,3 +238,53 @@ fn word_size_push_through_memory_stays_refused() {
         );
     }
 }
+
+/// A 66-prefixed `FF /4` must stay REFUSED, and nothing else in the crate can catch it.
+///
+/// `0xff` is in the Word allowlist, so this form reaches the classifier and would otherwise
+/// produce a `JmpMem`. Nothing downstream refuses it the way the stack-width matrix refuses
+/// `PushMem`'s Word form: `uses_stack` is false for a jump, so that matrix never sees this kind,
+/// and `static_control_target` is `None` for a dynamic target, so the Word control clamp never
+/// sees it either. The classifier's own operand-size check is the ONLY gate. At Word size the
+/// interpreter reads TWO bytes and masks EIP to 16 bits; lowering that as the Dword construction
+/// would read four bytes and jump unmasked, a miscompile twice over.
+///
+/// The assertion is an EXACT count, paired against a POSITIVE CONTROL: the unprefixed `FF /4` at
+/// the same entry must lower and grow the block to four instructions. Without the control, "the
+/// block is three instructions" is satisfied identically by the Word form being correctly refused
+/// OR by `JmpMem` never reaching the classifier at all, and the fixture cannot tell those apart.
+/// `JmpMem` needs no stack widening, unlike the `PushMem` pairing above: the only difference
+/// between the two cases here is the 0x66 prefix.
+#[test]
+fn word_size_jmp_through_memory_stays_refused() {
+    let cases: &[(&str, &[u8], u8)] = &[
+        (
+            "unprefixed control",
+            &[0xff, 0x25, 0x00, 0x08, 0x00, 0x00],
+            4,
+        ),
+        (
+            // 66 ff 25 00 08 00 00: jmp word [0x800] at Word operand size.
+            "0x66-prefixed",
+            &[0x66, 0xff, 0x25, 0x00, 0x08, 0x00, 0x00],
+            3,
+        ),
+    ];
+
+    for &(label, form, expected_instructions) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, expected_instructions,
+            "{label}: the Dword form must lower and the Word form must stay refused"
+        );
+    }
+}

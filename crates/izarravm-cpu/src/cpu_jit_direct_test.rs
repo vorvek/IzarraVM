@@ -3936,3 +3936,302 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
         1
     );
 }
+
+/// JMP through memory, executed NATIVELY in the middle of a block, and compared against the
+/// interpreter across the whole run, including the code the jump lands on.
+///
+/// `JmpMem` is a terminal, so unlike the `PushMem` mid-block fixture the jump does not sit
+/// between two more slots of the SAME block: it ends this one, and the target is reached through
+/// the normal continuation machinery (interpreted here, since the target is only two instructions
+/// long and structurally too short to compile on its own).
+///
+/// The starter is deliberately sacrificial rather than counted: the FIRST cold visit to an
+/// address is always interpreted once to mark it `Seen`, so the compiled block actually begins
+/// one instruction AFTER the starter, at the filler. That is the entry-position trap from the
+/// other side: the starter exists so the jump lands on the SECOND compiled slot, never the
+/// block's own entry, without needing to assert anything about the starter itself.
+///
+/// The source is a DS-based absolute operand on purpose, exactly as the PushMem fixture: a
+/// `read_segment` that wrongly returned SS is invisible on an ESP or EBP based source.
+#[test]
+fn a_mid_block_jmp_through_memory_matches_the_interpreter() {
+    let mut memory = vec![0; 0x2000];
+    memory[0x100..0x108].copy_from_slice(&[
+        0x90, // starter
+        0x40, // inc eax
+        0xff, 0x25, 0x00, 0x08, 0x00, 0x00, // jmp dword [0x800], MID-BLOCK, TERMINAL
+    ]);
+    // The target: two more instructions, too short to compile on its own, then HLT.
+    memory[0x200..0x203].copy_from_slice(&[
+        0x43, // inc ebx
+        0x46, // inc esi
+        0xf4, // hlt
+    ]);
+    memory[0x800..0x804].copy_from_slice(&0x0000_0200u32.to_le_bytes());
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(
+        native.jit_direct.len(),
+        1,
+        "only the source block should have compiled: the target is two slots, below the minimum"
+    );
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    // The AGGREGATE, not `trace.cycles()`, for the same reason as the PushMem fixtures: native
+    // execution batches the whole compiled window and emits no per-access log.
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.eip, interp.registers.eip);
+    // Anti-vacuity, and the load-bearing assertion. The compiled block itself is the filler plus
+    // the jump: the starter is a single cold visit, interpreted once to mark the address `Seen`,
+    // and never part of the compiled span (the entry-position trap, from the other side). Two
+    // native instructions means the jump itself retired natively rather than the block silently
+    // stopping before it.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
+}
+
+/// The dynamic link cell: run the jump once so the exit reports the MISS (the cell is still
+/// unbound), then again so the transfer goes NATIVE. Only this fixture can see the
+/// `dynamic_successor` registration: nothing else in the suite exercises `bind_dynamic_successor`
+/// at all.
+///
+/// The target block is installed BEFORE the source ever runs, so the very first native call CAN
+/// bind the cell, but the native code itself still takes the miss path on that call:
+/// `run_direct_block` calls `bind_dynamic_successor` only after the entry function returns and
+/// reports a nonzero `dynamic_link_cell`, so the bind happens in Rust, one call late. The SECOND
+/// call finds the cell bound and a live portal, and jumps `jmp_r64` straight into the target's
+/// body without a dispatcher round-trip.
+#[test]
+fn a_jmp_through_memory_links_and_transfers_natively_on_the_second_entry() {
+    const SOURCE: u32 = 0x100;
+    const TARGET: u32 = 0x300;
+    const MEM: u32 = 0x800;
+    let mut memory = vec![0; 0x2000];
+    memory[SOURCE as usize..SOURCE as usize + 8].copy_from_slice(&[
+        0x40, // inc eax
+        0x43, // inc ebx
+        0xff, 0x25, 0x00, 0x08, 0x00, 0x00, // jmp dword [0x800]
+    ]);
+    memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&[
+        0x42, // inc edx
+        0x46, // inc esi
+        0x47, // inc edi
+        0xf4, // hlt
+    ]);
+    memory[MEM as usize..MEM as usize + 4].copy_from_slice(&TARGET.to_le_bytes());
+
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    // A full interpreted run populates the decode cache for both blocks, exactly as the CPL3 and
+    // x87 differential fixtures do before taking manual control. It does NOT populate the native
+    // fast map: plain interpreted reads never touch it, only the JIT's own runtime population
+    // calls do (the CPL3 fixture's `populate_read`, for instance). `JmpMem`'s dword read needs
+    // `NativeMapBases` to exist before `compile` will emit it, so force the map on the way the
+    // compile-outcome fixtures do.
+    drive(&mut cpu, &mut bus);
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .expect("initialize direct map");
+
+    cpu.halted = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.eip = TARGET;
+    let target_key = jit::direct::key_for(&cpu, TARGET, true).expect("target decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(target_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let target_compilation = jit::direct::compile(&mut cpu, TARGET, true).expect("target block");
+    assert_eq!(target_compilation.span.instructions, 3);
+    cpu.jit_direct
+        .install(&target_compilation)
+        .expect("target install");
+
+    cpu.registers.eip = SOURCE;
+    let source_key = jit::direct::key_for(&cpu, SOURCE, true).expect("source decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(source_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let source_compilation = jit::direct::compile(&mut cpu, SOURCE, true).expect("source block");
+    assert_eq!(source_compilation.span.instructions, 3);
+    assert!(source_compilation.dynamic_successor);
+    let source_id = cpu
+        .jit_direct
+        .install(&source_compilation)
+        .expect("source install");
+    let source_block = cpu
+        .jit_direct
+        .block(source_id)
+        .expect("source block remains live");
+
+    cpu.registers.eip = SOURCE;
+    let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source_block)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.registers.eip, TARGET,
+        "the target must be set even on the first, unresolved pass: JmpMem writes EIP before the \
+         link-cell check ever runs"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers,
+        transfers_before,
+        "the first pass cannot be a linked transfer: the cell is unbound when the native call is \
+         made, and it is only bound afterward, in Rust, once the miss is reported"
+    );
+
+    cpu.registers.eip = SOURCE;
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source_block)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+        1,
+        "the second pass must find the now-bound cell and its live portal, and jump straight into \
+         the target without a dispatcher round-trip"
+    );
+    // Anti-vacuity. Three from source (two fillers plus the jump) and three from target (three
+    // fillers up to its own hlt boundary): six means the chain really crossed into the target
+    // natively, rather than the source jump landing back in the dispatcher.
+    assert_eq!(cpu.perf_counters().jit_direct_insns - insns_before, 6);
+    assert_eq!(cpu.registers.eip, TARGET + 3);
+}
+
+/// A ring-3 `JmpMem` whose source page is supervisor-only must side exit at the permission check
+/// before the dword is ever read, rather than completing the jump.
+///
+/// Unlike `PushMem`'s CPL3 fixture, `JmpMem` has no second access that needs to stay permissive:
+/// the whole instruction is the one dword read, so the source page needs no page of its own
+/// separate from the code, and there is nothing else to keep permissive.
+///
+/// `JmpMem` is a terminal, so the block ends at the jump. There is no HLT to work around (HLT is
+/// CPL0-only and this harness sets up no IDT), because the terminal jump never gets that far.
+#[test]
+fn cpl3_jmp_through_memory_permission_side_exit_is_counted() {
+    const JMP_ENTRY: u32 = 0x1301;
+    let mut cpu = fresh();
+    let mut memory = vec![0; 0x2000];
+    memory[JMP_ENTRY as usize..JMP_ENTRY as usize + 8].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0x25, 0x00, 0x13, 0x00, 0x00, // jmp dword [0x1300]
+    ]);
+    // JMP_ENTRY (0x1301) and the read target (0x1300) share a page, so the read dword at 0x1300
+    // falls partly inside these instruction bytes. Benign: the fixture never inspects the read
+    // value, and the user bit does not gate code fetch.
+
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    promote_to_cpl3(&mut cpu);
+    cpu.registers.eip = JMP_ENTRY;
+
+    // Warm the decode cache: `key_for` reads the physical start straight out of it.
+    for lin in [JMP_ENTRY, JMP_ENTRY + 1, JMP_ENTRY + 2] {
+        cpu.registers.eip = lin;
+        cpu.fetch_decoded(&mut bus, lin).expect("fixture decode");
+    }
+    cpu.registers.eip = JMP_ENTRY;
+
+    let page = bus
+        .direct_page(0x1300, BusAccessKind::DataRead)
+        .unwrap()
+        .unwrap();
+    assert!(cpu.jit_fast_map.populate_read(
+        0x1300,
+        0x1300,
+        page,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: false,
+        },
+    ));
+
+    let key = jit::direct::key_for(&cpu, JMP_ENTRY, true).unwrap();
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut cpu, JMP_ENTRY, true).unwrap();
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the block must span inc/inc/jmp, or this proves nothing about JmpMem at CPL3"
+    );
+    let id = cpu.jit_direct.install(&compilation).unwrap();
+    let block = cpu
+        .jit_direct
+        .block(id)
+        .expect("installed block must be live");
+
+    let exits_before = cpu.perf_counters().jit_direct_side_exits;
+    let permissions_before = cpu.perf_counters().jit_direct_exit_permission;
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    // The two fillers run natively before the side exit; only the jump, the third slot, refuses.
+    assert_eq!(
+        cpu.registers.eip,
+        JMP_ENTRY + 2,
+        "must exit exactly at the jump, EIP untouched: JmpMem writes EIP only after every guard \
+         passes"
+    );
+    assert_eq!(
+        cpu.registers.eax(),
+        1,
+        "the filler before the jump ran natively"
+    );
+    assert_eq!(
+        cpu.registers.ecx(),
+        1,
+        "the second filler before the jump ran natively"
+    );
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits - exits_before, 1);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_permission - permissions_before,
+        1
+    );
+    // Anti-vacuity: only the two fillers retired natively; the jump itself never completed.
+    assert_eq!(cpu.perf_counters().jit_direct_insns - insns_before, 2);
+}

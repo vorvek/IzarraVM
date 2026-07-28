@@ -1529,3 +1529,58 @@ fn ff_slash_6_register_form_stays_refused() {
         "the register form of FF /6 must be refused, so the block is the three fillers"
     );
 }
+
+/// The first fixture to compile a `JmpMem` slot at all.
+///
+/// Two `inc` fillers put the jump on the THIRD slot, never the entry: a terminal at the block's
+/// own entry point is never proven to run natively by anything that follows it, because nothing
+/// does. The compiled span must END at the jump: unlike `PushMem`, which lets growth continue
+/// past it, `JmpMem` is a terminal and stops the block right there.
+#[test]
+fn a_jmp_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0x25, 0x00, 0x08, 0x00, 0x00, // jmp dword [0x800]
+    ]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "two fillers plus the jump, and nothing past it: JmpMem is a terminal"
+    );
+    assert_eq!(
+        compilation.span.guest_len, 8,
+        "the span must end AT the jump, not run past it: two one-byte fillers plus the six-byte \
+         FF /4 form"
+    );
+    // The clock pin. Two 2-clock INCs plus the interpreter's explicit clocks(7) for group-5 arm 4
+    // (`execute_extended.rs:920-924`). Without its own `raw_clocks` arm JmpMem rides the `_ => 2`
+    // default and undercharges every jump by 5.
+    assert_eq!(
+        compilation.raw_clocks, 11,
+        "two 2-clock INCs plus a 7-clock JmpMem"
+    );
+    assert_eq!(compilation.dword_reads, 1);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+    assert_eq!(compilation.dword_stores, 0);
+    // The whole value of the slice rides on these two. Dropping either registration compiles a
+    // working-looking block whose jump either never links (`dynamic_successor`) or statically
+    // binds the wrong edge (`successors`), the bytes after the jump that are never a successor of
+    // an unconditional one.
+    assert!(
+        compilation.dynamic_successor,
+        "without this, link_sources never learns the cell and every jump exits to the dispatcher \
+         forever"
+    );
+    assert_eq!(
+        compilation.successors,
+        [None, None],
+        "a dynamic target has no static successor; the fall-through arm would record the bytes \
+         after the jump as one, a phantom edge a stale dynamically-bound cell can transfer into"
+    );
+}
