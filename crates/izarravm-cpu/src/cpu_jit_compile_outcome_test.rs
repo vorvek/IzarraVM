@@ -1443,8 +1443,10 @@ fn direct_barrier_opcode_is_still_unclassifiable() {
 /// The first fixture to compile a `PushMem` slot at all.
 ///
 /// The push sits BETWEEN two `inc` slots, so this also pins that block growth continues through
-/// it. A push that stopped the block would leave `span.instructions` at 1 and every assertion
-/// below would be describing a different block.
+/// it. A push that stopped the block would leave only the first `inc` as a slot, which is below
+/// the compiler's three-instruction minimum for a non-terminal span: `compile` would return
+/// `StructuralReject` instead of `Compiled`, and `compiled()` would panic before any assertion
+/// below runs.
 #[test]
 fn a_push_through_memory_is_lowered_with_both_accesses_registered() {
     let (mut cpu, mut bus) = fixture(&[
@@ -1480,11 +1482,50 @@ fn a_push_through_memory_is_lowered_with_both_accesses_registered() {
         compilation.raw_clocks, 6,
         "two 2-clock INCs plus a 2-clock PUSH"
     );
-    // BOTH halves of the access must be registered. A missing read leaves the source segment out
-    // of the block's SegmentLayout mask, and `data_matches` SKIPS unused segments, so the block
-    // would keep matching after a guest DS reload and read through a stale base.
+    // The static access counts PushMem feeds into the bus charge: one dword read (the source) and
+    // one dword store (the stack write), with every byte and word count at zero since this kind
+    // is dword-only. This does NOT pin the segment-mask scenario -- `SegmentLayout`'s mask is
+    // built from `read_segment()`/`write_segment()`, an independent accessor, not from these
+    // counts -- that is covered instead by the mid-block execution fixture
+    // (`a_mid_block_push_through_memory_matches_the_interpreter` in `cpu_jit_direct_test.rs`),
+    // whose DS-based source is what actually exercises a `read_segment` that could leave DS out
+    // of the mask.
     assert_eq!(compilation.dword_reads, 1);
     assert_eq!(compilation.dword_stores, 1);
     assert_eq!(compilation.byte_reads, 0);
     assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+}
+
+/// The REGISTER form of `FF /6`, `push eax`, must stay refused.
+///
+/// `classify` restricts `/6` to the memory operand only: the register form is architecturally
+/// `PUSH r32`, already covered by `0x50..0x57`, and admitting `FF /6` register-form onto that
+/// path without checking its own clock charge against those opcodes would be a timing bug rather
+/// than a missed lowering.
+///
+/// Three `inc` fillers land the count on the refusal alone: a block that grew past the register
+/// form would show 4 instructions instead of 3.
+#[test]
+fn ff_slash_6_register_form_stays_refused() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0x42, // inc edx
+        0xff,
+        0xf0, // push eax, REGISTER form
+        DIRECT_BARRIER,
+    ]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the register form of FF /6 must be refused, so the block is the three fillers"
+    );
 }
