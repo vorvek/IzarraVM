@@ -4160,6 +4160,9 @@ fn cpl3_jmp_through_memory_permission_side_exit_is_counted() {
         0x41, // inc ecx
         0xff, 0x25, 0x00, 0x13, 0x00, 0x00, // jmp dword [0x1300]
     ]);
+    // JMP_ENTRY (0x1301) and the read target (0x1300) share a page, so the read dword at 0x1300
+    // falls partly inside these instruction bytes. Benign: the fixture never inspects the read
+    // value, and the user bit does not gate code fetch.
 
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
