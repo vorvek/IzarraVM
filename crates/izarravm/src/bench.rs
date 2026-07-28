@@ -1037,6 +1037,8 @@ pub(super) fn perf_counters_json(
         "jit_direct_reject_alignment": perf.jit_direct_reject_alignment,
         "jit_direct_reject_fetch_limit": perf.jit_direct_reject_fetch_limit,
         "jit_direct_reject_zero_budget": perf.jit_direct_reject_zero_budget,
+        "jit_direct_chain_quota_entries": perf.jit_direct_chain_quota_entries,
+        "jit_direct_chain_quota_cache_misses": perf.jit_direct_chain_quota_cache_misses,
         "jit_direct_cache_resets": perf.jit_direct_cache_resets,
         "jit_direct_arena_compactions": perf.jit_direct_arena_compactions,
         "jit_direct_arena_compaction_live_blocks": perf.jit_direct_arena_compaction_live_blocks,

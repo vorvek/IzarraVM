@@ -876,6 +876,16 @@ impl CpuBus for MachineBus<'_> {
         2 + u64::from(self.cache.code_fetch_wait_states())
     }
 
+    /// Every JIT cost dial on this bus is a pure function of the active mode: the cache tier and
+    /// code-fetch constants are rewritten only by `CacheModel::set_mode`, the mode 13h wait
+    /// states come from `active_mode.persona()`, and the bus scale is `bus_timing(cpu.level())`.
+    /// The video wait states are copied once at bus construction and never written afterwards.
+    /// So the mode discriminant is an exact epoch, offset by one to stay clear of the trait
+    /// default's 0.
+    fn jit_cost_dial_epoch(&self) -> u64 {
+        self.active_mode as u64 + 1
+    }
+
     fn native_fetches_are_uniform(&self) -> bool {
         self.flat_data_cost
     }
