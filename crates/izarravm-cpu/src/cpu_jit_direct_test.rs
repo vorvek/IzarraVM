@@ -3875,13 +3875,19 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
     // A mutation battery proved that: deleting `emit_read_permission_check` from the source lane
     // SURVIVED this fixture until the stack was made permissive, because the exit was still
     // counted, just from the wrong lane. Now the source is the only thing that can refuse.
+    //
+    // The address is `ESP - 4`, NOT ESP. The write lands at 0x0ffc, which is in page 0, the same
+    // page as the code. Populating page 0x1000 instead leaves page 0 carrying whatever the code
+    // fetch gave it, which is supervisor-only, so the stack lane refuses and the mutation stays
+    // invisible. That mistake was made once here already.
+    let stack_addr = 0x1000u32.wrapping_sub(4);
     let stack_page = bus
-        .direct_page(0x1000, BusAccessKind::DataWrite)
+        .direct_page(stack_addr, BusAccessKind::DataWrite)
         .unwrap()
         .unwrap();
     assert!(cpu.jit_fast_map.populate_write(
-        0x1000,
-        0x1000,
+        stack_addr,
+        stack_addr,
         stack_page,
         jit::fast_map::PagePermissions {
             writable: true,
