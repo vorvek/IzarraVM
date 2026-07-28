@@ -288,6 +288,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x58..=0x5f => {
                 return Some(DirectKind::Pop { dst: opcode - 0x58 });
             }
+            // LEAVE. The 16-bit-stack form (SS.B = 0) moves only BP into SP and preserves
+            // ESP's high word, which the emitted full-width move would destroy; that case is
+            // refused at compile time by `uses_stack()` feeding the `stack_is_32bit` check,
+            // NOT here. The 16-bit OPERAND-size form is refused by the OperandSize::Word
+            // gate above, which does not list 0xc9.
+            0xc9 => {
+                return Some(DirectKind::Leave);
+            }
             0x68 => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Imm(insn.imm),

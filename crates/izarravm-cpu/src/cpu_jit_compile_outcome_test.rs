@@ -1306,3 +1306,73 @@ fn a_word_ret_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit
 
 #[path = "cpu_jit_s5_allowlist_test.rs"]
 mod s5_allowlist;
+
+/// The guard finding that blocked LEAVE from merging for a week, discharged.
+///
+/// A 16-bit stack LEAVE is `SP <- BP` and a two-byte pop, preserving ESP[31:16]. The emitted
+/// `Leave` arm does a full-width `mov ESP, EBP`, which would destroy that high half. There is no
+/// `Leave16`, so the only thing keeping the 16-bit-stack form out of a compiled block is the
+/// stack-width admission matrix, which sends every `uses_stack()` kind that is not an admitted
+/// (SS.B, operand size) pair to `Retry`.
+///
+/// The original review recorded that this guard had no test for LEAVE or for any kind. The 16-bit
+/// stack slices have since covered the other kinds; this covers LEAVE, and it is the last thing
+/// that slice was waiting on. Growth must stop at the two INCs before the LEAVE.
+#[test]
+fn a_leave_on_a_sixteen_bit_stack_is_refused() {
+    // inc eax; inc ecx; inc edx; c9 (leave). Operand size follows CS.D and is Dword here, so the
+    // tuple is (Leave, stack_is_32bit = false, Dword), which no arm admits.
+    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x42, 0xc9]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.span.guest_len, 3);
+}
+
+/// The positive control for the test above: on a 32-bit stack the SAME instruction IS admitted.
+/// Without this, a `Leave` arm that was never constructible at all would satisfy the refusal test
+/// while doing nothing, which is the registration-site failure this campaign keeps hitting.
+#[test]
+fn a_leave_on_a_thirty_two_bit_stack_enters_the_block() {
+    let mut memory = vec![0; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + 4].copy_from_slice(&[0x40, 0x41, 0x42, 0xc9]);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = fresh();
+    cpu.registers.set_esp(0x0800);
+    cpu.registers.eip = ENTRY;
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .expect("initialize direct map");
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "LEAVE must be admitted on a 32-bit stack, or the refusal test above proves nothing"
+    );
+    assert_eq!(compilation.span.guest_len, 4);
+    // The clock pin. LEAVE is `ESP <- EBP` then a POP, and the interpreter charges clocks(4) for
+    // the 0xc9 arm, the same as a bare POP. Without its own `raw_clocks` arm the kind rides the
+    // `_ => 2` default and undercharges by 2 per LEAVE, which moves core clocks on a real guest
+    // and is invisible to every architectural assertion. A mutation battery found that nothing
+    // else in the suite catches it.
+    assert_eq!(
+        compilation.raw_clocks, 10,
+        "three 2-clock INCs plus a 4-clock LEAVE"
+    );
+    // The read is one dword off SS, not a byte or a word: a wrong width miscounts the bus split
+    // and flips `has_wide_accesses`.
+    assert_eq!(compilation.dword_reads, 1);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+}
