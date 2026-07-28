@@ -2239,6 +2239,7 @@ pub(crate) enum DirectKind {
     /// `unit_growth_classify`, which shares this classifier): it stops LOWERING, so a unit whose
     /// entry slot is a NOP parks with `plan.leading == 0` and stays on the interpreter, exactly
     /// as it did while the opcode was unclassifiable.
+    Nop,
     /// PUSH r/m32, MEMORY form (0xFF /6): one dword read at `addr`, one dword write at
     /// `SS:[ESP-4]`, then `ESP -= 4`.
     ///
@@ -2261,7 +2262,6 @@ pub(crate) enum DirectKind {
     PushMem {
         addr: DirectAddr,
     },
-    Nop,
     X87 {
         insn: NativeX87Insn,
         addr: Option<DirectAddr>,
