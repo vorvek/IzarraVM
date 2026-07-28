@@ -705,9 +705,31 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // occurrences of it on this corpus. Refusing it is a missed lowering worth
                 // nothing; mapping it onto `Push` without checking is a timing bug.
                 //
-                // /2 CALL, /3 far CALL and /5 far JMP are not lowered here. /2 is a control
-                // transfer with a DYNAMIC target and needs the successor machinery `Ret` uses;
-                // the far forms load a descriptor.
+                // /3 far CALL and /5 far JMP are not lowered here; both load a descriptor, which
+                // needs machinery this classifier does not have.
+                //
+                // /2 CALL r32, REGISTER form only. The interpreter reads the target from the GPR
+                // BEFORE the return EIP is pushed (execute_extended.rs, group 5 arm 2), which is
+                // why the emit arm reloads home(dst) before the ESP adjust rather than after: the
+                // register form is a dynamic-target control transfer, needing the same successor
+                // machinery `Ret` and `JmpMem` use.
+                //
+                // Classified regardless of operand width; there is no width gate here the way /4
+                // JMP has one. `CallReg` IS `uses_stack()`, so a 66-prefixed form routes into the
+                // stack-width admission matrix in the compile loop, which refuses it for lack of a
+                // `CallReg16` mapping arm, the same PushMem precedent that guards PUSH r/m32.
+                //
+                // The MEMORY form is not lowered: the census measures zero occurrences of it, and
+                // lowering it would add a guarded load lane for nothing.
+                if m.reg == 2 {
+                    let DecodedOperand::Reg(dst) = insn.operand? else {
+                        return None;
+                    };
+                    let return_delta = lin
+                        .wrapping_add(u32::from(insn.len))
+                        .wrapping_sub(entry_lin);
+                    return Some(DirectKind::CallReg { dst, return_delta });
+                }
                 if m.reg == 6 {
                     let DecodedOperand::Mem(addr) = insn.operand? else {
                         return None;
