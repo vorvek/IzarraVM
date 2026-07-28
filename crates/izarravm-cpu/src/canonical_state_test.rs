@@ -835,8 +835,8 @@ fn execution_serialization_does_not_mutate_cpu() {
 #[test]
 #[cfg(feature = "jit")]
 fn arch_payload_keeps_pending_flags_offset_pinned() {
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4504);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4504);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
 }

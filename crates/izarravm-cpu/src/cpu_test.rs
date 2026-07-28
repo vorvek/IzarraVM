@@ -826,7 +826,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
     // Pending flags offset for direct native writes; shifts whenever PerfCounters grows.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4504);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the

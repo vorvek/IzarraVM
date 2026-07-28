@@ -42,12 +42,22 @@ pub(crate) struct LinkTarget {
 #[repr(C)]
 pub(crate) struct BlockPortal {
     pub(crate) body: AtomicUsize,
+    /// The address an INTEGER source jumps to. For an integer target this equals `body`; for a
+    /// float target it is the shared x87 re-entry pad, which enters the x87 register cache the
+    /// target's prologue would have entered and then jumps to `body`. Direct's mechanism; a
+    /// backend with no pad publishes `body` here and never notices the field.
+    ///
+    /// Held in the portal rather than the cell because it is a property of the TARGET and must
+    /// survive `compact_arena` relocation. A float block's value is always the one pad address,
+    /// so no publisher has an address argument it could get wrong.
+    pub(crate) integer_entry: AtomicUsize,
 }
 
 impl BlockPortal {
     pub(crate) fn new() -> Self {
         Self {
             body: AtomicUsize::new(0),
+            integer_entry: AtomicUsize::new(0),
         }
     }
 
@@ -60,11 +70,31 @@ impl BlockPortal {
     /// a different hidden representation should not call `clear` and should instead `publish`
     /// its own sentinel address (see the module doc comment).
     pub(crate) fn clear(&self) {
+        self.integer_entry.store(0, Ordering::Release);
         self.body.store(0, Ordering::Release);
     }
 
+    /// Publish a target with no x87 re-entry pad: an integer source and a float source both land
+    /// on `body`. Correct for every backend that does not build a pad, which is why this keeps a
+    /// one-argument signature.
     pub(crate) fn publish(&self, body: usize) {
         debug_assert_ne!(body, 0);
+        self.integer_entry.store(body, Ordering::Release);
+        self.body.store(body, Ordering::Release);
+    }
+
+    /// Publish a FLOAT target: an integer source is routed through the shared x87 re-entry pad.
+    /// `body` is stored last, so `visible()` never reports a portal whose `integer_entry` has not
+    /// been written yet.
+    /// `pad` is `None` only when the host could not build the shared pad. Publishing ZERO then is
+    /// deliberate and is the fail-safe direction: an integer source reading zero takes the
+    /// unresolved path, exactly as it does for an unlinked cell. Publishing `body` instead would
+    /// enter a float block with an unloaded x87 register cache, and it would make correctness
+    /// depend on `try_link_inner` also refusing the edge rather than on this value alone.
+    pub(crate) fn publish_x87(&self, body: usize, pad: Option<usize>) {
+        debug_assert_ne!(body, 0);
+        self.integer_entry
+            .store(pad.unwrap_or(0), Ordering::Release);
         self.body.store(body, Ordering::Release);
     }
 
@@ -73,7 +103,13 @@ impl BlockPortal {
     /// non-zero sentinel representation must not rely on this predicate and should define its
     /// own comparison against its own sentinel address instead.
     pub(crate) fn visible(&self) -> bool {
-        self.body.load(Ordering::Acquire) != 0
+        let body = self.body.load(Ordering::Acquire);
+        // One direction only. The reverse does not hold when the x87 pad could not be allocated:
+        // `try_link_inner` refuses those edges, so a float target can legitimately sit with a live
+        // `body` and a zero `integer_entry`, and an integer source reading zero takes the
+        // unresolved path exactly as it does today.
+        debug_assert!(body != 0 || self.integer_entry.load(Ordering::Acquire) == 0);
+        body != 0
     }
 }
 
@@ -94,6 +130,15 @@ pub(crate) fn zero_portal() -> &'static BlockPortal {
 pub(crate) struct LinkCell {
     pub(crate) portal: AtomicUsize,
     pub(crate) target_eip: AtomicU32,
+    /// The baked `x87_entry_top` of the block this cell is bound to, or `NO_ENTRY_TOP` when the
+    /// target has none. The shared x87 re-entry pad compares it against the CPU's live TOP and
+    /// bails when they differ, because a float block's emitted code addresses its register cache
+    /// relative to the TOP baked at compile time.
+    ///
+    /// Per EDGE rather than per target on purpose: `try_link_inner` is the single writer and
+    /// `LinkCell::clear` the single resetter, against the portal's three publishers and nine
+    /// clear sites.
+    pub(crate) entry_top: AtomicU8,
     /// Direct's own x87 link-relaxation mechanism (not shared with Clif): set when this slot's
     /// edge is a float source linking to an integer target, so the emitted jump at the link site
     /// knows to flush the live x87 cache back to `CpuGsw.fpu` before handing control to a target
@@ -109,6 +154,11 @@ pub(crate) struct LinkCell {
     pub(crate) spilling: AtomicU8,
 }
 
+/// "This edge's target has no baked x87 entry TOP." Deliberately OUT of the legal 0..=7 range:
+/// TOP 0 is the value a guest sits at after `FINIT`, so a zero sentinel would make a forgotten
+/// publisher fail SILENTLY into a wrong-TOP entry rather than bailing.
+pub(crate) const NO_ENTRY_TOP: u8 = 0xFF;
+
 impl LinkCell {
     /// A fresh cell defaults to Direct's own zero-body sentinel portal (`zero_portal`); see that
     /// function's doc comment for why this default is Direct-mechanism, not a shared invariant.
@@ -116,6 +166,7 @@ impl LinkCell {
         Self {
             portal: AtomicUsize::new(zero_portal().address()),
             target_eip: AtomicU32::new(0),
+            entry_top: AtomicU8::new(NO_ENTRY_TOP),
             spilling: AtomicU8::new(0),
         }
     }
@@ -132,7 +183,21 @@ impl LinkCell {
     pub(crate) fn clear(&self) {
         self.portal
             .store(zero_portal().address(), Ordering::Release);
+        self.entry_top.store(NO_ENTRY_TOP, Ordering::Release);
         self.spilling.store(0, Ordering::Release);
+    }
+
+    /// Record the target's baked x87 entry TOP for the shared re-entry pad's runtime guard. Like
+    /// `mark_spilling`, this is never called to un-set: a cell that should carry no TOP gets
+    /// there through `clear`, so a caller cannot forget to reset it by skipping a call here.
+    pub(crate) fn set_entry_top(&self, top: u8) {
+        debug_assert!(top < 8);
+        self.entry_top.store(top, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_top(&self) -> u8 {
+        self.entry_top.load(Ordering::Acquire)
     }
 
     /// Mark this slot's edge as needing the x87 boundary spill. Never called with `false`: a

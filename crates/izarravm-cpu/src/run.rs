@@ -2171,23 +2171,36 @@ impl CpuGsw {
     /// chain may run before returning to the dispatcher. Depends on the persona timing pair, the
     /// bus cost dials, and one bit of the block: whether it is an x87 block.
     ///
-    /// An integer entry never reaches a float block, so its bound only has to cover integer hops.
     /// A float entry may cross into integer blocks partway through the chain; charging every hop
     /// at the x87 rate over-estimates those integer hops but stays conservative in the safe
     /// direction, and it still covers the 586 FISTP conversion surcharge for the hops that really
     /// are x87.
+    ///
+    /// An integer entry USED to be unable to reach a float block, and this bound said so. With the
+    /// shared x87 re-entry pad that is no longer true, so the integer bound must now dominate a
+    /// float hop as well. It is computed as a `max` rather than asserted, and the max is taken
+    /// against the float class's TRUE cost: `has_x87` is `x87_slots != 0` and the block builder
+    /// caps such a block at `MAX_X87_BLOCK_INSTRUCTIONS`, so a float hop can never present the 32
+    /// instructions of bus traffic the float ENTRY bound charges.
+    ///
+    /// On both personas the Direct backend runs on this changes nothing: 586 gives an integer
+    /// bound of 1,177 against a true float hop of 765, and 486 gives 1,036 against 712, so the
+    /// `max` returns the integer term unchanged and the slice stays byte-identical here. It is not
+    /// decoration: on a bus whose data dials are all zero the two terms are 12 and 328, the
+    /// inequality reverses, and an integer-headed chain would under-budget every float hop.
     #[cfg(feature = "jit")]
     fn compute_global_block_upper<B: CpuBus>(bus: &B, num: u32, den: u32, has_x87: bool) -> u64 {
-        let unscaled_max_core = if has_x87 {
-            jit::direct::MAX_X87_BLOCK_CORE_CLOCKS
-        } else {
-            // A block can contain 31 four-clock instructions followed by a ten-clock RET.
-            4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6
+        let scale_core = |unscaled: u64| {
+            unscaled
+                .saturating_mul(u64::from(num))
+                .saturating_add(u64::from(den) - 1)
+                / u64::from(den)
         };
-        let max_core = unscaled_max_core
-            .saturating_mul(u64::from(num))
-            .saturating_add(u64::from(den) - 1)
-            / u64::from(den);
+        // A block can contain 31 four-clock instructions followed by a ten-clock RET.
+        let integer_core =
+            scale_core(4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6);
+        let x87_core = scale_core(jit::direct::MAX_X87_BLOCK_CORE_CLOCKS);
+        let max_core = if has_x87 { x87_core } else { integer_core };
         let max_read = bus
             .jit_data_cost_clocks(BusWidth::Dword)
             .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword))
@@ -2196,12 +2209,21 @@ impl CpuGsw {
             .max(bus.jit_data_cost_clocks(BusWidth::Byte))
             .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
         let max_store = max_read;
-        let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(
-            bus.jit_fetch_cost_clocks()
-                .saturating_add(max_read)
-                .saturating_add(max_store),
-        );
-        max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper))
+        let per_instruction_bus = bus
+            .jit_fetch_cost_clocks()
+            .saturating_add(max_read)
+            .saturating_add(max_store);
+        let global_raw_bus_upper =
+            (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(per_instruction_bus);
+        let own_class = max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
+        if has_x87 {
+            return own_class;
+        }
+        // The float hop an integer chain can now reach, at ITS true instruction cap.
+        let x87_raw_bus_upper =
+            (jit::direct::MAX_X87_BLOCK_INSTRUCTIONS as u64).saturating_mul(per_instruction_bus);
+        let x87_hop = x87_core.saturating_add(bus.jit_scale_bus_cost_upper(x87_raw_bus_upper));
+        own_class.max(x87_hop)
     }
 
     #[cfg(feature = "jit")]
@@ -2609,6 +2631,10 @@ impl CpuGsw {
             jit::direct::UnresolvedReason::DynamicHidden => {
                 self.perf.jit_direct_unresolved_exits += 1;
                 self.perf.jit_direct_unresolved_dynamic_hidden += 1;
+            }
+            jit::direct::UnresolvedReason::X87TopMismatch => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_x87_pad_bails += 1;
             }
         }
         self.perf.jit_native_load_hits += reads;
