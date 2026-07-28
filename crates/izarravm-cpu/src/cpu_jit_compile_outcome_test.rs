@@ -1584,3 +1584,130 @@ fn a_jmp_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor() {
          after the jump as one, a phantom edge a stale dynamically-bound cell can transfer into"
     );
 }
+
+/// The first fixture to compile a `CallReg` slot at all: `call ebx`, the REGISTER form of
+/// `0xFF /2`.
+///
+/// Modelled on `a_jmp_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor` above.
+/// Two `inc` fillers put the call on the THIRD slot, never the entry, and the compiled span must
+/// END at the call: it is a terminal, so growth stops there exactly as it does for `JmpMem`.
+#[test]
+fn a_call_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xd3, // call ebx
+    ]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "two fillers plus the call, and nothing past it: CallReg is a terminal"
+    );
+    assert_eq!(
+        compilation.span.guest_len, 4,
+        "the span must end AT the call, not run past it: two one-byte fillers plus the two-byte \
+         FF /2 register form"
+    );
+    // The clock pin. Two 2-clock INCs plus the interpreter's explicit clocks(7) for group-5 arm 2
+    // (`execute_extended.rs:914-918`). Without its own `raw_clocks` arm CallReg rides the `_ => 2`
+    // default and undercharges every call by 5.
+    assert_eq!(
+        compilation.raw_clocks, 11,
+        "two 2-clock INCs plus a 7-clock CallReg"
+    );
+    // One dword store (the return push) and no reads at all: the target comes from a register,
+    // not memory.
+    assert_eq!(compilation.dword_stores, 1);
+    assert_eq!(compilation.dword_reads, 0);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+    // As with JmpMem, the whole value of the slice rides on these two. Dropping either
+    // registration compiles a working-looking block whose call either never links
+    // (`dynamic_successor`) or statically binds the wrong edge (`successors`).
+    assert!(
+        compilation.dynamic_successor,
+        "without this, link_sources never learns the cell and every call exits to the dispatcher \
+         forever"
+    );
+    assert_eq!(
+        compilation.successors,
+        [None, None],
+        "a dynamic target has no static successor; the fall-through arm would record the bytes \
+         after the call as one, a phantom edge a stale dynamically-bound cell can transfer into"
+    );
+}
+
+/// The stack-access cap interacting with a terminal `CallReg`: `MAX_BLOCK_STACK_ACCESSES` is 4,
+/// and the compile loop's cap check runs BEFORE the slot that would cross it is admitted.
+///
+/// Three pushes plus `call ebx` is four stack accesses total, admitted as ONE block: the check
+/// at the call sees `stack_accesses == 3`, not yet at the cap, so the call joins the block as its
+/// terminal fourth stack use.
+///
+/// Four pushes plus `call ebx` is five stack accesses, and the fifth is refused: the check at the
+/// call sees `stack_accesses == 4`, the cap, and stops. The block compiled at that entry is just
+/// the four pushes (non-terminal, but at four instructions well past the three-slot minimum). A
+/// second compile at the call's own address, right after, forms its OWN one-instruction block: a
+/// terminal excuses the three-slot minimum (`slots.len() < 3 && !terminal`), and `defer_short` is
+/// dead outside tests, so nothing stops that one-slot block from being installed.
+#[test]
+fn call_through_a_register_respects_the_stack_access_cap() {
+    // Three pushes plus the call: one block, four instructions, none of them refused.
+    {
+        let (mut cpu, mut bus) = fixture(&[
+            0x50, // push eax
+            0x51, // push ecx
+            0x52, // push edx
+            0xff, 0xd3, // call ebx
+        ]);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "three pushes plus the call must compile as one block: the cap is checked BEFORE the \
+             call is admitted, and three stack uses have not reached it yet"
+        );
+    }
+
+    // Four pushes plus the call: the pushes alone hit the cap, so the call SPLITS into its own
+    // block at the next entry.
+    {
+        let (mut cpu, mut bus) = fixture(&[
+            0x50, // push eax
+            0x51, // push ecx
+            0x52, // push edx
+            0x53, // push ebx
+            0xff, 0xd0, // call eax
+        ]);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3, ENTRY + 4],
+        );
+
+        let pushes = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            pushes.span.instructions, 4,
+            "the fourth push hits the cap; the call itself is refused and never joins this block"
+        );
+        assert_eq!(pushes.span.guest_len, 4);
+
+        let call_entry = ENTRY + 4;
+        let call_block = compiled(jit::direct::compile(&mut cpu, call_entry, true));
+        assert_eq!(
+            call_block.span.instructions, 1,
+            "the call re-forms as its own one-slot block: a terminal excuses the three-slot \
+             minimum"
+        );
+        assert!(call_block.dynamic_successor);
+    }
+}

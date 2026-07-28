@@ -1123,6 +1123,72 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 terminal = true;
                 break;
             }
+            // CALL r32, REGISTER form. Modelled on the `Call` arm above (the store, the publish,
+            // then `sub esp, 4`), with two differences: the CS-limit check from `Ret`/`JmpMem`
+            // runs FIRST, against `home(dst)` directly rather than a loaded dword, and the tail is
+            // the dynamic path rather than the static one.
+            //
+            // The limit check must run before ANY mutation, matching the interpreter's own fault
+            // ordering: the interpreter pushes first and only faults on the NEXT fetch, so a
+            // native side exit here has to leave every guest-visible byte untouched, letting the
+            // interpreter's re-run of this same instruction reproduce push-then-fault exactly.
+            DirectKind::CallReg { dst, return_delta } => {
+                let side = e.label();
+                let reasons =
+                    MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(4))));
+                let limit = memory.segments.cs.limit;
+                let limit_exit = (limit != u32::MAX).then(|| e.label());
+                if let Some(limit_exit) = limit_exit {
+                    e.cmp_r32_imm32(home(dst), limit);
+                    e.jcc(7, limit_exit);
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                }
+                emit_store(
+                    &mut e,
+                    StoreSource::EipDelta(return_delta),
+                    MemoryWidth::Dword,
+                    stack_addr(0u32.wrapping_sub(4)),
+                    memory,
+                    reasons,
+                    AddressWrap::None,
+                );
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                // Pre-adjust: correct for EVERY dst, ESP included. `emit_store` cannot have
+                // clobbered `home(dst)`: its scratch set is RAX/RCX/RDX/RDI, and GUEST_HOMES is
+                // R8-R14 plus RBX, so the register read at the top of this arm is still live here.
+                e.mov_r32_r32(Reg::RDX, home(dst));
+                // AFTER the side exit is published, the same faulting-push invariant `Call` keeps:
+                // a faulting push must leave ESP at its pre-instruction value.
+                e.alu_r32_imm32(5, home(4), 4);
+                completed += 1;
+                completed_raw += slot.kind.raw_clocks() as u16;
+                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
+                completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
+                completed_dword_reads += slot.kind.dword_reads();
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                );
+                terminal = true;
+                break;
+            }
             DirectKind::Jcc {
                 condition,
                 taken_delta,
