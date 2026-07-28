@@ -13,6 +13,22 @@ fn stack_addr(disp: u32) -> DirectAddr {
     }
 }
 
+/// LEAVE's stack slot, addressed off EBP rather than ESP. LEAVE sets `ESP <- EBP` and then
+/// pops, so the popped dword sits at `SS:EBP`. Addressing it off EBP lets the memory guard
+/// run BEFORE any guest register is written, which is what every other lowered kind does:
+/// a memory side exit commits the guest homes and returns to the run loop at an instruction
+/// boundary, where an interrupt can be delivered, so a half-applied LEAVE would push the
+/// interrupt frame at `[EBP-4]` instead of `[ESP-4]`.
+fn frame_addr() -> DirectAddr {
+    DirectAddr {
+        segment: SegmentIndex::Ss,
+        base: Some(5),
+        index: None,
+        scale: 1,
+        disp: 0,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MemorySideExits {
     cross_page_or_alignment: Label,
@@ -700,6 +716,47 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 );
                 terminal = true;
                 break;
+            }
+            DirectKind::Leave => {
+                // ESP <- EBP, then POP EBP. The guard runs first, against SS:EBP, which is the
+                // address the pop reads from precisely because ESP is about to become EBP.
+                // Nothing guest-visible is written until the read has been guarded and performed,
+                // so a side exit leaves the whole instruction un-started.
+                //
+                // `AddressWrap::None` matches the 32-bit `Pop` arm: this kind only ever reaches
+                // the emitter on a 32-bit stack, because the stack-width admission matrix in
+                // `compile_with_instruction_limit` refuses every `uses_stack()` kind that is not
+                // an admitted (SS.B, operand size) pair, and no `Leave16` exists to be admitted.
+                let side = e.label();
+                let frame = frame_addr();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(frame));
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Dword,
+                    frame,
+                    memory,
+                    reasons,
+                    AddressWrap::None,
+                );
+                e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
+                // home(5) is read here and overwritten below, so the order of these three
+                // matters: ESP takes EBP's old value before EBP takes the popped one.
+                e.mov_r32_r32(home(4), home(5));
+                e.add_r32_imm32(home(4), 4);
+                e.mov_r32_r32(home(5), Reg::RDX);
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
             }
             DirectKind::X87 { insn, addr } => {
                 let side = e.label();

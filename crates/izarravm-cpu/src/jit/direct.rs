@@ -2162,6 +2162,17 @@ pub(crate) enum DirectKind {
     Pop16 {
         dst: u8,
     },
+    Leave,
+    /// LEAVE (0xC9): `ESP <- EBP` then `POP EBP`. Fieldless because the instruction has no
+    /// operands and its 16-bit operand-size form never reaches the classifier (the
+    /// OperandSize::Word gate rejects 0xc9 before the opcode arms). It cannot be spelled as
+    /// `Pop { dst: 5 }` plus a register move, because `raw_clocks`, `read_segment` and the
+    /// dword-read membership all key on the variant.
+    ///
+    /// There is deliberately no `Leave16`. The 16-bit STACK form (SS.B = 0) moves only BP into
+    /// SP and preserves ESP[31:16], which the emitted full-width move would destroy; it is
+    /// refused by the stack-width admission matrix in `compile_with_instruction_limit`, which
+    /// sends any `uses_stack()` kind that is not an admitted (width, size) pair to `Retry`.
     Call {
         return_delta: u32,
         target_delta: u32,
@@ -2289,8 +2300,9 @@ impl DirectKind {
             // Both widths charge the same: the interpreter returns clocks(4) for 0x58..=0x5f
             // irrespective of operand size. Unlike Push, which correctly rides the `_ => 2`
             // default, an omitted arm here undercharges every pop by 2 core clocks and no test
-            // would fail.
-            Self::Pop { .. } | Self::Pop16 { .. } => 4,
+            // would fail. LEAVE joins them: it is `ESP <- EBP` then POP and the interpreter
+            // charges the same clocks(4) for the 0xc9 arm.
+            Self::Pop { .. } | Self::Pop16 { .. } | Self::Leave => 4,
             Self::Call { .. } | Self::Call16 { .. } | Self::Jmp { .. } => 7,
             // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
             // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
@@ -2393,6 +2405,7 @@ impl DirectKind {
                         ..
                     }
                     | Self::Pop { .. }
+                    | Self::Leave
                     | Self::Ret { .. }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword),
         )
@@ -2569,7 +2582,7 @@ impl DirectKind {
                 }
                 MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE,
             },
-            Self::Pop { .. } | Self::Ret { .. } => COUNTER_MODE13_DWORD_READ,
+            Self::Pop { .. } | Self::Leave | Self::Ret { .. } => COUNTER_MODE13_DWORD_READ,
             // A Word read lands on the BYTE counter lane, matching `Load { Word }`:
             // `emit_mode13_read_completion` routes Word to the byte-read slot.
             Self::Pop16 { .. } | Self::Ret16 { .. } => COUNTER_MODE13_BYTE_READ,
@@ -2609,9 +2622,11 @@ impl DirectKind {
             {
                 Some(addr.segment)
             }
-            Self::Pop { .. } | Self::Pop16 { .. } | Self::Ret { .. } | Self::Ret16 { .. } => {
-                Some(SegmentIndex::Ss)
-            }
+            Self::Pop { .. }
+            | Self::Pop16 { .. }
+            | Self::Leave
+            | Self::Ret { .. }
+            | Self::Ret16 { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -2664,6 +2679,7 @@ impl DirectKind {
                     ..
                 }
                 | Self::Pop { .. }
+                | Self::Leave
                 | Self::Ret { .. }
         ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword)
     }
@@ -2701,6 +2717,7 @@ impl DirectKind {
                 | Self::Push16 { .. }
                 | Self::Pop { .. }
                 | Self::Pop16 { .. }
+                | Self::Leave
                 | Self::Call { .. }
                 | Self::Call16 { .. }
                 | Self::Ret { .. }
