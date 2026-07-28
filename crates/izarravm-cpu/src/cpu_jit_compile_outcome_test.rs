@@ -61,9 +61,13 @@ fn compiled(outcome: jit::direct::CompileOutcome) -> jit::direct::Compilation {
 #[test]
 fn structural_rejection_includes_the_complete_short_prefix_and_barrier() {
     let cases: &[(&[u8], &[u32], u16)] = &[
-        (&[0x90], &[ENTRY], 1),
-        (&[0x40, 0x90], &[ENTRY, ENTRY + 1], 2),
-        (&[0x40, 0x41, 0x90], &[ENTRY, ENTRY + 1, ENTRY + 2], 3),
+        (&[DIRECT_BARRIER], &[ENTRY], 1),
+        (&[0x40, DIRECT_BARRIER], &[ENTRY, ENTRY + 1], 2),
+        (
+            &[0x40, 0x41, DIRECT_BARRIER],
+            &[ENTRY, ENTRY + 1, ENTRY + 2],
+            3,
+        ),
     ];
 
     for &(code, addresses, expected_len) in cases {
@@ -79,7 +83,7 @@ fn structural_rejection_includes_the_complete_short_prefix_and_barrier() {
 
 #[test]
 fn three_supported_slots_compile_before_an_unsupported_barrier() {
-    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0x90]);
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, DIRECT_BARRIER]);
     warm(
         &mut cpu,
         &mut bus,
@@ -483,7 +487,7 @@ fn direct_page_coverage_failure_consumes_seen_without_a_watch() {
 }
 
 fn rejected_after_decode_eviction() -> (CpuGsw, TestBus, jit::direct::BlockKey) {
-    let (mut cpu, mut bus) = fixture(&[0x90]);
+    let (mut cpu, mut bus) = fixture(&[DIRECT_BARRIER]);
     warm(&mut cpu, &mut bus, &[ENTRY]);
     let span = structural(jit::direct::compile(&mut cpu, ENTRY, true));
     let key = span.key();
@@ -1375,4 +1379,63 @@ fn a_leave_on_a_thirty_two_bit_stack_enters_the_block() {
     assert_eq!(compilation.dword_reads, 1);
     assert_eq!(compilation.byte_reads, 0);
     assert_eq!(compilation.word_reads, 0);
+}
+
+#[test]
+fn a_nop_is_lowered_and_block_growth_continues_through_it() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x90, 0x41, DIRECT_BARRIER]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    // The whole point of the kind. A NOP that were still unclassifiable would stop the block at
+    // one instruction, and the clock pin below would then be asserting about a different block.
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "growth must continue past the NOP"
+    );
+    assert_eq!(compilation.span.guest_len, 3);
+    // The clock pin. Both interpreter arms charge clocks(3) for 0x90. Without its own
+    // `raw_clocks` arm the kind rides the `_ => 2` default and undercharges by one core clock per
+    // NOP, which moves core clocks on a real guest and is invisible to every architectural
+    // assertion in this suite. The same gap shipped twice before a mutation battery found it.
+    assert_eq!(
+        compilation.raw_clocks, 7,
+        "two 2-clock INCs plus a 3-clock NOP"
+    );
+    // A NOP touches no memory and no segment. A stray registration here would arm an alignment
+    // guard and a code watch for an instruction that emits nothing.
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.dword_reads, 0);
+}
+
+/// `DIRECT_BARRIER` must actually stop a block. Every fixture that uses it to pin a block
+/// boundary silently stops testing anything the day that opcode is lowered, and a vacuous PASS
+/// is worse than a failure because nobody looks at it. This is the tripwire.
+#[test]
+fn direct_barrier_opcode_is_still_unclassifiable() {
+    let (mut cpu, mut bus) = fixture(&[DIRECT_BARRIER]);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    let span = structural(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        span.guest_len(),
+        1,
+        "the barrier must be one byte and must reject structurally"
+    );
+
+    // The positive control, and it is not decoration: without it the assertion above also passes
+    // when the harness itself is broken and refuses everything.
+    let (mut cpu, mut bus) = fixture(&[0x40, 0xc3]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    assert_eq!(
+        compiled(jit::direct::compile(&mut cpu, ENTRY, true))
+            .span
+            .instructions,
+        2,
+        "the same harness must still compile a lowerable pair"
+    );
 }

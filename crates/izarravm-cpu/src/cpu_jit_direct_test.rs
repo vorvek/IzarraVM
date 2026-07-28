@@ -869,11 +869,18 @@ fn cold_straight_line_code_is_seen_but_not_compiled() {
 fn hot_unsupported_entries_stay_interpreted_without_legacy_region_fallback() {
     let mut memory = vec![0; 0x1000];
     memory[0x100..0x10d].copy_from_slice(&[
-        0xb9, 0x05, 0x00, 0x00, 0x00, // mov ecx,5
-        0x90, // nop: unsupported direct entry
-        0x90, // nop: unsupported direct entry
-        0x83, 0xe9, 0x01, // sub ecx,1
-        0x75, 0xf9, // jnz 0x105
+        0xb9,
+        0x05,
+        0x00,
+        0x00,
+        0x00,           // mov ecx,5
+        DIRECT_BARRIER, // unsupported direct entry
+        DIRECT_BARRIER, // unsupported direct entry
+        0x83,
+        0xe9,
+        0x01, // sub ecx,1
+        0x75,
+        0xf9, // jnz 0x105
         0xf4, // hlt
     ]);
     let mut cpu = fresh();
@@ -894,11 +901,22 @@ fn supported_prefix_compiles_before_an_unsupported_barrier() {
     let mut memory = vec![0; 0x1000];
     memory[0x100..0x112].copy_from_slice(&[
         0x90, // starter
-        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
-        0x89, 0xc3, // mov ebx,eax
-        0x83, 0xc3, 0x02, // add ebx,2
-        0x90, // unsupported barrier
-        0xb9, 0x04, 0x00, 0x00, 0x00, // mov ecx,4
+        0xb8,
+        0x01,
+        0x00,
+        0x00,
+        0x00, // mov eax,1
+        0x89,
+        0xc3, // mov ebx,eax
+        0x83,
+        0xc3,
+        0x02,           // add ebx,2
+        DIRECT_BARRIER, // unsupported barrier
+        0xb9,
+        0x04,
+        0x00,
+        0x00,
+        0x00, // mov ecx,4
         0xf4, // hlt
     ]);
     let mut interp = fresh();
