@@ -3869,6 +3869,26 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
         },
     ));
 
+    // The STACK side must be explicitly PERMISSIVE, and this is the load-bearing half of the
+    // fixture rather than setup noise. Without it the stack lane refuses too, so a permission
+    // side exit is counted whichever lane produced it, and the fixture cannot tell them apart.
+    // A mutation battery proved that: deleting `emit_read_permission_check` from the source lane
+    // SURVIVED this fixture until the stack was made permissive, because the exit was still
+    // counted, just from the wrong lane. Now the source is the only thing that can refuse.
+    let stack_page = bus
+        .direct_page(0x1000, BusAccessKind::DataWrite)
+        .unwrap()
+        .unwrap();
+    assert!(cpu.jit_fast_map.populate_write(
+        0x1000,
+        0x1000,
+        stack_page,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+    ));
+
     let key = jit::direct::key_for(&cpu, PUSH_ENTRY, true).unwrap();
     assert!(matches!(
         cpu.jit_direct.probe(key),
