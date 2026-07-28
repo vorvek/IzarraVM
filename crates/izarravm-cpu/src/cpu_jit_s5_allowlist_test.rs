@@ -181,3 +181,31 @@ fn a_word_near_jmp_above_the_wrap_is_refused_while_the_same_block_below_it_compi
         "the clamp must not apply at Dword operand size"
     );
 }
+
+/// A 66-prefixed `FF /6` must stay REFUSED, and nothing else in the crate can catch it.
+///
+/// `0xff` is in the Word allowlist, so this form reaches the classifier and produces a `PushMem`.
+/// What refuses it is the stack-width admission matrix, which is consulted only for kinds whose
+/// `uses_stack()` is true. Admitting it would push two bytes while decrementing ESP by four,
+/// which is a miscompile rather than a missed lowering.
+///
+/// The assertion is an EXACT count. `>= 3` is satisfied by the fillers alone with the form under
+/// test correctly refused, so it would pass either way.
+#[test]
+fn word_size_push_through_memory_stays_refused() {
+    // 66 ff 35 00 08 00 00: push word [0x800] at Word operand size.
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&[0x66, 0xff, 0x35, 0x00, 0x08, 0x00, 0x00]);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the Word form must be refused, so the block is the three fillers"
+    );
+}

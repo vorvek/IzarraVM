@@ -1439,3 +1439,52 @@ fn direct_barrier_opcode_is_still_unclassifiable() {
         "the same harness must still compile a lowerable pair"
     );
 }
+
+/// The first fixture to compile a `PushMem` slot at all.
+///
+/// The push sits BETWEEN two `inc` slots, so this also pins that block growth continues through
+/// it. A push that stopped the block would leave `span.instructions` at 1 and every assertion
+/// below would be describing a different block.
+#[test]
+fn a_push_through_memory_is_lowered_with_both_accesses_registered() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0xff,
+        0x35,
+        0x00,
+        0x08,
+        0x00,
+        0x00,           // push dword [0x800]
+        0x40,           // inc eax
+        DIRECT_BARRIER, // stop the block here
+    ]);
+    cpu.registers.set_esp(0x1000);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 7, ENTRY + 8],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "growth must continue past the push"
+    );
+    assert_eq!(compilation.span.guest_len, 8);
+    // The clock pin. The interpreter's group-5 arm 6 returns clocks(2), which is already the
+    // `_ => 2` default, so this kind carries NO raw_clocks arm. That is the ImulMemAcc situation
+    // and not the LEAVE one. Pinned anyway, because "correctly rides the default" and "nobody
+    // checked" are indistinguishable in a diff, and a wrong charge moves core clocks on a real
+    // guest without failing any architectural assertion.
+    assert_eq!(
+        compilation.raw_clocks, 6,
+        "two 2-clock INCs plus a 2-clock PUSH"
+    );
+    // BOTH halves of the access must be registered. A missing read leaves the source segment out
+    // of the block's SegmentLayout mask, and `data_matches` SKIPS unused segments, so the block
+    // would keep matching after a guest DS reload and read through a stale base.
+    assert_eq!(compilation.dword_reads, 1);
+    assert_eq!(compilation.dword_stores, 1);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+}
