@@ -3462,6 +3462,14 @@ mod jit_double_shift;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_sweep_lowering_test.rs"]
+mod jit_sweep_lowering;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_test_imm_test.rs"]
 mod jit_test_imm;
 

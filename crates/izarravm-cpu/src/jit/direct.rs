@@ -2719,6 +2719,13 @@ pub(crate) enum DirectKind {
     /// entry slot is a NOP parks with `plan.leading == 0` and stays on the interpreter, exactly
     /// as it did while the opcode was unclassifiable.
     Nop,
+    /// CLD (0xFC) / STD (0xFD). DF is bit 10 of EFLAGS and sits OUTSIDE the lazy arithmetic
+    /// descriptor: `set_flag`'s ARITH mask is CF|PF|AF|ZF|SF|OF, so a DF write goes straight to
+    /// `set_flag_live` and a DF read falls through to live eflags. Nothing here touches
+    /// `pending_flags`, which is why this needs no flag-descriptor dance.
+    DirectionFlag {
+        set: bool,
+    },
     /// PUSH r/m32, MEMORY form (0xFF /6): one dword read at `addr`, one dword write at
     /// `SS:[ESP-4]`, then `ESP -= 4`.
     ///

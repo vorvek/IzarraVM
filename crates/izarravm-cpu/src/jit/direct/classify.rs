@@ -328,6 +328,19 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x90 => {
                 return Some(DirectKind::Nop);
             }
+            // CLD / STD. Ranked third in the runtime-weighted reject audit at 1.37M dispatcher
+            // exits (10.9% of rejected-target exits) despite being worth only ~0.06pp of
+            // instruction coverage -- coverage share and dispatch-exit share are different
+            // quantities, and an earlier slice dismissed this opcode on the wrong one.
+            //
+            // Deliberately NOT added to the OperandSize::Word allowlist above, for the reason
+            // the NOP comment gives: no 16-bit block exists on any persona today, so the entry
+            // would be dead code no counter could gate.
+            0xfc | 0xfd => {
+                return Some(DirectKind::DirectionFlag {
+                    set: opcode == 0xfd,
+                });
+            }
             0xc9 => {
                 return Some(DirectKind::Leave);
             }

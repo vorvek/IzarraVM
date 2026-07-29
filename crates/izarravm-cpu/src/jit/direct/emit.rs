@@ -207,6 +207,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // Zero bytes, on purpose. The slot still costs its instruction, its raw clocks and
             // its EIP advance, all of which the loop tail below charges from the slot list.
             DirectKind::Nop => {}
+            DirectKind::DirectionFlag { set } => emit_direction_flag(&mut e, set),
             DirectKind::Bt { rm, index } => {
                 emit_bt_reg(&mut e, rm, index);
             }
@@ -4002,6 +4003,31 @@ fn emit_merge_double_shift_flags(e: &mut Encoder, defined: u32) {
     e.or_r32_r32(Reg::RBP, Reg::RDI);
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
     emit_clear_pending(e);
+}
+
+/// CLD / STD. Touches ONLY bit 10.
+///
+/// Both the RBP shadow and the in-memory EFLAGS have to move. RBP is the running
+/// materialized-eflags value and roughly ten sites publish it wholesale to `CpuGsw.eflags`
+/// (`store_r32_disp32(R15, eflags_offset(), RBP)`), so writing memory alone would let the next
+/// such publish resurrect the old DF. Writing RBP alone would lose it at the next reader that
+/// goes to memory.
+///
+/// No `emit_clear_pending` here, unlike every arithmetic site: DF is outside the lazy flag
+/// descriptor's ARITH mask entirely, so the descriptor stays valid across this instruction.
+fn emit_direction_flag(e: &mut Encoder, set: bool) {
+    if set {
+        e.or_r32_imm32(Reg::RBP, crate::FLAG_DF);
+    } else {
+        e.and_r32_imm32(Reg::RBP, !crate::FLAG_DF);
+    }
+    e.load_r32_disp32(Reg::RAX, Reg::R15, eflags_offset());
+    if set {
+        e.or_r32_imm32(Reg::RAX, crate::FLAG_DF);
+    } else {
+        e.and_r32_imm32(Reg::RAX, !crate::FLAG_DF);
+    }
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RAX);
 }
 
 fn emit_capture_flags(e: &mut Encoder, defined: u32) {

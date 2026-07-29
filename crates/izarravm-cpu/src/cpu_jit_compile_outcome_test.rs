@@ -97,7 +97,10 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
 
 #[test]
 fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
-    let code = [0x40, 0x41, 0x42, 0x43, 0xfc, 0x44, 0x45, 0x46, 0x47];
+    // 0x99 (CDQ), not 0xFC (CLD): CLD is natively lowered now, so a CLD here compiles straight
+    // through and the block never stops. 0x99 is still unlowered AND still classified into a
+    // helper family, which is what this test needs an interior barrier to be.
+    let code = [0x40, 0x41, 0x42, 0x43, 0x99, 0x44, 0x45, 0x46, 0x47];
     let addresses: Vec<_> = (0..code.len())
         .map(|offset| ENTRY + offset as u32)
         .collect();
@@ -117,8 +120,8 @@ fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
         .direct_barrier_census_snapshot()
         .expect("enabled census snapshot");
     let selected = snapshot.selected.expect("eligible census selection");
-    assert_eq!(selected.opcode, 0xfc);
-    assert_eq!(selected.helper_family, Some("direction_flag"));
+    assert_eq!(selected.opcode, 0x99);
+    assert_eq!(selected.helper_family, Some("sign_extend"));
     assert_eq!(selected.hits, 1);
     assert_eq!(selected.native_prefix_instructions, 4);
     assert_eq!(selected.native_suffix_instructions, 4);
