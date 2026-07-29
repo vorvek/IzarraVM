@@ -1498,6 +1498,82 @@ fn a_push_through_memory_is_lowered_with_both_accesses_registered() {
     assert_eq!(compilation.word_stores, 0);
 }
 
+/// Slice 39, B2's fixture: a block with one FLD m64 has `dword_reads == 2`, not 1, because an
+/// x87 Qword access is two independent dword bus transactions (`read_qword`,
+/// `fpu_exec.rs:720-740`), and `byte_reads`/`word_reads` stay at zero since m64 is dword-only
+/// traffic. Mirrors `a_push_through_memory_is_lowered_with_both_accesses_registered`'s shape:
+/// two 2-clock INCs bracket the x87 slot so growth continues past it and the barrier stops the
+/// block exactly there.
+#[test]
+fn an_fld_m64_is_lowered_with_two_dword_reads_registered() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0xdd,
+        0x05,
+        0x00,
+        0x08,
+        0x00,
+        0x00,           // fld qword [0x800]
+        0x40,           // inc eax
+        DIRECT_BARRIER, // stop the block here
+    ]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 7, ENTRY + 8],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "growth must continue past the FLD"
+    );
+    assert_eq!(compilation.span.guest_len, 8);
+    assert_eq!(compilation.dword_reads, 2, "one m64 read counts as two");
+    assert_eq!(compilation.dword_stores, 0);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+}
+
+/// Slice 39, B2's fixture, the store side: a block with one FSTP m64 has `dword_stores == 2`.
+/// Unlike the read side, this does NOT price the bus (B2: store bus cost is dynamic-only,
+/// `exit.ram_dword_writes`), but it still feeds the quota bound, the map/code-watch gates and
+/// the self-consistency debug assert in `run.rs`, so the static count must be right regardless.
+#[test]
+fn an_fstp_m64_is_lowered_with_two_dword_stores_registered() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0xdd,
+        0x1d,
+        0x00,
+        0x08,
+        0x00,
+        0x00,           // fstp qword [0x800]
+        0x40,           // inc eax
+        DIRECT_BARRIER, // stop the block here
+    ]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 7, ENTRY + 8],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "growth must continue past the FSTP"
+    );
+    assert_eq!(compilation.span.guest_len, 8);
+    assert_eq!(compilation.dword_stores, 2, "one m64 store counts as two");
+    assert_eq!(compilation.dword_reads, 0);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+}
+
 /// The REGISTER form of `FF /6`, `push eax`, must stay refused.
 ///
 /// `classify` restricts `/6` to the memory operand only: the register form is architecturally
