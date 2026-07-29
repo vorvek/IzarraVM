@@ -24,8 +24,8 @@ use super::x87_avx2_emit::{
     Avx2X87EmitContext, emit_enter as emit_x87_enter, emit_native_x87, emit_spill as emit_x87_spill,
 };
 use crate::{
-    AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, Prefixes,
-    PodKeyBuildHasher, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
+    AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, PodKeyBuildHasher,
+    Prefixes, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
 };
 
 #[cfg(all(
