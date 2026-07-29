@@ -1309,3 +1309,94 @@ fn opl_timers_advance_with_machine_clocks() {
         "timer 1 overflow raises IRQ + timer-1 flag"
     );
 }
+
+/// Arm 8-bit auto-init DMA playback of a constant DC buffer at 22050 Hz on the
+/// 0x40 time constant (the rate most DOS digital-sound engines program).
+fn arm_dc_dma_playback(machine: &mut Machine, byte: u8) {
+    for i in 0..256u32 {
+        machine.write_physical_u8(0x1_0000 + i, byte);
+    }
+    with_bus(machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x59, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0xFF, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+        // 22050 Hz via 0x41 (set sample rate), block 256, auto-init 8-bit out.
+        for &b in &[0x41u8, 0x56, 0x22, 0x48, 0xFF, 0x00, 0x1C] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    });
+}
+
+/// Pump audio the way the GUI emulation loop does: advance guest time by a
+/// slice, then render the OPL-native samples that slice of WALL time is worth.
+/// `speed_ratio` is guest time per wall second (1.0 = the guest keeps up).
+/// The wall slice length wobbles per pass the way the real loop's `dt` does, so
+/// the guest-clocked and wall-clocked windows disagree in BOTH directions and
+/// not just by the average shortfall.
+fn pump_slices(
+    machine: &mut Machine,
+    slices: usize,
+    wall_slice_secs: f64,
+    speed_ratio: f64,
+) -> Vec<(i16, i16)> {
+    let mut out = Vec::new();
+    for slice in 0..slices {
+        let wobble = 1.0 + 0.4 * f64::from(slice as u32 % 5) - 0.8;
+        let wall = wall_slice_secs * wobble;
+        let guest_ticks = (wall * speed_ratio * izarravm_core::MASTER_CLOCK_HZ as f64) as u64;
+        machine.advance_devices_ticks(guest_ticks);
+        out.extend(machine.render_audio((wall * f64::from(OPL_NATIVE_HZ)) as usize));
+    }
+    out
+}
+
+/// Count samples that fall far from the median: with a DC source and a silent
+/// OPL, every output frame should hold the same level. A notch toward zero is a
+/// full-scale impulse in the guest's ear.
+fn dropout_count(out: &[(i16, i16)], skip: usize) -> (usize, i16) {
+    let mut sorted: Vec<i16> = out[skip..].iter().map(|f| f.0).collect();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    let tolerance = (i32::from(median).abs() / 4).max(64);
+    let count = out[skip..]
+        .iter()
+        .filter(|f| (i32::from(f.0) - i32::from(median)).abs() > tolerance)
+        .count();
+    (count, median)
+}
+
+#[test]
+fn dsp_dc_playback_has_no_per_pump_dropouts_at_full_speed() {
+    let mut machine = test_machine();
+    arm_dc_dma_playback(&mut machine, 0x40);
+    // 1 ms pumps, the GUI's cadence, with the guest exactly at real time.
+    let out = pump_slices(&mut machine, 400, 0.001, 1.0);
+    let (dropouts, median) = dropout_count(&out, 2_000);
+    assert_eq!(
+        dropouts,
+        0,
+        "DC playback dropped to silence {dropouts} times (median {median}, {} frames)",
+        out.len()
+    );
+}
+
+#[test]
+fn dsp_dc_playback_has_no_per_pump_dropouts_slightly_behind_real_time() {
+    let mut machine = test_machine();
+    arm_dc_dma_playback(&mut machine, 0x40);
+    // A 486 persona a few percent short of real time: the guest-clocked DSP
+    // stream is shorter than the wall-clocked OPL window every pump.
+    let out = pump_slices(&mut machine, 400, 0.001, 0.96);
+    let (dropouts, median) = dropout_count(&out, 2_000);
+    assert_eq!(
+        dropouts,
+        0,
+        "DC playback dropped to silence {dropouts} times (median {median}, {} frames)",
+        out.len()
+    );
+}
