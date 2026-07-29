@@ -775,7 +775,29 @@ impl CpuGsw {
                 self.perf.brk_interrupt += 1;
                 break;
             }
-            if total + (bus.in_batch_scaled_bus_clocks() - bus_at_entry) >= cap {
+            // Was `total + (bus.in_batch_scaled_bus_clocks() - bus_at_entry) >= cap`, which put a
+            // 64-bit divide in this loop for a test that fires 22,903 times out of 553.6M in a
+            // Quake/586 run (2.99% of wall, measured with an inline barrier on the accessor).
+            //
+            // Exactly equivalent, not an approximation. `total >= cap` makes the original true on
+            // its own because the bus term is non-negative (the scaled figure is monotone in the
+            // batch's raw clocks). Otherwise `cap - total > 0`, and
+            // `total + (S - bus_at_entry) >= cap` iff `S >= bus_at_entry + (cap - total)`, which
+            // `in_batch_scaled_bus_clocks_at_least` answers with two multiplies.
+            //
+            // An effectively-unbounded `cap` (uncapped runs pass one) makes `bus_at_entry +
+            // (cap - total)` exceed u64. That is not an edge case to assert away: the target is
+            // then unreachable by any attainable scaled figure, so the original comparison is
+            // false and the run must NOT break. `checked_add` returning None IS that answer.
+            let hit_cap = if total >= cap {
+                true
+            } else {
+                match bus_at_entry.checked_add(cap - total) {
+                    None => false,
+                    Some(target) => bus.in_batch_scaled_bus_clocks_at_least(target),
+                }
+            };
+            if hit_cap {
                 self.perf.brk_cap += 1;
                 break;
             }

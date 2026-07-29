@@ -1061,6 +1061,20 @@ impl CpuBus for MachineBus<'_> {
             / u64::from(self.bus_den_at_batch_start)
     }
 
+    /// The division-free form of the run-loop cap test. Exactly equivalent to
+    /// `in_batch_scaled_bus_clocks() >= target` by `floor(A / den) >= target` iff
+    /// `A >= target * den`, so the run boundaries and `brk_cap` counts are bit-identical.
+    /// Widened to `u128` for the two products so no bound argument about `raw * num` or
+    /// `target * den` is needed; a 128-bit multiply is a few cycles against a 64-bit divide's
+    /// tens, and this runs once per retired instruction.
+    #[inline]
+    fn in_batch_scaled_bus_clocks_at_least(&self, target: u64) -> bool {
+        let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
+        let scaled = u128::from(raw) * u128::from(self.bus_num_at_batch_start)
+            + u128::from(self.bus_rem_at_batch_start);
+        scaled >= u128::from(target) * u128::from(self.bus_den_at_batch_start)
+    }
+
     fn read_memory(
         &mut self,
         address: u32,

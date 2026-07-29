@@ -775,6 +775,19 @@ pub trait CpuBus {
         0
     }
 
+    /// `in_batch_scaled_bus_clocks() >= target`, for implementations that can answer the
+    /// comparison more cheaply than they can produce the value.
+    ///
+    /// The straight-line run loop asks this once per retired instruction — 553.6M times in a
+    /// Quake/586 6.2G run — to test a cap that fires 22,903 times. `MachineBus`'s scaled figure
+    /// is `(raw * num + rem) / den`, so answering it by value put a 64-bit DIVIDE in that loop;
+    /// a RIP profile attributed 2.99% of wall to the accessor once an inline barrier made it
+    /// visible separately. Comparing instead of dividing is exact, not approximate: for integers
+    /// `A >= 0`, `target >= 0`, `den > 0`, `floor(A / den) >= target` iff `A >= target * den`.
+    fn in_batch_scaled_bus_clocks_at_least(&self, target: u64) -> bool {
+        self.in_batch_scaled_bus_clocks() >= target
+    }
+
     fn charge_direct_memory(
         &mut self,
         _address: u32,
