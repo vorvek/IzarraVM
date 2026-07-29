@@ -150,7 +150,7 @@ impl CpuGsw {
         if !self.fast_map_population_enabled() {
             return;
         }
-        if !self.populate_fast_map_active(
+        self.populate_fast_map_active(
             linear,
             physical,
             DirectPage {
@@ -161,14 +161,7 @@ impl CpuGsw {
                 mapping_epoch,
             },
             write,
-        ) {
-            return;
-        }
-        if write {
-            self.data_write_pages.note_fast_map_linear(physical, linear);
-        } else {
-            self.data_read_pages.note_fast_map_linear(physical, linear);
-        }
+        );
     }
 
     /// Lever 1: the interpreter's FastMap serve path. Applies exactly the hit predicate native
@@ -500,16 +493,13 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.populate_fast_map(_linear, physical, page, false) {
-            self.data_read_pages.note_fast_map_linear(physical, _linear);
-        }
+        self.populate_fast_map(_linear, physical, page, false);
         bus.charge_direct_memory(physical, width, kind)?;
         self.record_data_read(kind, true);
         self.perf.direct_data_pointer_reads += 1;
         Ok(Some(Self::read_direct_entry(
             DirectPageCacheEntry {
                 physical_page: page.physical_page,
-                fast_map_linear_page: _linear & !0x0fff,
                 ptr: page.ptr,
             },
             physical,
@@ -583,10 +573,8 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear
-            && self.populate_fast_map(linear, physical, page, false)
-        {
-            self.data_read_pages.note_fast_map_linear(physical, linear);
+        if let Some(linear) = _linear {
+            self.populate_fast_map(linear, physical, page, false);
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, true);
@@ -646,14 +634,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.populate_fast_map(_linear, physical, page, true) {
-            self.data_write_pages
-                .note_fast_map_linear(physical, _linear);
-        }
+        self.populate_fast_map(_linear, physical, page, true);
         bus.charge_direct_memory(physical, width, kind)?;
         let entry = DirectPageCacheEntry {
             physical_page: page.physical_page,
-            fast_map_linear_page: _linear & !0x0fff,
             ptr: page.ptr,
         };
         let changed = Self::read_direct_entry(entry, physical, width) != value;
@@ -738,10 +722,8 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear
-            && self.populate_fast_map(linear, physical, page, true)
-        {
-            self.data_write_pages.note_fast_map_linear(physical, linear);
+        if let Some(linear) = _linear {
+            self.populate_fast_map(linear, physical, page, true);
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         let changed = unsafe { *page.ptr.add(offset) != value };
