@@ -1715,3 +1715,306 @@ fn a_fidiv_by_integer_zero_exits_before_touching_x87_state() {
     );
     assert_ne!(cpu.fpu.status & 0x04, 0, "the interpreter recorded ZE");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Slice 39: Tier 2 m64 REAL forms (FLD/FST/FSTP m64, the eight 0xDC m64 arithmetic forms).
+// ---------------------------------------------------------------------------------------------
+
+const DATA2: usize = 0x300;
+
+/// FLD m64, FADD m64, FDIV m64 and FSTP m64 (twice) chained in one block, with a value
+/// unrepresentable in f32 (1e300) as the FIRST operand. m64 IS the native f64 representation,
+/// so unlike `LoadF32` there is no conversion: `read_real64` returns the eight bytes
+/// bit-reinterpreted, and a native emitter that copy-pasted `LoadF32`'s `vcvtss2sd` (reading
+/// only the low four bytes as an f32) would read garbage instead of 1e300, diverging from the
+/// interpreter immediately. The round-trip FSTP at the end stores that same value back out,
+/// pinning bit-exact preservation end to end.
+fn m64_arith_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![
+        0xdd, 0x05, // fld qword [DATA]         ST(0)=A=1e300
+    ];
+    code.extend_from_slice(&(DATA as u32).to_le_bytes());
+    code.extend_from_slice(&[0xdd, 0x05]); // fld qword [DATA+8]       ST(0)=B, ST(1)=A
+    code.extend_from_slice(&(DATA as u32 + 8).to_le_bytes());
+    code.extend_from_slice(&[0xdc, 0x05]); // fadd qword [DATA+16]     ST(0)=B+C
+    code.extend_from_slice(&(DATA as u32 + 16).to_le_bytes());
+    code.extend_from_slice(&[0xdc, 0x35]); // fdiv qword [DATA+24]     ST(0)=(B+C)/D
+    code.extend_from_slice(&(DATA as u32 + 24).to_le_bytes());
+    code.extend_from_slice(&[0xdd, 0x1d]); // fstp qword [DATA2]       store+pop, ST(0)=A again
+    code.extend_from_slice(&(DATA2 as u32).to_le_bytes());
+    code.extend_from_slice(&[0xdd, 0x1d]); // fstp qword [DATA2+8]     round-trips A, stack empty
+    code.extend_from_slice(&(DATA2 as u32 + 8).to_le_bytes());
+    code.extend_from_slice(&[
+        0xdf, 0xe0, // fnstsw ax
+        0x89, 0xc2, // mov edx,eax
+        0xf4, // hlt
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&1e300f64.to_bits().to_le_bytes()); // A
+    memory[DATA + 8..DATA + 16].copy_from_slice(&2.0f64.to_bits().to_le_bytes()); // B
+    memory[DATA + 16..DATA + 24].copy_from_slice(&3.0f64.to_bits().to_le_bytes()); // C
+    memory[DATA + 24..DATA + 32].copy_from_slice(&2.0f64.to_bits().to_le_bytes()); // D
+    memory
+}
+
+#[test]
+fn fld_fadd_fdiv_and_fstp_m64_match_the_interpreter_and_preserve_the_full_range_value() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (cpu, bus) = assert_program_matches_exact_insns(
+            mode,
+            m64_arith_program(),
+            0x037f,
+            8, // fld, fld, fadd, fdiv, fstp, fstp, fnstsw, mov -- hlt never retires natively
+        );
+        assert_eq!(
+            f64::from_bits(u64::from_le_bytes(
+                bus.memory[DATA2..DATA2 + 8].try_into().unwrap()
+            )),
+            2.5, // (B + C) / D = (2.0 + 3.0) / 2.0
+            "mode={mode:?}: the arithmetic result"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bus.memory[DATA2 + 8..DATA2 + 16].try_into().unwrap()),
+            1e300f64.to_bits(),
+            "mode={mode:?}: 1e300 must round-trip bit-exact, with no f32 conversion in between"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_side_exits,
+            0,
+            "mode={mode:?}"
+        );
+    }
+}
+
+fn fcom_m64_program(operand: f64) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xb8, 0x01, 0x00, 0x00, 0x00]; // mov eax,1        integer, before
+    code.extend_from_slice(&[0xdd, 0x05]); // fld qword [DATA]     ST(0)=5.0, mid-block
+    code.extend_from_slice(&(DATA as u32).to_le_bytes());
+    code.extend_from_slice(&[0xdc, 0x15]); // fcom qword [DATA+8]  /2, no pop
+    code.extend_from_slice(&(DATA as u32 + 8).to_le_bytes());
+    code.extend_from_slice(&[
+        0xdf, 0xe0, // fnstsw ax
+        0x89, 0xc2, // mov edx,eax
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2   integer, after
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&5.0f64.to_bits().to_le_bytes());
+    memory[DATA + 8..DATA + 16].copy_from_slice(&operand.to_bits().to_le_bytes());
+    memory
+}
+
+/// FCOM m64's three-way condition bits: ST(0) above, equal to and below the m64 operand. FCOM
+/// does not pop, mirroring FICOM's separation from FCOMP.
+#[test]
+fn fcom_m64_condition_bits_match_the_interpreter_above_equal_and_below() {
+    // ST(0) is 5.0. (operand, expected C3|C2|C0 bits).
+    let cases = [
+        (3.0, 0u16),    // ST(0) > operand: above
+        (5.0, 1 << 14), // ST(0) == operand: equal
+        (7.0, 1 << 8),  // ST(0) < operand: below
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (operand, expected_bits) in cases {
+            let (cpu, _) = assert_program_matches_exact_insns(
+                mode,
+                fcom_m64_program(operand),
+                0x037f,
+                6, // mov, fld, fcom, fnstsw, mov, mov -- hlt never retires natively
+            );
+            assert_eq!(
+                cpu.fpu.status & 0x4500,
+                expected_bits,
+                "mode={mode:?} operand={operand}"
+            );
+            assert_eq!(cpu.perf_counters().jit_direct_side_exits, 0);
+        }
+    }
+}
+
+/// A 4-aligned-not-8-aligned m64 access: the positive control for the `alignment_bytes`
+/// decision. `DATA + 4` is 4-aligned (0x204) but not 8-aligned, and the guard must admit it:
+/// the interpreter's `read_qword` requires only 4-alignment per half (`fpu_exec.rs:720-740`),
+/// so an 8-byte alignment requirement here would wrongly refuse a legitimate access.
+fn four_aligned_m64_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xdd, 0x05]; // fld qword [DATA + 4]
+    code.extend_from_slice(&(DATA as u32 + 4).to_le_bytes());
+    code.extend_from_slice(&[0xdd, 0x1d]); // fstp qword [DATA2]
+    code.extend_from_slice(&(DATA2 as u32).to_le_bytes());
+    code.extend_from_slice(&[
+        0x89, 0xc0, // mov eax,eax
+        0x89, 0xdb, // mov ebx,ebx
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA + 4..DATA + 12].copy_from_slice(&7.5f64.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn a_four_aligned_not_eight_aligned_m64_access_lowers_and_matches() {
+    let (cpu, bus) = assert_program_matches_exact_insns(
+        GswMode::Gsw586,
+        four_aligned_m64_program(),
+        0x037f,
+        4, // fld, fstp, mov, mov -- hlt never retires natively
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_cross_page_or_alignment,
+        0,
+        "a 4-aligned m64 access must not side-exit on alignment"
+    );
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits, 0);
+    assert_eq!(
+        f64::from_bits(u64::from_le_bytes(
+            bus.memory[DATA2..DATA2 + 8].try_into().unwrap()
+        )),
+        7.5
+    );
+}
+
+/// A 2-aligned m64 access: the alignment guard's negative control. `addr & 3 != 0` must side
+/// exit before the crossing check ever runs.
+fn two_aligned_m64_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xdd, 0x05]; // fld qword [DATA + 2]
+    code.extend_from_slice(&(DATA as u32 + 2).to_le_bytes());
+    code.extend_from_slice(&[0xdd, 0x1d]); // fstp qword [DATA2]
+    code.extend_from_slice(&(DATA2 as u32).to_le_bytes());
+    code.extend_from_slice(&[
+        0x89, 0xc0, // mov eax,eax
+        0x89, 0xdb, // mov ebx,ebx
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA + 2..DATA + 10].copy_from_slice(&11.25f64.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn a_two_aligned_m64_access_side_exits_and_matches() {
+    let (cpu, bus) = assert_program_matches(GswMode::Gsw586, two_aligned_m64_program(), 0x037f);
+    assert!(cpu.perf_counters().jit_direct_exit_cross_page_or_alignment > 0);
+    assert_eq!(
+        f64::from_bits(u64::from_le_bytes(
+            bus.memory[DATA2..DATA2 + 8].try_into().unwrap()
+        )),
+        11.25
+    );
+}
+
+/// An m64 access at page offset 0xFFC: the crossing check's positive control, LIVE for Qword
+/// only. `addr & 3 == 0` passes (0xFFC is 4-aligned), but the second dword half lands at
+/// 0x1000..0x1004, across the page boundary, so `page_offset > 0x1000 - 8` must side exit. The
+/// interpreter still completes it (as two separate dword transactions, one per page), so the
+/// state and bus clocks must still match exactly.
+fn cross_page_m64_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x2000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xdd, 0x05, 0xfc, 0x0f, 0x00, 0x00, // fld qword [0xffc]
+        0xdd, 0x1d, 0x00, 0x03, 0x00, 0x00, // fstp qword [0x300]
+        0x89, 0xc0, // mov eax,eax
+        0x89, 0xdb, // mov ebx,ebx
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[0xffc..0x1004].copy_from_slice(&9.375f64.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn cross_page_m64_memory_exit_reexecutes_precisely() {
+    let (cpu, bus) = assert_program_matches(GswMode::Gsw586, cross_page_m64_program(), 0x037f);
+    assert!(cpu.perf_counters().jit_direct_exit_cross_page_or_alignment > 0);
+    assert_eq!(
+        f64::from_bits(u64::from_le_bytes(
+            bus.memory[0x300..0x308].try_into().unwrap()
+        )),
+        9.375
+    );
+}
+
+fn fadd_m64_nan_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xb8, 0x01, 0x00, 0x00, 0x00]; // mov eax,1        integer, before
+    code.extend_from_slice(&[0xdd, 0x05]); // fld qword [DATA]     ST(0)=5.0, mid-block
+    code.extend_from_slice(&(DATA as u32).to_le_bytes());
+    code.extend_from_slice(&[0xdc, 0x05]); // fadd qword [DATA+8]  NaN operand
+    code.extend_from_slice(&(DATA as u32 + 8).to_le_bytes());
+    code.extend_from_slice(&[
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2   integer, after (interpreted)
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&5.0f64.to_bits().to_le_bytes());
+    memory[DATA + 8..DATA + 16].copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
+    memory
+}
+
+/// FADD m64 with a NaN bit pattern operand. A NaN or infinity is legal in guest memory for a
+/// Tier 2 memory operand (unlike LoadF32/BinaryMemory's F32 forms, this is the arm the 0xDA
+/// arm's comment warns must carry the guard it omits), so `emit_finite_guard` on the loaded
+/// operand catches it and side exits before any x87 state changes; the interpreter finishes the
+/// instruction and the result is NaN.
+#[test]
+fn fadd_m64_with_a_nan_operand_side_exits_and_matches_the_interpreter() {
+    let (cpu, _) = assert_program_matches_exact_insns(
+        GswMode::Gsw586,
+        fadd_m64_nan_program(),
+        0x037f,
+        2, // mov, fld
+    );
+    assert!(
+        cpu.perf_counters().jit_direct_exit_other > 0,
+        "a NaN operand must side-exit at the finite guard rather than be stored"
+    );
+    assert!(cpu.fpu.get(0).is_nan(), "the interpreter's result is NaN");
+}
+
+fn fcom_m64_nan_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xb8, 0x01, 0x00, 0x00, 0x00]; // mov eax,1        integer, before
+    code.extend_from_slice(&[0xdd, 0x05]); // fld qword [DATA]     ST(0)=5.0, mid-block
+    code.extend_from_slice(&(DATA as u32).to_le_bytes());
+    code.extend_from_slice(&[0xdc, 0x15]); // fcom qword [DATA+8]  /2, NaN operand
+    code.extend_from_slice(&(DATA as u32 + 8).to_le_bytes());
+    code.extend_from_slice(&[
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2   integer, after (interpreted)
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&5.0f64.to_bits().to_le_bytes());
+    memory[DATA + 8..DATA + 16].copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
+    memory
+}
+
+/// THE CONTRACT FIXTURE: FCOM m64 against a NaN operand. Native side exits at the same finite
+/// guard the FADD case above does (the guard in `BinaryMemoryF64`'s emit arm is unconditional,
+/// covering compares too), so it is the interpreter that writes the unordered condition triple
+/// C3=C2=C0, and the differential comparison is what proves native did not instead reach
+/// `emit_compare` and write C3 alone.
+#[test]
+fn fcom_m64_with_a_nan_operand_side_exits_and_the_interpreter_writes_the_unordered_triple() {
+    let (cpu, _) = assert_program_matches_exact_insns(
+        GswMode::Gsw586,
+        fcom_m64_nan_program(),
+        0x037f,
+        2, // mov, fld
+    );
+    assert!(cpu.perf_counters().jit_direct_exit_other > 0);
+    assert_eq!(
+        cpu.fpu.status & 0x4500,
+        (1 << 14) | (1 << 10) | (1 << 8),
+        "unordered: C3=C2=C0"
+    );
+}

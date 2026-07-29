@@ -213,6 +213,25 @@ fn dynamic_counter_mask_tracks_only_reachable_outputs() {
         width: MemoryWidth::Dword,
         addr,
     });
+    let x87_addr = crate::AddrMode {
+        segment: SegmentIndex::Ds,
+        base: None,
+        index: None,
+        scale: 1,
+        disp: 0,
+        address_size: crate::AddressSize::Dword,
+    };
+    let x87_qword_read = slot(DirectKind::X87 {
+        insn: NativeX87Insn::LoadF64 { addr: x87_addr },
+        addr: Some(addr),
+    });
+    let x87_qword_write = slot(DirectKind::X87 {
+        insn: NativeX87Insn::StoreF64 {
+            addr: x87_addr,
+            pop: false,
+        },
+        addr: Some(addr),
+    });
 
     assert_eq!(
         dynamic_counter_mask(&[byte_store]),
@@ -245,6 +264,17 @@ fn dynamic_counter_mask_tracks_only_reachable_outputs() {
     assert_eq!(
         dynamic_counter_mask(&[slot(DirectKind::MovImm { dst: 0, imm: 0 })]),
         0
+    );
+    // The x87 arm was entirely uncovered here before slice 39. A Qword access must land on the
+    // DWORD lane, not the wildcard BYTE lane a genuine Word access would hit: this is the
+    // regression pin for the explicit Qword arms added above the wildcards.
+    assert_eq!(
+        dynamic_counter_mask(&[x87_qword_read]),
+        COUNTER_MODE13_DWORD_READ
+    );
+    assert_eq!(
+        dynamic_counter_mask(&[x87_qword_write]),
+        COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
     );
 }
 

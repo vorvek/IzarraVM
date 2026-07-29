@@ -49,6 +49,12 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             | (0xda, 0..=2, 0..=7, 0..=7)
             | (0xda, 3, 5, 1)
             | (0xdb, 0..=2, 0 | 3, 0..=7)
+            // 0xDD memory forms: FLD/FST/FSTP m64 (`LoadF64`/`StoreF64`). `/1` (FISTTP,
+            // unimplemented) and `/4`-`/7` (FLDENV/FRSTOR/FNSAVE/FSTSW m16) stay rejected, same
+            // as the register-row absence pattern above documents for 0xDC.
+            | (0xdd, 0..=2, 0 | 2 | 3, 0..=7)
+            // 0xDC memory forms: f64 arithmetic, all 8 sub-opcodes (`BinaryMemoryF64`).
+            | (0xdc, 0..=2, 0..=7, 0..=7)
             // 0xDC mod=3, the ST(i)-destination binaries. The ABSENCE of 2 and 3 from this
             // pattern is the negative assertion that FCOM/FCOMP with an ST(i) destination stay
             // on the interpreter, where they raise #UD.
@@ -81,8 +87,10 @@ fn classifier_selects_exact_traced_slice() {
     }
     // 461 before the control-word pair, 509 after it. 0xDC mod=3 adds six sub-opcodes across
     // eight rm values: 6 * 8 = 48, landing at 557. 0xDA memory forms add 3 modes x 8 sub-opcodes
-    // x 8 rm values = 192, landing at 749.
-    assert_eq!(accepted, 749);
+    // x 8 rm values = 192, landing at 749. 0xDD memory (FLD/FST/FSTP m64) adds 3 modes x 3
+    // sub-opcodes x 8 rm values = 72, landing at 821. 0xDC memory (f64 arithmetic) adds 3 modes
+    // x 8 sub-opcodes x 8 rm values = 192, landing at 1013.
+    assert_eq!(accepted, 1013);
 }
 
 #[test]
@@ -111,7 +119,52 @@ fn classifier_preserves_operations_indices_and_addresses() {
                 addr: addr(),
             })
         );
+        // 0xDC memory forms: f64 arithmetic, same op mapping again.
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xdc, 0, extension, 5)),
+            Some(NativeX87Insn::BinaryMemoryF64 {
+                op: expected,
+                addr: addr(),
+            })
+        );
     }
+    // FLD/FST/FSTP m64. `/1` and `/4`-`/7` are NOT FLD/FST/FSTP and must stay unclassifiable;
+    // `/0`, `/2` and `/3` must classify with the right variant, pop flag and address.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdd, 0, 0, 5)),
+        Some(NativeX87Insn::LoadF64 { addr: addr() })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdd, 0, 2, 5)),
+        Some(NativeX87Insn::StoreF64 {
+            addr: addr(),
+            pop: false,
+        })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdd, 0, 3, 5)),
+        Some(NativeX87Insn::StoreF64 {
+            addr: addr(),
+            pop: true,
+        })
+    );
+    for extension in [1u8, 4, 5, 6, 7] {
+        assert!(
+            NativeX87Insn::classify(&insn(0xdd, 0, extension, 5)).is_none(),
+            "0xdd /{extension} memory (FISTTP/FLDENV/FRSTOR/FNSAVE/FSTSW) must stay \
+             unclassifiable"
+        );
+    }
+    // 0xDC mod=3 must still classify as `BinaryRegisterDest`, not `BinaryMemoryF64`: the
+    // register-mode branch is disjoint from the memory-mode branch above, and this is the
+    // regression pin that the memory arm did not shadow it.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdc, 3, 0, 3)),
+        Some(NativeX87Insn::BinaryRegisterDest {
+            op: NativeX87StiOp::Add,
+            index: 3,
+        })
+    );
     // 0xDA mod=3 is FCMOVcc territory except for FUCOMPP at reg=5, rm=1 (pinned separately
     // below); every other register-mode encoding must stay unclassifiable rather than being
     // misread as IntBinaryMemory.
@@ -539,6 +592,80 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FLD m64: `F64Mem`, not `F32Mem`, and an 8-byte read. No conversion, so `pops` is
+        // false the same as `LoadF32`.
+        (
+            insn(0xdd, 0, 0, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F64Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 8,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        // FST m64: an 8-byte write, no pop.
+        (
+            insn(0xdd, 0, 2, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F64Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 8,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        // FSTP m64: same shape as FST but popping.
+        (
+            insn(0xdd, 0, 3, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F64Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 8,
+                }),
+                pops: true,
+                terminates_block: false,
+            },
+        ),
+        // FADD m64: the non-popping 0xDC memory representative. `F64Mem` at raw 20, matching
+        // the interpreter's `fpu_mem_arith` clocks(20).
+        (
+            insn(0xdc, 0, 0, 0),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::F64Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 8,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        // FCOMP m64: the popping 0xDC memory representative, mirroring the 0xDA FICOMP row
+        // above (`pops` must read true here, same reason `top_delta` must join the
+        // `BinaryMemory | IntBinaryMemory | BinaryRegister` group for this shape).
+        (
+            insn(0xdc, 0, 3, 0),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::F64Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 8,
+                }),
+                pops: true,
+                terminates_block: false,
+            },
+        ),
     ];
     for (insn, expected) in cases {
         assert_eq!(NativeX87Insn::classify(&insn).unwrap().metadata(), expected);
@@ -760,15 +887,18 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         NativeX87Insn::LoadRegister { index: 3 },
         NativeX87Insn::Exchange { index: 3 },
     ];
+    shapes.push(NativeX87Insn::LoadF64 { addr: addr() });
     for pop in [false, true] {
         shapes.push(NativeX87Insn::StoreF32 { addr: addr(), pop });
         shapes.push(NativeX87Insn::StoreRegister { index: 3, pop });
+        shapes.push(NativeX87Insn::StoreF64 { addr: addr(), pop });
     }
     for extension in 0..=7 {
         let op = NativeX87BinaryOp::from_extension(extension).expect("binary op");
         shapes.push(NativeX87Insn::BinaryMemory { op, addr: addr() });
         shapes.push(NativeX87Insn::IntBinaryMemory { op, addr: addr() });
         shapes.push(NativeX87Insn::BinaryRegister { op, index: 3 });
+        shapes.push(NativeX87Insn::BinaryMemoryF64 { op, addr: addr() });
     }
     for op in [
         NativeX87StiOp::Add,
@@ -804,7 +934,10 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::ComparePopPop
         | NativeX87Insn::StoreStatusAx
         | NativeX87Insn::LoadControlWord { .. }
-        | NativeX87Insn::StoreControlWord { .. } => true,
+        | NativeX87Insn::StoreControlWord { .. }
+        | NativeX87Insn::LoadF64 { .. }
+        | NativeX87Insn::StoreF64 { .. }
+        | NativeX87Insn::BinaryMemoryF64 { .. } => true,
     }
 }
 
