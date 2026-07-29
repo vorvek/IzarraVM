@@ -3478,3 +3478,60 @@ fn decoded_insn_size_is_pinned_after_the_operand_length_pair() {
          re-verify that note before accepting growth"
     );
 }
+
+// --- PodKeyHasher: the BlockKey hasher swap ---------------------------------
+//
+// The failure mode this guards is specific and would be invisible to every other assertion:
+// `U32Hasher::write_u32` OVERWRITES its state, so reusing it for a three-field key would keep
+// only the last field written and collapse every `BlockKey` sharing a `mode_key` into one
+// bucket. The map would still be correct and would still pass every functional test; it would
+// just degrade to a linear scan. These tests fail if that ever happens.
+
+fn pod_key_hash(linear: u32, physical: u32, mode_key: u32) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = crate::PodKeyBuildHasher::default().build_hasher();
+    h.write_u32(linear);
+    h.write_u32(physical);
+    h.write_u32(mode_key);
+    h.finish()
+}
+
+#[test]
+fn pod_key_hasher_folds_every_field_and_does_not_overwrite() {
+    let base = pod_key_hash(1, 2, 3);
+    // Each field alone must move the hash. Overwriting semantics would make the first two
+    // assertions fail while the third still passed.
+    assert_ne!(base, pod_key_hash(9, 2, 3), "linear was not folded in");
+    assert_ne!(base, pod_key_hash(1, 9, 3), "physical was not folded in");
+    assert_ne!(base, pod_key_hash(1, 2, 9), "mode_key was not folded in");
+    // Field order must matter, or permuted keys alias.
+    assert_ne!(pod_key_hash(1, 2, 3), pod_key_hash(3, 2, 1));
+}
+
+#[test]
+fn pod_key_hasher_spreads_the_low_bits_hashbrown_indexes_with() {
+    // A Fibonacci multiply concentrates entropy high; hashbrown picks its bucket from the low
+    // bits. Without the xor-shift finalizer a realistic key population lands in very few
+    // buckets. Model 4096 buckets over page-strided linear/physical pairs, which is what a
+    // guest actually produces.
+    const BUCKETS: usize = 4096;
+    let mut counts = vec![0u32; BUCKETS];
+    let mut keys = 0u32;
+    for page in 0..512u32 {
+        for offset in [0u32, 0x40, 0x80, 0xc0, 0x100, 0x140, 0x180, 0x1c0] {
+            let linear = (page << 12) | offset;
+            let hash = pod_key_hash(linear, linear.wrapping_add(0x0010_0000), 0);
+            counts[(hash as usize) & (BUCKETS - 1)] += 1;
+            keys += 1;
+        }
+    }
+    let occupied = counts.iter().filter(|&&c| c != 0).count();
+    let worst = *counts.iter().max().unwrap();
+    // 4096 keys into 4096 buckets: a sound hash fills well over half and keeps the worst
+    // bucket shallow. The overwrite bug would give occupied == 1.
+    assert!(
+        occupied > BUCKETS / 2,
+        "only {occupied} of {BUCKETS} buckets used for {keys} keys"
+    );
+    assert!(worst <= 8, "worst bucket depth {worst} for {keys} keys");
+}

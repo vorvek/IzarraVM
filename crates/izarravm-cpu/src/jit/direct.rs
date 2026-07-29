@@ -25,7 +25,7 @@ use super::x87_avx2_emit::{
 };
 use crate::{
     AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, Prefixes,
-    Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
+    PodKeyBuildHasher, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
 };
 
 #[cfg(all(
@@ -529,7 +529,10 @@ pub(crate) enum BlockProbe {
 /// Bounded direct-block cache. Hash lookup is authoritative; the direct-mapped table is only a
 /// collision-checked accelerator. Capacity pressure clears the entire cache.
 pub(crate) struct BlockCache {
-    entries: HashMap<BlockKey, BlockState>,
+    /// Keyed with `PodKeyBuildHasher`, not std's SipHash: a RIP-sample profile of Quake/586
+    /// attributed 3.1 percent of wall to hashing this map's three-`u32` key. Its sibling
+    /// `physical_keys` below already used the crate's fast hasher for the same reason.
+    entries: HashMap<BlockKey, BlockState, PodKeyBuildHasher>,
     physical_keys: HashMap<u32, Vec<BlockKey>, U32BuildHasher>,
     blocks: Vec<CompiledBlock>,
     block_portals: Vec<Arc<BlockPortal>>,
@@ -618,7 +621,7 @@ impl BlockCache {
             "decode slot count must be a nonzero power of two"
         );
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::default(),
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
             block_portals: Vec::new(),

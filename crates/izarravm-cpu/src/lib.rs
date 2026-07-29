@@ -2562,6 +2562,47 @@ impl std::hash::Hasher for U32Hasher {
 }
 type U32BuildHasher = std::hash::BuildHasherDefault<U32Hasher>;
 
+/// An *accumulating* multiplicative hasher for small multi-field POD keys, replacing std's
+/// SipHash. A RIP-sample profile of Quake/586 attributed 3.1 percent of wall to SipHash on
+/// `jit::direct::BlockKey` alone, whose derived `Hash` issues three `write_u32` calls for three
+/// `u32` fields.
+///
+/// It is deliberately NOT `U32Hasher`, and reusing that type here would be a serious bug rather
+/// than a shortcut: `U32Hasher::write_u32` *overwrites* its state, so a three-field key would
+/// retain only the last field and every `BlockKey` sharing a `mode_key` would collide into one
+/// bucket. This one folds each field into the running state instead.
+///
+/// `finish` applies an xor-shift finalizer because a Fibonacci multiply concentrates entropy in
+/// the high bits while hashbrown selects its bucket from the low bits; without the fold-down the
+/// low bits would be poorly distributed even though the hash as a whole is not.
+#[derive(Default)]
+struct PodKeyHasher(u64);
+impl std::hash::Hasher for PodKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let x = self.0;
+        x ^ (x >> 32)
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+}
+pub(crate) type PodKeyBuildHasher = std::hash::BuildHasherDefault<PodKeyHasher>;
+
 impl DecodeCache {
     fn new(lines: usize) -> Self {
         assert!(
