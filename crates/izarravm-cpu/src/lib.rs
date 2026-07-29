@@ -2601,7 +2601,7 @@ impl std::hash::Hasher for PodKeyHasher {
         }
     }
 }
-pub(crate) type PodKeyBuildHasher = std::hash::BuildHasherDefault<PodKeyHasher>;
+type PodKeyBuildHasher = std::hash::BuildHasherDefault<PodKeyHasher>;
 
 impl DecodeCache {
     fn new(lines: usize) -> Self {

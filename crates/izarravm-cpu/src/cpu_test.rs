@@ -3487,13 +3487,17 @@ fn decoded_insn_size_is_pinned_after_the_operand_length_pair() {
 // bucket. The map would still be correct and would still pass every functional test; it would
 // just degrade to a linear scan. These tests fail if that ever happens.
 
+// Hash a REAL `BlockKey` through its derived `Hash`, not a hand-rolled sequence of three
+// `write_u32` calls. That distinction is load-bearing: `PodKeyHasher` overrides only
+// `write_u32`/`write_u64`/`write_usize`, so any narrower field (say `mode_key` widened to
+// `u16`, or a new `u16` added) falls through to the byte-rotate `write` fallback, a different
+// and much slower algorithm. A hand-rolled sequence would keep passing while the map itself
+// quietly stopped using the fast path.
 fn pod_key_hash(linear: u32, physical: u32, mode_key: u32) -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = crate::PodKeyBuildHasher::default().build_hasher();
-    h.write_u32(linear);
-    h.write_u32(physical);
-    h.write_u32(mode_key);
-    h.finish()
+    use std::hash::BuildHasher;
+    crate::PodKeyBuildHasher::default().hash_one(crate::jit::direct::BlockKey::new(
+        linear, physical, mode_key,
+    ))
 }
 
 #[test]
