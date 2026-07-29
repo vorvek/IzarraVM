@@ -2061,6 +2061,13 @@ fn native_paged_permissions_side_exit_in_all_modes() {
             cpu.idtr.limit = 0;
             let count_phys = PG_DATA_PHYS + (PG_COUNT_LIN - PG_DATA_LIN) as usize;
             bus.memory[count_phys..count_phys + 4].copy_from_slice(&1u32.to_le_bytes());
+            // The PTE carries the same denial as the TLB entry below. A hit never raises the
+            // fault itself (see `translate_linear_checked`), so a TLB entry that contradicts
+            // the live tables would just re-walk and be served -- the denial has to be real.
+            let data_pte = 0x2000 + (PG_DATA_LIN as usize >> 12) * 4;
+            let flags = 0x61 | u32::from(writable) << 1 | u32::from(user) << 2;
+            bus.memory[data_pte..data_pte + 4]
+                .copy_from_slice(&((PG_DATA_PHYS as u32) | flags).to_le_bytes());
             cpu.tlb
                 .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, writable, user, true);
             #[cfg(all(

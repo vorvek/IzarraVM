@@ -1921,7 +1921,7 @@ impl Machine {
         // DAC latch does on real hardware when its data is late) and clamp the
         // window to the wall budget so the sink ring cannot drift into its
         // high-water flush either.
-        // ponytail: a zero-order hold spreads a sustained shortfall as repeated
+        // Known ceiling: a zero-order hold spreads a sustained shortfall as repeated
         // samples (mild roughness). If that becomes audible, slew the resampler
         // ratio off the ring depth instead of holding.
         let len = opl_out.len();
