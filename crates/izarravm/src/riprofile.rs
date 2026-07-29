@@ -22,18 +22,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::mem;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    GetThreadContext, SymFromAddrW, SymGetLineFromAddrW64, SymInitializeW, SymSetOptions, CONTEXT,
-    IMAGEHLP_LINEW64, SYMBOL_INFOW, SYMOPT_DEFERRED_LOADS, SYMOPT_LOAD_LINES, SYMOPT_UNDNAME,
-};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    SymGetModuleInfoW64, SymLoadModuleExW, IMAGEHLP_MODULEW64,
+    CONTEXT, GetThreadContext, IMAGEHLP_LINEW64, IMAGEHLP_MODULEW64, SYMBOL_INFOW,
+    SYMOPT_DEFERRED_LOADS, SYMOPT_LOAD_LINES, SYMOPT_UNDNAME, SymFromAddrW, SymGetLineFromAddrW64,
+    SymGetModuleInfoW64, SymInitializeW, SymLoadModuleExW, SymSetOptions,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
@@ -102,7 +100,10 @@ impl Sampler {
                         if SuspendThread(target) == u32::MAX {
                             suspend_failures += 1;
                             first_error.get_or_insert_with(|| {
-                                ("SuspendThread", windows_sys::Win32::Foundation::GetLastError())
+                                (
+                                    "SuspendThread",
+                                    windows_sys::Win32::Foundation::GetLastError(),
+                                )
                             });
                             None
                         } else {
@@ -113,7 +114,10 @@ impl Sampler {
                             if ok == 0 {
                                 context_failures += 1;
                                 first_error.get_or_insert_with(|| {
-                                    ("GetThreadContext", windows_sys::Win32::Foundation::GetLastError())
+                                    (
+                                        "GetThreadContext",
+                                        windows_sys::Win32::Foundation::GetLastError(),
+                                    )
                                 });
                             }
                             (ok != 0).then_some(ctx.0.Rip)
@@ -134,7 +138,11 @@ impl Sampler {
             })
             .ok()?;
         eprintln!("riprofile: sampling armed (delay {delay}s, interval {SAMPLE_INTERVAL:?})");
-        Some(Self { stop, join, target: target_addr })
+        Some(Self {
+            stop,
+            join,
+            target: target_addr,
+        })
     }
 
     pub fn stop_and_report(self, out_path: &Path) {
@@ -208,9 +216,11 @@ impl Sampler {
             }
             let func = resolve_symbol(process, rip)
                 .unwrap_or_else(|| "<no symbol — JIT arena or foreign code>".into());
-            let site = resolve_line(process, rip)
-                .unwrap_or_else(|| format!("{func} (no line info)"));
-            let file = site.rsplit_once(':').map_or(site.clone(), |(f, _)| f.into());
+            let site =
+                resolve_line(process, rip).unwrap_or_else(|| format!("{func} (no line info)"));
+            let file = site
+                .rsplit_once(':')
+                .map_or(site.clone(), |(f, _)| f.into());
             *by_func.entry(func).or_default() += n;
             *by_site.entry(site).or_default() += n;
             *by_file.entry(file).or_default() += n;
@@ -232,14 +242,22 @@ impl Sampler {
             rows.sort_by(|a, b| b.1.cmp(a.1));
             report.push_str(&format!("== {title} ==\n"));
             for (name, n) in rows.into_iter().take(top) {
-                report.push_str(&format!("{:>7.3}%  {:>9}  {}\n", *n as f64 * 100.0 / total as f64, n, name));
+                report.push_str(&format!(
+                    "{:>7.3}%  {:>9}  {}\n",
+                    *n as f64 * 100.0 / total as f64,
+                    n,
+                    name
+                ));
             }
             report.push('\n');
         }
         match std::fs::File::create(out_path).and_then(|mut f| f.write_all(report.as_bytes())) {
             Ok(()) => eprintln!("riprofile: report written to {}", out_path.display()),
             Err(e) => {
-                eprintln!("riprofile: could not write {}: {e}; report follows\n{report}", out_path.display());
+                eprintln!(
+                    "riprofile: could not write {}: {e}; report follows\n{report}",
+                    out_path.display()
+                );
             }
         }
     }
@@ -274,7 +292,8 @@ fn resolve_line(process: HANDLE, rip: u64) -> Option<String> {
         while unsafe { *line.FileName.add(len) } != 0 {
             len += 1;
         }
-        let file = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(line.FileName, len) });
+        let file =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(line.FileName, len) });
         // Keep paths readable: everything from the last `crates` component on,
         // or the bare filename for std/vendored sources.
         let trimmed = file

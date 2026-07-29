@@ -759,8 +759,8 @@ fn run_boot_hdd_folder(
     }
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     #[cfg(windows)]
-    let rip_sampler = std::env::var_os("IZARRAVM_RIP_PROFILE")
-        .map(|path| (riprofile::Sampler::start(), path));
+    let rip_sampler =
+        std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| (riprofile::Sampler::start(), path));
     let start_wall = std::time::Instant::now();
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     let wall = start_wall.elapsed();
