@@ -1194,7 +1194,7 @@ fn static_hidden_portal_reports_reason_before_target_body() {
     decode_fixture(&mut cpu, &mut bus, &[ENTRY, ENTRY + 5, TARGET]);
     let source = install_fixture_block(&mut cpu, ENTRY);
     let target = install_fixture_block(&mut cpu, TARGET);
-    assert!(cpu.jit_direct.has_linked_successor(source));
+    assert!(cpu.jit_direct.has_linked_successor(source.id()));
 
     assert!(cpu.jit_direct.hide_portal_for_test(target.id()));
     assert!(cpu.jit_direct.is_link_visible(source.id()));

@@ -480,7 +480,7 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
         .jit_direct
         .block(source_id)
         .expect("source remains live");
-    assert!(native.jit_direct.has_linked_successor(source));
+    assert!(native.jit_direct.has_linked_successor(source.id()));
 
     decode_at(&mut native, &mut native_bus, collision);
     decode_at(&mut interp, &mut interp_bus, collision);
@@ -490,7 +490,7 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
     assert!(native.decode_cache.line_live(TARGET + 8, true));
     assert!(native.decode_cache.line_live(collision, true));
     assert!(
-        !native.jit_direct.has_linked_successor(source),
+        !native.jit_direct.has_linked_successor(source.id()),
         "evicting the target slot must hide its portal from the source edge"
     );
 

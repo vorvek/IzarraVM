@@ -528,7 +528,7 @@ impl SegmentLayout {
             .all(|segment| self.data[segment_index(segment)] == cpu.registers.segment(segment))
     }
 
-    pub(crate) fn link_compatible(self, target: Self) -> bool {
+    pub(crate) fn link_compatible(&self, target: &Self) -> bool {
         self.cs == target.cs && self.data == target.data
     }
 
@@ -614,6 +614,13 @@ impl RejectedSpan {
 
 /// Metadata for one sealed native block. Arena compaction can stale a copied entry address, so
 /// callers re-resolve `id` immediately before entering native code.
+///
+/// This struct is COPIED several times per Direct entry (probe, the `run_direct_block`
+/// argument, the pre-entry re-resolve), so its size is memcpy traffic multiplied by tens of
+/// millions of entries. `segment_layout` used to live here and was 116 of its 240 bytes; it
+/// now sits in `BlockCache::segment_layouts`, fetched once per entry instead of riding every
+/// copy. Keep new fields out unless they are genuinely read on a uniform-fetch entry, and
+/// keep `compiled_block_stays_small_enough_to_copy_per_entry` truthful.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompiledBlock {
     id: BlockId,
@@ -630,7 +637,6 @@ pub(crate) struct CompiledBlock {
     byte_stores: u8,
     word_stores: u8,
     dword_stores: u8,
-    segment_layout: SegmentLayout,
     memory_cpl3: bool,
     has_wide_accesses: bool,
     self_loop: bool,
@@ -694,18 +700,6 @@ impl CompiledBlock {
         self.dword_stores
     }
 
-    pub(crate) fn cs_descriptor_matches(&self, cpu: &CpuGsw) -> bool {
-        self.segment_layout.cs_matches(cpu)
-    }
-
-    pub(crate) fn data_descriptors_match(&self, cpu: &CpuGsw) -> bool {
-        self.segment_layout.data_matches(cpu)
-    }
-
-    pub(crate) fn chain_descriptors_match(&self, cpu: &CpuGsw) -> bool {
-        self.segment_layout.all_data_matches(cpu)
-    }
-
     pub(crate) fn memory_cpl3(&self) -> bool {
         self.memory_cpl3
     }
@@ -740,10 +734,11 @@ impl CompiledBlock {
     /// block (see `compile()`, around the `x87_entry_top`/`x87_exit_top` locals), an arbitrary
     /// value with no relationship to anything at link time. Comparing a float block's real
     /// `x87_exit_top` against that snapshot would accept or refuse edges at random.
-    fn link_compatible(self, target: Self) -> bool {
+    fn link_compatible(&self, target: &Self) -> bool {
+        // The segment-snapshot half of this predicate moved to the call site with
+        // `segment_layout`; both halves must still hold for an edge to link.
         if self.span.key.mode_key != target.span.key.mode_key
             || self.memory_cpl3 != target.memory_cpl3
-            || !self.segment_layout.link_compatible(target.segment_layout)
         {
             return false;
         }
@@ -847,6 +842,10 @@ pub(crate) struct BlockCache {
     entries: HashMap<BlockKey, BlockState, PodKeyBuildHasher>,
     physical_keys: HashMap<u32, Vec<BlockKey>, U32BuildHasher>,
     blocks: Vec<CompiledBlock>,
+    /// Parallel to `blocks`, same `BlockId::index()`. Split out of `CompiledBlock` because it
+    /// was 116 of that struct's 240 bytes while every hot-path read goes through a `&self`
+    /// method that never needed the copy. Entry reads it exactly once.
+    segment_layouts: Vec<SegmentLayout>,
     block_portals: Vec<Arc<BlockPortal>>,
     link_cells: Vec<[Arc<LinkCell>; 2]>,
     link_sources: HashMap<usize, LinkSource<BlockId>>,
@@ -936,6 +935,7 @@ impl BlockCache {
             entries: HashMap::default(),
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
+            segment_layouts: Vec::new(),
             block_portals: Vec::new(),
             link_cells: Vec::new(),
             link_sources: HashMap::new(),
@@ -1126,7 +1126,6 @@ impl BlockCache {
             byte_stores: compilation.byte_stores,
             word_stores: compilation.word_stores,
             dword_stores: compilation.dword_stores,
-            segment_layout: compilation.segment_layout,
             memory_cpl3: compilation.memory_cpl3,
             has_wide_accesses: compilation.has_wide_accesses,
             self_loop: compilation.self_loop,
@@ -1139,6 +1138,7 @@ impl BlockCache {
         watch.acquire_range(span.key.physical, u32::from(span.guest_len));
         if index == self.blocks.len() {
             self.blocks.push(block);
+            self.segment_layouts.push(compilation.segment_layout);
             if index == self.block_portals.len() {
                 self.block_portals.push(Arc::new(BlockPortal::new()));
             } else {
@@ -1161,6 +1161,7 @@ impl BlockCache {
             debug_assert!(!self.block_portals[index].visible());
             debug_assert!(self.block_decode_slots[index].is_empty());
             self.blocks[index] = block;
+            self.segment_layouts[index] = compilation.segment_layout;
             self.link_cells[index] = compilation.link_cells.clone();
             self.outbound[index] = [None, None];
             self.dynamic_next_slots[index] = 0;
@@ -1505,8 +1506,30 @@ impl BlockCache {
         std::mem::take(&mut self.stats)
     }
 
-    pub(crate) fn has_linked_successor(&self, block: CompiledBlock) -> bool {
-        self.active_index(block.id)
+    /// The block's compile-time segment snapshot, which no longer rides the `CompiledBlock`
+    /// copy. Returned by value: the three descriptor checks in `run_direct_block` sit between
+    /// `&mut self.jit_direct` uses (`retire_key_for_recompile`), so a borrow cannot span them.
+    /// One 116-byte copy per entry replaces four.
+    ///
+    /// Indexed WITHOUT `active_index`, deliberately. Callers reach this holding a possibly
+    /// stale `CompiledBlock` copy, and back when the layout was a field of that copy the
+    /// descriptor checks still ran (and still attributed their reject counters) against a
+    /// retired block's own snapshot. Adding a liveness gate here would move retirement
+    /// detection ahead of those counters and silently change reject attribution.
+    ///
+    /// Reading a reused slot's newer layout is harmless: it can only pick a different reject
+    /// counter, never admit a stale block. Entry is gated separately by the generational
+    /// re-resolve in `run_direct_block`, which fails for both a retired and a reused id.
+    /// `None` means the whole cache was reset out from under the copy, which that re-resolve
+    /// would have refused a few lines later anyway.
+    pub(crate) fn segment_layout(&self, id: BlockId) -> Option<SegmentLayout> {
+        self.segment_layouts.get(id.index()).copied()
+    }
+
+    // Takes the id, not the block: this reads `block.id` and nothing else, and passing
+    // `CompiledBlock` by value put a full-struct copy on the entry path for one word.
+    pub(crate) fn has_linked_successor(&self, id: BlockId) -> bool {
+        self.active_index(id)
             .and_then(|index| self.link_cells.get(index))
             .is_some_and(|cells| cells[0].linked() || cells[1].linked())
     }
@@ -1805,6 +1828,7 @@ impl BlockCache {
         self.entries.clear();
         self.physical_keys.clear();
         self.blocks.clear();
+        self.segment_layouts.clear();
         self.link_cells.clear();
         self.link_sources.clear();
         self.outbound.clear();
@@ -1892,7 +1916,8 @@ impl BlockCache {
         let target_block = self.blocks[target_index];
         if self.block_link_epochs.get(source_index).copied() != Some(self.link_epoch)
             || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch)
-            || !source_block.link_compatible(target_block)
+            || !self.segment_layouts[source_index].link_compatible(&self.segment_layouts[target_index])
+            || !source_block.link_compatible(&target_block)
             // The dynamic RET PIC path resolves a near-RET target at runtime from an arbitrary
             // return address, not from a compile-time successor shape, and
             // emit_completed_dynamic_path never emits the boundary spill link_compatible's

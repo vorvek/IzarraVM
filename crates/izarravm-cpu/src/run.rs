@@ -1171,7 +1171,7 @@ impl CpuGsw {
         if self.jit_direct.defer_short_enabled()
             && !block.is_self_loop()
             && block.span().instructions < jit::direct::MIN_STANDALONE_INSTRUCTIONS
-            && !self.jit_direct.has_linked_successor(block)
+            && !self.jit_direct.has_linked_successor(block.id())
         {
             self.perf.jit_direct_deferred_short += 1;
             return Ok(DirectContinuation::Interpret);
@@ -2291,7 +2291,12 @@ impl CpuGsw {
             self.jit_direct.retire_key_for_recompile(span.key);
             return Ok(DirectBlockOutcome::NotRun);
         }
-        if !block.cs_descriptor_matches(self) {
+        // Fetched once and held in a local across all three descriptor checks. It used to ride
+        // every `CompiledBlock` copy at 116 bytes a piece; the checks only ever read it.
+        let Some(segments) = self.jit_direct.segment_layout(block.id()) else {
+            return Ok(DirectBlockOutcome::NotRun);
+        };
+        if !segments.cs_matches(self) {
             self.perf.jit_direct_reject_cs_layout += 1;
             self.jit_direct.retire_key_for_recompile(span.key);
             return Ok(DirectBlockOutcome::NotRun);
@@ -2301,11 +2306,11 @@ impl CpuGsw {
             self.jit_direct.retire_key_for_recompile(span.key);
             return Ok(DirectBlockOutcome::NotRun);
         }
-        let has_link = self.jit_direct.has_linked_successor(block);
+        let has_link = self.jit_direct.has_linked_successor(block.id());
         let data_descriptors_match = if has_link {
-            block.chain_descriptors_match(self)
+            segments.all_data_matches(self)
         } else {
-            block.data_descriptors_match(self)
+            segments.data_matches(self)
         };
         if !data_descriptors_match {
             self.perf.jit_direct_reject_data_segment += 1;

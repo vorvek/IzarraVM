@@ -2135,3 +2135,17 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
     );
     assert_eq!(&masked[unmasked.len()..], &mask[..], "then the 64K mask");
 }
+
+/// `CompiledBlock` is copied out of `BlockCache::block()` several times per Direct entry
+/// (probe, the `run_direct_block` argument, and the pre-entry re-resolve), so its size is
+/// memcpy traffic multiplied by ~47M entries in a Quake/586 run. Fields that are not read
+/// on a uniform-fetch entry belong in a parallel `BlockCache` lane, not in the copy.
+#[test]
+fn compiled_block_stays_small_enough_to_copy_per_entry() {
+    assert_eq!(
+        core::mem::size_of::<CompiledBlock>(),
+        120,
+        "CompiledBlock size changed; if a field was added, check it is actually read on the \
+         uniform-fetch entry path before letting it ride every per-entry copy"
+    );
+}

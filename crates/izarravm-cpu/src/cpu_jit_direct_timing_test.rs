@@ -501,14 +501,20 @@ fn imul_memory_form_declares_its_read_and_its_segment() {
     // reading through a stale base. That is a wrong-memory-read bug, not lost bookkeeping, and it
     // is invisible to the debug_assert in `SegmentLayout::descriptor` in a release build.
     assert!(
-        block.data_descriptors_match(&cpu),
+        cpu.jit_direct
+            .segment_layout(block.id())
+            .expect("live block layout")
+            .data_matches(&cpu),
         "the block must match the segments it was compiled under"
     );
     let mut reloaded = cpu.registers.segment(SegmentIndex::Ds);
     reloaded.base = 0x1_0000;
     cpu.registers.set_segment(SegmentIndex::Ds, reloaded);
     assert!(
-        !block.data_descriptors_match(&cpu),
+        !cpu.jit_direct
+            .segment_layout(block.id())
+            .expect("live block layout")
+            .data_matches(&cpu),
         "reloading DS must invalidate a block that reads through DS"
     );
 }
@@ -595,14 +601,20 @@ fn control_word_forms_declare_a_word_access_and_their_segment() {
         // stale base. The `debug_assert` in `SegmentLayout::descriptor` is absent from a release
         // build, so the assertion is made against the live descriptor instead.
         assert!(
-            block.data_descriptors_match(&cpu),
+            cpu.jit_direct
+                .segment_layout(block.id())
+                .expect("live block layout")
+                .data_matches(&cpu),
             "{label}: compiled state"
         );
         let mut reloaded = cpu.registers.segment(SegmentIndex::Ds);
         reloaded.base = 0x1_0000;
         cpu.registers.set_segment(SegmentIndex::Ds, reloaded);
         assert!(
-            !block.data_descriptors_match(&cpu),
+            !cpu.jit_direct
+                .segment_layout(block.id())
+                .expect("live block layout")
+                .data_matches(&cpu),
             "{label}: reloading DS must invalidate a block that uses DS"
         );
     }
@@ -1241,14 +1253,20 @@ fn grp3_imul_memory_form_declares_its_read_and_its_segment() {
     assert_eq!(block.raw_clocks(), 2 + 2 + 2, "charged core clocks");
 
     assert!(
-        block.data_descriptors_match(&cpu),
+        cpu.jit_direct
+            .segment_layout(block.id())
+            .expect("live block layout")
+            .data_matches(&cpu),
         "matches at compile time"
     );
     let mut reloaded = cpu.registers.segment(SegmentIndex::Ds);
     reloaded.base = 0x1_0000;
     cpu.registers.set_segment(SegmentIndex::Ds, reloaded);
     assert!(
-        !block.data_descriptors_match(&cpu),
+        !cpu.jit_direct
+            .segment_layout(block.id())
+            .expect("live block layout")
+            .data_matches(&cpu),
         "reloading DS must invalidate a block that reads through DS"
     );
 }
@@ -2660,7 +2678,7 @@ fn descriptor_change_selectively_recompiles_and_does_not_keep_a_stale_link() {
     );
     let old_source = install_fixture_block(&mut cpu, SOURCE);
     let old_target = install_fixture_block(&mut cpu, TARGET);
-    assert!(cpu.jit_direct.has_linked_successor(old_source));
+    assert!(cpu.jit_direct.has_linked_successor(old_source.id()));
 
     let mut changed_ds = cpu.registers.segment(SegmentIndex::Ds);
     changed_ds.base = 0x1000;
@@ -2687,7 +2705,7 @@ fn descriptor_change_selectively_recompiles_and_does_not_keep_a_stale_link() {
     let source_compilation = jit::direct::compile(&mut cpu, SOURCE, true).unwrap();
     let source_id = cpu.jit_direct.install(&source_compilation).unwrap();
     let new_source = cpu.jit_direct.block(source_id).unwrap();
-    assert!(!cpu.jit_direct.has_linked_successor(new_source));
+    assert!(!cpu.jit_direct.has_linked_successor(new_source.id()));
 
     cpu.set_eip(TARGET);
     assert!(
@@ -2702,7 +2720,7 @@ fn descriptor_change_selectively_recompiles_and_does_not_keep_a_stale_link() {
     let target_compilation = jit::direct::compile(&mut cpu, TARGET, true).unwrap();
     let target_id = cpu.jit_direct.install(&target_compilation).unwrap();
     assert!(cpu.jit_direct.block(target_id).is_some());
-    assert!(cpu.jit_direct.has_linked_successor(new_source));
+    assert!(cpu.jit_direct.has_linked_successor(new_source.id()));
 
     cpu.registers.set_eax(0);
     cpu.registers.set_ecx(0);
