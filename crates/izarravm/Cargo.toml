@@ -48,4 +48,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_Input",
     "Win32_UI_WindowsAndMessaging",
+    # Temporary riprofile sampler (suspend/GetThreadContext + dbghelp).
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
 ] }
