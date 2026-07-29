@@ -745,7 +745,12 @@ pub struct PerfCounters {
     /// population on `mode().uses_approximate_timing()`.
     pub interp_fast_map_hits: u64,
     /// Interpreter direct data accesses that probed the FastMap and missed, falling through to
-    /// the canonical translate/direct-page-cache path unchanged.
+    /// the canonical translate/direct-page-cache path unchanged. Counted only when the FastMap
+    /// HAS storage, i.e. population has run at least once for this CPU. The guaranteed-miss case
+    /// -- JIT off, or the 386-slow/386 Accurate personas, where the map is never populated at all
+    /// -- returns out of `fast_map_data_slot` before this counter (see `FastMap::has_storage`), so
+    /// it reads zero there by construction, not because every one of those accesses was probed
+    /// and happened to miss. Do not read a zero here as "the FastMap was never consulted".
     pub interp_fast_map_misses: u64,
     pub fetch_page_hits: u64,
     pub fetch_page_misses: u64,

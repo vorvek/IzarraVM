@@ -1452,7 +1452,11 @@ fn fast_map_write_hit_still_invalidates_watched_code() {
 /// `fast_map_population_enabled` gates population on `mode().uses_approximate_timing()`; this
 /// asserts the consequence rather than assuming it: 386-slow and 386 (Accurate) never record a
 /// single FastMap hit, even with native admission force-armed and repeated reads/writes at the
-/// same address.
+/// same address. The FastMap is never populated at all in these personas, so `has_storage()`
+/// stays false and `fast_map_data_slot` returns before touching `interp_fast_map_misses` too
+/// (that counter means "probed and missed", not "guaranteed miss, never probed" -- see its doc
+/// comment); vacuousness is instead ruled out here by checking that the accesses actually
+/// reached the direct-page path (`data_direct_reads`/`data_direct_writes` move).
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -1495,9 +1499,24 @@ fn accurate_timing_personas_never_take_the_interpreter_fast_path() {
             0,
             "{mode:?} took the interpreter fast path"
         );
+        assert_eq!(
+            cpu.perf_counters().interp_fast_map_misses,
+            0,
+            "{mode:?} recorded a real FastMap miss -- the map should never have storage here"
+        );
         assert!(
-            cpu.perf_counters().interp_fast_map_misses > 0,
-            "{mode:?} never probed the FastMap at all -- the test would be vacuous"
+            !cpu.jit_fast_map.has_storage(),
+            "{mode:?} populated the FastMap despite Accurate timing"
+        );
+        // Rule out vacuousness a different way now that the miss counter no longer moves: the
+        // accesses must still have reached the direct-page path.
+        assert!(
+            cpu.perf_counters().data_direct_reads > 0,
+            "{mode:?}: reads never reached the direct-page path -- fixture is vacuous"
+        );
+        assert!(
+            cpu.perf_counters().data_direct_writes > 0,
+            "{mode:?}: writes never reached the direct-page path -- fixture is vacuous"
         );
         assert!(!cpu.jit_fast_map.has_read_mapping(0x3000, 0x3000));
         assert!(!cpu.jit_fast_map.has_write_mapping(0x3000, 0x3000));

@@ -308,6 +308,19 @@ impl FastMap {
         .map(FastMapAccess::physical)
     }
 
+    /// Whether the map has EVER been populated. `storage` allocates lazily inside `populate`
+    /// (`get_or_insert_with`), so this is `false` exactly in the cases that can never produce a
+    /// hit: the JIT is off, or the current persona is 386-slow/386 Accurate
+    /// (`fast_map_population_enabled` gates population on `mode().uses_approximate_timing()`).
+    /// The interpreter's serve path (`CpuGsw::fast_map_data_slot`) checks this FIRST, before
+    /// loading a mapping epoch, reading CPL, or reading CR0.WP -- all of that is real work a
+    /// guaranteed-miss access must not pay. This one `Option::is_some()` check is what makes a
+    /// JIT-off or Accurate-persona probe approximately free.
+    #[inline]
+    pub(crate) fn has_storage(&self) -> bool {
+        self.storage.is_some()
+    }
+
     /// Return stable array bases for native code generation after the first map fill.
     #[allow(dead_code)]
     pub(crate) fn native_bases(&self) -> Option<NativeMapBases> {
