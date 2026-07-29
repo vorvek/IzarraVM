@@ -968,6 +968,9 @@ fn write_hdd_profile_json(
         })).collect::<Vec<_>>(),
         "classified_wall_ns": classified_wall_ns,
         "unattributed_wall_ns": total_wall_ns.saturating_sub(classified_wall_ns),
+        "direct_barrier_census": direct_barrier_census_json(
+            machine.cpu().direct_barrier_census_snapshot()
+        ),
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
@@ -977,6 +980,39 @@ fn write_hdd_profile_json(
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
+}
+
+fn direct_barrier_census_json(
+    snapshot: Option<izarravm_cpu::DirectBarrierCensusSnapshot>,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    json!({
+        "rows": snapshot.rows.iter().map(direct_barrier_census_row_json).collect::<Vec<_>>(),
+        "selected": snapshot.selected.as_ref().map(direct_barrier_census_row_json),
+    })
+}
+
+fn direct_barrier_census_row_json(
+    row: &izarravm_cpu::DirectBarrierCensusRow,
+) -> serde_json::Value {
+    json!({
+        "opcode": row.opcode,
+        "modrm_reg": row.modrm_reg,
+        "operand_form": row.operand_form,
+        "operand_size": row.operand_size,
+        "address_size": row.address_size,
+        "prefix_mask": row.prefix_mask,
+        "helper_family": row.helper_family,
+        "hits": row.hits,
+        "native_prefix_instructions": row.native_prefix_instructions,
+        "native_suffix_instructions": row.native_suffix_instructions,
+        "eligible_shapes": row.eligible_shapes,
+        "eligible_suffix_instructions": row.eligible_suffix_instructions,
+        "max_native_prefix": row.max_native_prefix,
+        "max_native_suffix": row.max_native_suffix,
+    })
 }
 
 fn machine_profile_requested(value: Option<&str>) -> bool {

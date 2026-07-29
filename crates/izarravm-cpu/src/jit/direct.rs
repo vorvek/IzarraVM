@@ -24,8 +24,9 @@ use super::x87_avx2_emit::{
     Avx2X87EmitContext, emit_enter as emit_x87_enter, emit_native_x87, emit_spill as emit_x87_spill,
 };
 use crate::{
-    AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, PodKeyBuildHasher,
-    Prefixes, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
+    AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, DirectBarrierCensusRow,
+    DirectBarrierCensusSnapshot, OperandSize, PodKeyBuildHasher, Prefixes, Registers, SegmentIndex,
+    SegmentRegister, U32BuildHasher,
 };
 
 #[cfg(all(
@@ -99,6 +100,181 @@ pub(crate) struct BlockCacheStats {
     pub unlinks: u64,
     pub decode_dependencies_scanned: u64,
     pub portals_hidden: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct BarrierKey {
+    opcode: u16,
+    modrm_reg: u8,
+    operand_form: u8,
+    operand_size: u8,
+    address_size: u8,
+    prefix_mask: u16,
+}
+
+impl BarrierKey {
+    fn from_insn(insn: &DecodedInsn) -> Self {
+        let operand_form = match insn.operand {
+            None => 0,
+            Some(DecodedOperand::Reg(_)) => 1,
+            Some(DecodedOperand::Mem(_)) => 2,
+        };
+        let mut prefix_mask = u16::from(insn.prefixes.operand_size_override)
+            | (u16::from(insn.prefixes.address_size_override) << 1)
+            | (u16::from(insn.prefixes.lock) << 2);
+        prefix_mask |= match insn.prefixes.rep {
+            None => 0,
+            Some(crate::RepKind::Repe) => 1 << 3,
+            Some(crate::RepKind::Repne) => 2 << 3,
+        };
+        if let Some(segment) = insn.prefixes.segment_override {
+            prefix_mask |= (u16::try_from(segment_index(segment)).unwrap_or(0) + 1) << 5;
+        }
+        Self {
+            opcode: insn.opcode,
+            modrm_reg: insn.modrm.map_or(u8::MAX, |modrm| modrm.reg),
+            operand_form,
+            operand_size: u8::from(insn.operand_size == OperandSize::Dword),
+            address_size: u8::from(insn.address_size == AddressSize::Dword),
+            prefix_mask,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BarrierStats {
+    helper_family: Option<HelperFamily>,
+    hits: u64,
+    native_prefix_instructions: u64,
+    native_suffix_instructions: u64,
+    eligible_shapes: u64,
+    eligible_suffix_instructions: u64,
+    max_native_prefix: u8,
+    max_native_suffix: u8,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DirectBarrierCensus {
+    rows: HashMap<BarrierKey, BarrierStats>,
+}
+
+impl DirectBarrierCensus {
+    fn record(
+        &mut self,
+        insn: &DecodedInsn,
+        helper: Option<HelperSpec>,
+        native_prefix: usize,
+        native_suffix: usize,
+        shape_eligible: bool,
+    ) {
+        let row = self.rows.entry(BarrierKey::from_insn(insn)).or_default();
+        row.helper_family = helper.map(|spec| spec.family);
+        row.hits = row.hits.saturating_add(1);
+        row.native_prefix_instructions = row
+            .native_prefix_instructions
+            .saturating_add(native_prefix as u64);
+        row.native_suffix_instructions = row
+            .native_suffix_instructions
+            .saturating_add(native_suffix as u64);
+        row.max_native_prefix = row.max_native_prefix.max(native_prefix as u8);
+        row.max_native_suffix = row.max_native_suffix.max(native_suffix as u8);
+        if shape_eligible {
+            row.eligible_shapes = row.eligible_shapes.saturating_add(1);
+            row.eligible_suffix_instructions = row
+                .eligible_suffix_instructions
+                .saturating_add(native_suffix as u64);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> DirectBarrierCensusSnapshot {
+        let mut keyed_rows: Vec<_> = self
+            .rows
+            .iter()
+            .map(|(&key, &stats)| (key, census_row(key, stats)))
+            .collect();
+        keyed_rows.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .eligible_suffix_instructions
+                .cmp(&left.eligible_suffix_instructions)
+                .then_with(|| right.hits.cmp(&left.hits))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        let selected = keyed_rows
+            .iter()
+            .find_map(|(_, row)| (row.eligible_shapes != 0).then_some(row.clone()));
+        DirectBarrierCensusSnapshot {
+            rows: keyed_rows.into_iter().map(|(_, row)| row).collect(),
+            selected,
+        }
+    }
+}
+
+fn census_row(key: BarrierKey, stats: BarrierStats) -> DirectBarrierCensusRow {
+    DirectBarrierCensusRow {
+        opcode: key.opcode,
+        modrm_reg: (key.modrm_reg != u8::MAX).then_some(key.modrm_reg),
+        operand_form: match key.operand_form {
+            1 => "register",
+            2 => "memory",
+            _ => "none",
+        },
+        operand_size: if key.operand_size != 0 {
+            "dword"
+        } else {
+            "word"
+        },
+        address_size: if key.address_size != 0 {
+            "dword"
+        } else {
+            "word"
+        },
+        prefix_mask: key.prefix_mask,
+        helper_family: stats.helper_family.map(HelperFamily::name),
+        hits: stats.hits,
+        native_prefix_instructions: stats.native_prefix_instructions,
+        native_suffix_instructions: stats.native_suffix_instructions,
+        eligible_shapes: stats.eligible_shapes,
+        eligible_suffix_instructions: stats.eligible_suffix_instructions,
+        max_native_prefix: stats.max_native_prefix,
+        max_native_suffix: stats.max_native_suffix,
+    }
+}
+
+pub(crate) fn barrier_census_default() -> Option<Box<DirectBarrierCensus>> {
+    matches!(
+        std::env::var("IZARRAVM_DIRECT_BARRIER_CENSUS").as_deref(),
+        Ok("1")
+    )
+    .then(|| Box::new(DirectBarrierCensus::default()))
+}
+
+impl super::JitState {
+    fn barrier_census_enabled(&self) -> bool {
+        self.direct_barrier_census.is_some()
+    }
+
+    fn record_barrier(
+        &mut self,
+        insn: &DecodedInsn,
+        helper: Option<HelperSpec>,
+        native_prefix: usize,
+        native_suffix: usize,
+        shape_eligible: bool,
+    ) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.record(insn, helper, native_prefix, native_suffix, shape_eligible);
+        }
+    }
+
+    pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
+        self.direct_barrier_census
+            .as_deref()
+            .map(DirectBarrierCensus::snapshot)
+    }
+
+    pub(crate) fn set_barrier_census_enabled(&mut self, enabled: bool) {
+        self.direct_barrier_census = enabled.then(|| Box::new(DirectBarrierCensus::default()));
+    }
 }
 
 /// Everything that can change the meaning of bytes at a linear entry point.
@@ -3306,6 +3482,183 @@ enum CompileStop {
     Boundary,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HelperFamily {
+    DirectionFlag,
+    SignExtend,
+    AccumulatorExtend,
+}
+
+impl HelperFamily {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DirectionFlag => "direction_flag",
+            Self::SignExtend => "sign_extend",
+            Self::AccumulatorExtend => "accumulator_extend",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HelperSpec {
+    family: HelperFamily,
+    opcode: u16,
+    raw_clocks: u8,
+}
+
+#[derive(Clone, Copy)]
+enum PlannedInsn {
+    Native(DirectKind),
+    PreciseHelper(HelperSpec),
+    HardBoundary,
+}
+
+struct DirectUnitPlanner;
+
+impl DirectUnitPlanner {
+    fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> PlannedInsn {
+        if let Some(kind) = classify::classify(insn, lin, entry_lin) {
+            return PlannedInsn::Native(kind);
+        }
+        match precise_helper_spec(insn) {
+            Some(spec) => PlannedInsn::PreciseHelper(spec),
+            None => PlannedInsn::HardBoundary,
+        }
+    }
+}
+
+fn precise_helper_spec(insn: &DecodedInsn) -> Option<HelperSpec> {
+    if insn.modrm.is_some()
+        || insn.operand.is_some()
+        || insn.prefixes != Prefixes::default()
+        || insn.address_size != AddressSize::Dword
+    {
+        return None;
+    }
+    let (family, raw_clocks) = match (insn.opcode, insn.operand_size) {
+        (0xfc | 0xfd, OperandSize::Dword) => (HelperFamily::DirectionFlag, 2),
+        (0x99, OperandSize::Dword) => (HelperFamily::SignExtend, 2),
+        (0x98, OperandSize::Dword) => (HelperFamily::AccumulatorExtend, 3),
+        _ => return None,
+    };
+    Some(HelperSpec {
+        family,
+        opcode: insn.opcode,
+        raw_clocks,
+    })
+}
+
+fn stack_width_kind(
+    cpu: &CpuGsw,
+    kind: DirectKind,
+    operand_size: OperandSize,
+) -> Option<DirectKind> {
+    match (kind, cpu.stack_is_32bit(), operand_size) {
+        (kind, _, _) if !kind.uses_stack() => Some(kind),
+        (kind, true, OperandSize::Dword) => Some(kind),
+        (DirectKind::Push { source }, false, OperandSize::Word) => {
+            Some(DirectKind::Push16 { source })
+        }
+        (DirectKind::Pop { dst }, false, OperandSize::Word) => Some(DirectKind::Pop16 { dst }),
+        (DirectKind::Ret { release }, false, OperandSize::Word) => {
+            Some(DirectKind::Ret16 { release })
+        }
+        (
+            DirectKind::Call {
+                return_delta,
+                target_delta,
+            },
+            false,
+            OperandSize::Word,
+        ) => Some(DirectKind::Call16 {
+            return_delta,
+            target_delta,
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CensusSuffix {
+    instructions: usize,
+    self_loop: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn census_native_suffix(
+    cpu: &CpuGsw,
+    key: BlockKey,
+    entry_lin: u32,
+    mut lin: u32,
+    d: bool,
+    prefix_instructions: usize,
+    mut stack_accesses: u8,
+    mut memory_alu_slots: u8,
+) -> CensusSuffix {
+    let cs = cpu.registers.cs();
+    let mut result = CensusSuffix::default();
+    while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
+        let Some(insn) = cpu.decode_cache.get(lin, d) else {
+            break;
+        };
+        let insn_len = u32::from(insn.len);
+        let Some(next) = (insn_len != 0).then(|| lin.checked_add(insn_len)).flatten() else {
+            break;
+        };
+        let slot_eip = lin.wrapping_sub(cs.base);
+        if slot_eip
+            .checked_add(insn_len - 1)
+            .is_none_or(|last| last > cs.limit)
+            || entry_lin >> BLOCK_PAGE_SHIFT != next.wrapping_sub(1) >> BLOCK_PAGE_SHIFT
+        {
+            break;
+        }
+        let Some(expected_phys) = key.physical.checked_add(lin.wrapping_sub(entry_lin)) else {
+            break;
+        };
+        if expected_phys
+            .checked_add(insn_len - 1)
+            .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
+            || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
+            || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
+            || !insn.continuable
+            || (insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586)
+        {
+            break;
+        }
+        let PlannedInsn::Native(kind) = DirectUnitPlanner::classify(&insn, lin, entry_lin) else {
+            break;
+        };
+        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
+            break;
+        };
+        if kind.is_x87()
+            || !static_control_target_within_limit(
+                kind,
+                entry_lin.wrapping_sub(cs.base),
+                control_target_limit(insn.operand_size, cs.limit),
+            )
+            || !kind_segment_access_supported(cpu, kind)
+            || (kind.is_memory_alu()
+                && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
+                    || prefix_instructions + 1 + result.instructions
+                        >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
+            || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
+        {
+            break;
+        }
+        stack_accesses += u8::from(kind.uses_stack());
+        memory_alu_slots += u8::from(kind.is_memory_alu());
+        result.instructions += 1;
+        result.self_loop = matches!(kind, DirectKind::Jcc { taken_delta: 0, .. });
+        lin = next;
+        if kind.is_terminal() {
+            break;
+        }
+    }
+    result
+}
+
 fn compile_with_instruction_limit(
     cpu: &mut CpuGsw,
     entry_lin: u32,
@@ -3407,9 +3760,64 @@ fn compile_with_instruction_limit(
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         }
-        let Some(kind) = classify::classify(&insn, lin, entry_lin) else {
-            stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
-            break;
+        let kind = match DirectUnitPlanner::classify(&insn, lin, entry_lin) {
+            PlannedInsn::Native(kind) => kind,
+            PlannedInsn::PreciseHelper(helper) => {
+                if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                    && cpu.jit_direct.barrier_census_enabled()
+                {
+                    let suffix = census_native_suffix(
+                        cpu,
+                        key,
+                        entry_lin,
+                        next,
+                        d,
+                        slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                    );
+                    let shape_eligible = !slots.is_empty()
+                        && suffix.instructions != 0
+                        && slots.len() + 1 + suffix.instructions
+                            >= MIN_STANDALONE_INSTRUCTIONS.into()
+                        && x87_slots == 0
+                        && !suffix.self_loop;
+                    cpu.jit_direct.record_barrier(
+                        &insn,
+                        Some(helper),
+                        slots.len(),
+                        suffix.instructions,
+                        shape_eligible,
+                    );
+                }
+                stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
+                break;
+            }
+            PlannedInsn::HardBoundary => {
+                if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                    && cpu.jit_direct.barrier_census_enabled()
+                {
+                    let suffix = census_native_suffix(
+                        cpu,
+                        key,
+                        entry_lin,
+                        next,
+                        d,
+                        slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                    );
+                    cpu.jit_direct.record_barrier(
+                        &insn,
+                        None,
+                        slots.len(),
+                        suffix.instructions,
+                        false,
+                    );
+                }
+                stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
+                break;
+            }
         };
         // The stack-width admission matrix, and it is FIRST on purpose: everything below this
         // point reads the kind, and the access accessors in particular give different answers
@@ -3436,31 +3844,9 @@ fn compile_with_instruction_limit(
         // `classify` cannot make this decision: it has no `cpu`, and SS.B is CPU state. Deciding
         // it here is safe against block reuse because `jit_mode_key` already carries SS.B, so a
         // block compiled for one stack width can never be entered with the other.
-        let kind = match (kind, cpu.stack_is_32bit(), insn.operand_size) {
-            (kind, _, _) if !kind.uses_stack() => kind,
-            (kind, true, OperandSize::Dword) => kind,
-            (DirectKind::Push { source }, false, OperandSize::Word) => {
-                DirectKind::Push16 { source }
-            }
-            (DirectKind::Pop { dst }, false, OperandSize::Word) => DirectKind::Pop16 { dst },
-            (DirectKind::Ret { release }, false, OperandSize::Word) => {
-                DirectKind::Ret16 { release }
-            }
-            (
-                DirectKind::Call {
-                    return_delta,
-                    target_delta,
-                },
-                false,
-                OperandSize::Word,
-            ) => DirectKind::Call16 {
-                return_delta,
-                target_delta,
-            },
-            _ => {
-                stop = CompileStop::Retry;
-                break;
-            }
+        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
+            stop = CompileStop::Retry;
+            break;
         };
         // A Word-size relative branch masks its target to 16 bits: `relative_jump` computes
         // `(eip + rel) & operand_size.mask()`. The emitted form bakes an unmasked delta, so it is

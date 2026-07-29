@@ -96,6 +96,54 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
 }
 
 #[test]
+fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
+    let code = [0x40, 0x41, 0x42, 0x43, 0xfc, 0x44, 0x45, 0x46, 0x47];
+    let addresses: Vec<_> = (0..code.len()).map(|offset| ENTRY + offset as u32).collect();
+
+    let (mut disabled_cpu, mut disabled_bus) = fixture(&code);
+    warm(&mut disabled_cpu, &mut disabled_bus, &addresses);
+    let _ = compiled(jit::direct::compile(&mut disabled_cpu, ENTRY, true));
+    assert!(disabled_cpu.direct_barrier_census_snapshot().is_none());
+
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &addresses);
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 4);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let selected = snapshot.selected.expect("eligible census selection");
+    assert_eq!(selected.opcode, 0xfc);
+    assert_eq!(selected.helper_family, Some("direction_flag"));
+    assert_eq!(selected.hits, 1);
+    assert_eq!(selected.native_prefix_instructions, 4);
+    assert_eq!(selected.native_suffix_instructions, 4);
+    assert_eq!(selected.eligible_shapes, 1);
+    assert_eq!(selected.eligible_suffix_instructions, 4);
+}
+
+#[test]
+fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
+    let code = [0x40, 0x41, 0x42, 0x43, DIRECT_BARRIER, 0x44, 0x45, 0x46, 0x47];
+    let addresses: Vec<_> = (0..code.len()).map(|offset| ENTRY + offset as u32).collect();
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &addresses);
+
+    let _ = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot.rows.first().expect("recorded structural stop");
+    assert_eq!(row.opcode, u16::from(DIRECT_BARRIER));
+    assert_eq!(row.helper_family, None);
+    assert_eq!(row.eligible_shapes, 0);
+    assert!(snapshot.selected.is_none());
+}
+
+#[test]
 fn supported_terminals_compile_even_when_the_block_is_short() {
     let (mut single_cpu, mut single_bus) = fixture(&[0xc3]);
     warm(&mut single_cpu, &mut single_bus, &[ENTRY]);

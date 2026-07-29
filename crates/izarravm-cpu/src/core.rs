@@ -811,6 +811,26 @@ impl CpuGsw {
     pub fn profile_snapshot(&self) -> CpuProfileSnapshot {
         self.profile.snapshot()
     }
+
+    /// Enable or disable the host-only Direct structural-stop census.
+    pub fn enable_direct_barrier_census(&mut self, enabled: bool) {
+        #[cfg(feature = "jit")]
+        self.jit_direct.set_barrier_census_enabled(enabled);
+        #[cfg(not(feature = "jit"))]
+        let _ = enabled;
+    }
+
+    pub fn direct_barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.barrier_census_snapshot()
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            None
+        }
+    }
+
     pub fn is_paging_enabled(&self) -> bool {
         self.control.cr0 & CR0_PG != 0
     }

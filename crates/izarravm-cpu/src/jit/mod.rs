@@ -80,6 +80,7 @@ pub(crate) use region::RegionTable;
 /// surface unchanged.
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
+    pub(crate) direct_barrier_census: Option<Box<direct::DirectBarrierCensus>>,
     pub(crate) smc_heat: direct::SmcHeatMap,
     /// The native code watch, HOISTED out of `BlockCache` (Track C C1c-pre, design decision
     /// D-C1c.1, mirroring the C1a-pre `SmcHeatMap` hoist): "watched" is a property of what
@@ -156,6 +157,7 @@ impl JitState {
     pub(crate) fn new(direct: direct::BlockCache) -> Self {
         Self {
             direct,
+            direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
             clif_enabled: false,
@@ -201,6 +203,7 @@ impl Clone for JitState {
     fn clone(&self) -> Self {
         Self {
             direct: self.direct.clone(),
+            direct_barrier_census: None,
             smc_heat: self.smc_heat.clone(),
             // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone
             // produced (its clone built a new cache with a new watch).

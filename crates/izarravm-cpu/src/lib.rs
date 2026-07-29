@@ -1223,6 +1223,32 @@ pub struct CpuProfileSnapshot {
     pub smc_flush_blocks: Vec<(u32, u64)>,
 }
 
+/// One normalized Direct structural stop observed by the opt-in barrier census.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectBarrierCensusRow {
+    pub opcode: u16,
+    pub modrm_reg: Option<u8>,
+    pub operand_form: &'static str,
+    pub operand_size: &'static str,
+    pub address_size: &'static str,
+    pub prefix_mask: u16,
+    pub helper_family: Option<&'static str>,
+    pub hits: u64,
+    pub native_prefix_instructions: u64,
+    pub native_suffix_instructions: u64,
+    pub eligible_shapes: u64,
+    pub eligible_suffix_instructions: u64,
+    pub max_native_prefix: u8,
+    pub max_native_suffix: u8,
+}
+
+/// Deterministically sorted snapshot of the Direct structural-stop census.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectBarrierCensusSnapshot {
+    pub rows: Vec<DirectBarrierCensusRow>,
+    pub selected: Option<DirectBarrierCensusRow>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct CpuProfileBucketState {
     instructions: u64,
