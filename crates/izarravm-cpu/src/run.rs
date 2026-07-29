@@ -850,12 +850,23 @@ impl CpuGsw {
     /// runs so the decode-line lookup and the branch-target arithmetic match the instruction that
     /// retired (a near branch never changes either, but capturing before execution is
     /// unconditionally correct).
+    /// Split guard/body on purpose. The body below is far too large for the inliner to take at
+    /// the call site, so a plain `#[inline]` left a real call on the interpreted-retire path —
+    /// a RIP profile of Quake/586 still showed `unit_sim_observe` as its own 0.645% symbol with
+    /// the sim disabled, which is ~507M calls that do nothing but test one `Option` and return.
+    /// `#[inline(always)]` here folds that test into the caller and keeps the body out of line.
     #[cfg(feature = "jit")]
-    #[inline]
+    #[inline(always)]
     fn unit_sim_observe(&mut self, insn: &DecodedInsn, lin: u32, d: bool, cs_base: u32) {
         if self.unit_sim.0.is_none() {
             return;
         }
+        self.unit_sim_observe_enabled(insn, lin, d, cs_base);
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline(never)]
+    fn unit_sim_observe_enabled(&mut self, insn: &DecodedInsn, lin: u32, d: bool, cs_base: u32) {
         // The retired instruction's decode line is live (we just fetched or cached it), so
         // `line_phys_start` is Some and carries the true physical page even under CR0.PG=0. Fall
         // back to the linear page only if the line went unexpectedly cold (an instruction that

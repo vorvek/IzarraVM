@@ -728,7 +728,55 @@ impl Vega {
         false
     }
 
+    /// Conservative SUPERSET of `owns_memory`: false here proves no aperture can claim the
+    /// address, true only means the full chain has to run.
+    ///
+    /// Why it exists: `MachineBus::data_access_wait_states` and `code_fetch_wait_states` guard
+    /// on `address >= 0xA0000`, which is not "inside a video aperture" but "not conventional
+    /// RAM". A 32-bit protected-mode guest with its heap above 1 MB therefore ran all ten
+    /// predicates below, built ten `Option`s and returned false on EVERY data access and code
+    /// fetch. A RIP profile of Quake/586 put 3.37% of wall in `owns_memory` for exactly that.
+    ///
+    /// Every aperture except Distira's is at a compile-time constant. The legacy group
+    /// (`margo_banked_window_at`, `legacy_gfx_offset`, `hercules_offset`, `text_offset`,
+    /// `planar_offset`) is bounded by 0xA0000..0xC0000: the four `GfxAperture` selections are
+    /// A0000+128K, A0000+64K, B0000+32K and B8000+32K; Hercules is VGA_MONO_TEXT_BASE plus two
+    /// 32K pages, which ends exactly at 0xC0000; planar and the Margo banked window are
+    /// VGA_MODE13H_BASE plus one 64K window. Margo's LFB and MMIO are adjacent constants. Only
+    /// the Distira BAR moves, and it is read live here rather than cached, so there is no
+    /// invalidation hook to forget when the BAR is reprogrammed.
+    ///
+    /// The predicates all require the WHOLE access inside their range (`address + width <=
+    /// end`), so testing the start address alone cannot under-approximate.
+    #[inline]
+    fn may_own_memory(&self, address: u32) -> bool {
+        const LEGACY_END: u32 = 0x000C_0000;
+        const MARGO_END: u32 = MARGO_MMIO_BASE + MARGO_MMIO_SIZE as u32;
+        if (VGA_MODE13H_BASE..LEGACY_END).contains(&address)
+            || (MARGO_LFB_BASE..MARGO_END).contains(&address)
+        {
+            return true;
+        }
+        self.distira_memory_enabled()
+            && (self.distira_mem_base..self.distira_mem_base.saturating_add(DISTIRA_PCI_BAR_SIZE))
+                .contains(&address)
+    }
+
     pub(crate) fn owns_memory(&self, address: u32, width: usize) -> bool {
+        if !self.may_own_memory(address) {
+            // The superset is a hand-derived claim about every constant above, so prove it on
+            // every debug run rather than trusting the derivation: if this ever fires, an
+            // aperture moved outside the bounds `may_own_memory` encodes.
+            debug_assert!(
+                !self.owns_memory_uncached(address, width),
+                "may_own_memory missed an aperture claiming {address:#x} width {width}"
+            );
+            return false;
+        }
+        self.owns_memory_uncached(address, width)
+    }
+
+    fn owns_memory_uncached(&self, address: u32, width: usize) -> bool {
         self.margo_banked_window_at(address)
             || self.legacy_gfx_offset(address, width).is_some()
             || self.hercules_offset(address, width).is_some()
