@@ -219,6 +219,23 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
                 emit_pop(e, top);
             }
         }
+        // No finite guard here, for the same reason `LoadI32` needs none: an i64 magnitude is at
+        // most 2^63, which is finite under every rounding mode, so a `vcvtsi2sd` result here can
+        // never be NaN or infinity.
+        //
+        // What is NOT the same as `LoadI32`: an i32 fits exactly in f64's 53-bit mantissa, so
+        // that conversion is always exact. An i64 does not. Above 2^53 this conversion ROUNDS,
+        // and the interpreter's `as f64` (`fpu_exec.rs:819`) is round-to-nearest-even while the
+        // emitted `vcvtsi2sd` rounds per MXCSR.RC. Nothing in this crate ever sets MXCSR, so the
+        // two agree only because the host's default MXCSR is 0x1F80 (RC = 00, round-to-nearest).
+        // That is empirically true, not architecturally guaranteed, and it is not new here:
+        // `vaddsd`/`vmulsd`/`vsubsd`/`vdivsd` already carry the identical unstated dependency,
+        // campaign-wide, and no fixture can catch it because both sides read the same MXCSR.
+        NativeX87Insn::LoadI64 { .. } => {
+            let memory = context.memory.expect("FILD m64 needs a host pointer");
+            e.vcvtsi2sd_i64_disp32(VALUE0, VALUE0, memory, 0);
+            emit_push(e, top, VALUE0);
+        }
         // Unlike the 0xDA arm above, a Tier 2 memory operand CAN be NaN or infinity, so this is
         // the arm that MUST carry the guard the 0xDA arm's comment explains omitting: without
         // it, an unordered FCOM m64 would reach `emit_compare` and write C3 alone instead of the

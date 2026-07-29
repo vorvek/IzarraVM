@@ -3984,3 +3984,227 @@ fn fstp_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
         );
     }
 }
+
+/// Slice 40's fixture 5, the aperture timing fixture: FILD m64 in RAM and in the mode-13 window,
+/// modelled directly on `fld_m64_matches_the_interpreter_in_ram_and_in_the_aperture` above, with
+/// two changes. First, `direct_page_wait_states`/`mode13_wait_states` price Dword differently per
+/// lane (3 wait states in RAM, 7 in the aperture), so the two dynamic dword-read transactions an
+/// m64 access costs are NOT cost-interchangeable between the lanes, the same B4 argument that
+/// fixture applies. Second, and new to this slice, an `inc eax` precedes the FILD so it is NOT
+/// the block's first instruction: the review outcome requires every slice 40 fixture to be
+/// strictly mid-block, closing the entry-position gap slice 39's own aperture fixtures left open.
+fn fild_m64_aperture_case(target: u32) -> Vec<u8> {
+    let mut code = vec![0x40u8]; // inc eax, keeps the FILD off the block ENTRY
+    code.push(0xdf);
+    code.push(0xae); // fild qword [esi+disp32]
+    code.extend_from_slice(&target.to_le_bytes());
+    code.push(0x8b);
+    code.push(0x96); // mov edx,[esi+disp32]
+    code.extend_from_slice(&(target + 8).to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0xf4]); // mov esi,esi ; hlt
+    code
+}
+
+#[test]
+fn fild_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    const VALUE: i64 = 123_456_789_012_345;
+    for target in [RAM, MODE13] {
+        let code = fild_m64_aperture_case(target);
+        let mut memory = vec![0; 0x000b_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        memory[target as usize..target as usize + 8].copy_from_slice(&VALUE.to_le_bytes());
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        native.registers.eip = ENTRY;
+        interp.registers.eip = ENTRY;
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 1, ENTRY + 7, ENTRY + 13];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                target,
+                target,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                false,
+            );
+            cpu.fpu = X87::default();
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_esi(0);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.fp_rem = 3;
+            cpu.core_clocks_so_far = 0;
+            bus.trace = BusTrace::default();
+        }
+        let label = format!("fild m64 at {target:#x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: did not run directly"
+        );
+        for _ in 0..block.span().instructions {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
+        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+        assert_eq!(native.fp_rem, interp.fp_rem, "{label}: x87 remainder");
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "{label}: bus clocks"
+        );
+        assert_eq!(native.fpu.get(0), VALUE as f64, "{label}: FILD result");
+    }
+}
+
+/// Slice 40's fixture 3, the mid-block value differential: FILD m64 on two magnitudes the i32
+/// convert primitive cannot represent correctly, DS-based (plain disp32 addressing, no ESI and
+/// no segment override) and `direct_page_clocks` on so the aggregate bus clocks price the two
+/// dynamic dword reads for real, not just the state. An `inc eax` precedes the FILD so it is
+/// never the block's first instruction, and `block.span().instructions` is pinned to a literal
+/// (not merely compared to itself) so a classify regression that dropped FILD from the block
+/// would shrink the span below the pin rather than passing silently -- the insns-delta gate the
+/// review outcome calls for.
+///
+/// The first value, 5_000_000_000i64, is just above 2^32 (~4.29e9): a value that fit in 32 bits
+/// would still convert correctly through the WRONG i32 primitive (mutation 1 in the design's
+/// battery) and make this fixture vacuous. The second, `(1i64 << 54) + 1`, is above 2^53, f64's
+/// mantissa limit, so the conversion genuinely ROUNDS (B5): both sides must still agree, because
+/// they share the host's default MXCSR.RC = 00 (round-to-nearest-even), which is also what
+/// Rust's `as f64` cast (used both here and by the interpreter) uses.
+fn fild_m64_disp32_case(target: u32) -> Vec<u8> {
+    let mut code = vec![0x40u8]; // inc eax, keeps the FILD off the block ENTRY
+    code.push(0xdf);
+    code.push(0x2d); // fild qword [disp32], mod=00 reg=5 rm=101 (disp32-only, DS-based)
+    code.extend_from_slice(&target.to_le_bytes());
+    code.push(0x43); // inc ebx
+    code.push(0xf4); // hlt
+    code
+}
+
+#[test]
+fn fild_m64_above_2_32_and_2_53_matches_the_interpreter_mid_block() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    const EXPECTED_INSTRUCTIONS: u8 = 3; // inc eax, fild, inc ebx (HLT terminates, not counted)
+    for value in [5_000_000_000i64, (1i64 << 54) + 1] {
+        let code = fild_m64_disp32_case(TARGET);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        memory[TARGET as usize..TARGET as usize + 8].copy_from_slice(&value.to_le_bytes());
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        native.registers.eip = ENTRY;
+        interp.registers.eip = ENTRY;
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 1, ENTRY + 7, ENTRY + 8];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                TARGET,
+                TARGET,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                false,
+            );
+            cpu.fpu = X87::default();
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        assert_eq!(
+            block.span().instructions,
+            EXPECTED_INSTRUCTIONS,
+            "value {value}: FILD must join the native block rather than fall to the interpreter"
+        );
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            cpu.set_eip(ENTRY);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.fp_rem = 3;
+            cpu.core_clocks_so_far = 0;
+            bus.trace = BusTrace::default();
+        }
+        let label = format!("fild m64 value {value}");
+        let retired_before = native.perf_counters().jit_direct_insns;
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: did not run directly"
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - retired_before,
+            u64::from(EXPECTED_INSTRUCTIONS),
+            "{label}: not every instruction in the block retired natively"
+        );
+        for _ in 0..block.span().instructions {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
+        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+        assert_eq!(native.fp_rem, interp.fp_rem, "{label}: x87 remainder");
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "{label}: bus clocks"
+        );
+        assert_eq!(native.fpu.get(0), value as f64, "{label}: FILD result");
+    }
+}

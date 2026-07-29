@@ -2112,3 +2112,64 @@ fn fld_m64_with_a_nan_operand_side_exits_before_pushing_it() {
     );
     assert!(cpu.fpu.get(0).is_nan(), "the interpreter pushed the NaN");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Slice 40: FILD m64 (0xDF /5). FILD-only scope: `StoreI64` (FISTP m64, 0xDF /7) is deferred, so
+// there is no store-side counterpart to any fixture below.
+// ---------------------------------------------------------------------------------------------
+
+/// Fixture 6 (the review outcome's corrected list): a follow-on x87 slot AFTER the FILD, pinning
+/// `top_delta` at RUNTIME rather than only through the static `stack_effects_advance_every_top_
+/// with_wraparound` unit test. FLD pushes A, FILD pushes B on top of it (`top_delta`'s -1, the
+/// mutation this fixture exists to catch: mutation 2 in the design's battery), and the FSTP that
+/// follows pops and stores ST(0). If `LoadI64` had been left OUT of the `top_delta` push group
+/// (defaulting to 0, no stack movement), the compile-time TOP tracking used to address the FSTP
+/// slot would stay stale and address the physical register FLD's A still occupies instead of the
+/// one FILD's B was pushed into: the FSTP would store A a second time instead of B, and the pop
+/// would leave the wrong physical register as the new ST(0). Both are hard state divergences the
+/// differential and the exact-retirement gate below catch; a correct compile does neither.
+fn fild_m64_followed_by_fstp_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                    integer, before
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]      ST(0)=A
+        0xdf, 0x2d, 0x04, 0x02, 0x00, 0x00, // fild qword [0x204]     ST(0)=B, ST(1)=A
+        0xdd, 0x1d, 0x0c, 0x02, 0x00, 0x00, // fstp qword [0x20c]     the top_delta trap
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2                    integer, after
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&3.0f32.to_bits().to_le_bytes()); // A
+    memory[DATA + 4..DATA + 12].copy_from_slice(&123_456_789_012i64.to_le_bytes()); // B
+    memory
+}
+
+#[test]
+fn fild_m64_followed_by_another_x87_slot_addresses_the_pushed_stack_correctly() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (cpu, bus) = assert_program_matches_exact_insns(
+            mode,
+            fild_m64_followed_by_fstp_program(),
+            0x0f7f,
+            5, // mov, fld, fild, fstp, mov -- hlt never retires natively
+        );
+        assert_eq!(
+            f64::from_bits(u64::from_le_bytes(
+                bus.memory[DATA + 12..DATA + 20].try_into().unwrap()
+            )),
+            123_456_789_012_f64, // B: what the FSTP actually stored
+            "mode={mode:?}"
+        );
+        assert_eq!(
+            cpu.fpu.get(0),
+            3.0,
+            "mode={mode:?}: A must be the new ST(0) after the pop"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_side_exits,
+            0,
+            "mode={mode:?}"
+        );
+    }
+}
