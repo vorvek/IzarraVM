@@ -991,6 +991,11 @@ fn direct_barrier_census_json(
     json!({
         "rows": snapshot.rows.iter().map(direct_barrier_census_row_json).collect::<Vec<_>>(),
         "selected": snapshot.selected.as_ref().map(direct_barrier_census_row_json),
+        "unbound_targets": snapshot
+            .unbound_targets
+            .iter()
+            .map(|(label, count)| json!({ "kind": label, "count": count }))
+            .collect::<Vec<_>>(),
     })
 }
 

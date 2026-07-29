@@ -2290,6 +2290,21 @@ impl CpuGsw {
         own_class.max(x87_hop)
     }
 
+    /// Classify the successor a `StaticUnbound` exit just failed to reach. The CPU's EIP at this
+    /// point IS that successor's address, so the key it would have been compiled under is
+    /// recoverable without threading the exiting slot out of the native frame.
+    #[cfg(feature = "jit")]
+    #[inline(never)]
+    fn classify_unbound_exit(&mut self) {
+        let lin = self.linear_eip();
+        let d = self.registers.cs().default_size_32;
+        let Some(key) = jit::direct::key_for(self, lin, d) else {
+            return;
+        };
+        let kind = self.jit_direct.classify_unbound_target(key);
+        self.jit_direct.note_unbound_target(kind);
+    }
+
     #[cfg(feature = "jit")]
     fn run_direct_block<B: CpuBus>(
         &mut self,
@@ -2719,6 +2734,11 @@ impl CpuGsw {
             jit::direct::UnresolvedReason::StaticUnbound => {
                 self.perf.jit_direct_unresolved_exits += 1;
                 self.perf.jit_direct_unresolved_static_unbound += 1;
+                // Gated at the CALL SITE, not inside the classifier: this is 56% of all stint
+                // ends and `key_for` reads segment state and builds a three-word key.
+                if self.jit_direct.barrier_census_active() {
+                    self.classify_unbound_exit();
+                }
             }
             jit::direct::UnresolvedReason::StaticHidden => {
                 self.perf.jit_direct_unresolved_exits += 1;

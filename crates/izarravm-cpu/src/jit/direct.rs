@@ -187,9 +187,20 @@ pub(crate) struct DirectBarrierCensus {
     sites: HashMap<CensusSiteKey, CensusSite>,
     pending_left: Option<CensusSiteKey>,
     pending_right: Option<CensusSiteKey>,
+    /// Why static successor cells were unbound at the exits that hit them, indexed by
+    /// `UnboundTarget`. Lives HERE and not in `PerfCounters` on purpose: `PerfCounters` is
+    /// embedded in `CpuGsw` ahead of `pending_flags`, whose offset is pinned at 4512 by
+    /// `arch_payload_keeps_pending_flags_offset_pinned` and `region_ctx_fn_pointer_offsets`
+    /// because emitted code bakes it. Growing `PerfCounters` for a diagnostic shifts that pin;
+    /// the census is an `Option<Box<_>>` on `JitState` and costs the layout nothing.
+    unbound: [u64; UnboundTarget::COUNT],
 }
 
 impl DirectBarrierCensus {
+    fn note_unbound(&mut self, kind: UnboundTarget) {
+        self.unbound[kind as usize] += 1;
+    }
+
     fn record(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
         let BarrierObservation {
             helper,
@@ -309,6 +320,10 @@ impl DirectBarrierCensus {
         DirectBarrierCensusSnapshot {
             rows: keyed_rows.into_iter().map(|(_, row)| row).collect(),
             selected,
+            unbound_targets: UnboundTarget::ALL
+                .iter()
+                .map(|kind| (kind.label(), self.unbound[*kind as usize]))
+                .collect(),
         }
     }
 }
@@ -410,6 +425,14 @@ impl super::JitState {
     ) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
             census.note_interpreted(insn, linear, final_linear);
+        }
+    }
+
+    /// Record why a static successor was unbound. No-op unless the census is allocated, and the
+    /// CALLER still gates on `barrier_census_active` so the key construction is skipped too.
+    pub(crate) fn note_unbound_target(&mut self, kind: UnboundTarget) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.note_unbound(kind);
         }
     }
 
@@ -816,6 +839,44 @@ impl BlockId {
 
     fn index(self) -> usize {
         usize::from(self.0 as u16)
+    }
+}
+
+/// Result of `classify_unbound_target`. Diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnboundTarget {
+    /// The successor address has never been probed at all — a genuinely cold edge.
+    NeverSeen,
+    /// Probed, but not hot enough to compile yet, or dormant.
+    SeenNotCompiled,
+    /// Compilation was attempted and structurally refused. These are the edges an opcode
+    /// lowering slice would convert.
+    Rejected,
+    /// The target is compiled and live, but the edge was never linked — a `link_compatible`
+    /// refusal or a link that has not been attempted.
+    CompiledButUnlinked,
+    /// The target compiled once and its slot has since been retired or reused.
+    CompiledButRetired,
+}
+
+impl UnboundTarget {
+    const COUNT: usize = 5;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::NeverSeen,
+        Self::SeenNotCompiled,
+        Self::Rejected,
+        Self::CompiledButUnlinked,
+        Self::CompiledButRetired,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NeverSeen => "never_seen",
+            Self::SeenNotCompiled => "seen_not_compiled",
+            Self::Rejected => "rejected",
+            Self::CompiledButUnlinked => "compiled_unlinked",
+            Self::CompiledButRetired => "compiled_retired",
+        }
     }
 }
 
@@ -1511,6 +1572,28 @@ impl BlockCache {
     pub(crate) fn block(&self, id: BlockId) -> Option<CompiledBlock> {
         self.active_index(id)
             .and_then(|index| self.blocks.get(index).copied())
+    }
+
+    /// Why a static successor cell is still unbound, asked at the exit that hit it.
+    ///
+    /// Diagnostic only, and gated at the call site on the barrier census. Two successive audit
+    /// hypotheses for the 20.8M static-unbound exits (x87 link refusal, then link churn) were
+    /// both refuted by counters that already existed — `x87_pad_bails` and `reject_x87_top` are
+    /// flat zero, and the global `invalidate_translation` does not fire in steady state. This
+    /// answers the question directly instead of inferring it a third time.
+    pub(crate) fn classify_unbound_target(&self, key: BlockKey) -> UnboundTarget {
+        match self.entries.get(&key) {
+            None => UnboundTarget::NeverSeen,
+            Some(BlockState::Seen) | Some(BlockState::Dormant) => UnboundTarget::SeenNotCompiled,
+            Some(BlockState::Rejected(_)) => UnboundTarget::Rejected,
+            Some(BlockState::Compiled(id)) => {
+                if self.active_index(*id).is_some() {
+                    UnboundTarget::CompiledButUnlinked
+                } else {
+                    UnboundTarget::CompiledButRetired
+                }
+            }
+        }
     }
 
     pub(crate) fn take_stats(&mut self) -> BlockCacheStats {

@@ -1252,6 +1252,10 @@ pub struct DirectBarrierCensusRow {
 pub struct DirectBarrierCensusSnapshot {
     pub rows: Vec<DirectBarrierCensusRow>,
     pub selected: Option<DirectBarrierCensusRow>,
+    /// Why static successor cells were still unbound at the exits that hit them, as
+    /// (label, count). Answers "what is actually ending stints", which the row list above
+    /// cannot: rows are keyed by compile attempt, these are keyed by execution.
+    pub unbound_targets: Vec<(&'static str, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
