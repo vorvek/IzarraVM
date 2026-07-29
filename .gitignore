@@ -90,3 +90,4 @@ toka-dos/build-freedos-tokamous.com
 
 # MkDocs build output
 /site/
+/.worktrees/
