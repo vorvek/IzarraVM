@@ -116,6 +116,24 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "jit_direct_exit_permission",
     "jit_direct_exit_unavailable_or_kind",
     "jit_direct_hash_hits",
+    "jit_direct_helper_blocks",
+    "jit_direct_helper_calls",
+    "jit_direct_helper_continue_count",
+    "jit_direct_helper_cpu_errors",
+    "jit_direct_helper_emitted_bytes",
+    "jit_direct_helper_full_unit_budget_rejects",
+    "jit_direct_helper_generation_exits",
+    "jit_direct_helper_hard_stop",
+    "jit_direct_helper_link_publish_reject",
+    "jit_direct_helper_lost_link_transfers",
+    "jit_direct_helper_panics",
+    "jit_direct_helper_prefix_only_exits",
+    "jit_direct_helper_reject_nonuniform",
+    "jit_direct_helper_retired",
+    "jit_direct_helper_retired_exit",
+    "jit_direct_helper_retry_interpret",
+    "jit_direct_helper_stale_decode_exits",
+    "jit_direct_helper_state_change_exits",
     "jit_direct_hot_hits",
     "jit_direct_insns",
     "jit_direct_insns_sixteen_bit",
@@ -345,6 +363,11 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     assert_eq!(report["machine_phase_timing_enabled"], true);
     assert!(report["guest_seconds"].as_f64().unwrap() > 0.0);
     assert!(report["direct_native_coverage"].as_f64().is_some());
+    assert_eq!(report["direct_helper_coverage"].as_f64(), Some(0.0));
+    assert_eq!(
+        report["direct_unit_coverage"].as_f64(),
+        report["direct_native_coverage"].as_f64()
+    );
     assert!(
         report["direct_slow_exits_per_100_instructions"]
             .as_f64()
@@ -417,6 +440,21 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
 }
 
 #[test]
+fn direct_coverages_keep_native_helper_and_unit_counts_separate() {
+    let perf = PerfCounters {
+        instructions: 100,
+        jit_direct_insns: 60,
+        ..PerfCounters::default()
+    };
+    let helper = izarravm_cpu::DirectHelperCounters {
+        retired: 15,
+        ..izarravm_cpu::DirectHelperCounters::default()
+    };
+
+    assert_eq!(direct_coverages(&perf, helper), (0.6, 0.15, 0.75));
+}
+
+#[test]
 fn perf_counter_json_exposes_the_complete_counter_surface() {
     let perf = PerfCounters {
         brk_cont_decode_miss: 101,
@@ -440,12 +478,33 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         hits: 113,
         misses: 114,
     };
+    let direct_helper = izarravm_cpu::DirectHelperCounters {
+        calls: 201,
+        retired: 202,
+        continue_count: 203,
+        retired_exit: 204,
+        retry_interpret: 205,
+        hard_stop: 206,
+        reject_nonuniform: 207,
+        link_publish_reject: 208,
+        full_unit_budget_rejects: 209,
+        prefix_only_exits: 210,
+        lost_link_transfers: 211,
+        generation_exits: 212,
+        state_change_exits: 213,
+        stale_decode_exits: 214,
+        cpu_errors: 215,
+        panics: 216,
+        helper_blocks: 217,
+        emitted_bytes: 218,
+    };
 
     let report = bench::perf_counters_json(
         &perf,
         izarravm_cpu::PollSkipMemoryCounters::default(),
         jit_clif,
         fast_map_probe,
+        direct_helper,
     );
     let object = report.as_object().unwrap();
     let keys: Vec<_> = object.keys().map(String::as_str).collect();
@@ -465,6 +524,24 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         ("jit_clif_chain_abandoned_cleared", 112),
         ("interp_fast_map_hits", 113),
         ("interp_fast_map_misses", 114),
+        ("jit_direct_helper_calls", 201),
+        ("jit_direct_helper_retired", 202),
+        ("jit_direct_helper_continue_count", 203),
+        ("jit_direct_helper_retired_exit", 204),
+        ("jit_direct_helper_retry_interpret", 205),
+        ("jit_direct_helper_hard_stop", 206),
+        ("jit_direct_helper_reject_nonuniform", 207),
+        ("jit_direct_helper_link_publish_reject", 208),
+        ("jit_direct_helper_full_unit_budget_rejects", 209),
+        ("jit_direct_helper_prefix_only_exits", 210),
+        ("jit_direct_helper_lost_link_transfers", 211),
+        ("jit_direct_helper_generation_exits", 212),
+        ("jit_direct_helper_state_change_exits", 213),
+        ("jit_direct_helper_stale_decode_exits", 214),
+        ("jit_direct_helper_cpu_errors", 215),
+        ("jit_direct_helper_panics", 216),
+        ("jit_direct_helper_blocks", 217),
+        ("jit_direct_helper_emitted_bytes", 218),
     ] {
         assert_eq!(
             object[key].as_u64(),
@@ -478,6 +555,7 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         izarravm_cpu::PollSkipMemoryCounters::default(),
         izarravm_cpu::JitClifCounters::default(),
         izarravm_cpu::FastMapProbeCounters::default(),
+        izarravm_cpu::DirectHelperCounters::default(),
     );
     let zero_object = zeros.as_object().unwrap();
     assert_eq!(zero_object.len(), PERF_COUNTER_KEYS.len());
@@ -648,6 +726,26 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
     } = izarravm_cpu::JitClifCounters::default();
     let izarravm_cpu::FastMapProbeCounters { hits: _, misses: _ } =
         izarravm_cpu::FastMapProbeCounters::default();
+    let izarravm_cpu::DirectHelperCounters {
+        calls: _,
+        retired: _,
+        continue_count: _,
+        retired_exit: _,
+        retry_interpret: _,
+        hard_stop: _,
+        reject_nonuniform: _,
+        link_publish_reject: _,
+        full_unit_budget_rejects: _,
+        prefix_only_exits: _,
+        lost_link_transfers: _,
+        generation_exits: _,
+        state_change_exits: _,
+        stale_decode_exits: _,
+        cpu_errors: _,
+        panics: _,
+        helper_blocks: _,
+        emitted_bytes: _,
+    } = izarravm_cpu::DirectHelperCounters::default();
 }
 
 #[test]

@@ -102,6 +102,12 @@ enum DirectBlockOutcome {
 }
 
 #[cfg(feature = "jit")]
+struct DirectExitReconciliation {
+    charged: u64,
+    side_exit: bool,
+}
+
+#[cfg(feature = "jit")]
 #[derive(Clone, Copy)]
 struct ContinuationBudget {
     total: u64,
@@ -1015,6 +1021,7 @@ impl CpuGsw {
         d: bool,
         budget: ContinuationBudget,
     ) -> Result<DirectContinuation, CpuError> {
+        self.jit_direct.apply_deferred_direct_reset();
         // A 16-bit code segment can NEVER produce a block: `key_for` refuses on `!d`, its very
         // first test alongside `host_supported`. So on base this function already returned
         // Interpret for every such boundary, but only after a decode-cache line lookup, a hotness
@@ -1135,6 +1142,14 @@ impl CpuGsw {
                     return Ok(DirectContinuation::Interpret);
                 };
                 self.perf.jit_direct_blocks_installed += 1;
+                if compilation.helper_site.is_some() {
+                    self.direct_helper.helper_blocks =
+                        self.direct_helper.helper_blocks.saturating_add(1);
+                    self.direct_helper.emitted_bytes = self
+                        .direct_helper
+                        .emitted_bytes
+                        .saturating_add(compilation.code.len() as u64);
+                }
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the
                 // block-entry site are written branchlessly.
@@ -2193,6 +2208,10 @@ impl CpuGsw {
         self.perf.jit_direct_links_cleared += stats.unlinks;
         self.perf.jit_direct_decode_dependencies_scanned += stats.decode_dependencies_scanned;
         self.perf.jit_direct_portals_hidden += stats.portals_hidden;
+        self.direct_helper.link_publish_reject = self
+            .direct_helper
+            .link_publish_reject
+            .saturating_add(stats.helper_link_publish_rejects);
     }
 
     /// The worst-case cost of one chain hop, used as the divisor that decides how many blocks a
@@ -2255,6 +2274,637 @@ impl CpuGsw {
             (jit::direct::MAX_X87_BLOCK_INSTRUCTIONS as u64).saturating_mul(per_instruction_bus);
         let x87_hop = x87_core.saturating_add(bus.jit_scale_bus_cost_upper(x87_raw_bus_upper));
         own_class.max(x87_hop)
+    }
+
+    #[cfg(feature = "jit")]
+    fn apply_direct_native_accounting_uniform<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        exit: &mut jit::direct::NativeExit,
+        mode_key: u32,
+    ) -> u64 {
+        let instructions = std::mem::take(&mut exit.instructions);
+        let weighted_fp_clocks = std::mem::take(&mut exit.weighted_fp_clocks);
+        let raw_native_clocks = std::mem::take(&mut exit.raw_clocks);
+        let byte_reads_packed = std::mem::take(&mut exit.byte_reads);
+        let dword_reads = std::mem::take(&mut exit.dword_reads);
+        let mode13_byte_reads_packed = std::mem::take(&mut exit.mode13_byte_reads);
+        let mode13_dword_reads = std::mem::take(&mut exit.mode13_dword_reads);
+        let ram_byte_writes_packed = std::mem::take(&mut exit.ram_byte_writes);
+        let ram_dword_writes = std::mem::take(&mut exit.ram_dword_writes);
+        let mode13_byte_writes_packed = std::mem::take(&mut exit.mode13_byte_writes);
+        let mode13_dword_writes = std::mem::take(&mut exit.mode13_dword_writes);
+        let mode13_dirty_pages = std::mem::take(&mut exit.mode13_dirty_pages);
+
+        let fp = jit::native_x87::scale_weighted_fp_clocks(weighted_fp_clocks, self.fp_rem);
+        self.fp_rem = fp.remainder;
+        let raw_clocks = raw_native_clocks.saturating_add(fp.clocks);
+        let byte_reads = byte_reads_packed & u64::from(u32::MAX);
+        let word_reads = byte_reads_packed >> 32;
+        let mode13_byte_reads = mode13_byte_reads_packed & u64::from(u32::MAX);
+        let mode13_word_reads = mode13_byte_reads_packed >> 32;
+        let ram_byte_writes = ram_byte_writes_packed & u64::from(u32::MAX);
+        let ram_word_writes = ram_byte_writes_packed >> 32;
+        let mode13_byte_writes = mode13_byte_writes_packed & u64::from(u32::MAX);
+        let mode13_word_writes = mode13_byte_writes_packed >> 32;
+
+        bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(instructions));
+        debug_assert!(mode13_byte_reads <= byte_reads);
+        debug_assert!(mode13_word_reads <= word_reads);
+        debug_assert!(mode13_dword_reads <= dword_reads);
+        let ram_byte_reads = byte_reads - mode13_byte_reads;
+        let ram_word_reads = word_reads - mode13_word_reads;
+        let ram_dword_reads = dword_reads - mode13_dword_reads;
+        let data_clocks = bus
+            .jit_data_cost_clocks(BusWidth::Byte)
+            .saturating_mul(ram_byte_reads)
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(ram_word_reads),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(ram_dword_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(mode13_byte_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(mode13_word_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(mode13_dword_reads),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(ram_byte_writes),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(ram_word_writes),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(ram_dword_writes),
+            );
+        bus.charge_bus_clocks_bulk(data_clocks);
+        bus.charge_native_mode13_writes(izarravm_bus::NativeMode13Writes {
+            dirty_pages: mode13_dirty_pages as u16,
+            byte_writes: mode13_byte_writes,
+            word_writes: mode13_word_writes,
+            dword_writes: mode13_dword_writes,
+        });
+
+        let charged = self.scale_clocks_batch(raw_clocks);
+        self.elapsed_clocks += charged;
+        let reads = byte_reads + word_reads + dword_reads;
+        let writes = ram_byte_writes
+            + ram_word_writes
+            + ram_dword_writes
+            + mode13_byte_writes
+            + mode13_word_writes
+            + mode13_dword_writes;
+        if writes != 0
+            && let Some(page) = self.prefetch.physical_page()
+        {
+            self.record_write_page(page << 12);
+        }
+        self.perf.instructions += instructions;
+        self.perf.jit_direct_insns += instructions;
+        let sixteen_bit = u64::from(mode_key & 1 == 0);
+        self.perf.jit_direct_insns_sixteen_bit += sixteen_bit * instructions;
+        self.perf.jit_native_load_hits += reads;
+        self.perf.data_direct_reads += reads;
+        self.perf.direct_data_pointer_reads += reads;
+        self.perf.jit_native_store_hits += writes;
+        self.perf.data_direct_writes += writes;
+        self.perf.direct_data_pointer_writes += writes;
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
+        charged
+    }
+
+    #[cfg(feature = "jit")]
+    unsafe extern "C" fn direct_precise_helper<B: CpuBus>(
+        cpu: *mut CpuGsw,
+        context: *mut jit::direct::DirectRunContext,
+        site_linear: u32,
+        expected_len: u32,
+    ) -> u32 {
+        let cpu = unsafe { &mut *cpu };
+        let context = unsafe { &mut *context };
+        context.called = true;
+        cpu.direct_helper.calls = cpu.direct_helper.calls.saturating_add(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cpu.direct_precise_helper_inner::<B>(context, site_linear, expected_len)
+        }));
+        let disposition = match result {
+            Ok(disposition) => disposition,
+            Err(payload) => {
+                context.panic = Some(payload);
+                cpu.direct_helper.panics = cpu.direct_helper.panics.saturating_add(1);
+                jit::direct::HelperDisposition::HardStop
+            }
+        };
+        context.resume_eflags = cpu.materialized_eflags();
+        context.disposition = disposition;
+        match disposition {
+            jit::direct::HelperDisposition::Continue => {
+                cpu.direct_helper.continue_count =
+                    cpu.direct_helper.continue_count.saturating_add(1);
+            }
+            jit::direct::HelperDisposition::RetiredExit => {
+                cpu.direct_helper.retired_exit = cpu.direct_helper.retired_exit.saturating_add(1);
+            }
+            jit::direct::HelperDisposition::RetryInterpret => {
+                cpu.direct_helper.retry_interpret =
+                    cpu.direct_helper.retry_interpret.saturating_add(1);
+            }
+            jit::direct::HelperDisposition::HardStop => {
+                cpu.direct_helper.hard_stop = cpu.direct_helper.hard_stop.saturating_add(1);
+            }
+        }
+        disposition as u32
+    }
+
+    #[cfg(feature = "jit")]
+    fn direct_precise_helper_inner<B: CpuBus>(
+        &mut self,
+        context: &mut jit::direct::DirectRunContext,
+        site_linear: u32,
+        expected_len: u32,
+    ) -> jit::direct::HelperDisposition {
+        let bus = unsafe { &mut *(context.bus.cast::<B>()) };
+        #[cfg(test)]
+        let test_force = self.jit_direct.direct_helper_force_for_test();
+        let generation_matches = self.jit_direct.direct_generation() == context.generation;
+        let live = generation_matches
+            .then(|| self.decode_cache.get(context.site.linear, context.site.d))
+            .flatten();
+        let decode_matches = site_linear == context.site.linear
+            && expected_len == u32::from(context.site.expected.len)
+            && live == Some(context.site.expected)
+            && live.and_then(|insn| jit::direct::precise_helper_spec(&insn))
+                == Some(context.site.spec);
+
+        let flushed =
+            self.apply_direct_native_accounting_uniform(bus, &mut context.exit, context.mode_key);
+        context.flushed_native_core_clocks =
+            context.flushed_native_core_clocks.saturating_add(flushed);
+        self.core_clocks_so_far = context
+            .entry_total
+            .saturating_add(context.flushed_native_core_clocks);
+        if !generation_matches {
+            self.direct_helper.generation_exits =
+                self.direct_helper.generation_exits.saturating_add(1);
+            return jit::direct::HelperDisposition::RetryInterpret;
+        }
+        #[cfg(test)]
+        let decode_matches =
+            decode_matches && test_force != jit::DirectHelperTestForce::StaleDecode;
+        if !decode_matches {
+            self.direct_helper.stale_decode_exits =
+                self.direct_helper.stale_decode_exits.saturating_add(1);
+            return jit::direct::HelperDisposition::RetryInterpret;
+        }
+        #[cfg(test)]
+        match test_force {
+            jit::DirectHelperTestForce::HardError => {
+                context.error = Some(CpuError::DivideError);
+                self.direct_helper.cpu_errors = self.direct_helper.cpu_errors.saturating_add(1);
+                return jit::direct::HelperDisposition::HardStop;
+            }
+            jit::DirectHelperTestForce::Panic => panic!("forced Direct helper panic"),
+            jit::DirectHelperTestForce::ClearThenPanic => {
+                self.jit_direct.clear();
+                panic!("forced Direct helper panic after clear");
+            }
+            _ => {}
+        }
+
+        let outcome = match self.run_one_cached(bus, &context.site.expected, context.site.linear) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                context.error = Some(error);
+                self.direct_helper.cpu_errors = self.direct_helper.cpu_errors.saturating_add(1);
+                return jit::direct::HelperDisposition::HardStop;
+            }
+        };
+        self.direct_helper.retired = self.direct_helper.retired.saturating_add(1);
+        context.helper_core_clocks = context
+            .helper_core_clocks
+            .saturating_add(u64::from(outcome.core_clocks));
+        context.helper_halted |= outcome.halted;
+        #[cfg(test)]
+        match test_force {
+            jit::DirectHelperTestForce::GenerationAfterRetire => {
+                self.jit_direct.invalidate_translation();
+            }
+            jit::DirectHelperTestForce::InvalidateCurrentAfterRetire => {
+                self.jit_direct.invalidate_physical_range(
+                    context.site.linear,
+                    u32::from(context.site.expected.len),
+                );
+            }
+            jit::DirectHelperTestForce::ClearAfterRetire => self.jit_direct.clear(),
+            jit::DirectHelperTestForce::EipAfterRetire => {
+                self.registers.eip = self.registers.eip.wrapping_add(1);
+            }
+            jit::DirectHelperTestForce::ModeAfterRetire => {
+                let mut cs = self.registers.cs();
+                cs.default_size_32 = !cs.default_size_32;
+                self.registers.set_segment(SegmentIndex::Cs, cs);
+            }
+            jit::DirectHelperTestForce::SegmentAfterRetire => {
+                let mut ds = self.registers.segment(SegmentIndex::Ds);
+                ds.base = ds.base.wrapping_add(0x1000);
+                self.registers.set_segment(SegmentIndex::Ds, ds);
+            }
+            jit::DirectHelperTestForce::InterruptAfterRetire => {
+                self.interrupt_shadow = !self.interrupt_shadow;
+            }
+            jit::DirectHelperTestForce::HaltAfterRetire => self.halted = true,
+            jit::DirectHelperTestForce::RepAfterRetire => self.rep_resume_active = true,
+            _ => {}
+        }
+        if self.jit_direct.direct_generation() != context.generation {
+            self.direct_helper.generation_exits =
+                self.direct_helper.generation_exits.saturating_add(1);
+            return jit::direct::HelperDisposition::RetiredExit;
+        }
+
+        let segments = [
+            self.registers.segment(SegmentIndex::Es),
+            self.registers.segment(SegmentIndex::Cs),
+            self.registers.segment(SegmentIndex::Ss),
+            self.registers.segment(SegmentIndex::Ds),
+            self.registers.segment(SegmentIndex::Fs),
+            self.registers.segment(SegmentIndex::Gs),
+        ];
+        let state_changed = self.jit_mode_key() != context.mode_key
+            || self.current_privilege_level() != context.cpl
+            || segments != context.segments
+            || self.interrupt_shadow != context.interrupt_shadow
+            || self.can_take_interrupt() != context.can_take_interrupt
+            || self.halted
+            || outcome.halted
+            || self.rep_resume_active
+            || bus.requires_step_break()
+            || self.registers.cs().base.wrapping_add(self.registers.eip)
+                != context.site.fallthrough_linear;
+        if state_changed {
+            self.direct_helper.state_change_exits =
+                self.direct_helper.state_change_exits.saturating_add(1);
+            return jit::direct::HelperDisposition::RetiredExit;
+        }
+        jit::direct::HelperDisposition::Continue
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_direct_native_exit<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        block: jit::direct::CompiledBlock,
+        quota: u64,
+        uniform_fetches: bool,
+        trace_ptr: *const std::mem::MaybeUninit<jit::direct::NativeBlockTrace>,
+        trace_capacity: usize,
+        exit: &mut jit::direct::NativeExit,
+    ) -> DirectExitReconciliation {
+        let span = block.span();
+        debug_assert!((exit.trace_len as usize) <= trace_capacity);
+        debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
+        debug_assert!(u64::from(exit.linked_transfers) < quota);
+        debug_assert!(exit.mode13_dirty_pages <= u64::from(u16::MAX));
+        debug_assert!(exit.side_exit <= 1);
+        debug_assert!(
+            exit.side_exit != 0
+                || exit.side_exit_reason == jit::direct::SideExitReason::None as u32
+        );
+        debug_assert!(exit.side_exit_reason <= jit::direct::SideExitReason::Other as u32);
+        let side_exit = exit.side_exit != 0;
+
+        let final_eip = self.registers.eip;
+        let cs_base = self.registers.cs().base;
+        self.jit_direct.note_barrier_census_direct_run(
+            span.key.linear,
+            cs_base.wrapping_add(final_eip),
+            exit.linked_transfers,
+        );
+        if exit.dynamic_link_cell != 0 {
+            debug_assert_eq!(exit.dynamic_target_eip, final_eip);
+            self.jit_direct.bind_dynamic_successor(
+                exit.dynamic_link_cell,
+                exit.dynamic_target_eip,
+                cs_base.wrapping_add(exit.dynamic_target_eip),
+                span.key.mode_key,
+            );
+        }
+        let instructions = exit.instructions;
+        let fp = jit::native_x87::scale_weighted_fp_clocks(exit.weighted_fp_clocks, self.fp_rem);
+        self.fp_rem = fp.remainder;
+        let raw_clocks = exit.raw_clocks.saturating_add(fp.clocks);
+        let byte_reads = exit.byte_reads & u64::from(u32::MAX);
+        let word_reads = exit.byte_reads >> 32;
+        let dword_reads = exit.dword_reads;
+        let mode13_byte_reads = exit.mode13_byte_reads & u64::from(u32::MAX);
+        let mode13_word_reads = exit.mode13_byte_reads >> 32;
+        let ram_byte_writes = exit.ram_byte_writes & u64::from(u32::MAX);
+        let ram_word_writes = exit.ram_byte_writes >> 32;
+        let mode13_byte_writes = exit.mode13_byte_writes & u64::from(u32::MAX);
+        let mode13_word_writes = exit.mode13_byte_writes >> 32;
+        if uniform_fetches {
+            bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(instructions));
+        } else {
+            let trace = unsafe {
+                std::slice::from_raw_parts(
+                    trace_ptr.cast::<jit::direct::NativeBlockTrace>(),
+                    exit.trace_len as usize,
+                )
+            };
+            let mut traced_instructions = 0u64;
+            for trace in trace {
+                let traced = self
+                    .jit_direct
+                    .block_for_trace(trace.linear, trace.physical, span.key.mode_key)
+                    .expect("resident native trace must name a live block");
+                debug_assert!(trace.prefix_instructions <= u32::from(traced.span().instructions));
+                let repetitions = u64::from(trace.repetitions);
+                traced_instructions = traced_instructions
+                    .saturating_add(
+                        repetitions.saturating_mul(u64::from(traced.span().instructions)),
+                    )
+                    .saturating_add(u64::from(trace.prefix_instructions));
+                self.registers.eip = trace.linear.wrapping_sub(cs_base);
+                if !bus.charge_native_cached_fetches(
+                    trace.linear,
+                    trace.physical,
+                    traced.fetch_lens(),
+                    repetitions,
+                ) {
+                    for _ in 0..repetitions {
+                        let mut fetch_lin = trace.linear;
+                        for &len in traced.fetch_lens() {
+                            self.charge_cached_fetch(bus, fetch_lin, len)
+                                .expect("validated direct-block fetch charge cannot fault");
+                            fetch_lin = fetch_lin.wrapping_add(u32::from(len));
+                        }
+                    }
+                }
+                let mut fetch_lin = trace.linear;
+                for &len in traced
+                    .fetch_lens()
+                    .iter()
+                    .take(trace.prefix_instructions as usize)
+                {
+                    self.charge_cached_fetch(bus, fetch_lin, len)
+                        .expect("validated direct-block prefix fetch charge cannot fault");
+                    fetch_lin = fetch_lin.wrapping_add(u32::from(len));
+                }
+            }
+            debug_assert_eq!(traced_instructions, instructions);
+        }
+        self.registers.eip = final_eip;
+
+        debug_assert!(mode13_byte_reads <= byte_reads);
+        debug_assert!(mode13_word_reads <= word_reads);
+        debug_assert!(exit.mode13_dword_reads <= dword_reads);
+        let ram_byte_reads = byte_reads - mode13_byte_reads;
+        let ram_word_reads = word_reads - mode13_word_reads;
+        let ram_dword_reads = dword_reads - exit.mode13_dword_reads;
+        let data_clocks = bus
+            .jit_data_cost_clocks(BusWidth::Byte)
+            .saturating_mul(ram_byte_reads)
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(ram_word_reads),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(ram_dword_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(mode13_byte_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(mode13_word_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(exit.mode13_dword_reads),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(ram_byte_writes),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(ram_word_writes),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(exit.ram_dword_writes),
+            );
+        bus.charge_bus_clocks_bulk(data_clocks);
+        bus.charge_native_mode13_writes(izarravm_bus::NativeMode13Writes {
+            dirty_pages: exit.mode13_dirty_pages as u16,
+            byte_writes: mode13_byte_writes,
+            word_writes: mode13_word_writes,
+            dword_writes: exit.mode13_dword_writes,
+        });
+
+        let charged = self.scale_clocks_batch(raw_clocks);
+        self.elapsed_clocks += charged;
+        let reads = byte_reads + word_reads + dword_reads;
+        let writes = ram_byte_writes
+            + ram_word_writes
+            + exit.ram_dword_writes
+            + mode13_byte_writes
+            + mode13_word_writes
+            + exit.mode13_dword_writes;
+        if writes != 0
+            && let Some(page) = self.prefetch.physical_page()
+        {
+            self.record_write_page(page << 12);
+        }
+        self.perf.instructions += instructions;
+        self.perf.jit_direct_entries += 1;
+        self.perf.jit_direct_insns += instructions;
+        let sixteen_bit = u64::from(block.span().key.mode_key & 1 == 0);
+        self.perf.jit_direct_entries_sixteen_bit += sixteen_bit;
+        self.perf.jit_direct_insns_sixteen_bit += sixteen_bit * instructions;
+        self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
+        match exit.unresolved_reason {
+            jit::direct::UnresolvedReason::None => {}
+            jit::direct::UnresolvedReason::StaticUnbound => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_static_unbound += 1;
+            }
+            jit::direct::UnresolvedReason::StaticHidden => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_static_hidden += 1;
+            }
+            jit::direct::UnresolvedReason::DynamicMissOrUnbound => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_dynamic_miss_or_unbound += 1;
+            }
+            jit::direct::UnresolvedReason::DynamicHidden => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_dynamic_hidden += 1;
+            }
+            jit::direct::UnresolvedReason::X87TopMismatch => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_x87_pad_bails += 1;
+            }
+        }
+        self.perf.jit_native_load_hits += reads;
+        self.perf.data_direct_reads += reads;
+        self.perf.direct_data_pointer_reads += reads;
+        self.perf.jit_native_store_hits += writes;
+        self.perf.data_direct_writes += writes;
+        self.perf.direct_data_pointer_writes += writes;
+        if side_exit {
+            self.perf.jit_direct_side_exits += 1;
+            match exit.side_exit_reason {
+                reason if reason == jit::direct::SideExitReason::CrossPageOrAlignment as u32 => {
+                    self.perf.jit_direct_exit_cross_page_or_alignment += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::UnavailableOrKind as u32 => {
+                    self.perf.jit_direct_exit_unavailable_or_kind += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::Permission as u32 => {
+                    self.perf.jit_direct_exit_permission += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::CodeWatch as u32 => {
+                    self.perf.jit_direct_exit_code_watch += 1;
+                }
+                _ => self.perf.jit_direct_exit_other += 1,
+            }
+        }
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
+        DirectExitReconciliation { charged, side_exit }
+    }
+
+    #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn run_direct_helper_block<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        block: jit::direct::CompiledBlock,
+        site: jit::direct::DirectHelperSite,
+        total: u64,
+        bus_at_entry: u64,
+        quota: u64,
+    ) -> Result<DirectBlockOutcome, CpuError> {
+        debug_assert_eq!(quota, 1);
+        self.begin_instruction();
+        self.core_clocks_so_far = total;
+        let flags = self.materialized_eflags();
+        let mut context = jit::direct::DirectRunContext {
+            exit: jit::direct::NativeExit::default(),
+            helper_fn: Self::direct_precise_helper::<B>,
+            bus: (bus as *mut B).cast(),
+            site,
+            entry_total: total,
+            entry_bus_clocks: bus_at_entry,
+            generation: self.jit_direct.direct_generation(),
+            mode_key: self.jit_mode_key(),
+            cpl: self.current_privilege_level(),
+            segments: [
+                self.registers.segment(SegmentIndex::Es),
+                self.registers.segment(SegmentIndex::Cs),
+                self.registers.segment(SegmentIndex::Ss),
+                self.registers.segment(SegmentIndex::Ds),
+                self.registers.segment(SegmentIndex::Fs),
+                self.registers.segment(SegmentIndex::Gs),
+            ],
+            interrupt_shadow: self.interrupt_shadow,
+            can_take_interrupt: self.can_take_interrupt(),
+            resume_eflags: flags,
+            flushed_native_core_clocks: 0,
+            helper_core_clocks: 0,
+            helper_halted: false,
+            called: false,
+            disposition: jit::direct::HelperDisposition::Continue,
+            error: None,
+            panic: None,
+        };
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let direct_frame_guard = unsafe {
+            jit::NativeFrameGuard::enter(&mut self.jit_direct.direct_native_frame_depth as *mut u32)
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
+        let direct_frame_guard = ();
+        let entry: jit::direct::DirectEntryFn = unsafe { std::mem::transmute(block.entry_ptr()) };
+        unsafe {
+            entry(
+                self as *mut CpuGsw,
+                flags,
+                quota as u32,
+                &mut context.exit as *mut jit::direct::NativeExit,
+            );
+        }
+        let reconciliation = self.reconcile_direct_native_exit(
+            bus,
+            block,
+            quota,
+            true,
+            std::ptr::NonNull::<std::mem::MaybeUninit<jit::direct::NativeBlockTrace>>::dangling()
+                .as_ptr(),
+            0,
+            &mut context.exit,
+        );
+        let helper_charged = context
+            .flushed_native_core_clocks
+            .saturating_add(context.helper_core_clocks);
+        let helper_prefix_exit =
+            context.called && context.disposition != jit::direct::HelperDisposition::Continue;
+        if helper_prefix_exit {
+            self.direct_helper.prefix_only_exits =
+                self.direct_helper.prefix_only_exits.saturating_add(1);
+        } else if context.called && !reconciliation.side_exit {
+            self.direct_helper.lost_link_transfers =
+                self.direct_helper.lost_link_transfers.saturating_add(1);
+        }
+        let helper_error = context.error.take();
+        let helper_panic = context.panic.take();
+        let helper_halted = context.helper_halted;
+        drop(direct_frame_guard);
+        self.jit_direct.apply_deferred_direct_reset();
+        if let Some(error) = helper_error {
+            return Err(error);
+        }
+        if let Some(payload) = helper_panic {
+            std::panic::resume_unwind(payload);
+        }
+        let charged = helper_charged.saturating_add(reconciliation.charged);
+        let outcome = CycleOutcome {
+            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+            halted: helper_halted,
+        };
+        if reconciliation.side_exit || helper_prefix_exit {
+            Ok(DirectBlockOutcome::Prefix(outcome))
+        } else {
+            Ok(DirectBlockOutcome::Complete(outcome))
+        }
     }
 
     #[cfg(feature = "jit")]
@@ -2436,11 +3086,37 @@ impl CpuGsw {
             }
         };
         if quota == 0 {
+            if block.has_helper() {
+                self.direct_helper.full_unit_budget_rejects = self
+                    .direct_helper
+                    .full_unit_budget_rejects
+                    .saturating_add(1);
+            }
             self.perf.jit_direct_reject_zero_budget += 1;
             return Ok(DirectBlockOutcome::NotRun);
         }
 
         let uniform_fetches = bus.native_fetches_are_uniform();
+        if block.has_helper() && !uniform_fetches {
+            self.direct_helper.reject_nonuniform =
+                self.direct_helper.reject_nonuniform.saturating_add(1);
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        // Arena compaction can relocate code while callers still hold a copied block descriptor.
+        // Resolve its generational ID at the last safe point before entering native code.
+        let Some(current_block) = self.jit_direct.block(block.id()) else {
+            return Ok(DirectBlockOutcome::NotRun);
+        };
+        if let Some(site) = current_block.helper_site() {
+            return self.run_direct_helper_block(
+                bus,
+                current_block,
+                site,
+                total,
+                bus_at_entry,
+                quota,
+            );
+        }
         let trace_capacity = if uniform_fetches {
             0
         } else if block.is_self_loop() {
@@ -2459,11 +3135,6 @@ impl CpuGsw {
             },
             ..jit::direct::NativeExit::default()
         };
-        // Arena compaction can relocate code while callers still hold a copied block descriptor.
-        // Resolve its generational ID at the last safe point before entering native code.
-        let Some(current_block) = self.jit_direct.block(block.id()) else {
-            return Ok(DirectBlockOutcome::NotRun);
-        };
         self.begin_instruction();
         self.core_clocks_so_far = total;
         let flags = self.materialized_eflags();
@@ -2479,232 +3150,20 @@ impl CpuGsw {
                 &mut exit as *mut jit::direct::NativeExit,
             );
         }
-        debug_assert!((exit.trace_len as usize) <= trace_capacity);
-        debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
-        debug_assert!(u64::from(exit.linked_transfers) < quota);
-        debug_assert!(exit.mode13_dirty_pages <= u64::from(u16::MAX));
-        debug_assert!(exit.side_exit <= 1);
-        debug_assert!(
-            exit.side_exit != 0
-                || exit.side_exit_reason == jit::direct::SideExitReason::None as u32
+        let reconciliation = self.reconcile_direct_native_exit(
+            bus,
+            current_block,
+            quota,
+            uniform_fetches,
+            trace.as_ptr(),
+            trace_capacity,
+            &mut exit,
         );
-        debug_assert!(exit.side_exit_reason <= jit::direct::SideExitReason::Other as u32);
-        let side_exit = exit.side_exit != 0;
-
-        let final_eip = self.registers.eip;
-        let cs_base = self.registers.cs().base;
-        self.jit_direct.note_barrier_census_direct_run(
-            span.key.linear,
-            cs_base.wrapping_add(final_eip),
-            exit.linked_transfers,
-        );
-        if exit.dynamic_link_cell != 0 {
-            debug_assert_eq!(exit.dynamic_target_eip, final_eip);
-            self.jit_direct.bind_dynamic_successor(
-                exit.dynamic_link_cell,
-                exit.dynamic_target_eip,
-                cs_base.wrapping_add(exit.dynamic_target_eip),
-                span.key.mode_key,
-            );
-        }
-        let instructions = exit.instructions;
-        let fp = jit::native_x87::scale_weighted_fp_clocks(exit.weighted_fp_clocks, self.fp_rem);
-        self.fp_rem = fp.remainder;
-        let raw_clocks = exit.raw_clocks.saturating_add(fp.clocks);
-        let byte_reads = exit.byte_reads & u64::from(u32::MAX);
-        let word_reads = exit.byte_reads >> 32;
-        let dword_reads = exit.dword_reads;
-        let mode13_byte_reads = exit.mode13_byte_reads & u64::from(u32::MAX);
-        let mode13_word_reads = exit.mode13_byte_reads >> 32;
-        let ram_byte_writes = exit.ram_byte_writes & u64::from(u32::MAX);
-        let ram_word_writes = exit.ram_byte_writes >> 32;
-        let mode13_byte_writes = exit.mode13_byte_writes & u64::from(u32::MAX);
-        let mode13_word_writes = exit.mode13_byte_writes >> 32;
-        if uniform_fetches {
-            bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(instructions));
-        } else {
-            let trace = unsafe {
-                std::slice::from_raw_parts(
-                    trace.as_ptr().cast::<jit::direct::NativeBlockTrace>(),
-                    exit.trace_len as usize,
-                )
-            };
-            let mut traced_instructions = 0u64;
-            for trace in trace {
-                let traced = self
-                    .jit_direct
-                    .block_for_trace(trace.linear, trace.physical, span.key.mode_key)
-                    .expect("resident native trace must name a live block");
-                debug_assert!(trace.prefix_instructions <= u32::from(traced.span().instructions));
-                let repetitions = u64::from(trace.repetitions);
-                traced_instructions = traced_instructions
-                    .saturating_add(
-                        repetitions.saturating_mul(u64::from(traced.span().instructions)),
-                    )
-                    .saturating_add(u64::from(trace.prefix_instructions));
-                self.registers.eip = trace.linear.wrapping_sub(cs_base);
-                if !bus.charge_native_cached_fetches(
-                    trace.linear,
-                    trace.physical,
-                    traced.fetch_lens(),
-                    repetitions,
-                ) {
-                    for _ in 0..repetitions {
-                        let mut fetch_lin = trace.linear;
-                        for &len in traced.fetch_lens() {
-                            self.charge_cached_fetch(bus, fetch_lin, len)
-                                .expect("validated direct-block fetch charge cannot fault");
-                            fetch_lin = fetch_lin.wrapping_add(u32::from(len));
-                        }
-                    }
-                }
-                let mut fetch_lin = trace.linear;
-                for &len in traced
-                    .fetch_lens()
-                    .iter()
-                    .take(trace.prefix_instructions as usize)
-                {
-                    self.charge_cached_fetch(bus, fetch_lin, len)
-                        .expect("validated direct-block prefix fetch charge cannot fault");
-                    fetch_lin = fetch_lin.wrapping_add(u32::from(len));
-                }
-            }
-            debug_assert_eq!(traced_instructions, instructions);
-        }
-        self.registers.eip = final_eip;
-
-        debug_assert!(mode13_byte_reads <= byte_reads);
-        debug_assert!(mode13_word_reads <= word_reads);
-        debug_assert!(exit.mode13_dword_reads <= dword_reads);
-        let ram_byte_reads = byte_reads - mode13_byte_reads;
-        let ram_word_reads = word_reads - mode13_word_reads;
-        let ram_dword_reads = dword_reads - exit.mode13_dword_reads;
-
-        let data_clocks = bus
-            .jit_data_cost_clocks(BusWidth::Byte)
-            .saturating_mul(ram_byte_reads)
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Word)
-                    .saturating_mul(ram_word_reads),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Dword)
-                    .saturating_mul(ram_dword_reads),
-            )
-            .saturating_add(
-                bus.jit_mode13_data_cost_clocks(BusWidth::Byte)
-                    .saturating_mul(mode13_byte_reads),
-            )
-            .saturating_add(
-                bus.jit_mode13_data_cost_clocks(BusWidth::Word)
-                    .saturating_mul(mode13_word_reads),
-            )
-            .saturating_add(
-                bus.jit_mode13_data_cost_clocks(BusWidth::Dword)
-                    .saturating_mul(exit.mode13_dword_reads),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Byte)
-                    .saturating_mul(ram_byte_writes),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Word)
-                    .saturating_mul(ram_word_writes),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Dword)
-                    .saturating_mul(exit.ram_dword_writes),
-            );
-        bus.charge_bus_clocks_bulk(data_clocks);
-        bus.charge_native_mode13_writes(izarravm_bus::NativeMode13Writes {
-            dirty_pages: exit.mode13_dirty_pages as u16,
-            byte_writes: mode13_byte_writes,
-            word_writes: mode13_word_writes,
-            dword_writes: exit.mode13_dword_writes,
-        });
-
-        let charged = self.scale_clocks_batch(raw_clocks);
-        self.elapsed_clocks += charged;
-        let reads = byte_reads + word_reads + dword_reads;
-        let writes = ram_byte_writes
-            + ram_word_writes
-            + exit.ram_dword_writes
-            + mode13_byte_writes
-            + mode13_word_writes
-            + exit.mode13_dword_writes;
-        if writes != 0
-            && let Some(page) = self.prefetch.physical_page()
-        {
-            // Native stores are reported in one batch, without an address per write. Mark the
-            // current prefetch page conservatively so the next instruction drops any stale bytes.
-            self.record_write_page(page << 12);
-        }
-        self.perf.instructions += instructions;
-        self.perf.jit_direct_entries += 1;
-        self.perf.jit_direct_insns += instructions;
-        // The CS.D = 0 split of the two lines above. Mode-key bit 0 is CS.D, so a clear bit is a
-        // 16-bit code segment. Branchless because this is the hottest path in the backend: the
-        // predicate is a compare into a flag and the add is unconditional, so a 32-bit block
-        // pays two arithmetic ops and no misprediction.
-        let sixteen_bit = u64::from(block.span().key.mode_key & 1 == 0);
-        self.perf.jit_direct_entries_sixteen_bit += sixteen_bit;
-        self.perf.jit_direct_insns_sixteen_bit += sixteen_bit * instructions;
-        self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
-        match exit.unresolved_reason {
-            jit::direct::UnresolvedReason::None => {}
-            jit::direct::UnresolvedReason::StaticUnbound => {
-                self.perf.jit_direct_unresolved_exits += 1;
-                self.perf.jit_direct_unresolved_static_unbound += 1;
-            }
-            jit::direct::UnresolvedReason::StaticHidden => {
-                self.perf.jit_direct_unresolved_exits += 1;
-                self.perf.jit_direct_unresolved_static_hidden += 1;
-            }
-            jit::direct::UnresolvedReason::DynamicMissOrUnbound => {
-                self.perf.jit_direct_unresolved_exits += 1;
-                self.perf.jit_direct_unresolved_dynamic_miss_or_unbound += 1;
-            }
-            jit::direct::UnresolvedReason::DynamicHidden => {
-                self.perf.jit_direct_unresolved_exits += 1;
-                self.perf.jit_direct_unresolved_dynamic_hidden += 1;
-            }
-            jit::direct::UnresolvedReason::X87TopMismatch => {
-                self.perf.jit_direct_unresolved_exits += 1;
-                self.perf.jit_direct_x87_pad_bails += 1;
-            }
-        }
-        self.perf.jit_native_load_hits += reads;
-        self.perf.data_direct_reads += reads;
-        self.perf.direct_data_pointer_reads += reads;
-        self.perf.jit_native_store_hits += writes;
-        self.perf.data_direct_writes += writes;
-        self.perf.direct_data_pointer_writes += writes;
-        if side_exit {
-            self.perf.jit_direct_side_exits += 1;
-            match exit.side_exit_reason {
-                reason if reason == jit::direct::SideExitReason::CrossPageOrAlignment as u32 => {
-                    self.perf.jit_direct_exit_cross_page_or_alignment += 1;
-                }
-                reason if reason == jit::direct::SideExitReason::UnavailableOrKind as u32 => {
-                    self.perf.jit_direct_exit_unavailable_or_kind += 1;
-                }
-                reason if reason == jit::direct::SideExitReason::Permission as u32 => {
-                    self.perf.jit_direct_exit_permission += 1;
-                }
-                reason if reason == jit::direct::SideExitReason::CodeWatch as u32 => {
-                    self.perf.jit_direct_exit_code_watch += 1;
-                }
-                _ => self.perf.jit_direct_exit_other += 1,
-            }
-        }
-        if self.is_ring0_protected() {
-            self.perf.monitor_resident_core_clocks += charged;
-        }
         let outcome = CycleOutcome {
-            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+            core_clocks: reconciliation.charged.min(u64::from(u32::MAX)) as u32,
             halted: false,
         };
-        if side_exit {
+        if reconciliation.side_exit {
             Ok(DirectBlockOutcome::Prefix(outcome))
         } else {
             Ok(DirectBlockOutcome::Complete(outcome))

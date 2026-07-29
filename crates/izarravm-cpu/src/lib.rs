@@ -1189,6 +1189,37 @@ impl PartialEq for FastMapProbeCounters {
 }
 impl Eq for FastMapProbeCounters {}
 
+/// Hybrid Direct helper diagnostics. Kept at the `CpuGsw` tail so extending
+/// this surface cannot move the emitted-code layout, including `pending_flags`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectHelperCounters {
+    pub calls: u64,
+    pub retired: u64,
+    pub continue_count: u64,
+    pub retired_exit: u64,
+    pub retry_interpret: u64,
+    pub hard_stop: u64,
+    pub reject_nonuniform: u64,
+    pub link_publish_reject: u64,
+    pub full_unit_budget_rejects: u64,
+    pub prefix_only_exits: u64,
+    pub lost_link_transfers: u64,
+    pub generation_exits: u64,
+    pub state_change_exits: u64,
+    pub stale_decode_exits: u64,
+    pub cpu_errors: u64,
+    pub panics: u64,
+    pub helper_blocks: u64,
+    pub emitted_bytes: u64,
+}
+
+impl PartialEq for DirectHelperCounters {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for DirectHelperCounters {}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
     pub name: &'static str,
@@ -1593,6 +1624,9 @@ pub struct CpuGsw {
     /// Lever 1 hit/miss counters, at the tail for the same layout reason; see
     /// `FastMapProbeCounters`.
     fast_map_probe: FastMapProbeCounters,
+    /// Hybrid Direct helper diagnostics, after every pre-existing field so the
+    /// native emitter's `CpuGsw` offsets remain stable.
+    direct_helper: DirectHelperCounters,
 }
 
 impl Default for CpuGsw {
@@ -1662,6 +1696,7 @@ impl Default for CpuGsw {
             ))]
             fast_map_serve_enabled: FastMapServeGate::default(),
             fast_map_probe: FastMapProbeCounters::default(),
+            direct_helper: DirectHelperCounters::default(),
         }
     }
 }

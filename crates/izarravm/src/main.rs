@@ -927,7 +927,10 @@ fn write_hdd_profile_json(
     let master_ticks = machine.master_ticks();
     let guest_seconds = master_ticks as f64 / MASTER_CLOCK_HZ as f64;
     let perf = machine.cpu().perf_counters();
+    let direct_helper = machine.cpu().direct_helper_counters();
     let instructions = perf.instructions.max(1);
+    let (direct_native_coverage, direct_helper_coverage, direct_unit_coverage) =
+        direct_coverages(perf, direct_helper);
     let machine_profile = machine.host_profile_snapshot();
     let machine_phases = machine_profile.phases;
     let classified_wall_ns = machine_phases
@@ -954,7 +957,9 @@ fn write_hdd_profile_json(
         "cpu_core_clocks_per_host_second": machine.cpu().elapsed_clocks as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "combined_jit_native_coverage": perf.jit_native_insns.saturating_add(perf.jit_direct_insns) as f64 / instructions as f64,
         "combined_jit_slow_exits_per_100_instructions": 100.0 * perf.jit_helper_exits.saturating_add(perf.jit_direct_side_exits) as f64 / instructions as f64,
-        "direct_native_coverage": perf.jit_direct_insns as f64 / instructions as f64,
+        "direct_native_coverage": direct_native_coverage,
+        "direct_helper_coverage": direct_helper_coverage,
+        "direct_unit_coverage": direct_unit_coverage,
         "direct_slow_exits_per_100_instructions": 100.0 * perf.jit_direct_side_exits as f64 / instructions as f64,
         "timedemo": timedemo.map(|(gametics, realtics)| json!({
             "gametics": gametics,
@@ -976,10 +981,22 @@ fn write_hdd_profile_json(
             machine.cpu().poll_skip_memory(),
             machine.cpu().jit_clif_counters(),
             machine.cpu().fast_map_probe_counters(),
+            direct_helper,
         ),
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
+}
+
+fn direct_coverages(
+    perf: &PerfCounters,
+    direct_helper: izarravm_cpu::DirectHelperCounters,
+) -> (f64, f64, f64) {
+    let instructions = perf.instructions.max(1) as f64;
+    let native = perf.jit_direct_insns as f64 / instructions;
+    let helper = direct_helper.retired as f64 / instructions;
+    let unit = perf.jit_direct_insns.saturating_add(direct_helper.retired) as f64 / instructions;
+    (native, helper, unit)
 }
 
 fn direct_barrier_census_json(

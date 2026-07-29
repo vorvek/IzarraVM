@@ -58,6 +58,19 @@ fn compiled(outcome: jit::direct::CompileOutcome) -> jit::direct::Compilation {
     }
 }
 
+fn normalize_link_cell_immediates(compilation: &jit::direct::Compilation) -> Vec<u8> {
+    let mut code = compilation.code.clone();
+    for address in compilation.link_cell_addresses_for_test() {
+        let encoded = (address as u64).to_le_bytes();
+        for offset in 0..=code.len().saturating_sub(encoded.len()) {
+            if code[offset..offset + encoded.len()] == encoded {
+                code[offset..offset + encoded.len()].fill(0);
+            }
+        }
+    }
+    code
+}
+
 #[test]
 fn structural_rejection_includes_the_complete_short_prefix_and_barrier() {
     let cases: &[(&[u8], &[u32], u16)] = &[
@@ -124,6 +137,173 @@ fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
     assert_eq!(selected.native_suffix_instructions, 4);
     assert_eq!(selected.eligible_shapes, 1);
     assert_eq!(selected.eligible_suffix_instructions, 4);
+}
+
+#[test]
+fn cld_pilot_compiles_only_with_explicit_helper_policy() {
+    let code = [0x40, 0x41, 0x42, 0x43, 0xfc, 0x44, 0x45, 0x46, 0x47];
+    let addresses: Vec<_> = (0..code.len())
+        .map(|offset| ENTRY + offset as u32)
+        .collect();
+
+    let (mut off_cpu, mut off_bus) = fixture(&code);
+    warm(&mut off_cpu, &mut off_bus, &addresses);
+    let off = compiled(jit::direct::compile(&mut off_cpu, ENTRY, true));
+    assert_eq!(off.span.instructions, 4);
+    assert_eq!(off.native_instructions, 4);
+    assert!(off.helper_site.is_none());
+
+    let (mut on_cpu, mut on_bus) = fixture(&code);
+    on_cpu.jit_direct.set_direct_helpers_enabled_for_test(true);
+    warm(&mut on_cpu, &mut on_bus, &addresses);
+    let on = compiled(jit::direct::compile(&mut on_cpu, ENTRY, true));
+    let helper = on.helper_site.expect("interior CLD helper");
+    assert_eq!(on.span.instructions, 9);
+    assert_eq!(on.native_instructions, 8);
+    assert_eq!(on.span.guest_len, 9);
+    assert_eq!(helper.spec.opcode, 0xfc);
+    assert_eq!(helper.linear, ENTRY + 4);
+    assert_eq!(helper.fallthrough_linear, ENTRY + 5);
+    assert_eq!(helper.expected.opcode, 0xfc);
+    assert!(!on.has_x87);
+    assert!(!on.self_loop);
+    assert!(!on.dynamic_successor);
+    assert_eq!(on.successors, [None, None]);
+}
+
+#[test]
+fn cld_pilot_never_activates_outside_586_cs_d_one() {
+    let code = [0x40, 0x41, 0x42, 0x43, 0xfc, 0x44, 0x45, 0x46, 0x47];
+    let addresses: Vec<_> = (0..code.len())
+        .map(|offset| ENTRY + offset as u32)
+        .collect();
+
+    let (mut cpu_486, mut bus_486) = fixture(&code);
+    cpu_486.set_mode(GswMode::Gsw486);
+    cpu_486.jit_direct.set_direct_helpers_enabled_for_test(true);
+    warm(&mut cpu_486, &mut bus_486, &addresses);
+    let compiled_486 = compiled(jit::direct::compile(&mut cpu_486, ENTRY, true));
+    assert_eq!(compiled_486.span.instructions, 4);
+    assert_eq!(compiled_486.native_instructions, 4);
+    assert!(compiled_486.helper_site.is_none());
+
+    let (mut cpu_16, mut bus_16) = fixture(&code);
+    let mut cs = cpu_16.registers.cs();
+    cs.default_size_32 = false;
+    cpu_16.registers.set_segment(SegmentIndex::Cs, cs);
+    cpu_16.jit_direct.set_direct_helpers_enabled_for_test(true);
+    warm(&mut cpu_16, &mut bus_16, &addresses);
+    let compiled_16 = compiled(jit::direct::compile(&mut cpu_16, ENTRY, false));
+    assert_eq!(compiled_16.span.instructions, 4);
+    assert_eq!(compiled_16.native_instructions, 4);
+    assert!(compiled_16.helper_site.is_none());
+}
+
+#[test]
+fn helper_policy_does_not_change_native_only_emission() {
+    let code = [0x40, 0x41, 0x42, 0x43];
+    let addresses = [ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3];
+
+    let (mut off_cpu, mut off_bus) = fixture(&code);
+    off_cpu
+        .jit_direct
+        .set_direct_helpers_enabled_for_test(false);
+    warm(&mut off_cpu, &mut off_bus, &addresses);
+    let off = compiled(jit::direct::compile(&mut off_cpu, ENTRY, true));
+
+    let (mut on_cpu, mut on_bus) = fixture(&code);
+    on_cpu.jit_direct.set_direct_helpers_enabled_for_test(true);
+    warm(&mut on_cpu, &mut on_bus, &addresses);
+    let on = compiled(jit::direct::compile(&mut on_cpu, ENTRY, true));
+
+    assert!(off.helper_site.is_none());
+    assert!(on.helper_site.is_none());
+    assert_eq!(off.span, on.span);
+    assert_eq!(off.native_instructions, on.native_instructions);
+    assert_eq!(off.raw_clocks, on.raw_clocks);
+    assert_eq!(
+        normalize_link_cell_immediates(&off),
+        normalize_link_cell_immediates(&on)
+    );
+}
+
+#[test]
+fn cld_pilot_rejects_nonselected_and_invalid_shapes() {
+    let cases: &[(&[u8], &[u32])] = &[
+        (
+            &[0xfc, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+        ),
+        (
+            &[0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0xfc],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+        ),
+        (
+            &[0x40, 0x41, 0x42, 0x43, 0xfc, 0xfc, 0x44, 0x45, 0x46, 0x47],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        ),
+        (
+            &[0x40, 0x41, 0x42, 0xfc, 0x43, 0x44, 0x45],
+            &[0, 1, 2, 3, 4, 5, 6],
+        ),
+        (
+            &[0x40, 0x41, 0x42, 0x43, 0xfc, 0x75, 0xf9],
+            &[0, 1, 2, 3, 4, 5],
+        ),
+        (
+            &[0x40, 0x41, 0xd9, 0xe8, 0x42, 0xfc, 0x43, 0x44, 0x45],
+            &[0, 1, 2, 4, 5, 6, 7, 8],
+        ),
+        (
+            &[0x40, 0x41, 0x42, 0x43, 0xfd, 0x44, 0x45, 0x46, 0x47],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+        ),
+        (
+            &[0x40, 0x41, 0x42, 0x43, 0x98, 0x44, 0x45, 0x46, 0x47],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+        ),
+    ];
+
+    for &(code, relative_starts) in cases {
+        let starts: Vec<_> = relative_starts
+            .iter()
+            .map(|offset| ENTRY + offset)
+            .collect();
+        let (mut cpu, mut bus) = fixture(code);
+        cpu.jit_direct.set_direct_helpers_enabled_for_test(true);
+        warm(&mut cpu, &mut bus, &starts);
+        match jit::direct::compile(&mut cpu, ENTRY, true) {
+            jit::direct::CompileOutcome::Compiled(compilation) => {
+                assert!(compilation.helper_site.is_none(), "code={code:02x?}");
+            }
+            jit::direct::CompileOutcome::StructuralReject(_)
+            | jit::direct::CompileOutcome::Retry => {}
+        }
+    }
+}
+
+#[test]
+fn page_shortening_that_loses_the_suffix_returns_the_native_prefix() {
+    let code = [0x40, 0x41, 0x42, 0x43, 0xfc, 0x44, 0x45, 0x46, 0x47];
+    let addresses: Vec<_> = (0..code.len())
+        .map(|offset| ENTRY + offset as u32)
+        .collect();
+    let (mut cpu, mut bus) = fixture(&code);
+    warm(&mut cpu, &mut bus, &addresses);
+    let prefix = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+
+    cpu.jit_direct.set_direct_helpers_enabled_for_test(true);
+    let shortened = compiled(jit::direct::compile_with_page_len_for_test(
+        &mut cpu,
+        ENTRY,
+        true,
+        prefix.code.len(),
+    ));
+    assert_eq!(shortened.span.instructions, 4);
+    assert_eq!(shortened.native_instructions, 4);
+    assert!(shortened.helper_site.is_none());
+    assert_eq!(shortened.code.len(), prefix.code.len());
+    assert_eq!(shortened.raw_clocks, prefix.raw_clocks);
 }
 
 #[test]

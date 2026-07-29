@@ -709,14 +709,20 @@ impl CpuGsw {
         self.fast_map_probe
     }
 
-    /// Zero the host-side performance counters, including the memory-poll and
-    /// clif subsets stored outside `PerfCounters` (see `PollSkipMemoryCounters`
-    /// and `JitClifCounters`).
+    /// Hybrid Direct helper diagnostics accumulated since construction or the
+    /// last `reset_perf_counters` call.
+    pub fn direct_helper_counters(&self) -> DirectHelperCounters {
+        self.direct_helper
+    }
+
+    /// Zero the host-side performance counters, including the diagnostic
+    /// subsets stored at the `CpuGsw` tail.
     pub fn reset_perf_counters(&mut self) {
         self.perf = PerfCounters::default();
         self.poll_skip_memory = PollSkipMemoryCounters::default();
         self.jit_clif = JitClifCounters::default();
         self.fast_map_probe = FastMapProbeCounters::default();
+        self.direct_helper = DirectHelperCounters::default();
     }
 
     #[cfg(feature = "jit")]

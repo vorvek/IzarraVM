@@ -87,6 +87,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     let EmitInput {
         slots,
         span,
+        native_instructions,
         raw_clocks,
         weighted_fp_clocks,
         byte_reads,
@@ -98,16 +99,18 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         self_loop,
         x87_entry_top,
         memory,
+        helper_bridge,
         link_cell_ptrs,
     } = input;
     let full_accounting = StaticAccounting {
-        instructions: span.instructions,
+        instructions: native_instructions,
         raw_clocks: raw_clocks as u16,
         byte_reads,
         word_reads,
         dword_reads,
         weighted_fp_clocks,
     };
+    let mut epoch_accounting = full_accounting;
     let mut e = Encoder::new();
     for reg in SAVED_HOST_REGS {
         e.push(reg);
@@ -170,7 +173,33 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     let mut terminal = false;
     let mut x87_gate_emitted = false;
     let mut current_x87_top = x87_entry_top;
-    for slot in slots {
+    for (slot_index, slot) in slots.iter().enumerate() {
+        if slot.helper.is_some() {
+            let prefix = StaticAccounting {
+                instructions: completed,
+                raw_clocks: completed_raw,
+                byte_reads: completed_byte_reads,
+                word_reads: completed_word_reads,
+                dword_reads: completed_dword_reads,
+                weighted_fp_clocks: completed_weighted_fp_clocks,
+            };
+            emit_precise_helper(
+                &mut e,
+                *slot,
+                span,
+                prefix,
+                helper_bridge.expect("helper slot requires a stable bridge"),
+                shared_return,
+            );
+            completed = 0;
+            completed_raw = 0;
+            completed_weighted_fp_clocks = 0;
+            completed_byte_reads = 0;
+            completed_word_reads = 0;
+            completed_dword_reads = 0;
+            epoch_accounting = static_accounting_for_slots(&slots[slot_index + 1..]);
+            continue;
+        }
         match slot.kind {
             DirectKind::MovReg { dst, src, width } => match width {
                 MemoryWidth::Word => e.mov_r16_r16(home(dst), home(src)),
@@ -772,7 +801,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     Reg::RDX,
                     link_cell_ptrs,
                     shared_return,
-                    full_accounting,
+                    epoch_accounting,
                 );
                 terminal = true;
                 break;
@@ -919,7 +948,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     target_delta,
                     Some(link_cell_ptrs[0]),
                     shared_return,
-                    full_accounting,
+                    epoch_accounting,
                     x87_entry_top.is_some(),
                 );
                 terminal = true;
@@ -980,7 +1009,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     target_delta,
                     Some(link_cell_ptrs[0]),
                     shared_return,
-                    full_accounting,
+                    epoch_accounting,
                     x87_entry_top.is_some(),
                 );
                 terminal = true;
@@ -1000,7 +1029,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     target_delta,
                     Some(link_cell_ptrs[0]),
                     shared_return,
-                    full_accounting,
+                    epoch_accounting,
                     x87_entry_top.is_some(),
                 );
                 terminal = true;
@@ -1060,7 +1089,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     Reg::RDX,
                     link_cell_ptrs,
                     shared_return,
-                    full_accounting,
+                    epoch_accounting,
                 );
                 terminal = true;
                 break;
@@ -1119,7 +1148,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     Reg::RDX,
                     link_cell_ptrs,
                     shared_return,
-                    full_accounting,
+                    epoch_accounting,
                 );
                 terminal = true;
                 break;
@@ -1185,7 +1214,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     Reg::RDX,
                     link_cell_ptrs,
                     shared_return,
-                    full_accounting,
+                    epoch_accounting,
                 );
                 terminal = true;
                 break;
@@ -1215,7 +1244,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         u32::from(span.guest_len),
                         Some(link_cell_ptrs[0]),
                         shared_return,
-                        full_accounting,
+                        epoch_accounting,
                         x87_entry_top.is_some(),
                     );
                 }
@@ -1237,7 +1266,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         taken_delta,
                         Some(link_cell_ptrs[1]),
                         shared_return,
-                        full_accounting,
+                        epoch_accounting,
                         x87_entry_top.is_some(),
                     );
                 }
@@ -1260,7 +1289,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             u32::from(span.guest_len),
             Some(link_cell_ptrs[0]),
             shared_return,
-            full_accounting,
+            epoch_accounting,
             x87_entry_top.is_some(),
         );
     }
@@ -1272,7 +1301,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             true,
             StaticAccounting::default(),
             true,
-            full_accounting,
+            epoch_accounting,
         );
         e.jmp(shared_return);
     }
@@ -1316,7 +1345,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     if let Some(side_return) = side_return {
         e.place(side_return);
         if self_loop {
-            emit_add_repeated_accounting(&mut e, full_accounting);
+            emit_add_repeated_accounting(&mut e, epoch_accounting);
         }
         emit_fetch_trace(
             &mut e,
@@ -1342,12 +1371,59 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     }
     emit_store_homes(&mut e);
     emit_return(&mut e, COUNTER_ALL);
-    debug_assert_eq!(usize::from(completed), slots.len());
-    debug_assert_eq!(u32::from(completed_raw), raw_clocks);
-    debug_assert_eq!(completed_weighted_fp_clocks, weighted_fp_clocks);
-    debug_assert_eq!(completed_byte_reads, byte_reads);
-    debug_assert_eq!(completed_word_reads, word_reads);
-    debug_assert_eq!(completed_dword_reads, dword_reads);
+    debug_assert_eq!(completed, epoch_accounting.instructions);
+    debug_assert_eq!(completed_raw, epoch_accounting.raw_clocks);
+    debug_assert_eq!(
+        completed_weighted_fp_clocks,
+        epoch_accounting.weighted_fp_clocks
+    );
+    debug_assert_eq!(completed_byte_reads, epoch_accounting.byte_reads);
+    debug_assert_eq!(completed_word_reads, epoch_accounting.word_reads);
+    debug_assert_eq!(completed_dword_reads, epoch_accounting.dword_reads);
+    debug_assert_eq!(
+        slots.iter().filter(|slot| slot.helper.is_none()).count(),
+        usize::from(native_instructions)
+    );
+    debug_assert_eq!(
+        slots
+            .iter()
+            .filter(|slot| slot.helper.is_none())
+            .map(|slot| slot.kind.raw_clocks())
+            .sum::<u32>(),
+        raw_clocks
+    );
+    debug_assert_eq!(
+        slots
+            .iter()
+            .filter(|slot| slot.helper.is_none())
+            .map(|slot| slot.weighted_fp_clocks)
+            .sum::<u32>(),
+        weighted_fp_clocks
+    );
+    debug_assert_eq!(
+        slots
+            .iter()
+            .filter(|slot| slot.helper.is_none())
+            .map(|slot| slot.kind.byte_reads())
+            .sum::<u8>(),
+        byte_reads
+    );
+    debug_assert_eq!(
+        slots
+            .iter()
+            .filter(|slot| slot.helper.is_none())
+            .map(|slot| slot.kind.word_reads())
+            .sum::<u8>(),
+        word_reads
+    );
+    debug_assert_eq!(
+        slots
+            .iter()
+            .filter(|slot| slot.helper.is_none())
+            .map(|slot| slot.kind.dword_reads())
+            .sum::<u8>(),
+        dword_reads
+    );
     debug_assert_eq!(
         slots.iter().map(|slot| slot.kind.byte_stores()).sum::<u8>(),
         byte_stores
@@ -1367,6 +1443,108 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         code: e.finish(),
         body_offset,
     }
+}
+
+pub(super) fn emit_helper_bridge() -> Vec<u8> {
+    let mut e = Encoder::new();
+    #[cfg(target_os = "windows")]
+    let context = Reg::RDX;
+    #[cfg(not(target_os = "windows"))]
+    let context = Reg::RSI;
+    e.load_r64_disp32(
+        Reg::RAX,
+        context,
+        core::mem::offset_of!(DirectRunContext, helper_fn) as i32,
+    );
+    e.jmp_r64(Reg::RAX);
+    e.finish()
+}
+
+fn static_accounting_for_slots(slots: &[DirectInsn]) -> StaticAccounting {
+    slots.iter().filter(|slot| slot.helper.is_none()).fold(
+        StaticAccounting::default(),
+        |mut total, slot| {
+            total.instructions += 1;
+            total.raw_clocks += slot.kind.raw_clocks() as u16;
+            total.byte_reads += slot.kind.byte_reads();
+            total.word_reads += slot.kind.word_reads();
+            total.dword_reads += slot.kind.dword_reads();
+            total.weighted_fp_clocks += slot.weighted_fp_clocks;
+            total
+        },
+    )
+}
+
+fn emit_precise_helper(
+    e: &mut Encoder,
+    slot: DirectInsn,
+    span: BlockSpan,
+    prefix: StaticAccounting,
+    bridge: usize,
+    shared_return: Label,
+) {
+    debug_assert!(slot.helper.is_some());
+    emit_add_static_accounting(e, prefix);
+    emit_export_accounting(e, COUNTER_ALL);
+    emit_store_homes(e);
+    emit_advance_eip(e, slot.lin.wrapping_sub(span.key.linear));
+    e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
+
+    #[cfg(target_os = "windows")]
+    {
+        e.mov_r64_r64(Reg::RCX, Reg::R15);
+        e.mov_r64_r64(Reg::RDX, Reg::RAX);
+        e.mov_r32_imm32(Reg::R8, slot.lin);
+        e.mov_r32_imm32(Reg::R9, u32::from(slot.len));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        e.mov_r64_r64(Reg::RDI, Reg::R15);
+        e.mov_r64_r64(Reg::RSI, Reg::RAX);
+        e.mov_r32_imm32(Reg::RDX, slot.lin);
+        e.mov_r32_imm32(Reg::RCX, u32::from(slot.len));
+    }
+    e.mov_r64_imm64(Reg::RAX, bridge as u64);
+    #[cfg(target_os = "windows")]
+    e.sub_r64_imm32(Reg::RSP, 40);
+    e.call_r64(Reg::RAX);
+    #[cfg(target_os = "windows")]
+    e.add_r64_imm32(Reg::RSP, 40);
+
+    e.mov_r64_r64(Reg::RDI, Reg::RAX);
+    e.xor_r64_self(Reg::RDX);
+    for (_, stack_offset, _) in dynamic_counter_fields() {
+        e.store_r64_disp8(Reg::RSP, stack_offset, Reg::RDX);
+    }
+    for stack_offset in [
+        STACK_INSTRUCTIONS,
+        STACK_RAW_CLOCKS,
+        STACK_BYTE_READS,
+        STACK_DWORD_READS,
+        STACK_WEIGHTED_FP_CLOCKS,
+    ] {
+        e.store_r64_disp8(Reg::RSP, stack_offset, Reg::RDX);
+    }
+
+    e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
+    e.load_r32_disp32(
+        Reg::RBP,
+        Reg::RAX,
+        core::mem::offset_of!(DirectRunContext, resume_eflags) as i32,
+    );
+    emit_load_homes(e);
+    e.cmp_r32_imm32(Reg::RDI, HelperDisposition::Continue as u32);
+    let continue_suffix = e.label();
+    e.jz(continue_suffix);
+    e.jmp(shared_return);
+    e.place(continue_suffix);
+    e.load_r32_disp32(
+        Reg::RDX,
+        Reg::RAX,
+        core::mem::offset_of!(DirectRunContext, site) as i32
+            + core::mem::offset_of!(DirectHelperSite, entry_eip) as i32,
+    );
+    e.store_r32_disp32(Reg::R15, eip_offset(), Reg::RDX);
 }
 
 fn emit_accounting(
@@ -4140,6 +4318,12 @@ fn emit_store_homes(e: &mut Encoder) {
     }
 }
 
+fn emit_load_homes(e: &mut Encoder) {
+    for (index, home) in GUEST_HOMES.into_iter().enumerate() {
+        e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(super) const X87_NONVOLATILE_XMMS: [Xmm; 6] = [
     Xmm::XMM6,
@@ -4164,7 +4348,7 @@ fn emit_restore_x87_host_xmms(e: &mut Encoder) {
     }
 }
 
-fn emit_return(e: &mut Encoder, counter_mask: u16) {
+fn emit_export_accounting(e: &mut Encoder, counter_mask: u16) {
     e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_EXIT);
     for (bit, stack_offset, output_offset) in dynamic_counter_fields() {
         if counter_mask & bit != 0 {
@@ -4197,6 +4381,10 @@ fn emit_return(e: &mut Encoder, counter_mask: u16) {
         e.load_r64_disp8(Reg::RAX, Reg::RSP, stack_offset);
         e.store_r64_disp32(Reg::RDI, output_offset as i32, Reg::RAX);
     }
+}
+
+fn emit_return(e: &mut Encoder, counter_mask: u16) {
+    emit_export_accounting(e, counter_mask);
     e.add_r64_imm32(Reg::RSP, NATIVE_STACK_LEN);
     for reg in SAVED_HOST_REGS.into_iter().rev() {
         e.pop(reg);

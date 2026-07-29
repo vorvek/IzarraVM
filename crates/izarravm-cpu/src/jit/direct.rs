@@ -100,6 +100,7 @@ pub(crate) struct BlockCacheStats {
     pub unlinks: u64,
     pub decode_dependencies_scanned: u64,
     pub portals_hidden: u64,
+    pub helper_link_publish_rejects: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -296,6 +297,8 @@ impl DirectBarrierCensus {
             .iter()
             .map(|(&key, &stats)| (key, census_row(key, stats)))
             .collect();
+        // Pilot selection uses compile-time structural stops. Runtime bridge counts validate the
+        // selected pilot but never change it after the census.
         keyed_rows.sort_by(|(left_key, left), (right_key, right)| {
             right
                 .eligible_suffix_instructions
@@ -639,6 +642,7 @@ pub(crate) struct CompiledBlock {
     x87_exit_top: u8,
     dynamic_successor: bool,
     successors: [Option<LinkTarget>; 2],
+    helper_site: Option<DirectHelperSite>,
 }
 
 impl CompiledBlock {
@@ -664,6 +668,14 @@ impl CompiledBlock {
 
     pub(crate) fn raw_clocks(&self) -> u32 {
         u32::from(self.raw_clocks)
+    }
+
+    pub(crate) fn helper_site(&self) -> Option<DirectHelperSite> {
+        self.helper_site
+    }
+
+    pub(crate) fn has_helper(&self) -> bool {
+        self.helper_site.is_some()
     }
 
     pub(crate) fn weighted_fp_clocks(&self) -> u32 {
@@ -741,7 +753,9 @@ impl CompiledBlock {
     /// value with no relationship to anything at link time. Comparing a float block's real
     /// `x87_exit_top` against that snapshot would accept or refuse edges at random.
     fn link_compatible(self, target: Self) -> bool {
-        if self.span.key.mode_key != target.span.key.mode_key
+        if self.has_helper()
+            || target.has_helper()
+            || self.span.key.mode_key != target.span.key.mode_key
             || self.memory_cpl3 != target.memory_cpl3
             || !self.segment_layout.link_compatible(target.segment_layout)
         {
@@ -878,6 +892,7 @@ pub(crate) struct BlockCache {
     /// integer-into-float edge, so the cell stays on the zero portal and the exit reports
     /// `StaticUnbound` exactly as it did before this mechanism existed.
     x87_pad: Option<super::exec_mem::ExecutableBuffer>,
+    helper_bridge: Option<super::exec_mem::ExecutableBuffer>,
     /// The `jit_cost_dial_epoch()` the cache above was computed under. The CPU cannot see a bus
     /// dial move, so the memo is keyed on the bus's own epoch rather than on an argument about
     /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
@@ -942,6 +957,7 @@ impl BlockCache {
             outbound: Vec::new(),
             global_block_upper_cache: [0; 2],
             x87_pad: None,
+            helper_bridge: None,
             global_block_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
             inbound: HashMap::new(),
@@ -1069,6 +1085,11 @@ impl BlockCache {
             .map_or_else(super::exec_mem::host_page_len, ExecutableArena::slot_len);
         let code_len = u32::try_from(compilation.code.len()).ok()?;
         let raw_clocks = u16::try_from(compilation.raw_clocks).ok()?;
+        debug_assert_eq!(
+            usize::from(compilation.native_instructions)
+                + usize::from(compilation.helper_site.is_some()),
+            usize::from(span.instructions)
+        );
         if compilation.code.is_empty()
             || compilation.code.len() > page_len
             || compilation.body_offset >= compilation.code.len()
@@ -1135,6 +1156,7 @@ impl BlockCache {
             x87_exit_top: compilation.x87_exit_top,
             dynamic_successor: compilation.dynamic_successor,
             successors: compilation.successors,
+            helper_site: compilation.helper_site,
         };
         watch.acquire_range(span.key.physical, u32::from(span.guest_len));
         if index == self.blocks.len() {
@@ -1237,6 +1259,28 @@ impl BlockCache {
     /// the pad, so if none exists then no float block is visible and none needs one.
     fn x87_pad_address_if_built(&self) -> Option<usize> {
         self.x87_pad.as_ref().map(|pad| pad.entry_ptr() as usize)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn helper_bridge_address(&mut self) -> Option<usize> {
+        if self.helper_bridge.is_none() {
+            self.helper_bridge =
+                super::exec_mem::ExecutableBuffer::new(&emit::emit_helper_bridge());
+        }
+        self.helper_bridge
+            .as_ref()
+            .map(|bridge| bridge.entry_ptr() as usize)
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    pub(crate) fn helper_bridge_address(&mut self) -> Option<usize> {
+        None
     }
 
     /// Publish `index`'s portal, routing an integer source through the shared pad when the block
@@ -1890,6 +1934,11 @@ impl BlockCache {
         };
         let source_block = self.blocks[source_index];
         let target_block = self.blocks[target_index];
+        if source_block.has_helper() || target_block.has_helper() {
+            self.stats.helper_link_publish_rejects =
+                self.stats.helper_link_publish_rejects.saturating_add(1);
+            return false;
+        }
         if self.block_link_epochs.get(source_index).copied() != Some(self.link_epoch)
             || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch)
             || !source_block.link_compatible(target_block)
@@ -2044,6 +2093,11 @@ impl BlockCache {
         let Some(index) = self.active_index(id) else {
             return;
         };
+        if self.blocks[index].has_helper() {
+            self.block_portals[index].clear();
+            self.block_link_epochs[index] = 0;
+            return;
+        }
         if self.block_link_epochs.get(index).copied() == Some(self.link_epoch) {
             if !self.block_portals[index].visible() {
                 self.publish_portal(index);
@@ -2219,6 +2273,7 @@ impl CompileOutcome {
 pub(crate) struct Compilation {
     pub span: BlockSpan,
     pub fetch_lens: [u8; MAX_BLOCK_INSTRUCTIONS],
+    pub native_instructions: u8,
     pub raw_clocks: u32,
     pub weighted_fp_clocks: u32,
     pub byte_reads: u8,
@@ -2242,9 +2297,17 @@ pub(crate) struct Compilation {
     /// from the successor match falls to the fall-through arm, which is a wrong edge rather than
     /// a missing one, and nothing observable in guest state or in the block's shape shows it.
     pub(crate) successors: [Option<LinkTarget>; 2],
+    pub(crate) helper_site: Option<DirectHelperSite>,
     link_cells: [Arc<LinkCell>; 2],
     body_offset: usize,
     pub code: Vec<u8>,
+}
+
+#[cfg(test)]
+impl Compilation {
+    pub(crate) fn link_cell_addresses_for_test(&self) -> [usize; 2] {
+        self.link_cells.each_ref().map(|cell| cell.address())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2253,6 +2316,7 @@ struct DirectInsn {
     len: u8,
     weighted_fp_clocks: u32,
     kind: DirectKind,
+    helper: Option<HelperSpec>,
 }
 
 #[derive(Clone, Copy)]
@@ -3619,7 +3683,7 @@ enum CompileStop {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HelperFamily {
+pub(crate) enum HelperFamily {
     DirectionFlag,
     SignExtend,
     AccumulatorExtend,
@@ -3636,10 +3700,58 @@ impl HelperFamily {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HelperSpec {
-    family: HelperFamily,
-    opcode: u16,
-    raw_clocks: u8,
+pub(crate) struct HelperSpec {
+    pub(crate) family: HelperFamily,
+    pub(crate) opcode: u16,
+    pub(crate) raw_clocks: u8,
+}
+
+pub(crate) type DirectHelperFn =
+    unsafe extern "C" fn(*mut CpuGsw, *mut DirectRunContext, u32, u32) -> u32;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum HelperDisposition {
+    #[default]
+    Continue = 0,
+    RetiredExit = 1,
+    RetryInterpret = 2,
+    HardStop = 3,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectHelperSite {
+    pub(crate) spec: HelperSpec,
+    pub(crate) expected: DecodedInsn,
+    pub(crate) linear: u32,
+    pub(crate) fallthrough_linear: u32,
+    pub(crate) entry_eip: u32,
+    pub(crate) d: bool,
+}
+
+#[repr(C)]
+pub(crate) struct DirectRunContext {
+    pub(crate) exit: NativeExit,
+    pub(crate) helper_fn: DirectHelperFn,
+    pub(crate) bus: *mut (),
+    pub(crate) site: DirectHelperSite,
+    pub(crate) entry_total: u64,
+    pub(crate) entry_bus_clocks: u64,
+    pub(crate) generation: u64,
+    pub(crate) mode_key: u32,
+    pub(crate) cpl: u8,
+    pub(crate) segments: [SegmentRegister; 6],
+    pub(crate) interrupt_shadow: bool,
+    pub(crate) can_take_interrupt: bool,
+    pub(crate) resume_eflags: u32,
+    pub(crate) flushed_native_core_clocks: u64,
+    pub(crate) helper_core_clocks: u64,
+    pub(crate) helper_halted: bool,
+    pub(crate) called: bool,
+    pub(crate) disposition: HelperDisposition,
+    pub(crate) error: Option<crate::CpuError>,
+    pub(crate) panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 #[derive(Clone, Copy)]
@@ -3663,7 +3775,7 @@ impl DirectUnitPlanner {
     }
 }
 
-fn precise_helper_spec(insn: &DecodedInsn) -> Option<HelperSpec> {
+pub(crate) fn precise_helper_spec(insn: &DecodedInsn) -> Option<HelperSpec> {
     if insn.modrm.is_some()
         || insn.operand.is_some()
         || insn.prefixes != Prefixes::default()
@@ -3682,6 +3794,18 @@ fn precise_helper_spec(insn: &DecodedInsn) -> Option<HelperSpec> {
         opcode: insn.opcode,
         raw_clocks,
     })
+}
+
+fn direct_helper_edges_for_test(cpu: &CpuGsw) -> bool {
+    #[cfg(test)]
+    {
+        cpu.jit_direct.direct_helper_edges_for_test()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cpu;
+        false
+    }
 }
 
 fn stack_width_kind(
@@ -3810,6 +3934,7 @@ fn compile_with_instruction_limit(
     let mut fetch_lens = [0u8; MAX_BLOCK_INSTRUCTIONS];
     let mut lin = entry_lin;
     let mut raw_clocks = 0u32;
+    let mut native_raw_clocks = 0u32;
     let mut weighted_fp_clocks = 0u32;
     let mut byte_reads = 0u8;
     let mut word_reads = 0u8;
@@ -3826,6 +3951,8 @@ fn compile_with_instruction_limit(
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
     let mut stop = CompileStop::Boundary;
+    let mut helper_site = None;
+    let mut helper_index = None;
 
     while slots.len() < instruction_limit.min(MAX_BLOCK_INSTRUCTIONS) {
         if x87_slots != 0 && slots.len() == MAX_X87_BLOCK_INSTRUCTIONS {
@@ -3931,6 +4058,44 @@ fn compile_with_instruction_limit(
                         },
                     );
                 }
+                let pilot_allowed = cpu.jit_direct.direct_helpers_enabled()
+                    && cpu.persona() == CpuPersona::I586
+                    && d
+                    && helper.family == HelperFamily::DirectionFlag
+                    && helper.opcode == 0xfc
+                    && helper_site.is_none()
+                    && x87_slots == 0
+                    && (direct_helper_edges_for_test(cpu) || !slots.is_empty())
+                    && (direct_helper_edges_for_test(cpu) || instruction_limit > slots.len() + 1);
+                if pilot_allowed {
+                    let Some(next_raw_clocks) =
+                        raw_clocks.checked_add(u32::from(helper.raw_clocks))
+                    else {
+                        stop = CompileStop::Retry;
+                        break;
+                    };
+                    let site = DirectHelperSite {
+                        spec: helper,
+                        expected: insn,
+                        linear: lin,
+                        fallthrough_linear: next,
+                        entry_eip,
+                        d,
+                    };
+                    helper_index = Some(slots.len());
+                    helper_site = Some(site);
+                    raw_clocks = next_raw_clocks;
+                    fetch_lens[slots.len()] = insn.len;
+                    slots.push(DirectInsn {
+                        lin,
+                        len: insn.len,
+                        weighted_fp_clocks: 0,
+                        kind: DirectKind::Nop,
+                        helper: Some(helper),
+                    });
+                    lin = next;
+                    continue;
+                }
                 stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
                 break;
             }
@@ -3994,6 +4159,11 @@ fn compile_with_instruction_limit(
             stop = CompileStop::Retry;
             break;
         };
+        if helper_site.is_some()
+            && (kind.is_x87() || matches!(kind, DirectKind::Jcc { taken_delta: 0, .. }))
+        {
+            break;
+        }
         // A Word-size relative branch masks its target to 16 bits: `relative_jump` computes
         // `(eip + rel) & operand_size.mask()`. The emitted form bakes an unmasked delta, so it is
         // only correct where that mask is a no-op. Clamping the limit to 0xFFFF for Word makes
@@ -4097,6 +4267,9 @@ fn compile_with_instruction_limit(
         }
         memory_alu_slots += u8::from(kind.is_memory_alu());
         raw_clocks = next_raw_clocks;
+        native_raw_clocks = native_raw_clocks
+            .checked_add(kind.raw_clocks())
+            .expect("native raw clocks were already checked in the total");
         weighted_fp_clocks = next_weighted_fp_clocks;
         byte_reads = next_byte_reads;
         word_reads = next_word_reads;
@@ -4118,10 +4291,21 @@ fn compile_with_instruction_limit(
             len: insn.len,
             weighted_fp_clocks: slot_weighted_fp_clocks,
             kind,
+            helper: None,
         });
         lin = next;
         if kind.is_terminal() {
             break;
+        }
+    }
+
+    if let Some(index) = helper_index {
+        let native_suffix = slots.len().saturating_sub(index + 1);
+        if (!direct_helper_edges_for_test(cpu) && (index == 0 || native_suffix == 0))
+            || slots.len() < usize::from(MIN_STANDALONE_INSTRUCTIONS)
+            || x87_slots != 0
+        {
+            return compile_with_instruction_limit(cpu, entry_lin, d, index);
         }
     }
 
@@ -4212,47 +4396,62 @@ fn compile_with_instruction_limit(
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
     };
-    let dynamic_successor = matches!(
-        slots.last().map(|slot| slot.kind),
-        Some(
-            DirectKind::Ret { .. }
+    let dynamic_successor = helper_site.is_none()
+        && matches!(
+            slots.last().map(|slot| slot.kind),
+            Some(
+                DirectKind::Ret { .. }
+                    | DirectKind::Ret16 { .. }
+                    | DirectKind::JmpMem { .. }
+                    | DirectKind::CallReg { .. }
+            )
+        );
+    let successors = if helper_site.is_some() {
+        [None, None]
+    } else {
+        match slots.last().map(|slot| slot.kind) {
+            Some(DirectKind::Jcc { taken_delta, .. }) => [
+                Some(fallthrough),
+                (!self_loop).then_some(LinkTarget {
+                    linear: entry_lin.wrapping_add(taken_delta),
+                    mode_key: key.mode_key,
+                }),
+            ],
+            Some(
+                DirectKind::Call { target_delta, .. }
+                | DirectKind::Call16 { target_delta, .. }
+                | DirectKind::Jmp { target_delta },
+            ) => [
+                Some(LinkTarget {
+                    linear: entry_lin.wrapping_add(target_delta),
+                    mode_key: key.mode_key,
+                }),
+                None,
+            ],
+            Some(
+                DirectKind::Ret { .. }
                 | DirectKind::Ret16 { .. }
                 | DirectKind::JmpMem { .. }
-                | DirectKind::CallReg { .. }
-        )
-    );
-    let successors = match slots.last().map(|slot| slot.kind) {
-        Some(DirectKind::Jcc { taken_delta, .. }) => [
-            Some(fallthrough),
-            (!self_loop).then_some(LinkTarget {
-                linear: entry_lin.wrapping_add(taken_delta),
-                mode_key: key.mode_key,
-            }),
-        ],
-        Some(
-            DirectKind::Call { target_delta, .. }
-            | DirectKind::Call16 { target_delta, .. }
-            | DirectKind::Jmp { target_delta },
-        ) => [
-            Some(LinkTarget {
-                linear: entry_lin.wrapping_add(target_delta),
-                mode_key: key.mode_key,
-            }),
-            None,
-        ],
-        Some(
-            DirectKind::Ret { .. }
-            | DirectKind::Ret16 { .. }
-            | DirectKind::JmpMem { .. }
-            | DirectKind::CallReg { .. },
-        ) => [None, None],
-        _ => [Some(fallthrough), None],
+                | DirectKind::CallReg { .. },
+            ) => [None, None],
+            _ => [Some(fallthrough), None],
+        }
     };
     let link_cells = [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())];
+    let helper_bridge = if helper_site.is_some() {
+        let Some(address) = cpu.jit_direct.helper_bridge_address() else {
+            return CompileOutcome::Retry;
+        };
+        Some(address)
+    } else {
+        None
+    };
     let emitted = emit::emit(EmitInput {
         slots: &slots,
         span,
-        raw_clocks,
+        native_instructions: u8::try_from(slots.len() - usize::from(helper_site.is_some()))
+            .expect("Direct native instruction count fits u8"),
+        raw_clocks: native_raw_clocks,
         weighted_fp_clocks,
         byte_reads,
         word_reads,
@@ -4273,11 +4472,14 @@ fn compile_with_instruction_limit(
                 emit::AddressWrap::Word
             },
         },
+        helper_bridge,
         link_cell_ptrs: link_cells.each_ref().map(|cell| cell.address()),
     });
     CompileOutcome::Compiled(Compilation {
         span,
         fetch_lens,
+        native_instructions: u8::try_from(slots.len() - usize::from(helper_site.is_some()))
+            .expect("Direct native instruction count fits u8"),
         raw_clocks,
         weighted_fp_clocks,
         byte_reads,
@@ -4295,6 +4497,7 @@ fn compile_with_instruction_limit(
         x87_exit_top,
         dynamic_successor,
         successors,
+        helper_site,
         link_cells,
         body_offset: emitted.body_offset,
         code: emitted.code,
@@ -4369,6 +4572,7 @@ fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
 struct EmitInput<'a> {
     slots: &'a [DirectInsn],
     span: BlockSpan,
+    native_instructions: u8,
     raw_clocks: u32,
     weighted_fp_clocks: u32,
     byte_reads: u8,
@@ -4380,6 +4584,7 @@ struct EmitInput<'a> {
     self_loop: bool,
     x87_entry_top: Option<u8>,
     memory: MemoryEmitContext,
+    helper_bridge: Option<usize>,
     link_cell_ptrs: [usize; 2],
 }
 
