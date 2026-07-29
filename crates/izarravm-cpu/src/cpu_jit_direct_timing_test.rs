@@ -3974,13 +3974,11 @@ fn fstp_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
             "{label}: bus clocks"
         );
         assert_eq!(
-            f64::from_bits(
-                u64::from_le_bytes(
-                    native_bus.memory[target as usize..target as usize + 8]
-                        .try_into()
-                        .unwrap()
-                )
-            ),
+            f64::from_bits(u64::from_le_bytes(
+                native_bus.memory[target as usize..target as usize + 8]
+                    .try_into()
+                    .unwrap()
+            )),
             1.0,
             "{label}: FSTP result"
         );
