@@ -927,6 +927,13 @@ impl CpuGsw {
     #[cfg(feature = "jit")]
     pub fn set_clif_backend_enabled(&mut self, on: bool) {
         self.jit_direct.clif_enabled = on && jit::host_supported();
+        // `clif_enabled` is one of the four inputs to `fast_map_population_enabled()`
+        // (memory.rs); refresh the interpreter serve gate's cached mirror so it cannot go stale.
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.refresh_fast_map_serve_gate();
     }
 
     /// Whether the clif policy is enabled on this instance.
@@ -943,6 +950,15 @@ impl CpuGsw {
             self.direct_runtime.admission_active,
             self.jit_direct.execution_enabled()
         );
+        // `admission_active` is one of the four inputs to `fast_map_population_enabled()`
+        // (memory.rs); refresh the interpreter serve gate's cached mirror unconditionally, not
+        // only on a real transition below, since `jit_regions.set_auto_admit` above (called from
+        // `set_jit_auto_admit` before this function runs) can also move the condition.
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.refresh_fast_map_serve_gate();
         if was_enabled == enabled {
             return;
         }
@@ -965,6 +981,14 @@ impl CpuGsw {
     pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
         self.set_jit_auto_admit(false);
         self.jit_regions.set_auto_admit(on && jit::host_supported());
+        // `jit_regions.auto_admit()` is one of the four inputs to `fast_map_population_enabled()`
+        // (memory.rs) and just changed AFTER `set_jit_auto_admit`'s own refresh ran; refresh again
+        // so the interpreter serve gate's cached mirror reflects the final state.
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.refresh_fast_map_serve_gate();
     }
 
     /// G1: shared demotion tail of both admission gates. Parks the key Dormant, stamps its entry

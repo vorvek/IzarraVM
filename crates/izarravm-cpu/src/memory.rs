@@ -56,6 +56,27 @@ impl CpuGsw {
             && !self.jit_regions.auto_admit()
     }
 
+    /// Recompute the cached `fast_map_serve_enabled` mirror of `fast_map_population_enabled()`.
+    /// This must be called from EVERY site that can change that predicate's inputs: `set_mode`
+    /// (persona), `finish_direct_execution_transition` (`direct_runtime.admission_active`, via
+    /// `jit_direct.execution_enabled()`), `set_clif_backend_enabled` (`jit_direct.clif_enabled`),
+    /// and `set_legacy_region_auto_admit` (`jit_regions.auto_admit()`, test-only). A missed call
+    /// site desyncs the cache from the real condition; `fast_map_data_slot`'s `debug_assert`
+    /// checks this cheaply in debug/test builds.
+    ///
+    /// Named "refresh", not "recompute-and-return", because callers outside this module (core.rs,
+    /// run.rs) reach it through `pub(super)` without needing to know the predicate itself, which
+    /// stays private -- population and the interpreter's serve gate both anchor on this ONE
+    /// computation so they can never disagree about when the FastMap is live.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn refresh_fast_map_serve_gate(&mut self) {
+        self.fast_map_serve_enabled.enabled = self.fast_map_population_enabled();
+    }
+
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -159,21 +180,27 @@ impl CpuGsw {
     /// (so the caller knows whether it may take the flat RAM charge or must defer to the video
     /// charge). `None` means the caller must fall through to the unchanged canonical path -- a
     /// clean-PTE write, an unaligned or page-crossing access, a CPL-3 hit on a supervisor page, a
-    /// stale mapping epoch, and a plain unpopulated page (386-slow/386 Accurate, or a cold miss)
-    /// all reject here by construction of `lookup_access`, not by any extra check of ours.
+    /// stale mapping epoch, and a plain unpopulated page (a cold miss, or `fast_map_serve_enabled`
+    /// having gone false since the last population -- see below) all reject here by construction
+    /// of `lookup_access`, not by any extra check of ours.
     ///
-    /// Every call site gates on `self.jit_fast_map.has_storage()` BEFORE calling this function at
-    /// all (see e.g. `read_linear_u8`), so this never runs for a guaranteed-miss access: JIT off,
-    /// or the 386-slow/386 Accurate personas, where the map is NEVER populated (`storage` stays
-    /// `None` for the CPU's whole life). That gate exists because, before it was added, a
-    /// guaranteed-miss probe still paid for the mapping-epoch load, CPL derivation, and CR0.WP
-    /// read below -- measured on a JIT-off control run at ~2.66 ns per interpreter data access, a
-    /// 4.6% wall regression, almost exactly what the hit path saves elsewhere. The
-    /// `debug_assert` below is a correctness net, not the gate itself: do not restore an
-    /// `if !has_storage() { return None }` here, and do not gate on a re-derived condition off
-    /// `mode()` / `admission_active` / `clif_enabled` / `auto_admit` (four predicate calls) --
-    /// either would re-add a redundant `Box<FastMap>` dereference on every one of the 347M+ hits
-    /// this path serves in the Quake/586 gate.
+    /// `fast_map_serve_enabled` (the cached mirror of `fast_map_population_enabled()`, kept in
+    /// sync by `refresh_fast_map_serve_gate`) is checked FIRST and short-circuits everything else.
+    /// This is NOT the same gate an earlier revision of this function used
+    /// (`FastMap::has_storage()`, "has any population ever happened"): storage, once allocated,
+    /// is never freed, so `has_storage()` stays `true` for the rest of the CPU's life after the
+    /// first successful population -- including across a LIVE GSW MODE SWITCH into a persona that
+    /// can never repopulate (386-slow/386 Accurate), where it wrongly kept paying this function's
+    /// preamble (and, transiently, wrongly kept SERVING from surviving entries) on every access.
+    /// `fast_map_serve_enabled` tracks the actual persona/admission condition instead, so it goes
+    /// false the instant a mode switch (or an admission/clif toggle) makes population impossible,
+    /// closing both the transient and the steady-state cost. See the campaign log for the
+    /// measured regression this replaced: a JIT-off control run showed the fixed preamble cost
+    /// (mapping-epoch load, CPL derivation, CR0.WP read) at ~2.66 ns per interpreter data access,
+    /// a 4.6% wall regression -- almost exactly what the hit path saves elsewhere. The mechanism
+    /// was the PREAMBLE running before a guaranteed miss could be rejected, not where the gate
+    /// checking `has_storage()` happened to be written (call site vs. here); do not reintroduce
+    /// that preamble-before-gate ordering for either gate.
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -186,9 +213,14 @@ impl CpuGsw {
         width: BusWidth,
         write: bool,
     ) -> Option<(u32, *mut u8, bool)> {
-        debug_assert!(
-            self.jit_fast_map.has_storage(),
-            "fast_map_data_slot called without its call-site has_storage() gate"
+        if !self.fast_map_serve_enabled.enabled {
+            return None;
+        }
+        debug_assert_eq!(
+            self.fast_map_serve_enabled.enabled,
+            self.fast_map_population_enabled(),
+            "fast_map_serve_enabled cache is stale relative to fast_map_population_enabled(); a \
+             state mutator is missing a refresh_fast_map_serve_gate() call"
         );
         let mapping_epoch = if write {
             self.data_write_pages.mapping_epoch()
@@ -206,11 +238,11 @@ impl CpuGsw {
             write_protect,
         ) {
             Some(access) => {
-                self.perf.interp_fast_map_hits += 1;
+                self.fast_map_probe.hits += 1;
                 Some((access.physical(), access.ptr(), access.is_mode13()))
             }
             None => {
-                self.perf.interp_fast_map_misses += 1;
+                self.fast_map_probe.misses += 1;
                 None
             }
         }
@@ -314,6 +346,18 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<()> {
         self.record_write_page(physical);
+        // Adversarial review asked whether `watched && changed` here can skip
+        // `note_code_write_hit`'s unconditional `clif_invalidate_physical_range` for a store that
+        // changes a byte inside a compiled clif unit but hits neither a Direct compiled block nor
+        // a decode-cache mark. It cannot: `code_write_watched` -> `range_hits_compiled_code` ->
+        // `code_watch.range_watched(..)`, and clif unit installation registers each unit's guest
+        // physical range into that SAME shared `code_watch` table (`jit/mod.rs`, clif unit
+        // install), so a byte inside a live clif unit is already watched through this path, not
+        // only through Direct's registration. `cargo test -p izarravm-cpu --features clif-backend`
+        // passes with this gate in place, consistent with there being no gap here. This is the
+        // SAME gate `write_linear_fragment`'s slow sized path already uses (clif-backend is off by
+        // default and pre-dates this slice), so this comment documents an existing hazard's
+        // resolution, not a new one this slice introduced.
         let watched = self.code_write_watched(physical, width.bytes());
         if mode13 {
             bus.charge_direct_memory(physical, width, kind)?;
@@ -790,19 +834,13 @@ impl CpuGsw {
         linear: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
-        // The `has_storage()` guard sits at the CALL SITE, not only inside
-        // `fast_map_data_slot`, so a guaranteed-miss access (JIT off, or 386-slow/386
-        // Accurate) never even calls into that function -- see its doc comment for why a
-        // fixed per-access cost ahead of the map lookup is a measured regression, not a
-        // theoretical one.
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.jit_fast_map.has_storage()
-            && let Some((physical, ptr, mode13)) =
-                self.fast_map_data_slot(linear, BusWidth::Byte, false)
+        if let Some((physical, ptr, mode13)) =
+            self.fast_map_data_slot(linear, BusWidth::Byte, false)
         {
             return self
                 .finish_fast_map_read(bus, physical, ptr, mode13, BusWidth::Byte, kind)
@@ -845,9 +883,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.jit_fast_map.has_storage()
-            && let Some((physical, ptr, mode13)) =
-                self.fast_map_data_slot(linear, BusWidth::Byte, true)
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, BusWidth::Byte, true)
         {
             return self.finish_fast_map_write(
                 bus,
@@ -1092,9 +1128,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.jit_fast_map.has_storage()
-            && let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false)
-        {
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false) {
             return self.finish_fast_map_read(bus, physical, ptr, mode13, width, kind);
         }
         let physical = self.translate_linear(bus, linear, false)?;
@@ -1122,9 +1156,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.jit_fast_map.has_storage()
-            && let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true)
-        {
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true) {
             return self.finish_fast_map_write(bus, physical, ptr, mode13, width, value, kind);
         }
         let physical = self.translate_linear(bus, linear, true)?;

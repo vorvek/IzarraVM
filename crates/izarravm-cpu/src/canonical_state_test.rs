@@ -835,10 +835,10 @@ fn execution_serialization_does_not_mutate_cpu() {
 #[test]
 #[cfg(feature = "jit")]
 fn arch_payload_keeps_pending_flags_offset_pinned() {
-    // 4528, not 4512: this slice added two u64 PerfCounters fields (interp_fast_map_hits/
-    // _misses), which precede `pending_flags` in CpuGsw's layout.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    // The lever-1 slice's interp_fast_map_hits/_misses counters live in FastMapProbeCounters at
+    // the CpuGsw tail (see that type), not in PerfCounters, specifically so this pin stays 4512.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
 }

@@ -436,11 +436,16 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         chain_abandoned_cleared: 112,
         ..izarravm_cpu::JitClifCounters::default()
     };
+    let fast_map_probe = izarravm_cpu::FastMapProbeCounters {
+        hits: 113,
+        misses: 114,
+    };
 
     let report = bench::perf_counters_json(
         &perf,
         izarravm_cpu::PollSkipMemoryCounters::default(),
         jit_clif,
+        fast_map_probe,
     );
     let object = report.as_object().unwrap();
     let keys: Vec<_> = object.keys().map(String::as_str).collect();
@@ -458,6 +463,8 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         ("monitor_trips_vec13", 110),
         ("monitor_resident_core_clocks", 111),
         ("jit_clif_chain_abandoned_cleared", 112),
+        ("interp_fast_map_hits", 113),
+        ("interp_fast_map_misses", 114),
     ] {
         assert_eq!(
             object[key].as_u64(),
@@ -470,6 +477,7 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         &PerfCounters::default(),
         izarravm_cpu::PollSkipMemoryCounters::default(),
         izarravm_cpu::JitClifCounters::default(),
+        izarravm_cpu::FastMapProbeCounters::default(),
     );
     let zero_object = zeros.as_object().unwrap();
     assert_eq!(zero_object.len(), PERF_COUNTER_KEYS.len());
@@ -576,8 +584,6 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         direct_page_misses: _,
         direct_data_pointer_reads: _,
         direct_data_pointer_writes: _,
-        interp_fast_map_hits: _,
-        interp_fast_map_misses: _,
         fetch_page_hits: _,
         fetch_page_misses: _,
         slow_prefetch_refills: _,
@@ -640,6 +646,8 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         resolve_clone_ns: _,
         clif_retired: _,
     } = izarravm_cpu::JitClifCounters::default();
+    let izarravm_cpu::FastMapProbeCounters { hits: _, misses: _ } =
+        izarravm_cpu::FastMapProbeCounters::default();
 }
 
 #[test]

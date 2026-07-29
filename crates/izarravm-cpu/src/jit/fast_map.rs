@@ -309,13 +309,17 @@ impl FastMap {
     }
 
     /// Whether the map has EVER been populated. `storage` allocates lazily inside `populate`
-    /// (`get_or_insert_with`), so this is `false` exactly in the cases that can never produce a
-    /// hit: the JIT is off, or the current persona is 386-slow/386 Accurate
-    /// (`fast_map_population_enabled` gates population on `mode().uses_approximate_timing()`).
-    /// The interpreter's serve path (`CpuGsw::fast_map_data_slot`) checks this FIRST, before
-    /// loading a mapping epoch, reading CPL, or reading CR0.WP -- all of that is real work a
-    /// guaranteed-miss access must not pay. This one `Option::is_some()` check is what makes a
-    /// JIT-off or Accurate-persona probe approximately free.
+    /// (`get_or_insert_with`) and is never freed afterward -- `invalidate_page`/`invalidate_all`
+    /// clear entries but leave `storage` itself `Some`. So this is `false` only before the FIRST
+    /// successful population on this CPU; it stays `true` for the rest of the CPU's life after
+    /// that, through every later invalidation and through a live GSW mode switch into a persona
+    /// that can never populate again. It is NOT a live "can this persona hit right now" test --
+    /// that condition is `CpuGsw::fast_map_serve_enabled` (memory.rs), a separately cached mirror
+    /// of `fast_map_population_enabled()` refreshed at every state change that predicate depends
+    /// on. Do not use `has_storage()` to gate the interpreter's serve path; it is kept as a
+    /// coarser diagnostic ("has population ever run at all") for tests. No non-test caller
+    /// currently exists; `#[allow(dead_code)]` matches this file's other test/native-only helpers.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn has_storage(&self) -> bool {
         self.storage.is_some()
