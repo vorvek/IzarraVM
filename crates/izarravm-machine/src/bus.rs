@@ -536,6 +536,26 @@ const fn io_word_sub_port(port: u16, index: u32) -> u16 {
     }
 }
 
+impl MachineBus<'_> {
+    /// The RAM-only tail of `charge_direct_memory`: the flat L1 cost in the Approximate class, or
+    /// the full A20-plus-wait-state routing otherwise. Factored out so the interpreter's FastMap
+    /// serve path (`CpuBus::charge_direct_ram_memory`) can charge a `PageKind::Ram` hit without
+    /// repeating the video-aperture range compare that `charge_direct_memory` already ran once at
+    /// FastMap population time. The Mode13 aperture keeps going through the full
+    /// `charge_direct_memory`, unchanged, so `note_direct_write` and its persona wait states never
+    /// get bypassed.
+    #[inline]
+    fn charge_ram_only(&mut self, address: u32, width: BusWidth, kind: BusAccessKind) {
+        if self.flat_data_cost {
+            self.trace.record(kind, address, width, self.cache.cost.l1);
+            return;
+        }
+        let address = self.apply_a20(address);
+        let ws = self.data_access_wait_states(address, width);
+        self.trace.record(kind, address, width, ws);
+    }
+}
+
 impl CpuBus for MachineBus<'_> {
     fn read_memory_direct(
         &mut self,
@@ -814,13 +834,22 @@ impl CpuBus for MachineBus<'_> {
         // BAR over its own source buffer keeps charging the stale entry's flat
         // cost until the post-instruction io_touched step break invalidates it.
         // That divergence is timing-only; functional behavior is identical.
-        if self.flat_data_cost {
-            self.trace.record(kind, address, width, self.cache.cost.l1);
-            return Ok(());
-        }
-        let address = self.apply_a20(address);
-        let ws = self.data_access_wait_states(address, width);
-        self.trace.record(kind, address, width, ws);
+        self.charge_ram_only(address, width, kind);
+        Ok(())
+    }
+
+    /// The interpreter's FastMap serve path calls this for a hit already classified as
+    /// `PageKind::Ram` at population time, so the video-aperture range compare `charge_direct_memory`
+    /// runs on every call is redundant here and is skipped. See `charge_ram_only` for the shared
+    /// tail; a Mode13 hit must NOT call this and instead calls `charge_direct_memory`, unchanged.
+    #[inline]
+    fn charge_direct_ram_memory(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        self.charge_ram_only(address, width, kind);
         Ok(())
     }
 

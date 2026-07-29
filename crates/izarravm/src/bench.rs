@@ -18,6 +18,9 @@ struct BenchRun {
     /// Clif churn subset (C1e), captured alongside for the same layout-preservation
     /// reason.
     jit_clif: izarravm_cpu::JitClifCounters,
+    /// Lever 1 (interpreter FastMap serve path) hit/miss subset, stored outside PerfCounters on
+    /// the CPU for the same layout-preservation reason; see FastMapProbeCounters.
+    fast_map_probe: izarravm_cpu::FastMapProbeCounters,
     machine_profile: MachineHostProfileSnapshot,
     cpu_profile: CpuProfileSnapshot,
 }
@@ -92,6 +95,7 @@ fn run_bench_one_profiled(
         perf,
         poll_skip_memory: machine.cpu().poll_skip_memory(),
         jit_clif: machine.cpu().jit_clif_counters(),
+        fast_map_probe: machine.cpu().fast_map_probe_counters(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
     })
@@ -396,7 +400,12 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
         "rt_factor"
     );
     // Collected for the host-side perf summary printed after the table.
-    let mut perf_rows: Vec<(&'static str, GswMode, PerfCounters)> = Vec::new();
+    let mut perf_rows: Vec<(
+        &'static str,
+        GswMode,
+        PerfCounters,
+        izarravm_cpu::FastMapProbeCounters,
+    )> = Vec::new();
     let mut out_of_band = false;
     for bench in BENCHES {
         let mut slow_row: Option<(u64, f64)> = None;
@@ -413,7 +422,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 println!("--- census {} {} ---", bench.name, mode.canonical_name());
                 print_cpu_profile(&run.cpu_profile);
             }
-            perf_rows.push((bench.name, mode, run.perf.clone()));
+            perf_rows.push((bench.name, mode, run.perf.clone(), run.fast_map_probe));
             let baseline_clocks = match &bench.source {
                 BenchSource::BootSelector(_) => baseline[mode_rank(mode) as usize],
                 BenchSource::LocalDosExe(_) | BenchSource::DosExe(_) => 0,
@@ -496,14 +505,14 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
     // and do not affect cyc/iter (the guest clock metric).
     println!();
     println!("=== perf counters (host-side diagnostics; off the guest-timing path) ===");
-    for (name, mode, perf) in &perf_rows {
+    for (name, mode, perf, fast_map_probe) in &perf_rows {
         let instructions = perf.instructions.max(1);
         let decode_hit = 100.0 * (1.0 - perf.decode_misses as f64 / instructions as f64);
         let insns_per_run = perf.instructions as f64 / perf.straight_line_runs.max(1) as f64;
         println!(
             "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
              brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
-             data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
+             data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
              jit[entries/insns/native/helper]={}/{}/{}/{}  \
@@ -524,6 +533,8 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.data_slow_writes,
             perf.direct_data_pointer_reads,
             perf.direct_data_pointer_writes,
+            fast_map_probe.hits,
+            fast_map_probe.misses,
             perf.direct_page_hits,
             perf.direct_page_misses,
             perf.fetch_page_hits,
@@ -687,7 +698,7 @@ pub(super) fn run_profile_exe(
     print_cpu_profile(&profiled.cpu_profile);
     println!();
     println!("=== perf counters ===");
-    print_perf_counter_row("profile", mode, &profiled.perf);
+    print_perf_counter_row("profile", mode, &profiled.perf, profiled.fast_map_probe);
 
     if let Some(json_path) = json_path {
         write_profile_json(
@@ -935,7 +946,12 @@ fn write_profile_json(
                 "register_samples": opcode.register_samples,
                 "memory_samples": opcode.memory_samples,
             })).collect::<Vec<_>>(),
-            "perf": perf_counters_json(&profiled.perf, profiled.poll_skip_memory, profiled.jit_clif),
+            "perf": perf_counters_json(
+                &profiled.perf,
+                profiled.poll_skip_memory,
+                profiled.jit_clif,
+                profiled.fast_map_probe,
+            ),
         },
     });
     std::fs::write(json_path, serde_json::to_string_pretty(&report)?)?;
@@ -946,6 +962,7 @@ pub(super) fn perf_counters_json(
     perf: &PerfCounters,
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
     jit_clif: izarravm_cpu::JitClifCounters,
+    fast_map_probe: izarravm_cpu::FastMapProbeCounters,
 ) -> serde_json::Value {
     json!({
         "instructions": perf.instructions,
@@ -979,6 +996,8 @@ pub(super) fn perf_counters_json(
         "direct_page_misses": perf.direct_page_misses,
         "direct_data_pointer_reads": perf.direct_data_pointer_reads,
         "direct_data_pointer_writes": perf.direct_data_pointer_writes,
+        "interp_fast_map_hits": fast_map_probe.hits,
+        "interp_fast_map_misses": fast_map_probe.misses,
         "fetch_page_hits": perf.fetch_page_hits,
         "fetch_page_misses": perf.fetch_page_misses,
         "slow_prefetch_refills": perf.slow_prefetch_refills,
@@ -1110,7 +1129,12 @@ pub(super) fn perf_counters_json(
     })
 }
 
-pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
+pub(super) fn print_perf_counter_row(
+    name: &str,
+    mode: GswMode,
+    perf: &PerfCounters,
+    fast_map_probe: izarravm_cpu::FastMapProbeCounters,
+) {
     let instructions = perf.instructions.max(1);
     let decode_hit = 100.0 * (1.0 - perf.decode_misses as f64 / instructions as f64);
     let insns_per_run = perf.instructions as f64 / perf.straight_line_runs.max(1) as f64;
@@ -1118,7 +1142,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
          brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
          inval[cs/smc/other/all]={}/{}/{}/{} narrow={}  \
-         data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
+         data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
          jit[entries/insns/native/helper]={}/{}/{}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
@@ -1149,6 +1173,8 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.data_slow_writes,
         perf.direct_data_pointer_reads,
         perf.direct_data_pointer_writes,
+        fast_map_probe.hits,
+        fast_map_probe.misses,
         perf.direct_page_hits,
         perf.direct_page_misses,
         perf.fetch_page_hits,

@@ -815,6 +815,819 @@ fn fast_map_same_tag_remap_replaces_residency_and_fault_keeps_read_mapping() {
     assert_eq!(denied_bus.memory[FRAME_B as usize], 0);
 }
 
+// --- Lever 1: interpreter FastMap serve path -------------------------------------------------
+//
+// The tests below exercise `CpuGsw::fast_map_data_slot` and its joined tails
+// (`finish_fast_map_read`/`finish_fast_map_write`) ONLY through the public interpreter API
+// (`read_memory_u8`/`write_memory_u8`/`read_memory_sized`/`write_memory_sized`) plus the
+// `fast_map_probe_counters()` hit/miss counters and `jit_fast_map` mapping queries --
+// those private helpers are not reachable from this module. None of these fixtures compile or run
+// native code (no `jit_direct::compile`/`install`), so the JIT block-entry-position trap that has
+// bitten this repo before does not apply here.
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn read_by_width(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, width: BusWidth) -> u32 {
+    match width {
+        BusWidth::Byte => u32::from(
+            cpu.read_memory_u8(bus, SegmentIndex::Ds, linear, BusAccessKind::DataRead)
+                .unwrap(),
+        ),
+        BusWidth::Word => cpu
+            .read_memory_sized(
+                bus,
+                SegmentIndex::Ds,
+                linear,
+                OperandSize::Word,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+        BusWidth::Dword => cpu
+            .read_memory_sized(
+                bus,
+                SegmentIndex::Ds,
+                linear,
+                OperandSize::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+    }
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn write_by_width(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, width: BusWidth, value: u32) {
+    match width {
+        BusWidth::Byte => cpu
+            .write_memory_u8(
+                bus,
+                SegmentIndex::Ds,
+                linear,
+                value as u8,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap(),
+        BusWidth::Word => cpu
+            .write_memory_sized(
+                bus,
+                SegmentIndex::Ds,
+                linear,
+                OperandSize::Word,
+                value,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap(),
+        BusWidth::Dword => cpu
+            .write_memory_sized(
+                bus,
+                SegmentIndex::Ds,
+                linear,
+                OperandSize::Dword,
+                value,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap(),
+    }
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn flip_bits(width: BusWidth, value: u32) -> u32 {
+    match width {
+        BusWidth::Byte => u32::from((value as u8) ^ 0xff),
+        BusWidth::Word => u32::from((value as u16) ^ 0xffff),
+        BusWidth::Dword => value ^ 0xffff_ffff,
+    }
+}
+
+/// Fidelity anchor for the whole slice: a FastMap hit and a forced slow path must be
+/// indistinguishable in guest-visible terms. `fast` primes the FastMap (`set_jit_auto_admit`) and
+/// takes the hit on the measured access; `slow` never populates (auto-admit stays off), so it
+/// always takes the canonical translate+DirectPageCache path, including on the measured access.
+/// Both buses share the same wait-state model (`direct_page_clocks = true`), so
+/// `trace.elapsed_clocks()` is directly comparable -- this is the interpreter-side counterpart of
+/// the design doc's "compare `trace.elapsed_clocks`, never `trace.cycles`" rule.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_serve_path_matches_slow_path_for_ram_reads_and_writes() {
+    const LINEAR: u32 = 0x0000_3010;
+
+    let fixture = |auto_admit: bool| {
+        let mut memory = vec![0u8; 0x6000];
+        memory[LINEAR as usize..LINEAR as usize + 4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        let mut cpu = CpuGsw::default();
+        cpu.set_jit_auto_admit(auto_admit);
+        (cpu, bus)
+    };
+
+    for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+        // --- Read direction ---
+        let (mut fast, mut fast_bus) = fixture(true);
+        let (mut slow, mut slow_bus) = fixture(false);
+        let prime_fast = read_by_width(&mut fast, &mut fast_bus, LINEAR, width);
+        let prime_slow = read_by_width(&mut slow, &mut slow_bus, LINEAR, width);
+        assert_eq!(prime_fast, prime_slow);
+        assert!(fast.jit_fast_map.has_read_mapping(LINEAR, LINEAR));
+        assert!(!slow.jit_fast_map.has_read_mapping(LINEAR, LINEAR));
+
+        let hits_before = fast.fast_map_probe_counters().hits;
+        fast_bus.trace.clear();
+        slow_bus.trace.clear();
+        let value_fast = read_by_width(&mut fast, &mut fast_bus, LINEAR, width);
+        let value_slow = read_by_width(&mut slow, &mut slow_bus, LINEAR, width);
+
+        assert_eq!(value_fast, value_slow, "{width:?} read value diverged");
+        assert_eq!(
+            fast.fast_map_probe_counters().hits,
+            hits_before + 1,
+            "{width:?} read did not take the fast path"
+        );
+        assert_eq!(slow.fast_map_probe_counters().hits, 0);
+        assert_eq!(
+            fast_bus.trace.elapsed_clocks(),
+            slow_bus.trace.elapsed_clocks(),
+            "{width:?} read charged different bus clocks"
+        );
+        assert_eq!(fast.registers.eflags, slow.registers.eflags);
+
+        // --- Write direction ---
+        let (mut fast, mut fast_bus) = fixture(true);
+        let (mut slow, mut slow_bus) = fixture(false);
+        // Prime with a same-value write (no guest-visible change) so it populates the fast CPU's
+        // write bias without disturbing the byte pattern the measured write overwrites.
+        let existing = read_by_width(&mut fast, &mut fast_bus, LINEAR, width);
+        write_by_width(&mut fast, &mut fast_bus, LINEAR, width, existing);
+        write_by_width(&mut slow, &mut slow_bus, LINEAR, width, existing);
+        assert!(fast.jit_fast_map.has_write_mapping(LINEAR, LINEAR));
+        assert!(!slow.jit_fast_map.has_write_mapping(LINEAR, LINEAR));
+
+        let hits_before = fast.fast_map_probe_counters().hits;
+        fast_bus.trace.clear();
+        slow_bus.trace.clear();
+        let new_value = flip_bits(width, existing);
+        write_by_width(&mut fast, &mut fast_bus, LINEAR, width, new_value);
+        write_by_width(&mut slow, &mut slow_bus, LINEAR, width, new_value);
+
+        let end = LINEAR as usize + width.bytes() as usize;
+        assert_eq!(
+            fast_bus.memory[LINEAR as usize..end],
+            slow_bus.memory[LINEAR as usize..end],
+            "{width:?} write produced different memory"
+        );
+        assert_eq!(
+            fast.fast_map_probe_counters().hits,
+            hits_before + 1,
+            "{width:?} write did not take the fast path"
+        );
+        assert_eq!(slow.fast_map_probe_counters().hits, 0);
+        assert_eq!(
+            fast_bus.trace.elapsed_clocks(),
+            slow_bus.trace.elapsed_clocks(),
+            "{width:?} write charged different bus clocks"
+        );
+        assert_eq!(fast.registers.eflags, slow.registers.eflags);
+    }
+}
+
+/// A Mode13 hit must defer to the full `charge_direct_memory` (video wait states plus the
+/// `note_direct_write`-equivalent bookkeeping `TestBus::note_mode13_write` stands in for), never
+/// the flat RAM charge `charge_direct_ram_memory` takes. Same fast-vs-forced-slow differential as
+/// the RAM fidelity test above, at an address inside the FastMap's and the bus's Mode13 aperture
+/// (0xa0000..0xb0000 in both -- see `fast_map.rs::MODE13_BASE/END` and
+/// `bus.rs::charge_direct_memory`'s range test, which this test's agreement depends on).
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_mode13_write_charges_video_wait_states_like_the_slow_path() {
+    const LINEAR: u32 = 0x000a_0100;
+
+    let fixture = |auto_admit: bool| {
+        // Big enough to cover the whole 0xa0000..0xb0000 aperture.
+        let memory = vec![0u8; 0x000c_0000];
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        let mut cpu = CpuGsw::default();
+        cpu.set_jit_auto_admit(auto_admit);
+        // LINEAR (0xa0100) exceeds a default real-mode segment's 0xffff limit; go flat so the
+        // access resolves purely on the address, matching the other paged/flat fixtures here.
+        cpu.registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+        (cpu, bus)
+    };
+
+    for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+        let (mut fast, mut fast_bus) = fixture(true);
+        let (mut slow, mut slow_bus) = fixture(false);
+        write_by_width(&mut fast, &mut fast_bus, LINEAR, width, 0);
+        write_by_width(&mut slow, &mut slow_bus, LINEAR, width, 0);
+        assert!(fast.jit_fast_map.has_write_mapping(LINEAR, LINEAR));
+
+        let hits_before = fast.fast_map_probe_counters().hits;
+        fast_bus.trace.clear();
+        slow_bus.trace.clear();
+        write_by_width(&mut fast, &mut fast_bus, LINEAR, width, 0xa5);
+        write_by_width(&mut slow, &mut slow_bus, LINEAR, width, 0xa5);
+
+        assert_eq!(
+            fast.fast_map_probe_counters().hits,
+            hits_before + 1,
+            "{width:?} mode13 write did not take the fast path"
+        );
+        assert_eq!(
+            fast_bus.trace.elapsed_clocks(),
+            slow_bus.trace.elapsed_clocks(),
+            "{width:?} mode13 write charged different bus clocks"
+        );
+        assert_ne!(
+            fast_bus.trace.elapsed_clocks(),
+            0,
+            "{width:?} mode13 write charged nothing -- the test would be vacuous"
+        );
+        assert_eq!(fast_bus.mode13_dirty_pages, slow_bus.mode13_dirty_pages);
+        assert_ne!(fast_bus.mode13_dirty_pages, 0);
+        let (fast_writes, slow_writes) = match width {
+            BusWidth::Byte => (fast_bus.mode13_byte_writes, slow_bus.mode13_byte_writes),
+            BusWidth::Word => (fast_bus.mode13_word_writes, slow_bus.mode13_word_writes),
+            BusWidth::Dword => (fast_bus.mode13_dword_writes, slow_bus.mode13_dword_writes),
+        };
+        assert!(
+            fast_writes > 0,
+            "{width:?} note_direct_write-equivalent was not called on the fast path"
+        );
+        assert_eq!(fast_writes, slow_writes);
+        let end = LINEAR as usize + width.bytes() as usize;
+        assert_eq!(
+            fast_bus.memory[LINEAR as usize..end],
+            slow_bus.memory[LINEAR as usize..end]
+        );
+    }
+}
+
+/// `lookup_access` rejects an unaligned width even on a page that is otherwise live in the
+/// FastMap (populated here by a prior ALIGNED dword read), so an unaligned probe misses by
+/// construction of the hit predicate, not merely because the page was never touched.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_probe_rejects_unaligned_widths() {
+    const BASE: u32 = 0x0000_4000;
+    let mut memory = vec![0u8; 0x6000];
+    memory[BASE as usize..BASE as usize + 8]
+        .copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(true);
+
+    cpu.read_memory_sized(
+        &mut bus,
+        SegmentIndex::Ds,
+        BASE,
+        OperandSize::Dword,
+        BusAccessKind::DataRead,
+    )
+    .unwrap();
+    assert!(cpu.jit_fast_map.has_read_mapping(BASE, BASE));
+
+    for (offset, width) in [
+        (1u32, OperandSize::Word),
+        (1, OperandSize::Dword),
+        (2, OperandSize::Dword),
+    ] {
+        let hits_before = cpu.fast_map_probe_counters().hits;
+        let misses_before = cpu.fast_map_probe_counters().misses;
+        cpu.read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            BASE + offset,
+            width,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+        assert_eq!(
+            cpu.fast_map_probe_counters().hits,
+            hits_before,
+            "unaligned {width:?} at +{offset} took the fast path"
+        );
+        assert!(cpu.fast_map_probe_counters().misses > misses_before);
+    }
+}
+
+/// A crossing dword decomposes into two page-local WORD fragments (`page_local_fragment_width`
+/// never returns a width that would itself cross a page), so no single FastMap probe ever sees a
+/// crossing width. This sets up two adjacent linear pages backed by DIFFERENT physical frames --
+/// so a bug that served all 4 bytes from one page's bias would read garbage across the boundary
+/// -- and checks both the combined value AND that both fragments independently took the fast path.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_serves_cross_page_reads_correctly_via_page_local_fragments() {
+    const DIRECTORY: u32 = 0x1000;
+    const TABLE: u32 = 0x2000;
+    const LINEAR_PAGE0: u32 = 0x0000_3000;
+    const LINEAR_PAGE1: u32 = 0x0000_4000;
+    const FRAME0: u32 = 0x0000_6000;
+    const FRAME1: u32 = 0x0000_7000;
+    const BOUNDARY_LINEAR: u32 = LINEAR_PAGE0 + 0x0ffe;
+
+    let mut memory = vec![0u8; 0x9000];
+    memory[DIRECTORY as usize..DIRECTORY as usize + 4].copy_from_slice(&(TABLE | 7).to_le_bytes());
+    let pte0 = TABLE as usize + (((LINEAR_PAGE0 >> 12) as usize) & 0x3ff) * 4;
+    let pte1 = TABLE as usize + (((LINEAR_PAGE1 >> 12) as usize) & 0x3ff) * 4;
+    memory[pte0..pte0 + 4].copy_from_slice(&(FRAME0 | 7).to_le_bytes());
+    memory[pte1..pte1 + 4].copy_from_slice(&(FRAME1 | 7).to_le_bytes());
+    memory[(FRAME0 + 0x0ffe) as usize] = 0xaa;
+    memory[(FRAME0 + 0x0fff) as usize] = 0xbb;
+    memory[FRAME1 as usize] = 0xcc;
+    memory[(FRAME1 + 1) as usize] = 0xdd;
+
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(true);
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.control.cr3 = DIRECTORY;
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+
+    // A page's read bias serves any width once live, so a plain byte read anywhere inside it is
+    // enough to prime both pages.
+    cpu.read_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        LINEAR_PAGE0,
+        BusAccessKind::DataRead,
+    )
+    .unwrap();
+    cpu.read_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        LINEAR_PAGE1,
+        BusAccessKind::DataRead,
+    )
+    .unwrap();
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR_PAGE0, FRAME0));
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR_PAGE1, FRAME1));
+
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    let value = cpu
+        .read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            BOUNDARY_LINEAR,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+
+    assert_eq!(
+        value, 0xddcc_bbaa,
+        "cross-page fragments read the wrong bytes"
+    );
+    assert_eq!(
+        cpu.fast_map_probe_counters().hits,
+        hits_before + 2,
+        "expected both page-local fragments to take the fast path"
+    );
+}
+
+/// A CPL-3 access to a supervisor-only page must fault identically whether or not the FastMap is
+/// armed. `fast` primes a CPL-0 read (which sets a live FastMap entry with PAGE_USER unset, since
+/// the TLB entry's `user` bit is false), then flips to CPL 3 for the measured access, which must
+/// still fault via `lookup_access`'s own PAGE_USER check. `slow` never populates (auto-admit off)
+/// and takes the canonical `translate_linear_checked` path as the architectural reference.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_hit_still_faults_a_cpl3_access_to_a_supervisor_page() {
+    const DIRECTORY: u32 = 0x1000;
+    const TABLE: u32 = 0x2000;
+    const LINEAR: u32 = 0x0000_3000;
+    const FRAME: u32 = 0x0000_5000;
+
+    let fixture = || {
+        let mut memory = vec![0u8; 0x7000];
+        memory[DIRECTORY as usize..DIRECTORY as usize + 4]
+            .copy_from_slice(&(TABLE | 0x07).to_le_bytes());
+        let pte = TABLE as usize + (((LINEAR >> 12) as usize) & 0x3ff) * 4;
+        // Present + writable, but NOT user (bit 2 clear): a supervisor-only page.
+        memory[pte..pte + 4].copy_from_slice(&(FRAME | 0x03).to_le_bytes());
+        memory[FRAME as usize] = 0xa5;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let mut cpu = CpuGsw::default();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = DIRECTORY;
+        cpu.registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+        (cpu, bus)
+    };
+
+    let (mut fast, mut fast_bus) = fixture();
+    fast.set_jit_auto_admit(true);
+    fast.cpl = 0;
+    assert_eq!(
+        fast.read_memory_u8(
+            &mut fast_bus,
+            SegmentIndex::Ds,
+            LINEAR,
+            BusAccessKind::DataRead
+        )
+        .unwrap(),
+        0xa5
+    );
+    assert!(fast.jit_fast_map.has_read_mapping(LINEAR, FRAME));
+    fast.cpl = 3;
+    let fast_result = fast.read_memory_u8(
+        &mut fast_bus,
+        SegmentIndex::Ds,
+        LINEAR,
+        BusAccessKind::DataRead,
+    );
+    assert!(fast.fast_map_probe_counters().misses > 0);
+
+    let (mut slow, mut slow_bus) = fixture();
+    slow.cpl = 0;
+    slow.read_memory_u8(
+        &mut slow_bus,
+        SegmentIndex::Ds,
+        LINEAR,
+        BusAccessKind::DataRead,
+    )
+    .unwrap();
+    assert!(!slow.jit_fast_map.has_read_mapping(LINEAR, FRAME));
+    slow.cpl = 3;
+    let slow_result = slow.read_memory_u8(
+        &mut slow_bus,
+        SegmentIndex::Ds,
+        LINEAR,
+        BusAccessKind::DataRead,
+    );
+
+    match (fast_result, slow_result) {
+        (
+            Err(InternalFault::Exception {
+                vector: fv,
+                error_code: fe,
+            }),
+            Err(InternalFault::Exception {
+                vector: sv,
+                error_code: se,
+            }),
+        ) => {
+            assert_eq!(fv, 14);
+            assert_eq!(sv, 14);
+            assert_eq!(fe, se, "fast-path and slow-path #PF error codes diverged");
+        }
+        other => panic!("expected both paths to fault identically with vector 14, got {other:?}"),
+    }
+}
+
+/// A write to a page whose PTE dirty bit is not yet set must take the slow (walk) path even with
+/// the FastMap armed, because a write bias is only ever created after `record_write_page`'s walk
+/// commits the dirty bit -- see `fast_map_permissions` (memory.rs), which requires `entry.dirty`
+/// for a write. This is the same fixture shape as `fast_map_same_tag_dirty_upgrade_keeps_read_
+/// residency` above, extended with the new hit/miss counters this slice adds.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn first_write_to_a_clean_pte_page_takes_the_slow_path() {
+    const LINEAR: u32 = 0x3000;
+    const FRAME: u32 = 0x5000;
+    const PTE: usize = 0x2000 + ((LINEAR >> 12) as usize * 4);
+
+    let mut memory = vec![0u8; 0x8000];
+    memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    memory[PTE..PTE + 4].copy_from_slice(&(FRAME | 7).to_le_bytes());
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(true);
+    cpu.control.cr0 |= CR0_PE | CR0_PG | CR0_WP;
+    cpu.control.cr3 = 0x1000;
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, LINEAR, BusAccessKind::DataRead)
+        .unwrap();
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR, FRAME));
+    assert!(!cpu.jit_fast_map.has_write_mapping(LINEAR, FRAME));
+    assert!(!cpu.tlb.lookup(LINEAR >> 12).unwrap().dirty);
+
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    let misses_before = cpu.fast_map_probe_counters().misses;
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        LINEAR,
+        0xa5,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+
+    assert_eq!(
+        cpu.fast_map_probe_counters().hits,
+        hits_before,
+        "the clean-PTE write hit the fast path"
+    );
+    assert_eq!(cpu.fast_map_probe_counters().misses, misses_before + 1);
+    assert!(
+        cpu.tlb.lookup(LINEAR >> 12).unwrap().dirty,
+        "the walk that sets the dirty bit was skipped"
+    );
+    assert!(cpu.jit_fast_map.has_write_mapping(LINEAR, FRAME));
+    assert_eq!(bus.memory[FRAME as usize], 0xa5);
+}
+
+/// A write that hits the FastMap and changes a watched (decoded) code byte must still invalidate,
+/// preserving the G2 same-value elision: a same-value priming write (which ALSO takes the slow
+/// path here, since it is the first write and creates the write bias) must NOT invalidate, and
+/// the measured, value-changing write through the fast path must.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_write_hit_still_invalidates_watched_code() {
+    const CODE: u32 = 0x0000_0200;
+
+    let mut memory = vec![0u8; 0x1000];
+    memory[CODE as usize] = 0x90; // NOP
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(true);
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    // `line_live`'s second argument is the line's cached `default_size_32`, not "is decoded";
+    // force 32-bit CS (as `page_walk_overlap_cpu` does elsewhere in this file) so the
+    // `line_live(CODE, true)` checks below match what `fetch_decoded` actually cached.
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+
+    cpu.set_eip(CODE);
+    cpu.fetch_decoded(&mut bus, CODE)
+        .expect("decode the watched NOP");
+    assert!(cpu.decode_cache.line_live(CODE, true));
+    let invalidations_before = cpu.perf_counters().code_invalidations;
+
+    let existing = bus.memory[CODE as usize];
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        CODE,
+        existing,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(cpu.jit_fast_map.has_write_mapping(CODE, CODE));
+    assert!(
+        cpu.decode_cache.line_live(CODE, true),
+        "a same-value priming write must not invalidate (G2 elision)"
+    );
+    assert_eq!(cpu.perf_counters().code_invalidations, invalidations_before);
+
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        CODE,
+        0xcc,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+
+    assert_eq!(
+        cpu.fast_map_probe_counters().hits,
+        hits_before + 1,
+        "the measured write did not take the fast path"
+    );
+    assert!(
+        !cpu.decode_cache.line_live(CODE, true),
+        "a changed watched write through the fast path failed to invalidate"
+    );
+    assert_eq!(
+        cpu.perf_counters().code_invalidations,
+        invalidations_before + 1
+    );
+    assert_eq!(bus.memory[CODE as usize], 0xcc);
+}
+
+/// `fast_map_population_enabled` gates population on `mode().uses_approximate_timing()`, and
+/// `fast_map_serve_enabled` (the interpreter serve path's cached mirror of that predicate) gates
+/// entry to `fast_map_data_slot` on the SAME condition; this asserts the consequence rather than
+/// assuming it: 386-slow and 386 (Accurate) never record a single FastMap hit, and never even
+/// probe (the miss counter also stays at zero, since `fast_map_serve_enabled` is false and
+/// `fast_map_data_slot` is never entered), even with native admission force-armed and repeated
+/// reads/writes at the same address. `FastMap::has_storage()` (a coarser, separate diagnostic --
+/// "has population ever run at all") also stays false, since population never runs either.
+/// Vacuousness is ruled out by checking that the accesses actually reached the direct-page path
+/// (`data_direct_reads`/`data_direct_writes` move).
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn accurate_timing_personas_never_take_the_interpreter_fast_path() {
+    for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
+        assert!(!mode.uses_approximate_timing());
+        let mut memory = vec![0u8; 0x6000];
+        memory[0x3000..0x3004].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(mode);
+        cpu.set_jit_auto_admit(true);
+
+        for _ in 0..4 {
+            cpu.read_memory_sized(
+                &mut bus,
+                SegmentIndex::Ds,
+                0x3000,
+                OperandSize::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap();
+            cpu.write_memory_sized(
+                &mut bus,
+                SegmentIndex::Ds,
+                0x3000,
+                OperandSize::Dword,
+                0x5566_7788,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            cpu.fast_map_probe_counters().hits,
+            0,
+            "{mode:?} took the interpreter fast path"
+        );
+        assert_eq!(
+            cpu.fast_map_probe_counters().misses,
+            0,
+            "{mode:?} probed the FastMap at all -- fast_map_serve_enabled should be false here"
+        );
+        assert!(
+            !cpu.jit_fast_map.has_storage(),
+            "{mode:?} populated the FastMap despite Accurate timing"
+        );
+        // Rule out vacuousness a different way now that the miss counter no longer moves: the
+        // accesses must still have reached the direct-page path.
+        assert!(
+            cpu.perf_counters().data_direct_reads > 0,
+            "{mode:?}: reads never reached the direct-page path -- fixture is vacuous"
+        );
+        assert!(
+            cpu.perf_counters().data_direct_writes > 0,
+            "{mode:?}: writes never reached the direct-page path -- fixture is vacuous"
+        );
+        assert!(!cpu.jit_fast_map.has_read_mapping(0x3000, 0x3000));
+        assert!(!cpu.jit_fast_map.has_write_mapping(0x3000, 0x3000));
+    }
+}
+
+/// BLOCKING regression test (adversarial review of the lever-1 slice): a LIVE mode switch away
+/// from an Approximate persona -- e.g. `OUT 0xE1` selecting 386-slow mid-run, izarravm-machine
+/// `bus.rs`/`run.rs` -- must stop the interpreter's FastMap serve path immediately, both the hits
+/// AND the probe itself (misses), proving `fast_map_serve_enabled` gates ENTRY to
+/// `fast_map_data_slot`, not merely population. Before this fix, `set_mode` never touched the
+/// FastMap at all: `FastMap::storage` stays allocated forever once created, so gating on
+/// `has_storage()` stayed true after the switch -- every post-switch access on the Accurate
+/// persona kept paying the full preamble (reinstating the steady-state regression this whole
+/// slice exists to fix) while surviving live entries could even keep SERVING from the wrong
+/// persona (a transient violation of "386-slow/386 Accurate never enter it, by construction").
+/// The final assertion checks the gate is a live mirror, not a one-way latch: switching back to
+/// an Approximate persona must re-arm the fast path without needing to repopulate from scratch.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn live_mode_switch_to_an_accurate_persona_stops_the_fast_map_probe() {
+    const LINEAR: u32 = 0x0000_3000;
+    let mut memory = vec![0u8; 0x6000];
+    memory[LINEAR as usize..LINEAR as usize + 4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default(); // Gsw586 by default: an Approximate persona.
+    cpu.set_jit_auto_admit(true);
+
+    // Populate, then confirm the fast path is actually live on the Approximate persona before
+    // the switch (otherwise the test proves nothing about the transition).
+    for _ in 0..2 {
+        cpu.read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            LINEAR,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+    }
+    assert!(
+        cpu.fast_map_probe_counters().hits > 0,
+        "fixture did not warm the fast path before the switch"
+    );
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR, LINEAR));
+
+    cpu.set_mode(GswMode::Gsw386Slow);
+
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    let misses_before = cpu.fast_map_probe_counters().misses;
+    for _ in 0..4 {
+        cpu.read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            LINEAR,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+        cpu.write_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            LINEAR,
+            OperandSize::Dword,
+            0x5566_7788,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        cpu.fast_map_probe_counters().hits,
+        hits_before,
+        "hits kept increasing after a live switch to an Accurate persona"
+    );
+    assert_eq!(
+        cpu.fast_map_probe_counters().misses,
+        misses_before,
+        "the probe itself kept running after the switch -- fast_map_serve_enabled did not go \
+         false, so the guaranteed-miss preamble cost is back"
+    );
+    // Vacuousness check now that neither counter moves: the accesses still reached the
+    // direct-page path.
+    assert!(cpu.perf_counters().data_direct_reads > 0);
+    assert!(cpu.perf_counters().data_direct_writes > 0);
+
+    // Switching back to an Approximate persona must re-arm the fast path. The FastMap's own
+    // entries were never invalidated by the mode switch (only the serve gate closed), so this
+    // hits immediately without needing to repopulate.
+    cpu.set_mode(GswMode::Gsw586);
+    let hits_before_return = cpu.fast_map_probe_counters().hits;
+    cpu.read_memory_sized(
+        &mut bus,
+        SegmentIndex::Ds,
+        LINEAR,
+        OperandSize::Dword,
+        BusAccessKind::DataRead,
+    )
+    .unwrap();
+    assert!(
+        cpu.fast_map_probe_counters().hits > hits_before_return,
+        "fast path did not re-arm after switching back to an Approximate persona"
+    );
+}
+
+// --- end lever 1 tests -------------------------------------------------------------------------
+
 #[test]
 #[cfg(feature = "jit")]
 fn region_ctx_fn_pointer_offsets() {
@@ -825,7 +1638,9 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
-    // Pending flags offset for direct native writes; shifts whenever PerfCounters grows.
+    // Pending flags offset for direct native writes; shifts whenever PerfCounters grows. The
+    // lever-1 slice's interp_fast_map_hits/_misses counters live in FastMapProbeCounters at the
+    // CpuGsw tail instead (see that type), specifically so this pin stays at 4512.
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
 }
 
@@ -2125,6 +2940,25 @@ impl CpuBus for TestBus {
                 Self::direct_page_wait_states(width)
             };
             self.trace.record(kind, address, width, wait_states);
+        }
+        Ok(())
+    }
+
+    // Mirrors ONLY the non-Mode13 branch of `charge_direct_memory` above: same wait-state
+    // function, same `direct_page_clocks` gate, no `note_mode13_write`. The interpreter's FastMap
+    // serve path calls this instead of `charge_direct_memory` once it already knows (from the
+    // FastMap's own `PageKind`) that the hit is plain RAM, so a fast-path RAM access and a
+    // forced-slow-path RAM access must charge byte-identical clocks through this and the sibling
+    // method respectively -- that equivalence is exactly what the lever-1 fidelity tests check.
+    fn charge_direct_ram_memory(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        if self.direct_page_clocks {
+            self.trace
+                .record(kind, address, width, Self::direct_page_wait_states(width));
         }
         Ok(())
     }

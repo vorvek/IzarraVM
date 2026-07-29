@@ -845,7 +845,12 @@ fn run_boot_hdd_folder(
     }
     // Run-shape diagnostics (insns/run + break reasons). Unconditional: the counters are
     // always maintained, so unlike the sampled profile above this print costs nothing.
-    bench::print_perf_counter_row("hdd-folder", hardware.cpu, machine.cpu().perf_counters());
+    bench::print_perf_counter_row(
+        "hdd-folder",
+        hardware.cpu,
+        machine.cpu().perf_counters(),
+        machine.cpu().fast_map_probe_counters(),
+    );
     maybe_report_unit_sim(&mut machine);
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
     // that the run loop returned, or its last partial buffer's worth of lines -- most
@@ -958,6 +963,7 @@ fn write_hdd_profile_json(
             perf,
             machine.cpu().poll_skip_memory(),
             machine.cpu().jit_clif_counters(),
+            machine.cpu().fast_map_probe_counters(),
         ),
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;

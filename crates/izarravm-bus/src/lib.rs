@@ -784,6 +784,30 @@ pub trait CpuBus {
         Ok(())
     }
 
+    /// Charge a direct-memory access already known to be plain RAM (not the Mode13h VGA
+    /// aperture), skipping whatever aperture range compare `charge_direct_memory` would otherwise
+    /// redo. Callers that have NOT independently established the access is outside the VGA
+    /// aperture must call `charge_direct_memory` instead.
+    ///
+    /// The default DELEGATES to `charge_direct_memory` rather than no-op'ing: today only
+    /// `MachineBus` and `TestBus` override this trait, and both also override
+    /// `charge_direct_memory`, so nothing currently reaches this default. But nothing links the
+    /// pair, and a future bus that overrides one and forgets the other would otherwise charge
+    /// ZERO clocks on every FastMap hit -- a silent timing divergence with no test, no assert, no
+    /// compile error (this campaign has shipped exactly that "missing arm invisible to every
+    /// other assertion" bug class more than once). Delegating makes the failure mode "correct but
+    /// pays the redundant aperture compare this method exists to skip" instead of "silently
+    /// wrong"; behavior-neutral for both current implementors, since each already overrides this
+    /// method directly and never reaches the default.
+    fn charge_direct_ram_memory(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        self.charge_direct_memory(address, width, kind)
+    }
+
     /// Return an upper bound on the raw clocks added by one cached direct-memory charge. `Some`
     /// remains valid until the bus reports a step break. A JIT uses it only after its CPU-side
     /// direct-page cache hit; `None` keeps the ordinary instruction path.

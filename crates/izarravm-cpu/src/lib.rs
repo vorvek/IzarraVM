@@ -1159,6 +1159,36 @@ impl PartialEq for JitClifCounters {
 }
 impl Eq for JitClifCounters {}
 
+/// Lever 1 (interpreter FastMap serve path) hit/miss counters. Kept OUT of `PerfCounters` and at
+/// the very tail of `CpuGsw`, following the `PollSkipMemoryCounters`/`JitClifCounters` pattern
+/// exactly: these two fields were first added directly to `PerfCounters` and moved the pinned
+/// `pending_flags` offset from 4512 to 4528 (the interpreter's hot-field layout pin in
+/// `cpu_test.rs`/`canonical_state_test.rs`), an avoidable layout confound the campaign's adversarial
+/// review caught. At the tail they change only the struct's total size. Serialized into the same
+/// `interp_fast_map_hits`/`interp_fast_map_misses` perf JSON keys by `perf_counters_json`.
+/// Unconditional (not cfg-gated) like the other tail counters, so non-jit consumers can name the
+/// type; the fields simply stay zero on a build/persona that never probes the FastMap.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FastMapProbeCounters {
+    /// Interpreter direct data accesses served from the JIT FastMap.
+    pub hits: u64,
+    /// Interpreter direct data accesses that probed the FastMap (`self.fast_map_serve_enabled`
+    /// was true) and missed, falling through to the canonical translate/direct-page-cache path
+    /// unchanged. A guaranteed-miss access -- JIT off, or the current persona/admission state
+    /// disables population -- never reaches this counter at all (see
+    /// `CpuGsw::fast_map_serve_enabled`), so it is not "every miss ever", only misses that were
+    /// actually probed against a serve-enabled map.
+    pub misses: u64,
+}
+
+impl PartialEq for FastMapProbeCounters {
+    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for FastMapProbeCounters {}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
     pub name: &'static str,
@@ -1309,6 +1339,52 @@ impl PartialEq for DirectRuntimeState {
         true
     }
 }
+
+/// Cached mirror of `fast_map_population_enabled()` (memory.rs), gating the interpreter's
+/// FastMap serve path. A transparent host-side accelerator flag, exactly like
+/// `DirectRuntimeState.admission_active`: excluded from CPU equality (differential tests compare
+/// an interpreter and a native CPU that were driven through different setup call sequences, so
+/// this flag can legitimately differ between two otherwise-architecturally-identical CPUs) and
+/// reset to `false` on clone rather than copied, so a clone starts cold and gets its real value
+/// from whichever call site next runs `refresh_fast_map_serve_gate` (`set_mode`,
+/// `finish_direct_execution_transition`, etc.) -- never a stale copy of the source CPU's value.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[derive(Debug, Default)]
+struct FastMapServeGate {
+    enabled: bool,
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+impl Clone for FastMapServeGate {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+impl PartialEq for FastMapServeGate {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+impl Eq for FastMapServeGate {}
 
 #[cfg(feature = "jit")]
 impl Eq for DirectRuntimeState {}
@@ -1465,6 +1541,27 @@ pub struct CpuGsw {
     /// Clif shell diagnostics, also at the tail for the same layout reason (Track C C1a);
     /// see `JitClifCounters`.
     jit_clif: JitClifCounters,
+    /// Cached mirror of `fast_map_population_enabled()`, refreshed at every state change that
+    /// predicate depends on (`set_mode`, `finish_direct_execution_transition`,
+    /// `set_clif_backend_enabled`, `set_legacy_region_auto_admit` -- see
+    /// `memory.rs::refresh_fast_map_serve_gate` for the exact call-site inventory). The
+    /// interpreter's FastMap serve path gates on this instead of re-deriving the condition (four
+    /// predicate calls) or testing `FastMap::has_storage()` (which stays `true` forever once any
+    /// population has ever happened, including across a live GSW mode switch into a persona that
+    /// can never repopulate -- see the lever-1 campaign log for the regression that produced this
+    /// field). At the `CpuGsw` tail rather than added to `PerfCounters`, for the same layout
+    /// reason as `FastMapProbeCounters` below. See `FastMapServeGate` for why it is a wrapper
+    /// struct rather than a plain `bool`: it must be excluded from CPU equality and reset (not
+    /// copied) on clone, like `DirectRuntimeState.admission_active`.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fast_map_serve_enabled: FastMapServeGate,
+    /// Lever 1 hit/miss counters, at the tail for the same layout reason; see
+    /// `FastMapProbeCounters`.
+    fast_map_probe: FastMapProbeCounters,
 }
 
 impl Default for CpuGsw {
@@ -1527,6 +1624,13 @@ impl Default for CpuGsw {
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
             jit_clif: JitClifCounters::default(),
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            fast_map_serve_enabled: FastMapServeGate::default(),
+            fast_map_probe: FastMapProbeCounters::default(),
         }
     }
 }

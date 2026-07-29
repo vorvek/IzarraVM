@@ -566,6 +566,19 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         self.jit_regions.clear();
         self.invalidate_code_caches();
+        // `fast_map_population_enabled()` (memory.rs) depends on `mode()`: a live switch INTO an
+        // Accurate persona must stop the interpreter's FastMap serve path from probing at all, not
+        // merely stop it from populating further. Without this refresh, `fast_map_serve_enabled`
+        // stays stuck at whatever it was on the PREVIOUS persona -- on a switch away from an
+        // Approximate persona this both reinstates the guaranteed-miss preamble cost the serve
+        // gate exists to avoid, and lets already-live FastMap entries keep serving under a persona
+        // that must never take this path (both found by adversarial review of the lever-1 slice).
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.refresh_fast_map_serve_gate();
     }
 
     /// Advance the architectural TSC for machine time not represented by
@@ -689,6 +702,13 @@ impl CpuGsw {
         counters
     }
 
+    /// Lever 1 (interpreter FastMap serve path) hit/miss counters, stored outside
+    /// `PerfCounters` at the `CpuGsw` tail (see `FastMapProbeCounters` for why). Reset
+    /// alongside the other counters by `reset_perf_counters`.
+    pub fn fast_map_probe_counters(&self) -> FastMapProbeCounters {
+        self.fast_map_probe
+    }
+
     /// Zero the host-side performance counters, including the memory-poll and
     /// clif subsets stored outside `PerfCounters` (see `PollSkipMemoryCounters`
     /// and `JitClifCounters`).
@@ -696,6 +716,7 @@ impl CpuGsw {
         self.perf = PerfCounters::default();
         self.poll_skip_memory = PollSkipMemoryCounters::default();
         self.jit_clif = JitClifCounters::default();
+        self.fast_map_probe = FastMapProbeCounters::default();
     }
 
     #[cfg(feature = "jit")]

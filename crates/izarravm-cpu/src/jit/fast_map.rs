@@ -7,7 +7,6 @@
 //! Native code can then use the pointer bias while the mapping remains shadowed by the modeled TLB.
 //! Interpreter accesses continue through the canonical translation path.
 
-#[cfg(test)]
 use izarravm_bus::BusWidth;
 use izarravm_bus::DirectPage;
 
@@ -37,6 +36,17 @@ pub(crate) enum PageKind {
     Mode13 = 2,
 }
 
+/// Decode the two `PageKind` bits packed into a stored `flags` byte. Shared by the production
+/// `lookup_access` hit path and the test-only `FastMapEntry` inspector so the two never drift.
+#[inline]
+fn decode_kind(flags: u8) -> PageKind {
+    match flags & KIND_MASK {
+        x if x == PageKind::Ram as u8 => PageKind::Ram,
+        x if x == PageKind::Mode13 as u8 => PageKind::Mode13,
+        _ => PageKind::Unavailable,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PagePermissions {
     pub(crate) writable: bool,
@@ -50,20 +60,33 @@ impl PagePermissions {
     };
 }
 
-/// One permission-checked lookup used to test the same entry rules as native code.
+/// One permission-checked lookup used to test the same entry rules as native code. The
+/// interpreter's FastMap serve path (`CpuGsw::fast_map_data_slot`) consumes this directly; tests
+/// additionally use the `read`/`write` helpers below to exercise it without a full CPU.
 #[derive(Clone, Copy)]
-#[cfg(test)]
 pub(crate) struct FastMapAccess {
     physical: u32,
     ptr: *mut u8,
+    kind: PageKind,
 }
 
-#[cfg(test)]
 impl FastMapAccess {
     pub(crate) const fn physical(self) -> u32 {
         self.physical
     }
 
+    pub(crate) const fn ptr(self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Whether this hit resolved to the Mode 13h VGA aperture rather than plain RAM. The
+    /// interpreter's fast-path tail uses this to decide whether it may take the flat RAM charge
+    /// or must defer to the full `charge_direct_memory` for its video wait states.
+    pub(crate) fn is_mode13(self) -> bool {
+        self.kind == PageKind::Mode13
+    }
+
+    #[cfg(test)]
     #[inline]
     pub(crate) fn read(self, width: BusWidth) -> u32 {
         match width {
@@ -79,6 +102,7 @@ impl FastMapAccess {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn write(self, width: BusWidth, value: u32) {
         match width {
@@ -208,7 +232,6 @@ impl FastMap {
     /// A write bias exists only after the page walker has committed the PTE dirty bit, so a hit is
     /// safe to use without losing accessed/dirty side effects. Protection is checked against the
     /// current accessor because CPL can change while a mapping remains live.
-    #[cfg(test)]
     #[inline]
     pub(crate) fn lookup_access(
         &self,
@@ -260,6 +283,7 @@ impl FastMap {
         Some(FastMapAccess {
             physical: physical_page | offset,
             ptr: bias.wrapping_add(linear as usize) as *mut u8,
+            kind: decode_kind(flags),
         })
     }
 
@@ -282,6 +306,23 @@ impl FastMap {
             write_protect,
         )
         .map(FastMapAccess::physical)
+    }
+
+    /// Whether the map has EVER been populated. `storage` allocates lazily inside `populate`
+    /// (`get_or_insert_with`) and is never freed afterward -- `invalidate_page`/`invalidate_all`
+    /// clear entries but leave `storage` itself `Some`. So this is `false` only before the FIRST
+    /// successful population on this CPU; it stays `true` for the rest of the CPU's life after
+    /// that, through every later invalidation and through a live GSW mode switch into a persona
+    /// that can never populate again. It is NOT a live "can this persona hit right now" test --
+    /// that condition is `CpuGsw::fast_map_serve_enabled` (memory.rs), a separately cached mirror
+    /// of `fast_map_population_enabled()` refreshed at every state change that predicate depends
+    /// on. Do not use `has_storage()` to gate the interpreter's serve path; it is kept as a
+    /// coarser diagnostic ("has population ever run at all") for tests. No non-test caller
+    /// currently exists; `#[allow(dead_code)]` matches this file's other test/native-only helpers.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn has_storage(&self) -> bool {
+        self.storage.is_some()
     }
 
     /// Return stable array bases for native code generation after the first map fill.
@@ -544,11 +585,7 @@ impl FastMapEntry {
     }
 
     fn kind(self) -> PageKind {
-        match self.flags & KIND_MASK {
-            1 => PageKind::Ram,
-            2 => PageKind::Mode13,
-            _ => PageKind::Unavailable,
-        }
+        decode_kind(self.flags)
     }
 
     fn read_ptr(self, linear: u32) -> Option<*mut u8> {
