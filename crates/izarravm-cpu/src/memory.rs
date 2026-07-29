@@ -325,9 +325,24 @@ impl CpuGsw {
     /// unpaged, exactly like the two `record_write_page` call sites inside
     /// `translate_linear_checked` that this replaces); the cheap `code_write_watched` probe;
     /// the charge (same split as `finish_fast_map_read`); the old-bytes compare that drives G2
-    /// same-value elision; the store itself; then `note_code_write_hit` iff the store both hit
-    /// watched code and changed a byte (invariant 3), matching the compare-then-write-then-
-    /// invalidate ordering `write_linear_fragment` already documents for the slow sized path.
+    /// same-value elision; the store itself; then `note_code_write_hit` on change (invariant 3),
+    /// matching the compare-then-write-then-invalidate ordering `write_linear_fragment` already
+    /// documents for the slow sized path.
+    ///
+    /// The invalidation gate is width-sensitive, because the two slow paths this replaces are NOT
+    /// symmetric: `write_linear_fragment` (sized) pre-gates on `code_write_watched` before calling
+    /// `note_code_write_hit` at all, but `write_linear_u8` (byte) calls `note_code_write`
+    /// (`note_code_write_hit` unconditionally forwarded) on every `changed` write, with no watched
+    /// pre-check. `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
+    /// unconditional unit-sim feed (`core.rs`) -- diagnostic only, but the one place
+    /// `IZARRAVM_UNIT_SIM` observes SMC. An earlier version of this function used `watched &&
+    /// changed` for every width, which silently dropped that sim feed for a changed byte write
+    /// that hits no watched code, exactly the persona (486/586, where the FastMap is armed) the
+    /// simulator exists to model. So: byte writes call `note_code_write_hit` on `changed` alone,
+    /// matching the slow byte path; sized writes keep the `watched && changed` pre-gate, matching
+    /// the slow sized path. `note_code_write_hit` re-derives whether anything is actually watched
+    /// on its own regardless of the caller's gate, so calling it for an unwatched byte write is
+    /// safe -- the invalidation half is then a harmless no-op and only the sim feed fires.
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -366,7 +381,7 @@ impl CpuGsw {
         }
         let changed = Self::read_fast_map_ptr(ptr, width) != value;
         Self::write_fast_map_ptr(ptr, width, value);
-        if watched && changed {
+        if changed && (width == BusWidth::Byte || watched) {
             self.note_code_write_hit(physical, width.bytes());
         }
         self.record_data_write(kind, true);

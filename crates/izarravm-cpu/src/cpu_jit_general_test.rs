@@ -2515,6 +2515,73 @@ fn unit_sim_self_loop_keeps_entry_open() {
     );
 }
 
+/// Adversarial review F2: `finish_fast_map_write`'s fast BYTE-write path must feed the unit-sim
+/// diagnostic (`note_code_write_hit`'s unconditional first action) on every real change, exactly
+/// like the slow byte path (`write_linear_u8`'s `if changed { self.note_code_write(..) }`) --
+/// even when the changed byte hits no watched code at all. The sim tracks unit ownership at PAGE
+/// granularity (`page_owners`), coarser than `code_watch`'s precise per-instruction/per-block
+/// spans, so "a byte the sim's unit owns but code_watch does not watch" is a real, constructible
+/// case, not a hypothetical one: this fixture builds a unit over the `usim_program` loop, then
+/// writes a DIFFERENT, never-decoded byte in the SAME page through the fast map. `IZARRAVM_UNIT_SIM`
+/// exists specifically to model 486/586 -- the personas where the fast path is armed -- so silently
+/// dropping this feed there defeats the diagnostic's purpose. Before this fix, gating on
+/// `watched && changed` for every width silently skipped the sim feed here (report.sim_invalidations
+/// would read 0); the fix keeps that gate for sized writes but not byte writes.
+#[test]
+fn fast_map_byte_write_feeds_unit_sim_even_when_unwatched() {
+    // Same page as USIM_START/USIM_LOOP (0x200/0x201) but far from any decoded or compiled byte.
+    const UNRELATED_BYTE: u32 = 0x0800;
+
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(usim_program(3));
+    bus.direct_pages_enabled = true;
+    cpu.set_jit_auto_admit(true);
+    cpu.set_unit_sim_enabled(true);
+    usim_arm(&mut cpu, 6);
+
+    drive_to_halt(&mut cpu, &mut bus);
+    assert!(
+        !cpu.code_write_watched(UNRELATED_BYTE, 1),
+        "fixture picked a byte that is already watched -- pick a different offset"
+    );
+
+    // Priming write: unpaged real mode is always permissive, but the FastMap write bias for this
+    // page does not exist until a first write completes, so this one still takes the slow path.
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        UNRELATED_BYTE,
+        0,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+
+    // The measured write: must take the fast path, must change the byte, must hit no watched code.
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        UNRELATED_BYTE,
+        0xaa,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert_eq!(
+        cpu.fast_map_probe_counters().hits,
+        hits_before + 1,
+        "the measured write did not take the fast path -- fixture is vacuous"
+    );
+
+    let reports = cpu.take_unit_sim_report().expect("sim enabled");
+    let (cfg, report, _) = &reports[0];
+    assert_eq!(*cfg, "L0", "the first ladder rung is L0");
+    assert!(
+        report.sim_invalidations > 0,
+        "L0 saw no SMC kill -- the fast byte-write path did not feed the unit sim for a \
+         changed-but-unwatched byte"
+    );
+}
+
 /// A 16-bit code segment can never produce a Direct block, because `key_for` refuses on `!d`.
 /// This asserts the admission path is not merely fruitless there but SKIPPED: the decode line's
 /// `jit_direct_hotness` must stay at 0.
