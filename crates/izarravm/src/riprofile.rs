@@ -14,8 +14,9 @@
 //! `IZARRAVM_RIP_PROFILE_DELAY_SECS=<n>` (default 0) delays sampling to skip
 //! BIOS/DOS boot and demo load.
 //!
-//! ponytail: suspend/resume sampling at 2 kHz costs a few percent and skews
-//! nothing we care about (shares, not absolute wall). Not for A/B ladders.
+//! Suspend/resume sampling at 2 kHz costs a few percent of wall and skews
+//! nothing this is used for (relative shares, not absolute wall). Never build
+//! an A/B ladder against this profile.
 
 use std::collections::HashMap;
 use std::io::Write;
