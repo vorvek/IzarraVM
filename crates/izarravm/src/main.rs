@@ -11,6 +11,8 @@ mod cmos;
 mod crt;
 mod gui;
 mod prefs;
+#[cfg(windows)]
+mod riprofile;
 
 use clap::Parser;
 use izarravm_audio::AudioSubsystem;
@@ -756,9 +758,16 @@ fn run_boot_hdd_folder(
         machine.enable_machine_profiling();
     }
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
+    #[cfg(windows)]
+    let rip_sampler =
+        std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| (riprofile::Sampler::start(), path));
     let start_wall = std::time::Instant::now();
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     let wall = start_wall.elapsed();
+    #[cfg(windows)]
+    if let Some((Some(sampler), path)) = rip_sampler {
+        sampler.stop_and_report(std::path::Path::new(&path));
+    }
     let timedemo = extract_timedemo_realtics(&machine.screen_text().as_text());
     if let Some(path) = profile_json {
         write_hdd_profile_json(
