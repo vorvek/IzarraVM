@@ -1435,6 +1435,19 @@ impl Encoder {
         );
     }
 
+    /// `vcvtsi2sd dst, merge, qword [base + disp32]`. The REX.W sibling of
+    /// `vcvtsi2sd_i32_disp32`: same map/pp/opcode, `w` set true so `vex_prefix` forces the
+    /// 3-byte C4 form and the memory operand is read as a 64-bit integer instead of 32-bit.
+    pub(crate) fn vcvtsi2sd_i64_disp32(&mut self, dst: Xmm, merge: Xmm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 3, true, false, 0x2a),
+            dst.0,
+            Some(merge.0),
+            base,
+            disp32,
+        );
+    }
+
     fn vcvttsd2si(&mut self, dst: Reg, src: Xmm, wide: bool) {
         self.vex_reg_rm(VexOp::new(1, 3, wide, false, 0x2c), dst.0, None, src.0);
     }

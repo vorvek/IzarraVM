@@ -1537,6 +1537,45 @@ fn an_fld_m64_is_lowered_with_two_dword_reads_registered() {
     assert_eq!(compilation.word_stores, 0);
 }
 
+/// Slice 40's fixture 4: a block with one FILD m64 (0xDF /5) has `dword_reads == 2`, not 1, for
+/// the same reason the FLD m64 fixture above does: an x87 Qword access is two independent dword
+/// bus transactions regardless of whether the memory operand is interpreted as a float or an
+/// integer. Same bracketing shape: two 2-clock INCs around the x87 slot so growth continues past
+/// it and the barrier stops the block exactly there. `StoreI64` (FISTP m64) is deferred, so
+/// there is no store-side counterpart to this fixture in this slice.
+#[test]
+fn an_fild_m64_is_lowered_with_two_dword_reads_registered() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0xdf,
+        0x2d,
+        0x00,
+        0x08,
+        0x00,
+        0x00,           // fild qword [0x800]
+        0x40,           // inc eax
+        DIRECT_BARRIER, // stop the block here
+    ]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 7, ENTRY + 8],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "growth must continue past the FILD"
+    );
+    assert_eq!(compilation.span.guest_len, 8);
+    assert_eq!(compilation.dword_reads, 2, "one m64 read counts as two");
+    assert_eq!(compilation.dword_stores, 0);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+}
+
 /// Slice 39, B2's fixture, the store side: a block with one FSTP m64 has `dword_stores == 2`.
 /// Unlike the read side, this does NOT price the bus (B2: store bus cost is dynamic-only,
 /// `exit.ram_dword_writes`), but it still feeds the quota bound, the map/code-watch gates and

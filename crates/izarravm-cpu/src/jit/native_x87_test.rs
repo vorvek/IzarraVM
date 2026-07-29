@@ -63,6 +63,10 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             | (0xde, 3, 0 | 1 | 4 | 5 | 6 | 7, 0..=7)
             | (0xde, 3, 3, 1)
             | (0xdf, 3, 4, 0)
+            // 0xDF /5 memory: FILD m64 (`LoadI64`). Slice 40, FILD-only scope: `/7` (FISTP m64,
+            // deferred) and `/4`/`/6` (FBLD/FBSTP, unimplemented) stay rejected, the positive
+            // assertion of the scope cut.
+            | (0xdf, 0..=2, 5, 0..=7)
     )
 }
 
@@ -89,8 +93,9 @@ fn classifier_selects_exact_traced_slice() {
     // eight rm values: 6 * 8 = 48, landing at 557. 0xDA memory forms add 3 modes x 8 sub-opcodes
     // x 8 rm values = 192, landing at 749. 0xDD memory (FLD/FST/FSTP m64) adds 3 modes x 3
     // sub-opcodes x 8 rm values = 72, landing at 821. 0xDC memory (f64 arithmetic) adds 3 modes
-    // x 8 sub-opcodes x 8 rm values = 192, landing at 1013.
-    assert_eq!(accepted, 1013);
+    // x 8 sub-opcodes x 8 rm values = 192, landing at 1013. 0xDF /5 memory (FILD m64) adds 3
+    // modes x 1 sub-opcode x 8 rm values = 24, landing at 1037.
+    assert_eq!(accepted, 1037);
 }
 
 #[test]
@@ -153,6 +158,20 @@ fn classifier_preserves_operations_indices_and_addresses() {
             NativeX87Insn::classify(&insn(0xdd, 0, extension, 5)).is_none(),
             "0xdd /{extension} memory (FISTTP/FLDENV/FRSTOR/FNSAVE/FSTSW) must stay \
              unclassifiable"
+        );
+    }
+    // FILD m64 (0xDF /5). Slice 40 is FILD-only: `/7` (FISTP m64) MUST stay unclassifiable here,
+    // a positive assertion of the scope cut taken in review, not merely an absence from
+    // `expected_selected` above. `/4` and `/6` (FBLD/FBSTP) stay unclassifiable too, same as the
+    // 0xDD memory loop above.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdf, 0, 5, 5)),
+        Some(NativeX87Insn::LoadI64 { addr: addr() })
+    );
+    for extension in [4u8, 6, 7] {
+        assert!(
+            NativeX87Insn::classify(&insn(0xdf, 0, extension, 5)).is_none(),
+            "0xdf /{extension} memory (FBLD/FBSTP/FISTP m64) must stay unclassifiable"
         );
     }
     // 0xDC mod=3 must still classify as `BinaryRegisterDest`, not `BinaryMemoryF64`: the
@@ -666,6 +685,21 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FILD m64: `IntConvert16`, NOT `IntConvert32` (B4's realistic copy-paste mistake), and
+        // an 8-byte read. No pop, joining the push group the same as `LoadI32`.
+        (
+            insn(0xdf, 0, 5, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert16,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 8,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
     ];
     for (insn, expected) in cases {
         assert_eq!(NativeX87Insn::classify(&insn).unwrap().metadata(), expected);
@@ -888,6 +922,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         NativeX87Insn::Exchange { index: 3 },
     ];
     shapes.push(NativeX87Insn::LoadF64 { addr: addr() });
+    shapes.push(NativeX87Insn::LoadI64 { addr: addr() });
     for pop in [false, true] {
         shapes.push(NativeX87Insn::StoreF32 { addr: addr(), pop });
         shapes.push(NativeX87Insn::StoreRegister { index: 3, pop });
@@ -937,7 +972,8 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::StoreControlWord { .. }
         | NativeX87Insn::LoadF64 { .. }
         | NativeX87Insn::StoreF64 { .. }
-        | NativeX87Insn::BinaryMemoryF64 { .. } => true,
+        | NativeX87Insn::BinaryMemoryF64 { .. }
+        | NativeX87Insn::LoadI64 { .. } => true,
     }
 }
 

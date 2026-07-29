@@ -248,6 +248,7 @@ fn avx_conversion_and_utility_forms_have_known_bytes() {
     e.vcvtsi2sd_r32(Xmm::XMM1, Xmm::XMM2, Reg::RAX);
     e.vcvtsi2sd_r64(Xmm::XMM9, Xmm::XMM10, Reg::R11);
     e.vcvtsi2sd_i32_disp32(Xmm::XMM9, Xmm::XMM10, Reg::R13, -0x1122_3344);
+    e.vcvtsi2sd_i64_disp32(Xmm::XMM9, Xmm::XMM10, Reg::R13, -0x1122_3344);
     e.vcvttsd2si_r32(Reg::R9, Xmm::XMM10);
     e.vcvttsd2si_r64(Reg::RAX, Xmm::XMM1);
     e.vmovq_xmm_r64(Xmm::XMM1, Reg::RAX);
@@ -268,6 +269,8 @@ fn avx_conversion_and_utility_forms_have_known_bytes() {
             0xC4, 0x41, 0xAB, 0x2A, 0xCB, // vcvtsi2sd xmm9,xmm10,r11
             0xC4, 0x41, 0x2B, 0x2A, 0x8D, 0xBC, 0xCC, 0xDD,
             0xEE, // vcvtsi2sd xmm9,xmm10,[r13+disp32]
+            0xC4, 0x41, 0xAB, 0x2A, 0x8D, 0xBC, 0xCC, 0xDD,
+            0xEE, // vcvtsi2sd xmm9,xmm10,[r13+disp32] (REX.W, i64)
             0xC4, 0x41, 0x7B, 0x2C, 0xCA, // vcvttsd2si r9d,xmm10
             0xC4, 0xE1, 0xFB, 0x2C, 0xC1, // vcvttsd2si rax,xmm1
             0xC4, 0xE1, 0xF9, 0x6E, 0xC8, // vmovq xmm1,rax
@@ -388,6 +391,8 @@ fn avx2_scalar_arithmetic_moves_and_conversions_execute() {
     e.vmovsd_disp32_xmm(base, 56, Xmm::XMM4);
     e.vcvtsi2sd_i32_disp32(Xmm::XMM5, Xmm::XMM3, base, 20);
     e.vmovsd_disp32_xmm(base, 64, Xmm::XMM5);
+    e.vcvtsi2sd_i64_disp32(Xmm::XMM6, Xmm::XMM3, base, 24);
+    e.vmovsd_disp32_xmm(base, 136, Xmm::XMM6);
     e.vcvtsd2ss(Xmm::XMM4, Xmm::XMM3, Xmm::XMM5);
     e.vmovss_disp32_xmm(base, 72, Xmm::XMM4);
 
@@ -444,6 +449,10 @@ fn avx2_scalar_arithmetic_moves_and_conversions_execute() {
     assert_eq!(f64::from_bits(values[14]), -7.0);
     assert_eq!(f64::from_bits(values[15]), ((1i64 << 40) + 3) as f64);
     assert_eq!(values[16] as u32, 1);
+    // The i64 disp32 memory form (`vcvtsi2sd_i64_disp32`, the REX.W sibling of the i32 form
+    // exercised above): same source value read directly from memory as a 64-bit integer rather
+    // than through a register.
+    assert_eq!(f64::from_bits(values[17]), ((1i64 << 40) + 3) as f64);
 }
 
 #[test]

@@ -196,6 +196,15 @@ pub(crate) enum NativeX87Insn {
         op: NativeX87BinaryOp,
         addr: AddrMode,
     },
+    /// FILD m64 (0xDF /5). Slice 40, FILD-only scope: the m64 INTEGER load. Unlike `LoadI32`
+    /// this converts a 64-bit integer, which can exceed f64's 53-bit mantissa and round; see the
+    /// emit arm's comment for what that does and does not put at risk. `StoreI64` (FISTP m64,
+    /// 0xDF /7) is DEFERRED to a later slice: its admitted population is plausibly near zero
+    /// once the i32-range guard is reused unchanged, and dropping it here removes the whole
+    /// range/chop risk surface from this slice. 0xDF /7 stays unclassified below.
+    LoadI64 {
+        addr: AddrMode,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,7 +244,8 @@ impl NativeX87Insn {
             | Self::LoadOne
             | Self::LoadZero
             | Self::LoadI32 { .. }
-            | Self::LoadF64 { .. } => -1,
+            | Self::LoadF64 { .. }
+            | Self::LoadI64 { .. } => -1,
             Self::BinaryMemory { op, .. }
             | Self::IntBinaryMemory { op, .. }
             | Self::BinaryRegister { op, .. }
@@ -330,6 +340,9 @@ impl NativeX87Insn {
                     op: NativeX87BinaryOp::from_extension(extension)?,
                     addr,
                 }),
+                // FILD m64. `/7` (FISTP m64, deferred to a later slice) and `/4`/`/6` (FBLD,
+                // FBSTP, unimplemented) are NOT here and fall to the catch-all `None` below.
+                (0xdf, 5) => Some(Self::LoadI64 { addr }),
                 _ => None,
             };
         }
@@ -551,6 +564,19 @@ impl NativeX87Insn {
                 fp_class: FpOpClass::F64Mem,
                 memory: read_qword,
                 pops: op.pops(),
+                terminates_block: false,
+            },
+            // 0xDF /5, verified against the interpreter (fpu_exec.rs:271-274): `Ok(clocks(14))`.
+            // `fp_class` is `IntConvert16`, NOT `IntConvert32`: `execute_fpu` derives the class
+            // from the opcode byte, and 0xdf (like 0xda and 0xde) maps to `IntConvert16` in the
+            // timing tail (fpu_exec.rs:87), unlike 0xdb which maps to `IntConvert32`. Copying
+            // `LoadI32`'s `IntConvert32` here is the realistic mistake (raw scale 272 against the
+            // correct 256, a 6 percent undercharge) and is what the mutation battery targets.
+            Self::LoadI64 { .. } => NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert16,
+                memory: read_qword,
+                pops: false,
                 terminates_block: false,
             },
         }
