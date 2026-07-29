@@ -162,17 +162,18 @@ impl CpuGsw {
     /// stale mapping epoch, and a plain unpopulated page (386-slow/386 Accurate, or a cold miss)
     /// all reject here by construction of `lookup_access`, not by any extra check of ours.
     ///
-    /// `has_storage()` is checked FIRST and short-circuits everything else. With the JIT off, or
-    /// on the 386-slow/386 Accurate personas, the map is NEVER populated (`storage` stays `None`
-    /// for the CPU's whole life), so every probe is a guaranteed miss -- and without this
-    /// early-out, guaranteed-miss probes still paid for the mapping-epoch load, CPL derivation,
-    /// and CR0.WP read before `lookup_access` could reject them. Measured on a JIT-off control
-    /// run: that cost ~2.66 ns per interpreter data access, a 4.6% wall regression, almost exactly
-    /// what the hit path saves elsewhere -- large enough on its own to erase the whole slice's
-    /// win on any workload that spends real time in an Accurate-class persona. `has_storage` costs
-    /// one `Option::is_some()`; do not replace it with a re-derived condition off `mode()` /
-    /// `admission_active` / `clif_enabled` / `auto_admit`, which is four predicate calls and would
-    /// reintroduce the same cost this early-out exists to remove.
+    /// Every call site gates on `self.jit_fast_map.has_storage()` BEFORE calling this function at
+    /// all (see e.g. `read_linear_u8`), so this never runs for a guaranteed-miss access: JIT off,
+    /// or the 386-slow/386 Accurate personas, where the map is NEVER populated (`storage` stays
+    /// `None` for the CPU's whole life). That gate exists because, before it was added, a
+    /// guaranteed-miss probe still paid for the mapping-epoch load, CPL derivation, and CR0.WP
+    /// read below -- measured on a JIT-off control run at ~2.66 ns per interpreter data access, a
+    /// 4.6% wall regression, almost exactly what the hit path saves elsewhere. The
+    /// `debug_assert` below is a correctness net, not the gate itself: do not restore an
+    /// `if !has_storage() { return None }` here, and do not gate on a re-derived condition off
+    /// `mode()` / `admission_active` / `clif_enabled` / `auto_admit` (four predicate calls) --
+    /// either would re-add a redundant `Box<FastMap>` dereference on every one of the 347M+ hits
+    /// this path serves in the Quake/586 gate.
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -185,9 +186,10 @@ impl CpuGsw {
         width: BusWidth,
         write: bool,
     ) -> Option<(u32, *mut u8, bool)> {
-        if !self.jit_fast_map.has_storage() {
-            return None;
-        }
+        debug_assert!(
+            self.jit_fast_map.has_storage(),
+            "fast_map_data_slot called without its call-site has_storage() gate"
+        );
         let mapping_epoch = if write {
             self.data_write_pages.mapping_epoch()
         } else {
@@ -788,13 +790,19 @@ impl CpuGsw {
         linear: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
+        // The `has_storage()` guard sits at the CALL SITE, not only inside
+        // `fast_map_data_slot`, so a guaranteed-miss access (JIT off, or 386-slow/386
+        // Accurate) never even calls into that function -- see its doc comment for why a
+        // fixed per-access cost ahead of the map lookup is a measured regression, not a
+        // theoretical one.
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) =
-            self.fast_map_data_slot(linear, BusWidth::Byte, false)
+        if self.jit_fast_map.has_storage()
+            && let Some((physical, ptr, mode13)) =
+                self.fast_map_data_slot(linear, BusWidth::Byte, false)
         {
             return self
                 .finish_fast_map_read(bus, physical, ptr, mode13, BusWidth::Byte, kind)
@@ -837,7 +845,9 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, BusWidth::Byte, true)
+        if self.jit_fast_map.has_storage()
+            && let Some((physical, ptr, mode13)) =
+                self.fast_map_data_slot(linear, BusWidth::Byte, true)
         {
             return self.finish_fast_map_write(
                 bus,
@@ -1082,7 +1092,9 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false) {
+        if self.jit_fast_map.has_storage()
+            && let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false)
+        {
             return self.finish_fast_map_read(bus, physical, ptr, mode13, width, kind);
         }
         let physical = self.translate_linear(bus, linear, false)?;
@@ -1110,7 +1122,9 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true) {
+        if self.jit_fast_map.has_storage()
+            && let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true)
+        {
             return self.finish_fast_map_write(bus, physical, ptr, mode13, width, value, kind);
         }
         let physical = self.translate_linear(bus, linear, true)?;
