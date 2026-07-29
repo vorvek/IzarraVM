@@ -81,14 +81,6 @@ pub(crate) use region::RegionTable;
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
     pub(crate) direct_barrier_census: Option<Box<direct::DirectBarrierCensus>>,
-    direct_helpers_enabled: bool,
-    direct_generation: u64,
-    pub(crate) direct_native_frame_depth: u32,
-    direct_reset_pending: bool,
-    #[cfg(test)]
-    direct_helper_force: DirectHelperTestForce,
-    #[cfg(test)]
-    direct_helper_edges_for_test: bool,
     pub(crate) smc_heat: direct::SmcHeatMap,
     /// The native code watch, HOISTED out of `BlockCache` (Track C C1c-pre, design decision
     /// D-C1c.1, mirroring the C1a-pre `SmcHeatMap` hoist): "watched" is a property of what
@@ -166,17 +158,6 @@ impl JitState {
         Self {
             direct,
             direct_barrier_census: direct::barrier_census_default(),
-            direct_helpers_enabled: matches!(
-                std::env::var("IZARRAVM_DIRECT_HELPERS").as_deref(),
-                Ok("1")
-            ),
-            direct_generation: 1,
-            direct_native_frame_depth: 0,
-            direct_reset_pending: false,
-            #[cfg(test)]
-            direct_helper_force: DirectHelperTestForce::None,
-            #[cfg(test)]
-            direct_helper_edges_for_test: false,
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
             clif_enabled: false,
@@ -223,14 +204,6 @@ impl Clone for JitState {
         Self {
             direct: self.direct.clone(),
             direct_barrier_census: None,
-            direct_helpers_enabled: self.direct_helpers_enabled,
-            direct_generation: 1,
-            direct_native_frame_depth: 0,
-            direct_reset_pending: false,
-            #[cfg(test)]
-            direct_helper_force: DirectHelperTestForce::None,
-            #[cfg(test)]
-            direct_helper_edges_for_test: false,
             smc_heat: self.smc_heat.clone(),
             // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone
             // produced (its clone built a new cache with a new watch).
@@ -279,29 +252,11 @@ impl Clone for JitState {
 // unchanged against the hoisted ownership.
 impl JitState {
     pub(crate) fn probe(&mut self, key: direct::BlockKey) -> direct::BlockProbe {
-        self.apply_deferred_direct_reset();
-        if self.direct_native_frame_depth != 0 {
-            return direct::BlockProbe::Interpret;
-        }
-        let resets = self.direct.heat_resets();
-        let probe = self.direct.probe(&mut self.code_watch, key);
-        if self.direct.heat_resets() != resets {
-            self.bump_direct_generation();
-        }
-        probe
+        self.direct.probe(&mut self.code_watch, key)
     }
 
     pub(crate) fn install(&mut self, compilation: &direct::Compilation) -> Option<direct::BlockId> {
-        self.apply_deferred_direct_reset();
-        if self.direct_native_frame_depth != 0 {
-            return None;
-        }
-        let resets = self.direct.heat_resets();
-        let installed = self.direct.install(&mut self.code_watch, compilation);
-        if self.direct.heat_resets() != resets {
-            self.bump_direct_generation();
-        }
-        installed
+        self.direct.install(&mut self.code_watch, compilation)
     }
 
     pub(crate) fn reject(&mut self, span: direct::RejectedSpan) {
@@ -309,96 +264,17 @@ impl JitState {
     }
 
     pub(crate) fn retire_key_for_recompile(&mut self, key: direct::BlockKey) -> bool {
-        let retired = self
-            .direct
-            .retire_key_for_recompile(&mut self.code_watch, key);
-        if retired {
-            self.bump_direct_generation();
-        }
-        retired
+        self.direct
+            .retire_key_for_recompile(&mut self.code_watch, key)
     }
 
     pub(crate) fn clear(&mut self) {
-        self.bump_direct_generation();
-        if self.direct_native_frame_depth != 0 {
-            self.direct_reset_pending = true;
-            return;
-        }
         self.direct.clear(&mut self.code_watch);
-        self.direct_reset_pending = false;
     }
 
     pub(crate) fn invalidate_physical_range(&mut self, physical: u32, width: u32) -> usize {
-        let invalidated =
-            self.direct
-                .invalidate_physical_range(&mut self.code_watch, physical, width);
-        if invalidated != 0 {
-            self.bump_direct_generation();
-        }
-        invalidated
-    }
-
-    pub(crate) fn invalidate_translation(&mut self) {
-        self.bump_direct_generation();
-        self.direct.invalidate_translation();
-    }
-
-    pub(crate) fn suspend_decode_slot(&mut self, slot: usize) -> usize {
-        self.bump_direct_generation();
-        self.direct.suspend_decode_slot(slot)
-    }
-
-    pub(crate) fn direct_generation(&self) -> u64 {
-        self.direct_generation
-    }
-
-    pub(crate) fn direct_helpers_enabled(&self) -> bool {
-        self.direct_helpers_enabled
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_direct_helpers_enabled_for_test(&mut self, enabled: bool) {
-        self.direct_helpers_enabled = enabled;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_direct_helper_force_for_test(&mut self, force: DirectHelperTestForce) {
-        self.direct_helper_force = force;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_helper_force_for_test(&self) -> DirectHelperTestForce {
-        self.direct_helper_force
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_direct_helper_edges_for_test(&mut self, enabled: bool) {
-        self.direct_helper_edges_for_test = enabled;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_helper_edges_for_test(&self) -> bool {
-        self.direct_helper_edges_for_test
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_reset_pending_for_test(&self) -> bool {
-        self.direct_reset_pending
-    }
-
-    pub(crate) fn apply_deferred_direct_reset(&mut self) {
-        if !self.direct_reset_pending || self.direct_native_frame_depth != 0 {
-            return;
-        }
-        self.direct.clear(&mut self.code_watch);
-        self.direct_reset_pending = false;
-    }
-
-    fn bump_direct_generation(&mut self) {
-        self.direct_generation = self
-            .direct_generation
-            .checked_add(1)
-            .expect("Direct execution generation exhausted");
+        self.direct
+            .invalidate_physical_range(&mut self.code_watch, physical, width)
     }
 
     /// The shared table-1 base every backend's emitted store checks consult.
@@ -518,26 +394,6 @@ impl JitState {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum DirectHelperTestForce {
-    #[default]
-    None,
-    StaleDecode,
-    GenerationAfterRetire,
-    InvalidateCurrentAfterRetire,
-    ClearAfterRetire,
-    EipAfterRetire,
-    ModeAfterRetire,
-    SegmentAfterRetire,
-    InterruptAfterRetire,
-    HaltAfterRetire,
-    RepAfterRetire,
-    HardError,
-    Panic,
-    ClearThenPanic,
-}
-
 impl std::fmt::Debug for JitState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JitState")
@@ -571,22 +427,35 @@ impl PartialEq for JitState {
 }
 impl Eq for JitState {}
 
-/// Drop guard for a backend's native-frame depth. The raw pointer avoids holding a Rust borrow
-/// into `CpuGsw` across a native entry that receives the whole CPU as a mutable pointer.
+/// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md` section 6, MINOR-4): a
+/// drop guard for `JitState::native_frame_depth`, incrementing on construction and
+/// decrementing on drop along EVERY exit path -- a normal return, an early `?`, or an unwind
+/// (including the `resume_unwind` `run_clif_unit` performs after a call-out panic) -- so a
+/// future fallible Rust inserted between entry and exit can never leak the increment and wedge
+/// the depth permanently nonzero. Holds a raw pointer rather than a borrow so it never aliases
+/// the `&mut CpuGsw` reborrow the adapter call itself needs (`self as *mut CpuGsw`): a
+/// reference into `self.jit_direct.native_frame_depth` held across that cast would conflict
+/// with it under the borrow checker, since the cast reborrows the whole of `*self`.
 #[cfg(all(
+    feature = "clif-backend",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 pub(crate) struct NativeFrameGuard(*mut u32);
 
 #[cfg(all(
+    feature = "clif-backend",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 impl NativeFrameGuard {
+    /// Mark one clif native frame entered for the guard's lifetime.
+    ///
     /// # Safety
     /// `depth` must be valid for reads and writes for the guard's whole lifetime, and nothing
-    /// else may mutate the pointee concurrently. Guest execution is single-threaded.
+    /// else may mutate the pointee concurrently. Guest execution is single-threaded and, by
+    /// design section 5's frame-free proof, at most one clif native frame is ever live, so the
+    /// sole caller (`run_clif_unit`, around the `adapter(..)` call in `run.rs`) upholds this.
     pub(crate) unsafe fn enter(depth: *mut u32) -> Self {
         // SAFETY: caller contract.
         unsafe {
@@ -597,6 +466,7 @@ impl NativeFrameGuard {
 }
 
 #[cfg(all(
+    feature = "clif-backend",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]

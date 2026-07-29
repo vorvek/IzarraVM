@@ -1644,26 +1644,6 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
 }
 
-#[test]
-#[cfg(feature = "jit")]
-fn direct_helper_counters_stay_at_the_cpu_tail() {
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
-    assert!(
-        core::mem::offset_of!(CpuGsw, direct_helper)
-            > core::mem::offset_of!(CpuGsw, fast_map_probe)
-    );
-
-    let mut cpu = CpuGsw::default();
-    let architectural_peer = cpu.clone();
-    cpu.direct_helper.calls = 7;
-    cpu.direct_helper.retired = 6;
-    assert_eq!(cpu.direct_helper_counters().calls, 7);
-    assert_eq!(cpu, architectural_peer);
-    cpu.reset_perf_counters();
-    assert_eq!(cpu.direct_helper_counters().calls, 0);
-    assert_eq!(cpu.direct_helper_counters().retired, 0);
-}
-
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
 /// interpreter's `alu_add(a, b, 0, Dword)` does, so that a later flag read (or materialization)
 /// sees the same six arithmetic bits. Swept across operand pairs that exercise the carry,

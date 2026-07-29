@@ -21,8 +21,6 @@ struct BenchRun {
     /// Lever 1 (interpreter FastMap serve path) hit/miss subset, stored outside PerfCounters on
     /// the CPU for the same layout-preservation reason; see FastMapProbeCounters.
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
-    /// Hybrid Direct helper counters, also stored at the CPU tail.
-    direct_helper: izarravm_cpu::DirectHelperCounters,
     machine_profile: MachineHostProfileSnapshot,
     cpu_profile: CpuProfileSnapshot,
 }
@@ -98,7 +96,6 @@ fn run_bench_one_profiled(
         poll_skip_memory: machine.cpu().poll_skip_memory(),
         jit_clif: machine.cpu().jit_clif_counters(),
         fast_map_probe: machine.cpu().fast_map_probe_counters(),
-        direct_helper: machine.cpu().direct_helper_counters(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
     })
@@ -954,7 +951,6 @@ fn write_profile_json(
                 profiled.poll_skip_memory,
                 profiled.jit_clif,
                 profiled.fast_map_probe,
-                profiled.direct_helper,
             ),
         },
     });
@@ -967,9 +963,8 @@ pub(super) fn perf_counters_json(
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
     jit_clif: izarravm_cpu::JitClifCounters,
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
-    direct_helper: izarravm_cpu::DirectHelperCounters,
 ) -> serde_json::Value {
-    let mut counters = json!({
+    json!({
         "instructions": perf.instructions,
         "decode_misses": perf.decode_misses,
         "straight_line_runs": perf.straight_line_runs,
@@ -1131,66 +1126,7 @@ pub(super) fn perf_counters_json(
         "jit_clif_post_ns": jit_clif.post_ns,
         "jit_clif_resolve_clone_ns": jit_clif.resolve_clone_ns,
         "jit_clif_retired": jit_clif.clif_retired,
-    });
-    let object = counters
-        .as_object_mut()
-        .expect("perf counters are an object");
-    for (key, value) in [
-        ("jit_direct_helper_calls", direct_helper.calls),
-        ("jit_direct_helper_retired", direct_helper.retired),
-        (
-            "jit_direct_helper_continue_count",
-            direct_helper.continue_count,
-        ),
-        ("jit_direct_helper_retired_exit", direct_helper.retired_exit),
-        (
-            "jit_direct_helper_retry_interpret",
-            direct_helper.retry_interpret,
-        ),
-        ("jit_direct_helper_hard_stop", direct_helper.hard_stop),
-        (
-            "jit_direct_helper_reject_nonuniform",
-            direct_helper.reject_nonuniform,
-        ),
-        (
-            "jit_direct_helper_link_publish_reject",
-            direct_helper.link_publish_reject,
-        ),
-        (
-            "jit_direct_helper_full_unit_budget_rejects",
-            direct_helper.full_unit_budget_rejects,
-        ),
-        (
-            "jit_direct_helper_prefix_only_exits",
-            direct_helper.prefix_only_exits,
-        ),
-        (
-            "jit_direct_helper_lost_link_transfers",
-            direct_helper.lost_link_transfers,
-        ),
-        (
-            "jit_direct_helper_generation_exits",
-            direct_helper.generation_exits,
-        ),
-        (
-            "jit_direct_helper_state_change_exits",
-            direct_helper.state_change_exits,
-        ),
-        (
-            "jit_direct_helper_stale_decode_exits",
-            direct_helper.stale_decode_exits,
-        ),
-        ("jit_direct_helper_cpu_errors", direct_helper.cpu_errors),
-        ("jit_direct_helper_panics", direct_helper.panics),
-        ("jit_direct_helper_blocks", direct_helper.helper_blocks),
-        (
-            "jit_direct_helper_emitted_bytes",
-            direct_helper.emitted_bytes,
-        ),
-    ] {
-        object.insert(key.to_owned(), value.into());
-    }
-    counters
+    })
 }
 
 pub(super) fn print_perf_counter_row(

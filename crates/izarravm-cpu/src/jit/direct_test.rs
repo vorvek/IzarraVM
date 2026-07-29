@@ -56,15 +56,6 @@ fn cld_insn() -> DecodedInsn {
 }
 
 #[test]
-fn helper_context_keeps_native_exit_at_offset_zero() {
-    assert_eq!(core::mem::offset_of!(DirectRunContext, exit), 0);
-    assert_eq!(HelperDisposition::Continue as u32, 0);
-    assert_eq!(HelperDisposition::RetiredExit as u32, 1);
-    assert_eq!(HelperDisposition::RetryInterpret as u32, 2);
-    assert_eq!(HelperDisposition::HardStop as u32, 3);
-}
-
-#[test]
 fn barrier_census_records_runtime_bridge_diagnostics_without_reselecting() {
     let insn = cld_insn();
     let helper = precise_helper_spec(&insn).expect("CLD helper spec");
@@ -112,7 +103,6 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
     Compilation {
         span,
         fetch_lens,
-        native_instructions: span.instructions,
         raw_clocks: 1,
         weighted_fp_clocks: 0,
         byte_reads: 0,
@@ -131,7 +121,6 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         x87_exit_top: 0,
         dynamic_successor: false,
         successors: [None, None],
-        helper_site: None,
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
         body_offset: 0,
         code: vec![0xc3],
@@ -145,21 +134,6 @@ fn compilation_with_fetch_lens(key: BlockKey, fetch_lens: &[u8]) -> Compilation 
     let mut compilation = trivial_compilation(span);
     compilation.fetch_lens.fill(0);
     compilation.fetch_lens[..fetch_lens.len()].copy_from_slice(fetch_lens);
-    compilation
-}
-
-fn helper_compilation(key: BlockKey) -> Compilation {
-    let mut compilation = compilation_with_fetch_lens(key, &[1, 1, 1]);
-    let expected = cld_insn();
-    compilation.native_instructions = 2;
-    compilation.helper_site = Some(DirectHelperSite {
-        spec: precise_helper_spec(&expected).expect("CLD helper spec"),
-        expected,
-        linear: key.linear + 1,
-        fallthrough_linear: key.linear + 2,
-        entry_eip: key.linear,
-        d: true,
-    });
     compilation
 }
 
@@ -205,18 +179,6 @@ fn install_with_fetch_lens(cache: &mut JitState, key: BlockKey, fetch_lens: &[u8
     cache
         .install(&compilation_with_fetch_lens(key, fetch_lens))
         .expect("test block must install")
-}
-
-#[cfg(any(
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64")
-))]
-fn install_helper_trivial(cache: &mut JitState, key: BlockKey) -> BlockId {
-    assert!(matches!(cache.probe(key), BlockProbe::Interpret));
-    assert!(matches!(cache.probe(key), BlockProbe::Compile));
-    cache
-        .install(&helper_compilation(key))
-        .expect("helper test block must install")
 }
 
 #[test]
@@ -271,7 +233,6 @@ fn dynamic_counter_mask_tracks_only_reachable_outputs() {
         len: 1,
         weighted_fp_clocks: 0,
         kind,
-        helper: None,
     };
     let byte_store = slot(DirectKind::Store {
         source: StoreSource::Reg(0),
@@ -825,40 +786,6 @@ fn an_integer_target_publishes_the_same_address_in_both_portal_fields() {
     );
 }
 
-#[cfg(any(
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64")
-))]
-#[test]
-fn helper_blocks_never_publish_portals_or_links() {
-    let mut cache = BlockCache::default();
-    let ordinary_source = install_trivial(&mut cache, key(0x2000), 1);
-    let helper = install_helper_trivial(&mut cache, key(0x2100));
-    let ordinary_target = install_trivial(&mut cache, key(0x2200), 1);
-    let helper_index = helper.index();
-
-    assert!(cache.block(helper).is_some_and(|block| block.has_helper()));
-    assert!(!cache.is_link_visible(helper));
-    assert!(!cache.block_portals[helper_index].visible());
-    assert_eq!(cache.block_link_epochs[helper_index], 0);
-    assert!(!cache.linear_blocks.contains_key(&LinkTarget {
-        linear: key(0x2100).linear,
-        mode_key: key(0x2100).mode_key,
-    }));
-
-    cache.direct.make_link_visible(helper);
-    assert!(!cache.is_link_visible(helper));
-    assert!(!cache.block_portals[helper_index].visible());
-
-    assert!(!cache.direct.try_link(helper, 0, ordinary_target));
-    assert!(!cache.direct.try_link(ordinary_source, 0, helper));
-    assert!(!cache.link_cells[helper.index()][0].linked());
-    assert!(!cache.link_cells[ordinary_source.index()][0].linked());
-
-    let stats = cache.take_stats();
-    assert_eq!(stats.helper_link_publish_rejects, 2);
-}
-
 // A stale spilling flag would make a later float-to-float edge on the same slot spill and
 // re-enter incorrectly, since the target-side float block never expects to be re-entered
 // through its own prologue after a spill. This proves relinking clears it.
@@ -1040,95 +967,6 @@ fn decode_slot_suspension_requires_revalidation() {
         .revalidate_translation(block)
         .expect("decode revalidation");
     assert!(cache.is_link_visible(id));
-}
-
-#[cfg(any(
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64")
-))]
-#[test]
-fn direct_generation_advances_at_every_cache_invalidation_seam() {
-    let mut cache = BlockCache::new(8);
-
-    let generation = cache.direct_generation();
-    cache.clear();
-    assert_eq!(cache.direct_generation(), generation + 1);
-
-    let generation = cache.direct_generation();
-    cache.invalidate_translation();
-    assert_eq!(cache.direct_generation(), generation + 1);
-
-    let block = key(0x4100);
-    install_trivial(&mut cache, block, 1);
-    let generation = cache.direct_generation();
-    assert!(cache.retire_key_for_recompile(block));
-    assert_eq!(cache.direct_generation(), generation + 1);
-
-    assert!(matches!(cache.probe(block), BlockProbe::Compile));
-    let id = cache
-        .install(&trivial_compilation(
-            BlockSpan::new(block, 1, 1).expect("replacement span"),
-        ))
-        .expect("replacement block must install");
-    let slot = block.linear as usize & cache.decode_slot_mask;
-    let generation = cache.direct_generation();
-    assert_eq!(cache.suspend_decode_slot(slot), 1);
-    assert_eq!(cache.direct_generation(), generation + 1);
-
-    let generation = cache.direct_generation();
-    assert_eq!(cache.invalidate_physical_range(block.physical, 1), 1);
-    assert_eq!(cache.direct_generation(), generation + 1);
-    assert!(cache.block(id).is_none());
-
-    let mut capped = BlockCache::with_entry_cap(1);
-    assert!(matches!(capped.probe(key(0x5000)), BlockProbe::Interpret));
-    let generation = capped.direct_generation();
-    assert!(matches!(capped.probe(key(0x5100)), BlockProbe::Interpret));
-    assert_eq!(capped.direct_generation(), generation + 1);
-}
-
-#[cfg(any(
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64")
-))]
-#[test]
-fn live_direct_frame_defers_clear_and_blocks_probe_and_install() {
-    let mut cache = BlockCache::default();
-    let resident = key(0x4100);
-    let resident_id = install_trivial(&mut cache, resident, 1);
-    let candidate = key(0x4200);
-    assert!(matches!(cache.probe(candidate), BlockProbe::Interpret));
-    assert!(matches!(cache.probe(candidate), BlockProbe::Compile));
-    let candidate_compilation =
-        trivial_compilation(BlockSpan::new(candidate, 1, 1).expect("candidate span"));
-    let generation = cache.direct_generation();
-    let depth = &mut cache.direct_native_frame_depth as *mut u32;
-
-    // SAFETY: cache outlives the guard and this test is single-threaded.
-    let guard = unsafe { super::super::NativeFrameGuard::enter(depth) };
-    cache.clear();
-    assert_eq!(cache.direct_generation(), generation + 1);
-    assert!(cache.direct_reset_pending_for_test());
-    assert_eq!(cache.direct_native_frame_depth, 1);
-    assert!(cache.block(resident_id).is_some());
-    assert!(matches!(cache.probe(resident), BlockProbe::Interpret));
-    assert!(cache.install(&candidate_compilation).is_none());
-    assert!(cache.block(resident_id).is_some());
-
-    drop(guard);
-    assert_eq!(cache.direct_native_frame_depth, 0);
-    assert!(cache.direct_reset_pending_for_test());
-    assert!(cache.block(resident_id).is_some());
-
-    cache.apply_deferred_direct_reset();
-    assert!(!cache.direct_reset_pending_for_test());
-    assert_eq!(cache.direct_generation(), generation + 1);
-    assert!(cache.block(resident_id).is_none());
-    assert_eq!(cache.len(), 0);
-
-    assert!(matches!(cache.probe(candidate), BlockProbe::Interpret));
-    assert!(matches!(cache.probe(candidate), BlockProbe::Compile));
-    assert!(cache.install(&candidate_compilation).is_some());
 }
 
 #[cfg(any(
