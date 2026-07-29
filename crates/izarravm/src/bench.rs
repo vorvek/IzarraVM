@@ -503,7 +503,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
         println!(
             "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
              brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
-             data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
+             data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
              jit[entries/insns/native/helper]={}/{}/{}/{}  \
@@ -524,6 +524,8 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.data_slow_writes,
             perf.direct_data_pointer_reads,
             perf.direct_data_pointer_writes,
+            perf.interp_fast_map_hits,
+            perf.interp_fast_map_misses,
             perf.direct_page_hits,
             perf.direct_page_misses,
             perf.fetch_page_hits,
@@ -979,6 +981,8 @@ pub(super) fn perf_counters_json(
         "direct_page_misses": perf.direct_page_misses,
         "direct_data_pointer_reads": perf.direct_data_pointer_reads,
         "direct_data_pointer_writes": perf.direct_data_pointer_writes,
+        "interp_fast_map_hits": perf.interp_fast_map_hits,
+        "interp_fast_map_misses": perf.interp_fast_map_misses,
         "fetch_page_hits": perf.fetch_page_hits,
         "fetch_page_misses": perf.fetch_page_misses,
         "slow_prefetch_refills": perf.slow_prefetch_refills,
@@ -1118,7 +1122,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
          brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
          inval[cs/smc/other/all]={}/{}/{}/{} narrow={}  \
-         data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
+         data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
          jit[entries/insns/native/helper]={}/{}/{}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
@@ -1149,6 +1153,8 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.data_slow_writes,
         perf.direct_data_pointer_reads,
         perf.direct_data_pointer_writes,
+        perf.interp_fast_map_hits,
+        perf.interp_fast_map_misses,
         perf.direct_page_hits,
         perf.direct_page_misses,
         perf.fetch_page_hits,

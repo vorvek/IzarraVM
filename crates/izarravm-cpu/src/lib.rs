@@ -739,6 +739,14 @@ pub struct PerfCounters {
     pub direct_page_misses: u64,
     pub direct_data_pointer_reads: u64,
     pub direct_data_pointer_writes: u64,
+    /// Interpreter direct data accesses served from the JIT `FastMap` (lever 1: interpreter
+    /// FastMap serve path). Populated on every direct access regardless of backend, but only
+    /// ever nonzero in Approximate-class personas, since `fast_map_population_enabled` gates
+    /// population on `mode().uses_approximate_timing()`.
+    pub interp_fast_map_hits: u64,
+    /// Interpreter direct data accesses that probed the FastMap and missed, falling through to
+    /// the canonical translate/direct-page-cache path unchanged.
+    pub interp_fast_map_misses: u64,
     pub fetch_page_hits: u64,
     pub fetch_page_misses: u64,
     pub slow_prefetch_refills: u64,

@@ -69,9 +69,10 @@ impl CpuGsw {
         page: DirectPage,
         write: bool,
     ) -> bool {
-        let Some(permissions) = self.fast_map_permissions(linear, physical, write) else {
-            return false;
-        };
+        // Track the free reordering from the lever-1 design doc: both operands here are
+        // side-effect free, and `mapped` is by far the more common outcome (this runs on every
+        // direct access), so testing it first skips the TLB probe in `fast_map_permissions`
+        // entirely on the already-mapped path instead of computing and discarding it.
         let mapped = if write {
             self.jit_fast_map
                 .has_write_mapping_at_epoch(linear, physical, page.mapping_epoch)
@@ -82,6 +83,9 @@ impl CpuGsw {
         if mapped {
             return true;
         }
+        let Some(permissions) = self.fast_map_permissions(linear, physical, write) else {
+            return false;
+        };
         if write {
             self.jit_fast_map
                 .populate_write(linear, physical, page, permissions)
@@ -144,6 +148,169 @@ impl CpuGsw {
         } else {
             self.data_read_pages.note_fast_map_linear(physical, linear);
         }
+    }
+
+    /// Lever 1: the interpreter's FastMap serve path. Applies exactly the hit predicate native
+    /// code uses (`FastMap::lookup_access`) against the CURRENT accessor state -- CPL and CR0.WP
+    /// can both move since the mapping was published, so they are read fresh on every probe,
+    /// exactly as `translate_linear_checked` rechecks a TLB hit's cached bits against the live
+    /// accessor. `Some` means address resolution and page lookup are done: physical address, a
+    /// host pointer already biased for `linear`, and whether the page is the Mode13h VGA aperture
+    /// (so the caller knows whether it may take the flat RAM charge or must defer to the video
+    /// charge). `None` means the caller must fall through to the unchanged canonical path -- a
+    /// clean-PTE write, an unaligned or page-crossing access, a CPL-3 hit on a supervisor page, a
+    /// stale mapping epoch, and a plain unpopulated page (386-slow/386 Accurate, or a cold miss)
+    /// all reject here by construction of `lookup_access`, not by any extra check of ours.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn fast_map_data_slot(
+        &mut self,
+        linear: u32,
+        width: BusWidth,
+        write: bool,
+    ) -> Option<(u32, *mut u8, bool)> {
+        let mapping_epoch = if write {
+            self.data_write_pages.mapping_epoch()
+        } else {
+            self.data_read_pages.mapping_epoch()
+        };
+        let user = self.current_privilege_level() == 3;
+        let write_protect = self.control.cr0 & CR0_WP != 0;
+        match self.jit_fast_map.lookup_access(
+            linear,
+            mapping_epoch,
+            width,
+            write,
+            user,
+            write_protect,
+        ) {
+            Some(access) => {
+                self.perf.interp_fast_map_hits += 1;
+                Some((access.physical(), access.ptr(), access.is_mode13()))
+            }
+            None => {
+                self.perf.interp_fast_map_misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Raw load through a FastMap-resolved pointer. Mirrors `read_direct_entry`, but the FastMap
+    /// bias already accounts for the exact linear offset, so there is no separate page offset to
+    /// add.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn read_fast_map_ptr(ptr: *mut u8, width: BusWidth) -> u32 {
+        match width {
+            BusWidth::Byte => unsafe { u32::from(*ptr) },
+            BusWidth::Word => unsafe {
+                u32::from(u16::from_le(std::ptr::read_unaligned(ptr.cast::<u16>())))
+            },
+            BusWidth::Dword => unsafe { u32::from_le(std::ptr::read_unaligned(ptr.cast::<u32>())) },
+        }
+    }
+
+    /// Raw store through a FastMap-resolved pointer. Mirrors `write_direct_entry`; see
+    /// `read_fast_map_ptr`.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn write_fast_map_ptr(ptr: *mut u8, width: BusWidth, value: u32) {
+        match width {
+            BusWidth::Byte => unsafe {
+                *ptr = value as u8;
+            },
+            BusWidth::Word => unsafe {
+                std::ptr::write_unaligned(ptr.cast::<u16>(), (value as u16).to_le());
+            },
+            BusWidth::Dword => unsafe {
+                std::ptr::write_unaligned(ptr.cast::<u32>(), value.to_le());
+            },
+        }
+    }
+
+    /// The joined tail for a FastMap read hit: the SAME charge, counter increments as the slow
+    /// (DirectPageCache) read path, just fed by the FastMap's pointer instead of re-deriving one.
+    /// A Mode13 hit defers to the full `charge_direct_memory` so the VGA aperture keeps its
+    /// `note_direct_write` and persona wait states (invariant 1); a Ram hit takes the equivalent
+    /// flat charge through `charge_direct_ram_memory`, which skips only the redundant aperture
+    /// range compare `charge_direct_memory` would otherwise redo (see `bus.rs::charge_ram_only`).
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn finish_fast_map_read<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        ptr: *mut u8,
+        mode13: bool,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> ExecResult<u32> {
+        if mode13 {
+            bus.charge_direct_memory(physical, width, kind)?;
+        } else {
+            bus.charge_direct_ram_memory(physical, width, kind)?;
+        }
+        self.record_data_read(kind, true);
+        self.perf.direct_data_pointer_reads += 1;
+        Ok(Self::read_fast_map_ptr(ptr, width))
+    }
+
+    /// The joined tail for a FastMap write hit. Runs, in order: `record_write_page` (invariant 2 --
+    /// a FastMap write bias only exists after the PTE dirty bit is committed, or the page is
+    /// unpaged, exactly like the two `record_write_page` call sites inside
+    /// `translate_linear_checked` that this replaces); the cheap `code_write_watched` probe;
+    /// the charge (same split as `finish_fast_map_read`); the old-bytes compare that drives G2
+    /// same-value elision; the store itself; then `note_code_write_hit` iff the store both hit
+    /// watched code and changed a byte (invariant 3), matching the compare-then-write-then-
+    /// invalidate ordering `write_linear_fragment` already documents for the slow sized path.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn finish_fast_map_write<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        ptr: *mut u8,
+        mode13: bool,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        self.record_write_page(physical);
+        let watched = self.code_write_watched(physical, width.bytes());
+        if mode13 {
+            bus.charge_direct_memory(physical, width, kind)?;
+        } else {
+            bus.charge_direct_ram_memory(physical, width, kind)?;
+        }
+        let changed = Self::read_fast_map_ptr(ptr, width) != value;
+        Self::write_fast_map_ptr(ptr, width, value);
+        if watched && changed {
+            self.note_code_write_hit(physical, width.bytes());
+        }
+        self.record_data_write(kind, true);
+        self.perf.direct_data_pointer_writes += 1;
+        Ok(())
     }
 
     #[inline]
@@ -606,6 +773,18 @@ impl CpuGsw {
         linear: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some((physical, ptr, mode13)) =
+            self.fast_map_data_slot(linear, BusWidth::Byte, false)
+        {
+            return self
+                .finish_fast_map_read(bus, physical, ptr, mode13, BusWidth::Byte, kind)
+                .map(|value| value as u8);
+        }
         let physical = if self.control.cr0 & CR0_PG == 0 {
             linear
         } else {
@@ -638,6 +817,23 @@ impl CpuGsw {
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, BusWidth::Byte, true)
+        {
+            return self.finish_fast_map_write(
+                bus,
+                physical,
+                ptr,
+                mode13,
+                BusWidth::Byte,
+                u32::from(value),
+                kind,
+            );
+        }
         let physical = if self.control.cr0 & CR0_PG == 0 {
             self.record_write_page(linear);
             linear
@@ -866,6 +1062,14 @@ impl CpuGsw {
         if width == BusWidth::Byte {
             return self.read_linear_u8(bus, linear, kind).map(u32::from);
         }
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false) {
+            return self.finish_fast_map_read(bus, physical, ptr, mode13, width, kind);
+        }
         let physical = self.translate_linear(bus, linear, false)?;
         if let Some(value) = self.read_direct_page_cached(bus, linear, physical, width, kind)? {
             return Ok(value);
@@ -885,6 +1089,14 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         if width == BusWidth::Byte {
             return self.write_linear_u8(bus, linear, value as u8, kind);
+        }
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true) {
+            return self.finish_fast_map_write(bus, physical, ptr, mode13, width, value, kind);
         }
         let physical = self.translate_linear(bus, linear, true)?;
         // G2: same-value elision for sized stores. Probe the code watch first (side-effect free);

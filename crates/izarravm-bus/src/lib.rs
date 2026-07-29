@@ -784,6 +784,20 @@ pub trait CpuBus {
         Ok(())
     }
 
+    /// Charge a direct-memory access already known to be plain RAM (not the Mode13h VGA
+    /// aperture), skipping whatever aperture range compare `charge_direct_memory` would otherwise
+    /// redo. Callers that have NOT independently established the access is outside the VGA
+    /// aperture must call `charge_direct_memory` instead; the default here mirrors the base
+    /// method's no-op default for buses without direct-memory timing.
+    fn charge_direct_ram_memory(
+        &mut self,
+        _address: u32,
+        _width: BusWidth,
+        _kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        Ok(())
+    }
+
     /// Return an upper bound on the raw clocks added by one cached direct-memory charge. `Some`
     /// remains valid until the bus reports a step break. A JIT uses it only after its CPU-side
     /// direct-page cache hit; `None` keeps the ordinary instruction path.
