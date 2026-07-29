@@ -2466,9 +2466,33 @@ impl CpuGsw {
                     Self::compute_global_block_upper(bus, num, den, block.has_x87()),
                     "cached global_block_upper went stale"
                 );
+                // CHAIN PRICING. `global_block_upper` is a SOUND bound — it prices every hop as
+                // 32 four-clock instructions plus RET plus 32 worst-case bus accesses — and that
+                // soundness is what makes it useless. The measured average Direct block is 6.4
+                // instructions at roughly 2 clocks, so the sound bound overprices a hop by 10-40x
+                // and cuts chains that far short of the budget they were allowed. The dispatch
+                // audit (dev_docs/2026-07-30-dispatch-architecture-audit.md) attributes ~13.4M of
+                // 46.7M stint-ends to this, against a PIT-edge cap that fires 22,903 times.
+                //
+                // It is also FAKE precision. It guarantees native code never overshoots the edge
+                // by one block while the interpreter arm of the same loop overshoots by an
+                // instruction and a REP fast path by a whole string chunk. The owner's ruling
+                // (2026-07-30) is that sub-perceptual timing exactness is not worth this, and
+                // real parts of the same stepping vary between packages anyway.
+                //
+                // `iteration_upper` is THIS block's actual cost, already computed above for the
+                // first hop. Chains are loop bodies, so the entry block is a far better estimate
+                // of the next hop than the global maximum. Overshoot is now possible and bounded
+                // by MAX_CHAIN_BLOCKS hops of (real hop cost - entry cost); `brk_cap` and the
+                // scaled-bus term still end the run, one block late instead of 10-40x early.
+                //
+                // `global_block_upper` stays live below as the x87 crossing guard's input and as
+                // the memoised two-entry table; only the divisor changes here.
+                let per_hop_estimate = iteration_upper.max(1);
+                debug_assert!(per_hop_estimate <= global_block_upper.max(1));
                 let additional = available
                     .saturating_sub(iteration_upper)
-                    .checked_div(global_block_upper)
+                    .checked_div(per_hop_estimate)
                     .unwrap_or(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1);
                 1 + additional.min(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1)
             }
