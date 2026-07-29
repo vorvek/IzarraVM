@@ -98,7 +98,9 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
 #[test]
 fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
     let code = [0x40, 0x41, 0x42, 0x43, 0xfc, 0x44, 0x45, 0x46, 0x47];
-    let addresses: Vec<_> = (0..code.len()).map(|offset| ENTRY + offset as u32).collect();
+    let addresses: Vec<_> = (0..code.len())
+        .map(|offset| ENTRY + offset as u32)
+        .collect();
 
     let (mut disabled_cpu, mut disabled_bus) = fixture(&code);
     warm(&mut disabled_cpu, &mut disabled_bus, &addresses);
@@ -126,8 +128,20 @@ fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
 
 #[test]
 fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
-    let code = [0x40, 0x41, 0x42, 0x43, DIRECT_BARRIER, 0x44, 0x45, 0x46, 0x47];
-    let addresses: Vec<_> = (0..code.len()).map(|offset| ENTRY + offset as u32).collect();
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        0x43,
+        DIRECT_BARRIER,
+        0x44,
+        0x45,
+        0x46,
+        0x47,
+    ];
+    let addresses: Vec<_> = (0..code.len())
+        .map(|offset| ENTRY + offset as u32)
+        .collect();
     let (mut cpu, mut bus) = fixture(&code);
     cpu.enable_direct_barrier_census(true);
     warm(&mut cpu, &mut bus, &addresses);

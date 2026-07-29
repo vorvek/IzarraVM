@@ -145,29 +145,63 @@ impl BarrierKey {
 struct BarrierStats {
     helper_family: Option<HelperFamily>,
     hits: u64,
+    runtime_hits: u64,
     native_prefix_instructions: u64,
     native_suffix_instructions: u64,
     eligible_shapes: u64,
     eligible_suffix_instructions: u64,
     max_native_prefix: u8,
     max_native_suffix: u8,
+    exact_root_bridges: u64,
+    right_direct_entries: u64,
+    removed_inbound_links: u64,
+    removed_outbound_links: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CensusSiteKey {
+    entry_linear: u32,
+    helper_linear: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CensusSite {
+    row: BarrierKey,
+    fallthrough_linear: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BarrierObservation {
+    helper: Option<HelperSpec>,
+    entry_linear: u32,
+    helper_linear: u32,
+    fallthrough_linear: u32,
+    native_prefix: usize,
+    native_suffix: usize,
+    shape_eligible: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DirectBarrierCensus {
     rows: HashMap<BarrierKey, BarrierStats>,
+    sites: HashMap<CensusSiteKey, CensusSite>,
+    pending_left: Option<CensusSiteKey>,
+    pending_right: Option<CensusSiteKey>,
 }
 
 impl DirectBarrierCensus {
-    fn record(
-        &mut self,
-        insn: &DecodedInsn,
-        helper: Option<HelperSpec>,
-        native_prefix: usize,
-        native_suffix: usize,
-        shape_eligible: bool,
-    ) {
-        let row = self.rows.entry(BarrierKey::from_insn(insn)).or_default();
+    fn record(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
+        let BarrierObservation {
+            helper,
+            entry_linear,
+            helper_linear,
+            fallthrough_linear,
+            native_prefix,
+            native_suffix,
+            shape_eligible,
+        } = observation;
+        let key = BarrierKey::from_insn(insn);
+        let row = self.rows.entry(key).or_default();
         row.helper_family = helper.map(|spec| spec.family);
         row.hits = row.hits.saturating_add(1);
         row.native_prefix_instructions = row
@@ -183,6 +217,76 @@ impl DirectBarrierCensus {
             row.eligible_suffix_instructions = row
                 .eligible_suffix_instructions
                 .saturating_add(native_suffix as u64);
+            self.sites.insert(
+                CensusSiteKey {
+                    entry_linear,
+                    helper_linear,
+                },
+                CensusSite {
+                    row: key,
+                    fallthrough_linear,
+                },
+            );
+        }
+    }
+
+    fn batch_begin(&mut self) {
+        self.pending_left = None;
+        self.pending_right = None;
+    }
+
+    fn batch_end(&mut self) {
+        self.pending_left = None;
+        self.pending_right = None;
+    }
+
+    fn note_direct_run(&mut self, entry_linear: u32, final_linear: u32, linked_transfers: u32) {
+        if let Some(pending) = self.pending_right.take()
+            && let Some(site) = self.sites.get(&pending).copied()
+            && entry_linear == site.fallthrough_linear
+        {
+            let removed_outbound = u64::from(linked_transfers != 0);
+            let row = self
+                .rows
+                .get_mut(&site.row)
+                .expect("census site must retain its row");
+            row.right_direct_entries = row.right_direct_entries.saturating_add(1);
+            row.removed_outbound_links =
+                row.removed_outbound_links.saturating_add(removed_outbound);
+        }
+
+        let key = CensusSiteKey {
+            entry_linear,
+            helper_linear: final_linear,
+        };
+        self.pending_left = self.sites.contains_key(&key).then_some(key);
+    }
+
+    fn note_interpreted(&mut self, insn: &DecodedInsn, linear: u32, final_linear: u32) {
+        self.pending_right = None;
+        let key = BarrierKey::from_insn(insn);
+        if let Some(row) = self.rows.get_mut(&key)
+            && row.helper_family.is_some()
+        {
+            row.runtime_hits = row.runtime_hits.saturating_add(1);
+        }
+
+        let Some(pending) = self.pending_left.take() else {
+            return;
+        };
+        if pending.helper_linear != linear {
+            return;
+        }
+        let Some(site) = self.sites.get(&pending).copied() else {
+            return;
+        };
+        let row = self
+            .rows
+            .get_mut(&site.row)
+            .expect("census site must retain its row");
+        row.exact_root_bridges = row.exact_root_bridges.saturating_add(1);
+        if final_linear == site.fallthrough_linear {
+            self.pending_right = Some(pending);
         }
     }
 
@@ -231,12 +335,17 @@ fn census_row(key: BarrierKey, stats: BarrierStats) -> DirectBarrierCensusRow {
         prefix_mask: key.prefix_mask,
         helper_family: stats.helper_family.map(HelperFamily::name),
         hits: stats.hits,
+        runtime_hits: stats.runtime_hits,
         native_prefix_instructions: stats.native_prefix_instructions,
         native_suffix_instructions: stats.native_suffix_instructions,
         eligible_shapes: stats.eligible_shapes,
         eligible_suffix_instructions: stats.eligible_suffix_instructions,
         max_native_prefix: stats.max_native_prefix,
         max_native_suffix: stats.max_native_suffix,
+        exact_root_bridges: stats.exact_root_bridges,
+        right_direct_entries: stats.right_direct_entries,
+        removed_inbound_links: stats.removed_inbound_links,
+        removed_outbound_links: stats.removed_outbound_links,
     }
 }
 
@@ -253,16 +362,43 @@ impl super::JitState {
         self.direct_barrier_census.is_some()
     }
 
-    fn record_barrier(
+    fn record_barrier(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.record(insn, observation);
+        }
+    }
+
+    pub(crate) fn barrier_census_batch_begin(&mut self) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.batch_begin();
+        }
+    }
+
+    pub(crate) fn barrier_census_batch_end(&mut self) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.batch_end();
+        }
+    }
+
+    pub(crate) fn note_barrier_census_direct_run(
         &mut self,
-        insn: &DecodedInsn,
-        helper: Option<HelperSpec>,
-        native_prefix: usize,
-        native_suffix: usize,
-        shape_eligible: bool,
+        entry_linear: u32,
+        final_linear: u32,
+        linked_transfers: u32,
     ) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.record(insn, helper, native_prefix, native_suffix, shape_eligible);
+            census.note_direct_run(entry_linear, final_linear, linked_transfers);
+        }
+    }
+
+    pub(crate) fn note_barrier_census_interpreted(
+        &mut self,
+        insn: &DecodedInsn,
+        linear: u32,
+        final_linear: u32,
+    ) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.note_interpreted(insn, linear, final_linear);
         }
     }
 
@@ -3784,10 +3920,15 @@ fn compile_with_instruction_limit(
                         && !suffix.self_loop;
                     cpu.jit_direct.record_barrier(
                         &insn,
-                        Some(helper),
-                        slots.len(),
-                        suffix.instructions,
-                        shape_eligible,
+                        BarrierObservation {
+                            helper: Some(helper),
+                            entry_linear: entry_lin,
+                            helper_linear: lin,
+                            fallthrough_linear: next,
+                            native_prefix: slots.len(),
+                            native_suffix: suffix.instructions,
+                            shape_eligible,
+                        },
                     );
                 }
                 stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
@@ -3809,10 +3950,15 @@ fn compile_with_instruction_limit(
                     );
                     cpu.jit_direct.record_barrier(
                         &insn,
-                        None,
-                        slots.len(),
-                        suffix.instructions,
-                        false,
+                        BarrierObservation {
+                            helper: None,
+                            entry_linear: entry_lin,
+                            helper_linear: lin,
+                            fallthrough_linear: next,
+                            native_prefix: slots.len(),
+                            native_suffix: suffix.instructions,
+                            shape_eligible: false,
+                        },
                     );
                 }
                 stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);

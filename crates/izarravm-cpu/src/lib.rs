@@ -1234,12 +1234,17 @@ pub struct DirectBarrierCensusRow {
     pub prefix_mask: u16,
     pub helper_family: Option<&'static str>,
     pub hits: u64,
+    pub runtime_hits: u64,
     pub native_prefix_instructions: u64,
     pub native_suffix_instructions: u64,
     pub eligible_shapes: u64,
     pub eligible_suffix_instructions: u64,
     pub max_native_prefix: u8,
     pub max_native_suffix: u8,
+    pub exact_root_bridges: u64,
+    pub right_direct_entries: u64,
+    pub removed_inbound_links: u64,
+    pub removed_outbound_links: u64,
 }
 
 /// Deterministically sorted snapshot of the Direct structural-stop census.

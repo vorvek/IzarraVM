@@ -37,6 +37,56 @@ fn key(linear: u32) -> BlockKey {
     BlockKey::new(linear, 0x20_000 + (linear & 0xfff), 7)
 }
 
+fn cld_insn() -> DecodedInsn {
+    DecodedInsn {
+        len: 1,
+        prefixes: Prefixes::default(),
+        opcode: 0xfc,
+        operand_size: OperandSize::Dword,
+        address_size: AddressSize::Dword,
+        modrm: None,
+        operand: None,
+        imm: 0,
+        imm2: 0,
+        group: DecodeGroup::FlagsMisc,
+        continuable: true,
+        disp_len: 0,
+        imm_len: 0,
+    }
+}
+
+#[test]
+fn barrier_census_records_runtime_bridge_diagnostics_without_reselecting() {
+    let insn = cld_insn();
+    let helper = precise_helper_spec(&insn).expect("CLD helper spec");
+    let mut census = DirectBarrierCensus::default();
+    census.record(
+        &insn,
+        BarrierObservation {
+            helper: Some(helper),
+            entry_linear: 0x100,
+            helper_linear: 0x104,
+            fallthrough_linear: 0x105,
+            native_prefix: 4,
+            native_suffix: 4,
+            shape_eligible: true,
+        },
+    );
+    census.batch_begin();
+    census.note_direct_run(0x100, 0x104, 0);
+    census.note_interpreted(&insn, 0x104, 0x105);
+    census.note_direct_run(0x105, 0x109, 1);
+    census.batch_end();
+
+    let snapshot = census.snapshot();
+    let selected = snapshot.selected.expect("compile-time selection");
+    assert_eq!(selected.runtime_hits, 1);
+    assert_eq!(selected.exact_root_bridges, 1);
+    assert_eq!(selected.right_direct_entries, 1);
+    assert_eq!(selected.removed_inbound_links, 0);
+    assert_eq!(selected.removed_outbound_links, 1);
+}
+
 fn cell_portal(cell: &LinkCell) -> &BlockPortal {
     let address = cell.portal.load(Ordering::Acquire);
     assert_ne!(address, 0);
