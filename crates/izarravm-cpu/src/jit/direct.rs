@@ -156,6 +156,9 @@ struct BarrierStats {
     right_direct_entries: u64,
     removed_inbound_links: u64,
     removed_outbound_links: u64,
+    /// Exits that actually happened into a block this barrier rejected. RUNTIME-weighted, unlike
+    /// `hits` (compile attempts) which mis-ranked the ShiftCl slice by three orders of magnitude.
+    unbound_exits: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -194,11 +197,25 @@ pub(crate) struct DirectBarrierCensus {
     /// because emitted code bakes it. Growing `PerfCounters` for a diagnostic shifts that pin;
     /// the census is an `Option<Box<_>>` on `JitState` and costs the layout nothing.
     unbound: [u64; UnboundTarget::COUNT],
+    /// Block entry linear -> the barrier row that refused it, so a rejected-target exit can be
+    /// attributed back to the opcode responsible. Keyed on linear alone: two rejected blocks
+    /// sharing a linear across mode/physical would merge, which is acceptable for a diagnostic
+    /// and keeps the compile-side insert to one word.
+    rejected_barrier: HashMap<u32, BarrierKey>,
 }
 
 impl DirectBarrierCensus {
     fn note_unbound(&mut self, kind: UnboundTarget) {
         self.unbound[kind as usize] += 1;
+    }
+
+    /// Attribute one rejected-target exit back to the barrier that refused that block.
+    fn note_unbound_rejected_at(&mut self, linear: u32) {
+        let Some(&key) = self.rejected_barrier.get(&linear) else {
+            return;
+        };
+        let row = self.rows.entry(key).or_default();
+        row.unbound_exits = row.unbound_exits.saturating_add(1);
     }
 
     fn record(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
@@ -212,6 +229,7 @@ impl DirectBarrierCensus {
             shape_eligible,
         } = observation;
         let key = BarrierKey::from_insn(insn);
+        self.rejected_barrier.insert(entry_linear, key);
         let row = self.rows.entry(key).or_default();
         row.helper_family = helper.map(|spec| spec.family);
         row.hits = row.hits.saturating_add(1);
@@ -307,10 +325,18 @@ impl DirectBarrierCensus {
             .iter()
             .map(|(&key, &stats)| (key, census_row(key, stats)))
             .collect();
+        // Sorted by RUNTIME unbound exits first. `eligible_suffix_instructions` was the old
+        // primary key and it is a compile-attempt aggregate; ranking by it is what sent the
+        // ShiftCl slice after a family worth 0.06pp. It stays as a tiebreak only.
         keyed_rows.sort_by(|(left_key, left), (right_key, right)| {
             right
-                .eligible_suffix_instructions
-                .cmp(&left.eligible_suffix_instructions)
+                .unbound_exits
+                .cmp(&left.unbound_exits)
+                .then_with(|| {
+                    right
+                        .eligible_suffix_instructions
+                        .cmp(&left.eligible_suffix_instructions)
+                })
                 .then_with(|| right.hits.cmp(&left.hits))
                 .then_with(|| left_key.cmp(right_key))
         });
@@ -348,6 +374,7 @@ fn census_row(key: BarrierKey, stats: BarrierStats) -> DirectBarrierCensusRow {
             "word"
         },
         prefix_mask: key.prefix_mask,
+        unbound_exits: stats.unbound_exits,
         helper_family: stats.helper_family.map(HelperFamily::name),
         hits: stats.hits,
         runtime_hits: stats.runtime_hits,
@@ -430,9 +457,12 @@ impl super::JitState {
 
     /// Record why a static successor was unbound. No-op unless the census is allocated, and the
     /// CALLER still gates on `barrier_census_active` so the key construction is skipped too.
-    pub(crate) fn note_unbound_target(&mut self, kind: UnboundTarget) {
+    pub(crate) fn note_unbound_target(&mut self, kind: UnboundTarget, linear: u32) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
             census.note_unbound(kind);
+            if kind == UnboundTarget::Rejected {
+                census.note_unbound_rejected_at(linear);
+            }
         }
     }
 
@@ -462,6 +492,10 @@ impl BlockKey {
             physical,
             mode_key,
         }
+    }
+
+    pub(crate) const fn linear(self) -> u32 {
+        self.linear
     }
 
     fn hot_index(self) -> usize {

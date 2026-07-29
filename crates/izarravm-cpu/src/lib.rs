@@ -1226,6 +1226,9 @@ pub struct CpuProfileSnapshot {
 /// One normalized Direct structural stop observed by the opt-in barrier census.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectBarrierCensusRow {
+    /// Exits that actually happened into a block this barrier rejected. The runtime-weighted
+    /// ranking key; `hits` below is compile attempts and must not be used for prioritisation.
+    pub unbound_exits: u64,
     pub opcode: u16,
     pub modrm_reg: Option<u8>,
     pub operand_form: &'static str,

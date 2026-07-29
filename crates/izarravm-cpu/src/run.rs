@@ -2302,7 +2302,7 @@ impl CpuGsw {
             return;
         };
         let kind = self.jit_direct.classify_unbound_target(key);
-        self.jit_direct.note_unbound_target(kind);
+        self.jit_direct.note_unbound_target(kind, key.linear());
     }
 
     #[cfg(feature = "jit")]

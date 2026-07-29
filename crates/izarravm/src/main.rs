@@ -1002,6 +1002,7 @@ fn direct_barrier_census_json(
 fn direct_barrier_census_row_json(row: &izarravm_cpu::DirectBarrierCensusRow) -> serde_json::Value {
     json!({
         "opcode": row.opcode,
+        "unbound_exits": row.unbound_exits,
         "modrm_reg": row.modrm_reg,
         "operand_form": row.operand_form,
         "operand_size": row.operand_size,
