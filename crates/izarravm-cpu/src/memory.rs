@@ -150,7 +150,7 @@ impl CpuGsw {
         if !self.fast_map_population_enabled() {
             return;
         }
-        if !self.populate_fast_map_active(
+        self.populate_fast_map_active(
             linear,
             physical,
             DirectPage {
@@ -161,14 +161,7 @@ impl CpuGsw {
                 mapping_epoch,
             },
             write,
-        ) {
-            return;
-        }
-        if write {
-            self.data_write_pages.note_fast_map_linear(physical, linear);
-        } else {
-            self.data_read_pages.note_fast_map_linear(physical, linear);
-        }
+        );
     }
 
     /// Lever 1: the interpreter's FastMap serve path. Applies exactly the hit predicate native
@@ -381,7 +374,19 @@ impl CpuGsw {
         }
         let changed = Self::read_fast_map_ptr(ptr, width) != value;
         Self::write_fast_map_ptr(ptr, width, value);
-        if changed && (width == BusWidth::Byte || watched) {
+        // `note_code_write_hit` is a total no-op when `watched` is false and no unit sim is
+        // attached: `code_write_watched` being false means both `range_hits_compiled_code` and
+        // `decode_cache.range_hits_code` are false, so every branch inside is skipped and nothing
+        // is incremented. The `width == BusWidth::Byte` half of the original gate called it
+        // anyway on every unwatched byte write, only to feed the diagnostic unit sim -- but with
+        // `clif-backend` on, the call also runs `clif_invalidate_physical_range` UNCONDITIONALLY
+        // (core.rs), which scans every entry in `ClifUnitCache`. Watch registration is
+        // chunk-granular (coarser than byte-exact), so `!watched` guarantees no overlap and that
+        // scan was a guaranteed no-op -- a dormant perf regression on the default (non-clif) hot
+        // path once clif-backend is enabled. Narrowing the byte-width half to "only when a unit
+        // sim is actually attached" keeps the diagnostic feed working while dropping the call
+        // entirely on the default build's unwatched byte-write path.
+        if changed && (watched || (width == BusWidth::Byte && self.unit_sim.0.is_some())) {
             self.note_code_write_hit(physical, width.bytes());
         }
         self.record_data_write(kind, true);
@@ -500,16 +505,13 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.populate_fast_map(_linear, physical, page, false) {
-            self.data_read_pages.note_fast_map_linear(physical, _linear);
-        }
+        self.populate_fast_map(_linear, physical, page, false);
         bus.charge_direct_memory(physical, width, kind)?;
         self.record_data_read(kind, true);
         self.perf.direct_data_pointer_reads += 1;
         Ok(Some(Self::read_direct_entry(
             DirectPageCacheEntry {
                 physical_page: page.physical_page,
-                fast_map_linear_page: _linear & !0x0fff,
                 ptr: page.ptr,
             },
             physical,
@@ -583,10 +585,8 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear
-            && self.populate_fast_map(linear, physical, page, false)
-        {
-            self.data_read_pages.note_fast_map_linear(physical, linear);
+        if let Some(linear) = _linear {
+            self.populate_fast_map(linear, physical, page, false);
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, true);
@@ -646,14 +646,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.populate_fast_map(_linear, physical, page, true) {
-            self.data_write_pages
-                .note_fast_map_linear(physical, _linear);
-        }
+        self.populate_fast_map(_linear, physical, page, true);
         bus.charge_direct_memory(physical, width, kind)?;
         let entry = DirectPageCacheEntry {
             physical_page: page.physical_page,
-            fast_map_linear_page: _linear & !0x0fff,
             ptr: page.ptr,
         };
         let changed = Self::read_direct_entry(entry, physical, width) != value;
@@ -738,10 +734,8 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear
-            && self.populate_fast_map(linear, physical, page, true)
-        {
-            self.data_write_pages.note_fast_map_linear(physical, linear);
+        if let Some(linear) = _linear {
+            self.populate_fast_map(linear, physical, page, true);
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         let changed = unsafe { *page.ptr.add(offset) != value };
