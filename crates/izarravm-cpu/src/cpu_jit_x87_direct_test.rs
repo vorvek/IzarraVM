@@ -2018,3 +2018,97 @@ fn fcom_m64_with_a_nan_operand_side_exits_and_the_interpreter_writes_the_unorder
         "unordered: C3=C2=C0"
     );
 }
+
+/// The `top_delta` trap, mirrored from `ficomp_followed_by_fstp_program` for the 0xDC m64 slice.
+/// FCOMP m64 (0xDC extension 3, `ComparePop`) pops, so the x87 slot immediately behind it must
+/// address the PHYSICAL register the pop left as the new ST(0), not the one that was ST(0)
+/// before the pop. If `BinaryMemoryF64` fell out of `top_delta`'s `op.pops()` group (the mutation
+/// this fixture exists to catch), the compile-time TOP tracking used for the follow-on FSTP would
+/// stay stale, and it would either address the wrong physical register (corrupting the stored
+/// value) or trip the empty-tag guard on the register the real runtime pop just vacated. Either
+/// way the exact-retirement gate and the state comparison below catch it; a correct compile does
+/// neither.
+fn fcomp_m64_followed_by_fstp_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xb8, 0x01, 0x00, 0x00, 0x00]; // mov eax,1     integer, before
+    code.extend_from_slice(&[0xdd, 0x05]); // fld qword [DATA]       ST(0)=A
+    code.extend_from_slice(&(DATA as u32).to_le_bytes());
+    code.extend_from_slice(&[0xdd, 0x05]); // fld qword [DATA+8]     ST(0)=B, ST(1)=A
+    code.extend_from_slice(&(DATA as u32 + 8).to_le_bytes());
+    code.extend_from_slice(&[0xdc, 0x1d]); // fcomp qword [DATA+16]  pops: ST(0)=A now
+    code.extend_from_slice(&(DATA as u32 + 16).to_le_bytes());
+    code.extend_from_slice(&[0xdd, 0x1d]); // fstp qword [DATA2]     the top_delta trap
+    code.extend_from_slice(&(DATA2 as u32).to_le_bytes());
+    code.extend_from_slice(&[
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2   integer, after
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&3.0f64.to_bits().to_le_bytes()); // A
+    memory[DATA + 8..DATA + 16].copy_from_slice(&5.0f64.to_bits().to_le_bytes()); // B
+    memory[DATA + 16..DATA + 24].copy_from_slice(&5.0f64.to_bits().to_le_bytes()); // ties B, condition bits inert
+    memory
+}
+
+#[test]
+fn fcomp_m64_followed_by_another_x87_slot_addresses_the_popped_stack_correctly() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (cpu, bus) = assert_program_matches_exact_insns(
+            mode,
+            fcomp_m64_followed_by_fstp_program(),
+            0x037f,
+            6, // mov, fld, fld, fcomp, fstp, mov -- hlt never retires natively
+        );
+        assert_eq!(
+            f64::from_bits(u64::from_le_bytes(
+                bus.memory[DATA2..DATA2 + 8].try_into().unwrap()
+            )),
+            3.0, // A: what the pop left as the new ST(0)
+            "mode={mode:?}"
+        );
+        assert_eq!(cpu.fpu.top(), 0, "mode={mode:?}");
+        assert_eq!(
+            cpu.perf_counters().jit_direct_side_exits,
+            0,
+            "mode={mode:?}"
+        );
+    }
+}
+
+fn fld_m64_nan_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![0xb8, 0x01, 0x00, 0x00, 0x00]; // mov eax,1   integer, before
+    code.extend_from_slice(&[0xdd, 0x05]); // fld qword [DATA]   NaN operand, mid-block
+    code.extend_from_slice(&(DATA as u32).to_le_bytes());
+    code.extend_from_slice(&[
+        0xbb, 0x02, 0x00, 0x00, 0x00, // mov ebx,2   integer, after (interpreted)
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
+    memory
+}
+
+/// `LoadF64`'s OWN finite guard, as opposed to `BinaryMemoryF64`'s: both existing m64 NaN
+/// fixtures (`fadd_m64_nan_program`, `fcom_m64_nan_program`) put the NaN in the SECOND operand,
+/// consumed by the 0xDC arithmetic slot's guard, and never touch the guard inside `LoadF64`'s own
+/// emit arm. This one FLDs the NaN bit pattern directly, so the only guard standing between it
+/// and the resident cache is `LoadF64`'s. The native side must side-exit at the FLD itself, never
+/// completing the push; the retirement count proves the FLD did not lower (only the leading `mov`
+/// retires natively), and the interpreter, re-executing the FLD, pushes the NaN.
+#[test]
+fn fld_m64_with_a_nan_operand_side_exits_before_pushing_it() {
+    let (cpu, _) = assert_program_matches_exact_insns(
+        GswMode::Gsw586,
+        fld_m64_nan_program(),
+        0x037f,
+        1, // mov -- the fld itself must side-exit rather than retire natively
+    );
+    assert!(
+        cpu.perf_counters().jit_direct_exit_other > 0,
+        "a NaN operand must side-exit at LoadF64's own finite guard rather than be pushed"
+    );
+    assert!(cpu.fpu.get(0).is_nan(), "the interpreter pushed the NaN");
+}
