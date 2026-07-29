@@ -176,6 +176,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 MemoryWidth::Word => e.mov_r16_r16(home(dst), home(src)),
                 MemoryWidth::Dword => e.mov_r32_r32(home(dst), home(src)),
                 MemoryWidth::Byte => unreachable!("byte register moves use MovRegByte"),
+                MemoryWidth::Qword => unreachable!("register moves are never 8-byte wide"),
             },
             DirectKind::MovRegByte { dst, src } => {
                 emit_read_store_value(&mut e, StoreSource::Reg(src), MemoryWidth::Byte, Reg::RDX);
@@ -1781,6 +1782,9 @@ fn emit_load(
             e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
             e.mov_r32_r32(home(dst), Reg::RDX);
         }
+        // classify only ever produces a GPR-sized `Load` (Byte, Word or Dword); the x87 memory
+        // forms route through `emit_x87_slot`/`x87_avx2_emit`, not here.
+        MemoryWidth::Qword => unreachable!("GPR loads are never 8-byte wide"),
     }
 }
 
@@ -1818,6 +1822,9 @@ fn emit_load_extend(
         // arm exists so that a future edit passing `operand_width` (which is Dword for every
         // admitted form) fails loudly instead of silently emitting a dword read.
         (MemoryWidth::Dword, _) => {
+            unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
+        }
+        (MemoryWidth::Qword, _) => {
             unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
         }
     }
@@ -1984,21 +1991,35 @@ fn emit_x87_memory_completion(
     e.jz(mode13);
     if direction == NativeX87MemoryDirection::Write {
         match width {
+            MemoryWidth::Byte => unreachable!("no x87 memory form is byte-wide"),
             MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
-            _ => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+            MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+            // Two dword transactions per m64 access (`write_qword` splits into two independent
+            // 4-aligned dword writes; see `MemoryWidth::alignment_bytes`), so the dword lane
+            // moves by 2 rather than 1. This is the RAM lane, which is not mode-13: it feeds
+            // `exit.ram_dword_writes`, charged directly at run.rs.
+            MemoryWidth::Qword => emit_dynamic_increment_by(e, STACK_RAM_DWORD_WRITES, 2),
         }
     }
     e.jmp(done);
     e.place(mode13);
     match direction {
         NativeX87MemoryDirection::Read => match width {
+            MemoryWidth::Byte => unreachable!("no x87 memory form is byte-wide"),
             MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS),
-            _ => emit_dynamic_increment(e, STACK_MODE13_DWORD_READS),
+            MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_READS),
+            // Same reasoning as the RAM write arm above: an m64 read wholly inside the aperture
+            // increments mode13_dword_reads by 2, not 1. A read cannot straddle RAM and the
+            // aperture (the guard admits only single-page accesses), so this is all-or-nothing
+            // per access.
+            MemoryWidth::Qword => emit_dynamic_increment_by(e, STACK_MODE13_DWORD_READS, 2),
         },
         NativeX87MemoryDirection::Write => {
             match width {
+                MemoryWidth::Byte => unreachable!("no x87 memory form is byte-wide"),
                 MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES),
-                _ => emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES),
+                MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES),
+                MemoryWidth::Qword => emit_dynamic_increment_by(e, STACK_MODE13_DWORD_WRITES, 2),
             }
             emit_mode13_dirty_bit(e, map);
         }
@@ -2072,6 +2093,10 @@ fn emit_mode13_read_completion(e: &mut Encoder, width: MemoryWidth) {
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_READS),
         MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS),
         MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_READS),
+        // This path serves the GPR read kinds (Load, AluMemSource, RmwIncDec's read half,
+        // ImulMem...); the x87 memory forms have their own dynamic completion,
+        // `emit_x87_memory_completion`, which is where the Qword +2 accounting lives.
+        MemoryWidth::Qword => unreachable!("GPR memory reads are never 8-byte wide"),
     }
     e.place(done);
 }
@@ -2163,6 +2188,7 @@ fn emit_alu_mem_source(
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RCX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0),
         MemoryWidth::Dword => e.load_r32_disp8(Reg::RCX, Reg::RDI, 0),
+        MemoryWidth::Qword => unreachable!("ALU memory-source operands are never 8-byte wide"),
     }
     e.mov_r32_r32(Reg::RAX, home(dst));
     emit_alu_preloaded(e, op, dst, width);
@@ -2285,6 +2311,7 @@ fn emit_test_imm_mem(
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
         MemoryWidth::Dword => e.load_r32_disp8(Reg::RAX, Reg::RDI, 0),
+        MemoryWidth::Qword => unreachable!("TEST immediate memory operands are never 8-byte wide"),
     }
     e.mov_r32_imm32(Reg::RCX, imm);
     emit_test_preloaded(e, width);
@@ -2310,11 +2337,13 @@ fn emit_alu_mem_dest(
             MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
             MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
             MemoryWidth::Dword => e.load_r32_disp8(Reg::RAX, Reg::RDI, 0),
+            MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
         }
         emit_read_store_value(e, source, width, Reg::RCX);
         match width {
             MemoryWidth::Byte => emit_alu_byte_preloaded(e, op),
             MemoryWidth::Word | MemoryWidth::Dword => emit_alu_preloaded(e, op, 0, width),
+            MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
         }
         return;
     }
@@ -2351,6 +2380,7 @@ fn emit_alu_mem_dest(
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Dword => e.load_r32_disp8(Reg::RDX, Reg::RDI, 0),
+        MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
     }
     emit_read_store_value(e, source, width, Reg::RCX);
     emit_alu_candidate(e, op, width);
@@ -2370,6 +2400,7 @@ fn emit_alu_mem_dest(
         MemoryWidth::Byte => e.store_r8_disp8(Reg::RDI, 0, Reg::RDX),
         MemoryWidth::Word => e.store_r16_disp8(Reg::RDI, 0, Reg::RDX),
         MemoryWidth::Dword => e.store_r32_disp8(Reg::RDI, 0, Reg::RDX),
+        MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
     }
 
     e.load_r64_disp32(Reg::RCX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
@@ -2382,6 +2413,7 @@ fn emit_alu_mem_dest(
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
         MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
         MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+        MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
     }
     e.jmp(done);
     e.place(mode13);
@@ -2398,6 +2430,7 @@ fn emit_alu_mem_dest(
             emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
             emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
         }
+        MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
     }
     emit_mode13_dirty_bit(e, map);
     e.place(done);
@@ -2689,6 +2722,9 @@ fn emit_store(
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
         MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
         MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+        // classify only ever produces a GPR-sized `Store` (Byte, Word or Dword); the x87 store
+        // forms (StoreF64, StoreI32) route through `emit_x87_slot`, not here.
+        MemoryWidth::Qword => unreachable!("GPR stores are never 8-byte wide"),
     }
     e.jmp(done);
 
@@ -2701,6 +2737,7 @@ fn emit_store(
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES),
         MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES),
         MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES),
+        MemoryWidth::Qword => unreachable!("GPR stores are never 8-byte wide"),
     }
     emit_mode13_dirty_bit(e, map);
     e.place(done);
@@ -2774,13 +2811,13 @@ fn emit_rmw_inc_dec(
     e.add_r64_r64(Reg::RDX, Reg::RAX);
 
     match width {
-        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Byte | MemoryWidth::Qword => unreachable!("group 5 INC/DEC is word or dword"),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0),
         MemoryWidth::Dword => e.load_r32_disp8(Reg::RCX, Reg::RDI, 0),
     }
     e.mov_r32_r32(Reg::RAX, Reg::RCX);
     match width {
-        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Byte | MemoryWidth::Qword => unreachable!("group 5 INC/DEC is word or dword"),
         MemoryWidth::Word => {
             e.mov_r32_imm32(Reg::RDI, 1);
             e.alu_r16_r16(if is_dec { 5 } else { 0 }, Reg::RAX, Reg::RDI);
@@ -2790,7 +2827,7 @@ fn emit_rmw_inc_dec(
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
     emit_pending_inc_dec(e, is_dec, width, Reg::RCX, Reg::RAX);
     match width {
-        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Byte | MemoryWidth::Qword => unreachable!("group 5 INC/DEC is word or dword"),
         MemoryWidth::Word => e.store_r16_disp8(Reg::RDX, 0, Reg::RAX),
         MemoryWidth::Dword => e.store_r32_disp8(Reg::RDX, 0, Reg::RAX),
     }
@@ -2804,14 +2841,14 @@ fn emit_rmw_inc_dec(
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.jz(mode13);
     match width {
-        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Byte | MemoryWidth::Qword => unreachable!("group 5 INC/DEC is word or dword"),
         MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
         MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
     }
     e.jmp(done);
     e.place(mode13);
     match width {
-        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Byte | MemoryWidth::Qword => unreachable!("group 5 INC/DEC is word or dword"),
         MemoryWidth::Word => {
             emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS);
             emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES);
@@ -3006,11 +3043,18 @@ fn emit_push_mem(
 fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     debug_assert!(width.needs_alignment_guard());
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
-    e.and_r32_imm32(Reg::RDX, width.bytes() - 1);
+    e.and_r32_imm32(Reg::RDX, width.alignment_bytes() - 1);
     e.cmp_r32_imm32(Reg::RDX, 0);
     e.jnz(side);
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, 0x0fff);
+    // The crossing bound uses `bytes()` (the transaction's actual size), not
+    // `alignment_bytes()` (the guard's alignment requirement). For every width except Qword the
+    // two are equal, so this check is dead code: an aligned access of size N can never sit
+    // within N bytes of the page end. Qword is the one width where alignment_bytes() (4) is
+    // smaller than bytes() (8), so a 4-aligned access can start as late as offset 0xFFC and its
+    // second dword half crosses into the next page; this compare is what catches that, and it is
+    // LIVE for Qword only.
     e.cmp_r32_imm32(Reg::RDX, 0x1000 - width.bytes());
     e.jcc(7, side);
 }
@@ -3024,6 +3068,8 @@ fn emit_pending_inc_dec(e: &mut Encoder, is_dec: bool, width: MemoryWidth, old: 
         MemoryWidth::Byte => 0,
         MemoryWidth::Word => 0x100,
         MemoryWidth::Dword => 0x200,
+        // Only the RMW INC/DEC paths call this, and they only ever pass Word or Dword.
+        MemoryWidth::Qword => unreachable!("INC/DEC memory operands are never 8-byte wide"),
     };
     e.or_r32_imm32(
         Reg::RDI,
@@ -3167,6 +3213,10 @@ fn emit_code_watch_table_branch(
     if width.needs_alignment_guard() {
         e.mov_r32_r32(Reg::RCX, Reg::RAX);
         e.and_r32_imm32(Reg::RCX, 0x0fff);
+        // The last-byte probe wants the access's actual SIZE, `bytes()`, not its alignment
+        // requirement `alignment_bytes()`: for Qword those differ (8 vs 4), and the guard
+        // upstream (`emit_wide_page_guard`) already guarantees a Qword access cannot cross a
+        // page, so this offset (base + 7) always lands on the same page as the first byte.
         e.add_r32_imm32(Reg::RCX, width.bytes() - 1);
         e.shift_r32_imm8(5, Reg::RCX, 4);
         e.bt_r64_mem(Reg::RDX, Reg::RCX);
@@ -3192,7 +3242,7 @@ fn emit_mov_extend_reg(e: &mut Encoder, dst: u8, src: u8, width: MemoryWidth, si
         // arm covers BOTH polarities on purpose: at Dword, emit_read_store_value falls through to
         // a plain 32-bit move with no mask, so an unsigned Dword would silently copy the whole
         // source register instead of failing. Mirrors emit_load_extend's guard.
-        (MemoryWidth::Dword, _) => {
+        (MemoryWidth::Dword | MemoryWidth::Qword, _) => {
             unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
         }
     }
@@ -3220,6 +3270,9 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
                 e.and_r32_imm32(value, 0xffff);
             }
             MemoryWidth::Dword => e.mov_r32_r32(value, home(src)),
+            // No x87 memory form reaches `emit_read_store_value`: the m64 forms move through
+            // `x87_avx2_emit`'s `vmovsd` arms, not through a GPR home.
+            MemoryWidth::Qword => unreachable!("GPR-sourced values are never 8-byte wide"),
         },
         StoreSource::Imm(imm) => e.mov_r32_imm32(
             value,
@@ -3227,6 +3280,7 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
                 MemoryWidth::Byte => imm & 0xff,
                 MemoryWidth::Word => imm & 0xffff,
                 MemoryWidth::Dword => imm,
+                MemoryWidth::Qword => unreachable!("GPR-sourced values are never 8-byte wide"),
             },
         ),
         StoreSource::EipDelta(delta) => {
@@ -3255,11 +3309,19 @@ fn emit_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidth) {
             emit_read_store_value(e, source, width, Reg::RDX);
             e.store_r32_disp8(Reg::RDI, 0, Reg::RDX);
         }
+        MemoryWidth::Qword => unreachable!("GPR stores are never 8-byte wide"),
     }
 }
 
 fn emit_dynamic_increment(e: &mut Encoder, offset: i8) {
-    e.mov_r64_imm64(Reg::RDX, 1);
+    emit_dynamic_increment_by(e, offset, 1);
+}
+
+/// The parameterised form `emit_dynamic_increment` wraps. Only the x87 Qword completion needs
+/// `n != 1` today (two dword transactions per m64 access), so the ~15 existing single-increment
+/// call sites stay on the thin wrapper above rather than all naming `1` explicitly.
+fn emit_dynamic_increment_by(e: &mut Encoder, offset: i8, n: u64) {
+    e.mov_r64_imm64(Reg::RDX, n);
     e.add_r64_to_mem_disp8(Reg::RSP, offset, Reg::RDX);
 }
 
@@ -3381,6 +3443,7 @@ fn emit_alu_candidate(e: &mut Encoder, op: u8, width: MemoryWidth) {
         MemoryWidth::Byte => e.alu_r8_r8(op, Reg::RDX, Reg::RCX),
         MemoryWidth::Word => e.alu_r16_r16(op, Reg::RDX, Reg::RCX),
         MemoryWidth::Dword => e.alu_r32_r32(op, Reg::RDX, Reg::RCX),
+        MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
     }
     e.pushfq();
     e.pop(Reg::RAX);
@@ -3404,6 +3467,9 @@ fn emit_commit_alu_candidate(e: &mut Encoder, op: u8, source: StoreSource, width
         MemoryWidth::Byte => 0,
         MemoryWidth::Word => 0x100,
         MemoryWidth::Dword => 0x200,
+        // Only `emit_alu_mem_dest`'s write path calls this, for a GPR-sourced ALU memory
+        // destination, never 8-byte wide.
+        MemoryWidth::Qword => unreachable!("ALU memory-dest operands are never 8-byte wide"),
     };
 
     if matches!(op, 2 | 3) {
@@ -3559,6 +3625,7 @@ fn emit_inc_dec_reg(e: &mut Encoder, dst: u8, is_dec: bool, width: MemoryWidth) 
             e.alu_r16_r16(if is_dec { 5 } else { 0 }, home(dst), Reg::RDX);
         }
         MemoryWidth::Dword => e.alu_r32_imm32(if is_dec { 5 } else { 0 }, home(dst), 1),
+        MemoryWidth::Qword => unreachable!("register INC/DEC is never 8-byte wide"),
     }
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
     if matches!(width, MemoryWidth::Word) {
@@ -3749,6 +3816,7 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
         MemoryWidth::Byte => e.alu_r8_r8(4, Reg::RDX, Reg::RCX),
         MemoryWidth::Word => e.alu_r16_r16(4, Reg::RDX, Reg::RCX),
         MemoryWidth::Dword => e.alu_r32_r32(4, Reg::RDX, Reg::RCX),
+        MemoryWidth::Qword => unreachable!("TEST operands are never 8-byte wide"),
     }
     emit_capture_flags(e, LOGIC_FLAGS);
     emit_pending(
@@ -3757,6 +3825,7 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
             MemoryWidth::Byte => 0x8000_0002,
             MemoryWidth::Word => 0x8000_0102,
             MemoryWidth::Dword => 0x8000_0202,
+            MemoryWidth::Qword => unreachable!("TEST operands are never 8-byte wide"),
         },
         None,
         None,

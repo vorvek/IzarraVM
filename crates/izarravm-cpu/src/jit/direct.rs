@@ -2331,6 +2331,13 @@ pub(crate) enum MemoryWidth {
     Byte,
     Word,
     Dword,
+    /// An x87 m64 access. NOT twice a Dword in the way it is guarded: the interpreter's
+    /// `read_qword`/`write_qword` (`fpu_exec.rs:720-740`) issue two independently 4-aligned
+    /// dword bus transactions rather than one 8-aligned qword transaction, so native must
+    /// require only 4-alignment (plus a no-page-cross check) to admit the same population the
+    /// interpreter admits. See `alignment_bytes` below, which is why `bytes()` (8, the size)
+    /// and `alignment_bytes()` (4, the guard) diverge for this variant alone.
+    Qword,
 }
 
 /// The `MemoryWidth` of one x87 memory access, and the SINGLE source of truth for it.
@@ -2350,6 +2357,7 @@ fn x87_memory_width(access: NativeX87MemoryAccess) -> MemoryWidth {
     match access.width {
         2 => MemoryWidth::Word,
         4 => MemoryWidth::Dword,
+        8 => MemoryWidth::Qword,
         other => unreachable!("x87 memory access width {other} has no MemoryWidth"),
     }
 }
@@ -2375,6 +2383,23 @@ impl MemoryWidth {
             Self::Byte => 1,
             Self::Word => 2,
             Self::Dword => 4,
+            Self::Qword => 8,
+        }
+    }
+
+    /// The guard's alignment requirement, distinct from `bytes()` for Qword ONLY. Every other
+    /// width self-aligns (`alignment_bytes() == bytes()`), so the two names are interchangeable
+    /// there and a caller that reaches for the wrong one still emits the byte-identical guard.
+    /// For Qword they diverge on purpose: the interpreter reads an m64 as two independently
+    /// 4-aligned dword transactions (`fpu_exec.rs:720-740`), not one 8-aligned qword
+    /// transaction, so requiring 8-byte alignment natively would refuse a large population of
+    /// legitimately-4-aligned doubles that DOS compilers emit. `emit_wide_page_guard` is the
+    /// site that must read this method rather than `bytes()` for the alignment mask.
+    pub(crate) const fn alignment_bytes(self) -> u32 {
+        match self {
+            Self::Byte => 1,
+            Self::Word => 2,
+            Self::Dword | Self::Qword => 4,
         }
     }
 
@@ -2505,6 +2530,11 @@ impl DirectKind {
     }
 
     pub(crate) fn dword_reads(self) -> u8 {
+        // An x87 Qword read is TWO dword bus transactions, not one (`read_qword` issues two
+        // independent 4-aligned dword reads: fpu_exec.rs:720-740), so it adds 2 here rather than
+        // matching alongside the Dword arm below, which would undercount by half. The two terms
+        // are mutually exclusive (a kind is never both a Dword and a Qword access), so plain
+        // addition cannot double count.
         u8::from(
             matches!(
                 self,
@@ -2533,7 +2563,11 @@ impl DirectKind {
                     | Self::PushMem { .. }
                     | Self::JmpMem { .. }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword),
-        )
+        ) + 2 * u8::from(x87_memory_access_is(
+            self,
+            NativeX87MemoryDirection::Read,
+            MemoryWidth::Qword,
+        ))
     }
 
     pub(crate) fn byte_stores(self) -> u8 {
@@ -2579,6 +2613,9 @@ impl DirectKind {
     }
 
     pub(crate) fn dword_stores(self) -> u8 {
+        // Mirrors `dword_reads`'s Qword handling: `write_qword` is two independent 4-aligned
+        // dword writes, so the Qword term adds 2 rather than joining the Dword arm's single
+        // count. The two terms stay mutually exclusive for the same reason.
         u8::from(
             matches!(
                 self,
@@ -2601,7 +2638,11 @@ impl DirectKind {
                     ..
                 }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Dword),
-        )
+        ) + 2 * u8::from(x87_memory_access_is(
+            self,
+            NativeX87MemoryDirection::Write,
+            MemoryWidth::Qword,
+        ))
     }
 
     #[cfg(test)]
@@ -2625,6 +2666,7 @@ impl DirectKind {
             Self::LoadExtend { width, .. } => match width {
                 MemoryWidth::Byte | MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                 MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
+                MemoryWidth::Qword => unreachable!("MOVZX/MOVSX source is never 8-byte wide"),
             },
             // One dword read and nothing else, the same as AluMemSource's Dword arm.
             Self::ImulMem { .. } | Self::ImulMemAcc { .. } => COUNTER_MODE13_DWORD_READ,
@@ -2644,12 +2686,18 @@ impl DirectKind {
                 MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
                 MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                 MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
+                MemoryWidth::Qword => {
+                    unreachable!("ALU memory-source operands are never 8-byte wide")
+                }
             },
             Self::AluMemDest { op, width, .. } => {
                 let read = match width {
                     MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
                     MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                     MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
+                    MemoryWidth::Qword => {
+                        unreachable!("ALU memory-dest operands are never 8-byte wide")
+                    }
                 };
                 if op == 7 {
                     read
@@ -2658,6 +2706,9 @@ impl DirectKind {
                         MemoryWidth::Byte => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
                         MemoryWidth::Word => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
                         MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE,
+                        MemoryWidth::Qword => {
+                            unreachable!("ALU memory-dest operands are never 8-byte wide")
+                        }
                     } | COUNTER_MODE13_DIRTY
                 }
             }
@@ -2687,6 +2738,17 @@ impl DirectKind {
                 .memory
                 .map(|access| (access.direction, x87_memory_width(access)))
             {
+                // Qword gets its own arms, ABOVE the wildcards below: a qword access is still
+                // ONE dynamic increment of the dword lane (the completion's Qword arm increments
+                // it by 2, but the mask only records WHICH counter moved, not by how much), and
+                // leaving it to fall into the wildcard arms would route it onto the byte-read/
+                // byte-write lane the way a genuine Word access does, which is wrong.
+                Some((NativeX87MemoryDirection::Read, MemoryWidth::Qword)) => {
+                    COUNTER_MODE13_DWORD_READ
+                }
+                Some((NativeX87MemoryDirection::Write, MemoryWidth::Qword)) => {
+                    COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
+                }
                 Some((NativeX87MemoryDirection::Read, MemoryWidth::Dword)) => {
                     COUNTER_MODE13_DWORD_READ
                 }
@@ -2708,6 +2770,7 @@ impl DirectKind {
                         | COUNTER_MODE13_DIRTY
                 }
                 MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE,
+                MemoryWidth::Qword => unreachable!("INC/DEC memory operands are never 8-byte wide"),
             },
             Self::Pop { .. } | Self::Leave | Self::Ret { .. } | Self::JmpMem { .. } => {
                 COUNTER_MODE13_DWORD_READ
@@ -2799,58 +2862,17 @@ impl DirectKind {
         }
     }
 
+    // Routed through the counting accessors rather than re-matching the shape list here: an x87
+    // Qword access counts 2 dword reads (or stores) there, and re-deriving that from a separate
+    // `matches!` list would let this predicate silently disagree with `dword_reads`/
+    // `dword_stores` the moment a future width changes one and not the other. Mirrors
+    // `has_word_access` below, which is already written this way.
     fn has_dword_read(self) -> bool {
-        matches!(
-            self,
-            Self::Load {
-                width: MemoryWidth::Dword,
-                ..
-            } | Self::AluMemSource {
-                width: MemoryWidth::Dword,
-                ..
-            } | Self::AluMemDest {
-                width: MemoryWidth::Dword,
-                ..
-            } | Self::RmwIncDec {
-                width: MemoryWidth::Dword,
-                ..
-            } | Self::DoubleShiftMem { .. }
-                | Self::ImulMem { .. }
-                | Self::ImulMemAcc { .. }
-                | Self::TestImmMem {
-                    width: MemoryWidth::Dword,
-                    ..
-                }
-                | Self::Pop { .. }
-                | Self::Leave
-                | Self::Ret { .. }
-                | Self::PushMem { .. }
-                | Self::JmpMem { .. }
-        ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword)
+        self.dword_reads() != 0
     }
 
     fn has_dword_store(self) -> bool {
-        matches!(
-            self,
-            Self::Store {
-                width: MemoryWidth::Dword,
-                ..
-            } | Self::RmwIncDec {
-                width: MemoryWidth::Dword,
-                ..
-            } | Self::DoubleShiftMem { .. }
-                | Self::Push { .. }
-                | Self::Call { .. }
-                | Self::CallReg { .. }
-                | Self::PushMem { .. }
-        ) || matches!(
-            self,
-            Self::AluMemDest {
-                op: 0..=6,
-                width: MemoryWidth::Dword,
-                ..
-            }
-        ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Dword)
+        self.dword_stores() != 0
     }
 
     fn has_word_access(self) -> bool {

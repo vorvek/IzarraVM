@@ -22,7 +22,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // `DirectKind::read_segment` would have dropped the segment from the block's
             // `SegmentLayout` mask and made `kind_segment_access_supported` trivially true.
             | NativeX87Insn::LoadControlWord { addr }
-            | NativeX87Insn::StoreControlWord { addr } => Some(direct_addr(addr)?),
+            | NativeX87Insn::StoreControlWord { addr }
+            | NativeX87Insn::LoadF64 { addr }
+            | NativeX87Insn::StoreF64 { addr, .. }
+            | NativeX87Insn::BinaryMemoryF64 { addr, .. } => Some(direct_addr(addr)?),
             _ => None,
         };
         return Some(DirectKind::X87 { insn: native, addr });

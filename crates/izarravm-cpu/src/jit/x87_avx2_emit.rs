@@ -198,6 +198,40 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             e.movzx_r32_word_disp32(Reg::RDX, context.cpu, control_offset());
             e.store_r16_disp32(memory, 0, Reg::RDX);
         }
+        // m64 IS the native f64 representation: no conversion, unlike LoadF32's vcvtss2sd. The
+        // finite guard is still mandatory: a NaN or infinity bit pattern is legal in guest
+        // memory and the resident cache cannot hold one, the same reason LoadF32 guards its
+        // converted value.
+        NativeX87Insn::LoadF64 { .. } => {
+            let memory = context.memory.expect("FLD m64 needs a host pointer");
+            e.vmovsd_xmm_disp32(VALUE0, memory, 0);
+            emit_finite_guard(e, VALUE0, context.side_exit);
+            emit_push(e, top, VALUE0);
+        }
+        // No conversion and no guard: `emit_load_physical` already finite-guards the value
+        // coming off the resident cache, so it is finite by construction before it reaches the
+        // store.
+        NativeX87Insn::StoreF64 { pop, .. } => {
+            let memory = context.memory.expect("FST/FSTP m64 needs a host pointer");
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.vmovsd_disp32_xmm(memory, 0, VALUE0);
+            if pop {
+                emit_pop(e, top);
+            }
+        }
+        // Unlike the 0xDA arm above, a Tier 2 memory operand CAN be NaN or infinity, so this is
+        // the arm that MUST carry the guard the 0xDA arm's comment explains omitting: without
+        // it, an unordered FCOM m64 would reach `emit_compare` and write C3 alone instead of the
+        // interpreter's C3=C2=C0 triple.
+        NativeX87Insn::BinaryMemoryF64 { op, .. } => {
+            let memory = context
+                .memory
+                .expect("0xDC memory source needs a host pointer");
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.vmovsd_xmm_disp32(VALUE1, memory, 0);
+            emit_finite_guard(e, VALUE1, context.side_exit);
+            emit_binary_st0(e, top, op, context.side_exit);
+        }
     }
 }
 

@@ -176,6 +176,26 @@ pub(crate) enum NativeX87Insn {
     StoreControlWord {
         addr: AddrMode,
     },
+    /// FLD m64 (0xDD /0). The m64 IS the native f64 representation, so unlike `LoadF32` there
+    /// is no conversion: the eight bytes at `addr` are the resident value's bit pattern
+    /// verbatim. A NaN or infinity bit pattern is legal in guest memory, so the emitted form
+    /// still runs a finite guard before caching it, the same reason `LoadF32` does.
+    LoadF64 {
+        addr: AddrMode,
+    },
+    /// FST/FSTP m64 (0xDD /2 no pop, /3 pop). Also no conversion: `f64::to_bits` unchanged.
+    StoreF64 {
+        addr: AddrMode,
+        pop: bool,
+    },
+    /// `0xDC` memory forms: f64 arithmetic against ST(0), all eight extensions. The interpreter
+    /// serves this with the same `fpu_mem_arith` shape 0xDA's integer forms use, condition
+    /// triple included for the compare variants, so the op set rides `NativeX87BinaryOp`
+    /// unchanged.
+    BinaryMemoryF64 {
+        op: NativeX87BinaryOp,
+        addr: AddrMode,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,10 +234,12 @@ impl NativeX87Insn {
             | Self::LoadRegister { .. }
             | Self::LoadOne
             | Self::LoadZero
-            | Self::LoadI32 { .. } => -1,
+            | Self::LoadI32 { .. }
+            | Self::LoadF64 { .. } => -1,
             Self::BinaryMemory { op, .. }
             | Self::IntBinaryMemory { op, .. }
-            | Self::BinaryRegister { op, .. } => {
+            | Self::BinaryRegister { op, .. }
+            | Self::BinaryMemoryF64 { op, .. } => {
                 if op.pops() {
                     1
                 } else {
@@ -227,10 +249,12 @@ impl NativeX87Insn {
             Self::StoreF32 { pop: true, .. }
             | Self::StoreRegister { pop: true, .. }
             | Self::StoreI32 { .. }
+            | Self::StoreF64 { pop: true, .. }
             | Self::PopBinary { .. } => 1,
             Self::ComparePopPop => 2,
             Self::StoreF32 { pop: false, .. }
             | Self::StoreRegister { pop: false, .. }
+            | Self::StoreF64 { pop: false, .. }
             | Self::Exchange { .. }
             | Self::StoreStatusAx
             // Neither control-word form touches the register stack, the status word or the tag
@@ -297,6 +321,15 @@ impl NativeX87Insn {
                     op: NativeX87BinaryOp::from_extension(extension)?,
                     addr,
                 }),
+                // FLD/FST/FSTP m64. `/1` (FISTTP, unimplemented) and `/4`-`/7` (FLDENV, FRSTOR,
+                // FSAVE, FSTSW m16) are NOT here and fall to the catch-all `None` below.
+                (0xdd, 0) => Some(Self::LoadF64 { addr }),
+                (0xdd, 2) => Some(Self::StoreF64 { addr, pop: false }),
+                (0xdd, 3) => Some(Self::StoreF64 { addr, pop: true }),
+                (0xdc, extension) => Some(Self::BinaryMemoryF64 {
+                    op: NativeX87BinaryOp::from_extension(extension)?,
+                    addr,
+                }),
                 _ => None,
             };
         }
@@ -359,6 +392,14 @@ impl NativeX87Insn {
         let write_word = Some(NativeX87MemoryAccess {
             direction: Write,
             width: 2,
+        });
+        let read_qword = Some(NativeX87MemoryAccess {
+            direction: Read,
+            width: 8,
+        });
+        let write_qword = Some(NativeX87MemoryAccess {
+            direction: Write,
+            width: 8,
         });
         match self {
             Self::BinaryMemory { op, .. } => NativeX87Metadata {
@@ -481,6 +522,35 @@ impl NativeX87Insn {
                 fp_class: FpOpClass::F32Mem,
                 memory: write_word,
                 pops: false,
+                terminates_block: false,
+            },
+            // 0xDD /0, verified against the interpreter (fpu_exec.rs:178-182): `Ok(clocks(14))`.
+            // `fp_class` is F64Mem, not F32Mem: `execute_fpu` derives the class from the opcode
+            // byte, and 0xdd (unlike 0xd9) maps to F64Mem in the timing tail (fpu_exec.rs:88-89).
+            Self::LoadF64 { .. } => NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F64Mem,
+                memory: read_qword,
+                pops: false,
+                terminates_block: false,
+            },
+            // 0xDD /2 and /3, both verified `Ok(clocks(14))` (fpu_exec.rs:183-191). Only `pops`
+            // differs between the two sub-opcodes, mirroring `StoreF32`.
+            Self::StoreF64 { pop, .. } => NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F64Mem,
+                memory: write_qword,
+                pops: pop,
+                terminates_block: false,
+            },
+            // 0xDC memory, all eight extensions, verified `Ok(clocks(20))` (fpu_exec.rs:124-128,
+            // `fpu_mem_arith`). Same raw clocks as `BinaryMemory`'s F32 counterpart; only the
+            // class and the operand width differ.
+            Self::BinaryMemoryF64 { op, .. } => NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::F64Mem,
+                memory: read_qword,
+                pops: op.pops(),
                 terminates_block: false,
             },
         }
