@@ -3870,3 +3870,119 @@ fn fld_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
         assert_eq!(native.fpu.get(0), 12.5, "{label}: FLD result");
     }
 }
+
+/// The slice 39 mutation battery's coverage gap, closed: mutation 2 (B2's re-aimed catcher,
+/// `emit_x87_memory_completion`'s RAM WRITE Qword arm incrementing by 1 instead of 2) SURVIVED
+/// against `fld_fadd_fdiv_and_fstp_m64_match_the_interpreter_and_preserve_the_full_range_value`
+/// (`cpu_jit_x87_direct_test.rs`), because that fixture's bus comes from `direct_memory`, which
+/// never sets `direct_page_clocks`. `TestBus::jit_data_cost_clocks` returns 0 whenever that flag
+/// is clear, so the RAM dword-write lane's bus price is invisible there regardless of
+/// `ram_dword_writes`'s value: the differential proves STATE and STORE correctness, not the RAM
+/// write bus charge.
+///
+/// This fixture prices it for real, modelled on `fld_m64_matches_the_interpreter_in_ram_and_in_the_aperture`
+/// above with `direct_page_clocks` on: FLD1 (no memory access) then FSTP m64 to `esi`-relative
+/// memory, comparing aggregate bus clocks against the interpreter's two independent dword writes
+/// (`write_qword`, `fpu_exec.rs:742-764`). Distinct RAM and mode13 wait states (B4's requirement)
+/// make a missing dword-write charge visible in either lane.
+fn fstp_m64_case(target: u32) -> Vec<u8> {
+    let mut code = vec![0xd9u8, 0xe8]; // fld1                    ST(0) = 1.0
+    code.push(0xdd);
+    code.push(0x9e); // fstp qword [esi+disp32]  /3
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0xf4]); // mov esi,esi ; hlt
+    code
+}
+
+#[test]
+fn fstp_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    for target in [RAM, MODE13] {
+        let code = fstp_m64_case(target);
+        let mut memory = vec![0; 0x000b_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        native.registers.eip = ENTRY;
+        interp.registers.eip = ENTRY;
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 8];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                target,
+                target,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                true,
+            );
+            cpu.fpu = X87::default();
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_esi(0);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.fp_rem = 3;
+            cpu.core_clocks_so_far = 0;
+            bus.trace = BusTrace::default();
+        }
+        let label = format!("fstp m64 at {target:#x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: did not run directly"
+        );
+        for _ in 0..block.span().instructions {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
+        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+        assert_eq!(native.fp_rem, interp.fp_rem, "{label}: x87 remainder");
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "{label}: bus clocks"
+        );
+        assert_eq!(
+            f64::from_bits(
+                u64::from_le_bytes(
+                    native_bus.memory[target as usize..target as usize + 8]
+                        .try_into()
+                        .unwrap()
+                )
+            ),
+            1.0,
+            "{label}: FSTP result"
+        );
+    }
+}
