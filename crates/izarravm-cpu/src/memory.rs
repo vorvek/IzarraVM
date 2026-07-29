@@ -374,7 +374,19 @@ impl CpuGsw {
         }
         let changed = Self::read_fast_map_ptr(ptr, width) != value;
         Self::write_fast_map_ptr(ptr, width, value);
-        if changed && (width == BusWidth::Byte || watched) {
+        // `note_code_write_hit` is a total no-op when `watched` is false and no unit sim is
+        // attached: `code_write_watched` being false means both `range_hits_compiled_code` and
+        // `decode_cache.range_hits_code` are false, so every branch inside is skipped and nothing
+        // is incremented. The `width == BusWidth::Byte` half of the original gate called it
+        // anyway on every unwatched byte write, only to feed the diagnostic unit sim -- but with
+        // `clif-backend` on, the call also runs `clif_invalidate_physical_range` UNCONDITIONALLY
+        // (core.rs), which scans every entry in `ClifUnitCache`. Watch registration is
+        // chunk-granular (coarser than byte-exact), so `!watched` guarantees no overlap and that
+        // scan was a guaranteed no-op -- a dormant perf regression on the default (non-clif) hot
+        // path once clif-backend is enabled. Narrowing the byte-width half to "only when a unit
+        // sim is actually attached" keeps the diagnostic feed working while dropping the call
+        // entirely on the default build's unwatched byte-write path.
+        if changed && (watched || (width == BusWidth::Byte && self.unit_sim.0.is_some())) {
             self.note_code_write_hit(physical, width.bytes());
         }
         self.record_data_write(kind, true);
