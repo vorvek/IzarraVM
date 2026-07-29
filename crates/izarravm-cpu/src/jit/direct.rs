@@ -380,6 +380,17 @@ impl super::JitState {
         }
     }
 
+    /// Whether the census exists at all. Callers MUST gate on this before building the
+    /// arguments to the two `note_barrier_census_*` hooks below: those sit on the
+    /// per-interpreted-instruction and per-Direct-exit retire paths, and their `final_linear`
+    /// argument costs a `cs()` read plus an add that is pure waste when the census is off
+    /// (the default). Checking `is_some` inside the callee is too late — the argument has
+    /// already been evaluated at the call site.
+    #[inline]
+    pub(crate) fn barrier_census_active(&self) -> bool {
+        self.direct_barrier_census.is_some()
+    }
+
     pub(crate) fn note_barrier_census_direct_run(
         &mut self,
         entry_linear: u32,
