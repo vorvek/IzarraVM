@@ -915,18 +915,11 @@ impl Encoder {
 
     /// `shr dst32, cl` (D3 /5).
     pub(crate) fn shr_r32_cl(&mut self, dst: Reg) {
-        self.shift_r32_cl(5, dst);
-    }
-
-    /// A 32-bit shift/rotate by CL (D3 /op). The host applies the architectural five-bit count
-    /// mask itself, exactly as it does for the imm8 form in `shift_r32_imm8`.
-    pub(crate) fn shift_r32_cl(&mut self, op: u8, dst: Reg) {
-        assert!(op < 8, "shift group must fit three bits");
         if dst.ext() {
             self.rex(false, false, false, true);
         }
         self.bytes.push(0xD3);
-        self.modrm(0b11, op, dst.low3());
+        self.modrm(0b11, 5, dst.low3());
     }
 
     /// `movzx dst32, byte [base + index]` (0F B6 /r, mod=00, rm=100 SIB, scale=1, no REX.W) -- load a

@@ -587,27 +587,6 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     count,
                 });
             }
-            // Group 2 by CL, register destination. SHIFTS ONLY (/4 SHL, /5 SHR, /6 SAL, /7 SAR)
-            // — narrower than the imm8 arm above, which also admits ROR (/1) but routes it to
-            // `RotateRightReg` precisely because rotates do NOT define PF, ZF, SF or AF the way
-            // shifts do. `emit_shift_cl` merges the shift mask, so letting /1 reach it would
-            // write four flags a rotate must leave alone. ROL (/0), RCL (/2) and RCR (/3) stay
-            // out for the imm8 arm's reasons: no measured rejects, and RCL/RCR take the incoming
-            // CF as a rotate INPUT that the emitted form never loads.
-            //
-            // The barrier census ranks 0xd3 /7, /5 and /4 as the largest native suffixes any
-            // single barrier was discarding in Quake/586 (694, 333 and 145 instructions, against
-            // 91 for CLD).
-            0xd3 => {
-                let m = insn.modrm?;
-                if !matches!(m.reg, 4..=7) {
-                    return None;
-                }
-                let DecodedOperand::Reg(dst) = insn.operand? else {
-                    return None;
-                };
-                return Some(DirectKind::ShiftCl { op: m.reg, dst });
-            }
             0xf6 | 0xf7 => {
                 let m = insn.modrm?;
                 // NEG r/m32, register form. Deliberately carries NO width field: this arm sits

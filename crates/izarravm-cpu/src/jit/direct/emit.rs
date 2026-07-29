@@ -366,7 +366,6 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 ));
             }
             DirectKind::Shift { op, dst, count } => emit_shift(&mut e, op, dst, count),
-            DirectKind::ShiftCl { op, dst } => emit_shift_cl(&mut e, op, dst),
             DirectKind::RotateRightReg { dst, count } => emit_rotate_right_reg(&mut e, dst, count),
             DirectKind::DoubleShiftReg {
                 left,
@@ -3975,8 +3974,8 @@ fn emit_commit_double_shift_flags(e: &mut Encoder, count: ShiftCount) {
     match count {
         ShiftCount::Immediate(count) => match count & 0x1f {
             0 => {}
-            1 => emit_merge_spilled_flags(e, DEFINED | crate::FLAG_OF),
-            _ => emit_merge_spilled_flags(e, DEFINED),
+            1 => emit_merge_double_shift_flags(e, DEFINED | crate::FLAG_OF),
+            _ => emit_merge_double_shift_flags(e, DEFINED),
         },
         ShiftCount::Cl => {
             let one = e.label();
@@ -3987,59 +3986,16 @@ fn emit_commit_double_shift_flags(e: &mut Encoder, count: ShiftCount) {
             e.jz(done);
             e.cmp_r32_imm32(Reg::RAX, 1);
             e.jz(one);
-            emit_merge_spilled_flags(e, DEFINED);
+            emit_merge_double_shift_flags(e, DEFINED);
             e.jmp(done);
             e.place(one);
-            emit_merge_spilled_flags(e, DEFINED | crate::FLAG_OF);
+            emit_merge_double_shift_flags(e, DEFINED | crate::FLAG_OF);
             e.place(done);
         }
     }
 }
 
-/// Group-2 shift/rotate by CL (D3 /op), register destination.
-///
-/// The count is not known until run time, which forces three differences from `emit_shift`:
-///
-/// 1. The count is masked to five bits and SPILLED before the shift. `emit_shift` can test the
-///    immediate at compile time; here the test has to happen after the shift, by which point
-///    the host flags carry the shift's result and any `cmp` would destroy them.
-/// 2. The host flags are spilled with pushfq immediately after the shift, for the same reason,
-///    then merged from the spill slot the way the double-shift forms already do.
-/// 3. A zero count must merge NOTHING. `CpuGsw::shift_rotate` returns before touching a single
-///    flag when `count & 0x1f == 0` (core.rs: "a zero count affects no flags at all"), and the
-///    host agrees — `shl r32, cl` with CL=0 leaves EFLAGS alone — so the spilled value at that
-///    point is not the shift's flags at all but the leftover from the masking `and` above.
-///    Merging it would write four flags the guest must not observe.
-///
-/// OF is architecturally defined only for a count of exactly 1, matching `emit_shift`'s rule and
-/// `shift_rotate`'s single-bit loop.
-fn emit_shift_cl(e: &mut Encoder, op: u8, dst: u8) {
-    const DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
-    // Guest CL is the low byte of guest ECX (index 1). RCX is the only count register the D3
-    // form accepts, and it is emitter scratch: GUEST_HOMES is R8-R14 plus RBX, so copying into
-    // it can never clobber `home(dst)`, not even when `dst` is ECX itself.
-    e.mov_r32_r32(Reg::RCX, home(1));
-    e.and_r32_imm32(Reg::RCX, 0x1f);
-    e.store_r32_disp32(Reg::RSP, STACK_SHIFT_COUNT, Reg::RCX);
-    e.shift_r32_cl(op, home(dst));
-    e.pushfq();
-    e.pop(Reg::RAX);
-    e.store_r32_disp32(Reg::RSP, STACK_ALU_FLAGS, Reg::RAX);
-    let one = e.label();
-    let done = e.label();
-    e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_SHIFT_COUNT);
-    e.cmp_r32_imm32(Reg::RAX, 0);
-    e.jz(done);
-    e.cmp_r32_imm32(Reg::RAX, 1);
-    e.jz(one);
-    emit_merge_spilled_flags(e, DEFINED);
-    e.jmp(done);
-    e.place(one);
-    emit_merge_spilled_flags(e, DEFINED | crate::FLAG_OF);
-    e.place(done);
-}
-
-fn emit_merge_spilled_flags(e: &mut Encoder, defined: u32) {
+fn emit_merge_double_shift_flags(e: &mut Encoder, defined: u32) {
     e.load_r32_disp32(Reg::RDI, Reg::RSP, STACK_ALU_FLAGS);
     e.and_r32_imm32(Reg::RBP, !defined);
     e.and_r32_imm32(Reg::RDI, defined);

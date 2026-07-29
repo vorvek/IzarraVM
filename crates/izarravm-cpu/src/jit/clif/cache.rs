@@ -325,7 +325,7 @@ impl ClifUnitDescriptor {
         self.key.mode_key == target.key.mode_key
             && self.memory_cpl3 == target.memory_cpl3
             && (self.x87_mask != 0) == (target.x87_mask != 0)
-            && self.segment_layout.link_compatible(&target.segment_layout)
+            && self.segment_layout.link_compatible(target.segment_layout)
     }
 
     /// G8 chain form (design section 8): all six segments regardless of use, because a

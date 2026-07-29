@@ -2443,14 +2443,6 @@ pub(crate) enum DirectKind {
         dst: u8,
         count: u8,
     },
-    /// Group-2 shift by CL (0xd3), register destination. Deliberately a separate variant rather
-    /// than a `ShiftCount` field on `Shift`: `Shift` sits in clif's `lowerable` allowlist, and
-    /// widening it would silently hand clif a count source it cannot lower. Same reasoning as
-    /// `RotateRightReg` not being folded into `Shift`.
-    ShiftCl {
-        op: u8,
-        dst: u8,
-    },
     DoubleShiftReg {
         left: bool,
         dst: u8,
