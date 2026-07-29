@@ -31,6 +31,10 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     GetThreadContext, SymFromAddrW, SymGetLineFromAddrW64, SymInitializeW, SymSetOptions, CONTEXT,
     IMAGEHLP_LINEW64, SYMBOL_INFOW, SYMOPT_DEFERRED_LOADS, SYMOPT_LOAD_LINES, SYMOPT_UNDNAME,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    SymGetModuleInfoW64, SymLoadModuleExW, IMAGEHLP_MODULEW64,
+};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, ResumeThread, SuspendThread,
 };
@@ -76,8 +80,17 @@ impl Sampler {
         let join = std::thread::Builder::new()
             .name("rip-sampler".into())
             .spawn(move || {
+                // The Win32 ABI requires CONTEXT to be 16-byte aligned;
+                // windows-sys's struct declaration alone does not guarantee
+                // that on the stack, and a misaligned buffer makes
+                // GetThreadContext fail on every call.
+                #[repr(C, align(16))]
+                struct AlignedContext(CONTEXT);
                 let target = target_addr as HANDLE;
                 let mut samples = Vec::with_capacity(1 << 20);
+                let mut suspend_failures = 0u64;
+                let mut context_failures = 0u64;
+                let mut first_error = None;
                 std::thread::sleep(Duration::from_secs(delay));
                 while !stop_seen.load(Ordering::Relaxed) && samples.len() < MAX_SAMPLES {
                     std::thread::sleep(SAMPLE_INTERVAL);
@@ -86,17 +99,35 @@ impl Sampler {
                     // while it is suspended, so it cannot deadlock against us.
                     let rip = unsafe {
                         if SuspendThread(target) == u32::MAX {
-                            break;
+                            suspend_failures += 1;
+                            first_error.get_or_insert_with(|| {
+                                ("SuspendThread", windows_sys::Win32::Foundation::GetLastError())
+                            });
+                            None
+                        } else {
+                            let mut ctx: AlignedContext = mem::zeroed();
+                            ctx.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+                            let ok = GetThreadContext(target, &mut ctx.0);
+                            ResumeThread(target);
+                            if ok == 0 {
+                                context_failures += 1;
+                                first_error.get_or_insert_with(|| {
+                                    ("GetThreadContext", windows_sys::Win32::Foundation::GetLastError())
+                                });
+                            }
+                            (ok != 0).then_some(ctx.0.Rip)
                         }
-                        let mut ctx: CONTEXT = mem::zeroed();
-                        ctx.ContextFlags = CONTEXT_CONTROL_AMD64;
-                        let ok = GetThreadContext(target, &mut ctx);
-                        ResumeThread(target);
-                        (ok != 0).then_some(ctx.Rip)
                     };
                     if let Some(rip) = rip {
                         samples.push(rip);
                     }
+                }
+                if suspend_failures + context_failures > 0 {
+                    let (call, code) = first_error.unwrap_or(("?", 0));
+                    eprintln!(
+                        "riprofile: {suspend_failures} suspend / {context_failures} context \
+                         failures (first: {call} GetLastError={code})"
+                    );
                 }
                 samples
             })
@@ -124,12 +155,56 @@ impl Sampler {
             if SymInitializeW(process, std::ptr::null(), 1) == 0 {
                 eprintln!("riprofile: SymInitializeW failed; dumping raw addresses");
             }
+            // Invade-process enumeration can leave the main exe resolved by
+            // exports only (a Rust exe has none). Force-load its PDB.
+            let base = GetModuleHandleW(std::ptr::null());
+            let mut path = [0u16; 1024];
+            let len = GetModuleFileNameW(std::ptr::null_mut(), path.as_mut_ptr(), 1024);
+            if len > 0 {
+                let loaded = SymLoadModuleExW(
+                    process,
+                    std::ptr::null_mut(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    base as u64,
+                    0,
+                    std::ptr::null(),
+                    0,
+                );
+                if loaded == 0 {
+                    let e = windows_sys::Win32::Foundation::GetLastError();
+                    if e != 0 {
+                        eprintln!("riprofile: SymLoadModuleExW failed (GetLastError={e})");
+                    }
+                }
+                let mut info: IMAGEHLP_MODULEW64 = mem::zeroed();
+                info.SizeOfStruct = mem::size_of::<IMAGEHLP_MODULEW64>() as u32;
+                if SymGetModuleInfoW64(process, base as u64, &mut info) != 0 {
+                    eprintln!(
+                        "riprofile: exe module base {:#x}, SymType={}, lines={}",
+                        base as u64, info.SymType, info.LineNumbers
+                    );
+                } else {
+                    eprintln!(
+                        "riprofile: SymGetModuleInfoW64 failed (GetLastError={})",
+                        windows_sys::Win32::Foundation::GetLastError()
+                    );
+                }
+            }
         }
 
         let mut by_func: HashMap<String, u64> = HashMap::new();
         let mut by_site: HashMap<String, u64> = HashMap::new();
         let mut by_file: HashMap<String, u64> = HashMap::new();
+        let mut first_resolve_error = true;
         for (&rip, &n) in &counts {
+            if first_resolve_error && resolve_symbol(process, rip).is_none() {
+                first_resolve_error = false;
+                eprintln!(
+                    "riprofile: first failed SymFromAddrW rip={rip:#x} GetLastError={}",
+                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                );
+            }
             let func = resolve_symbol(process, rip)
                 .unwrap_or_else(|| "<no symbol — JIT arena or foreign code>".into());
             let site = resolve_line(process, rip)
