@@ -108,6 +108,12 @@ impl TlbEntry {
 /// may not. If a paged title regresses in a way that looks like stale translations, this is the
 /// first place to look; the corpus pass for this constant covered Quake under CWSDPMI and Doom
 /// under JEMMEX.
+///
+/// One half of that hazard is closed at the consumer: `translate_linear_checked` never raises a
+/// page fault from a hit, only from the walk, so an entry that is stale in the RESTRICTIVE
+/// direction (the guest relaxed a PTE and skipped its flush) costs a walk instead of a spurious
+/// #PF. The permissive direction -- the guest tightened a PTE and skipped its flush -- is still
+/// live, and is the one this capacity note is about.
 #[derive(Clone)]
 pub(crate) struct Tlb {
     pub(crate) entries: [TlbEntry; TLB_ENTRIES],

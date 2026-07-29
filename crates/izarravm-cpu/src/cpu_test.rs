@@ -340,6 +340,54 @@ fn pde_accessed_write_invalidates_overlapping_decoded_and_compiled_code() {
     assert_eq!(page_walk_write_addresses(&bus), vec![PAGE_WALK_DIRECTORY]);
 }
 
+/// A TLB entry cached while a page was read-only must not fault a later write once the
+/// guest has made the PTE writable, even with no INVLPG or CR3 reload in between. Real
+/// silicon survives that missing flush by evicting the entry out of its 32-64 slots; with
+/// 1024 direct-mapped slots the entry is still there, so the fault has to come from the
+/// walk, never from the hit. TSUMERA (Borland 32RTM under VCPI) tripped exactly this at
+/// exit: its ring-0 DPMI host flips a data page R/O -> R/W without reloading CR3, and the
+/// ring-3 refcount decrement that follows took a spurious #PF(7).
+#[test]
+fn write_after_guest_unprotects_a_pte_without_flushing_rewalks_instead_of_faulting() {
+    let linear = 0x1000;
+    let pte = PAGE_WALK_TABLE + 4;
+    let mut memory = vec![0; 0x7000];
+    memory[PAGE_WALK_DIRECTORY as usize..PAGE_WALK_DIRECTORY as usize + 4]
+        .copy_from_slice(&(PAGE_WALK_TABLE | 0x07).to_le_bytes());
+    // Present, read-only. CR0.WP is set by the fixture, so a supervisor write faults too.
+    memory[pte as usize..pte as usize + 4].copy_from_slice(&(PAGE_WALK_FRAME | 0x01).to_le_bytes());
+    memory[PAGE_WALK_FRAME as usize] = 0xa5;
+    let mut bus = TestBus::with_memory(memory);
+    let mut cpu = page_walk_overlap_cpu();
+    enable_page_walk_overlap_paging(&mut cpu);
+
+    // The read caches a translation whose R/W bit is clear.
+    assert_eq!(
+        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, linear, BusAccessKind::DataRead)
+            .unwrap(),
+        0xa5
+    );
+    assert_eq!(
+        cpu.tlb.lookup(linear >> 12).map(|e| e.writable),
+        Some(false)
+    );
+
+    // The guest sets R/W and skips the flush the architecture requires.
+    bus.memory[pte as usize..pte as usize + 4]
+        .copy_from_slice(&(PAGE_WALK_FRAME | 0x03).to_le_bytes());
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        linear,
+        0x5a,
+        BusAccessKind::DataWrite,
+    )
+    .expect("the live page tables permit this write");
+    assert_eq!(bus.memory[PAGE_WALK_FRAME as usize], 0x5a);
+    assert_eq!(cpu.tlb.lookup(linear >> 12).map(|e| e.writable), Some(true));
+}
+
 fn pte_dirty_overlap_fixture() -> (CpuGsw, TestBus, u32, u32) {
     let linear = 0x1000;
     let pte = PAGE_WALK_TABLE + 4;
