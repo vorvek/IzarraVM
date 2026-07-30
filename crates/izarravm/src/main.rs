@@ -31,6 +31,7 @@ use izarravm_machine::{
 };
 use serde_json::json;
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -282,7 +283,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if cli.headless_izarra_bios {
-        return run_izarra_bios(&hardware);
+        return run_izarra_bios();
     }
 
     if let Some(path) = &cli.headless_boot_floppy {
@@ -495,11 +496,16 @@ fn run_keyboard_demo(
 /// Boot the Izarra 3000 BIOS headless, run POST to halt, print the VDTS records.
 /// Its own function because a Machine is a large inline value (combining the
 /// headless paths overflows main's stack frame).
-fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+fn run_izarra_bios() -> Result<(), Box<dyn Error>> {
+    let hardware = HardwareProfile::from_config(&AppConfig::default())?;
     let mut machine = Machine::new(
-        MachineProfile::from_hardware_profile(hardware),
+        MachineProfile::from_hardware_profile(&hardware),
         izarravm_firmware::izarra_bios(),
     )?;
+    // Exercise the complete Izarra storage profile while leaving every medium
+    // unbootable, so POST can probe the ATA device and INT 19h still reaches its
+    // deterministic terminal halt.
+    machine.mount_hdd(vec![0; 512]);
     // The graphical POST blit and RAM sweep need more than the old 200 ms budget.
     let budget = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
@@ -519,7 +525,101 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("records: {}", results.records.len());
     println!("declared: {}", results.declared_record_count);
     println!("stop: {stop_reason:?}");
+    if stop_reason != StopReason::Halted {
+        return Err(format!("Izarra BIOS did not reach its terminal halt: {stop_reason:?}").into());
+    }
+    if let Some(message) = izarra_bios_failure_summary(&results) {
+        return Err(message.into());
+    }
     Ok(())
+}
+
+const IZARRA_BIOS_REQUIRED_RECORDS: &[(&str, SuiteRecordStatus)] = &[
+    ("suite.izarra", SuiteRecordStatus::Begin),
+    ("self.framework", SuiteRecordStatus::Pass),
+    ("self.extaccess", SuiteRecordStatus::Pass),
+    ("component.cpu_gsw", SuiteRecordStatus::Pass),
+    ("component.video_margo", SuiteRecordStatus::Pass),
+    ("video.margo_caps", SuiteRecordStatus::Measure),
+    ("memory.ramtest", SuiteRecordStatus::Pass),
+    ("memory.detected_kib", SuiteRecordStatus::Measure),
+    ("component.cpu_lotura", SuiteRecordStatus::Pass),
+    ("cpu.gsw_mode", SuiteRecordStatus::Measure),
+    ("component.kbd_8042", SuiteRecordStatus::Pass),
+    ("component.timer_pit", SuiteRecordStatus::Pass),
+    ("component.serial_com1", SuiteRecordStatus::Pass),
+    ("component.audio_sbdsp", SuiteRecordStatus::Pass),
+    ("sound.dsp_version", SuiteRecordStatus::Measure),
+    ("component.audio_opl", SuiteRecordStatus::Pass),
+    ("component.floppy_fdc", SuiteRecordStatus::Pass),
+    ("component.disk_hdd", SuiteRecordStatus::Pass),
+    ("component.optical_atapi", SuiteRecordStatus::Pass),
+];
+
+fn izarra_bios_failure_summary(results: &SuiteResults) -> Option<String> {
+    let mut issues = Vec::new();
+    if results.version != 1 {
+        issues.push(format!("unsupported result version {}", results.version));
+    }
+    if usize::from(results.declared_record_count) != results.records.len() {
+        issues.push(format!(
+            "declared {} records but parsed {}",
+            results.declared_record_count,
+            results.records.len()
+        ));
+    }
+    if results.records.len() != IZARRA_BIOS_REQUIRED_RECORDS.len() {
+        issues.push(format!(
+            "expected {} required records but parsed {}",
+            IZARRA_BIOS_REQUIRED_RECORDS.len(),
+            results.records.len()
+        ));
+    }
+
+    let mut names = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for record in &results.records {
+        if !names.insert(record.name.as_str()) {
+            duplicates.insert(record.name.as_str());
+        }
+    }
+    if !duplicates.is_empty() {
+        issues.push(format!(
+            "duplicate records: {}",
+            duplicates.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let required_names: BTreeSet<&str> = IZARRA_BIOS_REQUIRED_RECORDS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let unexpected: Vec<&str> = names.difference(&required_names).copied().collect();
+    if !unexpected.is_empty() {
+        issues.push(format!("unexpected records: {}", unexpected.join(", ")));
+    }
+
+    for &(name, expected_status) in IZARRA_BIOS_REQUIRED_RECORDS {
+        let Some(record) = results.records.iter().find(|record| record.name == name) else {
+            issues.push(format!("missing required record: {name}"));
+            continue;
+        };
+        if record.status == SuiteRecordStatus::Fail {
+            issues.push(format!("failed required record: {name}"));
+        } else if record.status != expected_status {
+            issues.push(format!(
+                "required record {name} has {:?}, expected {expected_status:?}",
+                record.status
+            ));
+        }
+        if expected_status == SuiteRecordStatus::Measure
+            && record.value.as_deref().is_none_or(str::is_empty)
+        {
+            issues.push(format!("required measurement has no value: {name}"));
+        }
+    }
+
+    (!issues.is_empty()).then(|| format!("Izarra BIOS gate failed: {}", issues.join("; ")))
 }
 
 /// Mount a floppy IMG, run the Izarra BIOS so INT 19h bootstraps it, and print

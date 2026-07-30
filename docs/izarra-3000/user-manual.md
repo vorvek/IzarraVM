@@ -63,11 +63,23 @@ Press **Tab** during POST to open the boot and speed menu. It draws as a
 single boxed panel over the POST screen, titled "Boot & Speed," with two
 stacked sections and an Accept row. Move between rows with Up/Down; Enter
 marks a row or fires Accept; F10 also accepts; Esc cancels back to the saved
-boot order without changing anything.
+primary boot device without changing anything.
 
-**Boot device**: three rows are Hard Disk, Floppy A:, and CD-ROM. The floppy
-is always selectable. Hard disk and CD-ROM are only selectable when the boot
-menu finds media to boot from; an unavailable row is drawn in grey.
+**Boot device**: three rows are Hard Disk, Floppy A:, and CD-ROM. The saved
+choice is a primary device, not an editable three-slot order. When that device
+cannot boot, the BIOS tries the fixed fallbacks below before entering INT 18h:
+
+| Primary | Attempt sequence |
+| --- | --- |
+| Floppy A: | Floppy A:, Hard Disk, CD-ROM |
+| Hard Disk | Hard Disk, Floppy A:, CD-ROM |
+| CD-ROM | CD-ROM, Hard Disk, Floppy A: |
+
+The floppy controller is always available. Hard disk and CD-ROM rows are
+selectable only when the menu finds bootable media; an unavailable row is grey.
+Enter on a device row boots it once without changing CMOS. F10, or Enter on the
+Accept row, saves the marked primary and CPU speed. Esc discards the menu state
+and restores the primary already stored in CMOS.
 
 **CPU speed** has four rows, from fastest to slowest:
 
@@ -80,7 +92,7 @@ menu finds media to boot from; an unavailable row is drawn in grey.
 
 Accepting the menu writes the chosen speed to the Lotura chipset's mode port
 immediately (the CPU actually changes speed class right there) and saves
-both the boot device order and the CPU speed to CMOS as the new defaults for
+both the primary boot device and the CPU speed to CMOS as the new defaults for
 future cold boots. There is no separate reboot: the machine falls straight
 through to booting the chosen device at the chosen speed.
 
@@ -108,12 +120,28 @@ box changes to describe whatever row is highlighted.
 
 ### What CMOS remembers
 
-Two settings persist across power cycles: the **keyboard layout** and the
-**CPU mode** the machine boots at. Both are written only when you choose Save
-and Exit; the Tab boot menu's Accept also writes the CPU mode (and the boot
-device order) directly, without going through the setup panel. A checksum
-covers the saved settings, so a corrupted CMOS is detected and the BIOS falls
-back to defaults rather than booting on garbage.
+The setup panel persists the **keyboard layout** and boot-time **CPU mode**.
+The Tab boot menu independently persists the **primary boot device** and CPU
+mode. A checksum covers these settings. If a saved image is corrupt, none of its
+apparently plausible setting bytes are applied: IzarraVM keeps the machine's
+seeded defaults, raises the CMOS diagnostic indication, regenerates the checksum,
+and writes the repaired image back to disk.
+
+## BIOS compatibility services
+
+The Izarra-BIOS reports 639 KiB of conventional memory through INT 12h, leaving
+the 1 KiB EBDA at physical `0x9FC00`; its E820 map reports the same boundary.
+
+RTC services include asynchronous INT 15h AH=83h waits, synchronous AH=86h
+waits, and INT 1Ah AH=06h/07h alarm set/cancel. IRQ8 reads RTC Registers B and C,
+handles simultaneous periodic and alarm causes, calls INT 4Ah for an alarm, and
+acknowledges both PICs.
+
+The rear gameport decodes every port from `0x200` through `0x207` as an alias.
+Joystick A supplies two 250 kOhm RC axes and two active-low buttons; joystick B
+is unpopulated. An OUT charges the axis timers and reads expose their live state.
+INT 15h AH=84h reports the same switches and A-axis positions, with zeroes for
+joystick B.
 
 ## Next
 

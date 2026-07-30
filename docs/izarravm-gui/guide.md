@@ -53,6 +53,7 @@ separate from the machine-hardware config you pass with `--config`:
 - Master volume
 - The CRT emulation style (below)
 - Your rebound hotkeys for input release and full screen
+- The optional host-controller UUID, two axis controls and polarity, and two buttons
 - The last floppy image, last CD image, and last CD folder you mounted
 - Whether the control panel is expanded or collapsed
 - The P330 receiver, exact host destination, P300 SoundFont, and MT-32 ROM paths
@@ -66,7 +67,19 @@ Opened from the control panel, the config modal has three sections:
 
 **Input**: rebind the "Input release" hotkey (the key combination that
 gives keyboard and mouse focus back to the host) and the "Full screen"
-toggle hotkey.
+toggle hotkey. **Set joystick buttons** opens a foreground setup window and
+temporarily disables the parent modal. Follow its prompts to center the stick,
+move X right, recenter, move Y down, then press Button 1 and Button 2. Cancel
+discards a partial capture. Completion changes only the staged modal settings;
+the parent Accept button persists and activates the binding without resetting
+the VM.
+
+The first accepted controller fixes the binding to its UUID. The wizard rejects
+duplicate axes or buttons and records axis polarity. Runtime input applies a
+rescaled 0.15 deadzone and sends only changed 8-bit samples. If that UUID is not
+connected, the gameport is detached; for identical controllers with one UUID,
+the first connected match is used. Setting `[input].joystick = false` in the
+machine config disables injection regardless of a saved GUI binding.
 
 **Display**: **CRT emulation**, a three-way choice:
 
