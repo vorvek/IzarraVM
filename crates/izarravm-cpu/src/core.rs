@@ -820,6 +820,18 @@ impl CpuGsw {
         let _ = enabled;
     }
 
+    /// Always available, unlike the census: see `DirectStallSnapshot`.
+    pub fn direct_stall_snapshot(&self) -> crate::DirectStallSnapshot {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.stall_snapshot()
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            crate::DirectStallSnapshot::default()
+        }
+    }
+
     pub fn direct_barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
         #[cfg(feature = "jit")]
         {

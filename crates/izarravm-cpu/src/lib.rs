@@ -1259,6 +1259,25 @@ pub struct DirectBarrierCensusSnapshot {
     /// (label, count). Answers "what is actually ending stints", which the row list above
     /// cannot: rows are keyed by compile attempt, these are keyed by execution.
     pub unbound_targets: Vec<(&'static str, u64)>,
+    /// The same classification for DYNAMIC successor misses (computed RET/JMP/CALL targets).
+    /// `compiled_unlinked` here means the target block EXISTS and the two-way inline cache could
+    /// not name it, which is a capacity answer; anything else means it does not exist yet, which
+    /// is a compilation answer. Nothing distinguished the two before.
+    pub dynamic_miss_targets: Vec<(&'static str, u64)>,
+}
+
+/// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here
+/// used to fold into a state (`Dormant`), a bool (`try_link_inner` returning false) or one
+/// catch-all counter (`SideExitReason::Other`), which is why the three largest unattributed exit
+/// pools in the campaign could not be priced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectStallSnapshot {
+    /// (label, count) per `DormantReason`.
+    pub dormant: Vec<(&'static str, u64)>,
+    /// (label, count) per `LinkRefusal`.
+    pub link_refusals: Vec<(&'static str, u64)>,
+    pub side_exit_segment_limit: u64,
+    pub side_exit_x87_eligibility: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

@@ -3764,7 +3764,9 @@ fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faul
         .expect("installed block must be live");
 
     let side_exits = native.perf_counters().jit_direct_side_exits;
-    let other_exits = native.perf_counters().jit_direct_exit_other;
+    // The CS-limit refusal now names itself instead of landing in the `Other`
+    // catch-all; `Other` has no Direct producer left at all.
+    let limit_exits = native.direct_stall_snapshot().side_exit_segment_limit;
     let insns_before = native.perf_counters().jit_direct_insns;
 
     assert!(
@@ -3793,7 +3795,7 @@ fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faul
     );
     assert_eq!(native.perf_counters().jit_direct_side_exits - side_exits, 1);
     assert_eq!(
-        native.perf_counters().jit_direct_exit_other - other_exits,
+        native.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
         1
     );
     // Anti-vacuity: only the two fillers retired natively; the call itself never completed.

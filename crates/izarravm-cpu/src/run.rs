@@ -1129,7 +1129,8 @@ impl CpuGsw {
                         return Ok(DirectContinuation::Interpret);
                     }
                     jit::direct::CompileOutcome::Retry => {
-                        self.jit_direct.dormant(key);
+                        self.jit_direct
+                            .dormant(key, jit::direct::DormantReason::CompileRetry);
                         return Ok(DirectContinuation::Interpret);
                     }
                 };
@@ -1149,7 +1150,8 @@ impl CpuGsw {
                             .is_some_and(|end| end as usize <= page.len)
                 });
                 if !code_page_covers_block {
-                    self.jit_direct.dormant(key);
+                    self.jit_direct
+                        .dormant(key, jit::direct::DormantReason::PageCoverFailed);
                     return Ok(DirectContinuation::Interpret);
                 }
                 // G1 pre-install gate (full span): the compiled block may cover chunks past its
@@ -1164,7 +1166,8 @@ impl CpuGsw {
                     return Ok(DirectContinuation::Interpret);
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {
-                    self.jit_direct.dormant(key);
+                    self.jit_direct
+                        .dormant(key, jit::direct::DormantReason::InstallFailed);
                     return Ok(DirectContinuation::Interpret);
                 };
                 self.perf.jit_direct_blocks_installed += 1;
@@ -2305,6 +2308,22 @@ impl CpuGsw {
         self.jit_direct.note_unbound_target(kind, key.linear());
     }
 
+    /// The dynamic-successor counterpart of `classify_unbound_exit`. Same recovery of the key
+    /// from the live EIP, separate lane, because a dynamic miss and a static unbound have
+    /// different fixes: a static unbound wants the target compiled, a dynamic miss whose target
+    /// is already `CompiledButUnlinked` wants a wider inline cache.
+    #[cfg(feature = "jit")]
+    #[inline(never)]
+    fn classify_dynamic_miss_exit(&mut self) {
+        let lin = self.linear_eip();
+        let d = self.registers.cs().default_size_32;
+        let Some(key) = jit::direct::key_for(self, lin, d) else {
+            return;
+        };
+        let kind = self.jit_direct.classify_unbound_target(key);
+        self.jit_direct.note_dynamic_miss_target(kind);
+    }
+
     #[cfg(feature = "jit")]
     fn run_direct_block<B: CpuBus>(
         &mut self,
@@ -2565,7 +2584,7 @@ impl CpuGsw {
             exit.side_exit != 0
                 || exit.side_exit_reason == jit::direct::SideExitReason::None as u32
         );
-        debug_assert!(exit.side_exit_reason <= jit::direct::SideExitReason::Other as u32);
+        debug_assert!(exit.side_exit_reason <= jit::direct::SideExitReason::MAX);
         let side_exit = exit.side_exit != 0;
 
         let final_eip = self.registers.eip;
@@ -2747,6 +2766,18 @@ impl CpuGsw {
             jit::direct::UnresolvedReason::DynamicMissOrUnbound => {
                 self.perf.jit_direct_unresolved_exits += 1;
                 self.perf.jit_direct_unresolved_dynamic_miss_or_unbound += 1;
+                // The same classification the StaticUnbound arm runs, into its own lane. This is
+                // the only remaining exit pool large enough to move wall (20% of entries) and
+                // nothing distinguished "the target was never compiled" from "the target is
+                // compiled and the two-way inline cache missed it". `classify_unbound_target`
+                // answers exactly that: CompiledButUnlinked means the block exists and the PIC
+                // could not name it, anything else means it does not exist yet.
+                //
+                // Gated at the CALL SITE for the reason the static arm documents: `key_for`
+                // reads segment state and builds a three-word key, and this fires 6.9M times.
+                if self.jit_direct.barrier_census_active() {
+                    self.classify_dynamic_miss_exit();
+                }
             }
             jit::direct::UnresolvedReason::DynamicHidden => {
                 self.perf.jit_direct_unresolved_exits += 1;
@@ -2774,6 +2805,12 @@ impl CpuGsw {
                 }
                 reason if reason == jit::direct::SideExitReason::Permission as u32 => {
                     self.perf.jit_direct_exit_permission += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::SegmentLimit as u32 => {
+                    self.jit_direct.note_side_exit_segment_limit();
+                }
+                reason if reason == jit::direct::SideExitReason::X87Eligibility as u32 => {
+                    self.jit_direct.note_side_exit_x87_eligibility();
                 }
                 reason if reason == jit::direct::SideExitReason::CodeWatch as u32 => {
                     self.perf.jit_direct_exit_code_watch += 1;

@@ -506,7 +506,8 @@ fn failed_install_consumes_seen_without_a_code_watch() {
     compilation.code.clear();
 
     assert!(cpu.jit_direct.install(&compilation).is_none());
-    cpu.jit_direct.dormant(key);
+    cpu.jit_direct
+        .dormant(key, jit::direct::DormantReason::CompileRetry);
     assert!(matches!(
         cpu.jit_direct.probe(key),
         jit::direct::BlockProbe::Rejected

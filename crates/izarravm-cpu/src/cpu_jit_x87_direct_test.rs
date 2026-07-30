@@ -1015,7 +1015,7 @@ fn a_dc_divide_by_zero_exits_before_touching_x87_state() {
     memory[DATA + 4..DATA + 8].copy_from_slice(&0.0f32.to_bits().to_le_bytes());
     let (cpu, _) = assert_program_matches(GswMode::Gsw586, memory, 0x0f7f);
     assert!(
-        cpu.perf_counters().jit_direct_exit_other > 0,
+        cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0,
         "the infinite result must side-exit rather than be stored"
     );
     assert_ne!(cpu.fpu.status & 0x04, 0, "the interpreter recorded ZE");
@@ -1646,13 +1646,13 @@ fn nearest_fistp_program() -> Vec<u8> {
 fn exceptional_arithmetic_and_non_chop_fistp_exit_before_mutation() {
     let (divide_cpu, _) =
         assert_program_matches(GswMode::Gsw586, exceptional_divide_program(), 0x037f);
-    assert!(divide_cpu.perf_counters().jit_direct_exit_other > 0);
+    assert!(divide_cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0);
     assert!(divide_cpu.fpu.get(0).is_infinite());
     assert_ne!(divide_cpu.fpu.status & 0x04, 0);
 
     let (fist_cpu, fist_bus) =
         assert_program_matches(GswMode::Gsw586, nearest_fistp_program(), 0x037f);
-    assert!(fist_cpu.perf_counters().jit_direct_exit_other > 0);
+    assert!(fist_cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0);
     assert_eq!(
         i32::from_le_bytes(fist_bus.memory[DATA + 4..DATA + 8].try_into().unwrap()),
         4
@@ -2195,7 +2195,7 @@ fn a_fidiv_by_integer_zero_exits_before_touching_x87_state() {
     let (cpu, _) =
         assert_program_matches_exact_insns(GswMode::Gsw586, memory, 0x0f7f, 2 /* mov, fld */);
     assert!(
-        cpu.perf_counters().jit_direct_exit_other > 0,
+        cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0,
         "the infinite result must side-exit rather than be stored"
     );
     assert_ne!(cpu.fpu.status & 0x04, 0, "the interpreter recorded ZE");
@@ -2459,7 +2459,7 @@ fn fadd_m64_with_a_nan_operand_side_exits_and_matches_the_interpreter() {
         2, // mov, fld
     );
     assert!(
-        cpu.perf_counters().jit_direct_exit_other > 0,
+        cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0,
         "a NaN operand must side-exit at the finite guard rather than be stored"
     );
     assert!(cpu.fpu.get(0).is_nan(), "the interpreter's result is NaN");
@@ -2496,7 +2496,7 @@ fn fcom_m64_with_a_nan_operand_side_exits_and_the_interpreter_writes_the_unorder
         0x037f,
         2, // mov, fld
     );
-    assert!(cpu.perf_counters().jit_direct_exit_other > 0);
+    assert!(cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0);
     assert_eq!(
         cpu.fpu.status & 0x4500,
         (1 << 14) | (1 << 10) | (1 << 8),
@@ -2592,7 +2592,7 @@ fn fld_m64_with_a_nan_operand_side_exits_before_pushing_it() {
         1, // mov -- the fld itself must side-exit rather than retire natively
     );
     assert!(
-        cpu.perf_counters().jit_direct_exit_other > 0,
+        cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0,
         "a NaN operand must side-exit at LoadF64's own finite guard rather than be pushed"
     );
     assert!(cpu.fpu.get(0).is_nan(), "the interpreter pushed the NaN");

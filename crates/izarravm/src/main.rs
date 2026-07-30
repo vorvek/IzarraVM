@@ -971,6 +971,7 @@ fn write_hdd_profile_json(
         "direct_barrier_census": direct_barrier_census_json(
             machine.cpu().direct_barrier_census_snapshot()
         ),
+        "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
@@ -996,6 +997,28 @@ fn direct_barrier_census_json(
             .iter()
             .map(|(label, count)| json!({ "kind": label, "count": count }))
             .collect::<Vec<_>>(),
+        "dynamic_miss_targets": snapshot
+            .dynamic_miss_targets
+            .iter()
+            .map(|(label, count)| json!({ "kind": label, "count": count }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json::Value {
+    json!({
+        "dormant": snapshot
+            .dormant
+            .iter()
+            .map(|(label, count)| json!({ "reason": label, "count": count }))
+            .collect::<Vec<_>>(),
+        "link_refusals": snapshot
+            .link_refusals
+            .iter()
+            .map(|(label, count)| json!({ "reason": label, "count": count }))
+            .collect::<Vec<_>>(),
+        "side_exit_segment_limit": snapshot.side_exit_segment_limit,
+        "side_exit_x87_eligibility": snapshot.side_exit_x87_eligibility,
     })
 }
 

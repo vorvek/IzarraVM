@@ -2493,7 +2493,9 @@ fn finite_cs_ret_limit_exit_case(stack_physical: u32) {
     arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
     arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
     let side_exits = native.perf_counters().jit_direct_side_exits;
-    let other_exits = native.perf_counters().jit_direct_exit_other;
+    // The CS-limit refusal now names itself instead of landing in the `Other`
+    // catch-all; `Other` has no Direct producer left at all.
+    let limit_exits = native.direct_stall_snapshot().side_exit_segment_limit;
 
     assert!(
         native
@@ -2512,7 +2514,7 @@ fn finite_cs_ret_limit_exit_case(stack_physical: u32) {
     );
     assert_eq!(native.perf_counters().jit_direct_side_exits - side_exits, 1);
     assert_eq!(
-        native.perf_counters().jit_direct_exit_other - other_exits,
+        native.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
         1
     );
 
@@ -3714,7 +3716,9 @@ fn finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_pr
     arm_stack_fixture(&mut native, ENTRY, 0);
     arm_stack_fixture(&mut interp, ENTRY, 0);
     let side_exits = native.perf_counters().jit_direct_side_exits;
-    let other_exits = native.perf_counters().jit_direct_exit_other;
+    // The CS-limit refusal now names itself instead of landing in the `Other`
+    // catch-all; `Other` has no Direct producer left at all.
+    let limit_exits = native.direct_stall_snapshot().side_exit_segment_limit;
     let insns_before = native.perf_counters().jit_direct_insns;
 
     assert!(
@@ -3737,7 +3741,7 @@ fn finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_pr
     );
     assert_eq!(native.perf_counters().jit_direct_side_exits - side_exits, 1);
     assert_eq!(
-        native.perf_counters().jit_direct_exit_other - other_exits,
+        native.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
         1
     );
     // Anti-vacuity: only the two movs retired natively; the jump itself never completed.

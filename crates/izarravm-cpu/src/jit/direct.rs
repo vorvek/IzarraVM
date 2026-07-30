@@ -102,6 +102,109 @@ pub(crate) struct BlockCacheStats {
     pub portals_hidden: u64,
 }
 
+/// The stall tallies, deliberately NOT part of `BlockCacheStats`.
+///
+/// `BlockCacheStats` is DRAINED by `take_stats` on every dispatcher exit and folded into
+/// `PerfCounters`; a field added there is zeroed before anything can read it back off the cache.
+/// These three groups have no `PerfCounters` home to be folded into -- growing that struct shifts
+/// the `pending_flags` offset pinned at 4512 -- so they live here, accumulate for the whole run,
+/// and are read directly by `stall_snapshot`. Not cleared by `reset_storage` either: a diagnostic
+/// that reset itself mid-run would under-report exactly the pathological runs it exists for.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DirectStallTally {
+    /// Why a compile attempt parked its key `Dormant` instead of installing, indexed by
+    /// `DormantReason`. Before this split all four reasons folded into one terminal state that
+    /// `classify_unbound_target` then reported as `SeenNotCompiled`, indistinguishable from a key
+    /// that had simply never been hot enough to try -- which is what made the 5.2M-exit
+    /// seen-not-compiled bucket unattributable.
+    pub dormant: [u64; DormantReason::COUNT],
+    /// Why `try_link_inner` refused an edge, indexed by `LinkRefusal`. Every one of these leaves
+    /// the source cell on the zero portal, so the exit reports `StaticUnbound` and is
+    /// indistinguishable from a target that was never compiled.
+    pub link_refusals: [u64; LinkRefusal::COUNT],
+    /// The two halves the old `SideExitReason::Other` counter conflated.
+    pub side_exit_segment_limit: u64,
+    pub side_exit_x87_eligibility: u64,
+}
+
+/// The four terminal states a non-structural compile failure can land in. Threaded from the three
+/// `dormant()` call sites plus the heat demotion so the counter names a mechanism rather than an
+/// outcome; see `BlockCacheStats::dormant`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DormantReason {
+    /// `CompileOutcome::Retry`. Twenty distinct `CompileStop::Retry` sites fold into this one
+    /// value, so it is still coarse -- but it separates "the compiler gave up" from the three
+    /// post-compile gates below, which is the split that decides whether retrying is worth
+    /// anything.
+    CompileRetry,
+    /// G4: no single RAM direct page covers the block's whole physical span.
+    PageCoverFailed,
+    /// G1: the span's SMC heat is hot at install time. This one DOES carry a heat stamp and so
+    /// has a designed recovery path through `lift_cold_smc_dormant`; the other three do not.
+    SpanHot,
+    /// The arena refused the allocation.
+    InstallFailed,
+}
+
+impl DormantReason {
+    pub(crate) const COUNT: usize = 4;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::CompileRetry,
+        Self::PageCoverFailed,
+        Self::SpanHot,
+        Self::InstallFailed,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::CompileRetry => "compile_retry",
+            Self::PageCoverFailed => "page_cover_failed",
+            Self::SpanHot => "span_hot",
+            Self::InstallFailed => "install_failed",
+        }
+    }
+}
+
+/// The six ways `try_link_inner` can refuse. Ordered as the function tests them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkRefusal {
+    /// Source or target is no longer an active index.
+    Inactive,
+    /// One end predates the current link epoch.
+    StaleEpoch,
+    /// `SegmentLayout::link_compatible` refused.
+    SegmentLayout,
+    /// `CompiledBlock::link_compatible` refused.
+    BlockShape,
+    /// The RET-PIC-only strict `has_x87` equality.
+    DynamicX87Class,
+    /// Integer source into a float target with no x87 re-entry pad built.
+    MissingX87Pad,
+}
+
+impl LinkRefusal {
+    pub(crate) const COUNT: usize = 6;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Inactive,
+        Self::StaleEpoch,
+        Self::SegmentLayout,
+        Self::BlockShape,
+        Self::DynamicX87Class,
+        Self::MissingX87Pad,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::StaleEpoch => "stale_epoch",
+            Self::SegmentLayout => "segment_layout",
+            Self::BlockShape => "block_shape",
+            Self::DynamicX87Class => "dynamic_x87_class",
+            Self::MissingX87Pad => "missing_x87_pad",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct BarrierKey {
     opcode: u16,
@@ -197,6 +300,11 @@ pub(crate) struct DirectBarrierCensus {
     /// because emitted code bakes it. Growing `PerfCounters` for a diagnostic shifts that pin;
     /// the census is an `Option<Box<_>>` on `JitState` and costs the layout nothing.
     unbound: [u64; UnboundTarget::COUNT],
+    /// The same classification for DYNAMIC successor misses (computed RET/JMP/CALL targets),
+    /// kept in its own lane because the two have different fixes: a static unbound wants its
+    /// target compiled, a dynamic miss whose target reads `CompiledButUnlinked` wants a wider
+    /// inline cache than the hardcoded two ways.
+    unbound_dynamic: [u64; UnboundTarget::COUNT],
     /// Block entry linear -> the barrier row that refused it, so a rejected-target exit can be
     /// attributed back to the opcode responsible. Keyed on linear alone: two rejected blocks
     /// sharing a linear across mode/physical would merge, which is acceptable for a diagnostic
@@ -207,6 +315,10 @@ pub(crate) struct DirectBarrierCensus {
 impl DirectBarrierCensus {
     fn note_unbound(&mut self, kind: UnboundTarget) {
         self.unbound[kind as usize] += 1;
+    }
+
+    fn note_unbound_dynamic(&mut self, kind: UnboundTarget) {
+        self.unbound_dynamic[kind as usize] += 1;
     }
 
     /// Attribute one rejected-target exit back to the barrier that refused that block.
@@ -350,6 +462,10 @@ impl DirectBarrierCensus {
                 .iter()
                 .map(|kind| (kind.label(), self.unbound[*kind as usize]))
                 .collect(),
+            dynamic_miss_targets: UnboundTarget::ALL
+                .iter()
+                .map(|kind| (kind.label(), self.unbound_dynamic[*kind as usize]))
+                .collect(),
         }
     }
 }
@@ -464,6 +580,39 @@ impl super::JitState {
                 census.note_unbound_rejected_at(linear);
             }
         }
+    }
+
+    /// Unlike the census snapshot this is ALWAYS available: none of its three groups is census
+    /// gated, because each is a single increment on a path that has already left native code.
+    pub(crate) fn stall_snapshot(&self) -> crate::DirectStallSnapshot {
+        crate::DirectStallSnapshot {
+            dormant: DormantReason::ALL
+                .iter()
+                .map(|r| (r.label(), self.stalls.dormant[*r as usize]))
+                .collect(),
+            link_refusals: LinkRefusal::ALL
+                .iter()
+                .map(|r| (r.label(), self.stalls.link_refusals[*r as usize]))
+                .collect(),
+            side_exit_segment_limit: self.stalls.side_exit_segment_limit,
+            side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
+        }
+    }
+
+    pub(crate) fn note_dynamic_miss_target(&mut self, kind: UnboundTarget) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.note_unbound_dynamic(kind);
+        }
+    }
+
+    /// Both are one unconditional increment on a path that has already taken a dispatcher exit,
+    /// so unlike the census hooks these are NOT gated: the gate would cost as much as the work.
+    pub(crate) fn note_side_exit_segment_limit(&mut self) {
+        self.stalls.side_exit_segment_limit += 1;
+    }
+
+    pub(crate) fn note_side_exit_x87_eligibility(&mut self) {
+        self.stalls.side_exit_x87_eligibility += 1;
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
@@ -1007,6 +1156,8 @@ pub(crate) struct BlockCache {
     /// resets, so it can never erase the live backend's demotion evidence.
     heat_resets: u64,
     stats: BlockCacheStats,
+    /// See `DirectStallTally`: never drained, never reset.
+    stalls: DirectStallTally,
     #[cfg(test)]
     defer_short_for_test: bool,
     #[cfg(test)]
@@ -1075,6 +1226,7 @@ impl BlockCache {
             admission_heat: DEFAULT_ADMISSION_HEAT,
             heat_resets: 0,
             stats: BlockCacheStats::default(),
+            stalls: DirectStallTally::default(),
             #[cfg(test)]
             defer_short_for_test: false,
             #[cfg(test)]
@@ -1301,7 +1453,12 @@ impl BlockCache {
 
     /// Keep a non-structural failure on the interpreter until an explicit cache reset or a new
     /// mode/translation key makes another admission attempt meaningful.
-    pub(crate) fn dormant(&mut self, key: BlockKey) {
+    /// `reason` is counted even when the key was NOT in `Seen` and so is not re-parked: the
+    /// question the counter answers is "how often did this gate fire", not "how many keys does
+    /// the map now hold in each state", and a key already Dormant from an earlier attempt would
+    /// otherwise vanish from the tally.
+    pub(crate) fn dormant(&mut self, key: BlockKey, reason: DormantReason) {
+        self.stalls.dormant[reason as usize] += 1;
         if self.entries.get(&key) == Some(&BlockState::Seen) {
             self.entries.insert(key, BlockState::Dormant);
         }
@@ -1383,7 +1540,7 @@ impl BlockCache {
     }
 
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
-        self.dormant(key);
+        self.dormant(key, DormantReason::SpanHot);
         let _ = heat.bump(key.physical, 1, epoch);
     }
 
@@ -2035,38 +2192,57 @@ impl BlockCache {
         target_eip: Option<u32>,
     ) -> bool {
         let Some(source_index) = self.active_index(source) else {
+            self.stalls.link_refusals[LinkRefusal::Inactive as usize] += 1;
             return false;
         };
         let Some(target_index) = self.active_index(target) else {
+            self.stalls.link_refusals[LinkRefusal::Inactive as usize] += 1;
             return false;
         };
         let source_block = self.blocks[source_index];
         let target_block = self.blocks[target_index];
-        if self.block_link_epochs.get(source_index).copied() != Some(self.link_epoch)
+        // Split out of the single `||` chain the six conditions used to share, so each refusal
+        // names itself. The ORDER is the original chain's order and the short-circuit is
+        // preserved, which matters: a stale epoch must be reported before the layout compare,
+        // because a stale index's `segment_layouts` entry is not meaningful.
+        let refusal = if self.block_link_epochs.get(source_index).copied() != Some(self.link_epoch)
             || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch)
-            || !self.segment_layouts[source_index].link_compatible(&self.segment_layouts[target_index])
-            || !source_block.link_compatible(&target_block)
-            // The dynamic RET PIC path resolves a near-RET target at runtime from an arbitrary
-            // return address, not from a compile-time successor shape, and
-            // emit_completed_dynamic_path never emits the boundary spill link_compatible's
-            // float-to-integer case relies on. So RET PIC keeps the strict has_x87 equality on
-            // top of the relaxed rule; static successors (target_eip == None, resolved above by
-            // resolve_successors/resolve_waiting) get the full relaxed rule instead.
-            //
-            // This equality is ALSO what keeps the shared x87 re-entry pad safe on that path.
-            // `emit_completed_dynamic_path` loads `BlockPortal::body` unconditionally, not
-            // `integer_entry`, so it would bypass the pad. Same class on both ends means the two
-            // fields are equal for every target it can bind, so the bypass is unobservable.
-            // Relaxing this line without teaching that path the pad is a silent wrong-entry bug.
-            || (target_eip.is_some() && source_block.has_x87 != target_block.has_x87)
         {
-            return false;
+            Some(LinkRefusal::StaleEpoch)
+        } else if !self.segment_layouts[source_index]
+            .link_compatible(&self.segment_layouts[target_index])
+        {
+            Some(LinkRefusal::SegmentLayout)
+        } else if !source_block.link_compatible(&target_block) {
+            Some(LinkRefusal::BlockShape)
+        }
+        // The dynamic RET PIC path resolves a near-RET target at runtime from an arbitrary
+        // return address, not from a compile-time successor shape, and
+        // emit_completed_dynamic_path never emits the boundary spill link_compatible's
+        // float-to-integer case relies on. So RET PIC keeps the strict has_x87 equality on
+        // top of the relaxed rule; static successors (target_eip == None, resolved above by
+        // resolve_successors/resolve_waiting) get the full relaxed rule instead.
+        //
+        // This equality is ALSO what keeps the shared x87 re-entry pad safe on that path.
+        // `emit_completed_dynamic_path` loads `BlockPortal::body` unconditionally, not
+        // `integer_entry`, so it would bypass the pad. Same class on both ends means the two
+        // fields are equal for every target it can bind, so the bypass is unobservable.
+        // Relaxing this line without teaching that path the pad is a silent wrong-entry bug.
+        else if target_eip.is_some() && source_block.has_x87 != target_block.has_x87 {
+            Some(LinkRefusal::DynamicX87Class)
         }
         // An integer source reaching a float target goes through the shared pad. Without one there
         // is no correct address to publish: `body` would enter the target with an unloaded x87
         // register cache. Refusing here leaves the cell on the zero portal, so the exit reports
         // `StaticUnbound` exactly as it did before the pad existed.
-        if !source_block.has_x87 && target_block.has_x87 && self.x87_pad_address().is_none() {
+        else if !source_block.has_x87 && target_block.has_x87 && self.x87_pad_address().is_none()
+        {
+            Some(LinkRefusal::MissingX87Pad)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            self.stalls.link_refusals[refusal as usize] += 1;
             return false;
         }
         let slot_index = usize::from(slot);
@@ -2276,7 +2452,28 @@ pub(crate) enum SideExitReason {
     UnavailableOrKind = 2,
     Permission = 3,
     CodeWatch = 4,
+    /// The catch-all. After the split below only the clif backend still produces it (two sites
+    /// in `clif/lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
+    /// side-exit growth across the x87 sweep and could not be attributed to any of its six
+    /// emitters. `allow(dead_code)` because the default feature set builds no clif producer, and
+    /// the discriminant must keep its value regardless: `run.rs` still has a catch-all arm for
+    /// it, and renumbering would silently remap what emitted code stores.
+    #[allow(dead_code)]
     Other = 5,
+    /// A CS segment-limit check on a computed control-transfer target: the five
+    /// `Ret`/`Ret16`/`JmpMem`/`CallReg` sites plus `MemorySideExits`' own limit stub.
+    SegmentLimit = 6,
+    /// An x87 slot's eligibility guard: a non-finite value, an Empty or Special tag, a
+    /// non-truncate rounding mode at a FIST, an out-of-range integer conversion, or a subnormal
+    /// at FSTP m80. Unlike every other reason here this one is a per-EXECUTION property of the
+    /// data, not a per-compile property of the address, so it can fire on a block that will
+    /// never bind differently.
+    X87Eligibility = 7,
+}
+
+impl SideExitReason {
+    /// The largest discriminant emitted code can store, for the `run.rs` bound assertion.
+    pub(crate) const MAX: u32 = Self::X87Eligibility as u32;
 }
 
 #[repr(u32)]

@@ -78,7 +78,7 @@ impl MemorySideExits {
             stubs.push((self.code_watch, common, SideExitReason::CodeWatch));
         }
         if let Some(segment_limit) = self.segment_limit {
-            stubs.push((segment_limit, common, SideExitReason::Other));
+            stubs.push((segment_limit, common, SideExitReason::SegmentLimit));
         }
     }
 }
@@ -754,7 +754,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 if let Some(limit_exit) = limit_exit {
                     e.cmp_r32_imm32(Reg::RDX, limit);
                     e.jcc(7, limit_exit);
-                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
                 }
                 emit_mode13_read_completion(&mut e, MemoryWidth::Word);
                 e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
@@ -874,7 +874,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         access.direction == NativeX87MemoryDirection::Write,
                     );
                 }
-                side_exit_reason_stubs.push((eligibility, side, SideExitReason::Other));
+                side_exit_reason_stubs.push((eligibility, side, SideExitReason::X87Eligibility));
                 side_exits.push((
                     side,
                     slot.lin.wrapping_sub(span.key.linear),
@@ -1035,7 +1035,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 if let Some(limit_exit) = limit_exit {
                     e.cmp_r32_imm32(Reg::RDX, limit);
                     e.jcc(7, limit_exit);
-                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
                 }
                 emit_mode13_read_completion(&mut e, MemoryWidth::Dword);
                 // Re-load the return target. `emit_mode13_read_completion` clobbers RDX on its
@@ -1098,7 +1098,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 if let Some(limit_exit) = limit_exit {
                     e.cmp_r32_imm32(Reg::RDX, limit);
                     e.jcc(7, limit_exit);
-                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
                 }
                 emit_mode13_read_completion(&mut e, MemoryWidth::Dword);
                 // Re-load the target. `emit_mode13_read_completion` clobbers RDX on its mode13
@@ -1154,7 +1154,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 if let Some(limit_exit) = limit_exit {
                     e.cmp_r32_imm32(home(dst), limit);
                     e.jcc(7, limit_exit);
-                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
                 }
                 emit_store(
                     &mut e,
