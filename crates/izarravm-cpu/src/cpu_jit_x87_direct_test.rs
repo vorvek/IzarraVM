@@ -731,6 +731,159 @@ fn dynamic_float_to_integer_crossing_spills_the_boundary_and_matches_the_interpr
     );
 }
 
+/// The other dynamic direction: an INTEGER source into a FLOAT target, which
+/// `emit_completed_dynamic_path` used to refuse (`LinkRefusal::DynamicIntegerToFloat`, 1,064,706
+/// refusals on the Quake fixture) because it loaded `BlockPortal::body` unconditionally and would
+/// have entered the target with an unloaded x87 register cache. It now loads `integer_entry`,
+/// which for a float target is the shared re-entry pad.
+///
+/// The x87 comparison is the non-vacuity: the target's own prologue is SKIPPED on a chained entry,
+/// so if the pad does not run in its place, the block's epilogue spills whatever XMM4-11 happened
+/// to hold into `CpuGsw.fpu.st` and the comparison fails. `x87_pad_bails` is asserted at zero
+/// separately, because a pad that bailed on the TOP guard would also leave `fpu` correct - by
+/// never crossing at all, which is the vacuous pass this fixture has to exclude.
+#[test]
+fn dynamic_integer_to_float_crossing_enters_through_the_pad_and_matches_the_interpreter() {
+    const SOURCE: u32 = ENTRY;
+    const TARGET: u32 = 0x300;
+    const MEM: u32 = 0x800;
+    let mut memory = vec![0; 0x2000];
+    memory[SOURCE as usize - 1] = 0x90;
+    // Pure integer, no x87 opcode: `has_x87` is false, so this block loads `integer_entry`.
+    let source = [
+        0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, // three mov eax,eax
+        0xff, 0x25, 0x00, 0x08, 0x00, 0x00, // jmp dword [0x800]
+    ];
+    let target = [
+        0xd9, 0xe8, // fld1
+        0x89, 0xdb, 0x89, 0xdb, // mov ebx,ebx x2
+        0xf4, // hlt
+    ];
+    memory[SOURCE as usize..SOURCE as usize + source.len()].copy_from_slice(&source);
+    memory[TARGET as usize..TARGET as usize + target.len()].copy_from_slice(&target);
+    memory[MEM as usize..MEM as usize + 4].copy_from_slice(&TARGET.to_le_bytes());
+
+    let mut native = x87_cpu(GswMode::Gsw586);
+    let mut interpreter = x87_cpu(GswMode::Gsw586);
+    let mut native_bus = direct_memory(memory.clone());
+    let mut interpreter_bus = direct_memory(memory.clone());
+    arm(&mut native, 0x0f7f);
+    run_to_halt(&mut native, &mut native_bus);
+    arm(&mut interpreter, 0x0f7f);
+    run_to_halt(&mut interpreter, &mut interpreter_bus);
+    native
+        .read_memory_u8(
+            &mut native_bus,
+            SegmentIndex::Ds,
+            0,
+            BusAccessKind::DataRead,
+        )
+        .expect("initialize direct map");
+
+    arm(&mut native, 0x0f7f);
+    native.registers.eip = TARGET;
+    let target_key = jit::direct::key_for(&native, TARGET, true).expect("target key");
+    assert!(matches!(
+        native.jit_direct.probe(target_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let target_compilation =
+        jit::direct::compile(&mut native, TARGET, true).expect("float target block");
+    assert!(
+        target_compilation.has_x87,
+        "the target must carry x87 for this to test the pad"
+    );
+    // The pad guards the target's baked entry TOP against the CPU's live TOP, so a fixture whose
+    // two disagree would bail instead of crossing and prove nothing.
+    assert_eq!(target_compilation.x87_entry_top, 0);
+    native
+        .jit_direct
+        .install(&target_compilation)
+        .expect("target install");
+
+    native.registers.eip = SOURCE;
+    let source_key = jit::direct::key_for(&native, SOURCE, true).expect("source key");
+    assert!(matches!(
+        native.jit_direct.probe(source_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let source_compilation =
+        jit::direct::compile(&mut native, SOURCE, true).expect("integer source block");
+    assert!(!source_compilation.has_x87);
+    assert!(source_compilation.dynamic_successor);
+    let source_id = native
+        .jit_direct
+        .install(&source_compilation)
+        .expect("source install");
+    let source_block = native
+        .jit_direct
+        .block(source_id)
+        .expect("source block remains live");
+
+    // First pass reports the miss; the bind happens afterwards, in Rust.
+    arm(&mut native, 0x0f7f);
+    native.registers.eip = SOURCE;
+    native_bus.memory.copy_from_slice(&memory);
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, source_block)
+            .unwrap()
+    );
+
+    arm(&mut native, 0x0f7f);
+    arm(&mut interpreter, 0x0f7f);
+    native.registers.eip = SOURCE;
+    interpreter.registers.eip = SOURCE;
+    native_bus.memory.copy_from_slice(&memory);
+    interpreter_bus.memory.copy_from_slice(&memory);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    let transfers = native.perf_counters().jit_direct_linked_transfers;
+    let bails = native.perf_counters().jit_direct_x87_pad_bails;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, source_block)
+            .unwrap()
+    );
+    for _ in 0..7 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - transfers,
+        1,
+        "the crossing must go native through the pad, not fall back through the dispatcher"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_x87_pad_bails - bails,
+        0,
+        "a bailing pad would leave fpu correct by never crossing, which is a vacuous pass"
+    );
+    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        native.fpu, interpreter.fpu,
+        "the pad must load the register cache the target's skipped prologue would have loaded"
+    );
+    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(native.fp_rem, interpreter.fp_rem);
+    assert_eq!(native_bus.memory, interpreter_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+    let refusals = native.jit_direct.stall_snapshot().link_refusals;
+    let refused = |name: &str| {
+        refusals
+            .iter()
+            .find(|(label, _)| *label == name)
+            .map(|(_, count)| *count)
+            .expect("named refusal")
+    };
+    assert_eq!(refused("dynamic_integer_to_float"), 0);
+    assert_eq!(refused("dynamic_float_to_integer"), 0);
+}
+
 // The differential test above proves CpuGsw.fpu ends up correct after a float-to-integer
 // crossing, but that alone does not prove the crossing restores RSI and XMM6-11 before handing
 // control to the integer target. Deleting that restore while keeping the spill would still pass

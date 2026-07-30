@@ -1711,14 +1711,25 @@ fn emit_completed_dynamic_path(
             Reg::RCX,
             core::mem::offset_of!(LinkCell, portal) as i8,
         );
-        // Reads `body`, NOT `integer_entry`, and deliberately: `try_link_inner` still keeps the
-        // strict has_x87 equality for an INTEGER source on this path, so a target reached from
-        // here is either the same class (where the two portal fields are equal) or a float target
-        // reached from a float source. See the comment on that check.
+        // The same compile-time field selection `emit_completed_path` makes, for the same reason.
+        // A FLOAT source loads `body` and lands on the target directly, its register cache already
+        // live, with the float-to-integer case handled by the `spilling` test below. An INTEGER
+        // source loads `integer_entry`, which IS `body` for an integer target and is the shared
+        // x87 re-entry pad for a float one - and the pad is why the cell has to be in RCX at the
+        // jump, which is the register it reads its entry TOP and its portal from.
+        //
+        // The zero test keeps meaning "unresolved or hidden" for both, because `clear()` zeroes
+        // both fields, and it also covers the float target whose pad could not be built:
+        // `publish_x87` stores zero rather than `body` there, so an integer source takes the
+        // unresolved path instead of entering an unloaded register cache.
         e.load_r64_disp8(
             Reg::RAX,
             Reg::RAX,
-            core::mem::offset_of!(BlockPortal, body) as i8,
+            if x87_source {
+                core::mem::offset_of!(BlockPortal, body) as i8
+            } else {
+                core::mem::offset_of!(BlockPortal, integer_entry) as i8
+            },
         );
         e.cmp_r64_imm32(Reg::RAX, 0);
         e.jz(dynamic_hidden_or_unbound);

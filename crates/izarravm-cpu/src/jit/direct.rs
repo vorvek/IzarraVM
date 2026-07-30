@@ -176,17 +176,17 @@ pub(crate) enum LinkRefusal {
     SegmentLayout,
     /// `CompiledBlock::link_compatible` refused.
     BlockShape,
-    /// The RET-PIC-only strict `has_x87` equality, INTEGER source into a FLOAT target. This is
-    /// the direction the shared x87 re-entry pad exists for: a static integer-to-float edge binds
-    /// through `integer_entry`, and this path refuses only because
-    /// `emit_completed_dynamic_path` loads `BlockPortal::body` unconditionally and would enter
-    /// the target with an unloaded register cache.
+    /// The RET-PIC-only strict `has_x87` equality, INTEGER source into a FLOAT target. RETIRED,
+    /// and kept only so the counter can prove it: `emit_completed_dynamic_path` now selects
+    /// `BlockPortal::integer_entry` for an integer source, which is the shared x87 re-entry pad
+    /// for a float target, so nothing refuses for this reason any more and this must read zero.
+    /// A non-zero value means an edge reached the refusal without going through the pad.
     DynamicIntegerToFloat,
-    /// The same equality, FLOAT source into an INTEGER target. RETIRED, and kept only so the
-    /// counter can prove it: `emit_completed_dynamic_path` now emits the boundary spill that
-    /// `link_compatible`'s float-to-integer case relies on, so nothing refuses for this reason
-    /// any more and this must read zero. A non-zero value means a crossing found some path that
-    /// reaches the refusal without going through the spill.
+    /// The same equality, FLOAT source into an INTEGER target. RETIRED on the same terms:
+    /// `emit_completed_dynamic_path` emits the boundary spill that `link_compatible`'s
+    /// float-to-integer case relies on, so this must read zero too. The two are kept apart rather
+    /// than merged because they were fixed by two different mechanisms in two commits, and a
+    /// regression in either one should name itself.
     DynamicFloatToInteger,
     /// Integer source into a float target with no x87 re-entry pad built.
     MissingX87Pad,
@@ -2248,26 +2248,13 @@ impl BlockCache {
         } else if !source_block.link_compatible(&target_block) {
             Some(LinkRefusal::BlockShape)
         }
-        // The dynamic RET PIC path resolves a near-RET target at runtime from an arbitrary return
-        // address rather than from a compile-time successor shape, so it used to keep a strict
-        // has_x87 equality on top of the relaxed rule, in BOTH directions.
+        // The dynamic RET PIC path used to layer a strict `has_x87` equality on top of the relaxed
+        // rule, in both directions, because it resolves its target at runtime from an arbitrary
+        // return address rather than from a compile-time successor shape. Both halves are gone:
+        // `emit_completed_dynamic_path` now emits the boundary spill for a float source and
+        // selects `integer_entry` for an integer one, which is the whole of what the static path
+        // does. `target_eip` no longer changes which edges link, only how the cell is written.
         //
-        // The float-to-integer direction is now allowed, because
-        // `emit_completed_dynamic_path` emits the boundary spill that
-        // `SpanMeta::link_compatible`'s float-to-integer case relies on: the same runtime
-        // `LinkCell::spilling` test, the same `emit_x87_spill`, the same RSI and XMM6-11 restore
-        // as the static path, keyed off the same `mark_spilling` set below.
-        //
-        // The INTEGER-to-float direction still refuses. `emit_completed_dynamic_path` loads
-        // `BlockPortal::body` unconditionally rather than `integer_entry`, so it would bypass the
-        // shared x87 re-entry pad and enter a float body with an unloaded register cache. With
-        // that direction refused, every target it can bind either matches its source's class (the
-        // two portal fields are equal) or is a float target reached from a float source (which
-        // wants `body`), so the bypass stays unobservable. Relaxing THIS line without teaching
-        // that path the pad is a silent wrong-entry bug.
-        else if target_eip.is_some() && !source_block.has_x87 && target_block.has_x87 {
-            Some(LinkRefusal::DynamicIntegerToFloat)
-        }
         // An integer source reaching a float target goes through the shared pad. Without one there
         // is no correct address to publish: `body` would enter the target with an unloaded x87
         // register cache. Refusing here leaves the cell on the zero portal, so the exit reports
