@@ -167,6 +167,56 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             emit_sti_binary(e, top, index, op, context.side_exit);
             emit_pop(e, top);
         }
+        // FCHS and FABS, both as one bit of the operand's raw pattern in a GPR rather than a
+        // packed-double mask in an XMM: there is no `vandpd`/`vxorpd`-with-constant helper in the
+        // encoder, and a 64-bit round trip is the same instruction count as building the mask
+        // would be. `emit_store_physical` re-derives the tag from the stored value, which is what
+        // keeps FCHS on a zero correct -- the interpreter's `set` tags -0.0 as Zero, and so does
+        // the `vucomisd` against zero inside `emit_store_physical`.
+        NativeX87Insn::SignOp { negate } => {
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.vmovq_r64_xmm(Reg::RDX, VALUE0);
+            if negate {
+                e.mov_r64_imm64(Reg::RAX, 1u64 << 63);
+                e.xor_r64_r64(Reg::RDX, Reg::RAX);
+            } else {
+                // Shift the sign out and back rather than masking, for the same
+                // no-64-bit-immediate-AND reason the negate arm builds its constant.
+                e.shift_r64_imm8(4, Reg::RDX, 1);
+                e.shift_r64_imm8(5, Reg::RDX, 1);
+            }
+            e.vmovq_xmm_r64(VALUE0, Reg::RDX);
+            emit_store_physical(e, top, VALUE0);
+        }
+        // FTST. The only compare shape that loads ONE physical register: its right-hand side is
+        // the literal +0.0, not a stack slot, so there is no second tag or finite guard.
+        NativeX87Insn::TestZero => {
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.vxorpd(ZERO, ZERO, ZERO);
+            emit_compare(e, VALUE0, ZERO);
+        }
+        // FXAM. `emit_load_physical` has already side exited on empty, NaN and infinity, so the
+        // only classes reachable here are finite zero (C3) and finite non-zero (C2), with C1 the
+        // sign bit and C0 always clear. That is why this arm can decide the whole classification
+        // from one `vucomisd` without consulting the tag word the interpreter reads.
+        NativeX87Insn::Examine => {
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.and_r32_imm32(CACHE_REG, !u32::from(X87_CONDITION_MASK));
+            e.vmovq_r64_xmm(Reg::RDX, VALUE0);
+            e.shift_r64_imm8(5, Reg::RDX, 63);
+            e.shl_r32_imm8(Reg::RDX, 9);
+            e.vxorpd(ZERO, ZERO, ZERO);
+            e.vucomisd(VALUE0, ZERO);
+            let zero = e.label();
+            let done = e.label();
+            e.jz(zero);
+            e.or_r32_imm32(Reg::RDX, 1 << 10);
+            e.jmp(done);
+            e.place(zero);
+            e.or_r32_imm32(Reg::RDX, 1 << 14);
+            e.place(done);
+            e.or_r32_r32(CACHE_REG, Reg::RDX);
+        }
         // FUCOM/FUCOMP. Byte for byte the `BinaryRegister` compare path: the interpreter models
         // the unordered forms with the same `fpu_compare` the ordered ones use, so anything that
         // would distinguish them (a signaling-NaN #IA) is unreachable on both sides. Both

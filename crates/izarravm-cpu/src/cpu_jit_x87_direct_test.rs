@@ -1178,6 +1178,83 @@ fn fist_m32_stores_without_popping_and_matches_the_interpreter() {
     }
 }
 
+/// One 0xD9 /4 register form, with an FNSTSW to capture the condition bits it may write and an
+/// FSTP to capture the value it may rewrite. Both halves matter: FCHS and FABS move the value and
+/// must leave the condition bits alone, FTST and FXAM do the exact opposite.
+fn d9_sign_and_classify_program(op: u8, value: f32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                integer, before
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]  ST(0)=value
+        0xd9, op, // the tested 0xD9 /4 form
+        0xdf, 0xe0, // fnstsw ax
+        0xd9, 0x1d, 0x04, 0x02, 0x00, 0x00, // fstp dword [0x204]
+        0xba, 0x02, 0x00, 0x00, 0x00, // mov edx,2                integer, after
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+    memory
+}
+
+/// FCHS, FABS, FTST and FXAM against the interpreter.
+///
+/// -0.0 is the load-bearing input. It is the one value where the zero test and the sign test
+/// disagree, so it separates FXAM's C3 (set: the value IS zero) from its C1 (set: the sign bit is
+/// on) -- a lowering that derived C1 from the comparison rather than from bit 63 passes every
+/// other row here and fails this one. It also catches an FCHS written as a subtraction from zero,
+/// which would turn -0.0 into +0.0 and land different bytes in the stored dword.
+#[test]
+fn fchs_fabs_ftst_and_fxam_match_the_interpreter() {
+    const C0: u16 = 1 << 8;
+    const C1: u16 = 1 << 9;
+    const C2: u16 = 1 << 10;
+    const C3: u16 = 1 << 14;
+    // (op, value, expected stored f32, expected C3|C2|C1|C0).
+    let cases = [
+        (0xe0u8, -2.5f32, 2.5f32, 0u16), // FCHS: value moves, condition bits do not
+        (0xe0, 3.5, -3.5, 0),
+        (0xe0, -0.0, 0.0, 0),
+        (0xe1, -2.5, 2.5, 0), // FABS
+        (0xe1, 3.5, 3.5, 0),
+        (0xe1, -0.0, 0.0, 0),
+        (0xe4, 3.5, 3.5, 0),         // FTST: ST(0) above zero
+        (0xe4, -2.5, -2.5, C0),      // below
+        (0xe4, 0.0, 0.0, C3),        // equal
+        (0xe4, -0.0, -0.0, C3),      // -0.0 compares EQUAL to zero, so C3 and not C0
+        (0xe5, 3.5, 3.5, C2),        // FXAM: finite non-zero, positive
+        (0xe5, -2.5, -2.5, C2 | C1), // finite non-zero, negative
+        (0xe5, 0.0, 0.0, C3),        // zero, positive
+        (0xe5, -0.0, -0.0, C3 | C1), // zero, NEGATIVE: C3 from the value, C1 from the sign bit
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (op, value, expected_value, expected_bits) in cases {
+            let (cpu, bus) = assert_program_matches_exact_insns(
+                mode,
+                d9_sign_and_classify_program(op, value),
+                0x0f7f,
+                6, // mov, fld, op, fnstsw, fstp, mov -- hlt never retires natively
+            );
+            assert_eq!(
+                u32::from_le_bytes(bus.memory[DATA + 4..DATA + 8].try_into().unwrap()),
+                expected_value.to_bits(),
+                "mode={mode:?} op={op:#x} value={value}: stored bits (sign included)"
+            );
+            assert_eq!(
+                cpu.fpu.status & (C0 | C1 | C2 | C3),
+                expected_bits,
+                "mode={mode:?} op={op:#x} value={value}: condition bits"
+            );
+            assert_eq!(
+                cpu.perf_counters().jit_direct_side_exits,
+                0,
+                "mode={mode:?} op={op:#x} value={value}"
+            );
+        }
+    }
+}
+
 fn constants_and_register_store_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;

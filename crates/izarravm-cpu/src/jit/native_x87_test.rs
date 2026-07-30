@@ -43,6 +43,9 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             | (0xd9, 0..=2, 0 | 2 | 3 | 5 | 7, 0..=7)
             | (0xd9, 3, 0 | 1, 0..=7)
             | (0xd9, 3, 5, 0 | 6)
+            // 0xD9 /4: FCHS, FABS, FTST, FXAM. rm 2, 3, 6 and 7 are undefined in the interpreter
+            // and must stay rejected, so this is an explicit rm list, not a range.
+            | (0xd9, 3, 4, 0 | 1 | 4 | 5)
             // 0xDA memory forms: integer m32 arithmetic, all 8 sub-opcodes (`IntBinaryMemory`).
             // The register row keeps only `(0xda, 3, 5, 1)`, FUCOMPP; every other 0xDA mod=3
             // encoding is FCMOVcc and unrepresentable here, so it stays rejected.
@@ -101,8 +104,9 @@ fn classifier_selects_exact_traced_slice() {
     // x 8 sub-opcodes x 8 rm values = 192, landing at 1013. 0xDF /5 memory (FILD m64) adds 3
     // modes x 1 sub-opcode x 8 rm values = 24, landing at 1037. 0xDD mod=3 /4 and /5
     // (FUCOM/FUCOMP) add 2 sub-opcodes x 8 rm values = 16, landing at 1053. 0xDB /2 memory
-    // (FIST m32) adds 3 modes x 1 sub-opcode x 8 rm values = 24, landing at 1077.
-    assert_eq!(accepted, 1077);
+    // (FIST m32) adds 3 modes x 1 sub-opcode x 8 rm values = 24, landing at 1077. 0xD9 mod=3 /4
+    // (FCHS/FABS/FTST/FXAM) adds 4 rm values, landing at 1081.
+    assert_eq!(accepted, 1081);
 }
 
 #[test]
@@ -247,6 +251,31 @@ fn classifier_preserves_operations_indices_and_addresses() {
             pop: true,
         })
     );
+    // 0xD9 /4. FCHS and FABS share a variant and are separated only by `negate`, so both are
+    // pinned; the four undefined rm values must stay unclassifiable rather than falling into
+    // either of them.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 4, 0)),
+        Some(NativeX87Insn::SignOp { negate: true })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 4, 1)),
+        Some(NativeX87Insn::SignOp { negate: false })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 4, 4)),
+        Some(NativeX87Insn::TestZero)
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 4, 5)),
+        Some(NativeX87Insn::Examine)
+    );
+    for rm in [2u8, 3, 6, 7] {
+        assert!(
+            NativeX87Insn::classify(&insn(0xd9, 3, 4, rm)).is_none(),
+            "0xd9 mod=3 /4 rm={rm} is undefined and must stay unclassifiable"
+        );
+    }
     // FUCOM/FUCOMP ST(i). The pop flag is the only thing separating /4 from /5, and it drives
     // `top_delta`, so both are pinned with their index. `/0` (FFREE) stays unclassifiable.
     assert_eq!(
@@ -752,6 +781,39 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // The 0xD9 /4 group's three clock figures. FCHS/FABS at 6, FTST at 4 and FXAM at 8 are
+        // the whole reason these are three metadata arms rather than one; folding any two
+        // together is invisible in every value and shows only here and in `run timing differs`.
+        (
+            insn(0xd9, 3, 4, 0),
+            NativeX87Metadata {
+                raw_clocks: 6,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd9, 3, 4, 4),
+            NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd9, 3, 4, 5),
+            NativeX87Metadata {
+                raw_clocks: 8,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
         // FIST m32, the NON-popping half of the 0xDB /2-/3 pair. `pops` false against FISTP's
         // true is the only field that moves, and `IntConvert32` (272 at I586) must not drift to
         // the `IntConvert16` its 0xDF sibling uses -- `execute_fpu` derives the class from the
@@ -1006,6 +1068,10 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         NativeX87Insn::LoadZero,
         NativeX87Insn::ComparePopPop,
         NativeX87Insn::StoreStatusAx,
+        NativeX87Insn::SignOp { negate: true },
+        NativeX87Insn::SignOp { negate: false },
+        NativeX87Insn::TestZero,
+        NativeX87Insn::Examine,
         NativeX87Insn::LoadF32 { addr: addr() },
         NativeX87Insn::LoadI32 { addr: addr() },
         NativeX87Insn::LoadControlWord { addr: addr() },
@@ -1068,7 +1134,10 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::StoreF64 { .. }
         | NativeX87Insn::BinaryMemoryF64 { .. }
         | NativeX87Insn::LoadI64 { .. }
-        | NativeX87Insn::UnorderedCompare { .. } => true,
+        | NativeX87Insn::UnorderedCompare { .. }
+        | NativeX87Insn::SignOp { .. }
+        | NativeX87Insn::TestZero
+        | NativeX87Insn::Examine => true,
     }
 }
 

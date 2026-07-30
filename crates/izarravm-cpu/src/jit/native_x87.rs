@@ -200,6 +200,21 @@ pub(crate) enum NativeX87Insn {
         op: NativeX87BinaryOp,
         addr: AddrMode,
     },
+    /// FCHS (0xD9 E0, `negate`) and FABS (0xD9 E1). Both are a single bit of ST(0), so neither
+    /// can turn a finite value into a non-finite one and neither needs a result guard on top of
+    /// the one `emit_load_physical` already applies to the operand.
+    SignOp {
+        negate: bool,
+    },
+    /// FTST (0xD9 E4): compare ST(0) against +0.0 and write the condition triple. The zero is a
+    /// literal in the emitted form rather than a stack slot, so unlike every other compare shape
+    /// this one loads only ONE physical register.
+    TestZero,
+    /// FXAM (0xD9 E5): classify ST(0) into C3/C2/C0 with C1 carrying the sign. Admitted only
+    /// because `emit_load_physical` has already excluded the three classes that would need the
+    /// tag word to answer -- empty, NaN and infinity all side exit at its tag and finite guards --
+    /// which leaves exactly the finite zero/non-zero split the emitted form can decide.
+    Examine,
     /// FUCOM/FUCOMP ST(i) (0xDD /4 no pop, /5 pop). The interpreter treats these exactly like
     /// FCOM/FCOMP -- one `fpu_compare` and an optional pop, with the unordered-versus-signaling
     /// NaN distinction unmodelled (`fpu_dd_register`, fpu_exec.rs:656-666) -- so the emitted form
@@ -284,6 +299,11 @@ impl NativeX87Insn {
             | Self::UnorderedCompare { pop: false, .. }
             | Self::Exchange { .. }
             | Self::StoreStatusAx
+            // The whole 0xD9 /4 group is TOP-insensitive: two of them rewrite ST(0) in place and
+            // two only write condition bits.
+            | Self::SignOp { .. }
+            | Self::TestZero
+            | Self::Examine
             // Neither control-word form touches the register stack, the status word or the tag
             // word, so both are TOP-insensitive. That is what makes them safe to admit, and it is
             // also why they pin a block to its compile-time TOP for no architectural reason; see
@@ -375,6 +395,13 @@ impl NativeX87Insn {
             }),
             (0xd9, 0, index) => Some(Self::LoadRegister { index }),
             (0xd9, 1, index) => Some(Self::Exchange { index }),
+            // 0xD9 /4 register forms. rm 2, 3, 6 and 7 are undefined -- `fpu_d9_register` has no
+            // arm for 0xE2/0xE3/0xE6/0xE7 and answers #UD -- so the rm list is explicit rather
+            // than `0..=7`, the same shape the (0xd9, 5, 0 | 6) pair below uses.
+            (0xd9, 4, 0) => Some(Self::SignOp { negate: true }),
+            (0xd9, 4, 1) => Some(Self::SignOp { negate: false }),
+            (0xd9, 4, 4) => Some(Self::TestZero),
+            (0xd9, 4, 5) => Some(Self::Examine),
             (0xd9, 5, 0) => Some(Self::LoadOne),
             (0xd9, 5, 6) => Some(Self::LoadZero),
             (0xda, 5, 1) | (0xde, 3, 1) => Some(Self::ComparePopPop),
@@ -518,6 +545,31 @@ impl NativeX87Insn {
             },
             Self::BinaryRegisterDest { .. } => NativeX87Metadata {
                 raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+            // The 0xD9 /4 group carries THREE different clock figures across four encodings
+            // (fpu_d9_register, fpu_exec.rs:436-454): FCHS and FABS are 6, FTST is 4 and FXAM is
+            // 8. Folding them into one arm at a shared number is the realistic mistake, so they
+            // get three arms and three pinned rows in the metadata battery.
+            Self::SignOp { .. } => NativeX87Metadata {
+                raw_clocks: 6,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+            Self::TestZero => NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+            Self::Examine => NativeX87Metadata {
+                raw_clocks: 8,
                 fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
