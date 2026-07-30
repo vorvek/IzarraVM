@@ -425,11 +425,12 @@ impl Encoder {
 
     /// `movsx dst32, src8` (0F BE /r with mod=11, MOVSX r32, r8: SIGN-extend a register).
     /// Register sibling of `movsx_r32_byte_disp8`. Every current caller passes either RDX or a
-    /// `GUEST_HOMES` member: RDX needs no REX, and every `GUEST_HOMES` register is an extended
-    /// register (R8-R14) that forces `REX.B` through `optional_rex`'s `src.ext()` -- and no home
-    /// is RSP/RBP/RSI/RDI, so the AH/CH/DH/BH aliasing encoding (legacy index 4..=7 with no REX)
-    /// is unreachable for either family. Anyone adding a caller with a legacy non-RDX register
-    /// (RSP/RBP/RSI/RDI in particular) must re-derive this guarantee rather than assume it.
+    /// `GUEST_HOMES` member. `GUEST_HOMES` is R8-R14 plus RBX: the seven extended homes force
+    /// `REX.B` through `optional_rex`'s `src.ext()`, and RBX (low3 = 3) encodes as BL with no
+    /// REX. No home -- and not RDX -- is RSP/RBP/RSI/RDI, so the AH/CH/DH/BH aliasing encoding
+    /// (legacy index 4..=7 with no REX) is unreachable for either family. Anyone adding a caller
+    /// with a legacy non-RDX register (RSP/RBP/RSI/RDI in particular) must re-derive this
+    /// guarantee rather than assume it.
     /// Written out separately from the word form rather than parameterised, for the reason the
     /// memory pair records: the second opcode byte is the whole difference and a shared helper's
     /// test could not see it being picked wrongly.
