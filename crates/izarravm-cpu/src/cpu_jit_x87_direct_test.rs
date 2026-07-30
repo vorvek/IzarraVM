@@ -1052,6 +1052,78 @@ fn fcompp_and_fucompp_match_the_interpreter_and_pop_twice() {
     }
 }
 
+/// FUCOM/FUCOMP ST(1) with an x87 slot BEHIND the compare, so the pop is observable.
+///
+/// `a` lands in ST(1) and `b` in ST(0), so the compare is `b` against `a`. The trailing FSTP
+/// stores whatever the compare left as ST(0): `b` for the non-popping form, `a` for the popping
+/// one. That difference is the `top_delta` pin -- a shape that claimed the wrong stack effect
+/// would store the other value or trip the empty-tag guard, and neither survives the state
+/// comparison or the exact-retirement gate.
+fn fucom_program(pop: bool, a: f32, b: f32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    // 0xDD mod=3 with rm=1: /4 is FUCOM ST(1) (0xE1), /5 is FUCOMP ST(1) (0xE9).
+    let modrm = if pop { 0xe9 } else { 0xe1 };
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                integer, before
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]  ST(0)=a
+        0xd9, 0x05, 0x04, 0x02, 0x00, 0x00, // fld dword [0x204]  ST(0)=b, ST(1)=a
+        0xdd, modrm, // fucom/fucomp st(1)
+        0xdf, 0xe0, // fnstsw ax
+        0xd9, 0x1d, 0x08, 0x02, 0x00, 0x00, // fstp dword [0x208] the top_delta trap
+        0x89, 0xc2, // mov edx,eax             integer, after
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&a.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&b.to_bits().to_le_bytes());
+    memory
+}
+
+/// FUCOM/FUCOMP's three-way condition bits and stack effect. The interpreter serves these with
+/// the same `fpu_compare` the ordered forms use, so the values are not the interesting part; the
+/// interesting parts are that the pair is admitted at all, that only `/5` pops, and that the
+/// shape is charged `clocks(4)` rather than the ordered register compare's 20. The clock
+/// difference rides `run timing differs` inside the shared comparison.
+#[test]
+fn fucom_and_fucomp_condition_bits_and_pop_match_the_interpreter() {
+    // (a in ST(1), b in ST(0), expected C3|C2|C0 for b against a).
+    let cases = [
+        (3.0f32, 5.0f32, 0u16), // b > a: above
+        (5.0, 5.0, 1 << 14),    // b == a: equal
+        (7.0, 5.0, 1 << 8),     // b < a: below
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for pop in [false, true] {
+            for (a, b, expected_bits) in cases {
+                let (cpu, bus) = assert_program_matches_exact_insns(
+                    mode,
+                    fucom_program(pop, a, b),
+                    0x0f7f,
+                    7, // mov, fld, fld, fucom, fnstsw, fstp, mov -- hlt never retires natively
+                );
+                assert_eq!(
+                    cpu.fpu.status & 0x4500,
+                    expected_bits,
+                    "mode={mode:?} pop={pop} a={a} b={b}"
+                );
+                assert_eq!(
+                    f32::from_bits(u32::from_le_bytes(
+                        bus.memory[DATA + 8..DATA + 12].try_into().unwrap()
+                    )),
+                    if pop { a } else { b },
+                    "mode={mode:?} pop={pop}: FSTP stored the wrong stack slot"
+                );
+                assert_eq!(
+                    cpu.perf_counters().jit_direct_side_exits,
+                    0,
+                    "mode={mode:?} pop={pop}"
+                );
+            }
+        }
+    }
+}
+
 fn constants_and_register_store_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;

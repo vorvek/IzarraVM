@@ -59,7 +59,10 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             // pattern is the negative assertion that FCOM/FCOMP with an ST(i) destination stay
             // on the interpreter, where they raise #UD.
             | (0xdc, 3, 0 | 1 | 4..=7, 0..=7)
-            | (0xdd, 3, 2 | 3, 0..=7)
+            // 0xDD mod=3 /4 and /5: FUCOM/FUCOMP ST(i). `/0` (FFREE) stays rejected -- it writes
+            // the tag word to Empty without touching a value, which `emit_store_physical` has no
+            // shape for -- and so do `/6`/`/7`, which are undefined.
+            | (0xdd, 3, 2..=5, 0..=7)
             | (0xde, 3, 0 | 1 | 4 | 5 | 6 | 7, 0..=7)
             | (0xde, 3, 3, 1)
             | (0xdf, 3, 4, 0)
@@ -94,8 +97,9 @@ fn classifier_selects_exact_traced_slice() {
     // x 8 rm values = 192, landing at 749. 0xDD memory (FLD/FST/FSTP m64) adds 3 modes x 3
     // sub-opcodes x 8 rm values = 72, landing at 821. 0xDC memory (f64 arithmetic) adds 3 modes
     // x 8 sub-opcodes x 8 rm values = 192, landing at 1013. 0xDF /5 memory (FILD m64) adds 3
-    // modes x 1 sub-opcode x 8 rm values = 24, landing at 1037.
-    assert_eq!(accepted, 1037);
+    // modes x 1 sub-opcode x 8 rm values = 24, landing at 1037. 0xDD mod=3 /4 and /5
+    // (FUCOM/FUCOMP) add 2 sub-opcodes x 8 rm values = 16, landing at 1053.
+    assert_eq!(accepted, 1053);
 }
 
 #[test]
@@ -217,6 +221,28 @@ fn classifier_preserves_operations_indices_and_addresses() {
             pop: true,
         })
     );
+    // FUCOM/FUCOMP ST(i). The pop flag is the only thing separating /4 from /5, and it drives
+    // `top_delta`, so both are pinned with their index. `/0` (FFREE) stays unclassifiable.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdd, 3, 4, 6)),
+        Some(NativeX87Insn::UnorderedCompare {
+            index: 6,
+            pop: false,
+        })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdd, 3, 5, 6)),
+        Some(NativeX87Insn::UnorderedCompare {
+            index: 6,
+            pop: true,
+        })
+    );
+    for extension in [0u8, 6, 7] {
+        assert!(
+            NativeX87Insn::classify(&insn(0xdd, 3, extension, 6)).is_none(),
+            "0xdd mod=3 /{extension} (FFREE / undefined) must stay unclassifiable"
+        );
+    }
     assert_eq!(
         NativeX87Insn::classify(&insn(0xd9, 3, 5, 0)),
         Some(NativeX87Insn::LoadOne)
@@ -700,6 +726,30 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FUCOM/FUCOMP ST(i): `clocks(4)`, not the 20 the ordered register compare
+        // (`BinaryRegister`, pinned two rows from the top of this list) charges. Both rows are
+        // register-form compares and only the concrete number separates them, which is why the
+        // popping and non-popping variants are both here rather than one standing in for the pair.
+        (
+            insn(0xdd, 3, 4, 2),
+            NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xdd, 3, 5, 2),
+            NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: true,
+                terminates_block: false,
+            },
+        ),
     ];
     for (insn, expected) in cases {
         assert_eq!(NativeX87Insn::classify(&insn).unwrap().metadata(), expected);
@@ -927,6 +977,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         shapes.push(NativeX87Insn::StoreF32 { addr: addr(), pop });
         shapes.push(NativeX87Insn::StoreRegister { index: 3, pop });
         shapes.push(NativeX87Insn::StoreF64 { addr: addr(), pop });
+        shapes.push(NativeX87Insn::UnorderedCompare { index: 3, pop });
     }
     for extension in 0..=7 {
         let op = NativeX87BinaryOp::from_extension(extension).expect("binary op");
@@ -973,7 +1024,8 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::LoadF64 { .. }
         | NativeX87Insn::StoreF64 { .. }
         | NativeX87Insn::BinaryMemoryF64 { .. }
-        | NativeX87Insn::LoadI64 { .. } => true,
+        | NativeX87Insn::LoadI64 { .. }
+        | NativeX87Insn::UnorderedCompare { .. } => true,
     }
 }
 

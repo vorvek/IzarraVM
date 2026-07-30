@@ -165,6 +165,20 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             emit_sti_binary(e, top, index, op, context.side_exit);
             emit_pop(e, top);
         }
+        // FUCOM/FUCOMP. Byte for byte the `BinaryRegister` compare path: the interpreter models
+        // the unordered forms with the same `fpu_compare` the ordered ones use, so anything that
+        // would distinguish them (a signaling-NaN #IA) is unreachable on both sides. Both
+        // `emit_load_physical` calls finite-guard, so `emit_compare` never sees an unordered pair
+        // and never has to write the C3=C2=C0 triple, which is the same contract the 0xDC memory
+        // arm's comment spells out.
+        NativeX87Insn::UnorderedCompare { index, pop } => {
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            emit_load_physical(e, physical(top, index), VALUE1, context.side_exit);
+            emit_compare(e, VALUE0, VALUE1);
+            if pop {
+                emit_pop(e, top);
+            }
+        }
         NativeX87Insn::ComparePopPop => {
             emit_load_physical(e, top, VALUE0, context.side_exit);
             emit_load_physical(e, physical(top, 1), VALUE1, context.side_exit);

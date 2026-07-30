@@ -196,6 +196,16 @@ pub(crate) enum NativeX87Insn {
         op: NativeX87BinaryOp,
         addr: AddrMode,
     },
+    /// FUCOM/FUCOMP ST(i) (0xDD /4 no pop, /5 pop). The interpreter treats these exactly like
+    /// FCOM/FCOMP -- one `fpu_compare` and an optional pop, with the unordered-versus-signaling
+    /// NaN distinction unmodelled (`fpu_dd_register`, fpu_exec.rs:656-666) -- so the emitted form
+    /// is `BinaryRegister`'s compare path verbatim. What is NOT shared is the timing: this is
+    /// `clocks(4)` against `BinaryRegister`'s 20, which is the whole reason it cannot be folded
+    /// into `NativeX87BinaryOp` and must carry its own metadata arm.
+    UnorderedCompare {
+        index: u8,
+        pop: bool,
+    },
     /// FILD m64 (0xDF /5). Slice 40, FILD-only scope: the m64 INTEGER load. Unlike `LoadI32`
     /// this converts a 64-bit integer, which can exceed f64's 53-bit mantissa and round; see the
     /// emit arm's comment for what that does and does not put at risk. `StoreI64` (FISTP m64,
@@ -260,11 +270,13 @@ impl NativeX87Insn {
             | Self::StoreRegister { pop: true, .. }
             | Self::StoreI32 { .. }
             | Self::StoreF64 { pop: true, .. }
+            | Self::UnorderedCompare { pop: true, .. }
             | Self::PopBinary { .. } => 1,
             Self::ComparePopPop => 2,
             Self::StoreF32 { pop: false, .. }
             | Self::StoreRegister { pop: false, .. }
             | Self::StoreF64 { pop: false, .. }
+            | Self::UnorderedCompare { pop: false, .. }
             | Self::Exchange { .. }
             | Self::StoreStatusAx
             // Neither control-word form touches the register stack, the status word or the tag
@@ -362,6 +374,8 @@ impl NativeX87Insn {
             (0xda, 5, 1) | (0xde, 3, 1) => Some(Self::ComparePopPop),
             (0xdd, 2, index) => Some(Self::StoreRegister { index, pop: false }),
             (0xdd, 3, index) => Some(Self::StoreRegister { index, pop: true }),
+            (0xdd, 4, index) => Some(Self::UnorderedCompare { index, pop: false }),
+            (0xdd, 5, index) => Some(Self::UnorderedCompare { index, pop: true }),
             // 0xDC and 0xDE mod=3 are the same instruction apart from the pop, and the
             // interpreter dispatches both into one `fpu_reg_arith_sti`. They share one classifier
             // here for the same reason: the sub-opcode swap has one home rather than two
@@ -501,6 +515,16 @@ impl NativeX87Insn {
                 fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
+                terminates_block: false,
+            },
+            // `clocks(4)`, verified at fpu_exec.rs:665. Copying `BinaryRegister`'s 20 is the
+            // realistic mistake here (both are register-form compares) and would overcharge every
+            // FUCOM by 5x its weighted cost; the mutation battery targets the concrete number.
+            Self::UnorderedCompare { pop, .. } => NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: pop,
                 terminates_block: false,
             },
             Self::ComparePopPop => NativeX87Metadata {
