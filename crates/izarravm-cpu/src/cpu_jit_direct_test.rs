@@ -1016,10 +1016,11 @@ fn direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() 
 /// `StoreSource::Reg` selects the lane by ModRM reg exactly as the interpreter's `read_gpr8` does
 /// and a lowering that read the low byte of the wrong register would still look plausible.
 ///
-/// Four slots exactly: the filler and the three ALU forms, with the entry NOP interpreted. Three
-/// memory-ALU slots is what fits - each emits its own side-exit stubs, and a fourth pushed the
-/// block past the host page and made `compile_with_page_len` bisect it back down. Every op in the
-/// program is therefore mid-block and actually executed by the emitter.
+/// Four slots exactly: the filler and the three ALU forms, with the entry NOP interpreted. That
+/// is not a fixture accident, it is `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` (4) and
+/// `MAX_MEMORY_ALU_SLOTS` (3), so three memory-ALU ops plus one other slot is the largest block
+/// this shape can produce. Every op in the program is therefore mid-block and really emitted; a
+/// fourth would silently fall outside the block and go untested.
 #[test]
 fn direct_byte_alu_memory_destination_matches_the_interpreter() {
     let mut memory = vec![0; 0x1000];

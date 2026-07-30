@@ -604,7 +604,7 @@ fn retained_link_cell_is_unlinked_when_its_cache_drops() {
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 #[test]
-fn dynamic_ret_pic_requires_matching_x87_chain_top_and_kind() {
+fn dynamic_ret_pic_requires_a_matching_x87_top_and_spills_into_an_integer_target() {
     let mut cache = BlockCache::default();
     let source = key(0x1000);
     let wrong_top = key(0x1100);
@@ -642,12 +642,16 @@ fn dynamic_ret_pic_requires_matching_x87_chain_top_and_kind() {
         wrong_top.linear,
         wrong_top.mode_key
     ));
-    assert!(!cache.bind_dynamic_successor(
+    // A FLOAT source into an INTEGER target now binds on the dynamic path, and carries the same
+    // spilling mark the static path uses: `emit_completed_dynamic_path` emits the boundary spill
+    // that mark drives. This used to be refused as `LinkRefusal::DynamicFloatToInteger`.
+    assert!(cache.bind_dynamic_successor(
         site_cell,
         integer.linear,
         integer.linear,
         integer.mode_key
     ));
+    assert!(cache.link_cells[source_id.index()][0].is_spilling());
 
     assert!(matches!(cache.probe(matching_top), BlockProbe::Interpret));
     assert!(matches!(cache.probe(matching_top), BlockProbe::Compile));

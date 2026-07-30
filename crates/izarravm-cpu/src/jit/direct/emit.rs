@@ -794,6 +794,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     link_cell_ptrs,
                     shared_return,
                     full_accounting,
+                    x87_entry_top.is_some(),
                 );
                 terminal = true;
                 break;
@@ -1082,6 +1083,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     link_cell_ptrs,
                     shared_return,
                     full_accounting,
+                    x87_entry_top.is_some(),
                 );
                 terminal = true;
                 break;
@@ -1141,6 +1143,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     link_cell_ptrs,
                     shared_return,
                     full_accounting,
+                    x87_entry_top.is_some(),
                 );
                 terminal = true;
                 break;
@@ -1207,6 +1210,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     link_cell_ptrs,
                     shared_return,
                     full_accounting,
+                    x87_entry_top.is_some(),
                 );
                 terminal = true;
                 break;
@@ -1662,6 +1666,16 @@ fn emit_completed_path(
     e.jmp(shared_return);
 }
 
+/// The RET PIC completion. Mirrors `emit_completed_path`'s register convention on purpose: RCX
+/// holds the `LinkCell` address across the whole taken branch and RDX holds the resolved target,
+/// which is what lets the x87 boundary spill below be the same code in both places.
+///
+/// The cell has to be in RCX rather than RAX because `emit_increment_exit_u32` clobbers RAX, and
+/// the spill has to happen after the quota decrement (an exhausted quota returns to the block's
+/// own epilogue, which spills for itself). Holding the target in RDX rather than RCX costs one
+/// `mov` and buys the same property: `x87_avx2_emit::emit_spill` clobbers RAX and RSI and leaves
+/// RCX/RDX alone. RDX is free to reuse at that point because the two unresolved epilogues reach
+/// it only from branches taken BEFORE the move, and the EIP it held is in `CpuGsw.eip` anyway.
 fn emit_completed_dynamic_path(
     e: &mut Encoder,
     span: BlockSpan,
@@ -1669,6 +1683,7 @@ fn emit_completed_dynamic_path(
     link_cells: [usize; 2],
     shared_return: Label,
     accounting: StaticAccounting,
+    x87_source: bool,
 ) {
     e.store_r32_disp32(Reg::R15, eip_offset(), target);
     emit_accounting(
@@ -1684,37 +1699,64 @@ fn emit_completed_dynamic_path(
     let unresolved_done = e.label();
     for link_cell in link_cells {
         let next = e.label();
-        e.mov_r64_imm64(Reg::RAX, link_cell as u64);
+        e.mov_r64_imm64(Reg::RCX, link_cell as u64);
         e.cmp_r32_disp8(
             Reg::RDX,
-            Reg::RAX,
+            Reg::RCX,
             core::mem::offset_of!(LinkCell, target_eip) as i8,
         );
         e.jnz(next);
         e.load_r64_disp8(
-            Reg::RCX,
             Reg::RAX,
+            Reg::RCX,
             core::mem::offset_of!(LinkCell, portal) as i8,
         );
-        // Reads `body`, NOT `integer_entry`, and deliberately: `try_link_inner` keeps strict
-        // has_x87 equality on the RET PIC path, so this can only ever bind a same-class target,
-        // where the two portal fields are equal. See the comment on that check.
+        // Reads `body`, NOT `integer_entry`, and deliberately: `try_link_inner` still keeps the
+        // strict has_x87 equality for an INTEGER source on this path, so a target reached from
+        // here is either the same class (where the two portal fields are equal) or a float target
+        // reached from a float source. See the comment on that check.
         e.load_r64_disp8(
-            Reg::RCX,
-            Reg::RCX,
+            Reg::RAX,
+            Reg::RAX,
             core::mem::offset_of!(BlockPortal, body) as i8,
         );
-        e.cmp_r64_imm32(Reg::RCX, 0);
+        e.cmp_r64_imm32(Reg::RAX, 0);
         e.jz(dynamic_hidden_or_unbound);
         e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_QUOTA);
         e.sub_r64_imm32(Reg::RDI, 1);
         e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RDI);
         e.cmp_r64_imm32(Reg::RDI, 0);
         e.jz(shared_return);
+        e.mov_r64_r64(Reg::RDX, Reg::RAX);
         emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, linked_transfers));
         e.xor_r64_self(Reg::RDI);
         e.store_r64_disp8(Reg::RSP, STACK_ITERATIONS, Reg::RDI);
-        e.jmp_r64(Reg::RCX);
+        // The same per-slot runtime check `emit_completed_path` makes, and for the same reason:
+        // whether THIS edge spills is a `LinkCell` property, not a compile-time one, because the
+        // cell can be relinked from a float target to an integer one. An integer source never
+        // sets `x87_source`, so a pure integer chain does not pay for this arm's existence.
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if x87_source {
+            let transfer = e.label();
+            e.test_byte_disp8_imm8(Reg::RCX, core::mem::offset_of!(LinkCell, spilling) as i8, 1);
+            e.jz(transfer);
+            emit_x87_spill(e, Reg::R15);
+            #[cfg(target_os = "windows")]
+            {
+                e.load_r64_disp32(Reg::RSI, Reg::RSP, STACK_SAVED_RSI);
+                emit_restore_x87_host_xmms(e);
+            }
+            e.place(transfer);
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
+        debug_assert!(!x87_source);
+        e.jmp_r64(Reg::RDX);
         e.place(next);
     }
     emit_store_unresolved_reason(e, UnresolvedReason::DynamicMissOrUnbound);
@@ -1722,12 +1764,12 @@ fn emit_completed_dynamic_path(
     e.place(dynamic_hidden_or_unbound);
     let dynamic_hidden = e.label();
     e.load_r64_disp8(
-        Reg::RCX,
         Reg::RAX,
+        Reg::RCX,
         core::mem::offset_of!(LinkCell, portal) as i8,
     );
     e.mov_r64_imm64(Reg::RDI, zero_portal().address() as u64);
-    e.cmp_r64_r64(Reg::RCX, Reg::RDI);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDI);
     e.jnz(dynamic_hidden);
     emit_store_unresolved_reason(e, UnresolvedReason::DynamicMissOrUnbound);
     e.jmp(unresolved_done);
