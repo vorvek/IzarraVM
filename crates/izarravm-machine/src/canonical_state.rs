@@ -14,6 +14,7 @@ use crate::{
         cache_level_config, code_fetch_ws, tier_cost,
     },
     dma::{CanonicalDma8237Pair, CanonicalDmaEventTotalsV1},
+    gameport::CanonicalGamePort,
     ide::CanonicalIdeChannel,
     pci::CanonicalPciConfig,
     pic::CanonicalPic8259Pair,
@@ -41,7 +42,7 @@ struct StateSnapshotV1FoundationSection {
 ///
 /// Machine, memory, device, media, audio, and video sections will extend this
 /// list before the complete-schema validator or any snapshot artifact exists.
-const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 18] = [
+const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 19] = [
     StateSnapshotV1FoundationSection {
         id: 0x0000_0001,
         version: 1,
@@ -132,6 +133,11 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
         version: 1,
         requirement: CanonicalSectionRequirement::Required,
     },
+    StateSnapshotV1FoundationSection {
+        id: 0x0002_000f,
+        version: 1,
+        requirement: CanonicalSectionRequirement::Required,
+    },
 ];
 
 const _: () = {
@@ -205,6 +211,10 @@ const _: () = {
         sections[17].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
             == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+    assert!(
+        sections[18].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK
+            == STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
+    );
     assert!(sections[0].id < sections[1].id);
     assert!(sections[1].id < sections[2].id);
     assert!(sections[2].id < sections[3].id);
@@ -222,6 +232,7 @@ const _: () = {
     assert!(sections[14].id < sections[15].id);
     assert!(sections[15].id < sections[16].id);
     assert!(sections[16].id < sections[17].id);
+    assert!(sections[17].id < sections[18].id);
 };
 
 /// A machine boundary that cannot yet be represented by canonical owner payloads.
@@ -552,6 +563,7 @@ pub struct CanonicalMachineStateCapture<'a> {
     ata: CanonicalAtaDisk<'a>,
     bmide: CanonicalBusMasterIde<'a>,
     atapi_channel: CanonicalIdeChannel<'a>,
+    gameport: CanonicalGamePort<'a>,
 }
 
 impl CanonicalMachineStateCapture<'_> {
@@ -742,6 +754,15 @@ impl CanonicalMachineStateCapture<'_> {
     ) -> Result<(), CanonicalStateError> {
         self.atapi_channel.write_payload(out)
     }
+
+    /// Writes the required ISA gameport owner payload.
+    #[allow(dead_code)]
+    pub(crate) fn write_gameport_payload(
+        &self,
+        out: &mut CanonicalFieldWriter<'_>,
+    ) -> Result<(), CanonicalStateError> {
+        self.gameport.write_payload(out)
+    }
 }
 
 impl Machine {
@@ -873,6 +894,7 @@ impl Machine {
         let ata = CanonicalAtaDisk::new(self.ata.as_ref());
         let bmide = self.bmide.canonical_projection();
         let atapi_channel = self.ide.canonical_projection();
+        let gameport = self.gameport.canonical_projection();
         let timeline = self.timeline.canonical_projection(self.active_mode)?;
         let now_ticks = self.timeline.now_ticks();
         if self.halted_ticks > now_ticks {
@@ -937,6 +959,7 @@ impl Machine {
             ata,
             bmide,
             atapi_channel,
+            gameport,
         })
     }
 }

@@ -85,9 +85,9 @@ impl RtcSetup {
                 if !machine.load_cmos(&image) {
                     warn!(
                         path = %self.cmos_path.display(),
-                        "cmos.bin had a bad checksum; repaired and reusing the bytes"
+                        "cmos.bin had a bad checksum; restored Izarra defaults"
                     );
-                    // The device repaired the checksum; persist the fixed image.
+                    // Persist the defaulted, checksummed replacement.
                     save_cmos_file(&self.cmos_path, &machine.cmos_bytes());
                 }
             }

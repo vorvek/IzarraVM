@@ -10,7 +10,7 @@
 ; old side-by-side panes, so the menu is a single stacked column: three device
 ; rows, four CPU-speed rows, and an Accept row, walked by a flat focus index 0..7
 ; (0..2 device, 3..6 speed, 7 Accept). The menu is modal -- there is no Cancel
-; button -- but Esc bails to the default boot order so an accidental Tab is not a
+; button -- but Esc restores the persisted primary so an accidental Tab is not a
 ; trap. F10 or Enter-on-Accept commits.
 ;
 ; Drawing uses the lfb_* primitives, which share the mode-13h gfx_* register
@@ -18,7 +18,7 @@
 ; ART_INK_INDEX ink, ART_RED_INDEX title, ART_GREY_INDEX disabled rows. The LFB
 ; mode is already active from the POST screen, so the menu just blits the box over
 ; it (the wordmark and mascot on the right stay visible, matching the boot art).
-; Accept applies the speed live (port 0xE1) and persists order/speed to CMOS, then
+; Accept applies the speed live (port 0xE1) and persists primary/speed to CMOS, then
 ; falls through to boot_entry at the chosen speed with no cold reset.
 
 ; --- Colours (art palette indices) -----------------------------------------
@@ -86,7 +86,7 @@ bootbox_menu:
     ret
 
 ; ===========================================================================
-; State seeding: probe boot-device availability, read CMOS 0x11 (order) and
+; State seeding: probe boot-device availability, read CMOS 0x11 (primary) and
 ; 0x12 (speed) into the marks, and place initial focus on the marked device.
 ; Leaves DS = 0. Clobbers AX, BX, CX, DX.
 ; ===========================================================================
@@ -109,21 +109,18 @@ bx_seed:
     je .no_cd
     or byte [BMX_AVAIL], 0x02
 .no_cd:
-    ; Marked device from CMOS 0x11, falling back to floppy if its media vanished.
-    mov al, BOOT_CMOS_ORDER
+    ; Marked device is the persisted primary even when its media is absent. The
+    ; Rust INT 19h planner applies the fallback policy after the menu closes.
+    mov al, BOOT_CMOS_PRIMARY
     out 0x70, al
     in al, 0x71
     cmp al, 2
     je .dev_cd
     cmp al, 1
     jne .dev_floppy
-    test byte [BMX_AVAIL], 0x01
-    jz .dev_floppy
     mov al, BMX_RG_DEV_HDD
     jmp .dev_store
 .dev_cd:
-    test byte [BMX_AVAIL], 0x02
-    jz .dev_floppy
     mov al, BMX_RG_DEV_CD
     jmp .dev_store
 .dev_floppy:
@@ -152,7 +149,7 @@ bx_handle_key:
     cmp ah, BX_SC_ESC
     je bx_cancel
     cmp ah, BX_SC_F10
-    je bx_accept
+    je .f10
     cmp ah, BX_SC_UP
     je .up
     cmp ah, BX_SC_DOWN
@@ -160,6 +157,20 @@ bx_handle_key:
     cmp ah, BX_SC_ENTER
     je .enter
     ret
+.f10:
+    xor cx, cx
+    mov ds, cx
+    mov al, [BMX_FOCUS_IDX]
+    cmp al, BX_FOCUS_SPD0
+    jae bx_accept
+    call bx_dev_avail
+    test al, al
+    jz .ret
+    xor cx, cx
+    mov ds, cx
+    mov al, [BMX_FOCUS_IDX]
+    mov [BMX_MARK_DEV], al
+    jmp bx_accept
 .up:
     xor cx, cx
     mov ds, cx
@@ -192,7 +203,7 @@ bx_handle_key:
     je bx_accept
     cmp al, BX_FOCUS_SPD0
     jae .mark_spd
-    ; device row (focus 0..2 == device row): mark it if available.
+    ; A device-row Enter is a one-boot override. It never edits CMOS.
     call bx_dev_avail               ; AL row -> AL 1/0 (clobbers AX, BX)
     test al, al
     jz .ret                         ; unavailable: leave the mark unchanged
@@ -200,6 +211,19 @@ bx_handle_key:
     mov ds, cx
     mov al, [BMX_FOCUS_IDX]
     mov [BMX_MARK_DEV], al
+    cmp al, BMX_RG_DEV_HDD
+    je .one_hdd
+    cmp al, BMX_RG_DEV_CD
+    je .one_cd
+    mov byte [BOOT_CHOICE], BOOT_DEV_FLOPPY
+    jmp .one_exit
+.one_hdd:
+    mov byte [BOOT_CHOICE], BOOT_DEV_DISK
+    jmp .one_exit
+.one_cd:
+    mov byte [BOOT_CHOICE], BOOT_DEV_CDROM
+.one_exit:
+    mov byte [BMX_EXIT], 1
 .ret:
     ret
 .mark_spd:
@@ -209,7 +233,7 @@ bx_handle_key:
     ret
 
 ; ===========================================================================
-; Accept: apply the marked speed live (port 0xE1), persist order/speed to CMOS
+; Accept: apply the marked speed live (port 0xE1), persist primary/speed to CMOS
 ; with a fresh checksum, set BOOT_CHOICE, and flag the loop to exit. Mirrors the
 ; old bx2_accept / su_commit. Reached as a tail target; sets BMX_EXIT and returns.
 ; ===========================================================================
@@ -233,18 +257,18 @@ bx_accept:
     mov ds, cx
     mov al, [BMX_MARK_DEV]
     cmp al, BMX_RG_DEV_HDD
-    je .order_hdd
+    je .primary_hdd
     cmp al, BMX_RG_DEV_CD
-    je .order_cd
+    je .primary_cd
     xor al, al
-    jmp .order_store
-.order_hdd:
+    jmp .primary_store
+.primary_hdd:
     mov al, 1
-    jmp .order_store
-.order_cd:
+    jmp .primary_store
+.primary_cd:
     mov al, 2
-.order_store:
-    mov ah, BOOT_CMOS_ORDER
+.primary_store:
+    mov ah, BOOT_CMOS_PRIMARY
     call su_cmos_write
     call su_cmos_checksum
     ; Session boot device into BOOT_CHOICE.
@@ -266,12 +290,19 @@ bx_accept:
     mov byte [BMX_EXIT], 1
     ret
 
-; bx_cancel: Esc bail. Write nothing to 0xE1/CMOS; set BOOT_CHOICE to floppy so
-; boot_entry runs the default order, then flag exit.
+; bx_cancel: Esc bail. Write nothing; restore BOOT_CHOICE from the persisted
+; primary so the standard fallback planner receives the original selection.
 bx_cancel:
     xor cx, cx
     mov ds, cx
-    mov byte [BOOT_CHOICE], BOOT_DEV_FLOPPY
+    mov al, BOOT_CMOS_PRIMARY
+    out 0x70, al
+    in al, 0x71
+    cmp al, BOOT_DEV_CDROM
+    jbe .store
+    mov al, BOOT_DEV_FLOPPY
+.store:
+    mov [BOOT_CHOICE], al
     mov byte [BMX_EXIT], 1
     ret
 

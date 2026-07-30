@@ -24,6 +24,9 @@ use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{ActiveDisplay, MARGO_LFB_BASE, Machine, MachineProfile, StopReason};
 
+mod support;
+use support::mount_idle_boot_floppy;
+
 // Set 1 make/break codes used by the setup page.
 const DEL_MAKE: u8 = 0x53;
 const DEL_BREAK: u8 = 0xd3;
@@ -42,7 +45,9 @@ const A_BREAK: u8 = 0x9e;
 
 fn boot_machine() -> Machine {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    Machine::new(profile, izarra_bios()).unwrap()
+    let mut machine = Machine::new(profile, izarra_bios()).unwrap();
+    mount_idle_boot_floppy(&mut machine);
+    machine
 }
 
 fn press(machine: &mut Machine, make_code: u8, break_code: u8, clocks: u64) -> StopReason {
@@ -150,15 +155,10 @@ fn setup_save_enables_debug_on_com1() {
 }
 
 #[test]
-fn setup_save_then_setup_draws_the_lfb() {
-    // After a Save the BIOS commits the change and cold-resets (the setup page's
-    // documented exit); POST then runs again and, finding no further hotkey,
-    // boots straight through to the idle loop. Both POST and the setup page
-    // present on the Margo LFB (mode 0x150), so the display mode stays LFB
-    // across the reset, and the chosen GSW mode is the one that was saved
-    // (proving the reset replayed POST at the new live speed rather than
-    // leaving some stale mode-13h/text state behind, the way the old mode-13h
-    // page could).
+fn setup_save_reboots_and_keeps_the_chosen_speed() {
+    // Save commits and cold-resets. POST uses the Margo LFB, then the unified
+    // boot planner restores legacy VGA before entering the signed idle sector.
+    // The persisted speed must survive both transitions.
     let mut machine = boot_machine();
     enter_setup(&mut machine);
     let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
@@ -168,8 +168,8 @@ fn setup_save_then_setup_draws_the_lfb() {
 
     assert_eq!(
         machine.active_display(),
-        ActiveDisplay::MargoLfb,
-        "the post-save reboot leaves the Margo LFB presented"
+        ActiveDisplay::VgaRaster,
+        "the boot planner restored legacy VGA after the POST LFB"
     );
     assert_eq!(machine.active_mode(), GswMode::Gsw486);
 }

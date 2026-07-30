@@ -9,6 +9,9 @@ use izarravm_core::VideoCard;
 use izarravm_firmware::{SuiteRecordStatus, izarra_bios, parse_result_block};
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
+mod support;
+use support::mount_idle_boot_floppy;
+
 /// Boot the BIOS with `memory_mib` of RAM, run POST to halt, and return the
 /// memory.ramtest status and the parsed memory.detected_kib value.
 fn ramtest_result(memory_mib: u16) -> (SuiteRecordStatus, u32) {
@@ -17,6 +20,7 @@ fn ramtest_result(memory_mib: u16) -> (SuiteRecordStatus, u32) {
         izarra_bios(),
     )
     .unwrap();
+    mount_idle_boot_floppy(&mut machine);
     let stop = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert!(
         matches!(stop, StopReason::CycleLimit { .. }),
@@ -58,16 +62,17 @@ fn ramtest_passes_and_sizes_4mib() {
 }
 
 #[test]
-fn ramtest_caps_the_int12h_word_at_640_kib() {
-    // The INT 12h slot 0040:0013 reports conventional memory only, which a PC
-    // caps at 640 KiB however much RAM is installed. The full detected total
+fn ramtest_preserves_the_ebda_adjusted_int12h_word() {
+    // The INT 12h slot 0040:0013 reports conventional memory below the EBDA.
+    // The full detected total
     // (16384 KiB here) lives in the memory.detected_kib record instead. A
     // self-booting game sizes its heap off this word, so reporting the total
     // sent QuickDOS booters into ROM/unmapped space and a "Bad free parm" halt.
     let mut machine =
         Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), izarra_bios()).unwrap();
+    mount_idle_boot_floppy(&mut machine);
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let memory = machine.memory().as_slice();
     let word = u16::from_le_bytes([memory[0x413], memory[0x414]]);
-    assert_eq!(word, 640);
+    assert_eq!(word, 639);
 }

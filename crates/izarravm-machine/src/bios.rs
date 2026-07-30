@@ -585,24 +585,35 @@ impl Machine {
         }
     }
 
-    /// INT 15h AH=83h event wait. The machine has no async RTC wait queue yet, so
-    /// it advances the guest clock, sets the completion byte, and returns.
+    /// INT 15h AH=83h event wait, backed by the standard BDA fields and RTC PIE.
+    /// The ROM INT 70h handler owns countdown and completion.
     fn int15_event_wait(&mut self, al: u8) {
         match al {
             0x00 => {
-                let micros = (u64::from(self.cpu.registers.ecx() as u16) << 16)
-                    | u64::from(self.cpu.registers.edx() as u16);
-                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                if self.read_physical_u8(BDA_RTC_WAIT_FLAG as u32) & BDA_RTC_WAIT_PENDING != 0 {
+                    self.set_eax_ah(0x86);
+                    self.set_int_frame_carry(true);
+                    return;
+                }
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
                 let bx = self.cpu.registers.ebx() as u16;
-                let addr = es.wrapping_add(u32::from(bx));
-                self.stall_for_micros(micros);
-                let byte = self.read_physical_u8(addr);
-                let _ = self.write_guest_ram_u8(addr as usize, byte | 0x80);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_COMPLETE, bx);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_COMPLETE + 2, es);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_TIMEOUT, dx);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_TIMEOUT + 2, cx);
+                let _ = self.write_guest_ram_u8(BDA_RTC_WAIT_FLAG, BDA_RTC_WAIT_PENDING);
+                let register_b = self.rtc.set_periodic_interrupt_enabled(true);
                 self.set_eax_ah(0x00);
+                self.set_eax_al(register_b);
                 self.set_int_frame_carry(false);
             }
             0x01 => {
+                let _ = self.write_guest_ram_u8(BDA_RTC_WAIT_FLAG, 0);
+                let register_b = self.rtc.set_periodic_interrupt_enabled(false);
                 self.set_eax_ah(0x00);
+                self.set_eax_al(register_b);
                 self.set_int_frame_carry(false);
             }
             _ => {
@@ -612,17 +623,17 @@ impl Machine {
         }
     }
 
-    /// INT 15h AH=84h joystick BIOS support. No game port is installed, which the
-    /// BIOS reports as open switches and zeroed position counters.
+    /// INT 15h AH=84h joystick BIOS support for the Izarra gameport.
     fn int15_joystick(&mut self) {
         match self.cpu.registers.edx() as u16 {
             0x0000 => {
-                self.set_ax(0x0000);
+                self.set_eax_al(self.gameport.bios_switches());
                 self.set_int_frame_carry(false);
             }
             0x0001 => {
-                self.set_ax(0x0000);
-                self.set_bx(0x0000);
+                let (x, y) = self.gameport.bios_axes();
+                self.set_ax(x);
+                self.set_bx(y);
                 self.set_cx(0x0000);
                 self.set_dx(0x0000);
                 self.set_int_frame_carry(false);
@@ -793,14 +804,14 @@ impl Machine {
         self.set_int_frame_carry(false);
     }
 
-    /// The system memory map E820h enumerates: 640 KB of conventional RAM, the reserved
+    /// The system memory map E820h enumerates conventional RAM below the EBDA, the reserved
     /// video/ROM hole below 1 MB, and a single available region for everything above 1 MB.
     fn e820_regions(&self) -> Vec<(u64, u64, u32)> {
         let total = u64::from(self.profile.memory_mib) * 0x10_0000;
         let mut regions = vec![
-            (0x0u64, 0x9_FC00u64, 1u32), // 639 KB conventional, available (below the EBDA)
-            (0x9_FC00, 0x400, 2),        // 1 KB extended BIOS data area, reserved
-            (0xA_0000, 0x6_0000, 2),     // video + ROM BIOS hole, reserved
+            (0x0u64, CONVENTIONAL_MEMORY_TOP, 1u32),
+            (u64::from(EBDA_LINEAR), 0x400, 2),
+            (0xA_0000, 0x6_0000, 2), // video + ROM BIOS hole, reserved
         ];
         if total > 0x10_0000 {
             regions.push((0x10_0000, total - 0x10_0000, 1)); // extended RAM, available
@@ -913,11 +924,10 @@ impl Machine {
                 self.set_dx(dx);
                 self.set_int_frame_carry(false);
             }
-            // AH=09h read RTC alarm time and status. No alarm source is armed, so
-            // return zero time with DL=00h (alarm not enabled).
             0x09 => {
-                self.set_cx(0x0000);
-                self.set_dx(0x0000);
+                let (hour, minute, second, enabled) = self.rtc.alarm();
+                self.set_cx((u16::from(bin_to_bcd(hour)) << 8) | u16::from(bin_to_bcd(minute)));
+                self.set_dx((u16::from(bin_to_bcd(second)) << 8) | u16::from(enabled));
                 self.set_int_frame_carry(false);
             }
             // AH=03h set RTC time: CH/CL/DH are BCD hours/minutes/seconds (DL = DST flag,
@@ -966,13 +976,34 @@ impl Machine {
                 let _ = self.write_guest_ram_u16(BDA_DAY_COUNT, cx);
                 self.set_int_frame_carry(false);
             }
-            // AH=06h/07h set/cancel alarm: no alarm hardware modeled, accept and ignore.
+            // AH=06h set RTC alarm: CH/CL/DH are BCD hours/minutes/seconds.
+            0x06 => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let hour = bcd_to_bin((cx >> 8) as u8);
+                let minute = bcd_to_bin(cx as u8);
+                let second = bcd_to_bin((dx >> 8) as u8);
+                if hour > 23 || minute > 59 || second > 59 {
+                    self.set_int_frame_carry(true);
+                } else if self.rtc.set_alarm(hour, minute, second) {
+                    self.set_eax_ah(0);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_eax_ah(1);
+                    self.set_int_frame_carry(true);
+                }
+            }
+            0x07 => {
+                self.rtc.cancel_alarm();
+                self.set_eax_ah(0);
+                self.set_int_frame_carry(false);
+            }
             // AH=08h/0Ch set power-on alarm/date, AH=0Dh reset, AH=0Fh initialize RTC: all
             // documented as succeeding, and the host-driven clock makes them no-ops.
             // Limit: power-management and alarm hardware are not modeled; these return
             // success without persisting state. AH=0Eh keeps the default carry since no
             // power-on alarm date is stored.
-            0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
+            0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
             // AH=80h PCjr/Tandy sound multiplexor. A Tandy 1000SL/TL BIOS exposes
             // this as a bare IRET; the base profile keeps the caller state intact.
             0x80 => {}
@@ -1128,52 +1159,61 @@ impl Machine {
         self.cpu.registers.eip = u32::from(off);
     }
 
-    /// Service INT 19h (BOOTSTRAP LOADER). Re-run the boot: load the boot sector of
-    /// the default drive to 0000:7C00 and jump there. The default drive is A: when
-    /// a floppy is mounted, otherwise the Katea ATA fixed disk (80h) when it carries
-    /// a 0x55AA MBR signature. When neither is bootable, fall through to the INT 18h
-    /// path. DL carries the drive the loaded code booted from (00h floppy, 80h fixed
-    /// disk), the way a real BIOS leaves it.
-    ///
-    /// This mirrors the izarra-bios ROM's own INT 19h: a mounted floppy is treated
-    /// as bootable and sector 0 is loaded with no 0xAA55 signature check, so a guest
-    /// re-invoking INT 19h gets the same outcome the ROM gives at power-on.
-    ///
-    /// Limit: the floppy boot copies sector 0 and jumps; it does not retry on a
-    /// read error. The fixed-disk boot loads the real MBR at LBA 0 (signature-gated)
-    /// and lets it chain to the active partition. The retired Rust Toka-DOS HLE
-    /// boot record no longer backs a non-bootable C: drive.
+    /// Service INT 19h using the primary device selected by POST or the boot menu,
+    /// followed by the Izarra fallback order. Power-on reaches this same planner.
     pub(super) fn handle_int19(&mut self) {
-        if self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR) == 2 {
-            if self.boot_el_torito() {
+        let primary = BootDevice::from_code(self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR));
+        for device in primary.fallback_order() {
+            if self.try_boot_device(device) {
                 return;
             }
-            self.handle_int18();
-            return;
         }
-        // A: floppy first. Copy its boot sector (CHS 0,0,1) to 0000:7C00 and jump
-        // there. A mounted floppy is bootable (matching the ROM path); only an
-        // unreadable sector 0 falls through.
+        self.handle_int18();
+    }
+
+    fn try_boot_device(&mut self, device: BootDevice) -> bool {
+        match device {
+            BootDevice::Floppy => self.try_boot_floppy(),
+            BootDevice::HardDisk => self.try_boot_hard_disk(),
+            BootDevice::CdRom => {
+                let booted = self.boot_el_torito();
+                if booted {
+                    self.prepare_boot_environment();
+                }
+                booted
+            }
+        }
+    }
+
+    fn prepare_boot_environment(&mut self) {
+        let _ = self.int10_set_mode_number(0x03);
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+    }
+
+    fn try_boot_floppy(&mut self) -> bool {
         if let Some(sector) = self
             .floppy
             .as_ref()
             .and_then(|f| f.read_sector(0, 0, 1))
-            .filter(|s| s.len() >= 512)
+            .filter(|s| s.len() >= 512 && s[510] == 0x55 && s[511] == 0xAA)
             .map(<[u8]>::to_vec)
         {
             self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector[..512]);
-            self.cpu.registers.set_edx(0x00); // DL = 00h: booted from floppy A:
-            // The floppy's own sector-0 code is the OS now, so the HLE Toka-DOS
-            // and IZEMM stand down and the disk owns the DOS interrupts through the
-            // IVT. Real hardware just runs whatever sector 0 holds; this confines
-            // the HLE injection to the C: boot below.
+            self.cpu.registers.set_edx(0x00);
             self.booter_inert = true;
+            self.prepare_boot_environment();
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
-            return;
+            return true;
         }
-        // Fixed disk (Katea ATA primary master): boot from LBA 0 if it carries a
-        // boot signature. Unlike the floppy path, INT 13h stays intercepted so
-        // Katea keeps serving disk I/O to the booted OS. DL=80h = first fixed disk.
+        false
+    }
+
+    fn try_boot_hard_disk(&mut self) -> bool {
         if let Some(sector0) = self
             .ata
             .as_ref()
@@ -1183,13 +1223,11 @@ impl Machine {
             self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector0[..512]);
             self.cpu.registers.set_edx(0x80);
             self.booter_inert = true;
+            self.prepare_boot_environment();
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
-            return;
+            return true;
         }
-        // Nothing bootable (no signed floppy or ATA MBR): the retired Rust
-        // Toka-DOS HLE boot fallback is absent, so hand off to the diskless/no-boot
-        // path exactly like the firmware's .disk_absent branch.
-        self.handle_int18();
+        false
     }
 
     /// Service INT 18h (DISKLESS BOOT HOOK). On a real PC this entered ROM BASIC;

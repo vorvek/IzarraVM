@@ -15,6 +15,9 @@ use izarravm_core::VideoCard;
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile};
 
+mod support;
+use support::mount_idle_boot_floppy;
+
 // A free low-RAM scratch area after a bare BIOS boot (above the BDA, below the
 // boot-sector load address): results and the handler code.
 const RESULT_LAST: u32 = 0x8000; // last scancode the guest ISR read from 0x60
@@ -36,6 +39,7 @@ const HANDLER: [u8; 22] = [
 fn booted_to_idle() -> Machine {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
+    mount_idle_boot_floppy(&mut machine);
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     machine
 }

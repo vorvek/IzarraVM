@@ -98,7 +98,7 @@ Only **Save and Exit** from the [Del setup panel](izbios/configuration-panel.md)
 commits keyboard layout and CPU mode to CMOS. **Discard and Exit**, and
 pressing Esc from the main setup menu, both throw changes away on purpose.
 The [Tab boot menu](izarra-3000/user-manual.md#the-tab-boot-menu)'s Accept
-also saves the CPU mode and boot device order independently. If you only
+also saves the CPU mode and primary boot device independently. If you only
 used Tab, your keyboard layout choice (which only the Del panel edits)
 wasn't touched either way.
 

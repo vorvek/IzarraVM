@@ -524,22 +524,73 @@ fn int15_21_post_error_log_stores_and_reads_entries() {
 }
 
 #[test]
-fn int15_83_event_wait_sets_completion_byte() {
-    let mut m = int15_machine(16);
+fn int15_83_event_wait_completes_asynchronously_from_int70() {
+    let mut m = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .unwrap();
+    m.mount_floppy(idle_boot_floppy_image()).unwrap();
+    m.run_until_halt_or_cycles(20_000_000).unwrap();
     m.write_physical_u8(0x4_0000, 0x01);
     prime_dos_int_frame(&mut m);
     m.cpu.registers.set_eax(0x8300);
     m.cpu.registers.set_ecx(0x0000);
-    m.cpu.registers.set_edx(0x0001);
+    m.cpu.registers.set_edx(0x03D1); // 977 microseconds
     m.cpu
         .registers
         .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
     m.cpu.registers.set_ebx(0x0000);
+    let ticks_before = m.master_ticks();
     m.handle_int15();
 
     assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0");
-    assert_eq!(m.read_physical_u8(0x4_0000), 0x81, "completion bit set");
+    assert_eq!(
+        m.master_ticks(),
+        ticks_before,
+        "call returns without stalling"
+    );
+    assert_eq!(m.read_physical_u8(0x4_0000), 0x01, "not completed inline");
+    assert_eq!(m.read_physical_u8(BDA_RTC_WAIT_FLAG as u32), 1);
     assert_eq!(dos_int_flags(&m) & 1, 0, "CF clear");
+
+    let deadline = m.rtc.ticks_until_periodic_irq().unwrap();
+    m.advance_devices_ticks(deadline);
+    m.run_until_halt_or_cycles(100_000).unwrap();
+    assert_eq!(
+        m.read_physical_u8(0x4_0000),
+        0x81,
+        "completion bit set by INT 70h"
+    );
+    assert_eq!(m.read_physical_u8(BDA_RTC_WAIT_FLAG as u32), 0);
+}
+
+#[test]
+fn int15_83_rejects_a_second_wait_and_cancels_the_first() {
+    let mut m = int15_machine(16);
+    for attempt in 0..2 {
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x8300);
+        m.cpu.registers.set_ecx(0);
+        m.cpu.registers.set_edx(10_000);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        m.cpu.registers.set_ebx(0);
+        m.handle_int15();
+        if attempt == 0 {
+            assert_eq!(dos_int_flags(&m) & 1, 0);
+        } else {
+            assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x86);
+            assert_eq!(dos_int_flags(&m) & 1, 1);
+        }
+    }
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x8301);
+    m.handle_int15();
+    assert_eq!(m.read_physical_u8(BDA_RTC_WAIT_FLAG as u32), 0);
+    assert!(m.rtc.ticks_until_periodic_irq().is_none());
 }
 
 #[test]
@@ -549,7 +600,7 @@ fn int15_84_reports_absent_joystick() {
     m.cpu.registers.set_eax(0x84FF);
     m.cpu.registers.set_edx(0x0000);
     m.handle_int15();
-    assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "switches open");
+    assert_eq!(m.cpu.registers.eax() as u8, 0xf0, "switches open");
     assert_eq!(dos_int_flags(&m) & 1, 0, "switch read CF clear");
 
     prime_dos_int_frame(&mut m);
@@ -563,6 +614,33 @@ fn int15_84_reports_absent_joystick() {
     assert_eq!(m.cpu.registers.ecx() as u16, 0x0000, "joy B X");
     assert_eq!(m.cpu.registers.edx() as u16, 0x0000, "joy B Y");
     assert_eq!(dos_int_flags(&m) & 1, 0, "position read CF clear");
+}
+
+#[test]
+fn int15_84_reports_joystick_a_and_leaves_joystick_b_unpopulated() {
+    let mut m = int15_machine(16);
+    m.set_joystick_state(Some(JoystickState {
+        x: 0x24,
+        y: 0xc8,
+        buttons: 0x01,
+    }));
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x8400);
+    m.cpu.registers.set_edx(0x0000);
+    m.handle_int15();
+    assert_eq!(m.cpu.registers.eax() as u8, 0xe0);
+    assert_eq!(dos_int_flags(&m) & 1, 0);
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x8400);
+    m.cpu.registers.set_edx(0x0001);
+    m.handle_int15();
+    assert_eq!(m.cpu.registers.eax() as u16, 0x24);
+    assert_eq!(m.cpu.registers.ebx() as u16, 0xc8);
+    assert_eq!(m.cpu.registers.ecx() as u16, 0);
+    assert_eq!(m.cpu.registers.edx() as u16, 0);
+    assert_eq!(dos_int_flags(&m) & 1, 0);
 }
 
 #[test]
@@ -670,6 +748,63 @@ fn int1a_09_reports_alarm_disabled() {
     assert_eq!(m.cpu.registers.ecx() as u16, 0x0000, "alarm time");
     assert_eq!(m.cpu.registers.edx() as u16, 0x0000, "alarm disabled");
     assert_eq!(dos_int_flags(&m) & 1, 0, "CF clear");
+}
+
+#[test]
+fn int1a_alarm_programs_and_cancels_the_rtc() {
+    let mut m = int15_machine(16);
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x0600);
+    m.cpu.registers.set_ecx(0x1020);
+    m.cpu.registers.set_edx(0x3000);
+    m.handle_int1a();
+    assert_eq!(dos_int_flags(&m) & 1, 0);
+    assert_eq!(m.rtc.alarm(), (10, 20, 30, true));
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x0900);
+    m.handle_int1a();
+    assert_eq!(m.cpu.registers.ecx() as u16, 0x1020);
+    assert_eq!(m.cpu.registers.edx() as u16, 0x3001);
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x0700);
+    m.handle_int1a();
+    assert!(!m.rtc.alarm().3);
+}
+
+#[test]
+fn rtc_alarm_irq_invokes_int4a_and_clears_register_c() {
+    let mut m = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .unwrap();
+    m.mount_floppy(idle_boot_floppy_image()).unwrap();
+    m.run_until_halt_or_cycles(20_000_000).unwrap();
+    m.seed_rtc(2026, 7, 30, 5, 10, 30, 44);
+
+    let handler = [
+        0x1e, 0x50, 0xb8, 0x00, 0x50, 0x8e, 0xd8, 0xc6, 0x06, 0x00, 0x01, 0xa5, 0x58, 0x1f, 0xcf,
+    ];
+    m.write_guest_block(0x5_0000, &handler);
+    m.memory.write_u16(0x4a * 4, 0).unwrap();
+    m.memory.write_u16(0x4a * 4 + 2, 0x5000).unwrap();
+    m.write_physical_u8(0x5_0100, 0);
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x0600);
+    m.cpu.registers.set_ecx(0x1030);
+    m.cpu.registers.set_edx(0x4500);
+    m.handle_int1a();
+    assert_eq!(dos_int_flags(&m) & 1, 0);
+
+    m.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ);
+    m.run_until_halt_or_cycles(100_000).unwrap();
+    assert_eq!(m.read_physical_u8(0x5_0100), 0xa5);
+
+    m.rtc.write_port(0x70, 0x0c);
+    assert_eq!(m.rtc.read_port(0x71).unwrap() & 0xa0, 0);
 }
 
 #[test]
@@ -1958,6 +2093,23 @@ fn game_port_reports_no_joystick() {
     for port in [0x0200, 0x0207] {
         bus.write_io(port, BusWidth::Byte, 0xff, false).unwrap();
         assert_eq!(bus.read_io(port, BusWidth::Byte, 0, false).unwrap(), 0xf0);
+    }
+}
+
+#[test]
+fn game_port_aliases_share_joystick_state_and_charge_deadlines() {
+    let mut m = int15_machine(16);
+    m.set_joystick_state(Some(JoystickState {
+        x: 0,
+        y: u8::MAX,
+        buttons: 0x02,
+    }));
+    let mut bus = m.make_bus();
+    for port in 0x0200..=0x0207 {
+        bus.write_io(port, BusWidth::Byte, 0, false).unwrap();
+        let value = bus.read_io(port, BusWidth::Byte, 0, false).unwrap() as u8;
+        assert_eq!(value & 0x03, 0x03, "axis timers at {port:#06x}");
+        assert_eq!(value & 0xf0, 0xd0, "switches at {port:#06x}");
     }
 }
 

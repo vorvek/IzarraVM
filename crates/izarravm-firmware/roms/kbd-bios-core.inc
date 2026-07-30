@@ -14,10 +14,10 @@
 ; "lock key held" guard so a held CapsLock/NumLock/ScrollLock/Insert key toggles
 ; the matching KB_FLAGS bit once per press, not once per auto-repeat.
 %define KB_FLAGS_1     0x0018      ; BDA: second shift-flags byte
-%define KB_LAYOUT      0x0096      ; BDA: active keyboard layout index
-%define KB_PREFIX      0x0097      ; pending E0 extended-key prefix
-%define KB_ALTGR       0x0098      ; right Alt held
-%define KB_DEAD        0x0099      ; BDA: pending dead-key accent id (0 = none)
+%define KB_LAYOUT      0x00b0      ; BDA: active keyboard layout index
+%define KB_PREFIX      0x00b1      ; pending E0 extended-key prefix
+%define KB_ALTGR       0x00b2      ; right Alt held
+%define KB_DEAD        0x00b3      ; pending dead-key accent id
 %endif
 
 ; INT 09h: keyboard hardware ISR
@@ -329,6 +329,8 @@ int16:
     je .funcs
     cmp ah, 0x0a        ; get keyboard id
     je .kbid
+    cmp ah, 0x92        ; keyboard capability byte
+    je .capabilities
     iret
 .read:
     sti
@@ -581,6 +583,10 @@ int16:
     ; AH=0Ah get keyboard ID. BX = MF2 enhanced-keyboard ID (BH=0xAB, BL=0x41).
     mov bx, 0xab41
     clc
+    iret
+.capabilities:
+    ; Bit 7 advertises the enhanced AH=10h through AH=12h services.
+    mov ah, 0x80
     iret
 
 ; BDA ring enqueue: AX = scancode:ascii

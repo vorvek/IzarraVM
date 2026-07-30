@@ -35,15 +35,15 @@ bios_start:
     xor ax, ax
     mov ds, ax                  ; DS = 0 for the IVT and the result block
     ; Seed the boot-device choice from CMOS 0x11 (0 floppy, 1 disk, 2 CD-ROM).
-    ; The Tab boot menu re-reads this for its default highlight; the
-    ; copy here is what boot_entry uses when no menu runs. Clamp to floppy.
-    mov al, BOOT_CMOS_ORDER
+    ; The Tab boot menu re-reads this for its default highlight; the low-RAM
+    ; copy is the primary passed to the Rust INT 19h planner. Clamp to floppy.
+    mov al, BOOT_CMOS_PRIMARY
     out 0x70, al
     in al, 0x71
     cmp al, 2
-    jbe .order_ok
+    jbe .primary_ok
     xor al, al
-.order_ok:
+.primary_ok:
     mov [BOOT_CHOICE], al
     mov byte [POST_HOTKEY], 0
 
@@ -81,8 +81,10 @@ bios_start:
     add di, 4
     loop .fill_slave
 
-    ; Give IRQ12 (INT 74h) a real PS/2 mouse ISR; the other slave IRQs keep the
-    ; EOI-only stub. DS is 0 here, so these stores land in IVT segment 0.
+    ; Give IRQ8 and IRQ12 real RTC and PS/2 mouse handlers. The other slave IRQs
+    ; retain the EOI-only stub. DS is 0, so these stores land in the IVT.
+    mov word [0x70 * 4], int70
+    mov word [0x70 * 4 + 2], ROM_SEG
     mov word [0x74 * 4], int74
     mov word [0x74 * 4 + 2], ROM_SEG
 
@@ -116,10 +118,10 @@ bios_start:
     in al, PORT_PIC_DATA
     and al, 0xf8                 ; unmask IRQ0 timer, IRQ1 keyboard, IRQ2 cascade
     out PORT_PIC_DATA, al
-    ; Unmask slave IRQ12 (the PS/2 mouse) so INT 74h fires; the slave reaches the
+    ; Unmask slave IRQ8 (RTC) and IRQ12 (PS/2 mouse); the slave reaches the
     ; CPU through the master cascade on IR2, unmasked just above.
     in al, PORT_PIC2_DATA
-    and al, 0xef                 ; clear bit 4 (IRQ12)
+    and al, 0xee                 ; clear bits 0 and 4 (IRQ8, IRQ12)
     out PORT_PIC2_DATA, al
 
     call unreal_init            ; widen FS to 4 GB for peek32/poke32/read_margo_reg
@@ -197,6 +199,66 @@ irq_stub_slave:
     mov al, 0x20
     out PORT_PIC2_CMD, al        ; EOI the slave first
     out PORT_PIC_CMD, al         ; then the master cascade line (IR2)
+    pop ax
+    iret
+
+; INT 70h: acknowledge Register C, dispatch enabled alarms through INT 4Ah, and
+; retire an INT 15h AH=83h wait at the RTC's 1024 Hz periodic rate.
+int70:
+    push ax
+    push bx
+    push ds
+    push es
+    mov al, 0x0b
+    out 0x70, al
+    in al, 0x71
+    mov bh, al                    ; enabled sources from Register B
+    mov al, 0x0c
+    out 0x70, al
+    in al, 0x71                   ; read and clear Register C
+    mov bl, al
+
+    test bh, 0x20                ; AIE
+    jz .periodic
+    test bl, 0x20                ; AF
+    jz .periodic
+    int 0x4a
+
+.periodic:
+    test bh, 0x40                ; PIE
+    jz .eoi
+    test bl, 0x40                ; PF
+    jz .eoi
+    mov ax, BDA_SEG
+    mov ds, ax
+    test byte [BDA_RTC_WAIT_FLAG], BDA_RTC_WAIT_PENDING
+    jz .eoi
+    cmp word [BDA_RTC_WAIT_TIMEOUT + 2], 0
+    jne .subtract
+    cmp word [BDA_RTC_WAIT_TIMEOUT], RTC_USEC_PER_TICK
+    jbe .complete
+.subtract:
+    sub word [BDA_RTC_WAIT_TIMEOUT], RTC_USEC_PER_TICK
+    sbb word [BDA_RTC_WAIT_TIMEOUT + 2], 0
+    jmp .eoi
+
+.complete:
+    les bx, [BDA_RTC_WAIT_COMPLETE]
+    or byte [es:bx], 0x80
+    mov byte [BDA_RTC_WAIT_FLAG], 0
+    mov al, 0x0b
+    out 0x70, al
+    in al, 0x71
+    and al, 0xbf                  ; release PIE after the BIOS wait
+    out 0x71, al
+
+.eoi:
+    mov al, 0x20
+    out PORT_PIC2_CMD, al
+    out PORT_PIC_CMD, al
+    pop es
+    pop ds
+    pop bx
     pop ax
     iret
 

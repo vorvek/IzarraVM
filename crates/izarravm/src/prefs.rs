@@ -10,6 +10,7 @@
 //! falls back to defaults rather than aborting the run.
 
 use izarravm_core::MidiConfig;
+use izarravm_input::JoystickBinding;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -133,6 +134,8 @@ pub struct GuiPrefs {
     pub input_release: KeyBinding,
     /// Hotkey that toggles fullscreen. Default Ctrl+F11.
     pub fullscreen: KeyBinding,
+    /// Optional host controller mapping for the Izarra gameport.
+    pub joystick_binding: Option<JoystickBinding>,
     /// Last floppy IMG mounted, re-mounted on startup if it still exists.
     pub last_floppy_image: Option<PathBuf>,
     /// Last CD image (.iso/.cue/.bin) mounted, re-mounted on startup if it still
@@ -158,6 +161,7 @@ impl Default for GuiPrefs {
             crt_style: CrtStyle::Subtle,
             input_release: KeyBinding::new(true, false, false, "F2"),
             fullscreen: KeyBinding::new(true, false, false, "F11"),
+            joystick_binding: None,
             last_floppy_image: None,
             last_cd_image: None,
             last_cd_folder: None,

@@ -2258,6 +2258,17 @@ fn cmos_persists_and_reloads_via_bytes() {
         bus.write_io(0x70, BusWidth::Byte, 0x11, false).unwrap();
         bus.write_io(0x71, BusWidth::Byte, 1, false).unwrap(); // disk-first
     });
+    let sum = machine.cmos_bytes()[0x10..=0x2d]
+        .iter()
+        .fold(0u16, |sum, byte| sum.wrapping_add(u16::from(*byte)));
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x70, BusWidth::Byte, 0x2e, false).unwrap();
+        bus.write_io(0x71, BusWidth::Byte, u32::from((sum >> 8) as u8), false)
+            .unwrap();
+        bus.write_io(0x70, BusWidth::Byte, 0x2f, false).unwrap();
+        bus.write_io(0x71, BusWidth::Byte, u32::from(sum as u8), false)
+            .unwrap();
+    });
     assert!(
         machine.take_cmos_dirty(),
         "an NVRAM write should mark dirty"
@@ -2266,7 +2277,7 @@ fn cmos_persists_and_reloads_via_bytes() {
 
     // A fresh machine loads the saved image and reads the same bytes back.
     let mut other = test_machine();
-    other.load_cmos(&saved);
+    assert!(other.load_cmos(&saved));
     assert_eq!(other.cmos_bytes()[0x10], 3);
     assert_eq!(other.cmos_bytes()[0x11], 1);
 }

@@ -884,6 +884,95 @@ fn boot_suite_failure_summary_lists_every_failed_record() {
     assert_eq!(boot_suite_failure_summary(&results), None);
 }
 
+fn passing_izarra_results() -> SuiteResults {
+    let records = IZARRA_BIOS_REQUIRED_RECORDS
+        .iter()
+        .map(|&(name, status)| izarravm_firmware::SuiteRecord {
+            status,
+            name: name.to_owned(),
+            value: (status == SuiteRecordStatus::Measure).then(|| "value".to_owned()),
+        })
+        .collect::<Vec<_>>();
+    SuiteResults {
+        version: 1,
+        declared_record_count: records.len() as u16,
+        payload_len: 0,
+        checksum: 0,
+        records,
+    }
+}
+
+#[test]
+fn izarra_bios_gate_accepts_one_complete_passing_record_set() {
+    assert_eq!(izarra_bios_failure_summary(&passing_izarra_results()), None);
+}
+
+#[test]
+fn izarra_bios_gate_rejects_incomplete_duplicate_missing_and_failed_records() {
+    let mut incomplete = passing_izarra_results();
+    incomplete.declared_record_count += 1;
+    assert!(
+        izarra_bios_failure_summary(&incomplete)
+            .unwrap()
+            .contains("declared 20 records but parsed 19")
+    );
+
+    let mut duplicate = passing_izarra_results();
+    duplicate.records.push(duplicate.records[1].clone());
+    duplicate.declared_record_count += 1;
+    assert!(
+        izarra_bios_failure_summary(&duplicate)
+            .unwrap()
+            .contains("duplicate records: self.framework")
+    );
+
+    let mut missing = passing_izarra_results();
+    missing
+        .records
+        .retain(|record| record.name != "component.timer_pit");
+    missing.declared_record_count -= 1;
+    assert!(
+        izarra_bios_failure_summary(&missing)
+            .unwrap()
+            .contains("missing required record: component.timer_pit")
+    );
+
+    let mut failed = passing_izarra_results();
+    failed
+        .records
+        .iter_mut()
+        .find(|record| record.name == "component.audio_opl")
+        .unwrap()
+        .status = SuiteRecordStatus::Fail;
+    assert!(
+        izarra_bios_failure_summary(&failed)
+            .unwrap()
+            .contains("failed required record: component.audio_opl")
+    );
+}
+
+#[test]
+fn izarra_bios_gate_rejects_empty_measurements_and_unexpected_records() {
+    let mut empty_measurement = passing_izarra_results();
+    empty_measurement
+        .records
+        .iter_mut()
+        .find(|record| record.name == "memory.detected_kib")
+        .unwrap()
+        .value = None;
+    assert!(
+        izarra_bios_failure_summary(&empty_measurement)
+            .unwrap()
+            .contains("required measurement has no value: memory.detected_kib")
+    );
+
+    let mut unexpected = passing_izarra_results();
+    unexpected.records[1].name = "component.unsupported".to_owned();
+    let message = izarra_bios_failure_summary(&unexpected).unwrap();
+    assert!(message.contains("unexpected records: component.unsupported"));
+    assert!(message.contains("missing required record: self.framework"));
+}
+
 #[test]
 fn state_glide_ovl_discovery_is_case_insensitive() {
     let dir = std::env::temp_dir().join(format!(

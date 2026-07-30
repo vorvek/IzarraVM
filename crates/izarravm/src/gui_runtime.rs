@@ -45,6 +45,8 @@ struct WinitApp {
     // When the next mouse-motion flush is due, paced independently of next_frame
     // at MOUSE_FLUSH_HZ (see its doc comment).
     next_mouse_flush: Instant,
+    // Host gamepads are polled non-blockingly on a fixed cadence independent of rendering.
+    next_joystick_poll: Instant,
     // Raw mouse motion the Windows WM_INPUT hook accumulates between frames; drained
     // each frame in about_to_wait. Always zero on platforms without the hook.
     raw_mouse: RawMouseAccum,
@@ -404,6 +406,10 @@ impl ApplicationHandler for WinitApp {
             self.gui.flush_guest_motion();
             self.next_mouse_flush = now + Duration::from_secs_f64(1.0 / MOUSE_FLUSH_HZ);
         }
+        if now >= self.next_joystick_poll {
+            self.gui.poll_joystick();
+            self.next_joystick_poll = now + Duration::from_secs_f64(1.0 / JOYSTICK_POLL_HZ);
+        }
         // Pace rendering to the guest refresh rate. Render directly here once the
         // deadline elapses rather than via request_redraw: winit dispatches
         // about_to_wait from its own loop, so it keeps firing under a mouse-event
@@ -414,7 +420,9 @@ impl ApplicationHandler for WinitApp {
             self.next_frame = now + Duration::from_secs_f64(1.0 / hz);
         }
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-            self.next_frame.min(self.next_mouse_flush),
+            self.next_frame
+                .min(self.next_mouse_flush)
+                .min(self.next_joystick_poll),
         ));
     }
 }
@@ -539,6 +547,7 @@ pub fn run(
     glide_ovl: Option<Vec<u8>>,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
+    joystick_enabled: bool,
 ) -> Result<(), Box<dyn Error>> {
     let raw_mouse = RawMouseAccum::default();
     let event_loop = build_event_loop(raw_mouse.clone())?;
@@ -551,6 +560,7 @@ pub fn run(
         glide_ovl,
         test_pattern,
         rtc_setup,
+        joystick_enabled,
     );
     let egui_ctx = egui::Context::default();
     enlarge_ui_fonts(&egui_ctx);
@@ -572,6 +582,7 @@ pub fn run(
         egui_renderer: None,
         next_frame: Instant::now(),
         next_mouse_flush: Instant::now(),
+        next_joystick_poll: Instant::now(),
         raw_mouse,
     };
     event_loop.run_app(&mut app)?;

@@ -361,6 +361,7 @@ fn clean_image_load_leaves_diagnostic_clear() {
     let mut r2 = Rtc::new();
     assert!(r2.load_nvram(&saved));
     assert_eq!(r2.nvram_byte(REG_DIAGNOSTIC), 0);
+    assert_eq!(r2.nvram(), saved);
 }
 
 #[test]
@@ -374,6 +375,29 @@ fn tampered_image_sets_diagnostic_bad_checksum_bit() {
     let mut r2 = Rtc::new();
     assert!(!r2.load_nvram(&saved));
     assert_ne!(r2.nvram_byte(REG_DIAGNOSTIC) & DIAG_BAD_CHECKSUM, 0);
+}
+
+#[test]
+fn corrupt_image_cannot_override_constructor_seeded_settings() {
+    let mut target = Rtc::new();
+    for (index, value) in [(0x10, 2), (0x11, 1), (0x12, 6), (0x13, 1)] {
+        target.set_nvram(index, value);
+    }
+    target.refresh_checksum();
+    let defaults = target.nvram();
+
+    let mut candidate = Rtc::new();
+    for (index, value) in [(0x10, 5), (0x11, 2), (0x12, 9), (0x13, 0xff)] {
+        candidate.set_nvram(index, value);
+    }
+    candidate.refresh_checksum();
+    let mut corrupt = candidate.nvram();
+    corrupt[0x20] ^= 0x80;
+
+    assert!(!target.load_nvram(&corrupt));
+    assert_eq!(&target.nvram()[0x10..=0x2d], &defaults[0x10..=0x2d]);
+    assert!(target.checksum_valid());
+    assert!(target.take_nvram_dirty());
 }
 
 #[test]

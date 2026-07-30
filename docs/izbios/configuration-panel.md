@@ -106,11 +106,12 @@ saved.
 Only two settings are written by this panel: the **keyboard layout** (CMOS
 offset `0x10`) and the **CPU mode** (CMOS offset `0x12`). The clock is
 written to the real-time clock hardware directly, not CMOS, when the Time
-screen was used. The Tab boot menu writes the CPU mode and the boot device
-order (CMOS offset `0x11`) independently of this panel. The two entry
+screen was used. The Tab boot menu writes the CPU mode and the primary boot
+device (CMOS offset `0x11`) independently of this panel. The two entry
 points share the same underlying CMOS fields where they overlap. A stored
-checksum protects the saved block; if it doesn't match at boot, the BIOS
-falls back to defaults rather than trusting corrupted settings.
+checksum protects the saved block. If it doesn't match at boot, no setting from
+that image is applied. IzarraVM retains the seeded defaults, records the CMOS
+diagnostic indication, creates a new checksum, and persists the repaired image.
 
 ## Next
 

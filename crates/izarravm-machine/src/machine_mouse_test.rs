@@ -214,6 +214,7 @@ fn bios_irq12_preserves_interrupted_cx_dx() {
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
+    machine.mount_floppy(idle_boot_floppy_image()).unwrap();
     let _ = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     for (offset, byte) in PROGRAM.iter().copied().enumerate() {
         machine.write_physical_u8(0x8000 + offset as u32, byte);

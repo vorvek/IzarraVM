@@ -15,7 +15,10 @@ use izarravm_cpu::CpuCanonicalCaptureError;
 use izarravm_cpu::SegmentIndex;
 
 use super::*;
-use crate::{BIOS_ROM_SIZE, Bios32Call, MachineProfile, StopReason, WaitStateProfile, unittester};
+use crate::{
+    BIOS_ROM_SIZE, Bios32Call, JoystickState, MachineProfile, StopReason, WaitStateProfile,
+    unittester,
+};
 
 const MACHINE_CONTROL_TIMING_PAYLOAD_LEN: usize = 163;
 const EMPTY_MODELED_CACHE_PAYLOAD_LEN: usize = 16;
@@ -33,6 +36,7 @@ const ATA_MID_SECTOR_PAYLOAD_LEN: usize = ATA_IDLE_PAYLOAD_LEN + crate::ata::SEC
 const BMIDE_IDLE_PAYLOAD_LEN: usize = 60;
 const BMIDE_BASE: u16 = 0xf000;
 const ATAPI_IDLE_PAYLOAD_LEN: usize = 130;
+const GAMEPORT_PAYLOAD_LEN: usize = 20;
 const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
 const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
 const PIIX_IDE_DEVFN: u8 = 7 << 3 | 1;
@@ -440,6 +444,22 @@ fn atapi_payload_from_capture(capture: &CanonicalMachineStateCapture<'_>) -> Vec
     view.sections()[0].payload().to_vec()
 }
 
+fn gameport_payload(machine: &Machine) -> Vec<u8> {
+    let capture = machine.canonical_state_capture().unwrap();
+    let mut state = CanonicalStateWriter::new().unwrap();
+    state
+        .section(
+            CanonicalSectionId::new(0x0002_000f).unwrap(),
+            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionRequirement::Required,
+            |out| capture.write_gameport_payload(out),
+        )
+        .unwrap();
+    let bytes = state.finish().unwrap();
+    let view = CanonicalStateView::parse(&bytes).unwrap();
+    view.sections()[0].payload().to_vec()
+}
+
 fn atapi_idle_golden() -> Vec<u8> {
     // Fresh channel after soft reset: the ATAPI signature in the task file,
     // DRDY|DSC status, diagnostic-pass error, and full MODE SELECT volumes.
@@ -672,6 +692,7 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
             (0x0002_000c, 1),
             (0x0002_000d, 1),
             (0x0002_000e, 1),
+            (0x0002_000f, 1),
         ]
     );
     assert!(
@@ -743,6 +764,33 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
         sections[17].id & STATE_SNAPSHOT_V1_OWNER_NAMESPACE_MASK,
         STATE_SNAPSHOT_V1_MACHINE_NAMESPACE
     );
+}
+
+#[test]
+fn gameport_payload_captures_attachment_controls_and_absolute_deadlines() {
+    let mut machine = test_machine();
+    assert_eq!(gameport_payload(&machine), vec![0; GAMEPORT_PAYLOAD_LEN]);
+
+    machine.set_joystick_state(Some(JoystickState {
+        x: 17,
+        y: 231,
+        buttons: 0x03,
+    }));
+    let uncharged = gameport_payload(&machine);
+    assert_eq!(&uncharged[..4], &[1, 17, 231, 3]);
+    assert_eq!(&uncharged[4..], &[0; 16]);
+
+    {
+        let mut bus = machine.make_bus();
+        bus.write_io(0x0207, BusWidth::Byte, 0, false).unwrap();
+    }
+    let charged = gameport_payload(&machine);
+    assert_eq!(&charged[..4], &[1, 17, 231, 3]);
+    assert_ne!(&charged[4..12], &[0; 8]);
+    assert_ne!(&charged[12..20], &[0; 8]);
+
+    machine.set_joystick_state(None);
+    assert_eq!(gameport_payload(&machine), vec![0; GAMEPORT_PAYLOAD_LEN]);
 }
 
 #[test]

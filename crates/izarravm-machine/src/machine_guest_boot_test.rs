@@ -3,6 +3,14 @@
 
 use super::*;
 
+fn marker_boot_image(marker: u8, size: usize) -> Vec<u8> {
+    let mut image = vec![0u8; size];
+    image[..8].copy_from_slice(&[0xbb, 0x00, 0x05, 0xb0, marker, 0x88, 0x07, 0xf4]);
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    image
+}
+
 #[test]
 fn sound_blaster_env_entries_default_config() {
     let entries = sound_blaster_env_entries(&SoundBlasterConfig::default());
@@ -269,6 +277,7 @@ fn lotura_reports_id_and_switches_mode_live() {
 fn izarra_bios_post_publishes_result_block() {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.mount_floppy(idle_boot_floppy_image()).unwrap();
     // The full-screen RLE background blit delays the POST step loop to ~10M
     // cycles, so the result block fills out later than the old mode-13h screen.
     let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
@@ -352,6 +361,7 @@ fn izarra_bios_slow_post_continues_after_ramtest() {
 fn izarra_bios_ramtest_esc_skips_and_continues_post() {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.mount_floppy(idle_boot_floppy_image()).unwrap();
     machine.set_fast_post(false);
     for _ in 0..40 {
         machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -588,7 +598,7 @@ fn fast_post_port_reflects_the_flag() {
 #[test]
 fn izarra_bios_int19_boots_floppy_sector_zero() {
     // INT 19h must load sector 0 of the mounted floppy to 0000:7C00 and far
-    // jump there with no signature check. The boot sector writes a sentinel
+    // jump there after validating its signature. The boot sector writes a sentinel
     // and halts; if the sentinel lands, the bootstrap loaded and jumped.
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
@@ -598,6 +608,8 @@ fn izarra_bios_int19_boots_floppy_sector_zero() {
     // boot_entry enters with DS=0, so [bx] addresses 0000:0500.
     let boot = [0xBB, 0x00, 0x05, 0xB0, 0x99, 0x88, 0x07, 0xF4];
     img[..boot.len()].copy_from_slice(&boot);
+    img[510] = 0x55;
+    img[511] = 0xaa;
     machine.mount_floppy(img).unwrap();
 
     machine.run_until_halt_or_cycles(50_000_000).unwrap();
@@ -605,6 +617,66 @@ fn izarra_bios_int19_boots_floppy_sector_zero() {
         machine.read_physical_u8(0x0500),
         0x99,
         "the boot sector ran from 0000:7C00, so INT 19h loaded and jumped"
+    );
+}
+
+#[test]
+fn cold_boot_and_guest_int19_use_the_same_primary_policy() {
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut cold = Machine::new(profile.clone(), izarravm_firmware::izarra_bios()).unwrap();
+    cold.set_cmos_byte(CMOS_PRIMARY_BOOT_DEVICE, BootDevice::HardDisk as u8);
+    cold.mount_floppy(marker_boot_image(0x11, 1_474_560))
+        .unwrap();
+    cold.mount_hdd(marker_boot_image(0x22, 512 * 4));
+    cold.run_until_halt_or_cycles(50_000_000).unwrap();
+    assert_eq!(cold.read_physical_u8(0x0500), 0x22);
+    assert_eq!(cold.cpu.registers.edx() as u8, 0x80);
+
+    let mut invoked = int15_machine(16);
+    invoked
+        .mount_floppy(marker_boot_image(0x11, 1_474_560))
+        .unwrap();
+    invoked.mount_hdd(marker_boot_image(0x22, 512 * 4));
+    invoked.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, BootDevice::HardDisk as u8);
+    invoked.handle_int19();
+    assert_eq!(
+        invoked.read_physical_u8(BOOT_SECTOR_ADDRESS as u32 + 4),
+        0x22
+    );
+    assert_eq!(invoked.cpu.registers.edx() as u8, 0x80);
+}
+
+#[test]
+fn boot_menu_escape_restores_primary_and_enter_is_one_boot_only() {
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let build = || {
+        let mut machine = Machine::new(profile.clone(), izarravm_firmware::izarra_bios()).unwrap();
+        machine.set_cmos_byte(CMOS_PRIMARY_BOOT_DEVICE, BootDevice::HardDisk as u8);
+        machine
+            .mount_floppy(marker_boot_image(0x11, 1_474_560))
+            .unwrap();
+        machine.mount_hdd(marker_boot_image(0x22, 512 * 4));
+        machine
+    };
+
+    let mut cancelled = build();
+    cancelled.inject_key_scancodes(&[0x0f, 0x8f]);
+    cancelled.run_until_halt_or_cycles(25_000_000).unwrap();
+    cancelled.inject_key_scancodes(&[0x01, 0x81]);
+    cancelled.run_until_halt_or_cycles(25_000_000).unwrap();
+    assert_eq!(cancelled.read_physical_u8(0x0500), 0x22);
+
+    let mut overridden = build();
+    overridden.inject_key_scancodes(&[0x0f, 0x8f]);
+    overridden.run_until_halt_or_cycles(25_000_000).unwrap();
+    overridden.inject_key_scancodes(&[0x50, 0xd0]);
+    overridden.run_until_halt_or_cycles(3_000_000).unwrap();
+    overridden.inject_key_scancodes(&[0x1c, 0x9c]);
+    overridden.run_until_halt_or_cycles(25_000_000).unwrap();
+    assert_eq!(overridden.read_physical_u8(0x0500), 0x11);
+    assert_eq!(
+        overridden.cmos_byte(CMOS_PRIMARY_BOOT_DEVICE),
+        BootDevice::HardDisk as u8
     );
 }
 
@@ -639,6 +711,8 @@ fn floppy_booter_owns_int21_through_its_ivt_handler() {
         0xCF, // iret
     ];
     img[..boot.len()].copy_from_slice(&boot);
+    img[510] = 0x55;
+    img[511] = 0xaa;
     machine.mount_floppy(img).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(50_000_000).unwrap();
@@ -929,6 +1003,7 @@ fn booter_hardcoded_legacy_iret_keeps_int13_serviced() {
 fn izarra_bios_isr_enqueues_injected_key() {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.mount_floppy(idle_boot_floppy_image()).unwrap();
     // Run POST so the BIOS reaches its idle loop (past the setup hotkey window,
     // which would otherwise drain the key). Then inject a key: IRQ1 reaches the
     // installed INT 09h, which enqueues it into the BDA ring. The idle loop does
@@ -1227,6 +1302,8 @@ fn int19_floppy_boot_loads_sector_and_jumps_to_7c00() {
     let mut image = vec![0u8; 368_640];
     image[0] = 0xeb; // a plausible boot-sector first byte (JMP short)
     image[1] = 0x3c;
+    image[510] = 0x55;
+    image[511] = 0xaa;
     m.mount_floppy(image).unwrap();
     m.handle_int19();
     // Boot sector copied to 0000:7C00, DL = 0 (floppy), CS:IP = 0000:7C00.

@@ -45,6 +45,7 @@ impl Machine {
             pic: &mut self.pic,
             pit: &mut self.pit,
             keyboard: &mut self.keyboard,
+            gameport: &mut self.gameport,
             speaker: &mut self.speaker,
             rtc: &mut self.rtc,
             dma: &mut self.dma,
@@ -1582,15 +1583,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
         }
         if (0x0200..=0x0207).contains(&port) {
-            // Game port with no joystick attached: the four one-shot axis timers
-            // (bits 0-3) have no pots to charge through so they read expired (0),
-            // and the button inputs (bits 4-7) float high (open switches,
-            // active-low) -- the same absent-joystick answer INT 15h AH=84h gives.
-            // A routine joystick probe must see "no joystick", not an
-            // UnsupportedPort fault that halts the machine. The ISA gameport
-            // decodes the whole 0x200-0x207 range as aliases of one register
-            // (TSUMERA probes 0x200, not 0x201).
-            return Ok(0xf0);
+            return Ok(u32::from(self.gameport.read(self.guest_tick_now())));
         }
         if let Some(value) = self.unittester.read_port(port) {
             return Ok(u32::from(value));
@@ -1795,9 +1788,8 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if (0x0200..=0x0207).contains(&port) {
-            // Game port (0x200-0x207 aliases): an OUT fires the four axis
-            // one-shots. With no joystick they expire immediately, so there is
-            // no state to keep.
+            let now = self.guest_tick_now();
+            self.gameport.charge(now);
             return Ok(());
         }
         if port == 0x00e1 {

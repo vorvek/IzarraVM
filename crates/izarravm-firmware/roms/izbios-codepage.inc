@@ -8,7 +8,7 @@
 %define CPFONT_WINDOW_SEG  0xC400
 %define CPFONT_SELECT_PORT 0xE7
 ; CMOS 0x13 holds the code-page index: 0=CP437, 1=CP850, 2=CP860, 3=CP863, 4=CP865.
-; (0x11 is the boot-device order, 0x12 the GSW default, so the code page takes 0x13.)
+; (0x11 is the primary boot device, 0x12 the GSW default, so this uses 0x13.)
 %define CP_CMOS_INDEX      0x13
 
 ; load_codepage_font: AL = code-page index (0..4, clamped to 0 if out of range).

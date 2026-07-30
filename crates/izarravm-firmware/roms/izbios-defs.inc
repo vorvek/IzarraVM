@@ -8,6 +8,7 @@
 %define ROM_SEG        0xf000      ; the BIOS is mapped at 0xF0000
 %define VGA13_SEG      0xa000      ; mode 13h framebuffer segment (linear, chain-4)
 %define BDA_SEG        0x0040      ; BIOS data area segment
+%define CONVENTIONAL_MEMORY_KIB 639
 %define STACK_TOP      0x7000      ; SS:SP top at boot (grows down, clear of RAM map)
 
 ; BDA keyboard ring (offsets into BDA_SEG), shared by core bring-up and the
@@ -20,16 +21,12 @@
 ; as the transient "lock key held" guard so a held CapsLock/NumLock/ScrollLock/
 ; Insert key toggles KB_FLAGS once per press, not once per auto-repeat.
 %define KB_FLAGS_1     0x0018
-; Cached active keyboard-layout index (0..5), read once from CMOS 0x10 at boot
-; and refreshed live when the setup page changes it. Lives in a BDA byte the rest
-; of this BIOS does not use (0x96 is the AT keyboard status-flags-3 slot), so the
-; INT 09h ISR can read it with DS already pointing at the BDA segment.
-%define KB_LAYOUT      0x0096
-; Extended-key prefix and right-Alt state used by INT 09h. These occupy the two
-; following AT keyboard status bytes in the BDA.
-%define KB_PREFIX      0x0097
-%define KB_ALTGR       0x0098
-%define KB_DEAD        0x0099      ; BDA: pending dead-key accent id (0 = none)
+; Izarra keyboard state uses the reserved BDA tail. Standard RTC wait services
+; own 0x98..0xA0, so keyboard state must not overlap that ABI.
+%define KB_LAYOUT      0x00b0
+%define KB_PREFIX      0x00b1
+%define KB_ALTGR       0x00b2
+%define KB_DEAD        0x00b3
 ; CMOS index of the persisted layout (MC146818 ports 0x70/0x71). en-US is 0.
 %define KB_CMOS_LAYOUT 0x10
 ; Bytes per layout block: 128 each for unshifted, shifted, and AltGr.
@@ -41,6 +38,13 @@
 %define BDA_TICKS          0x006c
 %define BDA_TICK_FLAG      0x0070
 %define BDA_TICK_ROLLOVER  0x001800b0
+
+; INT 15h AH=83h user timer fields in the standard AT BDA layout.
+%define BDA_RTC_WAIT_COMPLETE 0x0098 ; far pointer: offset, segment
+%define BDA_RTC_WAIT_TIMEOUT  0x009c ; remaining microseconds, dword
+%define BDA_RTC_WAIT_FLAG     0x00a0
+%define BDA_RTC_WAIT_PENDING  0x01
+%define RTC_USEC_PER_TICK     977
 
 ; Unreal-mode flat data selector (GDT index 1) for ramtest_peek32/poke32 and
 ; read_margo_reg. FS is loaded with this once at bring-up and never reloaded.
@@ -68,9 +72,9 @@
 ; it opens the boot-device menu instead of the setup page.
 %define BOOTMENU_HOTKEY 0x0f
 
-; CMOS NVRAM byte 0x11 holds the boot choice: 0 = floppy, 1 = disk, 2 = CD-ROM.
-; The boot menu seeds its default highlight from this byte.
-%define BOOT_CMOS_ORDER 0x11
+; CMOS NVRAM byte 0x11 holds one primary device: 0 floppy, 1 disk, 2 CD-ROM.
+; INT 19h expands it into the Izarra fallback policy.
+%define BOOT_CMOS_PRIMARY 0x11
 
 ; CMOS NVRAM byte 0x12 holds the saved GSW speed code (0 386, 1 486, 2 586,
 ; 3 386-slow). Written by the setup panel and boot menu on Save/Accept; applied
@@ -81,9 +85,8 @@
 ; output; zero and unknown values leave BIOS output off.
 %define DEBUG_CMOS_COM1 0x14
 
-; Boot-device choice (segment 0 byte), written by the boot menu and read by
-; boot_entry: 0 = floppy, 1 = disk (Toka-DOS on C:), 2 = CD-ROM. It lives after
-; the BOX_* fields in the free tail of BIOS_SCRATCH. Defaults to floppy.
+; Session boot-device choice (segment 0 byte), seeded from CMOS and optionally
+; replaced by a one-boot menu selection. INT 19h reads it as the primary.
 %define BOOT_CHOICE    (BIOS_SCRATCH + 0x17)   ; 0x0537
 ; First POST hotkey latched from anywhere in diagnostics: 0 none, 1 Del/setup,
 ; 2 Tab/boot menu. First one wins.

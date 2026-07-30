@@ -11,6 +11,9 @@ use izarravm_core::VideoCard;
 use izarravm_firmware::{SuiteRecordStatus, izarra_bios, parse_result_block};
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
+mod support;
+use support::mount_idle_boot_floppy;
+
 #[test]
 fn full_post_block_is_consistent_and_every_component_passes() {
     let mut machine =
@@ -19,6 +22,7 @@ fn full_post_block_is_consistent_and_every_component_passes() {
     // this is the fully-equipped machine where every component is present and must
     // PASS. (On a bare machine C: is HLE-backed, so the HDD probe FAILs by design.)
     machine.mount_hdd(vec![0u8; 64 * 512]);
+    mount_idle_boot_floppy(&mut machine);
     // The full-screen RLE POST background delays the step loop to ~10M cycles, so
     // give POST room to append every record before sampling the block.
     let stop = machine.run_until_halt_or_cycles(20_000_000).unwrap();
