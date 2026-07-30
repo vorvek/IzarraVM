@@ -259,53 +259,27 @@ impl BarrierKey {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct BarrierStats {
-    helper_family: Option<HelperFamily>,
     hits: u64,
     runtime_hits: u64,
     native_prefix_instructions: u64,
     native_suffix_instructions: u64,
-    eligible_shapes: u64,
-    eligible_suffix_instructions: u64,
     max_native_prefix: u8,
     max_native_suffix: u8,
-    exact_root_bridges: u64,
-    right_direct_entries: u64,
-    removed_inbound_links: u64,
-    removed_outbound_links: u64,
     /// Exits that actually happened into a block this barrier rejected. RUNTIME-weighted, unlike
     /// `hits` (compile attempts) which mis-ranked the ShiftCl slice by three orders of magnitude.
     unbound_exits: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct CensusSiteKey {
-    entry_linear: u32,
-    helper_linear: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CensusSite {
-    row: BarrierKey,
-    fallthrough_linear: u32,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BarrierObservation {
-    helper: Option<HelperSpec>,
     entry_linear: u32,
-    helper_linear: u32,
-    fallthrough_linear: u32,
     native_prefix: usize,
     native_suffix: usize,
-    shape_eligible: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DirectBarrierCensus {
     rows: HashMap<BarrierKey, BarrierStats>,
-    sites: HashMap<CensusSiteKey, CensusSite>,
-    pending_left: Option<CensusSiteKey>,
-    pending_right: Option<CensusSiteKey>,
     /// Why static successor cells were unbound at the exits that hit them, indexed by
     /// `UnboundTarget`. Lives HERE and not in `PerfCounters` on purpose: `PerfCounters` is
     /// embedded in `CpuGsw` ahead of `pending_flags`, whose offset is pinned by
@@ -346,18 +320,13 @@ impl DirectBarrierCensus {
 
     fn record(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
         let BarrierObservation {
-            helper,
             entry_linear,
-            helper_linear,
-            fallthrough_linear,
             native_prefix,
             native_suffix,
-            shape_eligible,
         } = observation;
         let key = BarrierKey::from_insn(insn);
         self.rejected_barrier.insert(entry_linear, key);
         let row = self.rows.entry(key).or_default();
-        row.helper_family = helper.map(|spec| spec.family);
         row.hits = row.hits.saturating_add(1);
         row.native_prefix_instructions = row
             .native_prefix_instructions
@@ -367,58 +336,9 @@ impl DirectBarrierCensus {
             .saturating_add(native_suffix as u64);
         row.max_native_prefix = row.max_native_prefix.max(native_prefix as u8);
         row.max_native_suffix = row.max_native_suffix.max(native_suffix as u8);
-        if shape_eligible {
-            row.eligible_shapes = row.eligible_shapes.saturating_add(1);
-            row.eligible_suffix_instructions = row
-                .eligible_suffix_instructions
-                .saturating_add(native_suffix as u64);
-            self.sites.insert(
-                CensusSiteKey {
-                    entry_linear,
-                    helper_linear,
-                },
-                CensusSite {
-                    row: key,
-                    fallthrough_linear,
-                },
-            );
-        }
     }
 
-    fn batch_begin(&mut self) {
-        self.pending_left = None;
-        self.pending_right = None;
-    }
-
-    fn batch_end(&mut self) {
-        self.pending_left = None;
-        self.pending_right = None;
-    }
-
-    fn note_direct_run(&mut self, entry_linear: u32, final_linear: u32, linked_transfers: u32) {
-        if let Some(pending) = self.pending_right.take()
-            && let Some(site) = self.sites.get(&pending).copied()
-            && entry_linear == site.fallthrough_linear
-        {
-            let removed_outbound = u64::from(linked_transfers != 0);
-            let row = self
-                .rows
-                .get_mut(&site.row)
-                .expect("census site must retain its row");
-            row.right_direct_entries = row.right_direct_entries.saturating_add(1);
-            row.removed_outbound_links =
-                row.removed_outbound_links.saturating_add(removed_outbound);
-        }
-
-        let key = CensusSiteKey {
-            entry_linear,
-            helper_linear: final_linear,
-        };
-        self.pending_left = self.sites.contains_key(&key).then_some(key);
-    }
-
-    fn note_interpreted(&mut self, insn: &DecodedInsn, linear: u32, final_linear: u32) {
-        self.pending_right = None;
+    fn note_interpreted(&mut self, insn: &DecodedInsn) {
         // EVERY row, not only the ex-helper families. `runtime_hits` counts how many times the
         // guest actually EXECUTES this shape interpreted, which makes it the census's only
         // per-execution, position-free column - and therefore the only one that can rank a shape
@@ -435,24 +355,6 @@ impl DirectBarrierCensus {
         if let Some(row) = self.rows.get_mut(&key) {
             row.runtime_hits = row.runtime_hits.saturating_add(1);
         }
-
-        let Some(pending) = self.pending_left.take() else {
-            return;
-        };
-        if pending.helper_linear != linear {
-            return;
-        }
-        let Some(site) = self.sites.get(&pending).copied() else {
-            return;
-        };
-        let row = self
-            .rows
-            .get_mut(&site.row)
-            .expect("census site must retain its row");
-        row.exact_root_bridges = row.exact_root_bridges.saturating_add(1);
-        if final_linear == site.fallthrough_linear {
-            self.pending_right = Some(pending);
-        }
     }
 
     pub(crate) fn snapshot(&self) -> DirectBarrierCensusSnapshot {
@@ -461,27 +363,16 @@ impl DirectBarrierCensus {
             .iter()
             .map(|(&key, &stats)| (key, census_row(key, stats)))
             .collect();
-        // Sorted by RUNTIME unbound exits first. `eligible_suffix_instructions` was the old
-        // primary key and it is a compile-attempt aggregate; ranking by it is what sent the
-        // ShiftCl slice after a family worth 0.06pp. It stays as a tiebreak only.
+        // Sorted by RUNTIME unbound exits first, tiebroken by compile attempts (`hits`).
         keyed_rows.sort_by(|(left_key, left), (right_key, right)| {
             right
                 .unbound_exits
                 .cmp(&left.unbound_exits)
-                .then_with(|| {
-                    right
-                        .eligible_suffix_instructions
-                        .cmp(&left.eligible_suffix_instructions)
-                })
                 .then_with(|| right.hits.cmp(&left.hits))
                 .then_with(|| left_key.cmp(right_key))
         });
-        let selected = keyed_rows
-            .iter()
-            .find_map(|(_, row)| (row.eligible_shapes != 0).then_some(row.clone()));
         DirectBarrierCensusSnapshot {
             rows: keyed_rows.into_iter().map(|(_, row)| row).collect(),
-            selected,
             unbound_targets: UnboundTarget::ALL
                 .iter()
                 .map(|kind| (kind.label(), self.unbound[*kind as usize]))
@@ -515,19 +406,12 @@ fn census_row(key: BarrierKey, stats: BarrierStats) -> DirectBarrierCensusRow {
         },
         prefix_mask: key.prefix_mask,
         unbound_exits: stats.unbound_exits,
-        helper_family: stats.helper_family.map(HelperFamily::name),
         hits: stats.hits,
         runtime_hits: stats.runtime_hits,
         native_prefix_instructions: stats.native_prefix_instructions,
         native_suffix_instructions: stats.native_suffix_instructions,
-        eligible_shapes: stats.eligible_shapes,
-        eligible_suffix_instructions: stats.eligible_suffix_instructions,
         max_native_prefix: stats.max_native_prefix,
         max_native_suffix: stats.max_native_suffix,
-        exact_root_bridges: stats.exact_root_bridges,
-        right_direct_entries: stats.right_direct_entries,
-        removed_inbound_links: stats.removed_inbound_links,
-        removed_outbound_links: stats.removed_outbound_links,
     }
 }
 
@@ -550,48 +434,17 @@ impl super::JitState {
         }
     }
 
-    pub(crate) fn barrier_census_batch_begin(&mut self) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.batch_begin();
-        }
-    }
-
-    pub(crate) fn barrier_census_batch_end(&mut self) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.batch_end();
-        }
-    }
-
-    /// Whether the census exists at all. Callers MUST gate on this before building the
-    /// arguments to the two `note_barrier_census_*` hooks below: those sit on the
-    /// per-interpreted-instruction and per-Direct-exit retire paths, and their `final_linear`
-    /// argument costs a `cs()` read plus an add that is pure waste when the census is off
-    /// (the default). Checking `is_some` inside the callee is too late — the argument has
-    /// already been evaluated at the call site.
+    /// Whether the census exists at all. Callers MUST gate on this before calling
+    /// `note_barrier_census_interpreted`, which sits on the per-interpreted-instruction retire
+    /// path. Checking `is_some` inside the callee is too late for the gate to save anything.
     #[inline]
     pub(crate) fn barrier_census_active(&self) -> bool {
         self.direct_barrier_census.is_some()
     }
 
-    pub(crate) fn note_barrier_census_direct_run(
-        &mut self,
-        entry_linear: u32,
-        final_linear: u32,
-        linked_transfers: u32,
-    ) {
+    pub(crate) fn note_barrier_census_interpreted(&mut self, insn: &DecodedInsn) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.note_direct_run(entry_linear, final_linear, linked_transfers);
-        }
-    }
-
-    pub(crate) fn note_barrier_census_interpreted(
-        &mut self,
-        insn: &DecodedInsn,
-        linear: u32,
-        final_linear: u32,
-    ) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.note_interpreted(insn, linear, final_linear);
+            census.note_interpreted(insn);
         }
     }
 
@@ -4025,34 +3878,9 @@ enum CompileStop {
     Boundary,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HelperFamily {
-    DirectionFlag,
-    SignExtend,
-    AccumulatorExtend,
-}
-
-impl HelperFamily {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::DirectionFlag => "direction_flag",
-            Self::SignExtend => "sign_extend",
-            Self::AccumulatorExtend => "accumulator_extend",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HelperSpec {
-    family: HelperFamily,
-    opcode: u16,
-    raw_clocks: u8,
-}
-
 #[derive(Clone, Copy)]
 enum PlannedInsn {
     Native(DirectKind),
-    PreciseHelper(HelperSpec),
     HardBoundary,
 }
 
@@ -4060,35 +3888,11 @@ struct DirectUnitPlanner;
 
 impl DirectUnitPlanner {
     fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> PlannedInsn {
-        if let Some(kind) = classify::classify(insn, lin, entry_lin) {
-            return PlannedInsn::Native(kind);
-        }
-        match precise_helper_spec(insn) {
-            Some(spec) => PlannedInsn::PreciseHelper(spec),
+        match classify::classify(insn, lin, entry_lin) {
+            Some(kind) => PlannedInsn::Native(kind),
             None => PlannedInsn::HardBoundary,
         }
     }
-}
-
-fn precise_helper_spec(insn: &DecodedInsn) -> Option<HelperSpec> {
-    if insn.modrm.is_some()
-        || insn.operand.is_some()
-        || insn.prefixes != Prefixes::default()
-        || insn.address_size != AddressSize::Dword
-    {
-        return None;
-    }
-    let (family, raw_clocks) = match (insn.opcode, insn.operand_size) {
-        (0xfc | 0xfd, OperandSize::Dword) => (HelperFamily::DirectionFlag, 2),
-        (0x99, OperandSize::Dword) => (HelperFamily::SignExtend, 2),
-        (0x98, OperandSize::Dword) => (HelperFamily::AccumulatorExtend, 3),
-        _ => return None,
-    };
-    Some(HelperSpec {
-        family,
-        opcode: insn.opcode,
-        raw_clocks,
-    })
 }
 
 /// What PUSHFD actually stores: the low 16 flags always, plus the persona's writable high bits.
@@ -4157,7 +3961,6 @@ fn stack_width_kind(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CensusSuffix {
     instructions: usize,
-    self_loop: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4226,7 +4029,6 @@ fn census_native_suffix(
         stack_accesses += u8::from(kind.uses_stack());
         memory_alu_slots += u8::from(kind.is_memory_alu());
         result.instructions += 1;
-        result.self_loop = matches!(kind, DirectKind::Jcc { taken_delta: 0, .. });
         lin = next;
         if kind.is_terminal() {
             break;
@@ -4339,42 +4141,6 @@ fn compile_with_instruction_limit(
         }
         let kind = match DirectUnitPlanner::classify(&insn, lin, entry_lin) {
             PlannedInsn::Native(kind) => kind,
-            PlannedInsn::PreciseHelper(helper) => {
-                if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
-                    && cpu.jit_direct.barrier_census_enabled()
-                {
-                    let suffix = census_native_suffix(
-                        cpu,
-                        key,
-                        entry_lin,
-                        next,
-                        d,
-                        slots.len(),
-                        stack_accesses,
-                        memory_alu_slots,
-                    );
-                    let shape_eligible = !slots.is_empty()
-                        && suffix.instructions != 0
-                        && slots.len() + 1 + suffix.instructions
-                            >= MIN_STANDALONE_INSTRUCTIONS.into()
-                        && x87_slots == 0
-                        && !suffix.self_loop;
-                    cpu.jit_direct.record_barrier(
-                        &insn,
-                        BarrierObservation {
-                            helper: Some(helper),
-                            entry_linear: entry_lin,
-                            helper_linear: lin,
-                            fallthrough_linear: next,
-                            native_prefix: slots.len(),
-                            native_suffix: suffix.instructions,
-                            shape_eligible,
-                        },
-                    );
-                }
-                stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
-                break;
-            }
             PlannedInsn::HardBoundary => {
                 if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
                     && cpu.jit_direct.barrier_census_enabled()
@@ -4392,13 +4158,9 @@ fn compile_with_instruction_limit(
                     cpu.jit_direct.record_barrier(
                         &insn,
                         BarrierObservation {
-                            helper: None,
                             entry_linear: entry_lin,
-                            helper_linear: lin,
-                            fallthrough_linear: next,
                             native_prefix: slots.len(),
                             native_suffix: suffix.instructions,
-                            shape_eligible: false,
                         },
                     );
                 }

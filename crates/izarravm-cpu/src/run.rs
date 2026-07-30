@@ -516,11 +516,7 @@ impl CpuGsw {
         bus: &mut B,
         cap: u64,
     ) -> Result<BudgetedRunOutcome, CpuError> {
-        #[cfg(feature = "jit")]
-        self.jit_direct.barrier_census_batch_begin();
         let result = self.run_budgeted_inner(bus, cap);
-        #[cfg(feature = "jit")]
-        self.jit_direct.barrier_census_batch_end();
         // Close the unit simulator's batch on EVERY return path, including the `?` error
         // propagations inside the loop, so an open sim entry never leaks across batches.
         #[cfg(feature = "jit")]
@@ -1498,13 +1494,6 @@ impl CpuGsw {
 
         let final_eip = self.registers.eip;
         let cs_base = self.registers.cs().base;
-        if self.jit_direct.barrier_census_active() {
-            self.jit_direct.note_barrier_census_direct_run(
-                span.key.linear,
-                cs_base.wrapping_add(final_eip),
-                exit.linked_transfers,
-            );
-        }
         if exit.dynamic_link_cell != 0 {
             debug_assert_eq!(exit.dynamic_target_eip, final_eip);
             self.jit_direct.bind_dynamic_successor(
@@ -1811,15 +1800,10 @@ impl CpuGsw {
                     self.perf.instructions += 1;
                     // Gated at the CALL SITE, not inside the hook: this is the common
                     // interpreted-retire tail (506.85M instructions in a Quake/586 run) and the
-                    // third argument is a `cs()` read plus an add that the census, off by
-                    // default, never consumes.
+                    // census, off by default, never consumes it otherwise.
                     #[cfg(feature = "jit")]
                     if self.jit_direct.barrier_census_active() {
-                        self.jit_direct.note_barrier_census_interpreted(
-                            insn,
-                            lin,
-                            self.registers.cs().base.wrapping_add(self.registers.eip),
-                        );
+                        self.jit_direct.note_barrier_census_interpreted(insn);
                     }
                     // This non-profiling fast tail is the COMMON continuation retire path; observe
                     // the instruction here (once) so the sim count tracks perf.instructions.
@@ -1855,11 +1839,7 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         if result.is_ok() {
             if self.jit_direct.barrier_census_active() {
-                self.jit_direct.note_barrier_census_interpreted(
-                    insn,
-                    lin,
-                    self.registers.cs().base.wrapping_add(self.registers.eip),
-                );
+                self.jit_direct.note_barrier_census_interpreted(insn);
             }
             self.unit_sim_observe(
                 insn,

@@ -967,7 +967,6 @@ fn direct_barrier_census_json(
     };
     json!({
         "rows": snapshot.rows.iter().map(direct_barrier_census_row_json).collect::<Vec<_>>(),
-        "selected": snapshot.selected.as_ref().map(direct_barrier_census_row_json),
         "unbound_targets": snapshot
             .unbound_targets
             .iter()
@@ -1007,19 +1006,12 @@ fn direct_barrier_census_row_json(row: &izarravm_cpu::DirectBarrierCensusRow) ->
         "operand_size": row.operand_size,
         "address_size": row.address_size,
         "prefix_mask": row.prefix_mask,
-        "helper_family": row.helper_family,
         "hits": row.hits,
         "runtime_hits": row.runtime_hits,
         "native_prefix_instructions": row.native_prefix_instructions,
         "native_suffix_instructions": row.native_suffix_instructions,
-        "eligible_shapes": row.eligible_shapes,
-        "eligible_suffix_instructions": row.eligible_suffix_instructions,
         "max_native_prefix": row.max_native_prefix,
         "max_native_suffix": row.max_native_suffix,
-        "exact_root_bridges": row.exact_root_bridges,
-        "right_direct_entries": row.right_direct_entries,
-        "removed_inbound_links": row.removed_inbound_links,
-        "removed_outbound_links": row.removed_outbound_links,
     })
 }
 
