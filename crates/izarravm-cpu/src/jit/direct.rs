@@ -987,6 +987,16 @@ pub(crate) struct BlockCache {
     /// `CpuGsw::set_mode`, which reaches `clear()` below. Cleared there ABOVE the empty-cache
     /// early return, so the clear does not depend on an argument about when that return is taken.
     global_block_upper_cache: [u64; 2],
+    /// Memoised `iteration_upper`, THIS block's own cost bound, parallel to `blocks` and indexed
+    /// by the same `BlockId::index()`. 0 is unset. Unlike the two-entry table above, a false
+    /// "unset" here would only cost a recompute, never a wrong answer, so the sentinel needs no
+    /// non-collision argument: the value is at least `scaled_core_upper` and a block with zero
+    /// raw clocks simply misses forever.
+    ///
+    /// Its inputs are the block's own immutable metadata plus the same persona timing pair and
+    /// bus cost dials `global_block_upper` reads, so it carries the same epoch key. A recycled
+    /// slot is zeroed by `install`, so a stale entry cannot outlive its block.
+    iteration_upper_cache: Vec<u64>,
     /// The shared x87 re-entry pad, in its OWN executable mapping rather than in the arena.
     /// Deliberately not a block: `reset_storage` sets `arena = None` and frees it, which would
     /// dangle every `integer_entry` published at a float block, and `compact_arena` relocates
@@ -1003,6 +1013,9 @@ pub(crate) struct BlockCache {
     /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
     /// `max`, three multiplies and a division.
     global_block_upper_epoch: u64,
+    /// The `jit_cost_dial_epoch()` `iteration_upper_cache` was computed under. Same key, same
+    /// reasoning as `global_block_upper_epoch` above.
+    iteration_upper_epoch: u64,
     free_block_slots: Vec<u16>,
     next_block_generation: u64,
     live_blocks: usize,
@@ -1064,8 +1077,10 @@ impl BlockCache {
             link_sources: HashMap::new(),
             outbound: Vec::new(),
             global_block_upper_cache: [0; 2],
+            iteration_upper_cache: Vec::new(),
             x87_pad: None,
             global_block_upper_epoch: 0,
+            iteration_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
             inbound: HashMap::new(),
             waiting: HashMap::new(),
@@ -1274,6 +1289,7 @@ impl BlockCache {
             self.dynamic_next_slots.push(0);
             self.block_link_epochs.push(0);
             self.block_active.push(true);
+            self.iteration_upper_cache.push(0);
             if index == self.block_decode_slots.len() {
                 self.block_decode_slots.push(Vec::new());
             } else {
@@ -1291,6 +1307,8 @@ impl BlockCache {
             self.dynamic_next_slots[index] = 0;
             self.block_link_epochs[index] = 0;
             self.block_active[index] = true;
+            // A recycled slot must not serve the retired occupant's cost bound to its successor.
+            self.iteration_upper_cache[index] = 0;
         }
         self.register_decode_dependencies(id, &decode_slots[..decode_slot_len]);
         if compilation.dynamic_successor {
@@ -1405,6 +1423,32 @@ impl BlockCache {
         self.global_block_upper_cache[x87_index] = value;
     }
 
+    /// Memoised `iteration_upper` for one block, valid only under `epoch`. Returns 0 for unset,
+    /// which the caller treats as a miss and recomputes; see the field for why that sentinel needs
+    /// no non-collision argument. Goes through `active_index` so a `BlockId` whose slot has since
+    /// been recycled reads as a miss rather than as its successor's bound.
+    pub(crate) fn iteration_upper_cached(&self, id: BlockId, epoch: u64) -> u64 {
+        if self.iteration_upper_epoch != epoch {
+            return 0;
+        }
+        self.active_index(id)
+            .and_then(|index| self.iteration_upper_cache.get(index).copied())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_iteration_upper_cached(&mut self, id: BlockId, epoch: u64, value: u64) {
+        if self.iteration_upper_epoch != epoch {
+            self.iteration_upper_cache.fill(0);
+            self.iteration_upper_epoch = epoch;
+        }
+        let Some(index) = self.active_index(id) else {
+            return;
+        };
+        if let Some(slot) = self.iteration_upper_cache.get_mut(index) {
+            *slot = value;
+        }
+    }
+
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
         self.dormant(key, DormantReason::SpanHot);
         let _ = heat.bump(key.physical, 1, epoch);
@@ -1454,6 +1498,7 @@ impl BlockCache {
         // `reset_storage` removes a reachability argument standing between a mode switch and a
         // miscompiled quota.
         self.global_block_upper_cache = [0; 2];
+        self.iteration_upper_cache.fill(0);
         // CS reloads and monitor transitions can invalidate code millions of times while the
         // direct cache is unused. Avoid clearing the 65,536-entry hot table when it is already
         // empty.
@@ -1994,6 +2039,7 @@ impl BlockCache {
             slots.clear();
         }
         self.block_link_epochs.clear();
+        self.iteration_upper_cache.clear();
         watch.clear();
         // Every storage reset drops heat; the owner of the hoisted map observes this counter.
         self.heat_resets = self.heat_resets.wrapping_add(1);

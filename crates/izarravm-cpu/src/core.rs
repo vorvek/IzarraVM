@@ -552,10 +552,26 @@ impl CpuGsw {
     /// `scale_clocks_batches_exactly`).
     #[cfg(feature = "jit")]
     pub(super) fn scale_clocks_batch(&mut self, clocks: u64) -> u64 {
-        let (num, den) = level_timing(self.persona());
+        let persona = self.persona();
+        let (num, den) = level_timing(persona);
         let scaled = clocks * u64::from(num) + self.timing_rem;
-        self.timing_rem = scaled % u64::from(den);
-        scaled / u64::from(den)
+        // Specialized per persona for the same reason `scale_clocks` above is: a runtime `den`
+        // from the `level_timing` match emits a real hardware div, while a compile-time constant
+        // strength-reduces to a magic-multiplier multiply-shift. Quotient first, remainder as
+        // `scaled - quot * den`, so this is one div plus a mul and a sub rather than two divs.
+        let (quot, rem) = match persona {
+            CpuPersona::I386 => {
+                let q = scaled / 5u64;
+                (q, scaled - q * 5)
+            }
+            CpuPersona::I486 | CpuPersona::I586 => {
+                let q = scaled / 12u64;
+                (q, scaled - q * 12)
+            }
+        };
+        let _ = den; // den is unused; the match arms carry the constant directly
+        self.timing_rem = rem;
+        quot
     }
 
     /// Scale an x87 op's raw core clocks by the active level's FP-timing factor for the

@@ -3568,6 +3568,171 @@ fn chain_quota_memo_clears_on_a_mode_change_even_when_no_block_is_cached() {
     );
 }
 
+/// One CPU holding two installed blocks that must not share a memo slot: an x87 block (FLD1 then
+/// FSTP m64, so both `weighted_fp_clocks` and the dword-store count are nonzero) and an integer
+/// block of the same instruction count with no memory traffic at all. Returns them in that order.
+///
+/// Modelled on `fstp_m64_matches_the_interpreter_in_ram_and_in_the_aperture` below, minus the
+/// interpreter differential: these fixtures are never executed, only priced.
+fn install_x87_and_integer_blocks(
+    mode: GswMode,
+) -> (
+    CpuGsw,
+    TestBus,
+    jit::direct::CompiledBlock,
+    jit::direct::CompiledBlock,
+) {
+    const X87_ENTRY: u32 = 0x101;
+    const INT_ENTRY: u32 = 0x201;
+    const RAM: u32 = 0x0003_0000;
+
+    let mut memory = vec![0; 0x000b_0000];
+    let mut x87_code = vec![0xd9u8, 0xe8, 0xdd, 0x9e]; // fld1 ; fstp qword [esi+disp32]
+    x87_code.extend_from_slice(&RAM.to_le_bytes());
+    x87_code.extend_from_slice(&[0x89, 0xf6, 0xf4]); // mov esi,esi ; hlt
+    memory[X87_ENTRY as usize..X87_ENTRY as usize + x87_code.len()].copy_from_slice(&x87_code);
+    let int_code = [
+        0x83u8, 0xc0, 0x01, // add eax,1
+        0x83, 0xc0, 0x01, // add eax,1
+        0x89, 0xf6, // mov esi,esi
+        0xf4, // hlt
+    ];
+    memory[INT_ENTRY as usize..INT_ENTRY as usize + int_code.len()].copy_from_slice(&int_code);
+
+    // `fresh()` with the mode chosen up front: `set_mode` reloads the segments, so it has to run
+    // before the flat-segment setup rather than after it.
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(mode);
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+    ] {
+        cpu.load_segment_real(segment, 0);
+    }
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    cpu.registers.eip = 0x100;
+    make_data_segments_flat(&mut cpu);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+    bus.uniform_native_fetches = true;
+    let starts = [
+        X87_ENTRY,
+        X87_ENTRY + 2,
+        X87_ENTRY + 8,
+        INT_ENTRY,
+        INT_ENTRY + 3,
+        INT_ENTRY + 6,
+    ];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        RAM,
+        RAM,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        true,
+    );
+    cpu.fpu = X87::default();
+    let x87_block = install_fixture_block(&mut cpu, X87_ENTRY);
+    let int_block = install_fixture_block(&mut cpu, INT_ENTRY);
+    assert!(x87_block.has_x87(), "the x87 fixture must be an x87 block");
+    assert!(
+        !int_block.has_x87(),
+        "the integer fixture must not be an x87 block"
+    );
+    (cpu, bus, x87_block, int_block)
+}
+
+/// N4: the per-entry `iteration_upper` memo must never disagree with a fresh computation, and two
+/// blocks whose bounds genuinely differ must not collide in one slot. The x87/integer pair is the
+/// widest split available: the float block carries a `weighted_fp_clocks` term and two dword
+/// stores that the integer block has neither of.
+///
+/// Both a cold and a warm read are asserted, so a memo that never stored and a memo that stored
+/// the wrong block's value both fail here.
+#[test]
+fn iteration_upper_memo_matches_a_fresh_recompute_for_x87_and_integer_blocks() {
+    let (mut cpu, bus, x87_block, int_block) = install_x87_and_integer_blocks(GswMode::Gsw586);
+
+    let x87_fresh = cpu.recompute_iteration_upper_for_test(&bus, &x87_block);
+    let int_fresh = cpu.recompute_iteration_upper_for_test(&bus, &int_block);
+    assert_ne!(
+        x87_fresh, int_fresh,
+        "the fixture pair must price differently or this test cannot see a slot collision"
+    );
+
+    // Pass 0 is the cold fill, pass 1 the memo hit. Both must agree with the fresh value.
+    for pass in 0..2 {
+        assert_eq!(
+            cpu.iteration_upper_for_test(&bus, &x87_block),
+            x87_fresh,
+            "x87 block, pass {pass}"
+        );
+        assert_eq!(
+            cpu.iteration_upper_for_test(&bus, &int_block),
+            int_fresh,
+            "integer block, pass {pass}"
+        );
+    }
+}
+
+/// The other half of the memo key. Two independent invalidations, both pinned: the bus's cost-dial
+/// epoch, which covers a dial moving with no CPU involvement at all, and the mode change, which
+/// reaches `BlockCache::clear` and drops the whole table with the blocks it described.
+///
+/// Neither fixture can prove this: a single-persona corpus run never changes a dial, so byte
+/// identity would hold whether the invalidation existed or not. Same reasoning as
+/// `chain_quota_memo_clears_on_a_mode_change_even_when_no_block_is_cached` above.
+#[test]
+fn iteration_upper_memo_is_dropped_by_a_dial_epoch_change_and_by_a_mode_change() {
+    let (mut cpu, _bus, x87_block, int_block) = install_x87_and_integer_blocks(GswMode::Gsw586);
+    let x87_id = x87_block.id();
+    let int_id = int_block.id();
+
+    assert_eq!(cpu.jit_direct.iteration_upper_cached(x87_id, 7), 0);
+    cpu.jit_direct.set_iteration_upper_cached(x87_id, 7, 12_345);
+    cpu.jit_direct.set_iteration_upper_cached(int_id, 7, 67_890);
+    assert_eq!(cpu.jit_direct.iteration_upper_cached(x87_id, 7), 12_345);
+    assert_eq!(cpu.jit_direct.iteration_upper_cached(int_id, 7), 67_890);
+
+    // A different bus epoch invalidates without any CPU involvement.
+    assert_eq!(cpu.jit_direct.iteration_upper_cached(x87_id, 8), 0);
+    assert_eq!(cpu.jit_direct.iteration_upper_cached(int_id, 8), 0);
+
+    // Storing under the new epoch drops the old epoch's entries rather than leaving one live.
+    cpu.jit_direct.set_iteration_upper_cached(x87_id, 8, 999);
+    assert_eq!(cpu.jit_direct.iteration_upper_cached(int_id, 8), 0);
+
+    // And a mode change drops the table along with the blocks it described.
+    cpu.set_mode(GswMode::Gsw486);
+    assert_eq!(
+        cpu.jit_direct.iteration_upper_cached(x87_id, 8),
+        0,
+        "a mode change must drop the per-block iteration bound memo"
+    );
+
+    // The persona timing pair is the other half of the key, and it is NOT separately testable
+    // here: `key_for` admits the Direct backend on I486 and I586 only, and `level_timing` returns
+    // the same (1, 12) for both, so no admissible persona pair prices a block differently. The
+    // epoch covers it regardless -- the persona cannot move without `CpuGsw::set_mode`, which
+    // reaches the `clear()` asserted above.
+    let (mut on_486, bus_486, x87_486, _) = install_x87_and_integer_blocks(GswMode::Gsw486);
+    let fresh_486 = on_486.recompute_iteration_upper_for_test(&bus_486, &x87_486);
+    for _ in 0..2 {
+        assert_eq!(
+            on_486.iteration_upper_for_test(&bus_486, &x87_486),
+            fresh_486
+        );
+    }
+}
+
 /// `JmpMem`'s source, read from the mode-13 aperture, must LOWER and match the interpreter
 /// exactly, aggregate bus clocks included. This is the corrected shape from the review outcome:
 /// `JmpMem` uses the Ret arm's construction (`emit_ram_read_pointer_inner` plus the mode13

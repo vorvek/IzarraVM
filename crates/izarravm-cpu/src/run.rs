@@ -1198,6 +1198,91 @@ impl CpuGsw {
         own_class.max(x87_hop)
     }
 
+    /// THIS block's own worst-case cost for one iteration: its scaled core clocks (integer plus
+    /// the FP-class weighted term) plus its own fetch and data traffic folded through the bus
+    /// scale, so the result lives in the same scaled guest-clock domain as `cap` and the in-batch
+    /// bus growth it is compared against.
+    ///
+    /// Every input is fixed for the life of the block under one set of cost dials: the counts and
+    /// clock totals are block metadata sealed at compile time, and the rest is the persona timing
+    /// pair plus the same bus dials `compute_global_block_upper` reads. See `iteration_upper`
+    /// below for the memo that exploits this.
+    #[cfg(feature = "jit")]
+    fn compute_iteration_upper<B: CpuBus>(
+        bus: &B,
+        block: &jit::direct::CompiledBlock,
+        num: u32,
+        den: u32,
+    ) -> u64 {
+        let fp_core_upper = u64::from(block.weighted_fp_clocks())
+            .saturating_add(u64::from(FP_TIMING_DEN) - 1)
+            / u64::from(FP_TIMING_DEN);
+        let scaled_core_upper = u64::from(block.raw_clocks())
+            .saturating_add(fp_core_upper)
+            .saturating_mul(u64::from(num))
+            .saturating_add(u64::from(den) - 1)
+            / u64::from(den);
+        let fetch_upper = bus
+            .jit_fetch_cost_clocks()
+            .saturating_mul(u64::from(block.span().instructions));
+        let byte_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Byte)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
+        let word_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Word)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word));
+        let dword_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Dword)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
+        let data_upper = byte_data_upper
+            .saturating_mul(u64::from(block.byte_reads()))
+            .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_reads())))
+            .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_reads())))
+            .saturating_add(byte_data_upper.saturating_mul(u64::from(block.byte_stores())))
+            .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_stores())))
+            .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_stores())));
+        let raw_bus_upper = fetch_upper.saturating_add(data_upper);
+        // `cap` and the in-batch bus growth use the bus's scaled guest-clock domain. Fold the raw
+        // fetch/data bound through that same scale before deciding how much native work fits.
+        scaled_core_upper.saturating_add(bus.jit_scale_bus_cost_upper(raw_bus_upper))
+    }
+
+    /// `compute_iteration_upper` memoised per block, keyed on the bus's cost-dial epoch. Same key
+    /// and same shape as the `global_block_upper` memo in `run_direct_block`, one level down: that
+    /// one collapses to two entries because it reads only `has_x87()` off the block, this one has
+    /// to be per block because it reads the block's own clock and access counts.
+    ///
+    /// This ran on EVERY direct-block entry, not just the chain-eligible ones, and it is the more
+    /// expensive of the two: six bus accessor calls, three `max`, eight multiplies and two
+    /// divisions with runtime denominators, all to rederive a number that cannot move until the
+    /// dials do. The `debug_assert_eq!` recomputes and compares on every entry, so a debug or test
+    /// build proves the memo continuously and a release build pays nothing for it.
+    #[cfg(feature = "jit")]
+    fn iteration_upper<B: CpuBus>(
+        &mut self,
+        bus: &B,
+        block: &jit::direct::CompiledBlock,
+        num: u32,
+        den: u32,
+    ) -> u64 {
+        let epoch = bus.jit_cost_dial_epoch();
+        let cached = self.jit_direct.iteration_upper_cached(block.id(), epoch);
+        let value = if cached != 0 {
+            cached
+        } else {
+            let computed = Self::compute_iteration_upper(bus, block, num, den);
+            self.jit_direct
+                .set_iteration_upper_cached(block.id(), epoch, computed);
+            computed
+        };
+        debug_assert_eq!(
+            value,
+            Self::compute_iteration_upper(bus, block, num, den),
+            "cached iteration_upper went stale"
+        );
+        value
+    }
+
     /// Classify the successor a `StaticUnbound` exit just failed to reach. The CPU's EIP at this
     /// point IS that successor's address, so the key it would have been compiled under is
     /// recoverable without threading the exiting slot out of the native frame.
@@ -1319,41 +1404,10 @@ impl CpuGsw {
         }
 
         let (num, den) = level_timing(self.persona());
-        let fp_core_upper = u64::from(block.weighted_fp_clocks())
-            .saturating_add(u64::from(FP_TIMING_DEN) - 1)
-            / u64::from(FP_TIMING_DEN);
-        let scaled_core_upper = u64::from(block.raw_clocks())
-            .saturating_add(fp_core_upper)
-            .saturating_mul(u64::from(num))
-            .saturating_add(u64::from(den) - 1)
-            / u64::from(den);
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(bus_at_entry);
-        let fetch_upper = bus
-            .jit_fetch_cost_clocks()
-            .saturating_mul(u64::from(span.instructions));
-        let byte_data_upper = bus
-            .jit_data_cost_clocks(BusWidth::Byte)
-            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
-        let word_data_upper = bus
-            .jit_data_cost_clocks(BusWidth::Word)
-            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word));
-        let dword_data_upper = bus
-            .jit_data_cost_clocks(BusWidth::Dword)
-            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
-        let data_upper = byte_data_upper
-            .saturating_mul(u64::from(block.byte_reads()))
-            .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_reads())))
-            .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_reads())))
-            .saturating_add(byte_data_upper.saturating_mul(u64::from(block.byte_stores())))
-            .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_stores())))
-            .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_stores())));
-        let raw_bus_upper = fetch_upper.saturating_add(data_upper);
-        // `cap` and `bus_growth` use the bus's scaled guest-clock domain. Fold the raw
-        // fetch/data bound through that same scale before deciding how much native work fits.
-        let iteration_upper =
-            scaled_core_upper.saturating_add(bus.jit_scale_bus_cost_upper(raw_bus_upper));
+        let iteration_upper = self.iteration_upper(bus, &block, num, den);
         let used = total.saturating_add(bus_growth);
         let available = cap.saturating_sub(used).saturating_sub(1);
         let budget_quota = available.checked_div(iteration_upper).unwrap_or(u64::MAX);
@@ -1728,6 +1782,29 @@ impl CpuGsw {
         } else {
             Ok(DirectBlockOutcome::Complete(outcome))
         }
+    }
+
+    /// The memoised `iteration_upper` for one block, at the live persona. Pairs with
+    /// `recompute_iteration_upper_for_test` so a test can assert the memo against a fresh
+    /// computation without entering native code.
+    #[cfg(all(feature = "jit", test))]
+    pub(crate) fn iteration_upper_for_test<B: CpuBus>(
+        &mut self,
+        bus: &B,
+        block: &jit::direct::CompiledBlock,
+    ) -> u64 {
+        let (num, den) = level_timing(self.persona());
+        self.iteration_upper(bus, block, num, den)
+    }
+
+    #[cfg(all(feature = "jit", test))]
+    pub(crate) fn recompute_iteration_upper_for_test<B: CpuBus>(
+        &self,
+        bus: &B,
+        block: &jit::direct::CompiledBlock,
+    ) -> u64 {
+        let (num, den) = level_timing(self.persona());
+        Self::compute_iteration_upper(bus, block, num, den)
     }
 
     #[cfg(all(feature = "jit", test))]
