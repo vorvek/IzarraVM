@@ -9,6 +9,11 @@ pub(crate) const BIOS_BOOT_CHOICE_ADDR: u32 = 0x0537;
 pub(crate) const EBDA_SEGMENT: u16 = 0x9FC0;
 pub(crate) const EBDA_LINEAR: u32 = (EBDA_SEGMENT as u32) << 4;
 
+pub(crate) const BDA_RTC_WAIT_COMPLETE: usize = 0x498;
+pub(crate) const BDA_RTC_WAIT_TIMEOUT: usize = 0x49C;
+pub(crate) const BDA_RTC_WAIT_FLAG: usize = 0x4A0;
+pub(crate) const BDA_RTC_WAIT_PENDING: u8 = 0x01;
+
 pub(crate) const BIOS32_HEADER_ROM_OFFSET: usize = 0xEA00;
 pub(crate) const BIOS32_DIRECTORY_ROM_OFFSET: usize = 0xEA10;
 pub(crate) const BIOS32_PCI_ROM_OFFSET: usize = 0xEA20;

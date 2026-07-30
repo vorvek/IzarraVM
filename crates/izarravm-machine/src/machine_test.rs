@@ -170,10 +170,18 @@ fn int16_read_after_with_layout(layout: u8, scancodes: &[u8]) -> u16 {
     const PROG: [u8; 9] = [0xB4, 0x00, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
-    machine.write_physical_u8(0x0496, layout);
+    machine.write_physical_u8(0x04b0, layout);
     machine.inject_key_scancodes(scancodes);
     machine.run_until_halt_or_cycles(3_000_000).unwrap();
     read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
+}
+
+fn idle_boot_floppy_image() -> Vec<u8> {
+    let mut image = vec![0u8; 1_474_560];
+    image[..3].copy_from_slice(&[0xfb, 0xeb, 0xfd]);
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    image
 }
 
 fn int16_read_after(scancodes: &[u8]) -> u16 {

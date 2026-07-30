@@ -14,10 +14,10 @@
 ; "lock key held" guard so a held CapsLock/NumLock/ScrollLock/Insert key toggles
 ; the matching KB_FLAGS bit once per press, not once per auto-repeat.
 %define KB_FLAGS_1     0x0018      ; BDA: second shift-flags byte
-%define KB_LAYOUT      0x0096      ; BDA: active keyboard layout index
-%define KB_PREFIX      0x0097      ; pending E0 extended-key prefix
-%define KB_ALTGR       0x0098      ; right Alt held
-%define KB_DEAD        0x0099      ; BDA: pending dead-key accent id (0 = none)
+%define KB_LAYOUT      0x00b0      ; BDA: active keyboard layout index
+%define KB_PREFIX      0x00b1      ; pending E0 extended-key prefix
+%define KB_ALTGR       0x00b2      ; right Alt held
+%define KB_DEAD        0x00b3      ; pending dead-key accent id
 %endif
 
 ; INT 09h: keyboard hardware ISR

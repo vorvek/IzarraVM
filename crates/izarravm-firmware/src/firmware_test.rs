@@ -130,7 +130,12 @@ fn izarra_bios_reset_far_jump() {
 
 #[test]
 fn izarra_bios_reserves_machine_injection_windows() {
-    for range in [0xea00..0xea30, 0xf060..0xf079, 0xf080..0xf087, 0xf200..0xf400] {
+    for range in [
+        0xea00..0xea30,
+        0xf060..0xf079,
+        0xf080..0xf087,
+        0xf200..0xf400,
+    ] {
         assert!(
             IZARRA_BIOS[range.clone()].iter().all(|byte| *byte == 0),
             "machine injection window {range:?} is not empty"

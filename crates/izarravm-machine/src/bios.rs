@@ -585,24 +585,35 @@ impl Machine {
         }
     }
 
-    /// INT 15h AH=83h event wait. The machine has no async RTC wait queue yet, so
-    /// it advances the guest clock, sets the completion byte, and returns.
+    /// INT 15h AH=83h event wait, backed by the standard BDA fields and RTC PIE.
+    /// The ROM INT 70h handler owns countdown and completion.
     fn int15_event_wait(&mut self, al: u8) {
         match al {
             0x00 => {
-                let micros = (u64::from(self.cpu.registers.ecx() as u16) << 16)
-                    | u64::from(self.cpu.registers.edx() as u16);
-                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                if self.read_physical_u8(BDA_RTC_WAIT_FLAG as u32) & BDA_RTC_WAIT_PENDING != 0 {
+                    self.set_eax_ah(0x86);
+                    self.set_int_frame_carry(true);
+                    return;
+                }
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
                 let bx = self.cpu.registers.ebx() as u16;
-                let addr = es.wrapping_add(u32::from(bx));
-                self.stall_for_micros(micros);
-                let byte = self.read_physical_u8(addr);
-                let _ = self.write_guest_ram_u8(addr as usize, byte | 0x80);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_COMPLETE, bx);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_COMPLETE + 2, es);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_TIMEOUT, dx);
+                let _ = self.write_guest_ram_u16(BDA_RTC_WAIT_TIMEOUT + 2, cx);
+                let _ = self.write_guest_ram_u8(BDA_RTC_WAIT_FLAG, BDA_RTC_WAIT_PENDING);
+                let register_b = self.rtc.set_periodic_interrupt_enabled(true);
                 self.set_eax_ah(0x00);
+                self.set_eax_al(register_b);
                 self.set_int_frame_carry(false);
             }
             0x01 => {
+                let _ = self.write_guest_ram_u8(BDA_RTC_WAIT_FLAG, 0);
+                let register_b = self.rtc.set_periodic_interrupt_enabled(false);
                 self.set_eax_ah(0x00);
+                self.set_eax_al(register_b);
                 self.set_int_frame_carry(false);
             }
             _ => {
@@ -800,7 +811,7 @@ impl Machine {
         let mut regions = vec![
             (0x0u64, CONVENTIONAL_MEMORY_TOP, 1u32),
             (u64::from(EBDA_LINEAR), 0x400, 2),
-            (0xA_0000, 0x6_0000, 2),     // video + ROM BIOS hole, reserved
+            (0xA_0000, 0x6_0000, 2), // video + ROM BIOS hole, reserved
         ];
         if total > 0x10_0000 {
             regions.push((0x10_0000, total - 0x10_0000, 1)); // extended RAM, available
@@ -913,11 +924,10 @@ impl Machine {
                 self.set_dx(dx);
                 self.set_int_frame_carry(false);
             }
-            // AH=09h read RTC alarm time and status. No alarm source is armed, so
-            // return zero time with DL=00h (alarm not enabled).
             0x09 => {
-                self.set_cx(0x0000);
-                self.set_dx(0x0000);
+                let (hour, minute, second, enabled) = self.rtc.alarm();
+                self.set_cx((u16::from(bin_to_bcd(hour)) << 8) | u16::from(bin_to_bcd(minute)));
+                self.set_dx((u16::from(bin_to_bcd(second)) << 8) | u16::from(enabled));
                 self.set_int_frame_carry(false);
             }
             // AH=03h set RTC time: CH/CL/DH are BCD hours/minutes/seconds (DL = DST flag,
@@ -966,13 +976,34 @@ impl Machine {
                 let _ = self.write_guest_ram_u16(BDA_DAY_COUNT, cx);
                 self.set_int_frame_carry(false);
             }
-            // AH=06h/07h set/cancel alarm: no alarm hardware modeled, accept and ignore.
+            // AH=06h set RTC alarm: CH/CL/DH are BCD hours/minutes/seconds.
+            0x06 => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let hour = bcd_to_bin((cx >> 8) as u8);
+                let minute = bcd_to_bin(cx as u8);
+                let second = bcd_to_bin((dx >> 8) as u8);
+                if hour > 23 || minute > 59 || second > 59 {
+                    self.set_int_frame_carry(true);
+                } else if self.rtc.set_alarm(hour, minute, second) {
+                    self.set_eax_ah(0);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_eax_ah(1);
+                    self.set_int_frame_carry(true);
+                }
+            }
+            0x07 => {
+                self.rtc.cancel_alarm();
+                self.set_eax_ah(0);
+                self.set_int_frame_carry(false);
+            }
             // AH=08h/0Ch set power-on alarm/date, AH=0Dh reset, AH=0Fh initialize RTC: all
             // documented as succeeding, and the host-driven clock makes them no-ops.
             // Limit: power-management and alarm hardware are not modeled; these return
             // success without persisting state. AH=0Eh keeps the default carry since no
             // power-on alarm date is stored.
-            0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
+            0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
             // AH=80h PCjr/Tandy sound multiplexor. A Tandy 1000SL/TL BIOS exposes
             // this as a bare IRET; the base profile keeps the caller state intact.
             0x80 => {}

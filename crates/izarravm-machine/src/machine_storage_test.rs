@@ -649,7 +649,11 @@ fn int13_edd_high_lba_never_aliases_sector_zero() {
 
         machine.handle_int13();
 
-        assert_eq!((machine.cpu.registers.eax() >> 8) as u8, 0x04, "AH={ah:02x}");
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            0x04,
+            "AH={ah:02x}"
+        );
         assert_eq!(machine.read_physical_u8(dap + 2), 0, "AH={ah:02x} count");
         assert_eq!(
             machine.ata.as_ref().unwrap().read_lba(0).unwrap(),

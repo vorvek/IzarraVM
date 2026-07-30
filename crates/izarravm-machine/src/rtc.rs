@@ -333,6 +333,41 @@ impl Rtc {
         self.periodic_phase.ticks_until(1, self.periodic_rate_hz())
     }
 
+    pub(crate) fn set_periodic_interrupt_enabled(&mut self, enabled: bool) -> u8 {
+        if enabled {
+            self.ram[usize::from(REG_B)] |= REG_B_PIE;
+        } else {
+            self.ram[usize::from(REG_B)] &= !REG_B_PIE;
+        }
+        self.ram[usize::from(REG_B)]
+    }
+
+    pub(crate) fn alarm(&self) -> (u8, u8, u8, bool) {
+        (
+            self.ram[usize::from(REG_HOURS_ALARM)],
+            self.ram[usize::from(REG_MINUTES_ALARM)],
+            self.ram[usize::from(REG_SECONDS_ALARM)],
+            self.ram[usize::from(REG_B)] & REG_B_AIE != 0,
+        )
+    }
+
+    pub(crate) fn set_alarm(&mut self, hour: u8, minute: u8, second: u8) -> bool {
+        if self.ram[usize::from(REG_B)] & REG_B_AIE != 0 {
+            return false;
+        }
+        self.ram[usize::from(REG_HOURS_ALARM)] = hour;
+        self.ram[usize::from(REG_MINUTES_ALARM)] = minute;
+        self.ram[usize::from(REG_SECONDS_ALARM)] = second;
+        self.ram[usize::from(REG_B)] =
+            (self.ram[usize::from(REG_B)] & !0x80) | REG_B_AIE | REG_B_DEFAULT;
+        true
+    }
+
+    pub(crate) fn cancel_alarm(&mut self) {
+        self.ram[usize::from(REG_B)] &= !(REG_B_AIE | 0x80);
+        self.ram[usize::from(REG_B)] |= REG_B_DEFAULT;
+    }
+
     /// Whole one-second update events until an enabled update or alarm source
     /// can assert IRQ8. Periodic timing is returned separately in master ticks.
     pub(crate) fn seconds_until_irq(&self) -> Option<u64> {
