@@ -253,6 +253,27 @@ pub(crate) enum NativeX87Insn {
     StoreI64 {
         addr: AddrMode,
     },
+    /// FSTP m80 (0xDB /7): store ST(0) as an 80-bit extended real, then pop.
+    ///
+    /// The register file is f64, so this is not a widening of the stored value -- it is the
+    /// interpreter's `write_extended80` (fpu_exec.rs:917-957) reproduced as bit surgery, and the
+    /// emitted form matches it exactly for every finite input rather than matching an 8087. The
+    /// f64-for-f80 ceiling this inherits is the file-level one documented in `fpu.rs`, not
+    /// anything this shape introduces.
+    ///
+    /// The one input the emitted form refuses is a SUBNORMAL f64. That is the single branch where
+    /// the interpreter stops doing bit surgery and reaches for `log2().floor()` with an explicit
+    /// "normalized by scaling, not exact bits" admission; reproducing an inexact path exactly is
+    /// not worth an emitted loop, so it side exits and the interpreter takes it.
+    ///
+    /// The load direction, FLD m80 (0xDB /5), is DEFERRED. It needs an unsigned-64-to-f64
+    /// conversion (`vcvtsi2sd` is signed, and keeping round-to-nearest through the sign fix needs
+    /// the sticky-bit trick) plus a power-of-two scale with two separate range windows. That is
+    /// real rounding risk for a row worth a nineteenth of this one, and the two are not paired in
+    /// the hot path or the counts would be closer.
+    StoreExtended80 {
+        addr: AddrMode,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +329,7 @@ impl NativeX87Insn {
             | Self::StoreRegister { pop: true, .. }
             | Self::StoreI32 { pop: true, .. }
             | Self::StoreI64 { .. }
+            | Self::StoreExtended80 { .. }
             | Self::StoreF64 { pop: true, .. }
             | Self::UnorderedCompare { pop: true, .. }
             | Self::PopBinary { .. } => 1,
@@ -386,6 +408,8 @@ impl NativeX87Insn {
                 (0xdb, 0) => Some(Self::LoadI32 { addr }),
                 (0xdb, 2) => Some(Self::StoreI32 { addr, pop: false }),
                 (0xdb, 3) => Some(Self::StoreI32 { addr, pop: true }),
+                // FSTP m80. `/5` (FLD m80) is deliberately absent; see `StoreExtended80`.
+                (0xdb, 7) => Some(Self::StoreExtended80 { addr }),
                 (0xda, extension) => Some(Self::IntBinaryMemory {
                     op: NativeX87BinaryOp::from_extension(extension)?,
                     addr,
@@ -695,6 +719,23 @@ impl NativeX87Insn {
                 fp_class: FpOpClass::IntConvert16,
                 memory: read_qword,
                 pops: false,
+                terminates_block: false,
+            },
+            // 0xDB /7, `Ok(clocks(14))` (fpu_exec.rs:236-242). `IntConvert32` because the class
+            // comes from the OPCODE BYTE and 0xdb maps there -- NOT `F64Mem`, which is what
+            // reading this as "a floating-point store" would suggest and which would undercharge
+            // the largest x87 row in the reject census by 34x.
+            //
+            // The access is ten bytes as ONE `MemoryWidth::Tbyte`, which is what keeps the store
+            // all-or-nothing across a page boundary; see that variant's comment.
+            Self::StoreExtended80 { .. } => NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert32,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: Write,
+                    width: 10,
+                }),
+                pops: true,
                 terminates_block: false,
             },
             // 0xDF /7, `Ok(clocks(14))` (fpu_exec.rs:276-281). `IntConvert16` for the same reason

@@ -253,7 +253,9 @@ fn width_mask(width: MemoryWidth) -> u32 {
         MemoryWidth::Dword => 0xffff_ffff,
         // clif lowers no x87 memory form (its `lowerable()` excludes X87 entirely), so a
         // Qword width can never reach this GPR-sized helper.
-        MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("clif lowers no x87 memory form")
+        }
     }
 }
 
@@ -262,7 +264,9 @@ fn width_sign(width: MemoryWidth) -> u32 {
         MemoryWidth::Byte => 0x80,
         MemoryWidth::Word => 0x8000,
         MemoryWidth::Dword => 0x8000_0000,
-        MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("clif lowers no x87 memory form")
+        }
     }
 }
 
@@ -271,7 +275,9 @@ fn width_tag(width: MemoryWidth) -> u32 {
         MemoryWidth::Byte => 0,
         MemoryWidth::Word => 0x100,
         MemoryWidth::Dword => 0x200,
-        MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("clif lowers no x87 memory form")
+        }
     }
 }
 
@@ -357,7 +363,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => self.gpr8(i),
             MemoryWidth::Word => self.gpr16(i),
             MemoryWidth::Dword => self.gpr32(i),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         }
     }
 
@@ -366,7 +374,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => self.set_gpr8(i, v),
             MemoryWidth::Word => self.set_gpr16(i, v),
             MemoryWidth::Dword => self.set_gpr32(i, v),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         }
     }
 
@@ -1178,7 +1188,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => offset_of!(ClifMode13Lanes, byte_reads),
             MemoryWidth::Word => offset_of!(ClifMode13Lanes, word_reads),
             MemoryWidth::Dword => offset_of!(ClifMode13Lanes, dword_reads),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         }
     }
 
@@ -1187,7 +1199,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => offset_of!(ClifMode13Lanes, byte_writes),
             MemoryWidth::Word => offset_of!(ClifMode13Lanes, word_writes),
             MemoryWidth::Dword => offset_of!(ClifMode13Lanes, dword_writes),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         }
     }
 
@@ -1382,7 +1396,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
             MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         };
         self.mode13_read_completion(is_mode13, width);
         self.write_width(dst, width, value);
@@ -1544,7 +1560,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
             MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         };
         self.mode13_read_completion(is_mode13, width);
         self.lower_alu(op, dst, b, width);
@@ -1578,7 +1596,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
             MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         };
         self.mode13_read_completion(is_mode13, width);
         let vb = match width {
@@ -1631,7 +1651,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Dword => {
                 self.b.ins().store(memflags, value, host, 0);
             }
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         }
     }
 
@@ -1682,7 +1704,9 @@ impl<'a> UnitBuilder<'a> {
                 MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
                 MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
                 MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
-                MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+                MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("clif lowers no x87 memory form")
+                }
             };
             self.mode13_read_completion(is_mode13, width);
             let b_masked = self.store_source_value(source, width, slot);
@@ -1701,7 +1725,9 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, read_host, 0),
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, read_host, 0),
             MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, read_host, 0),
-            MemoryWidth::Qword => unreachable!("clif lowers no x87 memory form"),
+            MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                unreachable!("clif lowers no x87 memory form")
+            }
         };
         let write_host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
         self.code_watch_checks(map, linear, page64, width, slot, side);
@@ -2185,7 +2211,7 @@ impl<'a> UnitBuilder<'a> {
         let write_host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let a = match width {
-            MemoryWidth::Byte | MemoryWidth::Qword => {
+            MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
                 unreachable!("group-5 INC/DEC is word or dword")
             }
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, read_host, 0),

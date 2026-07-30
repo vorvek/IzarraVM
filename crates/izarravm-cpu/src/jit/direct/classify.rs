@@ -27,7 +27,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             | NativeX87Insn::StoreF64 { addr, .. }
             | NativeX87Insn::BinaryMemoryF64 { addr, .. }
             | NativeX87Insn::LoadI64 { addr }
-            | NativeX87Insn::StoreI64 { addr } => Some(direct_addr(addr)?),
+            | NativeX87Insn::StoreI64 { addr }
+            | NativeX87Insn::StoreExtended80 { addr } => Some(direct_addr(addr)?),
             _ => None,
         };
         return Some(DirectKind::X87 { insn: native, addr });

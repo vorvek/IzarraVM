@@ -1404,6 +1404,138 @@ fn fistp_m64_out_of_range_exits_before_touching_x87_state() {
     }
 }
 
+/// FLD m64 then FSTP m80 into `at`. The destination displacement is a parameter so the same
+/// program can prove that a merely 2-aligned ten-byte store is admitted, which is the whole point
+/// of `MemoryWidth::Tbyte` carrying the loosest alignment in the enum.
+fn fstp_m80_program(value: f64, at: u32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = vec![
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                integer, before
+        0xdd, 0x05, 0x00, 0x02, 0x00, 0x00, // fld qword [0x200]  ST(0)=value
+        0xdb, 0x3d, // fstp tbyte [at]                            0xDB /7
+    ];
+    code.extend_from_slice(&at.to_le_bytes());
+    code.extend_from_slice(&[
+        0xba, 0x02, 0x00, 0x00, 0x00, // mov edx,2                integer, after
+        0xf4,
+    ]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&value.to_bits().to_le_bytes());
+    memory
+}
+
+/// FSTP m80 against the interpreter, plus an INDEPENDENT check of the 80-bit encoding.
+///
+/// The differential half cannot catch a conversion that is wrong in the same way on both sides,
+/// because both sides are this crate. So each case also pins the architectural mantissa and
+/// sign-exponent word by hand: 1.0 is 0x8000000000000000 at exponent 0x3FFF, the integer bit is
+/// explicit in the 80-bit format where it is implicit in f64, and a zero is all-zero mantissa
+/// with an all-zero exponent carrying only the sign.
+#[test]
+fn fstp_m80_matches_the_interpreter_and_the_extended_encoding() {
+    // (value, mantissa, sign-exponent word).
+    let cases = [
+        (1.0f64, 0x8000_0000_0000_0000u64, 0x3fffu16),
+        (-1.0, 0x8000_0000_0000_0000, 0xbfff),
+        (2.0, 0x8000_0000_0000_0000, 0x4000),
+        (0.5, 0x8000_0000_0000_0000, 0x3ffe),
+        (3.0, 0xc000_0000_0000_0000, 0x4000),
+        // The zero branch, both signs. -0.0 is the one that separates a sign taken from bit 63
+        // from a sign inferred from a comparison.
+        (0.0, 0, 0),
+        (-0.0, 0, 0x8000),
+        // A full 52-bit fraction, so every mantissa bit has to land in the right place.
+        (
+            f64::from_bits(0x3ff9_2492_4924_9249),
+            0xc924_9249_2492_4800,
+            0x3fff,
+        ),
+        // The smallest NORMAL f64: biased == 1, the low edge of the branch that is lowered, one
+        // step above the subnormals that side exit.
+        // 2^-1022: biased 1, so the extended exponent is 1 - 1023 + 16383 = 15361, NOT 1. The
+        // rebias is the whole content of the exponent path and this is where it is visible.
+        (f64::MIN_POSITIVE, 0x8000_0000_0000_0000, 0x3c01),
+        (f64::MAX, 0xffff_ffff_ffff_f800, 0x43fe),
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        // 0x208 is 8-aligned, 0x20c is 4-aligned and nothing more. Both are admitted; a merely
+        // 2-aligned destination is NOT, and `fstp_m80_at_a_two_aligned_address_exits` below is
+        // the positive assertion of that cut.
+        for at in [0x208u32, 0x20c] {
+            for (value, mantissa, sign_exponent) in cases {
+                let (cpu, bus) = assert_program_matches_exact_insns(
+                    mode,
+                    fstp_m80_program(value, at),
+                    0x0f7f,
+                    4, // mov, fld, fstp, mov -- hlt never retires natively
+                );
+                let base = at as usize;
+                assert_eq!(
+                    u64::from_le_bytes(bus.memory[base..base + 8].try_into().unwrap()),
+                    mantissa,
+                    "mode={mode:?} at={at:#x} value={value}: mantissa"
+                );
+                assert_eq!(
+                    u16::from_le_bytes(bus.memory[base + 8..base + 10].try_into().unwrap()),
+                    sign_exponent,
+                    "mode={mode:?} at={at:#x} value={value}: sign and exponent"
+                );
+                assert_eq!(cpu.fpu.top(), 0, "mode={mode:?} at={at:#x} value={value}");
+                assert_eq!(
+                    cpu.perf_counters().jit_direct_side_exits,
+                    0,
+                    "mode={mode:?} at={at:#x} value={value}"
+                );
+            }
+        }
+    }
+}
+
+/// A ten-byte store that is only 2-aligned is refused at the width's alignment guard.
+///
+/// Not a byte-correctness cut: the stored bytes would be right. It is a BUS-TIMING cut. The
+/// interpreter writes the first eight bytes as two dword transactions, and a dword write only
+/// takes the direct-page path when it is 4-aligned; at 2-aligned it falls onto the slow path and
+/// is charged clocks the native store never pays. This fixture is the positive assertion of that
+/// population cut, and the shared comparison behind it is what proves the exit keeps the two
+/// roles in step.
+#[test]
+fn fstp_m80_at_a_two_aligned_address_exits() {
+    let (cpu, _) = assert_program_matches_exact_insns(
+        GswMode::Gsw586,
+        fstp_m80_program(1.0, 0x20a),
+        0x0f7f,
+        2, // mov, fld -- the store exits at the alignment guard on every pass
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_cross_page_or_alignment,
+        cpu.perf_counters().jit_direct_side_exits,
+        "every side exit here is the alignment guard, not some other refusal"
+    );
+    assert!(cpu.perf_counters().jit_direct_side_exits > 0);
+}
+
+/// A subnormal f64 is the one finite input FSTP m80 refuses. The interpreter normalizes it with
+/// `log2().floor()` and says in its own comment that the result is scaled rather than exact;
+/// reproducing an inexact path exactly is not worth an emitted loop, so the native form leaves
+/// and the interpreter does it. Only the two instructions ahead of the store retire natively.
+#[test]
+fn fstp_m80_of_a_subnormal_exits_to_the_interpreter() {
+    let (cpu, bus) = assert_program_matches_exact_insns(
+        GswMode::Gsw586,
+        fstp_m80_program(f64::from_bits(1), 0x208),
+        0x0f7f,
+        2,
+    );
+    assert_ne!(
+        u64::from_le_bytes(bus.memory[0x208..0x210].try_into().unwrap()),
+        0,
+        "the interpreter still stored the subnormal"
+    );
+    assert!(cpu.perf_counters().jit_direct_side_exits > 0);
+}
+
 fn constants_and_register_store_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;

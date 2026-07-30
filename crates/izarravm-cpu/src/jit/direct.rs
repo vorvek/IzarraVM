@@ -2824,6 +2824,26 @@ pub(crate) enum MemoryWidth {
     /// interpreter admits. See `alignment_bytes` below, which is why `bytes()` (8, the size)
     /// and `alignment_bytes()` (4, the guard) diverge for this variant alone.
     Qword,
+    /// An x87 m80 access: ten bytes as ONE guarded region, not two.
+    ///
+    /// The interpreter issues three transactions (`write_extended80`: two dwords through
+    /// `write_qword`, then a word at +8), and the obvious native shape is two independently
+    /// guarded pointers. That shape is wrong for a reason that has nothing to do with
+    /// correctness of the bytes: the first access's dynamic bus counters are incremented before
+    /// the second pointer's page guard can side exit, so a ten-byte store straddling a page
+    /// would charge two dword writes, exit, and let the interpreter charge all three again.
+    /// Guarding the whole span once makes the access all-or-nothing, which is the same property
+    /// every other width here has.
+    ///
+    /// `alignment_bytes()` is 4, inherited from Qword for the same reason and not by copying.
+    /// The first eight bytes ARE Qword's two dword transactions, and the interpreter's dword
+    /// write only takes the direct-page path when it is 4-aligned; at 2-aligned it falls onto
+    /// the slow bus path and is charged clocks the native store does not pay. Admitting a merely
+    /// 2-aligned m80 therefore diverges on bus timing rather than on bytes, which is what the
+    /// m80 differential fixture caught when this was first written as 2. Ten-byte compiler
+    /// temporaries that land 2-aligned stay on the interpreter, the same population cut FST m64
+    /// already lives with.
+    Tbyte,
 }
 
 /// The `MemoryWidth` of one x87 memory access, and the SINGLE source of truth for it.
@@ -2844,6 +2864,7 @@ fn x87_memory_width(access: NativeX87MemoryAccess) -> MemoryWidth {
         2 => MemoryWidth::Word,
         4 => MemoryWidth::Dword,
         8 => MemoryWidth::Qword,
+        10 => MemoryWidth::Tbyte,
         other => unreachable!("x87 memory access width {other} has no MemoryWidth"),
     }
 }
@@ -2870,6 +2891,7 @@ impl MemoryWidth {
             Self::Word => 2,
             Self::Dword => 4,
             Self::Qword => 8,
+            Self::Tbyte => 10,
         }
     }
 
@@ -2885,7 +2907,10 @@ impl MemoryWidth {
         match self {
             Self::Byte => 1,
             Self::Word => 2,
-            Self::Dword | Self::Qword => 4,
+            // Tbyte joins the four-byte group rather than getting its own arm: its first eight
+            // bytes are literally Qword's two dword transactions, so the requirement is the
+            // same one, not a coincidence. See the variant's comment.
+            Self::Dword | Self::Qword | Self::Tbyte => 4,
         }
     }
 
@@ -3108,7 +3133,12 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 }
-            ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Word),
+            ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Word)
+                // An m80 write ends in a word at +8 (`write_extended80`), on top of the two
+                // dwords `dword_stores` counts below. Both terms are needed: registering only the
+                // dword pair against an emitted completion that also bumps the word lane is the
+                // static-versus-dynamic disagreement that underflows `ram_word_writes`.
+                || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Tbyte),
         )
     }
 
@@ -3138,11 +3168,12 @@ impl DirectKind {
                     ..
                 }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Dword),
-        ) + 2 * u8::from(x87_memory_access_is(
-            self,
-            NativeX87MemoryDirection::Write,
-            MemoryWidth::Qword,
-        ))
+        ) + 2 * u8::from(
+            x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Qword)
+                // The m80 write's first eight bytes are the same two dword transactions a Qword
+                // write issues; its trailing word is registered by `word_stores`.
+                || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Tbyte),
+        )
     }
 
     #[cfg(test)]
@@ -3166,7 +3197,9 @@ impl DirectKind {
             Self::LoadExtend { width, .. } => match width {
                 MemoryWidth::Byte | MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                 MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
-                MemoryWidth::Qword => unreachable!("MOVZX/MOVSX source is never 8-byte wide"),
+                MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("MOVZX/MOVSX source is never 8- or 10-byte wide")
+                }
             },
             // One dword read and nothing else, the same as AluMemSource's Dword arm.
             Self::ImulMem { .. } | Self::ImulMemAcc { .. } => COUNTER_MODE13_DWORD_READ,
@@ -3186,8 +3219,8 @@ impl DirectKind {
                 MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
                 MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                 MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
-                MemoryWidth::Qword => {
-                    unreachable!("ALU memory-source operands are never 8-byte wide")
+                MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("ALU memory-source operands are never 8- or 10-byte wide")
                 }
             },
             Self::AluMemDest { op, width, .. } => {
@@ -3195,8 +3228,8 @@ impl DirectKind {
                     MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
                     MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                     MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
-                    MemoryWidth::Qword => {
-                        unreachable!("ALU memory-dest operands are never 8-byte wide")
+                    MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                        unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
                     }
                 };
                 if op == 7 {
@@ -3206,8 +3239,8 @@ impl DirectKind {
                         MemoryWidth::Byte => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
                         MemoryWidth::Word => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
                         MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE,
-                        MemoryWidth::Qword => {
-                            unreachable!("ALU memory-dest operands are never 8-byte wide")
+                        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                            unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
                         }
                     } | COUNTER_MODE13_DIRTY
                 }
@@ -3249,6 +3282,17 @@ impl DirectKind {
                 Some((NativeX87MemoryDirection::Write, MemoryWidth::Qword)) => {
                     COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
                 }
+                // Tbyte is the ONE access that moves both lanes: the completion bumps the dword
+                // pair AND the word (byte-slot) counter, because `write_extended80` ends in a
+                // word at +8. Falling into the `Write, _` wildcard below would declare only the
+                // byte lane and leave the dword lane unregistered.
+                Some((NativeX87MemoryDirection::Write, MemoryWidth::Tbyte)) => {
+                    COUNTER_RAM_DWORD_WRITE
+                        | COUNTER_RAM_BYTE_WRITE
+                        | COUNTER_MODE13_DWORD_WRITE
+                        | COUNTER_MODE13_BYTE_WRITE
+                        | COUNTER_MODE13_DIRTY
+                }
                 Some((NativeX87MemoryDirection::Read, MemoryWidth::Dword)) => {
                     COUNTER_MODE13_DWORD_READ
                 }
@@ -3270,7 +3314,9 @@ impl DirectKind {
                         | COUNTER_MODE13_DIRTY
                 }
                 MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE,
-                MemoryWidth::Qword => unreachable!("INC/DEC memory operands are never 8-byte wide"),
+                MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("INC/DEC memory operands are never 8- or 10-byte wide")
+                }
             },
             Self::Pop { .. } | Self::Leave | Self::Ret { .. } | Self::JmpMem { .. } => {
                 COUNTER_MODE13_DWORD_READ

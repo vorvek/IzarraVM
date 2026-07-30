@@ -54,9 +54,10 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             // encoding is FCMOVcc and unrepresentable here, so it stays rejected.
             | (0xda, 0..=2, 0..=7, 0..=7)
             | (0xda, 3, 5, 1)
-            // 0xDB memory /2 and /3: FIST/FISTP m32, one interpreter arm with a pop flag. `/5`
-            // and `/7` (FLD/FSTP m80) stay rejected here; `/1`, `/4` and `/6` are undefined.
-            | (0xdb, 0..=2, 0 | 2 | 3, 0..=7)
+            // 0xDB memory /2 and /3: FIST/FISTP m32, one interpreter arm with a pop flag, plus
+            // `/7` FSTP m80. `/5` (FLD m80) stays rejected -- deferred, see `StoreExtended80` --
+            // and `/1`, `/4` and `/6` are undefined.
+            | (0xdb, 0..=2, 0 | 2 | 3 | 7, 0..=7)
             // 0xDD memory forms: FLD/FST/FSTP m64 (`LoadF64`/`StoreF64`). `/1` (FISTTP,
             // unimplemented) and `/4`-`/7` (FLDENV/FRSTOR/FNSAVE/FSTSW m16) stay rejected, same
             // as the register-row absence pattern above documents for 0xDC.
@@ -110,8 +111,8 @@ fn classifier_selects_exact_traced_slice() {
     // (FIST m32) adds 3 modes x 1 sub-opcode x 8 rm values = 24, landing at 1077. 0xD9 mod=3 /4
     // (FCHS/FABS/FTST/FXAM) adds 4 rm values, landing at 1081. FSQRT (0xD9 /7 rm=2) adds one,
     // landing at 1082. 0xDF /7 memory (FISTP m64) adds 3 modes x 8 rm values = 24, landing at
-    // 1106.
-    assert_eq!(accepted, 1106);
+    // 1106. 0xDB /7 memory (FSTP m80) adds another 24, landing at 1130.
+    assert_eq!(accepted, 1130);
 }
 
 #[test]
@@ -193,7 +194,13 @@ fn classifier_preserves_operations_indices_and_addresses() {
             pop: true,
         })
     );
-    for extension in [1u8, 4, 5, 6, 7] {
+    // FSTP m80, and the FLD m80 beside it that must NOT come with it: 0xDB /5 is the deferred
+    // load direction, and admitting it by widening the /7 arm is the realistic mistake.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdb, 0, 7, 5)),
+        Some(NativeX87Insn::StoreExtended80 { addr: addr() })
+    );
+    for extension in [1u8, 4, 5, 6] {
         assert!(
             NativeX87Insn::classify(&insn(0xdb, 0, extension, 5)).is_none(),
             "0xdb /{extension} memory must stay unclassifiable"
@@ -867,6 +874,23 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FSTP m80: the largest row in the reject census, and the one whose class is easiest to
+        // get wrong. `IntConvert32` (272 at I586) because the class comes from the opcode byte
+        // and 0xdb maps there; `F64Mem` (8) is what "it stores a float" would suggest and would
+        // undercharge it 34-fold. The access is ten bytes wide and a WRITE.
+        (
+            insn(0xdb, 0, 7, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert32,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 10,
+                }),
+                pops: true,
+                terminates_block: false,
+            },
+        ),
         // FISTP m64: `IntConvert16` like its FILD sibling and UNLIKE `StoreI32`'s
         // `IntConvert32`. The class comes from the opcode byte, so the two integer STORES
         // disagree while the two 0xDF forms agree -- the opposite of what grouping by operation
@@ -1136,6 +1160,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
     shapes.push(NativeX87Insn::LoadF64 { addr: addr() });
     shapes.push(NativeX87Insn::LoadI64 { addr: addr() });
     shapes.push(NativeX87Insn::StoreI64 { addr: addr() });
+    shapes.push(NativeX87Insn::StoreExtended80 { addr: addr() });
     for pop in [false, true] {
         shapes.push(NativeX87Insn::StoreF32 { addr: addr(), pop });
         shapes.push(NativeX87Insn::StoreRegister { index: 3, pop });
@@ -1190,6 +1215,7 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::BinaryMemoryF64 { .. }
         | NativeX87Insn::LoadI64 { .. }
         | NativeX87Insn::StoreI64 { .. }
+        | NativeX87Insn::StoreExtended80 { .. }
         | NativeX87Insn::UnorderedCompare { .. }
         | NativeX87Insn::SignOp { .. }
         | NativeX87Insn::TestZero

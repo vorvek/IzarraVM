@@ -165,6 +165,65 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
                 emit_pop(e, top);
             }
         }
+        // FSTP m80. `write_extended80` (fpu_exec.rs:917-957) as straight-line bit surgery.
+        //
+        // `emit_load_physical` has already excluded NaN and infinity, so the interpreter's two
+        // special-pattern branches are unreachable and what remains is its zero branch and its
+        // normal branch. Those two are exactly `biased == 0 && fraction == 0` and `biased != 0`,
+        // and the gap between them -- `biased == 0 && fraction != 0`, a subnormal -- is the one
+        // input this refuses, because that is where the interpreter stops being exact.
+        //
+        // Register budget is the reason for the shape rather than the order. RDI holds the host
+        // pointer for the whole arm and RAX/RCX/RDX are the only scratch, so there is no register
+        // free to park a `1 << 63` constant in while the sign is also live. The sign is therefore
+        // re-extracted from VALUE0 after the mantissa is finished, which costs three instructions
+        // and no spill.
+        NativeX87Insn::StoreExtended80 { .. } => {
+            let memory = context.memory.expect("FSTP m80 needs a host pointer");
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+
+            e.vmovq_r64_xmm(Reg::RDX, VALUE0);
+            e.mov_r64_r64(Reg::RCX, Reg::RDX);
+            e.shift_r64_imm8(5, Reg::RCX, 52);
+            e.mov_r32_r32(Reg::RAX, Reg::RCX);
+            // Sets ZF, which is the zero-or-subnormal test: `and` against the exponent field.
+            e.and_r32_imm32(Reg::RAX, 0x7ff);
+            let zero_or_subnormal = e.label();
+            let sign_and_emit = e.label();
+            e.jz(zero_or_subnormal);
+
+            // Normal. `shl 11` moves the 52-bit fraction to bits 62..11 and drags the exponent's
+            // low bit into bit 63, which the explicit integer bit then overwrites, so the two
+            // steps together are exactly `(1 << 63) | (fraction << 11)`.
+            e.shift_r64_imm8(4, Reg::RDX, 11);
+            e.mov_r64_imm64(Reg::RCX, 1u64 << 63);
+            e.or_r64_r64(Reg::RDX, Reg::RCX);
+            // biased - 1023 + 16383. Range-safe without a guard: a non-subnormal finite f64 has
+            // `biased` in 1..=2046, so the result is 15361..=17406 and cannot reach the 0x7FFF
+            // the interpreter reserves for NaN and infinity.
+            e.add_r32_imm32(Reg::RAX, 15_360);
+            e.jmp(sign_and_emit);
+
+            e.place(zero_or_subnormal);
+            // `shl 12` discards the sign and exponent, leaving the fraction. Zero for a true
+            // zero, in which case RDX is now the all-zero mantissa the interpreter writes and RAX
+            // is the zero exponent it writes; non-zero for a subnormal, which leaves.
+            e.shift_r64_imm8(4, Reg::RDX, 12);
+            e.jnz(context.side_exit);
+
+            e.place(sign_and_emit);
+            // The sign comes off VALUE0 rather than off a saved copy: the normal path clobbered
+            // RCX with the integer-bit constant, and -0.0 makes this load-bearing -- it is a
+            // zero whose stored sign-exponent word is 0x8000, not 0.
+            e.vmovq_r64_xmm(Reg::RCX, VALUE0);
+            e.shift_r64_imm8(5, Reg::RCX, 63);
+            e.shl_r32_imm8(Reg::RCX, 15);
+            e.or_r32_r32(Reg::RAX, Reg::RCX);
+
+            e.store_r64_disp32(memory, 0, Reg::RDX);
+            e.store_r16_disp32(memory, 8, Reg::RAX);
+            emit_pop(e, top);
+        }
         // FISTP m64. The i32 arm above with a wider conversion, a wider store and -- the part
         // that is not a widening -- a strict low bound; see `emit_fistp_chop_guard`.
         NativeX87Insn::StoreI64 { .. } => {
