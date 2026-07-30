@@ -12,6 +12,8 @@
 use super::*;
 
 const ENTRY: u32 = 0x401;
+/// Well inside the fixture's 0x5000 of memory, so a stack slot's store page resolves.
+const STACK_TOP: u32 = 0x4000;
 
 fn flat_cpu() -> CpuGsw {
     let mut cpu = CpuGsw::default();
@@ -61,10 +63,38 @@ fn differential(body: &[u8], seed_eflags: u32, live_pending: bool, context: &str
         (&mut native, &mut native_bus),
         (&mut interpreter, &mut interpreter_bus),
     ] {
+        // ESP must be live BEFORE compiling, not only before running: a stack-touching slot
+        // resolves its store page at compile time, and the default ESP of 0 makes that page
+        // 0xFFFFFFFC, which cannot resolve and returns the whole block as Retry --
+        // indistinguishable from the opcode still being a barrier.
+        cpu.registers.set_esp(STACK_TOP);
         for &linear in &starts {
             cpu.set_eip(linear);
             cpu.fetch_decoded(bus, linear).unwrap();
         }
+        // The page the stack slot writes into has to be in the fast map before compilation, for
+        // the same reason ESP does: an unresolvable store page returns the block as Retry.
+        let page = (STACK_TOP - 4) & !0xfff;
+        let read = bus
+            .direct_page(page, BusAccessKind::DataRead)
+            .unwrap()
+            .unwrap();
+        assert!(cpu.jit_fast_map.populate_read(
+            page,
+            page,
+            read,
+            jit::fast_map::PagePermissions::UNPAGED
+        ));
+        let write = bus
+            .direct_page(page, BusAccessKind::DataWrite)
+            .unwrap()
+            .unwrap();
+        assert!(cpu.jit_fast_map.populate_write(
+            page,
+            page,
+            write,
+            jit::fast_map::PagePermissions::UNPAGED
+        ));
     }
 
     let key = jit::direct::key_for(&native, ENTRY, true).expect("entry key");
@@ -72,12 +102,13 @@ fn differential(body: &[u8], seed_eflags: u32, live_pending: bool, context: &str
         native.jit_direct.probe(key),
         jit::direct::BlockProbe::Interpret
     ));
-    let compilation = jit::direct::compile(&mut native, ENTRY, true).unwrap_or_else(|| {
-        panic!(
-            "{context}: the \
-             opcode under test did not compile; it is still a barrier"
-        )
-    });
+    let compilation = match jit::direct::compile(&mut native, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("{context}: structurally rejected; the opcode is still a barrier")
+        }
+        jit::direct::CompileOutcome::Retry => panic!("{context}: compile asked for a retry"),
+    };
     let id = native
         .jit_direct
         .install(&compilation)
@@ -92,7 +123,7 @@ fn differential(body: &[u8], seed_eflags: u32, live_pending: bool, context: &str
         cpu.halted = false;
         cpu.interrupt_shadow = false;
         cpu.registers.gpr.fill(0);
-        cpu.registers.set_esp(0xc000);
+        cpu.registers.set_esp(STACK_TOP);
         cpu.registers.eflags = seed_eflags;
         cpu.pending_flags = PendingFlags::default();
         if live_pending {
@@ -157,6 +188,27 @@ fn direction_flag_matches_the_interpreter_from_both_polarities() {
                     &format!("{name} seed={seed:#x} pending={pending}"),
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn pushfd_matches_the_interpreter_including_the_persona_mask() {
+    // The live-pending cases are the point: the interpreter calls `materialize_flags()` before
+    // reading EFLAGS, so a lowering that pushed a stale image, or that pushed the right image
+    // but left the descriptor standing, diverges on the pushed dword or on `pending_flags`.
+    //
+    // Seeds carry bits the persona mask must KEEP (AC 0x40000, ID 0x200000 on 586) and bits it
+    // must DROP (RF 0x10000). A lowering that pushed raw EFLAGS passes the plain seeds and fails
+    // these.
+    for seed in [0x202u32, 0x602, 0x1_0202, 0x24_0202, 0x25_0a02] {
+        for pending in [false, true] {
+            differential(
+                &[0x9c],
+                seed,
+                pending,
+                &format!("PUSHFD seed={seed:#x} pending={pending}"),
+            );
         }
     }
 }

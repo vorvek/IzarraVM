@@ -572,6 +572,14 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.alu_r32_imm32(5, home(4), 4);
             }
             DirectKind::Push { source } => {
+                // PUSHFD's `materialize_flags()`, in the interpreter's order: settle the lazy
+                // descriptor BEFORE the store, so a stack fault leaves the same CPU state the
+                // interpreter would. RBP already holds the settled value; what is missing is
+                // publishing it and tearing the descriptor down.
+                if matches!(source, StoreSource::Flags { .. }) {
+                    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+                    emit_clear_pending(&mut e);
+                }
                 let side = e.label();
                 let reasons =
                     MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(4))));
@@ -3275,6 +3283,22 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
             // `x87_avx2_emit`'s `vmovsd` arms, not through a GPR home.
             MemoryWidth::Qword => unreachable!("GPR-sourced values are never 8-byte wide"),
         },
+        // PUSHFD. RBP is the running materialized-EFLAGS shadow, so it is already the value the
+        // interpreter's `materialize_flags()` would settle to; the descriptor teardown that must
+        // accompany it is emitted by the `Push` arm before this runs, not here, because this
+        // helper is shared with sources that must NOT clear it.
+        StoreSource::Flags { mask } => {
+            e.mov_r32_r32(value, Reg::RBP);
+            e.and_r32_imm32(
+                value,
+                match width {
+                    MemoryWidth::Byte => mask & 0xff,
+                    MemoryWidth::Word => mask & 0xffff,
+                    MemoryWidth::Dword => mask,
+                    MemoryWidth::Qword => unreachable!("PUSHFD is never 8-byte wide"),
+                },
+            );
+        }
         StoreSource::Imm(imm) => e.mov_r32_imm32(
             value,
             match width {

@@ -344,6 +344,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0xc9 => {
                 return Some(DirectKind::Leave);
             }
+            // PUSHFD. Fifth in the runtime-weighted reject audit at 1,194,127 dispatcher exits
+            // (9.5%). The persona mask and the V86 refusal are resolved in `stack_width_kind`,
+            // which has the CPU; `u32::MAX` is the placeholder until then and must never reach
+            // the emitter.
+            0x9c => {
+                return Some(DirectKind::Push {
+                    source: StoreSource::Flags { mask: u32::MAX },
+                });
+            }
             0x68 => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Imm(insn.imm),

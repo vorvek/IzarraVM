@@ -2885,6 +2885,12 @@ impl MemoryWidth {
 
 #[derive(Clone, Copy)]
 pub(crate) enum StoreSource {
+    /// PUSHFD's operand: the materialized EFLAGS, masked to what the persona pushes. The mask is
+    /// resolved in `stack_width_kind` (which has the CPU) rather than in `classify` (which does
+    /// not), and `u32::MAX` is the unresolved placeholder classify emits.
+    Flags {
+        mask: u32,
+    },
     Reg(u8),
     Imm(u32),
     EipDelta(u32),
@@ -2931,6 +2937,14 @@ impl DirectKind {
             // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
             Self::Ret { .. } | Self::Ret16 { .. } => 10,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
+            // PUSHFD is clocks(3) where PUSH r32 is clocks(2), so it cannot ride the `_ => 2`
+            // default the other push forms use.
+            Self::Push {
+                source: StoreSource::Flags { .. },
+            }
+            | Self::Push16 {
+                source: StoreSource::Flags { .. },
+            } => 3,
             Self::Load { raw_clocks, .. }
             | Self::LoadExtend { raw_clocks, .. }
             | Self::Store { raw_clocks, .. } => u32::from(raw_clocks),
@@ -3844,11 +3858,44 @@ fn precise_helper_spec(insn: &DecodedInsn) -> Option<HelperSpec> {
     })
 }
 
+/// What PUSHFD actually stores: the low 16 flags always, plus the persona's writable high bits.
+/// RF and VM are masked to zero by construction because they are outside this set. Mirrors the
+/// interpreter's 0x9C arm exactly.
+fn pushf_mask(persona: CpuPersona) -> u32 {
+    let high = match persona {
+        CpuPersona::I386 => 0,
+        CpuPersona::I486 => crate::FLAG_AC,
+        CpuPersona::I586 => crate::FLAG_AC | crate::FLAG_ID,
+    };
+    0xffff | high
+}
+
 fn stack_width_kind(
     cpu: &CpuGsw,
     kind: DirectKind,
     operand_size: OperandSize,
 ) -> Option<DirectKind> {
+    // PUSHFD checks IOPL in V86 and can raise #GP there (`check_v86_iopl`, execute.rs 0x9C).
+    // The emitted form has no fault path, so refuse it outright when compiling in V86. That is
+    // sound rather than merely cautious: V86 is bit 2 of `jit_mode_key`, so a block compiled
+    // outside V86 can never later run inside it -- the entry mode-key check rejects first.
+    //
+    // The persona mask is resolved HERE for the same reason: `classify` has no `&CpuGsw`.
+    let kind = match kind {
+        DirectKind::Push {
+            source: StoreSource::Flags { .. },
+        } => {
+            if cpu.is_v86_mode() {
+                return None;
+            }
+            DirectKind::Push {
+                source: StoreSource::Flags {
+                    mask: pushf_mask(cpu.persona()),
+                },
+            }
+        }
+        other => other,
+    };
     match (kind, cpu.stack_is_32bit(), operand_size) {
         (kind, _, _) if !kind.uses_stack() => Some(kind),
         (kind, true, OperandSize::Dword) => Some(kind),
