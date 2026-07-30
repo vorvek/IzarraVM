@@ -230,6 +230,27 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             let op = (opcode >> 3) & 7;
             let form = opcode & 7;
             match form {
+                // Byte r/m destination, byte register source. Memory only: the register form
+                // needs a byte-lane `AluReg` that does not exist yet, and the point of this arm
+                // is the memory row.
+                //
+                // Width is a property of the form, not of the prefix — the interpreter's arm
+                // reads `read_operand_u8`/`read_gpr8` and charges the same `clocks(2)` as every
+                // other ALU form without consulting `operand_size` — so `MemoryWidth::Byte` is a
+                // literal here rather than `operand_width`. 0x38 is deliberately NOT in the
+                // Word-size allowlist above, so a 66-prefixed encoding never reaches this arm.
+                0 => {
+                    let m = insn.modrm?;
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None;
+                    };
+                    return Some(DirectKind::AluMemDest {
+                        op,
+                        source: StoreSource::Reg(m.reg),
+                        width: MemoryWidth::Byte,
+                        addr: direct_addr(addr)?,
+                    });
+                }
                 1 => {
                     let m = insn.modrm?;
                     return match insn.operand? {

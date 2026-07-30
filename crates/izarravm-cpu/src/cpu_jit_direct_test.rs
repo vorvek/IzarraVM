@@ -1010,6 +1010,99 @@ fn direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() 
     }
 }
 
+/// ALU form 0 (byte r/m destination, byte register source) with a memory destination. Covers a
+/// non-writing op (CMP, op 7, which takes the read-only path in `emit_alu_mem_dest`) and three
+/// writing ops, and drives the byte source through the high lanes AH/BH as well as BL/CL, because
+/// `StoreSource::Reg` selects the lane by ModRM reg exactly as the interpreter's `read_gpr8` does
+/// and a lowering that read the low byte of the wrong register would still look plausible.
+///
+/// Four slots exactly: the filler and the three ALU forms, with the entry NOP interpreted. Three
+/// memory-ALU slots is what fits - each emits its own side-exit stubs, and a fourth pushed the
+/// block past the host page and made `compile_with_page_len` bisect it back down. Every op in the
+/// program is therefore mid-block and actually executed by the emitter.
+#[test]
+fn direct_byte_alu_memory_destination_matches_the_interpreter() {
+    let mut memory = vec![0; 0x1000];
+    memory[0x100] = 0x90;
+    let code: &[u8] = &[
+        0x89, 0xf6, // mov esi, esi (filler; keeps the first ALU slot off the block entry)
+        0x38, 0x25, 0x00, 0x03, 0x00, 0x00, // cmp byte [0x300], ah
+        0x28, 0x1d, 0x01, 0x03, 0x00, 0x00, // sub byte [0x301], bl
+        0x00, 0x3d, 0x02, 0x03, 0x00, 0x00, // add byte [0x302], bh
+        0xf4, // hlt
+    ];
+    memory[0x101..0x101 + code.len()].copy_from_slice(code);
+    memory[0x300..0x303].copy_from_slice(&[0x10, 0x05, 0x7f]);
+    // AH = 0x10 makes the CMP set ZF; BL = 0x06 makes the SUB borrow; BH = 0x01 makes the ADD
+    // carry out of 0x7f into the sign bit.
+    let initial = [0x0000_1000u32, 0, 0, 0x0100_0006, 0, 0, 0, 0];
+
+    let arm = |cpu: &mut CpuGsw| {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr = initial;
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        make_data_segments_flat(cpu);
+    };
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    arm(&mut interp);
+    drive(&mut interp, &mut interp_bus);
+    arm(&mut native);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..4 {
+        arm(&mut native);
+        native_bus.memory.copy_from_slice(&memory);
+        drive(&mut native, &mut native_bus);
+    }
+    assert!(
+        native.jit_direct.len() > 0,
+        "byte ALU memory-dest block did not compile: perf={:?}",
+        native.perf_counters()
+    );
+
+    for (cpu, bus) in [
+        (&mut interp, &mut interp_bus),
+        (&mut native, &mut native_bus),
+    ] {
+        arm(cpu);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+        bus.memory.copy_from_slice(&memory);
+        bus.trace = BusTrace::default();
+    }
+    let before = native.perf_counters().jit_direct_insns;
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes, "timing");
+    assert_eq!(native, interp, "CPU state");
+    assert_eq!(native.eflags(), interp.eflags(), "EFLAGS");
+    assert_eq!(native_bus.memory, interp_bus.memory, "memory");
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks(),
+        "bus timing"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_insns - before,
+        4,
+        "form 0 did not retire natively: {:?}",
+        native.perf_counters()
+    );
+}
+
 #[test]
 fn cold_straight_line_code_is_seen_but_not_compiled() {
     let memory = shift_program();
