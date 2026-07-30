@@ -417,10 +417,20 @@ impl DirectBarrierCensus {
 
     fn note_interpreted(&mut self, insn: &DecodedInsn, linear: u32, final_linear: u32) {
         self.pending_right = None;
+        // EVERY row, not only the ex-helper families. `runtime_hits` counts how many times the
+        // guest actually EXECUTES this shape interpreted, which makes it the census's only
+        // per-execution, position-free column - and therefore the only one that can rank a shape
+        // by what it costs rather than by where a block happened to stop.
+        //
+        // It used to carry `&& row.helper_family.is_some()`, an artifact of the commit that
+        // instrumented the three helper-eligible opcodes, and that one conjunct left 34 of 36
+        // rows reading zero. It is what let `unbound_exits` be the ranking column by default, and
+        // `unbound_exits` ranked `0x8C` (a segment reload run ~1.2M times) SEVEN TIMES ABOVE
+        // `0x38 /0` (an inner-loop CMP), when the second was worth three times the whole rest of
+        // the night put together. Costs nothing when the census is off: the call site in `run.rs`
+        // is gated on `barrier_census_active()` before the arguments are even built.
         let key = BarrierKey::from_insn(insn);
-        if let Some(row) = self.rows.get_mut(&key)
-            && row.helper_family.is_some()
-        {
+        if let Some(row) = self.rows.get_mut(&key) {
             row.runtime_hits = row.runtime_hits.saturating_add(1);
         }
 
