@@ -1240,9 +1240,9 @@ impl Machine {
         self.rtc.nvram()
     }
 
-    /// Load a 64-byte CMOS image from a persisted cmos.bin, restoring NVRAM and
-    /// the saved time. Returns false if the image had a bad NVRAM checksum (the
-    /// bytes are kept and the checksum is repaired), so the host can log it.
+    /// Load a 64-byte CMOS image from a persisted cmos.bin. Returns false if its
+    /// NVRAM checksum is bad; constructor-seeded defaults are retained and
+    /// checksummed so the host can persist a safe replacement.
     pub fn load_cmos(&mut self, bytes: &[u8; 64]) -> bool {
         let valid = self.rtc.load_nvram(bytes);
         if let Some(mode) = GswMode::from_register_code(self.rtc.nvram_byte(0x12)) {

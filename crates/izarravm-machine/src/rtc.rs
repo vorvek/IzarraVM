@@ -513,53 +513,57 @@ impl Rtc {
         }
     }
 
-    /// Replace the whole CMOS image from a persisted file. The clock fields are
-    /// re-derived from the loaded registers so a reload restores both NVRAM and
-    /// the saved time.
+    /// Load a persisted CMOS image after validating its checksummed settings.
+    /// Valid images restore their NVRAM and clock fields. Invalid images leave
+    /// the constructor-seeded defaults in place.
     ///
     /// A bad NVRAM checksum is recorded before it is repaired: diagnostic byte
     /// 0x0E gets bit 6 (incorrect-checksum) set so a guest can detect a tampered
     /// or corrupt image. Bit 7 (RTC power lost) follows Register D's VRT bit: a
     /// cleared VRT in the file means the battery died. The stored checksum is
-    /// then refreshed in place (the data bytes are kept) and `false` is
-    /// returned, so the caller can log that the file was inconsistent.
+    /// then refreshed over the retained defaults and `false` is returned, so
+    /// the caller can persist a repaired image without trusting corrupt setup.
     pub fn load_nvram(&mut self, bytes: &[u8; 64]) -> bool {
-        self.ram = *bytes;
+        let stored =
+            (u16::from(bytes[NVRAM_CHECKSUM_HIGH]) << 8) | u16::from(bytes[NVRAM_CHECKSUM_LOW]);
+        let valid = stored == Self::checksum_for(bytes);
+        let power_lost = bytes[usize::from(REG_D)] & 0x80 == 0;
         self.periodic_phase = RatePhase::default();
+
+        if !valid {
+            self.ram[REG_DIAGNOSTIC] =
+                DIAG_BAD_CHECKSUM | if power_lost { DIAG_POWER_LOST } else { 0 };
+            self.ram[usize::from(REG_B)] |= 0x06;
+            self.ram[usize::from(REG_D)] |= 0x80;
+            self.refresh_checksum();
+            self.nvram_dirty = true;
+            return false;
+        }
+
+        self.ram = *bytes;
         // A century byte of 0 means an older image without one; fall back to the
         // default so the year does not resolve to year 0.
         if self.ram[REG_CENTURY] == 0 {
             self.ram[REG_CENTURY] = CENTURY_DEFAULT;
             self.ram[REG_CENTURY_ALT] = CENTURY_DEFAULT;
         }
-        // Record power-loss from the loaded Register D before we force VRT on.
-        let power_lost = self.ram[usize::from(REG_D)] & 0x80 == 0;
         // Keep the status registers sane regardless of the file: force binary
         // 24-hour mode and VRT so the BIOS reads a known format.
         self.ram[usize::from(REG_B)] |= 0x06;
         self.ram[usize::from(REG_D)] |= 0x80;
         self.read_time_registers();
-        let valid = self.checksum_valid();
-        // Stamp the diagnostic byte before repairing so a guest can still see
-        // that the image was inconsistent.
-        let mut diag = 0u8;
-        if !valid {
-            diag |= DIAG_BAD_CHECKSUM;
-        }
-        if power_lost {
-            diag |= DIAG_POWER_LOST;
-        }
-        self.ram[REG_DIAGNOSTIC] = diag;
-        if !valid {
-            self.refresh_checksum();
-        }
-        valid
+        self.ram[REG_DIAGNOSTIC] = if power_lost { DIAG_POWER_LOST } else { 0 };
+        true
     }
 
     /// 16-bit checksum of NVRAM bytes 0x10..=0x2D, as stored at 0x2E/0x2F.
     pub fn checksum(&self) -> u16 {
+        Self::checksum_for(&self.ram)
+    }
+
+    fn checksum_for(ram: &[u8; 64]) -> u16 {
         let mut sum: u16 = 0;
-        for byte in &self.ram[NVRAM_CHECKSUM_LO..=NVRAM_CHECKSUM_HI] {
+        for byte in &ram[NVRAM_CHECKSUM_LO..=NVRAM_CHECKSUM_HI] {
             sum = sum.wrapping_add(u16::from(*byte));
         }
         sum
@@ -573,6 +577,7 @@ impl Rtc {
     }
 
     /// Whether the stored checksum matches the current NVRAM contents.
+    #[cfg(test)]
     pub fn checksum_valid(&self) -> bool {
         let stored = (u16::from(self.ram[NVRAM_CHECKSUM_HIGH]) << 8)
             | u16::from(self.ram[NVRAM_CHECKSUM_LOW]);
