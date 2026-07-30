@@ -1405,8 +1405,9 @@ fn fistp_m64_out_of_range_exits_before_touching_x87_state() {
 }
 
 /// FLD m64 then FSTP m80 into `at`. The destination displacement is a parameter so the same
-/// program can prove that a merely 2-aligned ten-byte store is admitted, which is the whole point
-/// of `MemoryWidth::Tbyte` carrying the loosest alignment in the enum.
+/// program can be pointed at an admitted alignment and at a refused one: 0x208 and 0x20c
+/// exercise the two admitted cases, and 2-aligned is REFUSED -- see
+/// `fstp_m80_at_a_two_aligned_address_exits` for why that cut exists.
 fn fstp_m80_program(value: f64, at: u32) -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;

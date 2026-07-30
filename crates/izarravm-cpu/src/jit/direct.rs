@@ -2895,14 +2895,19 @@ impl MemoryWidth {
         }
     }
 
-    /// The guard's alignment requirement, distinct from `bytes()` for Qword ONLY. Every other
-    /// width self-aligns (`alignment_bytes() == bytes()`), so the two names are interchangeable
-    /// there and a caller that reaches for the wrong one still emits the byte-identical guard.
-    /// For Qword they diverge on purpose: the interpreter reads an m64 as two independently
-    /// 4-aligned dword transactions (`fpu_exec.rs:720-740`), not one 8-aligned qword
-    /// transaction, so requiring 8-byte alignment natively would refuse a large population of
-    /// legitimately-4-aligned doubles that DOS compilers emit. `emit_wide_page_guard` is the
-    /// site that must read this method rather than `bytes()` for the alignment mask.
+    /// The guard's alignment requirement, distinct from `bytes()` for Qword AND Tbyte. Byte,
+    /// Word and Dword self-align (`alignment_bytes() == bytes()`), so for those three the two
+    /// names are interchangeable and a caller that reaches for the wrong one still emits the
+    /// byte-identical guard.
+    ///
+    /// For the two wide widths they diverge on purpose: the interpreter reads an m64 as two
+    /// independently 4-aligned dword transactions (`fpu_exec.rs:720-740`), not one 8-aligned
+    /// qword transaction, so requiring 8-byte alignment natively would refuse a large population
+    /// of legitimately-4-aligned doubles that DOS compilers emit. Tbyte's first eight bytes ARE
+    /// those two transactions, so it inherits the same 4, and the divergence is wider still
+    /// (4 against 10). `emit_wide_page_guard` is the site that must read this method rather than
+    /// `bytes()` for the alignment mask -- and, because both wide widths have
+    /// `alignment_bytes() < bytes()`, the site whose page-crossing compare is live for both.
     pub(crate) const fn alignment_bytes(self) -> u32 {
         match self {
             Self::Byte => 1,

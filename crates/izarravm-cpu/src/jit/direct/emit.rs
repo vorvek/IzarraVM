@@ -3112,12 +3112,15 @@ fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, 0x0fff);
     // The crossing bound uses `bytes()` (the transaction's actual size), not
-    // `alignment_bytes()` (the guard's alignment requirement). For every width except Qword the
-    // two are equal, so this check is dead code: an aligned access of size N can never sit
-    // within N bytes of the page end. Qword is the one width where alignment_bytes() (4) is
-    // smaller than bytes() (8), so a 4-aligned access can start as late as offset 0xFFC and its
-    // second dword half crosses into the next page; this compare is what catches that, and it is
-    // LIVE for Qword only.
+    // `alignment_bytes()` (the guard's alignment requirement). For Byte, Word and Dword the two
+    // are equal, so this check is dead code there: an aligned access of size N can never sit
+    // within N bytes of the page end.
+    //
+    // It is LIVE for the two wide widths, both of which have alignment_bytes() = 4 below their
+    // size. A 4-aligned Qword can start as late as offset 0xFFC and its second dword half crosses
+    // into the next page. A 4-aligned Tbyte is worse: 10 bytes against a 4-byte alignment refuses
+    // everything from 0xFF8 up, which is what keeps `write_extended80`'s trailing word at +8
+    // inside the page the pointer was resolved against.
     e.cmp_r32_imm32(Reg::RDX, 0x1000 - width.bytes());
     e.jcc(7, side);
 }
