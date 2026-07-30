@@ -951,7 +951,8 @@ impl Eq for PerfCounters {}
 /// of `PerfCounters` and at the very tail of `CpuGsw` so no pre-existing
 /// field offset moves (growing `PerfCounters` shifted the hot `pending_flags`
 /// field and cost the interpreter measurable wall time; the offset pin in
-/// cpu_test.rs guards 4528). Serialized into the same perf JSON keys by
+/// cpu_test.rs guards it -- see `pending_flags_offset` for the current value).
+/// Serialized into the same perf JSON keys by
 /// `perf_counters_json`. Unconditional (not cfg jit) like the other poll
 /// counters in `PerfCounters`, so non-jit consumers can name the type.
 #[derive(Debug, Clone, Copy, Default)]
@@ -970,10 +971,13 @@ impl Eq for PollSkipMemoryCounters {}
 
 /// Lever 1 (interpreter FastMap serve path) hit/miss counters. Kept OUT of `PerfCounters` and at
 /// the very tail of `CpuGsw`, following the `PollSkipMemoryCounters` pattern
-/// exactly: these two fields were first added directly to `PerfCounters` and moved the pinned
-/// `pending_flags` offset from 4512 to 4528 (the interpreter's hot-field layout pin in
-/// `cpu_test.rs`/`canonical_state_test.rs`), an avoidable layout confound the campaign's adversarial
-/// review caught. At the tail they change only the struct's total size. Serialized into the same
+/// exactly: these two fields were first added directly to `PerfCounters` and, AT THE TIME, moved
+/// the pinned `pending_flags` offset from 4512 to 4528 (the interpreter's hot-field layout pin in
+/// `cpu_test.rs`/`canonical_state_test.rs`) -- an avoidable layout confound the campaign's
+/// adversarial review caught, which is why they moved to the tail instead of staying in
+/// `PerfCounters`. HISTORY: the pin has since moved again (unrelated later changes to
+/// `PerfCounters`/`CpuGsw`); see the pin tests for the current value, not this comment. At the
+/// tail they change only the struct's total size. Serialized into the same
 /// `interp_fast_map_hits`/`interp_fast_map_misses` perf JSON keys by `perf_counters_json`.
 /// Unconditional (not cfg-gated) like the other tail counters, so non-jit consumers can name the
 /// type; the fields simply stay zero on a build/persona that never probes the FastMap.
@@ -1315,8 +1319,9 @@ pub struct CpuGsw {
     /// existed), so persistent residue
     /// would trip the derived `CpuGsw` equality on nothing architectural (found by the
     /// C1e storm battery). Loose fields, not a struct: the lone `u8` packs into an
-    /// existing padding hole, keeping `pending_flags` on its pinned offset 4528 (the
-    /// cpu_test.rs offset pin; a `{u32, u8}` struct here shifted it by 8).
+    /// existing padding hole, keeping `pending_flags` on its pinned offset (see
+    /// `pending_flags_offset` in cpu_test.rs for the current value; a `{u32, u8}` struct here
+    /// shifted it by 8).
     decode_tail_start: u32,
     decode_disp_len: u8,
     data_read_pages: DirectPageCache,
@@ -2163,15 +2168,17 @@ struct RepExecution {
 /// blocks. That population only reaches zero at conflict-free sizes, so the residual 1.78M here is
 /// what a hashed index could still claim at a fraction of the memory.
 ///
-/// At 56 bytes per line (measured via `size_of::<DecodeLine>()`, not derived: DecodeLine is
+/// At 56 bytes per line NOW (measured via `size_of::<DecodeLine>()`, not derived: DecodeLine is
 /// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32,
 /// jit_direct_hotness: u8` -- DecodedInsn itself measures 40 bytes, having grown 36 -> 40 when C1e
 /// added the recorded {disp_len, imm_len} pair) 32768 lines is ~1.75 MB, against ~0.22 MB at 4096.
-/// The dynarec-refactor Task 2 region-JIT deletion dropped two fields from this struct
-/// (`jit_region: Option<NonZeroU32>` and `jit_hotness: u16`, 6 bytes together) but the measured
-/// size stayed at 56: the removed bytes came out of what was already alignment padding, not out of
-/// the line count's real footprint, so this figure is unchanged. That no longer fits a small L2,
-/// which is the real cost of this change and the reason not to go further without evidence.
+/// HISTORY: before the dynarec-refactor Task 2 region-JIT deletion, DecodeLine carried two more
+/// fields (`jit_region: Option<NonZeroU32>` and `jit_hotness: u16`, 6 bytes together) and measured
+/// 60 bytes with zero slack. Deleting those two fields shrank the line 60 -> 56, a REAL footprint
+/// win, not an accounting wash: the 32768-line cache dropped from 1.875 MiB to 1.75 MB. The line
+/// has NO slack of its own either at the current 56 bytes -- adding any field back grows it to 60
+/// bytes and the whole cache by 128 KB at this line count. That no longer fits a small L2, which
+/// is the real cost of this change and the reason not to go further without evidence.
 ///
 /// NOT purely microarchitectural, despite what this comment said before. Guest STATE is untouched
 /// (the decode cache is transparent to CpuGsw equality), but a decode hit charges one collapsed

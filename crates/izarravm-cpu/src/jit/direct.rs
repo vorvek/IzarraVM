@@ -107,7 +107,8 @@ pub(crate) struct BlockCacheStats {
 /// `BlockCacheStats` is DRAINED by `take_stats` on every dispatcher exit and folded into
 /// `PerfCounters`; a field added there is zeroed before anything can read it back off the cache.
 /// These three groups have no `PerfCounters` home to be folded into -- growing that struct shifts
-/// the `pending_flags` offset pinned at 4528 -- so they live here, accumulate for the whole run,
+/// the pinned `pending_flags` offset (see the pin tests in cpu_test.rs/canonical_state_test.rs
+/// for the current value) -- so they live here, accumulate for the whole run,
 /// and are read directly by `stall_snapshot`. Not cleared by `reset_storage` either: a diagnostic
 /// that reset itself mid-run would under-report exactly the pathological runs it exists for.
 #[derive(Clone, Copy, Debug, Default)]
@@ -307,10 +308,11 @@ pub(crate) struct DirectBarrierCensus {
     pending_right: Option<CensusSiteKey>,
     /// Why static successor cells were unbound at the exits that hit them, indexed by
     /// `UnboundTarget`. Lives HERE and not in `PerfCounters` on purpose: `PerfCounters` is
-    /// embedded in `CpuGsw` ahead of `pending_flags`, whose offset is pinned at 4528 by
-    /// `arch_payload_keeps_pending_flags_offset_pinned` and `region_ctx_fn_pointer_offsets`
-    /// because emitted code bakes it. Growing `PerfCounters` for a diagnostic shifts that pin;
-    /// the census is an `Option<Box<_>>` on `JitState` and costs the layout nothing.
+    /// embedded in `CpuGsw` ahead of `pending_flags`, whose offset is pinned by
+    /// `arch_payload_keeps_pending_flags_offset_pinned` (canonical_state_test.rs) and
+    /// `pending_flags_offset` (cpu_test.rs) because emitted code bakes it. Growing `PerfCounters`
+    /// for a diagnostic shifts that pin; the census is an `Option<Box<_>>` on `JitState` and costs
+    /// the layout nothing.
     unbound: [u64; UnboundTarget::COUNT],
     /// The same classification for DYNAMIC successor misses (computed RET/JMP/CALL targets),
     /// kept in its own lane because the two have different fixes: a static unbound wants its
