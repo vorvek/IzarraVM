@@ -2175,10 +2175,12 @@ struct RepExecution {
 /// HISTORY: before the dynarec-refactor Task 2 region-JIT deletion, DecodeLine carried two more
 /// fields (`jit_region: Option<NonZeroU32>` and `jit_hotness: u16`, 6 bytes together) and measured
 /// 60 bytes with zero slack. Deleting those two fields shrank the line 60 -> 56, a REAL footprint
-/// win, not an accounting wash: the 32768-line cache dropped from 1.875 MiB to 1.75 MB. The line
-/// has NO slack of its own either at the current 56 bytes -- adding any field back grows it to 60
-/// bytes and the whole cache by 128 KB at this line count. That no longer fits a small L2, which
-/// is the real cost of this change and the reason not to go further without evidence.
+/// win, not an accounting wash: the 32768-line cache dropped from 1.875 MiB to 1.75 MB. At 56
+/// bytes the line holds 54 bytes of fields, so there are 2 bytes of trailing padding: a u8 or u16
+/// added back lands there and the line stays at 56, while any 4-byte field grows it to 60 and the
+/// cache by 128 KB at this line count. Measure `size_of::<DecodeLine>()` rather than trusting this
+/// sentence -- repr(Rust) ordering is unspecified. 1.75 MB no longer fits a small L2, which is the
+/// real cost of the 32768-line size and the reason not to go further without evidence.
 ///
 /// NOT purely microarchitectural, despite what this comment said before. Guest STATE is untouched
 /// (the decode cache is transparent to CpuGsw equality), but a decode hit charges one collapsed
