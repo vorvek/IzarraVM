@@ -2503,6 +2503,19 @@ pub(crate) enum DirectKind {
         condition: u8,
         dst: u8,
     },
+    /// CBW/CWDE (0x98): widen the accumulator's sign into the next width. `width` is the
+    /// interpreter's `operand_size` (the DESTINATION width): Word writes AX from AL (CBW),
+    /// Dword writes EAX from AX (CWDE). No flags touched. Accumulator-implicit, so the kind
+    /// carries no register index.
+    Cwde {
+        width: MemoryWidth,
+    },
+    /// CWD/CDQ (0x99): fill the upper half with the accumulator's sign. `width` is the
+    /// accumulator's own width: Word fills DX from AX (CWD), Dword fills EDX from EAX (CDQ). No
+    /// flags touched.
+    Cdq {
+        width: MemoryWidth,
+    },
     MovImmByte {
         dst: u8,
         imm: u8,
@@ -3070,6 +3083,10 @@ impl DirectKind {
             // The interpreter's 0x0f90..=0x0f9f arm returns clocks(4) for both operand forms
             // against a default of 2, so this cannot ride the `_ => 2` arm below.
             Self::SetCc { .. } => 4,
+            // 0x98 (CBW/CWDE) returns clocks(3) for both operand forms (execute.rs); 0x99
+            // (CWD/CDQ) returns clocks(2) for both, which is what the `_ => 2` default already
+            // gives, so Cdq deliberately has no arm here.
+            Self::Cwde { .. } => 3,
             Self::X87 { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand

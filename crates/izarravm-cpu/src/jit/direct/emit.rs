@@ -210,6 +210,44 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.setcc(condition, Reg::RDX);
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
             }
+            // CBW / CWDE. Dword widens AX to EAX in one step: `movsx_r32_r16` reads the source's
+            // low 16 bits and defines all 32, so `home(0)` as both source and destination is
+            // safe -- the instruction reads before it writes, same as `emit_mov_extend_reg`'s
+            // `dst == src` case. Word (CBW) widens AL to AX and must leave EAX's upper 16 bits
+            // alone, so it goes through RDX and `emit_write_gpr16`: `movsx_r32_r8` already sign
+            // extends AL across all 32 bits, and the low 16 of that is exactly AL sign-extended
+            // to 16, so no further shift is needed.
+            DirectKind::Cwde { width } => match width {
+                MemoryWidth::Dword => e.movsx_r32_r16(home(0), home(0)),
+                MemoryWidth::Word => {
+                    e.movsx_r32_r8(Reg::RDX, home(0));
+                    emit_write_gpr16(&mut e, 0, Reg::RDX);
+                }
+                MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("classify only ever produces Word or Dword for 0x98")
+                }
+            },
+            // CWD / CDQ. Both widths fill the "upper half" register with 32 copies of the
+            // accumulator's sign bit via `sar reg, 31`; the mutation record for this slice is
+            // this SAR flipped to a SHR, which fails the fixture at eax = 0x8000_0000. Dword
+            // fills EDX from EAX directly. Word must leave EDX's upper 16 bits alone, so the
+            // sign is materialized in RDX (via `movsx_r32_r16`, which extends AX's sign across
+            // all 32 bits the same way the Dword arm's copy-then-SAR does) and only the low 16
+            // are written through `emit_write_gpr16`.
+            DirectKind::Cdq { width } => match width {
+                MemoryWidth::Dword => {
+                    e.mov_r32_r32(home(2), home(0));
+                    e.shift_r32_imm8(7, home(2), 31);
+                }
+                MemoryWidth::Word => {
+                    e.movsx_r32_r16(Reg::RDX, home(0));
+                    e.shift_r32_imm8(7, Reg::RDX, 31);
+                    emit_write_gpr16(&mut e, 2, Reg::RDX);
+                }
+                MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("classify only ever produces Word or Dword for 0x99")
+                }
+            },
             DirectKind::MovImmByte { dst, imm } => {
                 e.mov_r32_imm32(Reg::RDX, u32::from(imm));
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
