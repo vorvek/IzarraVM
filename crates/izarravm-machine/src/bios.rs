@@ -793,13 +793,13 @@ impl Machine {
         self.set_int_frame_carry(false);
     }
 
-    /// The system memory map E820h enumerates: 640 KB of conventional RAM, the reserved
+    /// The system memory map E820h enumerates conventional RAM below the EBDA, the reserved
     /// video/ROM hole below 1 MB, and a single available region for everything above 1 MB.
     fn e820_regions(&self) -> Vec<(u64, u64, u32)> {
         let total = u64::from(self.profile.memory_mib) * 0x10_0000;
         let mut regions = vec![
-            (0x0u64, 0x9_FC00u64, 1u32), // 639 KB conventional, available (below the EBDA)
-            (0x9_FC00, 0x400, 2),        // 1 KB extended BIOS data area, reserved
+            (0x0u64, CONVENTIONAL_MEMORY_TOP, 1u32),
+            (u64::from(EBDA_LINEAR), 0x400, 2),
             (0xA_0000, 0x6_0000, 2),     // video + ROM BIOS hole, reserved
         ];
         if total > 0x10_0000 {

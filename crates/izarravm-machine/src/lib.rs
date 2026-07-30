@@ -96,6 +96,7 @@ mod fat32;
 mod fat32_volume;
 mod fat_name;
 mod fdc;
+mod firmware_contract;
 mod floppy;
 mod ide;
 mod iso9660;
@@ -117,6 +118,8 @@ mod speaker;
 mod storage;
 mod uart;
 mod unittester;
+
+use firmware_contract::*;
 
 pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
 
@@ -2340,9 +2343,6 @@ const BIOS_BASE_MEMORY_KIB: u16 = 640;
 /// later read. It sits in the inter-application scratch area at 0040:00F0, which no
 /// other field here uses.
 const BDA_DAY_COUNT: usize = 0x4f0;
-/// Low-memory byte shared with the Izarra ROM's BOOT_CHOICE definition.
-const BIOS_BOOT_CHOICE_ADDR: u32 = 0x0537;
-
 /// Segment of the ROM-resident IRET the BIOS keeps at ROM offset 0xF000, i.e.
 /// FF00:0000. The host intercepts the BIOS service interrupts by vector number,
 /// so their IVT targets only need a valid IRET to return on. Pointing them at
@@ -2483,9 +2483,6 @@ const DOS_CALL5_ENTRY_STUB: [u8; 49] = [
 /// Placed at 0x200 to stay clear of the machine-patched ROM residents below
 /// it (the shared legacy IRET at 0x0000, the CALL-5 adapter, the timer and
 /// master-IRQ ISR stubs at 0x0060/0x0080).
-const BIOS_INT_STUB_TABLE_ROM_OFFSET: usize = 0xF200;
-const BIOS_INT_STUB_TABLE_LINEAR: u32 = 0xFF200;
-const BIOS_INT_STUB_TABLE_LEN: u32 = 512;
 /// Linear address of the legacy shared chain target FF00:0000. Period
 /// booters hardcode it (IVT[0x13] -> FF00:0000, or a hook chaining there), so
 /// the machine writes the same `nop; iret` shape there that the per-vector
@@ -2502,12 +2499,6 @@ const BIOS_LEGACY_IRET_LINEAR: u32 = 0xFF000;
 /// One compare covers FF000 (legacy) through the stub table's end (FF3FF).
 const BIOS_STUB_WINDOW_LEN: u32 = 0x400;
 const BIOS_LEGACY_IRET_ROM_OFFSET: usize = 0xF000;
-
-const BIOS32_HEADER_ROM_OFFSET: usize = 0xEA00;
-const BIOS32_DIRECTORY_ROM_OFFSET: usize = 0xEA10;
-const BIOS32_PCI_ROM_OFFSET: usize = 0xEA20;
-const BIOS32_DIRECTORY_LINEAR: u32 = 0xFEA10;
-const BIOS32_PCI_LINEAR: u32 = 0xFEA20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bios32Call {
@@ -2561,9 +2552,7 @@ fn write_bios_int_stub_table(rom: &mut [u8]) {
 }
 
 const BIOS_TIMER_ISR_ROM_OFF: u16 = 0x0060;
-const BIOS_TIMER_ISR_ROM_OFFSET: usize = 0xf060;
 const BIOS_MASTER_IRQ_ISR_ROM_OFF: u16 = 0x0080;
-const BIOS_MASTER_IRQ_ISR_ROM_OFFSET: usize = 0xf080;
 
 // INT 08h: bump the BIOS tick dword, chain INT 1Ch, EOI the master PIC, IRET.
 const BIOS_TIMER_ISR_STUB: [u8; 25] = [
@@ -2593,8 +2582,6 @@ const BIOS_MASTER_IRQ_ISR_STUB: [u8; 7] = [
 /// top of conventional memory. Segment 0x9FC0 is physical 0x9FC00, so the EBDA
 /// runs 0x9FC00-0x9FFFF and the conventional-memory word at 0040:0013 drops from
 /// 640 to 639 KB. INT 15h AH=C1h returns this segment in ES.
-const EBDA_SEGMENT: u16 = 0x9FC0;
-
 /// Physical base of the INT 15h AH=C0h system-configuration table. It lives inside
 /// the reserved EBDA (after the size byte at offset 0), so it is consistent with
 /// the lowered conventional-memory size and out of the BDA's way.

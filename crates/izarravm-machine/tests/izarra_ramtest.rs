@@ -58,9 +58,9 @@ fn ramtest_passes_and_sizes_4mib() {
 }
 
 #[test]
-fn ramtest_caps_the_int12h_word_at_640_kib() {
-    // The INT 12h slot 0040:0013 reports conventional memory only, which a PC
-    // caps at 640 KiB however much RAM is installed. The full detected total
+fn ramtest_preserves_the_ebda_adjusted_int12h_word() {
+    // The INT 12h slot 0040:0013 reports conventional memory below the EBDA.
+    // The full detected total
     // (16384 KiB here) lives in the memory.detected_kib record instead. A
     // self-booting game sizes its heap off this word, so reporting the total
     // sent QuickDOS booters into ROM/unmapped space and a "Bad free parm" halt.
@@ -69,5 +69,5 @@ fn ramtest_caps_the_int12h_word_at_640_kib() {
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let memory = machine.memory().as_slice();
     let word = u16::from_le_bytes([memory[0x413], memory[0x414]]);
-    assert_eq!(word, 640);
+    assert_eq!(word, 639);
 }

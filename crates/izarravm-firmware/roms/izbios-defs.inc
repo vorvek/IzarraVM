@@ -8,6 +8,7 @@
 %define ROM_SEG        0xf000      ; the BIOS is mapped at 0xF0000
 %define VGA13_SEG      0xa000      ; mode 13h framebuffer segment (linear, chain-4)
 %define BDA_SEG        0x0040      ; BIOS data area segment
+%define CONVENTIONAL_MEMORY_KIB 639
 %define STACK_TOP      0x7000      ; SS:SP top at boot (grows down, clear of RAM map)
 
 ; BDA keyboard ring (offsets into BDA_SEG), shared by core bring-up and the
@@ -70,7 +71,7 @@
 
 ; CMOS NVRAM byte 0x11 holds the boot choice: 0 = floppy, 1 = disk, 2 = CD-ROM.
 ; The boot menu seeds its default highlight from this byte.
-%define BOOT_CMOS_ORDER 0x11
+%define BOOT_CMOS_PRIMARY 0x11
 
 ; CMOS NVRAM byte 0x12 holds the saved GSW speed code (0 386, 1 486, 2 586,
 ; 3 386-slow). Written by the setup panel and boot menu on Save/Accept; applied

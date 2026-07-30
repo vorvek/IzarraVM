@@ -90,7 +90,7 @@ ramtest_run:
     ; word; handing them the full total puts their arena above 640 KiB in
     ; ROM/unmapped space and corrupts it on the first free. The full total
     ; still lands in RAMTEST_KIB and the on-screen counter.
-    mov word [0x0013], 640         ; INT 12h conventional-memory word
+    mov word [0x0013], CONVENTIONAL_MEMORY_KIB
     pop ecx                        ; ECX = extended KiB (no longer needed)
 
     ; --- choose both strides from the POST-pacing port. ECX takes the conventional

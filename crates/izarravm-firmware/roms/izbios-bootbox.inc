@@ -110,7 +110,7 @@ bx_seed:
     or byte [BMX_AVAIL], 0x02
 .no_cd:
     ; Marked device from CMOS 0x11, falling back to floppy if its media vanished.
-    mov al, BOOT_CMOS_ORDER
+    mov al, BOOT_CMOS_PRIMARY
     out 0x70, al
     in al, 0x71
     cmp al, 2
@@ -244,7 +244,7 @@ bx_accept:
 .order_cd:
     mov al, 2
 .order_store:
-    mov ah, BOOT_CMOS_ORDER
+    mov ah, BOOT_CMOS_PRIMARY
     call su_cmos_write
     call su_cmos_checksum
     ; Session boot device into BOOT_CHOICE.
