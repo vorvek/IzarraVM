@@ -3,7 +3,12 @@
 
 #![forbid(unsafe_code)]
 
+mod joystick;
 mod keyboard;
+pub use joystick::{
+    GamepadManager, JoystickAxis, JoystickAxisBinding, JoystickBinding, JoystickButton,
+    JoystickPolarity, JoystickSample, JoystickWizard, JoystickWizardStep,
+};
 pub use keyboard::HostKeyboard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

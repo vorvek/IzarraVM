@@ -11,8 +11,10 @@ pub use runtime::run;
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioDebugSnapshot, AudioPlayer, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
-use izarravm_input::HostKeyboard;
-use izarravm_machine::{CdAudioState, Machine, MachineProfile, StopReason};
+use izarravm_input::{
+    GamepadManager, HostKeyboard, JoystickBinding, JoystickSample, JoystickWizard,
+};
+use izarravm_machine::{CdAudioState, JoystickState, Machine, MachineProfile, StopReason};
 use serde::Serialize;
 use std::cell::Cell;
 use std::error::Error;
@@ -79,6 +81,7 @@ const RUNTIME_PROFILE_SCHEMA: &str = "izarravm.runtime.v1";
 /// guest can never drain faster than 250 packets/s. 200 Hz matches the highest
 /// standard PS/2 sample rate while leaving room for the aux byte pacing.
 const MOUSE_FLUSH_HZ: f64 = 200.0;
+const JOYSTICK_POLL_HZ: f64 = 120.0;
 
 /// How long a drive-access LED stays lit after the last access, so a burst of
 /// fast reads reads as a steady glow rather than an imperceptible flicker.
@@ -703,6 +706,8 @@ enum Command {
     /// One scroll-wheel detent from the host, forwarded to the emulated mouse.
     /// Positive is scroll-up, negative is scroll-down. Capture only.
     MouseWheel(i32),
+    /// Replace joystick A's quantized gameport state, or detach it.
+    Joystick(Option<JoystickState>),
     /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
     /// rewrite a dirty image to on eject.
     MountFloppy {
@@ -1233,6 +1238,10 @@ impl Emulator {
         let _ = self.commands.send(Command::MouseWheel(dz));
     }
 
+    fn send_joystick(&self, state: Option<JoystickState>) {
+        let _ = self.commands.send(Command::Joystick(state));
+    }
+
     fn mount_floppy(&self, bytes: Vec<u8>, flush_path: Option<PathBuf>) {
         let _ = self
             .commands
@@ -1426,6 +1435,7 @@ fn emulate(
                     machine.inject_mouse_relative(dx, dy, buttons)
                 }
                 Command::MouseWheel(dz) => machine.inject_mouse_wheel(dz),
+                Command::Joystick(state) => machine.set_joystick_state(state),
                 Command::MountFloppy { bytes, flush_path } => match machine.mount_floppy(bytes) {
                     Ok(()) => floppy_flush_path = flush_path,
                     Err(err) => error!(%err, "failed to mount floppy image"),
@@ -1702,6 +1712,10 @@ pub struct GuiApp {
     glide_ovl: Option<Vec<u8>>,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
+    joystick_enabled: bool,
+    gamepads: Option<GamepadManager>,
+    joystick_binding: Option<JoystickBinding>,
+    last_joystick_sent: Option<Option<JoystickSample>>,
     title: String,
     // Input-capture state, the single source of truth for routing. When true the
     // OS cursor is confined and hidden over the window, all keyboard input goes
@@ -1823,6 +1837,8 @@ enum BindTarget {
 struct ConfigDialog {
     input_release: KeyBinding,
     fullscreen: KeyBinding,
+    joystick_binding: Option<JoystickBinding>,
+    joystick_wizard: Option<JoystickWizard>,
     crt_style: CrtStyle,
     // ReSonique 2 amp gain in tenths (120 = 12.0x); see GuiApp::amp_gain.
     amp_gain: u32,
@@ -1836,6 +1852,19 @@ struct ConfigDialog {
     midi_ports: Vec<MidiPortId>,
     // The binding awaiting a key press, set when the user clicks a rebind button.
     capturing: Option<BindTarget>,
+}
+
+fn apply_joystick_binding(
+    live: &mut Option<JoystickBinding>,
+    prefs: &mut GuiPrefs,
+    staged: &Option<JoystickBinding>,
+    last_sent: &mut Option<Option<JoystickSample>>,
+) {
+    if staged != live {
+        *live = staged.clone();
+        *last_sent = None;
+    }
+    prefs.joystick_binding = staged.clone();
 }
 
 fn path_text(path: Option<&PathBuf>) -> String {
@@ -1946,6 +1975,7 @@ impl GuiApp {
         glide_ovl: Option<Vec<u8>>,
         test_pattern: bool,
         rtc_setup: crate::cmos::RtcSetup,
+        joystick_enabled: bool,
     ) -> Self {
         let audio = match AudioPlayer::new() {
             Ok(player) => Some(player),
@@ -1966,6 +1996,16 @@ impl GuiApp {
         let crt_style = prefs.crt_style;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
+        let joystick_binding = prefs.joystick_binding.clone();
+        let gamepads = joystick_enabled
+            .then(GamepadManager::new)
+            .and_then(|result| match result {
+                Ok(manager) => Some(manager),
+                Err(err) => {
+                    warn!(%err, "host controller input unavailable");
+                    None
+                }
+            });
         let gain = SharedGain::new(volume_gain(volume));
         let amp = SharedGain::new(amp_multiplier(amp_gain));
         let pc_speaker_volume = prefs.pc_speaker_volume;
@@ -1981,6 +2021,10 @@ impl GuiApp {
             glide_ovl,
             test_pattern,
             rtc_setup,
+            joystick_enabled,
+            gamepads,
+            joystick_binding,
+            last_joystick_sent: None,
             title,
             input_captured: false,
             guest_locks: [false; HOST_LOCK_KEYS.len()],
@@ -2066,6 +2110,7 @@ impl GuiApp {
             self.speaker_vol.clone(),
         ));
         self.frame_seq = u64::MAX;
+        self.last_joystick_sent = None;
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
         // A fresh machine boots with an empty drive A:, then we remount whatever
         // was in it so a Reset keeps the disk in the drive (no race to re-mount
@@ -2286,6 +2331,49 @@ impl GuiApp {
         self.mouse_rel_y = 0.0;
         if let Some(emu) = &self.emu {
             emu.send_mouse_relative(dx, dy, self.last_buttons);
+        }
+    }
+
+    /// Drain host-controller events and forward only changed 8-bit gameport samples.
+    fn poll_joystick(&mut self) {
+        let completed = if let Some(gamepads) = &mut self.gamepads {
+            let wizard = self
+                .config_dialog
+                .as_mut()
+                .and_then(|dialog| dialog.joystick_wizard.as_mut());
+            gamepads.poll_wizard(wizard);
+            self.config_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.joystick_wizard.as_ref())
+                .and_then(JoystickWizard::binding)
+        } else {
+            None
+        };
+        if let Some(binding) = completed
+            && let Some(dialog) = &mut self.config_dialog
+        {
+            dialog.joystick_binding = Some(binding);
+            dialog.joystick_wizard = None;
+        }
+
+        let sample = if self.joystick_enabled {
+            self.gamepads
+                .as_ref()
+                .zip(self.joystick_binding.as_ref())
+                .and_then(|(gamepads, binding)| gamepads.sample(binding))
+        } else {
+            None
+        };
+        if self.last_joystick_sent.as_ref() == Some(&sample) {
+            return;
+        }
+        self.last_joystick_sent = Some(sample);
+        if let Some(emu) = &self.emu {
+            emu.send_joystick(sample.map(|sample| JoystickState {
+                x: sample.x,
+                y: sample.y,
+                buttons: sample.buttons,
+            }));
         }
     }
 

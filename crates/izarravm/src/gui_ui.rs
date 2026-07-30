@@ -272,6 +272,8 @@ impl GuiApp {
         self.config_dialog = Some(ConfigDialog {
             input_release: self.input_release.clone(),
             fullscreen: self.fullscreen_key.clone(),
+            joystick_binding: self.joystick_binding.clone(),
+            joystick_wizard: None,
             crt_style: self.crt_style,
             amp_gain: self.amp_gain,
             pc_speaker_volume: self.pc_speaker_volume,
@@ -326,6 +328,7 @@ impl GuiApp {
         };
         let mut keep_open = true;
         let mut accept = false;
+        let parent_disabled = dialog.joystick_wizard.is_some();
         let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
             egui::Frame::new()
                 .fill(PANEL_FACE)
@@ -337,6 +340,9 @@ impl GuiApp {
                 })
                 .corner_radius(4.0)
                 .show(ui, |ui| {
+                    if parent_disabled {
+                        ui.disable();
+                    }
                     beige_visuals(ui);
                     ui.set_width(440.0);
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
@@ -348,17 +354,61 @@ impl GuiApp {
 
                     ui.label(egui::RichText::new("INPUT").color(LABEL).size(11.0));
                     beige_group(ui, |ui| {
-                        egui::Grid::new("config-keys")
-                            .num_columns(2)
-                            .spacing([16.0, 10.0])
-                            .show(ui, |ui| {
-                                ui.label("Input release");
-                                bind_button(ui, &mut dialog, BindTarget::InputRelease);
-                                ui.end_row();
-                                ui.label("Full screen");
-                                bind_button(ui, &mut dialog, BindTarget::Fullscreen);
-                                ui.end_row();
-                            });
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label("Input release");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    bind_button(ui, &mut dialog, BindTarget::InputRelease);
+                                },
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Full screen");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    bind_button(ui, &mut dialog, BindTarget::Fullscreen);
+                                },
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Joystick");
+                            let bound = dialog.joystick_binding.as_ref().map_or_else(
+                                || "Not set".to_owned(),
+                                |binding| binding.controller_name.clone(),
+                            );
+                            ui.label(bound);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            dialog.joystick_binding.is_some(),
+                                            egui::Button::new("Clear joystick"),
+                                        )
+                                        .clicked()
+                                    {
+                                        dialog.joystick_binding = None;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.joystick_enabled && self.gamepads.is_some(),
+                                            egui::Button::new("Set joystick buttons"),
+                                        )
+                                        .clicked()
+                                    {
+                                        dialog.joystick_wizard = Some(JoystickWizard::default());
+                                    }
+                                },
+                            );
+                        });
+                        if !self.joystick_enabled {
+                            ui.small("Joystick input is disabled in izarravm.toml.");
+                        } else if self.gamepads.is_none() {
+                            ui.small("Host controller input is unavailable.");
+                        }
                     });
 
                     ui.add_space(8.0);
@@ -517,8 +567,39 @@ impl GuiApp {
                     });
                 });
         });
-        if modal.should_close() {
+        if modal.should_close() && !parent_disabled {
             keep_open = false;
+        }
+        if let Some(wizard) = &dialog.joystick_wizard {
+            let mut cancel_wizard = false;
+            let wizard_modal =
+                egui::Modal::new(egui::Id::new("joystick-setup-window")).show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(PANEL_FACE)
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            beige_visuals(ui);
+                            ui.set_width(300.0);
+                            ui.label(header_text("Joystick setup", 17.0));
+                            ui.add_space(8.0);
+                            ui.label(wizard.step().instruction());
+                            if let Some(error) = wizard.error() {
+                                ui.colored_label(egui::Color32::from_rgb(170, 62, 48), error);
+                            }
+                            ui.add_space(10.0);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        cancel_wizard = true;
+                                    }
+                                },
+                            );
+                        });
+                });
+            if cancel_wizard || wizard_modal.should_close() {
+                dialog.joystick_wizard = None;
+            }
         }
         if accept {
             self.apply_config(&dialog);
@@ -536,6 +617,12 @@ impl GuiApp {
         self.prefs.input_release = dialog.input_release.clone();
         self.prefs.fullscreen = dialog.fullscreen.clone();
         self.prefs.crt_style = dialog.crt_style;
+        apply_joystick_binding(
+            &mut self.joystick_binding,
+            &mut self.prefs,
+            &dialog.joystick_binding,
+            &mut self.last_joystick_sent,
+        );
         // Amp gain: update the live value + prefs and push the new multiplier to
         // the shared amp atomic so the emulation thread's audio pump picks it up
         // without a restart.

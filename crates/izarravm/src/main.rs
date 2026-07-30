@@ -332,6 +332,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         glide_ovl,
         cli.margo_test_pattern,
         rtc_setup,
+        config.input.joystick,
     )?;
     Ok(())
 }

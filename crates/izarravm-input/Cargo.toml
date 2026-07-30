@@ -12,4 +12,5 @@ authors.workspace = true
 
 [dependencies]
 gilrs.workspace = true
+serde.workspace = true
 winit.workspace = true
