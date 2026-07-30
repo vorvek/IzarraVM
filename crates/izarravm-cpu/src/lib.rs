@@ -545,9 +545,14 @@ pub struct PerfCounters {
     /// run, so the hot loop carries no per-instruction counter traffic.
     pub decode_probes: u64,
     /// Continuation-loop dispatcher consultations that DECLINED (the Direct auto-admission
-    /// path returned `DirectContinuation::Interpret`). With `jit_direct_entries` and the
-    /// prefix/side-exit counters this completes the seam's in/out ledger. Same fold-per-run
-    /// discipline and Phase-2 identity role as `decode_probes`.
+    /// path returned `DirectContinuation::Interpret`). On an approximate-timing persona with
+    /// the Direct backend live, this counter closes the seam's in/out ledger together with
+    /// `jit_direct_entries` and the prefix/side-exit counters (measured on quake/586: 735
+    /// unaccounted out of 496M probes). On an Accurate persona, or with the Direct backend
+    /// disabled, every probe falls through to an uncounted `None` before ever reaching the
+    /// Direct dispatch arm, so this counter reads 0 by construction while `decode_probes`
+    /// stays large -- the ledger does not close there. Same fold-per-run discipline and
+    /// Phase-2 identity role as `decode_probes`.
     pub jit_direct_dispatch_declines: u64,
     /// Calls to `run_straight_line` (one per machine batch entry). The denominator for
     /// the average straight-line run length = instructions / straight_line_runs.
@@ -957,7 +962,7 @@ impl Eq for PerfCounters {}
 /// of `PerfCounters` and at the very tail of `CpuGsw` so no pre-existing
 /// field offset moves (growing `PerfCounters` shifted the hot `pending_flags`
 /// field and cost the interpreter measurable wall time; the offset pin in
-/// cpu_test.rs guards 4512). Serialized into the same perf JSON keys by
+/// cpu_test.rs guards 4528). Serialized into the same perf JSON keys by
 /// `perf_counters_json`. Unconditional (not cfg jit) like the other poll
 /// counters in `PerfCounters`, so non-jit consumers can name the type.
 #[derive(Debug, Clone, Copy, Default)]
@@ -978,7 +983,7 @@ impl Eq for PollSkipMemoryCounters {}
 /// the `jit_direct_*`/`jit_direct_reject_*` counters in `PerfCounters`. Kept OUT of
 /// `PerfCounters` and at the very tail of `CpuGsw`, following the `PollSkipMemoryCounters`
 /// pattern exactly: growing `PerfCounters` shifts the hot `pending_flags` field off its
-/// pinned 4512 and costs the interpreter measurable wall time (the offset pin in cpu_test.rs
+/// pinned 4528 and costs the interpreter measurable wall time (the offset pin in cpu_test.rs
 /// guards it). A C1a shell never retires a guest instruction natively (F-A1 option B: it
 /// side-exits immediately), so there is no `insns` counterpart yet; `entries` counts adapter
 /// round trips instead. Unconditional (not cfg-gated) like the other diagnostic counters, so
@@ -1516,7 +1521,7 @@ pub struct CpuGsw {
     /// (a native clif unit retires slots without re-decoding), so persistent residue
     /// would trip the derived `CpuGsw` equality on nothing architectural (found by the
     /// C1e storm battery). Loose fields, not a struct: the lone `u8` packs into an
-    /// existing padding hole, keeping `pending_flags` on its pinned offset 4512 (the
+    /// existing padding hole, keeping `pending_flags` on its pinned offset 4528 (the
     /// cpu_test.rs offset pin; a `{u32, u8}` struct here shifted it by 8).
     decode_tail_start: u32,
     decode_disp_len: u8,
@@ -1602,7 +1607,7 @@ pub struct CpuGsw {
     cpl: u8,
     /// Memory-poll skip counters, deliberately the LAST field: adding them to
     /// `PerfCounters` (declared far above) shifted every later CpuGsw field,
-    /// moving the hot `pending_flags` off its pinned 4512 and costing the
+    /// moving the hot `pending_flags` off its pinned 4528 and costing the
     /// interpreter measurable wall time. At the tail they change only the
     /// struct's total size. See `PollSkipMemoryCounters`.
     poll_skip_memory: PollSkipMemoryCounters,

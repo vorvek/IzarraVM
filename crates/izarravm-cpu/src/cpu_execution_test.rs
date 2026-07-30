@@ -491,6 +491,10 @@ fn seam_counters_bound_probes_and_are_deterministic() {
     //     probes >= instructions - straight_line_runs (the first instruction of
     //     each run is not a continuation) and probes <= instructions +
     //     straight_line_runs (at most one extra break-detecting probe per run).
+    //     This floor is specific to this no-JIT-admission fixture (real-mode 16-bit,
+    //     which admits no Direct blocks): a single native block entry can retire many
+    //     instructions behind one probe, so on a Direct-admitting workload instructions
+    //     would grow much faster than probes and the floor would not hold.
     //  2. The counter is deterministic: both CPUs report the same value.
     //  3. Declines never exceed probes.
     let p1 = run_fixture_and_return_perf();
