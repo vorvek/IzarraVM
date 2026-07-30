@@ -1688,8 +1688,9 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
     // Pending flags offset for direct native writes; shifts whenever PerfCounters grows. The
     // lever-1 slice's interp_fast_map_hits/_misses counters live in FastMapProbeCounters at the
-    // CpuGsw tail instead (see that type), specifically so this pin stays at 4512.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    // CpuGsw tail instead (see that type), to avoid moving this pin. The dynarec-refactor Task 2
+    // seam counters DO live in PerfCounters by design, moving this pin from 4512 to 4528.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the

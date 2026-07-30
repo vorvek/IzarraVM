@@ -602,6 +602,12 @@ impl CpuGsw {
         let bus_at_entry = bus.in_batch_scaled_bus_clocks();
         let rep_budget = RepBudget { bus_at_entry, cap };
         self.perf.straight_line_runs += 1;
+        // Seam counters, folded once per run (never per-instruction on the hot path).
+        let mut seam_probes: u64 = 0;
+        // Only the jit-gated Direct dispatch arm below increments this; a no-jit build folds it
+        // unconditionally (always 0) so the fold site does not need its own cfg split.
+        #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
+        let mut seam_declines: u64 = 0;
         loop {
             let can_take_before = self.can_take_interrupt();
             let outcome = if first {
@@ -610,6 +616,7 @@ impl CpuGsw {
             } else {
                 let lin = self.linear_eip();
                 let cs = self.registers.cs();
+                seam_probes += 1;
                 let insn = match self.decode_cache.get(lin, cs.default_size_32) {
                     Some(i) => {
                         if !i.continuable {
@@ -717,7 +724,10 @@ impl CpuGsw {
                                 skip_direct_once = true;
                                 Some(outcome)
                             }
-                            DirectContinuation::Interpret => None,
+                            DirectContinuation::Interpret => {
+                                seam_declines += 1;
+                                None
+                            }
                         }
                     } else {
                         None
@@ -752,6 +762,11 @@ impl CpuGsw {
             // exactly the boundary that loop would have stopped at.
             if outcome.halted {
                 self.perf.brk_halt += 1;
+                // This early return is a second lexical exit from the loop (the other is the
+                // fall-through after `break`, folded below the loop). Fold here too so a run that
+                // ends in HLT does not lose its seam counts.
+                self.perf.decode_probes += seam_probes;
+                self.perf.jit_direct_dispatch_declines += seam_declines;
                 return Ok(BudgetedRunOutcome {
                     consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
                     halted: true,
@@ -802,6 +817,11 @@ impl CpuGsw {
                 break;
             }
         }
+        // Fold once per run, not per instruction. A propagated hard `CpuError` (a `?` inside the
+        // loop above) skips this fold, which is acceptable: a hard error aborts the entire run
+        // and no gate run produces one.
+        self.perf.decode_probes += seam_probes;
+        self.perf.jit_direct_dispatch_declines += seam_declines;
         Ok(BudgetedRunOutcome {
             consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
             halted: false,

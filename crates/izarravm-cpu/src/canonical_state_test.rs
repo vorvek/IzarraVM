@@ -836,9 +836,12 @@ fn execution_serialization_does_not_mutate_cpu() {
 #[cfg(feature = "jit")]
 fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The lever-1 slice's interp_fast_map_hits/_misses counters live in FastMapProbeCounters at
-    // the CpuGsw tail (see that type), not in PerfCounters, specifically so this pin stays 4512.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    // the CpuGsw tail (see that type), not in PerfCounters, specifically to avoid moving this pin.
+    // The dynarec-refactor Task 2 seam counters (decode_probes, jit_direct_dispatch_declines) DO
+    // live in PerfCounters by design (they are the seam's identity oracle), so this pin moved from
+    // 4512 to 4528 (two added u64 fields = 16 bytes) when those landed.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
 }

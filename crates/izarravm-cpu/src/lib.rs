@@ -538,6 +538,17 @@ pub struct PerfCounters {
     /// Instructions that required a fresh decode (a decode-cache miss in `fetch_decoded`).
     /// Decode-cache hit rate = 1 - decode_misses / instructions.
     pub decode_misses: u64,
+    /// Decode-cache probes made by the straight-line continuation path (`run_budgeted_inner`'s
+    /// per-iteration `DecodeCache::get`). This is the execution count of the seam the dynarec
+    /// refactor moves in Phase 2, and it must be byte-identical across that move on identical
+    /// runs — it is the phase's identity oracle. Accumulated in a run-local and folded once per
+    /// run, so the hot loop carries no per-instruction counter traffic.
+    pub decode_probes: u64,
+    /// Continuation-loop dispatcher consultations that DECLINED (the Direct auto-admission
+    /// path returned `DirectContinuation::Interpret`). With `jit_direct_entries` and the
+    /// prefix/side-exit counters this completes the seam's in/out ledger. Same fold-per-run
+    /// discipline and Phase-2 identity role as `decode_probes`.
+    pub jit_direct_dispatch_declines: u64,
     /// Calls to `run_straight_line` (one per machine batch entry). The denominator for
     /// the average straight-line run length = instructions / straight_line_runs.
     pub straight_line_runs: u64,

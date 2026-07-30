@@ -967,6 +967,8 @@ pub(super) fn perf_counters_json(
     json!({
         "instructions": perf.instructions,
         "decode_misses": perf.decode_misses,
+        "decode_probes": perf.decode_probes,
+        "jit_direct_dispatch_declines": perf.jit_direct_dispatch_declines,
         "straight_line_runs": perf.straight_line_runs,
         "brk_decode_or_branch": perf.brk_decode_or_branch,
         "brk_cont_decode_miss": perf.brk_cont_decode_miss,
