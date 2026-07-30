@@ -4305,7 +4305,10 @@ fn emit_clear_pending(e: &mut Encoder) {
 /// Emit the SHARED x87 re-entry pad. One of these exists per `BlockCache`, in its own executable
 /// mapping outside the arena, and every float block's portal points its `integer_entry` at it.
 ///
-/// Reached only by `jmp RDX` from `emit_completed_path` in an INTEGER source block, so on entry:
+/// Reached by `jmp RDX` from `emit_completed_path` OR from `emit_completed_dynamic_path`, in an
+/// INTEGER source block either way. Both sites establish the same state, which is why the dynamic
+/// path had to adopt the static one's register convention (the LinkCell in RCX) before it could
+/// select `integer_entry`. On entry:
 /// RCX holds the `LinkCell` address (kept out of RAX there precisely so it survives the quota
 /// decrement), R15 holds the `CpuGsw` pointer, RDI was just zeroed, RSP is the source block's
 /// frame, and RAX/RDX are dead. RBP holds guest EFLAGS and RBX/R12-R14/R8-R11 are guest homes;

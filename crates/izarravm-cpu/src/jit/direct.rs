@@ -969,9 +969,12 @@ impl CompiledBlock {
         self.has_x87.then_some(self.x87_entry_top)
     }
 
-    /// Static-successor compatibility (Jmp/Jcc/Call/fallthrough edges). The dynamic RET PIC path
-    /// (`try_link_inner` with a `target_eip`) layers an extra `has_x87` equality on top of this,
-    /// so it stays strict; see the comment there for why.
+    /// Edge compatibility, for STATIC successors (Jmp/Jcc/Call/fallthrough) and for the dynamic
+    /// RET PIC path alike. It used to be static-only: the dynamic path layered an extra `has_x87`
+    /// equality on top of this in both directions, because `emit_completed_dynamic_path` emitted
+    /// neither the float-to-integer boundary spill nor the integer-to-float portal-field
+    /// selection. It emits both now, so `target_eip` no longer changes WHICH edges link, only how
+    /// the cell is written, and this is the only x87 edge predicate there is.
     ///
     /// The has_x87 pair is a real three-case rule now, not a dead clause. It used to read
     /// `self.has_x87 == target.has_x87 && (!self.has_x87 || self.x87_exit_top ==
@@ -1004,35 +1007,24 @@ impl CompiledBlock {
             // the live x87 cache back to `CpuGsw.fpu` before handing control over. The target
             // has no TOP of its own to pin against, so there is no TOP condition here.
             (true, false) => true,
-            // Integer source, float target: refused. A chained entry publishes body_ptr =
-            // entry + body_offset and jumps straight there, so the target's own prologue never
-            // runs. `emit_x87_enter` sits ABOVE body_offset (see `emit()`: body_offset is
-            // captured right after the `x87_entry_top.is_some()` enter block), so skipping the
-            // prologue means the target's XMM4-11 physical cache is never loaded from
-            // `CpuGsw.fpu` and its baked compile-time entry TOP is never pinned to the CPU's
-            // real `top()`. There is no boundary fix-up that helps here, unlike the float-to-
-            // integer case: the missing work happens on the target side, before the jump lands,
-            // not at the jump site.
+            // Integer source, float target: link, THROUGH THE SHARED PAD. A chained entry jumps
+            // to a published address and skips the target's own prologue, and `emit_x87_enter`
+            // sits ABOVE `body_offset` (see `emit()`, where body_offset is captured right after
+            // the `x87_entry_top.is_some()` enter block), so entering at `body` would leave the
+            // target's XMM4-11 cache unloaded and its baked entry TOP unpinned. What makes the
+            // edge legal is that an integer source does not publish `body`: both emitters select
+            // `BlockPortal::integer_entry`, which for a float target is the shared x87 re-entry
+            // pad, and the pad does exactly the prologue's work after guarding the baked TOP
+            // against the CPU's live one.
             //
-            // This refusal also underwrites the float-to-integer crossing's frame read above.
-            // That crossing reloads RSI from STACK_SAVED_RSI, a slot only an x87 prologue writes;
-            // an integer entry never runs one, so if this arm allowed the edge, an integer-headed
-            // chain could reach that reload with the slot (and the XMM6-11 save area) never
-            // initialized. Uniform frame length alone does not make the crossing's frame read
-            // safe; this refusal is what makes it safe, by induction over the chain: every block
-            // that can reach a float-to-integer crossing was itself entered through an x87
-            // prologue.
-            // RELAXED. An integer source may now reach a float target, because it lands on the
-            // shared x87 re-entry pad rather than on `body`: the pad does exactly the work the
-            // target's prologue would have done, loading the register cache into XMM4-11 and
-            // packing the status/tag word into RSI, after guarding the target's baked entry TOP
-            // against the CPU's live TOP.
-            //
-            // The frame induction the old refusal provided is restored rather than abandoned. A
-            // float-to-integer crossing reloads RSI and XMM6-11 from slots only an x87 prologue
-            // writes; the pad writes the same slots, so every block that can reach such a
-            // crossing was entered either through a prologue or through the pad. `try_link_inner`
-            // refuses this shape when no pad could be built, which keeps that induction total.
+            // The frame induction this arm used to provide by REFUSING is preserved, not
+            // abandoned, and it is what the float-to-integer arm above depends on. That crossing
+            // reloads RSI from STACK_SAVED_RSI and restores XMM6-11 from the frame, slots only an
+            // x87 prologue writes. The pad writes the same slots, so every block that can reach
+            // such a crossing was entered either through a prologue or through the pad. Uniform
+            // frame length alone would not make that read safe. `try_link_inner` refuses this
+            // shape outright when no pad could be built (`LinkRefusal::MissingX87Pad`), which is
+            // what keeps the induction total.
             (false, true) => true,
         }
     }
