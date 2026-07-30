@@ -97,13 +97,31 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
 
 #[test]
 fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
-    // 0x99 (CDQ), not 0xFC (CLD): CLD is natively lowered now, so a CLD here compiles straight
-    // through and the block never stops. 0x99 is still unlowered (Task 4 lowers it next), which
-    // is what this test needs an interior barrier to be. This is the same shape the old
+    // Not 0xFC (CLD, natively lowered already) and not 0x99/CDQ (the CHOICE THIS TEST USED TO
+    // MAKE, until the adversarial review on the PreciseHelper-scaffolding deletion caught that
+    // Task 4 -- the very next slice in this phase -- teaches `classify` to admit 0x98/0x99,
+    // which would silently turn this fixture's span from 4 instructions to 8, drop its census
+    // row, and panic the `.expect` below. That is the exact 0xFC failure class the sibling
+    // `DIRECT_BARRIER` constant's own doc comment (`cpu_test.rs`) narrates: "it will eventually
+    // be lowered too". `DIRECT_BARRIER` is durable FOR THIS TEST specifically because, unlike
+    // 0x99, it carries its own certifying test (`direct_barrier_opcode_is_still_unclassifiable`
+    // in `cpu_test.rs`) that fails LOUDLY the day it stops being a barrier, rather than degrading
+    // silently -- so reusing it here means a future re-classification is caught upstream, not
+    // discovered here first. This is the same shape the old
     // `..._scores_an_interior_helper_shape` test used before the `PreciseHelper` scaffolding
     // (`HelperFamily`/`eligible_shapes`/`selected`) it exercised was deleted: `runtime_hits`,
     // ungated from helper families in `cd24b945`, is the one column that survives that deletion.
-    let code = [0x40, 0x41, 0x42, 0x43, 0x99, 0x44, 0x45, 0x46, 0x47];
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        0x43,
+        DIRECT_BARRIER,
+        0x44,
+        0x45,
+        0x46,
+        0x47,
+    ];
     let addresses: Vec<_> = (0..code.len())
         .map(|offset| ENTRY + offset as u32)
         .collect();
@@ -136,7 +154,7 @@ fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
     let row = snapshot
         .rows
         .iter()
-        .find(|row| row.opcode == 0x99)
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
         .expect("recorded structural stop");
     assert_eq!(row.hits, 1);
     assert_eq!(row.native_prefix_instructions, 4);
