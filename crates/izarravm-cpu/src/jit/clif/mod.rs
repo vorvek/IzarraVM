@@ -69,16 +69,22 @@ pub(crate) struct ClifBackend {
 impl ClifBackend {
     /// Pin the host ISA once. `None` on an unsupported host or an arena allocation failure,
     /// exactly like the other native machinery: compile nothing, interpret.
+    ///
+    /// Uses `new_unregistered()`, not `new()`: the shared UNWIND_INFO `jit::unwind` registers
+    /// for a Direct arena describes the Direct backend's own prologue shape, and a
+    /// Cranelift-compiled unit's prologue (`push rbp; mov rbp, rsp`) is different, so
+    /// registering it here would make a stack walk read a return address from the wrong
+    /// stack slot instead of just failing to resolve.
     pub(crate) fn new() -> Option<Self> {
-        Self::with_arena(ExecutableArena::new()?)
+        Self::with_arena(ExecutableArena::new_unregistered()?)
     }
 
     /// Test seam: a backend whose arena is deliberately small
-    /// (`ExecutableArena::with_len_for_test`), so a test can fill it in a handful of installs
-    /// instead of 32 MiB of them.
+    /// (`ExecutableArena::with_len_for_test_unregistered`), so a test can fill it in a handful
+    /// of installs instead of 32 MiB of them. Unregistered for the same reason as `new()`.
     #[cfg(test)]
     pub(crate) fn with_arena_len_for_test(total_len: usize) -> Option<Self> {
-        Self::with_arena(ExecutableArena::with_len_for_test(total_len)?)
+        Self::with_arena(ExecutableArena::with_len_for_test_unregistered(total_len)?)
     }
 
     fn with_arena(arena: ExecutableArena) -> Option<Self> {

@@ -3,6 +3,15 @@
 
 //! Windows x64 unwind-info registration for the Direct JIT's code arena.
 //!
+//! Direct-arena only — Cranelift frames have a different shape and register nothing. This
+//! module describes exactly one prologue: the Direct backend's 7 `SAVED_HOST_REGS` pushes
+//! then `sub rsp, NATIVE_STACK_LEN`. A Cranelift-compiled unit's prologue (`push rbp; mov
+//! rbp, rsp`) does not match it, so `ExecutableArena::new_unregistered` (which
+//! `ClifBackend` uses instead of `new`) never builds an `ArenaUnwind` for the clif arena —
+//! registering this descriptor there would make a stack walk read a return address from
+//! the wrong slot, an actively wrong unwind rather than the merely-unresolved one that
+//! walking off the end of an unregistered arena produces.
+//!
 //! Every emitted block shares ONE frame shape — the 7 `SAVED_HOST_REGS` pushes then
 //! `sub rsp, NATIVE_STACK_LEN` (see direct.rs, "One frame shape for every block") — so a
 //! single shared UNWIND_INFO, written once into a metadata page past the arena's code
@@ -18,6 +27,21 @@
 //! Known, accepted gap: x87-bearing blocks save RSI by a plain store (not a push), so a
 //! debugger recovering nonvolatile REGISTERS through an arena frame sees a stale RSI.
 //! Stack WALKS (RIP chains) — the point of this module — are unaffected.
+//!
+//! Known, accepted gap: five emitted `pushfq`/`popfq` (or `push`/`popfq`) pairs move RSP by
+//! 8 for the span of one instruction each -- `emit_capture_flags` and `emit_load_host_flags`
+//! (`jit/direct/emit.rs`), plus the three inlined `pushfq`/`pop rax` sequences in the ALU,
+//! double-shift, and count-shift paths (`jit/direct/emit.rs` around lines 3614, 4141, 4212)
+//! -- while the UNWIND_INFO above asserts a constant RSP for the whole block body. A sample
+//! landing inside one of those narrow windows walks the frame one slot short: it reads a
+//! fabricated "return address" out of the saved-RBX slot instead of the honest,
+//! orphan-at-the-arena result registration didn't exist to prevent before this module. The
+//! window is a handful of host instructions out of an entire block body, so the odds of a
+//! sample landing there are small, and accepting it avoids the alternative of describing
+//! RSP motion mid-block (`UWOP_SET_FPREG`, or capturing flags through `lahf` instead of
+//! `pushfq` so RSP never moves) -- both of which change emitted bytes, which this phase
+//! forbids. The fix belongs to whichever later phase is already changing the flag-capture
+//! encoding (Phase 2+), not this one.
 //!
 //! `IZARRAVM_JIT_UNWIND=0` disables registration (A/B escape hatch). Any registration
 //! failure degrades silently to the pre-registration world: code runs, walks stop at the

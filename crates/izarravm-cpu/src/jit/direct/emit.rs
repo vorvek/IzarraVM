@@ -4254,6 +4254,8 @@ fn emit_direction_flag(e: &mut Encoder, set: bool) {
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RAX);
 }
 
+// The pushfq/pop below moves RSP by 8 for one instruction: the accepted unwind gap
+// described in jit/unwind.rs's module doc ("Known, accepted gap" beside the pushfq list).
 fn emit_capture_flags(e: &mut Encoder, defined: u32) {
     e.pushfq();
     e.pop(Reg::RDI);
@@ -4262,6 +4264,8 @@ fn emit_capture_flags(e: &mut Encoder, defined: u32) {
     e.or_r32_r32(Reg::RBP, Reg::RDI);
 }
 
+// The push/popfq below moves RSP by 8 for one instruction: the same accepted unwind gap as
+// `emit_capture_flags` above (see jit/unwind.rs's module doc).
 fn emit_load_host_flags(e: &mut Encoder) {
     e.mov_r32_r32(Reg::RAX, Reg::RBP);
     e.and_r32_imm32(Reg::RAX, ARITH_FLAGS | 0x2);

@@ -85,16 +85,36 @@ impl ExecutableArena {
     /// Reserve the fixed-size arena as Read+Write memory. Individual pages become Read+Execute as
     /// blocks are installed. Unsupported hosts and allocation failure both return `None`.
     pub(crate) fn new() -> Option<Self> {
-        Self::with_len(EXECUTABLE_ARENA_LEN)
+        Self::with_len(EXECUTABLE_ARENA_LEN, true)
     }
 
-    fn with_len(total_len: usize) -> Option<Self> {
+    /// Identical to `new()` except it never registers unwind info, regardless of
+    /// `IZARRAVM_JIT_UNWIND`. The shared UNWIND_INFO `jit::unwind` builds describes the Direct
+    /// backend's own prologue shape (`SAVED_HOST_REGS` pushes then `sub rsp, imm32`); a
+    /// Cranelift-compiled unit has a different prologue (`push rbp; mov rbp, rsp`), so
+    /// registering the Direct descriptor for a clif arena would make a stack walk read a return
+    /// address from the wrong slot -- actively wrong, not merely unresolved. `ClifBackend` (the
+    /// only other `ExecutableArena` owner) calls this instead of `new()`.
+    #[cfg_attr(
+        not(all(
+            feature = "clif-backend",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn new_unregistered() -> Option<Self> {
+        Self::with_len(EXECUTABLE_ARENA_LEN, false)
+    }
+
+    fn with_len(total_len: usize, register_unwind: bool) -> Option<Self> {
         let page_len = page_size();
         let len = total_len / page_len * page_len;
         if len == 0 {
             return None;
         }
-        let unwind_enabled = cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        let unwind_enabled = register_unwind
+            && cfg!(all(target_os = "windows", target_arch = "x86_64"))
             && std::env::var("IZARRAVM_JIT_UNWIND")
                 .map(|v| v != "0")
                 .unwrap_or(true);
@@ -129,7 +149,23 @@ impl ExecutableArena {
     /// Test seam: a small arena so fill-then-compact paths run without 32MB of installs.
     #[cfg(test)]
     pub(crate) fn with_len_for_test(total_len: usize) -> Option<Self> {
-        Self::with_len(total_len)
+        Self::with_len(total_len, true)
+    }
+
+    /// The clif backend's test-seam counterpart: same small-arena shrink as
+    /// `with_len_for_test`, but never registers unwind info -- clif arenas never do, on any
+    /// size (see `new_unregistered`).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(all(
+            feature = "clif-backend",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_len_for_test_unregistered(total_len: usize) -> Option<Self> {
+        Self::with_len(total_len, false)
     }
 
     /// Copy one block into the next page and seal that page Read+Execute. A thin one-page-cap
