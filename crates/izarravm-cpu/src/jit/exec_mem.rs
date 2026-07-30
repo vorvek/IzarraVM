@@ -31,6 +31,10 @@ pub(crate) struct ExecutableArena {
     /// Spans appended by `append_unsealed` and not yet sealed; they register into `spans`
     /// when `seal_used_prefix` succeeds.
     pending_spans: Vec<(usize, usize)>,
+    /// Windows x64 unwind-info registration for every sealed span (see `jit::unwind`).
+    /// `None` when unwind registration is disabled (`IZARRAVM_JIT_UNWIND=0`) or failed.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    unwind: Option<super::unwind::ArenaUnwind>,
 }
 
 /// Identifies one arena slot without exposing its address before that slot is executable.
@@ -90,7 +94,25 @@ impl ExecutableArena {
         if len == 0 {
             return None;
         }
-        let ptr = alloc_rw(len)?;
+        let unwind_enabled = cfg!(all(target_os = "windows", target_arch = "x86_64"))
+            && std::env::var("IZARRAVM_JIT_UNWIND")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let alloc_len = if unwind_enabled { len + page_len } else { len };
+        let ptr = alloc_rw(alloc_len)?;
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        let unwind = if unwind_enabled {
+            // SAFETY: the page at ptr+len was just allocated RW above.
+            super::unwind::ArenaUnwind::new(
+                ptr,
+                len,
+                unsafe { ptr.add(len) },
+                page_len,
+                (len / page_len) as u32,
+            )
+        } else {
+            None
+        };
         Some(Self {
             ptr,
             len,
@@ -99,6 +121,8 @@ impl ExecutableArena {
             sealed: 0,
             spans: Vec::new(),
             pending_spans: Vec::new(),
+            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+            unwind,
         })
     }
 
@@ -144,6 +168,10 @@ impl ExecutableArena {
         self.used += rounded;
         self.sealed = self.used;
         self.spans.push((offset, rounded));
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        if let Some(u) = self.unwind.as_mut() {
+            u.cover(offset, rounded);
+        }
         Some(slot)
     }
 
@@ -203,6 +231,12 @@ impl ExecutableArena {
             return false;
         }
         self.sealed = self.used;
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        if let Some(u) = self.unwind.as_mut() {
+            for &(offset, len) in &self.pending_spans {
+                u.cover(offset, len);
+            }
+        }
         // `sealed == 0` above means `spans` is still empty, so the pending appends (made in
         // offset order) keep the registry sorted.
         self.spans.append(&mut self.pending_spans);
@@ -290,6 +324,10 @@ impl ExecutableArena {
             self.used = 0;
             self.spans.clear();
             self.pending_spans.clear();
+            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+            if let Some(u) = self.unwind.as_mut() {
+                u.clear();
+            }
             return true;
         }
         if !make_rw(self.ptr, self.sealed) {
@@ -299,6 +337,10 @@ impl ExecutableArena {
         self.sealed = 0;
         self.spans.clear();
         self.pending_spans.clear();
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        if let Some(u) = self.unwind.as_mut() {
+            u.clear();
+        }
         true
     }
 
@@ -333,6 +375,11 @@ impl Drop for ExecutableBuffer {
 
 impl Drop for ExecutableArena {
     fn drop(&mut self) {
+        // Unregister before the memory disappears; ArenaUnwind::drop deletes the table.
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            self.unwind = None;
+        }
         // SAFETY: this is the original base and length returned by `alloc_rw`. Some pages have
         // since become Read+Execute, which does not change how the allocation is released.
         unsafe { free(self.ptr, self.len) };

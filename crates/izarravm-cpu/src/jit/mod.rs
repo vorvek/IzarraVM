@@ -62,6 +62,8 @@ mod region;
 pub(crate) mod smc_heat;
 pub(crate) mod step;
 pub(crate) mod unit_sim;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod unwind;
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")

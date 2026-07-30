@@ -222,6 +222,34 @@ fn install_span_rejects_oversized_empty_and_unsealed_prefix() {
     assert!(fresh.install_span(&[0xC3]).is_some());
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[test]
+fn installed_span_registers_a_runtime_function() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn RtlLookupFunctionEntry(
+            control_pc: u64,
+            image_base: *mut u64,
+            history_table: *mut core::ffi::c_void,
+        ) -> *const core::ffi::c_void;
+    }
+    let page = super::host_page_len();
+    let mut arena = super::ExecutableArena::with_len_for_test(4 * page).unwrap();
+    let entry = arena.install(&[0xC3]).unwrap(); // one RET; content is irrelevant to lookup
+    let mut base = 0u64;
+    // Probe an address INSIDE the span body, not just the entry.
+    let rf = unsafe { RtlLookupFunctionEntry(entry as u64 + 4, &mut base, std::ptr::null_mut()) };
+    assert!(
+        !rf.is_null(),
+        "no RUNTIME_FUNCTION covers the sealed span; growable-table registration missing"
+    );
+    // First install sits at arena offset 0, so the reported range base is the entry itself.
+    assert_eq!(
+        base, entry as u64,
+        "table registered under the wrong RangeBase"
+    );
+}
+
 #[cfg(not(any(
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")

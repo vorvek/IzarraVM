@@ -3777,7 +3777,7 @@ const GUEST_HOMES: [Reg; 8] = [
     Reg::R14,
     Reg::RBX,
 ];
-const SAVED_HOST_REGS: [Reg; 7] = [
+pub(crate) const SAVED_HOST_REGS: [Reg; 7] = [
     Reg::RBX,
     Reg::RBP,
     Reg::RDI,
@@ -3825,9 +3825,9 @@ const BASE_STACK_LEN: u32 = 160;
 // callee-saved and there is no non-volatile XMM to save, so the frame is
 // just the base.
 #[cfg(target_os = "windows")]
-const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN + 8 + 6 * 16;
+pub(crate) const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN + 8 + 6 * 16;
 #[cfg(not(target_os = "windows"))]
-const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN;
+pub(crate) const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN;
 const STACK_QUOTA: i8 = 0;
 const STACK_ITERATIONS: i8 = 8;
 const STACK_RAM_BYTE_WRITES: i8 = 16;
