@@ -159,51 +159,32 @@ fn izarra_bios_embeds_8x8_font() {
 
 #[test]
 fn izarra_bios_int16_dispatch_has_enhanced_aliases() {
-    // The INT 16h dispatch routes each function to its own handler: AH=00h/10h
-    // (legacy/enhanced read), 01h/11h (legacy/enhanced peek), 02h/12h (legacy
-    // flags / extended shift status), 04h keyclick, 05h buffer write, then
-    // 03h/09h/0Ah (set typematic, get functionality, get keyboard id). Each
-    // arm is a `cmp ah, imm8` (opcode 80 FC). Only AH=00h/10h reach their
-    // nearby read handlers with a short `je rel8` (74); every later handler
-    // sits past the grown read/peek/flags code, so NASM emits the near
-    // `je rel16` form (0F 84).
-    // Assert the whole chain appears in order, ending in the bare iret
-    // fall-through. Runtime coverage of this handler is infeasible without
-    // booting the full ROM into a guest stub (the DOS-program test harness
-    // installs a different keyboard ROM, kbd-bios-core.inc), so this asserts
-    // the assembled bytes. Re-derive the displacements from the rebuilt .bin
-    // (read the bytes at the dispatch site) whenever a handler is added.
-    let dispatch: &[u8] = &[
-        0x80, 0xfc, 0x00, // cmp ah, 0x00 (read)
-        0x74, 0x45, //       je .read
-        0x80, 0xfc, 0x10, // cmp ah, 0x10 (enhanced read)
-        0x74, 0x77, //       je .read16
-        0x80, 0xfc, 0x01, // cmp ah, 0x01 (peek)
-        0x0f, 0x84, 0xa1, 0x00, // je .peek
-        0x80, 0xfc, 0x11, // cmp ah, 0x11 (enhanced peek)
-        0x0f, 0x84, 0xc9, 0x00, // je .peek16
-        0x80, 0xfc, 0x02, // cmp ah, 0x02 (flags)
-        0x0f, 0x84, 0xeb, 0x00, // je .flags
-        0x80, 0xfc, 0x12, // cmp ah, 0x12 (extended shift status)
-        0x0f, 0x84, 0xf3, 0x00, // je .flags12
-        0x80, 0xfc, 0x04, // cmp ah, 0x04 (PCjr keyclick)
-        0x0f, 0x84, 0xfd, 0x00, // je .keyclick
-        0x80, 0xfc, 0x05, // cmp ah, 0x05 (buffer write)
-        0x0f, 0x84, 0xf7, 0x00, // je .bufwrite
-        0x80, 0xfc, 0x03, // cmp ah, 0x03 (set typematic rate and delay)
-        0x0f, 0x84, 0x1e, 0x01, // je .typematic
-        0x80, 0xfc, 0x09, // cmp ah, 0x09 (get keyboard functionality)
-        0x0f, 0x84, 0x5f, 0x01, // je .funcs
-        0x80, 0xfc, 0x0a, // cmp ah, 0x0a (get keyboard id)
-        0x0f, 0x84, 0x5d, 0x01, // je .kbid
-        0xcf, //             iret (unhandled fall-through)
+    let functions = [
+        0x00, 0x10, 0x01, 0x11, 0x02, 0x12, 0x04, 0x05, 0x03, 0x09, 0x0a, 0x92,
     ];
-    assert!(
-        IZARRA_BIOS
-            .windows(dispatch.len())
-            .any(|window| window == dispatch),
-        "INT 16h enhanced-function dispatch not found in the Izarra BIOS ROM"
-    );
+    for (name, rom) in [
+        ("izarra-bios.bin", IZARRA_BIOS),
+        ("kbd-bios.bin", KBD_BIOS),
+        ("kbd-resident.bin", KBD_RESIDENT_BIOS),
+    ] {
+        let start = rom
+            .windows(3)
+            .position(|window| window == [0x80, 0xfc, 0x00])
+            .unwrap_or_else(|| panic!("INT 16h dispatch missing from {name}"));
+        let dispatch = &rom[start..start + 128.min(rom.len() - start)];
+        let mut cursor = 0;
+        for function in functions {
+            let relative = dispatch[cursor..]
+                .windows(3)
+                .position(|window| window == [0x80, 0xfc, function])
+                .unwrap_or_else(|| panic!("INT 16h AH={function:02X} missing from {name}"));
+            cursor += relative + 3;
+        }
+        assert!(
+            rom.windows(3).any(|window| window == [0xb4, 0x80, 0xcf]),
+            "INT 16h AH=92h handler missing from {name}"
+        );
+    }
 }
 
 #[test]

@@ -176,6 +176,19 @@ fn int16_enhanced_read_matches_plain_read() {
 }
 
 #[test]
+fn int16_92_advertises_enhanced_keyboard_services() {
+    // mov ax,9217h; int 16h; mov [0200h],ax; int 20h
+    const PROG: [u8; 10] = [0xb8, 0x17, 0x92, 0xcd, 0x16, 0xa3, 0x00, 0x02, 0xcd, 0x20];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
+    machine.run_until_halt_or_cycles(100_000).unwrap();
+    assert_eq!(
+        read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200),
+        0x8017
+    );
+}
+
+#[test]
 fn int16_keyclick_call_returns_to_caller() {
     // mov ax,0401h; int 16h; mov word [0200h],1234h; int 20h
     const PROG: [u8; 13] = [

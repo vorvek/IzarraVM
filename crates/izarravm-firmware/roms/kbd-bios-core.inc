@@ -329,6 +329,8 @@ int16:
     je .funcs
     cmp ah, 0x0a        ; get keyboard id
     je .kbid
+    cmp ah, 0x92        ; keyboard capability byte
+    je .capabilities
     iret
 .read:
     sti
@@ -581,6 +583,10 @@ int16:
     ; AH=0Ah get keyboard ID. BX = MF2 enhanced-keyboard ID (BH=0xAB, BL=0x41).
     mov bx, 0xab41
     clc
+    iret
+.capabilities:
+    ; Bit 7 advertises the enhanced AH=10h through AH=12h services.
+    mov ah, 0x80
     iret
 
 ; BDA ring enqueue: AX = scancode:ascii
