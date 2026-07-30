@@ -622,6 +622,73 @@ fn int13_ah42_extended_read_via_disk_address_packet() {
     assert_eq!(m.read_physical_u8(dap + 2), 1);
 }
 
+fn write_dap_lba(machine: &mut Machine, dap: u32, lba: u64) {
+    for (offset, byte) in lba.to_le_bytes().into_iter().enumerate() {
+        machine.write_physical_u8(dap + 8 + offset as u32, byte);
+    }
+}
+
+#[test]
+fn int13_edd_high_lba_never_aliases_sector_zero() {
+    for ah in [0x42u8, 0x43, 0x44] {
+        let mut machine = machine_with_hdd(64);
+        let dap = 0x5_0000u32;
+        machine.write_physical_u8(dap, 16);
+        machine.write_physical_u8(dap + 2, 1);
+        machine.write_physical_u8(dap + 7, 0x60);
+        write_dap_lba(&mut machine, dap, 1u64 << 32);
+        machine.write_physical_u8(0x6_0000, 0xcc);
+        let sector_zero_before = machine.ata.as_ref().unwrap().read_lba(0).unwrap();
+        machine.cpu.registers.set_eax(u32::from(ah) << 8);
+        machine.cpu.registers.set_edx(0x0080);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x5000));
+        machine.cpu.registers.set_esi(0);
+
+        machine.handle_int13();
+
+        assert_eq!((machine.cpu.registers.eax() >> 8) as u8, 0x04, "AH={ah:02x}");
+        assert_eq!(machine.read_physical_u8(dap + 2), 0, "AH={ah:02x} count");
+        assert_eq!(
+            machine.ata.as_ref().unwrap().read_lba(0).unwrap(),
+            sector_zero_before,
+            "AH={ah:02x} sector zero"
+        );
+    }
+}
+
+#[test]
+fn int13_edd_rejects_overflow_and_flat_buffer_packets() {
+    for (size, lba, flat) in [(16, u64::MAX, false), (24, 0, true)] {
+        let mut machine = machine_with_hdd(64);
+        let dap = 0x5_0000u32;
+        machine.write_physical_u8(dap, size);
+        machine.write_physical_u8(dap + 2, 2);
+        if flat {
+            for offset in 4..8 {
+                machine.write_physical_u8(dap + offset, 0xff);
+            }
+        } else {
+            machine.write_physical_u8(dap + 7, 0x60);
+        }
+        write_dap_lba(&mut machine, dap, lba);
+        machine.cpu.registers.set_eax(0x4200);
+        machine.cpu.registers.set_edx(0x0080);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x5000));
+        machine.cpu.registers.set_esi(0);
+
+        machine.handle_int13();
+
+        assert_ne!((machine.cpu.registers.eax() >> 8) as u8, 0);
+        assert_eq!(machine.read_physical_u8(dap + 2), 0);
+    }
+}
+
 fn assert_chs_fixed_disk_deadline(mode: GswMode, ah: u8, count: u8) {
     let mut machine = machine_with_hdd(64);
     machine.set_mode(mode);

@@ -1720,10 +1720,8 @@ impl Machine {
 
     /// EDD AH=42h/43h/44h extended read, write, and verify. The Disk Address
     /// Packet at DS:SI holds the block count and the 64-bit starting LBA; reads
-    /// and writes use the seg:off transfer buffer inside the packet. Only the low
-    /// 32 bits of the LBA are honored. Limit: the 64-bit-flat-buffer form (DAP
-    /// bytes 16-23 when the seg:off is 0xFFFF:0xFFFF) is not decoded; lift by
-    /// reading the wide pointer.
+    /// and writes use the seg:off transfer buffer inside the packet. The optional
+    /// 64-bit flat-buffer pointer is not supported.
     fn int13_edd_transfer(&mut self, ah: u8) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
@@ -1735,11 +1733,28 @@ impl Machine {
         let count = u16::from_le_bytes([packet[2], packet[3]]);
         let buf_off = u16::from_le_bytes([packet[4], packet[5]]);
         let buf_seg = u16::from_le_bytes([packet[6], packet[7]]);
-        let lba = u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]);
+        let lba = u64::from_le_bytes([
+            packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14],
+            packet[15],
+        ]);
         let buffer = (u32::from(buf_seg) << 4).wrapping_add(u32::from(buf_off));
 
-        let total = self.ata.as_ref().map_or(0, |d| d.total_sectors());
-        if lba.saturating_add(u32::from(count)) > total {
+        let packet_size = packet[0];
+        let flat_buffer = packet_size >= 24 && buf_off == 0xffff && buf_seg == 0xffff;
+        if !matches!(packet_size, 16 | 24) || count == 0 || flat_buffer {
+            self.set_dap_blocks(dap, 0);
+            self.set_eax_ah(0x01);
+            self.set_fixed_disk_status(0x01);
+            self.set_int_frame_carry(true);
+            return;
+        }
+
+        let total = self
+            .ata
+            .as_ref()
+            .map_or(0, |disk| u64::from(disk.total_sectors()));
+        let end = lba.checked_add(u64::from(count));
+        if end.is_none_or(|end| end > total) {
             // Out of range: AH=0x04 (sector not found), CF set, and the DAP block
             // count is rewritten to the number actually transferred (zero here).
             self.set_dap_blocks(dap, 0);
@@ -1751,7 +1766,7 @@ impl Machine {
         self.c_accesses += 1;
         let mut done: u16 = 0;
         for i in 0..count {
-            let l = lba + u32::from(i);
+            let l = u32::try_from(lba + u64::from(i)).expect("validated EDD LBA fits ATA");
             let addr = buffer.wrapping_add(u32::from(i) * 512);
             match ah {
                 0x42 => {
