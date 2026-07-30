@@ -67,7 +67,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     //
     // `0x8c` is the one non-byte member and it is here for the same structural reason rather than
     // as an exception: its interpreter arm writes `OperandSize::Word` unconditionally, so the
-    // 66-prefixed and unprefixed encodings have identical semantics and `MovCsToReg` carries no
+    // 66-prefixed and unprefixed encodings have identical semantics and `MovSegToReg` carries no
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
@@ -108,12 +108,6 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     {
         return None;
     }
-    // IMUL r32, r/m32, both operand forms. Must stay below the Word-size gate above: a
-    // 66-prefixed IMUL decodes with OperandSize::Word and is not in that gate's allowlist, so it
-    // already falls through to `None` there. Moving this arm above the gate, or adding 0x0faf to
-    // the allowlist, would silently lower a 16-bit IMUL as a 32-bit multiply instead: the
-    // destination's high 16 bits would be clobbered rather than preserved, and CF/OF would be
-    // computed against the wrong width.
     // SETcc r/m8, register destination. Byte-wide whatever the operand-size prefix says (the
     // interpreter's arm calls `write_operand_u8` without consulting `operand_size`), but 0x0f9x
     // is NOT in the Word-size allowlist above, so a 66-prefixed encoding never reaches here and
@@ -128,6 +122,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             dst,
         });
     }
+    // IMUL r32, r/m32, both operand forms. Must stay below the Word-size gate above: a
+    // 66-prefixed IMUL decodes with OperandSize::Word and is not in that gate's allowlist, so it
+    // already falls through to `None` there. Moving this arm above the gate, or adding 0x0faf to
+    // the allowlist, would silently lower a 16-bit IMUL as a 32-bit multiply instead: the
+    // destination's high 16 bits would be clobbered rather than preserved, and CF/OF would be
+    // computed against the wrong width.
     if insn.opcode == 0x0faf {
         // Keyed on the full u16 opcode rather than the u8 truncation further down: that
         // truncation (`u8::try_from(insn.opcode).ok()`) returns None for every two-byte opcode,
