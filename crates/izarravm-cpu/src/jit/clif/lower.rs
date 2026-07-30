@@ -139,7 +139,13 @@ fn lowerable(kind: &DirectKind) -> bool {
             | DirectKind::DoubleShiftReg { .. }
             | DirectKind::Load { .. }
             | DirectKind::Store { .. }
-            | DirectKind::Push { .. }
+            // PUSHFD's `StoreSource::Flags` is deliberately NOT lowered here: it needs the
+            // materialized-EFLAGS shadow and the pending-descriptor teardown that only Direct's
+            // RBP contract provides. Excluding it makes a PUSHFD block a growth-run stopper
+            // under --features clif-backend rather than a wrong lowering.
+            | DirectKind::Push {
+                source: StoreSource::Reg(_) | StoreSource::Imm(_) | StoreSource::EipDelta(_),
+            }
             | DirectKind::Pop { .. }
             | DirectKind::AluMemSource { .. }
             | DirectKind::TestImmMem { .. }
@@ -1412,6 +1418,9 @@ impl<'a> UnitBuilder<'a> {
                 let v = self.imm32(slot);
                 self.b.ins().band_imm(v, i64::from(width_mask(width)))
             }
+            StoreSource::Flags { .. } => {
+                unreachable!("PUSHFD is refused by `lowerable`; clif never sees a Flags source")
+            }
             StoreSource::EipDelta(_) => {
                 unreachable!("EipDelta store sources exist only inside Call, a terminal")
             }
@@ -1456,6 +1465,9 @@ impl<'a> UnitBuilder<'a> {
         let value = match source {
             StoreSource::Reg(src) => self.gpr32(src),
             StoreSource::Imm(_) => self.imm32(slot),
+            StoreSource::Flags { .. } => {
+                unreachable!("PUSHFD is refused by `lowerable`; clif never sees a Flags source")
+            }
             StoreSource::EipDelta(_) => {
                 unreachable!("EipDelta store sources exist only inside Call, a terminal")
             }
@@ -1595,6 +1607,9 @@ impl<'a> UnitBuilder<'a> {
                     _ => self.imm32(slot),
                 };
                 self.b.ins().band_imm(v, i64::from(width_mask(width)))
+            }
+            StoreSource::Flags { .. } => {
+                unreachable!("PUSHFD is refused by `lowerable`; clif never sees a Flags source")
             }
             StoreSource::EipDelta(_) => {
                 unreachable!("EipDelta store sources exist only inside Call, a terminal")

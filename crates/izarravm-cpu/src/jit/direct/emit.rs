@@ -208,6 +208,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // its EIP advance, all of which the loop tail below charges from the slot list.
             DirectKind::Nop => {}
             DirectKind::DirectionFlag { set } => emit_direction_flag(&mut e, set),
+            DirectKind::ShiftCl { op, dst } => emit_shift_cl(&mut e, op, dst),
             DirectKind::Bt { rm, index } => {
                 emit_bt_reg(&mut e, rm, index);
             }
@@ -4027,6 +4028,57 @@ fn emit_merge_double_shift_flags(e: &mut Encoder, defined: u32) {
     e.or_r32_r32(Reg::RBP, Reg::RDI);
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
     emit_clear_pending(e);
+}
+
+/// Group-2 shift/rotate by CL (0xD3 /op), register destination.
+///
+/// The count is runtime data, which forces three differences from `emit_shift`:
+///
+/// 1. The masked count stays in RCX across the shift. Nothing between the mask and the last read
+///    writes RCX -- `shl r32, cl` only READS CL, and `pushfq`/`pop rax` do not touch it -- so no
+///    stack slot is needed for it, unlike the double-shift path this was first modelled on.
+/// 2. The host flags are captured with `pushfq` immediately after the shift, because the count
+///    test below would otherwise destroy them.
+/// 3. A zero count must merge NOTHING. `CpuGsw::shift_rotate` returns before touching a flag when
+///    `count & 0x1f == 0` ("a zero count affects no flags at all"), and the host agrees, so the
+///    captured value at that point is the masking `and`'s leftovers rather than the shift's.
+///
+/// COMPACTNESS IS THE POINT, not style. The first version of this lowering spilled the count and
+/// the flags to the frame and inlined a full merge -- including `emit_clear_pending`'s four
+/// stores -- into BOTH the count==1 and count>1 arms. That came to ~31 host instructions per
+/// site, grew generated code 51% and arena compactions 47.6%, and the slice was reverted for it.
+/// Here the two arms are two instructions each and everything after them, the OR, the EFLAGS
+/// publish and the single `emit_clear_pending`, is shared.
+fn emit_shift_cl(e: &mut Encoder, op: u8, dst: u8) {
+    const DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
+    const WITH_OF: u32 = DEFINED | crate::FLAG_OF;
+    let one = e.label();
+    let merge = e.label();
+    let done = e.label();
+
+    // Guest CL is the low byte of guest ECX. RCX is emitter scratch and GUEST_HOMES is R8-R14
+    // plus RBX, so this can never clobber `home(dst)` -- not even when `dst` is ECX itself.
+    e.mov_r32_r32(Reg::RCX, home(1));
+    e.and_r32_imm32(Reg::RCX, 0x1f);
+    e.shift_r32_cl(op, home(dst));
+    e.pushfq();
+    e.pop(Reg::RAX);
+
+    e.test_r32_r32(Reg::RCX, Reg::RCX);
+    e.jz(done);
+    e.cmp_r32_imm32(Reg::RCX, 1);
+    e.jz(one);
+    e.and_r32_imm32(Reg::RBP, !DEFINED);
+    e.and_r32_imm32(Reg::RAX, DEFINED);
+    e.jmp(merge);
+    e.place(one);
+    e.and_r32_imm32(Reg::RBP, !WITH_OF);
+    e.and_r32_imm32(Reg::RAX, WITH_OF);
+    e.place(merge);
+    e.or_r32_r32(Reg::RBP, Reg::RAX);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+    e.place(done);
 }
 
 /// CLD / STD. Touches ONLY bit 10.

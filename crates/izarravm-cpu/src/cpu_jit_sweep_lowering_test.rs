@@ -38,6 +38,17 @@ fn flat_cpu() -> CpuGsw {
 /// Run `body` mid-block against the interpreter. `seed_eflags` is applied to both roles, so a
 /// lowering that reads a flag it should have ignored, or drops one it should have kept, diverges.
 fn differential(body: &[u8], seed_eflags: u32, live_pending: bool, context: &str) {
+    differential_with(body, seed_eflags, live_pending, 0, context);
+}
+
+/// As `differential`, but seeds ECX too, for the count-bearing forms.
+fn differential_with(
+    body: &[u8],
+    seed_eflags: u32,
+    live_pending: bool,
+    seed_ecx: u32,
+    context: &str,
+) {
     // A leading `mov esi,esi` keeps the tested opcode off the entry slot; the two trailing
     // register moves and the HLT give the block a tail and a terminator.
     let mut code = vec![0x89, 0xf6];
@@ -124,6 +135,7 @@ fn differential(body: &[u8], seed_eflags: u32, live_pending: bool, context: &str
         cpu.interrupt_shadow = false;
         cpu.registers.gpr.fill(0);
         cpu.registers.set_esp(STACK_TOP);
+        cpu.registers.set_ecx(seed_ecx);
         cpu.registers.eflags = seed_eflags;
         cpu.pending_flags = PendingFlags::default();
         if live_pending {
@@ -187,6 +199,31 @@ fn direction_flag_matches_the_interpreter_from_both_polarities() {
                     pending,
                     &format!("{name} seed={seed:#x} pending={pending}"),
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn shift_by_cl_matches_the_interpreter_for_every_count_class() {
+    // The classes that matter are MASK classes, not magnitudes: 0 (no flag may move at all -- the
+    // merge must be skipped entirely), 1 (OF defined), 2..=31 (OF preserved from the seed), and
+    // 32/33 which mask back to 0 and 1. The two garbage seeds carry bits above CL and above the
+    // five-bit mask that the host masks away and the lowering must not react to.
+    //
+    // Seeds with OF set (0xa02, 0x8d7) are load-bearing: on a count above 1 the lowering must
+    // PRESERVE the seeded OF, so a version that always merged the OF bit fails here and passes
+    // every OF-clear seed.
+    for op in [4u8, 5, 6, 7] {
+        for ecx in [0u32, 1, 5, 31, 32, 33, 0xffff_ff05, 0x0000_2101] {
+            for seed in [0x202u32, 0xa02, 0x8d7] {
+                // 0xD3 /op with mod=11 on EAX (rm=0), and on ECX (rm=1) to pin that the count is
+                // read before a destination write can disturb it.
+                for rm in [0u8, 1] {
+                    let modrm = 0b1100_0000 | (op << 3) | rm;
+                    let context = format!("d3 /{op} rm={rm} ecx={ecx:#x} seed={seed:#x}");
+                    differential_with(&[0xd3, modrm], seed, true, ecx, &context);
+                }
             }
         }
     }

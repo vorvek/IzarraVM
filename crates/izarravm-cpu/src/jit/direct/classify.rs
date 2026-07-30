@@ -609,6 +609,22 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     count,
                 });
             }
+            // Group 2 by CL. Sixth in the runtime-weighted reject audit: /7 alone is 807,607
+            // dispatcher exits and the three shift sub-ops together are 7.9% of rejected-target
+            // exits. Same /4..=7 admission as the imm8 arm's shift half; ROL (/0), ROR (/1),
+            // RCL (/2) and RCR (/3) stay out -- ROR because its flag rules differ and the other
+            // three for the imm8 arm's standing reasons (no measured rejects; RCL/RCR consume
+            // the incoming CF as a rotate input the emitted form never loads).
+            0xd3 => {
+                let m = insn.modrm?;
+                if !matches!(m.reg, 4..=7) {
+                    return None;
+                }
+                let DecodedOperand::Reg(dst) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::ShiftCl { op: m.reg, dst });
+            }
             0xf6 | 0xf7 => {
                 let m = insn.modrm?;
                 // NEG r/m32, register form. Deliberately carries NO width field: this arm sits

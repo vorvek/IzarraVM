@@ -2560,6 +2560,17 @@ pub(crate) enum DirectKind {
         dst: u8,
         count: u8,
     },
+    /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
+    /// admits ROR (/1) but routes it to `RotateRightReg`, because rotates do not define PF, ZF,
+    /// SF or AF and `emit_shift_cl` merges the shift mask.
+    ///
+    /// A separate variant rather than a `ShiftCount` field on `Shift`: `Shift` is in clif's
+    /// `lowerable` allowlist and widening it would hand clif a count source it cannot lower.
+    /// Same reasoning as `RotateRightReg` not being folded in.
+    ShiftCl {
+        op: u8,
+        dst: u8,
+    },
     DoubleShiftReg {
         left: bool,
         dst: u8,
