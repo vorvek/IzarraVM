@@ -46,6 +46,9 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             // 0xD9 /4: FCHS, FABS, FTST, FXAM. rm 2, 3, 6 and 7 are undefined in the interpreter
             // and must stay rejected, so this is an explicit rm list, not a range.
             | (0xd9, 3, 4, 0 | 1 | 4 | 5)
+            // 0xD9 /7 rm=2 is FSQRT, the only member of that group with a single-instruction
+            // host equivalent. The other seven encodings stay rejected.
+            | (0xd9, 3, 7, 2)
             // 0xDA memory forms: integer m32 arithmetic, all 8 sub-opcodes (`IntBinaryMemory`).
             // The register row keeps only `(0xda, 3, 5, 1)`, FUCOMPP; every other 0xDA mod=3
             // encoding is FCMOVcc and unrepresentable here, so it stays rejected.
@@ -105,8 +108,9 @@ fn classifier_selects_exact_traced_slice() {
     // modes x 1 sub-opcode x 8 rm values = 24, landing at 1037. 0xDD mod=3 /4 and /5
     // (FUCOM/FUCOMP) add 2 sub-opcodes x 8 rm values = 16, landing at 1053. 0xDB /2 memory
     // (FIST m32) adds 3 modes x 1 sub-opcode x 8 rm values = 24, landing at 1077. 0xD9 mod=3 /4
-    // (FCHS/FABS/FTST/FXAM) adds 4 rm values, landing at 1081.
-    assert_eq!(accepted, 1081);
+    // (FCHS/FABS/FTST/FXAM) adds 4 rm values, landing at 1081. FSQRT (0xD9 /7 rm=2) adds one,
+    // landing at 1082.
+    assert_eq!(accepted, 1082);
 }
 
 #[test]
@@ -274,6 +278,20 @@ fn classifier_preserves_operations_indices_and_addresses() {
         assert!(
             NativeX87Insn::classify(&insn(0xd9, 3, 4, rm)).is_none(),
             "0xd9 mod=3 /4 rm={rm} is undefined and must stay unclassifiable"
+        );
+    }
+    // FSQRT, and the seven 0xD9 /7 encodings around it that must NOT come with it. FPREM,
+    // FYL2XP1, FSINCOS, FRNDINT, FSCALE, FSIN and FCOS are either transcendental or
+    // rounding-control dependent, and admitting any of them by widening the rm match is the
+    // realistic mistake this loop exists to catch.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 7, 2)),
+        Some(NativeX87Insn::SquareRoot)
+    );
+    for rm in [0u8, 1, 3, 4, 5, 6, 7] {
+        assert!(
+            NativeX87Insn::classify(&insn(0xd9, 3, 7, rm)).is_none(),
+            "0xd9 mod=3 /7 rm={rm} must stay unclassifiable"
         );
     }
     // FUCOM/FUCOMP ST(i). The pop flag is the only thing separating /4 from /5, and it drives
@@ -814,6 +832,19 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FSQRT: `clocks(70)`, the largest raw figure in the table by a factor of three. It is
+        // pinned because it is also the shape most likely to be "rounded" toward its neighbours,
+        // and because the `MAX_X87_BLOCK_CORE_CLOCKS` derivation below reads it.
+        (
+            insn(0xd9, 3, 7, 2),
+            NativeX87Metadata {
+                raw_clocks: 70,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
         // FIST m32, the NON-popping half of the 0xDB /2-/3 pair. `pops` false against FISTP's
         // true is the only field that moves, and `IntConvert32` (272 at I586) must not drift to
         // the `IntConvert16` its 0xDF sibling uses -- `execute_fpu` derives the class from the
@@ -1072,6 +1103,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         NativeX87Insn::SignOp { negate: false },
         NativeX87Insn::TestZero,
         NativeX87Insn::Examine,
+        NativeX87Insn::SquareRoot,
         NativeX87Insn::LoadF32 { addr: addr() },
         NativeX87Insn::LoadI32 { addr: addr() },
         NativeX87Insn::LoadControlWord { addr: addr() },
@@ -1137,7 +1169,8 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::UnorderedCompare { .. }
         | NativeX87Insn::SignOp { .. }
         | NativeX87Insn::TestZero
-        | NativeX87Insn::Examine => true,
+        | NativeX87Insn::Examine
+        | NativeX87Insn::SquareRoot => true,
     }
 }
 

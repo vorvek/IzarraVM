@@ -188,6 +188,17 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             e.vmovq_xmm_r64(VALUE0, Reg::RDX);
             emit_store_physical(e, top, VALUE0);
         }
+        // FSQRT. The guard on the RESULT is the whole arm: the interpreter stores a NaN and
+        // raises IE for a negative operand, and the resident cache cannot hold a NaN, so this
+        // must side exit before `emit_store_physical` and let the interpreter record the
+        // exception. `emit_finite_guard` tests the exponent field for all-ones, which catches
+        // that NaN as well as an infinity.
+        NativeX87Insn::SquareRoot => {
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.vsqrtsd(VALUE0, VALUE0, VALUE0);
+            emit_finite_guard(e, VALUE0, context.side_exit);
+            emit_store_physical(e, top, VALUE0);
+        }
         // FTST. The only compare shape that loads ONE physical register: its right-hand side is
         // the literal +0.0, not a stack slot, so there is no second tag or finite guard.
         NativeX87Insn::TestZero => {

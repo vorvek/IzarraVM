@@ -1290,6 +1290,13 @@ impl Encoder {
         self.vex_scalar_binary(0x5e, dst, src1, src2);
     }
 
+    /// `vsqrtsd dst, src1, src2`. Unary in effect but three-operand in encoding: like every
+    /// scalar VEX form the upper lane comes from `src1`, so callers that want a pure unary pass
+    /// the same register for `src1` and `src2`.
+    pub(crate) fn vsqrtsd(&mut self, dst: Xmm, src1: Xmm, src2: Xmm) {
+        self.vex_scalar_binary(0x51, dst, src1, src2);
+    }
+
     /// `vucomisd lhs, rhs`.
     pub(crate) fn vucomisd(&mut self, lhs: Xmm, rhs: Xmm) {
         self.vex_reg_rm(VexOp::new(1, 1, false, false, 0x2e), lhs.0, None, rhs.0);

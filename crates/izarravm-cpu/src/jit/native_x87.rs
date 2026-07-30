@@ -206,6 +206,14 @@ pub(crate) enum NativeX87Insn {
     SignOp {
         negate: bool,
     },
+    /// FSQRT (0xD9 FA). The one member of the 0xD9 /7 register group that lowers: every other
+    /// encoding there is a transcendental, a partial remainder or an RC-dependent rounding, none
+    /// of which has a single-instruction host equivalent.
+    ///
+    /// The interpreter STORES a NaN result and raises IE (fpu_exec.rs:483-491), so the native
+    /// form must not: `emit_finite_guard` on the result catches the negative operand and side
+    /// exits with the stack untouched, and the interpreter then re-executes and records IE.
+    SquareRoot,
     /// FTST (0xD9 E4): compare ST(0) against +0.0 and write the condition triple. The zero is a
     /// literal in the emitted form rather than a stack slot, so unlike every other compare shape
     /// this one loads only ONE physical register.
@@ -304,6 +312,7 @@ impl NativeX87Insn {
             | Self::SignOp { .. }
             | Self::TestZero
             | Self::Examine
+            | Self::SquareRoot
             // Neither control-word form touches the register stack, the status word or the tag
             // word, so both are TOP-insensitive. That is what makes them safe to admit, and it is
             // also why they pin a block to its compile-time TOP for no architectural reason; see
@@ -402,6 +411,9 @@ impl NativeX87Insn {
             (0xd9, 4, 1) => Some(Self::SignOp { negate: false }),
             (0xd9, 4, 4) => Some(Self::TestZero),
             (0xd9, 4, 5) => Some(Self::Examine),
+            // FSQRT alone out of the eight 0xD9 /7 encodings. The other seven (FPREM, FYL2XP1,
+            // FSINCOS, FRNDINT, FSCALE, FSIN, FCOS) stay rejected.
+            (0xd9, 7, 2) => Some(Self::SquareRoot),
             (0xd9, 5, 0) => Some(Self::LoadOne),
             (0xd9, 5, 6) => Some(Self::LoadZero),
             (0xda, 5, 1) | (0xde, 3, 1) => Some(Self::ComparePopPop),
@@ -563,6 +575,17 @@ impl NativeX87Insn {
             },
             Self::TestZero => NativeX87Metadata {
                 raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+            // `clocks(70)`, the largest raw figure any lowered shape carries. It still lands well
+            // under the per-slot ceiling `MAX_X87_BLOCK_CORE_CLOCKS` is derived from, because
+            // `Register` scales by 2/8 where the IntConvert classes that set that ceiling scale
+            // by 256/8: ceil(70 * 2 / 8) = 18 against the bound's 640.
+            Self::SquareRoot => NativeX87Metadata {
+                raw_clocks: 70,
                 fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,

@@ -1255,6 +1255,72 @@ fn fchs_fabs_ftst_and_fxam_match_the_interpreter() {
     }
 }
 
+fn fsqrt_program(value: f32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                integer, before
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]  ST(0)=value
+        0xd9, 0xfa, // fsqrt
+        0xd9, 0x1d, 0x04, 0x02, 0x00, 0x00, // fstp dword [0x204]
+        0xba, 0x02, 0x00, 0x00, 0x00, // mov edx,2                integer, after
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn fsqrt_matches_the_interpreter_for_non_negative_operands() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (value, expected) in [
+            (4.0f32, 2.0f32),
+            (2.0, std::f32::consts::SQRT_2),
+            (0.0, 0.0),
+        ] {
+            let (cpu, bus) = assert_program_matches_exact_insns(
+                mode,
+                fsqrt_program(value),
+                0x0f7f,
+                5, // mov, fld, fsqrt, fstp, mov -- hlt never retires natively
+            );
+            assert_eq!(
+                f32::from_bits(u32::from_le_bytes(
+                    bus.memory[DATA + 4..DATA + 8].try_into().unwrap()
+                )),
+                expected,
+                "mode={mode:?} value={value}"
+            );
+            assert_eq!(
+                cpu.perf_counters().jit_direct_side_exits,
+                0,
+                "mode={mode:?} value={value}"
+            );
+        }
+    }
+}
+
+/// FSQRT of a negative operand. The interpreter STORES the NaN and raises IE; the resident cache
+/// cannot hold a NaN, so the native form must side exit at the result guard with the x87 stack
+/// untouched and let the interpreter do both. Only the two instructions ahead of the FSQRT retire
+/// natively, and they do so on every pass because the exit is taken every time.
+#[test]
+fn fsqrt_of_a_negative_operand_exits_before_touching_x87_state() {
+    let (cpu, bus) =
+        assert_program_matches_exact_insns(GswMode::Gsw586, fsqrt_program(-4.0), 0x0f7f, 2);
+    // The FSTP behind the FSQRT carried the NaN out to memory, so that is where it is visible.
+    assert!(
+        f32::from_bits(u32::from_le_bytes(
+            bus.memory[DATA + 4..DATA + 8].try_into().unwrap()
+        ))
+        .is_nan(),
+        "the interpreter computed and stored the NaN"
+    );
+    assert_ne!(cpu.fpu.status & 0x01, 0, "IE must be recorded");
+    assert!(cpu.perf_counters().jit_direct_side_exits > 0);
+}
+
 fn constants_and_register_store_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;
