@@ -74,10 +74,10 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             | (0xde, 3, 0 | 1 | 4 | 5 | 6 | 7, 0..=7)
             | (0xde, 3, 3, 1)
             | (0xdf, 3, 4, 0)
-            // 0xDF /5 memory: FILD m64 (`LoadI64`). Slice 40, FILD-only scope: `/7` (FISTP m64,
-            // deferred) and `/4`/`/6` (FBLD/FBSTP, unimplemented) stay rejected, the positive
-            // assertion of the scope cut.
-            | (0xdf, 0..=2, 5, 0..=7)
+            // 0xDF memory /5 and /7: FILD m64 and FISTP m64. `/4` and `/6` (FBLD/FBSTP,
+            // unimplemented) stay rejected, and `/0`-`/3` are the m16 integer forms, which are
+            // separately out of scope.
+            | (0xdf, 0..=2, 5 | 7, 0..=7)
     )
 }
 
@@ -109,8 +109,9 @@ fn classifier_selects_exact_traced_slice() {
     // (FUCOM/FUCOMP) add 2 sub-opcodes x 8 rm values = 16, landing at 1053. 0xDB /2 memory
     // (FIST m32) adds 3 modes x 1 sub-opcode x 8 rm values = 24, landing at 1077. 0xD9 mod=3 /4
     // (FCHS/FABS/FTST/FXAM) adds 4 rm values, landing at 1081. FSQRT (0xD9 /7 rm=2) adds one,
-    // landing at 1082.
-    assert_eq!(accepted, 1082);
+    // landing at 1082. 0xDF /7 memory (FISTP m64) adds 3 modes x 8 rm values = 24, landing at
+    // 1106.
+    assert_eq!(accepted, 1106);
 }
 
 #[test]
@@ -206,10 +207,14 @@ fn classifier_preserves_operations_indices_and_addresses() {
         NativeX87Insn::classify(&insn(0xdf, 0, 5, 5)),
         Some(NativeX87Insn::LoadI64 { addr: addr() })
     );
-    for extension in [4u8, 6, 7] {
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdf, 0, 7, 5)),
+        Some(NativeX87Insn::StoreI64 { addr: addr() })
+    );
+    for extension in [4u8, 6] {
         assert!(
             NativeX87Insn::classify(&insn(0xdf, 0, extension, 5)).is_none(),
-            "0xdf /{extension} memory (FBLD/FBSTP/FISTP m64) must stay unclassifiable"
+            "0xdf /{extension} memory (FBLD/FBSTP) must stay unclassifiable"
         );
     }
     // 0xDC mod=3 must still classify as `BinaryRegisterDest`, not `BinaryMemoryF64`: the
@@ -862,6 +867,23 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FISTP m64: `IntConvert16` like its FILD sibling and UNLIKE `StoreI32`'s
+        // `IntConvert32`. The class comes from the opcode byte, so the two integer STORES
+        // disagree while the two 0xDF forms agree -- the opposite of what grouping by operation
+        // would suggest, and the reason this row sits next to the FIST m32 one.
+        (
+            insn(0xdf, 0, 7, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert16,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 8,
+                }),
+                pops: true,
+                terminates_block: false,
+            },
+        ),
         // FUCOM/FUCOMP ST(i): `clocks(4)`, not the 20 the ordered register compare
         // (`BinaryRegister`, pinned two rows from the top of this list) charges. Both rows are
         // register-form compares and only the concrete number separates them, which is why the
@@ -1113,6 +1135,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
     ];
     shapes.push(NativeX87Insn::LoadF64 { addr: addr() });
     shapes.push(NativeX87Insn::LoadI64 { addr: addr() });
+    shapes.push(NativeX87Insn::StoreI64 { addr: addr() });
     for pop in [false, true] {
         shapes.push(NativeX87Insn::StoreF32 { addr: addr(), pop });
         shapes.push(NativeX87Insn::StoreRegister { index: 3, pop });
@@ -1166,6 +1189,7 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::StoreF64 { .. }
         | NativeX87Insn::BinaryMemoryF64 { .. }
         | NativeX87Insn::LoadI64 { .. }
+        | NativeX87Insn::StoreI64 { .. }
         | NativeX87Insn::UnorderedCompare { .. }
         | NativeX87Insn::SignOp { .. }
         | NativeX87Insn::TestZero

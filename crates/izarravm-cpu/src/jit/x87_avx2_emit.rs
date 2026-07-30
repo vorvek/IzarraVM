@@ -151,12 +151,36 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
         NativeX87Insn::StoreI32 { pop, .. } => {
             let memory = context.memory.expect("FIST/FISTP needs a host pointer");
             emit_load_physical(e, top, VALUE0, context.side_exit);
-            emit_fistp_chop_guard(e, context.cpu, context.side_exit);
+            emit_fistp_chop_guard(
+                e,
+                context.cpu,
+                context.side_exit,
+                -2_147_483_649.0,
+                6,
+                2_147_483_648.0,
+            );
             e.vcvttsd2si_r32(Reg::RDX, VALUE0);
             e.store_r32_disp32(memory, 0, Reg::RDX);
             if pop {
                 emit_pop(e, top);
             }
+        }
+        // FISTP m64. The i32 arm above with a wider conversion, a wider store and -- the part
+        // that is not a widening -- a strict low bound; see `emit_fistp_chop_guard`.
+        NativeX87Insn::StoreI64 { .. } => {
+            let memory = context.memory.expect("FISTP m64 needs a host pointer");
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            emit_fistp_chop_guard(
+                e,
+                context.cpu,
+                context.side_exit,
+                -9_223_372_036_854_775_808.0,
+                2,
+                9_223_372_036_854_775_808.0,
+            );
+            e.vcvttsd2si_r64(Reg::RDX, VALUE0);
+            e.store_r64_disp32(memory, 0, Reg::RDX);
+            emit_pop(e, top);
         }
         // 0xDC and 0xDE mod=3 differ by exactly one emitted step. Sharing the body makes that
         // structural instead of a comment: the interpreter models both with one function.
@@ -474,17 +498,43 @@ fn emit_condition(e: &mut Encoder, set: u32) {
     }
 }
 
-fn emit_fistp_chop_guard(e: &mut Encoder, cpu: Reg, side_exit: Label) {
+/// The integer-store admission guard, shared by FIST/FISTP m32 and FISTP m64.
+///
+/// Two conditions. RC must be truncate, because that is the only rounding mode `vcvttsd2si`
+/// implements and the interpreter applies `fpu_round_rc` before its own range check. And the
+/// operand in VALUE0 must ROUND into the destination's range: the interpreter tests the rounded
+/// value, so the bounds here are stated on the unrounded operand and differ from the integer
+/// limits by design.
+///
+/// `low_exit_cc` is the parameter that is easy to get wrong, and it is genuinely different
+/// between the two widths rather than a copy. For m32 the bound is `-2^31 - 1`, which is exactly
+/// representable, and `trunc(v) >= -2^31` holds for every `v` strictly above it -- so the exit is
+/// JBE (6), refusing `v <= -2^31 - 1`. For m64 the same reasoning would want `-2^63 - 1`, which
+/// is NOT representable: at that magnitude f64 steps by 2048, so no double lies strictly between
+/// `-2^63 - 1` and `-2^63` and `trunc(v) >= -2^63` collapses to `v >= -2^63`. The exit is
+/// therefore JB (2) against `-2^63` itself. Using JBE there would wrongly refuse the single most
+/// likely out-of-range-looking input, exactly `-2^63`, which IS in range.
+///
+/// The high side needs no such split: both widths refuse `v >= 2^N`, JAE (3), because `2^N` is
+/// representable and one past the largest storable integer in both cases.
+fn emit_fistp_chop_guard(
+    e: &mut Encoder,
+    cpu: Reg,
+    side_exit: Label,
+    low: f64,
+    low_exit_cc: u8,
+    high: f64,
+) {
     e.movzx_r32_word_disp32(Reg::RAX, cpu, control_offset());
     e.and_r32_imm32(Reg::RAX, 0x0c00);
     e.cmp_r32_imm32(Reg::RAX, 0x0c00);
     e.jnz(side_exit);
 
-    e.mov_r64_imm64(Reg::RDX, (-2_147_483_649.0f64).to_bits());
+    e.mov_r64_imm64(Reg::RDX, low.to_bits());
     e.vmovq_xmm_r64(VALUE1, Reg::RDX);
     e.vucomisd(VALUE0, VALUE1);
-    e.jcc(6, side_exit);
-    e.mov_r64_imm64(Reg::RDX, 2_147_483_648.0f64.to_bits());
+    e.jcc(low_exit_cc, side_exit);
+    e.mov_r64_imm64(Reg::RDX, high.to_bits());
     e.vmovq_xmm_r64(VALUE1, Reg::RDX);
     e.vucomisd(VALUE0, VALUE1);
     e.jcc(3, side_exit);

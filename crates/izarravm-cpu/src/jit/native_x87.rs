@@ -242,6 +242,17 @@ pub(crate) enum NativeX87Insn {
     LoadI64 {
         addr: AddrMode,
     },
+    /// FISTP m64 (0xDF /7), the deferral `LoadI64`'s comment above opened. It always pops: unlike
+    /// every other store form in this file there is no non-popping sibling, because `0xDF /6` is
+    /// FBSTP rather than a FIST m64.
+    ///
+    /// The range guard is NOT a widened copy of the m32 one. `-2^63` is exactly representable in
+    /// f64 and no double lies strictly between `-2^63 - 1` and `-2^63`, so the admission test on
+    /// the low side is a strict `<` where the m32 guard needs `<=` against a bound one past its
+    /// range; see `emit_fistp_chop_guard`.
+    StoreI64 {
+        addr: AddrMode,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +307,7 @@ impl NativeX87Insn {
             Self::StoreF32 { pop: true, .. }
             | Self::StoreRegister { pop: true, .. }
             | Self::StoreI32 { pop: true, .. }
+            | Self::StoreI64 { .. }
             | Self::StoreF64 { pop: true, .. }
             | Self::UnorderedCompare { pop: true, .. }
             | Self::PopBinary { .. } => 1,
@@ -390,6 +402,7 @@ impl NativeX87Insn {
                 // FILD m64. `/7` (FISTP m64, deferred to a later slice) and `/4`/`/6` (FBLD,
                 // FBSTP, unimplemented) are NOT here and fall to the catch-all `None` below.
                 (0xdf, 5) => Some(Self::LoadI64 { addr }),
+                (0xdf, 7) => Some(Self::StoreI64 { addr }),
                 _ => None,
             };
         }
@@ -682,6 +695,17 @@ impl NativeX87Insn {
                 fp_class: FpOpClass::IntConvert16,
                 memory: read_qword,
                 pops: false,
+                terminates_block: false,
+            },
+            // 0xDF /7, `Ok(clocks(14))` (fpu_exec.rs:276-281). `IntConvert16` for the same reason
+            // `LoadI64` uses it and `StoreI32` does not: the class comes from the OPCODE BYTE,
+            // and 0xdf maps to IntConvert16 where 0xdb maps to IntConvert32. Reaching for
+            // `StoreI32`'s class here because both are integer STORES is the mistake.
+            Self::StoreI64 { .. } => NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert16,
+                memory: write_qword,
+                pops: true,
                 terminates_block: false,
             },
         }

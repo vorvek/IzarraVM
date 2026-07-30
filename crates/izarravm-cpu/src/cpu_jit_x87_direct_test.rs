@@ -1321,6 +1321,89 @@ fn fsqrt_of_a_negative_operand_exits_before_touching_x87_state() {
     assert!(cpu.perf_counters().jit_direct_side_exits > 0);
 }
 
+fn fistp_m64_program(value: f64) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                 integer, before
+        0xdd, 0x05, 0x00, 0x02, 0x00, 0x00, // fld qword [0x200]   ST(0)=value
+        0xdf, 0x3d, 0x08, 0x02, 0x00, 0x00, // fistp qword [0x208] 0xDF /7
+        0xba, 0x02, 0x00, 0x00, 0x00, // mov edx,2                 integer, after
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 8].copy_from_slice(&value.to_bits().to_le_bytes());
+    memory
+}
+
+/// FISTP m64 across the range the chop guard admits.
+///
+/// Both signs carry a fraction, so a rounding mode that was not truncate shows in the stored
+/// integer, and the magnitudes are past 2^32 so a conversion that had stayed 32-bit wide would
+/// wrap rather than merely lose precision.
+#[test]
+fn fistp_m64_matches_the_interpreter_inside_the_admitted_range() {
+    let cases = [
+        (3.5f64, 3i64),
+        (-3.5, -3),
+        (1_234_567_890_123.5, 1_234_567_890_123),
+        (-1_234_567_890_123.5, -1_234_567_890_123),
+        // Exactly -2^63. In range, and the value the low bound must NOT refuse: the m32 guard's
+        // JBE shape would have rejected it, which is why this width uses a strict JB.
+        (-9_223_372_036_854_775_808.0, i64::MIN),
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (value, expected) in cases {
+            let (cpu, bus) = assert_program_matches_exact_insns(
+                mode,
+                fistp_m64_program(value),
+                0x0f7f,
+                4, // mov, fld, fistp, mov -- hlt never retires natively
+            );
+            assert_eq!(
+                i64::from_le_bytes(bus.memory[DATA + 8..DATA + 16].try_into().unwrap()),
+                expected,
+                "mode={mode:?} value={value}"
+            );
+            assert_eq!(cpu.fpu.top(), 0, "mode={mode:?} value={value}");
+            assert_eq!(
+                cpu.perf_counters().jit_direct_side_exits,
+                0,
+                "mode={mode:?} value={value}"
+            );
+        }
+    }
+}
+
+/// Out of range on both sides. The interpreter stores the integer indefinite and raises IE; the
+/// native form has to leave before the conversion so it can. 2^63 itself is the upper case, one
+/// past the largest storable integer, and it is the bound the guard refuses with JAE.
+#[test]
+fn fistp_m64_out_of_range_exits_before_touching_x87_state() {
+    for value in [9_223_372_036_854_775_808.0f64, -1.0e19] {
+        let (cpu, bus) = assert_program_matches_exact_insns(
+            GswMode::Gsw586,
+            fistp_m64_program(value),
+            0x0f7f,
+            2,
+        );
+        assert_eq!(
+            u64::from_le_bytes(bus.memory[DATA + 8..DATA + 16].try_into().unwrap()),
+            0x8000_0000_0000_0000,
+            "value={value}: the interpreter stored the integer indefinite"
+        );
+        assert_ne!(
+            cpu.fpu.status & 0x01,
+            0,
+            "value={value}: IE must be recorded"
+        );
+        assert!(
+            cpu.perf_counters().jit_direct_side_exits > 0,
+            "value={value}"
+        );
+    }
+}
+
 fn constants_and_register_store_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;
