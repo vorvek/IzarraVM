@@ -16,10 +16,9 @@ pub(crate) struct ExecutableBuffer {
 /// blocks can be sealed Read+Execute while unused slots remain Read+Write.
 pub(crate) const EXECUTABLE_ARENA_LEN: usize = 32 * 1024 * 1024;
 
-/// A bounded collection of page-multiple executable-code spans. The Direct backend installs
-/// one-page spans through `install`; the clif backend's units may span multiple contiguous
-/// pages through `install_span`. Only span BASES are valid entries; the registry records every
-/// span as `(offset, len_rounded_to_pages)` in offset order.
+/// A bounded collection of one-page executable-code spans, installed through `install`. Only
+/// span BASES are valid entries; the registry records every span as `(offset, page_len)` in
+/// offset order.
 pub(crate) struct ExecutableArena {
     ptr: *mut u8,
     len: usize,
@@ -85,36 +84,16 @@ impl ExecutableArena {
     /// Reserve the fixed-size arena as Read+Write memory. Individual pages become Read+Execute as
     /// blocks are installed. Unsupported hosts and allocation failure both return `None`.
     pub(crate) fn new() -> Option<Self> {
-        Self::with_len(EXECUTABLE_ARENA_LEN, true)
+        Self::with_len(EXECUTABLE_ARENA_LEN)
     }
 
-    /// Identical to `new()` except it never registers unwind info, regardless of
-    /// `IZARRAVM_JIT_UNWIND`. The shared UNWIND_INFO `jit::unwind` builds describes the Direct
-    /// backend's own prologue shape (`SAVED_HOST_REGS` pushes then `sub rsp, imm32`); a
-    /// Cranelift-compiled unit has a different prologue (`push rbp; mov rbp, rsp`), so
-    /// registering the Direct descriptor for a clif arena would make a stack walk read a return
-    /// address from the wrong slot -- actively wrong, not merely unresolved. `ClifBackend` (the
-    /// only other `ExecutableArena` owner) calls this instead of `new()`.
-    #[cfg_attr(
-        not(all(
-            feature = "clif-backend",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn new_unregistered() -> Option<Self> {
-        Self::with_len(EXECUTABLE_ARENA_LEN, false)
-    }
-
-    fn with_len(total_len: usize, register_unwind: bool) -> Option<Self> {
+    fn with_len(total_len: usize) -> Option<Self> {
         let page_len = page_size();
         let len = total_len / page_len * page_len;
         if len == 0 {
             return None;
         }
-        let unwind_enabled = register_unwind
-            && cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        let unwind_enabled = cfg!(all(target_os = "windows", target_arch = "x86_64"))
             && std::env::var("IZARRAVM_JIT_UNWIND")
                 .map(|v| v != "0")
                 .unwrap_or(true);
@@ -149,54 +128,25 @@ impl ExecutableArena {
     /// Test seam: a small arena so fill-then-compact paths run without 32MB of installs.
     #[cfg(test)]
     pub(crate) fn with_len_for_test(total_len: usize) -> Option<Self> {
-        Self::with_len(total_len, true)
+        Self::with_len(total_len)
     }
 
-    /// The clif backend's test-seam counterpart: same small-arena shrink as
-    /// `with_len_for_test`, but never registers unwind info -- clif arenas never do, on any
-    /// size (see `new_unregistered`).
-    #[cfg(test)]
-    #[cfg_attr(
-        not(all(
-            feature = "clif-backend",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn with_len_for_test_unregistered(total_len: usize) -> Option<Self> {
-        Self::with_len(total_len, false)
-    }
-
-    /// Copy one block into the next page and seal that page Read+Execute. A thin one-page-cap
-    /// wrapper over `install_span`, so the Direct backend's callers (which pre-reject oversized
-    /// compilations) govern unchanged.
+    /// Copy one block into the next page and seal that page Read+Execute. The Direct backend's
+    /// callers pre-reject oversized compilations, so every install is exactly one page; the span
+    /// registers under its base offset, and only the base is a valid entry.
     pub(crate) fn install(&mut self, code: &[u8]) -> Option<*const u8> {
-        if code.len() > self.page_len {
+        if code.is_empty() || code.len() > self.page_len || self.sealed != self.used {
             return None;
         }
-        self.install_span(code)
-    }
-
-    /// Copy a code buffer of any length into the next span (rounded up to a page multiple) and
-    /// seal exactly that span Read+Execute. The span registers under its base offset; only the
-    /// base is a valid entry.
-    pub(crate) fn install_span(&mut self, code: &[u8]) -> Option<*const u8> {
-        if code.is_empty() || self.sealed != self.used {
-            return None;
-        }
-        let rounded = code
-            .len()
-            .div_ceil(self.page_len)
-            .checked_mul(self.page_len)?;
+        let rounded = self.page_len;
         let offset = self.used;
         if rounded > self.len - offset {
             return None;
         }
-        // SAFETY: `offset + rounded <= len`, all values are page-aligned, and these pages have
+        // SAFETY: `offset + rounded <= len`, all values are page-aligned, and this page has
         // not previously been exposed or sealed.
         let slot = unsafe { self.ptr.add(offset) };
-        // SAFETY: the span has `rounded` writable bytes and `code` fits in it.
+        // SAFETY: the page has `rounded` writable bytes and `code` fits in it.
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), slot, code.len()) };
         if !flush_instruction_cache(slot, rounded) || !make_rx(slot, rounded) {
             return None;
@@ -209,35 +159,6 @@ impl ExecutableArena {
             u.cover(offset, rounded);
         }
         Some(slot)
-    }
-
-    /// Whether a same-sized `install_span(code)` call would fail purely because the arena
-    /// lacks remaining capacity for a span that large -- as opposed to `install_span`'s other
-    /// `None` causes (empty code, a pending unsealed prefix, or an OS page-protection
-    /// failure), none of which mean the arena itself is full. Track C-second-cause A1
-    /// (`dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md` section 3.7): the
-    /// clif backend calls this AFTER a successful Cranelift compile to distinguish "this
-    /// specific unit doesn't fit anymore" from every other `finalize` failure, so only the
-    /// former sets its sticky arena-exhausted flag. Mirrors `install_span`'s own capacity
-    /// check exactly (`rounded > self.len - offset`, `offset` there being `self.used`, which
-    /// this type's only clif-side caller never diverges from since it never calls
-    /// `append_unsealed`/`seal_used_prefix`).
-    #[cfg_attr(
-        not(all(
-            feature = "clif-backend",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn would_exceed_capacity(&self, code_len: usize) -> bool {
-        if code_len == 0 {
-            return false;
-        }
-        let Some(rounded) = code_len.div_ceil(self.page_len).checked_mul(self.page_len) else {
-            return true;
-        };
-        rounded > self.len - self.used
     }
 
     /// Copy one block into the next slot without making it executable. This is allowed only in a
@@ -332,52 +253,6 @@ impl ExecutableArena {
 
     pub(crate) fn is_full(&self) -> bool {
         self.used == self.len
-    }
-
-    /// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md` section 7.2):
-    /// reclaim the whole arena, re-arming the sealed prefix writable and dropping every span
-    /// registration, returning it to the empty state `new`/`with_len` produced. Returns false
-    /// if the OS protection change fails; the caller must then abandon this arena (section 7.3,
-    /// the drop+rebuild fallback) rather than trust an indeterminate mix of RW/RX pages.
-    ///
-    /// SAFETY CONTRACT (caller-enforced, not expressible in the type): no code in this arena
-    /// may be on any thread's call stack when this runs. `ClifBackend::reset_arena` (the sole
-    /// caller, section 7.4) upholds this by calling it only from the frame-free top-of-
-    /// admission point the design's section 5 proof establishes.
-    #[cfg_attr(
-        not(all(
-            feature = "clif-backend",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn reset(&mut self) -> bool {
-        if self.sealed == 0 {
-            // Nothing was ever sealed executable (a fresh arena, or one whose only spans are
-            // still-unsealed `append_unsealed` slots): no page needs a protection flip, only
-            // the bookkeeping below.
-            self.used = 0;
-            self.spans.clear();
-            self.pending_spans.clear();
-            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-            if let Some(u) = self.unwind.as_mut() {
-                u.clear();
-            }
-            return true;
-        }
-        if !make_rw(self.ptr, self.sealed) {
-            return false;
-        }
-        self.used = 0;
-        self.sealed = 0;
-        self.spans.clear();
-        self.pending_spans.clear();
-        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        if let Some(u) = self.unwind.as_mut() {
-            u.clear();
-        }
-        true
     }
 
     pub(crate) fn slot_len(&self) -> usize {
@@ -498,15 +373,6 @@ mod os {
         unsafe { VirtualProtect(ptr as *mut c_void, len, PAGE_EXECUTE_READ, &mut old) != 0 }
     }
 
-    /// Track C A2 (design section 7.1): the inverse of `make_rx`, re-arming a sealed span
-    /// writable so `ExecutableArena::reset` can reclaim it. The whole arena is one
-    /// `MEM_COMMIT|MEM_RESERVE` region from a single `VirtualAlloc`, so one call may span the
-    /// entire sealed prefix even though it was made RX in span-sized chunks.
-    pub(super) fn make_rw(ptr: *mut u8, len: usize) -> bool {
-        let mut old = 0u32;
-        unsafe { VirtualProtect(ptr as *mut c_void, len, PAGE_READWRITE, &mut old) != 0 }
-    }
-
     pub(super) fn flush_instruction_cache(ptr: *mut u8, len: usize) -> bool {
         unsafe { FlushInstructionCache(GetCurrentProcess(), ptr as *const c_void, len) != 0 }
     }
@@ -572,12 +438,6 @@ mod os {
         unsafe { mprotect(ptr as *mut c_void, len, PROT_READ | PROT_EXEC) == 0 }
     }
 
-    /// Track C A2 (design section 7.1): the inverse of `make_rx`, re-arming a sealed span
-    /// writable so `ExecutableArena::reset` can reclaim it.
-    pub(super) fn make_rw(ptr: *mut u8, len: usize) -> bool {
-        unsafe { mprotect(ptr as *mut c_void, len, PROT_READ | PROT_WRITE) == 0 }
-    }
-
     pub(super) fn flush_instruction_cache(_ptr: *mut u8, _len: usize) -> bool {
         true
     }
@@ -603,16 +463,13 @@ mod os {
     pub(super) fn make_rx(_ptr: *mut u8, _len: usize) -> bool {
         false
     }
-    pub(super) fn make_rw(_ptr: *mut u8, _len: usize) -> bool {
-        false
-    }
     pub(super) fn flush_instruction_cache(_ptr: *mut u8, _len: usize) -> bool {
         false
     }
     pub(super) unsafe fn free(_ptr: *mut u8, _len: usize) {}
 }
 
-use os::{alloc_rw, flush_instruction_cache, free, make_rw, make_rx, page_size};
+use os::{alloc_rw, flush_instruction_cache, free, make_rx, page_size};
 
 pub(crate) fn host_page_len() -> usize {
     page_size()

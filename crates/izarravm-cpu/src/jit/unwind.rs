@@ -3,14 +3,10 @@
 
 //! Windows x64 unwind-info registration for the Direct JIT's code arena.
 //!
-//! Direct-arena only — Cranelift frames have a different shape and register nothing. This
-//! module describes exactly one prologue: the Direct backend's 7 `SAVED_HOST_REGS` pushes
-//! then `sub rsp, NATIVE_STACK_LEN`. A Cranelift-compiled unit's prologue (`push rbp; mov
-//! rbp, rsp`) does not match it, so `ExecutableArena::new_unregistered` (which
-//! `ClifBackend` uses instead of `new`) never builds an `ArenaUnwind` for the clif arena —
-//! registering this descriptor there would make a stack walk read a return address from
-//! the wrong slot, an actively wrong unwind rather than the merely-unresolved one that
-//! walking off the end of an unregistered arena produces.
+//! Direct-arena only. This module describes exactly one prologue: the Direct backend's
+//! 7 `SAVED_HOST_REGS` pushes then `sub rsp, NATIVE_STACK_LEN`. (The now-removed clif
+//! backend's Cranelift-compiled units had a different prologue shape -- `push rbp; mov
+//! rbp, rsp` -- and never registered against this descriptor for exactly that reason.)
 //!
 //! Every emitted block shares ONE frame shape — the 7 `SAVED_HOST_REGS` pushes then
 //! `sub rsp, NATIVE_STACK_LEN` (see direct.rs, "One frame shape for every block") — so a
@@ -117,9 +113,6 @@ pub(crate) struct ArenaUnwind {
     entries: Box<[RuntimeFunction]>,
     count: u32,
     unwind_rva: u32,
-    /// The registered range, kept so `clear` can re-register after an arena reset.
-    range_base: usize,
-    range_end: usize,
 }
 
 // SAFETY: the table handle and entry array are used only from the emulation thread that
@@ -167,8 +160,6 @@ impl ArenaUnwind {
             entries,
             count: 0,
             unwind_rva: code_len as u32,
-            range_base: range_base as usize,
-            range_end: range_base as usize + code_len + page_len,
         })
     }
 
@@ -188,34 +179,6 @@ impl ArenaUnwind {
         self.count += 1;
         // SAFETY: `table` is a live registration over `entries`, and `count` <= capacity.
         unsafe { RtlGrowFunctionTable(self.table, self.count) };
-    }
-
-    /// Drop every published entry (arena reset): delete the table and re-register it
-    /// empty over the same range. Called only from `ExecutableArena::reset`, the
-    /// clif-only path Phase 1 deletes; it exists so Phase 0 leaves no correctness hole.
-    pub(crate) fn clear(&mut self) {
-        if !self.table.is_null() {
-            // SAFETY: `table` is the live registration created in `new` or a prior `clear`.
-            unsafe { RtlDeleteGrowableFunctionTable(self.table) };
-        }
-        self.count = 0;
-        let mut table: *mut c_void = core::ptr::null_mut();
-        // SAFETY: same contract as in `new`; `entries` is unchanged and stable.
-        let status = unsafe {
-            RtlAddGrowableFunctionTable(
-                &mut table,
-                self.entries.as_ptr(),
-                0,
-                self.entries.len() as u32,
-                self.range_base,
-                self.range_end,
-            )
-        };
-        debug_assert_eq!(status, 0, "re-registration after arena reset failed");
-        // A failed re-registration leaves `table` null; `cover`/Drop both guard against
-        // that (see the null checks above and in `Drop::drop`), so this degrades to an
-        // unregistered arena rather than crashing.
-        self.table = table;
     }
 }
 
