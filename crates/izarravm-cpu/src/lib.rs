@@ -2163,10 +2163,15 @@ struct RepExecution {
 /// blocks. That population only reaches zero at conflict-free sizes, so the residual 1.78M here is
 /// what a hashed index could still claim at a fraction of the memory.
 ///
-/// At ~56 bytes per line (DecodeLine = tag + generation + DecodedInsn; DecodedInsn grew 36 -> 40
-/// bytes when C1e added the recorded {disp_len, imm_len} pair) 32768 lines is ~1.75 MB, against
-/// ~0.22 MB at 4096. That no longer fits a small L2, which is the real cost of this change and the
-/// reason not to go further without evidence.
+/// At 56 bytes per line (measured via `size_of::<DecodeLine>()`, not derived: DecodeLine is
+/// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32,
+/// jit_direct_hotness: u8` -- DecodedInsn itself measures 40 bytes, having grown 36 -> 40 when C1e
+/// added the recorded {disp_len, imm_len} pair) 32768 lines is ~1.75 MB, against ~0.22 MB at 4096.
+/// The dynarec-refactor Task 2 region-JIT deletion dropped two fields from this struct
+/// (`jit_region: Option<NonZeroU32>` and `jit_hotness: u16`, 6 bytes together) but the measured
+/// size stayed at 56: the removed bytes came out of what was already alignment padding, not out of
+/// the line count's real footprint, so this figure is unchanged. That no longer fits a small L2,
+/// which is the real cost of this change and the reason not to go further without evidence.
 ///
 /// NOT purely microarchitectural, despite what this comment said before. Guest STATE is untouched
 /// (the decode cache is transparent to CpuGsw equality), but a decode hit charges one collapsed

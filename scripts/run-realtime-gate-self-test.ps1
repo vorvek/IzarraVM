@@ -86,9 +86,12 @@ function Invoke-RealtimeGateSelfTest {
     # The clif backend (Task 1) and the region JIT (Task 2, dynarec-refactor) are both gone from
     # the codebase: neither `jit_clif_*` nor `jit_region_entries`/`jit_region_insns` exist as JSON
     # keys any more, so a policy that still named them would be asserting against a key that can
-    # never appear. `jit_native_insns` is the surviving (permanently-zero) counter the region JIT
-    # used to be the sole producer of; its continued presence in `required_zero_counters` is the
-    # policy's proof that legacy backend activity is still excluded.
+    # never appear. This check is NOT proof that legacy backend activity is excluded any more --
+    # `jit_native_insns`'s only producer was the region engine, so it is a dead, permanently-zero
+    # counter now, and asserting its presence is a placeholder pin, not a live guarantee. It stays
+    # here only until the flagged follow-up (retire jit_native_insns, jit_helper_exits,
+    # jit_native_memory_helpers, and jit_table_clears, all dead for the same reason) lands and
+    # removes the key from `required_zero_counters` entirely; update this assertion in that commit.
     if ($directPolicy.environment.IZARRAVM_JIT -cne "1" -or
         $directPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
         ($directPolicy.required_zero_counters | Where-Object {
