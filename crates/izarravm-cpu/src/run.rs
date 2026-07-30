@@ -15,18 +15,6 @@ pub(super) fn diff_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
 }
 
-/// The optional linear address forced JIT admission compiles
-/// (`IZARRAVM_JIT_REGION=<hex>`, with or without `0x`). `None` leaves normal hotness admission in
-/// control. Cached on first read, like `diff_trace_enabled`.
-#[cfg(feature = "jit")]
-fn jit_forced_region_lin() -> Option<u32> {
-    static FORCED: OnceLock<Option<u32>> = OnceLock::new();
-    *FORCED.get_or_init(|| {
-        let value = std::env::var("IZARRAVM_JIT_REGION").ok()?;
-        u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
-    })
-}
-
 /// Whether an opcode is a port-I/O instruction (IN / OUT / INS / OUTS), for the unit simulator's
 /// `touches_io` fact. IN (0xE4/0xE5 imm, 0xEC/0xED DX) and the string forms INS (0x6C/0x6D) / OUTS
 /// (0x6E/0x6F) plus OUT (0xE6/0xE7 imm, 0xEE/0xEF DX). OUT/INS/OUTS are also non-continuable, so the
@@ -559,18 +547,12 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         let mut skip_direct_once = false;
         #[cfg(feature = "jit")]
-        let forced_region_lin = jit_forced_region_lin();
-        #[cfg(feature = "jit")]
         let native_continuations_active = {
             debug_assert_eq!(
                 self.direct_runtime.admission_active,
                 self.jit_direct.execution_enabled()
             );
-            let legacy_requested = forced_region_lin.is_some()
-                || self.jit_regions.auto_admit()
-                || self.jit_regions.len() != 0;
             self.direct_runtime.admission_active
-                || legacy_requested && self.jit_direct.backend_enabled()
         };
         // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
         // derives it from PIT-edge instants), but `total` counts core clocks
@@ -622,15 +604,14 @@ impl CpuGsw {
                         break;
                     }
                 };
-                // JIT admission: a compiled region stamped on this line runs natively instead of
-                // the interpreted continuation, occupying one loop iteration; the loop's own
-                // break checks below then fire at exactly the boundary the region stopped at.
+                // JIT admission: a compiled Direct block covering this line runs natively instead
+                // of the interpreted continuation, occupying one loop iteration; the loop's own
+                // break checks below then fire at exactly the boundary the block stopped at.
                 // The probe read+branch is the whole per-continuation dispatch cost.
                 #[cfg(feature = "jit")]
-                let region_outcome = if !native_continuations_active {
+                let direct_outcome = if !native_continuations_active {
                     None
                 } else {
-                    let stamped_region = self.decode_cache.region_at(lin, cs.default_size_32);
                     let continuation_budget = ContinuationBudget {
                         total,
                         bus_at_entry,
@@ -638,17 +619,6 @@ impl CpuGsw {
                     };
                     if !self.jit_direct.backend_enabled() || std::mem::take(&mut skip_direct_once) {
                         None
-                    } else if forced_region_lin == Some(lin)
-                        || !self.jit_direct.auto_admit()
-                            && (self.jit_regions.auto_admit() || stamped_region.is_some())
-                    {
-                        self.try_region_continuation(
-                            bus,
-                            lin,
-                            cs.default_size_32,
-                            stamped_region,
-                            continuation_budget,
-                        )?
                     } else if self.mode().uses_approximate_timing() {
                         match self.try_direct_continuation(
                             bus,
@@ -671,8 +641,8 @@ impl CpuGsw {
                     }
                 };
                 #[cfg(not(feature = "jit"))]
-                let region_outcome: Option<CycleOutcome> = None;
-                match region_outcome {
+                let direct_outcome: Option<CycleOutcome> = None;
+                match direct_outcome {
                     Some(outcome) => outcome,
                     None => {
                         // A continuation skips cycle_no_interrupt_check (which resets this
@@ -900,13 +870,11 @@ impl CpuGsw {
     #[cfg(feature = "jit")]
     pub fn set_jit_auto_admit(&mut self, on: bool) {
         let was_enabled = self.direct_runtime.admission_active;
-        self.jit_regions.set_auto_admit(false);
         self.jit_direct.set_auto_admit(on && jit::host_supported());
         self.finish_direct_execution_transition(was_enabled);
     }
 
-    /// Enable or disable every native execution path, including forced legacy regions.
-    /// Unsupported hosts cannot be enabled.
+    /// Enable or disable the native execution path. Unsupported hosts cannot be enabled.
     #[cfg(feature = "jit")]
     pub fn set_native_backend_enabled(&mut self, on: bool) {
         let was_enabled = self.direct_runtime.admission_active;
@@ -922,10 +890,10 @@ impl CpuGsw {
             self.direct_runtime.admission_active,
             self.jit_direct.execution_enabled()
         );
-        // `admission_active` is one of the four inputs to `fast_map_population_enabled()`
+        // `admission_active` is one of the inputs to `fast_map_population_enabled()`
         // (memory.rs); refresh the interpreter serve gate's cached mirror unconditionally, not
-        // only on a real transition below, since `jit_regions.set_auto_admit` above (called from
-        // `set_jit_auto_admit` before this function runs) can also move the condition.
+        // only on a real transition below, since a caller can reach this after changing another
+        // of that predicate's inputs.
         #[cfg(all(
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
@@ -940,27 +908,6 @@ impl CpuGsw {
         ))]
         self.jit_fast_map.invalidate_all();
         self.jit_direct.invalidate_translation();
-    }
-
-    #[cfg(all(feature = "jit", test))]
-    #[cfg_attr(
-        not(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
-        self.set_jit_auto_admit(false);
-        self.jit_regions.set_auto_admit(on && jit::host_supported());
-        // `jit_regions.auto_admit()` is one of the four inputs to `fast_map_population_enabled()`
-        // (memory.rs) and just changed AFTER `set_jit_auto_admit`'s own refresh ran; refresh again
-        // so the interpreter serve gate's cached mirror reflects the final state.
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        self.refresh_fast_map_serve_gate();
     }
 
     /// G1: shared demotion tail of both admission gates. Parks the key Dormant, stamps its entry
@@ -1000,9 +947,6 @@ impl CpuGsw {
         // `narrow_invalidate`, sets `generation = 0`, and the live generation is never 0, so such a
         // line can only come back through `put`.
         //
-        // The region backend is deliberately NOT given this early-out. `try_region_continuation`
-        // has no `!d` refusal and genuinely admits 16-bit code, which is why this sits inside the
-        // two continuation functions that provably refuse rather than at their shared call site.
         if !d {
             return Ok(DirectContinuation::Interpret);
         }
@@ -1833,291 +1777,6 @@ impl CpuGsw {
         // fixture that entered a block here would never see the cache's stats reach `perf`.
         self.flush_direct_cache_stats();
         Ok(!matches!(outcome, DirectBlockOutcome::NotRun))
-    }
-
-    /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on the
-    /// forced admission address, or once a line is hot enough) compile/re-stamp one first. `Ok(None)`
-    /// means "no region ran"; the caller falls back to the interpreted continuation.
-    #[cfg(feature = "jit")]
-    fn try_region_continuation<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        lin: u32,
-        d: bool,
-        stamped_region: Option<std::num::NonZeroU32>,
-        budget: ContinuationBudget,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
-        let idx = match stamped_region {
-            Some(idx) => idx,
-            None => {
-                // Admit when either the forced-address override names this line (the spike/test
-                // path) or hotness admission is enabled and this line's miss counter just crossed
-                // the threshold. Both are cheap: a compare and a counter bump. When neither fires,
-                // this branch is the whole per-continuation dispatch cost on the miss path.
-                let hot = self.jit_regions.auto_admit() && self.decode_cache.note_hot_miss(lin, d);
-                let forced = jit_forced_region_lin() == Some(lin);
-                if !forced && !hot {
-                    return Ok(None);
-                }
-                // Hot linear blocks are admitted only when the builder finds a useful all-native
-                // interior. Self-loops retain their existing gate, while forced admission remains
-                // available for differential tests of any block shape.
-                let Some(idx) = jit::block::try_admit_gated(self, lin, d, !forced) else {
-                    return Ok(None);
-                };
-                self.decode_cache.stamp_region(lin, d, idx);
-                idx
-            }
-        };
-        self.run_region(
-            bus,
-            idx,
-            lin,
-            d,
-            budget.total,
-            budget.bus_at_entry,
-            budget.cap,
-        )
-    }
-
-    /// Execute a compiled region as one continuation of `run_straight_line`. On return the
-    /// loop's own post-checks (halted, step break, interrupt transition, cap) re-fire at the
-    /// exact boundary the region stopped at, so break attribution and batch semantics stay
-    /// interpreter-identical. `Ok(None)` = an entry precondition failed, interpret instead.
-    ///
-    /// Deferred-at-exit accounting (one `scale_clocks` batch, `elapsed_clocks`,
-    /// `perf.instructions`, ring-0 residency) is sound because no admitted block reads any of
-    /// it mid-region (see the builder's invariants in `jit::block`) and the batch equals
-    /// the per-instruction sums by the remainder-carry identity.
-    #[cfg(feature = "jit")]
-    #[allow(clippy::too_many_arguments)]
-    fn run_region<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        idx: std::num::NonZeroU32,
-        lin: u32,
-        d: bool,
-        total: u64,
-        bus_at_entry: u64,
-        cap: u64,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
-        // Preconditions the region cannot honor per instruction: profiling and diff-trace
-        // sample every instruction, and a live STI shadow could make an interrupt newly
-        // serviceable after the FIRST slot, a mid-region boundary the run loop cannot see.
-        if self.profile.enabled || diff_trace_enabled() || self.interrupt_shadow {
-            return Ok(None);
-        }
-        let eip = self.registers.eip;
-        let cs_limit = self.registers.cs().limit;
-        let epoch = self.decode_cache.jit_smc_epoch;
-        let ring0 = self.is_ring0_protected();
-        let mode_key = self.jit_mode_key();
-        let (num, den) = level_timing(self.persona());
-        let rem0 = self.timing_rem;
-        // Native byte-memory helpers assume flat DS. Descriptor access rights are runtime values
-        // not present in the mode key, so set their per-entry guards before borrowing the table.
-        let ds_flat = self.jit_segment_flat(SegmentIndex::Ds);
-        let ds_readable = self.jit_segment_readable(SegmentIndex::Ds);
-        let ds_writable = self.jit_segment_writable(SegmentIndex::Ds);
-        let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
-        let (entry, ctx_ptr) = {
-            let Some(region) = self.jit_regions.get_mut(idx) else {
-                return Ok(None);
-            };
-            if region.entry_lin != lin || region.d != d {
-                return Ok(None);
-            }
-            if region.mode_key != mode_key {
-                // The same phys/d line is being entered in a different CPU mode/size than the block
-                // was compiled for (real vs pmode vs V86, or a size/level change). The block key
-                // includes the mode bitmask (spec §2.2), so this is a miss: drop the stamp and let
-                // the forced-admission path re-build the block for the current mode.
-                self.decode_cache.unstamp_region(lin, d);
-                return Ok(None);
-            }
-            if region.valid_epoch != epoch {
-                // A narrow SMC kill landed inside this region's span since the slots were last
-                // built: the stamp may outlive the killed slot lines, so drop it and let the
-                // forced-admission path re-run the builder over the fresh decodes.
-                self.decode_cache.unstamp_region(lin, d);
-                return Ok(None);
-            }
-            let ctx = &mut *region.ctx;
-            // Every slot must pass the same live CS-limit check its interpreted continuation
-            // would have (limits cannot change inside: no CS writer is admitted).
-            for slot in &ctx.slots {
-                let slot_eip = eip.wrapping_add(slot.lin.wrapping_sub(lin));
-                if !Self::fetch_within_limit(slot_eip, slot.insn.len, cs_limit) {
-                    return Ok(None);
-                }
-            }
-            let can_native_load = region.has_native_load && ds_flat && ds_readable;
-            let can_native_store = region.has_native_store && ds_flat && ds_writable;
-            let native_u8_clock_bound = if cap == u64::MAX
-                || (!can_native_load && !can_native_store)
-            {
-                Some(0)
-            } else {
-                (|| {
-                    let mut fetch_max = 0;
-                    for slot in &ctx.slots {
-                        if matches!(
-                            slot.kind,
-                            jit::step::SlotKind::MemLoadU8 | jit::step::SlotKind::MemStoreU8
-                        ) {
-                            fetch_max = fetch_max.max(bus.jit_cached_fetch_run_clocks(
-                                slot.physical,
-                                u32::from(slot.insn.len),
-                            )?);
-                        }
-                    }
-                    let mut data_max = 0;
-                    if can_native_load {
-                        data_max = data_max.max(bus.jit_direct_memory_max_clocks(
-                            BusWidth::Byte,
-                            BusAccessKind::DataRead,
-                        )?);
-                    }
-                    if can_native_store {
-                        data_max = data_max.max(bus.jit_direct_memory_max_clocks(
-                            BusWidth::Byte,
-                            BusAccessKind::DataWrite,
-                        )?);
-                    }
-                    let additional_bus = fetch_max.checked_add(data_max)?;
-                    let bus_now = bus.in_batch_scaled_bus_clocks();
-                    let bus_after = bus.jit_projected_batch_scaled_bus_clocks(additional_bus)?;
-                    let bus_bound = bus_after.checked_sub(bus_now)?.saturating_add(1);
-                    let num = u64::from(num);
-                    let den = u64::from(den);
-                    let core_bound = (2 * num).div_ceil(den);
-                    core_bound.checked_add(bus_bound)
-                })()
-            };
-            let native_memory_timing = native_u8_clock_bound.is_some();
-            ctx.step_fn = Some(step_fn);
-            ctx.inline_step_fn =
-                Some(jit::step::region_inline_slot::<B> as jit::step::RegionStepFn);
-            // Raw fn pointers to the flag helpers. The cast through `as` is sound: each helper is
-            // `fn(&mut self, ...)` and we store it as `unsafe extern "C" fn(*mut CpuGsw, ...)`,
-            // calling it with the cpu pointer the emitted code already holds; the `&mut` rebind
-            // inside is the same disjoint-reborrow pattern region_step uses.
-            ctx.set_pending_add_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut CpuGsw, u32, u32), jit::step::SetPendingAddFn>(
-                    Self::jit_set_pending_add as fn(&mut CpuGsw, u32, u32),
-                )
-            });
-            ctx.set_shift_flags_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut CpuGsw, u32, u8), jit::step::SetShiftFlagsFn>(
-                    Self::jit_set_shift_flags_shr as fn(&mut CpuGsw, u32, u8),
-                )
-            });
-            ctx.native_u8_fn = Some(jit::step::region_native_u8::<B> as jit::step::NativeU8Fn);
-            ctx.native_group_guard_fn =
-                Some(jit::step::region_native_group_guard::<B> as jit::step::NativeGroupGuardFn);
-            ctx.native_group_finish_fn =
-                Some(jit::step::region_native_group_finish::<B> as jit::step::NativeGroupFinishFn);
-            ctx.entry_eip = eip;
-            ctx.raw_clocks = 0;
-            ctx.insn_count = 0;
-            ctx.native_insn_count = 0;
-            ctx.helper_exit_count = 0;
-            ctx.native_memory_helper_count = 0;
-            ctx.native_load_enabled = u32::from(native_memory_timing && can_native_load);
-            ctx.native_store_enabled = u32::from(native_memory_timing && can_native_store);
-            ctx.native_u8_clock_bound = native_u8_clock_bound.unwrap_or(0);
-            ctx.run_total_at_entry = total;
-            ctx.bus_at_run_start = bus_at_entry;
-            ctx.cap = cap;
-            ctx.rem0 = rem0;
-            ctx.scale_num = num;
-            ctx.scale_den = den;
-            ctx.smc_epoch_at_entry = epoch;
-            ctx.d = d;
-            ctx.exit = jit::step::RegionExitKind::Boundary;
-            ctx.fault = None;
-            ctx.halted = false;
-            (region.entry, std::ptr::from_mut(ctx))
-        };
-        let block_start = (self.perf.jit_region_entries & 0x3ff == 0).then(std::time::Instant::now);
-        // SAFETY: the emitted code only forwards these pointers to `region_step::<B>`, whose
-        // contract this call establishes: `self` and `bus` stay live `&mut` for the whole call
-        // (no other reference to either exists here), `ctx` is the running region's boxed
-        // mailbox (a separate allocation from `self`, so the step function's two reborrows are
-        // disjoint; nothing reachable from the execute dispatch touches `jit_regions`), and `B`
-        // is the concrete bus type behind the erased pointer.
-        unsafe {
-            (entry)(
-                std::ptr::from_mut(self),
-                (std::ptr::from_mut(bus)).cast(),
-                ctx_ptr,
-            );
-        }
-        let (raw, count, native_count, helper_exits, memory_helpers, halted, fault) = {
-            let region = self
-                .jit_regions
-                .get_mut(idx)
-                .expect("the region that just ran is still installed");
-            let ctx = &mut *region.ctx;
-            (
-                ctx.raw_clocks,
-                ctx.insn_count,
-                ctx.native_insn_count,
-                ctx.helper_exit_count,
-                ctx.native_memory_helper_count,
-                ctx.halted,
-                ctx.fault.take(),
-            )
-        };
-        if let Some(start) = block_start {
-            self.perf.jit_native_block_ns += duration_ns_u64(start.elapsed());
-            self.perf.jit_native_block_samples += 1;
-        }
-        let charged = self.scale_clocks_batch(raw);
-        self.elapsed_clocks += charged;
-        self.perf.instructions += u64::from(count);
-        self.perf.jit_region_entries += 1;
-        self.perf.jit_region_insns += u64::from(count);
-        self.perf.jit_native_insns += u64::from(native_count);
-        self.perf.jit_helper_exits += u64::from(helper_exits);
-        self.perf.jit_native_memory_helpers += u64::from(memory_helpers);
-        if ring0 {
-            self.perf.monitor_resident_core_clocks += charged;
-        }
-        let mut out = charged;
-        if let Some((start_eip, fault)) = fault {
-            match fault {
-                InternalFault::Cpu(error) => return Err(error),
-                // finish_instruction's Exception arm, minus the CS restore (no admitted shape
-                // can change CS mid-region): rewind to the faulting instruction, deliver, and
-                // charge the interpreter's 59-clock delivery cost.
-                InternalFault::Exception { vector, error_code } => {
-                    self.set_eip(start_eip);
-                    self.deliver_exception(bus, vector, error_code, false)
-                        .map_err(|fault| match fault {
-                            InternalFault::Cpu(error) => error,
-                            InternalFault::Exception {
-                                vector: nested_vector,
-                                ..
-                            } => CpuError::NestedFaultDuringDelivery {
-                                original_vector: vector,
-                                nested_vector,
-                            },
-                        })?;
-                    let charged_fault = self.scale_clocks(59);
-                    self.elapsed_clocks += charged_fault;
-                    self.perf.instructions += 1;
-                    if self.is_ring0_protected() {
-                        self.perf.monitor_resident_core_clocks += charged_fault;
-                    }
-                    out += charged_fault;
-                }
-            }
-        }
-        Ok(Some(CycleOutcome {
-            core_clocks: out.min(u64::from(u32::MAX)) as u32,
-            halted,
-        }))
     }
 
     /// Execute one already-decoded cached instruction as a straight-line continuation. Consumes the
@@ -3017,121 +2676,6 @@ impl CpuGsw {
             }
             _ => Ok(None),
         }
-    }
-
-    /// Specialized `mov r8, [mem]` (0x8A) execute for a JIT `MemLoadU8` slot: the exact body of
-    /// `execute_hot_cached_datamove`'s 0x8A arm, reached WITHOUT the group/opcode dispatch chain
-    /// (`execute_hot_cached_decoded`'s register-only probe + the group match + the datamove opcode
-    /// match). Bit-identical to the interpreter by construction — it calls the same
-    /// `resolve_memory_addr_mode` / `read_memory_u8` / `write_gpr8` and returns the same `clocks(2)` —
-    /// so it inherits every segment/paging/fault/SMC/BusTrace behavior for free, in every CPU mode.
-    /// Any shape the classifier did not intend (defensive) falls back to the full dispatch, so the
-    /// result is identical regardless.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_load_u8<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x8a
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value =
-                self.read_memory_u8(bus, memory.segment, memory.offset, BusAccessKind::DataRead)?;
-            self.write_gpr8(modrm.reg, value);
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
-    }
-
-    /// Specialized `mov [mem], r8` (0x88) execute for a JIT `MemStoreU8` slot: the exact body of
-    /// `execute_hot_cached_datamove`'s 0x88 arm, reached WITHOUT the group/opcode dispatch chain.
-    /// Bit-identical to the interpreter by construction — same `resolve_memory_addr_mode` /
-    /// `read_gpr8` / `write_memory_u8` / `clocks(2)`. In particular `write_memory_u8` runs
-    /// `note_code_write` on every store, so the SMC code-write watch (Round 3 trap #2) is inherited
-    /// for free, along with the segment/paging/fault/BusTrace behavior, in every CPU mode. Any shape
-    /// the classifier did not intend falls back to the full dispatch, so the result is identical.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_store_u8<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x88
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value = self.read_gpr8(modrm.reg);
-            self.write_memory_u8(
-                bus,
-                memory.segment,
-                memory.offset,
-                value,
-                BusAccessKind::DataWrite,
-            )?;
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
-    }
-
-    /// Specialized `mov r16/r32, [mem]` (0x8B) execute for a JIT `MemLoadSized` slot: the exact body
-    /// of `execute_hot_cached_datamove`'s 0x8B arm, reached WITHOUT the group/opcode dispatch chain.
-    /// Bit-identical to the interpreter — same `resolve_memory_addr_mode` / `read_memory_sized`
-    /// (which does the alignment/#AC, page-cross and segment/paging checks for the width) /
-    /// `write_gpr_sized` / `clocks(2)`. `insn.operand_size` is the captured decode size (unprefixed in
-    /// a region, so it is the segment default), so word and dword loads are both correct. Any
-    /// unexpected shape falls back to the full dispatch.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_load_sized<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x8b
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value = self.read_memory_sized(
-                bus,
-                memory.segment,
-                memory.offset,
-                insn.operand_size,
-                BusAccessKind::DataRead,
-            )?;
-            self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
-    }
-
-    /// Specialized `mov [mem], r16/r32` (0x89) execute for a JIT `MemStoreSized` slot: the exact body
-    /// of `execute_hot_cached_datamove`'s 0x89 arm, reached WITHOUT the group/opcode dispatch chain.
-    /// Bit-identical — same `resolve_memory_addr_mode` / `read_gpr_sized` / `write_memory_sized`
-    /// (which runs `note_code_write`, so the SMC watch and the alignment/page-cross/segment/paging
-    /// checks are inherited) / `clocks(2)`, in every mode. Any unexpected shape falls back.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_store_sized<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x89
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value = self.read_gpr_sized(modrm.reg, insn.operand_size);
-            self.write_memory_sized(
-                bus,
-                memory.segment,
-                memory.offset,
-                insn.operand_size,
-                value,
-                BusAccessKind::DataWrite,
-            )?;
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
     }
 
     #[inline]

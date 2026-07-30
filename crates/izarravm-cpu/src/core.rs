@@ -328,14 +328,6 @@ impl CpuGsw {
                         self.perf.code_invalidations += 1;
                         heat_hit = true;
                     }
-                    // A kill inside an installed region's physical span stales its slot table
-                    // even though the entry line's stamp may survive; bump the epoch so entry
-                    // re-validates through the matcher.
-                    #[cfg(feature = "jit")]
-                    if kills > 0 && self.jit_regions.covers_physical(physical, width) {
-                        self.decode_cache.jit_smc_epoch =
-                            self.decode_cache.jit_smc_epoch.wrapping_add(1);
-                    }
                 }
                 None => {
                     self.perf.decode_inval_smc += 1;
@@ -443,7 +435,7 @@ impl CpuGsw {
     /// for one mode must never be reused in another at the same phys/d. Packs the CS operand-size
     /// default (D bit), protected mode (CR0.PE), V86, the SS stack big bit (B), and the GSW mode.
     /// A mode change already invalidates the decode cache (`set_mode`), but it is folded in here
-    /// too so the key is self-contained. Validated at every region entry (`run_region`).
+    /// too so the key is self-contained. Validated at every compiled-block entry.
     #[cfg(feature = "jit")]
     pub(super) fn jit_mode_key(&self) -> u32 {
         let mut key = 0u32;
@@ -465,34 +457,6 @@ impl CpuGsw {
             key |= 1 << 4;
         }
         key | (u32::from(self.mode.rank()) << 8)
-    }
-
-    /// Whether `seg` is FLAT: base 0 and limit `u32::MAX`. This is exactly the interpreter's
-    /// `segment_linear_byte` fast path (base 0 + limit max → return the offset as the linear address),
-    /// so under it EA == linear and no segment-limit fault is ever skipped (with limit max no offset can
-    /// exceed it, and the flat fast path returns before the expand-down logic). The native memory
-    /// probe needs this for DS because it computes the linear offset directly. DS is not part of the
-    /// mode key, so every region entry rechecks it.
-    #[cfg(feature = "jit")]
-    pub(super) fn jit_segment_flat(&self, seg: SegmentIndex) -> bool {
-        let d = self.registers.segment(seg);
-        d.base == 0 && d.limit == u32::MAX
-    }
-
-    /// Whether a data read through `seg` is permitted. This deliberately uses the interpreter's
-    /// descriptor check so execute-only code loaded into DS cannot enter a native memory region.
-    #[cfg(feature = "jit")]
-    pub(super) fn jit_segment_readable(&self, seg: SegmentIndex) -> bool {
-        let access = self.registers.segment(seg).access;
-        self.check_segment_access_kind(seg, access, false).is_ok()
-    }
-
-    /// Whether a data write through `seg` is permitted. A direct-page cache hit proves that the
-    /// physical page is writable, but it says nothing about the current segment descriptor.
-    #[cfg(feature = "jit")]
-    pub(super) fn jit_segment_writable(&self, seg: SegmentIndex) -> bool {
-        let access = self.registers.segment(seg).access;
-        self.check_segment_access_kind(seg, access, true).is_ok()
     }
 
     /// The active GSW compatibility mode.
@@ -519,8 +483,6 @@ impl CpuGsw {
         self.fp_rem = 0;
         self.rep_resume_active = false;
         *self.rep_execution = RepExecution::default();
-        #[cfg(feature = "jit")]
-        self.jit_regions.clear();
         self.invalidate_code_caches();
         // `fast_map_population_enabled()` (memory.rs) depends on `mode()`: a live switch INTO an
         // Accurate persona must stop the interpreter's FastMap serve path from probing at all, not
@@ -1534,72 +1496,5 @@ impl CpuGsw {
             0xe => self.flag(FLAG_ZF) || (self.flag(FLAG_SF) != self.flag(FLAG_OF)),
             _ => !self.flag(FLAG_ZF) && (self.flag(FLAG_SF) == self.flag(FLAG_OF)),
         }
-    }
-
-    // -------- JIT inline-slot flag helpers (feature `jit`) --------
-    //
-    // The v2 region inlines the register-only slots (mov r32,r32 / add r32,imm32 / shr r32,imm8)
-    // natively against gpr[] (addressed by offset, see the repr(C) Registers guard test). The mov
-    // slots touch no flags; the add and shr slots must update the lazy/eager flag state exactly as
-    // the interpreter's `alu_add` and `shift_rotate` would. These helpers are that exact update,
-    // factored so the emitted native code can call them with the operands it already has in host
-    // registers, skipping the interpreter's full decode/dispatch for the flag side effect.
-    //
-    // Each helper takes the SAME arguments the interpreter handler used (the operand values, not gpr
-    // indices) so the descriptor it constructs is byte-identical to what `alu_add`/`shift_rotate`
-    // would have produced. The native code has already written the result gpr by offset store; the
-    // helper only updates flags. A mid-region fault on a LATER memory slot therefore sees the same
-    // pending/live flag state the interpreter would have at that eip (the property the differential
-    // suite's flag-equality-after-every-exit test pins).
-
-    /// Set `pending_flags` as a deferred 32-bit ADD of `b` to `a`, exactly as `alu_add(a, b, 0,
-    /// BusWidth::Dword)` does. The caller (native inline code) has already computed and written the
-    /// result to gpr; this only records the flag descriptor. `a` and `b` are the width-masked (here
-    /// full 32-bit) operands, matching the lazy-flags contract: `b` is the raw second operand, not
-    /// b+carry (plain ADD, carry 0, so the lazy Add form applies).
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_set_pending_add(&mut self, a: u32, b: u32) {
-        let result = a.wrapping_add(b);
-        let lf = LazyFlags {
-            a,
-            b,
-            result,
-            width: BusWidth::Dword,
-            op: LazyFlagOp::Add,
-            cf_override: None,
-        };
-        self.pending_flags = PendingFlags::from_legacy(&lf);
-    }
-
-    /// Update flags for a 32-bit SHR of `value` by `raw_count`, exactly as
-    /// `shift_rotate(5, value, raw_count, BusWidth::Dword)` followed by `set_shift_result_flags`
-    /// does. The caller has already written `value >> (count & 0x1f)` to gpr.
-    ///
-    /// Replicates the single-bit-shift loop's flag semantics precisely: CF is the last bit shifted
-    /// out (bit `count-1` of the original value, i.e. bit 24 for count 25). For count != 1, OF is
-    /// undefined and falls back to the live OF; AF is always preserved (read live before the
-    /// descriptor is dropped). Shifts never stay lazy, so this materializes: it folds any pending
-    /// descriptor's CF/OF/AF out, clears pending, and writes CF/OF/AF/SZP live.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_set_shift_flags_shr(&mut self, value: u32, raw_count: u8) {
-        let count = u32::from(raw_count) & 0x1f;
-        // A zero count affects no flags at all (shift_rotate returns early); the inline path never
-        // calls this for count 0 (the matcher's SHR slots pin count to 25), but the guard keeps the
-        // helper a faithful replica of shift_rotate for any caller.
-        if count == 0 {
-            return;
-        }
-        let result = value >> count;
-        // CF = the last bit shifted out by the single-bit loop: after `count` right shifts, that is
-        // bit (count-1) of the original value.
-        let cf = (value >> (count - 1)) & 1 != 0;
-        // OF is defined only for count == 1: for SHR it is the MSB of the original value. For any
-        // other count, set_shift_result_flags receives None and falls back to the live OF.
-        let of = if count == 1 {
-            Some(value & 0x8000_0000 != 0)
-        } else {
-            None
-        };
-        self.set_shift_result_flags(Some(cf), of, result, BusWidth::Dword);
     }
 }

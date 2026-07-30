@@ -606,16 +606,7 @@ pub struct PerfCounters {
     /// Device writes for which the machine could not provide a physical range. These retain the
     /// conservative whole-cache reset and should stay near zero in normal game workloads.
     pub device_write_coarse_resets: u64,
-    /// Compiled-region executions (one per `run_region` call that passed its entry
-    /// preconditions) and the instructions those executions retired. `jit_region_insns /
-    /// jit_region_entries` is the mean instructions per region entry; a Doom A/B run asserts
-    /// `jit_region_entries > 0` to prove the region actually executed. Always present (zero
-    /// without the `jit` feature) so perf-row consumers need no feature gymnastics.
-    pub jit_region_entries: u64,
-    pub jit_region_insns: u64,
-    /// Direct x64 block executions, retired guest instructions, and prefix side exits. These do
-    /// not include the legacy region engine, so acceptance reports can measure direct coverage
-    /// and exits per 100 instructions without mixing the two execution models.
+    /// Direct x64 block executions, retired guest instructions, and prefix side exits.
     pub jit_direct_entries: u64,
     pub jit_direct_insns: u64,
     pub jit_direct_side_exits: u64,
@@ -724,22 +715,20 @@ pub struct PerfCounters {
     pub jit_direct_decode_dependencies_scanned: u64,
     /// Compiled portals hidden because one of their live decode lines was displaced.
     pub jit_direct_portals_hidden: u64,
-    /// Guest instructions completed by emitted native operations, excluding instructions run by
-    /// `region_step`. Compare with `jit_region_insns` to measure native opcode coverage.
+    /// Dead since the region JIT's deletion (dynarec-refactor Task 2): the only producer was the
+    /// now-removed `region_step`/`region_inline_slot`/`region_native_*` engine, so this reads 0
+    /// forever. Kept (not one of the four counters the deletion gate enumerates as removed,
+    /// because it was already 0 on every unarmed baseline run) rather than deleted in this slice;
+    /// a follow-up cleanup can retire it along with `jit_helper_exits` and
+    /// `jit_native_memory_helpers` below.
     pub jit_native_insns: u64,
-    /// Transitions from emitted code into `region_step`, including a transition that reports a
-    /// fault. Inline bookkeeping and flag helpers are not counted.
+    /// Dead since the region JIT's deletion; see `jit_native_insns`.
     pub jit_helper_exits: u64,
-    /// Calls from emitted byte-memory probes into the exact Rust memory helper.
+    /// Dead since the region JIT's deletion; see `jit_native_insns`.
     pub jit_native_memory_helpers: u64,
-    /// Wall time for sampled compiled-region calls and the number of samples. The first entry and
-    /// every 1,024th entry are sampled to keep timing overhead out of the hot path.
-    pub jit_native_block_ns: u64,
-    pub jit_native_block_samples: u64,
-    /// Times the compiled-region table hit its capacity and was dropped wholesale (a coarse GC;
-    /// see `JIT_REGION_TABLE_CAP`). Nonzero means the working set of hot loops exceeded the cap and
-    /// the JIT is re-warming - a signal to raise the cap or add per-entry eviction. Zero on the
-    /// single-phase anchors. Always present (zero without the `jit` feature).
+    /// Dead since the region JIT's deletion (dynarec-refactor Task 2): its only producer was the
+    /// compiled-region table's capacity eviction, which no longer exists, so this reads 0
+    /// forever. Kept for the same reason as `jit_native_insns` above.
     pub jit_table_clears: u64,
     /// Byte loads completed through the native address probe and exact direct-page helper.
     pub jit_native_load_hits: u64,
@@ -1344,12 +1333,7 @@ pub struct CpuGsw {
     // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
     // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
     decode_cache: DecodeCache,
-    /// Compiled loop-regions (feature `jit`). Installed by stamping a 1-based index into the
-    /// entry address's `DecodeLine::jit_region`; the table is a transparent accelerator with
-    /// the same equality/clone exclusions as the decode cache. See `jit::region`.
-    #[cfg(feature = "jit")]
-    jit_regions: jit::RegionTable,
-    /// Helper-free register block cache. Like the decode and region caches, this is host-only
+    /// Helper-free register block cache. Like the decode cache, this is host-only
     /// accelerator state and clones empty.
     /// The Direct block cache plus the jit state shared across backends (the hoisted G1 SMC
     /// heat map; see `jit::JitState`). Kept under the existing field name because the wrapper
@@ -1412,13 +1396,12 @@ pub struct CpuGsw {
     cpl: u8,
     /// Memory-poll skip counters, deliberately the LAST field: adding them to
     /// `PerfCounters` (declared far above) shifted every later CpuGsw field,
-    /// moving the hot `pending_flags` off its pinned 4528 and costing the
+    /// moving the hot `pending_flags` off its pinned offset and costing the
     /// interpreter measurable wall time. At the tail they change only the
     /// struct's total size. See `PollSkipMemoryCounters`.
     poll_skip_memory: PollSkipMemoryCounters,
     /// Cached mirror of `fast_map_population_enabled()`, refreshed at every state change that
-    /// predicate depends on (`set_mode`, `finish_direct_execution_transition`,
-    /// `set_legacy_region_auto_admit` -- see
+    /// predicate depends on (`set_mode`, `finish_direct_execution_transition` -- see
     /// `memory.rs::refresh_fast_map_serve_gate` for the exact call-site inventory). The
     /// interpreter's FastMap serve path gates on this instead of re-deriving the condition (four
     /// predicate calls) or testing `FastMap::has_storage()` (which stays `true` forever once any
@@ -1476,8 +1459,6 @@ impl Default for CpuGsw {
             written_count: 0,
             written_pages_overflow: false,
             decode_cache,
-            #[cfg(feature = "jit")]
-            jit_regions: jit::RegionTable::default(),
             #[cfg(feature = "jit")]
             jit_direct,
             #[cfg(feature = "jit")]
@@ -2213,13 +2194,6 @@ fn decode_cache_lines() -> usize {
     })
 }
 
-/// Continuation misses on one line before hotness-driven admission compiles it (feature `jit`).
-/// A hot self-loop head is hit once per iteration, so it admits after this many iterations; a cold
-/// one-shot line never reaches it. 32 is early enough to catch a real loop within one batch and high
-/// enough that transient warm-up code is not compiled. Only consulted when `jit_auto_admit` is on.
-#[cfg(feature = "jit")]
-const JIT_HOTNESS_THRESHOLD: u16 = 32;
-
 /// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
 /// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
 /// the stack sits just below the code and globals sit just above or among it, so a 4 KB-page OR even
@@ -2259,20 +2233,7 @@ struct DecodeLine {
     /// path's covers-the-written-byte check. `phys_start..phys_start + len` is contiguous because
     /// page-straddling instructions are never inserted into this cache.
     phys_start: u32,
-    /// 1-based index into the JIT's compiled-region table, `None` when no region starts at this
-    /// line's address. Lives IN the decode line (not a separate map) so region lookup rides the
-    /// `decode_cache.get` the run loop already does every continuation: admission costs zero
-    /// extra lookups (settled invariant 1 from the seed post-mortem). `put` clears it, so a
-    /// re-decode (generation bump, SMC) drops the stale region for free.
-    #[cfg(feature = "jit")]
-    jit_region: Option<std::num::NonZeroU32>,
-    /// Miss counter for hotness-driven admission (feature `jit`): each continuation that reaches
-    /// this line without a stamped region bumps it, and admission fires once it hits
-    /// `JIT_HOTNESS_THRESHOLD`. Reset to 0 on every `put` (a re-decoded line restarts its count),
-    /// so a cold one-shot line never reaches the threshold.
-    #[cfg(feature = "jit")]
-    jit_hotness: u16,
-    /// Saturating direct-code admission count, independent of legacy region stamps.
+    /// Saturating direct-code admission count.
     #[cfg(feature = "jit")]
     jit_direct_hotness: u8,
 }
@@ -2377,13 +2338,6 @@ struct DecodeCache {
     /// insert has touched the page since."
     #[cfg(feature = "jit")]
     poll_neg: Box<[u64]>,
-    /// Bumped whenever a narrow SMC kill lands inside an installed JIT region's physical span:
-    /// the region's slot table may now be stale (the entry line's stamp can survive a kill of a
-    /// LATER slot's line). `run_region` refuses a region whose `valid_epoch` lags and unstamps
-    /// it, forcing matcher re-admission over the fresh decodes. Lives here (not on `CpuGsw`)
-    /// because the whole cache is excluded from CPU equality; this is host bookkeeping.
-    #[cfg(feature = "jit")]
-    jit_smc_epoch: u32,
 }
 
 /// Result of publishing one decoded instruction. A different live key reports the displaced slot
@@ -2494,8 +2448,6 @@ impl DecodeCache {
             poll_neg_gens: vec![0u32; POLL_NEG_GEN_SLOTS].into_boxed_slice(),
             #[cfg(feature = "jit")]
             poll_neg: vec![0u64; POLL_NEG_SLOTS].into_boxed_slice(),
-            #[cfg(feature = "jit")]
-            jit_smc_epoch: 0,
         }
     }
 
@@ -2661,10 +2613,6 @@ impl DecodeCache {
             d,
             phys_start: phys,
             #[cfg(feature = "jit")]
-            jit_region: None,
-            #[cfg(feature = "jit")]
-            jit_hotness: 0,
-            #[cfg(feature = "jit")]
             jit_direct_hotness: 0,
         };
 
@@ -2714,20 +2662,6 @@ impl DecodeCache {
         Some(killed)
     }
 
-    /// The compiled-region index stamped on the live line for `lin`, if any. A second load of
-    /// the same direct-mapped line `get` just hit (still in L1), not a separate map: this is the
-    /// entire JIT admission check the continuation loop pays.
-    #[cfg(feature = "jit")]
-    #[inline]
-    fn region_at(&self, lin: u32, d: bool) -> Option<std::num::NonZeroU32> {
-        let line = &self.lines[(lin & self.mask) as usize];
-        if line.generation == self.generation && line.tag == lin && line.d == d {
-            line.jit_region
-        } else {
-            None
-        }
-    }
-
     /// The stored physical start of the live line for `lin`. Warm fetch timing uses this to retain
     /// the translation from the cold decode; JIT admission also derives block provenance from it.
     fn line_phys_start(&self, lin: u32, d: bool) -> Option<u32> {
@@ -2737,9 +2671,8 @@ impl DecodeCache {
     }
 
     /// Whether the line for `lin` is live for exactly this key: the same condition `get` uses,
-    /// without copying the insn. The region step probes this per slot, which is the
-    /// interpreter's own next-continuation decode probe in miss-detection terms. Compiled root
-    /// dispatch uses it to validate a suspended portal before republishing it.
+    /// without copying the insn. Compiled root dispatch uses it to validate a suspended portal
+    /// before republishing it.
     #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     #[inline]
     fn line_live(&self, lin: u32, d: bool) -> bool {
@@ -2784,55 +2717,6 @@ impl DecodeCache {
         let page_gen = u64::from(self.poll_neg_gen(lin) & POLL_NEG_GEN_MASK);
         self.poll_neg[Self::poll_neg_slot(lin, d)] =
             u64::from(lin) | (u64::from(d) << 32) | (1u64 << 33) | (page_gen << 34);
-    }
-
-    /// Drop the region stamp from the live line for `lin` (the region went stale via a narrow SMC
-    /// kill inside its span or a mode-key mismatch; the next probe misses and re-admission refreshes
-    /// the slots). The line was hot enough to carry a region and is being unstamped because the
-    /// region went STALE, not because it cooled, so prime the hotness counter to re-fire admission on
-    /// the very next continuation (one interpreted iteration, then re-admit reusing the region's
-    /// table slot). Without this, the fire-once counter stays pinned at the threshold and, under pure
-    /// auto-admit (no forced address to re-trigger `try_admit`), a self-patching or mode-switching
-    /// loop would de-JIT permanently.
-    #[cfg(feature = "jit")]
-    fn unstamp_region(&mut self, lin: u32, d: bool) {
-        let line = &mut self.lines[(lin & self.mask) as usize];
-        if line.generation == self.generation && line.tag == lin && line.d == d {
-            line.jit_region = None;
-            line.jit_hotness = JIT_HOTNESS_THRESHOLD.saturating_sub(1);
-        }
-    }
-
-    /// Stamp a compiled region's table index onto the live line for `lin`, so the continuation
-    /// loop's `region_at` probe finds it. A no-op when the line is not live for exactly this
-    /// key: stamping through a stale or mismatched line could attach the region to an address
-    /// it was not compiled for.
-    #[cfg(feature = "jit")]
-    fn stamp_region(&mut self, lin: u32, d: bool, idx: std::num::NonZeroU32) {
-        let line = &mut self.lines[(lin & self.mask) as usize];
-        if line.generation == self.generation && line.tag == lin && line.d == d {
-            line.jit_region = Some(idx);
-        }
-    }
-
-    /// Bump the hotness miss counter for the live line at `lin` and report whether it just crossed
-    /// `JIT_HOTNESS_THRESHOLD`. Fires EXACTLY ONCE (at the crossing) and then pins the counter at the
-    /// threshold, so a line that fails to compile is not re-attempted every continuation. A no-op
-    /// returning false when the line is not live for this key (the caller has just decoded it via
-    /// `get`, so normally it is). Cheap: one array index + a compare + a conditional increment.
-    #[cfg(feature = "jit")]
-    fn note_hot_miss(&mut self, lin: u32, d: bool) -> bool {
-        let line = &mut self.lines[(lin & self.mask) as usize];
-        if line.generation == self.generation
-            && line.tag == lin
-            && line.d == d
-            && line.jit_hotness < JIT_HOTNESS_THRESHOLD
-        {
-            line.jit_hotness += 1;
-            line.jit_hotness == JIT_HOTNESS_THRESHOLD
-        } else {
-            false
-        }
     }
 
     /// Observe a continuation for direct-code admission. Once the second encounter makes the line

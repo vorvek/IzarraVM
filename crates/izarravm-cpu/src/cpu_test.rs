@@ -37,7 +37,7 @@ fn tlb_entry_repr_c_offsets_are_stable() {
     assert_eq!(core::mem::offset_of!(TlbEntry, dirty), 14);
 }
 
-/// The v2 region emitter bakes `offset_of!(CpuGsw, registers)` into its emitted bytes (the
+/// The Direct backend's emitter bakes `offset_of!(CpuGsw, registers)` into its emitted bytes (the
 /// prologue computes `regs_ptr = cpu_ptr + regs_offset`, and inline slots address gpr as
 /// `[regs_ptr + 4*i]`). CpuGsw is NOT repr(C), so rustc is free to reorder its fields; this
 /// test pins the current offset so a rustc version bump that moved `registers` is caught here
@@ -50,12 +50,16 @@ fn cpu_registers_field_offset_is_stable() {
     let off = core::mem::offset_of!(CpuGsw, registers);
     // The current layout places `registers` at a non-zero offset (rustc reorders CpuGsw's
     // fields for alignment). The emitter handles any value (it bakes `offset_of!` at emit
-    // time, verified by the differential suites jit_region + jit_general); this assertion
-    // freezes the known position so a change is visible. The constant shifts whenever
-    // PerfCounters grows (that field precedes `registers`); the emitter re-reads the offset,
-    // so updating this number is a documentation change, not a code fix.
+    // time, verified by the differential suite jit_general); this assertion freezes the known
+    // position so a change is visible. The constant shifts whenever PerfCounters or another
+    // preceding field grows or shrinks; the dynarec-refactor Task 2 region-JIT deletion removed
+    // four PerfCounters fields (32 bytes) and the `jit_regions: jit::RegionTable` field from
+    // `CpuGsw` itself, moving this pin from 504 to 464 (measured via a failing-test readout, not
+    // derived: rustc's field reordering does not guarantee the naive byte-count shift). The
+    // emitter re-reads the offset, so updating this number is a documentation change, not a code
+    // fix.
     assert_eq!(
-        off, 504,
+        off, 464,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -197,11 +201,6 @@ fn direct_runtime_admission_tracks_backend_policy_and_clones_cold() {
     cpu.set_native_backend_enabled(true);
     assert_synchronized(&cpu);
     cpu.set_jit_auto_admit(false);
-    assert_synchronized(&cpu);
-
-    cpu.set_jit_auto_admit(true);
-    cpu.set_legacy_region_auto_admit(true);
-    assert!(!cpu.direct_runtime.admission_active);
     assert_synchronized(&cpu);
 
     cpu.reset();
@@ -1678,109 +1677,17 @@ fn live_mode_switch_to_an_accurate_persona_stops_the_fast_map_probe() {
 
 #[test]
 #[cfg(feature = "jit")]
-fn region_ctx_fn_pointer_offsets() {
-    // Pin ALL offsets the emitted native code reads/writes so a field reorder is caught.
-    use jit::step::RegionCtx;
-    assert_eq!(core::mem::offset_of!(RegionCtx, step_fn), 0);
-    assert_eq!(core::mem::offset_of!(RegionCtx, inline_step_fn), 8);
-    assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
-    assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
-    assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
-    // Pending flags offset for direct native writes; shifts whenever PerfCounters grows. The
-    // lever-1 slice's interp_fast_map_hits/_misses counters live in FastMapProbeCounters at the
-    // CpuGsw tail instead (see that type), to avoid moving this pin. The dynarec-refactor Task 2
-    // seam counters DO live in PerfCounters by design, moving this pin from 4512 to 4528.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
-}
-
-/// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
-/// interpreter's `alu_add(a, b, 0, Dword)` does, so that a later flag read (or materialization)
-/// sees the same six arithmetic bits. Swept across operand pairs that exercise the carry,
-/// zero, sign, overflow, half-carry, and parity paths. The comparison goes through
-/// `materialized_eflags`, the same reader the interpreter uses, so it is exact.
-#[cfg(feature = "jit")]
-#[test]
-fn jit_set_pending_add_matches_alu_add() {
-    let probes = [
-        (0u32, 0u32),
-        (1, 1),
-        (0xffff_ffff, 1),
-        (0x7fff_ffff, 1),
-        (0x8000_0000, 0x8000_0000),
-        (0x0f, 0x01),
-        (0x1f, 0x01),
-        (0x1234_5678, 0x9abc_def0),
-        (0xffff_ffff, 0xffff_ffff),
-        (0x0000_00ff, 0x0000_0001),
-    ];
-    for &(a, b) in &probes {
-        let mut ref_cpu = CpuGsw::default();
-        ref_cpu.alu_add(a, b, 0, BusWidth::Dword);
-        let ref_ef = ref_cpu.materialized_eflags();
-
-        let mut jit_cpu = CpuGsw::default();
-        jit_cpu.jit_set_pending_add(a, b);
-        let jit_ef = jit_cpu.materialized_eflags();
-
-        assert_eq!(
-            jit_ef, ref_ef,
-            "jit_set_pending_add({a:#x}, {b:#x}) flags diverge from alu_add"
-        );
-        // The descriptor itself must match too (cf_override, op, width, result).
-        assert_eq!(
-            jit_cpu.pending_flags, ref_cpu.pending_flags,
-            "jit_set_pending_add({a:#x}, {b:#x}) descriptor diverges"
-        );
-    }
-}
-
-/// The JIT's `jit_set_shift_flags_shr` helper must leave the identical flag state the
-/// interpreter's `shift_rotate(5, value, count, Dword)` does, for every count 0..=31 and a set
-/// of values that exercise CF (last bit out), OF (count==1 MSB), ZF/SF/PF (result), and the
-/// AF/OF-preserved paths (count != 1). This is the hardest correctness property of the inline
-/// SHR slots: a divergence here would corrupt the jnz back-edge decision.
-#[cfg(feature = "jit")]
-#[test]
-fn jit_set_shift_flags_shr_matches_shift_rotate() {
-    let values = [
-        0u32,
-        1,
-        0x8000_0000,
-        0xffff_ffff,
-        0x7fff_ffff,
-        0x4000_0000,
-        0x0200_0000, // bit 25 set: CF probe for count 26
-        0x0100_0000, // bit 24 set: CF probe for count 25 (the drawcolumn shift)
-        0x1234_5678,
-        0x0000_0001,
-    ];
-    for &value in &values {
-        for count in 0u8..=31 {
-            let mut ref_cpu = CpuGsw::default();
-            // Seed a non-trivial pending descriptor first, so the slow path of
-            // set_shift_result_flags (fold-then-eager) is exercised, matching the real loop
-            // where an earlier add slot leaves a descriptor outstanding.
-            ref_cpu.alu_add(0x1000, 0x2000, 0, BusWidth::Dword);
-            ref_cpu.shift_rotate(5, value, count, BusWidth::Dword);
-            let ref_ef = ref_cpu.materialized_eflags();
-
-            let mut jit_cpu = CpuGsw::default();
-            jit_cpu.alu_add(0x1000, 0x2000, 0, BusWidth::Dword);
-            jit_cpu.jit_set_shift_flags_shr(value, count);
-            let jit_ef = jit_cpu.materialized_eflags();
-
-            assert_eq!(
-                jit_ef, ref_ef,
-                "jit_set_shift_flags_shr({value:#x}, {count}) flags diverge from shift_rotate"
-            );
-            // No descriptor should be outstanding after a shift (shifts materialize eagerly).
-            assert_eq!(
-                jit_cpu.pending_flags.tag & (1u32 << 31) != 0,
-                ref_cpu.pending_flags.tag & (1u32 << 31) != 0,
-                "jit_set_shift_flags_shr({value:#x}, {count}) pending-state diverges"
-            );
-        }
-    }
+fn pending_flags_offset() {
+    // Pending flags offset for direct native writes; shifts whenever PerfCounters or CpuGsw's
+    // other fields grow or shrink. The lever-1 slice's interp_fast_map_hits/_misses counters live
+    // in FastMapProbeCounters at the CpuGsw tail instead (see that type), to avoid moving this
+    // pin. The dynarec-refactor Task 2 region-JIT deletion drops the `jit_regions:
+    // jit::RegionTable` field from `CpuGsw` (RegionTable itself is gone) and four PerfCounters
+    // fields (jit_region_entries, jit_region_insns, jit_native_block_ns,
+    // jit_native_block_samples), moving this pin from 4528 to 4456 (measured via a failing-test
+    // readout, not derived: rustc's field reordering is not guaranteed to move linearly with a
+    // struct's size change).
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -3430,15 +3337,6 @@ mod straight_line;
 mod strings_segments;
 #[path = "cpu_v86_test.rs"]
 mod v86;
-
-/// Differential tests for the compiled loop-region.
-#[cfg(all(
-    feature = "jit",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-#[path = "cpu_jit_region_test.rs"]
-mod jit_region;
 
 /// Differential tests for the generic JIT block builder.
 #[cfg(all(

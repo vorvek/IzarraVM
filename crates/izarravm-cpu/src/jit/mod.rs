@@ -42,7 +42,6 @@ pub(crate) mod fast_map;
 pub(crate) mod links;
 #[allow(dead_code)]
 pub(crate) mod native_x87;
-mod region;
 #[cfg_attr(
     not(all(
         target_arch = "x86_64",
@@ -60,8 +59,6 @@ mod unwind;
     any(target_os = "windows", target_os = "linux")
 ))]
 pub(crate) mod x87_avx2_emit;
-
-pub(crate) use region::RegionTable;
 
 /// The CPU's jit state: the Direct block cache plus state owned ABOVE the individual backends.
 /// Track C C1a-pre hoists the G1 SMC heat map here so a future backend could share it with the

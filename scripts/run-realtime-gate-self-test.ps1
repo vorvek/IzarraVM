@@ -83,12 +83,19 @@ function Invoke-RealtimeGateSelfTest {
         throw "The twelve-pair Direct Quake schedule does not repeat the fixed six-pair order."
     }
     $directPolicy = Get-DirectQuakeExecutionPolicy
+    # The clif backend (Task 1) and the region JIT (Task 2, dynarec-refactor) are both gone from
+    # the codebase: neither `jit_clif_*` nor `jit_region_entries`/`jit_region_insns` exist as JSON
+    # keys any more, so a policy that still named them would be asserting against a key that can
+    # never appear. `jit_native_insns` is the surviving (permanently-zero) counter the region JIT
+    # used to be the sole producer of; its continued presence in `required_zero_counters` is the
+    # policy's proof that legacy backend activity is still excluded.
     if ($directPolicy.environment.IZARRAVM_JIT -cne "1" -or
         $directPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
         ($directPolicy.required_zero_counters | Where-Object {
-            $_.StartsWith("jit_clif_", [StringComparison]::Ordinal)
+            $_.StartsWith("jit_clif_", [StringComparison]::Ordinal) -or
+            $_ -ceq "jit_region_entries" -or $_ -ceq "jit_region_insns"
         }) -or
-        $directPolicy.required_zero_counters -cnotcontains "jit_region_entries") {
+        $directPolicy.required_zero_counters -cnotcontains "jit_native_insns") {
         throw "The Direct Quake execution policy does not exclude legacy backend activity."
     }
     if ((Get-DirectQuakeCampaignMetric ([double[]](1.03) * 6) "Proof").classification -cne
@@ -1235,8 +1242,6 @@ function Invoke-RealtimeGateSelfTest {
             direct_slow_exits_per_100_instructions = 0.0
             perf = [pscustomobject][ordered]@{
                 instructions = [uint64]1000
-                jit_region_entries = if ($automatic) { 1 } else { 0 }
-                jit_region_insns = if ($automatic) { 100 } else { 0 }
                 jit_native_insns = if ($automatic) { 100 } else { 0 }
                 jit_helper_exits = 0
                 jit_native_memory_helpers = 0
@@ -1600,7 +1605,7 @@ function Invoke-RealtimeGateSelfTest {
         }
     }
     foreach ($field in @(
-        "jit_region_entries", "jit_region_insns", "jit_native_insns",
+        "jit_native_insns",
         "jit_direct_entries", "jit_direct_insns", "jit_direct_side_exits"
     )) {
         $interpreterPolarityScreen = & $newTrackMScreen `
@@ -2183,8 +2188,6 @@ function Invoke-RealtimeGateSelfTest {
             direct_slow_exits_per_100_instructions = 0.0
             perf = [pscustomobject][ordered]@{
                 instructions = $instructions
-                jit_region_entries = 0
-                jit_region_insns = 0
                 jit_native_insns = 0
                 jit_direct_entries = 0
                 jit_direct_insns = 0

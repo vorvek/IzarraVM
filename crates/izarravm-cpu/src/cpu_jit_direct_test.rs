@@ -1167,7 +1167,6 @@ fn hot_unsupported_entries_stay_interpreted_without_legacy_region_fallback() {
     let installed = cpu.jit_direct.len();
     let entries = cpu.perf_counters().jit_direct_entries;
     let insns = cpu.perf_counters().jit_direct_insns;
-    let region_entries = cpu.perf_counters().jit_region_entries;
 
     assert_eq!(cpu.registers.ecx(), 0, "the guest must still run correctly");
 
@@ -1201,13 +1200,6 @@ fn hot_unsupported_entries_stay_interpreted_without_legacy_region_fallback() {
         2 * entries,
         "the block must be the tail and nothing else"
     );
-
-    // The second half of the name, and it is an INVARIANT here rather than a live gate:
-    // `set_jit_auto_admit(true)` also calls `jit_regions.set_auto_admit(false)`, and the region
-    // path is entered only when direct auto-admit is OFF or under the IZARRAVM_JIT_REGION
-    // override, so this counter cannot move whatever the opcodes are. Kept because it is free and
-    // would catch a change to that admission gate.
-    assert_eq!(region_entries, 0);
 }
 
 /// A lowered NOP must actually EXECUTE inside a native block. Every other NOP fixture in the
@@ -1338,7 +1330,6 @@ fn supported_prefix_compiles_before_an_unsupported_barrier() {
     assert_eq!(native.registers.ebx(), 3);
     assert_eq!(native.registers.ecx(), 4);
     assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 3);
-    assert_eq!(native.perf_counters().jit_region_entries, 0);
 }
 
 #[test]

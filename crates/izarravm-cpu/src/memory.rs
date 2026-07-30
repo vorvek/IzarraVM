@@ -46,14 +46,13 @@ impl CpuGsw {
         #[cfg(not(test))]
         let admission_active = self.direct_runtime.admission_active;
 
-        admission_active && self.mode().uses_approximate_timing() && !self.jit_regions.auto_admit()
+        admission_active && self.mode().uses_approximate_timing()
     }
 
     /// Recompute the cached `fast_map_serve_enabled` mirror of `fast_map_population_enabled()`.
     /// This must be called from EVERY site that can change that predicate's inputs: `set_mode`
     /// (persona), `finish_direct_execution_transition` (`direct_runtime.admission_active`, via
-    /// `jit_direct.execution_enabled()`),
-    /// and `set_legacy_region_auto_admit` (`jit_regions.auto_admit()`, test-only). A missed call
+    /// `jit_direct.execution_enabled()`). A missed call
     /// site desyncs the cache from the real condition; `fast_map_data_slot`'s `debug_assert`
     /// checks this cheaply in debug/test builds.
     ///
@@ -507,16 +506,6 @@ impl CpuGsw {
     }
 
     #[inline]
-    pub(super) fn read_direct_byte_page_cached_without_fast_map<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        physical: u32,
-        kind: BusAccessKind,
-    ) -> ExecResult<Option<u8>> {
-        self.read_direct_byte_page_cached_inner(bus, None, physical, kind)
-    }
-
-    #[inline]
     fn read_direct_byte_page_cached_inner<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -646,18 +635,6 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<Option<bool>> {
         self.write_direct_byte_page_cached_inner(bus, Some(linear), physical, value, kind)
-    }
-
-    /// `Some(changed)` means the direct write completed; `None` asks the caller to use the bus path.
-    #[inline]
-    pub(super) fn write_direct_byte_page_cached_without_fast_map<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        physical: u32,
-        value: u8,
-        kind: BusAccessKind,
-    ) -> ExecResult<Option<bool>> {
-        self.write_direct_byte_page_cached_inner(bus, None, physical, value, kind)
     }
 
     #[inline]
