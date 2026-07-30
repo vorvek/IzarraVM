@@ -104,8 +104,8 @@ fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
     // row, and panic the `.expect` below. That is the exact 0xFC failure class the sibling
     // `DIRECT_BARRIER` constant's own doc comment (`cpu_test.rs`) narrates: "it will eventually
     // be lowered too". `DIRECT_BARRIER` is durable FOR THIS TEST specifically because, unlike
-    // 0x99, it carries its own certifying test (`direct_barrier_opcode_is_still_unclassifiable`
-    // in `cpu_test.rs`) that fails LOUDLY the day it stops being a barrier, rather than degrading
+    // 0x99, it carries its own certifying test (`direct_barrier_opcode_is_still_unclassifiable`,
+    // below in this file) that fails LOUDLY the day it stops being a barrier, rather than degrading
     // silently -- so reusing it here means a future re-classification is caught upstream, not
     // discovered here first. This is the same shape the old
     // `..._scores_an_interior_helper_shape` test used before the `PreciseHelper` scaffolding
