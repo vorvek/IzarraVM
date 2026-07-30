@@ -83,10 +83,19 @@ fn bootable_cd() -> CdImage {
     CdImage::from_iso(iso).unwrap()
 }
 
-// The real Wizardry III booter image. The headless boot-floppy smoke command uses
-// the same path; the test is skipped when the corpus is not present so it stays
-// green on machines without the local collection.
-const WIZ3_IMAGE: &str = "R:/La Colección by Neville/dosroot/Wizardry III - The Legacy of Llylgamyn (PC Booter)/WIZ3MAST.IMG";
+fn signed_cga_boot_floppy() -> Vec<u8> {
+    let mut image = vec![0u8; 737_280];
+    image[..8].copy_from_slice(&[
+        0xb8, 0x04, 0x00, // mov ax,0004h
+        0xcd, 0x10, // int 10h
+        0xfa, // cli
+        0xf4, // hlt
+        0x90, // nop
+    ]);
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    image
+}
 
 fn boot_machine() -> Machine {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
@@ -133,21 +142,11 @@ fn tab_opens_the_boot_menu_on_the_lfb() {
 }
 
 #[test]
-fn tab_then_accept_boots_the_floppy() {
-    // Mount the Wizardry booter, open the two-pane menu with Tab, and Accept with
-    // F10. The menu opens with Floppy already the marked device (the only bootable
-    // one), so Accept boots it: the floppy path reads the boot sector and jumps to
-    // it; the booter switches the card to CGA for its title. Reaching CGA proves
-    // the menu drove the floppy bootstrap.
-    let image = match std::fs::read(WIZ3_IMAGE) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            eprintln!("skipping: Wizardry III corpus image not present");
-            return;
-        }
-    };
+fn tab_then_accept_boots_a_signed_floppy() {
     let mut machine = boot_machine();
-    machine.mount_floppy(image).expect("720 KB image mounts");
+    machine
+        .mount_floppy(signed_cga_boot_floppy())
+        .expect("720 KB image mounts");
     open_boot_menu(&mut machine);
     press(&mut machine, F10_MAKE, F10_BREAK, 3_000_000);
     // The floppy now takes realistic mechanical time (seek + rotational latency +
@@ -162,7 +161,10 @@ fn tab_then_accept_boots_the_floppy() {
             break;
         }
     }
-    assert!(reached_cga, "the Wizardry booter ran and switched to CGA");
+    assert!(
+        reached_cga,
+        "the signed boot sector ran and switched to CGA"
+    );
 }
 
 #[test]
@@ -286,7 +288,6 @@ fn tab_selects_available_hard_disk_and_boots_it() {
 
     open_boot_menu(&mut machine);
     press(&mut machine, UP_MAKE, UP_BREAK, 3_000_000);
-    press(&mut machine, ENTER_MAKE, ENTER_BREAK, 3_000_000);
     press(&mut machine, F10_MAKE, F10_BREAK, 60_000_000);
 
     assert_eq!(machine.read_physical_u8(0x0500), 0x42, "the MBR ran");
@@ -298,7 +299,7 @@ fn tab_selects_available_hard_disk_and_boots_it() {
     assert_eq!(
         machine.cmos_byte(0x11),
         1,
-        "Accept persisted disk-first boot order"
+        "F10 persisted HDD as the primary device"
     );
 }
 
@@ -308,7 +309,6 @@ fn tab_selects_available_cd_rom_row() {
     machine.mount_cd(bootable_cd());
     open_boot_menu(&mut machine);
     press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
-    press(&mut machine, ENTER_MAKE, ENTER_BREAK, 3_000_000);
     press(&mut machine, F10_MAKE, F10_BREAK, 35_000_000);
 
     assert_eq!(
@@ -322,5 +322,5 @@ fn tab_selects_available_cd_rom_row() {
         0xE0,
         "no-emulation boot used DL=E0h"
     );
-    assert_eq!(machine.cmos_byte(0x11), 2, "CD choice persisted in CMOS");
+    assert_eq!(machine.cmos_byte(0x11), 2, "F10 persisted CD as primary");
 }

@@ -21,6 +21,9 @@ use izarravm_core::VideoCard;
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile};
 
+mod support;
+use support::mount_idle_boot_floppy;
+
 // CMOS NVRAM index of the persisted keyboard layout (MC146818 general area).
 const CMOS_LAYOUT: usize = 0x10;
 
@@ -50,6 +53,7 @@ fn translate(layout: u8, scancode: u8) -> u8 {
 fn translate_sequence(layout: u8, scancodes: &[u8]) -> u8 {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
+    mount_idle_boot_floppy(&mut machine);
     // The bring-up caches CMOS 0x10 into the BDA, so set the layout before any run.
     machine.set_cmos_byte(CMOS_LAYOUT, layout);
     // Run past POST and the setup-hotkey window to the idle loop.

@@ -12,6 +12,9 @@ use izarravm_core::VideoCard;
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile};
 
+mod support;
+use support::mount_idle_boot_floppy;
+
 // BDA 0x40:0x17 shift flags. Left shift is bit 1 (0x02), right shift bit 0.
 const KB_FLAGS: u32 = 0x0417;
 const LSHIFT: u8 = 0x02;
@@ -22,6 +25,7 @@ const SHIFT_BREAK: u8 = 0xaa;
 fn booted_to_idle() -> Machine {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
+    mount_idle_boot_floppy(&mut machine);
     // Past POST and the setup-hotkey window, to the idle loop with IRQ1 unmasked.
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     machine

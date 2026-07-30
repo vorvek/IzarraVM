@@ -1159,52 +1159,61 @@ impl Machine {
         self.cpu.registers.eip = u32::from(off);
     }
 
-    /// Service INT 19h (BOOTSTRAP LOADER). Re-run the boot: load the boot sector of
-    /// the default drive to 0000:7C00 and jump there. The default drive is A: when
-    /// a floppy is mounted, otherwise the Katea ATA fixed disk (80h) when it carries
-    /// a 0x55AA MBR signature. When neither is bootable, fall through to the INT 18h
-    /// path. DL carries the drive the loaded code booted from (00h floppy, 80h fixed
-    /// disk), the way a real BIOS leaves it.
-    ///
-    /// This mirrors the izarra-bios ROM's own INT 19h: a mounted floppy is treated
-    /// as bootable and sector 0 is loaded with no 0xAA55 signature check, so a guest
-    /// re-invoking INT 19h gets the same outcome the ROM gives at power-on.
-    ///
-    /// Limit: the floppy boot copies sector 0 and jumps; it does not retry on a
-    /// read error. The fixed-disk boot loads the real MBR at LBA 0 (signature-gated)
-    /// and lets it chain to the active partition. The retired Rust Toka-DOS HLE
-    /// boot record no longer backs a non-bootable C: drive.
+    /// Service INT 19h using the primary device selected by POST or the boot menu,
+    /// followed by the Izarra fallback order. Power-on reaches this same planner.
     pub(super) fn handle_int19(&mut self) {
-        if self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR) == 2 {
-            if self.boot_el_torito() {
+        let primary = BootDevice::from_code(self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR));
+        for device in primary.fallback_order() {
+            if self.try_boot_device(device) {
                 return;
             }
-            self.handle_int18();
-            return;
         }
-        // A: floppy first. Copy its boot sector (CHS 0,0,1) to 0000:7C00 and jump
-        // there. A mounted floppy is bootable (matching the ROM path); only an
-        // unreadable sector 0 falls through.
+        self.handle_int18();
+    }
+
+    fn try_boot_device(&mut self, device: BootDevice) -> bool {
+        match device {
+            BootDevice::Floppy => self.try_boot_floppy(),
+            BootDevice::HardDisk => self.try_boot_hard_disk(),
+            BootDevice::CdRom => {
+                let booted = self.boot_el_torito();
+                if booted {
+                    self.prepare_boot_environment();
+                }
+                booted
+            }
+        }
+    }
+
+    fn prepare_boot_environment(&mut self) {
+        let _ = self.int10_set_mode_number(0x03);
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+    }
+
+    fn try_boot_floppy(&mut self) -> bool {
         if let Some(sector) = self
             .floppy
             .as_ref()
             .and_then(|f| f.read_sector(0, 0, 1))
-            .filter(|s| s.len() >= 512)
+            .filter(|s| s.len() >= 512 && s[510] == 0x55 && s[511] == 0xAA)
             .map(<[u8]>::to_vec)
         {
             self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector[..512]);
-            self.cpu.registers.set_edx(0x00); // DL = 00h: booted from floppy A:
-            // The floppy's own sector-0 code is the OS now, so the HLE Toka-DOS
-            // and IZEMM stand down and the disk owns the DOS interrupts through the
-            // IVT. Real hardware just runs whatever sector 0 holds; this confines
-            // the HLE injection to the C: boot below.
+            self.cpu.registers.set_edx(0x00);
             self.booter_inert = true;
+            self.prepare_boot_environment();
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
-            return;
+            return true;
         }
-        // Fixed disk (Katea ATA primary master): boot from LBA 0 if it carries a
-        // boot signature. Unlike the floppy path, INT 13h stays intercepted so
-        // Katea keeps serving disk I/O to the booted OS. DL=80h = first fixed disk.
+        false
+    }
+
+    fn try_boot_hard_disk(&mut self) -> bool {
         if let Some(sector0) = self
             .ata
             .as_ref()
@@ -1214,13 +1223,11 @@ impl Machine {
             self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector0[..512]);
             self.cpu.registers.set_edx(0x80);
             self.booter_inert = true;
+            self.prepare_boot_environment();
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
-            return;
+            return true;
         }
-        // Nothing bootable (no signed floppy or ATA MBR): the retired Rust
-        // Toka-DOS HLE boot fallback is absent, so hand off to the diskless/no-boot
-        // path exactly like the firmware's .disk_absent branch.
-        self.handle_int18();
+        false
     }
 
     /// Service INT 18h (DISKLESS BOOT HOOK). On a real PC this entered ROM BASIC;

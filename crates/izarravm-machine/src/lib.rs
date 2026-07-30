@@ -1176,6 +1176,7 @@ impl Machine {
             .cpu
             .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
         machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
+        machine.set_cmos_byte(CMOS_PRIMARY_BOOT_DEVICE, BootDevice::Floppy as u8);
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.

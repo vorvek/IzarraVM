@@ -40,6 +40,36 @@ fn el_torito_iso(media: u8) -> CdImage {
     CdImage::from_iso(iso).unwrap()
 }
 
+fn bootable_floppy(marker: u8) -> Vec<u8> {
+    let mut image = vec![0u8; 1_474_560];
+    image[0] = marker;
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    image
+}
+
+fn bootable_hdd(marker: u8) -> Vec<u8> {
+    let mut image = vec![0u8; 512 * 4];
+    image[0] = marker;
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    image
+}
+
+fn boot_result(machine: &mut Machine) -> (u16, u8, u8) {
+    let segment = machine.cpu.registers.segment(SegmentIndex::Cs).selector;
+    let address = if segment == 0x2000 {
+        0x2_0000
+    } else {
+        BOOT_SECTOR_ADDRESS as u32
+    };
+    (
+        segment,
+        machine.cpu.registers.edx() as u8,
+        machine.read_physical_u8(address),
+    )
+}
+
 #[test]
 fn el_torito_boots_no_emulation_and_every_common_emulation_mode() {
     for media in 0u8..=4 {
@@ -117,6 +147,78 @@ fn el_torito_cd_edd_reads_2048_byte_blocks_and_4b_terminates_emulation() {
         "reported floppy-emulation media"
     );
     assert!(m.eltorito_emulation.is_none());
+}
+
+#[test]
+fn int19_uses_primary_device_then_the_exact_fallback_policy() {
+    for (primary, expected) in [
+        (BootDevice::Floppy, (0x0000, 0x00, 0x11)),
+        (BootDevice::HardDisk, (0x0000, 0x80, 0x22)),
+        (BootDevice::CdRom, (0x2000, 0xe0, 0xfa)),
+    ] {
+        let mut machine = int15_machine(16);
+        machine.mount_floppy(bootable_floppy(0x11)).unwrap();
+        machine.mount_hdd(bootable_hdd(0x22));
+        machine.mount_cd(el_torito_iso(0));
+        machine.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, primary as u8);
+        machine.handle_int19();
+        assert_eq!(boot_result(&mut machine), expected, "primary {primary:?}");
+    }
+
+    let cases = [
+        (BootDevice::Floppy, false, true, true, (0x0000, 0x80, 0x22)),
+        (
+            BootDevice::HardDisk,
+            true,
+            false,
+            true,
+            (0x0000, 0x00, 0x11),
+        ),
+        (BootDevice::CdRom, true, true, false, (0x0000, 0x80, 0x22)),
+    ];
+    for (primary, floppy, hdd, cd, expected) in cases {
+        let mut machine = int15_machine(16);
+        if floppy {
+            machine.mount_floppy(bootable_floppy(0x11)).unwrap();
+        }
+        if hdd {
+            machine.mount_hdd(bootable_hdd(0x22));
+        }
+        if cd {
+            machine.mount_cd(el_torito_iso(0));
+        }
+        machine.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, primary as u8);
+        machine.handle_int19();
+        assert_eq!(
+            boot_result(&mut machine),
+            expected,
+            "fallback from {primary:?}"
+        );
+    }
+}
+
+#[test]
+fn int19_skips_present_but_unbootable_primary_media() {
+    let mut floppy_primary = int15_machine(16);
+    floppy_primary.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+    floppy_primary.mount_hdd(bootable_hdd(0x22));
+    floppy_primary.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, BootDevice::Floppy as u8);
+    floppy_primary.handle_int19();
+    assert_eq!(boot_result(&mut floppy_primary), (0x0000, 0x80, 0x22));
+
+    let mut hdd_primary = int15_machine(16);
+    hdd_primary.mount_hdd(vec![0u8; 512 * 4]);
+    hdd_primary.mount_floppy(bootable_floppy(0x11)).unwrap();
+    hdd_primary.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, BootDevice::HardDisk as u8);
+    hdd_primary.handle_int19();
+    assert_eq!(boot_result(&mut hdd_primary), (0x0000, 0x00, 0x11));
+
+    let mut cd_primary = int15_machine(16);
+    cd_primary.mount_cd(CdImage::from_iso(vec![0u8; 32 * cdimage::DATA_SECTOR]).unwrap());
+    cd_primary.mount_hdd(bootable_hdd(0x22));
+    cd_primary.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, BootDevice::CdRom as u8);
+    cd_primary.handle_int19();
+    assert_eq!(boot_result(&mut cd_primary), (0x0000, 0x80, 0x22));
 }
 
 #[test]
@@ -1117,7 +1219,10 @@ fn int19_floppy_boot_marks_the_machine_booter_inert() {
     // so the HLE Toka-DOS stands down the way it would on real hardware:
     // whatever is in the boot sector is the OS now, not the HLE.
     let mut m = int15_machine(16);
-    m.mount_floppy(vec![0u8; 1_474_560]).unwrap(); // 1.44 MB, readable sector 0
+    let mut image = vec![0u8; 1_474_560];
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    m.mount_floppy(image).unwrap();
     assert!(!m.booter_inert(), "booter-inert defaults off");
     m.handle_int19();
     assert!(
@@ -1188,7 +1293,10 @@ fn floppy_booted_machine_stands_dos_down_at_interrupt_ack() {
     // stand down so the disk's own handler runs, not the HLE. This catches a
     // stale booter-inert snapshot in the per-interrupt bus.
     let mut m = int15_machine(16);
-    m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+    let mut image = vec![0u8; 1_474_560];
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    m.mount_floppy(image).unwrap();
     m.handle_int19();
     ack_and_dispatch(&mut m, 0x21);
     assert_eq!(

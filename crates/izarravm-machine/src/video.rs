@@ -62,7 +62,7 @@ impl Machine {
         self.vega.margo_active()
     }
 
-    fn int10_set_mode_number(&mut self, requested_mode: u8) -> bool {
+    pub(super) fn int10_set_mode_number(&mut self, requested_mode: u8) -> bool {
         let mode = requested_mode & 0x7F;
         let clear = requested_mode & 0x80 == 0;
         match mode {

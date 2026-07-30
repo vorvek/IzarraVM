@@ -35,15 +35,15 @@ bios_start:
     xor ax, ax
     mov ds, ax                  ; DS = 0 for the IVT and the result block
     ; Seed the boot-device choice from CMOS 0x11 (0 floppy, 1 disk, 2 CD-ROM).
-    ; The Tab boot menu re-reads this for its default highlight; the
-    ; copy here is what boot_entry uses when no menu runs. Clamp to floppy.
+    ; The Tab boot menu re-reads this for its default highlight; the low-RAM
+    ; copy is the primary passed to the Rust INT 19h planner. Clamp to floppy.
     mov al, BOOT_CMOS_PRIMARY
     out 0x70, al
     in al, 0x71
     cmp al, 2
-    jbe .order_ok
+    jbe .primary_ok
     xor al, al
-.order_ok:
+.primary_ok:
     mov [BOOT_CHOICE], al
     mov byte [POST_HOTKEY], 0
 

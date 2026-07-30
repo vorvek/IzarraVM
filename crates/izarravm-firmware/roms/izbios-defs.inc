@@ -72,8 +72,8 @@
 ; it opens the boot-device menu instead of the setup page.
 %define BOOTMENU_HOTKEY 0x0f
 
-; CMOS NVRAM byte 0x11 holds the boot choice: 0 = floppy, 1 = disk, 2 = CD-ROM.
-; The boot menu seeds its default highlight from this byte.
+; CMOS NVRAM byte 0x11 holds one primary device: 0 floppy, 1 disk, 2 CD-ROM.
+; INT 19h expands it into the Izarra fallback policy.
 %define BOOT_CMOS_PRIMARY 0x11
 
 ; CMOS NVRAM byte 0x12 holds the saved GSW speed code (0 386, 1 486, 2 586,
@@ -85,9 +85,8 @@
 ; output; zero and unknown values leave BIOS output off.
 %define DEBUG_CMOS_COM1 0x14
 
-; Boot-device choice (segment 0 byte), written by the boot menu and read by
-; boot_entry: 0 = floppy, 1 = disk (Toka-DOS on C:), 2 = CD-ROM. It lives after
-; the BOX_* fields in the free tail of BIOS_SCRATCH. Defaults to floppy.
+; Session boot-device choice (segment 0 byte), seeded from CMOS and optionally
+; replaced by a one-boot menu selection. INT 19h reads it as the primary.
 %define BOOT_CHOICE    (BIOS_SCRATCH + 0x17)   ; 0x0537
 ; First POST hotkey latched from anywhere in diagnostics: 0 none, 1 Del/setup,
 ; 2 Tab/boot menu. First one wins.

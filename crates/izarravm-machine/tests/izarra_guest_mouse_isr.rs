@@ -5,6 +5,9 @@ use izarravm_core::VideoCard;
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
+mod support;
+use support::mount_idle_boot_floppy;
+
 const RESULT_STATUS: u32 = 0x8000; // packet status byte the handler saw
 const RESULT_X: u32 = 0x8001; // packet X byte the handler saw
 const RESULT_COUNT: u32 = 0x8002; // times the handler ran
@@ -27,6 +30,7 @@ const HANDLER: [u8; 31] = [
 fn booted_to_idle() -> Machine {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
+    mount_idle_boot_floppy(&mut machine);
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     machine
 }
