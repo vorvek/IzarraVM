@@ -3852,6 +3852,14 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 }
 
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
+    let physical = cpu.decode_cache.line_phys_start(lin, d)?;
+    key_for_phys(cpu, lin, d, physical)
+}
+
+/// `key_for` for a caller that already holds the line's physical start (a `DecodeLineView` taken
+/// this iteration). Identical decision: the only thing `key_for` reads off the decode cache is
+/// that one field, and `line_phys_start` would return exactly this value for the same key.
+pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Option<BlockKey> {
     if !super::host_supported() || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586) {
         return None;
     }
@@ -3873,7 +3881,6 @@ pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
     if lin.wrapping_sub(0x000f_f000) < 0x400 {
         return None;
     }
-    let physical = cpu.decode_cache.line_phys_start(lin, d)?;
     // The first direct slice has no page-kind guard in emitted code. Keep video and ROM code on
     // the interpreter until the shared fast map can prove a page is ordinary RAM.
     if (0x000a_0000..0x0010_0000).contains(&physical) {

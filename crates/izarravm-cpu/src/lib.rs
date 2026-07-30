@@ -1171,6 +1171,12 @@ impl std::fmt::Debug for CpuProfileState {
 struct DirectRuntimeState {
     // Inline host policy for interpreter hot paths. Dynamic entry guards remain in the backend.
     admission_active: bool,
+    /// One-shot "the last native entry ran only a PREFIX of its block, so let the interpreter take
+    /// the next boundary" latch. Run-scoped, not architectural: `run_budgeted_inner` clears it on
+    /// every entry, so it never carries across a batch, and like `admission_active` it is excluded
+    /// from CPU equality and resets on clone. It lives here rather than as a run-loop local so the
+    /// whole admission decision fits in one dispatcher call.
+    skip_direct_once: bool,
 }
 
 #[cfg(feature = "jit")]
@@ -2229,6 +2235,29 @@ struct DecodeLine {
     jit_direct_hotness: u8,
 }
 
+/// One decode-line fetch, materialised once and threaded through a whole continuation iteration.
+///
+/// The straight-line loop used to index the decode table, and repeat its generation/tag/`d` test,
+/// up to four times per continuation for the same line: the main probe, the admission hotness
+/// bump, the block key's physical start, and the warm-fetch charge. They all want one line, so the
+/// line is read ONCE into this view and the values are handed to the downstream consumers.
+///
+/// `insn` is a COPY, not a borrow of the line, and that is settled rather than incidental:
+/// `invalidate_and_clear_code_marks` refills lines on a generation wrap, so a borrow cannot
+/// outlive the probe (`.bench/results/decodecache-20260731/RESULTS.md`). The other two fields are
+/// snapshots for the same reason; the run-loop call site carries the staleness argument.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecodeLineView {
+    pub(crate) insn: DecodedInsn,
+    /// Physical address of the instruction's first byte, as `DecodeCache::line_phys_start` would
+    /// report it for this key.
+    pub(crate) phys_start: u32,
+    /// The table index the line was found at. The view is proof the line is live for its key, so a
+    /// consumer holding one can address the line by slot without re-testing the tag.
+    #[cfg(feature = "jit")]
+    pub(crate) slot: u32,
+}
+
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
 /// physical page was decoded through, plus the alias condition that forces the sound global-flush
 /// fallback. Page-straddling instructions are not cached. Rebuilt from scratch after every global
@@ -2548,6 +2577,24 @@ impl DecodeCache {
         }
     }
 
+    /// `get`, plus the two other facts the continuation loop wants about the same line. One index
+    /// and one generation/tag/`d` check serve all three consumers; see `DecodeLineView`.
+    #[inline]
+    fn get_view(&self, lin: u32, d: bool) -> Option<DecodeLineView> {
+        let slot = lin & self.mask;
+        let line = &self.lines[slot as usize];
+        if line.generation == self.generation && line.tag == lin && line.d == d {
+            line.insn.map(|insn| DecodeLineView {
+                insn,
+                phys_start: line.phys_start,
+                #[cfg(feature = "jit")]
+                slot,
+            })
+        } else {
+            None
+        }
+    }
+
     #[inline]
     fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) -> DecodeInsertOutcome {
         let len = u32::from(insn.len);
@@ -2712,13 +2759,16 @@ impl DecodeCache {
 
     /// Observe a continuation for direct-code admission. Once the second encounter makes the line
     /// hot, later encounters stay eligible for the direct cache's separate first-seen/compile probe.
+    ///
+    /// Takes the SLOT rather than the key: the only caller reaches this holding a `DecodeLineView`
+    /// it took from this very cache in the same loop iteration, so the line is already proven live
+    /// for `(lin, d)` and the generation/tag/`d` retest this used to run was answering a question
+    /// that could not come back false. Nothing between the view and this call can invalidate a
+    /// line (the admission gate only reads the cache; see the caller's staleness note).
     #[cfg(feature = "jit")]
     #[inline]
-    fn direct_hot(&mut self, lin: u32, d: bool, threshold: u8) -> bool {
-        let line = &mut self.lines[(lin & self.mask) as usize];
-        if line.generation != self.generation || line.tag != lin || line.d != d {
-            return false;
-        }
+    fn direct_hot_at(&mut self, slot: u32, threshold: u8) -> bool {
+        let line = &mut self.lines[slot as usize];
         if line.jit_direct_hotness < threshold {
             line.jit_direct_hotness += 1;
         }

@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::run::ContinuationDispatch;
 
 const ENTRY: u32 = 0x100;
 
 fn fresh() -> CpuGsw {
+    fresh_in_mode(GswMode::Gsw586)
+}
+
+fn fresh_in_mode(mode: GswMode) -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.set_mode(GswMode::Gsw586);
+    cpu.set_mode(mode);
     for segment in [SegmentIndex::Cs, SegmentIndex::Ds, SegmentIndex::Ss] {
         cpu.load_segment_real(segment, 0);
     }
@@ -21,11 +26,15 @@ fn fresh() -> CpuGsw {
 }
 
 fn fixture(code: &[u8]) -> (CpuGsw, TestBus) {
+    fixture_in_mode(code, GswMode::Gsw586)
+}
+
+fn fixture_in_mode(code: &[u8], mode: GswMode) -> (CpuGsw, TestBus) {
     let mut memory = vec![0; 0x2000];
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
-    let mut cpu = fresh();
+    let mut cpu = fresh_in_mode(mode);
     cpu.jit_direct.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
@@ -269,6 +278,75 @@ fn retry_state_stays_dormant_after_decode_recovery_until_cache_clear() {
         cpu.perf_counters().jit_direct_blocks_installed,
         installed + 1
     );
+}
+
+/// Every gate ahead of the JIT answers `Skipped`, never `Declined`: the decline seam counter
+/// (`jit_direct_dispatch_declines`) counts boundaries the JIT was actually ASKED about. Warming
+/// only `ENTRY` leaves the third instruction undecoded, so the compile walk cannot finish and the
+/// consulted case lands on `Declined` without installing anything.
+#[test]
+fn dispatch_reports_skipped_for_every_gate_ahead_of_the_jit() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    cpu.set_jit_auto_admit(true);
+
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, false)
+            .expect("inactive continuations"),
+        ContinuationDispatch::Skipped
+    );
+
+    cpu.set_native_backend_enabled(false);
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("backend disabled"),
+        ContinuationDispatch::Skipped
+    );
+
+    let (mut cpu, mut bus) = fixture_in_mode(&[0x40, 0x41, 0x42], GswMode::Gsw386Slow);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    cpu.set_jit_auto_admit(true);
+    assert!(!cpu.mode().uses_approximate_timing());
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("exact-timing persona"),
+        ContinuationDispatch::Skipped
+    );
+
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    cpu.set_jit_auto_admit(true);
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("consulted"),
+        ContinuationDispatch::Declined
+    );
+}
+
+/// The latch is consumed by a short-circuited `||`, so a pending skip is NOT spent while the
+/// backend is disabled; it survives to the first boundary the JIT would really have taken.
+#[test]
+fn a_pending_direct_skip_survives_a_disabled_backend() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    cpu.set_jit_auto_admit(true);
+
+    cpu.set_native_backend_enabled(false);
+    cpu.set_skip_direct_once_for_test(true);
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("backend disabled"),
+        ContinuationDispatch::Skipped
+    );
+    assert!(cpu.skip_direct_once_for_test(), "the latch must survive");
+
+    cpu.set_native_backend_enabled(true);
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("latch spent"),
+        ContinuationDispatch::Skipped
+    );
+    assert!(!cpu.skip_direct_once_for_test(), "the latch must be spent");
 }
 
 #[test]

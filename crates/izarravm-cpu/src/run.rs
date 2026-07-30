@@ -66,6 +66,18 @@ enum DirectContinuation {
     Interpret,
 }
 
+/// What the single admission dispatcher decided for one continuation. The two non-native answers
+/// are kept apart because only one of them is a DECLINE: `Declined` means the JIT was actually
+/// consulted about this boundary and chose the interpreter (the `jit_direct_dispatch_declines`
+/// seam counter), while `Skipped` means a gate upstream of the JIT meant it was never asked.
+#[cfg(feature = "jit")]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub(crate) enum ContinuationDispatch {
+    Native(CycleOutcome),
+    Declined,
+    Skipped,
+}
+
 #[cfg(feature = "jit")]
 enum DirectBlockOutcome {
     NotRun,
@@ -540,8 +552,13 @@ impl CpuGsw {
     ) -> Result<BudgetedRunOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
+        // Run-scoped latch, cleared on every entry so it can never carry across a batch. It used
+        // to be a local here; it moved onto `direct_runtime` so the whole admission decision is one
+        // call, and this clear is what keeps that move behaviour-preserving.
         #[cfg(feature = "jit")]
-        let mut skip_direct_once = false;
+        {
+            self.direct_runtime.skip_direct_once = false;
+        }
         #[cfg(feature = "jit")]
         let native_continuations_active = {
             debug_assert_eq!(
@@ -582,24 +599,37 @@ impl CpuGsw {
                 let lin = self.linear_eip();
                 let cs = self.registers.cs();
                 seam_probes += 1;
-                let insn = match self.decode_cache.get(lin, cs.default_size_32) {
-                    Some(i) => {
-                        if !i.continuable {
+                // ONE decode-line fetch for the whole iteration. The probe, the admission hotness
+                // bump, the block key's physical start and the warm-fetch charge all wanted the
+                // same line and each used to index the table and repeat its tag check; they now
+                // read this view.
+                //
+                // STALENESS: the view is a snapshot taken BEFORE dispatch, and the interpreter
+                // below deliberately executes what it read. This is the same argument the decode
+                // cache's insn copy rests on (`.bench/results/decodecache-20260731/RESULTS.md`):
+                // a borrow would be unsound because lines get refilled, a copy simply commits to
+                // the instruction the probe saw. Nothing on the path between here and the consumers
+                // can invalidate this line anyway — admission only READS the decode cache (its
+                // compile walk uses `get`, never `put`), and every arm that returns to the
+                // interpreter does so before any guest instruction executes.
+                let view = match self.decode_cache.get_view(lin, cs.default_size_32) {
+                    Some(view) => {
+                        if !view.insn.continuable {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_not_continuable += 1;
                             break;
                         }
-                        if (lin & 0xfff) + u32::from(i.len) > 0x1000 {
+                        if (lin & 0xfff) + u32::from(view.insn.len) > 0x1000 {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_page_cross += 1;
                             break;
                         }
-                        if !Self::fetch_within_limit(self.registers.eip, i.len, cs.limit) {
+                        if !Self::fetch_within_limit(self.registers.eip, view.insn.len, cs.limit) {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_not_continuable += 1;
                             break;
                         }
-                        i
+                        view
                     }
                     None => {
                         self.perf.brk_decode_or_branch += 1;
@@ -610,38 +640,26 @@ impl CpuGsw {
                 // JIT admission: a compiled Direct block covering this line runs natively instead
                 // of the interpreted continuation, occupying one loop iteration; the loop's own
                 // break checks below then fire at exactly the boundary the block stopped at.
-                // The probe read+branch is the whole per-continuation dispatch cost.
+                // One call answers the whole question (see `dispatch_continuation`).
                 #[cfg(feature = "jit")]
-                let direct_outcome = if !native_continuations_active {
-                    None
-                } else {
-                    let continuation_budget = ContinuationBudget {
+                let direct_outcome = match self.dispatch_continuation(
+                    bus,
+                    native_continuations_active,
+                    &view,
+                    lin,
+                    cs.default_size_32,
+                    ContinuationBudget {
                         total,
                         bus_at_entry,
                         cap,
-                    };
-                    if !self.jit_direct.backend_enabled() || std::mem::take(&mut skip_direct_once) {
-                        None
-                    } else if self.mode().uses_approximate_timing() {
-                        match self.try_direct_continuation(
-                            bus,
-                            lin,
-                            cs.default_size_32,
-                            continuation_budget,
-                        )? {
-                            DirectContinuation::Run(outcome) => Some(outcome),
-                            DirectContinuation::Prefix(outcome) => {
-                                skip_direct_once = true;
-                                Some(outcome)
-                            }
-                            DirectContinuation::Interpret => {
-                                seam_declines += 1;
-                                None
-                            }
-                        }
-                    } else {
+                    },
+                )? {
+                    ContinuationDispatch::Native(outcome) => Some(outcome),
+                    ContinuationDispatch::Declined => {
+                        seam_declines += 1;
                         None
                     }
+                    ContinuationDispatch::Skipped => None,
                 };
                 #[cfg(not(feature = "jit"))]
                 let direct_outcome: Option<CycleOutcome> = None;
@@ -653,10 +671,10 @@ impl CpuGsw {
                         // total is exactly the prior instructions' charge in this run, not
                         // including the continuation about to execute.
                         self.core_clocks_so_far = total;
-                        if insn.prefixes.rep.is_some() {
-                            self.run_one_cached_budgeted(bus, &insn, lin, rep_budget)?
+                        if view.insn.prefixes.rep.is_some() {
+                            self.run_one_cached_budgeted(bus, &view, lin, rep_budget)?
                         } else {
-                            self.run_one_cached(bus, &insn, lin)?
+                            self.run_one_cached(bus, &view, lin)?
                         }
                     }
                 }
@@ -958,10 +976,59 @@ impl CpuGsw {
         self.perf.smc_heat_demotions += 1;
     }
 
+    /// The WHOLE admission decision for one continuation, in one call. The run loop used to spell
+    /// the gate chain out inline and own the `skip_direct_once` latch as a local; both live behind
+    /// this boundary now, so the loop asks one question and gets one of three answers.
+    ///
+    /// The decision tree is EXACTLY the one the inline form ran, gate for gate and in the same
+    /// order. Two properties of that order are load-bearing rather than incidental, and neither is
+    /// safe to "tidy":
+    ///
+    /// - The latch is consumed by a SHORT-CIRCUITED `||`. With the backend disabled the take never
+    ///   runs, so a pending skip SURVIVES a disabled stretch instead of being spent on a boundary
+    ///   the JIT was never going to take.
+    /// - The approximate-timing test is asked here AND again as `try_direct_continuation`'s second
+    ///   gate. The duplicate is not redundant at the seam: refusing here is a `Skipped`, while
+    ///   refusing inside would be an `Interpret` and would count a decline. The counter gate on
+    ///   `jit_direct_dispatch_declines` is what pins this.
+    #[cfg(feature = "jit")]
+    fn dispatch_continuation<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        native_continuations_active: bool,
+        view: &DecodeLineView,
+        lin: u32,
+        d: bool,
+        budget: ContinuationBudget,
+    ) -> Result<ContinuationDispatch, CpuError> {
+        // Hoisted by the caller and passed in: it is run-invariant, and re-reading it per
+        // continuation is exactly the per-iteration cost this task is removing.
+        if !native_continuations_active {
+            return Ok(ContinuationDispatch::Skipped);
+        }
+        if !self.jit_direct.backend_enabled()
+            || std::mem::take(&mut self.direct_runtime.skip_direct_once)
+        {
+            return Ok(ContinuationDispatch::Skipped);
+        }
+        if !self.mode().uses_approximate_timing() {
+            return Ok(ContinuationDispatch::Skipped);
+        }
+        match self.try_direct_continuation(bus, view, lin, d, budget)? {
+            DirectContinuation::Run(outcome) => Ok(ContinuationDispatch::Native(outcome)),
+            DirectContinuation::Prefix(outcome) => {
+                self.direct_runtime.skip_direct_once = true;
+                Ok(ContinuationDispatch::Native(outcome))
+            }
+            DirectContinuation::Interpret => Ok(ContinuationDispatch::Declined),
+        }
+    }
+
     #[cfg(feature = "jit")]
     fn try_direct_continuation<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        view: &DecodeLineView,
         lin: u32,
         d: bool,
         budget: ContinuationBudget,
@@ -994,11 +1061,11 @@ impl CpuGsw {
         }
         if !self
             .decode_cache
-            .direct_hot(lin, d, self.jit_direct.admission_heat())
+            .direct_hot_at(view.slot, self.jit_direct.admission_heat())
         {
             return Ok(DirectContinuation::Interpret);
         }
-        let Some(key) = jit::direct::key_for(self, lin, d) else {
+        let Some(key) = jit::direct::key_for_phys(self, lin, d, view.phys_start) else {
             return Ok(DirectContinuation::Interpret);
         };
         let probe = self.jit_direct.probe(key);
@@ -1146,8 +1213,14 @@ impl CpuGsw {
         lin: u32,
         d: bool,
     ) -> Result<(), CpuError> {
+        // The fixtures drive a decoded, live line; a miss here would have reached `key_for`'s
+        // `line_phys_start` and returned `Interpret`, which this helper discards either way.
+        let Some(view) = self.decode_cache.get_view(lin, d) else {
+            return Ok(());
+        };
         let _ = self.try_direct_continuation(
             bus,
+            &view,
             lin,
             d,
             ContinuationBudget {
@@ -1157,6 +1230,48 @@ impl CpuGsw {
             },
         )?;
         Ok(())
+    }
+
+    /// Drive `dispatch_continuation` (the gate chain plus the latch) on a decoded fixture line.
+    #[cfg(all(
+        test,
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn dispatch_continuation_for_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        d: bool,
+        native_continuations_active: bool,
+    ) -> Result<ContinuationDispatch, CpuError> {
+        let view = self
+            .decode_cache
+            .get_view(lin, d)
+            .expect("fixture decode line must be live");
+        self.dispatch_continuation(
+            bus,
+            native_continuations_active,
+            &view,
+            lin,
+            d,
+            ContinuationBudget {
+                total: 0,
+                bus_at_entry: 0,
+                cap: u64::MAX,
+            },
+        )
+    }
+
+    #[cfg(all(test, feature = "jit"))]
+    pub(super) fn skip_direct_once_for_test(&self) -> bool {
+        self.direct_runtime.skip_direct_once
+    }
+
+    #[cfg(all(test, feature = "jit"))]
+    pub(super) fn set_skip_direct_once_for_test(&mut self, on: bool) {
+        self.direct_runtime.skip_direct_once = on;
     }
 
     #[cfg(feature = "jit")]
@@ -1894,9 +2009,10 @@ impl CpuGsw {
     fn run_one_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        insn: &DecodedInsn,
+        view: &DecodeLineView,
         lin: u32,
     ) -> Result<CycleOutcome, CpuError> {
+        let insn = &view.insn;
         self.interrupt_shadow = false;
         self.begin_instruction();
         let start_eip = self.registers.eip;
@@ -1908,7 +2024,7 @@ impl CpuGsw {
         let profiling = self.profile.enabled;
         if !profiling {
             return match self
-                .charge_cached_fetch(bus, lin, insn.len)
+                .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
                 .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus))
             {
                 Ok(outcome) => {
@@ -1949,7 +2065,7 @@ impl CpuGsw {
         }
         let profile_start = self.profile.sample_start();
         let result = self
-            .charge_cached_fetch(bus, lin, insn.len)
+            .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
             .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus));
         // Profiling path: finish_instruction retires (increments perf.instructions) on Ok; observe
         // the same Ok retirements here so the count stays exact when profiling is enabled.
@@ -1984,10 +2100,11 @@ impl CpuGsw {
     fn run_one_cached_budgeted<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        insn: &DecodedInsn,
+        view: &DecodeLineView,
         lin: u32,
         rep_budget: RepBudget,
     ) -> Result<CycleOutcome, CpuError> {
+        let insn = &view.insn;
         debug_assert!(insn.prefixes.rep.is_some());
         self.interrupt_shadow = false;
         self.begin_instruction();
@@ -1998,7 +2115,7 @@ impl CpuGsw {
         self.rep_execution.yielded = false;
         if !profiling {
             return match self
-                .charge_cached_fetch(bus, lin, insn.len)
+                .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
                 .and_then(|()| self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget))
             {
                 Ok(outcome) if self.rep_execution.yielded => {
@@ -2043,7 +2160,7 @@ impl CpuGsw {
         }
         let profile_start = self.profile.sample_start();
         let result = self
-            .charge_cached_fetch(bus, lin, insn.len)
+            .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
             .and_then(|()| self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget));
         if self.rep_execution.yielded {
             let outcome = result.expect("a faulting REP chunk cannot also yield");
