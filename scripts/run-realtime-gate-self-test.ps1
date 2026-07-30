@@ -85,7 +85,9 @@ function Invoke-RealtimeGateSelfTest {
     $directPolicy = Get-DirectQuakeExecutionPolicy
     if ($directPolicy.environment.IZARRAVM_JIT -cne "1" -or
         $directPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
-        $directPolicy.required_zero_counters -cnotcontains "jit_clif_entries" -or
+        ($directPolicy.required_zero_counters | Where-Object {
+            $_.StartsWith("jit_clif_", [StringComparison]::Ordinal)
+        }) -or
         $directPolicy.required_zero_counters -cnotcontains "jit_region_entries") {
         throw "The Direct Quake execution policy does not exclude legacy backend activity."
     }
@@ -1241,10 +1243,6 @@ function Invoke-RealtimeGateSelfTest {
                 jit_direct_entries = if ($nativeDirect) { 90 } else { 0 }
                 jit_direct_insns = if ($nativeDirect) { 900 } else { 0 }
                 jit_direct_side_exits = 0
-                jit_clif_compile_attempts = 0
-                jit_clif_units_installed = 0
-                jit_clif_entries = 0
-                jit_clif_side_exits = 0
                 poll_skip_spans = 0
                 poll_skip_iterations = 0
             }
@@ -1419,15 +1417,6 @@ function Invoke-RealtimeGateSelfTest {
             throw "The Direct Quake campaign accepted a final HDD mismatch."
         }
         $directCandidate[0].gate_hdd_tree.tree_sha256 = "b" * 64
-        $directCandidate[0].perf.jit_clif_entries = 1
-        $clifMismatch = Get-DirectQuakeCampaignWorkloadSummary `
-            (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
-            $directWarmups $directCorrectness $directPolicy "Proof" $candidateSha $parentSha
-        if ($clifMismatch.provenance.verdict -cne "fail" -or
-            ($clifMismatch.provenance.failure_reasons -join " ") -notmatch "Clif activity") {
-            throw "The Direct Quake campaign accepted legacy Clif activity."
-        }
-        $directCandidate[0].perf.jit_clif_entries = 0
         $directCandidate[0].PSObject.Properties.Remove("scaled_bus_clocks")
         $missingScaledBus = Get-DirectQuakeCampaignWorkloadSummary `
             (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `

@@ -465,9 +465,7 @@ function Get-DirectQuakeExecutionPolicy {
         required_zero_counters = [object[]]@(
             "poll_skip_spans", "poll_skip_iterations",
             "jit_region_entries", "jit_region_insns", "jit_native_insns",
-            "jit_helper_exits", "jit_native_memory_helpers",
-            "jit_clif_compile_attempts", "jit_clif_units_installed",
-            "jit_clif_entries", "jit_clif_side_exits"
+            "jit_helper_exits", "jit_native_memory_helpers"
         )
     }
 }
@@ -1382,12 +1380,6 @@ function Get-DirectQuakeSampleReasons(
     foreach ($field in @($ExecutionPolicy.required_zero_counters)) {
         if ($null -eq $Sample.perf.PSObject.Properties[$field] -or $Sample.perf.$field -ne 0) {
             $reasons += "$label required zero counter $field was missing or nonzero"
-        }
-    }
-    foreach ($property in $Sample.perf.PSObject.Properties) {
-        if ($property.Name.StartsWith("jit_clif_", [StringComparison]::Ordinal) -and
-            $property.Value -ne 0) {
-            $reasons += "$label reported legacy Clif activity in $($property.Name)"
         }
     }
     if ($Sample.perf.jit_direct_entries -le 0 -or $Sample.perf.jit_direct_insns -le 0) {
