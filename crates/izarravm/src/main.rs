@@ -929,8 +929,6 @@ fn write_hdd_profile_json(
         "instructions_per_host_second": perf.instructions as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "budget_clocks_per_host_second": machine.elapsed_clocks() as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "cpu_core_clocks_per_host_second": machine.cpu().elapsed_clocks as f64 / wall_seconds.max(f64::MIN_POSITIVE),
-        "combined_jit_native_coverage": perf.jit_native_insns.saturating_add(perf.jit_direct_insns) as f64 / instructions as f64,
-        "combined_jit_slow_exits_per_100_instructions": 100.0 * perf.jit_helper_exits.saturating_add(perf.jit_direct_side_exits) as f64 / instructions as f64,
         "direct_native_coverage": perf.jit_direct_insns as f64 / instructions as f64,
         "direct_slow_exits_per_100_instructions": 100.0 * perf.jit_direct_side_exits as f64 / instructions as f64,
         "timedemo": timedemo.map(|(gametics, realtics)| json!({

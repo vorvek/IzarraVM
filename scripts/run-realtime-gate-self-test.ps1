@@ -83,22 +83,21 @@ function Invoke-RealtimeGateSelfTest {
         throw "The twelve-pair Direct Quake schedule does not repeat the fixed six-pair order."
     }
     $directPolicy = Get-DirectQuakeExecutionPolicy
-    # The clif backend (Task 1) and the region JIT (Task 2, dynarec-refactor) are both gone from
-    # the codebase: neither `jit_clif_*` nor `jit_region_entries`/`jit_region_insns` exist as JSON
-    # keys any more, so a policy that still named them would be asserting against a key that can
-    # never appear. This check is NOT proof that legacy backend activity is excluded any more --
-    # `jit_native_insns`'s only producer was the region engine, so it is a dead, permanently-zero
-    # counter now, and asserting its presence is a placeholder pin, not a live guarantee. It stays
-    # here only until the flagged follow-up (retire jit_native_insns, jit_helper_exits,
-    # jit_native_memory_helpers, and jit_table_clears, all dead for the same reason) lands and
-    # removes the key from `required_zero_counters` entirely; update this assertion in that commit.
+    # The clif backend (Task 1), the region JIT (Task 2), and the four dead region-only counters
+    # (dynarec-refactor Task 3b) are all gone from the codebase: `jit_clif_*`, `jit_region_*`, and
+    # `jit_native_*` do not exist as JSON keys any more, so a policy that still named any of them
+    # would be asserting against a key that can never appear. This structural check -- no required
+    # -zero-counters entry may carry any of those three dead prefixes -- is what would have caught
+    # both of this phase's gate-script regressions (the stale clif/region key names, and the dead
+    # jit_native_* counters) automatically, instead of relying on a manual sweep each time a legacy
+    # backend is retired.
     if ($directPolicy.environment.IZARRAVM_JIT -cne "1" -or
         $directPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
         ($directPolicy.required_zero_counters | Where-Object {
             $_.StartsWith("jit_clif_", [StringComparison]::Ordinal) -or
-            $_ -ceq "jit_region_entries" -or $_ -ceq "jit_region_insns"
-        }) -or
-        $directPolicy.required_zero_counters -cnotcontains "jit_native_insns") {
+            $_.StartsWith("jit_region_", [StringComparison]::Ordinal) -or
+            $_.StartsWith("jit_native_", [StringComparison]::Ordinal)
+        })) {
         throw "The Direct Quake execution policy does not exclude legacy backend activity."
     }
     if ((Get-DirectQuakeCampaignMetric ([double[]](1.03) * 6) "Proof").classification -cne
@@ -1245,9 +1244,6 @@ function Invoke-RealtimeGateSelfTest {
             direct_slow_exits_per_100_instructions = 0.0
             perf = [pscustomobject][ordered]@{
                 instructions = [uint64]1000
-                jit_native_insns = if ($automatic) { 100 } else { 0 }
-                jit_helper_exits = 0
-                jit_native_memory_helpers = 0
                 jit_direct_entries = if ($nativeDirect) { 90 } else { 0 }
                 jit_direct_insns = if ($nativeDirect) { 900 } else { 0 }
                 jit_direct_side_exits = 0
@@ -1608,7 +1604,6 @@ function Invoke-RealtimeGateSelfTest {
         }
     }
     foreach ($field in @(
-        "jit_native_insns",
         "jit_direct_entries", "jit_direct_insns", "jit_direct_side_exits"
     )) {
         $interpreterPolarityScreen = & $newTrackMScreen `
@@ -2191,7 +2186,6 @@ function Invoke-RealtimeGateSelfTest {
             direct_slow_exits_per_100_instructions = 0.0
             perf = [pscustomobject][ordered]@{
                 instructions = $instructions
-                jit_native_insns = 0
                 jit_direct_entries = 0
                 jit_direct_insns = 0
                 jit_direct_side_exits = 0

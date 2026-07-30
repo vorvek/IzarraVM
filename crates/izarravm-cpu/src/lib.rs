@@ -715,21 +715,6 @@ pub struct PerfCounters {
     pub jit_direct_decode_dependencies_scanned: u64,
     /// Compiled portals hidden because one of their live decode lines was displaced.
     pub jit_direct_portals_hidden: u64,
-    /// Dead since the region JIT's deletion (dynarec-refactor Task 2): the only producer was the
-    /// now-removed `region_step`/`region_inline_slot`/`region_native_*` engine, so this reads 0
-    /// forever. Kept (not one of the four counters the deletion gate enumerates as removed,
-    /// because it was already 0 on every unarmed baseline run) rather than deleted in this slice;
-    /// a follow-up cleanup can retire it along with `jit_helper_exits` and
-    /// `jit_native_memory_helpers` below.
-    pub jit_native_insns: u64,
-    /// Dead since the region JIT's deletion; see `jit_native_insns`.
-    pub jit_helper_exits: u64,
-    /// Dead since the region JIT's deletion; see `jit_native_insns`.
-    pub jit_native_memory_helpers: u64,
-    /// Dead since the region JIT's deletion (dynarec-refactor Task 2): its only producer was the
-    /// compiled-region table's capacity eviction, which no longer exists, so this reads 0
-    /// forever. Kept for the same reason as `jit_native_insns` above.
-    pub jit_table_clears: u64,
     /// Byte loads completed through the native address probe and exact direct-page helper.
     pub jit_native_load_hits: u64,
     /// Byte stores completed through the native address probe and exact direct-page helper.

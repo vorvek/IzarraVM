@@ -844,9 +844,13 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // jit_region_insns, jit_native_block_ns, jit_native_block_samples; 32 bytes) and dropped the
     // `jit_regions: jit::RegionTable` field from `CpuGsw` itself, moving this pin from 4528 to
     // 4456 (measured, not derived: rustc's field reordering does not guarantee a simple linear
-    // shift, so this number comes from a failing-test readout, not arithmetic).
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
+    // shift, so this number comes from a failing-test readout, not arithmetic). Task 3b deletes
+    // four more dead region-only PerfCounters fields (jit_native_insns, jit_helper_exits,
+    // jit_native_memory_helpers, jit_table_clears; 32 bytes), again measured (not derived) to move
+    // this pin from 4456 to 4424 -- see the sibling pin `tests::pending_flags_offset` in
+    // cpu_test.rs.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
 }

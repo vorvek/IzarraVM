@@ -235,7 +235,6 @@ function Get-PollSkipSampleFailureReasons(
         $reasons += "Doom/586 anchor is not exactly 2134 gametics and 828 realtics"
     }
     foreach ($field in @(
-        "jit_native_insns",
         "jit_direct_entries", "jit_direct_insns", "jit_direct_side_exits"
     )) {
         if ($null -eq $Sample.perf.PSObject.Properties[$field] -or $Sample.perf.$field -ne 0) {
@@ -463,9 +462,7 @@ function Get-DirectQuakeExecutionPolicy {
             IZARRAVM_POLL_SKIP = "0"
         }
         required_zero_counters = [object[]]@(
-            "poll_skip_spans", "poll_skip_iterations",
-            "jit_native_insns",
-            "jit_helper_exits", "jit_native_memory_helpers"
+            "poll_skip_spans", "poll_skip_iterations"
         )
     }
 }
@@ -784,7 +781,6 @@ function Get-BackendSelectionReasons(
         }
     }
     $zeroFields = @(
-        "jit_native_insns",
         "jit_direct_entries", "jit_direct_insns"
     )
     foreach ($sample in $Interpreter) {
@@ -1035,7 +1031,6 @@ function Get-TrackMSampleProvenanceReasons(
         return @($reasons)
     }
     foreach ($field in @(
-        "jit_native_insns",
         "jit_direct_entries", "jit_direct_insns", "jit_direct_side_exits"
     )) {
         if ($null -eq $Sample.perf.PSObject.Properties[$field]) {

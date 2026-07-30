@@ -1686,8 +1686,11 @@ fn pending_flags_offset() {
     // fields (jit_region_entries, jit_region_insns, jit_native_block_ns,
     // jit_native_block_samples), moving this pin from 4528 to 4456 (measured via a failing-test
     // readout, not derived: rustc's field reordering is not guaranteed to move linearly with a
-    // struct's size change).
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
+    // struct's size change). Task 3b then deletes four more dead region-only PerfCounters fields
+    // (jit_native_insns, jit_helper_exits, jit_native_memory_helpers, jit_table_clears; 32 bytes),
+    // moving this pin from 4456 to 4424 -- again measured against a failing test, matching the
+    // sibling pin in `arch_payload_keeps_pending_flags_offset_pinned` (canonical_state_test.rs).
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

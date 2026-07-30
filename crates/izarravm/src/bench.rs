@@ -511,8 +511,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
              data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-             jit[native/helper]={}/{}  \
-             jit_mem[load/store/tlb/helper]={}/{}/{}/{}",
+             jit_mem[load/store/tlb]={}/{}/{}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -541,12 +540,9 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.rep_string_iterations,
             perf.flag_materializations,
             perf.cache_tier_lookups,
-            perf.jit_native_insns,
-            perf.jit_helper_exits,
             perf.jit_native_load_hits,
             perf.jit_native_store_hits,
             perf.jit_paged_tlb_successes,
-            perf.jit_native_memory_helpers,
         );
     }
     if out_of_band {
@@ -1005,9 +1001,6 @@ pub(super) fn perf_counters_json(
         "device_write_bytes": perf.device_write_bytes,
         "device_write_code_hits": perf.device_write_code_hits,
         "device_write_coarse_resets": perf.device_write_coarse_resets,
-        "jit_native_insns": perf.jit_native_insns,
-        "jit_helper_exits": perf.jit_helper_exits,
-        "jit_native_memory_helpers": perf.jit_native_memory_helpers,
         "jit_direct_entries": perf.jit_direct_entries,
         "jit_direct_insns": perf.jit_direct_insns,
         "jit_direct_side_exits": perf.jit_direct_side_exits,
@@ -1058,7 +1051,6 @@ pub(super) fn perf_counters_json(
         "jit_direct_links_cleared": perf.jit_direct_links_cleared,
         "jit_direct_decode_dependencies_scanned": perf.jit_direct_decode_dependencies_scanned,
         "jit_direct_portals_hidden": perf.jit_direct_portals_hidden,
-        "jit_table_clears": perf.jit_table_clears,
         "jit_native_load_hits": perf.jit_native_load_hits,
         "jit_native_store_hits": perf.jit_native_store_hits,
         "jit_paged_tlb_successes": perf.jit_paged_tlb_successes,
@@ -1083,13 +1075,13 @@ pub(super) fn print_perf_counter_row(
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[native/helper]={}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
+         direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
          unresolved[static-unbound/static-hidden/dynamic-miss/dynamic-hidden]={}/{}/{}/{}  \
          compile[attempt/installed/ns]={}/{}/{} lookup[hot/hash/miss]={}/{}/{} links[new/clear/reset]={}/{}/{}  \
          portal[scan/hide]={}/{}  \
          arena[compact/live/bytes/fail]={}/{}/{}/{}  \
          gate[obs/shadow/agg/mode/top/cs/cpl/data/align/fetch/short/budget]={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}  \
-         jit_mem[load/store/tlb/helper]={}/{}/{}/{}",
+         jit_mem[load/store/tlb]={}/{}/{}",
         name,
         mode.canonical_name(),
         perf.instructions,
@@ -1127,8 +1119,6 @@ pub(super) fn print_perf_counter_row(
         perf.rep_string_iterations,
         perf.flag_materializations,
         perf.cache_tier_lookups,
-        perf.jit_native_insns,
-        perf.jit_helper_exits,
         perf.jit_direct_entries,
         perf.jit_direct_insns,
         perf.jit_direct_side_exits,
@@ -1169,7 +1159,6 @@ pub(super) fn print_perf_counter_row(
         perf.jit_native_load_hits,
         perf.jit_native_store_hits,
         perf.jit_paged_tlb_successes,
-        perf.jit_native_memory_helpers,
     );
     // Attribute combined decode-or-branch exits for profiling runs.
     println!(
