@@ -107,7 +107,8 @@ pub(crate) struct BlockCacheStats {
 /// `BlockCacheStats` is DRAINED by `take_stats` on every dispatcher exit and folded into
 /// `PerfCounters`; a field added there is zeroed before anything can read it back off the cache.
 /// These three groups have no `PerfCounters` home to be folded into -- growing that struct shifts
-/// the `pending_flags` offset pinned at 4512 -- so they live here, accumulate for the whole run,
+/// the pinned `pending_flags` offset (see the pin tests in cpu_test.rs/canonical_state_test.rs
+/// for the current value) -- so they live here, accumulate for the whole run,
 /// and are read directly by `stall_snapshot`. Not cleared by `reset_storage` either: a diagnostic
 /// that reset itself mid-run would under-report exactly the pathological runs it exists for.
 #[derive(Clone, Copy, Debug, Default)]
@@ -258,59 +259,34 @@ impl BarrierKey {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct BarrierStats {
-    helper_family: Option<HelperFamily>,
     hits: u64,
     runtime_hits: u64,
     native_prefix_instructions: u64,
     native_suffix_instructions: u64,
-    eligible_shapes: u64,
-    eligible_suffix_instructions: u64,
     max_native_prefix: u8,
     max_native_suffix: u8,
-    exact_root_bridges: u64,
-    right_direct_entries: u64,
-    removed_inbound_links: u64,
-    removed_outbound_links: u64,
     /// Exits that actually happened into a block this barrier rejected. RUNTIME-weighted, unlike
     /// `hits` (compile attempts) which mis-ranked the ShiftCl slice by three orders of magnitude.
     unbound_exits: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct CensusSiteKey {
-    entry_linear: u32,
-    helper_linear: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CensusSite {
-    row: BarrierKey,
-    fallthrough_linear: u32,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BarrierObservation {
-    helper: Option<HelperSpec>,
     entry_linear: u32,
-    helper_linear: u32,
-    fallthrough_linear: u32,
     native_prefix: usize,
     native_suffix: usize,
-    shape_eligible: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DirectBarrierCensus {
     rows: HashMap<BarrierKey, BarrierStats>,
-    sites: HashMap<CensusSiteKey, CensusSite>,
-    pending_left: Option<CensusSiteKey>,
-    pending_right: Option<CensusSiteKey>,
     /// Why static successor cells were unbound at the exits that hit them, indexed by
     /// `UnboundTarget`. Lives HERE and not in `PerfCounters` on purpose: `PerfCounters` is
-    /// embedded in `CpuGsw` ahead of `pending_flags`, whose offset is pinned at 4512 by
-    /// `arch_payload_keeps_pending_flags_offset_pinned` and `region_ctx_fn_pointer_offsets`
-    /// because emitted code bakes it. Growing `PerfCounters` for a diagnostic shifts that pin;
-    /// the census is an `Option<Box<_>>` on `JitState` and costs the layout nothing.
+    /// embedded in `CpuGsw` ahead of `pending_flags`, whose offset is pinned by
+    /// `arch_payload_keeps_pending_flags_offset_pinned` (canonical_state_test.rs) and
+    /// `pending_flags_offset` (cpu_test.rs) because emitted code bakes it. Growing `PerfCounters`
+    /// for a diagnostic shifts that pin; the census is an `Option<Box<_>>` on `JitState` and costs
+    /// the layout nothing.
     unbound: [u64; UnboundTarget::COUNT],
     /// The same classification for DYNAMIC successor misses (computed RET/JMP/CALL targets),
     /// kept in its own lane because the two have different fixes: a static unbound wants its
@@ -344,18 +320,13 @@ impl DirectBarrierCensus {
 
     fn record(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
         let BarrierObservation {
-            helper,
             entry_linear,
-            helper_linear,
-            fallthrough_linear,
             native_prefix,
             native_suffix,
-            shape_eligible,
         } = observation;
         let key = BarrierKey::from_insn(insn);
         self.rejected_barrier.insert(entry_linear, key);
         let row = self.rows.entry(key).or_default();
-        row.helper_family = helper.map(|spec| spec.family);
         row.hits = row.hits.saturating_add(1);
         row.native_prefix_instructions = row
             .native_prefix_instructions
@@ -365,58 +336,9 @@ impl DirectBarrierCensus {
             .saturating_add(native_suffix as u64);
         row.max_native_prefix = row.max_native_prefix.max(native_prefix as u8);
         row.max_native_suffix = row.max_native_suffix.max(native_suffix as u8);
-        if shape_eligible {
-            row.eligible_shapes = row.eligible_shapes.saturating_add(1);
-            row.eligible_suffix_instructions = row
-                .eligible_suffix_instructions
-                .saturating_add(native_suffix as u64);
-            self.sites.insert(
-                CensusSiteKey {
-                    entry_linear,
-                    helper_linear,
-                },
-                CensusSite {
-                    row: key,
-                    fallthrough_linear,
-                },
-            );
-        }
     }
 
-    fn batch_begin(&mut self) {
-        self.pending_left = None;
-        self.pending_right = None;
-    }
-
-    fn batch_end(&mut self) {
-        self.pending_left = None;
-        self.pending_right = None;
-    }
-
-    fn note_direct_run(&mut self, entry_linear: u32, final_linear: u32, linked_transfers: u32) {
-        if let Some(pending) = self.pending_right.take()
-            && let Some(site) = self.sites.get(&pending).copied()
-            && entry_linear == site.fallthrough_linear
-        {
-            let removed_outbound = u64::from(linked_transfers != 0);
-            let row = self
-                .rows
-                .get_mut(&site.row)
-                .expect("census site must retain its row");
-            row.right_direct_entries = row.right_direct_entries.saturating_add(1);
-            row.removed_outbound_links =
-                row.removed_outbound_links.saturating_add(removed_outbound);
-        }
-
-        let key = CensusSiteKey {
-            entry_linear,
-            helper_linear: final_linear,
-        };
-        self.pending_left = self.sites.contains_key(&key).then_some(key);
-    }
-
-    fn note_interpreted(&mut self, insn: &DecodedInsn, linear: u32, final_linear: u32) {
-        self.pending_right = None;
+    fn note_interpreted(&mut self, insn: &DecodedInsn) {
         // EVERY row, not only the ex-helper families. `runtime_hits` counts how many times the
         // guest actually EXECUTES this shape interpreted, which makes it the census's only
         // per-execution, position-free column - and therefore the only one that can rank a shape
@@ -433,24 +355,6 @@ impl DirectBarrierCensus {
         if let Some(row) = self.rows.get_mut(&key) {
             row.runtime_hits = row.runtime_hits.saturating_add(1);
         }
-
-        let Some(pending) = self.pending_left.take() else {
-            return;
-        };
-        if pending.helper_linear != linear {
-            return;
-        }
-        let Some(site) = self.sites.get(&pending).copied() else {
-            return;
-        };
-        let row = self
-            .rows
-            .get_mut(&site.row)
-            .expect("census site must retain its row");
-        row.exact_root_bridges = row.exact_root_bridges.saturating_add(1);
-        if final_linear == site.fallthrough_linear {
-            self.pending_right = Some(pending);
-        }
     }
 
     pub(crate) fn snapshot(&self) -> DirectBarrierCensusSnapshot {
@@ -459,27 +363,16 @@ impl DirectBarrierCensus {
             .iter()
             .map(|(&key, &stats)| (key, census_row(key, stats)))
             .collect();
-        // Sorted by RUNTIME unbound exits first. `eligible_suffix_instructions` was the old
-        // primary key and it is a compile-attempt aggregate; ranking by it is what sent the
-        // ShiftCl slice after a family worth 0.06pp. It stays as a tiebreak only.
+        // Sorted by RUNTIME unbound exits first, tiebroken by compile attempts (`hits`).
         keyed_rows.sort_by(|(left_key, left), (right_key, right)| {
             right
                 .unbound_exits
                 .cmp(&left.unbound_exits)
-                .then_with(|| {
-                    right
-                        .eligible_suffix_instructions
-                        .cmp(&left.eligible_suffix_instructions)
-                })
                 .then_with(|| right.hits.cmp(&left.hits))
                 .then_with(|| left_key.cmp(right_key))
         });
-        let selected = keyed_rows
-            .iter()
-            .find_map(|(_, row)| (row.eligible_shapes != 0).then_some(row.clone()));
         DirectBarrierCensusSnapshot {
             rows: keyed_rows.into_iter().map(|(_, row)| row).collect(),
-            selected,
             unbound_targets: UnboundTarget::ALL
                 .iter()
                 .map(|kind| (kind.label(), self.unbound[*kind as usize]))
@@ -513,19 +406,12 @@ fn census_row(key: BarrierKey, stats: BarrierStats) -> DirectBarrierCensusRow {
         },
         prefix_mask: key.prefix_mask,
         unbound_exits: stats.unbound_exits,
-        helper_family: stats.helper_family.map(HelperFamily::name),
         hits: stats.hits,
         runtime_hits: stats.runtime_hits,
         native_prefix_instructions: stats.native_prefix_instructions,
         native_suffix_instructions: stats.native_suffix_instructions,
-        eligible_shapes: stats.eligible_shapes,
-        eligible_suffix_instructions: stats.eligible_suffix_instructions,
         max_native_prefix: stats.max_native_prefix,
         max_native_suffix: stats.max_native_suffix,
-        exact_root_bridges: stats.exact_root_bridges,
-        right_direct_entries: stats.right_direct_entries,
-        removed_inbound_links: stats.removed_inbound_links,
-        removed_outbound_links: stats.removed_outbound_links,
     }
 }
 
@@ -548,48 +434,17 @@ impl super::JitState {
         }
     }
 
-    pub(crate) fn barrier_census_batch_begin(&mut self) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.batch_begin();
-        }
-    }
-
-    pub(crate) fn barrier_census_batch_end(&mut self) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.batch_end();
-        }
-    }
-
-    /// Whether the census exists at all. Callers MUST gate on this before building the
-    /// arguments to the two `note_barrier_census_*` hooks below: those sit on the
-    /// per-interpreted-instruction and per-Direct-exit retire paths, and their `final_linear`
-    /// argument costs a `cs()` read plus an add that is pure waste when the census is off
-    /// (the default). Checking `is_some` inside the callee is too late — the argument has
-    /// already been evaluated at the call site.
+    /// Whether the census exists at all. Callers MUST gate on this before calling
+    /// `note_barrier_census_interpreted`, which sits on the per-interpreted-instruction retire
+    /// path. Checking `is_some` inside the callee is too late for the gate to save anything.
     #[inline]
     pub(crate) fn barrier_census_active(&self) -> bool {
         self.direct_barrier_census.is_some()
     }
 
-    pub(crate) fn note_barrier_census_direct_run(
-        &mut self,
-        entry_linear: u32,
-        final_linear: u32,
-        linked_transfers: u32,
-    ) {
+    pub(crate) fn note_barrier_census_interpreted(&mut self, insn: &DecodedInsn) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.note_direct_run(entry_linear, final_linear, linked_transfers);
-        }
-    }
-
-    pub(crate) fn note_barrier_census_interpreted(
-        &mut self,
-        insn: &DecodedInsn,
-        linear: u32,
-        final_linear: u32,
-    ) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.note_interpreted(insn, linear, final_linear);
+            census.note_interpreted(insn);
         }
     }
 
@@ -734,29 +589,6 @@ impl SegmentLayout {
             data,
             used,
         })
-    }
-
-    /// An inert all-zeros layout for sentinel descriptors (Track C C1d, design section
-    /// 3.3b): filler for a descriptor whose only live fields are `entry` and `operands`;
-    /// nothing ever validates or reads it. Consumed by the clif backend only.
-    #[cfg(all(
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    pub(crate) fn inert() -> Self {
-        let zero = SegmentRegister {
-            selector: 0,
-            base: 0,
-            limit: 0,
-            access: 0,
-            default_size_32: false,
-        };
-        Self {
-            cs: zero,
-            data: [zero; 6],
-            used: 0,
-        }
     }
 
     pub(crate) fn cs_matches(self, cpu: &CpuGsw) -> bool {
@@ -2478,12 +2310,12 @@ pub(crate) enum SideExitReason {
     UnavailableOrKind = 2,
     Permission = 3,
     CodeWatch = 4,
-    /// The catch-all. After the split below only the clif backend still produces it (two sites
-    /// in `clif/lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
+    /// The catch-all. The now-removed clif backend was its only remaining producer (two sites
+    /// in its `lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
     /// side-exit growth across the x87 sweep and could not be attributed to any of its six
-    /// emitters. `allow(dead_code)` because the default feature set builds no clif producer, and
-    /// the discriminant must keep its value regardless: `run.rs` still has a catch-all arm for
-    /// it, and renumbering would silently remap what emitted code stores.
+    /// emitters. `allow(dead_code)` because no producer builds it anymore, and the discriminant
+    /// must keep its value regardless: `run.rs` still has a catch-all arm for it, and
+    /// renumbering would silently remap what emitted code stores.
     #[allow(dead_code)]
     Other = 5,
     /// A CS segment-limit check on a computed control-transfer target: the five
@@ -2671,6 +2503,19 @@ pub(crate) enum DirectKind {
         condition: u8,
         dst: u8,
     },
+    /// CBW/CWDE (0x98): widen the accumulator's sign into the next width. `width` is the
+    /// interpreter's `operand_size` (the DESTINATION width): Word writes AX from AL (CBW),
+    /// Dword writes EAX from AX (CWDE). No flags touched. Accumulator-implicit, so the kind
+    /// carries no register index.
+    Cwde {
+        width: MemoryWidth,
+    },
+    /// CWD/CDQ (0x99): fill the upper half with the accumulator's sign. `width` is the
+    /// accumulator's own width: Word fills DX from AX (CWD), Dword fills EDX from EAX (CDQ). No
+    /// flags touched.
+    Cdq {
+        width: MemoryWidth,
+    },
     MovImmByte {
         dst: u8,
         imm: u8,
@@ -2762,9 +2607,9 @@ pub(crate) enum DirectKind {
     /// ROR r/m32, register form (0xC1 /1 and 0xD1 /1). `count` is the RAW decoded immediate; the
     /// emitter applies the architectural five-bit mask, exactly as `Shift` does.
     ///
-    /// Deliberately NOT folded into `Shift`. That variant is in clif's lowerable allowlist and its
-    /// lowering falls through to an arithmetic shift right, so a rotate routed through it would be
-    /// silently emitted as SAR. It also differs in the flag contract that matters here: a shift
+    /// Deliberately NOT folded into `Shift`. That variant's emitter falls through to an
+    /// arithmetic shift right, so a rotate routed through it would be silently emitted as SAR.
+    /// It also differs in the flag contract that matters here: a shift
     /// leaves AF, and OF above count 1, architecturally UNDEFINED, which is the only reason
     /// `emit_shift` may publish a possibly stale RBP to eflags. A rotate PRESERVES SF, ZF, PF and
     /// AF, so it must not.
@@ -2812,9 +2657,9 @@ pub(crate) enum DirectKind {
     /// admits ROR (/1) but routes it to `RotateRightReg`, because rotates do not define PF, ZF,
     /// SF or AF and `emit_shift_cl` merges the shift mask.
     ///
-    /// A separate variant rather than a `ShiftCount` field on `Shift`: `Shift` is in clif's
-    /// `lowerable` allowlist and widening it would hand clif a count source it cannot lower.
-    /// Same reasoning as `RotateRightReg` not being folded in.
+    /// A separate variant rather than a `ShiftCount` field on `Shift`: `Shift` carries its count
+    /// as a decoded immediate (`count: u8`), while this form's count comes from CL at emission
+    /// time, not a literal, so the two do not share a representation.
     ShiftCl {
         op: u8,
         dst: u8,
@@ -2844,9 +2689,9 @@ pub(crate) enum DirectKind {
     /// 32-bit register, which is the whole point of the instruction. Any shared code that reads
     /// this field must treat it as the memory access width, never as the write-back width.
     ///
-    /// Deliberately NOT a flag on `Load`. `Load` is in clif's lowerable allowlist and `lower_slot`
-    /// would lower an extending load as a plain move, silently and wrongly. A new discriminant is
-    /// absent from that allowlist and so defaults to a growth-run stopper.
+    /// Deliberately NOT a flag on `Load`: `Load`'s emitter is a plain move, and an extending load
+    /// (zero/sign-extend to the full 32-bit destination) needs different emitted code, not a
+    /// conditional branch inside the same arm.
     LoadExtend {
         dst: u8,
         width: MemoryWidth,
@@ -2891,12 +2736,11 @@ pub(crate) enum DirectKind {
     /// PUSH on a 16-bit stack (SS.B = 0) at Word operand size: two bytes written at
     /// `(SP - 2) & 0xFFFF`, and only SP advances, preserving ESP[31:16].
     ///
-    /// A SEPARATE variant rather than a width field on `Push`, because `Push` is in clif's
-    /// `lowerable()` allowlist and `lower_push` hard-codes `MemoryWidth::Dword` and
-    /// `iadd_imm(esp, -4)`, so a field would be lowered as a 32-bit push there. The two widths
-    /// it stands for are ORTHOGONAL: SS.B picks the stack-pointer width and `operand_size` picks
-    /// how many bytes move (386 PRM 16.2, restated at `memory.rs:1218`). This variant is the
-    /// (SS.B = 0, Word) cell only; the compile loop refuses the other two new cells.
+    /// A SEPARATE variant rather than a width field on `Push`, because `Push`'s emitter
+    /// hard-codes `MemoryWidth::Dword` and `iadd_imm(esp, -4)`. The two widths it stands for are
+    /// ORTHOGONAL: SS.B picks the stack-pointer width and `operand_size` picks how many bytes
+    /// move (386 PRM 16.2, restated at `memory.rs:1218`). This variant is the (SS.B = 0, Word)
+    /// cell only; the compile loop refuses the other two new cells.
     Push16 {
         source: StoreSource,
     },
@@ -2907,9 +2751,8 @@ pub(crate) enum DirectKind {
     /// only SP advances (preserving ESP[31:16]), and the destination is MERGED into rather than
     /// replaced, exactly as `write_gpr_sized(index, Word, ..)` does.
     ///
-    /// Separate variant for the same reason as `Push16`: `Pop` is in clif's `lowerable()`
-    /// allowlist and `lower_pop` hard-codes the 32-bit width, the +4 advance AND a full 32-bit
-    /// destination write.
+    /// Separate variant for the same reason as `Push16`: `Pop`'s emitter hard-codes the 32-bit
+    /// width, the +4 advance AND a full 32-bit destination write.
     Pop16 {
         dst: u8,
     },
@@ -2972,11 +2815,6 @@ pub(crate) enum DirectKind {
     /// Zero emit is not a special case. `emit_shift` and `emit_rotate_right_reg` already return
     /// early at count 0 and write nothing, and the per-slot accounting in `emit_block` is driven
     /// by the slot list rather than by emitted bytes.
-    ///
-    /// Absent from clif's `lowerable()` allowlist, which does NOT stop unit growth (that is
-    /// `unit_growth_classify`, which shares this classifier): it stops LOWERING, so a unit whose
-    /// entry slot is a NOP parks with `plan.leading == 0` and stays on the interpreter, exactly
-    /// as it did while the opcode was unclassifiable.
     Nop,
     /// CLD (0xFC) / STD (0xFD). DF is bit 10 of EFLAGS and sits OUTSIDE the lazy arithmetic
     /// descriptor: `set_flag`'s ARITH mask is CF|PF|AF|ZF|SF|OF, so a DF write goes straight to
@@ -3245,6 +3083,10 @@ impl DirectKind {
             // The interpreter's 0x0f90..=0x0f9f arm returns clocks(4) for both operand forms
             // against a default of 2, so this cannot ride the `_ => 2` arm below.
             Self::SetCc { .. } => 4,
+            // 0x98 (CBW/CWDE) returns clocks(3) for both operand forms (execute.rs); 0x99
+            // (CWD/CDQ) returns clocks(2) for both, which is what the `_ => 2` default already
+            // gives, so Cdq deliberately has no arm here.
+            Self::Cwde { .. } => 3,
             Self::X87 { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
@@ -3777,7 +3619,7 @@ const GUEST_HOMES: [Reg; 8] = [
     Reg::R14,
     Reg::RBX,
 ];
-const SAVED_HOST_REGS: [Reg; 7] = [
+pub(crate) const SAVED_HOST_REGS: [Reg; 7] = [
     Reg::RBX,
     Reg::RBP,
     Reg::RDI,
@@ -3825,9 +3667,9 @@ const BASE_STACK_LEN: u32 = 160;
 // callee-saved and there is no non-volatile XMM to save, so the frame is
 // just the base.
 #[cfg(target_os = "windows")]
-const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN + 8 + 6 * 16;
+pub(crate) const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN + 8 + 6 * 16;
 #[cfg(not(target_os = "windows"))]
-const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN;
+pub(crate) const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN;
 const STACK_QUOTA: i8 = 0;
 const STACK_ITERATIONS: i8 = 8;
 const STACK_RAM_BYTE_WRITES: i8 = 16;
@@ -3942,74 +3784,6 @@ fn dynamic_counter_fields() -> [(u16, i8, usize); 7] {
     ]
 }
 
-/// Terminal kinds for the clif unit-boundary growth walker (Track C C1a, F-A5).
-#[cfg(all(
-    feature = "clif-backend",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-pub(crate) enum UnitTerminal {
-    Jcc { taken_delta: u32 },
-    Jmp,
-    Call,
-    Ret,
-}
-
-/// One growth-walk classification step for the clif walker (Track C C1a, F-A5).
-#[cfg(all(
-    feature = "clif-backend",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-pub(crate) struct UnitGrowthStep {
-    pub(crate) terminal: Option<UnitTerminal>,
-    pub(crate) wide_access: bool,
-    pub(crate) read_segments: u8,
-    pub(crate) write_segments: u8,
-    /// The full classification, carried so the C1b lowering compiles the same shape the
-    /// walker admitted (the walker's reduced fields above stay authoritative for layout).
-    pub(crate) kind: DirectKind,
-}
-
-/// Classify one decoded instruction for clif unit growth with the SAME classifier the
-/// Direct compiler uses (`classify::classify`, reused unchanged), reduced to the fields
-/// the walker needs. `None` is the stop-growth signal: the first structurally
-/// unclassifiable opcode ends the unit before it (plan Q1 resolution). Wide-access uses
-/// Direct's exact rule (the `has_wide_accesses` accumulation in `compile`); the word-gate
-/// persona restriction there is a compile heuristic, not a classification fact, so it is
-/// deliberately NOT replicated here.
-#[cfg(all(
-    feature = "clif-backend",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-pub(crate) fn unit_growth_classify(
-    insn: &DecodedInsn,
-    lin: u32,
-    entry_lin: u32,
-) -> Option<UnitGrowthStep> {
-    let kind = classify::classify(insn, lin, entry_lin)?;
-    let wide_access = kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
-    let read_segments = kind.read_segment().map_or(0, segment_bit);
-    let write_segments = kind.write_segment().map_or(0, segment_bit);
-    let terminal = match kind {
-        DirectKind::Jcc { taken_delta, .. } => Some(UnitTerminal::Jcc { taken_delta }),
-        DirectKind::Jmp { .. } => Some(UnitTerminal::Jmp),
-        DirectKind::JmpMem { .. } => Some(UnitTerminal::Jmp),
-        DirectKind::Call { .. } => Some(UnitTerminal::Call),
-        DirectKind::CallReg { .. } => Some(UnitTerminal::Call),
-        DirectKind::Ret { .. } => Some(UnitTerminal::Ret),
-        _ => None,
-    };
-    Some(UnitGrowthStep {
-        terminal,
-        wide_access,
-        read_segments,
-        write_segments,
-        kind,
-    })
-}
-
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
 ///
@@ -4121,34 +3895,9 @@ enum CompileStop {
     Boundary,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HelperFamily {
-    DirectionFlag,
-    SignExtend,
-    AccumulatorExtend,
-}
-
-impl HelperFamily {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::DirectionFlag => "direction_flag",
-            Self::SignExtend => "sign_extend",
-            Self::AccumulatorExtend => "accumulator_extend",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HelperSpec {
-    family: HelperFamily,
-    opcode: u16,
-    raw_clocks: u8,
-}
-
 #[derive(Clone, Copy)]
 enum PlannedInsn {
     Native(DirectKind),
-    PreciseHelper(HelperSpec),
     HardBoundary,
 }
 
@@ -4156,35 +3905,11 @@ struct DirectUnitPlanner;
 
 impl DirectUnitPlanner {
     fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> PlannedInsn {
-        if let Some(kind) = classify::classify(insn, lin, entry_lin) {
-            return PlannedInsn::Native(kind);
-        }
-        match precise_helper_spec(insn) {
-            Some(spec) => PlannedInsn::PreciseHelper(spec),
+        match classify::classify(insn, lin, entry_lin) {
+            Some(kind) => PlannedInsn::Native(kind),
             None => PlannedInsn::HardBoundary,
         }
     }
-}
-
-fn precise_helper_spec(insn: &DecodedInsn) -> Option<HelperSpec> {
-    if insn.modrm.is_some()
-        || insn.operand.is_some()
-        || insn.prefixes != Prefixes::default()
-        || insn.address_size != AddressSize::Dword
-    {
-        return None;
-    }
-    let (family, raw_clocks) = match (insn.opcode, insn.operand_size) {
-        (0xfc | 0xfd, OperandSize::Dword) => (HelperFamily::DirectionFlag, 2),
-        (0x99, OperandSize::Dword) => (HelperFamily::SignExtend, 2),
-        (0x98, OperandSize::Dword) => (HelperFamily::AccumulatorExtend, 3),
-        _ => return None,
-    };
-    Some(HelperSpec {
-        family,
-        opcode: insn.opcode,
-        raw_clocks,
-    })
 }
 
 /// What PUSHFD actually stores: the low 16 flags always, plus the persona's writable high bits.
@@ -4253,7 +3978,6 @@ fn stack_width_kind(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CensusSuffix {
     instructions: usize,
-    self_loop: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4322,7 +4046,6 @@ fn census_native_suffix(
         stack_accesses += u8::from(kind.uses_stack());
         memory_alu_slots += u8::from(kind.is_memory_alu());
         result.instructions += 1;
-        result.self_loop = matches!(kind, DirectKind::Jcc { taken_delta: 0, .. });
         lin = next;
         if kind.is_terminal() {
             break;
@@ -4435,42 +4158,6 @@ fn compile_with_instruction_limit(
         }
         let kind = match DirectUnitPlanner::classify(&insn, lin, entry_lin) {
             PlannedInsn::Native(kind) => kind,
-            PlannedInsn::PreciseHelper(helper) => {
-                if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
-                    && cpu.jit_direct.barrier_census_enabled()
-                {
-                    let suffix = census_native_suffix(
-                        cpu,
-                        key,
-                        entry_lin,
-                        next,
-                        d,
-                        slots.len(),
-                        stack_accesses,
-                        memory_alu_slots,
-                    );
-                    let shape_eligible = !slots.is_empty()
-                        && suffix.instructions != 0
-                        && slots.len() + 1 + suffix.instructions
-                            >= MIN_STANDALONE_INSTRUCTIONS.into()
-                        && x87_slots == 0
-                        && !suffix.self_loop;
-                    cpu.jit_direct.record_barrier(
-                        &insn,
-                        BarrierObservation {
-                            helper: Some(helper),
-                            entry_linear: entry_lin,
-                            helper_linear: lin,
-                            fallthrough_linear: next,
-                            native_prefix: slots.len(),
-                            native_suffix: suffix.instructions,
-                            shape_eligible,
-                        },
-                    );
-                }
-                stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
-                break;
-            }
             PlannedInsn::HardBoundary => {
                 if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
                     && cpu.jit_direct.barrier_census_enabled()
@@ -4488,13 +4175,9 @@ fn compile_with_instruction_limit(
                     cpu.jit_direct.record_barrier(
                         &insn,
                         BarrierObservation {
-                            helper: None,
                             entry_linear: entry_lin,
-                            helper_linear: lin,
-                            fallthrough_linear: next,
                             native_prefix: slots.len(),
                             native_suffix: suffix.instructions,
-                            shape_eligible: false,
                         },
                     );
                 }
@@ -4944,8 +4627,8 @@ struct MemoryEmitContext {
     /// function of CS.D, which the mode key pins.
     ///
     /// It lives here rather than on `DirectAddr` because that struct rides inside `Load`,
-    /// `Store`, `AluMemSource` and other kinds in clif's lowerable set, which would lower them
-    /// without the mask.
+    /// `Store`, `AluMemSource` and other kinds shared across many emit sites, and this
+    /// property is a block-wide fact, not a per-address one.
     ///
     /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
     /// and is keyed separately, so all nine `stack_addr` call sites pass a literal.

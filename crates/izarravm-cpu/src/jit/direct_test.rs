@@ -37,56 +37,6 @@ fn key(linear: u32) -> BlockKey {
     BlockKey::new(linear, 0x20_000 + (linear & 0xfff), 7)
 }
 
-fn cld_insn() -> DecodedInsn {
-    DecodedInsn {
-        len: 1,
-        prefixes: Prefixes::default(),
-        opcode: 0xfc,
-        operand_size: OperandSize::Dword,
-        address_size: AddressSize::Dword,
-        modrm: None,
-        operand: None,
-        imm: 0,
-        imm2: 0,
-        group: DecodeGroup::FlagsMisc,
-        continuable: true,
-        disp_len: 0,
-        imm_len: 0,
-    }
-}
-
-#[test]
-fn barrier_census_records_runtime_bridge_diagnostics_without_reselecting() {
-    let insn = cld_insn();
-    let helper = precise_helper_spec(&insn).expect("CLD helper spec");
-    let mut census = DirectBarrierCensus::default();
-    census.record(
-        &insn,
-        BarrierObservation {
-            helper: Some(helper),
-            entry_linear: 0x100,
-            helper_linear: 0x104,
-            fallthrough_linear: 0x105,
-            native_prefix: 4,
-            native_suffix: 4,
-            shape_eligible: true,
-        },
-    );
-    census.batch_begin();
-    census.note_direct_run(0x100, 0x104, 0);
-    census.note_interpreted(&insn, 0x104, 0x105);
-    census.note_direct_run(0x105, 0x109, 1);
-    census.batch_end();
-
-    let snapshot = census.snapshot();
-    let selected = snapshot.selected.expect("compile-time selection");
-    assert_eq!(selected.runtime_hits, 1);
-    assert_eq!(selected.exact_root_bridges, 1);
-    assert_eq!(selected.right_direct_entries, 1);
-    assert_eq!(selected.removed_inbound_links, 0);
-    assert_eq!(selected.removed_outbound_links, 1);
-}
-
 fn cell_portal(cell: &LinkCell) -> &BlockPortal {
     let address = cell.portal.load(Ordering::Acquire);
     assert_ne!(address, 0);
@@ -1233,66 +1183,6 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     assert_eq!(stats.arena_compaction_bytes, 16);
     assert_eq!(stats.arena_compaction_failures, 0);
     assert_eq!(stats.cache_resets, 0);
-}
-
-#[cfg(any(
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64")
-))]
-#[test]
-fn multi_page_span_filled_arena_compacts_and_relocates_blocks() {
-    // Fill-then-compact round trip through BlockCache::install's real full-arena
-    // recovery path, with a multi-page install_span alongside the one-page
-    // blocks so the span registry sees mixed span sizes in the source arena.
-    use super::super::exec_mem;
-    let mut cache = BlockCache::default();
-    let mut arena = exec_mem::ExecutableArena::with_len_for_test(8 * exec_mem::host_page_len())
-        .expect("small test arena");
-    let page = arena.slot_len();
-    let span_entry = arena
-        .install_span(&vec![0xC3u8; page + 8])
-        .expect("multi-page span");
-    assert!(arena.contains_sealed_span_range(span_entry, page + 8));
-    cache.arena = Some(arena);
-
-    // Six one-page blocks fill the remaining six pages.
-    let keys: Vec<BlockKey> = (0u32..6).map(|i| key(0x1000 + i * 0x100)).collect();
-    let ids: Vec<BlockId> = keys
-        .iter()
-        .map(|k| install_trivial(&mut cache, *k, 1))
-        .collect();
-    assert!(cache.arena.as_ref().expect("arena").is_full());
-
-    // Retire one block so compaction can reclaim, then let the next install
-    // fire compact_arena inside install() (the production recovery path).
-    assert_eq!(cache.invalidate_physical_range(keys[0].physical, 1), 1);
-    let new_key = key(0x2000);
-    let new_id = install_trivial(&mut cache, new_key, 1);
-
-    let stats = cache.take_stats();
-    assert_eq!(stats.arena_compactions, 1);
-    assert_eq!(stats.arena_compaction_failures, 0);
-    assert_eq!(stats.arena_compaction_live_blocks, 5);
-    assert_eq!(stats.cache_resets, 0);
-
-    // Every surviving entry relocated into the fresh arena stays a valid,
-    // executable span base under both range checks, and its portal is
-    // republished.
-    let survivors: Vec<BlockId> = ids[1..].iter().copied().chain([new_id]).collect();
-    let arena = cache.arena.as_ref().expect("fresh arena");
-    for id in survivors {
-        let block = cache.block(id).expect("surviving block");
-        let entry = block.entry_ptr();
-        let code_len = block.code_len as usize;
-        assert!(arena.contains_sealed_slot_range(entry, code_len));
-        assert!(arena.contains_sealed_span_range(entry, code_len));
-        let index = cache.active_index(id).expect("active survivor");
-        assert!(cache.block_portals[index].visible());
-        let f: extern "C" fn() = unsafe { std::mem::transmute(entry) };
-        f();
-    }
-    // The retired block did not survive.
-    assert!(cache.block(ids[0]).is_none());
 }
 
 #[cfg(any(

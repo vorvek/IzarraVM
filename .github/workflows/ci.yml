@@ -55,28 +55,3 @@ jobs:
 
       - name: Run boot suite
         run: cargo run -p izarravm -- --headless-boot-suite
-
-  clif-backend:
-    name: windows-latest clif-backend
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Clippy (clif-backend)
-        run: cargo clippy -p izarravm-cpu --all-targets --features clif-backend -- -D warnings
-
-      - name: Test (clif-backend)
-        run: cargo test -p izarravm-cpu --features clif-backend
-
-      - name: Build (clif-backend)
-        run: cargo build -p izarravm-cpu --features clif-backend

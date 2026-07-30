@@ -49,6 +49,25 @@ fn differential_with(
     seed_ecx: u32,
     context: &str,
 ) {
+    differential_full(body, seed_eflags, live_pending, seed_ecx, 0, context);
+}
+
+/// As `differential`, but seeds EAX instead of ECX, for the accumulator-implicit forms
+/// (CBW/CWDE/CWD/CDQ) that read the accumulator rather than a ModRM-selected register. Plain
+/// eflags and no live pending flags: none of the four touch flags, so there is nothing for those
+/// axes to catch here.
+fn differential_seeded(body: &[u8], seed_eax: u32, context: &str) {
+    differential_full(body, 0x202, false, 0, seed_eax, context);
+}
+
+fn differential_full(
+    body: &[u8],
+    seed_eflags: u32,
+    live_pending: bool,
+    seed_ecx: u32,
+    seed_eax: u32,
+    context: &str,
+) {
     // A leading `mov esi,esi` keeps the tested opcode off the entry slot; the two trailing
     // register moves and the HLT give the block a tail and a terminator.
     let mut code = vec![0x89, 0xf6];
@@ -136,6 +155,12 @@ fn differential_with(
         cpu.registers.gpr.fill(0);
         cpu.registers.set_esp(STACK_TOP);
         cpu.registers.set_ecx(seed_ecx);
+        cpu.registers.set_eax(seed_eax);
+        // Garbage in EDX's upper 16 bits for both roles identically: CWD/CBW must write only
+        // the low 16 bits of their destination, so a lowering that widened the write to all 32
+        // (e.g. a plain `mov_r32_r32` instead of `emit_write_gpr16`) clobbers this and diverges
+        // from the interpreter, which never touches bits above the ones it defines.
+        cpu.registers.set_edx(0xdead_0000);
         cpu.registers.eflags = seed_eflags;
         cpu.pending_flags = PendingFlags::default();
         if live_pending {
@@ -298,6 +323,60 @@ fn setcc_register_form_matches_the_interpreter_for_every_condition() {
                     differential(&[0x0f, 0x90 | condition, modrm], seed, pending, &context);
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn cwde_matches_the_interpreter_across_both_sign_boundaries_and_widths() {
+    // CBW/CWDE (0x98): CBW (Word, `0x66` prefix here) widens AL into AX; CWDE (Dword) widens AX
+    // into EAX. Neither touches flags, so `differential_seeded` leaves eflags plain and lazy
+    // flags inert. The seed set spans both sign boundaries this opcode can hit: 0x7fff/0x8000
+    // (AL = 0x7f/0x80) is the byte boundary CBW reads, 0x7fff_ffff/0x8000_0000 (AX =
+    // 0xffff/0x0000) is the word boundary CWDE reads, and 0/1/0x8000_0001/0xffff_ffff round out
+    // the set with boundary-adjacent and all-ones controls. `differential_full`'s fixed
+    // `0xdead_0000` seed in EDX (untouched by this opcode) and the seed's own upper 16 bits
+    // (nonzero on the Dword-boundary seeds) double as CBW's write-width check: a lowering that
+    // widened the write to all 32 bits of EAX instead of just AX would clobber that upper half
+    // and diverge from the interpreter, which defines only the bits CBW actually writes.
+    for word in [false, true] {
+        for seed in [
+            0u32,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0x8000_0001,
+            0xffff_ffff,
+            0x7fff,
+            0x8000,
+        ] {
+            let body = if word { vec![0x66, 0x98] } else { vec![0x98] };
+            let context = format!("cwde word={word} eax={seed:#x}");
+            differential_seeded(&body, seed, &context);
+        }
+    }
+}
+
+#[test]
+fn cdq_matches_the_interpreter_across_both_sign_boundaries_and_widths() {
+    // CWD/CDQ (0x99): CWD (Word) fills DX from AX's sign; CDQ (Dword) fills EDX from EAX's
+    // sign. Same seed set and same no-flags rationale as the CBW/CWDE test above. The fixed
+    // `0xdead_0000` seed in EDX is the write-width check for CWD: a lowering that filled all 32
+    // bits of EDX instead of just DX would clobber that upper half.
+    for word in [false, true] {
+        for seed in [
+            0u32,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0x8000_0001,
+            0xffff_ffff,
+            0x7fff,
+            0x8000,
+        ] {
+            let body = if word { vec![0x66, 0x99] } else { vec![0x99] };
+            let context = format!("cdq word={word} eax={seed:#x}");
+            differential_seeded(&body, seed, &context);
         }
     }
 }

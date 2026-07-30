@@ -83,10 +83,21 @@ function Invoke-RealtimeGateSelfTest {
         throw "The twelve-pair Direct Quake schedule does not repeat the fixed six-pair order."
     }
     $directPolicy = Get-DirectQuakeExecutionPolicy
+    # The clif backend (Task 1), the region JIT (Task 2), and the four dead region-only counters
+    # (dynarec-refactor Task 3b) are all gone from the codebase: `jit_clif_*`, `jit_region_*`, and
+    # `jit_native_*` do not exist as JSON keys any more, so a policy that still named any of them
+    # would be asserting against a key that can never appear. This structural check -- no required
+    # -zero-counters entry may carry any of those three dead prefixes -- is what would have caught
+    # both of this phase's gate-script regressions (the stale clif/region key names, and the dead
+    # jit_native_* counters) automatically, instead of relying on a manual sweep each time a legacy
+    # backend is retired.
     if ($directPolicy.environment.IZARRAVM_JIT -cne "1" -or
         $directPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
-        $directPolicy.required_zero_counters -cnotcontains "jit_clif_entries" -or
-        $directPolicy.required_zero_counters -cnotcontains "jit_region_entries") {
+        ($directPolicy.required_zero_counters | Where-Object {
+            $_.StartsWith("jit_clif_", [StringComparison]::Ordinal) -or
+            $_.StartsWith("jit_region_", [StringComparison]::Ordinal) -or
+            $_.StartsWith("jit_native_", [StringComparison]::Ordinal)
+        })) {
         throw "The Direct Quake execution policy does not exclude legacy backend activity."
     }
     if ((Get-DirectQuakeCampaignMetric ([double[]](1.03) * 6) "Proof").classification -cne
@@ -1233,18 +1244,9 @@ function Invoke-RealtimeGateSelfTest {
             direct_slow_exits_per_100_instructions = 0.0
             perf = [pscustomobject][ordered]@{
                 instructions = [uint64]1000
-                jit_region_entries = if ($automatic) { 1 } else { 0 }
-                jit_region_insns = if ($automatic) { 100 } else { 0 }
-                jit_native_insns = if ($automatic) { 100 } else { 0 }
-                jit_helper_exits = 0
-                jit_native_memory_helpers = 0
                 jit_direct_entries = if ($nativeDirect) { 90 } else { 0 }
                 jit_direct_insns = if ($nativeDirect) { 900 } else { 0 }
                 jit_direct_side_exits = 0
-                jit_clif_compile_attempts = 0
-                jit_clif_units_installed = 0
-                jit_clif_entries = 0
-                jit_clif_side_exits = 0
                 poll_skip_spans = 0
                 poll_skip_iterations = 0
             }
@@ -1419,15 +1421,6 @@ function Invoke-RealtimeGateSelfTest {
             throw "The Direct Quake campaign accepted a final HDD mismatch."
         }
         $directCandidate[0].gate_hdd_tree.tree_sha256 = "b" * 64
-        $directCandidate[0].perf.jit_clif_entries = 1
-        $clifMismatch = Get-DirectQuakeCampaignWorkloadSummary `
-            (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
-            $directWarmups $directCorrectness $directPolicy "Proof" $candidateSha $parentSha
-        if ($clifMismatch.provenance.verdict -cne "fail" -or
-            ($clifMismatch.provenance.failure_reasons -join " ") -notmatch "Clif activity") {
-            throw "The Direct Quake campaign accepted legacy Clif activity."
-        }
-        $directCandidate[0].perf.jit_clif_entries = 0
         $directCandidate[0].PSObject.Properties.Remove("scaled_bus_clocks")
         $missingScaledBus = Get-DirectQuakeCampaignWorkloadSummary `
             (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
@@ -1611,7 +1604,6 @@ function Invoke-RealtimeGateSelfTest {
         }
     }
     foreach ($field in @(
-        "jit_region_entries", "jit_region_insns", "jit_native_insns",
         "jit_direct_entries", "jit_direct_insns", "jit_direct_side_exits"
     )) {
         $interpreterPolarityScreen = & $newTrackMScreen `
@@ -2194,9 +2186,6 @@ function Invoke-RealtimeGateSelfTest {
             direct_slow_exits_per_100_instructions = 0.0
             perf = [pscustomobject][ordered]@{
                 instructions = $instructions
-                jit_region_entries = 0
-                jit_region_insns = 0
-                jit_native_insns = 0
                 jit_direct_entries = 0
                 jit_direct_insns = 0
                 jit_direct_side_exits = 0

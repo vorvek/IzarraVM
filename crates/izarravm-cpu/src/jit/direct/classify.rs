@@ -93,6 +93,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8a
                 | 0x8b
                 | 0x8c
+                | 0x98
+                | 0x99
                 | 0xa8
                 | 0xb0..=0xb7
                 | 0xc2
@@ -370,6 +372,22 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // admission work, not here.
             0x90 => {
                 return Some(DirectKind::Nop);
+            }
+            // CBW / CWDE. Unlike NOP and CLD/STD immediately below, this one IS in the
+            // Word-size allowlist above: the interpreter's arm switches on `operand_size` (the
+            // Word case is CBW, Dword is CWDE), so a 16-bit block containing it is a real
+            // lowering rather than dead code no counter could gate. Accumulator-implicit: no
+            // ModRM, no `insn.operand`.
+            0x98 => {
+                return Some(DirectKind::Cwde {
+                    width: operand_width,
+                });
+            }
+            // CWD / CDQ, same reasoning as 0x98 immediately above.
+            0x99 => {
+                return Some(DirectKind::Cdq {
+                    width: operand_width,
+                });
             }
             // CLD / STD. Ranked third in the runtime-weighted reject audit at 1.37M dispatcher
             // exits (10.9% of rejected-target exits) despite being worth only ~0.06pp of

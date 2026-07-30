@@ -1202,8 +1202,8 @@ impl CpuGsw {
         bus: &mut B,
         address_size: AddressSize,
     ) -> ExecResult<u32> {
-        // C1e: moffs bytes count as DISPLACEMENT (they are one architecturally, and the
-        // clif restamp's lane routing depends on the distinction).
+        // C1e: moffs bytes count as DISPLACEMENT (they are one architecturally; the
+        // now-removed clif backend's restamp lane routing depended on the distinction).
         match address_size {
             AddressSize::Word => {
                 self.decode_disp_len = 2;

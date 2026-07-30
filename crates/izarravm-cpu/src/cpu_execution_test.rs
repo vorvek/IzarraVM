@@ -451,6 +451,77 @@ fn perf_counters_track_decode_hits_and_run_breaks() {
     );
 }
 
+// Standalone setup for `seam_counters_bound_probes_and_are_deterministic`, mirroring the tight
+// loop and warm-cache-then-run_straight_line shape of `perf_counters_track_decode_hits_and_run_breaks`
+// above. Not extracted FROM that test's body: the sibling test interleaves counter assertions
+// between its two phases against one long-lived `cpu`/`bus` pair, so factoring out a shared
+// helper that both tests call would either change the sibling's structure or force this helper
+// to hand back the `cpu`/`bus` (defeating the point of a return-a-perf-snapshot helper). This
+// function reproduces the same code bytes, same warm-up count, and same run_straight_line cap,
+// so both tests exercise the identical continuation-loop shape.
+fn run_fixture_and_return_perf() -> PerfCounters {
+    // A tight loop: 0: inc ax (40); 1: inc ax (40); 2: jmp $-4 (EB FC) -> 0.
+    let mut memory = vec![0u8; 1024];
+    memory[0..4].copy_from_slice(&[0x40, 0x40, 0xeb, 0xfc]);
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.registers.eip = 0;
+    let mut bus = TestBus::with_memory(memory);
+
+    // Two passes through the 3-instruction body warm the decode cache, exactly like the sibling
+    // test, so the straight-line run below hits cache on every continuation.
+    for _ in 0..6 {
+        cpu.cycle(&mut bus).unwrap();
+    }
+    cpu.reset_perf_counters();
+    let _ = cpu.run_straight_line(&mut bus, 10_000).unwrap();
+    cpu.perf_counters().clone()
+}
+
+#[test]
+fn seam_counters_bound_probes_and_are_deterministic() {
+    // Mirror the setup of perf_counters_track_decode_hits_and_run_breaks: same
+    // harness, same straight-line program shape (several continuable instructions
+    // ending in a run break). Run the program twice on two identically
+    // constructed CPUs.
+    //
+    // Invariants (provable without pinning the exact probe count):
+    //  1. Every continuation is preceded by exactly one decode-cache probe, so
+    //     probes >= instructions - straight_line_runs (the first instruction of
+    //     each run is not a continuation) and probes <= instructions +
+    //     straight_line_runs (at most one extra break-detecting probe per run).
+    //     This floor is specific to this no-JIT-admission fixture (real-mode 16-bit,
+    //     which admits no Direct blocks): a single native block entry can retire many
+    //     instructions behind one probe, so on a Direct-admitting workload instructions
+    //     would grow much faster than probes and the floor would not hold.
+    //  2. The counter is deterministic: both CPUs report the same value.
+    //  3. Declines never exceed probes.
+    let p1 = run_fixture_and_return_perf();
+    let p2 = run_fixture_and_return_perf();
+    let floor = p1.instructions - p1.straight_line_runs;
+    let ceiling = p1.instructions + p1.straight_line_runs;
+    assert!(
+        p1.decode_probes >= floor,
+        "probes {} < floor {}",
+        p1.decode_probes,
+        floor
+    );
+    assert!(
+        p1.decode_probes <= ceiling,
+        "probes {} > ceiling {}",
+        p1.decode_probes,
+        ceiling
+    );
+    assert!(p1.decode_probes > 0);
+    assert!(p1.jit_direct_dispatch_declines <= p1.decode_probes);
+    assert_eq!(p1.decode_probes, p2.decode_probes);
+    assert_eq!(
+        p1.jit_direct_dispatch_declines,
+        p2.jit_direct_dispatch_declines
+    );
+}
+
 fn profile_test_cpu(code: &[u8]) -> (CpuGsw, TestBus) {
     let mut memory = vec![0u8; 1024];
     memory[..code.len()].copy_from_slice(code);

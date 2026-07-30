@@ -60,10 +60,6 @@ struct Cli {
     /// Run the portable CPU interpreter and disable native block admission.
     #[arg(long)]
     interpreter: bool,
-    /// Run the cranelift (Track C) native backend policy instead of the direct backend.
-    /// Requires a build with the clif-backend cargo feature.
-    #[arg(long, conflicts_with = "interpreter")]
-    clif: bool,
     #[arg(long)]
     memory_mib: Option<u16>,
     #[arg(long)]
@@ -174,26 +170,9 @@ struct MidiConfigPresence {
 
 fn requested_execution_backend(
     interpreter: bool,
-    clif: bool,
     native_backend_compiled: bool,
     native_backend_available: bool,
-    clif_backend_compiled: bool,
 ) -> Result<ExecutionBackend, &'static str> {
-    if clif {
-        // Loud failure, never a silent fallback (plan review finding F-A6), matching the
-        // AVX2 hard-error precedent below.
-        if !clif_backend_compiled {
-            return Err(
-                "this IzarraVM build does not include the cranelift backend; rebuild with --features clif-backend or drop --clif",
-            );
-        }
-        if !native_backend_available {
-            return Err(
-                "this IzarraVM build requires an AVX2-capable x86-64 CPU; use --interpreter to run the portable CPU core",
-            );
-        }
-        return Ok(ExecutionBackend::Clif);
-    }
     if interpreter || !native_backend_compiled {
         return Ok(ExecutionBackend::Interpreter);
     }
@@ -217,10 +196,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let execution_backend = requested_execution_backend(
         cli.interpreter,
-        cli.clif,
         izarravm_cpu::NATIVE_BACKEND_COMPILED,
         izarravm_cpu::native_backend_available(),
-        cfg!(feature = "clif-backend"),
     )?;
     set_process_execution_backend(execution_backend);
     if cli.profile_json.is_some() && cli.headless_profile_exe.is_none() && cli.hdd_folder.is_none()
@@ -952,8 +929,6 @@ fn write_hdd_profile_json(
         "instructions_per_host_second": perf.instructions as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "budget_clocks_per_host_second": machine.elapsed_clocks() as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "cpu_core_clocks_per_host_second": machine.cpu().elapsed_clocks as f64 / wall_seconds.max(f64::MIN_POSITIVE),
-        "combined_jit_native_coverage": perf.jit_native_insns.saturating_add(perf.jit_direct_insns) as f64 / instructions as f64,
-        "combined_jit_slow_exits_per_100_instructions": 100.0 * perf.jit_helper_exits.saturating_add(perf.jit_direct_side_exits) as f64 / instructions as f64,
         "direct_native_coverage": perf.jit_direct_insns as f64 / instructions as f64,
         "direct_slow_exits_per_100_instructions": 100.0 * perf.jit_direct_side_exits as f64 / instructions as f64,
         "timedemo": timedemo.map(|(gametics, realtics)| json!({
@@ -975,7 +950,6 @@ fn write_hdd_profile_json(
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
-            machine.cpu().jit_clif_counters(),
             machine.cpu().fast_map_probe_counters(),
         ),
     });
@@ -991,7 +965,6 @@ fn direct_barrier_census_json(
     };
     json!({
         "rows": snapshot.rows.iter().map(direct_barrier_census_row_json).collect::<Vec<_>>(),
-        "selected": snapshot.selected.as_ref().map(direct_barrier_census_row_json),
         "unbound_targets": snapshot
             .unbound_targets
             .iter()
@@ -1031,19 +1004,12 @@ fn direct_barrier_census_row_json(row: &izarravm_cpu::DirectBarrierCensusRow) ->
         "operand_size": row.operand_size,
         "address_size": row.address_size,
         "prefix_mask": row.prefix_mask,
-        "helper_family": row.helper_family,
         "hits": row.hits,
         "runtime_hits": row.runtime_hits,
         "native_prefix_instructions": row.native_prefix_instructions,
         "native_suffix_instructions": row.native_suffix_instructions,
-        "eligible_shapes": row.eligible_shapes,
-        "eligible_suffix_instructions": row.eligible_suffix_instructions,
         "max_native_prefix": row.max_native_prefix,
         "max_native_suffix": row.max_native_suffix,
-        "exact_root_bridges": row.exact_root_bridges,
-        "right_direct_entries": row.right_direct_entries,
-        "removed_inbound_links": row.removed_inbound_links,
-        "removed_outbound_links": row.removed_outbound_links,
     })
 }
 

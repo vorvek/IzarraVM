@@ -7,7 +7,7 @@
 //! `jit::direct` VERBATIM (field-for-field, method-for-method): none of the four referenced
 //! anything Direct-specific in their own definitions, and the extraction is behavior-preserving
 //! for Direct (see `dev_docs/plans/2026-07-19-track-c1d-design.md` section 5.1). `LinkSource` is
-//! generic over its own `SourceId` type parameter so a future backend (clif, Track C1d-main) can
+//! generic over its own `SourceId` type parameter so a future backend can
 //! instantiate it over its own unit-index type without pulling in Direct's `BlockId` (which stays
 //! in `direct.rs`, since it carries Direct's generational-slot semantics and is not itself
 //! mechanism-neutral); Direct instantiates `LinkSource<BlockId>`.
@@ -17,8 +17,9 @@
 //! zero-address default are DIRECT'S OWN mechanism (an inline zero-check against a permanent
 //! sentinel portal whose `body` is always 0), documented on each method below; a different backend
 //! may publish its own sentinel portal with a non-zero, backend-specific address and compare
-//! against THAT instead of zero (as clif's design does, see the C1d design doc section 3.3b). Do
-//! not read `zero_portal`/the zero-body convention as a shared invariant every backend must honor.
+//! against THAT instead of zero (the now-removed clif backend's design did exactly this, see the
+//! C1d design doc section 3.3b, historical). Do not read `zero_portal`/the zero-body convention
+//! as a shared invariant every backend must honor.
 //!
 //! CACHE-level bookkeeping (the tables that key, resolve, and invalidate against these types) and
 //! the resolution algorithms that operate on them stay OWNED separately by each backend's own

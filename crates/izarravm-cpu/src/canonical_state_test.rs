@@ -836,9 +836,21 @@ fn execution_serialization_does_not_mutate_cpu() {
 #[cfg(feature = "jit")]
 fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The lever-1 slice's interp_fast_map_hits/_misses counters live in FastMapProbeCounters at
-    // the CpuGsw tail (see that type), not in PerfCounters, specifically so this pin stays 4512.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    // the CpuGsw tail (see that type), not in PerfCounters, specifically to avoid moving this pin.
+    // The dynarec-refactor Task 2 seam counters (decode_probes, jit_direct_dispatch_declines) DO
+    // live in PerfCounters by design (they are the seam's identity oracle), so this pin moved from
+    // 4512 to 4528 (two added u64 fields = 16 bytes) when those landed. The same Task 2's
+    // region-JIT DELETION removed four other PerfCounters fields (jit_region_entries,
+    // jit_region_insns, jit_native_block_ns, jit_native_block_samples; 32 bytes) and dropped the
+    // `jit_regions: jit::RegionTable` field from `CpuGsw` itself, moving this pin from 4528 to
+    // 4456 (measured, not derived: rustc's field reordering does not guarantee a simple linear
+    // shift, so this number comes from a failing-test readout, not arithmetic). Task 3b deletes
+    // four more dead region-only PerfCounters fields (jit_native_insns, jit_helper_exits,
+    // jit_native_memory_helpers, jit_table_clears; 32 bytes), again measured (not derived) to move
+    // this pin from 4456 to 4424 -- see the sibling pin `tests::pending_flags_offset` in
+    // cpu_test.rs.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
 }

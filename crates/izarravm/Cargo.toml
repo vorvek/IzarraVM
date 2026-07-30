@@ -15,7 +15,6 @@ authors.workspace = true
 # interpreter-only build, while the release binary accepts `--interpreter` at launch.
 default = ["jit"]
 jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
-clif-backend = ["izarravm-cpu/clif-backend", "izarravm-machine/clif-backend"]
 
 [dependencies]
 clap.workspace = true

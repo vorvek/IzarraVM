@@ -210,6 +210,44 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.setcc(condition, Reg::RDX);
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
             }
+            // CBW / CWDE. Dword widens AX to EAX in one step: `movsx_r32_r16` reads the source's
+            // low 16 bits and defines all 32, so `home(0)` as both source and destination is
+            // safe -- the instruction reads before it writes, same as `emit_mov_extend_reg`'s
+            // `dst == src` case. Word (CBW) widens AL to AX and must leave EAX's upper 16 bits
+            // alone, so it goes through RDX and `emit_write_gpr16`: `movsx_r32_r8` already sign
+            // extends AL across all 32 bits, and the low 16 of that is exactly AL sign-extended
+            // to 16, so no further shift is needed.
+            DirectKind::Cwde { width } => match width {
+                MemoryWidth::Dword => e.movsx_r32_r16(home(0), home(0)),
+                MemoryWidth::Word => {
+                    e.movsx_r32_r8(Reg::RDX, home(0));
+                    emit_write_gpr16(&mut e, 0, Reg::RDX);
+                }
+                MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("classify only ever produces Word or Dword for 0x98")
+                }
+            },
+            // CWD / CDQ. Both widths fill the "upper half" register with 32 copies of the
+            // accumulator's sign bit via `sar reg, 31`; the mutation record for this slice is
+            // this SAR flipped to a SHR, which fails the fixture at eax = 0x8000_0000. Dword
+            // fills EDX from EAX directly. Word must leave EDX's upper 16 bits alone, so the
+            // sign is materialized in RDX (via `movsx_r32_r16`, which extends AX's sign across
+            // all 32 bits the same way the Dword arm's copy-then-SAR does) and only the low 16
+            // are written through `emit_write_gpr16`.
+            DirectKind::Cdq { width } => match width {
+                MemoryWidth::Dword => {
+                    e.mov_r32_r32(home(2), home(0));
+                    e.shift_r32_imm8(7, home(2), 31);
+                }
+                MemoryWidth::Word => {
+                    e.movsx_r32_r16(Reg::RDX, home(0));
+                    e.shift_r32_imm8(7, Reg::RDX, 31);
+                    emit_write_gpr16(&mut e, 2, Reg::RDX);
+                }
+                MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("classify only ever produces Word or Dword for 0x99")
+                }
+            },
             DirectKind::MovImmByte { dst, imm } => {
                 e.mov_r32_imm32(Reg::RDX, u32::from(imm));
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
@@ -2753,8 +2791,8 @@ pub(super) fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: Ad
 /// is congruent mod 2^16, and it matches `resolve_memory_addr_mode`'s `(sum as u16)`.
 ///
 /// It is a PARAMETER rather than a field on `DirectAddr` deliberately. A `DirectAddr` field would
-/// ride inside kinds that are in clif's `lowerable()` allowlist, such as `Load`, and clif would
-/// lower them without the mask. That is the same trap as putting a width field on `Push`.
+/// ride inside many kinds (`Load` among them) whose emitters would then need to remember to
+/// apply the mask individually. That is the same trap as putting a width field on `Push`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum AddressWrap {
     None,
@@ -4254,6 +4292,8 @@ fn emit_direction_flag(e: &mut Encoder, set: bool) {
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RAX);
 }
 
+// The pushfq/pop below moves RSP by 8 for one instruction: the accepted unwind gap
+// described in jit/unwind.rs's module doc ("Known, accepted gap" beside the pushfq list).
 fn emit_capture_flags(e: &mut Encoder, defined: u32) {
     e.pushfq();
     e.pop(Reg::RDI);
@@ -4262,6 +4302,8 @@ fn emit_capture_flags(e: &mut Encoder, defined: u32) {
     e.or_r32_r32(Reg::RBP, Reg::RDI);
 }
 
+// The push/popfq below moves RSP by 8 for one instruction: the same accepted unwind gap as
+// `emit_capture_flags` above (see jit/unwind.rs's module doc).
 fn emit_load_host_flags(e: &mut Encoder) {
     e.mov_r32_r32(Reg::RAX, Reg::RBP);
     e.and_r32_imm32(Reg::RAX, ARITH_FLAGS | 0x2);

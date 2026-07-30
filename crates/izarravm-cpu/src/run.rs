@@ -15,18 +15,6 @@ pub(super) fn diff_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
 }
 
-/// The optional linear address forced JIT admission compiles
-/// (`IZARRAVM_JIT_REGION=<hex>`, with or without `0x`). `None` leaves normal hotness admission in
-/// control. Cached on first read, like `diff_trace_enabled`.
-#[cfg(feature = "jit")]
-fn jit_forced_region_lin() -> Option<u32> {
-    static FORCED: OnceLock<Option<u32>> = OnceLock::new();
-    *FORCED.get_or_init(|| {
-        let value = std::env::var("IZARRAVM_JIT_REGION").ok()?;
-        u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
-    })
-}
-
 /// Whether an opcode is a port-I/O instruction (IN / OUT / INS / OUTS), for the unit simulator's
 /// `touches_io` fact. IN (0xE4/0xE5 imm, 0xEC/0xED DX) and the string forms INS (0x6C/0x6D) / OUTS
 /// (0x6E/0x6F) plus OUT (0xE6/0xE7 imm, 0xEE/0xEF DX). OUT/INS/OUTS are also non-continuable, so the
@@ -73,22 +61,6 @@ fn io_hist_requested() -> bool {
 
 #[cfg(feature = "jit")]
 enum DirectContinuation {
-    Run(CycleOutcome),
-    Prefix(CycleOutcome),
-    Interpret,
-}
-
-/// The clif continuation outcome (Track C C1d), mirroring `DirectContinuation`: `Run`
-/// resumes at a fresh instruction (a retired terminal or a chain hop's exact resume
-/// point), `Prefix` requires the interpreter to retire the exit-slot instruction before
-/// re-admission, `Interpret` ran nothing.
-#[cfg(all(
-    feature = "jit",
-    feature = "clif-backend",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-enum ClifContinuation {
     Run(CycleOutcome),
     Prefix(CycleOutcome),
     Interpret,
@@ -544,11 +516,7 @@ impl CpuGsw {
         bus: &mut B,
         cap: u64,
     ) -> Result<BudgetedRunOutcome, CpuError> {
-        #[cfg(feature = "jit")]
-        self.jit_direct.barrier_census_batch_begin();
         let result = self.run_budgeted_inner(bus, cap);
-        #[cfg(feature = "jit")]
-        self.jit_direct.barrier_census_batch_end();
         // Close the unit simulator's batch on EVERY return path, including the `?` error
         // propagations inside the loop, so an open sim entry never leaks across batches.
         #[cfg(feature = "jit")]
@@ -575,23 +543,13 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         let mut skip_direct_once = false;
         #[cfg(feature = "jit")]
-        let forced_region_lin = jit_forced_region_lin();
-        #[cfg(feature = "jit")]
         let native_continuations_active = {
             debug_assert_eq!(
                 self.direct_runtime.admission_active,
                 self.jit_direct.execution_enabled()
             );
-            let legacy_requested = forced_region_lin.is_some()
-                || self.jit_regions.auto_admit()
-                || self.jit_regions.len() != 0;
             self.direct_runtime.admission_active
-                || legacy_requested && self.jit_direct.backend_enabled()
         };
-        // One native backend runs at a time (plan decision D-C1.4): the clif policy takes this
-        // branch INSTEAD of Direct/legacy-region admission, never alongside it.
-        #[cfg(feature = "jit")]
-        let clif_continuations_active = self.clif_backend_enabled();
         // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
         // derives it from PIT-edge instants), but `total` counts core clocks
         // only. Track the batch's scaled-bus growth across this run so a
@@ -602,6 +560,12 @@ impl CpuGsw {
         let bus_at_entry = bus.in_batch_scaled_bus_clocks();
         let rep_budget = RepBudget { bus_at_entry, cap };
         self.perf.straight_line_runs += 1;
+        // Seam counters, folded once per run (never per-instruction on the hot path).
+        let mut seam_probes: u64 = 0;
+        // Only the jit-gated Direct dispatch arm below increments this; a no-jit build folds it
+        // unconditionally (always 0) so the fold site does not need its own cfg split.
+        #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
+        let mut seam_declines: u64 = 0;
         loop {
             let can_take_before = self.can_take_interrupt();
             let outcome = if first {
@@ -610,6 +574,7 @@ impl CpuGsw {
             } else {
                 let lin = self.linear_eip();
                 let cs = self.registers.cs();
+                seam_probes += 1;
                 let insn = match self.decode_cache.get(lin, cs.default_size_32) {
                     Some(i) => {
                         if !i.continuable {
@@ -635,58 +600,14 @@ impl CpuGsw {
                         break;
                     }
                 };
-                // JIT admission: a compiled region stamped on this line runs natively instead of
-                // the interpreted continuation, occupying one loop iteration; the loop's own
-                // break checks below then fire at exactly the boundary the region stopped at.
+                // JIT admission: a compiled Direct block covering this line runs natively instead
+                // of the interpreted continuation, occupying one loop iteration; the loop's own
+                // break checks below then fire at exactly the boundary the block stopped at.
                 // The probe read+branch is the whole per-continuation dispatch cost.
                 #[cfg(feature = "jit")]
-                let region_outcome = if clif_continuations_active {
-                    #[cfg(all(
-                        feature = "clif-backend",
-                        target_arch = "x86_64",
-                        any(target_os = "windows", target_os = "linux")
-                    ))]
-                    let clif_outcome = if self.mode().uses_approximate_timing()
-                        && !std::mem::take(&mut skip_direct_once)
-                    {
-                        let continuation_budget = ContinuationBudget {
-                            total,
-                            bus_at_entry,
-                            cap,
-                        };
-                        match self.try_clif_continuation(
-                            bus,
-                            lin,
-                            cs.default_size_32,
-                            continuation_budget,
-                        )? {
-                            // A completed chain resumes at a fresh instruction: no skip,
-                            // so back-to-back units and chain targets admit immediately
-                            // (Direct's Run shape).
-                            ClifContinuation::Run(outcome) => Some(outcome),
-                            // A stop-slot or failing-slot exit: the interpreter retires
-                            // that instruction before any re-admission at the exit
-                            // address (Direct's Prefix skip shape).
-                            ClifContinuation::Prefix(outcome) => {
-                                skip_direct_once = true;
-                                Some(outcome)
-                            }
-                            ClifContinuation::Interpret => None,
-                        }
-                    } else {
-                        None
-                    };
-                    #[cfg(not(all(
-                        feature = "clif-backend",
-                        target_arch = "x86_64",
-                        any(target_os = "windows", target_os = "linux")
-                    )))]
-                    let clif_outcome: Option<CycleOutcome> = None;
-                    clif_outcome
-                } else if !native_continuations_active {
+                let direct_outcome = if !native_continuations_active {
                     None
                 } else {
-                    let stamped_region = self.decode_cache.region_at(lin, cs.default_size_32);
                     let continuation_budget = ContinuationBudget {
                         total,
                         bus_at_entry,
@@ -694,17 +615,6 @@ impl CpuGsw {
                     };
                     if !self.jit_direct.backend_enabled() || std::mem::take(&mut skip_direct_once) {
                         None
-                    } else if forced_region_lin == Some(lin)
-                        || !self.jit_direct.auto_admit()
-                            && (self.jit_regions.auto_admit() || stamped_region.is_some())
-                    {
-                        self.try_region_continuation(
-                            bus,
-                            lin,
-                            cs.default_size_32,
-                            stamped_region,
-                            continuation_budget,
-                        )?
                     } else if self.mode().uses_approximate_timing() {
                         match self.try_direct_continuation(
                             bus,
@@ -717,15 +627,18 @@ impl CpuGsw {
                                 skip_direct_once = true;
                                 Some(outcome)
                             }
-                            DirectContinuation::Interpret => None,
+                            DirectContinuation::Interpret => {
+                                seam_declines += 1;
+                                None
+                            }
                         }
                     } else {
                         None
                     }
                 };
                 #[cfg(not(feature = "jit"))]
-                let region_outcome: Option<CycleOutcome> = None;
-                match region_outcome {
+                let direct_outcome: Option<CycleOutcome> = None;
+                match direct_outcome {
                     Some(outcome) => outcome,
                     None => {
                         // A continuation skips cycle_no_interrupt_check (which resets this
@@ -752,6 +665,11 @@ impl CpuGsw {
             // exactly the boundary that loop would have stopped at.
             if outcome.halted {
                 self.perf.brk_halt += 1;
+                // This early return is a second lexical exit from the loop (the other is the
+                // fall-through after `break`, folded below the loop). Fold here too so a run that
+                // ends in HLT does not lose its seam counts.
+                self.perf.decode_probes += seam_probes;
+                self.perf.jit_direct_dispatch_declines += seam_declines;
                 return Ok(BudgetedRunOutcome {
                     consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
                     halted: true,
@@ -802,6 +720,11 @@ impl CpuGsw {
                 break;
             }
         }
+        // Fold once per run, not per instruction. A propagated hard `CpuError` (a `?` inside the
+        // loop above) skips this fold, which is acceptable: a hard error aborts the entire run
+        // and no gate run produces one.
+        self.perf.decode_probes += seam_probes;
+        self.perf.jit_direct_dispatch_declines += seam_declines;
         Ok(BudgetedRunOutcome {
             consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
             halted: false,
@@ -943,40 +866,16 @@ impl CpuGsw {
     #[cfg(feature = "jit")]
     pub fn set_jit_auto_admit(&mut self, on: bool) {
         let was_enabled = self.direct_runtime.admission_active;
-        self.jit_regions.set_auto_admit(false);
         self.jit_direct.set_auto_admit(on && jit::host_supported());
         self.finish_direct_execution_transition(was_enabled);
     }
 
-    /// Enable or disable every native execution path, including forced legacy regions.
-    /// Unsupported hosts cannot be enabled.
+    /// Enable or disable the native execution path. Unsupported hosts cannot be enabled.
     #[cfg(feature = "jit")]
     pub fn set_native_backend_enabled(&mut self, on: bool) {
         let was_enabled = self.direct_runtime.admission_active;
         self.jit_direct.set_backend_enabled(on);
         self.finish_direct_execution_transition(was_enabled);
-    }
-
-    /// Enable or disable the clif (Track C) policy on this CPU instance, the per-instance
-    /// seam mirroring `set_native_backend_enabled` (plan decision D-C1.4). One native
-    /// backend runs at a time: enabling clif does not enable Direct, and the machine-level
-    /// selector never enables both. Unsupported hosts cannot be enabled.
-    #[cfg(feature = "jit")]
-    pub fn set_clif_backend_enabled(&mut self, on: bool) {
-        self.jit_direct.clif_enabled = on && jit::host_supported();
-        // `clif_enabled` is one of the four inputs to `fast_map_population_enabled()`
-        // (memory.rs); refresh the interpreter serve gate's cached mirror so it cannot go stale.
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        self.refresh_fast_map_serve_gate();
-    }
-
-    /// Whether the clif policy is enabled on this instance.
-    #[cfg(feature = "jit")]
-    pub fn clif_backend_enabled(&self) -> bool {
-        self.jit_direct.clif_enabled
     }
 
     #[cfg(feature = "jit")]
@@ -987,10 +886,10 @@ impl CpuGsw {
             self.direct_runtime.admission_active,
             self.jit_direct.execution_enabled()
         );
-        // `admission_active` is one of the four inputs to `fast_map_population_enabled()`
+        // `admission_active` is one of the inputs to `fast_map_population_enabled()`
         // (memory.rs); refresh the interpreter serve gate's cached mirror unconditionally, not
-        // only on a real transition below, since `jit_regions.set_auto_admit` above (called from
-        // `set_jit_auto_admit` before this function runs) can also move the condition.
+        // only on a real transition below, since a caller can reach this after changing another
+        // of that predicate's inputs.
         #[cfg(all(
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
@@ -1005,27 +904,6 @@ impl CpuGsw {
         ))]
         self.jit_fast_map.invalidate_all();
         self.jit_direct.invalidate_translation();
-    }
-
-    #[cfg(all(feature = "jit", test))]
-    #[cfg_attr(
-        not(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
-        self.set_jit_auto_admit(false);
-        self.jit_regions.set_auto_admit(on && jit::host_supported());
-        // `jit_regions.auto_admit()` is one of the four inputs to `fast_map_population_enabled()`
-        // (memory.rs) and just changed AFTER `set_jit_auto_admit`'s own refresh ran; refresh again
-        // so the interpreter serve gate's cached mirror reflects the final state.
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        self.refresh_fast_map_serve_gate();
     }
 
     /// G1: shared demotion tail of both admission gates. Parks the key Dormant, stamps its entry
@@ -1065,9 +943,6 @@ impl CpuGsw {
         // `narrow_invalidate`, sets `generation = 0`, and the live generation is never 0, so such a
         // line can only come back through `put`.
         //
-        // The region backend is deliberately NOT given this early-out. `try_region_continuation`
-        // has no `!d` refusal and genuinely admits 16-bit code, which is why this sits inside the
-        // two continuation functions that provably refuse rather than at their shared call site.
         if !d {
             return Ok(DirectContinuation::Interpret);
         }
@@ -1217,979 +1092,6 @@ impl CpuGsw {
             DirectBlockOutcome::Prefix(outcome) => Ok(DirectContinuation::Prefix(outcome)),
             DirectBlockOutcome::NotRun => Ok(DirectContinuation::Interpret),
         }
-    }
-
-    /// Track C3(b): a phase-timing clock read, `Some` only when `IZARRAVM_CLIF_PHASE_PROFILE`
-    /// is set (checked once, then cached). `None` (the default) makes every timing site a
-    /// branch on a cached bool, keeping the hot path free of `Instant::now()` reads.
-    #[cfg(all(
-        feature = "jit",
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    #[inline]
-    fn clif_phase_now() -> Option<std::time::Instant> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ON.get_or_init(|| std::env::var_os("IZARRAVM_CLIF_PHASE_PROFILE").is_some()) {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        }
-    }
-
-    /// Add `since.elapsed()` nanoseconds to `dst` (Track C3(b) phase timing; a no-op when the
-    /// profile flag is unset, so `since` is `None`).
-    #[cfg(all(
-        feature = "jit",
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    #[inline]
-    fn clif_phase_add(dst: &mut u64, since: Option<std::time::Instant>) {
-        if let Some(t) = since {
-            *dst = dst.wrapping_add(t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
-        }
-    }
-
-    /// Add the `from..to` span nanoseconds to `dst` (Track C3(b) phase timing).
-    #[cfg(all(
-        feature = "jit",
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    #[inline]
-    fn clif_phase_delta(
-        dst: &mut u64,
-        from: Option<std::time::Instant>,
-        to: Option<std::time::Instant>,
-    ) {
-        if let (Some(a), Some(b)) = (from, to) {
-            *dst = dst.wrapping_add(
-                b.saturating_duration_since(a)
-                    .as_nanos()
-                    .min(u128::from(u64::MAX)) as u64,
-            );
-        }
-    }
-
-    /// Track C C1a admission: the clif analogue of `try_direct_continuation`. A C1a unit is a
-    /// SIDE-EXIT-PER-INSTRUCTION shell (review finding F-A1, option B), so this never returns
-    /// a run/prefix outcome; every path, guard-reject or guard-pass, ends with the interpreter
-    /// retiring the current instruction. Guard-pass additionally enters the compiled shell
-    /// through the dispatcher-shaped adapter (a pure round-trip proof: the shell reads and
-    /// writes nothing) before falling through, so state and timing stay byte-identical to the
-    /// interpreter-only policy by construction.
-    #[cfg(all(
-        feature = "jit",
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    fn try_clif_continuation<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        lin: u32,
-        d: bool,
-        budget: ContinuationBudget,
-    ) -> Result<ClifContinuation, CpuError> {
-        // Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`): consume a
-        // pending arena reset FIRST, before `clif_hot` and before any admission or adapter
-        // call. This is the provably frame-free point design section 5 establishes -- the
-        // only native-entry site (`run_clif_unit`'s `adapter(..)` call) sits strictly AFTER
-        // this check within the same synchronous call, and no call-out re-enters this
-        // function, so nothing on the host stack can return into arena bytes this reclaims.
-        // Track C3(b) phase timing: `t_entry` clocks the dispatch-resolution prologue a hot
-        // cache would replace (`clif_hot` + `clif_key_for` + `clif_units.state` + the
-        // descriptor clone below). Only accumulated on `from_compiled` (an already-Compiled
-        // hot repeat), so a fresh install's Cranelift `compile_ns` never contaminates it.
-        let t_entry = Self::clif_phase_now();
-        let mut from_compiled = false;
-        self.jit_direct.apply_deferred_clif_arena_reset();
-        // Same reasoning as the Direct path: `clif_key_for` refuses on `!d`, so a 16-bit boundary
-        // cannot produce a unit and need not pay `clif_hot`. Placed AFTER the deferred arena reset
-        // above, not before. Deferring that reclaim would only postpone it to the next 32-bit
-        // boundary and is not itself unsafe, but the reset's contract names this as the point it is
-        // consumed, and a real-mode-only stretch should not be allowed to accrue deferral debt.
-        if !d {
-            return Ok(ClifContinuation::Interpret);
-        }
-        if !self
-            .decode_cache
-            .clif_hot(lin, d, jit::clif::cache::CLIF_DEFAULT_ADMISSION_HEAT)
-        {
-            return Ok(ClifContinuation::Interpret);
-        }
-        let Some(key) = jit::clif::cache::clif_key_for(self, lin, d) else {
-            return Ok(ClifContinuation::Interpret);
-        };
-        let unit_index = match self.jit_direct.clif_units.state(key) {
-            None => {
-                self.jit_direct.clif_units.note_seen(key);
-                return Ok(ClifContinuation::Interpret);
-            }
-            Some(jit::clif::cache::ClifUnitState::Dormant) => {
-                // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp aged out lifts
-                // back to Seen here, mirroring Direct's cold-Rejected recovery path.
-                let heat_epoch = self.smc_heat_epoch();
-                self.sync_smc_heat();
-                let jit = &mut *self.jit_direct;
-                jit.clif_units
-                    .lift_cold_dormant(&mut jit.smc_heat, key, heat_epoch);
-                return Ok(ClifContinuation::Interpret);
-            }
-            Some(jit::clif::cache::ClifUnitState::Compiled(index)) => {
-                // C1e post-restamp cooldown: interpret this one entry so the transient
-                // post-SMC fetch charge arises from the same interpreter path the oracle
-                // arm takes (timing identity by construction, not synthesis); the portal
-                // republishes inside `take_interp_once` and the next entry runs natively.
-                if self.jit_direct.clif_units.take_interp_once(index) {
-                    return Ok(ClifContinuation::Interpret);
-                }
-                from_compiled = true;
-                index
-            }
-            Some(jit::clif::cache::ClifUnitState::Seen) => {
-                // A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md section
-                // 3.7): once this backend's arena has failed to fit a unit for lack of
-                // remaining capacity, EVERY future Seen admission would otherwise walk, plan,
-                // and pay the ~680 microsecond Cranelift compile only to fail at
-                // `install_span`'s own capacity check and park Dormant anyway -- an O(1)
-                // reject here skips all of that. The flag is cleared by A2's deferred
-                // `reset_arena` (dev_docs/plans/2026-07-19-clif-arena-reset-design.md), which
-                // runs at the top of this function (`apply_deferred_clif_arena_reset`, above)
-                // on the next admission after a wholesale `clif_clear()` -- so a Seen entry
-                // parked here by a stale exhausted flag re-walks and compiles normally on its
-                // next visit instead of staying dormant for the backend's whole lifetime.
-                if self
-                    .jit_direct
-                    .clif_backend
-                    .as_ref()
-                    .is_some_and(jit::clif::ClifBackend::arena_exhausted)
-                {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_arena_exhausted += 1;
-                    return Ok(ClifContinuation::Interpret);
-                }
-                // G1 pre-compile gate (entry chunk only, cheap).
-                let heat_epoch = self.smc_heat_epoch();
-                self.sync_smc_heat();
-                if self.jit_direct.smc_heat.chunk_hot(key.physical, heat_epoch) {
-                    let jit = &mut *self.jit_direct;
-                    jit.smc_heat.bump(key.physical, 1, heat_epoch);
-                    jit.clif_units.park_dormant(key);
-                    self.perf.smc_heat_demotions += 1;
-                    self.jit_clif.park_heat_chunk += 1;
-                    return Ok(ClifContinuation::Interpret);
-                }
-                let Some(layout) = jit::clif::cache::walk_unit(self, key.linear, d) else {
-                    // Cause-B (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md
-                    // section 1): a structurally unclassifiable entry (`direct::
-                    // unit_growth_classify` declines it, or an unsupported prefix form) is a
-                    // property of the STATIC BYTES at this address, not of cache occupancy,
-                    // so it can never resolve on its own. Park it Dormant with the plain
-                    // no-lift `dormant()`, byte-identical to the structural-failure parks
-                    // below (`plan.leading == 0`, the code-cover check, segment capture):
-                    // recoverable only via a wholesale `clif_clear()`. Previously this bail
-                    // stayed `Seen` and re-ran the ENTIRE admission pipeline on every single
-                    // revisit (4,455,782 times in one Quake run) -- deliberately NOT given a
-                    // heat-cooldown or SMC-triggered lift (adversarial review MAJOR-3): an
-                    // unclassifiable opcode stays unclassifiable until the bytes change, and
-                    // a code change already triggers `clif_clear()`.
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.retry_incomplete_walk += 1;
-                    return Ok(ClifContinuation::Interpret);
-                };
-                // The unit executes its leading run of lowerable slots natively (Track C
-                // C1b); a unit with nothing lowerable at its entry parks Dormant and stays
-                // on the interpreter (entering a no-op body would consume a loop iteration
-                // without progress).
-                let plan = jit::clif::lower::plan_unit(&layout.kinds, true);
-                if plan.leading == 0 {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_no_lowerable += 1;
-                    return Ok(ClifContinuation::Interpret);
-                }
-                self.jit_clif.compile_attempts += 1;
-                // G4 dynamic half (dev_docs/specs/2026-07-15-smc-hardening-design.md): the
-                // kind MUST stay InstructionPrefetch, exactly as Direct's own gate requires
-                // (section 6.2): only a true-RAM page answers under this kind.
-                let code_page =
-                    bus.direct_page(key.physical, BusAccessKind::InstructionPrefetch)?;
-                let code_page_covers_unit = code_page.is_some_and(|page| {
-                    page.physical_page == key.physical & !0x0fff
-                        && (key.physical & 0x0fff)
-                            .checked_add(u32::from(layout.guest_len))
-                            .is_some_and(|end| end as usize <= page.len)
-                });
-                if !code_page_covers_unit {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_no_code_cover += 1;
-                    return Ok(ClifContinuation::Interpret);
-                }
-                // C1e: the certified code page's host pointer, kept on the descriptor so
-                // a restamp's post-write re-read goes through the SAME physical-RAM
-                // mapping the cover check just proved (design section 2.1, review m1).
-                let code_host = code_page
-                    .map(|page| page.ptr as usize)
-                    .expect("cover check passed");
-                // G1 pre-install gate (full span).
-                if self.jit_direct.smc_heat.span_hot(
-                    key.physical,
-                    u32::from(layout.guest_len),
-                    heat_epoch,
-                ) {
-                    let jit = &mut *self.jit_direct;
-                    jit.smc_heat.bump(key.physical, 1, heat_epoch);
-                    jit.clif_units.park_dormant(key);
-                    self.perf.smc_heat_demotions += 1;
-                    self.jit_clif.park_heat_span += 1;
-                    return Ok(ClifContinuation::Interpret);
-                }
-                let Some(segment_layout) = jit::direct::SegmentLayout::capture(
-                    self,
-                    layout.read_segments,
-                    layout.write_segments,
-                    // Zero: `MovSegToReg` is not in clif's `lowerable` set, so no clif unit can
-                    // contain a slot that needs a selector-only pin.
-                    0,
-                ) else {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_segment_capture_failed += 1;
-                    return Ok(ClifContinuation::Interpret);
-                };
-                let memory_cpl3 = self.current_privilege_level() == 3;
-                let entry_eip = key.linear.wrapping_sub(self.registers.cs().base);
-                // C1c: a unit with lowered memory slots bakes the FastMap SoA bases and the
-                // two code-watch table bases at compile time, exactly as Direct's emission
-                // does. No storage yet means nothing to bake; skip WITHOUT parking Dormant
-                // (Direct's Retry shape: the map appears once the interpreter's accesses
-                // populate it).
-                let has_memory = !plan.access_total.is_zero();
-                let map = if has_memory {
-                    let Some(map) = self.jit_fast_map.native_bases() else {
-                        // Track C1f: this bail stays Seen and is NOT parked Dormant (the C0
-                        // review's MINOR-2 suspect), so it is separately attributable as
-                        // `JitClifCounters::retry_no_fast_map`.
-                        self.jit_clif.retry_no_fast_map += 1;
-                        return Ok(ClifContinuation::Interpret);
-                    };
-                    Some(map)
-                } else {
-                    None
-                };
-                let code_watch_tables = [
-                    self.decode_cache.native_code_watch_table(),
-                    self.jit_direct.native_code_watch_table(),
-                ];
-                let mem_context = jit::clif::lower::UnitMemoryContext {
-                    map,
-                    code_watch_tables,
-                    segments: segment_layout,
-                    cpl3: memory_cpl3,
-                    // Stable for the CPU's lifetime: one Box<JitState>, and clones drop
-                    // every compiled unit, so no unit outlives its baked pointer.
-                    mode13_lanes: std::ptr::from_mut(&mut self.jit_direct.clif_run.mode13) as usize,
-                    chain_lanes: std::ptr::from_mut(&mut self.jit_direct.clif_run.chain) as usize,
-                    // Placeholder; the cells exist just below, before compile.
-                    cell_addrs: [0; 2],
-                };
-                if self.jit_direct.clif_backend.is_none() {
-                    self.jit_direct.clif_backend = jit::clif::ClifBackend::new();
-                }
-                let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_backend_unavailable += 1;
-                    return Ok(ClifContinuation::Interpret);
-                };
-                // C1d: the sentinel descriptor and portal exist before any cell is
-                // created, and fresh cells are IMMEDIATELY repointed at the sentinel
-                // portal (N1a: a clif cell must never sit at the zero-portal default,
-                // because the branch-free thunk would dereference the zero body as a
-                // descriptor address).
-                let Some(sentinel_addr) = backend
-                    .sentinel_descriptor()
-                    .map(|sentinel| std::ptr::from_ref(sentinel) as usize)
-                else {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_backend_unavailable += 1;
-                    return Ok(ClifContinuation::Interpret);
-                };
-                let sentinel_portal = self.jit_direct.clif_units.sentinel_portal(sentinel_addr);
-                let cells = [
-                    std::sync::Arc::new(jit::links::LinkCell::new()),
-                    std::sync::Arc::new(jit::links::LinkCell::new()),
-                ];
-                for cell in &cells {
-                    cell.set(sentinel_portal.as_ref());
-                }
-                let mem_context = jit::clif::lower::UnitMemoryContext {
-                    cell_addrs: [cells[0].address(), cells[1].address()],
-                    ..mem_context
-                };
-                let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_backend_unavailable += 1;
-                    return Ok(ClifContinuation::Interpret);
-                };
-                let compile_start = std::time::Instant::now();
-                let compiled =
-                    jit::clif::lower::compile_unit(backend, &layout, &plan, entry_eip, mem_context);
-                // Track C1f: a dedicated clif-only compile timer (see `JitClifCounters::
-                // compile_ns`'s doc comment for why this used to be folded into
-                // `PerfCounters::jit_direct_compile_ns`, mislabeling clif's cost as Direct's).
-                self.jit_clif.compile_ns +=
-                    compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-                let Some(entry) = compiled else {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_compile_failed += 1;
-                    return Ok(ClifContinuation::Interpret);
-                };
-                let descriptor = jit::clif::cache::ClifUnitDescriptor {
-                    key,
-                    guest_len: layout.guest_len,
-                    fetch_lens: layout.fetch_lens,
-                    instructions: layout.instructions,
-                    segment_layout,
-                    memory_cpl3,
-                    has_wide_accesses: layout.has_wide_accesses,
-                    is_self_loop: layout.is_self_loop,
-                    entry,
-                    operands: layout.operands,
-                    leading: plan.leading,
-                    x87_mask: plan.x87_mask,
-                    cum_raw_before: plan.cum_raw_before,
-                    cum_lowered_before: plan.cum_lowered_before,
-                    raw_clocks_total: plan.raw_clocks_total,
-                    lowered_total: plan.lowered_total,
-                    cum_access_before: plan.cum_access_before,
-                    access_total: plan.access_total,
-                    terminal: plan.terminal,
-                    disp_len: layout.disp_len,
-                    imm_len: layout.imm_len,
-                    imm_extend: layout.imm_extend,
-                    lea_mask: layout.lea_mask,
-                    moffs_mask: layout.moffs_mask,
-                    interp_once: false,
-                    code_host,
-                    successors: layout.successors,
-                };
-                let Some(index) = self
-                    .jit_direct
-                    .clif_install(descriptor, cells, sentinel_addr)
-                else {
-                    self.jit_direct.clif_units.dormant(key);
-                    self.jit_clif.park_install_failed += 1;
-                    return Ok(ClifContinuation::Interpret);
-                };
-                self.jit_clif.units_installed += 1;
-                index
-            }
-        };
-        let t_preclone = if from_compiled {
-            Self::clif_phase_now()
-        } else {
-            None
-        };
-        let Some(unit) = self.jit_direct.clif_units.unit(unit_index).cloned() else {
-            return Ok(ClifContinuation::Interpret);
-        };
-        if from_compiled {
-            Self::clif_phase_add(&mut self.jit_clif.resolve_clone_ns, t_preclone);
-            Self::clif_phase_add(&mut self.jit_clif.resolve_ns, t_entry);
-        }
-        self.run_clif_unit(bus, &unit, unit_index, budget)
-    }
-
-    /// The per-entry dynamic guards, in Direct's order (`run_direct_block`, plan section
-    /// 2.3), then one native unit run. G5 (x87 TOP) stays correctly omitted (plan section
-    /// 4: a call-out delegates the whole x87 operation, TOP included, to the interpreter,
-    /// so no compile-time TOP assumption exists to protect). G8 uses the non-chain form
-    /// only (linking is C1d). The G6/G7/G8 rejects still do not retire-for-recompile: the
-    /// next admission attempt at the same key already recompiles through the normal path
-    /// on a mode-key change (a new key), and a descriptor mismatch only rejects, never
-    /// wrongly enters; the retire refinement is revisited with chaining in C1d.
-    ///
-    /// After the guards, the unit runs its leading lowered slots natively and side-exits
-    /// with exact interpreter-equivalent state materialized (design section 4). Charging
-    /// happens here afterwards, through the SAME batch functions Direct uses
-    /// (`scale_clocks_batch`, `charge_cached_fetch`/bulk fetch), over the retired prefix's
-    /// static profile; x87 call-outs charged themselves through the interpreter during the
-    /// run (the no-double-charge invariant, design section 5) and contribute their core
-    /// clocks to the returned outcome so the batch budget sees them.
-    #[cfg(all(
-        feature = "jit",
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    fn run_clif_unit<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        unit: &jit::clif::cache::ClifUnitDescriptor,
-        unit_index: u32,
-        budget: ContinuationBudget,
-    ) -> Result<ClifContinuation, CpuError> {
-        // Track C3(b) phase timing: `t_guard` spans the entry guards + quota + snapshot writes
-        // (up to the adapter). Only paths that reach the post-adapter accumulator below record
-        // it, so guard REJECTS (which return `Interpret` without running) never contribute.
-        let t_guard = Self::clif_phase_now();
-        if self.profile.enabled || diff_trace_enabled() {
-            self.jit_clif.reject_observer += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        if self.interrupt_shadow {
-            self.jit_clif.reject_interrupt_shadow += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        if !bus.native_aggregate_accounting_allowed() {
-            self.jit_clif.reject_aggregate_accounting += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        if unit.key.mode_key != self.jit_mode_key() {
-            self.jit_clif.reject_mode_key += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        if !unit.cs_descriptor_matches(self) {
-            self.jit_clif.reject_cs_layout += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        if unit.memory_cpl3 != (self.current_privilege_level() == 3) {
-            self.jit_clif.reject_cpl += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        // G8, chain form when this unit has a live linked successor (design section 8):
-        // a resolved chain validates every body reachable through this unit's own cells,
-        // so ALL six data segments must match, not only the used ones. `has_link` is
-        // DYNAMIC (the successor may not have existed when this unit compiled): the cell
-        // is linked when its portal body is not the sentinel descriptor's address.
-        let has_link = self.jit_direct.clif_units.has_linked_successor(unit_index);
-        if has_link {
-            if !unit.chain_descriptors_match(self) {
-                self.jit_clif.reject_data_segment += 1;
-                return Ok(ClifContinuation::Interpret);
-            }
-        } else if !unit.data_descriptors_match(self) {
-            self.jit_clif.reject_data_segment += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        if unit.has_wide_accesses && self.alignment_armed && self.current_privilege_level() == 3 {
-            self.jit_clif.reject_alignment += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        let eip = self.registers.eip;
-        let fetch_last = u32::from(unit.guest_len) - 1;
-        if self
-            .registers
-            .cs()
-            .limit
-            .checked_sub(fetch_last)
-            .is_none_or(|last_start| eip > last_start)
-        {
-            self.jit_clif.reject_fetch_limit += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        // B1: one iteration must fit under the cap (Direct's quota shape with the chain
-        // count pinned at 1: no linking and no native self-loop repetition, so the only
-        // question is whether this single pass fits). The bound is scaled core clocks plus
-        // the lowered-population fetch estimate plus (C1c) the static per-width data-access
-        // bound, through the same scaling calls run_direct_block uses (run.rs's
-        // byte/word/dword_data_upper shape; the mode13 max() keeps the bound conservative
-        // even though increment 1 retires RAM accesses only). No fp weight (x87 charges
-        // itself).
-        let (num, den) = level_timing(self.persona());
-        let scaled_core_upper = u64::from(unit.raw_clocks_total)
-            .saturating_mul(u64::from(num))
-            .saturating_add(u64::from(den) - 1)
-            / u64::from(den);
-        let fetch_upper = bus
-            .jit_fetch_cost_clocks()
-            .saturating_mul(u64::from(unit.lowered_total));
-        let byte_data_upper = bus
-            .jit_data_cost_clocks(BusWidth::Byte)
-            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
-        let word_data_upper = bus
-            .jit_data_cost_clocks(BusWidth::Word)
-            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word));
-        let dword_data_upper = bus
-            .jit_data_cost_clocks(BusWidth::Dword)
-            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
-        let access_total = unit.access_total;
-        let data_upper = byte_data_upper
-            .saturating_mul(
-                u64::from(access_total.byte_reads) + u64::from(access_total.byte_stores),
-            )
-            .saturating_add(word_data_upper.saturating_mul(
-                u64::from(access_total.word_reads) + u64::from(access_total.word_stores),
-            ))
-            .saturating_add(dword_data_upper.saturating_mul(
-                u64::from(access_total.dword_reads) + u64::from(access_total.dword_stores),
-            ));
-        let iteration_upper = scaled_core_upper
-            .saturating_add(bus.jit_scale_bus_cost_upper(fetch_upper.saturating_add(data_upper)));
-        let bus_growth = bus
-            .in_batch_scaled_bus_clocks()
-            .saturating_sub(budget.bus_at_entry);
-        let used = budget.total.saturating_add(bus_growth);
-        let available = budget.cap.saturating_sub(used).saturating_sub(1);
-        let budget_quota = available.checked_div(iteration_upper).unwrap_or(u64::MAX);
-        if budget_quota == 0 {
-            self.jit_clif.reject_zero_budget += 1;
-            return Ok(ClifContinuation::Interpret);
-        }
-        // C1d: the linked-transfer quota, Direct's exact formula (run.rs's chain arm). The
-        // B2/G9 gate: an alignment-armed CPL3 entry is never chain-eligible and gets
-        // exactly one unit, so a dispatcher round-trip re-checks G9 before any successor
-        // runs. The per-hop bound switches on the ENTRY unit's x87-bearing-ness; the N2
-        // x87-parity link clause makes mixed chains unreachable, so the switch is exact by
-        // construction.
-        let chain_eligible =
-            has_link && !(self.alignment_armed && self.current_privilege_level() == 3);
-        let quota: u64 = if !chain_eligible {
-            1
-        } else {
-            let unscaled_max_core = if unit.x87_mask != 0 {
-                jit::direct::MAX_X87_BLOCK_CORE_CLOCKS
-            } else {
-                4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6
-            };
-            let max_core = unscaled_max_core
-                .saturating_mul(u64::from(num))
-                .saturating_add(u64::from(den) - 1)
-                / u64::from(den);
-            let max_read = dword_data_upper.max(word_data_upper).max(byte_data_upper);
-            let max_store = max_read;
-            let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(
-                bus.jit_fetch_cost_clocks()
-                    .saturating_add(max_read)
-                    .saturating_add(max_store),
-            );
-            let global_block_upper =
-                max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
-            let additional = available
-                .saturating_sub(iteration_upper)
-                .checked_div(global_block_upper)
-                .unwrap_or(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1);
-            1 + additional.min(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1)
-        };
-
-        // Guards passed. Stash the N1 key-material snapshot and reset the per-entry
-        // call-out scratch, then enter the compiled unit through the widened adapter with
-        // this call's monomorphized shim table as a stack local (design section 1.3).
-        let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
-            return Ok(ClifContinuation::Interpret);
-        };
-        let Some(adapter) = backend.callout_adapter() else {
-            return Ok(ClifContinuation::Interpret);
-        };
-        self.jit_direct.clif_run.pending_hard_error = None;
-        self.jit_direct.clif_run.caught_panic = None;
-        self.jit_direct.clif_run.last_callout_eip = 0;
-        self.jit_direct.clif_run.callout_core_clocks = 0;
-        self.jit_direct.clif_run.mode13 = Default::default();
-        self.jit_direct.clif_run.chain.transfers = 0;
-        self.jit_direct.clif_run.snapshot_mode_key = self.jit_mode_key();
-        self.jit_direct.clif_run.snapshot_cpl = self.current_privilege_level();
-        self.jit_direct.clif_run.snapshot_cs = self.registers.cs();
-        self.jit_direct.clif_run.snapshot_cache_generation = self.jit_direct.clif_units.generation;
-        self.begin_instruction();
-        self.core_clocks_so_far = budget.total;
-        let table = jit::clif::callout::ClifCallOutTable {
-            x87: jit::clif::callout::clif_x87_callout_shim::<B>,
-        };
-        let entry_ptr = unit.entry as *const u8;
-        // Track C A2 (design section 6): mark one clif native frame live for the dynamic
-        // extent of the adapter call below. The guard decrements on every exit from this
-        // scope, including the `resume_unwind` a few lines down, so `apply_deferred_clif_
-        // arena_reset` never observes a live frame as gone prematurely.
-        // SAFETY: the pointer is a live field of `self`, valid for reads/writes for the
-        // guard's lifetime; guest execution is single-threaded and design section 5 proves
-        // at most one clif native frame is ever live.
-        let _native_frame = unsafe {
-            jit::NativeFrameGuard::enter(std::ptr::from_mut(
-                &mut self.jit_direct.native_frame_depth,
-            ))
-        };
-        // SAFETY: the entry and adapter were installed by this backend's zero-relocation
-        // compile-and-install path at exactly the five-parameter/four-live-parameter
-        // signatures and stay live for the backend's lifetime; the table and the immediate
-        // slice outlive the call (the table is this frame's local, the immediates this
-        // frame's descriptor copy), and the bus pointer is dereferenced only by the
-        // identically-monomorphized shim during this call (design section 1.4).
-        let t_native = Self::clif_phase_now();
-        let disposition = unsafe {
-            adapter(
-                self as *mut CpuGsw,
-                std::ptr::from_mut(bus).cast(),
-                &table,
-                unit.operands.as_ptr(),
-                quota,
-                entry_ptr,
-            )
-        };
-        let t_post = Self::clif_phase_now();
-
-        // m1: a panic caught by the shim's belt resumes here, now that the disposition has
-        // crossed back through the compiled frames (which carry no unwind info).
-        if let Some(panic) = self.jit_direct.clif_run.caught_panic.take() {
-            std::panic::resume_unwind(panic);
-        }
-
-        // C1d: resolve the chain the thunks recorded (design section 4.3). Every trace
-        // entry is a landing record the transfer loaded from a portal: a live descriptor
-        // address, or the sentinel descriptor for an unresolved/hidden edge (necessarily
-        // the LAST entry, since the trampoline performs no further hops). Units that
-        // PERFORMED a transfer ran their full leading run; only the chain's final real
-        // unit can stop mid-run, and its stop decodes from the disposition exactly as a
-        // single unit's always has.
-        let transfers = self.jit_direct.clif_run.chain.transfers as usize;
-        // A2 section 13 (design
-        // `dev_docs/plans/2026-07-19-clif-chain-resolver-generation-guard-design.md`):
-        // graceful abandon when a mid-chain hop's x87 call-out fired a WHOLESALE
-        // `clif_units_clear` (a page-straddling / aliased SMC store into watched code that
-        // missed the narrow-invalidate path, `core.rs:389`). That drops every descriptor
-        // the completed transfers already recorded in `chain.trace`, so the descriptor-
-        // address lookups below would `.expect()`-panic on a now-empty `units` Vec. The
-        // `generation` bump is the exact signal the call-out latch (`callout.rs:191-201`)
-        // already acts on to stop native execution mid-hop, leaving the guest state and
-        // resume EIP materialized by the shim's exit -- the same snapshot captured before
-        // the adapter call (`snapshot_cache_generation`). Only the descriptor-address
-        // lookups can fault, so this is gated on `transfers > 0`: a `transfers == 0` entry
-        // resolves through the OWNED `unit` clone (`run.rs`'s `.cloned()` at the call site),
-        // which survives a clear, and must keep its exact behavior. On abandon, relay any
-        // pending hard error, else charge only the call-out core clocks tallied live (the
-        // native prefix charge is unrecoverable once the descriptors are gone; the
-        // interpreter already applied its own bus charges and the resolver's bulk bus
-        // charging is skipped, so nothing is double-counted) and resume on the interpreter,
-        // which runs the cleared code regions correctly. State exact, timing approximate on
-        // this astronomically rare path.
-        if transfers > 0
-            && self.jit_direct.clif_units.generation
-                != self.jit_direct.clif_run.snapshot_cache_generation
-        {
-            self.jit_clif.chain_abandoned_cleared += 1;
-            if let Some(error) = self.jit_direct.clif_run.pending_hard_error.take() {
-                return Err(error);
-            }
-            return Ok(ClifContinuation::Run(CycleOutcome {
-                core_clocks: self.jit_direct.clif_run.callout_core_clocks,
-                halted: false,
-            }));
-        }
-        debug_assert!(
-            (transfers as u64) < quota,
-            "the run.rs:1897 invariant shape"
-        );
-        let sentinel_addr = self.jit_direct.clif_units.sentinel_descriptor_addr();
-        let mut hop_indices: Vec<u32> = Vec::with_capacity(transfers);
-        let mut unresolved_hop = false;
-        for i in 0..transfers {
-            let body = self.jit_direct.clif_run.chain.trace[i];
-            if body == sentinel_addr {
-                debug_assert_eq!(i + 1, transfers, "the sentinel hop ends the chain");
-                unresolved_hop = true;
-                break;
-            }
-            let index = self
-                .jit_direct
-                .clif_units
-                .unit_index_by_descriptor_addr(body)
-                .expect("a chain trace entry names a live descriptor");
-            hop_indices.push(index);
-        }
-        let completed_transfers = hop_indices.len() as u64;
-        let final_unit_owned;
-        let final_unit: &jit::clif::cache::ClifUnitDescriptor =
-            if let Some(&last) = hop_indices.last() {
-                final_unit_owned = self
-                    .jit_direct
-                    .clif_units
-                    .unit(last)
-                    .cloned()
-                    .expect("the chain's final unit is live");
-                &final_unit_owned
-            } else {
-                unit
-            };
-        // The fully-run set: the entry unit whenever ANY hop happened (a unit only reaches
-        // its transfer thunk after its whole leading run retired, section 6.3's invariant),
-        // plus every hop target that itself hopped onward; a sentinel landing means the
-        // last REAL unit also ran fully. `full_prefix` excludes the final unit, whose
-        // charge the disposition decides below.
-        let mut full_prefix: Vec<u32> = Vec::new();
-        if !hop_indices.is_empty() || unresolved_hop {
-            full_prefix.push(unit_index);
-        }
-        if !hop_indices.is_empty() {
-            let keep = hop_indices.len() - usize::from(!unresolved_hop);
-            full_prefix.extend_from_slice(&hop_indices[..keep]);
-        }
-        let final_ran_fully = unresolved_hop
-            || disposition == jit::clif::callout::CLIF_CALLOUT_CONTINUE
-            || disposition == jit::clif::callout::CLIF_CHAIN_QUOTA_EXHAUSTED
-            || disposition == jit::clif::callout::CLIF_CHAIN_UNRESOLVED;
-        // Sum the fully-run prefix units' static profiles (each unit's own full totals,
-        // the additive generalization of the single-unit charge).
-        let mut prefix_raw = 0u64;
-        let mut prefix_lowered = 0u64;
-        let mut acc = [0u64; 6];
-        let mut replay: Vec<(u32, [u8; jit::direct::MAX_BLOCK_INSTRUCTIONS], u32, usize)> =
-            Vec::with_capacity(full_prefix.len() + 1);
-        for &index in &full_prefix {
-            let hop = self
-                .jit_direct
-                .clif_units
-                .unit(index)
-                .expect("a fully-run chain unit is live");
-            prefix_raw += u64::from(hop.raw_clocks_total);
-            prefix_lowered += u64::from(hop.lowered_total);
-            acc[0] += u64::from(hop.access_total.byte_reads);
-            acc[1] += u64::from(hop.access_total.word_reads);
-            acc[2] += u64::from(hop.access_total.dword_reads);
-            acc[3] += u64::from(hop.access_total.byte_stores);
-            acc[4] += u64::from(hop.access_total.word_stores);
-            acc[5] += u64::from(hop.access_total.dword_stores);
-            replay.push((
-                hop.key.linear,
-                hop.fetch_lens,
-                hop.x87_mask,
-                hop.leading as usize,
-            ));
-        }
-        // Map the final unit's exit back to its slot for prefix charging: a full run (a
-        // normal side exit, an exhausted or unresolved transfer edge) charges the whole
-        // leading run; a memory-check side exit carries its failing slot in the
-        // disposition; a call-out Exit/HardStop stopped at the recorded site.
-        let entry_eip = final_unit
-            .key
-            .linear
-            .wrapping_sub(self.jit_direct.clif_run.snapshot_cs.base);
-        let unit = final_unit;
-        let (stop_slot, final_raw, final_lowered) = if unresolved_hop {
-            // The sentinel hop's SOURCE (the chain's final real unit) is already in
-            // the fully-run prefix; the trampoline itself is not a unit and charges
-            // nothing (the spent quota decrement reconciles as an unresolved exit,
-            // not a completed transfer).
-            (0, 0, 0)
-        } else if final_ran_fully {
-            (
-                unit.leading as usize,
-                u64::from(unit.raw_clocks_total),
-                u64::from(unit.lowered_total),
-            )
-        } else if disposition & 0xff == jit::clif::lower::CLIF_MEM_EXIT {
-            let stop = jit::clif::lower::clif_mem_exit_slot(disposition);
-            debug_assert!(
-                stop < unit.leading as usize,
-                "memory exit past the leading run"
-            );
-            // Diagnostic reason counters only: the guest cannot observe which check
-            // fired (all exit at the un-advanced EIP with zero state change).
-            match jit::clif::lower::clif_mem_exit_reason(disposition) {
-                r if r == jit::direct::SideExitReason::CrossPageOrAlignment as u32 => {
-                    self.jit_clif.mem_exit_alignment += 1;
-                }
-                r if r == jit::direct::SideExitReason::UnavailableOrKind as u32 => {
-                    self.jit_clif.mem_exit_unavailable_or_kind += 1;
-                }
-                r if r == jit::direct::SideExitReason::Permission as u32 => {
-                    self.jit_clif.mem_exit_permission += 1;
-                }
-                r if r == jit::direct::SideExitReason::CodeWatch as u32 => {
-                    self.jit_clif.mem_exit_code_watch += 1;
-                }
-                _ => {
-                    self.jit_clif.mem_exit_segment_limit += 1;
-                }
-            }
-            (
-                stop,
-                u64::from(unit.cum_raw_before[stop]),
-                u64::from(unit.cum_lowered_before[stop]),
-            )
-        } else {
-            let mut slot_eip = entry_eip;
-            let mut stop = unit.leading as usize;
-            for slot in 0..unit.leading as usize {
-                if unit.x87_mask & (1 << slot) != 0
-                    && slot_eip == self.jit_direct.clif_run.last_callout_eip
-                {
-                    stop = slot;
-                    break;
-                }
-                slot_eip = slot_eip.wrapping_add(u32::from(unit.fetch_lens[slot]));
-            }
-            debug_assert!(
-                stop < unit.leading as usize,
-                "exit disposition without a site"
-            );
-            (
-                stop,
-                u64::from(unit.cum_raw_before[stop]),
-                u64::from(unit.cum_lowered_before[stop]),
-            )
-        };
-        replay.push((unit.key.linear, unit.fetch_lens, unit.x87_mask, stop_slot));
-        let raw_clocks = prefix_raw + final_raw;
-        let lowered_retired = prefix_lowered + final_lowered;
-        // Direct's Run-vs-Prefix continuation split: a chain that ended at a RETIRED
-        // terminal (a completed transfer edge, an exhausted or unresolved hop, or a
-        // lowered terminal's own side-exit arm) resumes at a FRESH instruction, so the
-        // dispatcher may probe admission there immediately; a stop-slot or failing-slot
-        // exit must let the interpreter retire that instruction first.
-        let run_shaped = final_ran_fully && unit.terminal
-            || disposition == jit::clif::callout::CLIF_CHAIN_QUOTA_EXHAUSTED
-            || disposition == jit::clif::callout::CLIF_CHAIN_UNRESOLVED
-            || unresolved_hop;
-
-        // Fetch charging for the retired lowered slots across the whole chain, mirroring
-        // run_direct_block's two shapes (bulk flat cost under uniform fetches, the
-        // per-unit cached-fetch replay otherwise); x87 slots are skipped, their call-out
-        // performed its own fetch.
-        if bus.native_fetches_are_uniform() {
-            bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(lowered_retired));
-        } else {
-            // charge_cached_fetch advances EIP as part of the interpreter's own warm-hit
-            // replay; the exit already materialized the exact resume EIP, so restore it
-            // afterwards, exactly as run_direct_block's trace replay restores final_eip.
-            let final_eip = self.registers.eip;
-            for (linear, fetch_lens, x87_mask, slots) in &replay {
-                let mut fetch_lin = *linear;
-                for (slot, &len) in fetch_lens.iter().take(*slots).enumerate() {
-                    if x87_mask & (1 << slot) == 0 {
-                        self.charge_cached_fetch(bus, fetch_lin, len)
-                            .expect("validated clif-unit fetch charge cannot fault");
-                    }
-                    fetch_lin = fetch_lin.wrapping_add(u32::from(len));
-                }
-            }
-            self.registers.eip = final_eip;
-        }
-        // C1c: the retired prefix's data-access charges in Direct's exact split
-        // (run.rs's data_clocks region): RAM lanes are the STATIC prefix counts MINUS the
-        // DYNAMIC mode13 lanes the unit accrued (every retired access is exactly one of
-        // the two kinds; the failing slot contributed to neither, per the strict-prefix
-        // cum arrays and the post-commit completion discipline), charged at the RAM data
-        // cost; mode13 READS charge at the mode13 data cost; mode13 WRITES and the
-        // dirty-page bitset relay through charge_native_mode13_writes, never through
-        // data_clocks, exactly as run_direct_block splits them.
-        let final_access = if unresolved_hop {
-            jit::clif::cache::ClifAccessCounts::default()
-        } else if stop_slot == unit.leading as usize {
-            unit.access_total
-        } else {
-            unit.cum_access_before[stop_slot]
-        };
-        acc[0] += u64::from(final_access.byte_reads);
-        acc[1] += u64::from(final_access.word_reads);
-        acc[2] += u64::from(final_access.dword_reads);
-        acc[3] += u64::from(final_access.byte_stores);
-        acc[4] += u64::from(final_access.word_stores);
-        acc[5] += u64::from(final_access.dword_stores);
-        let [
-            byte_reads,
-            word_reads,
-            dword_reads,
-            byte_stores,
-            word_stores,
-            dword_stores,
-        ] = acc;
-        let m13 = &self.jit_direct.clif_run.mode13;
-        debug_assert!(m13.byte_reads <= byte_reads);
-        debug_assert!(m13.word_reads <= word_reads);
-        debug_assert!(m13.dword_reads <= dword_reads);
-        debug_assert!(m13.byte_writes <= byte_stores);
-        debug_assert!(m13.word_writes <= word_stores);
-        debug_assert!(m13.dword_writes <= dword_stores);
-        debug_assert!(m13.dirty_pages <= u64::from(u16::MAX));
-        let mode13_writes = izarravm_bus::NativeMode13Writes {
-            dirty_pages: m13.dirty_pages as u16,
-            byte_writes: m13.byte_writes,
-            word_writes: m13.word_writes,
-            dword_writes: m13.dword_writes,
-        };
-        let any_access =
-            byte_reads + word_reads + dword_reads + byte_stores + word_stores + dword_stores != 0;
-        if any_access {
-            let ram_bytes = (byte_reads - m13.byte_reads) + (byte_stores - m13.byte_writes);
-            let ram_words = (word_reads - m13.word_reads) + (word_stores - m13.word_writes);
-            let ram_dwords = (dword_reads - m13.dword_reads) + (dword_stores - m13.dword_writes);
-            let mode13_read_clocks = bus
-                .jit_mode13_data_cost_clocks(BusWidth::Byte)
-                .saturating_mul(m13.byte_reads)
-                .saturating_add(
-                    bus.jit_mode13_data_cost_clocks(BusWidth::Word)
-                        .saturating_mul(m13.word_reads),
-                )
-                .saturating_add(
-                    bus.jit_mode13_data_cost_clocks(BusWidth::Dword)
-                        .saturating_mul(m13.dword_reads),
-                );
-            let data_clocks = bus
-                .jit_data_cost_clocks(BusWidth::Byte)
-                .saturating_mul(ram_bytes)
-                .saturating_add(
-                    bus.jit_data_cost_clocks(BusWidth::Word)
-                        .saturating_mul(ram_words),
-                )
-                .saturating_add(
-                    bus.jit_data_cost_clocks(BusWidth::Dword)
-                        .saturating_mul(ram_dwords),
-                )
-                .saturating_add(mode13_read_clocks);
-            bus.charge_bus_clocks_bulk(data_clocks);
-            if byte_stores + word_stores + dword_stores != 0
-                && let Some(page) = self.prefetch.physical_page()
-            {
-                // Native stores are charged in one batch without per-write addresses; mark
-                // the current prefetch page conservatively, exactly as run_direct_block
-                // does after a store-carrying block.
-                self.record_write_page(page << 12);
-            }
-        }
-        bus.charge_native_mode13_writes(mode13_writes);
-        let charged = self.scale_clocks_batch(raw_clocks);
-        self.elapsed_clocks += charged;
-        self.perf.instructions += lowered_retired;
-        self.jit_clif.clif_retired += lowered_retired;
-        if self.is_ring0_protected() {
-            self.perf.monitor_resident_core_clocks += charged;
-        }
-        self.jit_clif.entries += 1;
-        self.jit_clif.side_exits += 1;
-        self.jit_clif.linked_transfers += completed_transfers;
-        if unresolved_hop {
-            self.jit_clif.unresolved_transfers += 1;
-        }
-        // Track C3(b) phase timing: `guard_ns` = guards+quota+snapshot, `native_ns` = the
-        // adapter call, `post_ns` = chain resolution + the whole native-aggregate charge path.
-        // Together with `resolve_ns` this is the full per-entry cost split (all no-ops off-flag).
-        Self::clif_phase_delta(&mut self.jit_clif.guard_ns, t_guard, t_native);
-        Self::clif_phase_delta(&mut self.jit_clif.native_ns, t_native, t_post);
-        Self::clif_phase_add(&mut self.jit_clif.post_ns, t_post);
-        let outcome = CycleOutcome {
-            core_clocks: (charged
-                .saturating_add(u64::from(self.jit_direct.clif_run.callout_core_clocks)))
-            .min(u64::from(u32::MAX)) as u32,
-            halted: false,
-        };
-        if disposition == jit::clif::callout::CLIF_CALLOUT_HARD_STOP {
-            // B2's relay: reproduce the identical Err the interpreter-only policy would
-            // have returned from the same guest program (the failing instruction's own
-            // partial state is already in CpuGsw, left by the interpreter inside the
-            // call-out). A hard stop with no stashed error is the shim's panic belt; the
-            // unit still stops, the panic counter records the bug.
-            if let Some(error) = self.jit_direct.clif_run.pending_hard_error.take() {
-                return Err(error);
-            }
-        }
-        Ok(if run_shaped {
-            ClifContinuation::Run(outcome)
-        } else {
-            ClifContinuation::Prefix(outcome)
-        })
     }
 
     #[cfg(all(
@@ -2592,13 +1494,6 @@ impl CpuGsw {
 
         let final_eip = self.registers.eip;
         let cs_base = self.registers.cs().base;
-        if self.jit_direct.barrier_census_active() {
-            self.jit_direct.note_barrier_census_direct_run(
-                span.key.linear,
-                cs_base.wrapping_add(final_eip),
-                exit.linked_transfers,
-            );
-        }
         if exit.dynamic_link_cell != 0 {
             debug_assert_eq!(exit.dynamic_target_eip, final_eip);
             self.jit_direct.bind_dynamic_successor(
@@ -2873,291 +1768,6 @@ impl CpuGsw {
         Ok(!matches!(outcome, DirectBlockOutcome::NotRun))
     }
 
-    /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on the
-    /// forced admission address, or once a line is hot enough) compile/re-stamp one first. `Ok(None)`
-    /// means "no region ran"; the caller falls back to the interpreted continuation.
-    #[cfg(feature = "jit")]
-    fn try_region_continuation<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        lin: u32,
-        d: bool,
-        stamped_region: Option<std::num::NonZeroU32>,
-        budget: ContinuationBudget,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
-        let idx = match stamped_region {
-            Some(idx) => idx,
-            None => {
-                // Admit when either the forced-address override names this line (the spike/test
-                // path) or hotness admission is enabled and this line's miss counter just crossed
-                // the threshold. Both are cheap: a compare and a counter bump. When neither fires,
-                // this branch is the whole per-continuation dispatch cost on the miss path.
-                let hot = self.jit_regions.auto_admit() && self.decode_cache.note_hot_miss(lin, d);
-                let forced = jit_forced_region_lin() == Some(lin);
-                if !forced && !hot {
-                    return Ok(None);
-                }
-                // Hot linear blocks are admitted only when the builder finds a useful all-native
-                // interior. Self-loops retain their existing gate, while forced admission remains
-                // available for differential tests of any block shape.
-                let Some(idx) = jit::block::try_admit_gated(self, lin, d, !forced) else {
-                    return Ok(None);
-                };
-                self.decode_cache.stamp_region(lin, d, idx);
-                idx
-            }
-        };
-        self.run_region(
-            bus,
-            idx,
-            lin,
-            d,
-            budget.total,
-            budget.bus_at_entry,
-            budget.cap,
-        )
-    }
-
-    /// Execute a compiled region as one continuation of `run_straight_line`. On return the
-    /// loop's own post-checks (halted, step break, interrupt transition, cap) re-fire at the
-    /// exact boundary the region stopped at, so break attribution and batch semantics stay
-    /// interpreter-identical. `Ok(None)` = an entry precondition failed, interpret instead.
-    ///
-    /// Deferred-at-exit accounting (one `scale_clocks` batch, `elapsed_clocks`,
-    /// `perf.instructions`, ring-0 residency) is sound because no admitted block reads any of
-    /// it mid-region (see the builder's invariants in `jit::block`) and the batch equals
-    /// the per-instruction sums by the remainder-carry identity.
-    #[cfg(feature = "jit")]
-    #[allow(clippy::too_many_arguments)]
-    fn run_region<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        idx: std::num::NonZeroU32,
-        lin: u32,
-        d: bool,
-        total: u64,
-        bus_at_entry: u64,
-        cap: u64,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
-        // Preconditions the region cannot honor per instruction: profiling and diff-trace
-        // sample every instruction, and a live STI shadow could make an interrupt newly
-        // serviceable after the FIRST slot, a mid-region boundary the run loop cannot see.
-        if self.profile.enabled || diff_trace_enabled() || self.interrupt_shadow {
-            return Ok(None);
-        }
-        let eip = self.registers.eip;
-        let cs_limit = self.registers.cs().limit;
-        let epoch = self.decode_cache.jit_smc_epoch;
-        let ring0 = self.is_ring0_protected();
-        let mode_key = self.jit_mode_key();
-        let (num, den) = level_timing(self.persona());
-        let rem0 = self.timing_rem;
-        // Native byte-memory helpers assume flat DS. Descriptor access rights are runtime values
-        // not present in the mode key, so set their per-entry guards before borrowing the table.
-        let ds_flat = self.jit_segment_flat(SegmentIndex::Ds);
-        let ds_readable = self.jit_segment_readable(SegmentIndex::Ds);
-        let ds_writable = self.jit_segment_writable(SegmentIndex::Ds);
-        let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
-        let (entry, ctx_ptr) = {
-            let Some(region) = self.jit_regions.get_mut(idx) else {
-                return Ok(None);
-            };
-            if region.entry_lin != lin || region.d != d {
-                return Ok(None);
-            }
-            if region.mode_key != mode_key {
-                // The same phys/d line is being entered in a different CPU mode/size than the block
-                // was compiled for (real vs pmode vs V86, or a size/level change). The block key
-                // includes the mode bitmask (spec §2.2), so this is a miss: drop the stamp and let
-                // the forced-admission path re-build the block for the current mode.
-                self.decode_cache.unstamp_region(lin, d);
-                return Ok(None);
-            }
-            if region.valid_epoch != epoch {
-                // A narrow SMC kill landed inside this region's span since the slots were last
-                // built: the stamp may outlive the killed slot lines, so drop it and let the
-                // forced-admission path re-run the builder over the fresh decodes.
-                self.decode_cache.unstamp_region(lin, d);
-                return Ok(None);
-            }
-            let ctx = &mut *region.ctx;
-            // Every slot must pass the same live CS-limit check its interpreted continuation
-            // would have (limits cannot change inside: no CS writer is admitted).
-            for slot in &ctx.slots {
-                let slot_eip = eip.wrapping_add(slot.lin.wrapping_sub(lin));
-                if !Self::fetch_within_limit(slot_eip, slot.insn.len, cs_limit) {
-                    return Ok(None);
-                }
-            }
-            let can_native_load = region.has_native_load && ds_flat && ds_readable;
-            let can_native_store = region.has_native_store && ds_flat && ds_writable;
-            let native_u8_clock_bound = if cap == u64::MAX
-                || (!can_native_load && !can_native_store)
-            {
-                Some(0)
-            } else {
-                (|| {
-                    let mut fetch_max = 0;
-                    for slot in &ctx.slots {
-                        if matches!(
-                            slot.kind,
-                            jit::step::SlotKind::MemLoadU8 | jit::step::SlotKind::MemStoreU8
-                        ) {
-                            fetch_max = fetch_max.max(bus.jit_cached_fetch_run_clocks(
-                                slot.physical,
-                                u32::from(slot.insn.len),
-                            )?);
-                        }
-                    }
-                    let mut data_max = 0;
-                    if can_native_load {
-                        data_max = data_max.max(bus.jit_direct_memory_max_clocks(
-                            BusWidth::Byte,
-                            BusAccessKind::DataRead,
-                        )?);
-                    }
-                    if can_native_store {
-                        data_max = data_max.max(bus.jit_direct_memory_max_clocks(
-                            BusWidth::Byte,
-                            BusAccessKind::DataWrite,
-                        )?);
-                    }
-                    let additional_bus = fetch_max.checked_add(data_max)?;
-                    let bus_now = bus.in_batch_scaled_bus_clocks();
-                    let bus_after = bus.jit_projected_batch_scaled_bus_clocks(additional_bus)?;
-                    let bus_bound = bus_after.checked_sub(bus_now)?.saturating_add(1);
-                    let num = u64::from(num);
-                    let den = u64::from(den);
-                    let core_bound = (2 * num).div_ceil(den);
-                    core_bound.checked_add(bus_bound)
-                })()
-            };
-            let native_memory_timing = native_u8_clock_bound.is_some();
-            ctx.step_fn = Some(step_fn);
-            ctx.inline_step_fn =
-                Some(jit::step::region_inline_slot::<B> as jit::step::RegionStepFn);
-            // Raw fn pointers to the flag helpers. The cast through `as` is sound: each helper is
-            // `fn(&mut self, ...)` and we store it as `unsafe extern "C" fn(*mut CpuGsw, ...)`,
-            // calling it with the cpu pointer the emitted code already holds; the `&mut` rebind
-            // inside is the same disjoint-reborrow pattern region_step uses.
-            ctx.set_pending_add_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut CpuGsw, u32, u32), jit::step::SetPendingAddFn>(
-                    Self::jit_set_pending_add as fn(&mut CpuGsw, u32, u32),
-                )
-            });
-            ctx.set_shift_flags_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut CpuGsw, u32, u8), jit::step::SetShiftFlagsFn>(
-                    Self::jit_set_shift_flags_shr as fn(&mut CpuGsw, u32, u8),
-                )
-            });
-            ctx.native_u8_fn = Some(jit::step::region_native_u8::<B> as jit::step::NativeU8Fn);
-            ctx.native_group_guard_fn =
-                Some(jit::step::region_native_group_guard::<B> as jit::step::NativeGroupGuardFn);
-            ctx.native_group_finish_fn =
-                Some(jit::step::region_native_group_finish::<B> as jit::step::NativeGroupFinishFn);
-            ctx.entry_eip = eip;
-            ctx.raw_clocks = 0;
-            ctx.insn_count = 0;
-            ctx.native_insn_count = 0;
-            ctx.helper_exit_count = 0;
-            ctx.native_memory_helper_count = 0;
-            ctx.native_load_enabled = u32::from(native_memory_timing && can_native_load);
-            ctx.native_store_enabled = u32::from(native_memory_timing && can_native_store);
-            ctx.native_u8_clock_bound = native_u8_clock_bound.unwrap_or(0);
-            ctx.run_total_at_entry = total;
-            ctx.bus_at_run_start = bus_at_entry;
-            ctx.cap = cap;
-            ctx.rem0 = rem0;
-            ctx.scale_num = num;
-            ctx.scale_den = den;
-            ctx.smc_epoch_at_entry = epoch;
-            ctx.d = d;
-            ctx.exit = jit::step::RegionExitKind::Boundary;
-            ctx.fault = None;
-            ctx.halted = false;
-            (region.entry, std::ptr::from_mut(ctx))
-        };
-        let block_start = (self.perf.jit_region_entries & 0x3ff == 0).then(std::time::Instant::now);
-        // SAFETY: the emitted code only forwards these pointers to `region_step::<B>`, whose
-        // contract this call establishes: `self` and `bus` stay live `&mut` for the whole call
-        // (no other reference to either exists here), `ctx` is the running region's boxed
-        // mailbox (a separate allocation from `self`, so the step function's two reborrows are
-        // disjoint; nothing reachable from the execute dispatch touches `jit_regions`), and `B`
-        // is the concrete bus type behind the erased pointer.
-        unsafe {
-            (entry)(
-                std::ptr::from_mut(self),
-                (std::ptr::from_mut(bus)).cast(),
-                ctx_ptr,
-            );
-        }
-        let (raw, count, native_count, helper_exits, memory_helpers, halted, fault) = {
-            let region = self
-                .jit_regions
-                .get_mut(idx)
-                .expect("the region that just ran is still installed");
-            let ctx = &mut *region.ctx;
-            (
-                ctx.raw_clocks,
-                ctx.insn_count,
-                ctx.native_insn_count,
-                ctx.helper_exit_count,
-                ctx.native_memory_helper_count,
-                ctx.halted,
-                ctx.fault.take(),
-            )
-        };
-        if let Some(start) = block_start {
-            self.perf.jit_native_block_ns += duration_ns_u64(start.elapsed());
-            self.perf.jit_native_block_samples += 1;
-        }
-        let charged = self.scale_clocks_batch(raw);
-        self.elapsed_clocks += charged;
-        self.perf.instructions += u64::from(count);
-        self.perf.jit_region_entries += 1;
-        self.perf.jit_region_insns += u64::from(count);
-        self.perf.jit_native_insns += u64::from(native_count);
-        self.perf.jit_helper_exits += u64::from(helper_exits);
-        self.perf.jit_native_memory_helpers += u64::from(memory_helpers);
-        if ring0 {
-            self.perf.monitor_resident_core_clocks += charged;
-        }
-        let mut out = charged;
-        if let Some((start_eip, fault)) = fault {
-            match fault {
-                InternalFault::Cpu(error) => return Err(error),
-                // finish_instruction's Exception arm, minus the CS restore (no admitted shape
-                // can change CS mid-region): rewind to the faulting instruction, deliver, and
-                // charge the interpreter's 59-clock delivery cost.
-                InternalFault::Exception { vector, error_code } => {
-                    self.set_eip(start_eip);
-                    self.deliver_exception(bus, vector, error_code, false)
-                        .map_err(|fault| match fault {
-                            InternalFault::Cpu(error) => error,
-                            InternalFault::Exception {
-                                vector: nested_vector,
-                                ..
-                            } => CpuError::NestedFaultDuringDelivery {
-                                original_vector: vector,
-                                nested_vector,
-                            },
-                        })?;
-                    let charged_fault = self.scale_clocks(59);
-                    self.elapsed_clocks += charged_fault;
-                    self.perf.instructions += 1;
-                    if self.is_ring0_protected() {
-                        self.perf.monitor_resident_core_clocks += charged_fault;
-                    }
-                    out += charged_fault;
-                }
-            }
-        }
-        Ok(Some(CycleOutcome {
-            core_clocks: out.min(u64::from(u32::MAX)) as u32,
-            halted,
-        }))
-    }
-
     /// Execute one already-decoded cached instruction as a straight-line continuation. Consumes the
     /// one-instruction STI shadow (a running instruction uses up the one-cycle delay), charges the
     /// cached-hit fetch (without re-decoding, so no double charge), runs the decoded form, and uses a
@@ -3190,15 +1800,10 @@ impl CpuGsw {
                     self.perf.instructions += 1;
                     // Gated at the CALL SITE, not inside the hook: this is the common
                     // interpreted-retire tail (506.85M instructions in a Quake/586 run) and the
-                    // third argument is a `cs()` read plus an add that the census, off by
-                    // default, never consumes.
+                    // census, off by default, never consumes it otherwise.
                     #[cfg(feature = "jit")]
                     if self.jit_direct.barrier_census_active() {
-                        self.jit_direct.note_barrier_census_interpreted(
-                            insn,
-                            lin,
-                            self.registers.cs().base.wrapping_add(self.registers.eip),
-                        );
+                        self.jit_direct.note_barrier_census_interpreted(insn);
                     }
                     // This non-profiling fast tail is the COMMON continuation retire path; observe
                     // the instruction here (once) so the sim count tracks perf.instructions.
@@ -3234,11 +1839,7 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         if result.is_ok() {
             if self.jit_direct.barrier_census_active() {
-                self.jit_direct.note_barrier_census_interpreted(
-                    insn,
-                    lin,
-                    self.registers.cs().base.wrapping_add(self.registers.eip),
-                );
+                self.jit_direct.note_barrier_census_interpreted(insn);
             }
             self.unit_sim_observe(
                 insn,
@@ -4055,121 +2656,6 @@ impl CpuGsw {
             }
             _ => Ok(None),
         }
-    }
-
-    /// Specialized `mov r8, [mem]` (0x8A) execute for a JIT `MemLoadU8` slot: the exact body of
-    /// `execute_hot_cached_datamove`'s 0x8A arm, reached WITHOUT the group/opcode dispatch chain
-    /// (`execute_hot_cached_decoded`'s register-only probe + the group match + the datamove opcode
-    /// match). Bit-identical to the interpreter by construction — it calls the same
-    /// `resolve_memory_addr_mode` / `read_memory_u8` / `write_gpr8` and returns the same `clocks(2)` —
-    /// so it inherits every segment/paging/fault/SMC/BusTrace behavior for free, in every CPU mode.
-    /// Any shape the classifier did not intend (defensive) falls back to the full dispatch, so the
-    /// result is identical regardless.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_load_u8<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x8a
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value =
-                self.read_memory_u8(bus, memory.segment, memory.offset, BusAccessKind::DataRead)?;
-            self.write_gpr8(modrm.reg, value);
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
-    }
-
-    /// Specialized `mov [mem], r8` (0x88) execute for a JIT `MemStoreU8` slot: the exact body of
-    /// `execute_hot_cached_datamove`'s 0x88 arm, reached WITHOUT the group/opcode dispatch chain.
-    /// Bit-identical to the interpreter by construction — same `resolve_memory_addr_mode` /
-    /// `read_gpr8` / `write_memory_u8` / `clocks(2)`. In particular `write_memory_u8` runs
-    /// `note_code_write` on every store, so the SMC code-write watch (Round 3 trap #2) is inherited
-    /// for free, along with the segment/paging/fault/BusTrace behavior, in every CPU mode. Any shape
-    /// the classifier did not intend falls back to the full dispatch, so the result is identical.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_store_u8<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x88
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value = self.read_gpr8(modrm.reg);
-            self.write_memory_u8(
-                bus,
-                memory.segment,
-                memory.offset,
-                value,
-                BusAccessKind::DataWrite,
-            )?;
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
-    }
-
-    /// Specialized `mov r16/r32, [mem]` (0x8B) execute for a JIT `MemLoadSized` slot: the exact body
-    /// of `execute_hot_cached_datamove`'s 0x8B arm, reached WITHOUT the group/opcode dispatch chain.
-    /// Bit-identical to the interpreter — same `resolve_memory_addr_mode` / `read_memory_sized`
-    /// (which does the alignment/#AC, page-cross and segment/paging checks for the width) /
-    /// `write_gpr_sized` / `clocks(2)`. `insn.operand_size` is the captured decode size (unprefixed in
-    /// a region, so it is the segment default), so word and dword loads are both correct. Any
-    /// unexpected shape falls back to the full dispatch.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_load_sized<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x8b
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value = self.read_memory_sized(
-                bus,
-                memory.segment,
-                memory.offset,
-                insn.operand_size,
-                BusAccessKind::DataRead,
-            )?;
-            self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
-    }
-
-    /// Specialized `mov [mem], r16/r32` (0x89) execute for a JIT `MemStoreSized` slot: the exact body
-    /// of `execute_hot_cached_datamove`'s 0x89 arm, reached WITHOUT the group/opcode dispatch chain.
-    /// Bit-identical — same `resolve_memory_addr_mode` / `read_gpr_sized` / `write_memory_sized`
-    /// (which runs `note_code_write`, so the SMC watch and the alignment/page-cross/segment/paging
-    /// checks are inherited) / `clocks(2)`, in every mode. Any unexpected shape falls back.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_execute_store_sized<B: CpuBus>(
-        &mut self,
-        insn: &DecodedInsn,
-        bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x89
-            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
-        {
-            let memory = self.resolve_memory_addr_mode(&addr);
-            let value = self.read_gpr_sized(modrm.reg, insn.operand_size);
-            self.write_memory_sized(
-                bus,
-                memory.segment,
-                memory.offset,
-                insn.operand_size,
-                value,
-                BusAccessKind::DataWrite,
-            )?;
-            return Ok(clocks(2));
-        }
-        self.execute_hot_cached_or_decoded(insn, bus)
     }
 
     #[inline]

@@ -46,21 +46,13 @@ impl CpuGsw {
         #[cfg(not(test))]
         let admission_active = self.direct_runtime.admission_active;
 
-        // Track C C1c: the clif policy's lowered memory forms consume the SAME FastMap
-        // projection Direct does, and a FastMap miss exits to the interpreter for "the
-        // canonical access and publication" (the base design's wording). Publication IS
-        // this population, so it must be active under the clif policy too; without this
-        // the clif memory path would side-exit on every access forever.
-        (admission_active || self.jit_direct.clif_enabled)
-            && self.mode().uses_approximate_timing()
-            && !self.jit_regions.auto_admit()
+        admission_active && self.mode().uses_approximate_timing()
     }
 
     /// Recompute the cached `fast_map_serve_enabled` mirror of `fast_map_population_enabled()`.
     /// This must be called from EVERY site that can change that predicate's inputs: `set_mode`
     /// (persona), `finish_direct_execution_transition` (`direct_runtime.admission_active`, via
-    /// `jit_direct.execution_enabled()`), `set_clif_backend_enabled` (`jit_direct.clif_enabled`),
-    /// and `set_legacy_region_auto_admit` (`jit_regions.auto_admit()`, test-only). A missed call
+    /// `jit_direct.execution_enabled()`). A missed call
     /// site desyncs the cache from the real condition; `fast_map_data_slot`'s `debug_assert`
     /// checks this cheaply in debug/test builds.
     ///
@@ -186,7 +178,7 @@ impl CpuGsw {
     /// can never repopulate (386-slow/386 Accurate), where it wrongly kept paying this function's
     /// preamble (and, transiently, wrongly kept SERVING from surviving entries) on every access.
     /// `fast_map_serve_enabled` tracks the actual persona/admission condition instead, so it goes
-    /// false the instant a mode switch (or an admission/clif toggle) makes population impossible,
+    /// false the instant a mode switch (or an admission toggle) makes population impossible,
     /// closing both the transient and the steady-state cost. See the campaign log for the
     /// measured regression this replaced: a JIT-off control run showed the fixed preamble cost
     /// (mapping-epoch load, CPL derivation, CR0.WP read) at ~2.66 ns per interpreter data access,
@@ -354,18 +346,6 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<()> {
         self.record_write_page(physical);
-        // Adversarial review asked whether `watched && changed` here can skip
-        // `note_code_write_hit`'s unconditional `clif_invalidate_physical_range` for a store that
-        // changes a byte inside a compiled clif unit but hits neither a Direct compiled block nor
-        // a decode-cache mark. It cannot: `code_write_watched` -> `range_hits_compiled_code` ->
-        // `code_watch.range_watched(..)`, and clif unit installation registers each unit's guest
-        // physical range into that SAME shared `code_watch` table (`jit/mod.rs`, clif unit
-        // install), so a byte inside a live clif unit is already watched through this path, not
-        // only through Direct's registration. `cargo test -p izarravm-cpu --features clif-backend`
-        // passes with this gate in place, consistent with there being no gap here. This is the
-        // SAME gate `write_linear_fragment`'s slow sized path already uses (clif-backend is off by
-        // default and pre-dates this slice), so this comment documents an existing hazard's
-        // resolution, not a new one this slice introduced.
         let watched = self.code_write_watched(physical, width.bytes());
         if mode13 {
             bus.charge_direct_memory(physical, width, kind)?;
@@ -377,15 +357,10 @@ impl CpuGsw {
         // `note_code_write_hit` is a total no-op when `watched` is false and no unit sim is
         // attached: `code_write_watched` being false means both `range_hits_compiled_code` and
         // `decode_cache.range_hits_code` are false, so every branch inside is skipped and nothing
-        // is incremented. The `width == BusWidth::Byte` half of the original gate called it
-        // anyway on every unwatched byte write, only to feed the diagnostic unit sim -- but with
-        // `clif-backend` on, the call also runs `clif_invalidate_physical_range` UNCONDITIONALLY
-        // (core.rs), which scans every entry in `ClifUnitCache`. Watch registration is
-        // chunk-granular (coarser than byte-exact), so `!watched` guarantees no overlap and that
-        // scan was a guaranteed no-op -- a dormant perf regression on the default (non-clif) hot
-        // path once clif-backend is enabled. Narrowing the byte-width half to "only when a unit
-        // sim is actually attached" keeps the diagnostic feed working while dropping the call
-        // entirely on the default build's unwatched byte-write path.
+        // is incremented. The `width == BusWidth::Byte` half of the gate calls it anyway on every
+        // unwatched byte write, only to feed the diagnostic unit sim; narrowing that half to
+        // "only when a unit sim is actually attached" keeps the diagnostic feed working while
+        // dropping the call entirely on the default build's unwatched byte-write path.
         if changed && (watched || (width == BusWidth::Byte && self.unit_sim.0.is_some())) {
             self.note_code_write_hit(physical, width.bytes());
         }
@@ -531,16 +506,6 @@ impl CpuGsw {
     }
 
     #[inline]
-    pub(super) fn read_direct_byte_page_cached_without_fast_map<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        physical: u32,
-        kind: BusAccessKind,
-    ) -> ExecResult<Option<u8>> {
-        self.read_direct_byte_page_cached_inner(bus, None, physical, kind)
-    }
-
-    #[inline]
     fn read_direct_byte_page_cached_inner<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -670,18 +635,6 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<Option<bool>> {
         self.write_direct_byte_page_cached_inner(bus, Some(linear), physical, value, kind)
-    }
-
-    /// `Some(changed)` means the direct write completed; `None` asks the caller to use the bus path.
-    #[inline]
-    pub(super) fn write_direct_byte_page_cached_without_fast_map<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        physical: u32,
-        value: u8,
-        kind: BusAccessKind,
-    ) -> ExecResult<Option<bool>> {
-        self.write_direct_byte_page_cached_inner(bus, None, physical, value, kind)
     }
 
     #[inline]

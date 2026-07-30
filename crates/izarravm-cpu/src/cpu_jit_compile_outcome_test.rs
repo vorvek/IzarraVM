@@ -96,11 +96,32 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
 }
 
 #[test]
-fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
-    // 0x99 (CDQ), not 0xFC (CLD): CLD is natively lowered now, so a CLD here compiles straight
-    // through and the block never stops. 0x99 is still unlowered AND still classified into a
-    // helper family, which is what this test needs an interior barrier to be.
-    let code = [0x40, 0x41, 0x42, 0x43, 0x99, 0x44, 0x45, 0x46, 0x47];
+fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
+    // Not 0xFC (CLD, natively lowered already) and not 0x99/CDQ (the CHOICE THIS TEST USED TO
+    // MAKE, until the adversarial review on the PreciseHelper-scaffolding deletion caught that
+    // Task 4 -- the very next slice in this phase -- teaches `classify` to admit 0x98/0x99,
+    // which would silently turn this fixture's span from 4 instructions to 8, drop its census
+    // row, and panic the `.expect` below. That is the exact 0xFC failure class the sibling
+    // `DIRECT_BARRIER` constant's own doc comment (`cpu_test.rs`) narrates: "it will eventually
+    // be lowered too". `DIRECT_BARRIER` is durable FOR THIS TEST specifically because, unlike
+    // 0x99, it carries its own certifying test (`direct_barrier_opcode_is_still_unclassifiable`,
+    // below in this file) that fails LOUDLY the day it stops being a barrier, rather than degrading
+    // silently -- so reusing it here means a future re-classification is caught upstream, not
+    // discovered here first. This is the same shape the old
+    // `..._scores_an_interior_helper_shape` test used before the `PreciseHelper` scaffolding
+    // (`HelperFamily`/`eligible_shapes`/`selected`) it exercised was deleted: `runtime_hits`,
+    // ungated from helper families in `cd24b945`, is the one column that survives that deletion.
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        0x43,
+        DIRECT_BARRIER,
+        0x44,
+        0x45,
+        0x46,
+        0x47,
+    ];
     let addresses: Vec<_> = (0..code.len())
         .map(|offset| ENTRY + offset as u32)
         .collect();
@@ -116,17 +137,29 @@ fn barrier_census_is_opt_in_and_scores_an_interior_helper_shape() {
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(compilation.span.instructions, 4);
 
+    // Simulate the barrier opcode retiring once through the interpreter: this is the hook
+    // `run.rs` calls on every interpreted retirement, and `runtime_hits` is the census's only
+    // per-execution column.
+    let barrier_linear = ENTRY + 4;
+    cpu.registers.eip = barrier_linear;
+    cpu.begin_instruction();
+    let insn = cpu
+        .fetch_decoded(&mut bus, barrier_linear)
+        .expect("re-decode the barrier instruction");
+    cpu.jit_direct.note_barrier_census_interpreted(&insn);
+
     let snapshot = cpu
         .direct_barrier_census_snapshot()
         .expect("enabled census snapshot");
-    let selected = snapshot.selected.expect("eligible census selection");
-    assert_eq!(selected.opcode, 0x99);
-    assert_eq!(selected.helper_family, Some("sign_extend"));
-    assert_eq!(selected.hits, 1);
-    assert_eq!(selected.native_prefix_instructions, 4);
-    assert_eq!(selected.native_suffix_instructions, 4);
-    assert_eq!(selected.eligible_shapes, 1);
-    assert_eq!(selected.eligible_suffix_instructions, 4);
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+        .expect("recorded structural stop");
+    assert_eq!(row.hits, 1);
+    assert_eq!(row.native_prefix_instructions, 4);
+    assert_eq!(row.native_suffix_instructions, 4);
+    assert_eq!(row.runtime_hits, 1);
 }
 
 #[test]
@@ -155,9 +188,7 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
         .expect("enabled census snapshot");
     let row = snapshot.rows.first().expect("recorded structural stop");
     assert_eq!(row.opcode, u16::from(DIRECT_BARRIER));
-    assert_eq!(row.helper_family, None);
-    assert_eq!(row.eligible_shapes, 0);
-    assert!(snapshot.selected.is_none());
+    assert_eq!(row.runtime_hits, 0);
 }
 
 #[test]

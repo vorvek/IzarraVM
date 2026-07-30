@@ -15,9 +15,6 @@ struct BenchRun {
     /// Memory-poll subset, stored outside PerfCounters on the CPU (layout
     /// preservation; see PollSkipMemoryCounters) and captured here alongside.
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
-    /// Clif churn subset (C1e), captured alongside for the same layout-preservation
-    /// reason.
-    jit_clif: izarravm_cpu::JitClifCounters,
     /// Lever 1 (interpreter FastMap serve path) hit/miss subset, stored outside PerfCounters on
     /// the CPU for the same layout-preservation reason; see FastMapProbeCounters.
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
@@ -94,7 +91,6 @@ fn run_bench_one_profiled(
         wall,
         perf,
         poll_skip_memory: machine.cpu().poll_skip_memory(),
-        jit_clif: machine.cpu().jit_clif_counters(),
         fast_map_probe: machine.cpu().fast_map_probe_counters(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
@@ -515,8 +511,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
              data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-             jit[entries/insns/native/helper]={}/{}/{}/{}  \
-             jit_mem[load/store/tlb/helper]={}/{}/{}/{}  jit_time[ns/samples]={}/{}",
+             jit_mem[load/store/tlb]={}/{}/{}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -545,16 +540,9 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.rep_string_iterations,
             perf.flag_materializations,
             perf.cache_tier_lookups,
-            perf.jit_region_entries,
-            perf.jit_region_insns,
-            perf.jit_native_insns,
-            perf.jit_helper_exits,
             perf.jit_native_load_hits,
             perf.jit_native_store_hits,
             perf.jit_paged_tlb_successes,
-            perf.jit_native_memory_helpers,
-            perf.jit_native_block_ns,
-            perf.jit_native_block_samples,
         );
     }
     if out_of_band {
@@ -949,7 +937,6 @@ fn write_profile_json(
             "perf": perf_counters_json(
                 &profiled.perf,
                 profiled.poll_skip_memory,
-                profiled.jit_clif,
                 profiled.fast_map_probe,
             ),
         },
@@ -961,12 +948,13 @@ fn write_profile_json(
 pub(super) fn perf_counters_json(
     perf: &PerfCounters,
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
-    jit_clif: izarravm_cpu::JitClifCounters,
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
 ) -> serde_json::Value {
     json!({
         "instructions": perf.instructions,
         "decode_misses": perf.decode_misses,
+        "decode_probes": perf.decode_probes,
+        "jit_direct_dispatch_declines": perf.jit_direct_dispatch_declines,
         "straight_line_runs": perf.straight_line_runs,
         "brk_decode_or_branch": perf.brk_decode_or_branch,
         "brk_cont_decode_miss": perf.brk_cont_decode_miss,
@@ -1013,11 +1001,6 @@ pub(super) fn perf_counters_json(
         "device_write_bytes": perf.device_write_bytes,
         "device_write_code_hits": perf.device_write_code_hits,
         "device_write_coarse_resets": perf.device_write_coarse_resets,
-        "jit_region_entries": perf.jit_region_entries,
-        "jit_region_insns": perf.jit_region_insns,
-        "jit_native_insns": perf.jit_native_insns,
-        "jit_helper_exits": perf.jit_helper_exits,
-        "jit_native_memory_helpers": perf.jit_native_memory_helpers,
         "jit_direct_entries": perf.jit_direct_entries,
         "jit_direct_insns": perf.jit_direct_insns,
         "jit_direct_side_exits": perf.jit_direct_side_exits,
@@ -1068,64 +1051,11 @@ pub(super) fn perf_counters_json(
         "jit_direct_links_cleared": perf.jit_direct_links_cleared,
         "jit_direct_decode_dependencies_scanned": perf.jit_direct_decode_dependencies_scanned,
         "jit_direct_portals_hidden": perf.jit_direct_portals_hidden,
-        "jit_native_block_ns": perf.jit_native_block_ns,
-        "jit_native_block_samples": perf.jit_native_block_samples,
-        "jit_table_clears": perf.jit_table_clears,
         "jit_native_load_hits": perf.jit_native_load_hits,
         "jit_native_store_hits": perf.jit_native_store_hits,
         "jit_paged_tlb_successes": perf.jit_paged_tlb_successes,
         "monitor_trips_vec13": perf.monitor_trips_vec13,
         "monitor_resident_core_clocks": perf.monitor_resident_core_clocks,
-        "jit_clif_smc_unit_kills": jit_clif.smc_unit_kills,
-        "jit_clif_smc_unit_restamps": jit_clif.smc_unit_restamps,
-        "jit_clif_smc_unit_kills_no_layout": jit_clif.smc_unit_kills_no_layout,
-        "jit_clif_smc_unit_kills_multi_slot": jit_clif.smc_unit_kills_multi_slot,
-        // Track C1f: the rest of JitClifCounters, previously a blind spot (only the four
-        // SMC fields above were exposed to the committed profile JSON; see
-        // dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md).
-        "jit_clif_compile_attempts": jit_clif.compile_attempts,
-        "jit_clif_units_installed": jit_clif.units_installed,
-        "jit_clif_entries": jit_clif.entries,
-        "jit_clif_side_exits": jit_clif.side_exits,
-        "jit_clif_reject_observer": jit_clif.reject_observer,
-        "jit_clif_reject_interrupt_shadow": jit_clif.reject_interrupt_shadow,
-        "jit_clif_reject_aggregate_accounting": jit_clif.reject_aggregate_accounting,
-        "jit_clif_reject_mode_key": jit_clif.reject_mode_key,
-        "jit_clif_reject_cs_layout": jit_clif.reject_cs_layout,
-        "jit_clif_reject_cpl": jit_clif.reject_cpl,
-        "jit_clif_reject_data_segment": jit_clif.reject_data_segment,
-        "jit_clif_reject_alignment": jit_clif.reject_alignment,
-        "jit_clif_reject_fetch_limit": jit_clif.reject_fetch_limit,
-        "jit_clif_reject_zero_budget": jit_clif.reject_zero_budget,
-        "jit_clif_mem_exit_alignment": jit_clif.mem_exit_alignment,
-        "jit_clif_mem_exit_unavailable_or_kind": jit_clif.mem_exit_unavailable_or_kind,
-        "jit_clif_mem_exit_permission": jit_clif.mem_exit_permission,
-        "jit_clif_mem_exit_code_watch": jit_clif.mem_exit_code_watch,
-        "jit_clif_mem_exit_segment_limit": jit_clif.mem_exit_segment_limit,
-        "jit_clif_linked_transfers": jit_clif.linked_transfers,
-        "jit_clif_unresolved_transfers": jit_clif.unresolved_transfers,
-        "jit_clif_chain_abandoned_cleared": jit_clif.chain_abandoned_cleared,
-        "jit_clif_compile_ns": jit_clif.compile_ns,
-        "jit_clif_retry_incomplete_walk": jit_clif.retry_incomplete_walk,
-        "jit_clif_retry_no_fast_map": jit_clif.retry_no_fast_map,
-        // Track C-second-cause A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-
-        // design.md section 3.7): the sticky arena-exhausted short-circuit's own counter.
-        "jit_clif_park_arena_exhausted": jit_clif.park_arena_exhausted,
-        "jit_clif_park_no_lowerable": jit_clif.park_no_lowerable,
-        "jit_clif_park_heat_chunk": jit_clif.park_heat_chunk,
-        "jit_clif_park_heat_span": jit_clif.park_heat_span,
-        "jit_clif_park_no_code_cover": jit_clif.park_no_code_cover,
-        "jit_clif_park_segment_capture_failed": jit_clif.park_segment_capture_failed,
-        "jit_clif_park_backend_unavailable": jit_clif.park_backend_unavailable,
-        "jit_clif_park_compile_failed": jit_clif.park_compile_failed,
-        "jit_clif_park_install_failed": jit_clif.park_install_failed,
-        "jit_clif_entries_len": jit_clif.entries_len,
-        "jit_clif_resolve_ns": jit_clif.resolve_ns,
-        "jit_clif_guard_ns": jit_clif.guard_ns,
-        "jit_clif_native_ns": jit_clif.native_ns,
-        "jit_clif_post_ns": jit_clif.post_ns,
-        "jit_clif_resolve_clone_ns": jit_clif.resolve_clone_ns,
-        "jit_clif_retired": jit_clif.clif_retired,
     })
 }
 
@@ -1145,13 +1075,13 @@ pub(super) fn print_perf_counter_row(
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns/native/helper]={}/{}/{}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
+         direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
          unresolved[static-unbound/static-hidden/dynamic-miss/dynamic-hidden]={}/{}/{}/{}  \
          compile[attempt/installed/ns]={}/{}/{} lookup[hot/hash/miss]={}/{}/{} links[new/clear/reset]={}/{}/{}  \
          portal[scan/hide]={}/{}  \
          arena[compact/live/bytes/fail]={}/{}/{}/{}  \
          gate[obs/shadow/agg/mode/top/cs/cpl/data/align/fetch/short/budget]={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}  \
-         jit_mem[load/store/tlb/helper]={}/{}/{}/{}  jit_time[ns/samples]={}/{}",
+         jit_mem[load/store/tlb]={}/{}/{}",
         name,
         mode.canonical_name(),
         perf.instructions,
@@ -1189,10 +1119,6 @@ pub(super) fn print_perf_counter_row(
         perf.rep_string_iterations,
         perf.flag_materializations,
         perf.cache_tier_lookups,
-        perf.jit_region_entries,
-        perf.jit_region_insns,
-        perf.jit_native_insns,
-        perf.jit_helper_exits,
         perf.jit_direct_entries,
         perf.jit_direct_insns,
         perf.jit_direct_side_exits,
@@ -1233,9 +1159,6 @@ pub(super) fn print_perf_counter_row(
         perf.jit_native_load_hits,
         perf.jit_native_store_hits,
         perf.jit_paged_tlb_successes,
-        perf.jit_native_memory_helpers,
-        perf.jit_native_block_ns,
-        perf.jit_native_block_samples,
     );
     // Attribute combined decode-or-branch exits for profiling runs.
     println!(

@@ -424,11 +424,16 @@ impl Encoder {
     }
 
     /// `movsx dst32, src8` (0F BE /r with mod=11, MOVSX r32, r8: SIGN-extend a register).
-    /// Register sibling of `movsx_r32_byte_disp8`. Only ever called with RDX for both operands,
-    /// a legacy register below index 4, so DL is addressable with no REX and there is no
-    /// SPL-versus-AH aliasing hazard. Written out separately from the word form rather than
-    /// parameterised, for the reason the memory pair records: the second opcode byte is the whole
-    /// difference and a shared helper's test could not see it being picked wrongly.
+    /// Register sibling of `movsx_r32_byte_disp8`. Every current caller passes either RDX or a
+    /// `GUEST_HOMES` member. `GUEST_HOMES` is R8-R14 plus RBX: the seven extended homes force
+    /// `REX.B` through `optional_rex`'s `src.ext()`, and RBX (low3 = 3) encodes as BL with no
+    /// REX. No home -- and not RDX -- is RSP/RBP/RSI/RDI, so the AH/CH/DH/BH aliasing encoding
+    /// (legacy index 4..=7 with no REX) is unreachable for either family. Anyone adding a caller
+    /// with a legacy non-RDX register (RSP/RBP/RSI/RDI in particular) must re-derive this
+    /// guarantee rather than assume it.
+    /// Written out separately from the word form rather than parameterised, for the reason the
+    /// memory pair records: the second opcode byte is the whole difference and a shared helper's
+    /// test could not see it being picked wrongly.
     pub(crate) fn movsx_r32_r8(&mut self, dst: Reg, src: Reg) {
         self.optional_rex(false, dst.ext(), false, src.ext());
         self.bytes.extend_from_slice(&[0x0F, 0xBE]);
