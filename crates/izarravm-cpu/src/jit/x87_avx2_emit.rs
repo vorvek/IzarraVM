@@ -148,13 +148,15 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             e.vcvtsi2sd_i32_disp32(VALUE0, VALUE0, memory, 0);
             emit_push(e, top, VALUE0);
         }
-        NativeX87Insn::StoreI32 { .. } => {
-            let memory = context.memory.expect("FISTP needs a host pointer");
+        NativeX87Insn::StoreI32 { pop, .. } => {
+            let memory = context.memory.expect("FIST/FISTP needs a host pointer");
             emit_load_physical(e, top, VALUE0, context.side_exit);
             emit_fistp_chop_guard(e, context.cpu, context.side_exit);
             e.vcvttsd2si_r32(Reg::RDX, VALUE0);
             e.store_r32_disp32(memory, 0, Reg::RDX);
-            emit_pop(e, top);
+            if pop {
+                emit_pop(e, top);
+            }
         }
         // 0xDC and 0xDE mod=3 differ by exactly one emitted step. Sharing the body makes that
         // structural instead of a comment: the interpreter models both with one function.

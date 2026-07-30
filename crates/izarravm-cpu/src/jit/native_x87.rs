@@ -151,8 +151,12 @@ pub(crate) enum NativeX87Insn {
     LoadI32 {
         addr: AddrMode,
     },
+    /// FIST/FISTP m32 (0xDB /2 no pop, /3 pop). One interpreter arm serves both
+    /// (`execute_fpu_memory`'s `0xdb => 2 | 3`, fpu_exec.rs:223-229) and only the pop separates
+    /// them, exactly as `StoreF32` and `StoreF64` model their own /2-/3 pairs.
     StoreI32 {
         addr: AddrMode,
+        pop: bool,
     },
     PopBinary {
         op: NativeX87StiOp,
@@ -268,13 +272,14 @@ impl NativeX87Insn {
             }
             Self::StoreF32 { pop: true, .. }
             | Self::StoreRegister { pop: true, .. }
-            | Self::StoreI32 { .. }
+            | Self::StoreI32 { pop: true, .. }
             | Self::StoreF64 { pop: true, .. }
             | Self::UnorderedCompare { pop: true, .. }
             | Self::PopBinary { .. } => 1,
             Self::ComparePopPop => 2,
             Self::StoreF32 { pop: false, .. }
             | Self::StoreRegister { pop: false, .. }
+            | Self::StoreI32 { pop: false, .. }
             | Self::StoreF64 { pop: false, .. }
             | Self::UnorderedCompare { pop: false, .. }
             | Self::Exchange { .. }
@@ -338,7 +343,8 @@ impl NativeX87Insn {
                 (0xd9, 5) => Some(Self::LoadControlWord { addr }),
                 (0xd9, 7) => Some(Self::StoreControlWord { addr }),
                 (0xdb, 0) => Some(Self::LoadI32 { addr }),
-                (0xdb, 3) => Some(Self::StoreI32 { addr }),
+                (0xdb, 2) => Some(Self::StoreI32 { addr, pop: false }),
+                (0xdb, 3) => Some(Self::StoreI32 { addr, pop: true }),
                 (0xda, extension) => Some(Self::IntBinaryMemory {
                     op: NativeX87BinaryOp::from_extension(extension)?,
                     addr,
@@ -491,11 +497,11 @@ impl NativeX87Insn {
                 pops: false,
                 terminates_block: false,
             },
-            Self::StoreI32 { .. } => NativeX87Metadata {
+            Self::StoreI32 { pop, .. } => NativeX87Metadata {
                 raw_clocks: 14,
                 fp_class: FpOpClass::IntConvert32,
                 memory: write_dword,
-                pops: true,
+                pops: pop,
                 terminates_block: false,
             },
             // Both ST(i)-destination forms are `Ok(clocks(20))` on the same interpreter arm

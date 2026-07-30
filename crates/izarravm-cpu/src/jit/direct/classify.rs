@@ -15,7 +15,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             | NativeX87Insn::LoadF32 { addr }
             | NativeX87Insn::StoreF32 { addr, .. }
             | NativeX87Insn::LoadI32 { addr }
-            | NativeX87Insn::StoreI32 { addr }
+            | NativeX87Insn::StoreI32 { addr, .. }
             // Every variant whose `metadata().memory` is Some must appear here. The `_ => None`
             // below is silent: a missing arm leaves `addr: None`, `emit_x87_slot`'s
             // `addr.expect(..)` panics at block compilation, and behind that panic

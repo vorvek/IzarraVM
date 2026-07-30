@@ -1124,6 +1124,60 @@ fn fucom_and_fucomp_condition_bits_and_pop_match_the_interpreter() {
     }
 }
 
+/// FIST m32 (0xDB /2) followed by FISTP m32 (0xDB /3) against the SAME source value.
+///
+/// The second store is the pin on the first one's stack effect: FIST must leave ST(0) standing,
+/// so the FISTP behind it converts the same value and both slots land identical bytes. Had /2
+/// been given FISTP's `pop`, the FISTP would address a register the pop just tagged Empty,
+/// `emit_load_physical` would side exit, and both the exact-retirement gate and the
+/// side-exit assertion below would fail.
+fn fist_then_fistp_program(value: f32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1                integer, before
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]  ST(0)=value
+        0xdb, 0x15, 0x04, 0x02, 0x00, 0x00, // fist dword [0x204]  /2, no pop
+        0xdb, 0x1d, 0x08, 0x02, 0x00, 0x00, // fistp dword [0x208] /3, pops
+        0xba, 0x02, 0x00, 0x00, 0x00, // mov edx,2                integer, after
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+    memory
+}
+
+/// The control word is 0x0F7F, whose RC field is truncate, which is the only mode
+/// `emit_fistp_chop_guard` admits. Negative and positive sources both carry a fraction so a
+/// rounding mode that was not truncate would show in the stored integer.
+#[test]
+fn fist_m32_stores_without_popping_and_matches_the_interpreter() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (value, expected) in [(-2.75f32, -2i32), (2.75, 2), (7.0, 7)] {
+            let (cpu, bus) = assert_program_matches_exact_insns(
+                mode,
+                fist_then_fistp_program(value),
+                0x0f7f,
+                5, // mov, fld, fist, fistp, mov -- hlt never retires natively
+            );
+            for slot in [DATA + 4, DATA + 8] {
+                assert_eq!(
+                    i32::from_le_bytes(bus.memory[slot..slot + 4].try_into().unwrap()),
+                    expected,
+                    "mode={mode:?} value={value} slot={slot:#x}"
+                );
+            }
+            assert_eq!(cpu.fpu.top(), 0, "mode={mode:?} value={value}");
+            assert_eq!(cpu.fpu.tag, 0xffff, "mode={mode:?} value={value}");
+            assert_eq!(
+                cpu.perf_counters().jit_direct_side_exits,
+                0,
+                "mode={mode:?} value={value}"
+            );
+        }
+    }
+}
+
 fn constants_and_register_store_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;

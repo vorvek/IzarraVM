@@ -48,7 +48,9 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             // encoding is FCMOVcc and unrepresentable here, so it stays rejected.
             | (0xda, 0..=2, 0..=7, 0..=7)
             | (0xda, 3, 5, 1)
-            | (0xdb, 0..=2, 0 | 3, 0..=7)
+            // 0xDB memory /2 and /3: FIST/FISTP m32, one interpreter arm with a pop flag. `/5`
+            // and `/7` (FLD/FSTP m80) stay rejected here; `/1`, `/4` and `/6` are undefined.
+            | (0xdb, 0..=2, 0 | 2 | 3, 0..=7)
             // 0xDD memory forms: FLD/FST/FSTP m64 (`LoadF64`/`StoreF64`). `/1` (FISTTP,
             // unimplemented) and `/4`-`/7` (FLDENV/FRSTOR/FNSAVE/FSTSW m16) stay rejected, same
             // as the register-row absence pattern above documents for 0xDC.
@@ -98,8 +100,9 @@ fn classifier_selects_exact_traced_slice() {
     // sub-opcodes x 8 rm values = 72, landing at 821. 0xDC memory (f64 arithmetic) adds 3 modes
     // x 8 sub-opcodes x 8 rm values = 192, landing at 1013. 0xDF /5 memory (FILD m64) adds 3
     // modes x 1 sub-opcode x 8 rm values = 24, landing at 1037. 0xDD mod=3 /4 and /5
-    // (FUCOM/FUCOMP) add 2 sub-opcodes x 8 rm values = 16, landing at 1053.
-    assert_eq!(accepted, 1053);
+    // (FUCOM/FUCOMP) add 2 sub-opcodes x 8 rm values = 16, landing at 1053. 0xDB /2 memory
+    // (FIST m32) adds 3 modes x 1 sub-opcode x 8 rm values = 24, landing at 1077.
+    assert_eq!(accepted, 1077);
 }
 
 #[test]
@@ -162,6 +165,29 @@ fn classifier_preserves_operations_indices_and_addresses() {
             NativeX87Insn::classify(&insn(0xdd, 0, extension, 5)).is_none(),
             "0xdd /{extension} memory (FISTTP/FLDENV/FRSTOR/FNSAVE/FSTSW) must stay \
              unclassifiable"
+        );
+    }
+    // FIST/FISTP m32. Only the pop separates /2 from /3, and it drives `top_delta`, so the pair
+    // is pinned rather than one standing in for both. `/1`, `/4` and `/6` are undefined and
+    // `/5`/`/7` (FLD/FSTP m80) are separately out of scope; all five must stay unclassifiable.
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdb, 0, 2, 5)),
+        Some(NativeX87Insn::StoreI32 {
+            addr: addr(),
+            pop: false,
+        })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdb, 0, 3, 5)),
+        Some(NativeX87Insn::StoreI32 {
+            addr: addr(),
+            pop: true,
+        })
+    );
+    for extension in [1u8, 4, 5, 6, 7] {
+        assert!(
+            NativeX87Insn::classify(&insn(0xdb, 0, extension, 5)).is_none(),
+            "0xdb /{extension} memory must stay unclassifiable"
         );
     }
     // FILD m64 (0xDF /5). Slice 40 is FILD-only: `/7` (FISTP m64) MUST stay unclassifiable here,
@@ -726,6 +752,23 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
                 terminates_block: false,
             },
         ),
+        // FIST m32, the NON-popping half of the 0xDB /2-/3 pair. `pops` false against FISTP's
+        // true is the only field that moves, and `IntConvert32` (272 at I586) must not drift to
+        // the `IntConvert16` its 0xDF sibling uses -- `execute_fpu` derives the class from the
+        // opcode byte, and 0xdb is the one escape that maps to IntConvert32.
+        (
+            insn(0xdb, 0, 2, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert32,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 4,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
         // FUCOM/FUCOMP ST(i): `clocks(4)`, not the 20 the ordered register compare
         // (`BinaryRegister`, pinned two rows from the top of this list) charges. Both rows are
         // register-form compares and only the concrete number separates them, which is why the
@@ -965,7 +1008,6 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         NativeX87Insn::StoreStatusAx,
         NativeX87Insn::LoadF32 { addr: addr() },
         NativeX87Insn::LoadI32 { addr: addr() },
-        NativeX87Insn::StoreI32 { addr: addr() },
         NativeX87Insn::LoadControlWord { addr: addr() },
         NativeX87Insn::StoreControlWord { addr: addr() },
         NativeX87Insn::LoadRegister { index: 3 },
@@ -978,6 +1020,7 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         shapes.push(NativeX87Insn::StoreRegister { index: 3, pop });
         shapes.push(NativeX87Insn::StoreF64 { addr: addr(), pop });
         shapes.push(NativeX87Insn::UnorderedCompare { index: 3, pop });
+        shapes.push(NativeX87Insn::StoreI32 { addr: addr(), pop });
     }
     for extension in 0..=7 {
         let op = NativeX87BinaryOp::from_extension(extension).expect("binary op");
