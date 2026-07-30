@@ -176,20 +176,31 @@ pub(crate) enum LinkRefusal {
     SegmentLayout,
     /// `CompiledBlock::link_compatible` refused.
     BlockShape,
-    /// The RET-PIC-only strict `has_x87` equality.
-    DynamicX87Class,
+    /// The RET-PIC-only strict `has_x87` equality, INTEGER source into a FLOAT target. This is
+    /// the direction the shared x87 re-entry pad exists for: a static integer-to-float edge binds
+    /// through `integer_entry`, and this path refuses only because
+    /// `emit_completed_dynamic_path` loads `BlockPortal::body` unconditionally and would enter
+    /// the target with an unloaded register cache.
+    DynamicIntegerToFloat,
+    /// The same equality, FLOAT source into an INTEGER target. A different problem with a
+    /// different fix: the pad is irrelevant here, what is missing is the boundary spill that
+    /// `link_compatible`'s float-to-integer case relies on and that
+    /// `emit_completed_dynamic_path` never emits. Split from the direction above because only
+    /// one of the two is fixed by teaching the dynamic path the pad.
+    DynamicFloatToInteger,
     /// Integer source into a float target with no x87 re-entry pad built.
     MissingX87Pad,
 }
 
 impl LinkRefusal {
-    pub(crate) const COUNT: usize = 6;
+    pub(crate) const COUNT: usize = 7;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Inactive,
         Self::StaleEpoch,
         Self::SegmentLayout,
         Self::BlockShape,
-        Self::DynamicX87Class,
+        Self::DynamicIntegerToFloat,
+        Self::DynamicFloatToInteger,
         Self::MissingX87Pad,
     ];
 
@@ -199,7 +210,8 @@ impl LinkRefusal {
             Self::StaleEpoch => "stale_epoch",
             Self::SegmentLayout => "segment_layout",
             Self::BlockShape => "block_shape",
-            Self::DynamicX87Class => "dynamic_x87_class",
+            Self::DynamicIntegerToFloat => "dynamic_integer_to_float",
+            Self::DynamicFloatToInteger => "dynamic_float_to_integer",
             Self::MissingX87Pad => "missing_x87_pad",
         }
     }
@@ -2229,7 +2241,13 @@ impl BlockCache {
         // fields are equal for every target it can bind, so the bypass is unobservable.
         // Relaxing this line without teaching that path the pad is a silent wrong-entry bug.
         else if target_eip.is_some() && source_block.has_x87 != target_block.has_x87 {
-            Some(LinkRefusal::DynamicX87Class)
+            // Which side carries the x87 class decides which fix applies, and the two are not
+            // interchangeable, so they are counted apart rather than as one "class mismatch".
+            Some(if target_block.has_x87 {
+                LinkRefusal::DynamicIntegerToFloat
+            } else {
+                LinkRefusal::DynamicFloatToInteger
+            })
         }
         // An integer source reaching a float target goes through the shared pad. Without one there
         // is no correct address to publish: `body` would enter the target with an unloaded x87
