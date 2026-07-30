@@ -111,7 +111,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         byte_stores: 0,
         word_stores: 0,
         dword_stores: 0,
-        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0)
+        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0, 0)
             .expect("default segment layout"),
         memory_cpl3: false,
         has_wide_accesses: false,

@@ -65,6 +65,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // what makes 16-bit blocks link is a CONTIGUOUS admissible region rather than any single
     // opcode.
     //
+    // `0x8c` is the one non-byte member and it is here for the same structural reason rather than
+    // as an exception: its interpreter arm writes `OperandSize::Word` unconditionally, so the
+    // 66-prefixed and unprefixed encodings have identical semantics and `MovCsToReg` carries no
+    // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
+    //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
     // `0xf7`, `0xa9`, `0xb8..=0xbf`, `0xc7`, `0x81`, `0x83`, `0x85`, `0x8d`, `0xa3`. Every one is
     // the Dword sibling of an admitted byte form and its kind hard-codes Dword with no width
@@ -87,6 +92,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x89
                 | 0x8a
                 | 0x8b
+                | 0x8c
                 | 0xa8
                 | 0xb0..=0xb7
                 | 0xc2
@@ -480,6 +486,30 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         raw_clocks: 2,
                     }),
                 };
+            }
+            0x8c => {
+                // MOV r/m16, Sreg. The interpreter writes `OperandSize::Word` unconditionally
+                // ("always a word store regardless of operand size", execute.rs 0x8c), so this
+                // kind carries no width and both the prefixed and unprefixed encodings lower
+                // identically — which is what lets 0x8c join the Word-size allowlist above.
+                // reg 6 and 7 are left to the interpreter deliberately. `segment_from_reg_field`
+                // folds them into GS through a catch-all `_` arm rather than by intent, and
+                // reproducing an accident is how a lowering and its oracle drift apart; 0..=5 are
+                // the encodings with a named answer.
+                let m = insn.modrm?;
+                let segment = match m.reg {
+                    0 => SegmentIndex::Es,
+                    1 => SegmentIndex::Cs,
+                    2 => SegmentIndex::Ss,
+                    3 => SegmentIndex::Ds,
+                    4 => SegmentIndex::Fs,
+                    5 => SegmentIndex::Gs,
+                    _ => return None,
+                };
+                let DecodedOperand::Reg(dst) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::MovSegToReg { dst, segment });
             }
             0x8d => {
                 let m = insn.modrm?;

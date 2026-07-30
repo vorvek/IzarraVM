@@ -191,6 +191,15 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 signed,
             } => emit_mov_extend_reg(&mut e, dst, src, width, signed),
             DirectKind::MovImm { dst, imm } => e.mov_r32_imm32(home(dst), imm),
+            // Sixteen bits only, upper half preserved: the interpreter's 0x8c arm stores at
+            // `OperandSize::Word` whatever the prefix says. `mov_r32_imm32` into the scratch
+            // first because there is no 16-bit immediate form on the encoder and none is worth
+            // adding for one kind; the upper half of RDX is dead either way.
+            DirectKind::MovSegToReg { dst, segment } => {
+                let selector = memory.segments.selector(segment);
+                e.mov_r32_imm32(Reg::RDX, u32::from(selector));
+                e.mov_r16_r16(home(dst), Reg::RDX);
+            }
             DirectKind::MovImmByte { dst, imm } => {
                 e.mov_r32_imm32(Reg::RDX, u32::from(imm));
                 emit_write_gpr8(&mut e, dst, Reg::RDX);

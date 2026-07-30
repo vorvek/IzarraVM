@@ -692,12 +692,21 @@ pub(crate) struct SegmentLayout {
 }
 
 impl SegmentLayout {
-    pub(crate) fn capture(cpu: &CpuGsw, read_segments: u8, write_segments: u8) -> Option<Self> {
+    /// `used` is the PINNED set — every segment `data_matches` will compare on entry — while the
+    /// accessibility check below runs over the ACCESSED set only. The two used to be the same
+    /// mask; they came apart when `MovSegToReg` arrived, which needs a segment's selector pinned
+    /// without asserting anything about whether memory can be reached through it.
+    pub(crate) fn capture(
+        cpu: &CpuGsw,
+        read_segments: u8,
+        write_segments: u8,
+        selector_segments: u8,
+    ) -> Option<Self> {
         let data = SEGMENT_ORDER.map(|segment| cpu.registers.segment(segment));
-        let used = read_segments | write_segments;
+        let used = read_segments | write_segments | selector_segments;
         for segment in SEGMENT_ORDER {
             let bit = segment_bit(segment);
-            if used & bit == 0 {
+            if (read_segments | write_segments) & bit == 0 {
                 continue;
             }
             let descriptor = data[segment_index(segment)];
@@ -759,6 +768,17 @@ impl SegmentLayout {
 
     pub(crate) fn link_compatible(&self, target: &Self) -> bool {
         self.cs == target.cs && self.data == target.data
+    }
+
+    /// The pinned selector for `segment`, from whichever of the two snapshots holds it. CS lives
+    /// in its own field and is pinned for every block; the other five must be in `used`, which
+    /// `DirectKind::selector_segment` is what guarantees for a `MovSegToReg` slot.
+    pub(crate) fn selector(self, segment: SegmentIndex) -> u16 {
+        if segment == SegmentIndex::Cs {
+            return self.cs.selector;
+        }
+        debug_assert_ne!(self.used & segment_bit(segment), 0);
+        self.data[segment_index(segment)].selector
     }
 
     pub(crate) fn descriptor(self, segment: SegmentIndex) -> SegmentRegister {
@@ -2638,6 +2658,23 @@ pub(crate) enum DirectKind {
         dst: u8,
         imm: u32,
     },
+    /// `MOV r16, Sreg` (0x8C, register destination). The selector is baked as a compile-time
+    /// constant, which is sound because the block's `SegmentLayout` pins the whole descriptor:
+    /// `run_direct_block` rejects any entry whose live copy differs (`cs_matches` for CS,
+    /// `data_matches` for the other five) and `SegmentLayout::link_compatible` requires equal
+    /// snapshots on both ends of every link, so no chained path reaches this slot under a
+    /// different selector.
+    ///
+    /// For the five DATA segments that pinning is not automatic. `data_matches` SKIPS any
+    /// segment outside the block's `used` mask, and that mask is derived from actual memory
+    /// accesses — which a `0x8C` slot does not imply. `DirectKind::selector_segment` is what puts
+    /// the segment in the mask; without it a block whose only mention of DS is `mov ax, ds` would
+    /// bake one selector and then be re-entered under another. Register destination only: a
+    /// memory destination is a word store and belongs in `Store` if it ever ranks.
+    MovSegToReg {
+        dst: u8,
+        segment: SegmentIndex,
+    },
     MovImmByte {
         dst: u8,
         imm: u8,
@@ -3600,6 +3637,22 @@ impl DirectKind {
         }
     }
 
+    /// Segments this kind reads the SELECTOR of without touching memory through them.
+    ///
+    /// Separate from `read_segment` because the two want different things from
+    /// `SegmentLayout::capture`: a read wants the descriptor pinned AND validated as accessible,
+    /// while a selector read wants it pinned only. Folding this into `read_segment` would refuse
+    /// to compile `mov ax, fs` whenever FS is null — a legal instruction with a legal answer.
+    fn selector_segment(self) -> Option<SegmentIndex> {
+        match self {
+            // CS is excluded on purpose rather than by omission: it is not in `SegmentLayout.data`
+            // at all, it rides the separate `cs` field, and `cs_matches` pins it for every block
+            // unconditionally. Putting it in the mask would be inert at best.
+            Self::MovSegToReg { segment, .. } if segment != SegmentIndex::Cs => Some(segment),
+            _ => None,
+        }
+    }
+
     fn write_segment(self) -> Option<SegmentIndex> {
         match self {
             Self::Store { addr, .. }
@@ -4303,6 +4356,7 @@ fn compile_with_instruction_limit(
     let mut dword_stores = 0u8;
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
+    let mut selector_segments = 0u8;
     let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
@@ -4594,6 +4648,9 @@ fn compile_with_instruction_limit(
         if let Some(segment) = kind.write_segment() {
             write_segments |= segment_bit(segment);
         }
+        if let Some(segment) = kind.selector_segment() {
+            selector_segments |= segment_bit(segment);
+        }
         has_wide_accesses |=
             kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
         fetch_lens[slots.len()] = insn.len;
@@ -4627,7 +4684,9 @@ fn compile_with_instruction_limit(
     let Some(span) = BlockSpan::new(key, guest_len, slots.len()) else {
         return CompileOutcome::Retry;
     };
-    let Some(segment_layout) = SegmentLayout::capture(cpu, read_segments, write_segments) else {
+    let Some(segment_layout) =
+        SegmentLayout::capture(cpu, read_segments, write_segments, selector_segments)
+    else {
         return CompileOutcome::Retry;
     };
     let self_loop = matches!(

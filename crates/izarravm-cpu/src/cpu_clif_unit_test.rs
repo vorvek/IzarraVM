@@ -550,7 +550,8 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
         guest_len: 3,
         fetch_lens: [0; MAX_BLOCK_INSTRUCTIONS],
         instructions: 2,
-        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0).expect("default layout"),
+        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0, 0)
+            .expect("default layout"),
         memory_cpl3: false,
         has_wide_accesses: false,
         is_self_loop: false,
@@ -797,7 +798,8 @@ fn clif_invalidate_physical_range_no_longer_evicts_seen_dormant_on_page_overlap(
         guest_len: 3,
         fetch_lens,
         instructions: 1,
-        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0).expect("default layout"),
+        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0, 0)
+            .expect("default layout"),
         memory_cpl3: false,
         has_wide_accesses: false,
         is_self_loop: false,

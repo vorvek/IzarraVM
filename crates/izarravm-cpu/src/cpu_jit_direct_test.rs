@@ -879,6 +879,137 @@ fn direct_integer_continuity_matches_flags_bytes_and_effective_addresses() {
     }
 }
 
+/// `MOV r16, Sreg` bakes the block's pinned selector, so the fixture needs selectors that are
+/// neither zero nor equal to either half of any initial GPR, or a lowering that baked the wrong
+/// constant (or wrote 32 bits instead of 16) would still compare equal.
+///
+/// Selector and base are set independently here: base stays 0 so the entry keeps fetching the
+/// same bytes, while the selector carries two distinct non-zero bytes. Nothing re-derives one
+/// from the other outside `load_segment_real`, and the layout checks compare whole descriptors,
+/// so the pair is self-consistent for admission and for linking.
+///
+/// The second half is the load-bearing part. DS is re-pointed at a different selector with the
+/// block already compiled and hot; the answer must follow. Without `selector_segment` putting DS
+/// in the layout's `used` mask, `data_matches` skips DS entirely, the hot block is re-entered
+/// unchanged, and `mov bx, ds` keeps answering with the selector from compile time.
+#[test]
+fn direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() {
+    const CS_SELECTOR: u16 = 0x1234;
+    const DS_FIRST: u16 = 0x2258;
+    const DS_SECOND: u16 = 0x5678;
+    let mut memory = vec![0; 0x1000];
+    memory[0x100] = 0x90;
+    // Both encodings, because the interpreter's 0x8c arm writes `OperandSize::Word` whatever the
+    // prefix says: 66-prefixed (the shape the Quake census ranks) and unprefixed, which is the one
+    // that would break if the lowering ever consulted `operand_size`.
+    memory[0x101..0x10d].copy_from_slice(&[
+        // Filler, so that whichever of 0x100/0x101 the admission path keys the block at, neither
+        // 0x8c form lands on the block ENTRY, where it would never execute natively at all.
+        0x89, 0xf6, // mov esi, esi
+        0x66, 0x8c, 0xc8, // mov ax, cs
+        0x8c, 0xdb, // mov bx, ds
+        0x89, 0xc2, // mov edx, eax
+        0x89, 0xd9, // mov ecx, ebx
+        0xf4, // hlt
+    ]);
+    let initial = [0x1122_3344u32, 0, 0, 0xaabb_ccdd, 0, 0, 0, 0];
+    let expect = |ds: u16| {
+        [
+            0x1122_0000 | u32::from(CS_SELECTOR),
+            0xaabb_0000 | u32::from(ds),
+            0x1122_0000 | u32::from(CS_SELECTOR),
+            0xaabb_0000 | u32::from(ds),
+            0,
+            0,
+            0,
+            0,
+        ]
+    };
+
+    let arm = |cpu: &mut CpuGsw, ds_selector: u16| {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr = initial;
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        make_data_segments_flat(cpu);
+        for (segment, selector) in [
+            (SegmentIndex::Cs, CS_SELECTOR),
+            (SegmentIndex::Ds, ds_selector),
+        ] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.selector = selector;
+            descriptor.base = 0;
+            descriptor.limit = u32::MAX;
+            cpu.registers.set_segment(segment, descriptor);
+        }
+    };
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    arm(&mut interp, DS_FIRST);
+    drive(&mut interp, &mut interp_bus);
+    arm(&mut native, DS_FIRST);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        arm(&mut native, DS_FIRST);
+        drive(&mut native, &mut native_bus);
+    }
+    assert!(
+        native.jit_direct.len() > 0,
+        "MOV r16,Sreg block did not compile: perf={:?}",
+        native.perf_counters()
+    );
+
+    for (round, ds) in [(0, DS_FIRST), (1, DS_SECOND)] {
+        // One settling drive per round. Round 1 spends its first pass on the DS mismatch itself:
+        // `data_matches` fails, the block is retired and recompiled, and that pass runs a short
+        // prefix natively. Measuring the pass AFTER it keeps the retirement count comparable
+        // between the two rounds instead of encoding the recompile in the expected number.
+        arm(&mut native, ds);
+        drive(&mut native, &mut native_bus);
+        for cpu in [&mut interp, &mut native] {
+            arm(cpu, ds);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.trace = BusTrace::default();
+        }
+        let before = native.perf_counters().jit_direct_insns;
+        let interp_outcomes = drive(&mut interp, &mut interp_bus);
+        let native_outcomes = drive(&mut native, &mut native_bus);
+
+        assert_eq!(native_outcomes, interp_outcomes, "round {round} timing");
+        assert_eq!(native, interp, "round {round} CPU state");
+        assert_eq!(native.registers.gpr, expect(ds), "round {round} GPRs");
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "round {round} bus timing"
+        );
+        // Five slots: the filler, both 0x8c forms and both MOVs, with the entry NOP interpreted.
+        // Pinned exactly, because a block that stopped short of either 0x8c would still compare
+        // equal against an interpreter running the same instruction. Round 1 recompiles under the
+        // new DS and must land on the same five.
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - before,
+            5,
+            "round {round}: 0x8c did not retire natively: {:?}",
+            native.perf_counters()
+        );
+    }
+}
+
 #[test]
 fn cold_straight_line_code_is_seen_but_not_compiled() {
     let memory = shift_program();
