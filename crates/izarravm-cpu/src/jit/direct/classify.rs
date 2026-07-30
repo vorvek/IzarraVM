@@ -114,6 +114,20 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // the allowlist, would silently lower a 16-bit IMUL as a 32-bit multiply instead: the
     // destination's high 16 bits would be clobbered rather than preserved, and CF/OF would be
     // computed against the wrong width.
+    // SETcc r/m8, register destination. Byte-wide whatever the operand-size prefix says (the
+    // interpreter's arm calls `write_operand_u8` without consulting `operand_size`), but 0x0f9x
+    // is NOT in the Word-size allowlist above, so a 66-prefixed encoding never reaches here and
+    // the point is moot rather than relied on. Keyed on the full u16 for the reason 0x0faf below
+    // documents: the `u8::try_from` truncation further down cannot see a two-byte opcode.
+    if let 0x0f90..=0x0f9f = insn.opcode {
+        let DecodedOperand::Reg(dst) = insn.operand? else {
+            return None;
+        };
+        return Some(DirectKind::SetCc {
+            condition: (insn.opcode & 0x0f) as u8,
+            dst,
+        });
+    }
     if insn.opcode == 0x0faf {
         // Keyed on the full u16 opcode rather than the u8 truncation further down: that
         // truncation (`u8::try_from(insn.opcode).ok()`) returns None for every two-byte opcode,

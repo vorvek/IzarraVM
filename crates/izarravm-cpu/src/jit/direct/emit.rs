@@ -200,6 +200,16 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.mov_r32_imm32(Reg::RDX, u32::from(selector));
                 e.mov_r16_r16(home(dst), Reg::RDX);
             }
+            // RDX is cleared BEFORE the flag load, not after: `setcc` writes only DL, so the
+            // upper 24 bits would otherwise be whatever the previous slot left there and
+            // `emit_write_gpr8` would OR that into the guest register. The clear has to precede
+            // `emit_load_host_flags` because XOR writes the host flags that load just set up.
+            DirectKind::SetCc { condition, dst } => {
+                e.xor_r64_self(Reg::RDX);
+                emit_load_host_flags(&mut e);
+                e.setcc(condition, Reg::RDX);
+                emit_write_gpr8(&mut e, dst, Reg::RDX);
+            }
             DirectKind::MovImmByte { dst, imm } => {
                 e.mov_r32_imm32(Reg::RDX, u32::from(imm));
                 emit_write_gpr8(&mut e, dst, Reg::RDX);

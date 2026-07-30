@@ -276,3 +276,27 @@ fn byte_alu_memory_destination_matches_the_interpreter_for_every_op_and_lane() {
         }
     }
 }
+
+#[test]
+fn setcc_register_form_matches_the_interpreter_for_every_condition() {
+    // All sixteen conditions against flag seeds that separate them: OF, CF, ZF, SF and PF are
+    // each set and clear across the set, and 0x8d7 in particular has SF set with OF clear so the
+    // signed pairs (0xc/0xd/0xe/0xf) cannot be satisfied by an unsigned reading of the flags.
+    //
+    // Both a low lane (DL, rm=2) and a high one (BH, rm=7) because `emit_write_gpr8` splits on
+    // the register index and the high lanes take the shift-and-merge path. `live_pending` is
+    // driven both ways: the interpreter materializes lazily before reading a flag, so a lowering
+    // that read a stale EFLAGS image passes every eager seed and fails these.
+    for condition in 0u8..16 {
+        for rm in [2u8, 7] {
+            for seed in [0x202u32, 0x206, 0x246, 0x282, 0x8d7, 0xa02, 0xed7] {
+                for pending in [false, true] {
+                    let modrm = 0b1100_0000 | rm;
+                    let context =
+                        format!("setcc {condition:#x} rm={rm} seed={seed:#x} pending={pending}");
+                    differential(&[0x0f, 0x90 | condition, modrm], seed, pending, &context);
+                }
+            }
+        }
+    }
+}

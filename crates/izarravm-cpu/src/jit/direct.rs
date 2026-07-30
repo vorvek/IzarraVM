@@ -2661,6 +2661,14 @@ pub(crate) enum DirectKind {
         dst: u8,
         segment: SegmentIndex,
     },
+    /// `SETcc r8` (0F 90..9F, register destination). The guest condition encoding is x86's own,
+    /// so the emitted `setcc` takes it unchanged; `condition()` in the interpreter is the same
+    /// truth table the host flags implement. Register form only: a memory destination is a byte
+    /// store and has no census row.
+    SetCc {
+        condition: u8,
+        dst: u8,
+    },
     MovImmByte {
         dst: u8,
         imm: u8,
@@ -3232,6 +3240,9 @@ impl DirectKind {
             // of 2. The memory forms carry it as a field because Load and Store do; the register
             // form has no other field worth carrying, so it is a constant arm.
             Self::MovExtendReg { .. } => 3,
+            // The interpreter's 0x0f90..=0x0f9f arm returns clocks(4) for both operand forms
+            // against a default of 2, so this cannot ride the `_ => 2` arm below.
+            Self::SetCc { .. } => 4,
             Self::X87 { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
