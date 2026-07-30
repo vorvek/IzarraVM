@@ -794,6 +794,10 @@ pub struct Machine {
     dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
     last_audio_ticks: u64,
     dsp_render_phase: RatePhase,
+    /// Last DAC-rate frame the DSP stream delivered, held across the render
+    /// window when the guest-clocked stream comes up short of the wall-clock
+    /// window (see `hold_frame`). Cleared when the channel goes idle.
+    dsp_hold: (i32, i32),
     mixer: SbMixer, // the CT1745 mixer: IRQ/DMA routing + volume attenuation
     wavetable_mpu: Mpu401,
     midi_mpu: Mpu401,
@@ -808,6 +812,8 @@ pub struct Machine {
     wss_resampler: Resampler,
     wss_rate_hz: u32, // input rate the wss_resampler is currently configured for
     wss_render_phase: RatePhase,
+    /// The WSS counterpart of `dsp_hold`.
+    wss_hold: (i32, i32),
     wss_base: u16,     // I/O base of the 4-port config region (codec sits at base+4)
     wss_irq: u8,       // PIC line the codec's terminal-count interrupt forwards to
     wss_dma: usize,    // byte-wide DMA channel the codec pulls playback bytes from
@@ -1108,6 +1114,7 @@ impl Machine {
             dsp_rate_hz: 0,
             last_audio_ticks: 0,
             dsp_render_phase: RatePhase::default(),
+            dsp_hold: (0, 0),
             mixer,
             wavetable_mpu: Mpu401::default(),
             midi_mpu: Mpu401::default(),
@@ -1117,6 +1124,7 @@ impl Machine {
             wss_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             wss_rate_hz: 0,
             wss_render_phase: RatePhase::default(),
+            wss_hold: (0, 0),
             wss_base,
             wss_irq,
             wss_dma,
@@ -1901,7 +1909,34 @@ impl Machine {
         // The WSS stream is summed in raw afterward (independent of the mixer).
         let (master_l, master_r) = self.mixer.master_gain();
         let (outgain_l, outgain_r) = self.mixer.outgain_gain();
-        let len = opl_out.len().max(dsp_out.len()).max(wss_out.len());
+        // The mix window is the WALL-clock window the OPL was rendered for, since
+        // that is what the host sink consumes in real time. The DSP and WSS
+        // streams are produced and drained on the GUEST clock, so a guest a few
+        // percent short of real time hands back a few percent fewer frames every
+        // call. Taking `max()` here and reading the short stream positionally
+        // (`get(i).unwrap_or((0, 0))`) appended a hole of hard silence to the DAC
+        // stream on every render -- a full-scale impulse ~1000 times a second at
+        // the frontend's pump rate, which is exactly the "crackling" a 486 persona
+        // at 96-99% of real time produced. Hold the last frame instead (what the
+        // DAC latch does on real hardware when its data is late) and clamp the
+        // window to the wall budget so the sink ring cannot drift into its
+        // high-water flush either.
+        // Known ceiling: a zero-order hold spreads a sustained shortfall as repeated
+        // samples (mild roughness). If that becomes audible, slew the resampler
+        // ratio off the ring depth instead of holding.
+        let len = opl_out.len();
+        // An idle source must fall silent rather than hold its last level forever,
+        // so the latch is armed only while the channel still has output to make.
+        let mut dsp_hold = if self.dsp.needs_output_tick() {
+            self.dsp_hold
+        } else {
+            (0, 0)
+        };
+        let mut wss_hold = if self.wss_enabled && self.wss.is_playing() {
+            self.wss_hold
+        } else {
+            (0, 0)
+        };
         let spk = self.speaker.drain(len);
         // CD-Audio: pull the matching count of Red Book samples (44.1 kHz, the
         // DAC rate, so no resample) and attenuate by the CT1745 CD volume. A drive
@@ -1912,8 +1947,8 @@ impl Machine {
         let mixed = (0..len)
             .map(|i| {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
-                let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
-                let (wl, wr) = wss_out.get(i).copied().unwrap_or((0, 0));
+                let (dl, dr) = hold_frame(&mut dsp_hold, dsp_out.get(i).copied());
+                let (wl, wr) = hold_frame(&mut wss_hold, wss_out.get(i).copied());
                 // Host PC speaker volume: a straight attenuation on the beeper,
                 // independent of the card amp (0.0 mutes it). Unity leaves the mix
                 // bit-identical to before.
@@ -1941,6 +1976,8 @@ impl Machine {
                 (l, r)
             })
             .collect();
+        self.dsp_hold = dsp_hold;
+        self.wss_hold = wss_hold;
         self.host_profile
             .record(MachineProfilePhaseKind::AudioRender, render_start);
         mixed
@@ -2226,6 +2263,18 @@ fn opl_port(port: u16) -> Option<u16> {
         0x0229 => Some(0x0389),
         _ => None,
     }
+}
+
+/// Take the next frame of a guest-clocked DAC stream, latching it as the value
+/// to hold if the stream runs out before the wall-clock render window does.
+/// Holding the last level is what a real DAC's output latch does when its next
+/// sample is late; substituting silence would put a full-scale step in the
+/// stream on every render call the guest fell short on.
+fn hold_frame(hold: &mut (i32, i32), frame: Option<(i32, i32)>) -> (i32, i32) {
+    if let Some(frame) = frame {
+        *hold = frame;
+    }
+    *hold
 }
 
 /// Saturate an OPL mix value to the 16-bit DAC range.

@@ -1356,22 +1356,29 @@ impl CpuGsw {
         // without a flush); WP changes flush, so `wp` is consistent within a
         // generation. A write to a page whose dirty bit is not yet set falls through
         // to the walk so the PTE's D bit is updated.
+        //
+        // A hit NEVER raises the fault itself -- it either serves the access or falls
+        // through to the walk. A cached entry can only be more restrictive than the
+        // live tables (a guest that relaxes a PTE and skips the required flush), and
+        // this core's TLB is 1024 entries against real silicon's 32-64, so such an
+        // entry survives here long after hardware would have evicted it. Deciding the
+        // fault from the walk instead costs nothing on the hot path (it runs only when
+        // the hit would not have served the access anyway) and keeps the page tables
+        // the sole authority on what faults. Repro that found this: TSUMERA (Borland
+        // 32RTM under VCPI) at exit -- its ring-0 DPMI host flips a data page from R/O
+        // to R/W without reloading CR3, and the ring-3 refcount decrement that follows
+        // took a spurious #PF(7) off the stale entry.
         let page = linear >> 12;
         if let Some(e) = self.tlb.lookup(page) {
-            let protection_fault = if user {
-                !e.user || (write && !e.writable)
+            let permitted = if user {
+                e.user && (!write || e.writable)
             } else {
-                write && wp && !e.writable
+                !write || !wp || e.writable
             };
-            if protection_fault {
-                self.control.cr2 = linear;
-                return Err(InternalFault::Exception {
-                    vector: 14,
-                    error_code: Some(page_fault_code(true, write, user)),
-                });
-            }
-            // Serve the hit for a read, or a write to an already-dirty page.
-            if !write || e.dirty {
+            // Serve the hit only when it permits the access and needs no D-bit update.
+            // Anything else falls through to the walk, which re-reads the page tables
+            // and is the authority on both the permission and the fault it raises.
+            if permitted && (!write || e.dirty) {
                 let physical = e.phys | (linear & 0x0000_0fff);
                 if write {
                     self.record_write_page(physical);
