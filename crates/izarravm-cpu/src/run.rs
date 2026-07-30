@@ -1452,6 +1452,9 @@ impl CpuGsw {
                     self,
                     layout.read_segments,
                     layout.write_segments,
+                    // Zero: `MovSegToReg` is not in clif's `lowerable` set, so no clif unit can
+                    // contain a slot that needs a selector-only pin.
+                    0,
                 ) else {
                     self.jit_direct.clif_units.dormant(key);
                     self.jit_clif.park_segment_capture_failed += 1;

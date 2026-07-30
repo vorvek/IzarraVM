@@ -1063,6 +1063,25 @@ impl Encoder {
         self.bytes.push(imm8);
     }
 
+    /// `setcc dst8` (0F 90+cc /0, mod=11) -- write 1 or 0 into the low byte of `dst` from the
+    /// host flags, leaving the other 24 bits alone. The condition encoding is x86's own four-bit
+    /// code, the same one `jcc` takes and the same one the guest's ModRM-less opcode low nibble
+    /// carries, so no translation is needed at any layer.
+    ///
+    /// A REX prefix is emitted for RSP/RBP/RSI/RDI even without an extension bit, because without
+    /// one those encodings name AH/CH/DH/BH instead of SPL/BPL/SIL/DIL. That is inert for RDX,
+    /// the only register this has a caller for today, and it is here so the next caller cannot
+    /// silently write the wrong lane.
+    pub(crate) fn setcc(&mut self, condition: u8, dst: Reg) {
+        assert!(condition < 16, "condition code must fit four bits");
+        if dst.ext() || matches!(dst.low3(), 4..=7) {
+            self.rex(false, false, false, dst.ext());
+        }
+        self.bytes.push(0x0F);
+        self.bytes.push(0x90 | condition);
+        self.modrm(0b11, 0, dst.low3());
+    }
+
     /// `cmp reg16, word [base + disp8]` (66 + 3B /r).
     pub(crate) fn cmp_r16_disp8(&mut self, reg: Reg, base: Reg, disp8: i8) {
         self.bytes.push(0x66);

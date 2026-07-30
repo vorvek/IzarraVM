@@ -176,17 +176,17 @@ pub(crate) enum LinkRefusal {
     SegmentLayout,
     /// `CompiledBlock::link_compatible` refused.
     BlockShape,
-    /// The RET-PIC-only strict `has_x87` equality, INTEGER source into a FLOAT target. This is
-    /// the direction the shared x87 re-entry pad exists for: a static integer-to-float edge binds
-    /// through `integer_entry`, and this path refuses only because
-    /// `emit_completed_dynamic_path` loads `BlockPortal::body` unconditionally and would enter
-    /// the target with an unloaded register cache.
+    /// The RET-PIC-only strict `has_x87` equality, INTEGER source into a FLOAT target. RETIRED,
+    /// and kept only so the counter can prove it: `emit_completed_dynamic_path` now selects
+    /// `BlockPortal::integer_entry` for an integer source, which is the shared x87 re-entry pad
+    /// for a float target, so nothing refuses for this reason any more and this must read zero.
+    /// A non-zero value means an edge reached the refusal without going through the pad.
     DynamicIntegerToFloat,
-    /// The same equality, FLOAT source into an INTEGER target. A different problem with a
-    /// different fix: the pad is irrelevant here, what is missing is the boundary spill that
-    /// `link_compatible`'s float-to-integer case relies on and that
-    /// `emit_completed_dynamic_path` never emits. Split from the direction above because only
-    /// one of the two is fixed by teaching the dynamic path the pad.
+    /// The same equality, FLOAT source into an INTEGER target. RETIRED on the same terms:
+    /// `emit_completed_dynamic_path` emits the boundary spill that `link_compatible`'s
+    /// float-to-integer case relies on, so this must read zero too. The two are kept apart rather
+    /// than merged because they were fixed by two different mechanisms in two commits, and a
+    /// regression in either one should name itself.
     DynamicFloatToInteger,
     /// Integer source into a float target with no x87 re-entry pad built.
     MissingX87Pad,
@@ -417,10 +417,20 @@ impl DirectBarrierCensus {
 
     fn note_interpreted(&mut self, insn: &DecodedInsn, linear: u32, final_linear: u32) {
         self.pending_right = None;
+        // EVERY row, not only the ex-helper families. `runtime_hits` counts how many times the
+        // guest actually EXECUTES this shape interpreted, which makes it the census's only
+        // per-execution, position-free column - and therefore the only one that can rank a shape
+        // by what it costs rather than by where a block happened to stop.
+        //
+        // It used to carry `&& row.helper_family.is_some()`, an artifact of the commit that
+        // instrumented the three helper-eligible opcodes, and that one conjunct left 34 of 36
+        // rows reading zero. It is what let `unbound_exits` be the ranking column by default, and
+        // `unbound_exits` ranked `0x8C` (a segment reload run ~1.2M times) SEVEN TIMES ABOVE
+        // `0x38 /0` (an inner-loop CMP), when the second was worth three times the whole rest of
+        // the night put together. Costs nothing when the census is off: the call site in `run.rs`
+        // is gated on `barrier_census_active()` before the arguments are even built.
         let key = BarrierKey::from_insn(insn);
-        if let Some(row) = self.rows.get_mut(&key)
-            && row.helper_family.is_some()
-        {
+        if let Some(row) = self.rows.get_mut(&key) {
             row.runtime_hits = row.runtime_hits.saturating_add(1);
         }
 
@@ -692,12 +702,21 @@ pub(crate) struct SegmentLayout {
 }
 
 impl SegmentLayout {
-    pub(crate) fn capture(cpu: &CpuGsw, read_segments: u8, write_segments: u8) -> Option<Self> {
+    /// `used` is the PINNED set — every segment `data_matches` will compare on entry — while the
+    /// accessibility check below runs over the ACCESSED set only. The two used to be the same
+    /// mask; they came apart when `MovSegToReg` arrived, which needs a segment's selector pinned
+    /// without asserting anything about whether memory can be reached through it.
+    pub(crate) fn capture(
+        cpu: &CpuGsw,
+        read_segments: u8,
+        write_segments: u8,
+        selector_segments: u8,
+    ) -> Option<Self> {
         let data = SEGMENT_ORDER.map(|segment| cpu.registers.segment(segment));
-        let used = read_segments | write_segments;
+        let used = read_segments | write_segments | selector_segments;
         for segment in SEGMENT_ORDER {
             let bit = segment_bit(segment);
-            if used & bit == 0 {
+            if (read_segments | write_segments) & bit == 0 {
                 continue;
             }
             let descriptor = data[segment_index(segment)];
@@ -759,6 +778,17 @@ impl SegmentLayout {
 
     pub(crate) fn link_compatible(&self, target: &Self) -> bool {
         self.cs == target.cs && self.data == target.data
+    }
+
+    /// The pinned selector for `segment`, from whichever of the two snapshots holds it. CS lives
+    /// in its own field and is pinned for every block; the other five must be in `used`, which
+    /// `DirectKind::selector_segment` is what guarantees for a `MovSegToReg` slot.
+    pub(crate) fn selector(self, segment: SegmentIndex) -> u16 {
+        if segment == SegmentIndex::Cs {
+            return self.cs.selector;
+        }
+        debug_assert_ne!(self.used & segment_bit(segment), 0);
+        self.data[segment_index(segment)].selector
     }
 
     pub(crate) fn descriptor(self, segment: SegmentIndex) -> SegmentRegister {
@@ -949,9 +979,12 @@ impl CompiledBlock {
         self.has_x87.then_some(self.x87_entry_top)
     }
 
-    /// Static-successor compatibility (Jmp/Jcc/Call/fallthrough edges). The dynamic RET PIC path
-    /// (`try_link_inner` with a `target_eip`) layers an extra `has_x87` equality on top of this,
-    /// so it stays strict; see the comment there for why.
+    /// Edge compatibility, for STATIC successors (Jmp/Jcc/Call/fallthrough) and for the dynamic
+    /// RET PIC path alike. It used to be static-only: the dynamic path layered an extra `has_x87`
+    /// equality on top of this in both directions, because `emit_completed_dynamic_path` emitted
+    /// neither the float-to-integer boundary spill nor the integer-to-float portal-field
+    /// selection. It emits both now, so `target_eip` no longer changes WHICH edges link, only how
+    /// the cell is written, and this is the only x87 edge predicate there is.
     ///
     /// The has_x87 pair is a real three-case rule now, not a dead clause. It used to read
     /// `self.has_x87 == target.has_x87 && (!self.has_x87 || self.x87_exit_top ==
@@ -984,35 +1017,24 @@ impl CompiledBlock {
             // the live x87 cache back to `CpuGsw.fpu` before handing control over. The target
             // has no TOP of its own to pin against, so there is no TOP condition here.
             (true, false) => true,
-            // Integer source, float target: refused. A chained entry publishes body_ptr =
-            // entry + body_offset and jumps straight there, so the target's own prologue never
-            // runs. `emit_x87_enter` sits ABOVE body_offset (see `emit()`: body_offset is
-            // captured right after the `x87_entry_top.is_some()` enter block), so skipping the
-            // prologue means the target's XMM4-11 physical cache is never loaded from
-            // `CpuGsw.fpu` and its baked compile-time entry TOP is never pinned to the CPU's
-            // real `top()`. There is no boundary fix-up that helps here, unlike the float-to-
-            // integer case: the missing work happens on the target side, before the jump lands,
-            // not at the jump site.
+            // Integer source, float target: link, THROUGH THE SHARED PAD. A chained entry jumps
+            // to a published address and skips the target's own prologue, and `emit_x87_enter`
+            // sits ABOVE `body_offset` (see `emit()`, where body_offset is captured right after
+            // the `x87_entry_top.is_some()` enter block), so entering at `body` would leave the
+            // target's XMM4-11 cache unloaded and its baked entry TOP unpinned. What makes the
+            // edge legal is that an integer source does not publish `body`: both emitters select
+            // `BlockPortal::integer_entry`, which for a float target is the shared x87 re-entry
+            // pad, and the pad does exactly the prologue's work after guarding the baked TOP
+            // against the CPU's live one.
             //
-            // This refusal also underwrites the float-to-integer crossing's frame read above.
-            // That crossing reloads RSI from STACK_SAVED_RSI, a slot only an x87 prologue writes;
-            // an integer entry never runs one, so if this arm allowed the edge, an integer-headed
-            // chain could reach that reload with the slot (and the XMM6-11 save area) never
-            // initialized. Uniform frame length alone does not make the crossing's frame read
-            // safe; this refusal is what makes it safe, by induction over the chain: every block
-            // that can reach a float-to-integer crossing was itself entered through an x87
-            // prologue.
-            // RELAXED. An integer source may now reach a float target, because it lands on the
-            // shared x87 re-entry pad rather than on `body`: the pad does exactly the work the
-            // target's prologue would have done, loading the register cache into XMM4-11 and
-            // packing the status/tag word into RSI, after guarding the target's baked entry TOP
-            // against the CPU's live TOP.
-            //
-            // The frame induction the old refusal provided is restored rather than abandoned. A
-            // float-to-integer crossing reloads RSI and XMM6-11 from slots only an x87 prologue
-            // writes; the pad writes the same slots, so every block that can reach such a
-            // crossing was entered either through a prologue or through the pad. `try_link_inner`
-            // refuses this shape when no pad could be built, which keeps that induction total.
+            // The frame induction this arm used to provide by REFUSING is preserved, not
+            // abandoned, and it is what the float-to-integer arm above depends on. That crossing
+            // reloads RSI from STACK_SAVED_RSI and restores XMM6-11 from the frame, slots only an
+            // x87 prologue writes. The pad writes the same slots, so every block that can reach
+            // such a crossing was entered either through a prologue or through the pad. Uniform
+            // frame length alone would not make that read safe. `try_link_inner` refuses this
+            // shape outright when no pad could be built (`LinkRefusal::MissingX87Pad`), which is
+            // what keeps the induction total.
             (false, true) => true,
         }
     }
@@ -2228,27 +2250,13 @@ impl BlockCache {
         } else if !source_block.link_compatible(&target_block) {
             Some(LinkRefusal::BlockShape)
         }
-        // The dynamic RET PIC path resolves a near-RET target at runtime from an arbitrary
-        // return address, not from a compile-time successor shape, and
-        // emit_completed_dynamic_path never emits the boundary spill link_compatible's
-        // float-to-integer case relies on. So RET PIC keeps the strict has_x87 equality on
-        // top of the relaxed rule; static successors (target_eip == None, resolved above by
-        // resolve_successors/resolve_waiting) get the full relaxed rule instead.
+        // The dynamic RET PIC path used to layer a strict `has_x87` equality on top of the relaxed
+        // rule, in both directions, because it resolves its target at runtime from an arbitrary
+        // return address rather than from a compile-time successor shape. Both halves are gone:
+        // `emit_completed_dynamic_path` now emits the boundary spill for a float source and
+        // selects `integer_entry` for an integer one, which is the whole of what the static path
+        // does. `target_eip` no longer changes which edges link, only how the cell is written.
         //
-        // This equality is ALSO what keeps the shared x87 re-entry pad safe on that path.
-        // `emit_completed_dynamic_path` loads `BlockPortal::body` unconditionally, not
-        // `integer_entry`, so it would bypass the pad. Same class on both ends means the two
-        // fields are equal for every target it can bind, so the bypass is unobservable.
-        // Relaxing this line without teaching that path the pad is a silent wrong-entry bug.
-        else if target_eip.is_some() && source_block.has_x87 != target_block.has_x87 {
-            // Which side carries the x87 class decides which fix applies, and the two are not
-            // interchangeable, so they are counted apart rather than as one "class mismatch".
-            Some(if target_block.has_x87 {
-                LinkRefusal::DynamicIntegerToFloat
-            } else {
-                LinkRefusal::DynamicFloatToInteger
-            })
-        }
         // An integer source reaching a float target goes through the shared pad. Without one there
         // is no correct address to publish: `body` would enter the target with an unloaded x87
         // register cache. Refusing here leaves the cell on the zero portal, so the exit reports
@@ -2637,6 +2645,31 @@ pub(crate) enum DirectKind {
     MovImm {
         dst: u8,
         imm: u32,
+    },
+    /// `MOV r16, Sreg` (0x8C, register destination). The selector is baked as a compile-time
+    /// constant, which is sound because the block's `SegmentLayout` pins the whole descriptor:
+    /// `run_direct_block` rejects any entry whose live copy differs (`cs_matches` for CS,
+    /// `data_matches` for the other five) and `SegmentLayout::link_compatible` requires equal
+    /// snapshots on both ends of every link, so no chained path reaches this slot under a
+    /// different selector.
+    ///
+    /// For the five DATA segments that pinning is not automatic. `data_matches` SKIPS any
+    /// segment outside the block's `used` mask, and that mask is derived from actual memory
+    /// accesses — which a `0x8C` slot does not imply. `DirectKind::selector_segment` is what puts
+    /// the segment in the mask; without it a block whose only mention of DS is `mov ax, ds` would
+    /// bake one selector and then be re-entered under another. Register destination only: a
+    /// memory destination is a word store and belongs in `Store` if it ever ranks.
+    MovSegToReg {
+        dst: u8,
+        segment: SegmentIndex,
+    },
+    /// `SETcc r8` (0F 90..9F, register destination). The guest condition encoding is x86's own,
+    /// so the emitted `setcc` takes it unchanged; `condition()` in the interpreter is the same
+    /// truth table the host flags implement. Register form only: a memory destination is a byte
+    /// store and has no census row.
+    SetCc {
+        condition: u8,
+        dst: u8,
     },
     MovImmByte {
         dst: u8,
@@ -3209,6 +3242,9 @@ impl DirectKind {
             // of 2. The memory forms carry it as a field because Load and Store do; the register
             // form has no other field worth carrying, so it is a constant arm.
             Self::MovExtendReg { .. } => 3,
+            // The interpreter's 0x0f90..=0x0f9f arm returns clocks(4) for both operand forms
+            // against a default of 2, so this cannot ride the `_ => 2` arm below.
+            Self::SetCc { .. } => 4,
             Self::X87 { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
@@ -3596,6 +3632,22 @@ impl DirectKind {
             | Self::Leave
             | Self::Ret { .. }
             | Self::Ret16 { .. } => Some(SegmentIndex::Ss),
+            _ => None,
+        }
+    }
+
+    /// Segments this kind reads the SELECTOR of without touching memory through them.
+    ///
+    /// Separate from `read_segment` because the two want different things from
+    /// `SegmentLayout::capture`: a read wants the descriptor pinned AND validated as accessible,
+    /// while a selector read wants it pinned only. Folding this into `read_segment` would refuse
+    /// to compile `mov ax, fs` whenever FS is null — a legal instruction with a legal answer.
+    fn selector_segment(self) -> Option<SegmentIndex> {
+        match self {
+            // CS is excluded on purpose rather than by omission: it is not in `SegmentLayout.data`
+            // at all, it rides the separate `cs` field, and `cs_matches` pins it for every block
+            // unconditionally. Putting it in the mask would be inert at best.
+            Self::MovSegToReg { segment, .. } if segment != SegmentIndex::Cs => Some(segment),
             _ => None,
         }
     }
@@ -4303,6 +4355,7 @@ fn compile_with_instruction_limit(
     let mut dword_stores = 0u8;
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
+    let mut selector_segments = 0u8;
     let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
@@ -4594,6 +4647,9 @@ fn compile_with_instruction_limit(
         if let Some(segment) = kind.write_segment() {
             write_segments |= segment_bit(segment);
         }
+        if let Some(segment) = kind.selector_segment() {
+            selector_segments |= segment_bit(segment);
+        }
         has_wide_accesses |=
             kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
         fetch_lens[slots.len()] = insn.len;
@@ -4627,7 +4683,9 @@ fn compile_with_instruction_limit(
     let Some(span) = BlockSpan::new(key, guest_len, slots.len()) else {
         return CompileOutcome::Retry;
     };
-    let Some(segment_layout) = SegmentLayout::capture(cpu, read_segments, write_segments) else {
+    let Some(segment_layout) =
+        SegmentLayout::capture(cpu, read_segments, write_segments, selector_segments)
+    else {
         return CompileOutcome::Retry;
     };
     let self_loop = matches!(

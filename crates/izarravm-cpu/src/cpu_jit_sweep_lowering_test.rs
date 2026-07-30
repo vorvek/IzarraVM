@@ -249,3 +249,55 @@ fn pushfd_matches_the_interpreter_including_the_persona_mask() {
         }
     }
 }
+
+#[test]
+fn byte_alu_memory_destination_matches_the_interpreter_for_every_op_and_lane() {
+    // ALU form 0 with a memory destination: all eight ops, both the writing path and CMP's
+    // read-only one, driven through a low byte lane (CL) and a high one (CH). The lane matters
+    // because `StoreSource::Reg` picks it from the ModRM reg field exactly as `read_gpr8` does,
+    // and a lowering that took the low byte of the right register would pass every CL case.
+    //
+    // The disp32 lands inside the page the harness already populates in the fast map for the
+    // stack slot, so the access resolves without a side exit; anywhere else returns the whole
+    // block as Retry and the fixture would report the opcode as still being a barrier.
+    const TARGET: u32 = 0x3f00;
+    for op in 0u8..8 {
+        for lane in [1u8, 5] {
+            for ecx in [0x0000_0000u32, 0x0000_017f, 0x0000_ab01, 0xffff_ffff] {
+                for seed in [0x202u32, 0x8d7] {
+                    let modrm = (lane << 3) | 0b101;
+                    let mut body = vec![op << 3, modrm];
+                    body.extend_from_slice(&TARGET.to_le_bytes());
+                    let context =
+                        format!("alu form0 mem op={op} lane={lane} ecx={ecx:#x} seed={seed:#x}");
+                    differential_with(&body, seed, true, ecx, &context);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn setcc_register_form_matches_the_interpreter_for_every_condition() {
+    // All sixteen conditions against flag seeds that separate them: OF, CF, ZF, SF and PF are
+    // each set and clear across the set. The signed pairs (0xc/0xd/0xe/0xf) turn on SF != OF, and
+    // BOTH polarities of that are present: 0x282 has SF set with OF clear, 0xa02 has OF set with
+    // SF clear. 0x8d7 and 0xed7 carry SF and OF together, which is the SF == OF side.
+    //
+    // Both a low lane (DL, rm=2) and a high one (BH, rm=7) because `emit_write_gpr8` splits on
+    // the register index and the high lanes take the shift-and-merge path. `live_pending` is
+    // driven both ways: the interpreter materializes lazily before reading a flag, so a lowering
+    // that read a stale EFLAGS image passes every eager seed and fails these.
+    for condition in 0u8..16 {
+        for rm in [2u8, 7] {
+            for seed in [0x202u32, 0x206, 0x246, 0x282, 0x8d7, 0xa02, 0xed7] {
+                for pending in [false, true] {
+                    let modrm = 0b1100_0000 | rm;
+                    let context =
+                        format!("setcc {condition:#x} rm={rm} seed={seed:#x} pending={pending}");
+                    differential(&[0x0f, 0x90 | condition, modrm], seed, pending, &context);
+                }
+            }
+        }
+    }
+}
