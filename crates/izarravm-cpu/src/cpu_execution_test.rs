@@ -2478,3 +2478,88 @@ fn idiv_dword_min_over_negative_one_is_divide_error() {
 
     expect_de_delivered(&mut cpu, &mut bus);
 }
+
+/// Build the warm tight loop `perf_counters_track_decode_hits_and_run_breaks` uses (inc; inc;
+/// jmp $-4), with the TestBus reporting batch bus clocks scaled by `scale`, run it once under
+/// `cap`, and report `(instructions retired, brk_cap, V)` where `V` is the value the run loop's
+/// cap test compares against `cap`: the run's core total plus the batch's scaled-bus growth
+/// across the run. `V` is non-decreasing per instruction, so it is exactly the boundary
+/// coordinate the cap test steps along.
+fn cap_boundary_probe(scale: (u64, u64), cap: u64) -> (u64, u64, u64) {
+    let mut memory = vec![0u8; 1024];
+    memory[0..4].copy_from_slice(&[0x40, 0x40, 0xeb, 0xfc]);
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.registers.eip = 0;
+    let mut bus = TestBus::with_memory(memory);
+    // Warm the decode cache so the whole loop chains inside one run.
+    for _ in 0..6 {
+        cpu.cycle(&mut bus).unwrap();
+    }
+    cpu.reset_perf_counters();
+    bus.report_batch_clocks = true;
+    bus.batch_bus_scale = scale;
+    let scaled_at_entry = bus.in_batch_scaled_bus_clocks();
+    let outcome = cpu.run_straight_line(&mut bus, cap).unwrap();
+    let scaled_at_exit = bus.in_batch_scaled_bus_clocks();
+    let p = cpu.perf_counters();
+    (
+        p.instructions,
+        p.brk_cap,
+        u64::from(outcome.core_clocks) + (scaled_at_exit - scaled_at_entry),
+    )
+}
+
+#[test]
+fn cap_screen_matches_the_exact_test_at_the_boundary() {
+    // The raw-clock screen in front of the per-instruction cap test is only allowed to skip the
+    // exact test when the exact test would certainly answer "no". The place that is observable is
+    // the boundary: pin the run that ends exactly ON the cap, and the run whose cap sits one
+    // clock beyond that same instruction's value, which must NOT end there.
+    //
+    // Both scalings are checked. (1, 1) makes the screen's bound equal the exact figure, so the
+    // screen alone decides. A 586-shaped (7, 30) makes `F = ceil(7/30) = 1` a LOOSE bound - the
+    // screen passes long before the exact test can be true - so the fall-through arm is the one
+    // that produces every answer. A conservativeness bug in either direction moves a boundary.
+    for scale in [(1u64, 1u64), (7, 30)] {
+        // A probe run under a generous cap tells us the exact value V the cap test reached on
+        // the instruction it broke at, and how many instructions that took.
+        let (probe_instructions, probe_brk_cap, boundary) = cap_boundary_probe(scale, 10_000);
+        assert_eq!(
+            probe_brk_cap, 1,
+            "{scale:?}: the probe run ended on the cap"
+        );
+        assert!(
+            probe_instructions > 1,
+            "{scale:?}: the loop must chain past its first instruction for the boundary to be \
+             reached by a continuation, not by the run's first instruction"
+        );
+
+        // Exactly on the boundary: the cap test is true at that same instruction (its value is
+        // still V, and every earlier instruction's value was below the probe's 10_000 <= V), so
+        // the run must break there, retiring the identical instruction count.
+        let (on_instructions, on_brk_cap, on_boundary) = cap_boundary_probe(scale, boundary);
+        assert_eq!(
+            (on_instructions, on_brk_cap, on_boundary),
+            (probe_instructions, 1, boundary),
+            "{scale:?}: a cap equal to the boundary value must end the run at the very same \
+             instruction the probe ended at"
+        );
+
+        // One clock beyond it: V < cap at that instruction, so the break must NOT fire there and
+        // the loop must keep chaining. This is the direction an over-eager screen would break.
+        let (past_instructions, past_brk_cap, past_boundary) =
+            cap_boundary_probe(scale, boundary + 1);
+        assert_eq!(
+            past_brk_cap, 1,
+            "{scale:?}: the longer run still ends on the cap"
+        );
+        assert!(
+            past_instructions > probe_instructions && past_boundary > boundary,
+            "{scale:?}: a cap one clock past the boundary must retire more instructions \
+             (saw {past_instructions} at V={past_boundary}, boundary was {probe_instructions} \
+             at V={boundary})"
+        );
+    }
+}

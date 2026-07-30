@@ -1075,6 +1075,26 @@ impl CpuBus for MachineBus<'_> {
         scaled >= u128::from(target) * u128::from(self.bus_den_at_batch_start)
     }
 
+    /// The `raw` that `in_batch_scaled_bus_clocks` scales. Monotone within a batch because
+    /// `trace.elapsed_clocks()` only grows and the subtrahend is a batch-start snapshot.
+    #[inline]
+    fn in_batch_raw_bus_clocks(&self) -> u64 {
+        self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start
+    }
+
+    /// `F = ceil(num / den)` over this batch's snapshotted scale. See the trait doc for why that
+    /// is a valid bound on the scaled figure's growth per raw clock. `num` and `den` are `u32`
+    /// and `den > 0` (every `bus_timing` pair is), so the ceiling cannot overflow and is never 0.
+    /// A mode change never lands mid-batch — it is staged in `pending_mode` and applied after the
+    /// batch — so this stays constant for the whole batch, which is what makes it safe for the
+    /// run loop to read once per run.
+    #[inline]
+    fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
+        let num = u64::from(self.bus_num_at_batch_start);
+        let den = u64::from(self.bus_den_at_batch_start);
+        num.div_ceil(den).max(1)
+    }
+
     fn read_memory(
         &mut self,
         address: u32,

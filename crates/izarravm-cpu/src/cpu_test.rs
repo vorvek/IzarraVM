@@ -2503,6 +2503,11 @@ struct TestBus {
     // Opt-in batch-clock reporting for tight event-budget tests. Historical CPU tests leave it
     // off because their TestBus predates machine-level combined core/bus caps.
     report_batch_clocks: bool,
+    // The (num, den) the batch-clock reporting scales raw bus clocks by, mirroring MachineBus's
+    // batch-start snapshot of `bus_timing`. Default (1, 1) keeps every historical test on the
+    // identity scaling it was written against; the cap-screen tests set a real persona ratio so
+    // the screen's bound is looser than the exact test and the fall-through arm is exercised.
+    batch_bus_scale: (u64, u64),
     page_walk_bound_available: bool,
     rep_data_byte_cost_override: Option<u64>,
     direct_memory_max_clock_override: Option<u64>,
@@ -2534,6 +2539,7 @@ impl TestBus {
             uniform_native_fetches: false,
             direct_page_clocks: false,
             report_batch_clocks: false,
+            batch_bus_scale: (1, 1),
             page_walk_bound_available: true,
             rep_data_byte_cost_override: None,
             direct_memory_max_clock_override: None,
@@ -2831,7 +2837,25 @@ impl CpuBus for TestBus {
 
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         if self.report_batch_clocks {
+            let (num, den) = self.batch_bus_scale;
+            self.trace.elapsed_clocks() * num / den
+        } else {
+            0
+        }
+    }
+
+    fn in_batch_raw_bus_clocks(&self) -> u64 {
+        if self.report_batch_clocks {
             self.trace.elapsed_clocks()
+        } else {
+            0
+        }
+    }
+
+    fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
+        if self.report_batch_clocks {
+            let (num, den) = self.batch_bus_scale;
+            num.div_ceil(den).max(1)
         } else {
             0
         }

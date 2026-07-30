@@ -558,6 +558,13 @@ impl CpuGsw {
         // edge by the bus:core ratio. Buses without this accounting return 0,
         // which degrades to the core-only comparison.
         let bus_at_entry = bus.in_batch_scaled_bus_clocks();
+        // Screen inputs for the per-instruction cap test, read ONCE per run: the batch's raw
+        // clock count at entry and the batch-constant growth bound `F`. Both are batch-scoped
+        // (a run never spans a batch boundary, and a mode change is staged in `pending_mode` and
+        // applied after the batch), so hoisting them here is not a snapshot of stale state. See
+        // the cap test below for the derivation.
+        let raw_at_entry = bus.in_batch_raw_bus_clocks();
+        let cap_screen_scale = bus.in_batch_scaled_bus_clocks_screen_scale();
         let rep_budget = RepBudget { bus_at_entry, cap };
         self.perf.straight_line_runs += 1;
         // Seam counters, folded once per run (never per-instruction on the hot path).
@@ -707,8 +714,41 @@ impl CpuGsw {
             // (cap - total)` exceed u64. That is not an edge case to assert away: the target is
             // then unreachable by any attainable scaled figure, so the original comparison is
             // false and the run must NOT break. `checked_add` returning None IS that answer.
+            //
+            // The exact question still costs two u128 multiplies plus three loads off the bus,
+            // and it answers "no" for all but a handful of the instructions that ask it (see
+            // `cap_screen_matches_the_exact_test_at_the_boundary`, which pins the boundary the
+            // screen below must not move). So screen it first with one 64-bit compare.
+            //
+            // Derivation. Let `S(raw)` be the bus's scaled figure, `raw_e`/`raw` the batch's raw
+            // clocks at run entry and now, and `F = in_batch_scaled_bus_clocks_screen_scale()`,
+            // a per-batch constant with `S(raw) - S(raw_e) <= (raw - raw_e) * F` (the bus owns
+            // that bound; for `MachineBus` it is `ceil(num/den)` over the batch-start snapshot,
+            // and a mode change never lands mid-batch, so it is constant here). Then
+            //
+            //     total + (S(raw) - S(raw_e)) >= cap   =>   total + (raw - raw_e) * F >= cap
+            //
+            // by substituting the upper bound on the left. Contrapositive: when
+            // `total + (raw - raw_e) * F < cap` the exact test is CERTAINLY false, so skipping it
+            // cannot move a run boundary or a `brk_cap` count. The screen only ever admits extra
+            // work, never removes a break.
+            //
+            // Rounding and overflow both resolve toward "screen passes", i.e. toward asking the
+            // exact question: `F` is a CEILING (rounding the bound up keeps it an upper bound),
+            // and if either the product or the sum overflows u64 the screen is treated as passed
+            // rather than wrapped. `F == 0` means the bus offers no bound at all — then there is
+            // no screen and every ask goes to the exact test, which is the pre-screen behaviour.
             let hit_cap = if total >= cap {
                 true
+            } else if cap_screen_scale != 0
+                && bus
+                    .in_batch_raw_bus_clocks()
+                    .wrapping_sub(raw_at_entry)
+                    .checked_mul(cap_screen_scale)
+                    .and_then(|scaled_upper| scaled_upper.checked_add(total))
+                    .is_some_and(|bound| bound < cap)
+            {
+                false
             } else {
                 match bus_at_entry.checked_add(cap - total) {
                     None => false,
