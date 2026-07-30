@@ -736,29 +736,6 @@ impl SegmentLayout {
         })
     }
 
-    /// An inert all-zeros layout for sentinel descriptors (Track C C1d, design section
-    /// 3.3b): filler for a descriptor whose only live fields are `entry` and `operands`;
-    /// nothing ever validates or reads it. Consumed by the clif backend only.
-    #[cfg(all(
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    pub(crate) fn inert() -> Self {
-        let zero = SegmentRegister {
-            selector: 0,
-            base: 0,
-            limit: 0,
-            access: 0,
-            default_size_32: false,
-        };
-        Self {
-            cs: zero,
-            data: [zero; 6],
-            used: 0,
-        }
-    }
-
     pub(crate) fn cs_matches(self, cpu: &CpuGsw) -> bool {
         self.cs == cpu.registers.cs()
     }
@@ -2478,12 +2455,12 @@ pub(crate) enum SideExitReason {
     UnavailableOrKind = 2,
     Permission = 3,
     CodeWatch = 4,
-    /// The catch-all. After the split below only the clif backend still produces it (two sites
-    /// in `clif/lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
+    /// The catch-all. The now-removed clif backend was its only remaining producer (two sites
+    /// in its `lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
     /// side-exit growth across the x87 sweep and could not be attributed to any of its six
-    /// emitters. `allow(dead_code)` because the default feature set builds no clif producer, and
-    /// the discriminant must keep its value regardless: `run.rs` still has a catch-all arm for
-    /// it, and renumbering would silently remap what emitted code stores.
+    /// emitters. `allow(dead_code)` because no producer builds it anymore, and the discriminant
+    /// must keep its value regardless: `run.rs` still has a catch-all arm for it, and
+    /// renumbering would silently remap what emitted code stores.
     #[allow(dead_code)]
     Other = 5,
     /// A CS segment-limit check on a computed control-transfer target: the five
@@ -2762,9 +2739,9 @@ pub(crate) enum DirectKind {
     /// ROR r/m32, register form (0xC1 /1 and 0xD1 /1). `count` is the RAW decoded immediate; the
     /// emitter applies the architectural five-bit mask, exactly as `Shift` does.
     ///
-    /// Deliberately NOT folded into `Shift`. That variant is in clif's lowerable allowlist and its
-    /// lowering falls through to an arithmetic shift right, so a rotate routed through it would be
-    /// silently emitted as SAR. It also differs in the flag contract that matters here: a shift
+    /// Deliberately NOT folded into `Shift`. That variant's emitter falls through to an
+    /// arithmetic shift right, so a rotate routed through it would be silently emitted as SAR.
+    /// It also differs in the flag contract that matters here: a shift
     /// leaves AF, and OF above count 1, architecturally UNDEFINED, which is the only reason
     /// `emit_shift` may publish a possibly stale RBP to eflags. A rotate PRESERVES SF, ZF, PF and
     /// AF, so it must not.
@@ -2812,9 +2789,9 @@ pub(crate) enum DirectKind {
     /// admits ROR (/1) but routes it to `RotateRightReg`, because rotates do not define PF, ZF,
     /// SF or AF and `emit_shift_cl` merges the shift mask.
     ///
-    /// A separate variant rather than a `ShiftCount` field on `Shift`: `Shift` is in clif's
-    /// `lowerable` allowlist and widening it would hand clif a count source it cannot lower.
-    /// Same reasoning as `RotateRightReg` not being folded in.
+    /// A separate variant rather than a `ShiftCount` field on `Shift`: `Shift` carries its count
+    /// as a decoded immediate (`count: u8`), while this form's count comes from CL at emission
+    /// time, not a literal, so the two do not share a representation.
     ShiftCl {
         op: u8,
         dst: u8,
@@ -2844,9 +2821,9 @@ pub(crate) enum DirectKind {
     /// 32-bit register, which is the whole point of the instruction. Any shared code that reads
     /// this field must treat it as the memory access width, never as the write-back width.
     ///
-    /// Deliberately NOT a flag on `Load`. `Load` is in clif's lowerable allowlist and `lower_slot`
-    /// would lower an extending load as a plain move, silently and wrongly. A new discriminant is
-    /// absent from that allowlist and so defaults to a growth-run stopper.
+    /// Deliberately NOT a flag on `Load`: `Load`'s emitter is a plain move, and an extending load
+    /// (zero/sign-extend to the full 32-bit destination) needs different emitted code, not a
+    /// conditional branch inside the same arm.
     LoadExtend {
         dst: u8,
         width: MemoryWidth,
@@ -2891,12 +2868,11 @@ pub(crate) enum DirectKind {
     /// PUSH on a 16-bit stack (SS.B = 0) at Word operand size: two bytes written at
     /// `(SP - 2) & 0xFFFF`, and only SP advances, preserving ESP[31:16].
     ///
-    /// A SEPARATE variant rather than a width field on `Push`, because `Push` is in clif's
-    /// `lowerable()` allowlist and `lower_push` hard-codes `MemoryWidth::Dword` and
-    /// `iadd_imm(esp, -4)`, so a field would be lowered as a 32-bit push there. The two widths
-    /// it stands for are ORTHOGONAL: SS.B picks the stack-pointer width and `operand_size` picks
-    /// how many bytes move (386 PRM 16.2, restated at `memory.rs:1218`). This variant is the
-    /// (SS.B = 0, Word) cell only; the compile loop refuses the other two new cells.
+    /// A SEPARATE variant rather than a width field on `Push`, because `Push`'s emitter
+    /// hard-codes `MemoryWidth::Dword` and `iadd_imm(esp, -4)`. The two widths it stands for are
+    /// ORTHOGONAL: SS.B picks the stack-pointer width and `operand_size` picks how many bytes
+    /// move (386 PRM 16.2, restated at `memory.rs:1218`). This variant is the (SS.B = 0, Word)
+    /// cell only; the compile loop refuses the other two new cells.
     Push16 {
         source: StoreSource,
     },
@@ -2907,9 +2883,8 @@ pub(crate) enum DirectKind {
     /// only SP advances (preserving ESP[31:16]), and the destination is MERGED into rather than
     /// replaced, exactly as `write_gpr_sized(index, Word, ..)` does.
     ///
-    /// Separate variant for the same reason as `Push16`: `Pop` is in clif's `lowerable()`
-    /// allowlist and `lower_pop` hard-codes the 32-bit width, the +4 advance AND a full 32-bit
-    /// destination write.
+    /// Separate variant for the same reason as `Push16`: `Pop`'s emitter hard-codes the 32-bit
+    /// width, the +4 advance AND a full 32-bit destination write.
     Pop16 {
         dst: u8,
     },
@@ -2972,11 +2947,6 @@ pub(crate) enum DirectKind {
     /// Zero emit is not a special case. `emit_shift` and `emit_rotate_right_reg` already return
     /// early at count 0 and write nothing, and the per-slot accounting in `emit_block` is driven
     /// by the slot list rather than by emitted bytes.
-    ///
-    /// Absent from clif's `lowerable()` allowlist, which does NOT stop unit growth (that is
-    /// `unit_growth_classify`, which shares this classifier): it stops LOWERING, so a unit whose
-    /// entry slot is a NOP parks with `plan.leading == 0` and stays on the interpreter, exactly
-    /// as it did while the opcode was unclassifiable.
     Nop,
     /// CLD (0xFC) / STD (0xFD). DF is bit 10 of EFLAGS and sits OUTSIDE the lazy arithmetic
     /// descriptor: `set_flag`'s ARITH mask is CF|PF|AF|ZF|SF|OF, so a DF write goes straight to
@@ -3942,74 +3912,6 @@ fn dynamic_counter_fields() -> [(u16, i8, usize); 7] {
     ]
 }
 
-/// Terminal kinds for the clif unit-boundary growth walker (Track C C1a, F-A5).
-#[cfg(all(
-    feature = "clif-backend",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-pub(crate) enum UnitTerminal {
-    Jcc { taken_delta: u32 },
-    Jmp,
-    Call,
-    Ret,
-}
-
-/// One growth-walk classification step for the clif walker (Track C C1a, F-A5).
-#[cfg(all(
-    feature = "clif-backend",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-pub(crate) struct UnitGrowthStep {
-    pub(crate) terminal: Option<UnitTerminal>,
-    pub(crate) wide_access: bool,
-    pub(crate) read_segments: u8,
-    pub(crate) write_segments: u8,
-    /// The full classification, carried so the C1b lowering compiles the same shape the
-    /// walker admitted (the walker's reduced fields above stay authoritative for layout).
-    pub(crate) kind: DirectKind,
-}
-
-/// Classify one decoded instruction for clif unit growth with the SAME classifier the
-/// Direct compiler uses (`classify::classify`, reused unchanged), reduced to the fields
-/// the walker needs. `None` is the stop-growth signal: the first structurally
-/// unclassifiable opcode ends the unit before it (plan Q1 resolution). Wide-access uses
-/// Direct's exact rule (the `has_wide_accesses` accumulation in `compile`); the word-gate
-/// persona restriction there is a compile heuristic, not a classification fact, so it is
-/// deliberately NOT replicated here.
-#[cfg(all(
-    feature = "clif-backend",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-pub(crate) fn unit_growth_classify(
-    insn: &DecodedInsn,
-    lin: u32,
-    entry_lin: u32,
-) -> Option<UnitGrowthStep> {
-    let kind = classify::classify(insn, lin, entry_lin)?;
-    let wide_access = kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
-    let read_segments = kind.read_segment().map_or(0, segment_bit);
-    let write_segments = kind.write_segment().map_or(0, segment_bit);
-    let terminal = match kind {
-        DirectKind::Jcc { taken_delta, .. } => Some(UnitTerminal::Jcc { taken_delta }),
-        DirectKind::Jmp { .. } => Some(UnitTerminal::Jmp),
-        DirectKind::JmpMem { .. } => Some(UnitTerminal::Jmp),
-        DirectKind::Call { .. } => Some(UnitTerminal::Call),
-        DirectKind::CallReg { .. } => Some(UnitTerminal::Call),
-        DirectKind::Ret { .. } => Some(UnitTerminal::Ret),
-        _ => None,
-    };
-    Some(UnitGrowthStep {
-        terminal,
-        wide_access,
-        read_segments,
-        write_segments,
-        kind,
-    })
-}
-
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
 ///
@@ -4944,8 +4846,8 @@ struct MemoryEmitContext {
     /// function of CS.D, which the mode key pins.
     ///
     /// It lives here rather than on `DirectAddr` because that struct rides inside `Load`,
-    /// `Store`, `AluMemSource` and other kinds in clif's lowerable set, which would lower them
-    /// without the mask.
+    /// `Store`, `AluMemSource` and other kinds shared across many emit sites, and this
+    /// property is a block-wide fact, not a per-address one.
     ///
     /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
     /// and is keyed separately, so all nine `stack_addr` call sites pass a literal.

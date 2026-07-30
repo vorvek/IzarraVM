@@ -2753,8 +2753,8 @@ pub(super) fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: Ad
 /// is congruent mod 2^16, and it matches `resolve_memory_addr_mode`'s `(sum as u16)`.
 ///
 /// It is a PARAMETER rather than a field on `DirectAddr` deliberately. A `DirectAddr` field would
-/// ride inside kinds that are in clif's `lowerable()` allowlist, such as `Load`, and clif would
-/// lower them without the mask. That is the same trap as putting a width field on `Push`.
+/// ride inside many kinds (`Load` among them) whose emitters would then need to remember to
+/// apply the mask individually. That is the same trap as putting a width field on `Push`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum AddressWrap {
     None,

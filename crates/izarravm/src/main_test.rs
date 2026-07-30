@@ -51,51 +51,6 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "instructions",
     "interp_fast_map_hits",
     "interp_fast_map_misses",
-    "jit_clif_chain_abandoned_cleared",
-    "jit_clif_compile_attempts",
-    "jit_clif_compile_ns",
-    "jit_clif_entries",
-    "jit_clif_entries_len",
-    "jit_clif_guard_ns",
-    "jit_clif_linked_transfers",
-    "jit_clif_mem_exit_alignment",
-    "jit_clif_mem_exit_code_watch",
-    "jit_clif_mem_exit_permission",
-    "jit_clif_mem_exit_segment_limit",
-    "jit_clif_mem_exit_unavailable_or_kind",
-    "jit_clif_native_ns",
-    "jit_clif_park_arena_exhausted",
-    "jit_clif_park_backend_unavailable",
-    "jit_clif_park_compile_failed",
-    "jit_clif_park_heat_chunk",
-    "jit_clif_park_heat_span",
-    "jit_clif_park_install_failed",
-    "jit_clif_park_no_code_cover",
-    "jit_clif_park_no_lowerable",
-    "jit_clif_park_segment_capture_failed",
-    "jit_clif_post_ns",
-    "jit_clif_reject_aggregate_accounting",
-    "jit_clif_reject_alignment",
-    "jit_clif_reject_cpl",
-    "jit_clif_reject_cs_layout",
-    "jit_clif_reject_data_segment",
-    "jit_clif_reject_fetch_limit",
-    "jit_clif_reject_interrupt_shadow",
-    "jit_clif_reject_mode_key",
-    "jit_clif_reject_observer",
-    "jit_clif_reject_zero_budget",
-    "jit_clif_resolve_clone_ns",
-    "jit_clif_resolve_ns",
-    "jit_clif_retired",
-    "jit_clif_retry_incomplete_walk",
-    "jit_clif_retry_no_fast_map",
-    "jit_clif_side_exits",
-    "jit_clif_smc_unit_kills",
-    "jit_clif_smc_unit_kills_multi_slot",
-    "jit_clif_smc_unit_kills_no_layout",
-    "jit_clif_smc_unit_restamps",
-    "jit_clif_units_installed",
-    "jit_clif_unresolved_transfers",
     "jit_direct_arena_compaction_bytes",
     "jit_direct_arena_compaction_failures",
     "jit_direct_arena_compaction_live_blocks",
@@ -216,45 +171,22 @@ fn cli_accepts_explicit_interpreter_backend() {
 #[test]
 fn execution_backend_requires_avx2_only_for_native_builds() {
     assert_eq!(
-        requested_execution_backend(false, false, true, true, false),
+        requested_execution_backend(false, true, true),
         Ok(ExecutionBackend::Automatic)
     );
     assert!(
-        requested_execution_backend(false, false, true, false, false)
+        requested_execution_backend(false, true, false)
             .unwrap_err()
             .contains("AVX2")
     );
     assert_eq!(
-        requested_execution_backend(true, false, true, false, false),
+        requested_execution_backend(true, true, false),
         Ok(ExecutionBackend::Interpreter)
     );
     assert_eq!(
-        requested_execution_backend(false, false, false, false, false),
+        requested_execution_backend(false, false, false),
         Ok(ExecutionBackend::Interpreter)
     );
-}
-
-/// F-A6 pin: --clif without the clif-backend feature is a loud CLI error, never a silent
-/// fallback; with the feature it selects the Clif policy and still requires AVX2.
-#[test]
-fn clif_backend_selection_fails_loudly_without_the_feature() {
-    assert!(
-        requested_execution_backend(false, true, true, true, false)
-            .unwrap_err()
-            .contains("clif-backend")
-    );
-    assert_eq!(
-        requested_execution_backend(false, true, true, true, true),
-        Ok(ExecutionBackend::Clif)
-    );
-    assert!(
-        requested_execution_backend(false, true, true, false, true)
-            .unwrap_err()
-            .contains("AVX2")
-    );
-    let cli = Cli::try_parse_from(["izarravm", "--clif"]).unwrap();
-    assert!(cli.clif);
-    assert!(Cli::try_parse_from(["izarravm", "--clif", "--interpreter"]).is_err());
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -434,10 +366,6 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         monitor_resident_core_clocks: 111,
         ..PerfCounters::default()
     };
-    let jit_clif = izarravm_cpu::JitClifCounters {
-        chain_abandoned_cleared: 112,
-        ..izarravm_cpu::JitClifCounters::default()
-    };
     let fast_map_probe = izarravm_cpu::FastMapProbeCounters {
         hits: 113,
         misses: 114,
@@ -446,7 +374,6 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
     let report = bench::perf_counters_json(
         &perf,
         izarravm_cpu::PollSkipMemoryCounters::default(),
-        jit_clif,
         fast_map_probe,
     );
     let object = report.as_object().unwrap();
@@ -464,7 +391,6 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         ("jit_table_clears", 109),
         ("monitor_trips_vec13", 110),
         ("monitor_resident_core_clocks", 111),
-        ("jit_clif_chain_abandoned_cleared", 112),
         ("interp_fast_map_hits", 113),
         ("interp_fast_map_misses", 114),
     ] {
@@ -478,7 +404,6 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
     let zeros = bench::perf_counters_json(
         &PerfCounters::default(),
         izarravm_cpu::PollSkipMemoryCounters::default(),
-        izarravm_cpu::JitClifCounters::default(),
         izarravm_cpu::FastMapProbeCounters::default(),
     );
     let zero_object = zeros.as_object().unwrap();
@@ -603,53 +528,6 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         spans: _,
         iterations: _,
     } = izarravm_cpu::PollSkipMemoryCounters::default();
-    let izarravm_cpu::JitClifCounters {
-        compile_attempts: _,
-        units_installed: _,
-        entries: _,
-        side_exits: _,
-        reject_observer: _,
-        reject_interrupt_shadow: _,
-        reject_aggregate_accounting: _,
-        reject_mode_key: _,
-        reject_cs_layout: _,
-        reject_cpl: _,
-        reject_data_segment: _,
-        reject_alignment: _,
-        reject_fetch_limit: _,
-        reject_zero_budget: _,
-        mem_exit_alignment: _,
-        mem_exit_unavailable_or_kind: _,
-        mem_exit_permission: _,
-        mem_exit_code_watch: _,
-        mem_exit_segment_limit: _,
-        linked_transfers: _,
-        unresolved_transfers: _,
-        chain_abandoned_cleared: _,
-        smc_unit_kills: _,
-        smc_unit_restamps: _,
-        smc_unit_kills_no_layout: _,
-        smc_unit_kills_multi_slot: _,
-        compile_ns: _,
-        retry_no_fast_map: _,
-        retry_incomplete_walk: _,
-        park_arena_exhausted: _,
-        park_no_lowerable: _,
-        park_heat_chunk: _,
-        park_heat_span: _,
-        park_no_code_cover: _,
-        park_segment_capture_failed: _,
-        park_backend_unavailable: _,
-        park_compile_failed: _,
-        park_install_failed: _,
-        entries_len: _,
-        resolve_ns: _,
-        guard_ns: _,
-        native_ns: _,
-        post_ns: _,
-        resolve_clone_ns: _,
-        clif_retired: _,
-    } = izarravm_cpu::JitClifCounters::default();
     let izarravm_cpu::FastMapProbeCounters { hits: _, misses: _ } =
         izarravm_cpu::FastMapProbeCounters::default();
 }

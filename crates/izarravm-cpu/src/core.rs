@@ -114,22 +114,6 @@ impl CpuGsw {
         self.invalidate_decode_frontend();
         #[cfg(feature = "jit")]
         self.jit_direct.clear();
-        self.clif_units_clear();
-    }
-
-    /// Drop every compiled clif unit (Track C C1b). Lowered units execute real guest code,
-    /// so any event that can stale their bytes-to-code mapping without a per-range write
-    /// notification (a global decode flush clears the SMC marks that route writes into
-    /// `note_code_write_hit`) must kill them wholesale. No-op without the clif backend.
-    #[inline]
-    pub(super) fn clif_units_clear(&mut self) {
-        #[cfg(all(
-            feature = "jit",
-            feature = "clif-backend",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        self.jit_direct.clif_clear();
     }
 
     fn invalidate_decode_frontend(&mut self) {
@@ -147,7 +131,6 @@ impl CpuGsw {
         self.invalidate_decode_frontend();
         #[cfg(feature = "jit")]
         self.jit_direct.invalidate_translation();
-        self.clif_units_clear();
     }
 
     fn invalidate_direct_pages(&mut self) {
@@ -315,30 +298,6 @@ impl CpuGsw {
             invalidated = killed != 0;
             heat_hit |= killed != 0;
         }
-        // C1b: a write into a compiled clif unit's span invalidates it. This rides the
-        // same choke as Direct's invalidation (decode-native marks route the write here;
-        // G2 same-value elision upstream is sound for clif too, since unchanged bytes
-        // cannot stale a compiled unit). C1e (D3): the cache now classifies the write
-        // per slot; a tail-confined single-slot write RESTAMPS the live descriptor's
-        // operand lane(s) instead of killing, and only KILLS feed the G1 heat map
-        // (design 2.2c: restamp is the cheap survivor path, so it neither heats nor
-        // demotes; a restamp storm must not park the unit Dormant).
-        #[cfg(all(
-            feature = "jit",
-            feature = "clif-backend",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        {
-            let clif = self
-                .jit_direct
-                .clif_invalidate_physical_range(physical, width);
-            self.jit_clif.smc_unit_kills += u64::from(clif.kills);
-            self.jit_clif.smc_unit_restamps += u64::from(clif.restamps);
-            self.jit_clif.smc_unit_kills_no_layout += u64::from(clif.kills_no_layout);
-            self.jit_clif.smc_unit_kills_multi_slot += u64::from(clif.kills_multi_slot);
-            heat_hit |= clif.kills != 0;
-        }
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
             if self.profile.enabled {
@@ -384,9 +343,6 @@ impl CpuGsw {
                     self.decode_cache.invalidate_and_clear_code_marks();
                     #[cfg(feature = "jit")]
                     self.jit_direct.invalidate_translation();
-                    // The marks that route future writes here are gone; drop every clif
-                    // unit rather than trust an unwatched page.
-                    self.clif_units_clear();
                 }
             }
             // The fetch-page snapshot may hold the written bytes under either outcome.
@@ -674,34 +630,6 @@ impl CpuGsw {
         &self.perf
     }
 
-    /// The clif shell diagnostic subset, stored outside `PerfCounters` at the
-    /// `CpuGsw` tail (see `JitClifCounters` for why). Reset alongside the
-    /// other counters by `reset_perf_counters`.
-    pub fn jit_clif_counters(&self) -> JitClifCounters {
-        #[cfg_attr(
-            not(all(
-                feature = "jit",
-                feature = "clif-backend",
-                target_arch = "x86_64",
-                any(target_os = "windows", target_os = "linux")
-            )),
-            allow(unused_mut)
-        )]
-        let mut counters = self.jit_clif;
-        // Track C1f: `entries_len` is a live gauge, not an accumulator, so it is filled in
-        // here at read time rather than incremented at a `run.rs` call site.
-        #[cfg(all(
-            feature = "jit",
-            feature = "clif-backend",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        {
-            counters.entries_len = self.jit_direct.clif_entries_len() as u64;
-        }
-        counters
-    }
-
     /// Lever 1 (interpreter FastMap serve path) hit/miss counters, stored outside
     /// `PerfCounters` at the `CpuGsw` tail (see `FastMapProbeCounters` for why). Reset
     /// alongside the other counters by `reset_perf_counters`.
@@ -709,13 +637,11 @@ impl CpuGsw {
         self.fast_map_probe
     }
 
-    /// Zero the host-side performance counters, including the memory-poll and
-    /// clif subsets stored outside `PerfCounters` (see `PollSkipMemoryCounters`
-    /// and `JitClifCounters`).
+    /// Zero the host-side performance counters, including the memory-poll
+    /// subset stored outside `PerfCounters` (see `PollSkipMemoryCounters`).
     pub fn reset_perf_counters(&mut self) {
         self.perf = PerfCounters::default();
         self.poll_skip_memory = PollSkipMemoryCounters::default();
-        self.jit_clif = JitClifCounters::default();
         self.fast_map_probe = FastMapProbeCounters::default();
     }
 

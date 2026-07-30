@@ -744,7 +744,6 @@ impl CpuGsw {
     pub fn poll_skip_eligible(&self) -> bool {
         matches!(self.persona(), CpuPersona::I486 | CpuPersona::I586)
             && !self.jit_direct.backend_enabled()
-            && !self.jit_direct.clif_enabled
             && !self.profile.enabled
             && !crate::run::diff_trace_enabled()
             && !self.interrupt_shadow

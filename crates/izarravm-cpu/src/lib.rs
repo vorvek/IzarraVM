@@ -979,204 +979,8 @@ impl PartialEq for PollSkipMemoryCounters {
 }
 impl Eq for PollSkipMemoryCounters {}
 
-/// Track C C1a: clif side-exit shell admission and entry diagnostics, the clif analogues of
-/// the `jit_direct_*`/`jit_direct_reject_*` counters in `PerfCounters`. Kept OUT of
-/// `PerfCounters` and at the very tail of `CpuGsw`, following the `PollSkipMemoryCounters`
-/// pattern exactly: growing `PerfCounters` shifts the hot `pending_flags` field off its
-/// pinned 4528 and costs the interpreter measurable wall time (the offset pin in cpu_test.rs
-/// guards it). A C1a shell never retires a guest instruction natively (F-A1 option B: it
-/// side-exits immediately), so there is no `insns` counterpart yet; `entries` counts adapter
-/// round trips instead. Unconditional (not cfg-gated) like the other diagnostic counters, so
-/// non-clif consumers can name the type.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct JitClifCounters {
-    pub compile_attempts: u64,
-    pub units_installed: u64,
-    pub entries: u64,
-    pub side_exits: u64,
-    pub reject_observer: u64,
-    pub reject_interrupt_shadow: u64,
-    pub reject_aggregate_accounting: u64,
-    pub reject_mode_key: u64,
-    pub reject_cs_layout: u64,
-    pub reject_cpl: u64,
-    pub reject_data_segment: u64,
-    pub reject_alignment: u64,
-    pub reject_fetch_limit: u64,
-    pub reject_zero_budget: u64,
-    /// C1c memory side-exit reasons (diagnostic only; the guest cannot observe which check
-    /// fired, per the design's un-advanced-EIP discipline).
-    pub mem_exit_alignment: u64,
-    pub mem_exit_unavailable_or_kind: u64,
-    pub mem_exit_permission: u64,
-    pub mem_exit_code_watch: u64,
-    pub mem_exit_segment_limit: u64,
-    /// C1d: completed linked transfers (Direct's `linked_transfers` analogue) and hops
-    /// that landed in the resolver trampoline (the unresolved split).
-    pub linked_transfers: u64,
-    pub unresolved_transfers: u64,
-    /// C1d graceful-abandon safety valve (design
-    /// `dev_docs/plans/2026-07-19-clif-chain-resolver-generation-guard-design.md`, A2
-    /// section 13): a mid-chain hop's x87 call-out fired a wholesale `clif_units_clear`
-    /// (a page-straddling / aliased SMC store into watched code), dropping the descriptors
-    /// the completed transfers recorded in `chain.trace`. The resolver detects the
-    /// `generation` bump and abandons trace resolution instead of `.expect()`-panicking on
-    /// the dropped descriptors. Expected to stay zero in practice; a nonzero value only
-    /// means the rare self-modifying-code-during-an-x87-chain path was hit and handled.
-    pub chain_abandoned_cleared: u64,
-    /// C1e: clif-only recompile-churn diagnostics (D3). `smc_unit_restamps` and
-    /// `smc_unit_kills` partition every SMC write that hit a COMPILED clif unit's span;
-    /// `smc_unit_kills_multi_slot` is the subset of kills escalated by the coarse
-    /// multi-slot rule (every touched slot individually tail-confined, but more than one
-    /// touched). `smc_unit_kills_no_layout` is C1f's permanent-zero regression tripwire
-    /// (dev_docs/plans/2026-07-19-clif-compile-churn-fix-design.md, Option 2): it used to
-    /// count `Seen`/`Dormant` entries dropped by a page-granular conservative-eviction rule
-    /// that caused a compile-churn treadmill (a heat-parked verdict erased by any unrelated
-    /// write sharing its 4KB page, forcing a full re-walk and recompile for no reason); that
-    /// rule is gone (`Seen`/`Dormant` hold no resource a write could invalidate, so nothing
-    /// is lost by never dropping them), so this field is now EXPECTED to stay zero forever.
-    /// A nonzero value signals the page-eviction bug has been reintroduced.
-    pub smc_unit_kills: u64,
-    pub smc_unit_restamps: u64,
-    pub smc_unit_kills_no_layout: u64,
-    pub smc_unit_kills_multi_slot: u64,
-    /// Track C1f (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md): the
-    /// second compile-treadmill diagnosis, committing the counters the C0 review's
-    /// MINOR-2 asked for so a future re-diagnosis never again depends on reverted local
-    /// instrumentation (see the track-c1f-postfix summary's "BLIND SPOT" note). Time spent
-    /// inside the ONE `jit::clif::lower::compile_unit` Cranelift call per `Seen`-branch
-    /// visit that reaches it (`run.rs`, immediately before `units_installed` or
-    /// `park_compile_failed`). Previously this nanosecond total was folded into
-    /// `PerfCounters::jit_direct_compile_ns`, mislabeling clif's own compile cost as
-    /// Direct's (confirmed live: a clif-only run showed `jit_direct_compile_attempts == 0`
-    /// with `jit_direct_compile_ns` in the tens of seconds); this field is the clif-only
-    /// source of truth.
-    pub compile_ns: u64,
-    /// `retry_no_fast_map` (run.rs, the `has_memory`/`FastMap::native_bases` bail, the C0
-    /// review's MINOR-2 suspect): a
-    /// `Seen`-branch bail for a memory-bearing unit whose `FastMap` storage has not been
-    /// allocated yet (`jit::fast_map::FastMap::native_bases` returns `None` only before the
-    /// very first population anywhere, so this should be a narrow startup-window cost, not a
-    /// sustained one, UNLESS FastMap population is not actually active under the running
-    /// policy — see `memory.rs::fast_map_population_enabled`). Measured ZERO on a full
-    /// Quake/586 1200M-cycle run
-    /// (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md section 0): this bail
-    /// is proven not to fire in practice, so per the adversarial review's MAJOR-4 it is left
-    /// exactly as-is (WITHOUT parking Dormant, so the key stays `Seen` and the very next
-    /// visit would re-run the entire admission pipeline from scratch) — no machinery is
-    /// added for a bail that never fires.
-    pub retry_no_fast_map: u64,
-    /// `retry_incomplete_walk` (the `walk_unit` bail in the `Seen` arm, `run.rs`): `walk_unit`
-    /// returned no admittable layout (`instructions == 0`), which given `clif_hot` already
-    /// confirmed the decode-cache line at this exact `(lin, d)` moments earlier, can only
-    /// mean the entry instruction itself is structurally unclassifiable
-    /// (`direct::unit_growth_classify` declines it, or its prefixes are unsupported) — a
-    /// PERMANENT, deterministic condition for that address. Measured 4,455,782 on the same
-    /// Quake run (the dominant re-attempt-by-COUNT cause; section 0 of the design doc
-    /// above). FIXED (Cause-B): this bail now parks the key `Dormant` with the plain no-lift
-    /// `dormant()`, byte-identical to the structural-failure parks below (`park_no_lowerable`,
-    /// `park_no_code_cover`, `park_segment_capture_failed`) — recoverable only via a
-    /// wholesale `clif_clear()`, never a heat-cooldown or SMC-triggered lift (adversarial
-    /// review MAJOR-3: an unclassifiable opcode stays unclassifiable until the bytes change,
-    /// and a code change already triggers `clif_clear()`). This field's name and its
-    /// "un-parked retry" framing are kept (not renamed to a `park_*` name) exactly as
-    /// `smc_unit_kills_no_layout` was kept after PR #598: it is now a permanent
-    /// one-per-distinct-address tripwire, not deleted, so a regression that reopens the
-    /// treadmill is still named by an existing counter.
-    pub retry_incomplete_walk: u64,
-    /// `Seen`-branch visits parked Dormant for a heat or structural admission reason,
-    /// broken out by the exact guard that fired (mirroring the `jit_direct_reject_*`
-    /// per-reason pattern already used for `run_clif_unit`'s entry guards), so a churn
-    /// regression names its own cause instead of hiding in one lump. `park_heat_chunk` and
-    /// `park_heat_span` duplicate a subset of the shared (Direct+clif) `smc_heat_demotions`
-    /// counter but isolate clif's own two heat-gate sites specifically.
-    ///
-    /// Invariant (checkable in a regression test, since `compile_attempts` increments
-    /// unconditionally once the leading-run gate passes (`run.rs`, the `plan.leading == 0`
-    /// check's `else` branch), strictly before
-    /// every field below fires): `compile_attempts` equals the sum of `units_installed`,
-    /// `park_no_code_cover`, `park_heat_span`, `park_segment_capture_failed`,
-    /// `retry_no_fast_map`, `park_backend_unavailable`, `park_compile_failed`, and
-    /// `park_install_failed`. `park_arena_exhausted`, `park_no_lowerable`,
-    /// `park_heat_chunk`, and `retry_incomplete_walk` all fire BEFORE the
-    /// `compile_attempts` increment and are deliberately excluded from that sum.
-    ///
-    /// Track C-second-cause A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md
-    /// section 3.7): the sticky arena-exhausted short-circuit. Once `ClifBackend::
-    /// arena_exhausted()` latches — the FIRST time a finalized unit fails to install for
-    /// lack of remaining arena capacity, as opposed to a Cranelift codegen error or the
-    /// zero-relocation invariant's own reject, which are per-unit failures and must never
-    /// set it (adversarial review MINOR-5) — every later `Seen` admission on this backend
-    /// rejects HERE, before `walk_unit`/`plan_unit`/the ~680 microsecond Cranelift compile
-    /// that would only fail at install anyway. This is what collapses the pre-fix
-    /// `park_compile_failed = 108,293` (73.5 s of `compile_ns`, one Quake/586 1200M-cycle
-    /// run, design doc section 0) down to O(1) rejects: only the handful of units that fill
-    /// the arena for the FIRST time ever pay a genuine compile-then-fail; every later
-    /// admission on the SAME backend generation counts here instead. Track C A2
-    /// (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`) clears this flag on the next
-    /// frame-free admission after a wholesale `clif_clear()`, so a re-attempt of the same
-    /// working set after a clear compiles fresh against the reclaimed arena rather than
-    /// rejecting here forever. Counted, not left inferred, exactly like the other `park_*`
-    /// reasons above.
-    pub park_arena_exhausted: u64,
-    pub park_no_lowerable: u64,
-    pub park_heat_chunk: u64,
-    pub park_heat_span: u64,
-    pub park_no_code_cover: u64,
-    pub park_segment_capture_failed: u64,
-    /// The clif compile/install infrastructure itself was unavailable (backend allocation
-    /// failed after `ClifBackend::new()`, the sentinel descriptor was unavailable, or the
-    /// backend vanished on the second borrow): three merged `run.rs` sites, expected near
-    /// zero on any supported host.
-    pub park_backend_unavailable: u64,
-    pub park_compile_failed: u64,
-    pub park_install_failed: u64,
-    /// A snapshot (not an accumulator) of `ClifUnitCache`'s admission map size
-    /// (`entries: HashMap<ClifUnitKey, ClifUnitState>`) at read time, the requested
-    /// "entries-map size" gauge; zero on a non-clif-backend build.
-    pub entries_len: u64,
-    /// Track C3(b) per-entry phase timing (nanoseconds), flag-gated by the
-    /// `IZARRAVM_CLIF_PHASE_PROFILE` env var and ZERO when it is unset (the timers add
-    /// four `Instant::now()` reads per native unit run, too costly to leave always-on).
-    /// This partitions the ~11.4 microsecond-per-entry clif cost the residency finding
-    /// measured, to bound a hot-transfer cache's ceiling BEFORE building it: a cache can
-    /// only shrink `resolve_ns` (the dispatch resolution a cached `(key -> unit_index)`
-    /// replaces: `clif_hot` + `clif_key_for` + `clif_units.state` + the per-entry
-    /// descriptor `unit(index).cloned()`); `guard_ns` (the `run_clif_unit` entry guards +
-    /// quota + snapshot writes), `native_ns` (the compiled adapter call itself), and
-    /// `post_ns` (chain resolution + the whole native-aggregate charge path) are paid per
-    /// unit REGARDLESS, because clif's native code always returns to the Rust dispatcher
-    /// (only C1d's static link cells hop native-to-native). Sum over a run; divide by
-    /// `entries` for the per-entry split.
-    pub resolve_ns: u64,
-    pub guard_ns: u64,
-    pub native_ns: u64,
-    pub post_ns: u64,
-    /// The subset of `resolve_ns` spent in the per-entry descriptor clone
-    /// (`clif_units.unit(index).cloned()`), split out because the clone is clif overhead
-    /// Direct does not pay and is a standalone win to remove regardless of any cache;
-    /// `resolve_ns - resolve_clone_ns` is the pure lookup (clif_hot + key + state).
-    pub resolve_clone_ns: u64,
-    /// Track C3(b) coverage: guest instructions clif retired NATIVELY (sum of each entry's
-    /// `lowered_retired`). `PerfCounters::instructions` is the guest total and ALSO includes
-    /// these, so `perf.instructions - clif_retired` is the interpreter-retired remainder; that
-    /// fraction times the pure-interpreter ns/instruction estimates the
-    /// interpreter-between-side-exits time, which no hot cache can reduce. This is the number
-    /// that decides whether the residency lever is a cache (churn-bound) or linking
-    /// (coverage-bound).
-    pub clif_retired: u64,
-}
-
-impl PartialEq for JitClifCounters {
-    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-impl Eq for JitClifCounters {}
-
 /// Lever 1 (interpreter FastMap serve path) hit/miss counters. Kept OUT of `PerfCounters` and at
-/// the very tail of `CpuGsw`, following the `PollSkipMemoryCounters`/`JitClifCounters` pattern
+/// the very tail of `CpuGsw`, following the `PollSkipMemoryCounters` pattern
 /// exactly: these two fields were first added directly to `PerfCounters` and moved the pinned
 /// `pending_flags` offset from 4512 to 4528 (the interpreter's hot-field layout pin in
 /// `cpu_test.rs`/`canonical_state_test.rs`), an avoidable layout confound the campaign's adversarial
@@ -1518,7 +1322,8 @@ pub struct CpuGsw {
     /// consumed so far, from which the finalize step derives the recorded
     /// `{disp_len, imm_len}` pair. Both are ZEROED by the finalize step so no residue
     /// outlives the decode: two lockstep arms legally decode different numbers of times
-    /// (a native clif unit retires slots without re-decoding), so persistent residue
+    /// (a native clif unit used to retire slots without re-decoding, back when that backend
+    /// existed), so persistent residue
     /// would trip the derived `CpuGsw` equality on nothing architectural (found by the
     /// C1e storm battery). Loose fields, not a struct: the lone `u8` packs into an
     /// existing padding hole, keeping `pending_flags` on its pinned offset 4528 (the
@@ -1611,12 +1416,9 @@ pub struct CpuGsw {
     /// interpreter measurable wall time. At the tail they change only the
     /// struct's total size. See `PollSkipMemoryCounters`.
     poll_skip_memory: PollSkipMemoryCounters,
-    /// Clif shell diagnostics, also at the tail for the same layout reason (Track C C1a);
-    /// see `JitClifCounters`.
-    jit_clif: JitClifCounters,
     /// Cached mirror of `fast_map_population_enabled()`, refreshed at every state change that
     /// predicate depends on (`set_mode`, `finish_direct_execution_transition`,
-    /// `set_clif_backend_enabled`, `set_legacy_region_auto_admit` -- see
+    /// `set_legacy_region_auto_admit` -- see
     /// `memory.rs::refresh_fast_map_serve_gate` for the exact call-site inventory). The
     /// interpreter's FastMap serve path gates on this instead of re-deriving the condition (four
     /// predicate calls) or testing `FastMap::has_storage()` (which stays `true` forever once any
@@ -1696,7 +1498,6 @@ impl Default for CpuGsw {
             unit_sim: UnitSimSlot::default(),
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
-            jit_clif: JitClifCounters::default(),
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
@@ -2316,8 +2117,8 @@ struct DecodedInsn {
     /// displacement and immediate fields, recorded by the decoder as it consumes them
     /// (the single decode authority; never back-computed from the stored values, whose
     /// widths are ambiguous after sign extension). The moffs address bytes of 0xA0-0xA3
-    /// count as DISPLACEMENT (they are one architecturally, and clif's operand-lane
-    /// routing depends on it).
+    /// count as DISPLACEMENT (they are one architecturally, and the now-removed clif
+    /// backend's operand-lane routing depended on it).
     /// MEASURED layout effect (the L2-note truthfulness check the design mandates): the
     /// pair did NOT fit `DecodedInsn`'s padding; `size_of::<DecodedInsn>()` grew 36 -> 40
     /// (pinned by a test), so a `DecodeLine` grows by the same 4 bytes and the 4096-line
@@ -2474,15 +2275,6 @@ struct DecodeLine {
     /// Saturating direct-code admission count, independent of legacy region stamps.
     #[cfg(feature = "jit")]
     jit_direct_hotness: u8,
-    /// Independent clif admission counter (Track C C1a, plan section 2.4 row P4): the two
-    /// backends compile under a runtime policy switch (decision D-C1.4) with their own
-    /// hotness history, so this never shares `jit_direct_hotness`.
-    #[cfg(all(
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    jit_clif_hotness: u8,
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
@@ -2874,12 +2666,6 @@ impl DecodeCache {
             jit_hotness: 0,
             #[cfg(feature = "jit")]
             jit_direct_hotness: 0,
-            #[cfg(all(
-                feature = "clif-backend",
-                target_arch = "x86_64",
-                any(target_os = "windows", target_os = "linux")
-            ))]
-            jit_clif_hotness: 0,
         };
 
         DecodeInsertOutcome {
@@ -3062,26 +2848,6 @@ impl DecodeCache {
             line.jit_direct_hotness += 1;
         }
         line.jit_direct_hotness == threshold
-    }
-
-    /// Clif analogue of `direct_hot` (Track C C1a, plan section 2.4 row P4): an independent
-    /// per-decode-line counter, since the two backends compile under a runtime policy switch
-    /// (decision D-C1.4) and never share admission history.
-    #[cfg(all(
-        feature = "clif-backend",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    #[inline]
-    fn clif_hot(&mut self, lin: u32, d: bool, threshold: u8) -> bool {
-        let line = &mut self.lines[(lin & self.mask) as usize];
-        if line.generation != self.generation || line.tag != lin || line.d != d {
-            return false;
-        }
-        if line.jit_clif_hotness < threshold {
-            line.jit_clif_hotness += 1;
-        }
-        line.jit_clif_hotness == threshold
     }
 
     /// Invalidate every cached line and drop every matching code watch. The generation advance and

@@ -3330,7 +3330,6 @@ fn scalar_and_direct_native_stores_share_the_ram_owner() {
         cs.default_size_32 = true;
         cs.limit = u32::MAX;
         machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
-        machine.cpu.set_clif_backend_enabled(false);
         machine.cpu.set_native_backend_enabled(native);
         machine.set_jit_auto_admit(native);
         machine.trace.set_tracing_mode(TracingMode::Off);

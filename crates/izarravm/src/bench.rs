@@ -15,9 +15,6 @@ struct BenchRun {
     /// Memory-poll subset, stored outside PerfCounters on the CPU (layout
     /// preservation; see PollSkipMemoryCounters) and captured here alongside.
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
-    /// Clif churn subset (C1e), captured alongside for the same layout-preservation
-    /// reason.
-    jit_clif: izarravm_cpu::JitClifCounters,
     /// Lever 1 (interpreter FastMap serve path) hit/miss subset, stored outside PerfCounters on
     /// the CPU for the same layout-preservation reason; see FastMapProbeCounters.
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
@@ -94,7 +91,6 @@ fn run_bench_one_profiled(
         wall,
         perf,
         poll_skip_memory: machine.cpu().poll_skip_memory(),
-        jit_clif: machine.cpu().jit_clif_counters(),
         fast_map_probe: machine.cpu().fast_map_probe_counters(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
@@ -949,7 +945,6 @@ fn write_profile_json(
             "perf": perf_counters_json(
                 &profiled.perf,
                 profiled.poll_skip_memory,
-                profiled.jit_clif,
                 profiled.fast_map_probe,
             ),
         },
@@ -961,7 +956,6 @@ fn write_profile_json(
 pub(super) fn perf_counters_json(
     perf: &PerfCounters,
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
-    jit_clif: izarravm_cpu::JitClifCounters,
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
 ) -> serde_json::Value {
     json!({
@@ -1078,56 +1072,6 @@ pub(super) fn perf_counters_json(
         "jit_paged_tlb_successes": perf.jit_paged_tlb_successes,
         "monitor_trips_vec13": perf.monitor_trips_vec13,
         "monitor_resident_core_clocks": perf.monitor_resident_core_clocks,
-        "jit_clif_smc_unit_kills": jit_clif.smc_unit_kills,
-        "jit_clif_smc_unit_restamps": jit_clif.smc_unit_restamps,
-        "jit_clif_smc_unit_kills_no_layout": jit_clif.smc_unit_kills_no_layout,
-        "jit_clif_smc_unit_kills_multi_slot": jit_clif.smc_unit_kills_multi_slot,
-        // Track C1f: the rest of JitClifCounters, previously a blind spot (only the four
-        // SMC fields above were exposed to the committed profile JSON; see
-        // dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md).
-        "jit_clif_compile_attempts": jit_clif.compile_attempts,
-        "jit_clif_units_installed": jit_clif.units_installed,
-        "jit_clif_entries": jit_clif.entries,
-        "jit_clif_side_exits": jit_clif.side_exits,
-        "jit_clif_reject_observer": jit_clif.reject_observer,
-        "jit_clif_reject_interrupt_shadow": jit_clif.reject_interrupt_shadow,
-        "jit_clif_reject_aggregate_accounting": jit_clif.reject_aggregate_accounting,
-        "jit_clif_reject_mode_key": jit_clif.reject_mode_key,
-        "jit_clif_reject_cs_layout": jit_clif.reject_cs_layout,
-        "jit_clif_reject_cpl": jit_clif.reject_cpl,
-        "jit_clif_reject_data_segment": jit_clif.reject_data_segment,
-        "jit_clif_reject_alignment": jit_clif.reject_alignment,
-        "jit_clif_reject_fetch_limit": jit_clif.reject_fetch_limit,
-        "jit_clif_reject_zero_budget": jit_clif.reject_zero_budget,
-        "jit_clif_mem_exit_alignment": jit_clif.mem_exit_alignment,
-        "jit_clif_mem_exit_unavailable_or_kind": jit_clif.mem_exit_unavailable_or_kind,
-        "jit_clif_mem_exit_permission": jit_clif.mem_exit_permission,
-        "jit_clif_mem_exit_code_watch": jit_clif.mem_exit_code_watch,
-        "jit_clif_mem_exit_segment_limit": jit_clif.mem_exit_segment_limit,
-        "jit_clif_linked_transfers": jit_clif.linked_transfers,
-        "jit_clif_unresolved_transfers": jit_clif.unresolved_transfers,
-        "jit_clif_chain_abandoned_cleared": jit_clif.chain_abandoned_cleared,
-        "jit_clif_compile_ns": jit_clif.compile_ns,
-        "jit_clif_retry_incomplete_walk": jit_clif.retry_incomplete_walk,
-        "jit_clif_retry_no_fast_map": jit_clif.retry_no_fast_map,
-        // Track C-second-cause A1 (dev_docs/plans/2026-07-19-clif-compile-second-cause-
-        // design.md section 3.7): the sticky arena-exhausted short-circuit's own counter.
-        "jit_clif_park_arena_exhausted": jit_clif.park_arena_exhausted,
-        "jit_clif_park_no_lowerable": jit_clif.park_no_lowerable,
-        "jit_clif_park_heat_chunk": jit_clif.park_heat_chunk,
-        "jit_clif_park_heat_span": jit_clif.park_heat_span,
-        "jit_clif_park_no_code_cover": jit_clif.park_no_code_cover,
-        "jit_clif_park_segment_capture_failed": jit_clif.park_segment_capture_failed,
-        "jit_clif_park_backend_unavailable": jit_clif.park_backend_unavailable,
-        "jit_clif_park_compile_failed": jit_clif.park_compile_failed,
-        "jit_clif_park_install_failed": jit_clif.park_install_failed,
-        "jit_clif_entries_len": jit_clif.entries_len,
-        "jit_clif_resolve_ns": jit_clif.resolve_ns,
-        "jit_clif_guard_ns": jit_clif.guard_ns,
-        "jit_clif_native_ns": jit_clif.native_ns,
-        "jit_clif_post_ns": jit_clif.post_ns,
-        "jit_clif_resolve_clone_ns": jit_clif.resolve_clone_ns,
-        "jit_clif_retired": jit_clif.clif_retired,
     })
 }
 

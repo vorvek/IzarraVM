@@ -6,8 +6,9 @@
 //! page resets, the heat is lost, the code re-admits). See
 //! dev_docs/specs/2026-07-15-smc-hardening-design.md.
 //!
-//! Ownership (Track C C1a-pre hoist): the map is a PLAIN FIELD on `CpuGsw`, shared by the Direct
-//! cache and the future clif cache through SPLIT BORROWS. Deliberately no `Arc` and no `Mutex`:
+//! Ownership (Track C C1a-pre hoist): the map is a PLAIN FIELD on `CpuGsw`, reached through SPLIT
+//! BORROWS so a future backend could share it the way the (now-removed) clif backend once did.
+//! Deliberately no `Arc` and no `Mutex`:
 //! guest execution is single-threaded by design, so plain `&mut` discipline is the whole
 //! synchronization story. Heat is shared history at a physical address; it is cleared ONLY when
 //! the ACTIVE backend's cache resets its storage (the reset-coupling counter on `BlockCache`,

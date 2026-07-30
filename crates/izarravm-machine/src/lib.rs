@@ -205,13 +205,9 @@ pub enum ExecutionBackend {
     #[default]
     Automatic,
     Interpreter,
-    /// The Track C cranelift policy (C1a onward). Selecting it disables the Direct backend;
-    /// one native backend is active at a time (plan decision D-C1.4).
-    Clif,
 }
 
-// Widened from an AtomicBool when ExecutionBackend became tri-valued (Track C C1a, review
-// finding F-A2). Encoding: 0 Automatic, 1 Interpreter, 2 Clif.
+// Encoding: 0 Automatic, 1 Interpreter.
 static PROCESS_EXECUTION_BACKEND: AtomicU8 = AtomicU8::new(0);
 
 /// Set the execution backend inherited by subsequently constructed machines.
@@ -219,7 +215,6 @@ pub fn set_process_execution_backend(backend: ExecutionBackend) {
     let encoded = match backend {
         ExecutionBackend::Automatic => 0,
         ExecutionBackend::Interpreter => 1,
-        ExecutionBackend::Clif => 2,
     };
     PROCESS_EXECUTION_BACKEND.store(encoded, Ordering::Release);
 }
@@ -228,7 +223,6 @@ pub fn set_process_execution_backend(backend: ExecutionBackend) {
 pub fn process_execution_backend() -> ExecutionBackend {
     match PROCESS_EXECUTION_BACKEND.load(Ordering::Acquire) {
         1 => ExecutionBackend::Interpreter,
-        2 => ExecutionBackend::Clif,
         _ => ExecutionBackend::Automatic,
     }
 }
@@ -1178,10 +1172,6 @@ impl Machine {
         machine
             .cpu
             .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
-        #[cfg(feature = "jit")]
-        machine
-            .cpu
-            .set_clif_backend_enabled(matches!(execution_backend, ExecutionBackend::Clif));
         machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
