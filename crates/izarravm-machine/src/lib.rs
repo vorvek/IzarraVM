@@ -98,6 +98,7 @@ mod fat_name;
 mod fdc;
 mod firmware_contract;
 mod floppy;
+mod gameport;
 mod ide;
 mod iso9660;
 mod katea_names;
@@ -120,6 +121,7 @@ mod uart;
 mod unittester;
 
 use firmware_contract::*;
+pub use gameport::JoystickState;
 
 pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
 
@@ -766,6 +768,7 @@ pub struct Machine {
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
     keyboard: keyboard::Keyboard8042,
+    gameport: gameport::GamePort,
     speaker: speaker::Speaker,
     speaker_transitions: Vec<pit::OutTransition>,
     dma: dma::DmaController,
@@ -1096,6 +1099,7 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             keyboard: keyboard::Keyboard8042::default(),
+            gameport: gameport::GamePort::default(),
             speaker: speaker::Speaker::default(),
             speaker_transitions: Vec::new(),
             dma: dma::DmaController::default(),
@@ -1450,6 +1454,12 @@ impl Machine {
     /// large bogus delta.
     pub fn seed_mouse_origin(&mut self, x: i32, y: i32) {
         self.last_abs = (x.clamp(0, MOUSE_GUEST_MAX_X), y.clamp(0, MOUSE_GUEST_MAX_Y));
+    }
+
+    /// Replace the state presented by joystick A on the ISA gameport. `None`
+    /// electrically detaches the joystick and clears any charged RC timers.
+    pub fn set_joystick_state(&mut self, state: Option<JoystickState>) {
+        self.gameport.set_state(state);
     }
 
     /// Test seam: register a mouse packet handler (the INT 15h C207 effect),
@@ -2069,6 +2079,7 @@ struct MachineBus<'a> {
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
     keyboard: &'a mut keyboard::Keyboard8042,
+    gameport: &'a mut gameport::GamePort,
     speaker: &'a mut speaker::Speaker,
     rtc: &'a mut rtc::Rtc,
     dma: &'a mut dma::DmaController,

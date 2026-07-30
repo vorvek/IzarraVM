@@ -623,17 +623,17 @@ impl Machine {
         }
     }
 
-    /// INT 15h AH=84h joystick BIOS support. No game port is installed, which the
-    /// BIOS reports as open switches and zeroed position counters.
+    /// INT 15h AH=84h joystick BIOS support for the Izarra gameport.
     fn int15_joystick(&mut self) {
         match self.cpu.registers.edx() as u16 {
             0x0000 => {
-                self.set_ax(0x0000);
+                self.set_eax_al(self.gameport.bios_switches());
                 self.set_int_frame_carry(false);
             }
             0x0001 => {
-                self.set_ax(0x0000);
-                self.set_bx(0x0000);
+                let (x, y) = self.gameport.bios_axes();
+                self.set_ax(x);
+                self.set_bx(y);
                 self.set_cx(0x0000);
                 self.set_dx(0x0000);
                 self.set_int_frame_carry(false);

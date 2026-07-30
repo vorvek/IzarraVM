@@ -336,6 +336,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         pic: &mut machine.pic,
         pit: &mut machine.pit,
         keyboard: &mut machine.keyboard,
+        gameport: &mut machine.gameport,
         speaker: &mut machine.speaker,
         rtc: &mut machine.rtc,
         dma: &mut machine.dma,
