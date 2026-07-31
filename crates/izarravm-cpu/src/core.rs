@@ -286,6 +286,17 @@ impl CpuGsw {
         if let Some(sim) = self.unit_sim.0.as_mut() {
             sim.note_code_write(physical, width);
         }
+        // SMC trace (diagnostic, off by default). The gate is HERE, at the call site: with the
+        // trace disabled the slot is `None` and neither the decode-line probe nor the action
+        // record is built, so the invalidation path is byte-identical to an untraced build. See
+        // `smc_trace` and the trace-off probe pinned by the campaign protocol.
+        let traced = self.smc_trace.0.is_some().then(|| {
+            crate::smc_trace::SmcTracePre::new(
+                self.decode_cache.covering_line(physical),
+                self.perf.instructions,
+            )
+        });
+        let mut action = crate::smc_trace::SmcTraceAction::default();
         let mut invalidated = false;
         // G1: heat is incremented only on a byte-precise ACTUAL invalidation (a killed compiled
         // block or a narrow decode kill), never on the coarse global-flush fallback and never when
@@ -295,6 +306,7 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         if self.jit_direct.range_hits_compiled_code(physical, width) {
             let killed = self.jit_direct.invalidate_physical_range(physical, width);
+            action.blocks_killed = killed as u32;
             invalidated = killed != 0;
             heat_hit |= killed != 0;
         }
@@ -323,6 +335,7 @@ impl CpuGsw {
             });
             match narrow {
                 Some(kills) => {
+                    action.narrow_kills = kills;
                     self.perf.smc_narrow_kills += u64::from(kills);
                     if kills > 0 {
                         self.perf.code_invalidations += 1;
@@ -330,6 +343,7 @@ impl CpuGsw {
                     }
                 }
                 None => {
+                    action.wholesale = true;
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
                     self.decode_cache.invalidate_and_clear_code_marks();
@@ -345,10 +359,16 @@ impl CpuGsw {
             let epoch = self.smc_heat_epoch();
             self.sync_smc_heat();
             let newly_hot = self.jit_direct.smc_heat.bump(physical, width, epoch);
+            action.newly_hot = newly_hot;
             self.perf.smc_heat_chunks_hot += u64::from(newly_hot);
         }
         #[cfg(not(feature = "jit"))]
         let _ = heat_hit;
+        if let Some(pre) = traced
+            && let Some(trace) = self.smc_trace.0.as_mut()
+        {
+            trace.record(physical, width, pre, action);
+        }
         invalidated
     }
 

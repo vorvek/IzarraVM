@@ -29,6 +29,7 @@ mod mmx;
 mod mmx_exec;
 mod paging;
 mod run;
+mod smc_trace;
 mod strings;
 pub use fpu::X87;
 
@@ -1370,6 +1371,12 @@ pub struct CpuGsw {
     /// never makes an otherwise-identical CPU compare unequal. See `jit::unit_sim`.
     #[cfg(feature = "jit")]
     unit_sim: UnitSimSlot,
+    /// Optional SMC trace (diagnostic, off by default; `set_smc_trace_enabled`). When on, the
+    /// invalidation choke records every self-modifying write: the overwritten instruction's
+    /// decoded identity, which of its fields the write landed in, and which invalidation ran.
+    /// Non-architectural, excluded from CPU equality and cloned off, exactly like `unit_sim`.
+    /// See `smc_trace`.
+    smc_trace: smc_trace::SmcTraceSlot,
     /// Current privilege level. Per the 386 PRM, CPL is a *cached* quantity carried in
     /// (the hidden part of) CS, updated only at defined transition points -- it is not a
     /// live formula over the current CS selector. Updated at: real mode / PE clear (0);
@@ -1465,6 +1472,7 @@ impl Default for CpuGsw {
             alignment_armed: false,
             #[cfg(feature = "jit")]
             unit_sim: UnitSimSlot::default(),
+            smc_trace: smc_trace::SmcTraceSlot::default(),
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
             #[cfg(all(
@@ -2717,6 +2725,32 @@ impl DecodeCache {
             }
         }
         Some(killed)
+    }
+
+    /// Diagnostic (SMC trace only): the live decode line covering physical byte `physical`, as
+    /// `(physical start, decoded instruction)`. Uses exactly the reconstruction
+    /// `narrow_invalidate` uses -- same page-info lookup, same alias refusal, same 14-byte
+    /// backward candidate scan -- but mutates nothing, so it can be called BEFORE the
+    /// invalidation to learn what is about to be killed. `None` whenever the narrow path would
+    /// also refuse or find no covering line.
+    fn covering_line(&self, physical: u32) -> Option<(u32, DecodedInsn)> {
+        let info = *self.code_page_lin.get(&(physical >> 12))?;
+        if info.aliased {
+            return None;
+        }
+        let written_lin = (info.lin_page << 12) | (physical & 0xfff);
+        for candidate in written_lin.saturating_sub(14)..=written_lin {
+            let line = &self.lines[(candidate & self.mask) as usize];
+            if line.generation != self.generation || line.tag != candidate {
+                continue;
+            }
+            let Some(insn) = line.insn else { continue };
+            let len = u32::from(insn.len);
+            if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
+                return Some((line.phys_start, insn));
+            }
+        }
+        None
     }
 
     /// The stored physical start of the live line for `lin`. Warm fetch timing uses this to retain

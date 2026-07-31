@@ -835,6 +835,21 @@ impl CpuGsw {
         Some(ladder.reports())
     }
 
+    /// Enable or disable the SMC trace (diagnostic, off by default). Enabling installs a fresh
+    /// recorder; disabling drops what it collected. The trace only observes the invalidation
+    /// choke and never influences execution, so toggling it leaves architectural state and every
+    /// perf counter unchanged -- the campaign protocol pins that with a trace-off probe.
+    pub fn set_smc_trace_enabled(&mut self, on: bool) {
+        self.smc_trace.0 = on.then(|| Box::new(smc_trace::SmcTrace::default()));
+    }
+
+    /// Take the SMC trace's report lines, disabling the trace in the process. `None` when the
+    /// trace was never enabled. See `smc_trace` for the line format.
+    pub fn take_smc_trace_report(&mut self) -> Option<Vec<String>> {
+        let trace = self.smc_trace.0.take()?;
+        Some(trace.report_lines())
+    }
+
     /// The per-port io-read histogram (behind `IZARRAVM_IO_HIST=1`), sorted by count descending.
     /// `None` when the sim or the histogram was not enabled. Borrows (does not take) the sim, so it
     /// must be read BEFORE `take_unit_sim_report`. Consumed by the headless reporter.
