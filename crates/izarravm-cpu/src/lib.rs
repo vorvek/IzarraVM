@@ -2144,35 +2144,54 @@ struct RepExecution {
 ///   65536     9,511,922        0.0033                   732,871        80.44%
 ///  262144     8,615,694        0.0001                    30,870        80.56%
 ///
-/// 32768 is the knee. Past it, 65536 costs double the memory for another 1.7M misses and 0.12
-/// coverage points. The hidden-portal column is the reason this matters beyond decode cost: a
+/// On those three columns alone 32768 read as the knee, and it was the constant for the whole
+/// Direct era. The hidden-portal column is the reason this matters beyond decode cost: a
 /// decode eviction clears the portal of every compiled block registered on that line (see
 /// `fetch_decoded` and `suspend_decode_slot`), so decode conflicts turn directly into dark native
-/// blocks. That population only reaches zero at conflict-free sizes, so the residual 1.78M here is
+/// blocks. That population only reaches zero at conflict-free sizes, so the residual at 32768 is
 /// what a hashed index could still claim at a fraction of the memory.
+///
+/// WALL DECIDED THE STEP TO 65536, not the counter columns above. The refactor Phase 2 size sweep
+/// priced every size on wall under equal guest event and found the ladder MONOTONE downward: every
+/// decrease from 32768 lost on both fixtures, steeply on Quake. The step UP was then settled by a
+/// balanced six-pair A/B/B/A ladder (12 comparisons per fixture, per-role determinism gated):
+/// Quake improved on geomean, on the one-sided 95% lower bound, and on the independent min-wall
+/// cross-check, all three agreeing and every individual comparison favouring 65536; Doom came back
+/// neutral, its interval straddling parity on both estimators. So this constant is sized by the
+/// fixture that shows the effect and confirmed not to cost the fixture that does not.
+///
+/// The mechanism is NOT mainly "the interpreter decodes less". The same sweep profiled the decode
+/// tag check directly and found it absorbs only a small part of the wall that moves with this
+/// constant. What dominates is the portal coupling: an eviction hides the portal of every compiled
+/// block on the line, so a smaller table makes compiled blocks churn -- portal rescans and
+/// dispatcher entries rise far faster than decode misses do, and each straight-line run covers less
+/// guest work. Read this constant as a JIT-stability knob at least as much as an interpreter one;
+/// both channels push the same way, which is why the ladder is monotone.
 ///
 /// At 56 bytes per line NOW (measured via `size_of::<DecodeLine>()`, not derived: DecodeLine is
 /// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32,
 /// jit_direct_hotness: u8` -- DecodedInsn itself measures 40 bytes, having grown 36 -> 40 when C1e
-/// added the recorded {disp_len, imm_len} pair) 32768 lines is ~1.75 MB, against ~0.22 MB at 4096.
+/// added the recorded {disp_len, imm_len} pair) 65536 lines is ~3.5 MB, against ~1.75 MB at 32768
+/// and ~0.22 MB at 4096.
 /// HISTORY: before the dynarec-refactor Task 2 region-JIT deletion, DecodeLine carried two more
 /// fields (`jit_region: Option<NonZeroU32>` and `jit_hotness: u16`, 6 bytes together) and measured
 /// 60 bytes with zero slack. Deleting those two fields shrank the line 60 -> 56, a REAL footprint
 /// win, not an accounting wash: the 32768-line cache dropped from 1.875 MiB to 1.75 MB. At 56
 /// bytes the line holds 54 bytes of fields, so there are 2 bytes of trailing padding: a u8 or u16
 /// added back lands there and the line stays at 56, while any 4-byte field grows it to 60 and the
-/// cache by 128 KB at this line count. Measure `size_of::<DecodeLine>()` rather than trusting this
-/// sentence -- repr(Rust) ordering is unspecified. 1.75 MB no longer fits a small L2, which is the
-/// real cost of the 32768-line size and the reason not to go further without evidence.
+/// cache by 256 KB at this line count. Measure `size_of::<DecodeLine>()` rather than trusting this
+/// sentence -- repr(Rust) ordering is unspecified. 3.5 MB is well past any L2 and into L3
+/// territory, which is the real cost of this size: the table is no longer resident, and the wall
+/// ladder above is what justifies paying it. Do not grow it again without the same wall evidence.
 ///
 /// NOT purely microarchitectural, despite what this comment said before. Guest STATE is untouched
 /// (the decode cache is transparent to CpuGsw equality), but a decode hit charges one collapsed
 /// I-cache access where a miss charges per fetched byte, so changing which addresses hit changes
-/// charged guest bus clocks, master ticks, and in-guest fps. The Quake 42.7 fps and Doom
-/// 3042/843 realtics anchors move with this constant and have to be re-anchored, exactly as they
-/// were for the 2048 -> 4096 step. That is the "timing approx" half of the campaign contract, not
-/// a correctness change.
-const DECODE_CACHE_LINES: usize = 32768;
+/// charged guest bus clocks, master ticks, and in-guest fps. The Quake fps and Doom realtics
+/// anchors move with this constant and have to be RE-PINNED on both fixtures whenever it changes,
+/// exactly as they were for the 2048 -> 4096 step and again for 32768 -> 65536. That is the
+/// "timing approx" half of the campaign contract, not a correctness change.
+const DECODE_CACHE_LINES: usize = 65536;
 
 /// Sweep knob: `IZARRAVM_DECODE_CACHE_LINES=<power of two>` overrides the decode-cache size at
 /// construction. Decode replacement changes cold-fetch timing, so performance comparisons must
