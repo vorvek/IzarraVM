@@ -21,6 +21,27 @@ fn fresh() -> CpuGsw {
     cpu
 }
 
+/// `fresh()` with flat 4 GB segment limits. The decode-line collision tests below place their
+/// second address exactly one decode-cache stride above the first, and that stride is now larger
+/// than a real-mode segment, so the collision address is unreachable under the 64 KB limits
+/// `load_segment_real` installs. Widening the limits is the only part of the setup that has to
+/// move with the cache size: the collision itself is still derived from `decode_cache_lines()`
+/// rather than hardcoded, so it keeps colliding at whatever size the constant takes next.
+fn fresh_flat() -> CpuGsw {
+    let mut cpu = fresh();
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+    ] {
+        let mut s = cpu.registers.segment(segment);
+        s.limit = 0xffff_ffff;
+        cpu.registers.set_segment(segment, s);
+    }
+    cpu
+}
+
 fn drive(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
     let mut outcomes = Vec::new();
     for _ in 0..64 {
@@ -356,8 +377,8 @@ fn direct_compile_rejects_non_direct_and_partial_instruction_pages() {
 fn direct_block_replays_cold_fetch_after_internal_decode_line_collision() {
     const EVICTED_SLOT: u32 = 0x108;
 
-    let mut interp = fresh();
-    let mut native = fresh();
+    let mut interp = fresh_flat();
+    let mut native = fresh_flat();
     let collision = EVICTED_SLOT + native.decode_cache.mask + 1;
     let mut memory = loop_program();
     memory[0x101..0x105].copy_from_slice(&1u32.to_le_bytes());
@@ -461,8 +482,8 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
     memory[HLT as usize] = 0xf4;
     memory[collision as usize] = 0x90;
 
-    let mut native = fresh();
-    let mut interp = fresh();
+    let mut native = fresh_flat();
+    let mut interp = fresh_flat();
     // Keep the default decode-cache size. Installing a smaller one here would leave jit_direct's
     // decode-slot count at the default, and the eviction path only reports a slot to the JIT when
     // the two counts agree (see fetch_decoded and the guard in try_direct_continuation). Mismatched
@@ -2303,7 +2324,7 @@ fn invalidated_compiled_code_reused_as_data_stays_on_the_native_store_path() {
         .expect("old code installs");
     assert!(cpu.jit_direct.range_hits_compiled_code(target, 1));
 
-    assert_eq!(cpu.jit_direct.invalidate_physical_range(target, 1), 1);
+    assert_eq!(cpu.jit_direct.retire_physical_range_for_test(target, 1), 1);
     assert!(!cpu.jit_direct.range_hits_compiled_code(target, 1));
     assert!(
         cpu.decode_cache.range_hits_code(target, 1),

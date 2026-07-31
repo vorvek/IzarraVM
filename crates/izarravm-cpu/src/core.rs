@@ -253,7 +253,47 @@ impl CpuGsw {
     /// tiny-model layout the benchmarks use) writes only its own two bytes, so it never disturbs the
     /// adjacent code.
     pub(super) fn note_code_write(&mut self, physical: u32, width: u32) -> bool {
-        self.note_code_write_hit(physical, width)
+        // Value-less callers, and the one place mutable imm32 lanes are refused outright: a device
+        // or HLE range, a page-walk A/D-bit store, and the string-op translate-time invalidation
+        // all arrive here. None of them is the guest patching its own instruction stream through
+        // its own store path, so none of them may keep a block alive.
+        self.note_code_write_inner(physical, width, false)
+    }
+
+    /// Host address of `len` guest bytes at `physical`, from a page this CPU has already FETCHED
+    /// code out of. `None` whenever the fetch-page cache does not currently cover them, which is a
+    /// REFUSAL rather than a failure: the one caller (`imm_lane_for`) then keeps its baked
+    /// immediate and the block is correct as ever.
+    ///
+    /// The fetch cache, and ONLY the fetch cache, is the page-kind guard. `Bus::direct_page`
+    /// produces a VIDEO pointer (the mode-13h plane window) for `BusAccessKind::DataRead` and
+    /// `DataWrite` and for nothing else, so a fetch-cache entry can never be a device aperture —
+    /// while `data_read_pages` / `data_write_pages` can be, and are not cleared by
+    /// `note_direct_data_map_changed` in a way compiled blocks observe. An earlier revision fell
+    /// back to those two caches; a lane baked against a plane buffer could then have outlived a
+    /// write-token change and read an immediate the interpreter would not. Do not reintroduce the
+    /// fallback: the win from it is a lane that would have been created one recompile later
+    /// anyway, and the loss is the only structural argument that keeps device memory out.
+    ///
+    /// The pointer's lifetime is the lifetime of the mapping: a real direct-map change routes
+    /// through `note_direct_map_changed`, which drops every compiled block, and RAM host pointers
+    /// do not move for a given physical page.
+    ///
+    /// Keyed by linear address, so the physical page is matched by scanning the cache's handful of
+    /// entries — compile time only.
+    #[cfg(feature = "jit")]
+    pub(crate) fn direct_host_bytes(&self, physical: u32, len: u32) -> Option<usize> {
+        let page = physical & !0x0fff;
+        let offset = (physical & 0x0fff) as usize;
+        let last = physical.checked_add(len.checked_sub(1)?)?;
+        if last & !0x0fff != page {
+            return None;
+        }
+        let end = offset + len as usize;
+        self.fetch_page.entries.iter().find_map(|entry| {
+            (entry.valid && entry.physical_page == page && end <= entry.len && !entry.ptr.is_null())
+                .then(|| entry.ptr as usize + offset)
+        })
     }
 
     /// Cheap, side-effect-free probe hoisted out of `note_code_write_hit`: does the store range
@@ -269,12 +309,25 @@ impl CpuGsw {
         self.decode_cache.range_hits_code(physical, width)
     }
 
-    /// The invalidation body of a code write. Only reached once the store is known to have changed
-    /// a watched code byte (G2 elision skips it for same-value sized stores) or from a value-less
-    /// caller through `note_code_write`. The unit-sim feed lives here, behind the elision choke, so
-    /// the diagnostic mirrors the post-elision production invalidation path exactly.
+    /// The invalidation body of a code write, entered from the guest's own COMMITTED data stores.
+    /// Only reached once the store is known to have changed a watched code byte (G2 elision skips
+    /// it for same-value sized stores). These are the only writes allowed to take the mutable-lane
+    /// exemption; `note_code_write` is the value-less door and refuses it.
+    ///
+    /// The unit-sim feed lives in the shared body below, behind the elision choke, so the
+    /// diagnostic mirrors the post-elision production invalidation path exactly.
     #[inline]
     pub(super) fn note_code_write_hit(&mut self, physical: u32, width: u32) -> bool {
+        self.note_code_write_inner(physical, width, true)
+    }
+
+    /// In-flight SMC needs no check here, and that is a proof rather than an omission. A store
+    /// from native code into watched code never commits inside the block: the emitted store's
+    /// code-watch guard side-exits (`SideExitReason::CodeWatch`) before the write, and the
+    /// interpreter then replays the instruction. So no compiled block is mid-execution when this
+    /// runs, and a block cannot patch its own lane from under itself.
+    #[inline]
+    fn note_code_write_inner(&mut self, physical: u32, width: u32, lanes: bool) -> bool {
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
@@ -286,18 +339,42 @@ impl CpuGsw {
         if let Some(sim) = self.unit_sim.0.as_mut() {
             sim.note_code_write(physical, width);
         }
+        // SMC trace (diagnostic, off by default). The gate is HERE, at the call site: with the
+        // trace disabled the slot is `None` and neither the decode-line probe nor the action
+        // record is built, so the invalidation path is byte-identical to an untraced build. See
+        // `smc_trace` and the trace-off probe pinned by the campaign protocol.
+        let traced = self.smc_trace.0.is_some().then(|| {
+            crate::smc_trace::SmcTracePre::new(
+                self.decode_cache.covering_line(physical),
+                self.perf.instructions,
+            )
+        });
+        let mut action = crate::smc_trace::SmcTraceAction::default();
         let mut invalidated = false;
         // G1: heat is incremented only on a byte-precise ACTUAL invalidation (a killed compiled
         // block or a narrow decode kill), never on the coarse global-flush fallback and never when
         // the write hit no code. That precision dissolves the 16-byte false-demotion concern: a
         // data byte sharing a chunk with cold code kills nothing, so it never heats the chunk.
         let mut heat_hit = false;
+        // Whether this write was a pure immediate patch: some live block claimed it as a lane and
+        // no block died. That is the case whose heat contribution is dropped below.
+        #[cfg(feature = "jit")]
+        let mut lane_only = false;
         #[cfg(feature = "jit")]
         if self.jit_direct.range_hits_compiled_code(physical, width) {
-            let killed = self.jit_direct.invalidate_physical_range(physical, width);
-            invalidated = killed != 0;
-            heat_hit |= killed != 0;
+            let outcome = self
+                .jit_direct
+                .invalidate_physical_range(physical, width, lanes);
+            action.blocks_killed = outcome.blocks as u32;
+            invalidated = outcome.blocks != 0;
+            heat_hit |= outcome.blocks != 0;
+            lane_only = outcome.lane_accepts != 0 && outcome.blocks == 0;
+            self.perf.smc_lane_accepts += u64::from(outcome.lane_accepts);
+            self.perf.smc_lane_reject_width += u64::from(outcome.lane_reject_width);
+            self.perf.smc_lane_reject_address += u64::from(outcome.lane_reject_address);
         }
+        #[cfg(not(feature = "jit"))]
+        let _ = lanes;
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
             if self.profile.enabled {
@@ -323,6 +400,7 @@ impl CpuGsw {
             });
             match narrow {
                 Some(kills) => {
+                    action.narrow_kills = kills;
                     self.perf.smc_narrow_kills += u64::from(kills);
                     if kills > 0 {
                         self.perf.code_invalidations += 1;
@@ -330,6 +408,7 @@ impl CpuGsw {
                     }
                 }
                 None => {
+                    action.wholesale = true;
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
                     self.decode_cache.invalidate_and_clear_code_marks();
@@ -340,15 +419,27 @@ impl CpuGsw {
             // The fetch-page snapshot may hold the written bytes under either outcome.
             self.fetch_page.invalidate();
         }
+        // The demotion channel is the campaign's actual payoff. A lane patch still kills the
+        // narrow decode line (the interpreter's cached decode of that instruction carries a stale
+        // immediate, so killing the line keeps the interpreter trivially correct), and that kill
+        // is what sets `heat_hit`. Charging heat for it would leave the four Doom patch sites
+        // driving the same chunk-hot crossings and the same `smc_heat_demotions` that refuse
+        // Direct admission for the renderer loops, and the lane would buy nothing.
         #[cfg(feature = "jit")]
-        if heat_hit {
+        if heat_hit && !lane_only {
             let epoch = self.smc_heat_epoch();
             self.sync_smc_heat();
             let newly_hot = self.jit_direct.smc_heat.bump(physical, width, epoch);
+            action.newly_hot = newly_hot;
             self.perf.smc_heat_chunks_hot += u64::from(newly_hot);
         }
         #[cfg(not(feature = "jit"))]
         let _ = heat_hit;
+        if let Some(pre) = traced
+            && let Some(trace) = self.smc_trace.0.as_mut()
+        {
+            trace.record(physical, width, pre, action);
+        }
         invalidated
     }
 
@@ -552,10 +643,26 @@ impl CpuGsw {
     /// `scale_clocks_batches_exactly`).
     #[cfg(feature = "jit")]
     pub(super) fn scale_clocks_batch(&mut self, clocks: u64) -> u64 {
-        let (num, den) = level_timing(self.persona());
+        let persona = self.persona();
+        let (num, den) = level_timing(persona);
         let scaled = clocks * u64::from(num) + self.timing_rem;
-        self.timing_rem = scaled % u64::from(den);
-        scaled / u64::from(den)
+        // Specialized per persona for the same reason `scale_clocks` above is: a runtime `den`
+        // from the `level_timing` match emits a real hardware div, while a compile-time constant
+        // strength-reduces to a magic-multiplier multiply-shift. Quotient first, remainder as
+        // `scaled - quot * den`, so this is one div plus a mul and a sub rather than two divs.
+        let (quot, rem) = match persona {
+            CpuPersona::I386 => {
+                let q = scaled / 5u64;
+                (q, scaled - q * 5)
+            }
+            CpuPersona::I486 | CpuPersona::I586 => {
+                let q = scaled / 12u64;
+                (q, scaled - q * 12)
+            }
+        };
+        let _ = den; // den is unused; the match arms carry the constant directly
+        self.timing_rem = rem;
+        quot
     }
 
     /// Scale an x87 op's raw core clocks by the active level's FP-timing factor for the

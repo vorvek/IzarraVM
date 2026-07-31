@@ -826,8 +826,9 @@ fn rsm_is_undefined_opcode_outside_smm() {
 
 #[test]
 fn decoded_insn_stays_dense() {
-    // The decode cache stores one DecodedInsn per line. At the chosen 2048 lines this caps the
-    // footprint near 96 KB (see DECODE_CACHE_LINES), so the guard is against unbounded growth,
+    // The decode cache stores one DecodedInsn per line, so every byte here is multiplied by
+    // DECODE_CACHE_LINES (read its sizing comment for the current footprint, which is measured in
+    // megabytes, not kilobytes). The guard is against unbounded growth,
     // not a hard 32-byte target: if a field pushes it past 48 bytes, move a rarely-used field
     // behind recompute-at-execute (or shrink the cache) rather than letting the line balloon.
     assert!(

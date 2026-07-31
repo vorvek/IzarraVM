@@ -137,9 +137,14 @@ impl JitState {
         self.direct.clear(&mut self.code_watch);
     }
 
-    pub(crate) fn invalidate_physical_range(&mut self, physical: u32, width: u32) -> usize {
+    pub(crate) fn invalidate_physical_range(
+        &mut self,
+        physical: u32,
+        width: u32,
+        lanes: bool,
+    ) -> direct::RangeInvalidation {
         self.direct
-            .invalidate_physical_range(&mut self.code_watch, physical, width)
+            .invalidate_physical_range(&mut self.code_watch, physical, width, lanes)
     }
 
     /// The shared table-1 base every backend's emitted store checks consult.
@@ -149,6 +154,14 @@ impl JitState {
 
     pub(crate) fn range_hits_compiled_code(&self, physical: u32, width: u32) -> bool {
         self.code_watch.range_watched(physical, width)
+    }
+
+    /// Retire count only, with the mutable-lane exemption OFF: the pre-lane behaviour of
+    /// `invalidate_physical_range`, for the fixtures that predate lanes and assert on that count.
+    #[cfg(test)]
+    pub(crate) fn retire_physical_range_for_test(&mut self, physical: u32, width: u32) -> usize {
+        self.invalidate_physical_range(physical, width, false)
+            .blocks
     }
 
     #[cfg(test)]

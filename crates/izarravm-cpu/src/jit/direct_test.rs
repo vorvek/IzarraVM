@@ -73,6 +73,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         successors: [None, None],
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
         body_offset: 0,
+        imm_lanes: [NO_IMM_LANE; MAX_BLOCK_IMM_LANES],
         code: vec![0xc3],
     }
 }
@@ -296,7 +297,7 @@ fn empty_cache_clear_drains_retained_code_watch_pages() {
     assert!(matches!(cache.probe(key), BlockProbe::Interpret));
     assert!(matches!(cache.probe(key), BlockProbe::Compile));
     reject(&mut cache, key, 1);
-    assert_eq!(cache.invalidate_physical_range(key.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(key.physical, 1), 1);
     assert!(cache.entries.is_empty());
     assert_eq!(cache.code_watch.active_pages(), 0);
     assert_eq!(cache.code_watch.inactive_pages(), 1);
@@ -409,7 +410,7 @@ fn both_successor_cells_resolve_unlink_recompile_and_reset() {
     );
 
     let cells = cache.link_cells[source_id.index()].clone();
-    assert_eq!(cache.invalidate_physical_range(taken.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(taken.physical, 1), 1);
     assert!(cells[0].linked());
     assert!(!cells[1].linked());
     assert!(matches!(cache.probe(taken), BlockProbe::Interpret));
@@ -460,16 +461,16 @@ fn dynamic_ret_pic_keeps_two_targets_and_unlinks_replaced_or_retired_blocks() {
     assert!(cells[0].linked());
     assert!(cells[1].linked());
 
-    assert_eq!(cache.invalidate_physical_range(first.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(first.physical, 1), 1);
     assert!(cells[0].linked());
     assert!(cells[1].linked());
-    assert_eq!(cache.invalidate_physical_range(second.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(second.physical, 1), 1);
     assert!(cells[0].linked());
     assert!(!cells[1].linked());
-    assert_eq!(cache.invalidate_physical_range(third.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(third.physical, 1), 1);
     assert!(!cells[0].linked());
 
-    assert_eq!(cache.invalidate_physical_range(source.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(source.physical, 1), 1);
     assert!(!cache.bind_dynamic_successor(site_cell, first.linear, first.linear, first.mode_key));
     let stats = cache.take_stats();
     assert_eq!(stats.links, 3);
@@ -499,7 +500,10 @@ fn dynamic_ret_does_not_rebind_when_a_target_portal_slot_is_reused() {
     let old_portal = cache.block_portals[old_target_id.index()].address();
     assert!(cell.linked());
 
-    assert_eq!(cache.invalidate_physical_range(old_target.physical, 1), 1);
+    assert_eq!(
+        cache.retire_physical_range_for_test(old_target.physical, 1),
+        1
+    );
     assert!(!cell.linked());
     assert_eq!(cell.portal.load(Ordering::Acquire), zero_portal().address());
 
@@ -1039,7 +1043,7 @@ fn retired_slot_dependencies_do_not_hide_a_reused_metadata_portal() {
     let dependency_capacity = cache.decode_dependencies[0].capacity();
     let block_slot_capacity = cache.block_decode_slots[old_id.index()].capacity();
 
-    assert_eq!(cache.invalidate_physical_range(old.physical, 4), 1);
+    assert_eq!(cache.retire_physical_range_for_test(old.physical, 4), 1);
     assert!(cache.decode_dependencies[0].is_empty());
     assert!(cache.block_decode_slots[old_id.index()].is_empty());
     assert!(cache.decode_dependencies[0].capacity() >= dependency_capacity);
@@ -1097,7 +1101,7 @@ fn invalidated_metadata_slot_reuse_rejects_its_stale_generation() {
             .any(|source| source.block == stale_id)
     );
 
-    assert_eq!(cache.invalidate_physical_range(source.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(source.physical, 1), 1);
     assert!(cache.block(stale_id).is_none());
     assert_eq!(cache.blocks[stale_id.index()].entry, 0);
     assert_eq!(cache.blocks[stale_id.index()].body_entry, 0);
@@ -1156,7 +1160,7 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     let old_entry: extern "C" fn() =
         unsafe { std::mem::transmute(cache.block(source_id).expect("source").entry_ptr()) };
     old_entry();
-    assert_eq!(cache.invalidate_physical_range(dead.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(dead.physical, 1), 1);
     let link_epochs = cache.block_link_epochs.clone();
 
     assert!(cache.compact_arena());
@@ -1366,7 +1370,7 @@ fn physical_invalidation_removes_overlap_and_preserves_adjacent_blocks() {
     install_trivial(&mut cache, overlap, 16);
     install_trivial(&mut cache, adjacent, 16);
 
-    assert_eq!(cache.invalidate_physical_range(0x20_02f, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(0x20_02f, 1), 1);
     assert_eq!(cache.len(), 1);
     assert_eq!(cache.blocks.len(), 2, "stable block IDs must not compact");
     assert_eq!(cache.block_active, [false, true]);
@@ -1395,13 +1399,13 @@ fn physical_invalidation_refcounts_shared_watch_chunks() {
     install_trivial(&mut cache, second, 8);
     assert!(cache.range_hits_compiled_code(0x20_020, 16));
 
-    assert_eq!(cache.invalidate_physical_range(first.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(first.physical, 1), 1);
     assert!(
         cache.range_hits_compiled_code(first.physical, 1),
         "the neighboring block still owns the shared 16-byte watch"
     );
 
-    assert_eq!(cache.invalidate_physical_range(second.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(second.physical, 1), 1);
     assert!(!cache.range_hits_compiled_code(first.physical, 16));
 }
 
@@ -1416,12 +1420,12 @@ fn invalidated_code_chunk_can_be_reused_and_recompiled() {
     install_trivial(&mut cache, old, 8);
     assert!(cache.range_hits_compiled_code(old.physical, 1));
 
-    assert_eq!(cache.invalidate_physical_range(old.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(old.physical, 1), 1);
     assert!(!cache.range_hits_compiled_code(old.physical, 1));
 
     install_trivial(&mut cache, old, 8);
     assert!(cache.range_hits_compiled_code(old.physical, 1));
-    assert_eq!(cache.invalidate_physical_range(old.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(old.physical, 1), 1);
     assert!(!cache.range_hits_compiled_code(old.physical, 1));
 }
 
@@ -1437,7 +1441,7 @@ fn physical_invalidation_removes_every_linear_alias_without_stale_ready_hits() {
     install_trivial(&mut cache, first, 16);
     install_trivial(&mut cache, alias, 16);
 
-    assert_eq!(cache.invalidate_physical_range(0x30_084, 2), 2);
+    assert_eq!(cache.retire_physical_range_for_test(0x30_084, 2), 2);
     assert_eq!(cache.len(), 0);
     assert!(matches!(cache.probe(first), BlockProbe::Interpret));
     assert!(matches!(cache.probe(alias), BlockProbe::Interpret));
@@ -1455,7 +1459,7 @@ fn physical_invalidation_forgets_seen_and_rejected_entries_only_on_overlap() {
     reject(&mut cache, rejected, 1);
     assert!(matches!(cache.probe(adjacent), BlockProbe::Interpret));
 
-    assert_eq!(cache.invalidate_physical_range(0x40_010, 1), 2);
+    assert_eq!(cache.retire_physical_range_for_test(0x40_010, 1), 2);
     assert!(matches!(cache.probe(seen), BlockProbe::Interpret));
     assert!(matches!(cache.probe(rejected), BlockProbe::Interpret));
     assert!(matches!(cache.probe(adjacent), BlockProbe::Compile));
@@ -1469,7 +1473,7 @@ fn physical_invalidation_checks_both_pages_of_a_cross_page_write() {
     assert!(matches!(cache.probe(low), BlockProbe::Interpret));
     assert!(matches!(cache.probe(high), BlockProbe::Interpret));
 
-    assert_eq!(cache.invalidate_physical_range(0x4fff, 2), 2);
+    assert_eq!(cache.retire_physical_range_for_test(0x4fff, 2), 2);
     assert!(matches!(cache.probe(low), BlockProbe::Interpret));
     assert!(matches!(cache.probe(high), BlockProbe::Interpret));
 }
@@ -1636,7 +1640,7 @@ fn reset_storage_drops_smc_heat_but_incremental_invalidation_keeps_it() {
     // Installing then draining a block (an incremental invalidation) leaves heat intact:
     // no storage reset happened, so a sync is a no-op.
     install_trivial(&mut cpu.jit_direct, BlockKey::new(0x1000, phys, 7), 16);
-    cpu.jit_direct.invalidate_physical_range(phys, 4);
+    cpu.jit_direct.retire_physical_range_for_test(phys, 4);
     cpu.sync_smc_heat();
     assert!(
         cpu.jit_direct.smc_heat.chunk_hot(phys, 0),
@@ -1740,7 +1744,10 @@ fn hoisted_code_watch_keeps_the_table_base_and_the_watch_semantics() {
     assert!(cache.range_hits_compiled_code(rejected.physical, 4));
 
     // Per-range invalidation releases exactly the dead owner's chunks.
-    assert_eq!(cache.invalidate_physical_range(installed.physical, 1), 1);
+    assert_eq!(
+        cache.retire_physical_range_for_test(installed.physical, 1),
+        1
+    );
     assert!(!cache.range_hits_compiled_code(installed.physical, 4));
     assert!(cache.range_hits_compiled_code(rejected.physical, 4));
     assert_eq!(cache.native_code_watch_table(), base);

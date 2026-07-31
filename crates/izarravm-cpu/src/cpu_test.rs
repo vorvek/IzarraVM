@@ -1690,7 +1690,11 @@ fn pending_flags_offset() {
     // (jit_native_insns, jit_helper_exits, jit_native_memory_helpers, jit_table_clears; 32 bytes),
     // moving this pin from 4456 to 4424 -- again measured against a failing test, matching the
     // sibling pin in `arch_payload_keeps_pending_flags_offset_pinned` (canonical_state_test.rs).
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
+    // The mutable-imm-lane slice adds four PerfCounters fields (the lane registration, accept and
+    // two rejection-reason counters; 32 bytes), moving this pin back from 4424 to 4456, measured
+    // the same way. They belong in PerfCounters rather than at the CpuGsw tail because they are
+    // the slice's diagnostic trio and have to appear in the probe JSON alongside the SMC counters.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -2503,6 +2507,11 @@ struct TestBus {
     // Opt-in batch-clock reporting for tight event-budget tests. Historical CPU tests leave it
     // off because their TestBus predates machine-level combined core/bus caps.
     report_batch_clocks: bool,
+    // The (num, den) the batch-clock reporting scales raw bus clocks by, mirroring MachineBus's
+    // batch-start snapshot of `bus_timing`. Default (1, 1) keeps every historical test on the
+    // identity scaling it was written against; the cap-screen tests set a real persona ratio so
+    // the screen's bound is looser than the exact test and the fall-through arm is exercised.
+    batch_bus_scale: (u64, u64),
     page_walk_bound_available: bool,
     rep_data_byte_cost_override: Option<u64>,
     direct_memory_max_clock_override: Option<u64>,
@@ -2534,6 +2543,7 @@ impl TestBus {
             uniform_native_fetches: false,
             direct_page_clocks: false,
             report_batch_clocks: false,
+            batch_bus_scale: (1, 1),
             page_walk_bound_available: true,
             rep_data_byte_cost_override: None,
             direct_memory_max_clock_override: None,
@@ -2831,7 +2841,25 @@ impl CpuBus for TestBus {
 
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         if self.report_batch_clocks {
+            let (num, den) = self.batch_bus_scale;
+            self.trace.elapsed_clocks() * num / den
+        } else {
+            0
+        }
+    }
+
+    fn in_batch_raw_bus_clocks(&self) -> u64 {
+        if self.report_batch_clocks {
             self.trace.elapsed_clocks()
+        } else {
+            0
+        }
+    }
+
+    fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
+        if self.report_batch_clocks {
+            let (num, den) = self.batch_bus_scale;
+            num.div_ceil(den).max(1)
         } else {
             0
         }
@@ -3422,6 +3450,14 @@ mod jit_sweep_lowering;
 ))]
 #[path = "cpu_jit_test_imm_test.rs"]
 mod jit_test_imm;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_imm_lane_test.rs"]
+mod jit_imm_lane;
 
 /// C1e: `DecodedInsn`'s recorded `{disp_len, imm_len}` pair (design section 1.2, review
 /// finding M3) did NOT fit the struct's padding: the size grew 36 -> 40 and is pinned

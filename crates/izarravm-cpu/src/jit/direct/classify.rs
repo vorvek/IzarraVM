@@ -338,6 +338,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         op,
                         dst: 0,
                         imm: insn.imm,
+                        lane: None,
                     });
                 }
                 _ => {}
@@ -443,10 +444,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x81 | 0x83 => {
                 let m = insn.modrm?;
                 return match insn.operand? {
+                    // `lane: None` here is deliberate and not a stub: `classify` has no `&CpuGsw`
+                    // and no physical address, and a lane needs both. The compile loop attaches
+                    // one through `imm_lane_for` for the single shape that qualifies, exactly as
+                    // `stack_width_kind` resolves the CPU-dependent stack forms after this point.
                     DecodedOperand::Reg(dst) => Some(DirectKind::AluImm {
                         op: m.reg,
                         dst,
                         imm: insn.imm,
+                        lane: None,
                     }),
                     DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
                         op: m.reg,

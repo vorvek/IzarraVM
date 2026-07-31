@@ -279,9 +279,26 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             } => {
                 emit_alu(&mut e, op, dst, Some(src), None, width);
             }
-            DirectKind::AluImm { op, dst, imm } => {
-                emit_alu(&mut e, op, dst, None, Some(imm), MemoryWidth::Dword);
-            }
+            // The lane form differs from the baked form in exactly one instruction: where the
+            // source operand comes from. `emit_alu` would `mov ecx, imm32`; this loads the same
+            // four bytes out of guest RAM instead, so a guest patch of the immediate field takes
+            // effect on the next entry with no recompile. Everything after that -- the old
+            // destination in EAX, the operation, the flag capture, the lazy-flag record -- is the
+            // shared `emit_alu_preloaded`, so a lane slot and a baked slot cannot diverge in
+            // result or in flags.
+            //
+            // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, so
+            // no guest register lives in it, and the ADD path through `emit_alu_preloaded`
+            // (op 0, Dword, writes `home(dst)`) neither reads nor writes it.
+            DirectKind::AluImm { op, dst, imm, lane } => match lane {
+                Some(lane) => {
+                    e.mov_r64_imm64(Reg::RDX, lane.host as u64);
+                    e.load_r32_disp32(Reg::RCX, Reg::RDX, 0);
+                    e.mov_r32_r32(Reg::RAX, home(dst));
+                    emit_alu_preloaded(&mut e, op, dst, MemoryWidth::Dword);
+                }
+                None => emit_alu(&mut e, op, dst, None, Some(imm), MemoryWidth::Dword),
+            },
             DirectKind::AluByteImm { op, dst, imm } => {
                 emit_alu_byte_imm(&mut e, op, dst, imm);
             }

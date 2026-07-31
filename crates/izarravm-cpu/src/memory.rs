@@ -316,9 +316,16 @@ impl CpuGsw {
     ///
     /// The invalidation gate is width-sensitive, because the two slow paths this replaces are NOT
     /// symmetric: `write_linear_fragment` (sized) pre-gates on `code_write_watched` before calling
-    /// `note_code_write_hit` at all, but `write_linear_u8` (byte) calls `note_code_write`
-    /// (`note_code_write_hit` unconditionally forwarded) on every `changed` write, with no watched
-    /// pre-check. `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
+    /// `note_code_write_hit` at all, but `write_linear_u8` (byte) calls `note_code_write` on every
+    /// `changed` write, with no watched pre-check. Those two are separate DOORS onto the same body
+    /// (`note_code_write_inner`) and are no longer interchangeable: `note_code_write_hit` allows
+    /// the mutable imm32 lane exemption, `note_code_write` refuses it. Nothing here depends on the
+    /// difference — a lane accepts width 4 only, so no byte write is ever accepted through either
+    /// door, and this function calls `note_code_write_hit` for both widths. The one visible
+    /// consequence is diagnostic and lives on the SLOW byte path: a byte write landing inside a
+    /// lane goes through `write_linear_u8`'s value-less door, so it retires the block exactly as
+    /// it should but is not counted in `smc_lane_reject_width`, while the same write served here
+    /// would be. `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
     /// unconditional unit-sim feed (`core.rs`) -- diagnostic only, but the one place
     /// `IZARRAVM_UNIT_SIM` observes SMC. An earlier version of this function used `watched &&
     /// changed` for every width, which silently dropped that sim feed for a changed byte write

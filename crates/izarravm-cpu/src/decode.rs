@@ -369,6 +369,33 @@ impl CpuGsw {
             Some(physical) => physical,
             None => self.translate_code_linear(bus, lin)?,
         };
+        self.charge_fetch_run(bus, lin, len, physical)
+    }
+
+    /// `charge_cached_fetch` for a caller that already holds the line's physical start (a
+    /// `DecodeLineView` taken this iteration), skipping the decode-table lookup this would
+    /// otherwise repeat. Same linear observation, same charge, same eip advance; the caller owes
+    /// the argument that its snapshot equals what `line_phys_start` would return here.
+    pub(super) fn charge_cached_fetch_at<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        len: u8,
+        physical: u32,
+    ) -> ExecResult<()> {
+        bus.note_code_fetch_linear(lin);
+        self.charge_fetch_run(bus, lin, len, physical)
+    }
+
+    /// The charge + eip advance shared by both entry points, past the point where the physical
+    /// start is known.
+    fn charge_fetch_run<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        len: u8,
+        physical: u32,
+    ) -> ExecResult<()> {
         let count = u32::from(len);
         let first_count = count.min(0x1000 - (lin & 0x0fff));
         if first_count == count {

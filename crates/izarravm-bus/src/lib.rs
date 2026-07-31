@@ -788,6 +788,32 @@ pub trait CpuBus {
         self.in_batch_scaled_bus_clocks() >= target
     }
 
+    /// RAW (unscaled) bus clocks this batch has accumulated so far — the `raw` that
+    /// `in_batch_scaled_bus_clocks` divides down. Must be monotone non-decreasing within a batch.
+    /// Only meaningful together with a non-zero `in_batch_scaled_bus_clocks_screen_scale`.
+    fn in_batch_raw_bus_clocks(&self) -> u64 {
+        0
+    }
+
+    /// A per-batch constant `F` with `S(raw2) - S(raw1) <= (raw2 - raw1) * F` for every
+    /// `raw2 >= raw1` inside one batch, where `S` is `in_batch_scaled_bus_clocks`. `0` means the
+    /// bus offers no such bound and the run loop must always ask the exact question.
+    ///
+    /// Purpose: let the straight-line run loop screen the per-retired-instruction cap test with
+    /// one cheap 64-bit compare. The exact test asks whether
+    /// `total + (S(raw) - S(raw_entry)) >= cap`; substituting the bound above gives the
+    /// necessary condition `total + (raw - raw_entry) * F >= cap`, so when that fails the exact
+    /// test is certainly false and can be skipped. See `run_budgeted_inner` for the full
+    /// derivation and the overflow handling.
+    ///
+    /// For a bus whose scaled figure is `floor((raw * num + rem) / den)` with `den > 0` and a
+    /// per-batch snapshot of `(num, den, rem)`, `F = ceil(num / den)` is such a bound:
+    /// `floor(a / den) - floor(b / den) <= ceil((a - b) / den)` for `a >= b`, the `rem` term
+    /// cancels in `a - b`, and `ceil(x * num / den) <= x * ceil(num / den)` for `x >= 0`.
+    fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
+        0
+    }
+
     fn charge_direct_memory(
         &mut self,
         _address: u32,

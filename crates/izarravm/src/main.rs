@@ -819,6 +819,7 @@ fn run_boot_hdd_folder(
         .collect();
     machine.mount_hdd_folder_with_user_overrides(dir, overlays)?;
     maybe_enable_unit_sim(&mut machine);
+    maybe_enable_smc_trace(&mut machine);
     // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
     // sampled per-opcode CPU profile the bench harness uses, dumped after the
     // run. Reads the guest-clock attribution of e.g. the x87 opcode rows
@@ -939,6 +940,7 @@ fn run_boot_hdd_folder(
         machine.cpu().fast_map_probe_counters(),
     );
     maybe_report_unit_sim(&mut machine);
+    maybe_report_smc_trace(&mut machine);
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
     // that the run loop returned, or its last partial buffer's worth of lines -- most
     // often exactly the tail we care about -- is silently lost at process exit. This
@@ -1134,6 +1136,49 @@ fn unit_sim_requested() -> bool {
 fn maybe_enable_unit_sim(machine: &mut Machine) {
     if unit_sim_requested() {
         machine.set_unit_sim_enabled(true);
+    }
+}
+
+/// Turn on the CPU's SMC trace before a headless run when `IZARRAVM_SMC_TRACE` asks for it (any
+/// value other than "" or "0"). The trace only observes the invalidation choke and never touches
+/// guest-visible state, so a headless run stays byte-identical whether it is on or off.
+fn maybe_enable_smc_trace(machine: &mut Machine) {
+    if std::env::var("IZARRAVM_SMC_TRACE")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "" | "0"))
+    {
+        machine.set_smc_trace_enabled(true);
+    }
+}
+
+/// Write the SMC trace summary at the end of a headless run. `IZARRAVM_SMC_TRACE_OUT` names the
+/// file; without it the lines go to stdout alongside the perf row. A no-op when the trace was
+/// never enabled.
+fn maybe_report_smc_trace(machine: &mut Machine) {
+    let Some(lines) = machine.take_smc_trace_report() else {
+        return;
+    };
+    match std::env::var("IZARRAVM_SMC_TRACE_OUT")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        Some(path) => {
+            let body = lines.join("\n") + "\n";
+            if let Err(error) = std::fs::write(&path, body) {
+                eprintln!("smc_trace: could not write {path}: {error}");
+                for line in lines {
+                    println!("{line}");
+                }
+            } else {
+                println!("smc_trace written to {path} ({} lines)", lines.len());
+            }
+        }
+        None => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
     }
 }
 

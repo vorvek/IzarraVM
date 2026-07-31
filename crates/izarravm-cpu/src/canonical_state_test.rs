@@ -848,9 +848,10 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // four more dead region-only PerfCounters fields (jit_native_insns, jit_helper_exits,
     // jit_native_memory_helpers, jit_table_clears; 32 bytes), again measured (not derived) to move
     // this pin from 4456 to 4424 -- see the sibling pin `tests::pending_flags_offset` in
-    // cpu_test.rs.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
+    // cpu_test.rs. The mutable-imm-lane slice then adds four PerfCounters fields (32 bytes) and
+    // moves it back from 4424 to 4456, measured the same way.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
 }

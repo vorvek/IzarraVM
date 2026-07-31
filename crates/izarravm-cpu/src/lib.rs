@@ -29,6 +29,7 @@ mod mmx;
 mod mmx_exec;
 mod paging;
 mod run;
+mod smc_trace;
 mod strings;
 pub use fpu::X87;
 
@@ -587,6 +588,19 @@ pub struct PerfCounters {
     /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
     /// global-flush fallbacks only, so the two together split the SMC write traffic.
     pub smc_narrow_kills: u64,
+    /// Mutable imm32 lanes registered at block install: one per `ADD r32, imm32` slot whose
+    /// immediate is read out of guest RAM at execution instead of being baked into host code.
+    pub smc_lane_registrations: u64,
+    /// Guest writes classified as a lane patch — exactly four bytes at exactly a live block's
+    /// registered lane start. The owning block survives and contributes no SMC heat; the narrow
+    /// decode-line kill still runs.
+    pub smc_lane_accepts: u64,
+    /// Fail-closed rejections, split by which check refused. `width` is a write that starts at a
+    /// lane but is not four bytes wide (a byte or word patch of the dword field); `address` is a
+    /// write that overlaps a lane's bytes without starting on it (a straddle or partial overlap).
+    /// Both take the normal invalidation path, so a nonzero count is a retired block.
+    pub smc_lane_reject_width: u64,
+    pub smc_lane_reject_address: u64,
     /// G1 SMC heat demotions: compiled-block admissions refused because the entry chunk (pre-
     /// compile gate) or some chunk under the block span (pre-install gate) crossed the churn
     /// threshold this heat epoch. The block is parked Dormant and the region runs on the
@@ -1171,6 +1185,12 @@ impl std::fmt::Debug for CpuProfileState {
 struct DirectRuntimeState {
     // Inline host policy for interpreter hot paths. Dynamic entry guards remain in the backend.
     admission_active: bool,
+    /// One-shot "the last native entry ran only a PREFIX of its block, so let the interpreter take
+    /// the next boundary" latch. Run-scoped, not architectural: `run_budgeted_inner` clears it on
+    /// every entry, so it never carries across a batch, and like `admission_active` it is excluded
+    /// from CPU equality and resets on clone. It lives here rather than as a run-loop local so the
+    /// whole admission decision fits in one dispatcher call.
+    skip_direct_once: bool,
 }
 
 #[cfg(feature = "jit")]
@@ -1364,6 +1384,12 @@ pub struct CpuGsw {
     /// never makes an otherwise-identical CPU compare unequal. See `jit::unit_sim`.
     #[cfg(feature = "jit")]
     unit_sim: UnitSimSlot,
+    /// Optional SMC trace (diagnostic, off by default; `set_smc_trace_enabled`). When on, the
+    /// invalidation choke records every self-modifying write: the overwritten instruction's
+    /// decoded identity, which of its fields the write landed in, and which invalidation ran.
+    /// Non-architectural, excluded from CPU equality and cloned off, exactly like `unit_sim`.
+    /// See `smc_trace`.
+    smc_trace: smc_trace::SmcTraceSlot,
     /// Current privilege level. Per the 386 PRM, CPL is a *cached* quantity carried in
     /// (the hidden part of) CS, updated only at defined transition points -- it is not a
     /// live formula over the current CS selector. Updated at: real mode / PE clear (0);
@@ -1459,6 +1485,7 @@ impl Default for CpuGsw {
             alignment_armed: false,
             #[cfg(feature = "jit")]
             unit_sim: UnitSimSlot::default(),
+            smc_trace: smc_trace::SmcTraceSlot::default(),
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
             #[cfg(all(
@@ -2138,35 +2165,54 @@ struct RepExecution {
 ///   65536     9,511,922        0.0033                   732,871        80.44%
 ///  262144     8,615,694        0.0001                    30,870        80.56%
 ///
-/// 32768 is the knee. Past it, 65536 costs double the memory for another 1.7M misses and 0.12
-/// coverage points. The hidden-portal column is the reason this matters beyond decode cost: a
+/// On those three columns alone 32768 read as the knee, and it was the constant for the whole
+/// Direct era. The hidden-portal column is the reason this matters beyond decode cost: a
 /// decode eviction clears the portal of every compiled block registered on that line (see
 /// `fetch_decoded` and `suspend_decode_slot`), so decode conflicts turn directly into dark native
-/// blocks. That population only reaches zero at conflict-free sizes, so the residual 1.78M here is
+/// blocks. That population only reaches zero at conflict-free sizes, so the residual at 32768 is
 /// what a hashed index could still claim at a fraction of the memory.
+///
+/// WALL DECIDED THE STEP TO 65536, not the counter columns above. The refactor Phase 2 size sweep
+/// priced every size on wall under equal guest event and found the ladder MONOTONE downward: every
+/// decrease from 32768 lost on both fixtures, steeply on Quake. The step UP was then settled by a
+/// balanced six-pair A/B/B/A ladder (12 comparisons per fixture, per-role determinism gated):
+/// Quake improved on geomean, on the one-sided 95% lower bound, and on the independent min-wall
+/// cross-check, all three agreeing and every individual comparison favouring 65536; Doom came back
+/// neutral, its interval straddling parity on both estimators. So this constant is sized by the
+/// fixture that shows the effect and confirmed not to cost the fixture that does not.
+///
+/// The mechanism is NOT mainly "the interpreter decodes less". The same sweep profiled the decode
+/// tag check directly and found it absorbs only a small part of the wall that moves with this
+/// constant. What dominates is the portal coupling: an eviction hides the portal of every compiled
+/// block on the line, so a smaller table makes compiled blocks churn -- portal rescans and
+/// dispatcher entries rise far faster than decode misses do, and each straight-line run covers less
+/// guest work. Read this constant as a JIT-stability knob at least as much as an interpreter one;
+/// both channels push the same way, which is why the ladder is monotone.
 ///
 /// At 56 bytes per line NOW (measured via `size_of::<DecodeLine>()`, not derived: DecodeLine is
 /// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32,
 /// jit_direct_hotness: u8` -- DecodedInsn itself measures 40 bytes, having grown 36 -> 40 when C1e
-/// added the recorded {disp_len, imm_len} pair) 32768 lines is ~1.75 MB, against ~0.22 MB at 4096.
+/// added the recorded {disp_len, imm_len} pair) 65536 lines is ~3.5 MB, against ~1.75 MB at 32768
+/// and ~0.22 MB at 4096.
 /// HISTORY: before the dynarec-refactor Task 2 region-JIT deletion, DecodeLine carried two more
 /// fields (`jit_region: Option<NonZeroU32>` and `jit_hotness: u16`, 6 bytes together) and measured
 /// 60 bytes with zero slack. Deleting those two fields shrank the line 60 -> 56, a REAL footprint
 /// win, not an accounting wash: the 32768-line cache dropped from 1.875 MiB to 1.75 MB. At 56
 /// bytes the line holds 54 bytes of fields, so there are 2 bytes of trailing padding: a u8 or u16
 /// added back lands there and the line stays at 56, while any 4-byte field grows it to 60 and the
-/// cache by 128 KB at this line count. Measure `size_of::<DecodeLine>()` rather than trusting this
-/// sentence -- repr(Rust) ordering is unspecified. 1.75 MB no longer fits a small L2, which is the
-/// real cost of the 32768-line size and the reason not to go further without evidence.
+/// cache by 256 KB at this line count. Measure `size_of::<DecodeLine>()` rather than trusting this
+/// sentence -- repr(Rust) ordering is unspecified. 3.5 MB is well past any L2 and into L3
+/// territory, which is the real cost of this size: the table is no longer resident, and the wall
+/// ladder above is what justifies paying it. Do not grow it again without the same wall evidence.
 ///
 /// NOT purely microarchitectural, despite what this comment said before. Guest STATE is untouched
 /// (the decode cache is transparent to CpuGsw equality), but a decode hit charges one collapsed
 /// I-cache access where a miss charges per fetched byte, so changing which addresses hit changes
-/// charged guest bus clocks, master ticks, and in-guest fps. The Quake 42.7 fps and Doom
-/// 3042/843 realtics anchors move with this constant and have to be re-anchored, exactly as they
-/// were for the 2048 -> 4096 step. That is the "timing approx" half of the campaign contract, not
-/// a correctness change.
-const DECODE_CACHE_LINES: usize = 32768;
+/// charged guest bus clocks, master ticks, and in-guest fps. The Quake fps and Doom realtics
+/// anchors move with this constant and have to be RE-PINNED on both fixtures whenever it changes,
+/// exactly as they were for the 2048 -> 4096 step and again for 32768 -> 65536. That is the
+/// "timing approx" half of the campaign contract, not a correctness change.
+const DECODE_CACHE_LINES: usize = 65536;
 
 /// Sweep knob: `IZARRAVM_DECODE_CACHE_LINES=<power of two>` overrides the decode-cache size at
 /// construction. Decode replacement changes cold-fetch timing, so performance comparisons must
@@ -2227,6 +2273,29 @@ struct DecodeLine {
     /// Saturating direct-code admission count.
     #[cfg(feature = "jit")]
     jit_direct_hotness: u8,
+}
+
+/// One decode-line fetch, materialised once and threaded through a whole continuation iteration.
+///
+/// The straight-line loop used to index the decode table, and repeat its generation/tag/`d` test,
+/// up to four times per continuation for the same line: the main probe, the admission hotness
+/// bump, the block key's physical start, and the warm-fetch charge. They all want one line, so the
+/// line is read ONCE into this view and the values are handed to the downstream consumers.
+///
+/// `insn` is a COPY, not a borrow of the line, and that is settled rather than incidental:
+/// `invalidate_and_clear_code_marks` refills lines on a generation wrap, so a borrow cannot
+/// outlive the probe (`.bench/results/decodecache-20260731/RESULTS.md`). The other two fields are
+/// snapshots for the same reason; the run-loop call site carries the staleness argument.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecodeLineView {
+    pub(crate) insn: DecodedInsn,
+    /// Physical address of the instruction's first byte, as `DecodeCache::line_phys_start` would
+    /// report it for this key.
+    pub(crate) phys_start: u32,
+    /// The table index the line was found at. The view is proof the line is live for its key, so a
+    /// consumer holding one can address the line by slot without re-testing the tag.
+    #[cfg(feature = "jit")]
+    pub(crate) slot: u32,
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
@@ -2548,6 +2617,24 @@ impl DecodeCache {
         }
     }
 
+    /// `get`, plus the two other facts the continuation loop wants about the same line. One index
+    /// and one generation/tag/`d` check serve all three consumers; see `DecodeLineView`.
+    #[inline]
+    fn get_view(&self, lin: u32, d: bool) -> Option<DecodeLineView> {
+        let slot = lin & self.mask;
+        let line = &self.lines[slot as usize];
+        if line.generation == self.generation && line.tag == lin && line.d == d {
+            line.insn.map(|insn| DecodeLineView {
+                insn,
+                phys_start: line.phys_start,
+                #[cfg(feature = "jit")]
+                slot,
+            })
+        } else {
+            None
+        }
+    }
+
     #[inline]
     fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) -> DecodeInsertOutcome {
         let len = u32::from(insn.len);
@@ -2653,6 +2740,37 @@ impl DecodeCache {
         Some(killed)
     }
 
+    /// Diagnostic (SMC trace only): the live decode line covering physical byte `physical`, as
+    /// `(physical start, decoded instruction)`. Uses exactly the reconstruction
+    /// `narrow_invalidate` uses -- same page-info lookup, same alias refusal, same 14-byte
+    /// backward candidate scan -- but mutates nothing, so it can be called BEFORE the
+    /// invalidation to learn what is about to be killed. `None` whenever the narrow path would
+    /// also refuse or find no covering line.
+    ///
+    /// Returns the FIRST covering line the scan finds. Several cached lines can cover one physical
+    /// byte (the same bytes decoded from different entry points) and `narrow_invalidate` kills all
+    /// of them, so this reports one of possibly several -- another reason the trace's site rows
+    /// are not a per-hit identity claim (see `smc_trace`).
+    fn covering_line(&self, physical: u32) -> Option<(u32, DecodedInsn)> {
+        let info = *self.code_page_lin.get(&(physical >> 12))?;
+        if info.aliased {
+            return None;
+        }
+        let written_lin = (info.lin_page << 12) | (physical & 0xfff);
+        for candidate in written_lin.saturating_sub(14)..=written_lin {
+            let line = &self.lines[(candidate & self.mask) as usize];
+            if line.generation != self.generation || line.tag != candidate {
+                continue;
+            }
+            let Some(insn) = line.insn else { continue };
+            let len = u32::from(insn.len);
+            if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
+                return Some((line.phys_start, insn));
+            }
+        }
+        None
+    }
+
     /// The stored physical start of the live line for `lin`. Warm fetch timing uses this to retain
     /// the translation from the cold decode; JIT admission also derives block provenance from it.
     fn line_phys_start(&self, lin: u32, d: bool) -> Option<u32> {
@@ -2712,13 +2830,16 @@ impl DecodeCache {
 
     /// Observe a continuation for direct-code admission. Once the second encounter makes the line
     /// hot, later encounters stay eligible for the direct cache's separate first-seen/compile probe.
+    ///
+    /// Takes the SLOT rather than the key: the only caller reaches this holding a `DecodeLineView`
+    /// it took from this very cache in the same loop iteration, so the line is already proven live
+    /// for `(lin, d)` and the generation/tag/`d` retest this used to run was answering a question
+    /// that could not come back false. Nothing between the view and this call can invalidate a
+    /// line (the admission gate only reads the cache; see the caller's staleness note).
     #[cfg(feature = "jit")]
     #[inline]
-    fn direct_hot(&mut self, lin: u32, d: bool, threshold: u8) -> bool {
-        let line = &mut self.lines[(lin & self.mask) as usize];
-        if line.generation != self.generation || line.tag != lin || line.d != d {
-            return false;
-        }
+    fn direct_hot_at(&mut self, slot: u32, threshold: u8) -> bool {
+        let line = &mut self.lines[slot as usize];
         if line.jit_direct_hotness < threshold {
             line.jit_direct_hotness += 1;
         }

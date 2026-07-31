@@ -66,6 +66,16 @@ const MAX_MEMORY_ALU_SLOTS: u8 = 3;
 /// all six anchors byte-identical, the chain quota shrinks (a chain hop is assumed costlier,
 /// so chains return to the dispatcher earlier), entries up about 136,000, roughly 8 ms of wall.
 pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
+/// Mutable imm32 lanes per block. One `ADD r32, imm32` slot claims one lane; slots past this
+/// cap keep their baked immediate, which is a missed optimisation and never a correctness
+/// question. Four covers both of the paired patch sites the SMC trace found in a single block.
+pub(crate) const MAX_BLOCK_IMM_LANES: usize = 4;
+/// The only store width a lane accepts. The dword field is patched whole or not at all; a byte
+/// or word patch of it takes the normal invalidation path.
+pub(crate) const IMM_LANE_WIDTH: u32 = 4;
+/// Empty slot in a block's lane array. Physical address 0 is a real address (the real-mode IVT),
+/// so the sentinel has to be an address no six-byte instruction's immediate can start at.
+const NO_IMM_LANE: u32 = u32::MAX;
 const DEFAULT_ENTRY_CAP: usize = 131_072;
 const DEFAULT_DECODE_SLOT_COUNT: usize = 4_096;
 const BLOCK_PAGE_SHIFT: u32 = 12;
@@ -529,6 +539,19 @@ impl BlockKey {
     }
 }
 
+/// What one guest write did to the block cache. `blocks` is the retire count the invalidation
+/// choke has always used; the three lane figures are the diagnostic trio the campaign reads.
+///
+/// `lane_accepts` is what suppresses this write's SMC heat contribution: the whole point of a lane
+/// is that patching an immediate stops looking like code churn to the demotion gate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RangeInvalidation {
+    pub(crate) blocks: usize,
+    pub(crate) lane_accepts: u32,
+    pub(crate) lane_reject_width: u32,
+    pub(crate) lane_reject_address: u32,
+}
+
 /// Validated guest extent for one compiled block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BlockSpan {
@@ -967,6 +990,12 @@ pub(crate) struct BlockCache {
     /// was 116 of that struct's 240 bytes while every hot-path read goes through a `&self`
     /// method that never needed the copy. Entry reads it exactly once.
     segment_layouts: Vec<SegmentLayout>,
+    /// Parallel to `blocks`, same `BlockId::index()`: the physical start of each mutable imm32
+    /// lane the block's emitted code reads through, `NO_IMM_LANE` for an unused slot. Out of
+    /// `CompiledBlock` for the reason its size pin states — nothing here is read on a block entry,
+    /// only at the SMC write choke. A recycled slot is refilled by `install`, so a retired
+    /// occupant's lanes can never answer for its successor.
+    block_imm_lanes: Vec<[u32; MAX_BLOCK_IMM_LANES]>,
     block_portals: Vec<Arc<BlockPortal>>,
     link_cells: Vec<[Arc<LinkCell>; 2]>,
     link_sources: HashMap<usize, LinkSource<BlockId>>,
@@ -987,6 +1016,16 @@ pub(crate) struct BlockCache {
     /// `CpuGsw::set_mode`, which reaches `clear()` below. Cleared there ABOVE the empty-cache
     /// early return, so the clear does not depend on an argument about when that return is taken.
     global_block_upper_cache: [u64; 2],
+    /// Memoised `iteration_upper`, THIS block's own cost bound, parallel to `blocks` and indexed
+    /// by the same `BlockId::index()`. 0 is unset. Unlike the two-entry table above, a false
+    /// "unset" here would only cost a recompute, never a wrong answer, so the sentinel needs no
+    /// non-collision argument: the value is at least `scaled_core_upper` and a block with zero
+    /// raw clocks simply misses forever.
+    ///
+    /// Its inputs are the block's own immutable metadata plus the same persona timing pair and
+    /// bus cost dials `global_block_upper` reads, so it carries the same epoch key. A recycled
+    /// slot is zeroed by `install`, so a stale entry cannot outlive its block.
+    iteration_upper_cache: Vec<u64>,
     /// The shared x87 re-entry pad, in its OWN executable mapping rather than in the arena.
     /// Deliberately not a block: `reset_storage` sets `arena = None` and frees it, which would
     /// dangle every `integer_entry` published at a float block, and `compact_arena` relocates
@@ -1003,6 +1042,9 @@ pub(crate) struct BlockCache {
     /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
     /// `max`, three multiplies and a division.
     global_block_upper_epoch: u64,
+    /// The `jit_cost_dial_epoch()` `iteration_upper_cache` was computed under. Same key, same
+    /// reasoning as `global_block_upper_epoch` above.
+    iteration_upper_epoch: u64,
     free_block_slots: Vec<u16>,
     next_block_generation: u64,
     live_blocks: usize,
@@ -1059,13 +1101,16 @@ impl BlockCache {
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
             segment_layouts: Vec::new(),
+            block_imm_lanes: Vec::new(),
             block_portals: Vec::new(),
             link_cells: Vec::new(),
             link_sources: HashMap::new(),
             outbound: Vec::new(),
             global_block_upper_cache: [0; 2],
+            iteration_upper_cache: Vec::new(),
             x87_pad: None,
             global_block_upper_epoch: 0,
+            iteration_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
             inbound: HashMap::new(),
             waiting: HashMap::new(),
@@ -1263,6 +1308,7 @@ impl BlockCache {
         if index == self.blocks.len() {
             self.blocks.push(block);
             self.segment_layouts.push(compilation.segment_layout);
+            self.block_imm_lanes.push(compilation.imm_lanes);
             if index == self.block_portals.len() {
                 self.block_portals.push(Arc::new(BlockPortal::new()));
             } else {
@@ -1274,6 +1320,7 @@ impl BlockCache {
             self.dynamic_next_slots.push(0);
             self.block_link_epochs.push(0);
             self.block_active.push(true);
+            self.iteration_upper_cache.push(0);
             if index == self.block_decode_slots.len() {
                 self.block_decode_slots.push(Vec::new());
             } else {
@@ -1286,11 +1333,14 @@ impl BlockCache {
             debug_assert!(self.block_decode_slots[index].is_empty());
             self.blocks[index] = block;
             self.segment_layouts[index] = compilation.segment_layout;
+            self.block_imm_lanes[index] = compilation.imm_lanes;
             self.link_cells[index] = compilation.link_cells.clone();
             self.outbound[index] = [None, None];
             self.dynamic_next_slots[index] = 0;
             self.block_link_epochs[index] = 0;
             self.block_active[index] = true;
+            // A recycled slot must not serve the retired occupant's cost bound to its successor.
+            self.iteration_upper_cache[index] = 0;
         }
         self.register_decode_dependencies(id, &decode_slots[..decode_slot_len]);
         if compilation.dynamic_successor {
@@ -1405,6 +1455,32 @@ impl BlockCache {
         self.global_block_upper_cache[x87_index] = value;
     }
 
+    /// Memoised `iteration_upper` for one block, valid only under `epoch`. Returns 0 for unset,
+    /// which the caller treats as a miss and recomputes; see the field for why that sentinel needs
+    /// no non-collision argument. Goes through `active_index` so a `BlockId` whose slot has since
+    /// been recycled reads as a miss rather than as its successor's bound.
+    pub(crate) fn iteration_upper_cached(&self, id: BlockId, epoch: u64) -> u64 {
+        if self.iteration_upper_epoch != epoch {
+            return 0;
+        }
+        self.active_index(id)
+            .and_then(|index| self.iteration_upper_cache.get(index).copied())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_iteration_upper_cached(&mut self, id: BlockId, epoch: u64, value: u64) {
+        if self.iteration_upper_epoch != epoch {
+            self.iteration_upper_cache.fill(0);
+            self.iteration_upper_epoch = epoch;
+        }
+        let Some(index) = self.active_index(id) else {
+            return;
+        };
+        if let Some(slot) = self.iteration_upper_cache.get_mut(index) {
+            *slot = value;
+        }
+    }
+
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
         self.dormant(key, DormantReason::SpanHot);
         let _ = heat.bump(key.physical, 1, epoch);
@@ -1454,6 +1530,7 @@ impl BlockCache {
         // `reset_storage` removes a reachability argument standing between a mode switch and a
         // miscompiled quota.
         self.global_block_upper_cache = [0; 2];
+        self.iteration_upper_cache.fill(0);
         // CS reloads and monitor transitions can invalidate code millions of times while the
         // direct cache is unused. Avoid clearing the 65,536-entry hot table when it is already
         // empty.
@@ -1547,14 +1624,46 @@ impl BlockCache {
 
     /// Remove direct-cache entries whose translated physical bytes overlap a guest write. Block
     /// IDs and executable pages stay in place until the arena's normal whole-cache reset.
+    ///
+    /// `lanes` is whether this caller may take the mutable-lane exemption. Only a store path that
+    /// has committed the guest's own bytes passes `true`; the value-less callers (a device range,
+    /// a page-walk A/D store, a string translate-time invalidation) pass `false` and get the
+    /// unchanged behaviour.
+    ///
+    /// # Why matching a registered lane is a sound runtime classification
+    ///
+    /// A lane says "this block's compile-time decode found `ADD r32, imm32` whose immediate is
+    /// these four bytes". The write choke has no decoder, so it must decide from the address
+    /// alone, and what makes that valid is an induction over the block's life rather than a shape
+    /// learned once at the site:
+    ///
+    /// - Base: at install the block's decode of the instruction is current by construction, and
+    ///   `watch.acquire_range` covers the block's whole physical span.
+    /// - Step: every guest write overlapping that span reaches this function (the watch is what
+    ///   `code_write_watched` consults, and a native store into watched code side-exits before it
+    ///   commits, so the interpreter replays it through here). Every such write either matches a
+    ///   registered lane of THIS block exactly, or retires it below.
+    /// - Therefore a block that is still alive has had no non-lane byte of its span written since
+    ///   it compiled. Its opcode, ModRM, length and displacement bytes are exactly what the
+    ///   compiler decoded, and only its lane bytes may differ — which is precisely what the
+    ///   emitted code re-reads from RAM. So "the write is exactly this block's lane" IS the
+    ///   current shape of the instruction, not a stale memory of it.
+    ///
+    /// The remaining ways a live block's bytes could change are all closed elsewhere: a paging
+    /// remap gives a different `BlockKey` (physical is part of the key) and lanes are keyed on
+    /// physical anyway; an A20 toggle or direct-map change clears the whole cache; a device write
+    /// with no reportable range does too; and arena compaction moves host code without touching
+    /// block indices, so lanes stay attached to their blocks.
     pub(crate) fn invalidate_physical_range(
         &mut self,
         watch: &mut NativeCodeWatch,
         physical: u32,
         width: u32,
-    ) -> usize {
+        lanes: bool,
+    ) -> RangeInvalidation {
+        let mut result = RangeInvalidation::default();
         if width == 0 || self.entries.is_empty() {
-            return 0;
+            return result;
         }
 
         let mut invalidated = 0;
@@ -1596,6 +1705,37 @@ impl BlockCache {
                         survivor_count += 1;
                         continue;
                     }
+                    // Fail-closed lane check, per block. Everything that is not the one admitted
+                    // shape falls through to the retire below: a wrong width at a lane start, a
+                    // write that overlaps lane bytes without starting on one (a straddle or a
+                    // partial patch), a write that misses this block's lanes entirely, a block
+                    // with no lanes at all, and every write from a caller that cannot pass
+                    // `lanes`.
+                    if let BlockState::Compiled(id) = state
+                        && lanes
+                        && let Some(index) = self.active_index(id)
+                    {
+                        let block_lanes = self.block_imm_lanes[index];
+                        if physical != NO_IMM_LANE
+                            && width == IMM_LANE_WIDTH
+                            && block_lanes.contains(&physical)
+                        {
+                            result.lane_accepts += 1;
+                            keys[survivor_count] = key;
+                            survivor_count += 1;
+                            continue;
+                        }
+                        for lane in block_lanes.iter().copied().filter(|lane| {
+                            *lane != NO_IMM_LANE
+                                && physical_ranges_overlap(physical, width, *lane, IMM_LANE_WIDTH)
+                        }) {
+                            if physical == lane {
+                                result.lane_reject_width += 1;
+                            } else {
+                                result.lane_reject_address += 1;
+                            }
+                        }
+                    }
 
                     self.entries.remove(&key);
                     let hot_index = key.hot_index();
@@ -1619,7 +1759,8 @@ impl BlockCache {
             cursor = cursor.wrapping_add(step);
             remaining -= step;
         }
-        invalidated
+        result.blocks = invalidated;
+        result
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1980,6 +2121,7 @@ impl BlockCache {
         self.physical_keys.clear();
         self.blocks.clear();
         self.segment_layouts.clear();
+        self.block_imm_lanes.clear();
         self.link_cells.clear();
         self.link_sources.clear();
         self.outbound.clear();
@@ -1994,6 +2136,7 @@ impl BlockCache {
             slots.clear();
         }
         self.block_link_epochs.clear();
+        self.iteration_upper_cache.clear();
         watch.clear();
         // Every storage reset drops heat; the owner of the hoisted map observes this counter.
         self.heat_resets = self.heat_resets.wrapping_add(1);
@@ -2214,6 +2357,7 @@ impl BlockCache {
         self.block_active[index] = false;
         self.blocks[index].entry = 0;
         self.blocks[index].body_entry = 0;
+        self.block_imm_lanes[index] = [NO_IMM_LANE; MAX_BLOCK_IMM_LANES];
         self.free_block_slots
             .push(u16::try_from(index).expect("block slot index must fit its ID"));
         self.live_blocks -= 1;
@@ -2452,7 +2596,38 @@ pub(crate) struct Compilation {
     pub(crate) successors: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
     body_offset: usize,
+    /// Physical start of each mutable immediate this block's emitted code reads from guest RAM,
+    /// `NO_IMM_LANE` for an unused slot. `install` copies these into the cache's per-block lane
+    /// array, which is what the SMC write choke matches a patch against.
+    imm_lanes: [u32; MAX_BLOCK_IMM_LANES],
     pub code: Vec<u8>,
+}
+
+impl Compilation {
+    pub(crate) fn imm_lane_count(&self) -> usize {
+        self.imm_lanes
+            .iter()
+            .filter(|lane| **lane != NO_IMM_LANE)
+            .count()
+    }
+}
+
+/// One mutable immediate field: where its four bytes live in guest physical memory, and the host
+/// address of those same bytes for the emitted load.
+///
+/// `physical` is what the SMC write choke matches against, and keying on PHYSICAL rather than
+/// linear is what makes linear aliases of the same code free: two linear addresses mapping to one
+/// physical page produce one lane address, and a patch through either alias resolves to it.
+///
+/// `host` is a raw pointer to the same bytes, resolved at compile time from a direct page. It
+/// stays valid for the block's whole life: RAM host pointers never move for a given physical page
+/// (see `note_direct_data_map_changed`), and every event that could change which host bytes back a
+/// physical address — an A20 toggle, a direct-map change, a bus mapping-epoch change that is not
+/// data-only — routes through `invalidate_code_caches`, which clears this cache.
+#[derive(Clone, Copy)]
+pub(crate) struct ImmLane {
+    pub(crate) physical: u32,
+    pub(crate) host: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2539,6 +2714,12 @@ pub(crate) enum DirectKind {
         op: u8,
         dst: u8,
         imm: u32,
+        /// Present only for the one shape `imm_lane_for` admits (`ADD r32, imm32`, opcode 0x81
+        /// reg-destination, no prefixes). When present the emitted form IGNORES `imm` and loads
+        /// the four immediate bytes out of guest RAM on every execution, so a guest patch of
+        /// those bytes needs no recompile. `imm` still carries the value decoded at compile time
+        /// and is what the non-lane form bakes.
+        lane: Option<ImmLane>,
     },
     AluByteImm {
         op: u8,
@@ -3806,6 +3987,14 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 }
 
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
+    let physical = cpu.decode_cache.line_phys_start(lin, d)?;
+    key_for_phys(cpu, lin, d, physical)
+}
+
+/// `key_for` for a caller that already holds the line's physical start (a `DecodeLineView` taken
+/// this iteration). Identical decision: the only thing `key_for` reads off the decode cache is
+/// that one field, and `line_phys_start` would return exactly this value for the same key.
+pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Option<BlockKey> {
     if !super::host_supported() || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586) {
         return None;
     }
@@ -3827,7 +4016,6 @@ pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
     if lin.wrapping_sub(0x000f_f000) < 0x400 {
         return None;
     }
-    let physical = cpu.decode_cache.line_phys_start(lin, d)?;
     // The first direct slice has no page-kind guard in emitted code. Keep video and ROM code on
     // the interpreter until the shared fast map can prove a page is ordinary RAM.
     if (0x000a_0000..0x0010_0000).contains(&physical) {
@@ -3975,6 +4163,70 @@ fn stack_width_kind(
     }
 }
 
+/// Admit a mutable imm32 lane for one slot, or refuse.
+///
+/// The admitted shape is exactly one form and the checks are deliberately over-determined, each
+/// pinning a different property of the encoding:
+///
+/// - `opcode == 0x81` with a `DirectKind::AluImm` kind: the ALU group with a 32-bit immediate,
+///   and `AluImm` is produced only from `DecodedOperand::Reg`, so the ModRM mode is 3.
+/// - `op == 0`: the `/0` ADD member. The other seven members of the group are out of scope.
+/// - `OperandSize::Dword` plus `Prefixes::default()`: no operand-size override, no address-size
+///   override, no segment override, no REP, and no LOCK. A LOCK'd patch is refused here rather
+///   than relied on being impossible.
+/// - `disp_len == 0`, `imm_len == 4`, `len == 6`: the decoder's own record of what it consumed.
+///   Together these are what puts the immediate at instruction offset 2 and nowhere else, so the
+///   lane address is `physical + 2` by construction rather than by assumption about the encoding.
+///
+/// The lane is refused (and the slot keeps its baked immediate, correct as ever) when the block
+/// already holds `MAX_BLOCK_IMM_LANES`, or when no direct page can supply a host pointer for the
+/// immediate's bytes. The second is the page-kind guard: only a page the bus hands out as a direct
+/// mapping can be read this way, so device apertures and unmapped pages never produce a lane.
+fn imm_lane_for(
+    cpu: &CpuGsw,
+    insn: &DecodedInsn,
+    kind: DirectKind,
+    physical: u32,
+    lanes_used: usize,
+) -> Option<(DirectKind, ImmLane)> {
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        return None;
+    }
+    let DirectKind::AluImm {
+        op: 0, dst, imm, ..
+    } = kind
+    else {
+        return None;
+    };
+    if insn.opcode != 0x81
+        || insn.operand_size != OperandSize::Dword
+        || insn.prefixes != Prefixes::default()
+        || insn.disp_len != 0
+        || insn.imm_len != 4
+        || insn.len != 6
+    {
+        return None;
+    }
+    let lane = physical.checked_add(2)?;
+    // The instruction is already known page-local in physical (`physical_page_local` in the
+    // compile loop), so its immediate cannot straddle a page and one host pointer covers all four
+    // bytes.
+    let host = cpu.direct_host_bytes(lane, IMM_LANE_WIDTH)?;
+    let lane = ImmLane {
+        physical: lane,
+        host,
+    };
+    Some((
+        DirectKind::AluImm {
+            op: 0,
+            dst,
+            imm,
+            lane: Some(lane),
+        },
+        lane,
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CensusSuffix {
     instructions: usize,
@@ -4085,6 +4337,8 @@ fn compile_with_instruction_limit(
     let x87_entry_top = cpu.fpu.top();
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
+    let mut imm_lanes = [NO_IMM_LANE; MAX_BLOCK_IMM_LANES];
+    let mut imm_lane_count = 0usize;
     let mut stop = CompileStop::Boundary;
 
     while slots.len() < instruction_limit.min(MAX_BLOCK_INSTRUCTIONS) {
@@ -4335,6 +4589,18 @@ fn compile_with_instruction_limit(
         }
         has_wide_accesses |=
             kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
+        // Attached HERE, at the last point before the slot is committed, not next to `classify`.
+        // Every `break` above abandons the slot, and a lane recorded for an instruction that never
+        // joined the block would name bytes outside the block's span -- an address the write choke
+        // could never match, but also a lane the block does not actually read through.
+        let kind = match imm_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+            Some((kind, lane)) => {
+                imm_lanes[imm_lane_count] = lane.physical;
+                imm_lane_count += 1;
+                kind
+            }
+            None => kind,
+        };
         fetch_lens[slots.len()] = insn.len;
         slots.push(DirectInsn {
             lin,
@@ -4522,6 +4788,7 @@ fn compile_with_instruction_limit(
         successors,
         link_cells,
         body_offset: emitted.body_offset,
+        imm_lanes,
         code: emitted.code,
     })
 }

@@ -495,6 +495,18 @@ impl Machine {
         let _ = on;
     }
 
+    /// Enable or disable the CPU's off-by-default SMC trace (diagnostic). See
+    /// `CpuGsw::set_smc_trace_enabled`.
+    pub fn set_smc_trace_enabled(&mut self, on: bool) {
+        self.cpu.set_smc_trace_enabled(on);
+    }
+
+    /// Take the SMC trace's report lines, disabling the trace. `None` when it was never enabled.
+    /// See `CpuGsw::take_smc_trace_report`.
+    pub fn take_smc_trace_report(&mut self) -> Option<Vec<String>> {
+        self.cpu.take_smc_trace_report()
+    }
+
     /// Take the unit-simulator ladder's per-rung reports, disabling the sim in the process. Each
     /// element is `(cfg_label, headline, histogram)` for one ladder rung (the measurement set
     /// `{L0, L4, L6, P}`), where the histogram entries are `(member_count, entry_physical_page)`.
