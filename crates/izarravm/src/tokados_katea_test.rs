@@ -11,16 +11,19 @@ use super::*;
 #[test]
 #[ignore = "boots a full DOS image from a FAT32 HDD (slow in debug); run with --ignored"]
 fn katea_static_hdd_boots() {
-    let (mut machine, stop) = boot_hdd(500_000_000);
+    let (mut machine, stop, boot_cycles) = boot_hdd(500_000_000);
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        panic!("CPU fault during Katea HDD boot: {msg}\nstop={stop:?}\n{text}");
+        panic!(
+            "CPU fault during Katea HDD boot after {boot_cycles} requested cycles: {msg}\n\
+             stop={stop:?}\n{text}"
+        );
     }
     let text = machine.screen_text().as_text().to_ascii_lowercase();
     // The kernel must assign the FAT32 partition to C: and prompt there, NOT A:.
     assert!(
         text.contains("c:\\>"),
-        "no C:\\> prompt after HDD boot (stop={stop:?}).\n{text}"
+        "no C:\\> prompt after {boot_cycles} requested cycles (stop={stop:?}).\n{text}"
     );
 
     // VER: the kernel responds with its version banner.
@@ -32,9 +35,14 @@ fn katea_static_hdd_boots() {
             .run_until_halt_or_cycles(5_000_000)
             .expect("type ver");
     }
-    machine
-        .run_until_halt_or_cycles(20_000_000)
-        .expect("settle ver");
+    run_until_toka_condition(&mut machine, 20_000_000, |machine| {
+        current_root_prompt(machine)
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .contains("c:\\>ver")
+    });
     let ver_text = machine.screen_text().as_text().to_ascii_lowercase();
     assert!(
         ver_text.contains("c:\\>ver"),
@@ -53,9 +61,14 @@ fn katea_static_hdd_boots() {
             .run_until_halt_or_cycles(5_000_000)
             .expect("type dir");
     }
-    machine
-        .run_until_halt_or_cycles(40_000_000)
-        .expect("settle dir");
+    run_until_toka_condition(&mut machine, 40_000_000, |machine| {
+        current_root_prompt(machine)
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .contains("command")
+    });
     let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
     assert!(
         dir_text.contains("command"),
@@ -75,15 +88,8 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
     // whose 8.3 name (GREETING.TXT — already a valid 8.3 name, no ~n fold) is
     // distinct from the system files, so spotting it in DIR proves the host
     // folder reached the volume.
-    let dir = std::env::temp_dir().join(format!(
-        "katea_folder_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("katea_folder");
+    let dir = scratch.path();
     std::fs::write(dir.join("GREETING.TXT"), b"hi from the host folder\r\n")
         .expect("write host file");
 
@@ -92,13 +98,10 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
-    machine.mount_hdd_folder(&dir).expect("mount host folder");
-    let stop = machine
-        .run_until_halt_or_cycles(500_000_000)
-        .expect("run machine");
+    machine.mount_hdd_folder(dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, current_root_prompt);
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         panic!("CPU fault during Katea folder boot: {msg}\nstop={stop:?}\n{text}");
     }
     let text = machine.screen_text().as_text().to_ascii_lowercase();
@@ -116,9 +119,14 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
             .run_until_halt_or_cycles(5_000_000)
             .expect("type dir");
     }
-    machine
-        .run_until_halt_or_cycles(40_000_000)
-        .expect("settle dir");
+    run_until_toka_condition(&mut machine, 40_000_000, |machine| {
+        current_root_prompt(machine)
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .contains("greeti")
+    });
     let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
 
     // TYPE the host file: this drives the kernel to READ the file's data, which
@@ -134,12 +142,16 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
             .run_until_halt_or_cycles(5_000_000)
             .expect("type the type command");
     }
-    machine
-        .run_until_halt_or_cycles(40_000_000)
-        .expect("settle type");
+    run_until_toka_condition(&mut machine, 40_000_000, |machine| {
+        current_root_prompt(machine)
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .contains("hi from the host folder")
+    });
     let type_text = machine.screen_text().as_text().to_ascii_lowercase();
 
-    std::fs::remove_dir_all(&dir).ok();
     assert!(
         dir_text.contains("greeti"),
         "DIR C: did not list the host file off the folder facade.\n{dir_text}"
@@ -163,15 +175,8 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
 #[test]
 #[ignore = "boots a full DOS image under the slow graphical POST; run with --ignored"]
 fn katea_full_post_boot_hands_display_back_to_vga() {
-    let dir = std::env::temp_dir().join(format!(
-        "katea_fullpost_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("katea_fullpost");
+    let dir = scratch.path();
     std::fs::write(dir.join("GREETING.TXT"), b"hi\r\n").expect("write host file");
 
     let mut machine = Machine::new(
@@ -182,12 +187,11 @@ fn katea_full_post_boot_hands_display_back_to_vga() {
     // The GUI runs the full graphical POST, which lights the Margo LFB; headless
     // defaults to fast POST (text only), so this is the path the e2e tests miss.
     machine.set_fast_post(false);
-    machine.mount_hdd_folder(&dir).expect("mount host folder");
-    let stop = machine
-        .run_until_halt_or_cycles(600_000_000)
-        .expect("run machine");
+    machine.mount_hdd_folder(dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 600_000_000, |machine| {
+        current_root_prompt(machine) && !machine.margo_active()
+    });
     let text = machine.screen_text().as_text().to_ascii_lowercase();
-    std::fs::remove_dir_all(&dir).ok();
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault during full-POST Katea boot: {msg}\n{text}");
     }
@@ -215,14 +219,8 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
     // A unique scratch tree under the system temp dir: GAMES\HELLO\READAT.TXT
     // lives two directory levels down, so reaching it proves the subfolder
     // chain (root -> GAMES -> HELLO) is navigable and the file reads at depth.
-    let dir = std::env::temp_dir().join(format!(
-        "katea_tree_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = TokaScratch::new("katea_tree");
+    let dir = scratch.path();
     let depth = dir.join("GAMES").join("HELLO");
     std::fs::create_dir_all(&depth).expect("scratch tree");
     std::fs::write(depth.join("READAT.TXT"), b"read at depth ok\r\n").expect("write depth file");
@@ -233,14 +231,11 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
     )
     .expect("build machine");
     machine
-        .mount_hdd_folder(&dir)
+        .mount_hdd_folder(dir)
         .expect("mount host folder tree");
-    let stop = machine
-        .run_until_halt_or_cycles(500_000_000)
-        .expect("run machine");
+    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, current_root_prompt);
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         panic!("CPU fault during Katea tree boot: {msg}\nstop={stop:?}\n{text}");
     }
     let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
@@ -261,9 +256,15 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
                 .run_until_halt_or_cycles(5_000_000)
                 .expect("type cmd");
         }
-        machine
-            .run_until_halt_or_cycles(40_000_000)
-            .expect("settle cmd");
+        run_until_toka_condition(&mut machine, 40_000_000, |machine| {
+            current_prompt(machine, "C:\\GAMES\\HELLO>")
+                && (cmd != "dir\r"
+                    || machine
+                        .screen_text()
+                        .as_text()
+                        .to_ascii_lowercase()
+                        .contains("readat"))
+        });
     }
     let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
 
@@ -280,12 +281,16 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
             .run_until_halt_or_cycles(5_000_000)
             .expect("type the type command");
     }
-    machine
-        .run_until_halt_or_cycles(40_000_000)
-        .expect("settle type");
+    run_until_toka_condition(&mut machine, 40_000_000, |machine| {
+        current_prompt(machine, "C:\\GAMES\\HELLO>")
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .contains("read at depth ok")
+    });
     let type_text = machine.screen_text().as_text().to_ascii_lowercase();
 
-    std::fs::remove_dir_all(&dir).ok();
     assert!(
         dir_text.contains("readat"),
         "DIR in the subfolder did not list the file at depth.\n{dir_text}"
@@ -304,14 +309,8 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
 #[test]
 #[ignore = "boots a full DOS image and writes through Katea (slow in debug); run with --ignored"]
 fn katea_host_folder_writes_create_overwrite_grow_in_a_subfolder() {
-    let dir = std::env::temp_dir().join(format!(
-        "katea_m2_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = TokaScratch::new("katea_m2");
+    let dir = scratch.path();
     let saves = dir.join("SAVES");
     std::fs::create_dir_all(&saves).expect("scratch tree");
     // Pre-seed a file to overwrite and a batch file holding the write commands
@@ -330,13 +329,10 @@ echo deep>SUB\\DEEP.TXT\r\n";
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
-    machine.mount_hdd_folder(&dir).expect("mount host folder");
-    let stop = machine
-        .run_until_halt_or_cycles(500_000_000)
-        .expect("run machine");
+    machine.mount_hdd_folder(dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, current_root_prompt);
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         panic!("CPU fault during Katea write boot: {msg}\nstop={stop:?}\n{text}");
     }
     let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
@@ -357,9 +353,34 @@ echo deep>SUB\\DEEP.TXT\r\n";
                 .run_until_halt_or_cycles(5_000_000)
                 .expect("type cmd");
         }
-        machine
-            .run_until_halt_or_cycles(settle)
-            .expect("settle cmd");
+        run_until_toka_condition(&mut machine, settle, |machine| {
+            if !current_prompt(machine, "C:\\SAVES>") {
+                return false;
+            }
+            if cmd != "make\r" {
+                return true;
+            }
+            let reads = (
+                std::fs::read(saves.join("NEW.TXT")),
+                std::fs::read(saves.join("OLD.TXT")),
+                std::fs::read(saves.join("GROW.TXT")),
+                std::fs::read(saves.join("SUB").join("DEEP.TXT")),
+            );
+            let (Ok(new), Ok(old), Ok(grow), Ok(deep)) = reads else {
+                return false;
+            };
+            let new = String::from_utf8_lossy(&new);
+            let old = String::from_utf8_lossy(&old);
+            let grow = String::from_utf8_lossy(&grow);
+            let deep = String::from_utf8_lossy(&deep);
+            new.contains("created")
+                && old.contains("overwritten")
+                && !old.contains("before")
+                && grow.contains("line1")
+                && grow.contains("line2")
+                && std::fs::metadata(saves.join("SUB")).is_ok_and(|entry| entry.is_dir())
+                && deep.contains("deep")
+        });
     }
 
     // Final reconcile, then read the host folder back.
@@ -373,7 +394,6 @@ echo deep>SUB\\DEEP.TXT\r\n";
     let grow_txt = read(saves.join("GROW.TXT"));
     let deep_txt = read(saves.join("SUB").join("DEEP.TXT"));
     let sub_is_dir = saves.join("SUB").is_dir();
-    std::fs::remove_dir_all(&dir).ok();
 
     assert!(
         new_txt.contains("created"),
@@ -400,14 +420,8 @@ echo deep>SUB\\DEEP.TXT\r\n";
 #[test]
 #[ignore = "boots a full DOS image and mutates host files via Katea (slow); run with --ignored"]
 fn katea_host_folder_delete_rename_move_rmdir() {
-    let dir = std::env::temp_dir().join(format!(
-        "katea_m3_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = TokaScratch::new("katea_m3");
+    let dir = scratch.path();
     let ops = dir.join("OPS");
     std::fs::create_dir_all(ops.join("SUB")).expect("scratch tree");
     std::fs::create_dir_all(ops.join("EMPTYDIR")).expect("emptydir");
@@ -436,13 +450,10 @@ del PREEXIST.TXT\r\n";
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
-    machine.mount_hdd_folder(&dir).expect("mount host folder");
-    let stop = machine
-        .run_until_halt_or_cycles(500_000_000)
-        .expect("run machine");
+    machine.mount_hdd_folder(dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, current_root_prompt);
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         panic!("CPU fault during Katea mutation boot: {msg}\nstop={stop:?}\n{text}");
     }
     let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
@@ -462,9 +473,23 @@ del PREEXIST.TXT\r\n";
                 .run_until_halt_or_cycles(5_000_000)
                 .expect("type cmd");
         }
-        machine
-            .run_until_halt_or_cycles(settle)
-            .expect("settle cmd");
+        run_until_toka_condition(&mut machine, settle, |machine| {
+            if !current_prompt(machine, "C:\\OPS>") {
+                return false;
+            }
+            if cmd != "ops\r" {
+                return true;
+            }
+            matches!(ops.join("DELME.TXT").try_exists(), Ok(false))
+                && matches!(ops.join("RENAMED.TXT").try_exists(), Ok(true))
+                && matches!(ops.join("KEEP.TXT").try_exists(), Ok(false))
+                && matches!(ops.join("SUB").join("MOVEME.TXT").try_exists(), Ok(true))
+                && matches!(ops.join("MOVEME.TXT").try_exists(), Ok(false))
+                && matches!(ops.join("EMPTYDIR").try_exists(), Ok(false))
+                && matches!(ops.join("NEWDIR").try_exists(), Ok(true))
+                && matches!(ops.join("OLDDIR").try_exists(), Ok(false))
+                && matches!(ops.join("PREEXIST.TXT").try_exists(), Ok(false))
+        });
     }
     machine.flush_hdd_folder();
 
@@ -478,7 +503,6 @@ del PREEXIST.TXT\r\n";
     let dir_renamed_new = exists(ops.join("NEWDIR"));
     let dir_renamed_old_gone = !exists(ops.join("OLDDIR"));
     let preexist_gone = !exists(ops.join("PREEXIST.TXT"));
-    std::fs::remove_dir_all(&dir).ok();
 
     assert!(del_gone, "DELME.TXT not deleted");
     assert!(renamed_new, "RENAMED.TXT not present after rename");
@@ -503,18 +527,8 @@ del PREEXIST.TXT\r\n";
 #[test]
 #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
 fn katea_run_captures_a_program_exit_code() {
-    // Self-cleaning dir (drops at the end of the test body, after the assert),
-    // so a panic mid-test can't leak it — same guard the production katea_run uses.
-    let dir = TempDir::new(std::env::temp_dir().join(format!(
-            "katea_run_e2e_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )))
-    .unwrap();
-    let prog = dir.path().join("EXIT42.COM");
+    let scratch = TokaScratch::new("katea_run_e2e");
+    let prog = scratch.path().join("EXIT42.COM");
     std::fs::write(&prog, izarravm_firmware::exit42_com()).unwrap();
 
     let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
@@ -535,16 +549,8 @@ fn katea_run_captures_a_program_exit_code() {
 #[test]
 #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
 fn katea_run_guest_hlt_resumes_and_exits_under_tokaemm() {
-    let dir = TempDir::new(std::env::temp_dir().join(format!(
-            "katea_run_hlt_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )))
-    .unwrap();
-    let prog = dir.path().join("HLTTEST.COM");
+    let scratch = TokaScratch::new("katea_run_hlt");
+    let prog = scratch.path().join("HLTTEST.COM");
     std::fs::write(&prog, izarravm_firmware::hlttest_com()).unwrap();
 
     let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
@@ -561,16 +567,8 @@ fn katea_run_guest_hlt_resumes_and_exits_under_tokaemm() {
 #[test]
 #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
 fn katea_run_repeated_guest_hlt_resumes_and_exits_under_tokaemm() {
-    let dir = TempDir::new(std::env::temp_dir().join(format!(
-            "katea_run_multihlt_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )))
-    .unwrap();
-    let prog = dir.path().join("MULTIHLT.COM");
+    let scratch = TokaScratch::new("katea_run_multihlt");
+    let prog = scratch.path().join("MULTIHLT.COM");
     std::fs::write(&prog, izarravm_firmware::multihlt_com()).unwrap();
 
     let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
@@ -619,33 +617,22 @@ fn katea_run_repeated_guest_hlt_resumes_and_exits_under_tokaemm() {
 #[test]
 #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
 fn tokaedit_edits_and_saves_a_file() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaedit_e2e_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaedit_e2e");
+    let dir = scratch.path();
 
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
-    machine.mount_hdd_folder(&dir).expect("mount host folder");
-    let stop = machine
-        .run_until_halt_or_cycles(500_000_000)
-        .expect("run machine");
+    machine.mount_hdd_folder(dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, current_root_prompt);
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         panic!("CPU fault during TokaEdit e2e boot: {msg}\nstop={stop:?}\n{text}");
     }
     let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
     if !boot_text.contains("c:\\>") {
-        std::fs::remove_dir_all(&dir).ok();
         panic!("no C:\\> prompt after boot (stop={stop:?}).\n{boot_text}");
     }
 
@@ -664,7 +651,6 @@ fn tokaedit_edits_and_saves_a_file() {
     let editor_text = machine.screen_text().as_text();
     let editor_text_upper = editor_text.to_ascii_uppercase();
     if !editor_text_upper.contains("HELLO") {
-        std::fs::remove_dir_all(&dir).ok();
         panic!("EDIT did not open HELLO (stop={stop:?}).\n{editor_text}");
     }
 
@@ -681,7 +667,6 @@ fn tokaedit_edits_and_saves_a_file() {
     let body_text = machine.screen_text().as_text();
     if !body_text.contains("hi") {
         let trace = String::from_utf8_lossy(machine.serial_output()).into_owned();
-        std::fs::remove_dir_all(&dir).ok();
         panic!(
             "document text 'hi' did not land in the buffer.\n{body_text}\n=== COM1 ===\n{trace}"
         );
@@ -698,7 +683,6 @@ fn tokaedit_edits_and_saves_a_file() {
     }
     let menu_text = machine.screen_text().as_text();
     if !menu_text.contains("Save") {
-        std::fs::remove_dir_all(&dir).ok();
         panic!("File menu did not open after Alt+F.\n{menu_text}");
     }
     for code in ascii_to_set1('s') {
@@ -724,19 +708,15 @@ fn tokaedit_edits_and_saves_a_file() {
             .run_until_halt_or_cycles(5_000_000)
             .expect("exit hotkey step");
     }
-    machine
-        .run_until_halt_or_cycles(100_000_000)
-        .expect("settle exit");
+    run_until_toka_condition(&mut machine, 100_000_000, current_root_prompt);
 
     let after_exit = machine.screen_text().as_text().to_ascii_lowercase();
     if !after_exit.contains("c:\\>") {
-        std::fs::remove_dir_all(&dir).ok();
         panic!("did not return to the C:\\> prompt after Save/Exit.\n{after_exit}");
     }
 
     machine.flush_hdd_folder();
     let saved = std::fs::read(dir.join("HELLO")).expect("HELLO written to host folder");
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         saved, b"hi\r\n",
         "saved HELLO bytes did not match the typed document body"
