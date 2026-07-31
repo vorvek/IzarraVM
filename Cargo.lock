@@ -1759,9 +1759,7 @@ dependencies = [
 name = "izarravm-video"
 version = "0.1.0"
 dependencies = [
- "izarravm-core",
  "thiserror 2.0.18",
- "wgpu",
 ]
 
 [[package]]

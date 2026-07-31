@@ -12,5 +12,3 @@ authors.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-izarravm-core = { path = "../izarravm-core" }
-wgpu.workspace = true
