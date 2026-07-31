@@ -646,6 +646,16 @@ fn remapping_the_code_page_re_keys_instead_of_reusing_the_stale_lane() {
     native.flush_tlb_and_code_caches();
     decode_starts(&mut native, &mut native_bus, ENTRY, &block_starts());
 
+    // The property under test is that PHYSICAL KEYING is what makes the remap safe, so the block
+    // surviving the flush is half the claim and has to be asserted, not narrated. If a future
+    // change made a CR3 reload clear the whole block cache instead, the probe below would still
+    // miss and the test would still pass while testing something else entirely.
+    assert!(
+        native.jit_direct.block(id).is_some(),
+        "a TLB flush drops links and translations but keeps compiled blocks; the re-key below is \
+         the only thing standing between the stale lane and the new mapping"
+    );
+
     let new_key = jit::direct::key_for(&native, ENTRY, true).expect("keyable");
     assert_ne!(
         old_key.physical, new_key.physical,
@@ -690,7 +700,6 @@ fn remapping_the_code_page_re_keys_instead_of_reusing_the_stale_lane() {
         START_EBP.wrapping_add(NEW_IMM),
         "the remapped page's immediate must be the one that applies"
     );
-    let _ = id;
 }
 
 // ============================================================================================
@@ -913,8 +922,12 @@ fn loop_image(imm: u32) -> Vec<u8> {
 fn a_cap_break_never_observes_a_stale_or_half_applied_immediate() {
     const PATCH: u32 = 0x0001_0003;
     const START_EBP: u32 = 0x0000_0100;
-    let mut saw_native = false;
-    let mut saw_lane_accept = false;
+    // The warm loop settles with exactly two live lane-bearing blocks over the same bytes: the
+    // loop is entered at two different points, and each entry compiles its own block, each of
+    // which registers the same immediate as its lane. One patch is therefore accepted twice, once
+    // per owning block, which is what the accept counter counts. Pinned exactly rather than as
+    // "more than zero", so a change in either direction is visible.
+    const LIVE_LANE_OWNERS: u64 = 2;
 
     for cap in [
         7u64, 11, 13, 17, 19, 23, 29, 31, 37, 41, 53, 67, 83, 101, 149, 211, 307, 401,
@@ -929,14 +942,19 @@ fn a_cap_break_never_observes_a_stale_or_half_applied_immediate() {
         for _ in 0..64 {
             native.run_straight_line(&mut native_bus, 200).unwrap();
         }
-        assert!(
-            native.perf_counters().smc_lane_registrations > 0,
-            "cap {cap}: the loop block never took a lane; the case would be vacuous"
+        assert_eq!(
+            native.perf_counters().smc_lane_registrations,
+            LIVE_LANE_OWNERS,
+            "cap {cap}: the loop must settle with its lanes registered; the case would be vacuous"
         );
 
         let accepts_before = native.perf_counters().smc_lane_accepts;
         guest_store(&mut native, &mut native_bus, LANE, PATCH);
-        saw_lane_accept |= native.perf_counters().smc_lane_accepts > accepts_before;
+        assert_eq!(
+            native.perf_counters().smc_lane_accepts - accepts_before,
+            LIVE_LANE_OWNERS,
+            "cap {cap}: the patch must reach the lane choke and be accepted by every owner"
+        );
 
         // Settle with a full run rather than single `cycle` steps: a run that starts right after
         // a `cycle` breaks having retired one instruction, and a one-instruction window would put
@@ -959,8 +977,15 @@ fn a_cap_break_never_observes_a_stale_or_half_applied_immediate() {
         native.run_straight_line(&mut native_bus, cap).unwrap();
         let perf = native.perf_counters();
         let retired = perf.instructions - retired_before;
-        saw_native |= perf.jit_direct_insns > native_before;
         assert!(retired > 0, "cap {cap}: the run retired nothing");
+        // Per cap, not ORed across the sweep: a single cap that happened to enter native code
+        // would otherwise carry the whole sweep's non-vacuity claim. The exact native count is
+        // left unpinned because it is a function of the timing model, but every cap in the sweep
+        // must break inside a run that entered a block.
+        assert!(
+            perf.jit_direct_insns > native_before,
+            "cap {cap}: the capped run never entered native code"
+        );
 
         // The oracle: the same bytes, never compiled, resumed from the same architectural state
         // and stepped the same number of instructions.
@@ -994,8 +1019,6 @@ fn a_cap_break_never_observes_a_stale_or_half_applied_immediate() {
              number of applications of it"
         );
     }
-    assert!(saw_native, "no capped run entered native code");
-    assert!(saw_lane_accept, "no capped run's patch reached the lane");
 }
 
 // ============================================================================================
@@ -1032,6 +1055,64 @@ fn lane_then_store_image(imm: u32) -> Vec<u8> {
     memory
 }
 
+/// The UNALIGNED shape, and the one that matters most: `mov esi, esi` / `mov [ebx], eax` /
+/// `add ebp, imm32` / `mov esi, esi` / `hlt`, with no filler, so the immediate field starts 2 mod
+/// 4.
+///
+/// Two of Doom's four real patch sites are exactly this — `0x1cae09` and `0x1cb03e` from the step-1
+/// trace — and between them they take this path on the order of a million times per run. The
+/// emitted store reaches the wide-access page guard BEFORE the code-watch check, and that guard
+/// side-exits a misaligned dword store, so the in-flight chain runs through a DIFFERENT side exit
+/// than the aligned fixture. The rest of the chain has to hold identically: the interpreter replays
+/// the store, the write is accepted as a lane patch, the block survives, and the re-entry reads the
+/// new immediate.
+fn store_then_unaligned_lane_image(imm: u32) -> Vec<u8> {
+    let mut memory = vec![0u8; 0x5000];
+    let mut code = vec![0x89, 0xf6, 0x89, 0x03, 0x81, 0xc5];
+    code.extend_from_slice(&imm.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory
+}
+
+/// The unaligned shape with the slots swapped. The extra leading `mov esi, esi` is what puts the
+/// immediate at 2 mod 4 in this order.
+fn unaligned_lane_then_store_image(imm: u32) -> Vec<u8> {
+    let mut memory = vec![0u8; 0x5000];
+    let mut code = vec![0x89, 0xf6, 0x89, 0xf6, 0x81, 0xc5];
+    code.extend_from_slice(&imm.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0x03, 0x89, 0xf6, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory
+}
+
+/// Which side exit a fixture's self-store is expected to take before it commits. Both are
+/// "the store did not commit inside the block"; they differ in which guard got there first, and
+/// pinning that is what stops the aligned fixture from standing in for the unaligned one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelfStoreExit {
+    /// The dword store is 4-byte aligned, so the code-watch guard is the first to refuse it.
+    CodeWatch,
+    /// The dword store is misaligned, so the wide-access page guard refuses it first and the
+    /// code-watch check is never reached.
+    CrossPageOrAlignment,
+}
+
+/// One in-flight fixture: its bytes, where its lane is, and what the block looks like.
+struct InFlightCase {
+    label: &'static str,
+    build: fn(u32) -> Vec<u8>,
+    lane: u32,
+    starts: &'static [u32],
+    instructions: u8,
+    /// The HLT that ends the fixture, used as the stop condition for stepping.
+    hlt: u32,
+    /// The immediate the ADD uses on the FIRST pass: the new one when the store runs before it,
+    /// the original when it runs after.
+    first_pass_imm_is_new: bool,
+    exit: SelfStoreExit,
+}
+
 /// Step the CPU until it reaches `target_eip`, entering native code where it can. Bounded so a
 /// fixture that stops making progress fails instead of hanging.
 fn step_until(cpu: &mut CpuGsw, bus: &mut TestBus, target_eip: u32, context: &str) {
@@ -1048,39 +1129,85 @@ fn step_until(cpu: &mut CpuGsw, bus: &mut TestBus, target_eip: u32, context: &st
 }
 
 /// Matrix row 7. The in-flight case the step-2 review reasoned about rather than measured: a
-/// block that writes its own lane while it is executing. The reasoning is that the emitted store's
-/// code-watch guard side-exits BEFORE committing, the interpreter replays the store, and the write
-/// therefore reaches the choke with no block mid-execution. This makes each link observable — the
-/// side exit fires, the replayed store is accepted as a lane, the block survives, and the
-/// re-entered block reads the new immediate.
+/// block that writes its own lane while it is executing. The reasoning is that the emitted store
+/// side-exits BEFORE committing, the interpreter replays the store, and the write therefore
+/// reaches the choke with no block mid-execution. This makes each link observable — the side exit
+/// fires, the lane still holds the old bytes at the exit, the replayed store is accepted, the
+/// block survives, and the re-entered block reads the new immediate.
+///
+/// Four fixtures: both slot orders, at both alignments. The alignment split is not cosmetic. An
+/// aligned self-store is refused by the code-watch guard; a misaligned one is refused earlier, by
+/// the wide-access page guard, and never reaches the code-watch check at all. Two of Doom's four
+/// real patch sites are misaligned, so the aligned fixture alone would leave the path the guest
+/// actually takes about a million times a run completely unexercised. Each case pins WHICH guard
+/// fired and that the other one did not.
 #[test]
 fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
     const ORIGINAL_IMM: u32 = 0x0000_0003;
     const NEW_IMM: u32 = 0x0055_0011;
     const START_EBP: u32 = 0x0010_0000;
-    const HLT: u32 = ENTRY + 14;
 
-    for (label, builder, lane, starts, imm_this_pass) in [
-        (
-            "store before the lane",
-            store_then_lane_image as fn(u32) -> Vec<u8>,
-            ENTRY + 8,
-            [ENTRY, ENTRY + 2, ENTRY + 4, ENTRY + 6, ENTRY + 12],
-            NEW_IMM,
-        ),
-        (
-            "lane before the store",
-            lane_then_store_image as fn(u32) -> Vec<u8>,
-            ENTRY + 4,
-            [ENTRY, ENTRY + 2, ENTRY + 8, ENTRY + 10, ENTRY + 12],
-            ORIGINAL_IMM,
-        ),
-    ] {
+    let cases = [
+        InFlightCase {
+            label: "aligned, store before the lane",
+            build: store_then_lane_image,
+            lane: ENTRY + 8,
+            starts: &[ENTRY, ENTRY + 2, ENTRY + 4, ENTRY + 6, ENTRY + 12],
+            instructions: 5,
+            hlt: ENTRY + 14,
+            first_pass_imm_is_new: true,
+            exit: SelfStoreExit::CodeWatch,
+        },
+        InFlightCase {
+            label: "aligned, lane before the store",
+            build: lane_then_store_image,
+            lane: ENTRY + 4,
+            starts: &[ENTRY, ENTRY + 2, ENTRY + 8, ENTRY + 10, ENTRY + 12],
+            instructions: 5,
+            hlt: ENTRY + 14,
+            first_pass_imm_is_new: false,
+            exit: SelfStoreExit::CodeWatch,
+        },
+        InFlightCase {
+            label: "unaligned (the Doom shape), store before the lane",
+            build: store_then_unaligned_lane_image,
+            lane: ENTRY + 6,
+            starts: &[ENTRY, ENTRY + 2, ENTRY + 4, ENTRY + 10],
+            instructions: 4,
+            hlt: ENTRY + 12,
+            first_pass_imm_is_new: true,
+            exit: SelfStoreExit::CrossPageOrAlignment,
+        },
+        InFlightCase {
+            label: "unaligned, lane before the store",
+            build: unaligned_lane_then_store_image,
+            lane: ENTRY + 6,
+            starts: &[ENTRY, ENTRY + 2, ENTRY + 4, ENTRY + 10, ENTRY + 12],
+            instructions: 5,
+            hlt: ENTRY + 14,
+            first_pass_imm_is_new: false,
+            exit: SelfStoreExit::CrossPageOrAlignment,
+        },
+    ];
+
+    for case in cases {
+        let label = case.label;
+        assert_eq!(
+            case.lane % 4 == 0,
+            case.exit == SelfStoreExit::CodeWatch,
+            "{label}: the fixture's alignment and its expected guard disagree"
+        );
+        let first_pass_imm = if case.first_pass_imm_is_new {
+            NEW_IMM
+        } else {
+            ORIGINAL_IMM
+        };
+
         let mut native = flat_cpu();
-        let mut native_bus = test_bus(builder(ORIGINAL_IMM));
-        decode_starts(&mut native, &mut native_bus, ENTRY, &starts);
+        let mut native_bus = test_bus((case.build)(ORIGINAL_IMM));
+        decode_starts(&mut native, &mut native_bus, ENTRY, case.starts);
         warm_fast_map(&mut native, &mut native_bus, 0, 0);
-        let id = install_with_d(&mut native, ENTRY, 5, true);
+        let id = install_with_d(&mut native, ENTRY, case.instructions, true);
         assert_eq!(
             native.perf_counters().smc_lane_registrations,
             1,
@@ -1088,19 +1215,18 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
         );
 
         let mut interpreter = flat_cpu();
-        let mut interpreter_bus = test_bus(builder(ORIGINAL_IMM));
-        decode_starts(&mut interpreter, &mut interpreter_bus, ENTRY, &starts);
+        let mut interpreter_bus = test_bus((case.build)(ORIGINAL_IMM));
+        decode_starts(&mut interpreter, &mut interpreter_bus, ENTRY, case.starts);
 
         // EAX carries the new immediate, so the block's own store is the patch.
         arm_at(&mut native, ENTRY, START_EBP, 0);
         arm_at(&mut interpreter, ENTRY, START_EBP, 0);
         for cpu in [&mut native, &mut interpreter] {
             cpu.registers.set_eax(NEW_IMM);
-            cpu.registers.set_ebx(lane);
+            cpu.registers.set_ebx(case.lane);
         }
 
-        let exits_before = native.perf_counters().jit_direct_exit_code_watch;
-        let accepts_before = native.perf_counters().smc_lane_accepts;
+        let before = native.perf_counters().clone();
         let block = native.jit_direct.block(id).expect("installed");
         assert!(
             native
@@ -1108,22 +1234,44 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
                 .unwrap(),
             "{label}: the block must be entered"
         );
-        assert!(
-            native.perf_counters().jit_direct_exit_code_watch > exits_before,
-            "{label}: the store into watched code must side-exit before it commits"
-        );
+        let after = native.perf_counters().clone();
+        let watch = after.jit_direct_exit_code_watch - before.jit_direct_exit_code_watch;
+        let alignment = after.jit_direct_exit_cross_page_or_alignment
+            - before.jit_direct_exit_cross_page_or_alignment;
+        match case.exit {
+            SelfStoreExit::CodeWatch => {
+                assert!(
+                    watch > 0,
+                    "{label}: the store into watched code must side-exit on the code watch"
+                );
+                assert_eq!(
+                    alignment, 0,
+                    "{label}: an aligned store must not be refused by the page guard first"
+                );
+            }
+            SelfStoreExit::CrossPageOrAlignment => {
+                assert!(
+                    alignment > 0,
+                    "{label}: a misaligned store must side-exit on the wide-access page guard"
+                );
+                assert_eq!(
+                    watch, 0,
+                    "{label}: the page guard runs first, so the code-watch check is never reached"
+                );
+            }
+        }
         assert_eq!(
-            read32(&native_bus.memory, lane),
+            read32(&native_bus.memory, case.lane),
             ORIGINAL_IMM,
             "{label}: the side exit must precede the store's commit"
         );
 
         // The interpreter replays the store, which is where the write reaches the choke.
-        step_until(&mut native, &mut native_bus, HLT, label);
-        step_until(&mut interpreter, &mut interpreter_bus, HLT, label);
+        step_until(&mut native, &mut native_bus, case.hlt, label);
+        step_until(&mut interpreter, &mut interpreter_bus, case.hlt, label);
         assert_eq!(
             native.perf_counters().smc_lane_accepts,
-            accepts_before + 1,
+            before.smc_lane_accepts + 1,
             "{label}: the replayed store must be classified as a lane patch"
         );
         assert!(
@@ -1139,17 +1287,17 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
         );
         assert_eq!(
             native.registers.ebp(),
-            START_EBP.wrapping_add(imm_this_pass),
+            START_EBP.wrapping_add(first_pass_imm),
             "{label}: the first pass must use the immediate in force when the ADD ran"
         );
-        assert_eq!(read32(&native_bus.memory, lane), NEW_IMM);
+        assert_eq!(read32(&native_bus.memory, case.lane), NEW_IMM);
 
         // Re-enter: the surviving block must now read the patched immediate.
         arm_at(&mut native, ENTRY, START_EBP, 0);
         arm_at(&mut interpreter, ENTRY, START_EBP, 0);
         for cpu in [&mut native, &mut interpreter] {
             cpu.registers.set_eax(NEW_IMM);
-            cpu.registers.set_ebx(lane);
+            cpu.registers.set_ebx(case.lane);
         }
         let block = native
             .jit_direct
@@ -1160,8 +1308,8 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
                 .try_run_direct_block_for_test(&mut native_bus, block)
                 .unwrap()
         );
-        step_until(&mut native, &mut native_bus, HLT, label);
-        step_until(&mut interpreter, &mut interpreter_bus, HLT, label);
+        step_until(&mut native, &mut native_bus, case.hlt, label);
+        step_until(&mut interpreter, &mut interpreter_bus, case.hlt, label);
         assert_states_match(
             &native,
             &native_bus,
@@ -1195,16 +1343,35 @@ fn code_segment_16(cpu: &mut CpuGsw) {
     );
 }
 
-/// Matrix row 8. Three encodings that are NOT `ADD r32, imm32` in the admitted shape, each of
-/// which a looser lane test would wrongly admit:
+/// Which arm of the compiler a negative control must land on.
+///
+/// Pinning the arm is the whole point. Two of the three controls never reach `imm_lane_for` at
+/// all, so for them `smc_lane_registrations == 0` is true by construction and would stay true if
+/// the classifier were later opened up to these encodings — the assertion would keep passing while
+/// the thing it claims to protect had moved. Naming the arm makes the test fail on that change
+/// instead of sleeping through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlArm {
+    /// `classify` refuses the ADD outright: `0x81` is not in its `OperandSize::Word` allowlist
+    /// (the ALU-group immediate forms are excluded there by name), so the compile walk abandons
+    /// the block at that slot and `imm_lane_for` is never consulted. No block exists to run.
+    RejectedBeforeTheLaneCheck,
+    /// The block compiles, installs and is entered natively, and `imm_lane_for` DID see this ADD
+    /// and refused it — on the prefix and on the seven-byte length. This is the only control that
+    /// exercises the lane admission test itself.
+    CompiledWithoutALane,
+}
+
+/// Matrix row 8. Three encodings that are NOT `ADD r32, imm32` in the admitted shape:
 ///
 /// - `66 81 /0` in a 32-bit segment: an operand-size override makes it `ADD r16, imm16`.
 /// - `81 /0` in a 16-bit segment: the same bytes as the Doom site, but the operand size follows
 ///   CS.D, so it is a word form with a two-byte immediate.
-/// - `66 81 /0` in a 16-bit segment: a genuine 32-bit ADD with a four-byte immediate, refused on
-///   the prefix and on the seven-byte length.
+/// - `66 81 /0` in a 16-bit segment: a genuine 32-bit ADD with a four-byte immediate, and the only
+///   one of the three that reaches `imm_lane_for`, which refuses it on the prefix and the length.
 ///
-/// None may register a lane, and all must execute correctly patched or not.
+/// Each control pins which arm it lands on, so a classifier change that admitted any of them would
+/// fail here rather than pass quietly. All three must also execute correctly, patched or not.
 #[test]
 fn sixteen_bit_add_forms_never_register_a_lane() {
     struct Control {
@@ -1215,6 +1382,7 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
         prefix: &'static [u8],
         /// Immediate width in bytes.
         imm_len: u32,
+        arm: ControlArm,
     }
     let controls = [
         Control {
@@ -1223,6 +1391,7 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
             mode: GswMode::Gsw586,
             prefix: &[0x66, 0x81, 0xc5],
             imm_len: 2,
+            arm: ControlArm::RejectedBeforeTheLaneCheck,
         },
         Control {
             label: "unprefixed word ADD in a 16-bit segment",
@@ -1230,6 +1399,7 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
             mode: GswMode::Gsw586,
             prefix: &[0x81, 0xc5],
             imm_len: 2,
+            arm: ControlArm::RejectedBeforeTheLaneCheck,
         },
         Control {
             label: "0x66-prefixed dword ADD in a 16-bit segment",
@@ -1237,10 +1407,12 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
             mode: GswMode::Gsw586,
             prefix: &[0x66, 0x81, 0xc5],
             imm_len: 4,
+            arm: ControlArm::CompiledWithoutALane,
         },
     ];
 
     for control in controls {
+        let label = control.label;
         let add_len = control.prefix.len() as u32 + control.imm_len;
         let imm_at = ENTRY + 2 + control.prefix.len() as u32;
         let build = |imm: u32| {
@@ -1262,26 +1434,60 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
         let mut bus = test_bus(build(0x0000_1111));
         decode_starts(&mut cpu, &mut bus, ENTRY, &starts);
 
-        // The load-bearing assertion: whatever the compiler decides to do with these forms, none
-        // of them may claim a mutable lane.
-        match jit::direct::compile(&mut cpu, ENTRY, control.d) {
-            jit::direct::CompileOutcome::Compiled(compilation) => assert_eq!(
-                compilation.imm_lane_count(),
-                0,
-                "{}: a non-admitted encoding registered a lane",
-                control.label
+        // The probe comes first, exactly as the production dispatch does it: the cache records the
+        // key on the miss, and `install` refuses a compilation whose key it has never seen.
+        let key = jit::direct::key_for(&cpu, ENTRY, control.d)
+            .unwrap_or_else(|| panic!("{label}: the entry must be keyable at all"));
+        assert!(
+            matches!(
+                cpu.jit_direct.probe(key),
+                jit::direct::BlockProbe::Interpret
             ),
-            jit::direct::CompileOutcome::StructuralReject(_)
-            | jit::direct::CompileOutcome::Retry => {}
-        }
+            "{label}: a fresh cache must miss"
+        );
+
+        let installed = match (
+            control.arm,
+            jit::direct::compile(&mut cpu, ENTRY, control.d),
+        ) {
+            (
+                ControlArm::RejectedBeforeTheLaneCheck,
+                jit::direct::CompileOutcome::StructuralReject(_),
+            ) => None,
+            (ControlArm::RejectedBeforeTheLaneCheck, _) => panic!(
+                "{label}: expected a structural reject — the ALU-group immediate forms are not in \
+                 the OperandSize::Word allowlist, so the walk must abandon the block at this slot"
+            ),
+            (
+                ControlArm::CompiledWithoutALane,
+                jit::direct::CompileOutcome::Compiled(compilation),
+            ) => {
+                assert_eq!(
+                    compilation.imm_lane_count(),
+                    0,
+                    "{label}: a non-admitted encoding registered a lane"
+                );
+                assert_eq!(
+                    compilation.span.instructions, 3,
+                    "{label}: fixture block shape changed"
+                );
+                Some(
+                    cpu.jit_direct
+                        .install(&compilation)
+                        .unwrap_or_else(|| panic!("{label}: the lane-free block must install")),
+                )
+            }
+            (ControlArm::CompiledWithoutALane, _) => panic!(
+                "{label}: expected a compiled block whose ADD reached imm_lane_for and was refused"
+            ),
+        };
         assert_eq!(
             cpu.perf_counters().smc_lane_registrations,
             0,
-            "{}: no lane may be registered",
-            control.label
+            "{label}: no lane may be registered"
         );
 
-        // And it still executes correctly, before and after a patch of its immediate field.
+        // The oracle: the same bytes, never compiled.
         let mut interpreter = flat_cpu();
         interpreter.set_mode(control.mode);
         if !control.d {
@@ -1290,34 +1496,70 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
         let mut interpreter_bus = test_bus(build(0x0000_1111));
         decode_starts(&mut interpreter, &mut interpreter_bus, ENTRY, &starts);
 
-        for patch in [None, Some(0x0000_2222u32)] {
-            if let Some(patch) = patch {
-                for (cpu, bus) in [
-                    (&mut cpu, &mut bus),
-                    (&mut interpreter, &mut interpreter_bus),
-                ] {
-                    store_of_width(cpu, bus, imm_at, control.imm_len, patch);
-                }
-            }
-            arm_at(&mut cpu, ENTRY, 0x0000_0100, 0);
-            arm_at(&mut interpreter, ENTRY, 0x0000_0100, 0);
+        // Pass 1. Where a block exists it is ENTERED NATIVELY, so the comparison is native against
+        // interpreter rather than interpreter against interpreter.
+        arm_at(&mut cpu, ENTRY, 0x0000_0100, 0);
+        arm_at(&mut interpreter, ENTRY, 0x0000_0100, 0);
+        if let Some(id) = installed {
+            let native_before = cpu.perf_counters().jit_direct_insns;
+            let block = cpu.jit_direct.block(id).expect("installed");
+            assert!(
+                cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+                "{label}: the lane-free block must run natively"
+            );
+            assert!(
+                cpu.perf_counters().jit_direct_insns > native_before,
+                "{label}: the native leg retired nothing"
+            );
+        } else {
             for _ in 0..3 {
                 cpu.cycle(&mut bus).unwrap();
-                interpreter.cycle(&mut interpreter_bus).unwrap();
             }
-            assert_states_match(
-                &cpu,
-                &bus,
-                &interpreter,
-                &interpreter_bus,
-                &format!("{}: patch {patch:?}", control.label),
+        }
+        for _ in 0..3 {
+            interpreter.cycle(&mut interpreter_bus).unwrap();
+        }
+        assert_states_match(
+            &cpu,
+            &bus,
+            &interpreter,
+            &interpreter_bus,
+            &format!("{label}: unpatched"),
+        );
+
+        // Pass 2. Patch the immediate field. With no lane the write is ordinary code churn, so any
+        // block must retire and the next entry is interpreted.
+        store_of_width(&mut cpu, &mut bus, imm_at, control.imm_len, 0x0000_2222);
+        store_of_width(
+            &mut interpreter,
+            &mut interpreter_bus,
+            imm_at,
+            control.imm_len,
+            0x0000_2222,
+        );
+        if let Some(id) = installed {
+            assert!(
+                cpu.jit_direct.block(id).is_none(),
+                "{label}: with no lane, a patch of the immediate must retire the block"
             );
         }
+        arm_at(&mut cpu, ENTRY, 0x0000_0100, 0);
+        arm_at(&mut interpreter, ENTRY, 0x0000_0100, 0);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+            interpreter.cycle(&mut interpreter_bus).unwrap();
+        }
+        assert_states_match(
+            &cpu,
+            &bus,
+            &interpreter,
+            &interpreter_bus,
+            &format!("{label}: patched"),
+        );
         assert_eq!(
             cpu.perf_counters().smc_lane_accepts,
             0,
-            "{}: no write may be accepted as a lane patch",
-            control.label
+            "{label}: no write may be accepted as a lane patch"
         );
     }
 }
