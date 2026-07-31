@@ -14,6 +14,21 @@
 //! That is the default-off-instruments lesson - a callee-side `enabled` check still pays for the
 //! arguments on every one of the caller's invocations.
 //!
+//! READING THE OUTPUT. Two properties bound what a report can be used to claim, and both have
+//! already produced an overclaim once:
+//!
+//! - A site row's class, decoded identity, and field offset FREEZE at the site's first hit (the
+//!   `or_insert_with` in `record`); later hits only accumulate counters. A row is therefore one
+//!   observation plus a hit count, never evidence that every hit at that address had that shape -
+//!   the same address can also take hits that classify differently, and the per-event class totals
+//!   are the authority whenever the two disagree. **Design consequence for the parameterized-block
+//!   work: a mutable lane must classify EVERY write at runtime against the shape currently decoded
+//!   at that address. A per-site shape learned from this trace does not license one, and building
+//!   on one would be unsound.**
+//! - Only `REPORT_SITES` sites are printed, out of a site map that runs to six figures on a real
+//!   fixture. Site sums are therefore lower bounds; only the class totals are complete. Never
+//!   report a site sum and a class total against each other without saying which is which.
+//!
 //! Values: this records the immediate the decode cache held for the covering line, which is the
 //! value present BEFORE the write being traced. For a site the guest patches repeatedly that is
 //! exactly the value its PREVIOUS patch wrote (the write kills the line, the next execution
@@ -129,7 +144,8 @@ struct Site {
 /// value every patch" without letting a pathological site allocate unboundedly.
 const MAX_VALUES_PER_SITE: usize = 64;
 
-/// Sites written to the report. The tail is covered by the class totals instead.
+/// Sites written to the report. The tail is covered by the class totals instead, which is the
+/// whole reason the module docs forbid reading a site sum as a complete family count.
 const REPORT_SITES: usize = 64;
 
 /// The trace: a per-(address, width) site map plus per-class run totals.
@@ -231,9 +247,9 @@ impl SmcTrace {
         site.narrow_kills += u64::from(action.narrow_kills);
         site.wholesale += u64::from(action.wholesale);
         site.newly_hot += u64::from(action.newly_hot);
-        // A site whose class or identity varies across hits is reported by its FIRST observation
-        // plus the class totals; the campaign's question is about sites that are stable, and an
-        // unstable one shows up as a class mismatch between the site rows and the class rows.
+        // A site whose class or identity varies across hits keeps its FIRST observation in the row
+        // above and is otherwise only visible in the class totals. See the module docs: this is
+        // why a row is not a per-hit invariance claim.
         if let Some((_, insn)) = pre.covering
             && !site.values.contains(&insn.imm)
         {

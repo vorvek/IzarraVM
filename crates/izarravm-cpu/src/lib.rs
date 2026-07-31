@@ -2733,6 +2733,11 @@ impl DecodeCache {
     /// backward candidate scan -- but mutates nothing, so it can be called BEFORE the
     /// invalidation to learn what is about to be killed. `None` whenever the narrow path would
     /// also refuse or find no covering line.
+    ///
+    /// Returns the FIRST covering line the scan finds. Several cached lines can cover one physical
+    /// byte (the same bytes decoded from different entry points) and `narrow_invalidate` kills all
+    /// of them, so this reports one of possibly several -- another reason the trace's site rows
+    /// are not a per-hit identity claim (see `smc_trace`).
     fn covering_line(&self, physical: u32) -> Option<(u32, DecodedInsn)> {
         let info = *self.code_page_lin.get(&(physical >> 12))?;
         if info.aliased {
