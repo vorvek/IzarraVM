@@ -2,7 +2,7 @@
 ; SPDX-License-Identifier: GPL-3.0-only
 
 ; Margo-LFB setup page. Uses the
-; SETUP_SCRATCH region (segment 0, 256 bytes). Core calls setup_maybe_enter after
+; SETUP_SCRATCH region (segment 0, 12 bytes). Core calls setup_maybe_enter after
 ; run_post and before enter_setup_or_boot.
 ;
 ; Flow: peek the keyboard for a brief window. If the setup hotkey (Del, scancode
@@ -38,6 +38,9 @@
 %define SU_TIME_MONTH     SETUP_SCRATCH + 9
 %define SU_TIME_YEAR      SETUP_SCRATCH + 10   ; two-digit year (0..99)
 %define SU_WORKING_COM1   SETUP_SCRATCH + 11   ; COM1 debug output (0/1)
+%if (SU_WORKING_COM1 + 1) != (SETUP_SCRATCH + SETUP_SCRATCH_USED)
+    %error "setup scratch layout does not match SETUP_SCRATCH_USED"
+%endif
 
 ; Main-menu selectable rows, in highlight order.
 %define SU_ROW_TIME       0

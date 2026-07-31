@@ -80,15 +80,11 @@ pub(crate) use cache_config::{
 
 #[allow(unused_imports)]
 pub(crate) use video_params::{
-    BDA_VIDEO_SAVE_POINTER, BIOS_FONT_8X8_HIGH_ROM_OFFSET, BIOS_FONT_8X8_ROM_OFFSET,
-    BIOS_FONT_8X14_ROM_OFFSET, BIOS_FONT_8X16_ROM_OFFSET, DISTIRA_PCI_BAR_SIZE,
-    DISTIRA_PCI_DEVICE_ID, DISTIRA_PCI_LFB_OFFSET, DISTIRA_PCI_REVISION, DISTIRA_PCI_SLOT,
-    DISTIRA_PCI_TEX_OFFSET, DISTIRA_PCI_VENDOR_ID, INT10_FUNCTIONALITY_TABLE_OFFSET,
-    INT10_STATE_BDA_LEN, INT10_STATE_CGA_LATCH_MARKER, INT10_STATE_CGA_LATCH_OFFSET,
-    INT10_STATE_DAC_LEN, INT10_STATE_HARDWARE_LEN, INT10_STATIC_FUNCTIONALITY,
-    INT10_VIDEO_PARAM_ENTRIES, INT10_VIDEO_PARAM_ENTRY_LEN, INT10_VIDEO_PARAM_TABLE_ENTRIES,
-    INT10_VIDEO_PARAM_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
-    INT10_VIDEO_SAVE_POINTER_TABLE_PTRS, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_END,
+    DISTIRA_PCI_BAR_SIZE, DISTIRA_PCI_DEVICE_ID, DISTIRA_PCI_LFB_OFFSET, DISTIRA_PCI_REVISION,
+    DISTIRA_PCI_SLOT, DISTIRA_PCI_TEX_OFFSET, DISTIRA_PCI_VENDOR_ID, INT10_STATE_BDA_LEN,
+    INT10_STATE_CGA_LATCH_MARKER, INT10_STATE_CGA_LATCH_OFFSET, INT10_STATE_DAC_LEN,
+    INT10_STATE_HARDWARE_LEN, INT10_STATIC_FUNCTIONALITY, INT10_VIDEO_PARAM_ENTRIES,
+    INT10_VIDEO_PARAM_ENTRY_LEN, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_END,
     PCI_CONFIG_DATA_PORT, RAM_LOOKUP_PAGE_BITS, RAM_LOOKUP_PAGE_MASK, RAM_LOOKUP_PAGE_SIZE,
     RAM_LOOKUP_SLOW,
 };
@@ -120,7 +116,37 @@ mod storage;
 mod uart;
 mod unittester;
 
-use firmware_contract::*;
+use bios::BootDevice;
+pub(crate) use firmware_contract::address::{
+    BDA_DAY_COUNT, BDA_RTC_WAIT_COMPLETE, BDA_RTC_WAIT_FLAG, BDA_RTC_WAIT_PENDING,
+    BDA_RTC_WAIT_TIMEOUT, BDA_VIDEO_SAVE_POINTER, BIOS_BOOT_CHOICE_ADDR, BIOS_CONFIG_TABLE_ADDR,
+    BIOS_DISKETTE_PARAMETER_TABLE_ADDR, BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR,
+    BIOS_FONT_8X8_HIGH_ROM_OFFSET, BIOS_FONT_8X8_ROM_OFFSET, BIOS_FONT_8X14_ROM_OFFSET,
+    BIOS_FONT_8X16_ROM_OFFSET, BIOS_HALT_STUB_ADDRESS, BIOS_INT_STUB_TABLE_LEN,
+    BIOS_INT_STUB_TABLE_LINEAR, BIOS_LEGACY_IRET_LINEAR, BIOS_POST_ERROR_LOG_ADDR,
+    BIOS_POST_ERROR_LOG_COUNT_ADDR, BIOS_POST_ERROR_LOG_MAX, BIOS_ROM_IRET_SEG, BIOS_ROM_SEGMENT,
+    BIOS_STUB_WINDOW_LEN, BIOS32_DIRECTORY_LINEAR, BIOS32_PCI_LINEAR, BIOS32_PCI_ROM_OFFSET,
+    CMOS_GSW_MODE, CMOS_PRIMARY_BOOT_DEVICE, CODEPAGE_FONT_WINDOW, CONVENTIONAL_MEMORY_TOP,
+    EBDA_CD_BOOTABLE_OFF, EBDA_LINEAR, EBDA_MOUSE_HANDLER_OFF, EBDA_MOUSE_PKT_SIZE_OFF,
+    EBDA_SEGMENT, INT10_FUNCTIONALITY_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
+    RESULT_BLOCK_ADDRESS, VGA_BIOS_FONT_TABLE_OFF, VGA_BIOS_INT43_FONT_ADDR, VGA_BIOS_SEGMENT,
+    VGA_BIOS_SPAN_SIZE, bios_int_stub_off,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use firmware_contract::address::{
+    BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS, BIOS_INT_STUB_TABLE_ROM_OFFSET,
+    BIOS_IRET_STUB_ADDRESS, BIOS_LEGACY_IRET_ROM_OFFSET, BIOS_MASTER_IRQ_ISR_ROM_OFF,
+    BIOS_MASTER_IRQ_ISR_ROM_OFFSET, BIOS_RTC_ISR_ADDRESS, BIOS_SLAVE_IRQ_ISR_ADDRESS,
+    BIOS_TIMER_ISR_ROM_OFF, BIOS_TIMER_ISR_ROM_OFFSET, BIOS32_DIRECTORY_ROM_OFFSET,
+    BIOS32_HEADER_ROM_OFFSET, CONVENTIONAL_MEMORY_KIB, DOS_INT23_DEFAULT_STUB_ADDRESS,
+    DOS_INT24_DEFAULT_STUB_ADDRESS, EBDA_MOUSE_INDEX_OFF, EBDA_MOUSE_PACKET_OFF,
+    INT10_VIDEO_PARAM_TABLE_ENTRIES, INT10_VIDEO_PARAM_TABLE_OFFSET,
+    INT10_VIDEO_SAVE_POINTER_TABLE_PTRS, SETUP_SCRATCH_ADDRESS, SETUP_SCRATCH_USED, VGA_BIOS_BASE,
+    VGA_BIOS_INT1D_VIDEO_TABLE_ADDR, VGA_BIOS_INT1D_VIDEO_TABLE_OFF, VGA_BIOS_INT1F_FONT_ADDR,
+    VGA_BIOS_INT1F_FONT_OFF, VGA_BIOS_INT44_FONT_ADDR, VGA_BIOS_INT44_FONT_OFF,
+};
+use firmware_contract::{Bios32Call, install_boot_memory, patch_rom};
 pub use gameport::JoystickState;
 
 pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
@@ -132,29 +158,6 @@ pub use memmap::{
     VIDEO_RAM_BASE, classify, is_hma, is_umb_window,
 };
 
-/// The video BIOS ROM sits in the first 32 KiB of the upper-memory window on a
-/// VGA machine (0xC0000-0xC7FFF), matching where a real adapter's option ROM
-/// lives. The runtime image carries a valid option-ROM header and checksum.
-const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
-const VGA_BIOS_SEGMENT: u16 = (VGA_BIOS_BASE >> 4) as u16; // 0xC000
-const VGA_BIOS_INT1D_VIDEO_TABLE_OFF: u16 = 0x1000;
-const VGA_BIOS_INT1D_VIDEO_TABLE_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1D_VIDEO_TABLE_OFF as u32;
-const VGA_BIOS_FONT_TABLE_OFF: u16 = 0x2000;
-const VGA_BIOS_INT43_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_FONT_TABLE_OFF as u32;
-const VGA_BIOS_INT44_FONT_OFF: u16 = 0x3000;
-const VGA_BIOS_INT44_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT44_FONT_OFF as u32;
-const VGA_BIOS_INT1F_FONT_OFF: u16 = 0x3800;
-const VGA_BIOS_INT1F_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1F_FONT_OFF as u32;
-/// Lotura port 0xE7 banks one code-page font page here. The address sits in
-/// free space inside the VGA BIOS span (0xC0000-0xC7FFF); the VGA BIOS only
-/// uses through ~0xC3C00, so 0xC4000 is available without a new UMA reservation.
-const CODEPAGE_FONT_WINDOW: u32 = 0xC4000;
-/// Size of the video option ROM span this machine backs with flat RAM
-/// (INT 10h/1D/43/44/1F tables plus the code-page font bank): 32 KiB, matching
-/// where a real VGA adapter's option ROM lives. One past this, at 0xC8000, is
-/// the first byte of open, unoccupied upper memory.
-const VGA_BIOS_SPAN_SIZE: u32 = 0x8000;
-
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
 pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
@@ -163,13 +166,10 @@ pub const DISTIRA_LFB_BASE: u32 = 0xE140_0000;
 
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
-const BIOS_ROM_SEGMENT: u16 = (LOW_BIOS_BASE >> 4) as u16;
 
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
 pub const BOOT_SECTOR_ADDRESS: usize = 0x7c00;
 pub const BOOT_STAGE2_ADDRESS: usize = 0x8000;
-pub const BIOS_IRET_STUB_ADDRESS: usize = 0x0600;
-pub const RESULT_BLOCK_ADDRESS: usize = 0x9000;
 /// Fixed load segment for a .COM: PSP at linear 0x2000, clear of the IVT, BIOS
 /// data area, BIOS RAM stubs, and the worst-case Toka-DOS SysVars/SDA layout.
 const DOS_LOAD_SEGMENT: u16 = 0x0200;
@@ -1041,17 +1041,7 @@ impl Machine {
         let memory = Memory::from_mib(profile.memory_mib)?;
         let ram_lookup = RamPageLookup::new(memory.len(), &vega);
         let execution_backend = process_execution_backend();
-        // Lay the HLE entry stubs into ROM. PSP:0005 reaches the CALL 5 adapter
-        // through the low-memory DOS entry at 0000:00C0.
-        install_bios_font_mirror(&mut rom);
-        rom[DOS_CALL5_ROM_OFFSET..DOS_CALL5_ROM_OFFSET + DOS_CALL5_ENTRY_STUB.len()]
-            .copy_from_slice(&DOS_CALL5_ENTRY_STUB);
-        rom[BIOS_TIMER_ISR_ROM_OFFSET..BIOS_TIMER_ISR_ROM_OFFSET + BIOS_TIMER_ISR_STUB.len()]
-            .copy_from_slice(&BIOS_TIMER_ISR_STUB);
-        rom[BIOS_MASTER_IRQ_ISR_ROM_OFFSET
-            ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()]
-            .copy_from_slice(&BIOS_MASTER_IRQ_ISR_STUB);
-        write_bios_int_stub_table(&mut rom);
+        patch_rom(&mut rom);
         let mut machine = Self {
             memory,
             ram_lookup,
@@ -1184,7 +1174,7 @@ impl Machine {
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.
-        machine.set_cmos_byte(0x12, machine.active_mode.register_code());
+        machine.set_cmos_byte(CMOS_GSW_MODE, machine.active_mode.register_code());
         Ok(machine)
     }
 
@@ -1198,7 +1188,7 @@ impl Machine {
         let shadow = &rom[rom.len() - BIOS_ROM_SIZE..];
 
         let mut machine = Self::base(profile, CpuGsw::default(), shadow.to_vec())?;
-        install_boot_bios_stubs(&mut machine.memory, machine.active_mode)?;
+        install_boot_memory(&mut machine.memory, machine.active_mode)?;
         Ok(machine)
     }
 
@@ -1292,6 +1282,7 @@ impl Machine {
         // table into every ROM, including this synthetic boot ROM.
         let rom = vec![0u8; BIOS_ROM_SIZE];
         let mut machine = Self::base(profile, boot_sector_cpu(), rom)?;
+        install_boot_memory(&mut machine.memory, machine.active_mode)?;
 
         for (offset, byte) in image[0..512].iter().copied().enumerate() {
             machine
@@ -1306,7 +1297,6 @@ impl Machine {
                 .write_u8(BOOT_STAGE2_ADDRESS + offset, byte)?;
         }
 
-        install_boot_bios_stubs(&mut machine.memory, machine.active_mode)?;
         // The fixture enters with DL=80h and its boot sector loads stage 2 through
         // INT 13h. Back that request with the supplied image instead of relying on
         // an absent fixed disk to inherit a pre-cleared carry flag. Stage 2 remains
@@ -2350,696 +2340,6 @@ const BIOS_EQUIPMENT_FPU: u16 = 0x0002;
 /// caps usable low memory at 640 KiB no matter how much RAM is installed; the
 /// rest is extended memory above 1 MiB (reported by INT 15h AH=88h).
 const BIOS_BASE_MEMORY_KIB: u16 = 640;
-
-/// BDA scratch word INT 1Ah AH=0Bh latches the system-timer day count into, for a
-/// later read. It sits in the inter-application scratch area at 0040:00F0, which no
-/// other field here uses.
-const BDA_DAY_COUNT: usize = 0x4f0;
-/// Segment of the ROM-resident IRET the BIOS keeps at ROM offset 0xF000, i.e.
-/// FF00:0000. The host intercepts the BIOS service interrupts by vector number,
-/// so their IVT targets only need a valid IRET to return on. Pointing them at
-/// the ROM stub instead of the RAM stub at 0x600 keeps them working after a
-/// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
-const BIOS_ROM_IRET_SEG: u16 = 0xff00;
-
-/// RAM address of a one-byte HLT sentinel in the free gap between the IRET stub at
-/// 0x600 and the RTC ISR stub at 0x610. `install_dos_low_memory_stubs` seeds it as
-/// a safe HLT landing spot in the reserved low-memory stub cluster.
-const SYSINIT_HALT_STUB: usize = BIOS_IRET_STUB_ADDRESS + 1;
-
-/// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
-/// stub at 0x600 in the free BIOS scratch below the .COM load segment (0x1000).
-/// Unlike the host-serviced service INTs, the RTC interrupt arrives as a real
-/// hardware IRQ, so its ISR is genuine guest code: it acknowledges Register C
-/// and sends EOI to both 8259s before IRET.
-const BIOS_RTC_ISR_ADDRESS: usize = 0x0610;
-
-/// RAM address of the INT 18h "no bootable device" stub: CLI then HLT. Clearing
-/// IF makes the HLT a genuine stop (the run loop will not wake a CPU whose
-/// interrupts are masked), matching a real BIOS that gives up and halts.
-const BIOS_HALT_STUB_ADDRESS: usize = 0x0620;
-/// RAM address of the default IRQ12/IRQ13/IRQ14 slave-PIC handler. It sends EOIs
-/// to both PICs and returns, which is enough for an unclaimed slave interrupt.
-const BIOS_SLAVE_IRQ_ISR_ADDRESS: usize = 0x0622;
-
-/// RAM address of the INT 24h host-trampoline completion stub. A live guest INT
-/// 24h handler IRETs here, executes HLT to stop the instruction batch, then the
-/// machine decodes handler AL and resumes the original host-serviced INT return.
-const BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS: usize = 0x0630;
-/// Default DOS Ctrl-C handler: terminate via INT 21h AH=4Ch with code 0.
-const DOS_INT23_DEFAULT_STUB_ADDRESS: usize = 0x0632;
-/// Default DOS critical-error handler: return Fail (AL=03h) to the caller.
-const DOS_INT24_DEFAULT_STUB_ADDRESS: usize = 0x0637;
-
-/// EBDA offset of the far pointer to the user pointing-device (mouse) handler the
-/// guest installs with INT 15h AX=C207h (offset word then segment word). Offset
-/// 0x22 overlapped the fixed-disk parameter table (0x20..0x2F): a mounted HDD
-/// clobbered the handler pointer and a registered handler corrupted the disk
-/// geometry. The mouse sub-block lives in the free 0x01..0x0F gap: handler
-/// far-pointer at 0x02/0x04, packet buffer at 0x06..0x09 (4 bytes, the IntelliMouse
-/// wheel byte included), byte-index at 0x0A, packet size at 0x0B. The izbios INT 74h
-/// ISR mirrors these offsets (izbios-defs.inc EBDA_MOUSE_*).
-const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0002;
-/// EBDA offset of the mouse packet-size byte (izbios-defs.inc EBDA_MOUSE_PKT_SIZE):
-/// 3 for a standard mouse, 4 once the platform enables IntelliMouse wheel mode. The
-/// BIOS INT 74h ISR accumulates this many aux bytes before dispatching a frame.
-const EBDA_MOUSE_PKT_SIZE_OFF: u32 = 0x000B;
-/// Private firmware/media handshake: nonzero when the mounted CD has a valid
-/// x86 El Torito initial/default entry. The boot menu reads the matching offset.
-const EBDA_CD_BOOTABLE_OFF: u32 = 0x000C;
-
-/// Physical address of the CP/M CALL 5 entry. DOSINTS names this as INT 30h, but
-/// it is code over the IVT bytes for INT 30h and INT 31h rather than a real
-/// interrupt vector.
-const DOS_CALL5_ENTRY_ADDRESS: usize = 0x00c0;
-const DOS_CALL5_ENTRY_SEG: u16 = 0xff00;
-const DOS_CALL5_ENTRY_OFF: u16 = 0x0020;
-const DOS_CALL5_ROM_OFFSET: usize = 0xf020;
-const DOS_CALL5_MAX_FUNCTION: u8 = 0x24;
-
-/// ROM adapter for the PSP:0005 CP/M entry. CALL 5 pushes a near return address,
-/// the PSP far-call pushes PSP:000A, and this adapter rewrites the stack so RETF
-/// lands back at the original caller. CL selects the old DOS function.
-const DOS_CALL5_ENTRY_STUB: [u8; 49] = [
-    0x80,
-    0xf9,
-    DOS_CALL5_MAX_FUNCTION, // cmp cl,24h
-    0x77,
-    0x17, // ja bad
-    0x55, // push bp
-    0x8b,
-    0xec, // mov bp,sp
-    0x50, // push ax
-    0x8b,
-    0x46,
-    0x04, // mov ax,[bp+4]
-    0x87,
-    0x46,
-    0x06, // xchg ax,[bp+6]
-    0x89,
-    0x46,
-    0x04, // mov [bp+4],ax
-    0x58, // pop ax
-    0x5d, // pop bp
-    0x83,
-    0xc4,
-    0x02, // add sp,2
-    0x88,
-    0xcc, // mov ah,cl
-    0xcd,
-    0x21, // int 21h
-    0xcb, // retf
-    0x55, // bad: push bp
-    0x8b,
-    0xec, // mov bp,sp
-    0x50, // push ax
-    0x8b,
-    0x46,
-    0x04, // mov ax,[bp+4]
-    0x87,
-    0x46,
-    0x06, // xchg ax,[bp+6]
-    0x89,
-    0x46,
-    0x04, // mov [bp+4],ax
-    0x58, // pop ax
-    0x5d, // pop bp
-    0x83,
-    0xc4,
-    0x02, // add sp,2
-    0xb0,
-    0x00, // mov al,0
-    0xcb, // retf
-];
-
-/// Per-vector BIOS software-interrupt stub table: 256 two-byte `nop; iret`
-/// entries in ROM at FF00:0200 (physical 0xFF200), one per vector, seeded into
-/// the IVT as `FF00:(0x200 + 2*vector)`. The per-vector ENTRY ADDRESS is what
-/// lets the host recognize which BIOS service is being invoked from the
-/// instruction-FETCH seam, independent of HOW execution arrived: an `INT n`
-/// opcode (also caught by `interrupt_acknowledge`), a DPMI host's
-/// simulate-real-mode-interrupt dispatch that far-jumps through the IVT
-/// without any INT opcode (CWSDPMI servicing DJGPP `int86`, JEMM's
-/// Simulate_Int), or a guest chaining to a saved vector. The legacy shared
-/// IRET at FF00:0000 made all of those silent no-ops: Quake under CWSDPMI
-/// issued its INT 10h mode set and console teletype through the simulate path
-/// and the screen never left text mode.
-///
-/// The stub body is `nop; iret`, not a bare `iret`: the fetch-seam trigger
-/// posts `pending_soft_int`, which the run loop services at the next
-/// post-instruction break - after the NOP, BEFORE the IRET - so the
-/// real-mode INT frame is still on the stack when the HLE service runs
-/// (`set_int_frame_carry` patches CF in the saved FLAGS image). A bare IRET
-/// would pop the frame before the break.
-///
-/// Placed at 0x200 to stay clear of the machine-patched ROM residents below
-/// it (the shared legacy IRET at 0x0000, the CALL-5 adapter, the timer and
-/// master-IRQ ISR stubs at 0x0060/0x0080).
-/// Linear address of the legacy shared chain target FF00:0000. Period
-/// booters hardcode it (IVT[0x13] -> FF00:0000, or a hook chaining there), so
-/// the machine writes the same `nop; iret` shape there that the per-vector
-/// stubs use: the NOP fetch posts the vector stashed by the `INT n` opcode arm
-/// (`last_int_vector`) and the post-instruction break services the HLE before
-/// the IRET pops the frame.
-///
-/// Stub recognition is keyed on the LINEAR fetch address, never the physical
-/// one: an EMM386-class paging monitor (JemmEx) shadows the BIOS F-page, so
-/// the guest dispatches through linear FF00:02xx while the bytes are fetched
-/// from a copy in extended RAM. The linear address is the architectural
-/// identity of the stub; the physical backing is the guest's business.
-const BIOS_LEGACY_IRET_LINEAR: u32 = 0xFF000;
-/// One compare covers FF000 (legacy) through the stub table's end (FF3FF).
-const BIOS_STUB_WINDOW_LEN: u32 = 0x400;
-const BIOS_LEGACY_IRET_ROM_OFFSET: usize = 0xF000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Bios32Call {
-    Directory,
-    Pci,
-}
-
-const fn bios_int_stub_off(vector: u8) -> u16 {
-    0x0200 + (vector as u16) * 2
-}
-
-// The fetch seam treats 0xFF000..0xFF400 as service-posting addresses, so no
-// machine-written ROM resident may grow into the window or span its start
-// (an immediate byte at an even table offset would post a bogus service).
-const _: () = {
-    assert!(DOS_CALL5_ROM_OFFSET + DOS_CALL5_ENTRY_STUB.len() <= BIOS_TIMER_ISR_ROM_OFFSET);
-    assert!(
-        BIOS_TIMER_ISR_ROM_OFFSET + BIOS_TIMER_ISR_STUB.len() <= BIOS_MASTER_IRQ_ISR_ROM_OFFSET
-    );
-    assert!(
-        BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()
-            <= BIOS_INT_STUB_TABLE_ROM_OFFSET
-    );
-    // The legacy nop;iret pair itself must sit below every other resident's
-    // start and inside the recognition window.
-    assert!(BIOS_LEGACY_IRET_ROM_OFFSET + 2 <= DOS_CALL5_ROM_OFFSET);
-};
-
-fn write_bios_int_stub_table(rom: &mut [u8]) {
-    for vector in 0..=255usize {
-        rom[BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2] = 0x90; // nop
-        rom[BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2 + 1] = 0xCF; // iret
-    }
-    // The legacy shared chain target gets the same nop; iret shape (see
-    // BIOS_LEGACY_IRET_LINEAR). Machine-written for every ROM: the Izarra BIOS
-    // reserves a bare IRET here followed by zero padding, and the synthetic
-    // HLE ROMs relied on the constructors writing the IRET byte.
-    rom[BIOS_LEGACY_IRET_ROM_OFFSET] = 0x90; // nop
-    rom[BIOS_LEGACY_IRET_ROM_OFFSET + 1] = 0xCF; // iret
-
-    let mut header = [0u8; 16];
-    header[..4].copy_from_slice(b"_32_");
-    header[4..8].copy_from_slice(&BIOS32_DIRECTORY_LINEAR.to_le_bytes());
-    header[9] = 1; // one 16-byte paragraph
-    header[10] = 0u8.wrapping_sub(header.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
-    rom[BIOS32_HEADER_ROM_OFFSET..BIOS32_HEADER_ROM_OFFSET + 16].copy_from_slice(&header);
-    rom[BIOS32_DIRECTORY_ROM_OFFSET] = 0x90; // nop
-    rom[BIOS32_DIRECTORY_ROM_OFFSET + 1] = 0xCB; // lret
-    rom[BIOS32_PCI_ROM_OFFSET] = 0x90; // nop
-    rom[BIOS32_PCI_ROM_OFFSET + 1] = 0xCB; // lret
-}
-
-const BIOS_TIMER_ISR_ROM_OFF: u16 = 0x0060;
-const BIOS_MASTER_IRQ_ISR_ROM_OFF: u16 = 0x0080;
-
-// INT 08h: bump the BIOS tick dword, chain INT 1Ch, EOI the master PIC, IRET.
-const BIOS_TIMER_ISR_STUB: [u8; 25] = [
-    0x50, // push ax
-    0x1e, // push ds
-    0x31, 0xc0, // xor ax,ax
-    0x8e, 0xd8, // mov ds,ax
-    0x83, 0x06, 0x6c, 0x04, 0x01, // add word [046Ch],1
-    0x83, 0x16, 0x6e, 0x04, 0x00, // adc word [046Eh],0
-    0xcd, 0x1c, // int 1Ch
-    0xb0, 0x20, // mov al,20h
-    0xe6, 0x20, // out 20h,al
-    0x1f, // pop ds
-    0x58, // pop ax
-    0xcf, // iret
-];
-
-const BIOS_MASTER_IRQ_ISR_STUB: [u8; 7] = [
-    0x50, // push ax
-    0xb0, 0x20, // mov al,20h
-    0xe6, 0x20, // out 20h,al
-    0x58, // pop ax
-    0xcf, // iret
-];
-
-/// Real-mode segment of the 1 KB extended BIOS data area (EBDA), reserved at the
-/// top of conventional memory. Segment 0x9FC0 is physical 0x9FC00, so the EBDA
-/// runs 0x9FC00-0x9FFFF and the conventional-memory word at 0040:0013 drops from
-/// 640 to 639 KB. INT 15h AH=C1h returns this segment in ES.
-/// Physical base of the INT 15h AH=C0h system-configuration table. It lives inside
-/// the reserved EBDA (after the size byte at offset 0), so it is consistent with
-/// the lowered conventional-memory size and out of the BDA's way.
-const BIOS_CONFIG_TABLE_ADDR: u32 = 0x9FC10;
-/// AT fixed-disk parameter table for drive 80h, published through IVT[41h].
-const BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR: u32 = 0x9FC20;
-/// Default AT diskette parameter table, published through IVT[1Eh].
-const BIOS_DISKETTE_PARAMETER_TABLE_ADDR: u32 = 0x9FC30;
-/// POST error-log backing storage for INT 15h AH=21h. One count byte lives just
-/// before the returned record array.
-const BIOS_POST_ERROR_LOG_COUNT_ADDR: u32 = 0x9FC3F;
-const BIOS_POST_ERROR_LOG_ADDR: u32 = 0x9FC40;
-const BIOS_POST_ERROR_LOG_MAX: u8 = 16;
-
-fn install_bios_font_mirror(rom: &mut [u8]) {
-    let off = usize::from(BIOS_FONT_8X8_ROM_OFFSET);
-    rom[off..off + font::VGAFONT_8X8.len()].copy_from_slice(&font::VGAFONT_8X8);
-    let off = usize::from(BIOS_FONT_8X14_ROM_OFFSET);
-    rom[off..off + font::VGAFONT_8X14.len()].copy_from_slice(&font::VGAFONT_8X14);
-    let off = usize::from(BIOS_FONT_8X16_ROM_OFFSET);
-    rom[off..off + font::VGAFONT_8X16.len()].copy_from_slice(&font::VGAFONT_8X16);
-    let high = &font::VGAFONT_8X8[128 * 8..];
-    let off = usize::from(BIOS_FONT_8X8_HIGH_ROM_OFFSET);
-    rom[off..off + high.len()].copy_from_slice(high);
-}
-
-fn seed_bda_video_save_pointer(memory: &mut Memory) -> Result<(), BusError> {
-    memory.write_u16(
-        BDA_VIDEO_SAVE_POINTER,
-        INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
-    )?;
-    memory.write_u16(BDA_VIDEO_SAVE_POINTER + 2, VGA_BIOS_SEGMENT)
-}
-
-fn seed_video_bios_tables(memory: &mut Memory) -> Result<(), BusError> {
-    let vga_base = VGA_BIOS_BASE as usize;
-    for (index, byte) in INT10_STATIC_FUNCTIONALITY.iter().copied().enumerate() {
-        memory.write_u8(
-            vga_base + usize::from(INT10_FUNCTIONALITY_TABLE_OFFSET) + index,
-            byte,
-        )?;
-    }
-
-    let save_ptr = vga_base + usize::from(INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET);
-    memory.write_u16(save_ptr, INT10_VIDEO_PARAM_TABLE_OFFSET)?;
-    memory.write_u16(save_ptr + 2, VGA_BIOS_SEGMENT)?;
-    for slot in 1..INT10_VIDEO_SAVE_POINTER_TABLE_PTRS {
-        memory.write_u16(save_ptr + slot * 4, 0)?;
-        memory.write_u16(save_ptr + slot * 4 + 2, 0)?;
-    }
-
-    let param_table = vga_base + usize::from(INT10_VIDEO_PARAM_TABLE_OFFSET);
-    for offset in 0..INT10_VIDEO_PARAM_TABLE_ENTRIES * INT10_VIDEO_PARAM_ENTRY_LEN {
-        memory.write_u8(param_table + offset, 0)?;
-    }
-    for &(entry, bytes) in INT10_VIDEO_PARAM_ENTRIES {
-        let base = param_table + entry * INT10_VIDEO_PARAM_ENTRY_LEN;
-        for (offset, byte) in bytes.iter().copied().enumerate() {
-            memory.write_u8(base + offset, byte)?;
-        }
-    }
-    Ok(())
-}
-
-fn seed_vga_option_rom_header(memory: &mut Memory) -> Result<(), BusError> {
-    let base = VGA_BIOS_BASE as usize;
-    for offset in 0..VGA_BIOS_SPAN_SIZE as usize {
-        memory.write_u8(base + offset, 0)?;
-    }
-    memory.write_u8(base, 0x55)?;
-    memory.write_u8(base + 1, 0xAA)?;
-    memory.write_u8(base + 2, 0x40)?; // 32 KiB in 512-byte units
-    memory.write_u8(base + 3, 0xCB)?; // safe initialization RETF
-    for (index, byte) in b"IzarraVM VGA BIOS".iter().copied().enumerate() {
-        memory.write_u8(base + 4 + index, byte)?;
-    }
-    Ok(())
-}
-
-fn finalize_vga_option_rom_checksum(memory: &mut Memory) -> Result<(), BusError> {
-    let base = VGA_BIOS_BASE as usize;
-    let checksum_at = base + VGA_BIOS_SPAN_SIZE as usize - 1;
-    memory.write_u8(checksum_at, 0)?;
-    let sum = (0..VGA_BIOS_SPAN_SIZE as usize).try_fold(0u8, |sum, offset| {
-        memory
-            .read_u8(base + offset)
-            .map(|byte| sum.wrapping_add(byte))
-    })?;
-    memory.write_u8(checksum_at, 0u8.wrapping_sub(sum))
-}
-
-fn install_boot_bios_stubs(memory: &mut Memory, mode: GswMode) -> Result<(), BusError> {
-    // Low CPU exception vectors and INT 05h Print Screen start as safe BIOS
-    // defaults. Guests and DOS can replace them through the IVT.
-    for vector in 0x00usize..=0x07 {
-        let address = vector * 4;
-        memory.write_u16(address, bios_int_stub_off(vector as u8))?;
-        memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
-    }
-    // IRQ0 is real guest ISR code because the PIT can interrupt outside a BIOS
-    // service call. It maintains the BDA tick count and chains INT 1Ch.
-    memory.write_u16(0x08 * 4, BIOS_TIMER_ISR_ROM_OFF)?;
-    memory.write_u16(0x08 * 4 + 2, BIOS_ROM_IRET_SEG)?;
-    // Unclaimed master-PIC device IRQs only need to acknowledge the controller.
-    // IRQ1 is installed by the resident keyboard BIOS instead.
-    for vector in [0x0Ausize, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F] {
-        let address = vector * 4;
-        memory.write_u16(address, BIOS_MASTER_IRQ_ISR_ROM_OFF)?;
-        memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
-    }
-
-    // BIOS service interrupts the host intercepts by vector. Their IVT targets
-    // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
-    // the mouse driver and INT 2Fh is the IZCDEX CD bridge; INT 29h is the DOS
-    // fast-console hook; INT 25h/26h are the DOS absolute disk read/write; INT
-    // 27h is the obsolete TSR exit; INT 28h is the DOS idle hook's default IRET;
-    // INT 2Ah is the DOS network/critical-section hook; INT 2Bh-2Dh, 32h,
-    // 34h-3Fh, 47h, 4Bh-4Fh, 58h, and 5Dh-5Fh are DOS reserved IRET vectors;
-    // 61h-66h, 69h-6Bh, 6Eh, 78h-79h, 7Bh-85h, F0h-F7h, F9h, and FCh-FDh
-    // are unused, BASIC-reserved, or user-reserved IRET vectors.
-    // 45h, 48h-49h, 59h-5Bh, 6Dh, E0h, EFh, F8h, FAh-FBh, and FEh-FFh are
-    // optional vendor or machine-specific entry points with no resident provider.
-    // 5Ch, 60h, 68h, 6Fh, 7Ah, 86h, and E4h are optional resident API vectors;
-    // the host returns absent while the IVT still points at the default IRET.
-    // INT 2Eh is the DOS command-interpreter back door. INT 6Ch is the DOS
-    // realtime-clock/resume hook's default IRET. INT 18h/19h are the host-serviced
-    // boot and diskless vectors (the run loop services them and redirects CS:IP
-    // itself, so the IRET target is only a fallback). INT 1Bh and 1Ch are the
-    // Ctrl-Break and timer-tick hooks: no host handlers, just default IRETs so a
-    // guest that hooks or calls them through the vectors has valid targets. INT 40h
-    // is the relocated floppy handler, routed through the same disk service as
-    // INT 13h. INT 42h is the relocated video handler, routed through INT 10h.
-    // INT 4Ah is the AT user-alarm hook's default IRET.
-    for vector in [
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x25, 0x26, 0x27,
-        0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
-        0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x42, 0x47, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
-        0x45, 0x48, 0x49, 0x4A, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x61, 0x62,
-        0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x78, 0x79,
-        0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xE0, 0xE4,
-        0xEF, 0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD,
-        0xFE, 0xFF,
-    ] {
-        let address = vector * 4;
-        memory.write_u16(address, bios_int_stub_off(vector as u8))?;
-        memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
-    }
-    // INT 70h (IRQ8) is a real hardware interrupt, not a host-serviced INT, so its
-    // vector points at the RAM ISR stub that acks Register C and EOIs both PICs.
-    memory.write_u16(0x70 * 4, BIOS_RTC_ISR_ADDRESS as u16)?;
-    memory.write_u16(0x70 * 4 + 2, 0)?;
-    // INT 71h-77h are the AT slave-PIC IRQ9-IRQ15 defaults. With no BIOS
-    // device handler installed, acknowledge the interrupt and return.
-    for vector in [0x71usize, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77] {
-        memory.write_u16(vector * 4, BIOS_SLAVE_IRQ_ISR_ADDRESS as u16)?;
-        memory.write_u16(vector * 4 + 2, 0)?;
-    }
-    install_rtc_isr_stub(memory)?;
-    install_slave_irq_isr_stub(memory)?;
-    install_dos_low_memory_stubs(memory)?;
-    seed_vga_option_rom_header(memory)?;
-    seed_int1d_video_parameter_table(memory)?;
-    seed_int1e_diskette_parameter_table(memory)?;
-    seed_int1f_graphics_font_table(memory)?;
-    seed_int43_font_table(memory)?;
-    seed_int44_font_table(memory)?;
-    seed_int46_absent_fixed_disk_table(memory)?;
-    seed_video_bios_tables(memory)?;
-    finalize_vga_option_rom_checksum(memory)?;
-    // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
-    // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
-    // so INT 12h and the EBDA stay consistent.
-    let equipment = if mode.persona().has_fpu() {
-        BIOS_EQUIPMENT_WORD | BIOS_EQUIPMENT_FPU
-    } else {
-        BIOS_EQUIPMENT_WORD
-    };
-    memory.write_u16(0x410, equipment)?;
-    memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB - 1)?;
-    // Reserve the 1 KB EBDA at 0x9FC00 and write its size byte (1 = 1 KB) at offset
-    // 0, the way a real BIOS POST does. INT 15h AH=C1h returns its segment.
-    memory.write_u8((usize::from(EBDA_SEGMENT)) << 4, 1)?;
-    seed_bios_config_table(memory)?;
-    // Serial and parallel port base address tables POST detected (0040:0000 COM1-4,
-    // 0040:0008 LPT1-4). COM1 (0x03F8) + COM2 (0x02F8) and LPT1 (0x0378) + LPT2
-    // (0x0278) are wired, matching the equipment word; the rest read 0 (absent).
-    // INT 14h/17h drive the ports, and software that reads a base straight from the
-    // BDA finds it here.
-    memory.write_u16(0x400, 0x03f8)?; // COM1 base
-    memory.write_u16(0x402, 0x02f8)?; // COM2 base
-    memory.write_u16(0x404, 0)?; // COM3 absent
-    memory.write_u16(0x406, 0)?; // COM4 absent
-    memory.write_u16(0x408, 0x0378)?; // LPT1 base
-    memory.write_u16(0x40a, 0x0278)?; // LPT2 base
-    memory.write_u16(0x40c, 0)?; // LPT3 absent
-    memory.write_u16(0x40e, 0)?; // LPT4 absent
-    // Per-port timeout tables: serial 0040:007C-007F, printer 0040:0078-007B. The
-    // BIOS defaults a serial timeout of 0x01 and a printer timeout of 0x14.
-    for offset in 0x47c..=0x47f {
-        memory.write_u8(offset, 0x01)?; // COM1-4 timeouts
-    }
-    for offset in 0x478..=0x47b {
-        memory.write_u8(offset, 0x14)?; // LPT1-4 timeouts
-    }
-    // Seed the BDA video state to text 80x25 (mode 03h) like a real BIOS POST.
-    memory.write_u8(0x449, 0x03)?; // current video mode
-    memory.write_u16(0x44a, 80)?; // columns on screen
-    memory.write_u16(0x44c, 0x1000)?; // regen (page) size in bytes
-    memory.write_u16(0x44e, 0)?; // active page start in regen buffer
-    memory.write_u8(0x462, 0)?; // active display page
-    memory.write_u16(0x463, 0x03d4)?; // CRTC base port
-    memory.write_u8(0x465, 0x29)?; // CGA mode-control shadow (80x25 color text)
-    memory.write_u8(0x466, 0x00)?; // CGA color-select shadow
-    memory.write_u8(0x484, 24)?; // rows on screen minus one
-    memory.write_u16(0x485, 16)?; // character cell height in scan lines
-    memory.write_u8(0x487, 0x60)?; // EGA/VGA video-control byte
-    memory.write_u8(0x488, 0xf9)?; // EGA/VGA switches / feature bits
-    memory.write_u8(0x489, 0x51)?; // cursor emulation enabled, 400-line alphanumeric mode
-    memory.write_u8(0x48A, 0x08)?; // display-combination code: VGA colour
-    seed_bda_video_save_pointer(memory)?;
-    // Fixed-disk count: zero at construction, before any image is mounted.
-    // Machine::mount_hdd bumps it to 1 when a hard disk attaches, so the count
-    // tracks the real device rather than a fixed value. Ctrl-Break flag clear.
-    // Warm-boot magic 0x1234 tells the BIOS to skip the memory test on reset.
-    memory.write_u8(0x475, 0)?; // number of fixed disks
-    memory.write_u8(0x471, 0)?; // Ctrl-Break flag
-    memory.write_u16(0x472, 0x1234)?; // warm-boot magic
-    // Keyboard data area. The two shift-flag bytes start clear (no key held). The
-    // 32-byte INT 16h ring runs 0040:001E-003D; head and tail both point at its
-    // start (empty), and the start/end pointers (0040:0080/0082) bracket it. A
-    // guest that reads the BDA ring directly, or an INT 16h ROM that walks these
-    // pointers, finds the standard empty-buffer layout.
-    memory.write_u8(0x417, 0)?; // shift flags 1
-    memory.write_u8(0x418, 0)?; // shift flags 2
-    memory.write_u16(0x41a, 0x001e)?; // buffer head pointer (offset into segment 0040)
-    memory.write_u16(0x41c, 0x001e)?; // buffer tail pointer (head == tail: empty)
-    memory.write_u16(0x480, 0x001e)?; // buffer start
-    memory.write_u16(0x482, 0x003e)?; // buffer end (32 bytes -> 16 key slots)
-    memory.write_u8(0x496, 0)?; // keyboard mode/type flags
-    memory.write_u8(0x497, 0)?; // keyboard LED flags
-    // Disk status bytes start clear (no error). 0040:0041 is the floppy/INT 13h
-    // last status (AH=01h reads it); 0040:0074 is the fixed-disk last status.
-    memory.write_u8(0x43e, 0)?; // floppy recalibrate/seek status
-    memory.write_u8(0x441, 0)?; // last floppy disk status
-    memory.write_u8(0x474, 0)?; // last fixed-disk status
-    Ok(())
-}
-
-fn install_dos_low_memory_stubs(memory: &mut Memory) -> Result<(), BusError> {
-    memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)?;
-    memory.write_u8(DOS_CALL5_ENTRY_ADDRESS, 0xea)?; // jmp far FF00:0020
-    memory.write_u16(DOS_CALL5_ENTRY_ADDRESS + 1, DOS_CALL5_ENTRY_OFF)?;
-    memory.write_u16(DOS_CALL5_ENTRY_ADDRESS + 3, DOS_CALL5_ENTRY_SEG)?;
-    // A safe HLT sentinel byte in the reserved low-memory stub cluster.
-    memory.write_u8(SYSINIT_HALT_STUB, 0xf4)?;
-    // INT 18h's halt target: CLI;HLT in low RAM. INT 22h uses the same safe
-    // default terminate-address target until a shell or guest replaces it.
-    memory.write_u8(BIOS_HALT_STUB_ADDRESS, 0xfa)?;
-    memory.write_u8(BIOS_HALT_STUB_ADDRESS + 1, 0xf4)?;
-    memory.write_u8(BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS, 0xf4)?;
-    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS, 0xb8)?; // mov ax,4C00h
-    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 1, 0x00)?;
-    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 2, 0x4c)?;
-    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 3, 0xcd)?; // int 21h
-    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 4, 0x21)?;
-    memory.write_u8(DOS_INT24_DEFAULT_STUB_ADDRESS, 0xb0)?; // mov al,03h
-    memory.write_u8(DOS_INT24_DEFAULT_STUB_ADDRESS + 1, 0x03)?;
-    memory.write_u8(DOS_INT24_DEFAULT_STUB_ADDRESS + 2, 0xcf)?; // iret
-
-    for (vector, target) in [
-        (0x20usize, BIOS_IRET_STUB_ADDRESS),
-        (0x21, BIOS_IRET_STUB_ADDRESS),
-        (0x22, BIOS_HALT_STUB_ADDRESS),
-        (0x23, DOS_INT23_DEFAULT_STUB_ADDRESS),
-        (0x24, DOS_INT24_DEFAULT_STUB_ADDRESS),
-    ] {
-        let address = vector * 4;
-        memory.write_u16(address, target as u16)?;
-        memory.write_u16(address + 2, 0)?;
-    }
-    Ok(())
-}
-
-/// Write the default INT 70h (IRQ8) handler into low RAM: acknowledge the RTC by
-/// reading Register C (which clears its flags and de-asserts the line) and send
-/// end-of-interrupt to both 8259 PICs, then IRET. This is the minimum a real BIOS
-/// INT 70h does before chaining to any user routine. A guest that masks IRQ8 or
-/// installs its own handler simply overwrites this vector.
-///
-/// Limit: the real BIOS INT 70h also tests the RTC wait flag (0040:00A0) and
-/// signals the INT 15h AH=83h/86h event-wait completion at 0040:0098. The host
-/// INT 15h AH=83h path completes waits synchronously, so this stub only acks
-/// and EOIs.
-fn install_rtc_isr_stub(memory: &mut Memory) -> Result<(), BusError> {
-    // push ax; mov al,0Ch; out 70h,al; in al,71h; (ack Register C)
-    // mov al,20h; out A0h,al; out 20h,al; (EOI slave then master)
-    // pop ax; iret
-    const STUB: [u8; 14] = [
-        0x50, // push ax
-        0xb0, 0x0c, // mov al,0Ch (select Register C)
-        0xe6, 0x70, // out 70h,al
-        0xe4, 0x71, // in al,71h (read clears the flags)
-        0xb0, 0x20, // mov al,20h (non-specific EOI)
-        0xe6, 0xa0, // out A0h,al (slave PIC)
-        0xe6, 0x20, // out 20h,al (master PIC)
-        0x58, // pop ax
-    ];
-    for (offset, &byte) in STUB.iter().enumerate() {
-        memory.write_u8(BIOS_RTC_ISR_ADDRESS + offset, byte)?;
-    }
-    memory.write_u8(BIOS_RTC_ISR_ADDRESS + STUB.len(), 0xcf) // iret
-}
-
-/// Write the shared IRQ12/IRQ13/IRQ14 default handler into low RAM. These arrive
-/// through the slave PIC, so a default handler must EOI both controllers before
-/// returning.
-fn install_slave_irq_isr_stub(memory: &mut Memory) -> Result<(), BusError> {
-    const STUB: [u8; 9] = [
-        0x50, // push ax
-        0xb0, 0x20, // mov al,20h
-        0xe6, 0xa0, // out A0h,al
-        0xe6, 0x20, // out 20h,al
-        0x58, // pop ax
-        0xcf, // iret
-    ];
-    for (offset, &byte) in STUB.iter().enumerate() {
-        memory.write_u8(BIOS_SLAVE_IRQ_ISR_ADDRESS + offset, byte)?;
-    }
-    Ok(())
-}
-
-/// Seed the INT 15h AH=C0h system-configuration table at BIOS_CONFIG_TABLE_ADDR.
-/// The layout is the AT-class table the BIOS hands back in ES:BX: a WORD byte
-/// count, then model/submodel/revision and the five feature bytes. Only feature
-/// byte 1 carries set bits, and each is set only when the matching service is
-/// actually present, per the honest-reporting rule.
-fn seed_bios_config_table(memory: &mut Memory) -> Result<(), BusError> {
-    // Feature byte 1 (RBIL INTERRUP.B, AH=C0h):
-    //   bit6 second 8259 PIC present (the AT has IRQ8-15) -> set
-    //   bit5 RTC present (INT 1Ah / CMOS clock)           -> set
-    //   bit4 INT 15h/AH=4Fh keyboard-intercept issued     -> clear (no AH=4Fh callout)
-    //   bit3 wait-for-external-event (AH=41h) supported    -> clear (not implemented)
-    //   bit2 extended BIOS data area allocated             -> set (AH=C1h present)
-    //   bit1 Micro Channel bus                             -> clear (ISA)
-    const FEATURE_1: u8 = 0x40 | 0x20 | 0x04; // 0x64
-    let base = BIOS_CONFIG_TABLE_ADDR as usize;
-    let table: [u8; 10] = [
-        0x08, 0x00, // WORD length: 8 bytes follow
-        0xFC, // model: AT-class
-        0x00, // submodel
-        0x00, // BIOS revision
-        FEATURE_1, 0x00, 0x00, 0x00, 0x00, // feature bytes 1-5
-    ];
-    for (i, &byte) in table.iter().enumerate() {
-        memory.write_u8(base + i, byte)?;
-    }
-    Ok(())
-}
-
-fn write_ivt_pointer(memory: &mut Memory, vector: u8, linear: u32) -> Result<(), BusError> {
-    let address = usize::from(vector) * 4;
-    memory.write_u16(address, (linear & 0x0f) as u16)?;
-    memory.write_u16(address + 2, (linear >> 4) as u16)
-}
-
-fn seed_int1d_video_parameter_table(memory: &mut Memory) -> Result<(), BusError> {
-    const TEXT_40X25: [u8; 16] = [
-        0x38, 0x28, 0x2d, 0x0a, 0x1f, 0x06, 0x19, 0x1c, 0x02, 0x07, 0x06, 0x07, 0x00, 0x00, 0x00,
-        0x00,
-    ];
-    const TEXT_80X25: [u8; 16] = [
-        0x71, 0x50, 0x5a, 0x0a, 0x1f, 0x06, 0x19, 0x1c, 0x02, 0x07, 0x06, 0x07, 0x00, 0x00, 0x00,
-        0x00,
-    ];
-    const CGA_320X200: [u8; 16] = [
-        0x38, 0x28, 0x2d, 0x0a, 0x7f, 0x06, 0x64, 0x70, 0x02, 0x01, 0x06, 0x07, 0x00, 0x00, 0x00,
-        0x00,
-    ];
-    const CGA_640X200: [u8; 16] = [
-        0x71, 0x50, 0x5a, 0x0a, 0x7f, 0x06, 0x64, 0x70, 0x02, 0x01, 0x06, 0x07, 0x00, 0x00, 0x00,
-        0x00,
-    ];
-    const MDA_TEXT_80X25: [u8; 16] = [
-        0x61, 0x50, 0x52, 0x0f, 0x19, 0x06, 0x19, 0x19, 0x02, 0x0d, 0x0b, 0x0c, 0x00, 0x00, 0x00,
-        0x00,
-    ];
-    const TABLE: [[u8; 16]; 8] = [
-        TEXT_40X25,
-        TEXT_40X25,
-        TEXT_80X25,
-        TEXT_80X25,
-        CGA_320X200,
-        CGA_320X200,
-        CGA_640X200,
-        MDA_TEXT_80X25,
-    ];
-
-    let base = VGA_BIOS_INT1D_VIDEO_TABLE_ADDR as usize;
-    for (mode, regs) in TABLE.iter().enumerate() {
-        for (offset, &byte) in regs.iter().enumerate() {
-            memory.write_u8(base + mode * regs.len() + offset, byte)?;
-        }
-    }
-    write_ivt_pointer(memory, 0x1d, VGA_BIOS_INT1D_VIDEO_TABLE_ADDR)
-}
-
-fn seed_int1e_diskette_parameter_table(memory: &mut Memory) -> Result<(), BusError> {
-    const DPT_1440K: [u8; 11] = [
-        0xdf, 0x02, 0x25, 0x02, 0x12, 0x1b, 0xff, 0x6c, 0xf6, 0x0f, 0x08,
-    ];
-
-    let base = BIOS_DISKETTE_PARAMETER_TABLE_ADDR as usize;
-    for (offset, &byte) in DPT_1440K.iter().enumerate() {
-        memory.write_u8(base + offset, byte)?;
-    }
-    write_ivt_pointer(memory, 0x1e, BIOS_DISKETTE_PARAMETER_TABLE_ADDR)
-}
-
-fn seed_int1f_graphics_font_table(memory: &mut Memory) -> Result<(), BusError> {
-    let upper_half = &izarravm_video::font::VGAFONT_8X8[0x80 * 8..];
-    for (offset, &byte) in upper_half.iter().enumerate() {
-        memory.write_u8(VGA_BIOS_INT1F_FONT_ADDR as usize + offset, byte)?;
-    }
-    write_ivt_pointer(memory, 0x1f, VGA_BIOS_INT1F_FONT_ADDR)
-}
-
-fn seed_int43_font_table(memory: &mut Memory) -> Result<(), BusError> {
-    for (offset, &byte) in izarravm_video::font::VGAFONT_8X16.iter().enumerate() {
-        memory.write_u8(VGA_BIOS_INT43_FONT_ADDR as usize + offset, byte)?;
-    }
-    memory.write_u16(0x43 * 4, VGA_BIOS_FONT_TABLE_OFF)?;
-    memory.write_u16(0x43 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16)
-}
-
-fn seed_int44_font_table(memory: &mut Memory) -> Result<(), BusError> {
-    for (offset, &byte) in izarravm_video::font::VGAFONT_8X8.iter().enumerate() {
-        memory.write_u8(VGA_BIOS_INT44_FONT_ADDR as usize + offset, byte)?;
-    }
-    memory.write_u16(0x44 * 4, VGA_BIOS_INT44_FONT_OFF)?;
-    memory.write_u16(0x44 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16)
-}
-
-fn seed_int46_absent_fixed_disk_table(memory: &mut Memory) -> Result<(), BusError> {
-    memory.write_u16(0x46 * 4, 0)?;
-    memory.write_u16(0x46 * 4 + 2, 0)
-}
 
 #[cfg(test)]
 #[path = "machine_code_write_coherence_test.rs"]
