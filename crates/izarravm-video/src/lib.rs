@@ -691,10 +691,6 @@ impl TextFrame {
     }
 }
 
-pub fn preferred_wgpu_backends() -> wgpu::Backends {
-    wgpu::Backends::all()
-}
-
 #[cfg(test)]
 #[path = "lib_test.rs"]
 mod tests;
