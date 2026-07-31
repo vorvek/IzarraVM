@@ -260,19 +260,27 @@ impl CpuGsw {
         self.note_code_write_inner(physical, width, false)
     }
 
-    /// Host address of `len` guest bytes at `physical`, from a direct page this CPU already
-    /// holds. `None` whenever no cached direct page covers them, which is a REFUSAL rather than a
-    /// failure: the one caller (`imm_lane_for`) then keeps its baked immediate.
+    /// Host address of `len` guest bytes at `physical`, from a page this CPU has already FETCHED
+    /// code out of. `None` whenever the fetch-page cache does not currently cover them, which is a
+    /// REFUSAL rather than a failure: the one caller (`imm_lane_for`) then keeps its baked
+    /// immediate and the block is correct as ever.
     ///
-    /// Only pages the bus already handed out as direct mappings can answer, so a device aperture,
-    /// an unmapped hole, or an A20-gated alias never produces a pointer here. The pointer's
-    /// lifetime is the lifetime of the mapping: a real direct-map change routes through
-    /// `note_direct_map_changed`, which drops every compiled block along with these caches, and a
-    /// data-only mapping-epoch change leaves RAM host pointers where they were.
+    /// The fetch cache, and ONLY the fetch cache, is the page-kind guard. `Bus::direct_page`
+    /// produces a VIDEO pointer (the mode-13h plane window) for `BusAccessKind::DataRead` and
+    /// `DataWrite` and for nothing else, so a fetch-cache entry can never be a device aperture —
+    /// while `data_read_pages` / `data_write_pages` can be, and are not cleared by
+    /// `note_direct_data_map_changed` in a way compiled blocks observe. An earlier revision fell
+    /// back to those two caches; a lane baked against a plane buffer could then have outlived a
+    /// write-token change and read an immediate the interpreter would not. Do not reintroduce the
+    /// fallback: the win from it is a lane that would have been created one recompile later
+    /// anyway, and the loss is the only structural argument that keeps device memory out.
     ///
-    /// The fetch-page cache is consulted first because the caller is asking about CODE bytes,
-    /// which that cache is the one populated by fetching. It is keyed by linear address, so the
-    /// physical page is matched by scanning its handful of entries — compile-time only.
+    /// The pointer's lifetime is the lifetime of the mapping: a real direct-map change routes
+    /// through `note_direct_map_changed`, which drops every compiled block, and RAM host pointers
+    /// do not move for a given physical page.
+    ///
+    /// Keyed by linear address, so the physical page is matched by scanning the cache's handful of
+    /// entries — compile time only.
     #[cfg(feature = "jit")]
     pub(crate) fn direct_host_bytes(&self, physical: u32, len: u32) -> Option<usize> {
         let page = physical & !0x0fff;
@@ -282,21 +290,10 @@ impl CpuGsw {
             return None;
         }
         let end = offset + len as usize;
-        let fetched = self.fetch_page.entries.iter().find_map(|entry| {
+        self.fetch_page.entries.iter().find_map(|entry| {
             (entry.valid && entry.physical_page == page && end <= entry.len && !entry.ptr.is_null())
                 .then(|| entry.ptr as usize + offset)
-        });
-        if fetched.is_some() {
-            return fetched;
-        }
-        [&self.data_write_pages, &self.data_read_pages]
-            .into_iter()
-            .find_map(|cache| {
-                cache
-                    .get(physical)
-                    .filter(|entry| !entry.ptr.is_null())
-                    .map(|entry| entry.ptr as usize + offset)
-            })
+        })
     }
 
     /// Cheap, side-effect-free probe hoisted out of `note_code_write_hit`: does the store range

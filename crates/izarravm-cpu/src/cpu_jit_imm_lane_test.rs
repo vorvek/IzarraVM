@@ -339,6 +339,57 @@ fn straddling_write_over_the_lane_retires_the_block() {
     );
 }
 
+/// The page-kind guard, stated positively. A lane is created ONLY from the fetch-page cache — the
+/// one direct-page cache that cannot hold a device-aperture pointer, because `Bus::direct_page`
+/// hands out a video pointer for `DataRead`/`DataWrite` and for no other access kind. With the
+/// fetch entry gone but the data caches warm for the same page, the qualifying ADD must compile
+/// with a BAKED immediate: correct as ever, just not parameterized.
+///
+/// This is the review's fix under test. An earlier revision fell back to `data_write_pages` /
+/// `data_read_pages` and would create a lane here; restoring that fallback makes this test fail.
+#[test]
+fn a_page_the_fetch_cache_cannot_see_gets_no_lane() {
+    let mut cpu = flat_cpu();
+    let mut bus = test_bus(image(5));
+    decode_at(&mut cpu, &mut bus, &block_starts());
+    // Warm the data-write cache for the code page (well past the block's bytes), then drop the
+    // fetch entry — the state every code write already leaves behind, since the choke invalidates
+    // the fetch page.
+    guest_store(&mut cpu, &mut bus, ENTRY + 0x40, 0x1234_5678);
+    cpu.fetch_page.invalidate();
+
+    let key = jit::direct::key_for(&cpu, ENTRY, true).unwrap();
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation =
+        jit::direct::compile(&mut cpu, ENTRY, true).expect("the block still compiles");
+    assert_eq!(
+        compilation.imm_lane_count(),
+        0,
+        "no fetch-cached page, no lane"
+    );
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("the baked-immediate block installs");
+
+    arm(&mut cpu, 100);
+    let block = cpu.jit_direct.block(id).unwrap();
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(
+        cpu.registers.ebp(),
+        105,
+        "the baked immediate still applies"
+    );
+
+    // And with no lane, the patch that a lane would have absorbed retires the block instead.
+    guest_store(&mut cpu, &mut bus, LANE, 9);
+    assert_eq!(cpu.perf_counters().smc_lane_accepts, 0);
+    assert!(cpu.jit_direct.block(id).is_none());
+}
+
 /// Device and HLE writes never take the exemption, even when their range is byte-for-byte a lane.
 /// They arrive through the value-less choke with no store path behind them.
 #[test]
