@@ -3,6 +3,92 @@
 
 use super::*;
 
+struct TokaEmmScenario {
+    machine: Machine,
+    _scratch: TokaScratch,
+}
+
+impl TokaEmmScenario {
+    fn new(
+        label: &str,
+        profile: MachineProfile,
+        ordered_overrides: Vec<(String, Vec<u8>)>,
+    ) -> Self {
+        let driver_count = ordered_overrides
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("TOKAEMM.SYS"))
+            .count();
+        assert_eq!(
+            driver_count, 1,
+            "{label}: expected exactly one TOKAEMM.SYS override"
+        );
+
+        let scratch = TokaScratch::new(label);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(scratch.path(), ordered_overrides)
+            .expect("mount host folder with overrides");
+
+        Self {
+            machine,
+            _scratch: scratch,
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "expected exactly one TOKAEMM.SYS override")]
+fn tokaemm_scenario_rejects_missing_driver_override() {
+    let _ = TokaEmmScenario::new(
+        "missing-driver",
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        Vec::new(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "expected exactly one TOKAEMM.SYS override")]
+fn tokaemm_scenario_rejects_duplicate_driver_overrides_case_insensitively() {
+    let _ = TokaEmmScenario::new(
+        "duplicate-driver",
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "tokaemm.sys".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn tokaemm_scenario_owns_mounted_machine_and_scratch() {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw386Slow;
+    let expected_profile = profile.clone();
+    let scratch_path = {
+        let mut scenario = TokaEmmScenario::new(
+            "scenario-owner",
+            profile,
+            vec![(
+                "tOkAeMm.SyS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            )],
+        );
+        let scratch_path = scenario._scratch.path().to_owned();
+        assert_eq!(scenario.machine.profile(), &expected_profile);
+        assert_eq!(scenario.machine.read_physical_u8(0x475), 1);
+        assert!(scratch_path.is_dir());
+        scratch_path
+    };
+    assert!(!scratch_path.exists());
+}
+
 /// `DEVICE=C:\DOS\TOKAEMM.SYS` puts the running kernel into V86
 /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
 /// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
@@ -15,38 +101,30 @@ use super::*;
 #[test]
 #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
 fn tokaemm_m0_freedos_survives_in_v86() {
-    let scratch = TokaScratch::new("tokaemm-t3a");
-    let dir = scratch.path();
-
     // The stock CONFIG.SYS (from the committed image) plus a DEVICE= line for
     // the bespoke driver. Passed as an override so it replaces the system copy.
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
 
-    let mut machine = Machine::new(
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-t3a",
         MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::izarra_bios(),
-    )
-    .expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
-    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, current_root_prompt);
+    let (stop, _) = run_until_toka_condition(machine, 500_000_000, current_root_prompt);
     let text = machine.screen_text().as_text();
     // FreeDOS boots to the C:\> prompt with the whole system running in V86
     // under TOKAEMM's monitor (SYSINIT + FreeCOM + every IRQ virtualized).
-    if !current_root_prompt(&machine) {
+    if !current_root_prompt(machine) {
         panic!("FreeDOS did not reach C:\\> in V86 (stop={stop:?}).\n{text}");
     }
     let prompts_before = text.to_ascii_lowercase().matches("c:\\>").count();
@@ -59,7 +137,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         }
         let _ = machine.run_until_halt_or_cycles(20_000_000);
     }
-    let _ = run_until_toka_condition(&mut machine, 60_000_000, |machine| {
+    let _ = run_until_toka_condition(machine, 60_000_000, |machine| {
         current_root_prompt(machine)
             && machine
                 .screen_text()
@@ -72,7 +150,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     let after = machine.screen_text().as_text();
     let prompts = after.to_lowercase().matches("c:\\>").count();
     assert!(
-        current_root_prompt(&machine) && prompts > prompts_before,
+        current_root_prompt(machine) && prompts > prompts_before,
         "VER did not run at the V86 prompt (expected a second C:\\>).\n{after}"
     );
 }
@@ -84,8 +162,6 @@ fn tokaemm_small_ram_layouts_do_not_expose_out_of_range_pools() {
         .into_iter()
         .flat_map(|memory_mib| [(memory_mib, "RAM"), (memory_mib, "NOEMS")])
     {
-        let scratch = TokaScratch::new(&format!("tokaemm-small-{memory_mib}-{emm_arg}"));
-        let dir = scratch.path();
         let config = format!(
             "FILES=20\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -93,25 +169,23 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
         .into_bytes();
         let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPILOW\r\n".to_vec();
         let profile = MachineProfile::gsw_386(memory_mib, VideoCard::Vega);
-        let mut machine =
-            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-        machine
-            .mount_hdd_folder_with(
-                dir,
-                vec![
-                    ("CONFIG.SYS".to_string(), config),
-                    ("AUTOEXEC.BAT".to_string(), autoexec),
-                    (
-                        "TOKAEMM.SYS".to_string(),
-                        izarravm_firmware::tokaemm_sys().to_vec(),
-                    ),
-                    (
-                        "VCPILOW.COM".to_string(),
-                        izarravm_firmware::vcpilow_com().to_vec(),
-                    ),
-                ],
-            )
-            .expect("mount host folder with overrides");
+        let mut scenario = TokaEmmScenario::new(
+            &format!("tokaemm-small-{memory_mib}-{emm_arg}"),
+            profile,
+            vec![
+                ("CONFIG.SYS".to_string(), config),
+                ("AUTOEXEC.BAT".to_string(), autoexec),
+                (
+                    "TOKAEMM.SYS".to_string(),
+                    izarravm_firmware::tokaemm_sys().to_vec(),
+                ),
+                (
+                    "VCPILOW.COM".to_string(),
+                    izarravm_firmware::vcpilow_com().to_vec(),
+                ),
+            ],
+        );
+        let machine = &mut scenario.machine;
 
         let stop = machine
             .run_until_halt_or_cycles(500_000_000)
@@ -139,34 +213,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m1_xms_alloc_move_free_in_v86() {
-    let scratch = TokaScratch::new("tokaemm-m1");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nXMSTEST\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "XMSTEST.COM".to_string(),
-                    izarravm_firmware::xmstest_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m1",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "XMSTEST.COM".to_string(),
+                izarravm_firmware::xmstest_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -189,34 +258,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m3_umb_load_high_in_v86() {
-    let scratch = TokaScratch::new("tokaemm-m3");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBTEST\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "UMBTEST.COM".to_string(),
-                    izarravm_firmware::umbtest_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m3",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "UMBTEST.COM".to_string(),
+                izarravm_firmware::umbtest_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -237,34 +301,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m3_umb_direct_xms_in_v86() {
-    let scratch = TokaScratch::new("tokaemm-m3d");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBMECH\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "UMBMECH.COM".to_string(),
-                    izarravm_firmware::umbmech_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m3d",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "UMBMECH.COM".to_string(),
+                izarravm_firmware::umbmech_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -287,34 +346,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m2_ems_map_write_read_in_v86() {
-    let scratch = TokaScratch::new("tokaemm-m2");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSTEST\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "EMSTEST.COM".to_string(),
-                    izarravm_firmware::emstest_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m2",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "EMSTEST.COM".to_string(),
+                izarravm_firmware::emstest_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -336,34 +390,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m2_umb_coexists_with_ems_frame_in_v86() {
-    let scratch = TokaScratch::new("tokaemm-m2u");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBTEST\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "UMBTEST.COM".to_string(),
-                    izarravm_firmware::umbtest_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m2u",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "UMBTEST.COM".to_string(),
+                izarravm_firmware::umbtest_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -384,34 +433,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m2_ems_frameless_noems_in_v86() {
-    let scratch = TokaScratch::new("tokaemm-m2f");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSNONE\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "EMSNONE.COM".to_string(),
-                    izarravm_firmware::emsnone_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m2f",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "EMSNONE.COM".to_string(),
+                izarravm_firmware::emsnone_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -434,34 +478,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m0_de00_present_on_frameless_noems() {
-    let scratch = TokaScratch::new("tokaemm-vcpi0");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIDET\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "VCPIDET.COM".to_string(),
-                    izarravm_firmware::vcpidet_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-vcpi0",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "VCPIDET.COM".to_string(),
+                izarravm_firmware::vcpidet_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -485,36 +524,32 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m1_queries_and_page_pool() {
     for (memory_mib, emm_arg) in [(16, "RAM"), (16, "NOEMS"), (24, "RAM"), (24, "NOEMS")] {
-        let scratch = TokaScratch::new(&format!("tokaemm-vcpi1-{memory_mib}-{emm_arg}"));
-        let dir = scratch.path();
         let config = format!(
             "FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         )
         .into_bytes();
         let profile = MachineProfile::gsw_386(memory_mib, VideoCard::Vega);
-        let mut machine =
-            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-        machine
-            .mount_hdd_folder_with(
-                dir,
-                vec![
-                    ("CONFIG.SYS".to_string(), config),
-                    (
-                        "AUTOEXEC.BAT".to_string(),
-                        b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIMEM\r\n".to_vec(),
-                    ),
-                    (
-                        "TOKAEMM.SYS".to_string(),
-                        izarravm_firmware::tokaemm_sys().to_vec(),
-                    ),
-                    (
-                        "VCPIMEM.COM".to_string(),
-                        izarravm_firmware::vcpimem_com().to_vec(),
-                    ),
-                ],
-            )
-            .expect("mount host folder with overrides");
+        let mut scenario = TokaEmmScenario::new(
+            &format!("tokaemm-vcpi1-{memory_mib}-{emm_arg}"),
+            profile,
+            vec![
+                ("CONFIG.SYS".to_string(), config),
+                (
+                    "AUTOEXEC.BAT".to_string(),
+                    b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIMEM\r\n".to_vec(),
+                ),
+                (
+                    "TOKAEMM.SYS".to_string(),
+                    izarravm_firmware::tokaemm_sys().to_vec(),
+                ),
+                (
+                    "VCPIMEM.COM".to_string(),
+                    izarravm_firmware::vcpimem_com().to_vec(),
+                ),
+            ],
+        );
+        let machine = &mut scenario.machine;
         let stop = machine
             .run_until_halt_or_cycles(800_000_000)
             .expect("machine run");
@@ -539,34 +574,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m2_de01_pm_interface() {
-    let scratch = TokaScratch::new("tokaemm-vcpi2");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIIF\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "VCPIIF.COM".to_string(),
-                    izarravm_firmware::vcpiif_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-vcpi2",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "VCPIIF.COM".to_string(),
+                izarravm_firmware::vcpiif_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -592,36 +622,32 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
     for (memory_mib, emm_arg) in [(16, "RAM"), (16, "NOEMS"), (24, "RAM"), (24, "NOEMS")] {
-        let scratch = TokaScratch::new(&format!("tokaemm-vcpi3-{memory_mib}-{emm_arg}"));
-        let dir = scratch.path();
         let config = format!(
             "FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         )
         .into_bytes();
         let profile = MachineProfile::gsw_386(memory_mib, VideoCard::Vega);
-        let mut machine =
-            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-        machine
-            .mount_hdd_folder_with(
-                dir,
-                vec![
-                    ("CONFIG.SYS".to_string(), config),
-                    (
-                        "AUTOEXEC.BAT".to_string(),
-                        b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec(),
-                    ),
-                    (
-                        "TOKAEMM.SYS".to_string(),
-                        izarravm_firmware::tokaemm_sys().to_vec(),
-                    ),
-                    (
-                        "VCPISW.COM".to_string(),
-                        izarravm_firmware::vcpisw_com().to_vec(),
-                    ),
-                ],
-            )
-            .expect("mount host folder with overrides");
+        let mut scenario = TokaEmmScenario::new(
+            &format!("tokaemm-vcpi3-{memory_mib}-{emm_arg}"),
+            profile,
+            vec![
+                ("CONFIG.SYS".to_string(), config),
+                (
+                    "AUTOEXEC.BAT".to_string(),
+                    b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec(),
+                ),
+                (
+                    "TOKAEMM.SYS".to_string(),
+                    izarravm_firmware::tokaemm_sys().to_vec(),
+                ),
+                (
+                    "VCPISW.COM".to_string(),
+                    izarravm_firmware::vcpisw_com().to_vec(),
+                ),
+            ],
+        );
+        let machine = &mut scenario.machine;
         let stop = machine
             .run_until_halt_or_cycles(800_000_000)
             .expect("machine run");
@@ -643,34 +669,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m4_unhandled_gp_reflects_to_guest() {
-    let scratch = TokaScratch::new("tokaemm-vcpi4");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGPREFLCT\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "GPREFLCT.COM".to_string(),
-                    izarravm_firmware::gpreflct_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-vcpi4",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "GPREFLCT.COM".to_string(),
+                izarravm_firmware::gpreflct_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -693,34 +714,29 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m6_privileged_0f_emulation() {
-    let scratch = TokaScratch::new("tokaemm-vcpi6");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGPEMUL\r\n".to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "GPEMUL.COM".to_string(),
-                    izarravm_firmware::gpemul_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-vcpi6",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "GPEMUL.COM".to_string(),
+                izarravm_firmware::gpemul_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -841,9 +857,6 @@ fn tokaemm_m4_default_boot_runs_v86() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_and_gswmode_support_code_3_as_386_slow() {
-    let scratch = TokaScratch::new("tokaemm-gsw386slow");
-    let dir = scratch.path();
-
     let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
 DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -854,28 +867,26 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
 
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw386Slow;
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("CONFIG.SYS".to_string(), config),
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "TOKAEMM.SYS".to_string(),
-                    izarravm_firmware::tokaemm_sys().to_vec(),
-                ),
-                (
-                    "GSWMODE.COM".to_string(),
-                    izarravm_firmware::gswmode_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-gsw386slow",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "GSWMODE.COM".to_string(),
+                izarravm_firmware::gswmode_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let (stop, requested_cycles) =
-        run_until_toka_condition_with_frozen_clock(&mut machine, 800_000_000, |machine| {
+        run_until_toka_condition_with_frozen_clock(machine, 800_000_000, |machine| {
             if machine.active_mode() != GswMode::Gsw586 || !current_root_prompt(machine) {
                 return false;
             }
@@ -915,7 +926,7 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
         "GSWMODE did not explain how to migrate the removed 286 name.\n{text}"
     );
     assert!(
-        current_root_prompt(&machine),
+        current_root_prompt(machine),
         "no C:\\> prompt after the GSWMODE 386-slow/VER/GSWMODE 586 sequence \
              (stop={stop:?}).\n{text}"
     );
@@ -941,15 +952,10 @@ fn run_mem_autoexec_with_emm(
     dir_suffix: &str,
     commands: &str,
     emm_arg: Option<&str>,
-) -> (TokaScratch, MemScreen, StopReason) {
-    let scratch = TokaScratch::new(&format!("tokaemm-mem-{dir_suffix}"));
-    let dir = scratch.path();
-
+) -> (TokaEmmScenario, MemScreen, StopReason) {
     let autoexec =
         format!("@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\n{commands}\r\n").into_bytes();
     let profile = MachineProfile::gsw_386(24, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     let mut overrides = vec![("AUTOEXEC.BAT".to_string(), autoexec)];
     if let Some(emm_arg) = emm_arg {
         overrides.push((
@@ -961,23 +967,27 @@ DOS=HIGH,UMB\r\nSHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r
             .into_bytes(),
         ));
     }
-    machine
-        .mount_hdd_folder_with(dir, overrides)
-        .expect("mount host folder with overrides");
+    overrides.push((
+        "TOKAEMM.SYS".to_string(),
+        izarravm_firmware::tokaemm_sys().to_vec(),
+    ));
+    let mut scenario =
+        TokaEmmScenario::new(&format!("tokaemm-mem-{dir_suffix}"), profile, overrides);
+    let machine = &mut scenario.machine;
 
     // /P retains upstream's /PAGE pauses. Keep the existing phase budgets,
     // but stop at the live root prompt and inject Enter only after a phase
     // expires at a possible pager prompt.
-    let (mut stop, _) = run_until_toka_condition(&mut machine, 200_000_000, current_root_prompt);
+    let (mut stop, _) = run_until_toka_condition(machine, 200_000_000, current_root_prompt);
     for _ in 0..4 {
-        if current_root_prompt(&machine) || !matches!(stop, StopReason::CycleLimit { .. }) {
+        if current_root_prompt(machine) || !matches!(stop, StopReason::CycleLimit { .. }) {
             break;
         }
         machine.inject_key_scancodes(&[0x1c, 0x9c]); // Enter: dismiss any pager
-        (stop, _) = run_until_toka_condition(&mut machine, 150_000_000, current_root_prompt);
+        (stop, _) = run_until_toka_condition(machine, 150_000_000, current_root_prompt);
     }
     let frame = machine.screen_text();
-    if !matches!(stop, StopReason::CpuError(_)) && !current_root_prompt(&machine) {
+    if !matches!(stop, StopReason::CpuError(_)) && !current_root_prompt(machine) {
         let text = frame.as_text();
         panic!("MEM command did not return to C:\\> (stop={stop:?}).\n{text}");
     }
@@ -990,14 +1000,14 @@ DOS=HIGH,UMB\r\nSHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r
             .map(|cell| (cell.character, cell.attribute))
             .collect(),
     };
-    (scratch, screen, stop)
+    (scenario, screen, stop)
 }
 
-fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (TokaScratch, MemScreen, StopReason) {
+fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (TokaEmmScenario, MemScreen, StopReason) {
     run_mem_autoexec_with_emm(dir_suffix, commands, None)
 }
 
-fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (TokaScratch, MemScreen, StopReason) {
+fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (TokaEmmScenario, MemScreen, StopReason) {
     run_mem_autoexec(dir_suffix, &format!("MEM {mem_args}"))
 }
 
@@ -1031,7 +1041,7 @@ fn memory_map_rows(screen: &MemScreen) -> Vec<&[(u8, u8)]> {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_plain_reports_conventional_memory() {
-    let (_scratch, screen, stop) = run_mem_command("plain", "");
+    let (_scenario, screen, stop) = run_mem_command("plain", "");
     let text = &screen.text;
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running MEM under V86: {msg}\n{text}");
@@ -1102,7 +1112,7 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_noems_reports_combined_extended_free() {
-    let (_scratch, screen, stop) = run_mem_autoexec_with_emm("noems", "MEM", Some("NOEMS"));
+    let (_scenario, screen, stop) = run_mem_autoexec_with_emm("noems", "MEM", Some("NOEMS"));
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while running MEM with NOEMS: {msg}\n{}",
@@ -1120,7 +1130,7 @@ fn tokaemm_mem_noems_reports_combined_extended_free() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_redirect_keeps_raw_uncolored_bars() {
-    let (_scratch, screen, stop) =
+    let (_scenario, screen, stop) =
         run_mem_autoexec("redirect", "MEM > C:\\MEM.TXT\r\nTYPE C:\\MEM.TXT");
     if let StopReason::CpuError(msg) = &stop {
         panic!(
@@ -1150,7 +1160,7 @@ fn tokaemm_mem_redirect_keeps_raw_uncolored_bars() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_p_lists_resident_programs() {
-    let (_scratch, screen, stop) = run_mem_command("p", "/P");
+    let (_scenario, screen, stop) = run_mem_command("p", "/P");
     let text = &screen.text;
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running MEM /P under V86: {msg}\n{text}");
@@ -1187,7 +1197,7 @@ fn tokaemm_mem_p_labels_both_memory_areas() {
     let commands = "MEM /P > C:\\MEMP.TXT\r\n\
                     FIND \"Memory Detail:\" C:\\MEMP.TXT\r\n\
                     FIND \"TOKAMOUS\" C:\\MEMP.TXT";
-    let (_scratch, screen, stop) = run_mem_autoexec("p_areas", commands);
+    let (_scenario, screen, stop) = run_mem_autoexec("p_areas", commands);
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while checking MEM /P area headers: {msg}\n{}",
@@ -1210,7 +1220,7 @@ fn tokaemm_mem_p_labels_both_memory_areas() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
-    let (_scratch, screen, stop) = run_mem_command("classify", "/CLASSIFY /NOSUMMARY");
+    let (_scenario, screen, stop) = run_mem_command("classify", "/CLASSIFY /NOSUMMARY");
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while running MEM /CLASSIFY: {msg}\n{}",
@@ -1243,7 +1253,7 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_p_summary_restores_memory_map() {
-    let (_scratch, screen, stop) = run_mem_command("p_summary", "/P /SUMMARY");
+    let (_scenario, screen, stop) = run_mem_command("p_summary", "/P /SUMMARY");
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while running MEM /P /SUMMARY under V86: {msg}\n{}",
@@ -1279,16 +1289,20 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
-    let scratch = TokaScratch::new("tokaemm-ifinvariant");
-    let dir = scratch.path();
-
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-ifinvariant",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     const FLAG_IF: u32 = 0x0000_0200;
     const BURST: u64 = 20_000_000;
@@ -1332,9 +1346,6 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_tool_batch_attrib_choice_find_smoke() {
-    let scratch = TokaScratch::new("tokaemm-toolbatch");
-    let dir = scratch.path();
-
     // A two-line text file so FIND's match is unambiguous against the
     // non-matching line right next to it.
     let hello_txt = b"Hello from Toka-DOS\r\nWelcome to the IZARRA 3000\r\n".to_vec();
@@ -1346,19 +1357,21 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
         .to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                ("HELLO.TXT".to_string(), hello_txt),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-toolbatch",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            ("HELLO.TXT".to_string(), hello_txt),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
-    let (stop, _) = run_until_toka_condition(&mut machine, 400_000_000, |machine| {
+    let (stop, _) = run_until_toka_condition(machine, 400_000_000, |machine| {
         if !current_root_prompt(machine) {
             return false;
         }
@@ -1371,7 +1384,7 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
     }
 
     assert!(
-        current_root_prompt(&machine),
+        current_root_prompt(machine),
         "no C:\\> prompt after the tool batch ran (stop={stop:?}).\n{text}"
     );
 
@@ -1409,9 +1422,6 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_tool_xcopy_recursive_smoke() {
-    let scratch = TokaScratch::new("tokaemm-xcopy");
-    let dir = scratch.path();
-
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\n\
 MD SRC\r\n\
 ECHO hello > SRC\\A.TXT\r\n\
@@ -1423,13 +1433,20 @@ DIR DEST\r\n"
         .to_vec();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-xcopy",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
-    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, |machine| {
+    let (stop, _) = run_until_toka_condition(machine, 500_000_000, |machine| {
         if !current_root_prompt(machine) {
             return false;
         }
@@ -1448,7 +1465,7 @@ DIR DEST\r\n"
 
     let lower = text.to_ascii_lowercase();
     assert!(
-        current_root_prompt(&machine),
+        current_root_prompt(machine),
         "no C:\\> prompt after the XCOPY batch ran (stop={stop:?}).\n{text}"
     );
 
@@ -1486,25 +1503,24 @@ DIR DEST\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m4_mouse_wheel_under_v86() {
-    let scratch = TokaScratch::new("tokaemm-m4m");
-    let dir = scratch.path();
-
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMOUSETST\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "MOUSETST.COM".to_string(),
-                    izarravm_firmware::mousetst_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m4m",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "MOUSETST.COM".to_string(),
+                izarravm_firmware::mousetst_com().to_vec(),
+            ),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     // Run in chunks, injecting a wheel detent between them: the fixture polls
     // fn 03h in a bounded loop, so extra/early detents are harmless and a late
@@ -1537,25 +1553,24 @@ fn tokaemm_m4_mouse_wheel_under_v86() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m4_sb16_irq5_under_v86() {
-    let scratch = TokaScratch::new("tokaemm-m4s");
-    let dir = scratch.path();
-
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nSNDTST\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "SNDTST.COM".to_string(),
-                    izarravm_firmware::sndtst_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m4s",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "SNDTST.COM".to_string(),
+                izarravm_firmware::sndtst_com().to_vec(),
+            ),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
@@ -1587,25 +1602,24 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
 #[test]
 #[ignore = "boots a full FreeDOS image (slow); run with --ignored"]
 fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
-    let scratch = TokaScratch::new("tokaemm-ip0");
-    let dir = scratch.path();
-
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nIRQ5IP0\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine =
-        Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine
-        .mount_hdd_folder_with(
-            dir,
-            vec![
-                ("AUTOEXEC.BAT".to_string(), autoexec),
-                (
-                    "IRQ5IP0.COM".to_string(),
-                    izarravm_firmware::irq5ip0_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount host folder with overrides");
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-ip0",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "IRQ5IP0.COM".to_string(),
+                izarravm_firmware::irq5ip0_com().to_vec(),
+            ),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
 
     let stop = machine
         .run_until_halt_or_cycles(800_000_000)
