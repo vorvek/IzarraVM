@@ -439,3 +439,9 @@ fn overlapping_block_without_a_lane_retires_while_the_owner_survives() {
         "a block covering the lane bytes without a lane must retire"
     );
 }
+
+/// The campaign's step-3 differential matrix. Nested here rather than registered beside the other
+/// JIT test files so it inherits this module's fixture (`ENTRY`, `LANE`, `flat_cpu`, `image`,
+/// `lane_fixture`) instead of duplicating it.
+#[path = "cpu_jit_imm_lane_matrix_test.rs"]
+mod matrix;
