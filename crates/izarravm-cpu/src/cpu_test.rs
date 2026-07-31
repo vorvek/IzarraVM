@@ -1690,7 +1690,11 @@ fn pending_flags_offset() {
     // (jit_native_insns, jit_helper_exits, jit_native_memory_helpers, jit_table_clears; 32 bytes),
     // moving this pin from 4456 to 4424 -- again measured against a failing test, matching the
     // sibling pin in `arch_payload_keeps_pending_flags_offset_pinned` (canonical_state_test.rs).
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4424);
+    // The mutable-imm-lane slice adds four PerfCounters fields (the lane registration, accept and
+    // two rejection-reason counters; 32 bytes), moving this pin back from 4424 to 4456, measured
+    // the same way. They belong in PerfCounters rather than at the CpuGsw tail because they are
+    // the slice's diagnostic trio and have to appear in the probe JSON alongside the SMC counters.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -3446,6 +3450,14 @@ mod jit_sweep_lowering;
 ))]
 #[path = "cpu_jit_test_imm_test.rs"]
 mod jit_test_imm;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_imm_lane_test.rs"]
+mod jit_imm_lane;
 
 /// C1e: `DecodedInsn`'s recorded `{disp_len, imm_len}` pair (design section 1.2, review
 /// finding M3) did NOT fit the struct's padding: the size grew 36 -> 40 and is pinned

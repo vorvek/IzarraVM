@@ -498,15 +498,15 @@ fn rejected_span_invalidates_on_every_owned_byte_but_not_adjacent_bytes() {
         let mut cache = jit::JitState::new(jit::direct::BlockCache::default());
         let key = jit::direct::BlockKey::new(0x200, 0x320, 7);
         reject(&mut cache, key, 4);
-        assert_eq!(cache.invalidate_physical_range(0x320 + offset, 1), 1);
+        assert_eq!(cache.retire_physical_range_for_test(0x320 + offset, 1), 1);
         assert!(!cache.range_hits_compiled_code(0x320, 4));
     }
 
     let mut cache = jit::JitState::new(jit::direct::BlockCache::default());
     let key = jit::direct::BlockKey::new(0x200, 0x320, 7);
     reject(&mut cache, key, 4);
-    assert_eq!(cache.invalidate_physical_range(0x31f, 1), 0);
-    assert_eq!(cache.invalidate_physical_range(0x324, 1), 0);
+    assert_eq!(cache.retire_physical_range_for_test(0x31f, 1), 0);
+    assert_eq!(cache.retire_physical_range_for_test(0x324, 1), 0);
     assert!(matches!(
         cache.probe(key),
         jit::direct::BlockProbe::Rejected
@@ -520,7 +520,7 @@ fn repeated_reject_does_not_acquire_a_second_watch_owner() {
     reject(&mut cache, key, 4);
     cache.reject(jit::direct::RejectedSpan::new(key, 4).expect("rejected fixture span"));
 
-    assert_eq!(cache.invalidate_physical_range(0x322, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(0x322, 1), 1);
     assert!(!cache.range_hits_compiled_code(0x320, 4));
 }
 
@@ -565,12 +565,12 @@ fn compiled_and_rejected_owners_share_a_chunk_until_both_retire() {
         } else {
             rejected_key.physical
         };
-        assert_eq!(cpu.jit_direct.invalidate_physical_range(first, 1), 1);
+        assert_eq!(cpu.jit_direct.retire_physical_range_for_test(first, 1), 1);
         assert!(
             cpu.jit_direct
                 .range_hits_compiled_code(compiled_key.physical, 16)
         );
-        assert_eq!(cpu.jit_direct.invalidate_physical_range(second, 1), 1);
+        assert_eq!(cpu.jit_direct.retire_physical_range_for_test(second, 1), 1);
         assert!(
             !cpu.jit_direct
                 .range_hits_compiled_code(compiled_key.physical, 16)
@@ -594,7 +594,7 @@ fn cache_clear_unpublishes_rejected_watch_and_keeps_the_table_base() {
 
     reject(&mut cache, key, 4);
     assert_ne!(unsafe { *entry }, 0);
-    assert_eq!(cache.invalidate_physical_range(key.physical, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(key.physical, 1), 1);
     assert_eq!(unsafe { *entry }, 0);
 }
 

@@ -2324,7 +2324,7 @@ fn invalidated_compiled_code_reused_as_data_stays_on_the_native_store_path() {
         .expect("old code installs");
     assert!(cpu.jit_direct.range_hits_compiled_code(target, 1));
 
-    assert_eq!(cpu.jit_direct.invalidate_physical_range(target, 1), 1);
+    assert_eq!(cpu.jit_direct.retire_physical_range_for_test(target, 1), 1);
     assert!(!cpu.jit_direct.range_hits_compiled_code(target, 1));
     assert!(
         cpu.decode_cache.range_hits_code(target, 1),

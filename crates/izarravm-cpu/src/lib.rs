@@ -588,6 +588,19 @@ pub struct PerfCounters {
     /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
     /// global-flush fallbacks only, so the two together split the SMC write traffic.
     pub smc_narrow_kills: u64,
+    /// Mutable imm32 lanes registered at block install: one per `ADD r32, imm32` slot whose
+    /// immediate is read out of guest RAM at execution instead of being baked into host code.
+    pub smc_lane_registrations: u64,
+    /// Guest writes classified as a lane patch — exactly four bytes at exactly a live block's
+    /// registered lane start. The owning block survives and contributes no SMC heat; the narrow
+    /// decode-line kill still runs.
+    pub smc_lane_accepts: u64,
+    /// Fail-closed rejections, split by which check refused. `width` is a write that starts at a
+    /// lane but is not four bytes wide (a byte or word patch of the dword field); `address` is a
+    /// write that overlaps a lane's bytes without starting on it (a straddle or partial overlap).
+    /// Both take the normal invalidation path, so a nonzero count is a retired block.
+    pub smc_lane_reject_width: u64,
+    pub smc_lane_reject_address: u64,
     /// G1 SMC heat demotions: compiled-block admissions refused because the entry chunk (pre-
     /// compile gate) or some chunk under the block span (pre-install gate) crossed the churn
     /// threshold this heat epoch. The block is parked Dormant and the region runs on the

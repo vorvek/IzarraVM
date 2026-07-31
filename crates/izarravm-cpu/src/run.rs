@@ -1168,6 +1168,7 @@ impl CpuGsw {
                     return Ok(DirectContinuation::Interpret);
                 };
                 self.perf.jit_direct_blocks_installed += 1;
+                self.perf.smc_lane_registrations += compilation.imm_lane_count() as u64;
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the
                 // block-entry site are written branchlessly.
