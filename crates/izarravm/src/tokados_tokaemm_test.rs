@@ -15,15 +15,8 @@ use super::*;
 #[test]
 #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
 fn tokaemm_m0_freedos_survives_in_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_t3a_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-t3a");
+    let dir = scratch.path();
 
     // The stock CONFIG.SYS (from the committed image) plus a DEVICE= line for
     // the bespoke driver. Passed as an override so it replaces the system copy.
@@ -38,7 +31,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     .expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 (
@@ -49,14 +42,14 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         )
         .expect("mount host folder with overrides");
 
-    let stop = machine.run_until_halt_or_cycles(500_000_000);
+    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, current_root_prompt);
     let text = machine.screen_text().as_text();
     // FreeDOS boots to the C:\> prompt with the whole system running in V86
     // under TOKAEMM's monitor (SYSINIT + FreeCOM + every IRQ virtualized).
-    if !text.to_lowercase().contains("c:\\>") {
-        std::fs::remove_dir_all(&dir).ok();
+    if !current_root_prompt(&machine) {
         panic!("FreeDOS did not reach C:\\> in V86 (stop={stop:?}).\n{text}");
     }
+    let prompts_before = text.to_ascii_lowercase().matches("c:\\>").count();
 
     // Run a command at the virtualized prompt: type `VER` and confirm the shell
     // executes it and returns to a fresh prompt — interactive DOS in V86.
@@ -66,12 +59,20 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         }
         let _ = machine.run_until_halt_or_cycles(20_000_000);
     }
-    let _ = machine.run_until_halt_or_cycles(60_000_000);
+    let _ = run_until_toka_condition(&mut machine, 60_000_000, |machine| {
+        current_root_prompt(machine)
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .matches("c:\\>")
+                .count()
+                > prompts_before
+    });
     let after = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     let prompts = after.to_lowercase().matches("c:\\>").count();
     assert!(
-        prompts >= 2,
+        current_root_prompt(&machine) && prompts > prompts_before,
         "VER did not run at the V86 prompt (expected a second C:\\>).\n{after}"
     );
 }
@@ -83,15 +84,8 @@ fn tokaemm_small_ram_layouts_do_not_expose_out_of_range_pools() {
         .into_iter()
         .flat_map(|memory_mib| [(memory_mib, "RAM"), (memory_mib, "NOEMS")])
     {
-        let dir = std::env::temp_dir().join(format!(
-            "tokaemm_small_{memory_mib}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = TokaScratch::new(&format!("tokaemm-small-{memory_mib}-{emm_arg}"));
+        let dir = scratch.path();
         let config = format!(
             "FILES=20\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -103,7 +97,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine
             .mount_hdd_folder_with(
-                &dir,
+                dir,
                 vec![
                     ("CONFIG.SYS".to_string(), config),
                     ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -123,7 +117,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
             .run_until_halt_or_cycles(500_000_000)
             .expect("machine run");
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(
             stop,
             StopReason::TestExit { code: 0xA5 },
@@ -146,15 +139,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m1_xms_alloc_move_free_in_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m1_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m1");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -166,7 +152,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -186,7 +172,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -204,15 +189,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m3_umb_load_high_in_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m3_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m3");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -224,7 +202,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -244,7 +222,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -260,15 +237,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m3_umb_direct_xms_in_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m3d_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m3d");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -280,7 +250,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -300,7 +270,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -318,15 +287,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m2_ems_map_write_read_in_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m2_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m2");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -338,7 +300,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -358,7 +320,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -375,15 +336,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m2_umb_coexists_with_ems_frame_in_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m2u_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m2u");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -395,7 +349,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -415,7 +369,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -431,15 +384,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m2_ems_frameless_noems_in_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m2f_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m2f");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -451,7 +397,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -471,7 +417,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -489,15 +434,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m0_de00_present_on_frameless_noems() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_vcpi0_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-vcpi0");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -509,7 +447,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -529,7 +467,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -548,15 +485,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m1_queries_and_page_pool() {
     for (memory_mib, emm_arg) in [(16, "RAM"), (16, "NOEMS"), (24, "RAM"), (24, "NOEMS")] {
-        let dir = std::env::temp_dir().join(format!(
-            "tokaemm_vcpi1_{memory_mib}_{emm_arg}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = TokaScratch::new(&format!("tokaemm-vcpi1-{memory_mib}-{emm_arg}"));
+        let dir = scratch.path();
         let config = format!(
             "FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -567,7 +497,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine
             .mount_hdd_folder_with(
-                &dir,
+                dir,
                 vec![
                     ("CONFIG.SYS".to_string(), config),
                     (
@@ -589,7 +519,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .run_until_halt_or_cycles(800_000_000)
             .expect("machine run");
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(
             stop,
             StopReason::TestExit { code: 0xA5 },
@@ -610,15 +539,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m2_de01_pm_interface() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_vcpi2_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-vcpi2");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -630,7 +552,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -650,7 +572,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -671,15 +592,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
     for (memory_mib, emm_arg) in [(16, "RAM"), (16, "NOEMS"), (24, "RAM"), (24, "NOEMS")] {
-        let dir = std::env::temp_dir().join(format!(
-            "tokaemm_vcpi3_{memory_mib}_{emm_arg}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = TokaScratch::new(&format!("tokaemm-vcpi3-{memory_mib}-{emm_arg}"));
+        let dir = scratch.path();
         let config = format!(
             "FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS {emm_arg}\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -690,7 +604,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine
             .mount_hdd_folder_with(
-                &dir,
+                dir,
                 vec![
                     ("CONFIG.SYS".to_string(), config),
                     (
@@ -712,7 +626,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .run_until_halt_or_cycles(800_000_000)
             .expect("machine run");
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(
             stop,
             StopReason::TestExit { code: 0xA5 },
@@ -730,15 +643,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m4_unhandled_gp_reflects_to_guest() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_vcpi4_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-vcpi4");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -750,7 +656,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -770,7 +676,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -788,15 +693,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m6_privileged_0f_emulation() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_vcpi6_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-vcpi6");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
@@ -808,7 +706,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -828,7 +726,6 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -844,20 +741,13 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m4_default_boot_runs_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m4_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m4");
+    let dir = scratch.path();
 
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
-    machine.mount_hdd_folder(&dir).expect("mount host folder");
+    machine.mount_hdd_folder(dir).expect("mount host folder");
 
     // The seeding wrote real, editable defaults into the user folder.
     let seeded = std::fs::read_to_string(dir.join("CONFIG.SYS")).expect("seeded CONFIG.SYS");
@@ -866,12 +756,16 @@ fn tokaemm_m4_default_boot_runs_v86() {
         "seeded CONFIG.SYS lacks the expected defaults:\n{seeded}"
     );
 
-    let stop = machine
-        .run_until_halt_or_cycles(800_000_000)
-        .expect("machine run");
+    let (stop, _) = run_until_toka_condition(&mut machine, 800_000_000, |machine| {
+        current_root_prompt(machine)
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .contains("tokaemm:")
+    });
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         panic!("CPU fault during the default V86 boot: {msg}\n{text}");
     }
     let text = machine.screen_text().as_text();
@@ -891,7 +785,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
         in_v86 = machine.in_v86();
     }
     assert!(
-        lower.contains("c:\\>"),
+        current_root_prompt(&machine),
         "no C:\\> prompt on the default boot (stop={stop:?}).\n{text}"
     );
     assert!(
@@ -902,6 +796,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
         in_v86,
         "the default boot must leave the guest running in V86 (stop={stop:?}).\n{text}"
     );
+    let prompts_before = lower.matches("c:\\>").count();
 
     // Presentation leak guard (audit item 9): run `ver /w` at the live prompt,
     // which used to print FreeDOS/Tim-Norman/sourceforge.net copyright text
@@ -913,10 +808,22 @@ fn tokaemm_m4_default_boot_runs_v86() {
         }
         let _ = machine.run_until_halt_or_cycles(20_000_000);
     }
-    let _ = machine.run_until_halt_or_cycles(60_000_000);
+    let _ = run_until_toka_condition(&mut machine, 60_000_000, |machine| {
+        current_root_prompt(machine)
+            && machine
+                .screen_text()
+                .as_text()
+                .to_ascii_lowercase()
+                .matches("c:\\>")
+                .count()
+                > prompts_before
+    });
     let ver_text = machine.screen_text().as_text();
     let ver_lower = ver_text.to_ascii_lowercase();
-    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        current_root_prompt(&machine) && ver_lower.matches("c:\\>").count() > prompts_before,
+        "VER /W did not return to the V86 prompt.\n{ver_text}"
+    );
     assert!(
         !ver_lower.contains("freedos"),
         "boot/VER transcript leaks \"FreeDOS\" branding.\n{ver_text}"
@@ -934,15 +841,8 @@ fn tokaemm_m4_default_boot_runs_v86() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_and_gswmode_support_code_3_as_386_slow() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_gsw386slow_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-gsw386slow");
+    let dir = scratch.path();
 
     let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
 DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
@@ -958,7 +858,7 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("CONFIG.SYS".to_string(), config),
                 ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -974,25 +874,32 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
         )
         .expect("mount host folder with overrides");
 
-    let stop = machine
-        .run_until_halt_or_cycles(800_000_000)
-        .expect("machine run");
+    let (stop, requested_cycles) =
+        run_until_toka_condition_with_frozen_clock(&mut machine, 800_000_000, |machine| {
+            if machine.active_mode() != GswMode::Gsw586 || !current_root_prompt(machine) {
+                return false;
+            }
+            let lower = machine.screen_text().as_text().to_ascii_lowercase();
+            lower.contains("tokaemm: xms/umb/ems memory manager; system running in v86")
+                && lower.contains("switched to 386-slow")
+                && lower.contains("switched to 586")
+                && lower.contains("cpu mode '286' was removed; use '386-slow'")
+        });
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
-        std::fs::remove_dir_all(&dir).ok();
         panic!(
             "CPU fault after the GSWMODE 386-slow switch while TOKAEMM's ring-0 \
-                 monitor was resident: {msg}\nstop={stop:?}\n{text}"
+                 monitor was resident after {requested_cycles} requested cycles: \
+                 {msg}\nstop={stop:?}\n{text}"
         );
     }
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
         machine.active_mode(),
         GswMode::Gsw586,
         "GSWMODE 386-slow then GSWMODE 586 should leave the machine at 586 \
-             (stop={stop:?}).\n{text}"
+             after {requested_cycles} requested cycles (stop={stop:?}).\n{text}"
     );
     let lower = text.to_ascii_lowercase();
     assert!(
@@ -1008,7 +915,7 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
         "GSWMODE did not explain how to migrate the removed 286 name.\n{text}"
     );
     assert!(
-        lower.contains("c:\\>"),
+        current_root_prompt(&machine),
         "no C:\\> prompt after the GSWMODE 386-slow/VER/GSWMODE 586 sequence \
              (stop={stop:?}).\n{text}"
     );
@@ -1034,16 +941,9 @@ fn run_mem_autoexec_with_emm(
     dir_suffix: &str,
     commands: &str,
     emm_arg: Option<&str>,
-) -> (MemScreen, StopReason) {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_mem_{dir_suffix}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+) -> (TokaScratch, MemScreen, StopReason) {
+    let scratch = TokaScratch::new(&format!("tokaemm-mem-{dir_suffix}"));
+    let dir = scratch.path();
 
     let autoexec =
         format!("@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\n{commands}\r\n").into_bytes();
@@ -1062,28 +962,25 @@ DOS=HIGH,UMB\r\nSHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r
         ));
     }
     machine
-        .mount_hdd_folder_with(&dir, overrides)
+        .mount_hdd_folder_with(dir, overrides)
         .expect("mount host folder with overrides");
 
-    // /P retains upstream's /PAGE pausing behavior on top of the Toka-DOS
-    // /FULL addition, so a long listing (like the per-program table) may
-    // stop at a "Press <Enter> to continue" pager prompt. Run in a few
-    // short bursts, injecting Enter between them: harmless once the boot
-    // has already reached the next C:\> prompt, but dismisses the pager
-    // (if hit) so the run always makes it back to a prompt.
-    let mut stop = machine
-        .run_until_halt_or_cycles(200_000_000)
-        .expect("machine run");
+    // /P retains upstream's /PAGE pauses. Keep the existing phase budgets,
+    // but stop at the live root prompt and inject Enter only after a phase
+    // expires at a possible pager prompt.
+    let (mut stop, _) = run_until_toka_condition(&mut machine, 200_000_000, current_root_prompt);
     for _ in 0..4 {
-        if matches!(stop, StopReason::CpuError(_)) {
+        if current_root_prompt(&machine) || !matches!(stop, StopReason::CycleLimit { .. }) {
             break;
         }
         machine.inject_key_scancodes(&[0x1c, 0x9c]); // Enter: dismiss any pager
-        stop = machine
-            .run_until_halt_or_cycles(150_000_000)
-            .expect("machine re-run");
+        (stop, _) = run_until_toka_condition(&mut machine, 150_000_000, current_root_prompt);
     }
     let frame = machine.screen_text();
+    if !matches!(stop, StopReason::CpuError(_)) && !current_root_prompt(&machine) {
+        let text = frame.as_text();
+        panic!("MEM command did not return to C:\\> (stop={stop:?}).\n{text}");
+    }
     let screen = MemScreen {
         text: frame.as_text(),
         columns: frame.columns,
@@ -1093,15 +990,14 @@ DOS=HIGH,UMB\r\nSHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r
             .map(|cell| (cell.character, cell.attribute))
             .collect(),
     };
-    std::fs::remove_dir_all(&dir).ok();
-    (screen, stop)
+    (scratch, screen, stop)
 }
 
-fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (MemScreen, StopReason) {
+fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (TokaScratch, MemScreen, StopReason) {
     run_mem_autoexec_with_emm(dir_suffix, commands, None)
 }
 
-fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (MemScreen, StopReason) {
+fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (TokaScratch, MemScreen, StopReason) {
     run_mem_autoexec(dir_suffix, &format!("MEM {mem_args}"))
 }
 
@@ -1135,7 +1031,7 @@ fn memory_map_rows(screen: &MemScreen) -> Vec<&[(u8, u8)]> {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_plain_reports_conventional_memory() {
-    let (screen, stop) = run_mem_command("plain", "");
+    let (_scratch, screen, stop) = run_mem_command("plain", "");
     let text = &screen.text;
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running MEM under V86: {msg}\n{text}");
@@ -1176,8 +1072,9 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .lines()
         .find(|line| line.starts_with("Conventional"))
         .unwrap();
-    assert!(
-        conventional.contains("600K"),
+    assert_eq!(
+        conventional.split_whitespace().nth(3),
+        Some("599K"),
         "the high page tables should leave about 600 KiB conventional memory free.\n{text}"
     );
     assert_extended_category(&screen, "20,480K", "20,132K");
@@ -1205,7 +1102,7 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_noems_reports_combined_extended_free() {
-    let (screen, stop) = run_mem_autoexec_with_emm("noems", "MEM", Some("NOEMS"));
+    let (_scratch, screen, stop) = run_mem_autoexec_with_emm("noems", "MEM", Some("NOEMS"));
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while running MEM with NOEMS: {msg}\n{}",
@@ -1223,7 +1120,8 @@ fn tokaemm_mem_noems_reports_combined_extended_free() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_redirect_keeps_raw_uncolored_bars() {
-    let (screen, stop) = run_mem_autoexec("redirect", "MEM > C:\\MEM.TXT\r\nTYPE C:\\MEM.TXT");
+    let (_scratch, screen, stop) =
+        run_mem_autoexec("redirect", "MEM > C:\\MEM.TXT\r\nTYPE C:\\MEM.TXT");
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while redirecting MEM under V86: {msg}\n{}",
@@ -1252,7 +1150,7 @@ fn tokaemm_mem_redirect_keeps_raw_uncolored_bars() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_p_lists_resident_programs() {
-    let (screen, stop) = run_mem_command("p", "/P");
+    let (_scratch, screen, stop) = run_mem_command("p", "/P");
     let text = &screen.text;
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running MEM /P under V86: {msg}\n{text}");
@@ -1289,7 +1187,7 @@ fn tokaemm_mem_p_labels_both_memory_areas() {
     let commands = "MEM /P > C:\\MEMP.TXT\r\n\
                     FIND \"Memory Detail:\" C:\\MEMP.TXT\r\n\
                     FIND \"TOKAMOUS\" C:\\MEMP.TXT";
-    let (screen, stop) = run_mem_autoexec("p_areas", commands);
+    let (_scratch, screen, stop) = run_mem_autoexec("p_areas", commands);
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while checking MEM /P area headers: {msg}\n{}",
@@ -1312,7 +1210,7 @@ fn tokaemm_mem_p_labels_both_memory_areas() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
-    let (screen, stop) = run_mem_command("classify", "/CLASSIFY /NOSUMMARY");
+    let (_scratch, screen, stop) = run_mem_command("classify", "/CLASSIFY /NOSUMMARY");
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while running MEM /CLASSIFY: {msg}\n{}",
@@ -1334,8 +1232,9 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .lines()
         .find(|line| line.trim_start().starts_with("Free"))
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
-    assert!(
-        free.contains("(600K)"),
+    assert_eq!(
+        free.split_whitespace().nth(4),
+        Some("(599K)"),
         "MEM /CLASSIFY should report about 600 KiB conventional free.\n{}",
         screen.text
     );
@@ -1344,7 +1243,7 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_p_summary_restores_memory_map() {
-    let (screen, stop) = run_mem_command("p_summary", "/P /SUMMARY");
+    let (_scratch, screen, stop) = run_mem_command("p_summary", "/P /SUMMARY");
     if let StopReason::CpuError(msg) = &stop {
         panic!(
             "CPU fault while running MEM /P /SUMMARY under V86: {msg}\n{}",
@@ -1380,22 +1279,15 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_ifinvariant_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-ifinvariant");
+    let dir = scratch.path();
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
-        .mount_hdd_folder_with(&dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
+        .mount_hdd_folder_with(dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
         .expect("mount host folder with overrides");
 
     const FLAG_IF: u32 = 0x0000_0200;
@@ -1421,7 +1313,6 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
         }
     }
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
 
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault during the IF-invariant boot: {msg}\n{text}");
@@ -1441,15 +1332,8 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_tool_batch_attrib_choice_find_smoke() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_toolbatch_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-toolbatch");
+    let dir = scratch.path();
 
     // A two-line text file so FIND's match is unambiguous against the
     // non-matching line right next to it.
@@ -1466,7 +1350,7 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("AUTOEXEC.BAT".to_string(), autoexec),
                 ("HELLO.TXT".to_string(), hello_txt),
@@ -1474,18 +1358,20 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
         )
         .expect("mount host folder with overrides");
 
-    let stop = machine
-        .run_until_halt_or_cycles(400_000_000)
-        .expect("machine run");
+    let (stop, _) = run_until_toka_condition(&mut machine, 400_000_000, |machine| {
+        if !current_root_prompt(machine) {
+            return false;
+        }
+        let upper = machine.screen_text().as_text().to_ascii_uppercase();
+        upper.contains("[---RA]") && upper.contains("CONTINUE") && upper.contains("IZARRA 3000")
+    });
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running the tool batch under V86: {msg}\n{text}");
     }
 
-    let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("c:\\>"),
+        current_root_prompt(&machine),
         "no C:\\> prompt after the tool batch ran (stop={stop:?}).\n{text}"
     );
 
@@ -1523,15 +1409,8 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_tool_xcopy_recursive_smoke() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_xcopy_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-xcopy");
+    let dir = scratch.path();
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\n\
 MD SRC\r\n\
@@ -1547,21 +1426,29 @@ DIR DEST\r\n"
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
-        .mount_hdd_folder_with(&dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
+        .mount_hdd_folder_with(dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
         .expect("mount host folder with overrides");
 
-    let stop = machine
-        .run_until_halt_or_cycles(500_000_000)
-        .expect("machine run");
+    let (stop, _) = run_until_toka_condition(&mut machine, 500_000_000, |machine| {
+        if !current_root_prompt(machine) {
+            return false;
+        }
+        let text = machine.screen_text().as_text();
+        let lower = text.to_ascii_lowercase();
+        let upper = text.to_ascii_uppercase();
+        lower.contains("world")
+            && upper.contains("A.TXT")
+            && upper.contains("SUB")
+            && upper.contains("2 FILE(S) COPIED")
+    });
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running the XCOPY batch under V86: {msg}\n{text}");
     }
 
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("c:\\>"),
+        current_root_prompt(&machine),
         "no C:\\> prompt after the XCOPY batch ran (stop={stop:?}).\n{text}"
     );
 
@@ -1599,15 +1486,8 @@ DIR DEST\r\n"
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m4_mouse_wheel_under_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m4m_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m4m");
+    let dir = scratch.path();
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMOUSETST\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
@@ -1615,7 +1495,7 @@ fn tokaemm_m4_mouse_wheel_under_v86() {
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("AUTOEXEC.BAT".to_string(), autoexec),
                 (
@@ -1642,7 +1522,6 @@ fn tokaemm_m4_mouse_wheel_under_v86() {
             .expect("machine run");
     }
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -1658,15 +1537,8 @@ fn tokaemm_m4_mouse_wheel_under_v86() {
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m4_sb16_irq5_under_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_m4s_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-m4s");
+    let dir = scratch.path();
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nSNDTST\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
@@ -1674,7 +1546,7 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("AUTOEXEC.BAT".to_string(), autoexec),
                 (
@@ -1689,7 +1561,6 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
@@ -1716,15 +1587,8 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
 #[test]
 #[ignore = "boots a full FreeDOS image (slow); run with --ignored"]
 fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
-    let dir = std::env::temp_dir().join(format!(
-        "tokaemm_ip0_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = TokaScratch::new("tokaemm-ip0");
+    let dir = scratch.path();
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nIRQ5IP0\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
@@ -1732,7 +1596,7 @@ fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &dir,
+            dir,
             vec![
                 ("AUTOEXEC.BAT".to_string(), autoexec),
                 (
@@ -1747,7 +1611,6 @@ fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
         .run_until_halt_or_cycles(800_000_000)
         .expect("machine run");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },

@@ -3,19 +3,6 @@
 
 use super::*;
 
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "tokados_cd_{tag}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&path).expect("create CD test directory");
-    path
-}
-
 fn cd_autoexec(command: &str) -> Vec<u8> {
     format!(
         "@ECHO OFF\r\nPATH C:\\DOS\r\nSET BLASTER=A220 I5 D1 H5 P300 T6\r\n\
@@ -24,8 +11,12 @@ fn cd_autoexec(command: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn run_cd_memory_command(tag: &str, command: &str) -> (StopReason, String) {
-    let hdd_dir = scratch_dir(tag);
+fn run_cd_memory_command(
+    tag: &str,
+    command: &str,
+    mut complete: impl FnMut(&Machine) -> bool,
+) -> (TokaScratch, StopReason, String) {
+    let hdd_scratch = TokaScratch::new(tag);
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
@@ -33,35 +24,35 @@ fn run_cd_memory_command(tag: &str, command: &str) -> (StopReason, String) {
     .expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &hdd_dir,
+            hdd_scratch.path(),
             vec![("AUTOEXEC.BAT".to_string(), cd_autoexec(command))],
         )
         .expect("mount Toka-DOS folder");
 
-    let mut stop = machine
-        .run_until_halt_or_cycles(200_000_000)
-        .expect("run memory command");
+    let (mut stop, _) = run_until_toka_condition(&mut machine, 200_000_000, &mut complete);
     for _ in 0..4 {
-        if matches!(stop, StopReason::CpuError(_)) {
+        if !matches!(stop, StopReason::CycleLimit { .. }) || complete(&machine) {
             break;
         }
         machine.inject_key_scancodes(&[0x1c, 0x9c]);
-        stop = machine
-            .run_until_halt_or_cycles(150_000_000)
-            .expect("continue memory command");
+        (stop, _) = run_until_toka_condition(&mut machine, 150_000_000, &mut complete);
     }
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&hdd_dir).ok();
-    (stop, text)
+    if !matches!(stop, StopReason::CpuError(_)) && !complete(&machine) {
+        panic!(
+            "CD memory command did not return to a complete shell state (stop={stop:?}).\n{text}"
+        );
+    }
+    (hdd_scratch, stop, text)
 }
 
 #[test]
 #[ignore = "boots Toka-DOS and reads a folder-backed CD through the guest driver"]
 fn guest_cd_stack_owns_d_and_reads_a_file() {
-    let hdd_dir = scratch_dir("hdd");
-    let cd_dir = scratch_dir("disc");
-    std::fs::write(cd_dir.join("PROBE.TXT"), b"TOKA-CD-OK\r\n").expect("write CD probe");
-    let folder = izarravm_machine::build_cd_folder(&cd_dir).expect("build folder CD");
+    let hdd_scratch = TokaScratch::new("hdd");
+    let cd_scratch = TokaScratch::new("disc");
+    std::fs::write(cd_scratch.path().join("PROBE.TXT"), b"TOKA-CD-OK\r\n").expect("write CD probe");
+    let folder = izarravm_machine::build_cd_folder(cd_scratch.path()).expect("build folder CD");
     let image = izarravm_machine::CdImage::from_folder(folder).expect("mount folder CD");
 
     let mut machine = Machine::new(
@@ -72,7 +63,7 @@ fn guest_cd_stack_owns_d_and_reads_a_file() {
     machine.mount_cd(image);
     machine
         .mount_hdd_folder_with(
-            &hdd_dir,
+            hdd_scratch.path(),
             vec![
                 ("AUTOEXEC.BAT".to_string(), cd_autoexec("CDTEST")),
                 (
@@ -88,8 +79,6 @@ fn guest_cd_stack_owns_d_and_reads_a_file() {
         .expect("run guest CD fixture");
     let text = machine.screen_text().as_text();
     let pio_bytes = machine.cd_pio_byte_count();
-    std::fs::remove_dir_all(&hdd_dir).ok();
-    std::fs::remove_dir_all(&cd_dir).ok();
 
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while exercising the guest CD stack: {msg}\n{text}");
@@ -108,11 +97,11 @@ fn guest_cd_stack_owns_d_and_reads_a_file() {
 #[test]
 #[ignore = "boots Toka-DOS and directly exercises TOKACD request packets"]
 fn guest_tokacd_protocol_matrix() {
-    let hdd_dir = scratch_dir("protocol_hdd");
-    let cd_dir = scratch_dir("protocol_disc");
-    std::fs::write(cd_dir.join("PROBE.TXT"), b"TOKA-CD-PROTOCOL\r\n")
+    let hdd_scratch = TokaScratch::new("protocol_hdd");
+    let cd_scratch = TokaScratch::new("protocol_disc");
+    std::fs::write(cd_scratch.path().join("PROBE.TXT"), b"TOKA-CD-PROTOCOL\r\n")
         .expect("write protocol disc file");
-    let folder = izarravm_machine::build_cd_folder(&cd_dir).expect("build folder CD");
+    let folder = izarravm_machine::build_cd_folder(cd_scratch.path()).expect("build folder CD");
     let image = izarravm_machine::CdImage::from_folder(folder).expect("mount folder CD");
 
     let mut machine = Machine::new(
@@ -123,7 +112,7 @@ fn guest_tokacd_protocol_matrix() {
     machine.mount_cd(image);
     machine
         .mount_hdd_folder_with(
-            &hdd_dir,
+            hdd_scratch.path(),
             vec![
                 ("AUTOEXEC.BAT".to_string(), cd_autoexec("CDPROT")),
                 (
@@ -140,8 +129,6 @@ fn guest_tokacd_protocol_matrix() {
     let text = machine.screen_text().as_text();
     let pio_bytes = machine.cd_pio_byte_count();
     let media_present = machine.cd_audio_state().media_present;
-    std::fs::remove_dir_all(&hdd_dir).ok();
-    std::fs::remove_dir_all(&cd_dir).ok();
 
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while exercising TOKACD requests: {msg}\n{text}");
@@ -163,9 +150,9 @@ fn guest_tokacd_protocol_matrix() {
 fn guest_tokacd_live_swap_and_audio_sequence() {
     const DATA_SECTOR: usize = 2048;
     const RAW_SECTOR: usize = 2352;
-    let hdd_dir = scratch_dir("audio_hdd");
-    let cd_dir = scratch_dir("audio_disc");
-    let built = izarravm_machine::build_cd_folder(&cd_dir).expect("build empty data CD");
+    let hdd_scratch = TokaScratch::new("audio_hdd");
+    let cd_scratch = TokaScratch::new("audio_disc");
+    let built = izarravm_machine::build_cd_folder(cd_scratch.path()).expect("build empty data CD");
     let mut mixed_bin = built.meta.clone();
     mixed_bin.resize(24 * DATA_SECTOR, 0);
     mixed_bin.resize(mixed_bin.len() + 30 * RAW_SECTOR, 0x20);
@@ -185,7 +172,7 @@ fn guest_tokacd_live_swap_and_audio_sequence() {
     machine.mount_cd(initial);
     machine
         .mount_hdd_folder_with(
-            &hdd_dir,
+            hdd_scratch.path(),
             vec![
                 ("AUTOEXEC.BAT".to_string(), cd_autoexec("ECHO SWAP READY")),
                 (
@@ -196,9 +183,9 @@ fn guest_tokacd_live_swap_and_audio_sequence() {
         )
         .expect("mount Toka-DOS folder");
 
-    let first_stop = machine
-        .run_until_halt_or_cycles(600_000_000)
-        .expect("boot before media swap");
+    let (first_stop, _) = run_until_toka_condition(&mut machine, 600_000_000, |machine| {
+        current_root_prompt(machine) && machine.screen_text().as_text().contains("SWAP READY")
+    });
     let first_text = machine.screen_text().as_text();
     if let StopReason::CpuError(msg) = &first_stop {
         panic!("CPU fault before CD replacement: {msg}\n{first_text}");
@@ -218,8 +205,6 @@ fn guest_tokacd_live_swap_and_audio_sequence() {
         .run_until_halt_or_cycles(900_000_000)
         .expect("run CD audio fixture after replacement");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&hdd_dir).ok();
-    std::fs::remove_dir_all(&cd_dir).ok();
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while testing CD audio: {msg}\n{text}");
     }
@@ -233,9 +218,9 @@ fn guest_tokacd_live_swap_and_audio_sequence() {
 #[test]
 #[ignore = "boots Toka-DOS and verifies TOKACD escapes an unanswered PACKET"]
 fn guest_tokacd_packet_timeout_is_bounded() {
-    let hdd_dir = scratch_dir("timeout_hdd");
-    let cd_dir = scratch_dir("timeout_disc");
-    let built = izarravm_machine::build_cd_folder(&cd_dir).expect("build timeout CD");
+    let hdd_scratch = TokaScratch::new("timeout_hdd");
+    let cd_scratch = TokaScratch::new("timeout_disc");
+    let built = izarravm_machine::build_cd_folder(cd_scratch.path()).expect("build timeout CD");
     let image = izarravm_machine::CdImage::from_folder(built).expect("mount timeout CD");
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
@@ -245,7 +230,7 @@ fn guest_tokacd_packet_timeout_is_bounded() {
     machine.mount_cd(image);
     machine
         .mount_hdd_folder_with(
-            &hdd_dir,
+            hdd_scratch.path(),
             vec![
                 (
                     "AUTOEXEC.BAT".to_string(),
@@ -258,9 +243,9 @@ fn guest_tokacd_packet_timeout_is_bounded() {
             ],
         )
         .expect("mount Toka-DOS folder");
-    let first_stop = machine
-        .run_until_halt_or_cycles(600_000_000)
-        .expect("boot before timeout test");
+    let (first_stop, _) = run_until_toka_condition(&mut machine, 600_000_000, |machine| {
+        current_root_prompt(machine) && machine.screen_text().as_text().contains("TIMEOUT READY")
+    });
     let first_text = machine.screen_text().as_text();
     if let StopReason::CpuError(msg) = &first_stop {
         panic!("CPU fault before timeout test: {msg}\n{first_text}");
@@ -280,8 +265,6 @@ fn guest_tokacd_packet_timeout_is_bounded() {
         .run_until_halt_or_cycles(900_000_000)
         .expect("run packet timeout fixture");
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&hdd_dir).ok();
-    std::fs::remove_dir_all(&cd_dir).ok();
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault during packet timeout: {msg}\n{text}");
     }
@@ -295,7 +278,7 @@ fn guest_tokacd_packet_timeout_is_bounded() {
 #[test]
 #[ignore = "boots Toka-DOS with the guest CD stack and an empty drive"]
 fn guest_cd_stack_boots_without_media() {
-    let hdd_dir = scratch_dir("empty");
+    let hdd_scratch = TokaScratch::new("empty");
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
@@ -303,16 +286,15 @@ fn guest_cd_stack_boots_without_media() {
     .expect("build machine");
     machine
         .mount_hdd_folder_with(
-            &hdd_dir,
+            hdd_scratch.path(),
             vec![("AUTOEXEC.BAT".to_string(), cd_autoexec("ECHO CD EMPTY OK"))],
         )
         .expect("mount Toka-DOS folder");
 
-    let stop = machine
-        .run_until_halt_or_cycles(600_000_000)
-        .expect("boot without CD media");
+    let (stop, _) = run_until_toka_condition(&mut machine, 600_000_000, |machine| {
+        current_root_prompt(machine) && machine.screen_text().as_text().contains("CD EMPTY OK")
+    });
     let text = machine.screen_text().as_text();
-    std::fs::remove_dir_all(&hdd_dir).ok();
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while booting with no CD media: {msg}\n{text}");
     }
@@ -325,7 +307,17 @@ fn guest_cd_stack_boots_without_media() {
 #[test]
 #[ignore = "boots Toka-DOS and inspects upper-memory residency"]
 fn guest_cd_components_reside_in_upper_memory() {
-    let (stop, text) = run_cd_memory_command("memory", "LH TOKAMOUS\r\nMEM /P");
+    let (_scratch, stop, text) =
+        run_cd_memory_command("memory", "LH TOKAMOUS\r\nMEM /P", |machine| {
+            let upper = machine.screen_text().as_text().to_ascii_uppercase();
+            let upper_detail = upper
+                .split_once("UPPER MEMORY DETAIL:")
+                .map(|(_, rows)| rows)
+                .unwrap_or("");
+            current_root_prompt(machine)
+                && upper_detail.contains("TOKACD")
+                && upper_detail.contains("IZCDEX")
+        });
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while checking CD upper-memory residency: {msg}\n{text}");
     }
@@ -343,8 +335,17 @@ fn guest_cd_components_reside_in_upper_memory() {
 #[test]
 #[ignore = "boots Toka-DOS and checks conventional memory with the CD stack loaded"]
 fn guest_cd_stack_keeps_about_600k_conventional_free() {
-    let (stop, text) =
-        run_cd_memory_command("conventional", "LH TOKAMOUS\r\nMEM /CLASSIFY /NOSUMMARY");
+    let (_scratch, stop, text) = run_cd_memory_command(
+        "conventional",
+        "LH TOKAMOUS\r\nMEM /CLASSIFY /NOSUMMARY",
+        |machine| {
+            current_root_prompt(machine)
+                && machine.screen_text().as_text().lines().any(|line| {
+                    line.trim_start().starts_with("Free")
+                        && line.split_whitespace().nth(4) == Some("(599K)")
+                })
+        },
+    );
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while checking conventional memory: {msg}\n{text}");
     }
@@ -352,8 +353,9 @@ fn guest_cd_stack_keeps_about_600k_conventional_free() {
         .lines()
         .find(|line| line.trim_start().starts_with("Free"))
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{text}"));
-    assert!(
-        free.contains("(600K)"),
+    assert_eq!(
+        free.split_whitespace().nth(4),
+        Some("(599K)"),
         "the CD stack should leave about 600 KiB of conventional memory free.\n{text}"
     );
 }
