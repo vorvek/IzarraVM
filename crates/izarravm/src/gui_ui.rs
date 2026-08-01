@@ -394,7 +394,8 @@ impl GuiApp {
                                     }
                                     if ui
                                         .add_enabled(
-                                            self.joystick_enabled && self.gamepads.is_some(),
+                                            self.host_input.joystick_enabled()
+                                                && self.gamepads.is_some(),
                                             egui::Button::new("Set joystick buttons"),
                                         )
                                         .clicked()
@@ -404,7 +405,7 @@ impl GuiApp {
                                 },
                             );
                         });
-                        if !self.joystick_enabled {
+                        if !self.host_input.joystick_enabled() {
                             ui.small("Joystick input is disabled in izarravm.toml.");
                         } else if self.gamepads.is_none() {
                             ui.small("Host controller input is unavailable.");

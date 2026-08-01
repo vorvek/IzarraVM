@@ -1,12 +1,10 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::{Cli, cmos, prefs};
-use izarravm_audio::AudioSubsystem;
+use crate::{Cli, cmos, host_input::HostInputPolicy, prefs};
 use izarravm_core::{
     AppConfig, ConfigError, ConfigOverrides, HardwareProfile, MidiConfig, MidiPortId,
 };
-use izarravm_input::InputState;
 use izarravm_machine::MachineProfile;
 use std::fmt;
 use std::io;
@@ -153,6 +151,7 @@ fn discover_munt_roms(config: &mut MidiConfig, state_dir: &Path) {
 pub(super) struct ResolvedStartup {
     config: AppConfig,
     hardware: HardwareProfile,
+    host_input: HostInputPolicy,
     prefs: prefs::GuiPrefs,
     prefs_path: PathBuf,
     state_dir: PathBuf,
@@ -167,7 +166,7 @@ pub(super) struct GuiLaunch {
     pub(super) glide_ovl: Option<Vec<u8>>,
     pub(super) test_pattern: bool,
     pub(super) rtc_setup: cmos::RtcSetup,
-    pub(super) joystick_enabled: bool,
+    pub(super) host_input: HostInputPolicy,
     pub(super) prefs: prefs::GuiPrefs,
     pub(super) prefs_path: PathBuf,
 }
@@ -220,7 +219,7 @@ impl ResolvedStartup {
             glide_ovl,
             test_pattern,
             rtc_setup,
-            joystick_enabled: self.config.input.joystick,
+            host_input: self.host_input,
             prefs: self.prefs,
             prefs_path: self.prefs_path,
         }
@@ -298,27 +297,25 @@ fn resolve_with(
         discover_munt_roms(&mut config.audio.midi, &locations.state_dir);
     }
     let hardware = HardwareProfile::from_config(&config)?;
-    let audio = AudioSubsystem::from_config(&config.audio);
-    let input = InputState {
-        keyboard_enabled: config.input.keyboard,
-        mouse_enabled: config.input.mouse,
-        joystick_enabled: config.input.joystick,
-    };
+    let host_input = HostInputPolicy::from_config(&config.input);
     info!(
         cpu = %config.machine.cpu,
         hz = hardware.cpu.clock_rate().as_hz_f64(),
         memory_mib = config.machine.memory_mib,
         video = %config.machine.video,
         c_drive = %config.dos.c_drive.display(),
-        audio_devices = audio.devices.len(),
-        keyboard = input.keyboard_enabled,
-        mouse = input.mouse_enabled,
-        joystick = input.joystick_enabled,
+        sound_blaster = config.audio.sound_blaster.enabled,
+        wss = config.audio.wss.enabled,
+        midi = %config.audio.midi.backend,
+        keyboard = host_input.keyboard_enabled(),
+        mouse = host_input.mouse_enabled(),
+        joystick = host_input.joystick_enabled(),
         "configuration validated"
     );
     Ok(ResolvedStartup {
         config,
         hardware,
+        host_input,
         prefs: saved_prefs,
         prefs_path,
         state_dir: locations.state_dir.clone(),

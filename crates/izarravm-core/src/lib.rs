@@ -433,14 +433,6 @@ impl FromStr for MidiBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SteamInputMode {
-    #[default]
-    Off,
-    OptionalBackend,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
@@ -715,10 +707,12 @@ impl WssConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
-    pub pc_speaker: bool,
+    #[serde(default = "default_true", rename = "pc_speaker", skip_serializing)]
+    _pc_speaker: bool,
     pub sound_blaster: SoundBlasterConfig,
     pub wss: WssConfig,
-    pub opl3: bool,
+    #[serde(default = "default_true", rename = "opl3", skip_serializing)]
+    _opl3: bool,
     /// Retired: the standalone Yamaha ADPCM-B DAC was removed once the SB16 DSP
     /// gained native Creative ADPCM. Accepted and ignored so conf files with an
     /// old `[audio.yamaha_adpcm]` section still parse; never written back.
@@ -730,10 +724,10 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            pc_speaker: true,
+            _pc_speaker: true,
             sound_blaster: SoundBlasterConfig::default(),
             wss: WssConfig::default(),
-            opl3: true,
+            _opl3: true,
             yamaha_adpcm: RetiredAudioSection::default(),
             midi: MidiConfig::default(),
         }
@@ -788,13 +782,22 @@ pub enum MidiStatus {
     InitializationFailed,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RetiredSteamInputMode {
+    #[default]
+    Off,
+    OptionalBackend,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InputConfig {
     pub keyboard: bool,
     pub mouse: bool,
     pub joystick: bool,
-    pub steam_input: SteamInputMode,
+    #[serde(default, rename = "steam_input", skip_serializing)]
+    _steam_input: RetiredSteamInputMode,
 }
 
 impl Default for InputConfig {
@@ -803,7 +806,7 @@ impl Default for InputConfig {
             keyboard: true,
             mouse: true,
             joystick: true,
-            steam_input: SteamInputMode::Off,
+            _steam_input: RetiredSteamInputMode::Off,
         }
     }
 }
