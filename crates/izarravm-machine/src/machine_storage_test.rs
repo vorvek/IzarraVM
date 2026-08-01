@@ -272,7 +272,13 @@ fn ensure_user_config_seeds_missing_files_only() {
     std::fs::create_dir_all(&dir).unwrap();
     // A user-owned AUTOEXEC stays; a missing CONFIG.SYS is seeded.
     std::fs::write(dir.join("AUTOEXEC.BAT"), b"@ECHO OFF\r\nMYGAME\r\n").unwrap();
-    crate::storage::ensure_user_config(&dir, b"FILES=40\r\n", b"@ECHO OFF\r\nDEFAULT\r\n").unwrap();
+    crate::storage::ensure_user_config(
+        &dir,
+        b"FILES=40\r\n",
+        b"@ECHO OFF\r\nSET BLASTER=A220 I5 D1 H5 P300 T6\r\n",
+        &SoundBlasterConfig::default(),
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(),
         b"@ECHO OFF\r\nMYGAME\r\n",
@@ -301,7 +307,13 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
     )
     .unwrap();
     std::fs::write(config_only.join("AUTOEXEC.BAT"), b"@ECHO OFF\r\nMYGAME\r\n").unwrap();
-    crate::storage::ensure_user_config(&config_only, new_config, new_autoexec).unwrap();
+    crate::storage::ensure_user_config(
+        &config_only,
+        new_config,
+        new_autoexec,
+        &SoundBlasterConfig::default(),
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read(config_only.join("CONFIG.SYS")).unwrap(),
         new_config
@@ -319,7 +331,13 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
         crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT,
     )
     .unwrap();
-    crate::storage::ensure_user_config(&autoexec_only, new_config, new_autoexec).unwrap();
+    crate::storage::ensure_user_config(
+        &autoexec_only,
+        new_config,
+        new_autoexec,
+        &SoundBlasterConfig::default(),
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read(autoexec_only.join("CONFIG.SYS")).unwrap(),
         b"FILES=41\r\n"
@@ -330,6 +348,164 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
     );
 
     std::fs::remove_dir_all(&base).ok();
+}
+
+fn nondefault_sound_blaster() -> SoundBlasterConfig {
+    SoundBlasterConfig {
+        enabled: true,
+        irq: izarravm_core::SbIrq::I10,
+        dma: izarravm_core::SbDma8::D3,
+        high_dma: izarravm_core::SbDma16::D7,
+    }
+}
+
+#[test]
+fn stock_autoexec_tracks_default_nondefault_and_disabled_sb_profiles() {
+    let base = b"@ECHO OFF\r\nSET BLASTER=A220 I5 D1 H5 P300 T6\r\n\
+SET SETSOUND=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
+    assert_eq!(
+        crate::storage::stock_autoexec(base, &SoundBlasterConfig::default()),
+        base
+    );
+    assert_eq!(
+        crate::storage::stock_autoexec(base, &nondefault_sound_blaster()),
+        b"@ECHO OFF\r\nSET BLASTER=A220 I10 D3 H7 P300 T6\r\n\
+SET SETSOUND=A220 I10 D3 H7 P300 T6\r\nLH TOKAMOUS\r\n"
+    );
+    let disabled = SoundBlasterConfig {
+        enabled: false,
+        ..SoundBlasterConfig::default()
+    };
+    assert_eq!(
+        crate::storage::stock_autoexec(base, &disabled),
+        b"@ECHO OFF\r\nLH TOKAMOUS\r\n"
+    );
+}
+
+#[test]
+fn ensure_user_config_migrates_only_exact_emulator_autoexec_variants() {
+    let base_dir =
+        std::env::temp_dir().join(format!("katea_cfg_sb_variants_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base_dir);
+    let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+    let current_base = payload_file(&payload, "AUTOEXEC.BAT");
+    let disabled = SoundBlasterConfig {
+        enabled: false,
+        ..SoundBlasterConfig::default()
+    };
+    let target_config = nondefault_sound_blaster();
+    let target = crate::storage::stock_autoexec(&current_base, &target_config);
+    let variants = [
+        current_base.clone(),
+        crate::storage::stock_autoexec(&current_base, &disabled),
+        crate::storage::stock_autoexec(&current_base, &SoundBlasterConfig::default()),
+        crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT.to_vec(),
+        crate::storage::stock_autoexec(crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT, &disabled),
+        crate::storage::stock_autoexec(
+            crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT,
+            &nondefault_sound_blaster(),
+        ),
+    ];
+    for (index, variant) in variants.into_iter().enumerate() {
+        let dir = base_dir.join(format!("owned_{index}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AUTOEXEC.BAT"), variant).unwrap();
+        crate::storage::ensure_user_config(&dir, b"FILES=40\r\n", &current_base, &target_config)
+            .unwrap();
+        assert_eq!(std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(), target);
+    }
+
+    let custom_dir = base_dir.join("custom");
+    std::fs::create_dir_all(&custom_dir).unwrap();
+    let mut custom = current_base.clone();
+    custom.extend_from_slice(b"REM USER CHANGE\r\n");
+    std::fs::write(custom_dir.join("AUTOEXEC.BAT"), &custom).unwrap();
+    crate::storage::ensure_user_config(&custom_dir, b"FILES=40\r\n", &current_base, &target_config)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(custom_dir.join("AUTOEXEC.BAT")).unwrap(),
+        custom
+    );
+    std::fs::remove_dir_all(&base_dir).ok();
+}
+
+#[test]
+fn explicit_autoexec_override_wins_after_profile_stock_transform() {
+    let dir = std::env::temp_dir().join(format!("katea_sb_override_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster = nondefault_sound_blaster();
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    let expected = b"@ECHO OFF\r\nSECOND\r\n";
+    machine
+        .mount_hdd_folder_with(
+            &dir,
+            vec![
+                (
+                    "AUTOEXEC.BAT".to_string(),
+                    b"@ECHO OFF\r\nFIRST\r\n".to_vec(),
+                ),
+                ("autoexec.bat".to_string(), expected.to_vec()),
+            ],
+        )
+        .unwrap();
+
+    let disk = machine.ata.as_ref().unwrap();
+    let part_start = crate::katea_volume::PART_START;
+    let vbr = disk.read_lba(part_start).unwrap();
+    let sectors_per_cluster = u32::from(vbr[0x0D]);
+    let reserved = u32::from(u16::from_le_bytes([vbr[0x0E], vbr[0x0F]]));
+    let fats = u32::from(vbr[0x10]);
+    let fat_sectors = u32::from_le_bytes([vbr[0x24], vbr[0x25], vbr[0x26], vbr[0x27]]);
+    let root_cluster = u32::from_le_bytes([vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F]]);
+    let data_start = part_start + reserved + fats * fat_sectors;
+    let root_lba = data_start + (root_cluster - 2) * sectors_per_cluster;
+    let root = disk.read_lba(root_lba).unwrap();
+    let slot = (0..16)
+        .map(|index| index * 32)
+        .find(|&offset| &root[offset..offset + 11] == b"AUTOEXECBAT")
+        .expect("AUTOEXEC.BAT in root directory");
+    let first_cluster = (u32::from(u16::from_le_bytes([root[slot + 20], root[slot + 21]])) << 16)
+        | u32::from(u16::from_le_bytes([root[slot + 26], root[slot + 27]]));
+    let size = u32::from_le_bytes([
+        root[slot + 28],
+        root[slot + 29],
+        root[slot + 30],
+        root[slot + 31],
+    ]) as usize;
+    let file_lba = data_start + (first_cluster - 2) * sectors_per_cluster;
+    assert_eq!(&disk.read_lba(file_lba).unwrap()[..size], expected);
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repair_uses_the_disabled_stock_autoexec() {
+    let dir = std::env::temp_dir().join(format!("katea_sb_repair_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let sound_blaster = profile.sound_blaster;
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.mount_hdd_folder(&dir).unwrap();
+    std::fs::write(dir.join("CONFIG.SYS"), b"REM USER CONFIG\r\n").unwrap();
+    std::fs::write(dir.join("AUTOEXEC.BAT"), b"SET BLASTER=USER\r\n").unwrap();
+
+    machine.perform_toka_service(0x01);
+
+    assert_eq!(machine.toka_service_status, 0);
+    let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+    let expected =
+        crate::storage::stock_autoexec(&payload_file(&payload, "AUTOEXEC.BAT"), &sound_blaster);
+    assert_eq!(std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(), expected);
+    assert_eq!(
+        std::fs::read(dir.join("AUTOEXEC.OLD")).unwrap(),
+        b"SET BLASTER=USER\r\n"
+    );
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

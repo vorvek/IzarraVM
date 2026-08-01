@@ -74,6 +74,17 @@ fn new_raw_program_seeds_psp_env_pointer_with_blaster() {
 }
 
 #[test]
+fn new_raw_program_disabled_profile_omits_sb_environment() {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let machine = Machine::new_raw_program(profile, &[0xb8, 0x00, 0x4c, 0xcd, 0x21]).unwrap();
+    let env_seg = psp_env_segment(&machine);
+
+    assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
+    assert!(parse_env_block(&machine, env_seg).is_empty());
+}
+
+#[test]
 fn dos_env_block_carries_the_configured_routing() {
     // A non-default routing (IRQ7 / DMA3) flows from the host config through
     // the loader into the env block a guest scans via PSP:0x2C.

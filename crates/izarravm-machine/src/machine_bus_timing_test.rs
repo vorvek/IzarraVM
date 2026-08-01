@@ -2284,7 +2284,9 @@ fn cmos_persists_and_reloads_via_bytes() {
 
 #[test]
 fn pc_speaker_renders_a_square_wave() {
-    let mut machine = test_machine();
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
     with_bus(&mut machine, |bus| {
         bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap(); // ch2, lo/hi, mode 3
         bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap(); // divisor low

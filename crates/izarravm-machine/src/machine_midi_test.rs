@@ -52,7 +52,9 @@ fn arm_first_midi_track(machine: &mut Machine) {
 
 #[test]
 fn both_mpu_port_pairs_reset_and_acknowledge() {
-    let mut machine = test_machine();
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
 
     for base in [WAVETABLE_MPU_BASE, MIDI_MPU_BASE] {
         assert_eq!(read_byte(&mut machine, base + 1), 0x80);

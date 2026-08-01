@@ -239,8 +239,8 @@ fn boot_suite_reports_sb_8bit_dma_pass() {
                     && record.name == "sound.sb_8bit_dma"
             }),
             "boot suite should report PASS sound.sb_8bit_dma in {mode:?}; remaining={}, playing={}",
-            machine.dsp.block_remaining(),
-            machine.dsp.is_playing()
+            machine.sb16.test_block_remaining(),
+            machine.sb16.test_is_playing()
         );
     }
 }
@@ -358,7 +358,7 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
                 .unwrap();
         }
     });
-    let rate = u64::from(machine.dsp.output_frame_rate());
+    let rate = u64::from(machine.sb16.test_output_frame_rate());
     for _ in 0..30 {
         let clocks = machine
             .timeline
@@ -372,10 +372,13 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
         "Creative ADPCM block raised the 8-bit IRQ5 at block completion"
     );
     // Single-cycle playback stopped at the end of the block.
-    assert!(!machine.dsp.is_playing(), "single-cycle ADPCM halted at TC");
+    assert!(
+        !machine.sb16.test_is_playing(),
+        "single-cycle ADPCM halted at TC"
+    );
     // The decoder produced audible (non-silent) frames on the DSP ring: the
     // reference byte seeded 0x80 and the 0x50 code bytes moved it off center.
-    let decoded: Vec<_> = std::iter::from_fn(|| machine.dsp.drain_frame()).collect();
+    let decoded: Vec<_> = std::iter::from_fn(|| machine.sb16.test_drain_frame()).collect();
     assert_eq!(decoded.len(), 30, "15 packed bytes produce 30 frames");
     assert!(
         decoded.iter().any(|&(left, _)| left != 0),
@@ -599,6 +602,18 @@ fn opl_sounds_through_the_sound_blaster_aliases() {
 }
 
 #[test]
+fn opl_aliases_remain_live_when_the_sb16_path_is_disabled() {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
+
+    with_bus(&mut machine, |bus| program_tone(bus, 0x0220, 0x0221));
+    let pcm = machine.render_audio(2_000);
+
+    assert!(pcm.iter().any(|&(left, _)| left != 0));
+}
+
+#[test]
 fn play_audio_mixes_cd_audio_into_render_audio() {
     let mut machine = test_machine();
     machine.mount_cd(audio_cd(20));
@@ -679,6 +694,29 @@ fn cd_audio_is_silent_with_the_volume_muted() {
         pcm.iter().all(|&(l, r)| l == 0 && r == 0),
         "a muted CD volume yields silence even while playing"
     );
+}
+
+#[test]
+fn disabled_sb16_silences_ct1745_cd_input_without_stopping_transport() {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
+    machine.mount_cd(audio_cd(20));
+    machine.set_cd_linked_level(31);
+
+    let mut cdb = [0u8; 12];
+    cdb[0] = 0x45;
+    cdb[5] = 1;
+    cdb[8] = 16;
+    timed_packet(&mut machine, cdb);
+    assert!(machine.ide.device().mixer_audio_active());
+    let pcm = machine.render_audio(20_000);
+
+    assert!(machine.cd_audio_state().playing);
+    assert_eq!(machine.cd_audio_state().left_level, 0);
+    assert_eq!(machine.cd_audio_state().right_level, 0);
+    assert!(!machine.ide.device().mixer_audio_active());
+    assert!(pcm.iter().all(|&(left, right)| left == 0 && right == 0));
 }
 
 #[test]

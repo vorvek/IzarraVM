@@ -230,7 +230,7 @@ fn sb_dsp_reset_handshake_through_the_bus() {
         bus.write_io(0x226, BusWidth::Byte, 0x00, false).unwrap();
     });
     // Advance emulated time past the ~100us DSP settle window.
-    machine.advance_dsp_micros(200);
+    machine.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ / 5_000);
     let status = with_bus(&mut machine, |bus| {
         u8::try_from(bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap()).unwrap()
     });
@@ -284,6 +284,62 @@ fn sb_dsp_write_status_does_not_read_as_open_bus() {
         status & 0x80,
         0x00,
         "DSP write-status bit 7 clear means ready for commands"
+    );
+}
+
+#[test]
+fn idle_f2_publishes_8bit_status_and_22f_cross_acknowledges_it() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x22C, BusWidth::Byte, 0xF2, false).unwrap();
+    });
+    assert!(!machine.pic.irr_bit(5));
+
+    machine.advance_devices_ticks(0);
+
+    assert!(machine.pic.irr_bit(5));
+    let (status, cleared) = with_bus(&mut machine, |bus| {
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let status = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        bus.read_io(0x22F, BusWidth::Byte, 0, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let cleared = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        (status, cleared)
+    });
+    assert_eq!(status, 0x01);
+    assert_eq!(cleared, 0x00);
+    assert!(
+        machine.pic.irr_bit(5),
+        "the device ack does not clear the PIC"
+    );
+}
+
+#[test]
+fn f2_after_16bit_arm_publishes_16bit_status_and_22e_cross_acknowledges_it() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        for byte in [0xB0u8, 0x00, 0x00, 0x00, 0xF2] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+
+    machine.advance_devices_ticks(0);
+
+    assert!(machine.pic.irr_bit(5));
+    let (status, cleared) = with_bus(&mut machine, |bus| {
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let status = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let cleared = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        (status, cleared)
+    });
+    assert_eq!(status, 0x02);
+    assert_eq!(cleared, 0x00);
+    assert!(
+        machine.pic.irr_bit(5),
+        "the device ack does not clear the PIC"
     );
 }
 
@@ -343,7 +399,7 @@ fn sb16_8bit_dma_command_c0_plays_and_raises_irq5() {
     machine.advance_devices_clocks(200_000);
     let after = with_bus(&mut machine, |bus| bus.interrupt_pending());
     assert!(after, "SB16 0xC0 DMA playback must raise IRQ5");
-    let out = machine.render_dsp_audio(16);
+    let out = machine.sb16.test_render_dsp_audio(16);
     assert_eq!(out.len(), 16, "SB16 0xC0 playback drained DMA bytes");
 }
 
@@ -409,7 +465,7 @@ fn sb_mixer_selects_dma_channel_3() {
     });
     let out = {
         machine.advance_devices_clocks(200_000);
-        machine.render_dsp_audio(16)
+        machine.sb16.test_render_dsp_audio(16)
     };
     assert_eq!(out.len(), 16, "buffer drained via DMA channel 3");
     assert!(out.iter().any(|&(l, _)| l < 0), "expected negative samples");
@@ -449,7 +505,6 @@ fn machine_applies_host_sound_blaster_config_at_boot() {
     };
     let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
     // The mixer boots on the configured routing, not the hardware IRQ5/DMA1/DMA5.
-    assert_eq!(machine.sb_selected_irq(), 7);
     let (irq_byte, dma_byte) = with_bus(&mut machine, |bus| {
         bus.write_io(0x224, BusWidth::Byte, 0x80, false).unwrap();
         let irq = u8::try_from(bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap()).unwrap();
@@ -459,6 +514,47 @@ fn machine_applies_host_sound_blaster_config_at_boot() {
     });
     assert_eq!(irq_byte, 0x04, "register 0x80 boots on IRQ7");
     assert_eq!(dma_byte, 0x48, "register 0x81 boots on DMA3 | DMA6");
+}
+
+#[test]
+fn disabled_sb16_leaves_ports_dma_irq_and_voice_inert() {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
+    machine.write_physical_u8(0x1_0000, 0x55);
+
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0x04, false).unwrap();
+        bus.write_io(0x22C, BusWidth::Byte, 0xF2, false).unwrap();
+    });
+
+    machine.advance_devices_clocks(200_000);
+
+    assert!(!machine.pic.irr_bit(5));
+    assert!(machine.sb16.irq_deadline().is_none());
+    assert_eq!(machine.dma_read_byte(1), Some(0x55));
+    let (index, data, dsp_data) = with_bus(&mut machine, |bus| {
+        (
+            bus.read_io(0x224, BusWidth::Byte, 0, false).unwrap(),
+            bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap(),
+            bus.read_io(0x22A, BusWidth::Byte, 0, false).unwrap(),
+        )
+    });
+    assert_eq!((index, data, dsp_data), (0x82, 0x04, 0xFF));
+    assert!(
+        machine
+            .render_audio(128)
+            .iter()
+            .all(|&(left, right)| left == 0 && right == 0)
+    );
 }
 
 #[test]
@@ -478,6 +574,10 @@ fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0000
         bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask ch1
+        bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
         // DSP: 11025 Hz, block 16, single 8-bit DMA output.
         for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
@@ -488,14 +588,28 @@ fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         // Playback is now clock-driven: advance CPU time for well over the
         // 16-sample block (single-cycle -> end IRQ), then drain the ring.
         machine.advance_devices_clocks(200_000);
-        machine.render_dsp_audio(16)
+        machine.sb16.test_render_dsp_audio(16)
     };
-    assert_eq!(out.len(), 16);
-    // Unsigned 0x00 maps to a centered negative sample; mono is duplicated L/R.
-    assert!(out.iter().any(|&(l, _)| l < 0), "expected negative samples");
-    assert!(
-        out.iter().all(|&(l, r)| l == r),
-        "8-bit mono duplicated L/R"
+    assert_eq!(
+        out,
+        vec![
+            (-32768, -32768),
+            (-28672, -28672),
+            (-24576, -24576),
+            (-20480, -20480),
+            (-16384, -16384),
+            (-12288, -12288),
+            (-8192, -8192),
+            (-4096, -4096),
+            (0, 0),
+            (4096, 4096),
+            (8192, 8192),
+            (12288, 12288),
+            (16384, 16384),
+            (20480, 20480),
+            (24576, 24576),
+            (28672, 28672),
+        ]
     );
     // Single mode masks channel 1 at terminal count.
     assert_eq!(machine.dma_read_byte(1), None);
@@ -539,7 +653,7 @@ fn sb_pro_8bit_stereo_deinterleaves_two_bytes_per_frame_at_the_halved_rate() {
     machine.advance_devices_clocks(200_000);
     // Drain the raw producer ring: each frame must carry DISTINCT L/R pulled
     // from two interleaved DMA bytes (left = even byte, right = odd byte).
-    let raw = machine.render_dsp_audio(8);
+    let raw = machine.sb16.test_render_dsp_audio(8);
     assert_eq!(raw.len(), 8, "8 stereo frames from a 16-byte block");
     // Frame 0: left byte 0 (= -32768), right byte 16 (= -28672); distinct.
     assert_ne!(raw[0].0, raw[0].1, "frame 0 de-interleaves distinct L/R");
@@ -554,7 +668,8 @@ fn sb_pro_8bit_stereo_deinterleaves_two_bytes_per_frame_at_the_halved_rate() {
     let out = machine.render_audio(OPL_NATIVE_HZ as usize / 50);
     assert!(!out.is_empty(), "SB Pro stereo produces output");
     assert_eq!(
-        machine.dsp_rate_hz, 11_111,
+        machine.sb16.test_resampler_rate_hz(),
+        11_111,
         "DSP resampler configured at the halved per-channel rate"
     );
 }
@@ -580,14 +695,14 @@ fn sb_pro_stereo_auto_init_keeps_every_frame_in_a_large_batch() {
                 .unwrap();
         }
     });
-    let rate = u64::from(machine.dsp.output_frame_rate());
+    let rate = u64::from(machine.sb16.test_output_frame_rate());
     let clocks = machine
         .timeline
         .cpu_clocks_until(timeline::DeviceClock::Dsp, 8, rate)
         .unwrap();
 
     machine.advance_devices_clocks(clocks);
-    let out = machine.render_dsp_audio(8);
+    let out = machine.sb16.test_render_dsp_audio(8);
 
     assert_eq!(out.len(), 8, "four auto-init blocks produce eight frames");
     assert!(out.iter().all(|(left, right)| left != right));
@@ -628,13 +743,13 @@ fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
                 .unwrap();
         }
     });
-    let rate = u64::from(machine.dsp.output_frame_rate());
+    let rate = u64::from(machine.sb16.test_output_frame_rate());
     let clocks = machine
         .timeline
         .cpu_clocks_until(timeline::DeviceClock::Dsp, 32, rate)
         .unwrap();
     machine.advance_devices_clocks(clocks);
-    let out = machine.render_dsp_audio(32);
+    let out = machine.sb16.test_render_dsp_audio(32);
     assert_eq!(out.len(), 32, "a large batch keeps every stereo frame");
     assert_eq!(out[0].0, -1, "left channel is signed -1");
     assert_eq!(out[0].1, 1, "right channel is signed +1");
@@ -670,7 +785,7 @@ fn sb_16bit_dma_waits_for_the_first_sample_deadline_before_reading() {
                 .unwrap();
         }
     });
-    let rate = u64::from(machine.dsp.output_frame_rate());
+    let rate = u64::from(machine.sb16.test_output_frame_rate());
     let first_frame = machine
         .timeline
         .cpu_clocks_until(timeline::DeviceClock::Dsp, 1, rate)
@@ -678,7 +793,7 @@ fn sb_16bit_dma_waits_for_the_first_sample_deadline_before_reading() {
 
     machine.advance_devices_clocks(first_frame - 1);
 
-    assert_eq!(machine.dsp.drain_frame(), None);
+    assert_eq!(machine.sb16.test_drain_frame(), None);
     assert_eq!(
         machine.dma_read_word(5),
         Some(0x1000),
@@ -707,17 +822,17 @@ fn short_16bit_dma_does_not_fabricate_silent_words() {
                 .unwrap();
         }
     });
-    let rate = u64::from(machine.dsp.output_frame_rate());
+    let rate = u64::from(machine.sb16.test_output_frame_rate());
     let clocks = machine
         .timeline
         .cpu_clocks_until(timeline::DeviceClock::Dsp, 8, rate)
         .unwrap();
 
     machine.advance_devices_clocks(clocks);
-    let out = machine.render_dsp_audio(8);
+    let out = machine.sb16.test_render_dsp_audio(8);
 
     assert_eq!(out.len(), 3, "only the three DMA words become samples");
-    assert_eq!(machine.dsp.block_remaining(), 5);
+    assert_eq!(machine.sb16.test_block_remaining(), 5);
     assert!(
         !machine.pic.irr_bit(5),
         "an incomplete DSP block has no IRQ"
@@ -949,21 +1064,13 @@ fn wss_coexists_with_sb16_and_opl_without_cross_talk() {
         wss_frames.iter().all(|&(l, r)| l == r && l > 0),
         "WSS 8-bit unsigned 0xFF -> near-full-positive mono dup, undisturbed"
     );
-    let dsp_out = machine.render_dsp_audio(16);
+    let dsp_out = machine.sb16.test_render_dsp_audio(16);
     assert_eq!(dsp_out.len(), 16, "SB16 DSP still plays its own buffer");
 
     // No IRQ cross-talk: WSS fired IRQ7, the SB16 fired its mixer-selected
     // IRQ5, and neither stepped on the other.
-    assert_eq!(
-        machine.sb_selected_irq(),
-        5,
-        "SB16 default IRQ unchanged by WSS"
-    );
     assert!(machine.pic.irr_bit(7), "WSS raised IRQ7");
-    assert!(
-        machine.pic.irr_bit(machine.sb_selected_irq()),
-        "SB16 raised its own (IRQ5) line"
-    );
+    assert!(machine.pic.irr_bit(5), "SB16 raised its own IRQ5 line");
 
     // No DMA cross-talk: the WSS drew from ch0, the SB16 from ch1; both single
     // channels reached terminal count on their own.
@@ -1027,7 +1134,7 @@ fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
     });
     machine.advance_devices_clocks(200_000);
     assert!(
-        machine.dsp.is_playing(),
+        machine.sb16.test_is_playing(),
         "auto-init keeps the block looping"
     );
     assert!(
@@ -1035,7 +1142,7 @@ fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
         "the block edges latched IRR5 within their own step"
     );
     assert!(
-        !machine.dsp.take_irq(),
+        !machine.sb16.test_take_irq(),
         "no edge stays parked in the DSP latch after the step"
     );
     // Guest ISR: PIC acknowledge, device ack (0x22E read), then EOI.
@@ -1160,8 +1267,8 @@ fn event_batch_cap_reaches_a_near_due_stereo_dsp_edge_in_every_mode() {
                     .unwrap();
             }
         });
-        assert_eq!(machine.dsp.frames_until_next_irq(), Some(1));
-        let rate = u64::from(machine.dsp.output_frame_rate());
+        assert_eq!(machine.sb16.test_frames_until_next_irq(), Some(1));
+        let rate = u64::from(machine.sb16.test_output_frame_rate());
         let due_ticks = timeline::RatePhase::default().ticks_until(1, rate).unwrap();
         machine.advance_devices_ticks(due_ticks - 1);
 
@@ -1549,12 +1656,14 @@ fn wss_stream_reaches_the_mixed_render_output_through_render_audio() {
     // Finding: the de-interleave smoke test pre-drains the ring before calling
     // render_audio, so the resampler + L/R summation path is never proven to
     // carry WSS audio. Here we arm an asymmetric stereo buffer, advance devices,
-    // and call render_audio WITHOUT draining -- with OPL/DSP idle and the speaker
-    // silent, the only possible signal is the WSS stream, so the mixed output
+    // and call render_audio WITHOUT draining. With SB16 disabled, OPL idle, and
+    // the speaker silent, the only possible signal is WSS, so the mixed output
     // must show the codec's L>0 / R<0 sign pattern. Disabling WSS for the same
     // buffer must then yield silence, proving the contribution came from the
     // WSS mix path and not from some other stream.
-    let mut machine = test_machine();
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.enabled = false;
+    let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
     load_asymmetric_stereo(&mut machine, 64);
     with_bus(&mut machine, |bus| wss_arm_16bit_stereo(bus, 64));
     machine.advance_devices_clocks(200_000);

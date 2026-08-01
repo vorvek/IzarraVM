@@ -745,7 +745,8 @@ impl Machine {
         let Some(root) = self.katea_root.clone() else {
             return 1; // no Katea host folder mounted
         };
-        let (config, autoexec) = default_config_pair();
+        let sound_blaster = self.profile.sound_blaster;
+        let (config, autoexec) = default_config_pair(&sound_blaster);
         // Per-file, not atomic across the two: if AUTOEXEC's write fails after
         // CONFIG was already rewritten, the folder is left half-repaired (default
         // CONFIG, no live AUTOEXEC). No data is lost — both originals survive in
