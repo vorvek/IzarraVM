@@ -10,8 +10,6 @@ video = "vega"
 c_drive = "R:\\La Colecci\u00f3n by Neville\\dosroot\\"
 
 [audio]
-pc_speaker = true
-opl3 = true
 
 [audio.sound_blaster]
 enabled = true
@@ -31,7 +29,6 @@ backend = "off" # P330 receiver: off, external, or munt
 keyboard = true
 mouse = true
 joystick = true
-steam_input = "off"
 
 [diagnostics]
 trace_devices = false

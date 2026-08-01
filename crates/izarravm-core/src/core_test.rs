@@ -46,6 +46,82 @@ fn emm386_conf_key_parses_and_is_ignored() {
 }
 
 #[test]
+fn retired_host_facade_keys_preserve_hardware_and_public_input() {
+    let control: AppConfig = toml::from_str(
+        r#"
+        [input]
+        keyboard = false
+        mouse = true
+        joystick = false
+        "#,
+    )
+    .unwrap();
+    let retired: AppConfig = toml::from_str(
+        r#"
+        [audio]
+        pc_speaker = false
+        opl3 = false
+
+        [input]
+        keyboard = false
+        mouse = true
+        joystick = false
+        steam_input = "optional_backend"
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        HardwareProfile::from_config(&retired).unwrap(),
+        HardwareProfile::from_config(&control).unwrap()
+    );
+    assert_eq!(retired.input.keyboard, control.input.keyboard);
+    assert_eq!(retired.input.mouse, control.input.mouse);
+    assert_eq!(retired.input.joystick, control.input.joystick);
+}
+
+#[test]
+fn retired_host_facade_keys_accept_their_previous_values() {
+    for text in [
+        "[audio]\npc_speaker = true\nopl3 = true\n[input]\nsteam_input = \"off\"\n",
+        "[audio]\npc_speaker = false\nopl3 = false\n[input]\nsteam_input = \"optional_backend\"\n",
+    ] {
+        toml::from_str::<AppConfig>(text).unwrap();
+    }
+}
+
+#[test]
+fn retired_host_facade_keys_remain_strict() {
+    for text in [
+        "[audio]\npc_speaker = \"yes\"\n",
+        "[audio]\nopl3 = 1\n",
+        "[input]\nsteam_input = \"required\"\n",
+    ] {
+        assert!(toml::from_str::<AppConfig>(text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn retired_host_facade_keys_are_not_serialized() {
+    let config: AppConfig = toml::from_str(
+        r#"
+        [audio]
+        pc_speaker = false
+        opl3 = false
+
+        [input]
+        steam_input = "optional_backend"
+        "#,
+    )
+    .unwrap();
+    let serialized = toml::to_string(&config).unwrap();
+
+    assert!(!serialized.contains("pc_speaker"));
+    assert!(!serialized.contains("opl3"));
+    assert!(!serialized.contains("steam_input"));
+}
+
+#[test]
 fn rejects_memory_outside_supported_range() {
     let mut config = AppConfig::default();
     config.machine.memory_mib = 1;

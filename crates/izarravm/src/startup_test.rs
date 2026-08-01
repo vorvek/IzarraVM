@@ -825,6 +825,43 @@ fn explicit_paths_stay_relative_and_portable_glide_stays_global() {
 }
 
 #[test]
+fn gui_launch_carries_the_resolved_host_input_policy() {
+    let root = startup_test_dir("host-input-policy");
+    let config_path = root.join("input.toml");
+    let c_drive = root.join("c_drive");
+    let locations = StartupLocations {
+        state_dir: root.join("state"),
+        executable_dir: root.join("portable"),
+    };
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--c-drive",
+        c_drive.to_str().unwrap(),
+    ])
+    .unwrap();
+    let resolved = resolve_with(&cli, &locations, |path| {
+        if path == config_path {
+            Ok("[input]\nkeyboard = false\nmouse = true\njoystick = false\n".into())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fixture has no preferences",
+            ))
+        }
+    })
+    .unwrap();
+
+    let policy = resolved.into_gui(vec![0x42], false).host_input;
+    assert!(!policy.keyboard_enabled());
+    assert!(policy.mouse_enabled());
+    assert!(!policy.joystick_enabled());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn headless_startup_resolves_toml_then_cli_hardware() {
     let root = startup_test_dir("headless-resolution");
     let config_path = root.join("headless.toml");

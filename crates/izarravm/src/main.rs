@@ -10,6 +10,7 @@ mod bench_reference;
 mod cmos;
 mod crt;
 mod gui;
+mod host_input;
 mod prefs;
 #[cfg(windows)]
 mod riprofile;

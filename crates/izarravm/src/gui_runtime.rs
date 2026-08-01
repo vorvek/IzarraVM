@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::host_input::HostInputPolicy;
+use winit::keyboard::KeyCode;
 
 /// The wgpu surface, device, queue, and surface config for the one window.
 struct WgpuState {
@@ -11,16 +13,144 @@ struct WgpuState {
     config: wgpu::SurfaceConfiguration,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum KeyRoute {
+    Guest {
+        code: KeyCode,
+        pressed: bool,
+        repeat: bool,
+    },
+    Rebind {
+        key: String,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    },
+    ReleaseCapture,
+    ToggleFullscreen,
+    Swallowed,
+}
+
+#[derive(Clone, Copy)]
+struct KeyRouteContext<'a> {
+    capturing_bind: bool,
+    input_captured: bool,
+    input_release: &'a KeyBinding,
+    fullscreen: &'a KeyBinding,
+}
+
+#[derive(Default)]
+struct HostKeyRouter {
+    keyboard: HostKeyboard,
+    ctrl_down: bool,
+    shift_down: bool,
+    alt_down: bool,
+    pressed: Vec<KeyCode>,
+    swallowed: Vec<KeyCode>,
+}
+
+impl HostKeyRouter {
+    fn route(
+        &mut self,
+        code: KeyCode,
+        pressed: bool,
+        repeat: bool,
+        context: KeyRouteContext<'_>,
+    ) -> KeyRoute {
+        match code {
+            KeyCode::ControlLeft | KeyCode::ControlRight => self.ctrl_down = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.shift_down = pressed,
+            KeyCode::AltLeft | KeyCode::AltRight => self.alt_down = pressed,
+            _ => {}
+        }
+        if pressed {
+            if !self.pressed.contains(&code) {
+                self.pressed.push(code);
+            }
+        } else if let Some(index) = self.pressed.iter().position(|held| *held == code) {
+            self.pressed.swap_remove(index);
+        }
+
+        if !pressed {
+            if let Some(index) = self.swallowed.iter().position(|held| *held == code) {
+                self.swallowed.swap_remove(index);
+                return KeyRoute::Swallowed;
+            }
+        } else if self.swallowed.contains(&code) {
+            return KeyRoute::Swallowed;
+        }
+
+        let is_modifier = matches!(
+            code,
+            KeyCode::ControlLeft
+                | KeyCode::ControlRight
+                | KeyCode::ShiftLeft
+                | KeyCode::ShiftRight
+                | KeyCode::AltLeft
+                | KeyCode::AltRight
+        );
+        let key = format!("{code:?}");
+        let (ctrl, shift, alt) = (self.ctrl_down, self.shift_down, self.alt_down);
+
+        if pressed && !repeat && !is_modifier && context.capturing_bind {
+            self.swallow(code);
+            return KeyRoute::Rebind {
+                key,
+                ctrl,
+                shift,
+                alt,
+            };
+        }
+        if pressed
+            && !repeat
+            && context.input_captured
+            && context.input_release.matches(&key, ctrl, shift, alt)
+        {
+            self.swallow(code);
+            return KeyRoute::ReleaseCapture;
+        }
+        if pressed && !repeat && context.fullscreen.matches(&key, ctrl, shift, alt) {
+            self.swallow(code);
+            return KeyRoute::ToggleFullscreen;
+        }
+
+        KeyRoute::Guest {
+            code,
+            pressed,
+            repeat,
+        }
+    }
+
+    fn swallow(&mut self, code: KeyCode) {
+        if !self.swallowed.contains(&code) {
+            self.swallowed.push(code);
+        }
+    }
+
+    fn is_pressed(&self, code: KeyCode) -> bool {
+        self.pressed.contains(&code)
+    }
+
+    fn keyboard_mut(&mut self) -> &mut HostKeyboard {
+        &mut self.keyboard
+    }
+
+    fn focus_lost(&mut self, policy: HostInputPolicy) -> Vec<u8> {
+        let releases = policy.release_scancodes(&mut self.keyboard);
+        self.ctrl_down = false;
+        self.shift_down = false;
+        self.alt_down = false;
+        self.pressed.clear();
+        self.swallowed.clear();
+        releases
+    }
+}
+
 /// Owns the winit window and the egui-on-wgpu plumbing. The GUI logic lives in
 /// `GuiApp`; this struct routes raw winit events to it and drives the render.
 struct WinitApp {
     gui: GuiApp,
-    host_kbd: HostKeyboard,
-    // Physical modifier state, tracked so the configurable hotkeys (input
-    // release, fullscreen) and the rebind capture can read the live combo.
-    ctrl_down: bool,
-    shift_down: bool,
-    alt_down: bool,
+    keys: HostKeyRouter,
     // Whether the window is currently fullscreen, toggled by the fullscreen hotkey.
     is_fullscreen: bool,
     // Whether our window has keyboard focus. Raw device key events are global, so
@@ -31,9 +161,6 @@ struct WinitApp {
     // that drops numpad releases on the cooked WindowEvent path); the cooked path
     // is the fallback only until/unless raw events appear (e.g. on Wayland).
     raw_keys: bool,
-    // Host shortcuts are withheld from the guest; remember their trigger key so
-    // repeats and the matching release edge are swallowed too.
-    host_hotkeys_down: Vec<winit::keyboard::KeyCode>,
     window: Option<Arc<Window>>,
     wgpu: Option<WgpuState>,
     egui_ctx: egui::Context,
@@ -135,61 +262,45 @@ impl WinitApp {
     /// goes through HostKeyboard and on to the emulation thread. Used by both the
     /// raw DeviceEvent::Key path and the cooked WindowEvent fallback.
     fn handle_guest_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool, repeat: bool) {
-        use winit::keyboard::KeyCode;
-        // Track modifiers (still forwarded to the guest below).
-        match code {
-            KeyCode::ControlLeft | KeyCode::ControlRight => self.ctrl_down = pressed,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.shift_down = pressed,
-            KeyCode::AltLeft | KeyCode::AltRight => self.alt_down = pressed,
-            _ => {}
-        }
-        let is_modifier = matches!(
+        let route = self.keys.route(
             code,
-            KeyCode::ControlLeft
-                | KeyCode::ControlRight
-                | KeyCode::ShiftLeft
-                | KeyCode::ShiftRight
-                | KeyCode::AltLeft
-                | KeyCode::AltRight
+            pressed,
+            repeat,
+            KeyRouteContext {
+                capturing_bind: self.gui.is_capturing_bind(),
+                input_captured: self.gui.input_captured,
+                input_release: &self.gui.input_release,
+                fullscreen: &self.gui.fullscreen_key,
+            },
         );
-        // The winit KeyCode debug name is the binding's key identity (e.g. "F2").
-        let name = format!("{code:?}");
-        let (ctrl, shift, alt) = (self.ctrl_down, self.shift_down, self.alt_down);
-
-        if !pressed {
-            if let Some(index) = self.host_hotkeys_down.iter().position(|held| *held == code) {
-                self.host_hotkeys_down.swap_remove(index);
-                return;
+        match route {
+            KeyRoute::Guest {
+                code,
+                pressed,
+                repeat,
+            } => {
+                let codes = self.gui.host_input.key_scancodes(
+                    self.keys.keyboard_mut(),
+                    code,
+                    pressed,
+                    repeat,
+                );
+                self.gui.send_keys_to_guest(codes);
             }
-        } else if self.host_hotkeys_down.contains(&code) {
-            return;
-        }
-
-        // The config dialog is capturing a rebind: take the next non-modifier key
-        // as the new combo and swallow it.
-        if pressed && !is_modifier && self.gui.is_capturing_bind() {
-            self.gui.record_bind(&name, ctrl, shift, alt);
-            return;
-        }
-        if pressed
-            && !repeat
-            && self.gui.input_captured
-            && self.gui.input_release.matches(&name, ctrl, shift, alt)
-        {
-            self.host_hotkeys_down.push(code);
-            if let Some(window) = self.window.clone() {
-                self.gui.toggle_capture(&window, &mut self.host_kbd);
+            KeyRoute::Rebind {
+                key,
+                ctrl,
+                shift,
+                alt,
+            } => self.gui.record_bind(&key, ctrl, shift, alt),
+            KeyRoute::ReleaseCapture => {
+                if let Some(window) = self.window.clone() {
+                    self.gui.toggle_capture(&window, self.keys.keyboard_mut());
+                }
             }
-            return;
+            KeyRoute::ToggleFullscreen => self.toggle_fullscreen(),
+            KeyRoute::Swallowed => {}
         }
-        if pressed && !repeat && self.gui.fullscreen_key.matches(&name, ctrl, shift, alt) {
-            self.host_hotkeys_down.push(code);
-            self.toggle_fullscreen();
-            return;
-        }
-
-        let codes = self.host_kbd.key_with_repeat(code, pressed, repeat);
-        self.gui.send_keys_to_guest(codes);
     }
 
     /// Toggle borderless fullscreen on the window.
@@ -298,11 +409,8 @@ impl ApplicationHandler for WinitApp {
             if !*focused {
                 // Release everything held so a key down at the moment of an
                 // alt-tab (Shift, in a game) does not stick in the guest.
-                self.gui.send_keys_to_guest(self.host_kbd.release_all());
-                self.ctrl_down = false;
-                self.shift_down = false;
-                self.alt_down = false;
-                self.host_hotkeys_down.clear();
+                let releases = self.keys.focus_lost(self.gui.host_input);
+                self.gui.send_keys_to_guest(releases);
                 return;
             }
             // Focused(true): fall through so egui also observes regained focus.
@@ -310,7 +418,7 @@ impl ApplicationHandler for WinitApp {
         // While captured, pointer buttons go to the guest and egui is skipped;
         // motion comes from DeviceEvent::MouseMotion instead. When not captured,
         // fall through so the sidebar and the click-to-capture still work.
-        if self.gui.input_captured {
+        if self.gui.guest_mouse_active() {
             if let WindowEvent::MouseInput { state, button, .. } = &event {
                 let bit = match button {
                     MouseButton::Left => 0x01,
@@ -370,12 +478,12 @@ impl ApplicationHandler for WinitApp {
                     && let PhysicalKey::Code(code) = raw.physical_key
                 {
                     let pressed = raw.state == ElementState::Pressed;
-                    let repeat = pressed && !first_raw && self.host_kbd.is_held(code);
+                    let repeat = pressed && !first_raw && self.keys.is_pressed(code);
                     self.handle_guest_key(code, pressed, repeat);
                 }
             }
             // Raw relative pointer motion drives the captured guest cursor.
-            DeviceEvent::MouseMotion { delta } if self.gui.input_captured => {
+            DeviceEvent::MouseMotion { delta } if self.gui.guest_mouse_active() => {
                 self.gui
                     .accumulate_guest_motion(delta.0 as f32, delta.1 as f32);
             }
@@ -389,7 +497,7 @@ impl ApplicationHandler for WinitApp {
         if self.gui.take_want_capture()
             && let Some(window) = &self.window
         {
-            self.gui.toggle_capture(window, &mut self.host_kbd);
+            self.gui.toggle_capture(window, self.keys.keyboard_mut());
         }
         // Apply the raw mouse motion the Windows WM_INPUT hook accumulated since
         // the last pass (zero elsewhere, where DeviceEvent::MouseMotion drives
@@ -397,13 +505,15 @@ impl ApplicationHandler for WinitApp {
         // due, so it is never left stranded in raw_mouse between flushes.
         let now = Instant::now();
         let (rdx, rdy) = self.raw_mouse.take();
-        if self.gui.input_captured && (rdx != 0 || rdy != 0) {
+        if self.gui.guest_mouse_active() && (rdx != 0 || rdy != 0) {
             self.gui.accumulate_guest_motion(rdx as f32, rdy as f32);
         }
         // Flush mouse motion on its own, faster cadence (MOUSE_FLUSH_HZ),
         // independent of rendering: see that constant's doc comment.
         if now >= self.next_mouse_flush {
-            self.gui.flush_guest_motion();
+            if self.gui.guest_mouse_active() {
+                self.gui.flush_guest_motion();
+            }
             self.next_mouse_flush = now + Duration::from_secs_f64(1.0 / MOUSE_FLUSH_HZ);
         }
         if now >= self.next_joystick_poll {
@@ -481,12 +591,16 @@ fn read_raw_mouse_delta(
 #[cfg(windows)]
 fn build_event_loop(
     raw_mouse: RawMouseAccum,
+    mouse_enabled: bool,
 ) -> Result<EventLoop<()>, winit::error::EventLoopError> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, MSG, WM_INPUT, WM_MOUSEMOVE,
     };
     use winit::platform::windows::EventLoopBuilderExtWindows;
     let mut builder = EventLoop::builder();
+    if !mouse_enabled {
+        return builder.build();
+    }
     // Last legacy mouse-move we let through, to throttle the flood below.
     let last_move = Cell::new(None::<Instant>);
     builder.with_msg_hook(move |ptr| {
@@ -532,6 +646,7 @@ fn build_event_loop(
 #[cfg(not(windows))]
 fn build_event_loop(
     _raw_mouse: RawMouseAccum,
+    _mouse_enabled: bool,
 ) -> Result<EventLoop<()>, winit::error::EventLoopError> {
     EventLoop::builder().build()
 }
@@ -539,21 +654,18 @@ fn build_event_loop(
 /// Open the window and run the emulator. Returns when the user closes it.
 pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     let raw_mouse = RawMouseAccum::default();
-    let event_loop = build_event_loop(raw_mouse.clone())?;
+    let host_input = launch.host_input;
+    let event_loop = build_event_loop(raw_mouse.clone(), host_input.mouse_enabled())?;
     let gui = GuiApp::new(launch);
     let egui_ctx = egui::Context::default();
     enlarge_ui_fonts(&egui_ctx);
     apply_black_theme(&egui_ctx);
     let mut app = WinitApp {
         gui,
-        host_kbd: HostKeyboard::default(),
-        ctrl_down: false,
-        shift_down: false,
-        alt_down: false,
+        keys: HostKeyRouter::default(),
         is_fullscreen: false,
         focused: true,
         raw_keys: false,
-        host_hotkeys_down: Vec::new(),
         window: None,
         wgpu: None,
         egui_ctx,
@@ -567,3 +679,7 @@ pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     event_loop.run_app(&mut app)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "gui_runtime_test.rs"]
+mod tests;

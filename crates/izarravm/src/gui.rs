@@ -8,6 +8,7 @@ mod ui;
 
 pub use runtime::run;
 
+use crate::host_input::HostInputPolicy;
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioDebugSnapshot, AudioPlayer, AudioSink, MidiEngine};
@@ -1713,7 +1714,7 @@ pub struct GuiApp {
     glide_ovl: Option<Vec<u8>>,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
-    joystick_enabled: bool,
+    host_input: HostInputPolicy,
     gamepads: Option<GamepadManager>,
     joystick_binding: Option<JoystickBinding>,
     last_joystick_sent: Option<Option<JoystickSample>>,
@@ -1976,7 +1977,7 @@ impl GuiApp {
             glide_ovl,
             test_pattern,
             rtc_setup,
-            joystick_enabled,
+            host_input,
             prefs,
             prefs_path,
         } = launch;
@@ -1996,7 +1997,8 @@ impl GuiApp {
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
         let joystick_binding = prefs.joystick_binding.clone();
-        let gamepads = joystick_enabled
+        let gamepads = host_input
+            .joystick_enabled()
             .then(GamepadManager::new)
             .and_then(|result| match result {
                 Ok(manager) => Some(manager),
@@ -2020,7 +2022,7 @@ impl GuiApp {
             glide_ovl,
             test_pattern,
             rtc_setup,
-            joystick_enabled,
+            host_input,
             gamepads,
             joystick_binding,
             last_joystick_sent: None,
@@ -2206,7 +2208,10 @@ impl GuiApp {
         // Clicking the screen requests input capture (handled later by the event
         // loop, which owns the winit Window).
         let response = ui.interact(rect, ui.id().with("monitor-capture"), egui::Sense::click());
-        if response.clicked() && !self.input_captured {
+        if self
+            .host_input
+            .mouse_capture_requested(response.clicked(), self.input_captured)
+        {
             self.want_capture = true;
         }
     }
@@ -2214,7 +2219,7 @@ impl GuiApp {
     /// Forward already-translated Set 1 bytes to the emulation thread. Empty
     /// slices (an unmapped key, nothing held) are dropped.
     fn send_keys_to_guest(&self, codes: Vec<u8>) {
-        if codes.is_empty() {
+        if !self.host_input.keyboard_enabled() || codes.is_empty() {
             return;
         }
         if let Some(emu) = &self.emu {
@@ -2238,7 +2243,12 @@ impl GuiApp {
 
     /// Whether monitor_ui flagged a click-to-capture this frame, clearing it.
     fn take_want_capture(&mut self) -> bool {
-        std::mem::take(&mut self.want_capture)
+        let requested = std::mem::take(&mut self.want_capture);
+        self.host_input.mouse_enabled() && requested
+    }
+
+    fn guest_mouse_active(&self) -> bool {
+        self.host_input.mouse_active(self.input_captured)
     }
 
     /// Enter or leave input capture. While captured we lock and hide the OS cursor
@@ -2249,6 +2259,10 @@ impl GuiApp {
     /// is nothing for the OS cursor to escape and no warp to fight. On release we
     /// flush any held keys so nothing sticks down in the guest.
     fn toggle_capture(&mut self, window: &winit::window::Window, kbd: &mut HostKeyboard) {
+        if !self.input_captured && !self.host_input.mouse_enabled() {
+            self.want_capture = false;
+            return;
+        }
         self.input_captured = !self.input_captured;
         self.last_buttons = 0;
         if self.input_captured {
@@ -2262,7 +2276,8 @@ impl GuiApp {
                 .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
             window.set_cursor_visible(false);
         } else {
-            self.send_keys_to_guest(kbd.release_all());
+            let releases = self.host_input.release_scancodes(kbd);
+            self.send_keys_to_guest(releases);
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
             window.set_cursor_visible(true);
         }
@@ -2275,6 +2290,10 @@ impl GuiApp {
     /// Update the guest button mask from a pointer button edge and send it with any
     /// motion still pending this frame, so a click lands at the cursor's spot.
     fn set_guest_button(&mut self, bit: u8, pressed: bool) {
+        if !self.guest_mouse_active() {
+            self.last_buttons = 0;
+            return;
+        }
         if pressed {
             self.last_buttons |= bit;
         } else {
@@ -2294,6 +2313,10 @@ impl GuiApp {
     /// (positive = scroll-up); fractional pixel-delta accumulates so only whole
     /// detents are sent, one +/-1 command per notch.
     fn forward_guest_wheel(&mut self, lines: f32) {
+        if !self.guest_mouse_active() {
+            self.wheel_accum = 0.0;
+            return;
+        }
         self.wheel_accum += lines;
         if let Some(emu) = &self.emu {
             while self.wheel_accum >= 1.0 {
@@ -2311,6 +2334,12 @@ impl GuiApp {
     /// The guest driver applies its ratio and clamps to the video mode's range, so
     /// the host forwards the raw counts unscaled and unclamped.
     fn accumulate_guest_motion(&mut self, dx: f32, dy: f32) {
+        if !self.guest_mouse_active() {
+            self.mouse_rel_x = 0.0;
+            self.mouse_rel_y = 0.0;
+            self.mouse_dirty = false;
+            return;
+        }
         self.mouse_rel_x += dx;
         self.mouse_rel_y += dy;
         self.mouse_dirty = true;
@@ -2320,6 +2349,12 @@ impl GuiApp {
     /// packet, if any. The caller paces this separately from rendering so an 8000
     /// Hz mouse drives the guest at MOUSE_FLUSH_HZ, not at the host polling rate.
     fn flush_guest_motion(&mut self) {
+        if !self.guest_mouse_active() {
+            self.mouse_rel_x = 0.0;
+            self.mouse_rel_y = 0.0;
+            self.mouse_dirty = false;
+            return;
+        }
         if !self.mouse_dirty {
             return;
         }
@@ -2355,7 +2390,7 @@ impl GuiApp {
             dialog.joystick_wizard = None;
         }
 
-        let sample = if self.joystick_enabled {
+        let sample = if self.host_input.joystick_enabled() {
             self.gamepads
                 .as_ref()
                 .zip(self.joystick_binding.as_ref())
@@ -2381,6 +2416,10 @@ impl GuiApp {
     /// toggles once (guarded by its held-flag). Runs every frame, so it also
     /// catches the host toggling a lock mid-session, not just the load.
     fn sync_guest_locks(&mut self) {
+        if !self.host_input.keyboard_enabled() {
+            self.guest_locks = [false; HOST_LOCK_KEYS.len()];
+            return;
+        }
         let Some(emu) = &self.emu else {
             return;
         };
