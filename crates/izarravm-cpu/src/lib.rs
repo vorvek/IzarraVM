@@ -3032,6 +3032,32 @@ pub fn linear_address(segment: u16, offset: u16) -> usize {
 /// each place would let them drift with nothing to notice.
 pub(crate) const IN_AL_DX_CORE_CLOCKS: u32 = 12;
 
+/// What `PUSHA`/`PUSHAD` (0x60) charges, named for the same reason `IN_AL_DX_CORE_CLOCKS` is: the
+/// interpreter's `execute_decoded` arm and the JIT's `PushAllDword` call-out slot must charge the
+/// same number, and both read this constant rather than a literal of their own.
+pub(crate) const PUSH_ALL_CORE_CLOCKS: u32 = 18;
+
+/// What `POPA`/`POPAD` (0x61) charges. See `PUSH_ALL_CORE_CLOCKS`.
+pub(crate) const POP_ALL_CORE_CLOCKS: u32 = 18;
+
+/// The largest core charge any admitted call-out helper can return, and the term
+/// `compute_iteration_upper` / `compute_global_block_upper` must price a slot at when they cannot
+/// tell the helpers apart. Derived from the three constants above rather than written down, so a
+/// fourth helper with a bigger charge raises it by construction instead of silently under-budgeting
+/// the block that carries it.
+pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
+    let a = if IN_AL_DX_CORE_CLOCKS > PUSH_ALL_CORE_CLOCKS {
+        IN_AL_DX_CORE_CLOCKS
+    } else {
+        PUSH_ALL_CORE_CLOCKS
+    };
+    if a > POP_ALL_CORE_CLOCKS {
+        a
+    } else {
+        POP_ALL_CORE_CLOCKS
+    }
+};
+
 fn clocks(core_clocks: u32) -> CycleOutcome {
     CycleOutcome {
         core_clocks,

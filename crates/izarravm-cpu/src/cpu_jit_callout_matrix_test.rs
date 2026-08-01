@@ -1091,3 +1091,450 @@ fn a_structural_write_retires_a_lane_and_call_out_block_that_a_lane_write_kept()
         "a write to the block's opcode bytes must retire it, call-out or not"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The MEMORY class: `0x60` PUSHAD and `0x61` POPAD.
+//
+// Every row here is mid-block against a block-free interpreter on the same bytes, and
+// `compare_state` already covers guest RAM byte-for-byte -- which is the whole point for a helper
+// that moves thirty-two bytes of stack.
+// ---------------------------------------------------------------------------------------------
+
+const PUSHAD: u8 = 0x60;
+const POPAD: u8 = 0x61;
+/// `sub cx, 4` at Word operand size -- the third member of the census's coupled prologue family,
+/// forty-seven exits from PUSHAD and lowered NATIVELY rather than as a call-out.
+const SUB_CX_IMM8: [u8; 4] = [0x66, 0x83, 0xe9, 0x04];
+
+/// Put the pages a PUSHAD/POPAD frame touches into BOTH roles' fast maps.
+///
+/// `call_out_stack_frame_resident` refuses a frame whose pages the FastMap cannot serve, so
+/// without this every row below would measure the REFUSAL rather than the mechanism. That is not a
+/// fixture cheat: in production the interpreter's own direct-page path populates the map the first
+/// time it touches the stack (`populate_fast_map_from_cached`), so a cold first PUSHAD refuses,
+/// the interpreter executes it, and the next entry succeeds.
+/// `a_pushad_whose_frame_is_not_resident_is_refused_and_left_to_the_interpreter` is the row that
+/// measures the cold half deliberately.
+///
+/// Both roles, identically, so nothing the population does can move the differential.
+fn warm_stack_frame_pages(roles: &mut Roles) {
+    // One page either side of STACK_TOP, so a frame that crosses a page boundary is covered.
+    warm_pages(
+        roles,
+        &[STACK_TOP.wrapping_sub(0x1000) & !0xfff, STACK_TOP & !0xfff],
+    );
+}
+
+/// Arm the interpreter's FastMap serve gate on both roles and populate `pages` in both maps.
+///
+/// Population goes through REAL guest accesses rather than `FastMap::populate_write` directly, and
+/// that is the whole point: `lookup_access` compares the entry's mapping epoch against
+/// `data_write_pages.mapping_epoch()`, so an entry installed behind the DirectPageCache's back is
+/// not servable. Driving a read and a same-value write through `read_memory_bus_width` /
+/// `write_memory_bus_width` is exactly the path that populates the map in production, epochs
+/// included. The write is same-value, so guest RAM does not move and no code watch can fire.
+///
+/// Both roles, identically, and the traces are wiped afterwards so the warm-up contributes nothing
+/// to any differential.
+fn warm_pages(roles: &mut Roles, pages: &[u32]) {
+    for (cpu, bus) in [
+        (&mut roles.native, &mut roles.native_bus),
+        (&mut roles.interp, &mut roles.interp_bus),
+    ] {
+        cpu.jit_direct.set_fast_map_enabled_for_test(true);
+        cpu.refresh_fast_map_serve_gate();
+        for &page in pages {
+            let value = cpu
+                .read_memory_bus_width(
+                    bus,
+                    SegmentIndex::Ss,
+                    page,
+                    BusWidth::Dword,
+                    BusAccessKind::DataRead,
+                )
+                .expect("fixture warm read");
+            cpu.write_memory_bus_width(
+                bus,
+                SegmentIndex::Ss,
+                page,
+                BusWidth::Dword,
+                value,
+                BusAccessKind::DataWrite,
+            )
+            .expect("fixture warm write");
+        }
+    }
+    for bus in [&mut roles.native_bus, &mut roles.interp_bus] {
+        bus.trace = BusTrace::default();
+    }
+}
+
+/// Arm the serve gate WITHOUT populating anything, so a refusal is the residency clause rather
+/// than the gate.
+fn arm_fast_map_gate(roles: &mut Roles) {
+    for cpu in [&mut roles.native, &mut roles.interp] {
+        cpu.jit_direct.set_fast_map_enabled_for_test(true);
+        cpu.refresh_fast_map_serve_gate();
+    }
+}
+
+/// Seed the eight GPRs with distinct, high-bit-bearing values on both roles, then set ESP.
+///
+/// Distinct values are what makes a PUSHAD that pushed the registers in the wrong ORDER visible in
+/// guest RAM, and what makes a POPAD that loaded them into the wrong destinations visible in the
+/// register compare. `arm` fills the file with zeroes, which would pass against both bugs.
+fn seed_registers(roles: &mut Roles, esp: u32) {
+    const SEED: [u32; 8] = [
+        0x1111_0001,
+        0x2222_0002,
+        0x3333_0003,
+        0x4444_0004,
+        0xdead_dead, // overwritten by `esp` below; present so the array is eight wide
+        0x6666_0006,
+        0x7777_0007,
+        0x8888_0008,
+    ];
+    for cpu in [&mut roles.native, &mut roles.interp] {
+        cpu.registers.gpr = SEED;
+        cpu.registers.set_esp(esp);
+    }
+}
+
+#[test]
+fn pushad_mid_block_matches_the_interpreter() {
+    // The memory class's headline row. Thirty-two bytes of stack, eight registers read, ESP
+    // written -- and `compare_state` compares guest RAM, so a wrong push ORDER, a wrong pushed SP
+    // value (PUSHAD pushes the PRE-instruction SP, not the decremented one) or a missing store
+    // fails here rather than somewhere subtle.
+    let (code, starts) = program(&[&[PUSHAD]]);
+    let mut roles = build(&code, &starts, |_| {}, |_| {});
+    assert_eq!(
+        roles.instructions, 3,
+        "the block must cover all three slots"
+    );
+    assert_eq!(roles.callout_slots, 1);
+    warm_stack_frame_pages(&mut roles);
+    seed_registers(&mut roles, STACK_TOP);
+
+    let executed = roles.native.direct_stall_snapshot().callout_executed;
+    let retired = roles.native.perf_counters().jit_direct_insns;
+    assert!(run_block(&mut roles, 3), "the block did not run natively");
+
+    assert_eq!(
+        roles.native.direct_stall_snapshot().callout_executed - executed,
+        1,
+        "the PUSHAD call-out must have run"
+    );
+    assert_eq!(
+        roles
+            .native
+            .direct_stall_snapshot()
+            .side_exit_callout_abnormal,
+        0,
+        "the frame was made resident, so the fail-closed path must not fire"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - retired,
+        3,
+        "all three slots, the PUSHAD included, must retire natively"
+    );
+    assert_eq!(
+        roles.native.registers.esp(),
+        STACK_TOP - 32,
+        "ESP must have moved by the whole frame"
+    );
+    compare_state(&roles, "pushad mid-block");
+}
+
+#[test]
+fn popad_mid_block_matches_the_interpreter_and_the_reload_publishes_all_eight_registers() {
+    // The row the reload derivation exists for. `0xEC` wrote one byte of one register; POPAD
+    // writes EIGHT plus ESP, so if the emitted slot's whole-set reload were partial this diverges
+    // on `registers` -- and the frame below is seeded with eight DISTINCT values, so a reload that
+    // dropped any one entry leaves a recognisable stale value rather than a zero.
+    let (code, starts) = program(&[&[POPAD]]);
+    let mut roles = build(&code, &starts, |_| {}, |_| {});
+    assert_eq!(roles.instructions, 3);
+    assert_eq!(roles.callout_slots, 1);
+    warm_stack_frame_pages(&mut roles);
+    // The frame POPAD will load: EDI, ESI, EBP, (discarded SP), EBX, EDX, ECX, EAX.
+    const FRAME: [u32; 8] = [
+        0xaaaa_0007,
+        0xbbbb_0006,
+        0xcccc_0005,
+        0xdddd_0004,
+        0xeeee_0003,
+        0xffff_0002,
+        0x9999_0001,
+        0x8888_0000,
+    ];
+    let base = STACK_TOP - 32;
+    for bus in [&mut roles.native_bus, &mut roles.interp_bus] {
+        for (index, value) in FRAME.iter().enumerate() {
+            let at = base as usize + index * 4;
+            bus.memory[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    seed_registers(&mut roles, base);
+
+    let executed = roles.native.direct_stall_snapshot().callout_executed;
+    let retired = roles.native.perf_counters().jit_direct_insns;
+    assert!(run_block(&mut roles, 3), "the block did not run natively");
+
+    assert_eq!(
+        roles.native.direct_stall_snapshot().callout_executed - executed,
+        1
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - retired,
+        3,
+        "all three slots must retire natively"
+    );
+    // Spelled out rather than left to the differential: this is the mutation target.
+    assert_eq!(roles.native.registers.eax(), FRAME[7], "EAX");
+    assert_eq!(roles.native.registers.ecx(), FRAME[6], "ECX");
+    assert_eq!(roles.native.registers.edx(), FRAME[5], "EDX");
+    assert_eq!(roles.native.registers.ebx(), FRAME[4], "EBX");
+    assert_eq!(roles.native.registers.ebp(), FRAME[2], "EBP");
+    assert_eq!(roles.native.registers.esi(), FRAME[1], "ESI");
+    assert_eq!(roles.native.registers.edi(), FRAME[0], "EDI");
+    assert_eq!(
+        roles.native.registers.esp(),
+        STACK_TOP,
+        "ESP advances over the whole frame, discarded slot included"
+    );
+    compare_state(&roles, "popad mid-block");
+}
+
+#[test]
+fn pushad_and_popad_in_one_block_match_the_interpreter() {
+    // Two memory call-outs in one block, which is the shape the census's coupled family really
+    // takes (a prologue and its epilogue can land in one span). Also the first row where the
+    // SECOND helper reads registers the FIRST one wrote through the reload, so a reload that ran
+    // only on the success path, or only once, diverges.
+    let (code, starts) = program(&[&[PUSHAD], &SUB_CX_IMM8, &[POPAD]]);
+    let mut roles = build(&code, &starts, |_| {}, |_| {});
+    assert_eq!(roles.instructions, 5, "block shape");
+    assert_eq!(roles.callout_slots, 2, "both call-outs must be admitted");
+    warm_stack_frame_pages(&mut roles);
+    seed_registers(&mut roles, STACK_TOP);
+
+    let executed = roles.native.direct_stall_snapshot().callout_executed;
+    assert!(run_block(&mut roles, 5), "the block did not run natively");
+
+    assert_eq!(
+        roles.native.direct_stall_snapshot().callout_executed - executed,
+        2,
+        "both call-outs must run"
+    );
+    assert_eq!(
+        roles.native.registers.esp(),
+        STACK_TOP,
+        "PUSHAD then POPAD must leave ESP where it started"
+    );
+    compare_state(&roles, "pushad + word sub + popad");
+}
+
+#[test]
+fn a_page_crossing_pushad_frame_matches_the_interpreter() {
+    // The frame spans two pages, so the eight slots are resolved against two different fast-map
+    // entries. `call_out_stack_frame_resident` does not special-case this -- it resolves each dword
+    // individually -- and this row is what says that is enough rather than an oversight.
+    let (code, starts) = program(&[&[PUSHAD]]);
+    let mut roles = build(&code, &starts, |_| {}, |_| {});
+    warm_stack_frame_pages(&mut roles);
+    // Sixteen bytes into the page, so the frame's lower half lands on the page below.
+    let esp = (STACK_TOP & !0xfff) + 16;
+    seed_registers(&mut roles, esp);
+
+    let executed = roles.native.direct_stall_snapshot().callout_executed;
+    assert!(run_block(&mut roles, 3), "the block did not run natively");
+
+    assert_eq!(
+        roles.native.direct_stall_snapshot().callout_executed - executed,
+        1
+    );
+    assert_eq!(
+        roles
+            .native
+            .direct_stall_snapshot()
+            .side_exit_callout_abnormal,
+        0,
+        "both pages were resident, so the frame must be accepted"
+    );
+    assert_eq!(roles.native.registers.esp(), esp - 32);
+    compare_state(&roles, "page-crossing pushad");
+}
+
+#[test]
+fn a_pushad_whose_frame_hits_watched_code_is_refused_and_left_to_the_interpreter() {
+    // THE hazard this slice was designed around. A push whose range covers watched code would
+    // reach `note_code_write_hit` with this block's native code live on the stack -- the exact
+    // situation `note_code_write_inner`'s "no compiled block is mid-execution" proof rules out.
+    //
+    // The stack is aimed AT THE BLOCK'S OWN CODE, which is watched because the block is compiled
+    // over it. The call-out must refuse (abnormal, EIP at the PUSHAD, nothing written) and the
+    // interpreter must then execute the whole instruction -- which is what the twin, stepped only
+    // over the ONE slot the native run completed, pins.
+    let (code, starts) = program(&[&[PUSHAD]]);
+    let mut roles = build(&code, &starts, |_| {}, |_| {});
+    // The code page has to be servable too, or the refusal would be the residency clause rather
+    // than the code-watch clause and the row would prove the wrong thing.
+    warm_pages(
+        &mut roles,
+        &[
+            STACK_TOP.wrapping_sub(0x1000) & !0xfff,
+            STACK_TOP & !0xfff,
+            ENTRY & !0xfff,
+        ],
+    );
+    // ESP just past the block's last byte, 4-aligned, so the thirty-two bytes below it land ON the
+    // block's own code -- which is watched precisely because the block is compiled over it.
+    let esp = (ENTRY + code.len() as u32 + 3) & !3;
+    seed_registers(&mut roles, esp);
+    let before_memory = roles.native_bus.memory.clone();
+    let before_esp = roles.native.registers.esp();
+
+    let executed = roles.native.direct_stall_snapshot().callout_executed;
+    let retired = roles.native.perf_counters().jit_direct_insns;
+    // ONE interpreted step on the twin: the prefix slot. That is exactly what the run loop has
+    // executed when a native run ends at a PUSHAD.
+    assert!(run_block(&mut roles, 1), "the block did not run natively");
+
+    assert_eq!(
+        roles.native.direct_stall_snapshot().callout_executed - executed,
+        1,
+        "the helper must be entered before it can refuse"
+    );
+    assert_eq!(
+        roles
+            .native
+            .direct_stall_snapshot()
+            .side_exit_callout_abnormal,
+        1,
+        "the watched frame must take the fail-closed exit"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - retired,
+        1,
+        "only the prefix slot may retire"
+    );
+    assert_eq!(
+        roles.native_bus.memory, before_memory,
+        "a refused PUSHAD must not have written one byte"
+    );
+    assert_eq!(
+        roles.native.registers.esp(),
+        before_esp,
+        "a refused PUSHAD must not have moved ESP"
+    );
+    compare_state(&roles, "watched pushad frame");
+}
+
+#[test]
+fn a_pushad_whose_frame_is_not_resident_is_refused_and_left_to_the_interpreter() {
+    // The cold half, deliberately measured: no `warm_stack_frame_pages`, so `lookup_access` misses
+    // and the pre-check refuses on residency rather than on the code watch. Same fail-closed
+    // shape, different clause -- and this is the state EVERY PUSHAD is in the first time its stack
+    // page is touched, so it is the common case rather than a corner.
+    let (code, starts) = program(&[&[PUSHAD]]);
+    let mut roles = build(&code, &starts, |_| {}, |_| {});
+    arm_fast_map_gate(&mut roles);
+    seed_registers(&mut roles, STACK_TOP);
+    let before_memory = roles.native_bus.memory.clone();
+
+    let retired = roles.native.perf_counters().jit_direct_insns;
+    assert!(run_block(&mut roles, 1), "the block did not run natively");
+
+    assert_eq!(
+        roles
+            .native
+            .direct_stall_snapshot()
+            .side_exit_callout_abnormal,
+        1,
+        "a non-resident frame must take the fail-closed exit"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - retired,
+        1,
+        "only the prefix slot may retire"
+    );
+    assert_eq!(
+        roles.native_bus.memory, before_memory,
+        "a refused PUSHAD must not have written one byte"
+    );
+    compare_state(&roles, "non-resident pushad frame");
+}
+
+#[test]
+fn a_memory_call_out_composes_with_a_port_call_out_in_one_block() {
+    // The two CLASSES in one block. They are priced separately by `compute_iteration_upper` and
+    // gated differently at dispatch, so a block holding both is the shape that would catch a class
+    // split applied to the wrong counter.
+    let (code, starts) = program(&[&[PUSHAD], &[IN_AL_DX], &[POPAD]]);
+    let mut roles = build(
+        &code,
+        &starts,
+        |bus| {
+            bus.lazy_io_reads = true;
+            bus.io_read_sequence = DEVICE_VALUES.to_vec();
+        },
+        |_| {},
+    );
+    assert_eq!(roles.instructions, 5);
+    assert_eq!(roles.callout_slots, 3, "two memory slots and one port slot");
+    warm_stack_frame_pages(&mut roles);
+    seed_registers(&mut roles, STACK_TOP);
+
+    let executed = roles.native.direct_stall_snapshot().callout_executed;
+    assert!(run_block(&mut roles, 5), "the block did not run natively");
+
+    assert_eq!(
+        roles.native.direct_stall_snapshot().callout_executed - executed,
+        3,
+        "all three call-outs must run"
+    );
+    // PUSHAD saved EAX, the IN overwrote AL, and POPAD restored the saved value -- so a
+    // round-trip through all three classes leaves the SEEDED EAX, not the port byte. That is the
+    // sharp end of the composition claim: the memory helpers' guest RAM and the port helper's
+    // register write have to interleave in the right order for this to come out.
+    assert_eq!(
+        roles.native.registers.eax(),
+        0x1111_0001,
+        "POPAD must restore the EAX that PUSHAD saved, over the port byte the IN wrote"
+    );
+    compare_state(&roles, "pushad + in + popad");
+    compare_device_order(&roles, "pushad + in + popad");
+}
+
+#[test]
+fn the_prologue_family_lands_in_one_block() {
+    // The census claim, as a fixture. `0x60` PUSHAD, `0x83 /5` SUB at Word size and `0x61` POPAD
+    // are one function prologue and its epilogue in doom, forty-seven exits apart at the top of
+    // the rejected-row table. Lowering any one alone RELOCATES its exits onto the next
+    // instruction, so this row pins that all three join one block rather than each of them
+    // separately joining a block the others end.
+    let (code, starts) = program(&[&SUB_CX_IMM8, &[PUSHAD], &SUB_CX_IMM8, &[POPAD]]);
+    let mut roles = build(&code, &starts, |_| {}, |_| {});
+    assert_eq!(
+        roles.instructions, 6,
+        "all four family members plus the two fillers must be one block"
+    );
+    assert_eq!(roles.callout_slots, 2);
+    warm_stack_frame_pages(&mut roles);
+    seed_registers(&mut roles, STACK_TOP);
+    // A high half in ECX that the word SUB must PRESERVE: a lowering that used a 32-bit move to
+    // write the result back clobbers it, and the register compare below is what sees that.
+    for cpu in [&mut roles.native, &mut roles.interp] {
+        cpu.registers.set_ecx(0xdead_0002);
+    }
+
+    assert!(run_block(&mut roles, 6), "the block did not run natively");
+
+    assert_eq!(
+        roles.native.registers.ecx() & 0xffff_0000,
+        0xdead_0000,
+        "the word SUB must preserve ECX's high half"
+    );
+    compare_state(&roles, "prologue family");
+}

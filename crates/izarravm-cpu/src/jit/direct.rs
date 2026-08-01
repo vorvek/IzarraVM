@@ -8,9 +8,14 @@ mod census;
 mod classify;
 mod emit;
 
-pub(crate) use callout::CallOutTable;
+pub(crate) use callout::{
+    CALL_OUT_STACK_FRAME_DWORDS, CallOutHelper, CallOutSlotCounts, CallOutTable,
+};
 #[cfg(test)]
-pub(crate) use callout::{STATUS_STEP_BREAK_BIT, port_read_al_dx_for_test};
+pub(crate) use callout::{
+    STATUS_STEP_BREAK_BIT, pop_all_dword_for_test, port_read_al_dx_for_test,
+    push_all_dword_for_test,
+};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -542,7 +547,7 @@ pub(crate) struct CompiledBlock {
     has_wide_accesses: bool,
     self_loop: bool,
     has_x87: bool,
-    callout_slots: u8,
+    callout_slots: CallOutSlotCounts,
     x87_entry_top: u8,
     x87_exit_top: u8,
     dynamic_successor: bool,
@@ -574,9 +579,27 @@ impl CompiledBlock {
         u32::from(self.raw_clocks)
     }
 
-    /// How many interpreter call-out slots this block carries, for `compute_iteration_upper`.
+    /// How many interpreter call-out slots this block carries, of any class. The
+    /// `MAX_BLOCK_CALLOUT_SLOTS` budget bound counts THIS; the two class splits below are what
+    /// `compute_iteration_upper` prices, because a port slot and a memory slot cost wildly
+    /// different amounts of bus traffic and pricing both at the worst of the two would inflate
+    /// every doom port block by eight dword accesses it cannot make.
     pub(crate) fn callout_slots(&self) -> u32 {
-        u32::from(self.callout_slots)
+        self.callout_slots.total()
+    }
+
+    /// Call-out slots whose helper can reach `check_io_permission`, i.e. the port class. The
+    /// dispatch-time privilege refusal keys on this rather than on `callout_slots` so a PUSHAD
+    /// block still runs for a CPL-3 or V86 guest: PUSHAD probes no TSS, so the reason the port
+    /// class is refused there does not apply to it. See the class table in `jit/direct/callout.rs`.
+    pub(crate) fn callout_port_slots(&self) -> u32 {
+        self.callout_slots.port()
+    }
+
+    /// Call-out slots whose helper moves a guest stack frame, i.e. the memory class. Priced at
+    /// `CALL_OUT_STACK_FRAME_DWORDS` dword accesses each in `compute_iteration_upper`.
+    pub(crate) fn callout_memory_slots(&self) -> u32 {
+        self.callout_slots.memory()
     }
 
     pub(crate) fn weighted_fp_clocks(&self) -> u32 {
@@ -1146,6 +1169,16 @@ impl BlockCache {
             self.disabled = true;
             return None;
         };
+        // The one place the call-out TOTAL is dropped in favour of the two class counts, so the
+        // one place that can notice a slot belonging to neither class -- the shape a fourth
+        // `CallOutHelper` takes if it is added without choosing one. `CompiledBlock` then derives
+        // the total from the split, and `compute_iteration_upper` prices the split, so a classless
+        // slot would be invisible to both.
+        debug_assert_eq!(
+            compilation.callout_port_slots + compilation.callout_memory_slots,
+            compilation.callout_slots,
+            "a call-out slot belongs to neither the port class nor the memory class"
+        );
         let block = CompiledBlock {
             id,
             span,
@@ -1165,7 +1198,10 @@ impl BlockCache {
             has_wide_accesses: compilation.has_wide_accesses,
             self_loop: compilation.self_loop,
             has_x87: compilation.has_x87,
-            callout_slots: compilation.callout_slots,
+            callout_slots: CallOutSlotCounts::new(
+                compilation.callout_port_slots,
+                compilation.callout_memory_slots,
+            ),
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
             dynamic_successor: compilation.dynamic_successor,
@@ -2469,9 +2505,15 @@ pub(crate) struct Compilation {
     pub has_wide_accesses: bool,
     pub self_loop: bool,
     pub has_x87: bool,
-    /// How many interpreter call-out slots this block carries. Read ONLY by
-    /// `compute_iteration_upper`, which must cover their runtime charge; see the derivation there.
+    /// How many interpreter call-out slots this block carries, of any class. Bounded by
+    /// `MAX_BLOCK_CALLOUT_SLOTS`; the two class splits below are what carries the runtime charge
+    /// into `compute_iteration_upper`. See the derivation there.
     pub callout_slots: u8,
+    /// The port-class subset (`0xEC`), which the dispatch privilege gate keys on.
+    pub callout_port_slots: u8,
+    /// The memory-class subset (`0x60`, `0x61`), each of which moves
+    /// `CALL_OUT_STACK_FRAME_DWORDS` dwords of guest stack.
+    pub callout_memory_slots: u8,
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
     /// Readable outside this module for the same reason as `successors` below: a terminal that
@@ -2608,6 +2650,15 @@ pub(crate) enum DirectKind {
         /// those bytes needs no recompile. `imm` still carries the value decoded at compile time
         /// and is what the non-lane form bakes.
         lane: Option<ImmLane>,
+        /// The OPERAND width, and it is load-bearing rather than descriptive: at `Word` the
+        /// operation runs on the low sixteen bits, sets flags at sixteen bits, and merges its
+        /// result into the destination's low half instead of replacing all thirty-two. Before this
+        /// field existed the kind hard-coded Dword and `0x83` was kept out of `classify`'s
+        /// OperandSize::Word allowlist for exactly that reason; the field is what let it in.
+        ///
+        /// Only `Byte` is impossible here (`OperandSize` has two variants and the byte group is
+        /// `AluByteImm`), and a lane is admitted at `Dword` alone -- `IMM_LANE_WIDTH` is four.
+        width: MemoryWidth,
     },
     AluByteImm {
         op: u8,
@@ -2987,15 +3038,6 @@ pub(crate) enum DirectKind {
     CallOut {
         helper: CallOutHelper,
     },
-}
-
-/// Which interpreter path a `DirectKind::CallOut` slot routes through. One variant per admitted
-/// opcode, never a catch-all: `callout::helper_fn` matches this exhaustively, so adding an opcode
-/// to `classify` without an execute path is a compile error rather than a silent misroute.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallOutHelper {
-    /// `0xEC` IN AL,DX.
-    PortReadAlDx,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3697,6 +3739,13 @@ impl DirectKind {
         matches!(self, Self::CallOut { .. })
     }
 
+    fn call_out_helper(self) -> Option<CallOutHelper> {
+        match self {
+            Self::CallOut { helper } => Some(helper),
+            _ => None,
+        }
+    }
+
     fn is_memory_alu(self) -> bool {
         matches!(
             self,
@@ -4142,8 +4191,17 @@ fn imm_lane_for(
     if lanes_used >= MAX_BLOCK_IMM_LANES {
         return None;
     }
+    // `width: MemoryWidth::Dword` is matched rather than ignored. `IMM_LANE_WIDTH` is four and the
+    // lane patches the field whole; a Word `AluImm` reads only two of those bytes, so admitting one
+    // here would name a four-byte lane for a two-byte read. The `OperandSize::Dword` test below
+    // already implies it for every kind `classify` produces, which is exactly why matching it here
+    // costs nothing and closes the hole if that ever stops being true.
     let DirectKind::AluImm {
-        op: 0, dst, imm, ..
+        op: 0,
+        dst,
+        imm,
+        width: MemoryWidth::Dword,
+        ..
     } = kind
     else {
         return None;
@@ -4172,6 +4230,7 @@ fn imm_lane_for(
             dst,
             imm,
             lane: Some(lane),
+            width: MemoryWidth::Dword,
         },
         lane,
     ))
@@ -4285,6 +4344,8 @@ fn compile_with_instruction_limit(
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
     let mut callout_slots = 0u8;
+    let mut callout_port_slots = 0u8;
+    let mut callout_memory_slots = 0u8;
     let x87_entry_top = cpu.fpu.top();
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
@@ -4533,6 +4594,10 @@ fn compile_with_instruction_limit(
         stack_accesses += u8::from(kind.uses_stack());
         x87_slots += u8::from(kind.is_x87());
         callout_slots += u8::from(kind.is_call_out());
+        if let Some(helper) = kind.call_out_helper() {
+            callout_port_slots += u8::from(helper.probes_io_permission());
+            callout_memory_slots += u8::from(helper.moves_a_stack_frame());
+        }
         if let DirectKind::X87 { insn, .. } = kind {
             x87_exit_top = insn.advance_top(x87_exit_top);
         }
@@ -4758,6 +4823,8 @@ fn compile_with_instruction_limit(
         self_loop,
         has_x87: x87_slots != 0,
         callout_slots,
+        callout_port_slots,
+        callout_memory_slots,
         x87_entry_top,
         x87_exit_top,
         dynamic_successor,

@@ -1347,8 +1347,13 @@ impl CpuGsw {
         // defaults), where the bus terms that normally swamp the core term vanish -- and the
         // chain-pricing `debug_assert` that `per_hop_estimate <= global_block_upper` would trip
         // on a bound that is supposed to dominate by construction.
+        // `MAX_CALL_OUT_CORE_CLOCKS`, not `IN_AL_DX_CORE_CLOCKS`: this bound cannot see which
+        // helper a slot carries, so it prices every slot at the largest charge any admitted helper
+        // returns. That is 18 (PUSHAD/POPAD) rather than 12 (IN AL,DX) as of the memory class, and
+        // the constant is derived from the three per-opcode constants so a fourth helper raises it
+        // by construction.
         let callout_core = u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
-            .saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS));
+            .saturating_mul(u64::from(MAX_CALL_OUT_CORE_CLOCKS));
         let integer_core = scale_core(
             4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6 + callout_core,
         );
@@ -1369,18 +1374,55 @@ impl CpuGsw {
             .jit_fetch_cost_clocks()
             .saturating_add(max_read)
             .saturating_add(max_store)
-            // One byte-wide port access per instruction covers a block that is nothing but
+            // One byte-wide port access per instruction covers a block that is nothing but PORT
             // call-out slots, and keeps this bound above `compute_iteration_upper`'s matching
             // term for every slot count. Same reachable set as that term: no TSS probe, because
             // the helper refuses the privilege state that would reach one.
             .saturating_add(bus.jit_io_cost_clocks(BusWidth::Byte));
-        let global_raw_bus_upper =
-            (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(per_instruction_bus);
+        // The MEMORY class's traffic, added ONCE for the whole block rather than folded into the
+        // per-instruction term, and the difference is not cosmetic.
+        //
+        // Why a term at all: `max_read + max_store` budgets ONE read and ONE store per instruction,
+        // and a PUSHAD or POPAD slot makes `CALL_OUT_STACK_FRAME_DWORDS` accesses in a single
+        // instruction. Four of them in a 32-instruction block present 32 accesses where the other
+        // 28 instructions leave only 8 unclaimed, so the old bound no longer dominated
+        // `compute_iteration_upper`. That is a correctness bug -- the chain-pricing
+        // `debug_assert!(per_hop_estimate <= global_block_upper)` would trip on a zero-dial bus --
+        // and not a perf question.
+        //
+        // Why ONCE and not per instruction: `MAX_BLOCK_CALLOUT_SLOTS` bounds the slots per BLOCK,
+        // so `MAX_BLOCK_CALLOUT_SLOTS * CALL_OUT_STACK_FRAME_DWORDS` store-costs is already the
+        // worst any block can present, and it dominates `compute_iteration_upper`'s
+        // `memory_slots * CALL_OUT_STACK_FRAME_DWORDS * dword_data_upper` term by construction
+        // (`memory_slots <= MAX_BLOCK_CALLOUT_SLOTS`, and `max_store` is the max over every width
+        // and both the RAM and Mode13h dials, so it is `>= dword_data_upper`). Folding it into the
+        // per-instruction term instead would multiply it by `MAX_BLOCK_INSTRUCTIONS` -- 256
+        // store-costs of headroom rather than 32 -- and this bound DIVIDES the run's remaining
+        // budget to pick the chain quota, so inflating it shortens every chain in the cache,
+        // call-out-bearing or not. A bound that over-dominates is a throughput bug the same way an
+        // under-dominating one is a correctness bug.
+        //
+        // Zero for the x87 class, and that is the same by-construction fact the core term uses:
+        // x87 and call-out slots never share a block (the compile walk refuses the mix in either
+        // order), so an x87 block's `callout_memory_slots` is zero and pricing it would be pure
+        // inflation of a bound that already assumes 32 instructions of traffic for a 12-slot cap.
+        let callout_memory_bus = if has_x87 {
+            0
+        } else {
+            u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
+                .saturating_mul(u64::from(jit::direct::CALL_OUT_STACK_FRAME_DWORDS))
+                .saturating_mul(max_store)
+        };
+        let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
+            .saturating_mul(per_instruction_bus)
+            .saturating_add(callout_memory_bus);
         let own_class = max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
         if has_x87 {
             return own_class;
         }
-        // The float hop an integer chain can now reach, at ITS true instruction cap.
+        // The float hop an integer chain can now reach, at ITS true instruction cap. No call-out
+        // memory term for the reason above: the hop being priced is an x87 block, which cannot
+        // hold one.
         let x87_raw_bus_upper =
             (jit::direct::MAX_X87_BLOCK_INSTRUCTIONS as u64).saturating_mul(per_instruction_bus);
         let x87_hop = x87_core.saturating_add(bus.jit_scale_bus_cost_upper(x87_raw_bus_upper));
@@ -1406,15 +1448,35 @@ impl CpuGsw {
         let fp_core_upper = u64::from(block.weighted_fp_clocks())
             .saturating_add(u64::from(FP_TIMING_DEN) - 1)
             / u64::from(FP_TIMING_DEN);
+        // Every call-out slot belongs to exactly ONE class, so the two class terms below cover the
+        // whole population. A helper that was neither -- the shape a fourth `CallOutHelper` takes
+        // if someone adds it without choosing a class -- would be charged NOTHING here and would
+        // silently under-budget its block. This is the only place that could notice, so it does.
+        debug_assert_eq!(
+            block.callout_port_slots() + block.callout_memory_slots(),
+            block.callout_slots(),
+            "a call-out slot belongs to neither the port class nor the memory class"
+        );
         // CALL-OUT DOMINANCE. A call-out slot's charge is RUNTIME, so `block.raw_clocks()` --
         // which is the sum of the baked per-kind constants -- does not contain it and the bound
-        // would not cover it. Every admitted call-out is `0xEC`, whose interpreter charge is the
-        // constant `IN_AL_DX_CORE_CLOCKS`; that is not a worst case, it is the ONLY case, so
-        // adding it per slot is exact rather than conservative on the core term. Keep this arm in
-        // step with `classify`'s call-out admission: a second opcode with a larger charge, or any
-        // charge that is not a constant, must raise this to that opcode's maximum.
-        let callout_core_upper =
-            u64::from(block.callout_slots()).saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS));
+        // would not cover it.
+        //
+        // Priced BY CLASS rather than at the worst helper, and that is not an optimisation, it is
+        // exactness. Every port slot charges exactly `IN_AL_DX_CORE_CLOCKS` and every memory slot
+        // exactly `PUSH_ALL_CORE_CLOCKS` (= `POP_ALL_CORE_CLOCKS`); both are the ONLY case for
+        // their class, not a worst case, so the sum is exact. Pricing both classes at the maximum
+        // of the two would inflate every port-only block -- which is what doom's 20 M call-outs
+        // are -- by six core clocks a slot for traffic it cannot generate, and a budget bound
+        // decides admission at the margin.
+        //
+        // Keep this in step with `classify`'s call-out admission: a new helper needs a class here,
+        // and one whose charge is not a constant needs its maximum.
+        let callout_core_upper = u64::from(block.callout_port_slots())
+            .saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS))
+            .saturating_add(
+                u64::from(block.callout_memory_slots())
+                    .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),
+            );
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
             .saturating_add(callout_core_upper)
@@ -1440,16 +1502,31 @@ impl CpuGsw {
             .saturating_add(byte_data_upper.saturating_mul(u64::from(block.byte_stores())))
             .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_stores())))
             .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_stores())));
-        // The call-out's BUS term, the other half of the dominance argument, and it is ONE
-        // access: a byte-wide port read. There is deliberately no TSS-probe term. The helper
-        // refuses `is_v86_mode() || CPL > IOPL` as its first statement (jit/direct/callout.rs),
-        // which is exactly the condition under which `check_io_permission` would leave its early
-        // return and touch memory -- so the probe's word and byte reads are not in the call-out's
-        // reachable set at all, and pricing them here would inflate every call-out block's bound
-        // for traffic that cannot happen. If that refusal is ever relaxed, this term comes back
-        // with it.
-        let callout_bus_upper =
-            u64::from(block.callout_slots()).saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte));
+        // The call-out's BUS term, the other half of the dominance argument, and split by class for
+        // the reason the core term above is.
+        //
+        // PORT: ONE access, a byte-wide port read. There is deliberately no TSS-probe term. The
+        // helper refuses `is_v86_mode() || CPL > IOPL` as its first statement
+        // (jit/direct/callout.rs), which is exactly the condition under which `check_io_permission`
+        // would leave its early return and touch memory -- so the probe's word and byte reads are
+        // not in the call-out's reachable set at all, and pricing them here would inflate every
+        // call-out block's bound for traffic that cannot happen. If that refusal is ever relaxed,
+        // this term comes back with it.
+        //
+        // MEMORY: exactly `CALL_OUT_STACK_FRAME_DWORDS` dword accesses, no more and no fewer.
+        // `call_out_stack_frame_resident` refuses the frame unless all eight resolve through the
+        // FastMap, so there is no page-walk traffic to price either -- the same shape of argument,
+        // from the same kind of pre-check. `dword_data_upper` is reused rather than
+        // `jit_data_cost_clocks(Dword)` alone so a Mode13h dial that exceeds the RAM dial cannot
+        // make this an under-estimate; the aperture itself is refused by the pre-check, so the
+        // `max` is slack rather than reachable traffic.
+        let callout_bus_upper = u64::from(block.callout_port_slots())
+            .saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte))
+            .saturating_add(
+                u64::from(block.callout_memory_slots())
+                    .saturating_mul(u64::from(jit::direct::CALL_OUT_STACK_FRAME_DWORDS))
+                    .saturating_mul(dword_data_upper),
+            );
         let raw_bus_upper = fetch_upper
             .saturating_add(data_upper)
             .saturating_add(callout_bus_upper);
@@ -1598,7 +1675,13 @@ impl CpuGsw {
         // NOT retired: the state is transient (a V86 task returns to ring 0 and back), and the
         // block is perfectly good -- it is the privilege level that is wrong, like the alignment
         // and budget refusals below rather than the layout ones above.
-        if block.callout_slots() != 0
+        // Keyed on the PORT class alone as of the memory class. The reason a call-out block is
+        // refused here is the TSS bitmap probe that `check_io_permission` would take, and PUSHAD
+        // and POPAD do not probe it: they are unprivileged instructions whose only
+        // privilege-sensitive decision is page protection, which `call_out_stack_frame_resident`
+        // makes against the LIVE CPL inside the helper and fails closed on. Refusing a PUSHAD block
+        // here would cost every ring-3 protected-mode guest the lowering for nothing.
+        if block.callout_port_slots() != 0
             && (self.is_v86_mode() || self.current_privilege_level() > self.iopl())
         {
             self.jit_direct.note_reject_callout_privileged();

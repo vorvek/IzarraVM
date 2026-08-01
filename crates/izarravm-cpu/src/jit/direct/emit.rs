@@ -290,14 +290,24 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, so
             // no guest register lives in it, and the ADD path through `emit_alu_preloaded`
             // (op 0, Dword, writes `home(dst)`) neither reads nor writes it.
-            DirectKind::AluImm { op, dst, imm, lane } => match lane {
+            DirectKind::AluImm {
+                op,
+                dst,
+                imm,
+                lane,
+                width,
+            } => match lane {
+                // A lane is Dword-only (`IMM_LANE_WIDTH` is four and `imm_lane_for` matches the
+                // width), so this arm hard-codes it rather than passing `width` through: passing it
+                // would read as if a Word lane were possible.
                 Some(lane) => {
+                    debug_assert!(matches!(width, MemoryWidth::Dword));
                     e.mov_r64_imm64(Reg::RDX, lane.host as u64);
                     e.load_r32_disp32(Reg::RCX, Reg::RDX, 0);
                     e.mov_r32_r32(Reg::RAX, home(dst));
                     emit_alu_preloaded(&mut e, op, dst, MemoryWidth::Dword);
                 }
-                None => emit_alu(&mut e, op, dst, None, Some(imm), MemoryWidth::Dword),
+                None => emit_alu(&mut e, op, dst, None, Some(imm), width),
             },
             DirectKind::AluByteImm { op, dst, imm } => {
                 emit_alu_byte_imm(&mut e, op, dst, imm);
@@ -3819,14 +3829,48 @@ fn emit_alu(
 
 /// Emit an ALU operation with the old destination in EAX and the source in ECX.
 fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
+    // The WORD lane. Widened from CMP-only to the whole non-carry op set, with write-back, as the
+    // emitter half of admitting `0x83` to `classify`'s OperandSize::Word allowlist.
+    //
+    // Three properties make this sixteen-bit rather than a masked thirty-two-bit op, and each is
+    // one line: the operands are masked to sixteen bits BEFORE the operation so CF and the lazy
+    // descriptor's `a`/`b` are sixteen-bit values; the operation is `alu_r16_r16`, a real 66-prefixed
+    // instruction, so the host's own CF/OF/SF/ZF are the sixteen-bit ones; and the result is merged
+    // back with `mov_r16_r16`, which writes only the destination's low half and preserves its high
+    // half exactly as the interpreter's `write_gpr_sized(.., Word, ..)` does. A 32-bit `mov` there
+    // would clobber the high half, which is the miscompile the old allowlist existed to prevent.
+    //
+    // RDX holds the result, zero-extended because RAX was masked before the copy, which is what the
+    // lazy evaluator wants for a Word descriptor.
     if matches!(width, MemoryWidth::Word) {
-        debug_assert_eq!(op, 7, "the current word ALU family only admits CMP");
+        debug_assert!(
+            !matches!(op, 2 | 3),
+            "ADC/SBB take the incoming CF as an operand and have no word lane; classify refuses \
+             them at Word size"
+        );
+        let logic = matches!(op, 1 | 4 | 6);
         e.and_r32_imm32(Reg::RAX, 0xffff);
         e.and_r32_imm32(Reg::RCX, 0xffff);
         e.mov_r32_r32(Reg::RDX, Reg::RAX);
-        e.alu_r16_r16(5, Reg::RDX, Reg::RCX);
-        emit_capture_flags(e, ARITH_FLAGS);
-        emit_pending(e, 0x8000_0101, Some(Reg::RAX), Some(Reg::RCX), Reg::RDX);
+        // CMP is SUB without the write-back, exactly as the Dword lane below maps it.
+        let host_op = if op == 7 { 5 } else { op };
+        e.alu_r16_r16(host_op, Reg::RDX, Reg::RCX);
+        emit_capture_flags(e, if logic { LOGIC_FLAGS } else { ARITH_FLAGS });
+        // AFTER the capture: `mov` writes no flags, but putting it before would still be wrong to
+        // read as safe, and after is where the Dword lane does its equivalent too.
+        if op != 7 {
+            e.mov_r16_r16(home(dst), Reg::RDX);
+        }
+        // Word tag is 0x100 where Dword's is 0x200; the low byte is the operation class (0 add,
+        // 1 sub, 2 logic), the same encoding `PendingFlags::op`/`width` decode.
+        if logic {
+            emit_pending(e, 0x8000_0102, None, None, Reg::RDX);
+            // Must follow `emit_pending`: it clobbers RDX, which is the result this just stored.
+            emit_logic_live_af(e);
+        } else {
+            let tag = if op == 0 { 0x8000_0100 } else { 0x8000_0101 };
+            emit_pending(e, tag, Some(Reg::RAX), Some(Reg::RCX), Reg::RDX);
+        }
         return;
     }
     debug_assert!(matches!(width, MemoryWidth::Dword));

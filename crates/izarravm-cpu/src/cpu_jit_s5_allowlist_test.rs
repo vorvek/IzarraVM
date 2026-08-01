@@ -82,18 +82,20 @@ fn word_size_byte_forms_are_lowered() {
 /// later edit replaces the opcode list with a range, every positive fixture above still passes
 /// and only this one fails.
 ///
-/// `0x01` and `0x31` are the sharpest: `AluReg` DOES carry a width, but `emit_alu_preloaded`'s
-/// Word branch ignores `op`, hard-codes SUB, and writes the result to a scratch register instead
-/// of the destination. That is correct only for the CMP forms `0x39` and `0x3b` already admitted,
-/// so admitting ADD or XOR would leave the destination unchanged and set flags from a
-/// subtraction, silently, because the guarding `debug_assert_eq!` is compiled out of a release
-/// build.
+/// `0x01` and `0x31` remain refused for a reason that has SOFTENED rather than gone: the Word
+/// branch of `emit_alu_preloaded` no longer hard-codes SUB and no longer drops the result into a
+/// scratch register -- it handles the whole non-carry op set with a `mov_r16_r16` write-back, as
+/// the `0x83` slice needed. They stay out because nothing has measured them, not because they
+/// would miscompile; admitting an unmeasured opcode is a formation change with no census row to
+/// attribute it to.
+///
+/// `0x83` moved OUT of this list and into `word_size_0x83_register_forms_are_lowered` below; its
+/// two carry members and its memory form stay refused and are covered there.
 #[test]
 fn word_size_dword_siblings_stay_refused() {
     let cases: &[(&str, &[u8])] = &[
         ("0x05 add eax,imm", &[0x66, 0x05, 0x34, 0x12]),
         ("0x81 /0 add r/m,imm16", &[0x66, 0x81, 0xc1, 0x34, 0x12]),
-        ("0x83 /0 add r/m,imm8", &[0x66, 0x83, 0xc1, 0x03]),
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0]),
         ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10]),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12]),
@@ -102,6 +104,89 @@ fn word_size_dword_siblings_stay_refused() {
         ("0xf7 /0 test r/m,imm", &[0x66, 0xf7, 0xc1, 0x34, 0x12]),
         ("0x01 add r/m,r", &[0x66, 0x01, 0xc1]),
         ("0x31 xor r/m,r", &[0x66, 0x31, 0xc1]),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused at Word size, so the block is the three fillers"
+        );
+    }
+}
+
+/// `0x83` at Word size: the six non-carry sub-ops of the REGISTER form are lowered, and nothing
+/// else about the opcode is.
+///
+/// This is the admission half of the rejected-row campaign's Slice 1 (`0x83 /5` SUB r16,imm8 is
+/// 9,776,289 doom dispatcher exits, forty-seven apart from PUSHAD). Every sub-op is listed
+/// separately rather than looped over a range, for the reason the byte-form table above gives:
+/// the classifier decides `2 | 3` on their own and a range would hide a member.
+#[test]
+fn word_size_0x83_register_forms_are_lowered() {
+    // ModRM 0xc0 | (op << 3) | 1 -- destination CX, sub-op in `reg`.
+    let cases: &[(&str, u8)] = &[
+        ("/0 add", 0),
+        ("/1 or", 1),
+        ("/4 and", 4),
+        ("/5 sub", 5),
+        ("/6 xor", 6),
+        ("/7 cmp", 7),
+    ];
+
+    for &(label, op) in cases {
+        let form = [0x66u8, 0x83, 0xc0 | (op << 3) | 1, 0x03];
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        // A register ALU form touches no memory whatever the width says.
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// The three `0x83` shapes that stay refused at Word size, and the boundary that keeps them out.
+///
+/// ADC (/2) and SBB (/3) consume the incoming CF as an OPERAND, which the Dword lane handles by
+/// branching on the EFLAGS shadow (`emit_carry_alu_preloaded`) and which has no sixteen-bit twin.
+/// The MEMORY form would need `emit_alu_mem_dest`'s read/modify/write triple exercised at Word,
+/// which no fixture does. Both are missed lowerings; admitting either without its own differential
+/// row would be the miscompile.
+#[test]
+fn word_size_0x83_carry_and_memory_forms_stay_refused() {
+    let cases: &[(&str, &[u8])] = &[
+        ("/2 adc r/m16,imm8", &[0x66, 0x83, 0xd1, 0x03]),
+        ("/3 sbb r/m16,imm8", &[0x66, 0x83, 0xd9, 0x03]),
+        (
+            "/0 add m16,imm8",
+            &[0x66, 0x83, 0x05, 0x00, 0x03, 0x00, 0x00, 0x03],
+        ),
+        (
+            "/5 sub m16,imm8",
+            &[0x66, 0x83, 0x2d, 0x00, 0x03, 0x00, 0x00, 0x03],
+        ),
     ];
 
     for &(label, form) in cases {

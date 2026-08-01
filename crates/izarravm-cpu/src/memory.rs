@@ -233,6 +233,116 @@ impl CpuGsw {
         }
     }
 
+    /// Can a `PUSHAD`/`POPAD` interpreter call-out slot move its whole eight-dword stack frame
+    /// through the FastMap serve path, with NO page walk, NO fault and NO code-watch hit?
+    ///
+    /// This is the pre-check the interpreter does not have and the call-out must. `push_all_gpr`
+    /// discovers a bad stack slot by FAULTING on it, part-way, with earlier sub-pushes already
+    /// committed to guest memory; a call-out cannot deliver a fault (it returns a status, not an
+    /// `ExecResult`) and must not leave a partial frame, so it refuses instead — the native run
+    /// ends at the instruction and the interpreter executes it whole, fault included, exactly as
+    /// it does today for a block that stopped at a PUSHAD barrier.
+    ///
+    /// SIDE-EFFECT FREE by construction: `&self`, and every predicate it evaluates
+    /// (`segment_linear_range`, `FastMap::lookup_access`, `code_write_watched`) is a pure query.
+    /// It deliberately does NOT go through `fast_map_data_slot`, whose only difference is the
+    /// `fast_map_probe` hit/miss counters — a probe here plus the real probe in phase two would
+    /// double-count every access, and a probe here on a REFUSED frame would count an access that
+    /// never happened.
+    ///
+    /// What each clause excludes, in the order the hazards were enumerated:
+    ///
+    /// * `stack_is_32bit` — the SS.B = 0 forms address through SP alone and POPAD then merges the
+    ///   discarded slot's high half into ESP. Both are handled by `push_all_gpr`/`pop_all_gpr`, but
+    ///   the address arithmetic below would have to fork to match, so the 16-bit-stack population
+    ///   is refused rather than mirrored. No fixture and no 32-bit persona reaches it.
+    /// * `fast_map_serve_enabled` — without it `write_linear_fragment` falls to `translate_linear`,
+    ///   which is the page walk this exists to exclude.
+    /// * `esp` 4-aligned — makes every one of the eight accesses 4-aligned, which is simultaneously
+    ///   what `lookup_access` requires, what keeps each dword page-local (so the paged cross-page
+    ///   splitter is unreachable), and what makes `check_alignment`'s CPL-3 `#AC` unreachable.
+    /// * `segment_linear_range` per slot — the SS limit and the writability of the descriptor, the
+    ///   same call `push`/`pop` will make, evaluated for every slot including the ones an ESP WRAP
+    ///   sends to the far end of the address space. Wrapping is not special-cased: the offsets are
+    ///   computed with the same `wrapping_sub`/`wrapping_add` `push`/`pop` use, so a wrapped frame
+    ///   is either in-limit for all eight (and safe) or refused.
+    /// * `lookup_access` per slot — presence, the committed PTE dirty bit for a write, the live
+    ///   CPL/CR0.WP protection decision and the mapping epoch. A frame CROSSING A PAGE BOUNDARY is
+    ///   not a special case either: the slots are resolved individually, so the two pages are both
+    ///   proved resident or the frame is refused.
+    /// * `is_mode13` — keeps the frame on plain RAM, so phase two's charge is
+    ///   `charge_direct_ram_memory` (infallible for every bus in tree) rather than the aperture
+    ///   path with its `note_direct_write`.
+    /// * `code_write_watched` — THE hazard this campaign named. A push whose range hits watched
+    ///   code would reach `note_code_write_hit` with this block's native code live on the stack,
+    ///   which is exactly the situation `note_code_write_inner`'s "no compiled block is
+    ///   mid-execution" proof rules out. Refused here, so `finish_fast_map_write`'s
+    ///   `changed && watched` gate is provably false for all eight stores. Asked only for a WRITE:
+    ///   a POPAD READ of the same bytes cannot reach `note_code_write` at all.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn call_out_stack_frame_resident(&self, dwords: u32, write: bool) -> bool {
+        if !self.stack_is_32bit() || !self.fast_map_serve_enabled.enabled {
+            return false;
+        }
+        let esp = self.registers.esp();
+        if !esp.is_multiple_of(4) {
+            return false;
+        }
+        let mapping_epoch = if write {
+            self.data_write_pages.mapping_epoch()
+        } else {
+            self.data_read_pages.mapping_epoch()
+        };
+        let user = self.current_privilege_level() == 3;
+        let write_protect = self.control.cr0 & CR0_WP != 0;
+        for slot in 0..dwords {
+            // The SAME arithmetic `push` and `pop` perform: a push writes below ESP starting at
+            // ESP-4, a pop reads at ESP upwards.
+            let offset = if write {
+                esp.wrapping_sub(4 * (slot + 1))
+            } else {
+                esp.wrapping_add(4 * slot)
+            };
+            let Ok(linear) = self.segment_linear_range(SegmentIndex::Ss, offset, 4, write) else {
+                return false;
+            };
+            let Some(access) = self.jit_fast_map.lookup_access(
+                linear,
+                mapping_epoch,
+                BusWidth::Dword,
+                write,
+                user,
+                write_protect,
+            ) else {
+                return false;
+            };
+            if access.is_mode13() {
+                return false;
+            }
+            if write && self.code_write_watched(access.physical(), 4) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Fail-closed stand-in where there is no FastMap to prove residency against. Emitted blocks --
+    /// and therefore call-out slots -- do not exist on these targets either, so this is
+    /// unreachable; returning `false` keeps the helper's refusal the only possible answer if it
+    /// ever becomes reachable.
+    #[cfg(not(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    pub(crate) fn call_out_stack_frame_resident(&self, _dwords: u32, _write: bool) -> bool {
+        false
+    }
+
     /// Raw load through a FastMap-resolved pointer. Mirrors `read_direct_entry`, but the FastMap
     /// bias already accounts for the exact linear offset, so there is no separate page offset to
     /// add.
