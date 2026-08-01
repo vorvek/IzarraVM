@@ -6,11 +6,6 @@
 
 // Re-declare or pub use as needed from parent. For now self contained small data.
 
-pub const BIOS_FONT_8X8_ROM_OFFSET: u16 = 0xC000;
-pub const BIOS_FONT_8X14_ROM_OFFSET: u16 = 0xC800;
-pub const BIOS_FONT_8X16_ROM_OFFSET: u16 = 0xD600;
-pub const BIOS_FONT_8X8_HIGH_ROM_OFFSET: u16 = 0xE600;
-
 pub const INT10_STATE_HARDWARE_LEN: usize = 0x46;
 pub const INT10_STATE_CGA_LATCH_OFFSET: usize = 0x42;
 pub const INT10_STATE_CGA_LATCH_MARKER: [u8; 2] = *b"CG";
@@ -20,14 +15,7 @@ pub const INT10_STATE_DAC_LEN: usize = 3 + 256 * 3 + 1; // DAC_ENTRIES == 256
 pub const INT10_STATIC_FUNCTIONALITY: [u8; 16] = [
     0xff, 0xe0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x08, 0xe7, 0x0c, 0x00, 0x00, 0x00, 0x00,
 ];
-
-pub const INT10_FUNCTIONALITY_TABLE_OFFSET: u16 = 0x0100;
-pub const INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET: u16 = 0x0110;
-pub const INT10_VIDEO_SAVE_POINTER_TABLE_PTRS: usize = 7;
-pub const INT10_VIDEO_PARAM_TABLE_OFFSET: u16 = 0x0130;
 pub const INT10_VIDEO_PARAM_ENTRY_LEN: usize = 64;
-pub const INT10_VIDEO_PARAM_TABLE_ENTRIES: usize = 30;
-pub const BDA_VIDEO_SAVE_POINTER: usize = 0x4a8;
 
 // PCI / Distira chipset constants (static config tables)
 pub const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;

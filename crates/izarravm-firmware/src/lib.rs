@@ -92,6 +92,7 @@ pub const KBD_RESIDENT_BIOS_SOURCE: &str = include_str!("../roms/kbd-resident.as
 pub const KBD_RESIDENT_BIOS_SEG: u16 = 0xf000;
 pub const IZARRA_BIOS: &[u8] = include_bytes!("../roms/izarra-bios.bin");
 pub const IZARRA_BIOS_SOURCE: &str = include_str!("../roms/izarra-bios.asm");
+pub const IZARRA_BIOS_DEFS_SOURCE: &str = include_str!("../roms/izbios-defs.inc");
 
 /// The five code-page fonts (437, 850, 860, 863, 865), each at 8x16, 8x14, then
 /// 8x8. Code-page-major: block `cp` at `cp * 9728`, sizes at 0 / 4096 / 7680.

@@ -3,6 +3,31 @@
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BootDevice {
+    Floppy = 0,
+    HardDisk = 1,
+    CdRom = 2,
+}
+
+impl BootDevice {
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::HardDisk,
+            2 => Self::CdRom,
+            _ => Self::Floppy,
+        }
+    }
+
+    fn fallback_order(self) -> [Self; 3] {
+        match self {
+            Self::Floppy => [Self::Floppy, Self::HardDisk, Self::CdRom],
+            Self::HardDisk => [Self::HardDisk, Self::Floppy, Self::CdRom],
+            Self::CdRom => [Self::CdRom, Self::HardDisk, Self::Floppy],
+        }
+    }
+}
+
 impl Machine {
     /// Service INT 11h (GET EQUIPMENT LIST). Returns the BDA equipment word in AX,
     /// the way a real BIOS reads it from 0040:0010. The high word of EAX is left

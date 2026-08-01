@@ -6,10 +6,6 @@
 ; guest-invoked INT 19h, including boot-sector validation and El Torito CD boot.
 
 ; Boot-device codes stored in BOOT_CHOICE.
-%define BOOT_DEV_FLOPPY  0
-%define BOOT_DEV_DISK    1
-%define BOOT_DEV_CDROM   2
-
 ; boot_menu: shim. The two-pane boxed boot+speed menu lives in izbios-bootbox.inc
 ; as bootbox_menu. setup-ui.inc calls this label by name (call boot_menu), so the
 ; label must stay resolvable here; it just forwards into the new menu. Keep the

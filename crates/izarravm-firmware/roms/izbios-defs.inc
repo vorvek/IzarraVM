@@ -75,6 +75,9 @@
 ; CMOS NVRAM byte 0x11 holds one primary device: 0 floppy, 1 disk, 2 CD-ROM.
 ; INT 19h expands it into the Izarra fallback policy.
 %define BOOT_CMOS_PRIMARY 0x11
+%define BOOT_DEV_FLOPPY   0
+%define BOOT_DEV_DISK     1
+%define BOOT_DEV_CDROM    2
 
 ; CMOS NVRAM byte 0x12 holds the saved GSW speed code (0 386, 1 486, 2 586,
 ; 3 386-slow). Written by the setup panel and boot menu on Save/Accept; applied
@@ -87,7 +90,7 @@
 
 ; Session boot-device choice (segment 0 byte), seeded from CMOS and optionally
 ; replaced by a one-boot menu selection. INT 19h reads it as the primary.
-%define BOOT_CHOICE    (BIOS_SCRATCH + 0x17)   ; 0x0537
+%define BOOT_CHOICE    0x0537
 ; First POST hotkey latched from anywhere in diagnostics: 0 none, 1 Del/setup,
 ; 2 Tab/boot menu. First one wins.
 %define POST_HOTKEY    (BIOS_SCRATCH + 0x18)   ; 0x0538
@@ -171,7 +174,8 @@
 %define BIOS_SCRATCH     0x0520    ; foundation: general scratch (32 B)
 %define RAMTEST_SCRATCH  0x0540    ; detected size + flags (160 B, ends 0x5DF)
 ; 0x0600: emulator BIOS IRET stub. Reserved; never write here.
-%define SETUP_SCRATCH    0x0610    ; setup working copy (256 B, 0x610-0x70F)
+%define SETUP_SCRATCH      0x0610  ; setup working copy
+%define SETUP_SCRATCH_USED 12      ; 0x610-0x61B; RTC stub is retired first
 %define PROBE_SCRATCH    0x0710    ; per-probe value buffers (240 B, 0x710-0x7FF)
 ; 0x0800..STACK area free; stack top STACK_TOP; result block at RESULT_BLOCK.
 
