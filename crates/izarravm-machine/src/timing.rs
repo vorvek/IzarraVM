@@ -81,65 +81,14 @@ impl Machine {
 
     fn apply_device_advance(&mut self, advance: DeviceAdvance) {
         self.opl.advance_micros(advance.microseconds);
-
-        // The DSP reset-settle countdown advances with emulated time so a
-        // detection routine's delay loop sees 0xAA become available. No lazy
-        // twin yet; routed through the shared formula anyway so the last
-        // hand-synchronized copy of its arithmetic is gone.
-        self.dsp.advance_micros(advance.microseconds);
-
-        // DMA playback is clock-driven: accrue DSP sample phases per CPU clock
-        // and, for each whole sample, advance the block and buffer the rendered
-        // stereo frame onto the DSP ring. The block-completion IRQ that
-        // render_frame edges is forwarded to the PIC here, so playback timing and
-        // IRQ5 no longer depend on the host frontend pulling audio. The host path
-        // (render_dsp_audio) only drains what the clock already produced.
-        //
-        // The run loop caps normal CPU batches at the next programmed block edge,
-        // then forwards the DSP latch below so the guest can acknowledge each IRQ.
-        // An explicit device-only advance can span several edges while the CPU is
-        // unable to acknowledge; those requests coalesce in the device latch.
-        // The mixer's SB Pro stereo bit (0x0E bit1) selects 8-bit byte
-        // interleaving, which halves the per-channel frame rate; sample it before
-        // computing the rate the DSP frames at.
-        self.dsp.set_sbpro_stereo(self.mixer.sbpro_stereo());
-        let rate = self.dsp.output_frame_rate();
-        // The mixer selects the IRQ line and DMA channels (registers 0x80/0x81);
-        // read them before the borrow-splitting loop below so the loop's
-        // `let Machine { dsp, dma, memory, .. } = self;` shape is untouched.
-        let irq_line = self.mixer.selected_irq();
-        let dma8 = self.mixer.selected_dma_8();
-        let dma16 = self.mixer.selected_dma_16();
-        if self.dsp.needs_output_tick() && rate > 0 {
-            let n = advance.dsp_frames as usize;
+        let sb16_irq = {
             let Machine {
-                dsp, dma, memory, ..
+                sb16, dma, memory, ..
             } = self;
-            let is16 = dsp.is_16bit();
-            let ch = if is16 { dma16 } else { dma8 };
-            // HLE batches the elapsed output frames but keeps DMA reads at the
-            // frame that consumes them. This avoids copying stale data ahead of
-            // the guest's block IRQ and lets a dry DMA source stop the batch.
-            if is16 {
-                dsp.tick_n_samples(n, || None, || dma.read_word(ch, memory));
-            } else {
-                dsp.tick_n_samples(n, || dma.read_byte(ch, memory), || None);
-            }
-            if dsp.take_irq() {
-                let is_16bit = dsp.is_16bit();
-                self.mixer.set_irq_status(is_16bit);
-                self.pic.request(irq_line);
-            }
-        }
-        // Forward a pending DSP interrupt with playback idle too: the 0xF2
-        // IRQ-request command raises it without a transfer running (drivers
-        // probe their IRQ wiring that way). The real chip asserts the line
-        // regardless. take_irq is a test-and-clear latch, so this never
-        // double-delivers an edge the per-tick forward above already took.
-        if self.dsp.take_irq() {
-            let is_16bit = self.dsp.is_16bit();
-            self.mixer.set_irq_status(is_16bit);
-            self.pic.request(irq_line);
+            sb16.advance(advance.microseconds, advance.dsp_frames, dma, memory)
+        };
+        if let Some(irq) = sb16_irq {
+            self.pic.request(irq.line());
         }
 
         // AD1848 / Windows Sound System playback, clock-driven exactly like the
@@ -465,14 +414,9 @@ impl Machine {
     }
 
     fn device_rates(&mut self) -> DeviceRates {
-        self.dsp.set_sbpro_stereo(self.mixer.sbpro_stereo());
         let programmed_wss = self.wss.output_frame_rate();
         DeviceRates {
-            dsp_hz: if self.dsp.needs_output_tick() {
-                u64::from(self.dsp.output_frame_rate())
-            } else {
-                0
-            },
+            dsp_hz: self.sb16.timeline_rate_hz(),
             wss_hz: if self.wss_enabled && (self.wss.is_playing() || self.wss.autocal_active()) {
                 u64::from(if programmed_wss > 0 {
                     programmed_wss
@@ -657,13 +601,6 @@ impl Machine {
         )
     }
 
-    /// Advance the DSP reset-settle clock by `micros` microseconds. The run loop
-    /// drives this from CPU clocks in advance_devices; this exposes it directly
-    /// so a reset-detection golden can settle the DSP without running the CPU.
-    pub fn advance_dsp_micros(&mut self, micros: u64) {
-        self.dsp.advance_micros(micros);
-    }
-
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
     /// path wires GATE2 from port 0x61. Exposed so the GATE-triggered modes
     /// have a caller outside tests.
@@ -707,17 +644,17 @@ impl Machine {
         } else {
             None
         };
-        let dsp_wake = if self.pic.deliverable(self.mixer.selected_irq()) {
-            self.dsp.frames_until_next_irq().and_then(|frames| {
+        let dsp_wake = self.sb16.irq_deadline().and_then(|deadline| {
+            if self.pic.deliverable(deadline.line()) {
                 self.timeline.cpu_clocks_until(
                     timeline::DeviceClock::Dsp,
-                    frames,
-                    u64::from(self.dsp.output_frame_rate()),
+                    deadline.frames(),
+                    deadline.rate_hz(),
                 )
-            })
-        } else {
-            None
-        };
+            } else {
+                None
+            }
+        });
         // The AD1848 / WSS terminal-count wake, on the codec's own (config) IRQ
         // line. The codec drains one Current Count per output frame, so its IRQ
         // estimator is fed the frame rate directly (no byte/word-counter scaling
@@ -914,11 +851,11 @@ impl Machine {
         }
         // Next audio block IRQ edge. Both counters are expressed in output
         // frames, including stereo DMA-unit accounting inside the DSP.
-        if let Some(frames) = self.dsp.frames_until_next_irq()
+        if let Some(deadline) = self.sb16.irq_deadline()
             && let Some(clocks) = self.timeline.cpu_clocks_until(
                 timeline::DeviceClock::Dsp,
-                frames,
-                u64::from(self.dsp.output_frame_rate()),
+                deadline.frames(),
+                deadline.rate_hz(),
             )
         {
             cap = cap.min(clocks);

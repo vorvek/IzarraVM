@@ -51,8 +51,7 @@ impl Machine {
             dma: &mut self.dma,
             fdc: &mut self.fdc,
             opl: &mut self.opl,
-            dsp: &mut self.dsp,
-            mixer: &mut self.mixer,
+            sb16: &mut self.sb16,
             wavetable_mpu: &mut self.wavetable_mpu,
             midi_mpu: &mut self.midi_mpu,
             wss: &mut self.wss,
@@ -1513,7 +1512,9 @@ impl CpuBus for MachineBus<'_> {
         if !skip_io_touched {
             *self.io_touched = true;
         }
-        if let Some(value) = self.mixer.read_port(port) {
+        if matches!(port, 0x224 | 0x225)
+            && let Some(value) = self.sb16.read_port(port)
+        {
             return Ok(u32::from(value));
         }
         if port == WAVETABLE_MPU_BASE {
@@ -1566,12 +1567,9 @@ impl CpuBus for MachineBus<'_> {
         if fdc::Fdc::owns_port(port) {
             return Ok(u32::from(self.fdc.read_port(port).unwrap_or(0xff)));
         }
-        if let Some(value) = self.dsp.read_port(port) {
-            // A guest ISR acknowledges the DSP interrupt by reading 0x22E (8-bit)
-            // or 0x22F (16-bit); that read also clears the mixer's 0x82 source bit.
-            if port == 0x22E || port == 0x22F {
-                self.mixer.clear_irq_status();
-            }
+        if !matches!(port, 0x224 | 0x225)
+            && let Some(value) = self.sb16.read_port(port)
+        {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pit.read_port(port) {
@@ -1725,7 +1723,7 @@ impl CpuBus for MachineBus<'_> {
             self.opl.write_port(opl_port, value as u8);
             return Ok(());
         }
-        if self.mixer.write_port(port, value as u8) {
+        if matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {
             return Ok(());
         }
         if port == WAVETABLE_MPU_BASE {
@@ -1777,7 +1775,7 @@ impl CpuBus for MachineBus<'_> {
             self.fdc.write_port_at(port, value as u8, now_ticks);
             return Ok(());
         }
-        if self.dsp.write_port(port, value as u8) {
+        if !matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {
             return Ok(());
         }
         if self

@@ -166,7 +166,7 @@ fn absolute_tsc_origin_cannot_change_machine_or_cpu_continuation() {
     );
     assert_eq!(left.pic, right.pic);
     assert_eq!(left.pit, right.pit);
-    assert_eq!(left.dsp, right.dsp);
+    assert!(left.sb16.test_dsp_matches(&right.sb16));
     assert_eq!(left.wss, right.wss);
     assert_eq!(left.opl, right.opl);
     assert_eq!(left.elapsed_clocks, right.elapsed_clocks);

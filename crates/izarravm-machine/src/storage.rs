@@ -15,23 +15,99 @@ pub(super) const PREVIOUS_STOCK_AUTOEXEC_BAT: &[u8] =
     b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n\
 SET BLASTER=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
 
-/// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if absent. A file that
-/// byte-for-byte matches the immediately preceding stock version is upgraded to
-/// the current default. Every other existing file remains user-owned.
+const STOCK_SB_IRQS: &[u8] = &[2, 5, 7, 10];
+const STOCK_SB_DMA8: &[usize] = &[0, 1, 3];
+const STOCK_SB_DMA16: &[usize] = &[5, 6, 7];
+
+fn routed_stock_autoexec(base: &[u8], routing: Option<(u8, usize, usize)>) -> Vec<u8> {
+    let value = routing.map(|(irq, dma, high_dma)| {
+        format!(
+            "A220 I{irq} D{dma} H{high_dma} P{:03X} T6",
+            WAVETABLE_MPU_BASE
+        )
+    });
+    let mut result = Vec::with_capacity(base.len());
+    for line in base.split_inclusive(|byte| *byte == b'\n') {
+        let newline_len = if line.ends_with(b"\r\n") {
+            2
+        } else {
+            usize::from(line.ends_with(b"\n"))
+        };
+        let body_end = line.len() - newline_len;
+        let body = &line[..body_end];
+        let variable = if body.starts_with(b"SET BLASTER=") {
+            Some("BLASTER")
+        } else if body.starts_with(b"SET SETSOUND=") {
+            Some("SETSOUND")
+        } else {
+            None
+        };
+        let Some(variable) = variable else {
+            result.extend_from_slice(line);
+            continue;
+        };
+        let Some(value) = &value else {
+            continue;
+        };
+        result.extend_from_slice(format!("SET {variable}={value}").as_bytes());
+        result.extend_from_slice(&line[body_end..]);
+    }
+    result
+}
+
+/// Apply the machine's Sound Blaster routing to an emulator-owned stock
+/// AUTOEXEC template. Repair uses the same helper as folder mounting.
+pub(super) fn stock_autoexec(base: &[u8], config: &izarravm_core::SoundBlasterConfig) -> Vec<u8> {
+    routed_stock_autoexec(
+        base,
+        config.enabled.then_some((
+            config.irq.line(),
+            config.dma.channel(),
+            config.high_dma.channel(),
+        )),
+    )
+}
+
+fn is_emulator_stock_autoexec(bytes: &[u8], current_base: &[u8]) -> bool {
+    for base in [current_base, PREVIOUS_STOCK_AUTOEXEC_BAT] {
+        if bytes == routed_stock_autoexec(base, None) {
+            return true;
+        }
+        for &irq in STOCK_SB_IRQS {
+            for &dma in STOCK_SB_DMA8 {
+                for &high_dma in STOCK_SB_DMA16 {
+                    if bytes == routed_stock_autoexec(base, Some((irq, dma, high_dma))) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if absent. Exact current
+/// or previous emulator stock files follow profile changes. Other files remain
+/// user-owned.
 pub(super) fn ensure_user_config(
     dir: &std::path::Path,
-    config: &[u8],
-    autoexec: &[u8],
+    config_sys: &[u8],
+    stock_autoexec_base: &[u8],
+    sound_blaster: &izarravm_core::SoundBlasterConfig,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    for (name, previous, current) in [
-        ("CONFIG.SYS", PREVIOUS_STOCK_CONFIG_SYS, config),
-        ("AUTOEXEC.BAT", PREVIOUS_STOCK_AUTOEXEC_BAT, autoexec),
-    ] {
-        let path = dir.join(name);
-        if !path.exists() || std::fs::read(&path)? == previous {
-            std::fs::write(path, current)?;
-        }
+    let config_path = dir.join("CONFIG.SYS");
+    if !config_path.exists() || std::fs::read(&config_path)? == PREVIOUS_STOCK_CONFIG_SYS {
+        std::fs::write(config_path, config_sys)?;
+    }
+    let autoexec_path = dir.join("AUTOEXEC.BAT");
+    if !autoexec_path.exists()
+        || is_emulator_stock_autoexec(&std::fs::read(&autoexec_path)?, stock_autoexec_base)
+    {
+        std::fs::write(
+            autoexec_path,
+            stock_autoexec(stock_autoexec_base, sound_blaster),
+        )?;
     }
     Ok(())
 }
@@ -268,6 +344,12 @@ impl Machine {
             .into_iter()
             .filter(|(name, _)| !name.eq_ignore_ascii_case("HELLO.TXT"))
             .collect();
+        if let Some((_, bytes)) = system_files
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("AUTOEXEC.BAT"))
+        {
+            *bytes = stock_autoexec(bytes, &self.profile.sound_blaster);
+        }
         apply_overrides(&mut system_files, overrides);
 
         // The recursive tree volume walks `dir` (metadata only) overlaying the
@@ -299,6 +381,7 @@ impl Machine {
             dir,
             &payload_file(&payload, "CONFIG.SYS"),
             &payload_file(&payload, "AUTOEXEC.BAT"),
+            &self.profile.sound_blaster,
         )?;
         let mut system_files = user_folder_overlay(payload.files);
         apply_overrides(&mut system_files, overrides);
@@ -408,7 +491,7 @@ impl Machine {
     /// Live CD playback and guest mixer state for a host front panel.
     pub fn cd_audio_state(&self) -> crate::CdAudioState {
         let playback = self.ide.device().playback();
-        let (left_level, right_level) = self.mixer.cd_levels();
+        let (left_level, right_level) = self.sb16.cd_levels();
         crate::CdAudioState {
             media_present: self.ide.device().is_loaded(),
             audio_capable: self.ide.device().audio_capable(),
@@ -432,7 +515,7 @@ impl Machine {
 
     /// Set both guest-visible CT1745 CD levels to one linked raw value.
     pub fn set_cd_linked_level(&mut self, level: u8) {
-        self.mixer.set_cd_levels(level, level);
+        self.sb16.set_linked_cd_level(level);
     }
 
     pub(super) fn icdex_cd_drive_number(&self) -> Option<u8> {

@@ -6,9 +6,7 @@ pub use fat32::{
     fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
 };
 pub use fat32_volume::{Fat32Volume, build_fat32};
-use izarravm_audio::{
-    Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, SbDsp, SbMixer, TimedMidiMessage,
-};
+use izarravm_audio::{Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, TimedMidiMessage};
 use izarravm_bus::{
     BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CompiledBusDelta, CompiledBusWindow,
     CpuBus, DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, TracingMode,
@@ -46,6 +44,7 @@ use bus::DevicePorts;
 pub(crate) use pci::PciConfig;
 mod cache_config;
 mod ram_lookup;
+mod sb16_path;
 mod timeline;
 mod timing;
 mod vega;
@@ -54,6 +53,8 @@ mod video_params;
 
 use timeline::{DeviceAdvance, DeviceRates, RatePhase, Timeline};
 use vega::Vega;
+
+use sb16_path::{Ct1745Mix, Sb16Path, Sb16RenderWindow};
 
 /// Lightweight live state for the CD-ROM controls and status display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -787,18 +788,8 @@ pub struct Machine {
     /// render_audio to the speaker only. 1.0 = full (default), 0.0 = muted. Like
     /// card_amp it is host-side loudness only, never guest-visible.
     speaker_volume: f32,
-    dsp: SbDsp,
-    /// DSP PCM resampler (rate_hz -> 44100), rebuilt when the programmed rate
-    /// changes. Summed with the OPL stream in render_audio.
-    dsp_resampler: Resampler,
-    dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
+    sb16: Sb16Path,
     last_audio_ticks: u64,
-    dsp_render_phase: RatePhase,
-    /// Last DAC-rate frame the DSP stream delivered, held across the render
-    /// window when the guest-clocked stream comes up short of the wall-clock
-    /// window (see `hold_frame`). Cleared when the channel goes idle.
-    dsp_hold: (i32, i32),
-    mixer: SbMixer, // the CT1745 mixer: IRQ/DMA routing + volume attenuation
     wavetable_mpu: Mpu401,
     midi_mpu: Mpu401,
     // AD1848 / Windows Sound System codec. An always-on combo-card device that
@@ -812,7 +803,7 @@ pub struct Machine {
     wss_resampler: Resampler,
     wss_rate_hz: u32, // input rate the wss_resampler is currently configured for
     wss_render_phase: RatePhase,
-    /// The WSS counterpart of `dsp_hold`.
+    /// Last DAC-rate frame delivered by the WSS stream.
     wss_hold: (i32, i32),
     wss_base: u16,     // I/O base of the 4-port config region (codec sits at base+4)
     wss_irq: u8,       // PIC line the codec's terminal-count interrupt forwards to
@@ -925,14 +916,6 @@ const MOUSE_GUEST_MAX_Y: i32 = 199;
 const MOUSE_GUEST_CENTER_X: i32 = MOUSE_GUEST_MAX_X / 2;
 const MOUSE_GUEST_CENTER_Y: i32 = MOUSE_GUEST_MAX_Y / 2;
 
-/// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
-/// The host config is applied once at construction like `SBCONFIG`; a guest
-/// mixer reset (write `0x00`) still restores the hardware IRQ5/DMA1/DMA5.
-fn power_on_mixer(profile: &MachineProfile) -> SbMixer {
-    let sb = profile.sound_blaster;
-    SbMixer::with_power_on(sb.irq.line(), sb.dma.channel(), sb.high_dma.channel())
-}
-
 /// Derive the DOS environment entries that advertise the Sound Blaster to
 /// auto-detecting games. `BLASTER` and `SETSOUND` carry the same value:
 /// `A220` (the fixed Resonique 2 base), `I`/`D`/`H` from the host config, and
@@ -987,13 +970,12 @@ fn payload_file(payload: &katea_volume::SystemPayload, name: &str) -> Vec<u8> {
         .unwrap_or_else(|| panic!("katea: {name} missing from the committed image payload"))
 }
 
-/// The default `(CONFIG.SYS, AUTOEXEC.BAT)` bytes from the committed image payload
-/// — used by Repair, which has no `payload` already in scope.
-fn default_config_pair() -> (Vec<u8>, Vec<u8>) {
+/// Default `(CONFIG.SYS, AUTOEXEC.BAT)` bytes from the committed image payload.
+fn default_config_pair(sound_blaster: &SoundBlasterConfig) -> (Vec<u8>, Vec<u8>) {
     let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
     (
         payload_file(&payload, "CONFIG.SYS"),
-        payload_file(&payload, "AUTOEXEC.BAT"),
+        storage::stock_autoexec(&payload_file(&payload, "AUTOEXEC.BAT"), sound_blaster),
     )
 }
 
@@ -1020,7 +1002,7 @@ impl Machine {
         mut cpu: CpuGsw,
         mut rom: Vec<u8>,
     ) -> Result<Self, MachineError> {
-        let mixer = power_on_mixer(&profile);
+        let sb16 = Sb16Path::new(&profile.sound_blaster);
         // Build the AD1848 codec from the WSS board config. The codec's IRQ/DMA
         // jumper readback comes from the same WssConfig the env/detection use, so
         // the config region answers exactly what the codec is wired to. The base
@@ -1098,15 +1080,8 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             card_amp: 1.0,
             speaker_volume: 1.0,
-            dsp: SbDsp::default(),
-            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
-            // first use, so the value here never reaches the DAC as-is.
-            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
-            dsp_rate_hz: 0,
+            sb16,
             last_audio_ticks: 0,
-            dsp_render_phase: RatePhase::default(),
-            dsp_hold: (0, 0),
-            mixer,
             wavetable_mpu: Mpu401::default(),
             midi_mpu: Mpu401::default(),
             wss,
@@ -1308,12 +1283,6 @@ impl Machine {
 
     pub fn profile(&self) -> &MachineProfile {
         &self.profile
-    }
-
-    /// The IRQ line the CT1745 mixer currently routes the DSP interrupt to
-    /// (decoded from register `0x80`).
-    pub fn sb_selected_irq(&self) -> u8 {
-        self.mixer.selected_irq()
     }
 
     pub fn cpu(&self) -> &CpuGsw {
@@ -1756,29 +1725,6 @@ impl Machine {
         }
     }
 
-    /// Render `native_samples` of DSP DMA output as stereo frames by draining
-    /// the rendered-frame ring the per-CPU-clock producer (in `advance_devices`)
-    /// fills. The block counter and its completion IRQ now advance with CPU
-    /// time, independent of this call; this path only reads back frames for the
-    /// DAC. Each drained frame is attenuated by the CT1745 voice volume
-    /// (`0x32`/`0x33`) so a mid-buffer guest volume change applies immediately. A
-    /// silent (idle) DSP drains nothing, so the OPL passes through.
-    pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
-        let (voice_l, voice_r) = self.mixer.voice_gain();
-        let mut out = Vec::with_capacity(native_samples);
-        for _ in 0..native_samples {
-            match self.dsp.drain_frame() {
-                Some((l, r)) => {
-                    let l = clamp_i16((i32::from(l) as f32 * voice_l) as i32);
-                    let r = clamp_i16((i32::from(r) as f32 * voice_r) as i32);
-                    out.push((l, r));
-                }
-                None => break,
-            }
-        }
-        out
-    }
-
     /// Render `native_samples` of AD1848 / WSS DMA output as stereo frames by
     /// draining the codec's rendered-frame ring (filled by the clock-driven
     /// producer in advance_devices). The codec already applies its own I6/I7 DAC
@@ -1794,16 +1740,6 @@ impl Machine {
             }
         }
         out
-    }
-
-    /// Rebuild the DSP resampler when the programmed sample rate changes, so it
-    /// always runs rate_hz -> 44100.
-    fn sync_dsp_resampler(&mut self) {
-        let rate = self.dsp.output_frame_rate().max(1);
-        if rate != self.dsp_rate_hz {
-            self.dsp_resampler = Resampler::new(rate, DAC_HZ);
-            self.dsp_rate_hz = rate;
-        }
     }
 
     /// Rebuild the WSS resampler when the codec's programmed sample rate changes,
@@ -1855,21 +1791,11 @@ impl Machine {
         let now_ticks = self.timeline.now_ticks();
         let delta_ticks = now_ticks.saturating_sub(self.last_audio_ticks);
         self.last_audio_ticks = now_ticks;
-        self.sync_dsp_resampler();
-        let dsp_native_count = if delta_ticks > 0 {
-            self.dsp_render_phase
-                .advance(delta_ticks, u64::from(self.dsp.output_frame_rate())) as usize
-        } else {
-            (native_samples as f64 * self.dsp.output_frame_rate() as f64 / OPL_NATIVE_HZ as f64)
-                .round() as usize
-        };
-        // The DSP already produces stereo frames; widen to i32 and resample.
-        let dsp_stereo: Vec<(i32, i32)> = self
-            .render_dsp_audio(dsp_native_count)
-            .iter()
-            .map(|&(l, r)| (i32::from(l), i32::from(r)))
-            .collect();
-        let dsp_out = self.dsp_resampler.process(&dsp_stereo);
+        let dsp_out = self.sb16.render_voice(Sb16RenderWindow {
+            elapsed_master_ticks: delta_ticks,
+            fallback_opl_samples: native_samples,
+            output_frames: opl_out.len(),
+        });
 
         // AD1848 / WSS: the same wall-clock window's worth of codec frames,
         // resampled to the DAC rate. The codec is independent of the CT1745 mixer
@@ -1895,14 +1821,9 @@ impl Machine {
             Vec::new()
         };
 
-        // Apply master + output gain (0x30/0x31, 0x41/0x42) once to the summed
-        // pair. The DSP frames already carry the voice gain from render_dsp_audio,
-        // so this single scaling pass gives DSP·voice·master·outgain and
-        // OPL·master·outgain. A silent (idle) DSP yields no frames, so the OPL
-        // passes through (attenuated only by master/outgain) when no DMA is armed.
-        // The WSS stream is summed in raw afterward (independent of the mixer).
-        let (master_l, master_r) = self.mixer.master_gain();
-        let (outgain_l, outgain_r) = self.mixer.outgain_gain();
+        // Apply the CT1745 snapshot to OPL, DSP voice, and CD input. WSS remains
+        // independent and is summed in raw afterward.
+        let ct1745: Ct1745Mix = self.sb16.mix_snapshot();
         // The mix window is the WALL-clock window the OPL was rendered for, since
         // that is what the host sink consumes in real time. The DSP and WSS
         // streams are produced and drained on the GUEST clock, so a guest a few
@@ -1921,11 +1842,6 @@ impl Machine {
         let len = opl_out.len();
         // An idle source must fall silent rather than hold its last level forever,
         // so the latch is armed only while the channel still has output to make.
-        let mut dsp_hold = if self.dsp.needs_output_tick() {
-            self.dsp_hold
-        } else {
-            (0, 0)
-        };
         let mut wss_hold = if self.wss_enabled && self.wss.is_playing() {
             self.wss_hold
         } else {
@@ -1936,20 +1852,19 @@ impl Machine {
         // DAC rate, so no resample) and attenuate by the CT1745 CD volume. A drive
         // that is not playing returns silence, so this is a no-op when no PLAY
         // AUDIO is active. This realizes CD audio through the ReSonique 2 DAC.
-        let (cd_l_gain, cd_r_gain) = self.mixer.cd_gain();
         let cd = self.pull_cd_audio_samples(len);
         let mixed = (0..len)
             .map(|i| {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
-                let (dl, dr) = hold_frame(&mut dsp_hold, dsp_out.get(i).copied());
+                let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
                 let (wl, wr) = hold_frame(&mut wss_hold, wss_out.get(i).copied());
                 // Host PC speaker volume: a straight attenuation on the beeper,
                 // independent of the card amp (0.0 mutes it). Unity leaves the mix
                 // bit-identical to before.
                 let s = (f32::from(spk[i]) * speaker_volume) as i32;
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
-                let cl = (cl as f32 * cd_l_gain) as i32;
-                let cr = (cr as f32 * cd_r_gain) as i32;
+                let (sb_l, sb_r) = ct1745.mix_opl_voice((ol, or), (dl, dr));
+                let (cl, cr) = ct1745.mix_cd((cl, cr));
                 // OPL + SB16 DSP take the CT1745 master/outgain; the WSS codec and
                 // CD are summed in raw (their own attenuation already applied). All
                 // of these are ReSonique 2 card sources, so the analog output-stage
@@ -1961,16 +1876,13 @@ impl Machine {
                 // speaker. At card_amp == 1.0 this is bit-identical to the pre-amp
                 // mix (`... as i32 + wl + s + cl`), since a whole f32 casts back
                 // unchanged and integer addition commutes.
-                let card_l = (((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + cl) as f32
-                    * card_amp;
-                let card_r = (((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + cr) as f32
-                    * card_amp;
+                let card_l = (sb_l + wl + cl) as f32 * card_amp;
+                let card_r = (sb_r + wr + cr) as f32 * card_amp;
                 let l = clamp_i16(card_l as i32 + s);
                 let r = clamp_i16(card_r as i32 + s);
                 (l, r)
             })
             .collect();
-        self.dsp_hold = dsp_hold;
         self.wss_hold = wss_hold;
         self.host_profile
             .record(MachineProfilePhaseKind::AudioRender, render_start);
@@ -2075,8 +1987,7 @@ struct MachineBus<'a> {
     dma: &'a mut dma::DmaController,
     fdc: &'a mut fdc::Fdc,
     opl: &'a mut OplChip,
-    dsp: &'a mut SbDsp,
-    mixer: &'a mut SbMixer,
+    sb16: &'a mut Sb16Path,
     wavetable_mpu: &'a mut Mpu401,
     midi_mpu: &'a mut Mpu401,
     // The AD1848 codec and its config-region base. The port decode routes the 8
