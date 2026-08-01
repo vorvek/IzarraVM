@@ -2050,3 +2050,132 @@ fn compiled_block_stays_small_enough_to_copy_per_entry() {
          uniform-fetch entry path before letting it ride every per-entry copy"
     );
 }
+
+/// Every state an entry can be in maps to exactly one `UnboundTarget`, and the variant list is
+/// complete. The classes exist to close on `jit_direct_unresolved_static_unbound`, so a state
+/// that fell through to a default (or two states sharing a class) would silently break the
+/// attribution table the linking campaign is steered by.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn unbound_target_classes_are_exhaustive() {
+    let mut labels: Vec<&str> = UnboundTarget::ALL.iter().map(|k| k.label()).collect();
+    let distinct = {
+        labels.sort_unstable();
+        labels.dedup();
+        labels.len()
+    };
+    assert_eq!(
+        distinct,
+        UnboundTarget::COUNT,
+        "class labels must be unique"
+    );
+
+    let mut cache = BlockCache::default();
+
+    // Absent: never probed.
+    let cold = key(0x1000);
+    assert_eq!(cache.classify_unbound_target(cold), UnboundTarget::Absent);
+
+    // Seen: probed, not yet compiled.
+    assert!(matches!(cache.probe(cold), BlockProbe::Interpret));
+    assert_eq!(cache.classify_unbound_target(cold), UnboundTarget::Seen);
+
+    // Dormant, split by reason. `SpanHot` is the heat lane; the other three share the residual.
+    let heat = key(0x1100);
+    assert!(matches!(cache.probe(heat), BlockProbe::Interpret));
+    cache.dormant(heat, DormantReason::SpanHot);
+    assert_eq!(
+        cache.classify_unbound_target(heat),
+        UnboundTarget::DormantHeat
+    );
+    let other = key(0x1200);
+    assert!(matches!(cache.probe(other), BlockProbe::Interpret));
+    cache.dormant(other, DormantReason::CompileRetry);
+    assert_eq!(
+        cache.classify_unbound_target(other),
+        UnboundTarget::DormantOther
+    );
+
+    // Rejected.
+    let rejected = key(0x1300);
+    assert!(matches!(cache.probe(rejected), BlockProbe::Interpret));
+    cache.reject(RejectedSpan {
+        key: rejected,
+        guest_len: 1,
+    });
+    assert_eq!(
+        cache.classify_unbound_target(rejected),
+        UnboundTarget::Rejected
+    );
+
+    // Compiled and live, then retired out from under the same entry.
+    let compiled = key(0x1400);
+    install_trivial(&mut cache, compiled, 1);
+    assert_eq!(
+        cache.classify_unbound_target(compiled),
+        UnboundTarget::Compiled
+    );
+    assert_eq!(
+        cache.retire_physical_range_for_test(compiled.physical, 1),
+        1
+    );
+    assert_eq!(
+        cache.classify_unbound_target(compiled),
+        UnboundTarget::Absent,
+        "a retired range drops the entry entirely; CompiledRetired is the slot-reuse case"
+    );
+}
+
+/// The three link-clear causes account for every cleared link: their sum equals the aggregate
+/// `BlockCacheStats::unlinks` that feeds `jit_direct_links_cleared`. The aggregate is fed
+/// independently rather than derived, so this is the cross-check that they have not drifted --
+/// a new unlink site that forgets its cause would show up here as a shortfall.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_clear_causes_close_on_the_aggregate() {
+    let mut cache = BlockCache::default();
+    let source = key(0x1000);
+    let first = key(0x1100);
+    let second = key(0x1200);
+    let source_id = install_trivial(&mut cache, source, 1);
+    let first_id = install_trivial(&mut cache, first, 1);
+    let second_id = install_trivial(&mut cache, second, 1);
+
+    // Replace: the same cell relinked to a different target.
+    assert!(cache.try_link(source_id, 0, first_id));
+    assert!(cache.try_link(source_id, 0, second_id));
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::Replaced as usize],
+        1
+    );
+
+    // Retire: the linked target goes away.
+    assert_eq!(cache.retire_physical_range_for_test(second.physical, 1), 1);
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::Retired as usize],
+        1
+    );
+
+    // Reset: a surviving link dropped by the bulk clear.
+    let third = key(0x1300);
+    let third_id = install_trivial(&mut cache, third, 1);
+    assert!(cache.try_link(source_id, 0, third_id));
+    cache.clear();
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::Reset as usize],
+        1
+    );
+
+    let causes: u64 = cache.stalls.links_cleared.iter().sum();
+    let stats = cache.take_stats();
+    assert_eq!(
+        causes, stats.unlinks,
+        "the cause split must sum to the aggregate it attributes"
+    );
+}

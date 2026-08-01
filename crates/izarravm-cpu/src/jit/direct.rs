@@ -133,6 +133,12 @@ pub(crate) struct DirectStallTally {
     /// the source cell on the zero portal, so the exit reports `StaticUnbound` and is
     /// indistinguishable from a target that was never compiled.
     pub link_refusals: [u64; LinkRefusal::COUNT],
+    /// Which cause cleared each link, indexed by `LinkClearCause`. The aggregate
+    /// `jit_direct_links_cleared` counts the same events through `BlockCacheStats::unlinks` and
+    /// is left alone; these three are the attribution the aggregate could not carry. Always on:
+    /// each is one increment beside an increment that already happens, on paths that are already
+    /// doing map work.
+    pub links_cleared: [u64; LinkClearCause::COUNT],
     /// The two halves the old `SideExitReason::Other` counter conflated.
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
@@ -480,6 +486,10 @@ impl super::JitState {
             link_refusals: LinkRefusal::ALL
                 .iter()
                 .map(|r| (r.label(), self.stalls.link_refusals[*r as usize]))
+                .collect(),
+            links_cleared: LinkClearCause::ALL
+                .iter()
+                .map(|c| (c.label(), self.stalls.links_cleared[*c as usize]))
                 .collect(),
             side_exit_segment_limit: self.stalls.side_exit_segment_limit,
             side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
@@ -915,39 +925,90 @@ impl BlockId {
 }
 
 /// Result of `classify_unbound_target`. Diagnostic.
+///
+/// EXHAUSTIVE AND MUTUALLY EXCLUSIVE by construction: every unbound-exit classification call
+/// lands on exactly one variant, including the `NoKey` early-out, so the per-run totals sum to
+/// the unresolved-exit counter the classifier is gated behind. The identity is asserted by
+/// `unbound_target_classes_are_exhaustive` (direct_test.rs); do not add a classification path
+/// that returns without noting a variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnboundTarget {
-    /// The successor address has never been probed at all — a genuinely cold edge.
-    NeverSeen,
-    /// Probed, but not hot enough to compile yet, or dormant.
-    SeenNotCompiled,
+    /// The exiting EIP could not be turned into a `BlockKey` at all (`key_for` refused, e.g. the
+    /// successor page is not mapped). No entry-map probe happened, so this is not `Absent`: it
+    /// is "the question could not be asked". Exists so the classes close on the exit counter.
+    NoKey,
+    /// Probed for, but the successor address has no entry at all — a genuinely cold edge.
+    Absent,
+    /// The key is tracked and admissible, just not hot enough to have been compiled yet.
+    Seen,
+    /// Parked `Dormant` by the G1 SMC-heat gate (`DormantReason::SpanHot`). Split out from the
+    /// other three dormant reasons because this is the only one with a designed recovery path
+    /// (`lift_cold_smc_dormant`), so it is churn rather than a permanent refusal.
+    DormantHeat,
+    /// Parked `Dormant` by any non-heat reason — compile retry, page-cover failure, or an arena
+    /// install failure. None of these lift on their own.
+    DormantOther,
     /// Compilation was attempted and structurally refused. These are the edges an opcode
     /// lowering slice would convert.
     Rejected,
     /// The target is compiled and live, but the edge was never linked — a `link_compatible`
-    /// refusal or a link that has not been attempted.
-    CompiledButUnlinked,
+    /// refusal, or the transient window before the next probe binds it.
+    Compiled,
     /// The target compiled once and its slot has since been retired or reused.
-    CompiledButRetired,
+    CompiledRetired,
 }
 
 impl UnboundTarget {
-    const COUNT: usize = 5;
+    const COUNT: usize = 8;
     pub(crate) const ALL: [Self; Self::COUNT] = [
-        Self::NeverSeen,
-        Self::SeenNotCompiled,
+        Self::NoKey,
+        Self::Absent,
+        Self::Seen,
+        Self::DormantHeat,
+        Self::DormantOther,
         Self::Rejected,
-        Self::CompiledButUnlinked,
-        Self::CompiledButRetired,
+        Self::Compiled,
+        Self::CompiledRetired,
     ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::NeverSeen => "never_seen",
-            Self::SeenNotCompiled => "seen_not_compiled",
+            Self::NoKey => "no_key",
+            Self::Absent => "absent",
+            Self::Seen => "seen",
+            Self::DormantHeat => "dormant_heat",
+            Self::DormantOther => "dormant_other",
             Self::Rejected => "rejected",
-            Self::CompiledButUnlinked => "compiled_unlinked",
-            Self::CompiledButRetired => "compiled_retired",
+            Self::Compiled => "compiled",
+            Self::CompiledRetired => "compiled_retired",
+        }
+    }
+}
+
+/// Which of the three unlink causes cleared a link, for the split behind the aggregate
+/// `jit_direct_links_cleared`. That aggregate is NOT re-derived from these: it keeps its own
+/// independent `BlockCacheStats::unlinks` feed, so the two are a cross-check rather than one
+/// number counted twice. `link_clear_causes_close_on_the_aggregate` (direct_test.rs) pins the
+/// sum identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinkClearCause {
+    /// `try_link_inner` displaced an existing edge in a cell it wanted for a different target.
+    Replaced,
+    /// The target (or source) block was retired, via `unlink_block`.
+    Retired,
+    /// A bulk drop: `invalidate_translation` or `reset_storage`.
+    Reset,
+}
+
+impl LinkClearCause {
+    pub(crate) const COUNT: usize = 3;
+    pub(crate) const ALL: [Self; Self::COUNT] = [Self::Replaced, Self::Retired, Self::Reset];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Replaced => "replaced",
+            Self::Retired => "retired",
+            Self::Reset => "reset",
         }
     }
 }
@@ -955,7 +1016,11 @@ impl UnboundTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockState {
     Seen,
-    Dormant,
+    /// Carries the reason it was parked so `classify_unbound_target` can separate the
+    /// heat-demoted (recoverable) dormants from the rest. The reason is stamped by the FIRST
+    /// park: `dormant()` only rewrites a `Seen` entry, so a second gate firing on an
+    /// already-dormant key counts in `DirectStallTally::dormant` but does not restamp the state.
+    Dormant(DormantReason),
     Rejected(RejectedSpan),
     Compiled(BlockId),
 }
@@ -1209,7 +1274,7 @@ impl BlockCache {
                 BlockProbe::Ready(id)
             }
             Some(BlockState::Seen) => BlockProbe::Compile,
-            Some(BlockState::Dormant | BlockState::Rejected(_)) => BlockProbe::Rejected,
+            Some(BlockState::Dormant(_) | BlockState::Rejected(_)) => BlockProbe::Rejected,
             None => {
                 self.stats.lookup_misses += 1;
                 if self.entries.len() == self.entry_cap {
@@ -1376,7 +1441,7 @@ impl BlockCache {
     pub(crate) fn dormant(&mut self, key: BlockKey, reason: DormantReason) {
         self.stalls.dormant[reason as usize] += 1;
         if self.entries.get(&key) == Some(&BlockState::Seen) {
-            self.entries.insert(key, BlockState::Dormant);
+            self.entries.insert(key, BlockState::Dormant(reason));
         }
     }
 
@@ -1496,7 +1561,7 @@ impl BlockCache {
         key: BlockKey,
         epoch: u32,
     ) {
-        if self.entries.get(&key) == Some(&BlockState::Dormant)
+        if matches!(self.entries.get(&key), Some(BlockState::Dormant(_)))
             && heat.take_stale_stamp(key.physical, epoch)
         {
             self.entries.insert(key, BlockState::Seen);
@@ -1570,6 +1635,7 @@ impl BlockCache {
         self.waiting.clear();
         self.linear_blocks.clear();
         self.stats.unlinks += links;
+        self.stalls.links_cleared[LinkClearCause::Reset as usize] += links;
         self.link_epoch = self.link_epoch.wrapping_add(1);
         if self.link_epoch == 0 {
             self.block_link_epochs.fill(0);
@@ -1682,7 +1748,7 @@ impl BlockCache {
                         continue;
                     };
                     let overlaps = match state {
-                        BlockState::Seen | BlockState::Dormant => {
+                        BlockState::Seen | BlockState::Dormant(_) => {
                             physical_range_contains(physical, width, key.physical)
                         }
                         BlockState::Rejected(span) => physical_ranges_overlap(
@@ -1747,7 +1813,7 @@ impl BlockCache {
                             watch.release_range(span.key.physical, u32::from(span.guest_len));
                         }
                         BlockState::Compiled(id) => self.retire_block(watch, id),
-                        BlockState::Seen | BlockState::Dormant => {}
+                        BlockState::Seen | BlockState::Dormant(_) => {}
                     }
                     invalidated += 1;
                 }
@@ -1781,14 +1847,16 @@ impl BlockCache {
     /// answers the question directly instead of inferring it a third time.
     pub(crate) fn classify_unbound_target(&self, key: BlockKey) -> UnboundTarget {
         match self.entries.get(&key) {
-            None => UnboundTarget::NeverSeen,
-            Some(BlockState::Seen) | Some(BlockState::Dormant) => UnboundTarget::SeenNotCompiled,
+            None => UnboundTarget::Absent,
+            Some(BlockState::Seen) => UnboundTarget::Seen,
+            Some(BlockState::Dormant(DormantReason::SpanHot)) => UnboundTarget::DormantHeat,
+            Some(BlockState::Dormant(_)) => UnboundTarget::DormantOther,
             Some(BlockState::Rejected(_)) => UnboundTarget::Rejected,
             Some(BlockState::Compiled(id)) => {
                 if self.active_index(*id).is_some() {
-                    UnboundTarget::CompiledButUnlinked
+                    UnboundTarget::Compiled
                 } else {
-                    UnboundTarget::CompiledButRetired
+                    UnboundTarget::CompiledRetired
                 }
             }
         }
@@ -2116,6 +2184,7 @@ impl BlockCache {
             cells[1].clear();
         }
         self.stats.unlinks += links;
+        self.stalls.links_cleared[LinkClearCause::Reset as usize] += links;
         self.stats.cache_resets += 1;
         self.entries.clear();
         self.physical_keys.clear();
@@ -2254,7 +2323,7 @@ impl BlockCache {
             }
             return true;
         }
-        self.unlink_outbound(source, slot);
+        self.unlink_outbound(source, slot, LinkClearCause::Replaced);
         // AFTER `unlink_outbound`, which routes through `LinkCell::clear` and resets this to the
         // never-set sentinel. Setting it earlier leaves every cell at `NO_ENTRY_TOP`, the shared
         // x87 pad then bails on every crossing, and the mechanism is inert while every counter
@@ -2282,7 +2351,10 @@ impl BlockCache {
         true
     }
 
-    fn unlink_outbound(&mut self, source: BlockId, slot: u8) {
+    /// `cause` is passed by the caller rather than inferred: the same helper serves the
+    /// relink-replace path in `try_link_inner` and the retirement walk in `unlink_block`, and
+    /// nothing inside the helper can tell those apart.
+    fn unlink_outbound(&mut self, source: BlockId, slot: u8, cause: LinkClearCause) {
         let Some(source_index) = self.active_index(source) else {
             return;
         };
@@ -2299,6 +2371,7 @@ impl BlockCache {
             }
         }
         self.stats.unlinks += 1;
+        self.stalls.links_cleared[cause as usize] += 1;
     }
 
     fn unlink_block(&mut self, id: BlockId) {
@@ -2325,11 +2398,12 @@ impl BlockCache {
                         self.waiting.entry(successor).or_default().push(link);
                     }
                     self.stats.unlinks += 1;
+                    self.stalls.links_cleared[LinkClearCause::Retired as usize] += 1;
                 }
             }
         }
         for slot in 0..2 {
-            self.unlink_outbound(id, slot);
+            self.unlink_outbound(id, slot, LinkClearCause::Retired);
         }
         self.remove_waiting_sources(id);
     }
