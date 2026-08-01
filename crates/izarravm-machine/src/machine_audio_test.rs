@@ -288,6 +288,62 @@ fn sb_dsp_write_status_does_not_read_as_open_bus() {
 }
 
 #[test]
+fn idle_f2_publishes_8bit_status_and_22f_cross_acknowledges_it() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x22C, BusWidth::Byte, 0xF2, false).unwrap();
+    });
+    assert!(!machine.pic.irr_bit(5));
+
+    machine.advance_devices_ticks(0);
+
+    assert!(machine.pic.irr_bit(5));
+    let (status, cleared) = with_bus(&mut machine, |bus| {
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let status = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        bus.read_io(0x22F, BusWidth::Byte, 0, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let cleared = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        (status, cleared)
+    });
+    assert_eq!(status, 0x01);
+    assert_eq!(cleared, 0x00);
+    assert!(
+        machine.pic.irr_bit(5),
+        "the device ack does not clear the PIC"
+    );
+}
+
+#[test]
+fn f2_after_16bit_arm_publishes_16bit_status_and_22e_cross_acknowledges_it() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        for byte in [0xB0u8, 0x00, 0x00, 0x00, 0xF2] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+
+    machine.advance_devices_ticks(0);
+
+    assert!(machine.pic.irr_bit(5));
+    let (status, cleared) = with_bus(&mut machine, |bus| {
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let status = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
+        let cleared = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
+        (status, cleared)
+    });
+    assert_eq!(status, 0x02);
+    assert_eq!(cleared, 0x00);
+    assert!(
+        machine.pic.irr_bit(5),
+        "the device ack does not clear the PIC"
+    );
+}
+
+#[test]
 fn sb_dma_irq5_fires_from_the_cpu_clock_without_host_audio_pull() {
     let mut machine = test_machine();
     // 8-bit ramp at 0x01_0000; arm DMA ch1 + DSP exactly like the playback golden.
@@ -478,6 +534,10 @@ fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0000
         bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask ch1
+        bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
         // DSP: 11025 Hz, block 16, single 8-bit DMA output.
         for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
@@ -490,12 +550,26 @@ fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         machine.advance_devices_clocks(200_000);
         machine.render_dsp_audio(16)
     };
-    assert_eq!(out.len(), 16);
-    // Unsigned 0x00 maps to a centered negative sample; mono is duplicated L/R.
-    assert!(out.iter().any(|&(l, _)| l < 0), "expected negative samples");
-    assert!(
-        out.iter().all(|&(l, r)| l == r),
-        "8-bit mono duplicated L/R"
+    assert_eq!(
+        out,
+        vec![
+            (-32768, -32768),
+            (-28672, -28672),
+            (-24576, -24576),
+            (-20480, -20480),
+            (-16384, -16384),
+            (-12288, -12288),
+            (-8192, -8192),
+            (-4096, -4096),
+            (0, 0),
+            (4096, 4096),
+            (8192, 8192),
+            (12288, 12288),
+            (16384, 16384),
+            (20480, 20480),
+            (24576, 24576),
+            (28672, 28672),
+        ]
     );
     // Single mode masks channel 1 at terminal count.
     assert_eq!(machine.dma_read_byte(1), None);
