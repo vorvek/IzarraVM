@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::host_input::HostInputPolicy;
+use std::sync::Arc;
 use winit::keyboard::KeyCode;
 
 /// The wgpu surface, device, queue, and surface config for the one window.
@@ -656,7 +657,7 @@ pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     let raw_mouse = RawMouseAccum::default();
     let host_input = launch.host_input;
     let event_loop = build_event_loop(raw_mouse.clone(), host_input.mouse_enabled())?;
-    let gui = GuiApp::new(launch);
+    let gui = GuiApp::new(launch)?;
     let egui_ctx = egui::Context::default();
     enlarge_ui_fonts(&egui_ctx);
     apply_black_theme(&egui_ctx);
