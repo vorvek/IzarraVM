@@ -270,6 +270,7 @@ impl crate::jit::JitState {
             side_exit_callout_step_break: self.stalls.side_exit_callout_step_break,
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
             callout_executed: self.stalls.callout_executed,
+            reject_callout_privileged: self.stalls.reject_callout_privileged,
         }
     }
 
@@ -302,6 +303,10 @@ impl crate::jit::JitState {
     /// reasoning as the two side-exit counters above.
     pub(crate) fn note_callout_executed(&mut self) {
         self.stalls.callout_executed += 1;
+    }
+
+    pub(crate) fn note_reject_callout_privileged(&mut self) {
+        self.stalls.reject_callout_privileged += 1;
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {

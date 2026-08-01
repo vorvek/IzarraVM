@@ -19,6 +19,12 @@
 //! * deleting the runtime raw-clock add at the call site fails two tests on `core clocks`;
 //! * dropping the weighted-FP lane from the device-timestamp preview fails
 //!   `the_helper_folds_the_chains_float_clocks_into_the_device_timestamp`.
+//!
+//! The privileged port state is refused at TWO places, tested separately: `run_direct_block`
+//! refuses to ENTER the block (`a_call_out_block_is_not_entered_at_all_in_the_privileged_port_state`,
+//! the gate that decides cost), and the helper refuses before touching anything
+//! (`a_permission_checked_port_is_refused_before_the_tss_probe_can_touch_memory`, the gate that
+//! decides correctness).
 
 use super::*;
 
@@ -606,6 +612,14 @@ fn the_interpreter_still_does_the_tss_probe_the_call_out_refused() {
 fn v86_call_out_is_refused_before_the_tss_probe() {
     // The other half of the refused predicate, isolated: IOPL is 3 here, so the `CPL > IOPL` half
     // is FALSE and only `is_v86_mode()` can produce the refusal.
+    //
+    // Helper-level, and it stays helper-level even though `run_direct_block` now carries the
+    // load-bearing gate, because THREE independent gates already keep a V86 guest away from the
+    // emitted path and none of them can be switched off from a fixture: no 16-bit block is built
+    // at all (`try_direct_continuation` interprets every `!d` boundary), a CS.D = 0 IN is outside
+    // `classify`'s Word allowlist and stays a barrier, and the dispatch gate refuses the entry.
+    // This test covers the innermost of the four, which is the one that has to hold if the outer
+    // three are ever relaxed by the 16-bit admission work.
     let (mut cpu, mut bus) = paged_ring3_io_cpu(false);
     cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
     assert_eq!(cpu.current_privilege_level(), 3);
@@ -621,16 +635,25 @@ fn v86_call_out_is_refused_before_the_tss_probe() {
 }
 
 #[test]
-fn the_emitted_slot_takes_the_abnormal_exit_when_the_privilege_state_is_refused() {
-    // The guard wired through the EMITTED path, not just the helper.
-    let (mut fixture, mut interpreter, mut interpreter_bus) = slot_block_with(
+fn a_call_out_block_is_not_entered_at_all_in_the_privileged_port_state() {
+    // The DISPATCH gate, and the one that decides cost. The helper's refusal is correct but it is
+    // reached only after the whole-set spill, the scratch frame, the indirect call and the
+    // whole-set reload -- and then the run still ends and the interpreter still executes the
+    // instruction. Paying all of that to arrive where a barrier would have arrived for free is
+    // strictly worse than the pre-slice behaviour, on every execution, for a paged V86 or
+    // CPL>IOPL guest. `run_direct_block` therefore refuses to ENTER such a block, which returns
+    // the block to the interpreter: pre-slice behaviour exactly.
+    //
+    // `NotRun`, not an abnormal exit: nothing native runs, no call-out is executed, no side exit
+    // is recorded.
+    let (mut fixture, _, _) = slot_block_with(
         |bus| {
             bus.lazy_io_reads = true;
             bus.io_read_value = Some(0x5a);
         },
         |cpu| {
-            // CPL 3 with IOPL 0 and a zero-limit TSS: the interpreter would consult the bitmap,
-            // so the helper must refuse.
+            // CPL 3 with IOPL 0 and a zero-limit TSS: the state whose port reads would consult
+            // the bitmap.
             cpu.cpl = 3;
             cpu.tr.limit = 0;
         },
@@ -638,27 +661,65 @@ fn the_emitted_slot_takes_the_abnormal_exit_when_the_privilege_state_is_refused(
 
     let retired = fixture.cpu.perf_counters().jit_direct_insns;
     assert!(
-        fixture
+        !fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap(),
+        "the block must not be entered at all"
+    );
+
+    assert_eq!(
+        fixture.cpu.perf_counters().jit_direct_insns - retired,
+        0,
+        "nothing may retire natively"
+    );
+    assert_eq!(fixture.cpu.registers.eax(), 0xdead_beef, "AL untouched");
+    assert_eq!(fixture.cpu.elapsed_clocks, 0);
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.reject_callout_privileged, 1);
+    assert_eq!(
+        stalls.callout_executed, 0,
+        "the helper must never be reached, so nothing pays for the spill/call/reload"
+    );
+    assert_eq!(stalls.side_exit_callout_abnormal, 0);
+}
+
+#[test]
+fn a_call_out_block_runs_again_once_the_privilege_state_clears() {
+    // The dispatch gate is a TRANSIENT refusal, not a retirement: a V86 task returns to ring 0
+    // and back, and the block is perfectly good -- it is the privilege level that is wrong. Pinned
+    // because retiring here would recompile the block on every privilege transition.
+    let (mut fixture, _, _) = slot_block_with(
+        |bus| {
+            bus.lazy_io_reads = true;
+            bus.io_read_value = Some(0x5a);
+        },
+        |cpu| {
+            cpu.cpl = 3;
+            cpu.tr.limit = 0;
+        },
+    );
+    assert!(
+        !fixture
             .cpu
             .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
             .unwrap()
     );
-    interpreter.cycle(&mut interpreter_bus).unwrap();
 
-    assert_eq!(
-        fixture.cpu.perf_counters().jit_direct_insns - retired,
-        1,
-        "only the prefix may retire"
+    // IOPL 3 lets a CPL-3 task reach ports without the bitmap, which is the interpreter's own
+    // early-return condition.
+    fixture.cpu.registers.eflags |= 3 << 12;
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap(),
+        "the same block must run once the privilege state permits it"
     );
-    assert_eq!(fixture.cpu.registers, interpreter.registers);
-    assert_eq!(fixture.cpu.registers.eax(), 0xdead_beef, "AL untouched");
-    assert_eq!(fixture.cpu.elapsed_clocks, interpreter.elapsed_clocks);
     let stalls = fixture.cpu.direct_stall_snapshot();
-    assert_eq!(stalls.side_exit_callout_abnormal, 1);
-    assert_eq!(
-        stalls.callout_executed, 1,
-        "a refusal still counts as an executed call-out, so the ratio has a denominator"
-    );
+    assert_eq!(stalls.reject_callout_privileged, 1);
+    assert_eq!(stalls.callout_executed, 1);
+    assert_eq!(fixture.cpu.registers.eax() & 0xff, 0x5a);
 }
 
 #[test]

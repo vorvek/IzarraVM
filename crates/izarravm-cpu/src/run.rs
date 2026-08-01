@@ -1580,6 +1580,30 @@ impl CpuGsw {
             self.jit_direct.retire_key_for_recompile(span.key);
             return Ok(DirectBlockOutcome::NotRun);
         }
+        // A block carrying an interpreter call-out slot does not run in the privilege state whose
+        // port reads consult the TSS bitmap. THIS is the load-bearing gate; the matching refusal
+        // inside the helper (jit/direct/callout.rs) is the second line of defence, kept because it
+        // is what makes the helper's zero-partial-effects property hold on its own terms.
+        //
+        // Correctness is settled by the helper. What this site buys is COST. Without it, a paged
+        // V86 or CPL>IOPL guest -- EMM386 and VCPI DOS, first-class targets here -- would pay, on
+        // every single execution of a compiled IN: the whole-set spill, the scratch frame, the
+        // indirect call, the guard's refusal, the whole-set reload, the abnormal side exit, AND
+        // then the dispatcher trip back to the interpreter it would have taken anyway. Strictly
+        // worse than the pre-slice barrier, and unconditionally so. Refusing here returns the
+        // block to the interpreter, which is exactly the pre-slice behaviour.
+        //
+        // Two field reads at a site that already reads privilege state for the check above, and
+        // both are behind `callout_slots() != 0`, so a block without a slot pays one compare.
+        // NOT retired: the state is transient (a V86 task returns to ring 0 and back), and the
+        // block is perfectly good -- it is the privilege level that is wrong, like the alignment
+        // and budget refusals below rather than the layout ones above.
+        if block.callout_slots() != 0
+            && (self.is_v86_mode() || self.current_privilege_level() > self.iopl())
+        {
+            self.jit_direct.note_reject_callout_privileged();
+            return Ok(DirectBlockOutcome::NotRun);
+        }
         let has_link = self.jit_direct.has_linked_successor(block.id());
         let data_descriptors_match = if has_link {
             segments.all_data_matches(self)

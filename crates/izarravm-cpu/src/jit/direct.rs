@@ -204,6 +204,10 @@ pub(crate) struct DirectStallTally {
     /// DENOMINATOR the two counters above needed: an abnormal count of zero says nothing without
     /// it, because zero is also what a mechanism that never ran reports.
     pub callout_executed: u64,
+    /// Entries refused because a call-out-bearing block met the privilege state whose port reads
+    /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
+    /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
+    pub reject_callout_privileged: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -3918,9 +3922,22 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     // exactly zero. Refusing here keeps a 486 guest byte-identical by construction rather than
     // by measurement.
     //
-    // The 16-bit population is real mode, V86 and 16-bit protected mode. V86 is deliberately IN:
-    // no V86-sensitive opcode is classifiable at all (`classify` has no PUSHF/POPF, CLI/STI,
-    // INT/IRET or IN/OUT arm), and V86 blocks are key-separated by mode-key bit 2.
+    // The 16-bit population is real mode, V86 and 16-bit protected mode. V86 is deliberately IN,
+    // and the reason has CHANGED: it used to be that `classify` had no IN/OUT arm at all, which
+    // stopped being true when the interpreter call-out slot landed 0xEC. Three live gates carry
+    // the conclusion instead, any ONE of them sufficient:
+    //
+    //   1. `try_direct_continuation` (run.rs) returns `Interpret` for every `!d` boundary before
+    //      a key is ever built, so no 16-bit block exists on any persona today -- V86 included,
+    //      since a V86 code segment is always CS.D = 0.
+    //   2. `classify`'s Word-size allowlist excludes 0xEC, so even if a 16-bit block were built,
+    //      an IN in a CS.D = 0 segment decodes at `OperandSize::Word` and stays a barrier.
+    //   3. `run_direct_block` refuses to ENTER a call-out-bearing block whenever
+    //      `is_v86_mode() || CPL > IOPL`, so the slot cannot execute in V86 even if the first two
+    //      were somehow bypassed.
+    //
+    // The other V86-sensitive opcodes (PUSHF/POPF, CLI/STI, INT/IRET) still have no `classify`
+    // arm, and V86 blocks stay key-separated by mode-key bit 2.
     if !d && cpu.persona() != CpuPersona::I586 {
         return None;
     }
