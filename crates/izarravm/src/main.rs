@@ -985,6 +985,8 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
             .collect::<Vec<_>>(),
         "side_exit_segment_limit": snapshot.side_exit_segment_limit,
         "side_exit_x87_eligibility": snapshot.side_exit_x87_eligibility,
+        "side_exit_callout_step_break": snapshot.side_exit_callout_step_break,
+        "side_exit_callout_abnormal": snapshot.side_exit_callout_abnormal,
     })
 }
 

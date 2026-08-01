@@ -849,9 +849,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // jit_native_memory_helpers, jit_table_clears; 32 bytes), again measured (not derived) to move
     // this pin from 4456 to 4424 -- see the sibling pin `tests::pending_flags_offset` in
     // cpu_test.rs. The mutable-imm-lane slice then adds four PerfCounters fields (32 bytes) and
-    // moves it back from 4424 to 4456, measured the same way.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
+    // moves it back from 4424 to 4456, measured the same way. The Phase 5
+    // call-out slice adds `native_callout: CallOutTable` to `CpuGsw` (a raw pointer and a usize;
+    // 16 bytes), moving this pin from 4456 to 4472, measured the same way.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4472);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4472);
 }

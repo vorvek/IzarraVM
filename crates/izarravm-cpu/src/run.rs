@@ -1388,8 +1388,18 @@ impl CpuGsw {
         let fp_core_upper = u64::from(block.weighted_fp_clocks())
             .saturating_add(u64::from(FP_TIMING_DEN) - 1)
             / u64::from(FP_TIMING_DEN);
+        // CALL-OUT DOMINANCE. A call-out slot's charge is RUNTIME, so `block.raw_clocks()` --
+        // which is the sum of the baked per-kind constants -- does not contain it and the bound
+        // would not cover it. Every admitted call-out is `0xEC`, whose interpreter charge is the
+        // constant `IN_AL_DX_CORE_CLOCKS`; that is not a worst case, it is the ONLY case, so
+        // adding it per slot is exact rather than conservative on the core term. Keep this arm in
+        // step with `classify`'s call-out admission: a second opcode with a larger charge, or any
+        // charge that is not a constant, must raise this to that opcode's maximum.
+        let callout_core_upper =
+            u64::from(block.callout_slots()).saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS));
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
+            .saturating_add(callout_core_upper)
             .saturating_mul(u64::from(num))
             .saturating_add(u64::from(den) - 1)
             / u64::from(den);
@@ -1412,7 +1422,21 @@ impl CpuGsw {
             .saturating_add(byte_data_upper.saturating_mul(u64::from(block.byte_stores())))
             .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_stores())))
             .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_stores())));
-        let raw_bus_upper = fetch_upper.saturating_add(data_upper);
+        // The call-out's BUS term, the other half of the dominance argument. One `0xEC` records
+        // at most: one byte-wide port access, plus -- only when `check_io_permission` does not
+        // take its early return -- the TSS probe, which for a one-byte port is exactly one word
+        // read (the I/O map base at TSS+0x66) and one byte read (the permission bitmap byte). The
+        // loop in `check_io_permission` runs `width.bytes()` times, so Byte gives it one
+        // iteration and no more. Charged unconditionally rather than only in the V86/CPL>IOPL
+        // case, because the bound is computed per BLOCK and the privilege state is per entry.
+        let callout_bus_upper = u64::from(block.callout_slots()).saturating_mul(
+            bus.jit_io_cost_clocks(BusWidth::Byte)
+                .saturating_add(word_data_upper)
+                .saturating_add(byte_data_upper),
+        );
+        let raw_bus_upper = fetch_upper
+            .saturating_add(data_upper)
+            .saturating_add(callout_bus_upper);
         // `cap` and the in-batch bus growth use the bus's scaled guest-clock domain. Fold the raw
         // fetch/data bound through that same scale before deciding how much native work fits.
         scaled_core_upper.saturating_add(bus.jit_scale_bus_cost_upper(raw_bus_upper))
@@ -1703,6 +1727,16 @@ impl CpuGsw {
         // sealed it executable, and the current generational lookup keeps that arena entry live.
         let entry: jit::direct::DirectEntryFn =
             unsafe { std::mem::transmute(current_block.entry_ptr()) };
+        // The call-out window: two stores in, two out, so the erased `*mut B` is never reachable
+        // outside the call that owns the borrow. `publish::<B>` also picks the helper
+        // instantiations for THIS bus type, which is what makes the erasure sound; see
+        // `jit/direct/callout.rs`.
+        //
+        // UNCONDITIONAL, deliberately. Gating it on `block.callout_slots() != 0` would be wrong,
+        // not merely different: a chained native transfer jumps into a SUCCESSOR block's body
+        // without returning here, so an entry block with no call-out can reach a chained block
+        // that has one. The entry block's own slot count says nothing about the chain.
+        self.native_callout = jit::direct::CallOutTable::publish(bus);
         unsafe {
             entry(
                 self as *mut CpuGsw,
@@ -1711,6 +1745,7 @@ impl CpuGsw {
                 &mut exit as *mut jit::direct::NativeExit,
             );
         }
+        self.native_callout = jit::direct::CallOutTable::default();
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
         debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
         debug_assert!(u64::from(exit.linked_transfers) < quota);
@@ -1943,6 +1978,12 @@ impl CpuGsw {
                 }
                 reason if reason == jit::direct::SideExitReason::CodeWatch as u32 => {
                     self.perf.jit_direct_exit_code_watch += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::CallOutStepBreak as u32 => {
+                    self.jit_direct.note_side_exit_callout_step_break();
+                }
+                reason if reason == jit::direct::SideExitReason::CallOutAbnormal as u32 => {
+                    self.jit_direct.note_side_exit_callout_abnormal();
                 }
                 _ => self.perf.jit_direct_exit_other += 1,
             }

@@ -935,6 +935,14 @@ pub trait CpuBus {
         self.jit_data_cost_clocks(width)
     }
 
+    /// Raw bus clocks one port access of `width` records. The Direct backend's interpreter
+    /// call-out slots run real `read_io` calls from inside a native block, so the block's
+    /// pre-entry budget bound has to price them. Defaulted to 0 for buses that record no port
+    /// cost; `jit_cost_dial_epoch` must cover whatever an override reads.
+    fn jit_io_cost_clocks(&self, _width: BusWidth) -> u64 {
+        0
+    }
+
     /// Convert a raw native bus-cost bound into the clock domain used by
     /// `in_batch_scaled_bus_clocks`. The default is identity for buses whose
     /// batch accounting is already raw or which do not scale bus time.

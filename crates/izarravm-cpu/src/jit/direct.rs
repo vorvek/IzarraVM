@@ -3,9 +3,14 @@
 
 //! Admission and storage for page-local direct-code blocks.
 
+mod callout;
 mod census;
 mod classify;
 mod emit;
+
+pub(crate) use callout::CallOutTable;
+#[cfg(test)]
+pub(crate) use callout::{STATUS_STEP_BREAK_BIT, port_read_al_dx_for_test};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -56,6 +61,15 @@ pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
 const MAX_BLOCK_STACK_ACCESSES: u8 = 4;
 pub(crate) const MAX_X87_BLOCK_INSTRUCTIONS: usize = 12;
 pub(crate) const MAX_X87_SLOTS: u8 = 8;
+/// Interpreter call-out slots per block. A BUDGET bound, not a code-size one: every call-out
+/// widens `compute_iteration_upper` by its worst-case interpreter charge plus worst-case bus I/O
+/// (see the derivation there), and that bound divides the run's remaining budget to pick the
+/// chain quota. Left unbounded, a block of nothing but port reads would inflate the bound far
+/// enough to cut chains short across the whole cache. Four is the same order as
+/// `MAX_BLOCK_STACK_ACCESSES` and comfortably above the one-or-two port reads a poll idiom
+/// carries; `brk_cap` byte-identity on the no-call-out fixture is the isolation that this bound
+/// does not leak into blocks that hold none.
+const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
 /// Instruction bound for a block that holds ANY memory-ALU slot. It is a CODE SIZE bound, not a
 /// timing one, and it is the second half of a pair with `MAX_MEMORY_ALU_SLOTS`.
 ///
@@ -179,6 +193,13 @@ pub(crate) struct DirectStallTally {
     /// The two halves the old `SideExitReason::Other` counter conflated.
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
+    /// The two interpreter call-out exit shapes, split because they mean opposite things: a step
+    /// break is the mechanism working (a port touched device state, the run ends where an
+    /// interpreted continuation would), an abnormal is the helper refusing and the interpreter
+    /// re-running the instruction. Lumping them into `jit_direct_exit_other` would have made the
+    /// slice's own mechanism unreadable, which is the mistake `Other` already cost this campaign.
+    pub side_exit_callout_step_break: u64,
+    pub side_exit_callout_abnormal: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -513,6 +534,7 @@ pub(crate) struct CompiledBlock {
     has_wide_accesses: bool,
     self_loop: bool,
     has_x87: bool,
+    callout_slots: u8,
     x87_entry_top: u8,
     x87_exit_top: u8,
     dynamic_successor: bool,
@@ -542,6 +564,11 @@ impl CompiledBlock {
 
     pub(crate) fn raw_clocks(&self) -> u32 {
         u32::from(self.raw_clocks)
+    }
+
+    /// How many interpreter call-out slots this block carries, for `compute_iteration_upper`.
+    pub(crate) fn callout_slots(&self) -> u32 {
+        u32::from(self.callout_slots)
     }
 
     pub(crate) fn weighted_fp_clocks(&self) -> u32 {
@@ -1130,6 +1157,7 @@ impl BlockCache {
             has_wide_accesses: compilation.has_wide_accesses,
             self_loop: compilation.self_loop,
             has_x87: compilation.has_x87,
+            callout_slots: compilation.callout_slots,
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
             dynamic_successor: compilation.dynamic_successor,
@@ -2311,11 +2339,20 @@ pub(crate) enum SideExitReason {
     /// data, not a per-compile property of the address, so it can fire on a block that will
     /// never bind differently.
     X87Eligibility = 7,
+    /// An interpreter call-out slot reported an ABNORMAL status: the helper refused before any
+    /// guest-visible effect. EIP is at the call-out instruction and the run ends there, so the
+    /// interpreter re-executes it and delivers whatever it delivers today.
+    CallOutAbnormal = 8,
+    /// An interpreter call-out slot completed and the BUS asked for a step break (a port access
+    /// touched time-dependent device state). The run ends at the boundary AFTER the call-out,
+    /// which is exactly where `run_straight_line`'s post-instruction `requires_step_break` check
+    /// ends an interpreted continuation.
+    CallOutStepBreak = 9,
 }
 
 impl SideExitReason {
     /// The largest discriminant emitted code can store, for the `run.rs` bound assertion.
-    pub(crate) const MAX: u32 = Self::X87Eligibility as u32;
+    pub(crate) const MAX: u32 = Self::CallOutStepBreak as u32;
 }
 
 #[repr(u32)]
@@ -2424,6 +2461,9 @@ pub(crate) struct Compilation {
     pub has_wide_accesses: bool,
     pub self_loop: bool,
     pub has_x87: bool,
+    /// How many interpreter call-out slots this block carries. Read ONLY by
+    /// `compute_iteration_upper`, which must cover their runtime charge; see the derivation there.
+    pub callout_slots: u8,
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
     /// Readable outside this module for the same reason as `successors` below: a terminal that
@@ -2917,6 +2957,29 @@ pub(crate) enum DirectKind {
         insn: NativeX87Insn,
         addr: Option<DirectAddr>,
     },
+    /// An interpreter CALL-OUT slot: the block spills, routes exactly ONE instruction through a
+    /// Rust helper that reaches the bus, reloads, and keeps running. Phase 5 carries exactly one
+    /// opcode here, `0xEC` (IN AL,DX), and the helper is named by the variant so a second opcode
+    /// cannot be added without an emitter arm of its own.
+    ///
+    /// `raw_clocks` carries NO arm and MUST NOT: the call-out's charge is RUNTIME, returned by
+    /// the helper and added to the block's raw-clock lane at the call site. An arm here would
+    /// double-charge every call-out, and the `completed_raw == raw_clocks` assertion at the end
+    /// of `emit` could not see it because both sides would move together. The static bound the
+    /// budget needs lives in `Compilation::callout_slots` instead, folded into
+    /// `compute_iteration_upper` (see the derivation there).
+    CallOut {
+        helper: CallOutHelper,
+    },
+}
+
+/// Which interpreter path a `DirectKind::CallOut` slot routes through. One variant per admitted
+/// opcode, never a catch-all: `callout::helper_fn` matches this exhaustively, so adding an opcode
+/// to `classify` without an execute path is a compile error rather than a silent misroute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallOutHelper {
+    /// `0xEC` IN AL,DX.
+    PortReadAlDx,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3600,6 +3663,10 @@ impl DirectKind {
         matches!(self, Self::X87 { .. })
     }
 
+    fn is_call_out(self) -> bool {
+        matches!(self, Self::CallOut { .. })
+    }
+
     fn is_memory_alu(self) -> bool {
         matches!(
             self,
@@ -4174,6 +4241,7 @@ fn compile_with_instruction_limit(
     let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
+    let mut callout_slots = 0u8;
     let x87_entry_top = cpu.fpu.top();
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
@@ -4359,6 +4427,21 @@ fn compile_with_instruction_limit(
             stop = CompileStop::Retry;
             break;
         }
+        // x87 and call-out slots do not share a block, in either order. The call-out hands the
+        // helper the block's raw-clock prefix so the device sees the right guest-time offset
+        // (jit/direct/callout.rs), and an x87 slot's contribution to that prefix is not raw
+        // clocks at all: it is `weighted_fp_clocks`, which only becomes clocks through
+        // `scale_weighted_fp_clocks` and its own `fp_rem` carry. Mixing them would need a second
+        // carry previewed across the call for no fixture that wants it. Refusing is a missed
+        // lowering; admitting would be a silently wrong device timestamp.
+        if (kind.is_x87() && callout_slots != 0) || (kind.is_call_out() && x87_slots != 0) {
+            stop = CompileStop::Retry;
+            break;
+        }
+        if kind.is_call_out() && callout_slots == MAX_BLOCK_CALLOUT_SLOTS {
+            stop = CompileStop::Retry;
+            break;
+        }
         if kind.is_memory_alu()
             && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
                 || slots.len() >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS)
@@ -4406,6 +4489,7 @@ fn compile_with_instruction_limit(
         };
         stack_accesses += u8::from(kind.uses_stack());
         x87_slots += u8::from(kind.is_x87());
+        callout_slots += u8::from(kind.is_call_out());
         if let DirectKind::X87 { insn, .. } = kind {
             x87_exit_top = insn.advance_top(x87_exit_top);
         }
@@ -4477,10 +4561,18 @@ fn compile_with_instruction_limit(
     else {
         return CompileOutcome::Retry;
     };
-    let self_loop = matches!(
-        slots.last().map(|slot| slot.kind),
-        Some(DirectKind::Jcc { taken_delta: 0, .. })
-    );
+    // A self-loop block accounts by MULTIPLYING its whole static accounting by the iteration
+    // count at exit, so nothing inside the loop body may deposit into the runtime lanes per
+    // iteration. A call-out does exactly that (it adds the helper's runtime clocks at the call
+    // site), so the two shapes are incompatible: the loop-back would keep the deposits while the
+    // exit multiplied the static total, double-counting one and dropping the other. Refusing the
+    // self-loop SHAPE (not the block) leaves the block compiled and correct, just re-entered per
+    // iteration like every non-loop block.
+    let self_loop = callout_slots == 0
+        && matches!(
+            slots.last().map(|slot| slot.kind),
+            Some(DirectKind::Jcc { taken_delta: 0, .. })
+        );
     if self_loop && x87_slots != 0 && x87_entry_top != x87_exit_top {
         return CompileOutcome::Retry;
     }
@@ -4622,6 +4714,7 @@ fn compile_with_instruction_limit(
         has_wide_accesses,
         self_loop,
         has_x87: x87_slots != 0,
+        callout_slots,
         x87_entry_top,
         x87_exit_top,
         dynamic_successor,

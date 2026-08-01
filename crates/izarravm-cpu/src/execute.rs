@@ -1228,7 +1228,7 @@ impl CpuGsw {
     /// I/O-permission bitmap: the access is allowed only if every bit for ports
     /// `port..port+width` is 0. A bit at or beyond the TSS limit is treated as set
     /// (not permitted). A denied access faults `#GP(0)` to the monitor.
-    fn check_io_permission<B: CpuBus>(
+    pub(crate) fn check_io_permission<B: CpuBus>(
         &mut self,
         bus: &mut B,
         port: u16,
@@ -1328,7 +1328,7 @@ impl CpuGsw {
                     self.is_ring0_protected(),
                 )? as u8;
                 self.write_gpr8(0, value);
-                Ok(clocks(12))
+                Ok(clocks(IN_AL_DX_CORE_CLOCKS))
             }
             0xed => {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.

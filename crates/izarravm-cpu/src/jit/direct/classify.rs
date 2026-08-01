@@ -384,6 +384,32 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     width: operand_width,
                 });
             }
+            // IN AL, DX -- the FIRST and, this phase, the ONLY interpreter call-out slot. Not a
+            // native lowering: the block spills, routes this one instruction through the
+            // interpreter's port path (which needs the bus, and the bus is not reachable from
+            // emitted code), reloads, and keeps running. See `jit/direct/callout.rs` for the
+            // helper contract and the abnormal-set enumeration.
+            //
+            // Ranked here by the Phase 3 class table: exits to blocks rejected at this opcode's
+            // barrier are the single largest identified share of doom's unbound static exit pool.
+            //
+            // Byte-wide and accumulator-implicit: no ModRM, no `insn.operand`, the port comes
+            // from the live DX. The interpreter's 0xec arm does NOT consult `operand_size` (it
+            // reads DX and writes AL at `BusWidth::Byte` unconditionally), so the form is
+            // operand-size-invariant -- but 0xec is deliberately absent from the Word-size
+            // allowlist above for the reason that list documents, so a 66-prefixed encoding falls
+            // to `None` and stays a barrier. The invariance is stated, not relied on.
+            //
+            // The Approximate-class gate is INHERITED, not re-stated. `block_continuable`
+            // (decode.rs) admits the IN forms only on I486/I586, so on the Accurate 386 class
+            // `insn.continuable` is false and the compile walk stops at this instruction BEFORE
+            // it ever reaches `classify`. That is what makes the 386 personas provably
+            // byte-identical across this slice.
+            0xec => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::PortReadAlDx,
+                });
+            }
             // CWD / CDQ, same reasoning as 0x98 immediately above.
             0x99 => {
                 return Some(DirectKind::Cdq {
