@@ -54,12 +54,21 @@
 //! precedes the status branch precisely so the abnormal path reaches `shared_return` -- which
 //! stores homes -- with correct values instead of writing clobbered registers over good memory.
 //!
-//! # The abnormal set (exactly two producers)
+//! # The abnormal set (exactly three producers)
 //!
-//! 1. `check_io_permission` returns `Err`: the TSS I/O-permission bitmap denies the port
-//!    (`#GP(0)`), or a TSS probe itself faults. It runs BEFORE `read_io`, so no device has been
-//!    addressed.
-//! 2. `bus.read_io` returns `Err`. For `MachineBus` the sole producer is the `UnsupportedPort`
+//! 1. **The permission-checked port, refused up front.** When `is_v86_mode() || CPL > IOPL`,
+//!    `check_io_permission` would probe the TSS bitmap through `read_system_linear` -- and under
+//!    paging that walk WRITES guest memory (PDE/PTE accessed bits), records `written_pages`, can
+//!    set CR2, advances bus clocks mid-run, can evict a TLB entry and invalidate the fast map
+//!    whose bases the running block has baked in, and can reach `note_code_write` with this
+//!    block's native code live on the stack -- which is the exact situation
+//!    `note_code_write_inner`'s "no compiled block is mid-execution" proof rules out. The helper
+//!    refuses that state as its FIRST statement, before anything has run. Fail-closed by
+//!    construction, not by argument.
+//! 2. `check_io_permission` returns `Err` anyway. Unreachable given (1) -- it is the
+//!    interpreter's own gate, kept so that if the two predicates ever drift apart this refuses
+//!    rather than proceeds. It runs BEFORE `read_io`, so no device has been addressed.
+//! 3. `bus.read_io` returns `Err`. For `MachineBus` the sole producer is the `UnsupportedPort`
 //!    fall-through, reached only after every device declined the port -- so no device observed
 //!    the access there either.
 //!
@@ -81,11 +90,15 @@
 //!   interpreter's, not merely close.
 //! * **The device's view of time.** `read_io` takes `core_clocks_so_far`, which the interpreter
 //!   sets to the run's running total before each instruction. Inside a block that value is stale
-//!   by the block's own prefix, so the helper is handed that prefix's RAW clocks and adds the
-//!   scaled prefix on top -- through `preview_scale_clocks`, which performs the same long
-//!   division WITHOUT consuming `timing_rem`, so it changes no accounting. By the same batching
-//!   identity the result equals the interpreter's running total at this instruction. Without this
-//!   a mid-block IN would sample a beam or a counter a few clocks in the past.
+//!   by the RUN's prefix -- this block's earlier slots and, on a chained entry, every hop before
+//!   it. The helper is handed BOTH accounting lanes, raw and weighted-FP, and folds them exactly
+//!   as `run_direct_block` does (FP through `scale_weighted_fp_clocks`, added to raw, then the
+//!   persona's long division). Both scalings are previews: neither `fp_rem` nor `timing_rem` is
+//!   consumed, so no accounting moves and the charge is still made once, later, by the block's
+//!   single batch call. The FP lane is not decoration -- a call-out block never holds an x87
+//!   slot, but a float-entered CHAIN can hop into one, and reading only the raw lane would hand
+//!   the device a timestamp short by the whole float part of the chain. Without any of this a
+//!   mid-block IN samples a beam or a counter in the past.
 //! * **The step break.** After a successful read the helper asks `bus.requires_step_break()` and
 //!   reports it. The caller then ends the native run at the boundary AFTER the call-out -- the
 //!   same boundary `run_straight_line`'s post-instruction check produces for an interpreted
@@ -105,9 +118,11 @@
 //!
 //! # Self-modifying code
 //!
-//! A call-out cannot reach `note_code_write`: `write_gpr8` is register state, `read_io` writes no
-//! guest memory, and `check_io_permission` only reads. `debug_assert`ed structurally below by
-//! comparing the written-page bookkeeping across the call.
+//! A call-out cannot reach `note_code_write`, and after the privilege refusal above the argument
+//! needs no caveat: the TSS probe was the only memory access on this path and it is now
+//! unreachable. `write_gpr8` is register state and `read_io` writes no guest memory, so the path
+//! contains no guest memory access at all. `debug_assert`ed by comparing the written-page
+//! bookkeeping across the whole remaining body.
 //!
 //! # Unwinding
 //!
@@ -128,7 +143,7 @@ use izarravm_bus::{BusWidth, CpuBus};
 /// unwinding note in the module docs -- the nounwind guarantee is load-bearing, because a panic
 /// walking back through the call site would read the frame against unwind info that does not
 /// describe `CALLOUT_CALL_FRAME`.
-pub(crate) type CallOutFn = unsafe extern "C" fn(*mut CpuGsw, u64) -> i64;
+pub(crate) type CallOutFn = unsafe extern "C" fn(*mut CpuGsw, u64, u64) -> i64;
 
 /// The live bus and the monomorphised helpers for it, published by `run_direct_block` for the
 /// duration of one native entry into a block that carries at least one call-out slot.
@@ -136,11 +151,15 @@ pub(crate) type CallOutFn = unsafe extern "C" fn(*mut CpuGsw, u64) -> i64;
 /// `bus` is a type-ERASED `*mut B`. It is sound only because the same call that publishes it also
 /// publishes helpers monomorphised over that exact `B`, and both are cleared when the entry
 /// returns; nothing else reads either field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A CLEARED table is not a safety net. `port_read_al_dx` of 0 makes the emitted slot's
+/// `call rax` jump to address zero; the `debug_assert` inside the helper is on the far side of
+/// that and can never run. What makes the cleared state safe is that emitted code can only reach
+/// the load while `run_direct_block` holds the window open, and `run_direct_block` publishes
+/// unconditionally on every entry. The zero is a tripwire for a debugger, not a guard.
+#[derive(Debug)]
 pub(crate) struct CallOutTable {
     pub(crate) bus: *mut (),
-    /// `CallOutHelper::PortReadAlDx`. A `usize` rather than an `Option<CallOutFn>` so the emitted
-    /// load is one plain quadword and the null case is a null pointer the debug assert catches.
+    /// `CallOutHelper::PortReadAlDx`, as a `usize` so the emitted load is one plain quadword.
     pub(crate) port_read_al_dx: usize,
 }
 
@@ -152,6 +171,26 @@ impl Default for CallOutTable {
         }
     }
 }
+
+/// Excluded from CPU equality and reset on clone, exactly like `DirectRuntimeState` and
+/// `FastMapServeGate`: this is a host-side window into a bus that is live for the duration of one
+/// native entry and cleared the moment it returns. Two architecturally identical CPUs can hold
+/// different erased pointers here (or one can hold a stale value a clone must not inherit), and
+/// neither fact is guest state. Deriving over a raw pointer would have made a differential test
+/// compare host addresses.
+impl Clone for CallOutTable {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for CallOutTable {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CallOutTable {}
 
 impl CallOutTable {
     /// Publish `bus` and the helpers monomorphised over its type.
@@ -183,7 +222,11 @@ fn helper_offset(helper: CallOutHelper) -> i32 {
 /// `cpu` must be the live `CpuGsw` the native block was entered with, and its `native_callout`
 /// must have been published by `CallOutTable::publish::<B>` for the same `B` this instantiation
 /// was selected for. `run_direct_block` is the only publisher and it does both together.
-unsafe extern "C" fn port_read_al_dx<B: CpuBus>(cpu: *mut CpuGsw, prefix_raw_clocks: u64) -> i64 {
+unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    prefix_raw_clocks: u64,
+    prefix_weighted_fp_clocks: u64,
+) -> i64 {
     // SAFETY: by the contract above, `cpu` is the live CPU and no other reference to it is alive
     // across the call (emitted code holds only its ADDRESS, in R15).
     let cpu = unsafe { &mut *cpu };
@@ -199,29 +242,67 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(cpu: *mut CpuGsw, prefix_raw_clo
     // holds for the whole native entry, and this instantiation was selected by that same call, so
     // the type matches and the borrow is live and unaliased (the CPU and the bus are disjoint).
     let bus = unsafe { &mut *bus_ptr.cast::<B>() };
+    // The DENOMINATOR for the two side-exit counters, and the only always-on evidence that the
+    // mechanism ran at all. Counted before the refusal below so "abnormal / executed" is a real
+    // ratio rather than a count of one arm.
+    cpu.jit_direct.note_callout_executed();
 
-    // The written-page bookkeeping is the SMC assertion: nothing on this path may reach
-    // `note_code_write`, so both counters must come back unchanged. Sampled here rather than
-    // argued in prose so a future helper that does write memory trips a debug build.
+    // THE PERMISSION-CHECKED PORT IS REFUSED, BEFORE ANYTHING RUNS. This is the first statement
+    // in the body on purpose: at this point the helper has read two fields and done nothing else,
+    // so "zero partial effects" is true by construction rather than by argument.
     //
-    // ONE path could legitimately trip it and it is worth naming rather than excluding: a paged
-    // V86 task whose `check_io_permission` TSS probe takes a page walk that sets an accessed bit.
-    // That IS a guest memory write, so if it fires the SMC argument genuinely needs the paging
-    // case worked through -- the assertion is a tripwire for that question, not a claim that the
-    // question is already answered for every privilege state.
+    // `check_io_permission` takes its early return when `!is_v86_mode() && cpl <= iopl`. On the
+    // other branch it probes the TSS through `read_system_linear`, and under paging THAT WALK
+    // WRITES GUEST MEMORY: PDE/PTE accessed bits go through the page-walk write path, which
+    // records `written_pages`, can set CR2, advances bus clocks, can evict a TLB entry and
+    // invalidate the fast map whose bases this block has BAKED IN, and can reach
+    // `note_code_write` -- with this block's native code live on the stack, which is exactly the
+    // situation `note_code_write_inner`'s "no compiled block is mid-execution when this runs"
+    // proof (core.rs) says cannot happen.
+    //
+    // Supporting that would mean unwinding all five of those. Refusing it costs a privileged or
+    // V86 guest the call-out and nothing else: the native run ends at the call-out and the
+    // INTERPRETER executes the whole instruction, TSS probe included, exactly as it does today
+    // for a block that stopped at an IN barrier. Same boundary, same charge, same faults.
+    //
+    // Neither shipped fixture reaches it (both take the CPL0 early return), which is precisely
+    // why it has to be structural rather than tested-by-the-fixtures; `paged_v86_call_out_is_...`
+    // in cpu_jit_callout_test.rs is the fixture that does reach it.
+    if cpu.is_v86_mode() || cpu.current_privilege_level() > cpu.iopl() {
+        return STATUS_ABNORMAL;
+    }
+
+    // The SMC assertion, and it now guards a path that has NO memory access left in it: the
+    // permission probe was the only one, and the guard above excluded it. `read_io` writes no
+    // guest memory and `write_gpr8` is register state, so both counters must come back unchanged.
+    // Placed to cover the whole remaining body rather than as a tripwire for a hazard that is
+    // still reachable -- the hazard is gone.
     #[cfg(debug_assertions)]
     let written_before = (cpu.written_count, cpu.written_pages_overflow);
 
     // The device's view of guest time. `core_clocks_so_far` was set to the run's total at block
-    // ENTRY; the block's own prefix has run since. `preview_scale_clocks` applies the persona's
-    // long division to that prefix WITHOUT consuming `timing_rem`, so this is a pure read that
-    // reproduces the interpreter's running total at this instruction.
+    // ENTRY; the RUN's prefix has executed since -- this block's earlier slots and, on a chained
+    // entry, every hop before it.
+    //
+    // BOTH lanes are previewed, not just the raw one. A call-out block never holds an x87 slot,
+    // but a FLOAT-ENTERED CHAIN can hop into one, and those earlier hops deposited their cost in
+    // `STACK_WEIGHTED_FP_CLOCKS`, which only becomes clocks through `scale_weighted_fp_clocks`.
+    // Reading only the raw lane would hand the device a timestamp short by the whole float part
+    // of the chain. This mirrors `run_direct_block`'s own fold exactly -- FP clocks scaled first,
+    // added to raw, then the persona's long division -- and both scalings are read-only: neither
+    // `fp_rem` nor `timing_rem` is consumed, so the charge itself is still made once, later, by
+    // the block's single batch call.
+    let fp =
+        crate::jit::native_x87::scale_weighted_fp_clocks(prefix_weighted_fp_clocks, cpu.fp_rem);
     let now = cpu
         .core_clocks_so_far
-        .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks));
+        .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks.saturating_add(fp.clocks)));
 
     let port = cpu.read_gpr16(2);
     let ring0 = cpu.is_ring0_protected();
+    // Kept even though the guard above has already established its early-return condition. It is
+    // the interpreter's own gate, it is cheap once the TSS branch is unreachable, and if the two
+    // predicates ever drift apart this refuses rather than proceeds.
     if cpu.check_io_permission(bus, port, BusWidth::Byte).is_err() {
         return STATUS_ABNORMAL;
     }
@@ -251,11 +332,18 @@ pub(crate) fn port_read_al_dx_for_test<B: CpuBus>(
     cpu: &mut CpuGsw,
     bus: &mut B,
     prefix_raw_clocks: u64,
+    prefix_weighted_fp_clocks: u64,
 ) -> i64 {
     cpu.native_callout = CallOutTable::publish(bus);
     // SAFETY: the table was just published for this exact `B`, and `cpu` is not otherwise
     // borrowed across the call.
-    let status = unsafe { port_read_al_dx::<B>(cpu as *mut CpuGsw, prefix_raw_clocks) };
+    let status = unsafe {
+        port_read_al_dx::<B>(
+            cpu as *mut CpuGsw,
+            prefix_raw_clocks,
+            prefix_weighted_fp_clocks,
+        )
+    };
     cpu.native_callout = CallOutTable::default();
     status
 }
@@ -295,12 +383,19 @@ pub(super) fn emit_call_out(
     // Whole-set spill. Deliberately NOT a partial spill keyed on what IN reads and writes: this
     // phase buys correctness, and a partial set would have to be re-derived per helper.
     emit_store_homes(e);
-    // Argument 1: the block run's raw clocks so far.
+    // Both accounting lanes are read BEFORE the scratch frame moves RSP, since the constants are
+    // RSP-relative. RAX and RDX are the scratch pair (neither is a guest home), so holding the
+    // two values across the frame adjust costs nothing.
     e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_RAW_CLOCKS);
     if static_prefix_raw != 0 {
         e.add_r64_imm32(Reg::RAX, u32::from(static_prefix_raw));
     }
+    e.load_r64_disp8(Reg::RDX, Reg::RSP, STACK_WEIGHTED_FP_CLOCKS);
     e.sub_r64_imm32(Reg::RSP, CALLOUT_CALL_FRAME);
+    // Argument 2 FIRST: on Windows `FLAGS_ARG` IS RDX, so writing argument 1 before reading RDX
+    // would destroy the FP lane. On SysV `QUOTA_ARG` is RDX and this degenerates to `mov rdx,rdx`.
+    // (Windows' `QUOTA_ARG` is R8, a guest home -- already spilled, and reloaded after the call.)
+    e.mov_r64_r64(QUOTA_ARG, Reg::RDX);
     e.mov_r64_r64(FLAGS_ARG, Reg::RAX);
     e.mov_r64_r64(CPU_ARG, Reg::R15);
     e.load_r64_disp32(Reg::RAX, Reg::R15, helper_offset(helper));

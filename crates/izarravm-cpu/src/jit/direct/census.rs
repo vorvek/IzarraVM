@@ -269,6 +269,7 @@ impl crate::jit::JitState {
             side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
             side_exit_callout_step_break: self.stalls.side_exit_callout_step_break,
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
+            callout_executed: self.stalls.callout_executed,
         }
     }
 
@@ -294,6 +295,13 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_side_exit_callout_abnormal(&mut self) {
         self.stalls.side_exit_callout_abnormal += 1;
+    }
+
+    /// One unconditional increment inside the call-out helper, which has already left native code
+    /// and is about to touch the bus -- the same "the gate would cost as much as the work"
+    /// reasoning as the two side-exit counters above.
+    pub(crate) fn note_callout_executed(&mut self) {
+        self.stalls.callout_executed += 1;
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {

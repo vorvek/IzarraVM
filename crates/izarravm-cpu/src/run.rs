@@ -1339,9 +1339,22 @@ impl CpuGsw {
                 .saturating_add(u64::from(den) - 1)
                 / u64::from(den)
         };
-        // A block can contain 31 four-clock instructions followed by a ten-clock RET.
-        let integer_core =
-            scale_core(4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6);
+        // A block can contain 31 four-clock instructions followed by a ten-clock RET, PLUS its
+        // call-out slots. The call-out term is not covered by the four-clock-per-instruction
+        // shape: an `IN AL,DX` charges three times that, and the charge is deposited at runtime
+        // rather than baked into `raw_clocks`. Without it `iteration_upper` can legitimately
+        // exceed this "global maximum" on a bus whose cost dials are all zero (the `CpuBus` trait
+        // defaults), where the bus terms that normally swamp the core term vanish -- and the
+        // chain-pricing `debug_assert` that `per_hop_estimate <= global_block_upper` would trip
+        // on a bound that is supposed to dominate by construction.
+        let callout_core = u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
+            .saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS));
+        let integer_core = scale_core(
+            4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6 + callout_core,
+        );
+        // The x87 class needs no call-out term: x87 and call-out slots never share a block
+        // (the compile walk refuses the mix in either order), so an x87 block's `callout_slots`
+        // is zero by construction.
         let x87_core = scale_core(jit::direct::MAX_X87_BLOCK_CORE_CLOCKS);
         let max_core = if has_x87 { x87_core } else { integer_core };
         let max_read = bus
@@ -1355,7 +1368,12 @@ impl CpuGsw {
         let per_instruction_bus = bus
             .jit_fetch_cost_clocks()
             .saturating_add(max_read)
-            .saturating_add(max_store);
+            .saturating_add(max_store)
+            // One byte-wide port access per instruction covers a block that is nothing but
+            // call-out slots, and keeps this bound above `compute_iteration_upper`'s matching
+            // term for every slot count. Same reachable set as that term: no TSS probe, because
+            // the helper refuses the privilege state that would reach one.
+            .saturating_add(bus.jit_io_cost_clocks(BusWidth::Byte));
         let global_raw_bus_upper =
             (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(per_instruction_bus);
         let own_class = max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
@@ -1422,18 +1440,16 @@ impl CpuGsw {
             .saturating_add(byte_data_upper.saturating_mul(u64::from(block.byte_stores())))
             .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_stores())))
             .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_stores())));
-        // The call-out's BUS term, the other half of the dominance argument. One `0xEC` records
-        // at most: one byte-wide port access, plus -- only when `check_io_permission` does not
-        // take its early return -- the TSS probe, which for a one-byte port is exactly one word
-        // read (the I/O map base at TSS+0x66) and one byte read (the permission bitmap byte). The
-        // loop in `check_io_permission` runs `width.bytes()` times, so Byte gives it one
-        // iteration and no more. Charged unconditionally rather than only in the V86/CPL>IOPL
-        // case, because the bound is computed per BLOCK and the privilege state is per entry.
-        let callout_bus_upper = u64::from(block.callout_slots()).saturating_mul(
-            bus.jit_io_cost_clocks(BusWidth::Byte)
-                .saturating_add(word_data_upper)
-                .saturating_add(byte_data_upper),
-        );
+        // The call-out's BUS term, the other half of the dominance argument, and it is ONE
+        // access: a byte-wide port read. There is deliberately no TSS-probe term. The helper
+        // refuses `is_v86_mode() || CPL > IOPL` as its first statement (jit/direct/callout.rs),
+        // which is exactly the condition under which `check_io_permission` would leave its early
+        // return and touch memory -- so the probe's word and byte reads are not in the call-out's
+        // reachable set at all, and pricing them here would inflate every call-out block's bound
+        // for traffic that cannot happen. If that refusal is ever relaxed, this term comes back
+        // with it.
+        let callout_bus_upper =
+            u64::from(block.callout_slots()).saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte));
         let raw_bus_upper = fetch_upper
             .saturating_add(data_upper)
             .saturating_add(callout_bus_upper);

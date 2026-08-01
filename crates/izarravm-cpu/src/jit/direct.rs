@@ -69,7 +69,7 @@ pub(crate) const MAX_X87_SLOTS: u8 = 8;
 /// `MAX_BLOCK_STACK_ACCESSES` and comfortably above the one-or-two port reads a poll idiom
 /// carries; `brk_cap` byte-identity on the no-call-out fixture is the isolation that this bound
 /// does not leak into blocks that hold none.
-const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
+pub(crate) const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
 /// Instruction bound for a block that holds ANY memory-ALU slot. It is a CODE SIZE bound, not a
 /// timing one, and it is the second half of a pair with `MAX_MEMORY_ALU_SLOTS`.
 ///
@@ -200,6 +200,10 @@ pub(crate) struct DirectStallTally {
     /// slice's own mechanism unreadable, which is the mistake `Other` already cost this campaign.
     pub side_exit_callout_step_break: u64,
     pub side_exit_callout_abnormal: u64,
+    /// Every interpreter call-out the helper entered, counted before it can refuse. The
+    /// DENOMINATOR the two counters above needed: an abnormal count of zero says nothing without
+    /// it, because zero is also what a mechanism that never ran reports.
+    pub callout_executed: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three

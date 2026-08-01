@@ -13,10 +13,12 @@
 //! The tested opcode is MID-BLOCK in every emitted case. An opcode at a block's entry slot parks
 //! the block on the interpreter, so an entry-position fixture certifies nothing.
 //!
-//! Mutation record for this slice (both verified by hand before the commit):
-//! * dropping one `GUEST_HOMES` entry from the call-out's reload loop fails
-//!   `call_out_matches_the_interpreter_mid_block` on `registers`;
-//! * deleting the runtime raw-clock add at the call site fails the same test on `core clocks`.
+//! Mutation record for this slice (all verified by hand before the commit):
+//! * dropping one `GUEST_HOMES` entry from the call-out's reload loop fails four tests on
+//!   `registers`;
+//! * deleting the runtime raw-clock add at the call site fails two tests on `core clocks`;
+//! * dropping the weighted-FP lane from the device-timestamp preview fails
+//!   `the_helper_folds_the_chains_float_clocks_into_the_device_timestamp`.
 
 use super::*;
 
@@ -60,7 +62,7 @@ fn the_helper_charges_exactly_what_the_interpreter_charges_and_reports_the_step_
         bus.lazy_io_reads = lazy;
         bus.io_read_value = Some(0x5a);
 
-        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0);
+        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
         assert!(
             status >= 0,
             "lazy={lazy}: a served port read is not abnormal"
@@ -105,7 +107,7 @@ fn the_helper_hands_the_device_the_running_clock_total_not_the_block_entry_total
         let mut probe = flat_cpu();
         probe.scale_clocks_batch(prefix_raw)
     };
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, prefix_raw);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, prefix_raw, 0);
     assert!(status >= 0);
     assert_eq!(
         bus.last_read_io_core_clocks_so_far,
@@ -136,7 +138,7 @@ fn a_denied_port_is_abnormal_with_zero_partial_effects() {
     let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
     bus.lazy_io_reads = true;
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
     assert!(status < 0, "a denied port must be abnormal");
     assert_eq!(before, cpu.registers, "abnormal path wrote a register");
     assert_eq!(before_eflags, cpu.eflags(), "abnormal path wrote EFLAGS");
@@ -158,7 +160,7 @@ fn an_unsupported_port_is_abnormal_with_zero_partial_effects() {
     let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
     bus.io_read_fails = true;
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
     assert!(status < 0);
     assert_eq!(before, cpu.registers);
     assert_eq!(cpu.elapsed_clocks, 0);
@@ -179,6 +181,17 @@ struct Fixture {
 /// MID-BLOCK. Returns the compiled fixture and, separately, an interpreter twin on the same
 /// bytes and the same bus knobs.
 fn slot_block(configure: impl Fn(&mut TestBus)) -> (Fixture, CpuGsw, TestBus) {
+    slot_block_with(configure, |_| {})
+}
+
+/// As `slot_block`, but `configure_cpu` also runs on BOTH CPUs before the block is compiled.
+/// Privilege state has to be set before compilation, not just before the run: `memory_cpl3` is
+/// sealed into the block and re-checked at entry, so a block compiled at CPL 0 is simply not run
+/// at CPL 3 and the fixture would certify nothing.
+fn slot_block_with(
+    configure: impl Fn(&mut TestBus),
+    configure_cpu: impl Fn(&mut CpuGsw),
+) -> (Fixture, CpuGsw, TestBus) {
     let mut code = vec![0x89, 0xf6];
     let body_at = ENTRY + code.len() as u32;
     code.push(0xec);
@@ -202,6 +215,7 @@ fn slot_block(configure: impl Fn(&mut TestBus)) -> (Fixture, CpuGsw, TestBus) {
         (&mut native, &mut native_bus),
         (&mut interpreter, &mut interpreter_bus),
     ] {
+        configure_cpu(cpu);
         cpu.registers.set_esp(STACK_TOP);
         for &linear in &[ENTRY, body_at, tail_at] {
             cpu.set_eip(linear);
@@ -432,4 +446,274 @@ fn a_call_out_block_is_never_shaped_as_a_native_self_loop() {
         !compilation.self_loop,
         "a block holding a call-out must not be shaped as a native self-loop"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The privilege refusal: the TSS probe is EXCLUDED, not supported.
+// ---------------------------------------------------------------------------------------------
+
+const TSS_BASE: u32 = 0x2000;
+const TSS_IO_MAP_OFFSET: u16 = 0x100;
+const PAGED_DIRECTORY: u32 = 0x1000;
+const PAGED_TABLE: u32 = 0x3000;
+
+/// A CPU whose `check_io_permission` MUST consult the TSS bitmap, with paging on so that consult
+/// takes a real page walk. Low memory is identity-mapped with the ACCESSED BITS CLEAR, so the
+/// first walk through any entry writes one -- which is the hazard, and the thing the native path
+/// must be shown not to do.
+///
+/// `deny` picks whether the bitmap refuses `PORT`. Either way the CONSULT is the subject.
+fn paged_ring3_io_cpu(deny: bool) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0u8; 0x9000];
+    // PDE 0 -> the table: present, writable, user, accessed CLEAR.
+    memory[PAGED_DIRECTORY as usize..PAGED_DIRECTORY as usize + 4]
+        .copy_from_slice(&(PAGED_TABLE | 0x07).to_le_bytes());
+    for page in 0..9u32 {
+        let pte = (PAGED_TABLE + page * 4) as usize;
+        memory[pte..pte + 4].copy_from_slice(&((page << 12) | 0x07).to_le_bytes());
+    }
+    let base = TSS_BASE as usize;
+    memory[base + 0x66..base + 0x68].copy_from_slice(&TSS_IO_MAP_OFFSET.to_le_bytes());
+    let bitmap = base + usize::from(TSS_IO_MAP_OFFSET) + usize::from(PORT / 8);
+    memory[bitmap] = if deny { 1 << (PORT % 8) } else { 0 };
+
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.control.cr3 = PAGED_DIRECTORY;
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x0b, 0xfb));
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        cpu.registers
+            .set_segment(segment, SegmentRegister::flat(0x13, 0xf3));
+    }
+    // CPL 3 with IOPL 0 is the REACHABLE half of the refused predicate. Its V86 half is covered
+    // by `v86_call_out_is_refused_before_the_tss_probe` through the helper alone, because a V86
+    // BLOCK cannot exist: V86 code segments are always CS.D = 0 and no 16-bit block form is
+    // admitted on any persona yet.
+    cpu.cpl = 3;
+    cpu.registers.eflags = 0x202;
+    cpu.tr.base = TSS_BASE;
+    cpu.tr.limit = 0x1000;
+    cpu.registers.set_edx(u32::from(PORT));
+    cpu.registers.set_eax(0xdead_beef);
+
+    let mut bus = TestBus::with_memory(memory);
+    bus.lazy_io_reads = true;
+    bus.io_read_value = Some(0x5a);
+    (cpu, bus)
+}
+
+fn page_walk_writes(bus: &TestBus) -> Vec<u32> {
+    bus.trace
+        .cycles()
+        .iter()
+        .filter(|cycle| cycle.kind == BusAccessKind::PageWalkWrite)
+        .map(|cycle| cycle.address)
+        .collect()
+}
+
+#[test]
+fn a_permission_checked_port_is_refused_before_the_tss_probe_can_touch_memory() {
+    // Under `is_v86_mode() || CPL > IOPL` the interpreter's permission check walks the TSS, and
+    // under paging that walk WRITES guest memory (accessed bits), records written_pages, can set
+    // CR2, advances bus clocks and can reach `note_code_write` with the block's native code live
+    // on the stack. The helper refuses that state before anything runs.
+    for deny in [false, true] {
+        let (mut cpu, mut bus) = paged_ring3_io_cpu(deny);
+        let before = cpu.registers.clone();
+        let before_cr2 = cpu.control.cr2;
+
+        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+
+        assert!(
+            status < 0,
+            "deny={deny}: the privileged state must be refused"
+        );
+        assert_eq!(before, cpu.registers, "deny={deny}: registers");
+        assert_eq!(before_cr2, cpu.control.cr2, "deny={deny}: CR2");
+        assert_eq!(cpu.written_count, 0, "deny={deny}: written_pages");
+        assert!(!cpu.written_pages_overflow, "deny={deny}");
+        assert_eq!(cpu.elapsed_clocks, 0, "deny={deny}: clocks");
+        assert!(
+            page_walk_writes(&bus).is_empty(),
+            "deny={deny}: the refused path set a page-table accessed bit"
+        );
+        assert_eq!(
+            bus.trace.elapsed_clocks(),
+            0,
+            "deny={deny}: the refused path advanced bus clocks"
+        );
+        assert_eq!(
+            bus.last_read_io_core_clocks_so_far, None,
+            "deny={deny}: the refused path reached the device"
+        );
+    }
+}
+
+#[test]
+fn the_interpreter_still_does_the_tss_probe_the_call_out_refused() {
+    // What stops the test above from being vacuous: from the SAME state the interpreter really
+    // does walk the TSS, set accessed bits and charge for it. The hazard is live, and refusing it
+    // costs the guest only the call-out -- the instruction still executes, completely, one
+    // boundary later.
+    for deny in [false, true] {
+        let (mut cpu, mut bus) = paged_ring3_io_cpu(deny);
+        let entry = 0x4000u32;
+        bus.memory[entry as usize] = 0xec;
+        bus.memory[entry as usize + 1] = 0xf4;
+        cpu.set_eip(entry);
+
+        // NOT unwrapped: with `deny` the #GP has no IDT to land in and nests. Irrelevant here --
+        // the page walk that this test is about has already happened by then, which is the point.
+        let outcome = cpu.cycle(&mut bus);
+
+        assert!(
+            !page_walk_writes(&bus).is_empty(),
+            "deny={deny}: the fixture never reached a page walk, so it proves nothing"
+        );
+        if deny {
+            // The fault has no IDT to land in, so this fixture stops before `finish_instruction`
+            // can charge; the probe -- the subject -- already ran, which the walk above pins.
+            assert_eq!(
+                cpu.registers.eax(),
+                0xdead_beef,
+                "a denied port must not write AL"
+            );
+        } else {
+            outcome.expect("a permitted port must retire");
+            assert!(
+                cpu.elapsed_clocks > 0,
+                "the interpreted instruction must charge"
+            );
+            assert_eq!(cpu.registers.eip, entry + 1, "the IN must retire");
+            assert_eq!(
+                cpu.registers.eax(),
+                0xdead_be5a,
+                "the port byte lands in AL"
+            );
+        }
+    }
+}
+
+#[test]
+fn v86_call_out_is_refused_before_the_tss_probe() {
+    // The other half of the refused predicate, isolated: IOPL is 3 here, so the `CPL > IOPL` half
+    // is FALSE and only `is_v86_mode()` can produce the refusal.
+    let (mut cpu, mut bus) = paged_ring3_io_cpu(false);
+    cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+    assert_eq!(cpu.current_privilege_level(), 3);
+    assert_eq!(cpu.iopl(), 3);
+    let before = cpu.registers.clone();
+
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+
+    assert!(status < 0, "a V86 task must be refused");
+    assert_eq!(before, cpu.registers);
+    assert!(page_walk_writes(&bus).is_empty());
+    assert_eq!(bus.last_read_io_core_clocks_so_far, None);
+}
+
+#[test]
+fn the_emitted_slot_takes_the_abnormal_exit_when_the_privilege_state_is_refused() {
+    // The guard wired through the EMITTED path, not just the helper.
+    let (mut fixture, mut interpreter, mut interpreter_bus) = slot_block_with(
+        |bus| {
+            bus.lazy_io_reads = true;
+            bus.io_read_value = Some(0x5a);
+        },
+        |cpu| {
+            // CPL 3 with IOPL 0 and a zero-limit TSS: the interpreter would consult the bitmap,
+            // so the helper must refuse.
+            cpu.cpl = 3;
+            cpu.tr.limit = 0;
+        },
+    );
+
+    let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    interpreter.cycle(&mut interpreter_bus).unwrap();
+
+    assert_eq!(
+        fixture.cpu.perf_counters().jit_direct_insns - retired,
+        1,
+        "only the prefix may retire"
+    );
+    assert_eq!(fixture.cpu.registers, interpreter.registers);
+    assert_eq!(fixture.cpu.registers.eax(), 0xdead_beef, "AL untouched");
+    assert_eq!(fixture.cpu.elapsed_clocks, interpreter.elapsed_clocks);
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.side_exit_callout_abnormal, 1);
+    assert_eq!(
+        stalls.callout_executed, 1,
+        "a refusal still counts as an executed call-out, so the ratio has a denominator"
+    );
+}
+
+#[test]
+fn every_call_out_is_counted_whichever_arm_it_takes() {
+    // The denominator, pinned so a zero abnormal count on a fixture is evidence rather than an
+    // absence of evidence.
+    let (mut fixture, _, _) = slot_block(|bus| {
+        bus.lazy_io_reads = true;
+        bus.io_read_value = Some(0x5a);
+    });
+    fixture
+        .cpu
+        .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+        .unwrap();
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_executed, 1);
+    assert_eq!(stalls.side_exit_callout_abnormal, 0);
+    assert_eq!(stalls.side_exit_callout_step_break, 0);
+}
+
+#[test]
+fn the_helper_folds_the_chains_float_clocks_into_the_device_timestamp() {
+    // A call-out block never holds an x87 slot, but a FLOAT-ENTERED CHAIN can hop into one, and
+    // those earlier hops deposited their cost in the weighted-FP lane rather than the raw one.
+    // Previewing only the raw lane hands the device a timestamp short by the whole float part of
+    // the chain. The mutation record for this is the `fp.clocks` term deleted: this test then
+    // reads back the raw-only timestamp.
+    let mut cpu = flat_cpu();
+    cpu.registers.set_edx(u32::from(PORT));
+    cpu.core_clocks_so_far = 100;
+    let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+    bus.lazy_io_reads = true;
+
+    let prefix_raw = 24u64;
+    let prefix_fp = 4096u64;
+    let (expected, raw_only) = {
+        let mut probe = flat_cpu();
+        let fp = jit::native_x87::scale_weighted_fp_clocks(prefix_fp, probe.fp_rem);
+        assert!(fp.clocks > 0, "the fixture must carry real float clocks");
+        let mut raw_probe = flat_cpu();
+        (
+            probe.scale_clocks_batch(prefix_raw + fp.clocks),
+            raw_probe.scale_clocks_batch(prefix_raw),
+        )
+    };
+    assert_ne!(expected, raw_only, "the two readings must be separable");
+
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, prefix_raw, prefix_fp);
+
+    assert!(status >= 0);
+    assert_eq!(bus.last_read_io_core_clocks_so_far, Some(100 + expected));
+    // Still a preview: neither carry may be consumed, because the block still owes both charges.
+    assert_eq!(
+        cpu.timing_rem, 0,
+        "preview scaling consumed the integer carry"
+    );
+    assert_eq!(cpu.fp_rem, 0, "preview scaling consumed the float carry");
 }

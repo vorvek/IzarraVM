@@ -1089,6 +1089,8 @@ pub struct DirectStallSnapshot {
     /// Interpreter call-out exits, split by shape. See `BlockCacheStats`.
     pub side_exit_callout_step_break: u64,
     pub side_exit_callout_abnormal: u64,
+    /// Every call-out the helper entered - the denominator for the two counters above.
+    pub callout_executed: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

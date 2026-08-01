@@ -10,6 +10,16 @@ fn invoke_native_entry(
     block: jit::direct::CompiledBlock,
     quota: u32,
 ) -> jit::direct::NativeExit {
+    // This helper enters native code WITHOUT going through `run_direct_block`, so it never
+    // publishes `CpuGsw::native_callout`. A block carrying an interpreter call-out slot would
+    // therefore load a null helper pointer and `call` address zero. Refuse such a block here
+    // rather than leave the trap latent: any fixture that wants a call-out must drive it through
+    // `try_run_direct_block_for_test`, which does publish (see cpu_jit_callout_test.rs).
+    debug_assert_eq!(
+        block.callout_slots(),
+        0,
+        "invoke_native_entry does not publish a call-out table; use try_run_direct_block_for_test"
+    );
     let mut exit = jit::direct::NativeExit::default();
     let entry: jit::direct::DirectEntryFn = unsafe { std::mem::transmute(block.entry_ptr()) };
     let flags = cpu.eflags();
