@@ -589,146 +589,6 @@ fn stop_reason_json_preserves_each_outcome() {
 }
 
 #[test]
-fn saved_midi_preferences_fill_only_keys_absent_from_cli_and_toml() {
-    let mut config = MidiConfig::default();
-    let saved = MidiConfig {
-        backend: MidiBackend::Munt,
-        external_port: Some(MidiPortId {
-            name: "USB MIDI".into(),
-            ordinal: 2,
-        }),
-        soundfont: Some(PathBuf::from("saved.sf3")),
-        mt32_control_rom: Some(PathBuf::from("saved-control.rom")),
-        mt32_pcm_rom: Some(PathBuf::from("saved-pcm.rom")),
-    };
-    merge_saved_midi(
-        &mut config,
-        &saved,
-        MidiConfigPresence {
-            backend: true,
-            soundfont: true,
-            ..MidiConfigPresence::default()
-        },
-    );
-
-    assert_eq!(config.backend, MidiBackend::Off);
-    assert_eq!(config.soundfont, None);
-    assert_eq!(config.external_port, saved.external_port);
-    assert_eq!(config.mt32_control_rom, saved.mt32_control_rom);
-    assert_eq!(config.mt32_pcm_rom, saved.mt32_pcm_rom);
-}
-
-#[test]
-fn munt_discovery_is_case_insensitive_and_prefers_mt32() {
-    let dir = munt_test_dir("prefer-mt32");
-    let mt_control = dir.join("mt32_control.rom");
-    let mt_pcm = dir.join("Mt32_Pcm.Rom");
-    for name in [
-        &mt_control,
-        &mt_pcm,
-        &dir.join("CM32L_CONTROL.ROM"),
-        &dir.join("CM32L_PCM.ROM"),
-    ] {
-        std::fs::write(name, b"rom").unwrap();
-    }
-
-    let mut config = MidiConfig::default();
-    discover_munt_roms(&mut config, &dir);
-
-    assert_eq!(config.mt32_control_rom, Some(mt_control));
-    assert_eq!(config.mt32_pcm_rom, Some(mt_pcm));
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn munt_discovery_uses_only_complete_pairs() {
-    let dir = munt_test_dir("complete-pairs");
-    std::fs::write(dir.join("MT32_CONTROL.ROM"), b"rom").unwrap();
-    let cm_control = dir.join("cm32l_control.rom");
-    let cm_pcm = dir.join("cm32l_pcm.rom");
-    std::fs::write(&cm_control, b"rom").unwrap();
-    std::fs::write(&cm_pcm, b"rom").unwrap();
-
-    let mut config = MidiConfig::default();
-    discover_munt_roms(&mut config, &dir);
-    assert_eq!(config.mt32_control_rom, Some(cm_control));
-    assert_eq!(config.mt32_pcm_rom, Some(cm_pcm.clone()));
-
-    std::fs::remove_file(cm_pcm).unwrap();
-    let mut incomplete = MidiConfig::default();
-    discover_munt_roms(&mut incomplete, &dir);
-    assert_eq!(incomplete.mt32_control_rom, None);
-    assert_eq!(incomplete.mt32_pcm_rom, None);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn munt_discovery_does_not_mix_with_configured_paths() {
-    let dir = munt_test_dir("configured-paths");
-    std::fs::write(dir.join("MT32_CONTROL.ROM"), b"rom").unwrap();
-    std::fs::write(dir.join("MT32_PCM.ROM"), b"rom").unwrap();
-    let explicit = PathBuf::from("custom-control.rom");
-    let mut config = MidiConfig {
-        mt32_control_rom: Some(explicit.clone()),
-        ..MidiConfig::default()
-    };
-
-    discover_munt_roms(&mut config, &dir);
-
-    assert_eq!(config.mt32_control_rom, Some(explicit));
-    assert_eq!(config.mt32_pcm_rom, None);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn midi_presence_tracks_each_explicit_toml_and_cli_key() {
-    let path = std::env::temp_dir().join(format!(
-        "izarravm-midi-presence-{}-{}.toml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::write(
-        &path,
-        r#"
-            [audio.midi]
-            mt32_control_rom = "control.rom"
-
-            [audio.midi.external_port]
-            name = "USB MIDI"
-            ordinal = 1
-
-        "#,
-    )
-    .unwrap();
-    let cli = Cli::try_parse_from([
-        "izarravm",
-        "--config",
-        path.to_str().unwrap(),
-        "--midi-backend",
-        "external",
-        "--soundfont",
-        "cli.sf3",
-    ])
-    .unwrap();
-    let presence = midi_config_presence(&cli).unwrap();
-    let _ = std::fs::remove_file(path);
-
-    assert_eq!(
-        presence,
-        MidiConfigPresence {
-            backend: true,
-            external_port: true,
-            soundfont: true,
-            mt32_control_rom: true,
-            mt32_pcm_rom: false,
-        }
-    );
-}
-
-#[test]
 fn ascii_to_set1_maps_a_letter_to_make_and_break() {
     assert_eq!(ascii_to_set1('h'), vec![0x23, 0xa3]);
     // Uppercase wraps the key in left-Shift make/break.
@@ -828,32 +688,6 @@ fn katea_run_prog_name_picks_a_clean_8_3_name() {
     assert_eq!(katea_run_prog_name(Path::new("bar.com")), "PROG.COM");
     assert_eq!(katea_run_prog_name(Path::new("noext")), "PROG.COM");
     assert_eq!(katea_run_prog_name(Path::new("a.longext")), "PROG.LON");
-}
-
-#[test]
-fn c_root_path_lives_under_dot_izarravm_when_not_portable() {
-    let p = super::c_root_path(false);
-    assert!(
-        p.ends_with(std::path::Path::new(".izarravm").join("c_drive")),
-        "default C: root should end with .izarravm/c_drive, got {p:?}"
-    );
-    assert_eq!(p, state_dir_path().join("c_drive"));
-}
-
-#[test]
-fn c_root_path_is_a_bare_c_drive_when_portable() {
-    // Portable mode keys off the executable's own directory, so the path is
-    // just <exe_dir>/c_drive — no ~/.izarravm prefix.
-    let p = super::c_root_path(true);
-    assert_eq!(
-        p.file_name().and_then(|n| n.to_str()),
-        Some("c_drive"),
-        "portable C: root should be a c_drive folder, got {p:?}"
-    );
-    assert!(
-        !p.to_string_lossy().contains(".izarravm"),
-        "portable C: root must not use the ~/.izarravm prefix, got {p:?}"
-    );
 }
 
 #[test]
@@ -979,23 +813,6 @@ fn izarra_bios_gate_rejects_empty_measurements_and_unexpected_records() {
     let message = izarra_bios_failure_summary(&unexpected).unwrap();
     assert!(message.contains("unexpected records: component.unsupported"));
     assert!(message.contains("missing required record: self.framework"));
-}
-
-#[test]
-fn state_glide_ovl_discovery_is_case_insensitive() {
-    let dir = std::env::temp_dir().join(format!(
-        "izarravm-glide-ovl-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    assert_eq!(load_state_glide_ovl(&dir), None);
-    std::fs::write(dir.join("gLiDe2x.oVl"), b"state fallback").unwrap();
-    assert_eq!(load_state_glide_ovl(&dir), Some(b"state fallback".to_vec()));
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[cfg(feature = "jit")]

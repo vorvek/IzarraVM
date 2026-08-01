@@ -13,28 +13,28 @@ mod gui;
 mod prefs;
 #[cfg(windows)]
 mod riprofile;
+mod startup;
 
 use clap::Parser;
-use izarravm_audio::AudioSubsystem;
 use izarravm_core::{
-    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MASTER_CLOCK_HZ, MidiBackend, MidiConfig,
-    MidiPortId, SbDma8, SbDma16, SbIrq, VideoCard,
+    AppConfig, GswMode, HardwareProfile, MASTER_CLOCK_HZ, MidiBackend, SbDma8, SbDma16, SbIrq,
+    VideoCard,
 };
 use izarravm_cpu::CpuProfileSnapshot;
 use izarravm_firmware::{
     SuiteRecordStatus, SuiteResults, boot_test_image, neurketa_image, parse_result_block, test_rom,
 };
-use izarravm_input::InputState;
 use izarravm_machine::{
     ActiveDisplay, ExecutionBackend, Machine, MachineHostProfileSnapshot, MachineProfile,
     PerfCounters, StopReason, set_process_execution_backend,
 };
 use serde_json::json;
+use startup::ResolvedStartup;
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Default cycle budget for --headless-test-rom. Large enough that test386.bin
 /// reaches its POST-0x03 fault out of the box; halting ROMs return at their HLT
@@ -160,15 +160,6 @@ struct Cli {
     dosroot: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct MidiConfigPresence {
-    backend: bool,
-    external_port: bool,
-    soundfont: bool,
-    mt32_control_rom: bool,
-    mt32_pcm_rom: bool,
-}
-
 fn requested_execution_backend(
     interpreter: bool,
     native_backend_compiled: bool,
@@ -205,40 +196,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("--profile-json requires --headless-profile-exe or --hdd-folder".into());
     }
-    let midi_presence = midi_config_presence(&cli)?;
-    let mut config = load_config(&cli)?;
-    // When the user gave no C: location (no --c_drive, no --dosroot, and the
-    // config left at its "." default), use the per-user ~/.izarravm/c_drive (or,
-    // with --portable, a c_drive beside the executable). The folder is just user
-    // data now — Katea boots real FreeDOS from its own synthesized partition, so
-    // nothing is installed onto it.
-    if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
-        config.dos.c_drive = resolve_c_root(cli.portable);
-    }
-    let saved_prefs = prefs::GuiPrefs::load(&prefs::prefs_path(&config.dos.c_drive));
-    merge_saved_midi(&mut config.audio.midi, &saved_prefs.midi, midi_presence);
-    if !cli.portable {
-        discover_munt_roms(&mut config.audio.midi, &state_dir_path());
-    }
-    let hardware = HardwareProfile::from_config(&config)?;
-    let audio = AudioSubsystem::from_config(&config.audio);
-    let input = InputState {
-        keyboard_enabled: config.input.keyboard,
-        mouse_enabled: config.input.mouse,
-        joystick_enabled: config.input.joystick,
-    };
-    info!(
-        cpu = %config.machine.cpu,
-        hz = hardware.cpu.clock_rate().as_hz_f64(),
-        memory_mib = config.machine.memory_mib,
-        video = %config.machine.video,
-        c_drive = %config.dos.c_drive.display(),
-        audio_devices = audio.devices.len(),
-        keyboard = input.keyboard_enabled,
-        mouse = input.mouse_enabled,
-        joystick = input.joystick_enabled,
-        "configuration validated"
-    );
+    let startup = ResolvedStartup::from_cli(&cli)?;
+    let hardware = startup.hardware();
 
     if cli.headless_config_check {
         return Ok(());
@@ -250,15 +209,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // prologue, before clap could even print --help/--version. One Machine per
     // frame keeps every path well under the thread stack limit.
     if cli.headless_boot_suite {
-        return run_boot_suite(&hardware);
+        return run_boot_suite(hardware);
     }
 
     if cli.headless_bench {
-        return bench::run_bench(&hardware);
+        return bench::run_bench(hardware);
     }
 
     if let Some(path) = &cli.headless_bench_exe {
-        return bench::run_bench_exe(path, &hardware);
+        return bench::run_bench_exe(path, hardware);
     }
 
     if let Some(path) = &cli.headless_profile_exe {
@@ -266,20 +225,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             path,
             cli.profile_json.as_deref(),
             cli.profile_sample_stride,
-            &hardware,
+            hardware,
         );
     }
 
     if cli.headless_bandwidth {
-        return bench::run_bandwidth(&hardware);
+        return bench::run_bandwidth(hardware);
     }
 
     if cli.headless_test_rom {
-        return run_test_rom(cli.bios.as_deref(), cli.cycles, &hardware);
+        return run_test_rom(cli.bios.as_deref(), cli.cycles, hardware);
     }
 
     if cli.headless_keyboard {
-        return run_keyboard_demo(&hardware, cli.stdin_text.as_deref());
+        return run_keyboard_demo(hardware, cli.stdin_text.as_deref());
     }
 
     if cli.headless_izarra_bios {
@@ -287,20 +246,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(path) = &cli.headless_boot_floppy {
-        return run_boot_floppy(path, cli.cycles, &hardware);
+        return run_boot_floppy(path, cli.cycles, hardware);
     }
 
     if let Some(path) = &cli.headless_boot_hdd {
-        return run_boot_hdd(path, cli.cycles, &hardware);
+        return run_boot_hdd(path, cli.cycles, hardware);
     }
 
     if let Some(dir) = &cli.hdd_folder {
-        let glide_ovl = load_state_glide_ovl(&state_dir_path());
+        let glide_ovl = startup.load_global_glide_ovl();
         return run_boot_hdd_folder(
             dir,
             glide_ovl,
             cli.cycles,
-            &hardware,
+            hardware,
             cli.dump_result,
             cli.result_ppm.as_deref(),
             cli.profile_json.as_deref(),
@@ -309,7 +268,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(prog) = &cli.katea_run {
-        let code = katea_run(prog, MachineProfile::from_hardware_profile(&hardware))?;
+        let code = katea_run(prog, MachineProfile::from_hardware_profile(hardware))?;
         std::process::exit(code);
     }
 
@@ -317,83 +276,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(path) => std::fs::read(path)?,
         None => izarravm_firmware::izarra_bios().to_vec(),
     };
-    // The PC speaker is always-present motherboard hardware, so the host audio
-    // output is opened regardless of which sound cards are enabled. AudioPlayer
-    // falls back to silent if the host has no usable device.
-    // Read host local time and resolve host-side cmos.bin now, on the main thread,
-    // before the emulation thread spawns. now_local() is sound only single-threaded.
-    let rtc_setup = cmos::RtcSetup::from_c_root(&config.dos.c_drive);
-    let glide_ovl = load_state_glide_ovl(&state_dir_path());
-    gui::run(
-        MachineProfile::from_hardware_profile(&hardware),
-        rom,
-        config.dos.c_drive.clone(),
-        config.dos.cd_image.clone(),
-        config.audio.midi.clone(),
-        glide_ovl,
-        cli.margo_test_pattern,
-        rtc_setup,
-        config.input.joystick,
-    )?;
+    gui::run(startup.into_gui(rom, cli.margo_test_pattern))?;
     Ok(())
-}
-
-/// The C: root for a normal launch: `<home>/.izarravm/c_drive`, or `c_drive`
-/// beside the executable under `--portable`. Created if missing. Inlined from the
-/// retired HLE crate — it was only a path helper, not DOS emulation.
-fn resolve_c_root(portable: bool) -> PathBuf {
-    let dir = c_root_path(portable);
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-/// The C: root path (no filesystem side effects), split out so it is testable
-/// without creating directories.
-fn c_root_path(portable: bool) -> PathBuf {
-    if portable {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        exe_dir.join("c_drive")
-    } else {
-        state_dir_path().join("c_drive")
-    }
-}
-
-fn load_state_glide_ovl(state_dir: &Path) -> Option<Vec<u8>> {
-    let canonical = state_dir.join("GLIDE2X.OVL");
-    let path = canonical.is_file().then_some(canonical).or_else(|| {
-        std::fs::read_dir(state_dir)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.eq_ignore_ascii_case("GLIDE2X.OVL"))
-            })
-            .min()
-    })?;
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            info!(path = %path.display(), "using global GLIDE2X.OVL fallback");
-            Some(bytes)
-        }
-        Err(error) => {
-            warn!(%error, path = %path.display(), "could not read global GLIDE2X.OVL fallback");
-            None
-        }
-    }
-}
-
-fn state_dir_path() -> PathBuf {
-    #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".izarravm")
 }
 
 /// Run the clean-room boot suite and print its result block.
@@ -1574,109 +1458,6 @@ fn ascii_to_set1(ch: char) -> Vec<u8> {
         codes.push(0xaa); // left Shift break
     }
     codes
-}
-
-fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
-    let mut config = if let Some(path) = &cli.config {
-        AppConfig::from_toml_path(path)?
-    } else {
-        AppConfig::default()
-    };
-
-    let c_drive = cli.c_drive.clone().or_else(|| cli.dosroot.clone());
-    let external_midi_port = cli.midi_port.as_ref().map(|name| MidiPortId {
-        name: name.clone(),
-        ordinal: cli.midi_port_ordinal.unwrap_or(0),
-    });
-    config.apply_overrides(ConfigOverrides {
-        cpu: cli.cpu,
-        memory_mib: cli.memory_mib,
-        video: cli.video,
-        c_drive,
-        soundfont: cli.soundfont.clone(),
-        midi_backend: cli.midi_backend,
-        external_midi_port,
-        mt32_control_rom: cli.mt32_control_rom.clone(),
-        mt32_pcm_rom: cli.mt32_pcm_rom.clone(),
-        sb_irq: cli.sb_irq,
-        sb_dma: cli.sb_dma,
-        sb_high_dma: cli.sb_high_dma,
-    });
-
-    Ok(config)
-}
-
-fn midi_config_presence(cli: &Cli) -> Result<MidiConfigPresence, Box<dyn Error>> {
-    let mut presence = MidiConfigPresence::default();
-    if let Some(path) = &cli.config {
-        let text = std::fs::read_to_string(path)?;
-        let value: toml::Value = toml::from_str(&text)?;
-        if let Some(midi) = value
-            .get("audio")
-            .and_then(|audio| audio.get("midi"))
-            .and_then(toml::Value::as_table)
-        {
-            presence.backend = midi.contains_key("backend");
-            presence.external_port = midi.contains_key("external_port");
-            presence.soundfont = midi.contains_key("soundfont");
-            presence.mt32_control_rom = midi.contains_key("mt32_control_rom");
-            presence.mt32_pcm_rom = midi.contains_key("mt32_pcm_rom");
-        }
-    }
-    presence.backend |= cli.midi_backend.is_some();
-    presence.external_port |= cli.midi_port.is_some();
-    presence.soundfont |= cli.soundfont.is_some();
-    presence.mt32_control_rom |= cli.mt32_control_rom.is_some();
-    presence.mt32_pcm_rom |= cli.mt32_pcm_rom.is_some();
-    Ok(presence)
-}
-
-fn merge_saved_midi(config: &mut MidiConfig, saved: &MidiConfig, presence: MidiConfigPresence) {
-    if !presence.backend {
-        config.backend = saved.backend;
-    }
-    if !presence.external_port {
-        config.external_port.clone_from(&saved.external_port);
-    }
-    if !presence.soundfont {
-        config.soundfont.clone_from(&saved.soundfont);
-    }
-    if !presence.mt32_control_rom {
-        config.mt32_control_rom.clone_from(&saved.mt32_control_rom);
-    }
-    if !presence.mt32_pcm_rom {
-        config.mt32_pcm_rom.clone_from(&saved.mt32_pcm_rom);
-    }
-}
-
-fn discover_munt_roms(config: &mut MidiConfig, state_dir: &Path) {
-    if config.mt32_control_rom.is_some() || config.mt32_pcm_rom.is_some() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(state_dir) else {
-        return;
-    };
-    let files: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect();
-    let named = |name: &str| {
-        files.iter().find(|path| {
-            path.file_name()
-                .is_some_and(|file| file.to_string_lossy().eq_ignore_ascii_case(name))
-        })
-    };
-    for (control_name, pcm_name) in [
-        ("MT32_CONTROL.ROM", "MT32_PCM.ROM"),
-        ("CM32L_CONTROL.ROM", "CM32L_PCM.ROM"),
-    ] {
-        if let (Some(control), Some(pcm)) = (named(control_name), named(pcm_name)) {
-            config.mt32_control_rom = Some(control.clone());
-            config.mt32_pcm_rom = Some(pcm.clone());
-            return;
-        }
-    }
 }
 
 /// Print whatever the guest wrote to COM1 (the serial port), under a header so

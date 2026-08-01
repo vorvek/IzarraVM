@@ -9,6 +9,7 @@ mod ui;
 pub use runtime::run;
 
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
+use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioDebugSnapshot, AudioPlayer, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
 use izarravm_input::{
@@ -1965,18 +1966,20 @@ fn soundfont_picker(ui: &mut egui::Ui, soundfont: &mut Option<PathBuf>) {
 }
 
 impl GuiApp {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        profile: MachineProfile,
-        rom: Vec<u8>,
-        c_drive: PathBuf,
-        cd_image: Option<PathBuf>,
-        midi_config: MidiConfig,
-        glide_ovl: Option<Vec<u8>>,
-        test_pattern: bool,
-        rtc_setup: crate::cmos::RtcSetup,
-        joystick_enabled: bool,
-    ) -> Self {
+    fn new(launch: GuiLaunch) -> Self {
+        let GuiLaunch {
+            profile,
+            rom,
+            c_drive,
+            cd_image,
+            midi_config,
+            glide_ovl,
+            test_pattern,
+            rtc_setup,
+            joystick_enabled,
+            prefs,
+            prefs_path,
+        } = launch;
         let audio = match AudioPlayer::new() {
             Ok(player) => Some(player),
             Err(err) => {
@@ -1987,10 +1990,6 @@ impl GuiApp {
         // The machine details (CPU, memory) live in the controls panel; the window
         // title stays the product name.
         let title = String::from("IzarraVM");
-        // Load the GUI prefs (volume, last mounts) from next to the C: root. A
-        // missing or corrupt file falls back to defaults inside load().
-        let prefs_path = prefs::prefs_path(&c_drive);
-        let prefs = GuiPrefs::load(&prefs_path);
         let volume = prefs.master_volume.clamp(0.0, 1.0);
         let amp_gain = prefs.amp_gain;
         let crt_style = prefs.crt_style;

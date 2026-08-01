@@ -180,11 +180,12 @@ pub fn prefs_path(c_root: &Path) -> PathBuf {
 }
 
 impl GuiPrefs {
-    /// Load the prefs from `path`. A missing file yields the defaults silently;
-    /// an unreadable or unparseable file logs a warning and also yields defaults,
-    /// so a corrupt file never blocks startup. The volume is clamped to 0..1.
-    pub fn load(path: &Path) -> Self {
-        let text = match std::fs::read_to_string(path) {
+    /// A missing, unreadable, or unparseable file yields defaults.
+    pub(super) fn load_with(
+        path: &Path,
+        mut read_text: impl FnMut(&Path) -> std::io::Result<String>,
+    ) -> Self {
+        let text = match read_text(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(err) => {
