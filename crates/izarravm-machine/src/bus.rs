@@ -972,6 +972,16 @@ impl CpuBus for MachineBus<'_> {
         u64::from(izarravm_bus::BusCycle::clocks_for(width, wait_states))
     }
 
+    /// What `read_io`/`write_io` record for one port access: `clocks_for(width, wait_states.io)`,
+    /// the exact figure `self.trace.record` uses. `wait_states` is copied once at bus
+    /// construction and never rewritten, so it is constant within a `jit_cost_dial_epoch`.
+    fn jit_io_cost_clocks(&self, width: BusWidth) -> u64 {
+        u64::from(izarravm_bus::BusCycle::clocks_for(
+            width,
+            self.wait_states.io,
+        ))
+    }
+
     fn jit_scale_bus_cost_upper(&self, raw_clocks: u64) -> u64 {
         raw_clocks
             .saturating_mul(u64::from(self.bus_num_at_batch_start))

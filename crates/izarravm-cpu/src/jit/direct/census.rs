@@ -267,6 +267,10 @@ impl crate::jit::JitState {
                 .collect(),
             side_exit_segment_limit: self.stalls.side_exit_segment_limit,
             side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
+            side_exit_callout_step_break: self.stalls.side_exit_callout_step_break,
+            side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
+            callout_executed: self.stalls.callout_executed,
+            reject_callout_privileged: self.stalls.reject_callout_privileged,
         }
     }
 
@@ -284,6 +288,25 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_side_exit_x87_eligibility(&mut self) {
         self.stalls.side_exit_x87_eligibility += 1;
+    }
+
+    pub(crate) fn note_side_exit_callout_step_break(&mut self) {
+        self.stalls.side_exit_callout_step_break += 1;
+    }
+
+    pub(crate) fn note_side_exit_callout_abnormal(&mut self) {
+        self.stalls.side_exit_callout_abnormal += 1;
+    }
+
+    /// One unconditional increment inside the call-out helper, which has already left native code
+    /// and is about to touch the bus -- the same "the gate would cost as much as the work"
+    /// reasoning as the two side-exit counters above.
+    pub(crate) fn note_callout_executed(&mut self) {
+        self.stalls.callout_executed += 1;
+    }
+
+    pub(crate) fn note_reject_callout_privileged(&mut self) {
+        self.stalls.reject_callout_privileged += 1;
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {

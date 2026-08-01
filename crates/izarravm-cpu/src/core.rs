@@ -665,6 +665,25 @@ impl CpuGsw {
         quot
     }
 
+    /// `scale_clocks_batch` WITHOUT the side effect: the same long division over the same
+    /// `timing_rem` carry, but the new remainder is discarded instead of stored.
+    ///
+    /// Exists for exactly one caller, the JIT's interpreter call-out slot
+    /// (`jit/direct/callout.rs`), which needs the scaled value of a block prefix that the block
+    /// has NOT retired yet. The prefix is charged once, later, by `run_direct_block`'s single
+    /// batch call; consuming the carry here would move that charge and make the batch inexact.
+    /// Reading it without consuming it is what lets a mid-block port read hand the device the
+    /// same guest-time offset an interpreted continuation would.
+    #[cfg(feature = "jit")]
+    pub(super) fn preview_scale_clocks(&self, clocks: u64) -> u64 {
+        let persona = self.persona();
+        let scaled = clocks.saturating_mul(u64::from(level_timing(persona).0)) + self.timing_rem;
+        match persona {
+            CpuPersona::I386 => scaled / 5u64,
+            CpuPersona::I486 | CpuPersona::I586 => scaled / 12u64,
+        }
+    }
+
     /// Scale an x87 op's raw core clocks by the active level's FP-timing factor for the
     /// op's class, carrying the fractional remainder in `fp_rem` so a cheap FP op is not
     /// rounded to zero. Mirrors `scale_clocks` but uses `fp_timing_class` and `fp_rem`;

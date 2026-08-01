@@ -963,6 +963,65 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
             }
+            // The interpreter call-out slot. Two exits, both through the ordinary side-exit
+            // machinery so nothing about EIP advance, fetch tracing or prefix accounting is
+            // reinvented here (`jit/direct/callout.rs` carries the helper contract):
+            //
+            //   abnormal   EIP at the call-out, prefix = the slots BEFORE it. Byte-for-byte the
+            //              state the run loop sees today when a block ends at an IN barrier.
+            //   step break EIP AFTER the call-out, prefix = the slots before it PLUS the call-out
+            //              itself. `raw_clocks` in the static prefix stays `completed_raw`: this
+            //              instruction's charge is runtime and was already added to the lane at
+            //              the call site, so counting it here too would double it.
+            DirectKind::CallOut { helper } => {
+                let abnormal_common = e.label();
+                let abnormal_stub = e.label();
+                let step_break_common = e.label();
+                let step_break_stub = e.label();
+                callout::emit_call_out(
+                    &mut e,
+                    helper,
+                    completed_raw,
+                    abnormal_stub,
+                    step_break_stub,
+                );
+                side_exit_reason_stubs.push((
+                    abnormal_stub,
+                    abnormal_common,
+                    SideExitReason::CallOutAbnormal,
+                ));
+                side_exits.push((
+                    abnormal_common,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                side_exit_reason_stubs.push((
+                    step_break_stub,
+                    step_break_common,
+                    SideExitReason::CallOutStepBreak,
+                ));
+                side_exits.push((
+                    step_break_common,
+                    slot.lin
+                        .wrapping_add(u32::from(slot.len))
+                        .wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed + 1,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
             DirectKind::Call {
                 return_delta,
                 target_delta,
@@ -3634,7 +3693,7 @@ fn home(index: u8) -> Reg {
     GUEST_HOMES[usize::from(index & 7)]
 }
 
-fn gpr_offset(index: usize) -> i32 {
+pub(super) fn gpr_offset(index: usize) -> i32 {
     (core::mem::offset_of!(CpuGsw, registers)
         + core::mem::offset_of!(Registers, gpr)
         + index * core::mem::size_of::<u32>()) as i32
@@ -4446,7 +4505,7 @@ pub(super) fn emit_x87_reentry_pad() -> Vec<u8> {
     e.finish()
 }
 
-fn emit_store_homes(e: &mut Encoder) {
+pub(super) fn emit_store_homes(e: &mut Encoder) {
     for (index, home) in GUEST_HOMES.into_iter().enumerate() {
         e.store_r32_disp32(Reg::R15, gpr_offset(index), home);
     }

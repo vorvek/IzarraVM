@@ -210,6 +210,12 @@ fn differential_full(
     );
 }
 
+/// Phase 5 Task 2's call-out slot matrix. Nested here rather than registered beside the other JIT
+/// test files so it inherits this module's differential fixture (`ENTRY`, `STACK_TOP`,
+/// `flat_cpu`) instead of duplicating it.
+#[path = "cpu_jit_callout_matrix_test.rs"]
+mod callout_matrix;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a

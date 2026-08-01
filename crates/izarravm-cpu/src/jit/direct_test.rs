@@ -67,6 +67,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         has_wide_accesses: false,
         self_loop: false,
         has_x87: false,
+        callout_slots: 0,
         x87_entry_top: 0,
         x87_exit_top: 0,
         dynamic_successor: false,

@@ -1086,6 +1086,13 @@ pub struct DirectStallSnapshot {
     pub links_cleared: Vec<(&'static str, u64)>,
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
+    /// Interpreter call-out exits, split by shape. See `BlockCacheStats`.
+    pub side_exit_callout_step_break: u64,
+    pub side_exit_callout_abnormal: u64,
+    /// Every call-out the helper entered - the denominator for the two counters above.
+    pub callout_executed: u64,
+    /// Native entries refused because a call-out-bearing block met the privileged port state.
+    pub reject_callout_privileged: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1284,6 +1291,14 @@ pub struct CpuGsw {
     // a hand-written Default impl must keep it 0 because
     // cycle_no_interrupt_check assumes a fresh CPU starts there.
     core_clocks_so_far: u64,
+    // The live bus and the bus-monomorphised interpreter helpers an emitted call-out slot calls
+    // through (jit/direct/callout.rs). Published by `run_direct_block` immediately before it
+    // enters a block that carries a call-out slot and cleared immediately after, so the erased
+    // pointer is never live outside that window and blocks without call-outs never pay for it.
+    // Emitted code reads the function pointer straight out of this struct, so the field's
+    // position is load-bearing only through `offset_of!`, which computes it.
+    #[cfg(feature = "jit")]
+    pub(crate) native_callout: jit::direct::CallOutTable,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
     timing_rem: u64,
@@ -1452,6 +1467,8 @@ impl Default for CpuGsw {
             tr: SegmentRegister::default(),
             elapsed_clocks: 0,
             core_clocks_so_far: 0,
+            #[cfg(feature = "jit")]
+            native_callout: jit::direct::CallOutTable::default(),
             timing_rem: 0,
             fp_rem: 0,
             halted: false,
@@ -3008,6 +3025,12 @@ enum PagingAccessor {
 pub fn linear_address(segment: u16, offset: u16) -> usize {
     (usize::from(segment) << 4) + usize::from(offset)
 }
+
+/// What `IN AL, DX` (0xEC) charges. Named because TWO paths must charge it identically: the
+/// interpreter's `execute_port_io_decoded` arm, and the JIT's interpreter call-out slot
+/// (`jit/direct/callout.rs`), whose whole exact-clocks claim is that the two agree. A literal in
+/// each place would let them drift with nothing to notice.
+pub(crate) const IN_AL_DX_CORE_CLOCKS: u32 = 12;
 
 fn clocks(core_clocks: u32) -> CycleOutcome {
     CycleOutcome {

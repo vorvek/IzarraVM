@@ -1339,9 +1339,22 @@ impl CpuGsw {
                 .saturating_add(u64::from(den) - 1)
                 / u64::from(den)
         };
-        // A block can contain 31 four-clock instructions followed by a ten-clock RET.
-        let integer_core =
-            scale_core(4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6);
+        // A block can contain 31 four-clock instructions followed by a ten-clock RET, PLUS its
+        // call-out slots. The call-out term is not covered by the four-clock-per-instruction
+        // shape: an `IN AL,DX` charges three times that, and the charge is deposited at runtime
+        // rather than baked into `raw_clocks`. Without it `iteration_upper` can legitimately
+        // exceed this "global maximum" on a bus whose cost dials are all zero (the `CpuBus` trait
+        // defaults), where the bus terms that normally swamp the core term vanish -- and the
+        // chain-pricing `debug_assert` that `per_hop_estimate <= global_block_upper` would trip
+        // on a bound that is supposed to dominate by construction.
+        let callout_core = u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
+            .saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS));
+        let integer_core = scale_core(
+            4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6 + callout_core,
+        );
+        // The x87 class needs no call-out term: x87 and call-out slots never share a block
+        // (the compile walk refuses the mix in either order), so an x87 block's `callout_slots`
+        // is zero by construction.
         let x87_core = scale_core(jit::direct::MAX_X87_BLOCK_CORE_CLOCKS);
         let max_core = if has_x87 { x87_core } else { integer_core };
         let max_read = bus
@@ -1355,7 +1368,12 @@ impl CpuGsw {
         let per_instruction_bus = bus
             .jit_fetch_cost_clocks()
             .saturating_add(max_read)
-            .saturating_add(max_store);
+            .saturating_add(max_store)
+            // One byte-wide port access per instruction covers a block that is nothing but
+            // call-out slots, and keeps this bound above `compute_iteration_upper`'s matching
+            // term for every slot count. Same reachable set as that term: no TSS probe, because
+            // the helper refuses the privilege state that would reach one.
+            .saturating_add(bus.jit_io_cost_clocks(BusWidth::Byte));
         let global_raw_bus_upper =
             (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(per_instruction_bus);
         let own_class = max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
@@ -1388,8 +1406,18 @@ impl CpuGsw {
         let fp_core_upper = u64::from(block.weighted_fp_clocks())
             .saturating_add(u64::from(FP_TIMING_DEN) - 1)
             / u64::from(FP_TIMING_DEN);
+        // CALL-OUT DOMINANCE. A call-out slot's charge is RUNTIME, so `block.raw_clocks()` --
+        // which is the sum of the baked per-kind constants -- does not contain it and the bound
+        // would not cover it. Every admitted call-out is `0xEC`, whose interpreter charge is the
+        // constant `IN_AL_DX_CORE_CLOCKS`; that is not a worst case, it is the ONLY case, so
+        // adding it per slot is exact rather than conservative on the core term. Keep this arm in
+        // step with `classify`'s call-out admission: a second opcode with a larger charge, or any
+        // charge that is not a constant, must raise this to that opcode's maximum.
+        let callout_core_upper =
+            u64::from(block.callout_slots()).saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS));
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
+            .saturating_add(callout_core_upper)
             .saturating_mul(u64::from(num))
             .saturating_add(u64::from(den) - 1)
             / u64::from(den);
@@ -1412,7 +1440,19 @@ impl CpuGsw {
             .saturating_add(byte_data_upper.saturating_mul(u64::from(block.byte_stores())))
             .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_stores())))
             .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_stores())));
-        let raw_bus_upper = fetch_upper.saturating_add(data_upper);
+        // The call-out's BUS term, the other half of the dominance argument, and it is ONE
+        // access: a byte-wide port read. There is deliberately no TSS-probe term. The helper
+        // refuses `is_v86_mode() || CPL > IOPL` as its first statement (jit/direct/callout.rs),
+        // which is exactly the condition under which `check_io_permission` would leave its early
+        // return and touch memory -- so the probe's word and byte reads are not in the call-out's
+        // reachable set at all, and pricing them here would inflate every call-out block's bound
+        // for traffic that cannot happen. If that refusal is ever relaxed, this term comes back
+        // with it.
+        let callout_bus_upper =
+            u64::from(block.callout_slots()).saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte));
+        let raw_bus_upper = fetch_upper
+            .saturating_add(data_upper)
+            .saturating_add(callout_bus_upper);
         // `cap` and the in-batch bus growth use the bus's scaled guest-clock domain. Fold the raw
         // fetch/data bound through that same scale before deciding how much native work fits.
         scaled_core_upper.saturating_add(bus.jit_scale_bus_cost_upper(raw_bus_upper))
@@ -1538,6 +1578,30 @@ impl CpuGsw {
         if block.memory_cpl3() != (self.current_privilege_level() == 3) {
             self.perf.jit_direct_reject_cpl += 1;
             self.jit_direct.retire_key_for_recompile(span.key);
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        // A block carrying an interpreter call-out slot does not run in the privilege state whose
+        // port reads consult the TSS bitmap. THIS is the load-bearing gate; the matching refusal
+        // inside the helper (jit/direct/callout.rs) is the second line of defence, kept because it
+        // is what makes the helper's zero-partial-effects property hold on its own terms.
+        //
+        // Correctness is settled by the helper. What this site buys is COST. Without it, a paged
+        // V86 or CPL>IOPL guest -- EMM386 and VCPI DOS, first-class targets here -- would pay, on
+        // every single execution of a compiled IN: the whole-set spill, the scratch frame, the
+        // indirect call, the guard's refusal, the whole-set reload, the abnormal side exit, AND
+        // then the dispatcher trip back to the interpreter it would have taken anyway. Strictly
+        // worse than the pre-slice barrier, and unconditionally so. Refusing here returns the
+        // block to the interpreter, which is exactly the pre-slice behaviour.
+        //
+        // Two field reads at a site that already reads privilege state for the check above, and
+        // both are behind `callout_slots() != 0`, so a block without a slot pays one compare.
+        // NOT retired: the state is transient (a V86 task returns to ring 0 and back), and the
+        // block is perfectly good -- it is the privilege level that is wrong, like the alignment
+        // and budget refusals below rather than the layout ones above.
+        if block.callout_slots() != 0
+            && (self.is_v86_mode() || self.current_privilege_level() > self.iopl())
+        {
+            self.jit_direct.note_reject_callout_privileged();
             return Ok(DirectBlockOutcome::NotRun);
         }
         let has_link = self.jit_direct.has_linked_successor(block.id());
@@ -1703,6 +1767,16 @@ impl CpuGsw {
         // sealed it executable, and the current generational lookup keeps that arena entry live.
         let entry: jit::direct::DirectEntryFn =
             unsafe { std::mem::transmute(current_block.entry_ptr()) };
+        // The call-out window: two stores in, two out, so the erased `*mut B` is never reachable
+        // outside the call that owns the borrow. `publish::<B>` also picks the helper
+        // instantiations for THIS bus type, which is what makes the erasure sound; see
+        // `jit/direct/callout.rs`.
+        //
+        // UNCONDITIONAL, deliberately. Gating it on `block.callout_slots() != 0` would be wrong,
+        // not merely different: a chained native transfer jumps into a SUCCESSOR block's body
+        // without returning here, so an entry block with no call-out can reach a chained block
+        // that has one. The entry block's own slot count says nothing about the chain.
+        self.native_callout = jit::direct::CallOutTable::publish(bus);
         unsafe {
             entry(
                 self as *mut CpuGsw,
@@ -1711,6 +1785,7 @@ impl CpuGsw {
                 &mut exit as *mut jit::direct::NativeExit,
             );
         }
+        self.native_callout = jit::direct::CallOutTable::default();
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
         debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
         debug_assert!(u64::from(exit.linked_transfers) < quota);
@@ -1943,6 +2018,12 @@ impl CpuGsw {
                 }
                 reason if reason == jit::direct::SideExitReason::CodeWatch as u32 => {
                     self.perf.jit_direct_exit_code_watch += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::CallOutStepBreak as u32 => {
+                    self.jit_direct.note_side_exit_callout_step_break();
+                }
+                reason if reason == jit::direct::SideExitReason::CallOutAbnormal as u32 => {
+                    self.jit_direct.note_side_exit_callout_abnormal();
                 }
                 _ => self.perf.jit_direct_exit_other += 1,
             }

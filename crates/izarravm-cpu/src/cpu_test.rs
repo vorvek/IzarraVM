@@ -1693,8 +1693,10 @@ fn pending_flags_offset() {
     // The mutable-imm-lane slice adds four PerfCounters fields (the lane registration, accept and
     // two rejection-reason counters; 32 bytes), moving this pin back from 4424 to 4456, measured
     // the same way. They belong in PerfCounters rather than at the CpuGsw tail because they are
-    // the slice's diagnostic trio and have to appear in the probe JSON alongside the SMC counters.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4456);
+    // the slice's diagnostic trio and have to appear in the probe JSON alongside the SMC counters. The Phase 5
+    // call-out slice adds `native_callout: CallOutTable` to `CpuGsw` (a raw pointer and a usize;
+    // 16 bytes), moving this pin from 4456 to 4472, measured the same way.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4472);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -2488,6 +2490,25 @@ struct TestBus {
     // status-port path (MachineBus::read_io's 3DA/3BA/3C2 arm), so poll-loop chaining across an IN
     // can be exercised through the CPU alone. Writes still set io_touched. Default false.
     lazy_io_reads: bool,
+    // What `read_io` hands back. `None` keeps the historical constant 0; a value lets a port-read
+    // differential fixture see a byte actually land in AL (a call-out that never wrote the
+    // destination would pass against a bus that always returns 0).
+    io_read_value: Option<u32>,
+    // When true, `read_io` fails with `UnsupportedPort` -- the machine bus's only `read_io` error
+    // producer, and the second member of the call-out helper's abnormal set.
+    io_read_fails: bool,
+    // A SEQUENCE of port-read values, one consumed per `read_io`, falling back to `io_read_value`
+    // once exhausted. `io_read_value` is a CONSTANT, which cannot separate "the device was read
+    // again" from "the first value was cached"; a native block that re-executes must observe the
+    // fresh device value on every execution. See the varying-device row in
+    // cpu_jit_callout_matrix_test.rs.
+    io_read_sequence: Vec<u32>,
+    io_read_cursor: usize,
+    // Every `read_io` in order, as `(port, core_clocks_so_far)`: the device-visible read order and
+    // timestamps, which the call-out matrix compares between the native and the block-free
+    // interpreted role. `last_read_io_core_clocks_so_far` keeps only the most recent one and so
+    // cannot see an order or a count difference.
+    io_reads: Vec<(u16, u64)>,
     // Records the `core_clocks_so_far` the CPU threaded into the most recent `read_io` call, so
     // tests can assert on it (see core_clocks_so_far_reflects_prior_instructions_not_the_in_flight).
     last_read_io_core_clocks_so_far: Option<u64>,
@@ -2534,6 +2555,11 @@ impl TestBus {
             pending_irq: None,
             io_touched: false,
             lazy_io_reads: false,
+            io_read_value: None,
+            io_read_fails: false,
+            io_read_sequence: Vec::new(),
+            io_read_cursor: 0,
+            io_reads: Vec::new(),
             last_read_io_core_clocks_so_far: None,
             last_write_io_core_clocks_so_far: None,
             direct_pages_enabled: false,
@@ -3052,17 +3078,25 @@ impl CpuBus for TestBus {
         core_clocks_so_far: u64,
         _cpu_is_ring0_pm: bool,
     ) -> Result<u32, BusError> {
+        if self.io_read_fails {
+            return Err(BusError::UnsupportedPort { port });
+        }
         if !self.lazy_io_reads {
             self.io_touched = true;
         }
         self.last_read_io_core_clocks_so_far = Some(core_clocks_so_far);
+        self.io_reads.push((port, core_clocks_so_far));
         self.trace.push(BusCycle::new(
             BusAccessKind::IoRead,
             u32::from(port),
             width,
             0,
         ));
-        Ok(0)
+        let sequenced = self.io_read_sequence.get(self.io_read_cursor).copied();
+        if sequenced.is_some() {
+            self.io_read_cursor += 1;
+        }
+        Ok(sequenced.or(self.io_read_value).unwrap_or(0))
     }
 
     fn write_io(
@@ -3458,6 +3492,14 @@ mod jit_test_imm;
 ))]
 #[path = "cpu_jit_imm_lane_test.rs"]
 mod jit_imm_lane;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_callout_test.rs"]
+mod jit_callout;
 
 /// C1e: `DecodedInsn`'s recorded `{disp_len, imm_len}` pair (design section 1.2, review
 /// finding M3) did NOT fit the struct's padding: the size grew 36 -> 40 and is pinned
