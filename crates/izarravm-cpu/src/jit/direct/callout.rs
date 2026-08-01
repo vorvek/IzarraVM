@@ -88,6 +88,14 @@
 //!   `scale_clocks_batch`. `scale_clocks_batches_exactly` (cpu_test.rs) pins that batch against
 //!   summed per-instruction `scale_clocks`, so the guest-visible charge is EQUAL to the
 //!   interpreter's, not merely close.
+//!
+//!   That is the WHOLE charge, and the static lane must contribute NOTHING to it:
+//!   `DirectKind::raw_clocks` carries an explicit `CallOut { .. } => 0` arm, the same shape
+//!   `X87` carries. Omitting it selects the `_ => 2` default, which lands on top of the runtime
+//!   12 and makes every native IN cost 14 raw against the interpreter's 12. That shipped, and
+//!   neither the emitter's own `completed_raw` assertion (it sums the same accessor it checks)
+//!   nor a single-slot differential (the two-clock error floors away at the 586 dial) could see
+//!   it. `cpu_jit_callout_matrix_test.rs` separates them by ACCUMULATION, one to four slots.
 //! * **The device's view of time.** `read_io` takes `core_clocks_so_far`, which the interpreter
 //!   sets to the run's running total before each instruction. Inside a block that value is stale
 //!   by the RUN's prefix -- this block's earlier slots and, on a chained entry, every hop before

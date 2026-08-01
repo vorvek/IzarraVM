@@ -2497,6 +2497,18 @@ struct TestBus {
     // When true, `read_io` fails with `UnsupportedPort` -- the machine bus's only `read_io` error
     // producer, and the second member of the call-out helper's abnormal set.
     io_read_fails: bool,
+    // A SEQUENCE of port-read values, one consumed per `read_io`, falling back to `io_read_value`
+    // once exhausted. `io_read_value` is a CONSTANT, which cannot separate "the device was read
+    // again" from "the first value was cached"; a native block that re-executes must observe the
+    // fresh device value on every execution. See the varying-device row in
+    // cpu_jit_callout_matrix_test.rs.
+    io_read_sequence: Vec<u32>,
+    io_read_cursor: usize,
+    // Every `read_io` in order, as `(port, core_clocks_so_far)`: the device-visible read order and
+    // timestamps, which the call-out matrix compares between the native and the block-free
+    // interpreted role. `last_read_io_core_clocks_so_far` keeps only the most recent one and so
+    // cannot see an order or a count difference.
+    io_reads: Vec<(u16, u64)>,
     // Records the `core_clocks_so_far` the CPU threaded into the most recent `read_io` call, so
     // tests can assert on it (see core_clocks_so_far_reflects_prior_instructions_not_the_in_flight).
     last_read_io_core_clocks_so_far: Option<u64>,
@@ -2545,6 +2557,9 @@ impl TestBus {
             lazy_io_reads: false,
             io_read_value: None,
             io_read_fails: false,
+            io_read_sequence: Vec::new(),
+            io_read_cursor: 0,
+            io_reads: Vec::new(),
             last_read_io_core_clocks_so_far: None,
             last_write_io_core_clocks_so_far: None,
             direct_pages_enabled: false,
@@ -3070,13 +3085,18 @@ impl CpuBus for TestBus {
             self.io_touched = true;
         }
         self.last_read_io_core_clocks_so_far = Some(core_clocks_so_far);
+        self.io_reads.push((port, core_clocks_so_far));
         self.trace.push(BusCycle::new(
             BusAccessKind::IoRead,
             u32::from(port),
             width,
             0,
         ));
-        Ok(self.io_read_value.unwrap_or(0))
+        let sequenced = self.io_read_sequence.get(self.io_read_cursor).copied();
+        if sequenced.is_some() {
+            self.io_read_cursor += 1;
+        }
+        Ok(sequenced.or(self.io_read_value).unwrap_or(0))
     }
 
     fn write_io(

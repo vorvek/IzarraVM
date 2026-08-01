@@ -2970,12 +2970,20 @@ pub(crate) enum DirectKind {
     /// opcode here, `0xEC` (IN AL,DX), and the helper is named by the variant so a second opcode
     /// cannot be added without an emitter arm of its own.
     ///
-    /// `raw_clocks` carries NO arm and MUST NOT: the call-out's charge is RUNTIME, returned by
-    /// the helper and added to the block's raw-clock lane at the call site. An arm here would
-    /// double-charge every call-out, and the `completed_raw == raw_clocks` assertion at the end
-    /// of `emit` could not see it because both sides would move together. The static bound the
-    /// budget needs lives in `Compilation::callout_slots` instead, folded into
-    /// `compute_iteration_upper` (see the derivation there).
+    /// `raw_clocks` carries an explicit `=> 0` arm, and the rule is the opposite of what this
+    /// comment claimed when the slice shipped: the call-out's ENTIRE charge is the RUNTIME lane
+    /// (the helper's return value, added at the call site), so the STATIC lane must see zero.
+    /// Omitting the arm does not express that -- it selects the `_ => 2` default and charges 2 on
+    /// top of the runtime 12. `X87` carries its own `=> 0` for exactly this reason.
+    ///
+    /// The `completed_raw == raw_clocks` assertion at the end of `emit` is BLIND to this class
+    /// either way: it sums the same accessor it checks against, so it agrees with itself whatever
+    /// the arm returns. A single-slot differential is nearly blind too, because at the 586 dial
+    /// the two-clock error floors away. Only accumulation separates them; that is what
+    /// `cpu_jit_callout_matrix_test.rs` does across one to four slots.
+    ///
+    /// The static bound the budget needs lives in `Compilation::callout_slots` instead, folded
+    /// into `compute_iteration_upper` (see the derivation there).
     CallOut {
         helper: CallOutHelper,
     },
@@ -3180,6 +3188,20 @@ impl DirectKind {
             // gives, so Cdq deliberately has no arm here.
             Self::Cwde { .. } => 3,
             Self::X87 { .. } => 0,
+            // ZERO, and it MUST carry an explicit arm for exactly the reason `X87` above does: a
+            // call-out's whole charge arrives at RUNTIME, through the helper's return value and
+            // the lane add at the call site. The `_ => 2` default is not a harmless approximation
+            // here, it is a DOUBLE CHARGE -- the static 2 lands on top of the runtime 12 and every
+            // native `IN AL,DX` costs 14 raw where the interpreter costs 12.
+            //
+            // It shipped, and the way it hid is worth recording. Nothing in the emitter can see
+            // it: `completed_raw` sums this same function, so the end-of-`emit` assertion agrees
+            // with itself whichever value the arm returns. And a single-slot differential rounds
+            // it away -- at the 586 dial a three-slot block charges 18 raw against the
+            // interpreter's 16, and both floor to the same scaled clock. It takes ACCUMULATION to
+            // separate them, which is what the Task 2 matrix does (`call_out_charge_matches_the_
+            // interpreter_across_slot_counts`, one to four slots).
+            Self::CallOut { .. } => 0,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
             // forms share the arm because the interpreter charges them from one `Ok(clocks(9))`.
