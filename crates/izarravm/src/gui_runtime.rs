@@ -537,31 +537,10 @@ fn build_event_loop(
 }
 
 /// Open the window and run the emulator. Returns when the user closes it.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    profile: MachineProfile,
-    rom: Vec<u8>,
-    c_drive: PathBuf,
-    cd_image: Option<PathBuf>,
-    midi_config: MidiConfig,
-    glide_ovl: Option<Vec<u8>>,
-    test_pattern: bool,
-    rtc_setup: crate::cmos::RtcSetup,
-    joystick_enabled: bool,
-) -> Result<(), Box<dyn Error>> {
+pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     let raw_mouse = RawMouseAccum::default();
     let event_loop = build_event_loop(raw_mouse.clone())?;
-    let gui = GuiApp::new(
-        profile,
-        rom,
-        c_drive,
-        cd_image,
-        midi_config,
-        glide_ovl,
-        test_pattern,
-        rtc_setup,
-        joystick_enabled,
-    );
+    let gui = GuiApp::new(launch);
     let egui_ctx = egui::Context::default();
     enlarge_ui_fonts(&egui_ctx);
     apply_black_theme(&egui_ctx);
