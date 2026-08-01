@@ -82,7 +82,7 @@ impl GuiApp {
         let id = tex.id();
         let scale = 34.0 / LOGO_H as f32;
         let size = egui::vec2(LOGO_W as f32 * scale, LOGO_H as f32 * scale);
-        let running = self.emu.is_some();
+        let running = self.session_snapshot.powered;
         // A fixed-height row, bottom-aligned, so the logo, LED, and buttons
         // share one baseline (the Power button's). The explicit height stops the
         // Align::Max layout from expanding to fill the whole panel.
@@ -102,7 +102,7 @@ impl GuiApp {
                         })
                         .inner;
                     if reset.clicked() {
-                        self.start();
+                        self.reset_session();
                     }
                     if ui
                         .add_sized(
@@ -112,9 +112,9 @@ impl GuiApp {
                         .clicked()
                     {
                         if running {
-                            self.stop();
+                            self.power_off_session();
                         } else {
-                            self.start();
+                            self.power_on_session();
                         }
                     }
                     // A tall box so the LED centres vertically against the Power button.
@@ -138,27 +138,25 @@ impl GuiApp {
     }
 
     fn panel_body(&mut self, ui: &mut egui::Ui) {
-        let running = self.emu.is_some();
-        let (mode, speed, idle, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
-            Some(emu) => {
-                let f = emu.frame.lock().expect("frame snapshot poisoned");
-                (
-                    f.mode,
-                    f.speed_ratio,
-                    f.idle,
-                    f.floppy_accesses,
-                    f.c_accesses,
-                    f.cd_accesses,
-                )
-            }
-            None => (
+        let running = self.session_snapshot.powered;
+        let (mode, speed, idle, floppy_accesses, c_accesses, cd_accesses) = if running {
+            (
+                self.session_snapshot.mode,
+                self.session_snapshot.speed_ratio,
+                self.session_snapshot.idle,
+                self.session_snapshot.floppy_accesses,
+                self.session_snapshot.c_accesses,
+                self.session_snapshot.cd_accesses,
+            )
+        } else {
+            (
                 None,
                 0.0,
                 false,
                 self.floppy_access_seen,
                 self.c_access_seen,
                 self.cd_access_seen,
-            ),
+            )
         };
         // Light a drive LED whenever its access count advanced since last frame.
         let now = Instant::now();
@@ -180,7 +178,7 @@ impl GuiApp {
         self.drives_ui(ui, running);
 
         // Push the readout, volume, COM1, and vents to the bottom of the panel.
-        let mode = mode.unwrap_or(self.profile.cpu);
+        let mode = mode.unwrap_or(self.session_snapshot.configured_mode);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.separator();
@@ -205,12 +203,12 @@ impl GuiApp {
                 });
                 ui.horizontal(|ui| {
                     let text = if idle {
-                        format!("Idle - {} MB", self.profile.memory_mib)
+                        format!("Idle - {} MB", self.session_snapshot.memory_mib)
                     } else {
                         format!(
                             "Speed {:.0}% - {} MB",
                             speed * 100.0,
-                            self.profile.memory_mib
+                            self.session_snapshot.memory_mib
                         )
                     };
                     line(ui, text);
@@ -269,6 +267,7 @@ impl GuiApp {
     /// Open the configuration modal, seeding its staged settings from the live
     /// values so Cancel can discard cleanly.
     fn open_config_dialog(&mut self) {
+        let midi_config = self.session_snapshot.midi_config.clone();
         self.config_dialog = Some(ConfigDialog {
             input_release: self.input_release.clone(),
             fullscreen: self.fullscreen_key.clone(),
@@ -277,11 +276,11 @@ impl GuiApp {
             crt_style: self.crt_style,
             amp_gain: self.amp_gain,
             pc_speaker_volume: self.pc_speaker_volume,
-            midi_backend: self.midi_config.backend,
-            external_midi_port: self.midi_config.external_port.clone(),
-            soundfont: self.midi_config.soundfont.clone(),
-            mt32_control_rom: path_text(self.midi_config.mt32_control_rom.as_ref()),
-            mt32_pcm_rom: path_text(self.midi_config.mt32_pcm_rom.as_ref()),
+            midi_backend: midi_config.backend,
+            external_midi_port: midi_config.external_port,
+            soundfont: midi_config.soundfont,
+            mt32_control_rom: path_text(midi_config.mt32_control_rom.as_ref()),
+            mt32_pcm_rom: path_text(midi_config.mt32_pcm_rom.as_ref()),
             midi_ports: MidiEngine::external_ports(),
             capturing: None,
         });
@@ -312,17 +311,17 @@ impl GuiApp {
     /// Render the configuration modal. Accept applies the staged settings and
     /// closes; Cancel, the backdrop, or Esc discards and closes.
     fn config_ui(&mut self, ctx: &egui::Context) {
-        let (wavetable_status, midi_status) = self
-            .emu
-            .as_ref()
-            .map(|emu| {
-                let frame = emu.frame.lock().expect("frame snapshot poisoned");
-                (frame.wavetable_status, frame.midi_status)
-            })
-            .unwrap_or((
+        let (wavetable_status, midi_status) = if self.session_snapshot.powered {
+            (
+                self.session_snapshot.wavetable_status,
+                self.session_snapshot.midi_status,
+            )
+        } else {
+            (
                 MidiStatus::InitializationFailed,
                 MidiStatus::InitializationFailed,
-            ));
+            )
+        };
         let Some(mut dialog) = self.config_dialog.take() else {
             return;
         };
@@ -610,7 +609,7 @@ impl GuiApp {
         }
     }
 
-    /// Push the staged config to the live fields, the emulation thread, and prefs.
+    /// Push the staged config to the live fields, session, and prefs.
     fn apply_config(&mut self, dialog: &ConfigDialog) {
         self.input_release = dialog.input_release.clone();
         self.fullscreen_key = dialog.fullscreen.clone();
@@ -646,13 +645,9 @@ impl GuiApp {
             mt32_control_rom: optional_path(&dialog.mt32_control_rom),
             mt32_pcm_rom: optional_path(&dialog.mt32_pcm_rom),
         };
-        if midi_config != self.midi_config {
-            self.midi_config = midi_config.clone();
-            if let Some(emu) = &self.emu {
-                emu.configure_midi(midi_config.clone());
-            }
+        if midi_config != self.session_snapshot.midi_config {
+            let _ = self.request_session(SessionRequest::MidiConfig(midi_config));
         }
-        self.prefs.midi = midi_config;
         self.save_prefs();
     }
 
@@ -661,14 +656,10 @@ impl GuiApp {
     /// resizable, and closable; its open state is bound to `show_com1` so the
     /// close control and the footer button stay in sync.
     fn com1_window(&mut self, ctx: &egui::Context) {
-        let serial = match &self.emu {
-            Some(emu) => emu
-                .frame
-                .lock()
-                .expect("frame snapshot poisoned")
-                .serial
-                .clone(),
-            None => String::new(),
+        let serial = if self.session_snapshot.powered {
+            self.session_snapshot.serial.clone()
+        } else {
+            String::new()
         };
         let mut open = self.show_com1;
         beige_window(ctx, "COM1", &mut open, true, [480.0, 320.0], |ui| {
@@ -782,6 +773,7 @@ impl GuiApp {
     /// COM1 window. Keyboard, mouse capture, and focus loss are handled in the
     /// winit event loop now, not here, so the guest reads raw physical keys.
     pub(super) fn ui(&mut self, ctx: &egui::Context) {
+        self.poll_session();
         // The window title (capture-lock hint) is set directly on the winit window
         // from the event loop now; viewport commands are not applied without eframe.
         // Host render rate: count this frame, roll the rate up once a second.
