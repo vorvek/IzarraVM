@@ -52,6 +52,39 @@ pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
 const MAX_BLOCK_STACK_ACCESSES: u8 = 4;
 pub(crate) const MAX_X87_BLOCK_INSTRUCTIONS: usize = 12;
 pub(crate) const MAX_X87_SLOTS: u8 = 8;
+/// Instruction bound for a block that holds ANY memory-ALU slot. It is a CODE SIZE bound, not a
+/// timing one, and it is the second half of a pair with `MAX_MEMORY_ALU_SLOTS`.
+///
+/// Every installed block owns exactly one host page (`ExecutableArena::install` refuses a
+/// compilation longer than `host_page_len`), so a block's emitted bytes are the scarce resource.
+/// Memory-ALU slots are by far the largest emitters in the kind table: each one lowers an
+/// address computation, a fast-map probe, a read, the ALU op, a watched/device fallback and a
+/// transactional exit stub, which is of the order of a kilobyte per slot against a few tens of
+/// bytes for an ordinary register slot. The size is pinned from the test side by
+/// `repeated_memory_alu_root_splits_below_one_host_page_and_retires_natively`: it builds a root of
+/// nothing but memory-ALU instructions and asserts the block that comes out is
+/// `MAX_MEMORY_ALU_SLOTS` long and within a byte budget that is already most of one page.
+///
+/// `MAX_MEMORY_ALU_SLOTS` therefore bounds the memory-ALU term and this constant bounds
+/// EVERYTHING ELSE sharing the page with it — the difference of the two is how many non-memory-ALU
+/// slots may join, which at these values is one. Together they keep such a block inside its page
+/// without going through `compile_with_page_len`'s fallback, which re-compiles a binary search of
+/// shorter prefixes and lands on a shorter block anyway. Exceeding the page is a COST, never a
+/// correctness question: the fallback is the safety net, this pair is the fast path.
+/// `direct_byte_alu_memory_destination_matches_the_interpreter` documents the resulting worst
+/// shape from the test side, and depends on it to keep its ops mid-block.
+///
+/// The bound is deliberately unrelated to the chain quota: `compute_global_block_upper` already
+/// charges every hop `MAX_BLOCK_INSTRUCTIONS` instructions of worst-case bus traffic, so any value
+/// up to that cap is covered there and raising this one cannot under-budget a chain.
+///
+/// MEASURED 2026-08-01 (phase 3 task 3), so nobody re-runs it: 8 and 16 are both admissible and
+/// both really change formation — on quake the mean instructions per dispatcher entry rises about
+/// 3% and installed blocks fall about a sixth, on doom the same figures move by under a tenth of a
+/// percent. Neither bought wall. Six-pair A/B/B/A ladders against this value read noise_only on
+/// BOTH fixtures with the geomean and min-wall estimators agreeing (doom especially flat), and the
+/// SMC churn counters did not move either way. The break binds, and relaxing it is free of
+/// benefit; 4 stays until something changes what a memory-ALU slot costs to emit.
 const MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS: usize = 4;
 const MAX_MEMORY_ALU_SLOTS: u8 = 3;
 /// Per-hop chain clock bound for a block with any x87 slot. Derived, not chosen:
