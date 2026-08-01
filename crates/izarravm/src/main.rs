@@ -978,6 +978,11 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
             .iter()
             .map(|(label, count)| json!({ "reason": label, "count": count }))
             .collect::<Vec<_>>(),
+        "links_cleared": snapshot
+            .links_cleared
+            .iter()
+            .map(|(label, count)| json!({ "cause": label, "count": count }))
+            .collect::<Vec<_>>(),
         "side_exit_segment_limit": snapshot.side_exit_segment_limit,
         "side_exit_x87_eligibility": snapshot.side_exit_x87_eligibility,
     })

@@ -1080,6 +1080,10 @@ pub struct DirectStallSnapshot {
     pub dormant: Vec<(&'static str, u64)>,
     /// (label, count) per `LinkRefusal`.
     pub link_refusals: Vec<(&'static str, u64)>,
+    /// (label, count) per `LinkClearCause` — the cause split behind the aggregate
+    /// `PerfCounters::jit_direct_links_cleared`, which is fed independently and must equal the
+    /// sum of these three.
+    pub links_cleared: Vec<(&'static str, u64)>,
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
 }

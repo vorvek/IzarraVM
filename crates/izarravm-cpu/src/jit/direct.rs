@@ -3,12 +3,16 @@
 
 //! Admission and storage for page-local direct-code blocks.
 
+mod census;
 mod classify;
 mod emit;
 
 use std::{collections::HashMap, sync::Arc};
 
 use izarravm_core::CpuPersona;
+
+use census::BarrierObservation;
+pub(crate) use census::{DirectBarrierCensus, barrier_census_default};
 
 use super::code_watch::NativeCodeWatch;
 #[cfg(target_os = "windows")]
@@ -52,6 +56,39 @@ pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
 const MAX_BLOCK_STACK_ACCESSES: u8 = 4;
 pub(crate) const MAX_X87_BLOCK_INSTRUCTIONS: usize = 12;
 pub(crate) const MAX_X87_SLOTS: u8 = 8;
+/// Instruction bound for a block that holds ANY memory-ALU slot. It is a CODE SIZE bound, not a
+/// timing one, and it is the second half of a pair with `MAX_MEMORY_ALU_SLOTS`.
+///
+/// Every installed block owns exactly one host page (`ExecutableArena::install` refuses a
+/// compilation longer than `host_page_len`), so a block's emitted bytes are the scarce resource.
+/// Memory-ALU slots are by far the largest emitters in the kind table: each one lowers an
+/// address computation, a fast-map probe, a read, the ALU op, a watched/device fallback and a
+/// transactional exit stub, which is of the order of a kilobyte per slot against a few tens of
+/// bytes for an ordinary register slot. The size is pinned from the test side by
+/// `repeated_memory_alu_root_splits_below_one_host_page_and_retires_natively`: it builds a root of
+/// nothing but memory-ALU instructions and asserts the block that comes out is
+/// `MAX_MEMORY_ALU_SLOTS` long and within a byte budget that is already most of one page.
+///
+/// `MAX_MEMORY_ALU_SLOTS` therefore bounds the memory-ALU term and this constant bounds
+/// EVERYTHING ELSE sharing the page with it — the difference of the two is how many non-memory-ALU
+/// slots may join, which at these values is one. Together they keep such a block inside its page
+/// without going through `compile_with_page_len`'s fallback, which re-compiles a binary search of
+/// shorter prefixes and lands on a shorter block anyway. Exceeding the page is a COST, never a
+/// correctness question: the fallback is the safety net, this pair is the fast path.
+/// `direct_byte_alu_memory_destination_matches_the_interpreter` documents the resulting worst
+/// shape from the test side, and depends on it to keep its ops mid-block.
+///
+/// The bound is deliberately unrelated to the chain quota: `compute_global_block_upper` already
+/// charges every hop `MAX_BLOCK_INSTRUCTIONS` instructions of worst-case bus traffic, so any value
+/// up to that cap is covered there and raising this one cannot under-budget a chain.
+///
+/// MEASURED 2026-08-01 (phase 3 task 3), so nobody re-runs it: 8 and 16 are both admissible and
+/// both really change formation — on quake the mean instructions per dispatcher entry rises about
+/// 3% and installed blocks fall about a sixth, on doom the same figures move by under a tenth of a
+/// percent. Neither bought wall. Six-pair A/B/B/A ladders against this value read noise_only on
+/// BOTH fixtures with the geomean and min-wall estimators agreeing (doom especially flat), and the
+/// SMC churn counters did not move either way. The break binds, and relaxing it is free of
+/// benefit; 4 stays until something changes what a memory-ALU slot costs to emit.
 const MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS: usize = 4;
 const MAX_MEMORY_ALU_SLOTS: u8 = 3;
 /// Per-hop chain clock bound for a block with any x87 slot. Derived, not chosen:
@@ -133,6 +170,12 @@ pub(crate) struct DirectStallTally {
     /// the source cell on the zero portal, so the exit reports `StaticUnbound` and is
     /// indistinguishable from a target that was never compiled.
     pub link_refusals: [u64; LinkRefusal::COUNT],
+    /// Which cause cleared each link, indexed by `LinkClearCause`. The aggregate
+    /// `jit_direct_links_cleared` counts the same events through `BlockCacheStats::unlinks` and
+    /// is left alone; these three are the attribution the aggregate could not carry. Always on:
+    /// each is one increment beside an increment that already happens, on paths that are already
+    /// doing map work.
+    pub links_cleared: [u64; LinkClearCause::COUNT],
     /// The two halves the old `SideExitReason::Other` counter conflated.
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
@@ -225,291 +268,6 @@ impl LinkRefusal {
             Self::DynamicFloatToInteger => "dynamic_float_to_integer",
             Self::MissingX87Pad => "missing_x87_pad",
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct BarrierKey {
-    opcode: u16,
-    modrm_reg: u8,
-    operand_form: u8,
-    operand_size: u8,
-    address_size: u8,
-    prefix_mask: u16,
-}
-
-impl BarrierKey {
-    fn from_insn(insn: &DecodedInsn) -> Self {
-        let operand_form = match insn.operand {
-            None => 0,
-            Some(DecodedOperand::Reg(_)) => 1,
-            Some(DecodedOperand::Mem(_)) => 2,
-        };
-        let mut prefix_mask = u16::from(insn.prefixes.operand_size_override)
-            | (u16::from(insn.prefixes.address_size_override) << 1)
-            | (u16::from(insn.prefixes.lock) << 2);
-        prefix_mask |= match insn.prefixes.rep {
-            None => 0,
-            Some(crate::RepKind::Repe) => 1 << 3,
-            Some(crate::RepKind::Repne) => 2 << 3,
-        };
-        if let Some(segment) = insn.prefixes.segment_override {
-            prefix_mask |= (u16::try_from(segment_index(segment)).unwrap_or(0) + 1) << 5;
-        }
-        Self {
-            opcode: insn.opcode,
-            modrm_reg: insn.modrm.map_or(u8::MAX, |modrm| modrm.reg),
-            operand_form,
-            operand_size: u8::from(insn.operand_size == OperandSize::Dword),
-            address_size: u8::from(insn.address_size == AddressSize::Dword),
-            prefix_mask,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct BarrierStats {
-    hits: u64,
-    runtime_hits: u64,
-    native_prefix_instructions: u64,
-    native_suffix_instructions: u64,
-    max_native_prefix: u8,
-    max_native_suffix: u8,
-    /// Exits that actually happened into a block this barrier rejected. RUNTIME-weighted, unlike
-    /// `hits` (compile attempts) which mis-ranked the ShiftCl slice by three orders of magnitude.
-    unbound_exits: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BarrierObservation {
-    entry_linear: u32,
-    native_prefix: usize,
-    native_suffix: usize,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DirectBarrierCensus {
-    rows: HashMap<BarrierKey, BarrierStats>,
-    /// Why static successor cells were unbound at the exits that hit them, indexed by
-    /// `UnboundTarget`. Lives HERE and not in `PerfCounters` on purpose: `PerfCounters` is
-    /// embedded in `CpuGsw` ahead of `pending_flags`, whose offset is pinned by
-    /// `arch_payload_keeps_pending_flags_offset_pinned` (canonical_state_test.rs) and
-    /// `pending_flags_offset` (cpu_test.rs) because emitted code bakes it. Growing `PerfCounters`
-    /// for a diagnostic shifts that pin; the census is an `Option<Box<_>>` on `JitState` and costs
-    /// the layout nothing.
-    unbound: [u64; UnboundTarget::COUNT],
-    /// The same classification for DYNAMIC successor misses (computed RET/JMP/CALL targets),
-    /// kept in its own lane because the two have different fixes: a static unbound wants its
-    /// target compiled, a dynamic miss whose target reads `CompiledButUnlinked` wants a wider
-    /// inline cache than the hardcoded two ways.
-    unbound_dynamic: [u64; UnboundTarget::COUNT],
-    /// Block entry linear -> the barrier row that refused it, so a rejected-target exit can be
-    /// attributed back to the opcode responsible. Keyed on linear alone: two rejected blocks
-    /// sharing a linear across mode/physical would merge, which is acceptable for a diagnostic
-    /// and keeps the compile-side insert to one word.
-    rejected_barrier: HashMap<u32, BarrierKey>,
-}
-
-impl DirectBarrierCensus {
-    fn note_unbound(&mut self, kind: UnboundTarget) {
-        self.unbound[kind as usize] += 1;
-    }
-
-    fn note_unbound_dynamic(&mut self, kind: UnboundTarget) {
-        self.unbound_dynamic[kind as usize] += 1;
-    }
-
-    /// Attribute one rejected-target exit back to the barrier that refused that block.
-    fn note_unbound_rejected_at(&mut self, linear: u32) {
-        let Some(&key) = self.rejected_barrier.get(&linear) else {
-            return;
-        };
-        let row = self.rows.entry(key).or_default();
-        row.unbound_exits = row.unbound_exits.saturating_add(1);
-    }
-
-    fn record(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
-        let BarrierObservation {
-            entry_linear,
-            native_prefix,
-            native_suffix,
-        } = observation;
-        let key = BarrierKey::from_insn(insn);
-        self.rejected_barrier.insert(entry_linear, key);
-        let row = self.rows.entry(key).or_default();
-        row.hits = row.hits.saturating_add(1);
-        row.native_prefix_instructions = row
-            .native_prefix_instructions
-            .saturating_add(native_prefix as u64);
-        row.native_suffix_instructions = row
-            .native_suffix_instructions
-            .saturating_add(native_suffix as u64);
-        row.max_native_prefix = row.max_native_prefix.max(native_prefix as u8);
-        row.max_native_suffix = row.max_native_suffix.max(native_suffix as u8);
-    }
-
-    fn note_interpreted(&mut self, insn: &DecodedInsn) {
-        // EVERY row, not only the ex-helper families. `runtime_hits` counts how many times the
-        // guest actually EXECUTES this shape interpreted, which makes it the census's only
-        // per-execution, position-free column - and therefore the only one that can rank a shape
-        // by what it costs rather than by where a block happened to stop.
-        //
-        // It used to carry `&& row.helper_family.is_some()`, an artifact of the commit that
-        // instrumented the three helper-eligible opcodes, and that one conjunct left 34 of 36
-        // rows reading zero. It is what let `unbound_exits` be the ranking column by default, and
-        // `unbound_exits` ranked `0x8C` (a segment reload run ~1.2M times) SEVEN TIMES ABOVE
-        // `0x38 /0` (an inner-loop CMP), when the second was worth three times the whole rest of
-        // the night put together. Costs nothing when the census is off: the call site in `run.rs`
-        // is gated on `barrier_census_active()` before the arguments are even built.
-        let key = BarrierKey::from_insn(insn);
-        if let Some(row) = self.rows.get_mut(&key) {
-            row.runtime_hits = row.runtime_hits.saturating_add(1);
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> DirectBarrierCensusSnapshot {
-        let mut keyed_rows: Vec<_> = self
-            .rows
-            .iter()
-            .map(|(&key, &stats)| (key, census_row(key, stats)))
-            .collect();
-        // Sorted by RUNTIME unbound exits first, tiebroken by compile attempts (`hits`).
-        keyed_rows.sort_by(|(left_key, left), (right_key, right)| {
-            right
-                .unbound_exits
-                .cmp(&left.unbound_exits)
-                .then_with(|| right.hits.cmp(&left.hits))
-                .then_with(|| left_key.cmp(right_key))
-        });
-        DirectBarrierCensusSnapshot {
-            rows: keyed_rows.into_iter().map(|(_, row)| row).collect(),
-            unbound_targets: UnboundTarget::ALL
-                .iter()
-                .map(|kind| (kind.label(), self.unbound[*kind as usize]))
-                .collect(),
-            dynamic_miss_targets: UnboundTarget::ALL
-                .iter()
-                .map(|kind| (kind.label(), self.unbound_dynamic[*kind as usize]))
-                .collect(),
-        }
-    }
-}
-
-fn census_row(key: BarrierKey, stats: BarrierStats) -> DirectBarrierCensusRow {
-    DirectBarrierCensusRow {
-        opcode: key.opcode,
-        modrm_reg: (key.modrm_reg != u8::MAX).then_some(key.modrm_reg),
-        operand_form: match key.operand_form {
-            1 => "register",
-            2 => "memory",
-            _ => "none",
-        },
-        operand_size: if key.operand_size != 0 {
-            "dword"
-        } else {
-            "word"
-        },
-        address_size: if key.address_size != 0 {
-            "dword"
-        } else {
-            "word"
-        },
-        prefix_mask: key.prefix_mask,
-        unbound_exits: stats.unbound_exits,
-        hits: stats.hits,
-        runtime_hits: stats.runtime_hits,
-        native_prefix_instructions: stats.native_prefix_instructions,
-        native_suffix_instructions: stats.native_suffix_instructions,
-        max_native_prefix: stats.max_native_prefix,
-        max_native_suffix: stats.max_native_suffix,
-    }
-}
-
-pub(crate) fn barrier_census_default() -> Option<Box<DirectBarrierCensus>> {
-    matches!(
-        std::env::var("IZARRAVM_DIRECT_BARRIER_CENSUS").as_deref(),
-        Ok("1")
-    )
-    .then(|| Box::new(DirectBarrierCensus::default()))
-}
-
-impl super::JitState {
-    fn barrier_census_enabled(&self) -> bool {
-        self.direct_barrier_census.is_some()
-    }
-
-    fn record_barrier(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.record(insn, observation);
-        }
-    }
-
-    /// Whether the census exists at all. Callers MUST gate on this before calling
-    /// `note_barrier_census_interpreted`, which sits on the per-interpreted-instruction retire
-    /// path. Checking `is_some` inside the callee is too late for the gate to save anything.
-    #[inline]
-    pub(crate) fn barrier_census_active(&self) -> bool {
-        self.direct_barrier_census.is_some()
-    }
-
-    pub(crate) fn note_barrier_census_interpreted(&mut self, insn: &DecodedInsn) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.note_interpreted(insn);
-        }
-    }
-
-    /// Record why a static successor was unbound. No-op unless the census is allocated, and the
-    /// CALLER still gates on `barrier_census_active` so the key construction is skipped too.
-    pub(crate) fn note_unbound_target(&mut self, kind: UnboundTarget, linear: u32) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.note_unbound(kind);
-            if kind == UnboundTarget::Rejected {
-                census.note_unbound_rejected_at(linear);
-            }
-        }
-    }
-
-    /// Unlike the census snapshot this is ALWAYS available: none of its three groups is census
-    /// gated, because each is a single increment on a path that has already left native code.
-    pub(crate) fn stall_snapshot(&self) -> crate::DirectStallSnapshot {
-        crate::DirectStallSnapshot {
-            dormant: DormantReason::ALL
-                .iter()
-                .map(|r| (r.label(), self.stalls.dormant[*r as usize]))
-                .collect(),
-            link_refusals: LinkRefusal::ALL
-                .iter()
-                .map(|r| (r.label(), self.stalls.link_refusals[*r as usize]))
-                .collect(),
-            side_exit_segment_limit: self.stalls.side_exit_segment_limit,
-            side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
-        }
-    }
-
-    pub(crate) fn note_dynamic_miss_target(&mut self, kind: UnboundTarget) {
-        if let Some(census) = self.direct_barrier_census.as_mut() {
-            census.note_unbound_dynamic(kind);
-        }
-    }
-
-    /// Both are one unconditional increment on a path that has already taken a dispatcher exit,
-    /// so unlike the census hooks these are NOT gated: the gate would cost as much as the work.
-    pub(crate) fn note_side_exit_segment_limit(&mut self) {
-        self.stalls.side_exit_segment_limit += 1;
-    }
-
-    pub(crate) fn note_side_exit_x87_eligibility(&mut self) {
-        self.stalls.side_exit_x87_eligibility += 1;
-    }
-
-    pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
-        self.direct_barrier_census
-            .as_deref()
-            .map(DirectBarrierCensus::snapshot)
-    }
-
-    pub(crate) fn set_barrier_census_enabled(&mut self, enabled: bool) {
-        self.direct_barrier_census = enabled.then(|| Box::new(DirectBarrierCensus::default()));
     }
 }
 
@@ -915,39 +673,108 @@ impl BlockId {
 }
 
 /// Result of `classify_unbound_target`. Diagnostic.
+///
+/// EXHAUSTIVE AND MUTUALLY EXCLUSIVE by construction: every unbound-exit classification call
+/// lands on exactly one variant, including the `NoKey` early-out, so the per-run totals sum to
+/// the unresolved-exit counter the classifier is gated behind. `unbound_target_classes_are_exhaustive`
+/// (direct_test.rs) pins the state-to-class mapping, and `unbound_exit_classes_sum_to_the_static_unbound_counter`
+/// plus `dynamic_miss_classes_sum_to_the_dynamic_miss_counter` (cpu_jit_direct_execution_test.rs)
+/// pin the sum on the real dispatcher path for both lanes. Do not add a classification path that
+/// returns without noting a variant -- that is exactly what the second pair of tests exists to
+/// catch, and the first pair cannot see it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnboundTarget {
-    /// The successor address has never been probed at all — a genuinely cold edge.
-    NeverSeen,
-    /// Probed, but not hot enough to compile yet, or dormant.
-    SeenNotCompiled,
+    /// The exiting EIP could not be turned into a `BlockKey` at all (`key_for` refused, e.g. the
+    /// successor page is not mapped). No entry-map probe happened, so this is not `Absent`: it
+    /// is "the question could not be asked". Exists so the classes close on the exit counter.
+    NoKey,
+    /// Probed for, but the successor address has no entry at all — a genuinely cold edge.
+    Absent,
+    /// The key is tracked and admissible, just not hot enough to have been compiled yet.
+    Seen,
+    /// Parked `Dormant` by the G1 SMC-heat gate (`DormantReason::SpanHot`). Split out from the
+    /// other three dormant reasons because this is the only one with a designed recovery path
+    /// (`lift_cold_smc_dormant`), so it is churn rather than a permanent refusal.
+    DormantHeat,
+    /// Parked `Dormant` by any non-heat reason — compile retry, page-cover failure, or an arena
+    /// install failure. None of these lift on their own.
+    DormantOther,
     /// Compilation was attempted and structurally refused. These are the edges an opcode
     /// lowering slice would convert.
     Rejected,
     /// The target is compiled and live, but the edge was never linked — a `link_compatible`
-    /// refusal or a link that has not been attempted.
-    CompiledButUnlinked,
-    /// The target compiled once and its slot has since been retired or reused.
-    CompiledButRetired,
+    /// refusal, or the transient window before the next probe binds it.
+    Compiled,
+    /// The target compiled once and its slot has since been retired or reused. Currently
+    /// UNREACHABLE and reading zero on both fixtures by construction, not by luck: every retire
+    /// path rewrites or removes the entry before anything can exit to it, so a live
+    /// `Compiled(id)` whose slot is dead has no way to be observed today. Retained as a
+    /// tripwire -- a future slot-reuse or deferred-retire path would surface here first, and it
+    /// is cheaper to keep the class than to re-derive it. Do NOT read its zero as evidence
+    /// about retirement.
+    CompiledRetired,
 }
 
 impl UnboundTarget {
-    const COUNT: usize = 5;
+    const COUNT: usize = 8;
     pub(crate) const ALL: [Self; Self::COUNT] = [
-        Self::NeverSeen,
-        Self::SeenNotCompiled,
+        Self::NoKey,
+        Self::Absent,
+        Self::Seen,
+        Self::DormantHeat,
+        Self::DormantOther,
         Self::Rejected,
-        Self::CompiledButUnlinked,
-        Self::CompiledButRetired,
+        Self::Compiled,
+        Self::CompiledRetired,
     ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::NeverSeen => "never_seen",
-            Self::SeenNotCompiled => "seen_not_compiled",
+            Self::NoKey => "no_key",
+            Self::Absent => "absent",
+            Self::Seen => "seen",
+            Self::DormantHeat => "dormant_heat",
+            Self::DormantOther => "dormant_other",
             Self::Rejected => "rejected",
-            Self::CompiledButUnlinked => "compiled_unlinked",
-            Self::CompiledButRetired => "compiled_retired",
+            Self::Compiled => "compiled",
+            Self::CompiledRetired => "compiled_retired",
+        }
+    }
+}
+
+/// Which of the four unlink sites cleared a link, for the split behind the aggregate
+/// `jit_direct_links_cleared`. That aggregate is NOT re-derived from these: it keeps its own
+/// independent `BlockCacheStats::unlinks` feed, so the two are a cross-check rather than one
+/// number counted twice. `link_clear_causes_close_on_the_aggregate` (direct_test.rs) pins the
+/// sum identity, site by site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinkClearCause {
+    /// `try_link_inner` displaced an existing edge in a cell it wanted for a different target.
+    Replaced,
+    /// The target (or source) block was retired, via `unlink_block`.
+    Retired,
+    /// `invalidate_translation`: a paging/CR3/decode-slot flush tearing down link cells while
+    /// the blocks themselves STAY compiled. Split from `Reset` because the two look alike in an
+    /// aggregate and are nothing alike as a lever -- this one leaves the code in place and only
+    /// costs the re-binding, and it is where essentially all bulk clears actually come from
+    /// (`jit_direct_cache_resets` is a single-digit number over a whole fixture run).
+    Flushed,
+    /// `reset_storage`: the cache-wide drop, code and all. Rare; counted apart so a rise in it
+    /// cannot hide inside the flush lane.
+    Reset,
+}
+
+impl LinkClearCause {
+    pub(crate) const COUNT: usize = 4;
+    pub(crate) const ALL: [Self; Self::COUNT] =
+        [Self::Replaced, Self::Retired, Self::Flushed, Self::Reset];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Replaced => "replaced",
+            Self::Retired => "retired",
+            Self::Flushed => "flushed",
+            Self::Reset => "reset",
         }
     }
 }
@@ -955,7 +782,11 @@ impl UnboundTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockState {
     Seen,
-    Dormant,
+    /// Carries the reason it was parked so `classify_unbound_target` can separate the
+    /// heat-demoted (recoverable) dormants from the rest. The reason is stamped by the FIRST
+    /// park: `dormant()` only rewrites a `Seen` entry, so a second gate firing on an
+    /// already-dormant key counts in `DirectStallTally::dormant` but does not restamp the state.
+    Dormant(DormantReason),
     Rejected(RejectedSpan),
     Compiled(BlockId),
 }
@@ -1209,7 +1040,7 @@ impl BlockCache {
                 BlockProbe::Ready(id)
             }
             Some(BlockState::Seen) => BlockProbe::Compile,
-            Some(BlockState::Dormant | BlockState::Rejected(_)) => BlockProbe::Rejected,
+            Some(BlockState::Dormant(_) | BlockState::Rejected(_)) => BlockProbe::Rejected,
             None => {
                 self.stats.lookup_misses += 1;
                 if self.entries.len() == self.entry_cap {
@@ -1376,7 +1207,7 @@ impl BlockCache {
     pub(crate) fn dormant(&mut self, key: BlockKey, reason: DormantReason) {
         self.stalls.dormant[reason as usize] += 1;
         if self.entries.get(&key) == Some(&BlockState::Seen) {
-            self.entries.insert(key, BlockState::Dormant);
+            self.entries.insert(key, BlockState::Dormant(reason));
         }
     }
 
@@ -1496,7 +1327,7 @@ impl BlockCache {
         key: BlockKey,
         epoch: u32,
     ) {
-        if self.entries.get(&key) == Some(&BlockState::Dormant)
+        if matches!(self.entries.get(&key), Some(BlockState::Dormant(_)))
             && heat.take_stale_stamp(key.physical, epoch)
         {
             self.entries.insert(key, BlockState::Seen);
@@ -1570,6 +1401,7 @@ impl BlockCache {
         self.waiting.clear();
         self.linear_blocks.clear();
         self.stats.unlinks += links;
+        self.stalls.links_cleared[LinkClearCause::Flushed as usize] += links;
         self.link_epoch = self.link_epoch.wrapping_add(1);
         if self.link_epoch == 0 {
             self.block_link_epochs.fill(0);
@@ -1682,7 +1514,7 @@ impl BlockCache {
                         continue;
                     };
                     let overlaps = match state {
-                        BlockState::Seen | BlockState::Dormant => {
+                        BlockState::Seen | BlockState::Dormant(_) => {
                             physical_range_contains(physical, width, key.physical)
                         }
                         BlockState::Rejected(span) => physical_ranges_overlap(
@@ -1747,7 +1579,7 @@ impl BlockCache {
                             watch.release_range(span.key.physical, u32::from(span.guest_len));
                         }
                         BlockState::Compiled(id) => self.retire_block(watch, id),
-                        BlockState::Seen | BlockState::Dormant => {}
+                        BlockState::Seen | BlockState::Dormant(_) => {}
                     }
                     invalidated += 1;
                 }
@@ -1781,14 +1613,16 @@ impl BlockCache {
     /// answers the question directly instead of inferring it a third time.
     pub(crate) fn classify_unbound_target(&self, key: BlockKey) -> UnboundTarget {
         match self.entries.get(&key) {
-            None => UnboundTarget::NeverSeen,
-            Some(BlockState::Seen) | Some(BlockState::Dormant) => UnboundTarget::SeenNotCompiled,
+            None => UnboundTarget::Absent,
+            Some(BlockState::Seen) => UnboundTarget::Seen,
+            Some(BlockState::Dormant(DormantReason::SpanHot)) => UnboundTarget::DormantHeat,
+            Some(BlockState::Dormant(_)) => UnboundTarget::DormantOther,
             Some(BlockState::Rejected(_)) => UnboundTarget::Rejected,
             Some(BlockState::Compiled(id)) => {
                 if self.active_index(*id).is_some() {
-                    UnboundTarget::CompiledButUnlinked
+                    UnboundTarget::Compiled
                 } else {
-                    UnboundTarget::CompiledButRetired
+                    UnboundTarget::CompiledRetired
                 }
             }
         }
@@ -2116,6 +1950,7 @@ impl BlockCache {
             cells[1].clear();
         }
         self.stats.unlinks += links;
+        self.stalls.links_cleared[LinkClearCause::Reset as usize] += links;
         self.stats.cache_resets += 1;
         self.entries.clear();
         self.physical_keys.clear();
@@ -2254,7 +2089,7 @@ impl BlockCache {
             }
             return true;
         }
-        self.unlink_outbound(source, slot);
+        self.unlink_outbound(source, slot, LinkClearCause::Replaced);
         // AFTER `unlink_outbound`, which routes through `LinkCell::clear` and resets this to the
         // never-set sentinel. Setting it earlier leaves every cell at `NO_ENTRY_TOP`, the shared
         // x87 pad then bails on every crossing, and the mechanism is inert while every counter
@@ -2282,7 +2117,10 @@ impl BlockCache {
         true
     }
 
-    fn unlink_outbound(&mut self, source: BlockId, slot: u8) {
+    /// `cause` is passed by the caller rather than inferred: the same helper serves the
+    /// relink-replace path in `try_link_inner` and the retirement walk in `unlink_block`, and
+    /// nothing inside the helper can tell those apart.
+    fn unlink_outbound(&mut self, source: BlockId, slot: u8, cause: LinkClearCause) {
         let Some(source_index) = self.active_index(source) else {
             return;
         };
@@ -2299,6 +2137,7 @@ impl BlockCache {
             }
         }
         self.stats.unlinks += 1;
+        self.stalls.links_cleared[cause as usize] += 1;
     }
 
     fn unlink_block(&mut self, id: BlockId) {
@@ -2325,11 +2164,12 @@ impl BlockCache {
                         self.waiting.entry(successor).or_default().push(link);
                     }
                     self.stats.unlinks += 1;
+                    self.stalls.links_cleared[LinkClearCause::Retired as usize] += 1;
                 }
             }
         }
         for slot in 0..2 {
-            self.unlink_outbound(id, slot);
+            self.unlink_outbound(id, slot, LinkClearCause::Retired);
         }
         self.remove_waiting_sources(id);
     }

@@ -1462,11 +1462,15 @@ impl CpuGsw {
     fn classify_unbound_exit(&mut self) {
         let lin = self.linear_eip();
         let d = self.registers.cs().default_size_32;
-        let Some(key) = jit::direct::key_for(self, lin, d) else {
-            return;
+        // The `key_for` refusal is CLASSIFIED, not dropped. Returning early here would make the
+        // class totals fall short of `jit_direct_unresolved_static_unbound` by an unknown amount,
+        // and the whole point of the table is that it closes on that counter — see
+        // `unbound_target_classes_are_exhaustive` (jit/direct_test.rs).
+        let (kind, linear) = match jit::direct::key_for(self, lin, d) {
+            Some(key) => (self.jit_direct.classify_unbound_target(key), key.linear()),
+            None => (jit::direct::UnboundTarget::NoKey, 0),
         };
-        let kind = self.jit_direct.classify_unbound_target(key);
-        self.jit_direct.note_unbound_target(kind, key.linear());
+        self.jit_direct.note_unbound_target(kind, linear);
     }
 
     /// The dynamic-successor counterpart of `classify_unbound_exit`. Same recovery of the key
@@ -1478,10 +1482,12 @@ impl CpuGsw {
     fn classify_dynamic_miss_exit(&mut self) {
         let lin = self.linear_eip();
         let d = self.registers.cs().default_size_32;
-        let Some(key) = jit::direct::key_for(self, lin, d) else {
-            return;
+        // Same closure requirement as `classify_unbound_exit`: this lane closes on
+        // `jit_direct_unresolved_dynamic_miss_or_unbound`.
+        let kind = match jit::direct::key_for(self, lin, d) {
+            Some(key) => self.jit_direct.classify_unbound_target(key),
+            None => jit::direct::UnboundTarget::NoKey,
         };
-        let kind = self.jit_direct.classify_unbound_target(key);
         self.jit_direct.note_dynamic_miss_target(kind);
     }
 
