@@ -2162,20 +2162,50 @@ fn link_clear_causes_close_on_the_aggregate() {
         1
     );
 
-    // Reset: a surviving link dropped by the bulk clear.
+    // Flush: a translation invalidation drops the cell while the blocks stay compiled. This is
+    // the site the fixtures actually spend their clears on, so it gets its own cause.
     let third = key(0x1300);
     let third_id = install_trivial(&mut cache, third, 1);
     assert!(cache.try_link(source_id, 0, third_id));
+    cache.invalidate_translation();
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::Flushed as usize],
+        1
+    );
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::Reset as usize],
+        0,
+        "a translation flush must not be attributed to the cache-wide reset lane"
+    );
+    assert!(
+        cache.len() > 0,
+        "a flush leaves the blocks compiled; only the links go"
+    );
+
+    // Reset: the cache-wide drop, a separate site from the flush above. Needs a FRESH pair: the
+    // flush bumped the link epoch, so every block installed before it now refuses to relink on
+    // `LinkRefusal::StaleEpoch` until root dispatch republishes it.
+    let fourth = key(0x1400);
+    let fifth = key(0x1500);
+    let fourth_id = install_trivial(&mut cache, fourth, 1);
+    let fifth_id = install_trivial(&mut cache, fifth, 1);
+    assert!(cache.try_link(fourth_id, 0, fifth_id));
     cache.clear();
     assert_eq!(
         cache.stalls.links_cleared[LinkClearCause::Reset as usize],
         1
     );
 
-    let causes: u64 = cache.stalls.links_cleared.iter().sum();
+    // All FOUR sites, not three: deleting any single increment above must break the sum.
+    let causes = cache.stalls.links_cleared;
+    assert!(
+        causes.iter().all(|&n| n > 0),
+        "every cause site must be exercised by this fixture, got {causes:?}"
+    );
     let stats = cache.take_stats();
     assert_eq!(
-        causes, stats.unlinks,
+        causes.iter().sum::<u64>(),
+        stats.unlinks,
         "the cause split must sum to the aggregate it attributes"
     );
 }

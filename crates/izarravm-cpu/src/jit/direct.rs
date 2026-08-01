@@ -928,9 +928,12 @@ impl BlockId {
 ///
 /// EXHAUSTIVE AND MUTUALLY EXCLUSIVE by construction: every unbound-exit classification call
 /// lands on exactly one variant, including the `NoKey` early-out, so the per-run totals sum to
-/// the unresolved-exit counter the classifier is gated behind. The identity is asserted by
-/// `unbound_target_classes_are_exhaustive` (direct_test.rs); do not add a classification path
-/// that returns without noting a variant.
+/// the unresolved-exit counter the classifier is gated behind. `unbound_target_classes_are_exhaustive`
+/// (direct_test.rs) pins the state-to-class mapping, and `unbound_exit_classes_sum_to_the_static_unbound_counter`
+/// plus `dynamic_miss_classes_sum_to_the_dynamic_miss_counter` (cpu_jit_direct_execution_test.rs)
+/// pin the sum on the real dispatcher path for both lanes. Do not add a classification path that
+/// returns without noting a variant -- that is exactly what the second pair of tests exists to
+/// catch, and the first pair cannot see it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnboundTarget {
     /// The exiting EIP could not be turned into a `BlockKey` at all (`key_for` refused, e.g. the
@@ -954,7 +957,13 @@ pub(crate) enum UnboundTarget {
     /// The target is compiled and live, but the edge was never linked — a `link_compatible`
     /// refusal, or the transient window before the next probe binds it.
     Compiled,
-    /// The target compiled once and its slot has since been retired or reused.
+    /// The target compiled once and its slot has since been retired or reused. Currently
+    /// UNREACHABLE and reading zero on both fixtures by construction, not by luck: every retire
+    /// path rewrites or removes the entry before anything can exit to it, so a live
+    /// `Compiled(id)` whose slot is dead has no way to be observed today. Retained as a
+    /// tripwire -- a future slot-reuse or deferred-retire path would surface here first, and it
+    /// is cheaper to keep the class than to re-derive it. Do NOT read its zero as evidence
+    /// about retirement.
     CompiledRetired,
 }
 
@@ -985,29 +994,38 @@ impl UnboundTarget {
     }
 }
 
-/// Which of the three unlink causes cleared a link, for the split behind the aggregate
+/// Which of the four unlink sites cleared a link, for the split behind the aggregate
 /// `jit_direct_links_cleared`. That aggregate is NOT re-derived from these: it keeps its own
 /// independent `BlockCacheStats::unlinks` feed, so the two are a cross-check rather than one
 /// number counted twice. `link_clear_causes_close_on_the_aggregate` (direct_test.rs) pins the
-/// sum identity.
+/// sum identity, site by site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinkClearCause {
     /// `try_link_inner` displaced an existing edge in a cell it wanted for a different target.
     Replaced,
     /// The target (or source) block was retired, via `unlink_block`.
     Retired,
-    /// A bulk drop: `invalidate_translation` or `reset_storage`.
+    /// `invalidate_translation`: a paging/CR3/decode-slot flush tearing down link cells while
+    /// the blocks themselves STAY compiled. Split from `Reset` because the two look alike in an
+    /// aggregate and are nothing alike as a lever -- this one leaves the code in place and only
+    /// costs the re-binding, and it is where essentially all bulk clears actually come from
+    /// (`jit_direct_cache_resets` is a single-digit number over a whole fixture run).
+    Flushed,
+    /// `reset_storage`: the cache-wide drop, code and all. Rare; counted apart so a rise in it
+    /// cannot hide inside the flush lane.
     Reset,
 }
 
 impl LinkClearCause {
-    pub(crate) const COUNT: usize = 3;
-    pub(crate) const ALL: [Self; Self::COUNT] = [Self::Replaced, Self::Retired, Self::Reset];
+    pub(crate) const COUNT: usize = 4;
+    pub(crate) const ALL: [Self; Self::COUNT] =
+        [Self::Replaced, Self::Retired, Self::Flushed, Self::Reset];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Replaced => "replaced",
             Self::Retired => "retired",
+            Self::Flushed => "flushed",
             Self::Reset => "reset",
         }
     }
@@ -1635,7 +1653,7 @@ impl BlockCache {
         self.waiting.clear();
         self.linear_blocks.clear();
         self.stats.unlinks += links;
-        self.stalls.links_cleared[LinkClearCause::Reset as usize] += links;
+        self.stalls.links_cleared[LinkClearCause::Flushed as usize] += links;
         self.link_epoch = self.link_epoch.wrapping_add(1);
         if self.link_epoch == 0 {
             self.block_link_epochs.fill(0);

@@ -2034,3 +2034,171 @@ fn bt_and_byte_inc_dec_charge_the_interpreter_clocks() {
         "0xFE INC/DEC r8 charges 2, like 0xFF"
     );
 }
+
+/// The class counters close on `jit_direct_unresolved_static_unbound` on the REAL exit path, not
+/// just as a match arm. The two unit pins in `jit/direct_test.rs` check the classifier and the
+/// unlink sites in isolation, and both of them still pass if `classify_unbound_exit` goes back to
+/// dropping the `key_for` refusal on the floor -- which is precisely the hole that made the class
+/// totals fall short of the counter they are meant to attribute. This drives the dispatcher.
+///
+/// Both exit sites are covered: an ordinary uncompiled successor (`absent`) and a successor whose
+/// address `key_for` refuses outright (`no_key`, the BIOS window at `0xff000`).
+#[test]
+fn unbound_exit_classes_sum_to_the_static_unbound_counter() {
+    const ENTRY: u32 = 0x300;
+    const COLD_TARGET: u32 = 0x400;
+    // Inside the 0xff000..0xff400 window `key_for` refuses without probing the entry map.
+    const UNKEYABLE_TARGET: u32 = 0xff_100;
+    const UNKEYABLE_ENTRY: u32 = 0x500;
+
+    let mut memory = vec![0; 0x0010_0000];
+    memory[ENTRY as usize..ENTRY as usize + 10].copy_from_slice(&[
+        0xb8, 1, 0, 0, 0, // mov eax,1
+        0xe9, 0xf6, 0, 0, 0, // jmp COLD_TARGET
+    ]);
+    memory[COLD_TARGET as usize..COLD_TARGET as usize + 2].copy_from_slice(&[
+        0xeb, 0xfe, // jmp COLD_TARGET
+    ]);
+    memory[UNKEYABLE_ENTRY as usize..UNKEYABLE_ENTRY as usize + 10].copy_from_slice(&[
+        0xb8, 2, 0, 0, 0, // mov eax,2
+        0xe9, 0xf6, 0xeb, 0x0f, 0x00, // jmp UNKEYABLE_TARGET
+    ]);
+    memory[UNKEYABLE_TARGET as usize..UNKEYABLE_TARGET as usize + 2].copy_from_slice(&[
+        0xeb, 0xfe, // jmp UNKEYABLE_TARGET
+    ]);
+
+    let mut cpu = flat_stack_cpu(ENTRY);
+    cpu.jit_direct.enable_barrier_census_for_test();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(
+        &mut cpu,
+        &mut bus,
+        &[
+            ENTRY,
+            ENTRY + 5,
+            COLD_TARGET,
+            UNKEYABLE_ENTRY,
+            UNKEYABLE_ENTRY + 5,
+        ],
+    );
+    let cold_source = install_fixture_block(&mut cpu, ENTRY);
+    let unkeyable_source = install_fixture_block(&mut cpu, UNKEYABLE_ENTRY);
+
+    let before = cpu.perf_counters().clone();
+    for _ in 0..3 {
+        arm_stack_fixture(&mut cpu, ENTRY, 0x800);
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, cold_source)
+                .unwrap()
+        );
+        assert_eq!(cpu.registers.eip, COLD_TARGET);
+    }
+    for _ in 0..2 {
+        arm_stack_fixture(&mut cpu, UNKEYABLE_ENTRY, 0x800);
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, unkeyable_source)
+                .unwrap()
+        );
+        assert_eq!(cpu.registers.eip, UNKEYABLE_TARGET);
+    }
+
+    let exits = cpu.perf_counters().jit_direct_unresolved_static_unbound
+        - before.jit_direct_unresolved_static_unbound;
+    assert_eq!(exits, 5, "every entry must end on a static-unbound exit");
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("census must be allocated for this test");
+    let classes: Vec<(&str, u64)> = snapshot.unbound_targets.clone();
+    assert_eq!(
+        classes.iter().map(|(_, n)| n).sum::<u64>(),
+        exits,
+        "class totals must close on the exit counter exactly, got {classes:?}"
+    );
+    let of = |label: &str| {
+        classes
+            .iter()
+            .find(|(l, _)| *l == label)
+            .unwrap_or_else(|| panic!("missing class {label}"))
+            .1
+    };
+    assert_eq!(of("absent"), 3, "the cold successor was never probed");
+    assert_eq!(
+        of("no_key"),
+        2,
+        "a successor `key_for` refuses must be classified, not dropped"
+    );
+}
+
+/// The dynamic-miss lane closes on its own counter the same way. Same classifier, separate
+/// census array, and the same `key_for` hole -- so it needs its own witness rather than an
+/// argument by symmetry.
+#[test]
+fn dynamic_miss_classes_sum_to_the_dynamic_miss_counter() {
+    const ENTRY: u32 = 0x300;
+    const COLD_TARGET: u32 = 0x400;
+    const UNKEYABLE_TARGET: u32 = 0xff_100;
+    const INITIAL_ESP: u32 = 0x3000;
+
+    let mut memory = vec![0; 0x0010_0000];
+    memory[ENTRY as usize] = 0xc3; // ret
+    memory[COLD_TARGET as usize..COLD_TARGET as usize + 2].copy_from_slice(&[0xeb, 0xfe]);
+
+    let mut cpu = flat_stack_cpu(ENTRY);
+    cpu.jit_direct.enable_barrier_census_for_test();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[ENTRY, COLD_TARGET]);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        INITIAL_ESP,
+        INITIAL_ESP,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let source = install_fixture_block(&mut cpu, ENTRY);
+
+    let before = cpu.perf_counters().clone();
+    let targets = [COLD_TARGET, COLD_TARGET, UNKEYABLE_TARGET];
+    for target in targets {
+        arm_stack_fixture(&mut cpu, ENTRY, INITIAL_ESP);
+        bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+            .copy_from_slice(&target.to_le_bytes());
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, source).unwrap());
+        assert_eq!(cpu.registers.eip, target);
+    }
+
+    let exits = cpu
+        .perf_counters()
+        .jit_direct_unresolved_dynamic_miss_or_unbound
+        - before.jit_direct_unresolved_dynamic_miss_or_unbound;
+    assert_eq!(
+        exits,
+        targets.len() as u64,
+        "every RET must miss the inline cache"
+    );
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("census must be allocated for this test");
+    let classes: Vec<(&str, u64)> = snapshot.dynamic_miss_targets.clone();
+    assert_eq!(
+        classes.iter().map(|(_, n)| n).sum::<u64>(),
+        exits,
+        "dynamic class totals must close on the exit counter exactly, got {classes:?}"
+    );
+    assert_eq!(
+        classes
+            .iter()
+            .find(|(l, _)| *l == "no_key")
+            .expect("missing class no_key")
+            .1,
+        1,
+        "a dynamic target `key_for` refuses must be classified, not dropped"
+    );
+}

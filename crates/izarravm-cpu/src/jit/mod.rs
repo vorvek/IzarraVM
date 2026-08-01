@@ -168,6 +168,14 @@ impl JitState {
     pub(crate) fn mark_code_range(&mut self, physical: u32, len: u8) {
         self.code_watch.acquire_range(physical, u32::from(len));
     }
+
+    /// Allocate the barrier census without going through `IZARRAVM_DIRECT_BARRIER_CENSUS`.
+    /// Tests must not set that variable: the whole process shares one environment and the
+    /// harness runs threaded, so an env flip is visible to every other test's `JitState`.
+    #[cfg(test)]
+    pub(crate) fn enable_barrier_census_for_test(&mut self) {
+        self.direct_barrier_census = Some(Box::new(direct::DirectBarrierCensus::default()));
+    }
 }
 
 impl std::fmt::Debug for JitState {
