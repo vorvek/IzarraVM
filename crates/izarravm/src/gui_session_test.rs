@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 use super::*;
 use izarravm_core::{MidiPortId, VideoCard};
 use std::sync::atomic::{AtomicU64, Ordering};
