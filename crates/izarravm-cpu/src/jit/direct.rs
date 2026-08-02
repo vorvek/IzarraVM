@@ -29,7 +29,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use izarravm_core::CpuPersona;
 
-use census::BarrierObservation;
+use census::{BarrierStop, record_structural_barrier};
 // The stall/census TAXONOMY lives in `census.rs` beside the builder that already consumed it
 // (`stall_snapshot`, `snapshot`), moved verbatim to keep this file under the source-line ceiling.
 // Re-exported from here because every out-of-module path names them through `jit::direct`.
@@ -4020,85 +4020,6 @@ fn imm_lane_for(
     ))
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CensusSuffix {
-    instructions: usize,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn census_native_suffix(
-    cpu: &CpuGsw,
-    key: BlockKey,
-    entry_lin: u32,
-    mut lin: u32,
-    d: bool,
-    prefix_instructions: usize,
-    mut stack_accesses: u8,
-    mut memory_alu_slots: u8,
-) -> CensusSuffix {
-    let cs = cpu.registers.cs();
-    let mut result = CensusSuffix::default();
-    while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
-        let Some(insn) = cpu.decode_cache.get(lin, d) else {
-            break;
-        };
-        let insn_len = u32::from(insn.len);
-        let Some(next) = (insn_len != 0).then(|| lin.checked_add(insn_len)).flatten() else {
-            break;
-        };
-        let slot_eip = lin.wrapping_sub(cs.base);
-        if slot_eip
-            .checked_add(insn_len - 1)
-            .is_none_or(|last| last > cs.limit)
-            || entry_lin >> BLOCK_PAGE_SHIFT != next.wrapping_sub(1) >> BLOCK_PAGE_SHIFT
-        {
-            break;
-        }
-        let Some(expected_phys) = key.physical.checked_add(lin.wrapping_sub(entry_lin)) else {
-            break;
-        };
-        if expected_phys
-            .checked_add(insn_len - 1)
-            .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
-            || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
-            || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
-            || !insn.continuable
-            || (insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586)
-        {
-            break;
-        }
-        let PlannedInsn::Native(kind) = DirectUnitPlanner::classify(&insn, lin, entry_lin) else {
-            break;
-        };
-        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
-            break;
-        };
-        if kind.is_x87()
-            || !static_control_target_within_limit(
-                kind,
-                entry_lin.wrapping_sub(cs.base),
-                control_target_limit(insn.operand_size, cs.limit),
-            )
-            || !kind_segment_access_supported(cpu, kind)
-            || (kind.is_memory_alu()
-                && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
-                    || prefix_instructions + 1 + result.instructions
-                        >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
-            || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
-        {
-            break;
-        }
-        stack_accesses += u8::from(kind.uses_stack());
-        memory_alu_slots += u8::from(kind.is_memory_alu());
-        result.instructions += 1;
-        lin = next;
-        if kind.is_terminal() {
-            break;
-        }
-    }
-    result
-}
-
 fn compile_with_instruction_limit(
     cpu: &mut CpuGsw,
     entry_lin: u32,
@@ -4194,6 +4115,33 @@ fn compile_with_instruction_limit(
         // 16-bit admission work can produce a single native instruction.
         let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
         if !prefixes_supported || !insn.continuable {
+            // Attributed since the completeness slice. The two conditions are split rather than
+            // folded, because they are different work: a prefix refusal names a prefix the
+            // backend does not emit (the row's `prefix_mask` says which, and an explicit segment
+            // override is the common one), while a non-continuable shape is `block_continuable`'s
+            // decision inherited wholesale from the interpreter's batching rules. Prefix wins the
+            // tie, matching the `||` this arm is written with.
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                let reason = if prefixes_supported {
+                    BarrierStop::NonContinuable
+                } else {
+                    BarrierStop::PrefixUnsupported
+                };
+                record_structural_barrier(
+                    cpu,
+                    &insn,
+                    reason,
+                    key,
+                    entry_lin,
+                    next,
+                    d,
+                    slots.len(),
+                    stack_accesses,
+                    memory_alu_slots,
+                );
+            }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         }
@@ -4203,6 +4151,26 @@ fn compile_with_instruction_limit(
         // Follow-up (dev_docs/specs/2026-07-15-smc-hardening-design.md, G1): with heat demotion
         // landed, A/B re-enabling 486 word ops - heat should now bound the churn this defends.
         if insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586 {
+            // Attributed since the completeness slice, and expected to read ZERO on both shipped
+            // fixtures because they run 586. Instrumented anyway: "this arm is dead on the
+            // corpus" is a measurement worth having, and "nothing records it" is not the same
+            // statement. If a 486 persona ever benches, this row set is the whole Word population.
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                record_structural_barrier(
+                    cpu,
+                    &insn,
+                    BarrierStop::WordPersona,
+                    key,
+                    entry_lin,
+                    next,
+                    d,
+                    slots.len(),
+                    stack_accesses,
+                    memory_alu_slots,
+                );
+            }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         }
@@ -4212,8 +4180,10 @@ fn compile_with_instruction_limit(
                 if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
                     && cpu.jit_direct.barrier_census_enabled()
                 {
-                    let suffix = census_native_suffix(
+                    record_structural_barrier(
                         cpu,
+                        &insn,
+                        BarrierStop::HardBoundary,
                         key,
                         entry_lin,
                         next,
@@ -4221,14 +4191,6 @@ fn compile_with_instruction_limit(
                         slots.len(),
                         stack_accesses,
                         memory_alu_slots,
-                    );
-                    cpu.jit_direct.record_barrier(
-                        &insn,
-                        BarrierObservation {
-                            entry_linear: entry_lin,
-                            native_prefix: slots.len(),
-                            native_suffix: suffix.instructions,
-                        },
                     );
                 }
                 stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
