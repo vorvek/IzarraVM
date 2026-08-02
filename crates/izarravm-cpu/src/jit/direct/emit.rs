@@ -133,7 +133,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
     e.xor_r64_self(Reg::RAX);
     e.store_r64_disp8(Reg::RSP, STACK_ITERATIONS, Reg::RAX);
-    for (_, stack_offset, _) in dynamic_counter_fields() {
+    for (stack_offset, _) in dynamic_counter_fields() {
         e.store_r64_disp8(Reg::RSP, stack_offset, Reg::RAX);
     }
     for stack_offset in [
@@ -1630,7 +1630,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         emit_restore_x87_host_xmms(&mut e);
     }
     emit_store_homes(&mut e);
-    emit_return(&mut e, COUNTER_ALL);
+    emit_return(&mut e);
     debug_assert_eq!(usize::from(completed), slots.len());
     debug_assert_eq!(u32::from(completed_raw), raw_clocks);
     debug_assert_eq!(completed_weighted_fp_clocks, weighted_fp_clocks);
@@ -4601,7 +4601,7 @@ pub(super) fn emit_x87_reentry_pad() -> Vec<u8> {
     // `emit_return` already ends with `add rsp`, the reversed pops of SAVED_HOST_REGS, and `ret`.
     // Guest EFLAGS in RBP needs no store: it is mirrored to `CpuGsw.eflags` at every
     // flag-producing site, so the memory copy is current at any block boundary.
-    emit_return(&mut e, COUNTER_ALL);
+    emit_return(&mut e);
     e.finish()
 }
 
@@ -4635,13 +4635,11 @@ fn emit_restore_x87_host_xmms(e: &mut Encoder) {
     }
 }
 
-fn emit_return(e: &mut Encoder, counter_mask: u16) {
+fn emit_return(e: &mut Encoder) {
     e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_EXIT);
-    for (bit, stack_offset, output_offset) in dynamic_counter_fields() {
-        if counter_mask & bit != 0 {
-            e.load_r64_disp8(Reg::RAX, Reg::RSP, stack_offset);
-            e.store_r64_disp32(Reg::RDI, output_offset as i32, Reg::RAX);
-        }
+    for (stack_offset, output_offset) in dynamic_counter_fields() {
+        e.load_r64_disp8(Reg::RAX, Reg::RSP, stack_offset);
+        e.store_r64_disp32(Reg::RDI, output_offset as i32, Reg::RAX);
     }
     for (stack_offset, output_offset) in [
         (

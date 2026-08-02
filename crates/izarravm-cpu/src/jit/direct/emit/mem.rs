@@ -356,8 +356,8 @@ pub(super) fn emit_push_mem(
 /// COUNTER-ORDERING argument and not a conservatism: a mode-13 read completion increments the
 /// dynamic mode-13 read count the moment the read resolves, and the store guards below can still
 /// side exit afterwards, at which point `run.rs`'s `dword_reads - exit.mode13_dword_reads`
-/// underflows. `DirectKind::CallMem`'s `dynamic_counter_mask` registers only the RAM write lane,
-/// which is what makes that static/dynamic pair close.
+/// underflows. Staying RAM-only is what makes that static/dynamic pair close: the only lane either
+/// access can move is the RAM write one.
 ///
 /// The two accesses take DIFFERENT address wraps, again as in `emit_push_mem`: the operand takes
 /// the block's `memory.address_wrap` (Word whenever CS.D is 0), the stack cell takes `None`

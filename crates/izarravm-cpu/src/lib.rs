@@ -1130,13 +1130,24 @@ pub struct DirectBarrierCensusRow {
     /// Exits that actually happened into a block this barrier rejected. The runtime-weighted
     /// ranking key; `hits` below is compile attempts and must not be used for prioritisation.
     pub unbound_exits: u64,
+    /// The DYNAMIC-lane counterpart: computed RET/JMP/CALL targets whose inline cache missed
+    /// into a block this barrier rejected. A row's cost is the two columns together — the static
+    /// column alone under-priced the row Slice 4 lowered by 65%.
+    pub dynamic_unbound_exits: u64,
     pub opcode: u16,
     pub modrm_reg: Option<u8>,
     pub operand_form: &'static str,
     pub operand_size: &'static str,
     pub address_size: &'static str,
     pub prefix_mask: u16,
+    /// WHICH structural-stop arm of the compile walk refused the block: `hard_boundary` (the
+    /// opcode-coverage arm), `prefix_unsupported`, `non_continuable` or `word_persona`. Only the
+    /// first was instrumented before the attribution-completeness slice.
+    pub stop_reason: &'static str,
     pub hits: u64,
+    /// Interpreted retirements of this instruction SHAPE, ignoring the stop arm. Rows that share
+    /// a shape across stop arms therefore report the same value; it is a per-execution column and
+    /// an executing instruction has no stop arm.
     pub runtime_hits: u64,
     pub native_prefix_instructions: u64,
     pub native_suffix_instructions: u64,

@@ -2212,3 +2212,88 @@ fn dynamic_miss_classes_sum_to_the_dynamic_miss_counter() {
         "a dynamic target `key_for` refuses must be classified, not dropped"
     );
 }
+
+/// A dynamic miss into a REJECTED block is attributed back to the barrier that refused it.
+///
+/// `note_dynamic_miss_target` used to take the class and discard the entry linear, so this whole
+/// lane landed on no row at all — 2.86M exits per quake run, larger than its entire attributed
+/// static row set, and the lane Slice 4 measured at 65% of the static one for the row it lowered.
+/// The two columns are asserted apart: a row must not report a dynamic miss as a static unbound.
+#[test]
+fn a_dynamic_miss_into_a_rejected_block_is_attributed_to_its_barrier() {
+    const ENTRY: u32 = 0x300;
+    const REJECTED_TARGET: u32 = 0x400;
+    const INITIAL_ESP: u32 = 0x3000;
+    const BARRIER: u8 = 0xf4; // HLT — refused by the non-continuable arm, not by `classify`
+
+    let mut memory = vec![0; 0x0010_0000];
+    memory[ENTRY as usize] = 0xc3; // ret
+    memory[REJECTED_TARGET as usize] = BARRIER;
+
+    let mut cpu = flat_stack_cpu(ENTRY);
+    cpu.jit_direct.enable_barrier_census_for_test();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[ENTRY, REJECTED_TARGET]);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        INITIAL_ESP,
+        INITIAL_ESP,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let source = install_fixture_block(&mut cpu, ENTRY);
+
+    // Refuse the target the way the dispatcher would, so it becomes `BlockState::Rejected` AND
+    // leaves a census row behind. A one-instruction non-terminal block cannot survive the
+    // three-slot minimum, so this is a structural rejection by construction. The probe first is
+    // load-bearing: `reject` only rewrites a key already in `Seen`, exactly as `install` does.
+    let target_key = jit::direct::key_for(&cpu, REJECTED_TARGET, true).expect("target key");
+    assert!(matches!(
+        cpu.jit_direct.probe(target_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let span = match jit::direct::compile(&mut cpu, REJECTED_TARGET, true) {
+        jit::direct::CompileOutcome::StructuralReject(span) => span,
+        _ => panic!("the barrier target must reject structurally"),
+    };
+    cpu.jit_direct.reject(span);
+
+    for _ in 0..2 {
+        arm_stack_fixture(&mut cpu, ENTRY, INITIAL_ESP);
+        bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+            .copy_from_slice(&REJECTED_TARGET.to_le_bytes());
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, source).unwrap());
+        assert_eq!(cpu.registers.eip, REJECTED_TARGET);
+    }
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("census must be allocated for this test");
+    assert_eq!(
+        snapshot
+            .dynamic_miss_targets
+            .iter()
+            .find(|(label, _)| *label == "rejected")
+            .expect("missing class rejected")
+            .1,
+        2,
+        "both RETs must classify as a miss into a rejected block"
+    );
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(BARRIER))
+        .expect("the barrier that refused the target must own a row");
+    assert_eq!(
+        row.dynamic_unbound_exits, 2,
+        "both dynamic misses must land on the barrier's row"
+    );
+    assert_eq!(
+        row.unbound_exits, 0,
+        "a dynamic miss must not be reported in the static column"
+    );
+}

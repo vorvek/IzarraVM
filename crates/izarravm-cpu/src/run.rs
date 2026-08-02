@@ -1614,11 +1614,16 @@ impl CpuGsw {
         let d = self.registers.cs().default_size_32;
         // Same closure requirement as `classify_unbound_exit`: this lane closes on
         // `jit_direct_unresolved_dynamic_miss_or_unbound`.
-        let kind = match jit::direct::key_for(self, lin, d) {
-            Some(key) => self.jit_direct.classify_unbound_target(key),
-            None => jit::direct::UnboundTarget::NoKey,
+        //
+        // The entry linear is now recovered alongside the class, exactly as the static lane has
+        // always done. Discarding it left every dynamic miss into a REJECTED block attributed to
+        // no row at all -- 2.86M exits on quake, larger than its whole attributed static row set,
+        // and the lane Slice 4 found was 65% the size of the static one for the row it lowered.
+        let (kind, linear) = match jit::direct::key_for(self, lin, d) {
+            Some(key) => (self.jit_direct.classify_unbound_target(key), key.linear()),
+            None => (jit::direct::UnboundTarget::NoKey, 0),
         };
-        self.jit_direct.note_dynamic_miss_target(kind);
+        self.jit_direct.note_dynamic_miss_target(kind, linear);
     }
 
     #[cfg(feature = "jit")]

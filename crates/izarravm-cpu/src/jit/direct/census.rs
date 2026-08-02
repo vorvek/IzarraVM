@@ -9,6 +9,144 @@
 use super::*;
 
 // ---------------------------------------------------------------------------------------
+// The compile-walk side of the census: the structural-stop recorder and the forward scan that
+// prices what a barrier costs the block behind it. Moved out of `direct.rs` when the
+// attribution-completeness slice gave the recorder two more call sites, so the file that is
+// near its source-line ceiling carries only the three call sites and none of the machinery.
+// ---------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CensusSuffix {
+    instructions: usize,
+}
+
+/// Record one structural stop into the barrier census, from ANY of the arms that can set
+/// `CompileStop::Structural`.
+///
+/// Those arms are the whole population of rejections, by construction rather than by
+/// measurement: `BlockState::Rejected` is installed only by `run.rs`'s
+/// `CompileOutcome::StructuralReject` arm; that outcome is produced only by the short-block
+/// return at the end of `compile_with_instruction_limit`; and `CompileStop::Structural` is set
+/// only at the prefix / non-continuable arm, the Word-persona arm and the `HardBoundary` arm.
+/// Only the last was instrumented until the attribution-completeness slice, which is why doom's
+/// attributed row sum had fallen to 0.97% of its rejected class while the campaign was about to
+/// declare the row work finished.
+///
+/// CALL-SITE GATED like every other census hook ([[default-off-instruments-tax-hot-path]]): each
+/// caller checks `barrier_census_enabled()` before building a single argument, because
+/// `census_native_suffix` walks the decode cache forward. Callers also require the FULL-length
+/// pass — `compile_with_page_len` re-enters this walk once per binary-search step and converts
+/// any structural reject it sees into a `Retry`, so a shorter pass can neither install a
+/// rejection nor be allowed to double-count a row.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_structural_barrier(
+    cpu: &mut CpuGsw,
+    insn: &DecodedInsn,
+    stop: BarrierStop,
+    key: BlockKey,
+    entry_lin: u32,
+    next: u32,
+    d: bool,
+    prefix_instructions: usize,
+    stack_accesses: u8,
+    memory_alu_slots: u8,
+) {
+    let suffix = census_native_suffix(
+        cpu,
+        key,
+        entry_lin,
+        next,
+        d,
+        prefix_instructions,
+        stack_accesses,
+        memory_alu_slots,
+    );
+    cpu.jit_direct.record_barrier(
+        insn,
+        BarrierObservation {
+            entry_linear: entry_lin,
+            native_prefix: prefix_instructions,
+            native_suffix: suffix.instructions,
+            stop,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn census_native_suffix(
+    cpu: &CpuGsw,
+    key: BlockKey,
+    entry_lin: u32,
+    mut lin: u32,
+    d: bool,
+    prefix_instructions: usize,
+    mut stack_accesses: u8,
+    mut memory_alu_slots: u8,
+) -> CensusSuffix {
+    let cs = cpu.registers.cs();
+    let mut result = CensusSuffix::default();
+    while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
+        let Some(insn) = cpu.decode_cache.get(lin, d) else {
+            break;
+        };
+        let insn_len = u32::from(insn.len);
+        let Some(next) = (insn_len != 0).then(|| lin.checked_add(insn_len)).flatten() else {
+            break;
+        };
+        let slot_eip = lin.wrapping_sub(cs.base);
+        if slot_eip
+            .checked_add(insn_len - 1)
+            .is_none_or(|last| last > cs.limit)
+            || entry_lin >> BLOCK_PAGE_SHIFT != next.wrapping_sub(1) >> BLOCK_PAGE_SHIFT
+        {
+            break;
+        }
+        let Some(expected_phys) = key.physical.checked_add(lin.wrapping_sub(entry_lin)) else {
+            break;
+        };
+        if expected_phys
+            .checked_add(insn_len - 1)
+            .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
+            || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
+            || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
+            || !insn.continuable
+            || (insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586)
+        {
+            break;
+        }
+        let PlannedInsn::Native(kind) = DirectUnitPlanner::classify(&insn, lin, entry_lin) else {
+            break;
+        };
+        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
+            break;
+        };
+        if kind.is_x87()
+            || !static_control_target_within_limit(
+                kind,
+                entry_lin.wrapping_sub(cs.base),
+                control_target_limit(insn.operand_size, cs.limit),
+            )
+            || !kind_segment_access_supported(cpu, kind)
+            || (kind.is_memory_alu()
+                && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
+                    || prefix_instructions + 1 + result.instructions
+                        >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
+            || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
+        {
+            break;
+        }
+        stack_accesses += u8::from(kind.uses_stack());
+        memory_alu_slots += u8::from(kind.is_memory_alu());
+        result.instructions += 1;
+        lin = next;
+        if kind.is_terminal() {
+            break;
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------------------
 // The stall/census taxonomy. Moved VERBATIM out of `direct.rs` (source-line ceiling) to sit
 // beside `stall_snapshot` and `snapshot`, the two builders that already read every one of
 // these. `direct.rs` re-exports the whole set, so no path outside this module changed.
@@ -283,8 +421,54 @@ impl LinkClearCause {
     }
 }
 
+/// WHICH structural-stop arm of the compile walk refused the block.
+///
+/// Added by the attribution-completeness slice. Before it, `record_barrier` fired on the
+/// `HardBoundary` arm ALONE, so the two other arms that produce a `CompileStop::Structural` --
+/// and therefore a `BlockState::Rejected` that static exits pile into -- installed a rejected
+/// span with no census row at all. That was tolerable when `HardBoundary` was 78% of doom's
+/// rejected class and fatal by the time lowering slices had pushed it under 1%: "every row is
+/// under the stop floor" was about to be true while ~19.8M doom exits sat in a class the
+/// instrument could not name.
+///
+/// Carried IN THE ROW KEY rather than as a per-row side tally, so the arms are separate rows and
+/// each can be ranked, diffed and lowered independently. Pre-existing rows keep their identity:
+/// every row the census produced before this slice was a `HardBoundary`, so the extra key field
+/// is purely additive and a before/after row diff still lines up.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct BarrierKey {
+pub(crate) enum BarrierStop {
+    /// `classify` returned `PlannedInsn::HardBoundary` — the opcode-coverage arm, and the only
+    /// one instrumented before this slice.
+    HardBoundary,
+    /// `prefixes_supported_for` refused: the backend takes the operand-size override and nothing
+    /// else, so LOCK, REP/REPNE, an address-size override and **any explicit segment override**
+    /// all stop the walk here. The row's `prefix_mask` names which.
+    PrefixUnsupported,
+    /// `DecodedInsn::continuable` is false — `block_continuable` (decode.rs) refused the shape
+    /// for straight-line batching, and the compile walk inherits that refusal.
+    NonContinuable,
+    /// A Word-size instruction on a persona other than I586. Dead on both shipped fixtures (they
+    /// run 586) and instrumented anyway, because "it reads zero" is a measurement and "nothing
+    /// records it" is not.
+    WordPersona,
+}
+
+impl BarrierStop {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::HardBoundary => "hard_boundary",
+            Self::PrefixUnsupported => "prefix_unsupported",
+            Self::NonContinuable => "non_continuable",
+            Self::WordPersona => "word_persona",
+        }
+    }
+}
+
+/// The normalized instruction shape a barrier row is keyed on, WITHOUT the stop arm. Split out
+/// of `BarrierKey` so `note_interpreted` — which sits on the per-interpreted-instruction retire
+/// path — still costs exactly ONE map probe now that a shape can own up to four rows.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct BarrierShape {
     opcode: u16,
     modrm_reg: u8,
     operand_form: u8,
@@ -293,7 +477,13 @@ struct BarrierKey {
     prefix_mask: u16,
 }
 
-impl BarrierKey {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct BarrierKey {
+    shape: BarrierShape,
+    stop: BarrierStop,
+}
+
+impl BarrierShape {
     fn from_insn(insn: &DecodedInsn) -> Self {
         let operand_form = match insn.operand {
             None => 0,
@@ -325,7 +515,6 @@ impl BarrierKey {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct BarrierStats {
     hits: u64,
-    runtime_hits: u64,
     native_prefix_instructions: u64,
     native_suffix_instructions: u64,
     max_native_prefix: u8,
@@ -333,6 +522,12 @@ struct BarrierStats {
     /// Exits that actually happened into a block this barrier rejected. RUNTIME-weighted, unlike
     /// `hits` (compile attempts) which mis-ranked the ShiftCl slice by three orders of magnitude.
     unbound_exits: u64,
+    /// The same, for the DYNAMIC lane: a computed RET/JMP/CALL target whose inline cache missed
+    /// into a block this barrier rejected. Slice 4 found that lane was 65% the size of the static
+    /// one for the row it lowered and attributed to NOTHING, because `note_dynamic_miss_target`
+    /// classified without ever looking the entry linear back up. Ranking a row on the static
+    /// column alone under-prices it by whatever this column holds.
+    dynamic_unbound_exits: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +535,7 @@ pub(super) struct BarrierObservation {
     pub(super) entry_linear: u32,
     pub(super) native_prefix: usize,
     pub(super) native_suffix: usize,
+    pub(super) stop: BarrierStop,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -363,6 +559,13 @@ pub(crate) struct DirectBarrierCensus {
     /// sharing a linear across mode/physical would merge, which is acceptable for a diagnostic
     /// and keeps the compile-side insert to one word.
     rejected_barrier: HashMap<u32, BarrierKey>,
+    /// Interpreted retirements per SHAPE, i.e. ignoring which arm stopped the walk. Held apart
+    /// from `rows` so `note_interpreted` stays at one map probe: a shape can now own up to four
+    /// rows (one per `BarrierStop`), and probing `rows` per arm would multiply the cost of the
+    /// census's hottest hook by four. Every row of a shape reports this same total, which is the
+    /// honest reading — `runtime_hits` counts executions of an instruction SHAPE and an
+    /// executing instruction has no stop arm.
+    runtime_hits: HashMap<BarrierShape, u64>,
 }
 
 impl DirectBarrierCensus {
@@ -383,14 +586,31 @@ impl DirectBarrierCensus {
         row.unbound_exits = row.unbound_exits.saturating_add(1);
     }
 
+    /// The dynamic-lane counterpart. Same map, separate column: the two lanes have different
+    /// fixes and Slice 4 showed they move by wildly different factors for the same row.
+    fn note_dynamic_rejected_at(&mut self, linear: u32) {
+        let Some(&key) = self.rejected_barrier.get(&linear) else {
+            return;
+        };
+        let row = self.rows.entry(key).or_default();
+        row.dynamic_unbound_exits = row.dynamic_unbound_exits.saturating_add(1);
+    }
+
     fn record(&mut self, insn: &DecodedInsn, observation: BarrierObservation) {
         let BarrierObservation {
             entry_linear,
             native_prefix,
             native_suffix,
+            stop,
         } = observation;
-        let key = BarrierKey::from_insn(insn);
+        let key = BarrierKey {
+            shape: BarrierShape::from_insn(insn),
+            stop,
+        };
         self.rejected_barrier.insert(entry_linear, key);
+        // Register the shape so `note_interpreted` can find it with one probe and without ever
+        // creating a row for an instruction that never barriered.
+        self.runtime_hits.entry(key.shape).or_default();
         let row = self.rows.entry(key).or_default();
         row.hits = row.hits.saturating_add(1);
         row.native_prefix_instructions = row
@@ -416,9 +636,9 @@ impl DirectBarrierCensus {
         // `0x38 /0` (an inner-loop CMP), when the second was worth three times the whole rest of
         // the night put together. Costs nothing when the census is off: the call site in `run.rs`
         // is gated on `barrier_census_active()` before the arguments are even built.
-        let key = BarrierKey::from_insn(insn);
-        if let Some(row) = self.rows.get_mut(&key) {
-            row.runtime_hits = row.runtime_hits.saturating_add(1);
+        let shape = BarrierShape::from_insn(insn);
+        if let Some(hits) = self.runtime_hits.get_mut(&shape) {
+            *hits = hits.saturating_add(1);
         }
     }
 
@@ -426,7 +646,10 @@ impl DirectBarrierCensus {
         let mut keyed_rows: Vec<_> = self
             .rows
             .iter()
-            .map(|(&key, &stats)| (key, census_row(key, stats)))
+            .map(|(&key, &stats)| {
+                let runtime_hits = self.runtime_hits.get(&key.shape).copied().unwrap_or(0);
+                (key, census_row(key, stats, runtime_hits))
+            })
             .collect();
         // Sorted by RUNTIME unbound exits first, tiebroken by compile attempts (`hits`).
         keyed_rows.sort_by(|(left_key, left), (right_key, right)| {
@@ -450,29 +673,32 @@ impl DirectBarrierCensus {
     }
 }
 
-fn census_row(key: BarrierKey, stats: BarrierStats) -> DirectBarrierCensusRow {
+fn census_row(key: BarrierKey, stats: BarrierStats, runtime_hits: u64) -> DirectBarrierCensusRow {
+    let shape = key.shape;
     DirectBarrierCensusRow {
-        opcode: key.opcode,
-        modrm_reg: (key.modrm_reg != u8::MAX).then_some(key.modrm_reg),
-        operand_form: match key.operand_form {
+        opcode: shape.opcode,
+        modrm_reg: (shape.modrm_reg != u8::MAX).then_some(shape.modrm_reg),
+        operand_form: match shape.operand_form {
             1 => "register",
             2 => "memory",
             _ => "none",
         },
-        operand_size: if key.operand_size != 0 {
+        operand_size: if shape.operand_size != 0 {
             "dword"
         } else {
             "word"
         },
-        address_size: if key.address_size != 0 {
+        address_size: if shape.address_size != 0 {
             "dword"
         } else {
             "word"
         },
-        prefix_mask: key.prefix_mask,
+        prefix_mask: shape.prefix_mask,
+        stop_reason: key.stop.label(),
         unbound_exits: stats.unbound_exits,
+        dynamic_unbound_exits: stats.dynamic_unbound_exits,
         hits: stats.hits,
-        runtime_hits: stats.runtime_hits,
+        runtime_hits,
         native_prefix_instructions: stats.native_prefix_instructions,
         native_suffix_instructions: stats.native_suffix_instructions,
         max_native_prefix: stats.max_native_prefix,
@@ -550,9 +776,16 @@ impl crate::jit::JitState {
         }
     }
 
-    pub(crate) fn note_dynamic_miss_target(&mut self, kind: UnboundTarget) {
+    /// The dynamic-lane counterpart of `note_unbound_target`, and it now takes the entry linear
+    /// for the same reason that one does. It used to discard it, so every dynamic miss into a
+    /// rejected block was attributed to nothing: on quake that is 2.86M exits, larger than the
+    /// whole attributed static row set. Same call-site gate.
+    pub(crate) fn note_dynamic_miss_target(&mut self, kind: UnboundTarget, linear: u32) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
             census.note_unbound_dynamic(kind);
+            if kind == UnboundTarget::Rejected {
+                census.note_dynamic_rejected_at(linear);
+            }
         }
     }
 

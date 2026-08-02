@@ -29,7 +29,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use izarravm_core::CpuPersona;
 
-use census::BarrierObservation;
+use census::{BarrierStop, record_structural_barrier};
 // The stall/census TAXONOMY lives in `census.rs` beside the builder that already consumed it
 // (`stall_snapshot`, `snapshot`), moved verbatim to keep this file under the source-line ceiling.
 // Re-exported from here because every out-of-module path names them through `jit::direct`.
@@ -2833,7 +2833,7 @@ pub(crate) enum MemoryWidth {
 /// The `MemoryWidth` of one x87 memory access, and the SINGLE source of truth for it.
 ///
 /// Every consumer routes through here: `word_reads`, `dword_reads`, `word_stores`,
-/// `dword_stores`, `has_dword_read`, `has_dword_store`, `dynamic_counter_mask` and the emitter.
+/// `dword_stores`, `has_dword_read`, `has_dword_store` and the emitter.
 /// That is not tidiness. If the accessors tested `access.width` inline while only the emitter
 /// called this, then breaking this function would move the emitted guard and the emitted dynamic
 /// counter while leaving the static registration correct, and the registration test would pass
@@ -3189,195 +3189,6 @@ impl DirectKind {
         )
     }
 
-    #[cfg(test)]
-    fn dynamic_counter_mask(self) -> u16 {
-        match self {
-            Self::Load {
-                width: MemoryWidth::Byte,
-                ..
-            } => COUNTER_MODE13_BYTE_READ,
-            Self::Load {
-                width: MemoryWidth::Word,
-                ..
-            } => COUNTER_MODE13_BYTE_READ,
-            Self::Load {
-                width: MemoryWidth::Dword,
-                ..
-            } => COUNTER_MODE13_DWORD_READ,
-            // The extending loads mirror Load's read arms exactly. Only the SOURCE width matters
-            // to the counters, and it is only ever Byte or Word, so both land on the byte-read
-            // counter the way Load's Byte and Word arms do.
-            Self::LoadExtend { width, .. } => match width {
-                MemoryWidth::Byte | MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
-                MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
-                MemoryWidth::Qword | MemoryWidth::Tbyte => {
-                    unreachable!("MOVZX/MOVSX source is never 8- or 10-byte wide")
-                }
-            },
-            // One dword read and nothing else, the same as AluMemSource's Dword arm.
-            Self::ImulMem { .. } | Self::ImulMemAcc { .. } => COUNTER_MODE13_DWORD_READ,
-            Self::Store {
-                width: MemoryWidth::Byte,
-                ..
-            } => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY,
-            Self::Store {
-                width: MemoryWidth::Word,
-                ..
-            } => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY,
-            Self::Store {
-                width: MemoryWidth::Dword,
-                ..
-            } => COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY,
-            Self::AluMemSource { width, .. } => match width {
-                MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
-                MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
-                MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
-                MemoryWidth::Qword | MemoryWidth::Tbyte => {
-                    unreachable!("ALU memory-source operands are never 8- or 10-byte wide")
-                }
-            },
-            Self::AluMemDest { op, width, .. } => {
-                let read = match width {
-                    MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
-                    MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
-                    MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
-                    MemoryWidth::Qword | MemoryWidth::Tbyte => {
-                        unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
-                    }
-                };
-                if op == 7 {
-                    read
-                } else {
-                    read | match width {
-                        MemoryWidth::Byte => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
-                        MemoryWidth::Word => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
-                        MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE,
-                        MemoryWidth::Qword | MemoryWidth::Tbyte => {
-                            unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
-                        }
-                    } | COUNTER_MODE13_DIRTY
-                }
-            }
-            Self::DoubleShiftMem { .. } => {
-                COUNTER_RAM_DWORD_WRITE
-                    | COUNTER_MODE13_DWORD_READ
-                    | COUNTER_MODE13_DWORD_WRITE
-                    | COUNTER_MODE13_DIRTY
-            }
-            Self::TestImmMem {
-                width: MemoryWidth::Byte,
-                ..
-            } => COUNTER_MODE13_BYTE_READ,
-            Self::TestImmMem {
-                width: MemoryWidth::Word,
-                ..
-            } => COUNTER_MODE13_BYTE_READ,
-            Self::TestImmMem {
-                width: MemoryWidth::Dword,
-                ..
-            } => COUNTER_MODE13_DWORD_READ,
-            // A Word access lands on the BYTE counter slots, because `emit_dynamic_word_increment`
-            // packs the word count into the upper 32 bits of the byte slot. Same convention as
-            // Load, Store and AluMemSource above.
-            Self::X87 { insn, .. } => match insn
-                .metadata()
-                .memory
-                .map(|access| (access.direction, x87_memory_width(access)))
-            {
-                // Qword gets its own arms, ABOVE the wildcards below: a qword access is still
-                // ONE dynamic increment of the dword lane (the completion's Qword arm increments
-                // it by 2, but the mask only records WHICH counter moved, not by how much), and
-                // leaving it to fall into the wildcard arms would route it onto the byte-read/
-                // byte-write lane the way a genuine Word access does, which is wrong.
-                Some((NativeX87MemoryDirection::Read, MemoryWidth::Qword)) => {
-                    COUNTER_MODE13_DWORD_READ
-                }
-                Some((NativeX87MemoryDirection::Write, MemoryWidth::Qword)) => {
-                    COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
-                }
-                // Tbyte is the ONE access that moves both lanes: the completion bumps the dword
-                // pair AND the word (byte-slot) counter, because `write_extended80` ends in a
-                // word at +8. Falling into the `Write, _` wildcard below would declare only the
-                // byte lane and leave the dword lane unregistered.
-                Some((NativeX87MemoryDirection::Write, MemoryWidth::Tbyte)) => {
-                    COUNTER_RAM_DWORD_WRITE
-                        | COUNTER_RAM_BYTE_WRITE
-                        | COUNTER_MODE13_DWORD_WRITE
-                        | COUNTER_MODE13_BYTE_WRITE
-                        | COUNTER_MODE13_DIRTY
-                }
-                Some((NativeX87MemoryDirection::Read, MemoryWidth::Dword)) => {
-                    COUNTER_MODE13_DWORD_READ
-                }
-                Some((NativeX87MemoryDirection::Read, _)) => COUNTER_MODE13_BYTE_READ,
-                Some((NativeX87MemoryDirection::Write, MemoryWidth::Dword)) => {
-                    COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
-                }
-                Some((NativeX87MemoryDirection::Write, _)) => {
-                    COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY
-                }
-                None => 0,
-            },
-            Self::RmwIncDec { width, .. } => match width {
-                MemoryWidth::Byte => COUNTER_RAM_BYTE_WRITE,
-                MemoryWidth::Word => {
-                    COUNTER_RAM_BYTE_WRITE
-                        | COUNTER_MODE13_BYTE_READ
-                        | COUNTER_MODE13_BYTE_WRITE
-                        | COUNTER_MODE13_DIRTY
-                }
-                MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE,
-                MemoryWidth::Qword | MemoryWidth::Tbyte => {
-                    unreachable!("INC/DEC memory operands are never 8- or 10-byte wide")
-                }
-            },
-            Self::Pop { .. } | Self::Leave | Self::Ret { .. } | Self::JmpMem { .. } => {
-                COUNTER_MODE13_DWORD_READ
-            }
-            // A Word read lands on the BYTE counter lane, matching `Load { Word }`:
-            // `emit_mode13_read_completion` routes Word to the byte-read slot.
-            Self::Pop16 { .. } | Self::Ret16 { .. } => COUNTER_MODE13_BYTE_READ,
-            Self::Push { .. } | Self::Call { .. } | Self::CallReg { .. } => {
-                COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
-            }
-            // A Word store lands on the BYTE counter slots, matching `Store { Word }` above:
-            // `emit_dynamic_word_increment` packs the word count into the upper 32 bits of the
-            // byte slot. Mirroring the Word store is the rule here rather than reasoning from
-            // "the bus ignores width", which is true of `BusCycle::clocks_for` but NOT of these
-            // counter lanes.
-            Self::Push16 { .. } | Self::Call16 { .. } => {
-                COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY
-            }
-            // No read lane. The source read is RAM-only, and `run.rs` derives RAM reads by
-            // subtracting the mode-13 dynamic count from the static count, so no dynamic read
-            // counter is emitted. `emit_rmw_inc_dec_dword` is the precedent: it reads and writes
-            // and increments only the write lane.
-            // `CallMem` joins `PushMem` and not the `Call`/`CallReg` arm above. The stack store is
-            // the same dword either kind writes, but the mode-13 write and dirty bits are absent
-            // for the same reason `PushMem` lacks them: the emitted store refuses every page kind
-            // but plain RAM, so no mode-13 completion is ever emitted for it and registering a
-            // mode-13 lane here would make the static snapshot disagree with the dynamic count.
-            //
-            // Recorded because a mutation initially survived here and the write-off was WRONG in
-            // the direction that would have cost a future maintainer, so both halves are stated:
-            //
-            //  * RUNTIME: this function currently gates nothing. `emit_return` is called with
-            //    `COUNTER_ALL` at both of its sites, so every lane is copied into `NativeExit`
-            //    unconditionally and dropping an arm has no runtime consequence today. That
-            //    predates this kind.
-            //  * COVERAGE: the per-block fold IS live and IS tested.
-            //    `dynamic_counter_mask_tracks_only_reachable_outputs` (jit/direct_test.rs) asserts
-            //    the exact mask for a table of kinds, and this arm now has its own row there. The
-            //    mutation survived because that table was MISSING A ROW, not because the property
-            //    was unobservable -- the same gap slice 39 closed for the x87 arms.
-            //
-            // So a dropped arm is caught at compile-time-behaviour level even while the runtime
-            // gate is disabled, which is what the arm is for.
-            Self::PushMem { .. } | Self::CallMem { .. } => COUNTER_RAM_DWORD_WRITE,
-            _ => 0,
-        }
-    }
-
     /// A correctness site, not bookkeeping. Defaulting a memory kind to `None` here makes
     /// `kind_segment_access_supported` trivially true AND keeps the segment out of the block's
     /// `SegmentLayout` mask, and `data_matches` SKIPS unused segments, so a cached block would
@@ -3673,62 +3484,47 @@ const _: () = {
             <= NATIVE_STACK_LEN
     );
 };
-const COUNTER_RAM_BYTE_WRITE: u16 = 1 << 0;
-const COUNTER_RAM_DWORD_WRITE: u16 = 1 << 1;
-const COUNTER_MODE13_BYTE_WRITE: u16 = 1 << 2;
-const COUNTER_MODE13_DWORD_WRITE: u16 = 1 << 3;
-const COUNTER_MODE13_DIRTY: u16 = 1 << 4;
-const COUNTER_MODE13_BYTE_READ: u16 = 1 << 5;
-const COUNTER_MODE13_DWORD_READ: u16 = 1 << 6;
-const COUNTER_ALL: u16 = COUNTER_RAM_BYTE_WRITE
-    | COUNTER_RAM_DWORD_WRITE
-    | COUNTER_MODE13_BYTE_WRITE
-    | COUNTER_MODE13_DWORD_WRITE
-    | COUNTER_MODE13_DIRTY
-    | COUNTER_MODE13_BYTE_READ
-    | COUNTER_MODE13_DWORD_READ;
 
-#[cfg(test)]
-fn dynamic_counter_mask(slots: &[DirectInsn]) -> u16 {
-    slots
-        .iter()
-        .fold(0, |mask, slot| mask | slot.kind.dynamic_counter_mask())
-}
-
-fn dynamic_counter_fields() -> [(u16, i8, usize); 7] {
+/// The seven dynamic counter lanes, each pairing the emitter stack slot that accumulates it with
+/// the `NativeExit` field it is copied into on the way out.
+///
+/// The single source of truth for the SET and the ORDER of those lanes: `emit`'s prologue zeroes
+/// exactly these stack slots and `emit_return` copies exactly these slots out, so a lane can only
+/// ever be added or dropped in both places at once.
+///
+/// Every lane is unconditional. There was once a per-`DirectKind` mask that nominated a subset,
+/// but it never reached `emit_return`, which was always called with the all-bits constant; it was
+/// removed rather than wired up, because gating the copies would save about five stores per block
+/// exit — unmeasurable against this campaign's layout noise — on the hottest shared exit path,
+/// where a wrongly-cleared lane is a guest-visible bus-accounting error rather than a diagnostic
+/// one.
+fn dynamic_counter_fields() -> [(i8, usize); 7] {
     [
         (
-            COUNTER_RAM_BYTE_WRITE,
             STACK_RAM_BYTE_WRITES,
             core::mem::offset_of!(NativeExit, ram_byte_writes),
         ),
         (
-            COUNTER_RAM_DWORD_WRITE,
             STACK_RAM_DWORD_WRITES,
             core::mem::offset_of!(NativeExit, ram_dword_writes),
         ),
         (
-            COUNTER_MODE13_BYTE_WRITE,
             STACK_MODE13_BYTE_WRITES,
             core::mem::offset_of!(NativeExit, mode13_byte_writes),
         ),
         (
-            COUNTER_MODE13_DWORD_WRITE,
             STACK_MODE13_DWORD_WRITES,
             core::mem::offset_of!(NativeExit, mode13_dword_writes),
         ),
         (
-            COUNTER_MODE13_DIRTY,
             STACK_MODE13_DIRTY_PAGES,
             core::mem::offset_of!(NativeExit, mode13_dirty_pages),
         ),
         (
-            COUNTER_MODE13_BYTE_READ,
             STACK_MODE13_BYTE_READS,
             core::mem::offset_of!(NativeExit, mode13_byte_reads),
         ),
         (
-            COUNTER_MODE13_DWORD_READ,
             STACK_MODE13_DWORD_READS,
             core::mem::offset_of!(NativeExit, mode13_dword_reads),
         ),
@@ -4020,85 +3816,6 @@ fn imm_lane_for(
     ))
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CensusSuffix {
-    instructions: usize,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn census_native_suffix(
-    cpu: &CpuGsw,
-    key: BlockKey,
-    entry_lin: u32,
-    mut lin: u32,
-    d: bool,
-    prefix_instructions: usize,
-    mut stack_accesses: u8,
-    mut memory_alu_slots: u8,
-) -> CensusSuffix {
-    let cs = cpu.registers.cs();
-    let mut result = CensusSuffix::default();
-    while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
-        let Some(insn) = cpu.decode_cache.get(lin, d) else {
-            break;
-        };
-        let insn_len = u32::from(insn.len);
-        let Some(next) = (insn_len != 0).then(|| lin.checked_add(insn_len)).flatten() else {
-            break;
-        };
-        let slot_eip = lin.wrapping_sub(cs.base);
-        if slot_eip
-            .checked_add(insn_len - 1)
-            .is_none_or(|last| last > cs.limit)
-            || entry_lin >> BLOCK_PAGE_SHIFT != next.wrapping_sub(1) >> BLOCK_PAGE_SHIFT
-        {
-            break;
-        }
-        let Some(expected_phys) = key.physical.checked_add(lin.wrapping_sub(entry_lin)) else {
-            break;
-        };
-        if expected_phys
-            .checked_add(insn_len - 1)
-            .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
-            || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
-            || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
-            || !insn.continuable
-            || (insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586)
-        {
-            break;
-        }
-        let PlannedInsn::Native(kind) = DirectUnitPlanner::classify(&insn, lin, entry_lin) else {
-            break;
-        };
-        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
-            break;
-        };
-        if kind.is_x87()
-            || !static_control_target_within_limit(
-                kind,
-                entry_lin.wrapping_sub(cs.base),
-                control_target_limit(insn.operand_size, cs.limit),
-            )
-            || !kind_segment_access_supported(cpu, kind)
-            || (kind.is_memory_alu()
-                && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
-                    || prefix_instructions + 1 + result.instructions
-                        >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
-            || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
-        {
-            break;
-        }
-        stack_accesses += u8::from(kind.uses_stack());
-        memory_alu_slots += u8::from(kind.is_memory_alu());
-        result.instructions += 1;
-        lin = next;
-        if kind.is_terminal() {
-            break;
-        }
-    }
-    result
-}
-
 fn compile_with_instruction_limit(
     cpu: &mut CpuGsw,
     entry_lin: u32,
@@ -4194,6 +3911,33 @@ fn compile_with_instruction_limit(
         // 16-bit admission work can produce a single native instruction.
         let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
         if !prefixes_supported || !insn.continuable {
+            // Attributed since the completeness slice. The two conditions are split rather than
+            // folded, because they are different work: a prefix refusal names a prefix the
+            // backend does not emit (the row's `prefix_mask` says which, and an explicit segment
+            // override is the common one), while a non-continuable shape is `block_continuable`'s
+            // decision inherited wholesale from the interpreter's batching rules. Prefix wins the
+            // tie, matching the `||` this arm is written with.
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                let reason = if prefixes_supported {
+                    BarrierStop::NonContinuable
+                } else {
+                    BarrierStop::PrefixUnsupported
+                };
+                record_structural_barrier(
+                    cpu,
+                    &insn,
+                    reason,
+                    key,
+                    entry_lin,
+                    next,
+                    d,
+                    slots.len(),
+                    stack_accesses,
+                    memory_alu_slots,
+                );
+            }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         }
@@ -4203,6 +3947,26 @@ fn compile_with_instruction_limit(
         // Follow-up (dev_docs/specs/2026-07-15-smc-hardening-design.md, G1): with heat demotion
         // landed, A/B re-enabling 486 word ops - heat should now bound the churn this defends.
         if insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586 {
+            // Attributed since the completeness slice, and expected to read ZERO on both shipped
+            // fixtures because they run 586. Instrumented anyway: "this arm is dead on the
+            // corpus" is a measurement worth having, and "nothing records it" is not the same
+            // statement. If a 486 persona ever benches, this row set is the whole Word population.
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                record_structural_barrier(
+                    cpu,
+                    &insn,
+                    BarrierStop::WordPersona,
+                    key,
+                    entry_lin,
+                    next,
+                    d,
+                    slots.len(),
+                    stack_accesses,
+                    memory_alu_slots,
+                );
+            }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         }
@@ -4212,8 +3976,10 @@ fn compile_with_instruction_limit(
                 if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
                     && cpu.jit_direct.barrier_census_enabled()
                 {
-                    let suffix = census_native_suffix(
+                    record_structural_barrier(
                         cpu,
+                        &insn,
+                        BarrierStop::HardBoundary,
                         key,
                         entry_lin,
                         next,
@@ -4221,14 +3987,6 @@ fn compile_with_instruction_limit(
                         slots.len(),
                         stack_accesses,
                         memory_alu_slots,
-                    );
-                    cpu.jit_direct.record_barrier(
-                        &insn,
-                        BarrierObservation {
-                            entry_linear: entry_lin,
-                            native_prefix: slots.len(),
-                            native_suffix: suffix.instructions,
-                        },
                     );
                 }
                 stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);

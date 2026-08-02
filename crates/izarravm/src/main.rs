@@ -998,6 +998,8 @@ fn direct_barrier_census_row_json(row: &izarravm_cpu::DirectBarrierCensusRow) ->
     json!({
         "opcode": row.opcode,
         "unbound_exits": row.unbound_exits,
+        "dynamic_unbound_exits": row.dynamic_unbound_exits,
+        "stop_reason": row.stop_reason,
         "modrm_reg": row.modrm_reg,
         "operand_form": row.operand_form,
         "operand_size": row.operand_size,

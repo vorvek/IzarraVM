@@ -200,6 +200,194 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
     assert_eq!(row.runtime_hits, 0);
 }
 
+/// The prefix arm of the compile walk is ATTRIBUTED, not silent.
+///
+/// Before the completeness slice, `record_barrier` fired on the `HardBoundary` arm alone, so a
+/// block stopped by an unsupported prefix installed a rejected span with no census row. The
+/// control half is what makes this non-vacuous: the SAME opcode at the SAME position with no
+/// prefix is lowered and the block runs past it, so the row can only be the prefix's doing.
+#[test]
+fn barrier_census_attributes_the_prefix_refusal_arm() {
+    // `mov eax, [eax]`, once behind an explicit ES override and once bare.
+    let prefixed = [0x40, 0x41, 0x42, 0x43, 0x26, 0x8b, 0x00, 0x44, 0x45];
+    let bare = [0x40, 0x41, 0x42, 0x43, 0x8b, 0x00, 0x44, 0x45, 0x46];
+    let addresses: Vec<_> = (0..9u32).map(|offset| ENTRY + offset).collect();
+
+    let (mut control_cpu, mut control_bus) = fixture(&bare);
+    control_cpu.enable_direct_barrier_census(true);
+    warm(&mut control_cpu, &mut control_bus, &addresses);
+    let control = compiled(jit::direct::compile(&mut control_cpu, ENTRY, true));
+    assert!(
+        control.span.instructions > 5,
+        "control: the unprefixed load must be lowered so the walk runs past it, got {} slots",
+        control.span.instructions
+    );
+    assert!(
+        control_cpu
+            .direct_barrier_census_snapshot()
+            .expect("enabled census snapshot")
+            .rows
+            .iter()
+            .all(|row| row.opcode != 0x8b),
+        "control: the unprefixed load must not be a barrier at all"
+    );
+
+    let (mut cpu, mut bus) = fixture(&prefixed);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &addresses);
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "the prefixed load must stop the walk at the four INCs"
+    );
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == 0x8b)
+        .expect("the prefix refusal must produce a census row");
+    assert_eq!(row.stop_reason, "prefix_unsupported");
+    assert_ne!(
+        row.prefix_mask, 0,
+        "the row must name the prefix that refused it"
+    );
+    assert_eq!(row.hits, 1);
+    assert_eq!(row.native_prefix_instructions, 4);
+    assert_eq!(row.unbound_exits, 0, "no exit has happened yet");
+    assert_eq!(row.dynamic_unbound_exits, 0);
+}
+
+/// The non-continuable arm, same shape of claim. HLT is the durable choice: `block_continuable`
+/// names it explicitly as staying a terminator, and the assertion below re-derives that from the
+/// decoded instruction rather than trusting the comment, so the day HLT becomes continuable this
+/// test says so instead of silently measuring a different arm.
+#[test]
+fn barrier_census_attributes_the_non_continuable_arm() {
+    let code = [0x40, 0x41, 0x42, 0x43, 0xf4, 0x44, 0x45, 0x46, 0x47];
+    let addresses: Vec<_> = (0..code.len() as u32)
+        .map(|offset| ENTRY + offset)
+        .collect();
+
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &addresses);
+
+    cpu.registers.eip = ENTRY + 4;
+    cpu.begin_instruction();
+    let halt = cpu
+        .fetch_decoded(&mut bus, ENTRY + 4)
+        .expect("re-decode the halt");
+    assert!(
+        !halt.continuable,
+        "this fixture measures the non-continuable arm, so HLT must still be non-continuable"
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 4);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == 0xf4)
+        .expect("the non-continuable refusal must produce a census row");
+    assert_eq!(row.stop_reason, "non_continuable");
+    assert_eq!(row.prefix_mask, 0);
+    assert_eq!(row.hits, 1);
+    assert_eq!(row.native_prefix_instructions, 4);
+}
+
+/// The Word-persona arm, which reads ZERO on both shipped fixtures because they run 586.
+///
+/// It would have been cheap to disclose this arm as instrumented-but-untested. The campaign's own
+/// ledger says the opposite: "no fixture can see this" is a claim requiring evidence, and it is
+/// cheaper to add the fixture than to justify its absence. It is reachable — a 66-prefixed Word
+/// instruction in a 32-bit code segment passes the prefix arm above it (a 66 override IS what
+/// `prefixes_supported_for` expects for Word under `d == true`) and lands here on I486.
+#[test]
+fn barrier_census_attributes_the_word_persona_arm() {
+    // `mov cx, ax` behind the operand-size override, after four INCs.
+    let code = [0x40, 0x41, 0x42, 0x43, 0x66, 0x89, 0xc1, 0x44, 0x45];
+    let addresses: Vec<_> = [0, 1, 2, 3, 4, 7, 8].map(|offset| ENTRY + offset).to_vec();
+
+    let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw486);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &addresses);
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "the Word instruction must stop the walk on a non-586 persona"
+    );
+    let row = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot")
+        .rows
+        .iter()
+        .find(|row| row.opcode == 0x89)
+        .cloned()
+        .expect("the Word-persona refusal must produce a census row");
+    assert_eq!(row.stop_reason, "word_persona");
+    assert_eq!(row.operand_size, "word");
+    assert_eq!(row.prefix_mask, 1, "the operand-size override, and only it");
+
+    // The control that makes the persona the cause: the same bytes on 586 are lowered, so the
+    // walk runs past them and no row exists at all.
+    let (mut cpu586, mut bus586) = fixture(&code);
+    cpu586.enable_direct_barrier_census(true);
+    warm(&mut cpu586, &mut bus586, &addresses);
+    let wide = compiled(jit::direct::compile(&mut cpu586, ENTRY, true));
+    assert!(
+        wide.span.instructions > 4,
+        "control: 586 must admit the Word form, got {} slots",
+        wide.span.instructions
+    );
+    assert!(
+        cpu586
+            .direct_barrier_census_snapshot()
+            .expect("enabled census snapshot")
+            .rows
+            .iter()
+            .all(|row| row.stop_reason != "word_persona"),
+        "control: the Word-persona arm must not fire on 586"
+    );
+}
+
+/// The `HardBoundary` arm keeps its own label, so the three arms are distinguishable in the
+/// report rather than merged into one undifferentiated row set.
+#[test]
+fn barrier_census_labels_the_opcode_coverage_arm_apart_from_the_others() {
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        0x43,
+        DIRECT_BARRIER,
+        0x44,
+        0x45,
+        0x46,
+        0x47,
+    ];
+    let addresses: Vec<_> = (0..code.len() as u32)
+        .map(|offset| ENTRY + offset)
+        .collect();
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &addresses);
+    let _ = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot.rows.first().expect("recorded structural stop");
+    assert_eq!(row.opcode, u16::from(DIRECT_BARRIER));
+    assert_eq!(row.stop_reason, "hard_boundary");
+}
+
 #[test]
 fn supported_terminals_compile_even_when_the_block_is_short() {
     let (mut single_cpu, mut single_bus) = fixture(&[0xc3]);
