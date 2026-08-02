@@ -3534,20 +3534,63 @@ fn dynamic_counter_fields() -> [(i8, usize); 7] {
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
 ///
-/// The operand-size override is the ONLY prefix the backend supports, and whether it is present
-/// for a given `operand_size` depends on the segment width, because `decode` computes
-/// `operand_size = default_32 XOR operand_size_override`. Deriving the expected override from `d`
-/// keeps this exact in both widths.
+/// Two prefixes are supported: the operand-size override, and an explicit segment override naming
+/// one of the five DATA segments. LOCK, REP/REPNE and the address-size override are still refused.
+///
+/// Whether the operand-size override is present for a given `operand_size` depends on the segment
+/// width, because `decode` computes `operand_size = default_32 XOR operand_size_override`. Deriving
+/// the expected override from `d` keeps this exact in both widths.
 ///
 /// Under `d == true` this is byte-identical to the hard-coded form it replaced: Dword expects no
 /// override, Word expects one. Under `d == false` the mapping INVERTS, and the old form rejected
 /// BOTH arms, so every 16-bit instruction was refused here as `PrefixesUnsupported` no matter what
 /// the classifier could lower. Nothing 16-bit reaches this today (`key_for` refuses on `!d`), so
 /// this is a precondition for that work rather than a behaviour change.
+///
+/// ## The segment override (rejected-row campaign, slice 6)
+///
+/// The override needs NO new address machinery, and that is why the admission is a gate change
+/// rather than an emitter one. `decode`'s `parse_addressing_mode` folds `segment_override` into
+/// `AddrMode.segment` before the instruction leaves the decoder, `classify::direct_addr` copies
+/// that field verbatim into `DirectAddr`, and `DirectKind::read_segment` / `write_segment` return
+/// `addr.segment` for every memory kind. So the override already selects the base, the limit
+/// compare and the `SegmentLayout` pin at all three stages. The four `DirectAddr` producers in the
+/// tree are exactly: `direct_addr` (override folded by decode), the `0xa0..=0xa3` moffs arms
+/// (which read `segment_override` themselves), and `stack_addr` / `frame_addr` (hard-coded SS,
+/// matching the hard-coded `Some(SegmentIndex::Ss)` those kinds return) — so there is no path on
+/// which a lowered access can disagree with the interpreter about which segment it uses.
+///
+/// Census evidence for the admitted set (`.bench/results/rejected-rows-20260802/slice5`): SS
+/// carries 19,552,517 doom exits — 97.63% of doom's whole rejected class — ES 580 more, and GS
+/// 1,170 on quake. DS and FS measure zero on both fixtures but share the mechanism exactly: the
+/// five data segments are handled uniformly by `SEGMENT_ORDER`, `segment_bit`, `SegmentLayout.data`
+/// and `segment_access_supported`, with no per-segment arm anywhere, so splitting them would be a
+/// distinction the code does not make.
+///
+/// **CS is refused, explicitly rather than by omission**, and it is the only refusal here that
+/// costs measured exits (12,674 doom, on `0xFF /4` `jmp dword [cs:m]`; zero on quake). Two reasons,
+/// neither of which applies to the data segments. First, a CS-override WRITE is already
+/// unreachable — `segment_access_supported` refuses `write` to a code segment — so admitting CS
+/// would admit reads only, which is a narrower mechanism than the one this gate now expresses.
+/// Second, CS is the one segment this backend homes TWICE: `SegmentLayout` keeps it in the `cs`
+/// field pinned unconditionally by `cs_matches` AND at index 1 of `data`, and
+/// `DirectKind::selector_segment` already excludes it deliberately on the strength of that split.
+/// A CS-override memory kind would be the first thing to read `data[1]` through `descriptor`, i.e.
+/// to depend on the two homes agreeing, for 0.06% of the class. It stays a barrier.
 fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool) -> bool {
+    if prefixes.segment_override == Some(SegmentIndex::Cs) {
+        return false;
+    }
     prefixes
         == Prefixes {
             operand_size_override: (operand_size == OperandSize::Dword) != d,
+            // Carried through rather than defaulted: this is the admission. Every other field
+            // stays at its default, so LOCK, REP/REPNE and the address-size override still refuse.
+            // The address-size override in particular MUST keep refusing — `MemoryEmitContext`'s
+            // `address_wrap` is a BLOCK property derived from CS.D alone, and its doc comment says
+            // so; admitting a per-instruction address size would falsify that field for every
+            // other slot in the block.
+            segment_override: prefixes.segment_override,
             ..Prefixes::default()
         }
 }
