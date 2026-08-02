@@ -2753,27 +2753,35 @@ pub(crate) enum DirectKind {
         addr: DirectAddr,
         raw_clocks: u8,
     },
-    /// MOVZX/MOVSX r32, r/m8 or r/m16, MEMORY form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF).
+    /// MOVZX/MOVSX r16/r32, r/m8 or r/m16, MEMORY form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF).
     ///
     /// `width` is the SOURCE width and is only ever Byte or Word. This differs from `Load`, where
-    /// the source and destination widths are the same: here the destination is always the full
-    /// 32-bit register, which is the whole point of the instruction. Any shared code that reads
-    /// this field must treat it as the memory access width, never as the write-back width.
+    /// the source and destination widths are the same. Any shared code that reads this field must
+    /// treat it as the memory access width, never as the write-back width -- that is `dst_width`.
+    ///
+    /// `dst_width` is the DESTINATION width and is only ever Word or Dword. It is the operand
+    /// size, so the two fields are independent: `66 0F B6` is a Byte source into a Word
+    /// destination. Dword defines all 32 bits of the destination, which is the whole point of the
+    /// instruction; Word defines only the low 16 and PRESERVES the high 16, because the
+    /// interpreter's `write_gpr_sized(.., Word, ..)` is `write_gpr16`. Carrying it as a field
+    /// rather than assuming Dword is what admits the 66-prefixed forms at all: with a hard-coded
+    /// 32-bit write-back they are a miscompile, not a missed lowering.
     ///
     /// Deliberately NOT a flag on `Load`: `Load`'s emitter is a plain move, and an extending load
-    /// (zero/sign-extend to the full 32-bit destination) needs different emitted code, not a
-    /// conditional branch inside the same arm.
+    /// (zero/sign-extend into the destination) needs different emitted code, not a conditional
+    /// branch inside the same arm.
     LoadExtend {
         dst: u8,
         width: MemoryWidth,
+        dst_width: MemoryWidth,
         signed: bool,
         addr: DirectAddr,
         raw_clocks: u8,
     },
-    /// MOVZX/MOVSX r32, r8 or r16, REGISTER form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF, mod == 3).
+    /// MOVZX/MOVSX r16/r32, r8 or r16, REGISTER form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF, mod == 3).
     ///
-    /// `width` is the SOURCE width and is only ever Byte or Word; the destination is always the
-    /// full 32-bit register, which is the point of the instruction.
+    /// `width` is the SOURCE width and is only ever Byte or Word; `dst_width` is the destination
+    /// width and is only ever Word or Dword. Both mean exactly what `LoadExtend`'s do.
     ///
     /// `src` at Byte width is a BYTE-REGISTER index, so 4 to 7 mean AH, CH, DH and BH, the high
     /// byte of `home(src - 4)`. It is NOT a home index and shared code must never use it as one.
@@ -2788,6 +2796,7 @@ pub(crate) enum DirectKind {
         dst: u8,
         src: u8,
         width: MemoryWidth,
+        dst_width: MemoryWidth,
         signed: bool,
     },
     Store {

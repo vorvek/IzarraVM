@@ -188,8 +188,15 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 dst,
                 src,
                 width,
+                dst_width,
                 signed,
-            } => emit_mov_extend_reg(&mut e, dst, src, width, signed),
+            } => emit_mov_extend_reg(
+                &mut e,
+                dst,
+                src,
+                ExtendWidths::new(width, dst_width),
+                signed,
+            ),
             DirectKind::MovImm { dst, imm } => e.mov_r32_imm32(home(dst), imm),
             // Sixteen bits only, upper half preserved: the interpreter's 0x8c arm stores at
             // `OperandSize::Word` whatever the prefix says. `mov_r32_imm32` into the scratch
@@ -537,13 +544,22 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::LoadExtend {
                 dst,
                 width,
+                dst_width,
                 signed,
                 addr,
                 ..
             } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
-                emit_load_extend(&mut e, dst, width, signed, addr, memory, reasons);
+                emit_load_extend(
+                    &mut e,
+                    dst,
+                    ExtendWidths::new(width, dst_width),
+                    signed,
+                    addr,
+                    memory,
+                    reasons,
+                );
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
@@ -2029,18 +2045,24 @@ fn emit_load(
 fn emit_load_extend(
     e: &mut Encoder,
     dst: u8,
-    width: MemoryWidth,
+    widths: ExtendWidths,
     signed: bool,
     addr: DirectAddr,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
+    let ExtendWidths {
+        source: width,
+        destination: dst_width,
+    } = widths;
     // The memory half is emit_load's verbatim, including every side exit, the cross-page guard and
     // the mode13 completion, all of which emit_ram_read_pointer already parameterises by width.
-    // The destination write is what differs. emit_load loads a zero-extended value into RDX and
-    // then NARROWS it back through emit_write_gpr8 or emit_write_gpr16, because a MOV r8, r/m8 has
-    // to preserve the destination's upper bits. MOVZX and MOVSX must not narrow: they define all
-    // 32 bits, so the write is the full home, exactly as emit_load's own Dword arm does it.
+    // The destination write is what differs, and it differs in BOTH directions from emit_load's.
+    // emit_load loads a zero-extended value into RDX and then narrows it back through
+    // emit_write_gpr8 or emit_write_gpr16, because a MOV r8, r/m8 preserves the destination's
+    // upper bits. MOVZX and MOVSX narrow only to the OPERAND size, which is a different width from
+    // the source: 0F B6 extends a byte across all 32 bits, 66 0F B6 extends the same byte across
+    // 16 and leaves the destination's high half alone.
     //
     // Reading the pointer BEFORE writing the destination is not incidental. Every side exit is
     // resolved inside emit_ram_read_pointer, so an instruction that faults leaves the destination
@@ -2052,9 +2074,10 @@ fn emit_load_extend(
         (MemoryWidth::Byte, true) => e.movsx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
         (MemoryWidth::Word, false) => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
         (MemoryWidth::Word, true) => e.movsx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
-        // classify derives the width from the sub-opcode and can only produce Byte or Word. This
-        // arm exists so that a future edit passing `operand_width` (which is Dword for every
-        // admitted form) fails loudly instead of silently emitting a dword read.
+        // classify derives the SOURCE width from the sub-opcode and can only produce Byte or Word.
+        // This arm exists so that a future edit passing `operand_width` here -- which is now a live
+        // local rather than a constant, so the confusion is easier to make than it was -- fails
+        // loudly instead of silently emitting a dword read.
         (MemoryWidth::Dword, _) => {
             unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
         }
@@ -2062,7 +2085,58 @@ fn emit_load_extend(
             unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
         }
     }
-    e.mov_r32_r32(home(dst), Reg::RDX);
+    emit_extend_write_back(e, dst, dst_width);
+}
+
+/// The two widths a MOVZX/MOVSX carries, travelling together.
+///
+/// They are the same type and mean opposite things -- `source` is Byte or Word and comes from the
+/// sub-opcode, `destination` is Word or Dword and is the operand size -- so as two positional
+/// arguments they are silently swappable, and swapping them is precisely the miscompile this
+/// slice exists to prevent. Named fields make the swap a compile error instead. The constructor
+/// asserts the domains in debug builds, which is where a `classify` edit that passed
+/// `operand_width` for the source would be caught.
+#[derive(Clone, Copy)]
+struct ExtendWidths {
+    source: MemoryWidth,
+    destination: MemoryWidth,
+}
+
+impl ExtendWidths {
+    fn new(source: MemoryWidth, destination: MemoryWidth) -> Self {
+        debug_assert!(matches!(source, MemoryWidth::Byte | MemoryWidth::Word));
+        debug_assert!(matches!(
+            destination,
+            MemoryWidth::Word | MemoryWidth::Dword
+        ));
+        Self {
+            source,
+            destination,
+        }
+    }
+}
+
+/// The write-back half of MOVZX/MOVSX, shared by the memory and register forms so the two cannot
+/// drift on the one property that admits the 66-prefixed encodings.
+///
+/// The value is already fully extended in RDX. Dword defines all 32 bits of the destination; Word
+/// defines only the low 16 and preserves the high 16, which is `write_gpr_sized(.., Word, ..)`
+/// verbatim. Emitting the Dword form for a Word operand size is not a lost optimisation, it is a
+/// clobber of architectural state the instruction must not touch, and it is the reason these four
+/// opcodes were kept out of classify's Word allowlist until this field existed.
+fn emit_extend_write_back(e: &mut Encoder, dst: u8, dst_width: MemoryWidth) {
+    match dst_width {
+        MemoryWidth::Dword => e.mov_r32_r32(home(dst), Reg::RDX),
+        MemoryWidth::Word => emit_write_gpr16(e, dst, Reg::RDX),
+        // `dst_width` is `operand_width`, which `classify` derives from CS.D and the 0x66 prefix
+        // alone; it has no other value. Byte gets its own arm rather than joining the wide ones so
+        // that a caller confusing `dst_width` with the SOURCE width -- the one real hazard here --
+        // names the mistake it made.
+        MemoryWidth::Byte => unreachable!("MOVZX/MOVSX destination width is never Byte"),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("MOVZX/MOVSX destination width is never 8- or 10-byte wide")
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2414,7 +2488,7 @@ fn emit_load(
 fn emit_load_extend(
     _: &mut Encoder,
     _: u8,
-    _: MemoryWidth,
+    _: ExtendWidths,
     _: bool,
     _: DirectAddr,
     _: MemoryEmitContext,
@@ -3515,7 +3589,11 @@ fn emit_code_watch_table_branch(
 
 /// MOVZX and MOVSX, register form. No memory access, no flags on any path, so the lazy-flag
 /// descriptor is untouched and there are no side exits.
-fn emit_mov_extend_reg(e: &mut Encoder, dst: u8, src: u8, width: MemoryWidth, signed: bool) {
+fn emit_mov_extend_reg(e: &mut Encoder, dst: u8, src: u8, widths: ExtendWidths, signed: bool) {
+    let ExtendWidths {
+        source: width,
+        destination: dst_width,
+    } = widths;
     // emit_read_store_value already extracts the byte or word and ZERO-extends it, including the
     // case that makes this slice dangerous: at Byte width `src` 4..=7 means AH/CH/DH/BH, which is
     // bits 8-15 of home(src - 4), and no host home's bits 8-15 are addressable as an x86-64
@@ -3534,12 +3612,12 @@ fn emit_mov_extend_reg(e: &mut Encoder, dst: u8, src: u8, width: MemoryWidth, si
             unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
         }
     }
-    // These instructions define all 32 bits, so the write is the full register home. Narrowing it
-    // the way a MOV r8/r16 has to would preserve the destination's upper bits and be wrong.
+    // The write is the operand size, not the source size -- see `emit_extend_write_back`.
     //
-    // dst == src is safe by construction, including `movzx eax, ah`: the whole value is
-    // materialised into RDX before the single write, and no guest home is RDX.
-    e.mov_r32_r32(home(dst), Reg::RDX);
+    // dst == src is safe by construction at either destination width, including `movzx eax, ah`
+    // and `movzx ax, al`: the whole value is materialised into RDX before the single write, and no
+    // guest home is RDX.
+    emit_extend_write_back(e, dst, dst_width);
 }
 
 fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidth, value: Reg) {
