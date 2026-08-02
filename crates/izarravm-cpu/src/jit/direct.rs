@@ -7,6 +7,14 @@ mod callout;
 mod census;
 mod classify;
 mod emit;
+mod native_exit;
+
+/// Re-exported rather than moved-and-repathed: every one of these names is referenced as
+/// `jit::direct::X` from `run.rs`, `lib.rs` and the emitter, and the extraction is pure motion,
+/// so the paths must not move with the text.
+pub(crate) use native_exit::{
+    DirectEntryFn, NativeBlockTrace, NativeExit, SideExitReason, UnresolvedReason,
+};
 
 pub(crate) use callout::{
     CALL_OUT_STACK_FRAME_DWORDS, CallOutHelper, CallOutSlotCounts, CallOutTable,
@@ -2370,107 +2378,6 @@ impl std::fmt::Debug for BlockCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BlockCache {{ {} blocks }}", self.len())
     }
-}
-
-pub(crate) type DirectEntryFn = unsafe extern "C" fn(*mut CpuGsw, u32, u32, *mut NativeExit);
-
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SideExitReason {
-    None = 0,
-    CrossPageOrAlignment = 1,
-    UnavailableOrKind = 2,
-    Permission = 3,
-    CodeWatch = 4,
-    /// The catch-all. The now-removed clif backend was its only remaining producer (two sites
-    /// in its `lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
-    /// side-exit growth across the x87 sweep and could not be attributed to any of its six
-    /// emitters. `allow(dead_code)` because no producer builds it anymore, and the discriminant
-    /// must keep its value regardless: `run.rs` still has a catch-all arm for it, and
-    /// renumbering would silently remap what emitted code stores.
-    #[allow(dead_code)]
-    Other = 5,
-    /// A CS segment-limit check on a computed control-transfer target: the five
-    /// `Ret`/`Ret16`/`JmpMem`/`CallReg` sites plus `MemorySideExits`' own limit stub.
-    SegmentLimit = 6,
-    /// An x87 slot's eligibility guard: a non-finite value, an Empty or Special tag, a
-    /// non-truncate rounding mode at a FIST, an out-of-range integer conversion, or a subnormal
-    /// at FSTP m80. Unlike every other reason here this one is a per-EXECUTION property of the
-    /// data, not a per-compile property of the address, so it can fire on a block that will
-    /// never bind differently.
-    X87Eligibility = 7,
-    /// An interpreter call-out slot reported an ABNORMAL status: the helper refused before any
-    /// guest-visible effect. EIP is at the call-out instruction and the run ends there, so the
-    /// interpreter re-executes it and delivers whatever it delivers today.
-    CallOutAbnormal = 8,
-    /// An interpreter call-out slot completed and the BUS asked for a step break (a port access
-    /// touched time-dependent device state). The run ends at the boundary AFTER the call-out,
-    /// which is exactly where `run_straight_line`'s post-instruction `requires_step_break` check
-    /// ends an interpreted continuation.
-    CallOutStepBreak = 9,
-    /// A lowered DIV or IDIV refused its operands. The guard fires on a superset of the
-    /// interpreter's #DE conditions, the run ends AT the instruction with nothing done, and the
-    /// interpreter re-executes it -- delivering #DE where the guest's rules say it must. A
-    /// per-EXECUTION property of the data like `X87Eligibility`, not a per-compile property of
-    /// the address, so it can fire on a block that will never bind differently.
-    DivideGuard = 10,
-}
-
-impl SideExitReason {
-    /// The largest discriminant emitted code can store, for the `run.rs` bound assertion.
-    pub(crate) const MAX: u32 = Self::DivideGuard as u32;
-}
-
-#[repr(u32)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnresolvedReason {
-    #[default]
-    None = 0,
-    StaticUnbound,
-    StaticHidden,
-    DynamicMissOrUnbound,
-    DynamicHidden,
-    /// The shared x87 re-entry pad refused the crossing: the target float block's baked entry TOP
-    /// does not match the CPU's live TOP, so its register cache cannot be entered for it.
-    X87TopMismatch,
-}
-
-/// Fetch replay retained for buses that observe individual code addresses. Production RAM timing
-/// uses the aggregate counters in `NativeExit` and leaves this trace disabled.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeBlockTrace {
-    pub(crate) linear: u32,
-    pub(crate) physical: u32,
-    pub(crate) repetitions: u32,
-    pub(crate) prefix_instructions: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeExit {
-    pub(crate) instructions: u64,
-    pub(crate) raw_clocks: u64,
-    // Byte counters use the low lane and word counters use the high lane. Native chain bounds
-    // keep both 32-bit lanes well below overflow while preserving the original exit layout.
-    pub(crate) byte_reads: u64,
-    pub(crate) dword_reads: u64,
-    pub(crate) weighted_fp_clocks: u64,
-    pub(crate) mode13_byte_reads: u64,
-    pub(crate) mode13_dword_reads: u64,
-    pub(crate) ram_byte_writes: u64,
-    pub(crate) ram_dword_writes: u64,
-    pub(crate) mode13_byte_writes: u64,
-    pub(crate) mode13_dword_writes: u64,
-    pub(crate) mode13_dirty_pages: u64,
-    pub(crate) side_exit: u64,
-    pub(crate) side_exit_reason: u32,
-    pub(crate) trace_len: u32,
-    pub(crate) linked_transfers: u32,
-    pub(crate) unresolved_reason: UnresolvedReason,
-    pub(crate) trace_ptr: usize,
-    pub(crate) dynamic_link_cell: usize,
-    pub(crate) dynamic_target_eip: u32,
 }
 
 // Compilation already owns emitted buffers and link cells. Boxing it would add an allocation to
