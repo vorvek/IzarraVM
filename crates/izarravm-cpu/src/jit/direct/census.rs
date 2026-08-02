@@ -267,6 +267,7 @@ impl crate::jit::JitState {
                 .collect(),
             side_exit_segment_limit: self.stalls.side_exit_segment_limit,
             side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
+            side_exit_divide_guard: self.stalls.side_exit_divide_guard,
             side_exit_callout_step_break: self.stalls.side_exit_callout_step_break,
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
             callout_executed: self.stalls.callout_executed,
@@ -288,6 +289,10 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_side_exit_x87_eligibility(&mut self) {
         self.stalls.side_exit_x87_eligibility += 1;
+    }
+
+    pub(crate) fn note_side_exit_divide_guard(&mut self) {
+        self.stalls.side_exit_divide_guard += 1;
     }
 
     pub(crate) fn note_side_exit_callout_step_break(&mut self) {

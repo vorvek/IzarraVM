@@ -2053,14 +2053,12 @@ fn mul_register_form_matches_the_interpreter_in_486_mode() {
 
 #[test]
 fn group3_non_test_subops_remain_interpreter_only() {
-    // Everything in group 3 except TEST (/0), the lowered dword NEG (/3) and the lowered dword
-    // MUL (/4). The byte group 0xf6 stays entirely interpreter-only, including its own /3 and /4.
+    // Everything in group 3 except TEST (/0), the lowered dword NEG (/3), MUL (/4), IMUL (/5) and
+    // the lowered dword DIV (/6) and IDIV (/7) REGISTER forms. The byte group 0xf6 stays entirely
+    // interpreter-only, including its own /3 and /4.
     for code in [
         vec![0xf7, 0xcb], // /1 TEST alias, undocumented
         vec![0xf7, 0xd3], // /2 NOT r/m32
-        vec![0xf7, 0xeb], // /5 IMUL r/m32, the SIGNED sibling one modrm bit from the lowered /4
-        vec![0xf7, 0xf3], // /6 DIV r/m32
-        vec![0xf7, 0xfb], // /7 IDIV r/m32
         vec![0xf6, 0xcb], // /1 byte
         vec![0xf6, 0xd3], // /2 NOT r/m8
         vec![0xf6, 0xdb], // /3 NEG r/m8, the byte form is NOT lowered
@@ -2084,6 +2082,18 @@ fn group3_non_test_subops_remain_interpreter_only() {
         // writes DX and AX as halves of the existing EDX and EAX rather than replacing them, so
         // lowering it as the 32-bit form would clobber both high halves.
         vec![0x66, 0xf7, 0xe3],
+        // DIV/IDIV dword [disp32]: the MEMORY forms of the two sub-opcodes the F7 slice lowered.
+        // Both are register-only on purpose (a memory divide has two independent side-exit causes
+        // at one slot, and every fixture's memory row is under the campaign's 100k floor), so
+        // replacing the register-only `let-else` in that arm with a defaulting match would divide
+        // by EAX instead of by the memory operand and survive every register battery.
+        vec![0xf7, 0x35, 0x00, 0x50, 0x00, 0x00],
+        vec![0xf7, 0x3d, 0x00, 0x50, 0x00, 0x00],
+        // 66-prefixed DIV/IDIV r/m16, pinning the OperandSize::Word allowlist for /6 and /7 the
+        // way the two entries above pin it for /3 and /4. A 16-bit DIV divides DX:AX and writes
+        // only the low halves of EAX and EDX, so the 32-bit lowering would clobber both.
+        vec![0x66, 0xf7, 0xf3],
+        vec![0x66, 0xf7, 0xfb],
     ] {
         assert!(
             compile_leading_block(&code).is_none(),
@@ -2107,6 +2117,19 @@ fn group3_dword_neg_register_form_is_lowered() {
         Some(3),
         "NEG EBX must admit and carry the whole three-slot block"
     );
+    // The F7 slice's three. Their differential cover is `cpu_jit_f7_group_test.rs`; what this
+    // pins is ADMISSION, which is what the negative list above would otherwise be silent about.
+    for (code, name) in [
+        ([0xf7u8, 0xebu8], "IMUL EBX"),
+        ([0xf7, 0xf3], "DIV EBX"),
+        ([0xf7, 0xfb], "IDIV EBX"),
+    ] {
+        assert_eq!(
+            compile_leading_block(&code),
+            Some(3),
+            "{name} must admit and carry the whole three-slot block"
+        );
+    }
 }
 
 fn warm_exact_poll(

@@ -198,6 +198,11 @@ pub(crate) struct DirectStallTally {
     /// The two halves the old `SideExitReason::Other` counter conflated.
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
+    /// Lowered DIV/IDIV guard refusals. Always-on evidence that the guard is COLD: a
+    /// divide-by-zero is a crash on a healthy guest, so a nonzero count is either a fault the
+    /// guest handles or the conservative divisor == -1 arm, and the ratio against
+    /// `jit_direct_insns` is what says whether that arm ever needs an exact form.
+    pub side_exit_divide_guard: u64,
     /// The two interpreter call-out exit shapes, split because they mean opposite things: a step
     /// break is the mechanism working (a port touched device state, the run ends where an
     /// interpreted continuation would), an abnormal is the helper refusing and the interpreter
@@ -2403,11 +2408,17 @@ pub(crate) enum SideExitReason {
     /// which is exactly where `run_straight_line`'s post-instruction `requires_step_break` check
     /// ends an interpreted continuation.
     CallOutStepBreak = 9,
+    /// A lowered DIV or IDIV refused its operands. The guard fires on a superset of the
+    /// interpreter's #DE conditions, the run ends AT the instruction with nothing done, and the
+    /// interpreter re-executes it -- delivering #DE where the guest's rules say it must. A
+    /// per-EXECUTION property of the data like `X87Eligibility`, not a per-compile property of
+    /// the address, so it can fire on a block that will never bind differently.
+    DivideGuard = 10,
 }
 
 impl SideExitReason {
     /// The largest discriminant emitted code can store, for the `run.rs` bound assertion.
-    pub(crate) const MAX: u32 = Self::CallOutStepBreak as u32;
+    pub(crate) const MAX: u32 = Self::DivideGuard as u32;
 }
 
 #[repr(u32)]
@@ -2768,6 +2779,28 @@ pub(crate) enum DirectKind {
     /// excludes 0xF7, so a 66-prefixed form cannot reach the classify arm.
     ImulMemAcc {
         addr: DirectAddr,
+    },
+    /// IMUL r/m32, one-operand SIGNED multiply, REGISTER form (0xF7 /5) -- the sibling
+    /// `ImulMemAcc` is named after. Same implicit EDX:EAX destination, and no `raw_clocks` and no
+    /// `width` field for exactly the reasons that variant gives.
+    ImulRegAcc {
+        src: u8,
+    },
+    /// DIV (0xF7 /6) and IDIV (0xF7 /7) r/m32, REGISTER form; `signed` selects IDIV.
+    ///
+    /// The only lowered kind whose instruction can raise #DE, and it never raises one on the
+    /// HOST: `emit_div_reg` guards a superset of the interpreter's fault set and side-exits with
+    /// the instruction UN-STARTED, so the interpreter re-executes it and faults by its own rules.
+    /// Read that function before touching this. Carries no `raw_clocks` field: group 3 charges
+    /// `clocks(2)` for every sub-opcode, which is the `_ => 2` default -- the `ImulMemAcc`
+    /// situation, not the `ImulMem` one.
+    ///
+    /// ONE variant with a flag where the encoder keeps `div_r32` and `idiv_r64` apart, because
+    /// here the flag reaches a `match` whose two arms are separately emitted and separately
+    /// tested; there, it would have been one character inside a shared body.
+    DivReg {
+        src: u8,
+        signed: bool,
     },
     TestImmReg {
         dst: u8,

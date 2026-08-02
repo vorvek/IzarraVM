@@ -426,6 +426,30 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             }
             DirectKind::NegReg { dst } => emit_neg_reg(&mut e, dst),
             DirectKind::MulReg { src } => emit_mul_reg(&mut e, src),
+            DirectKind::ImulRegAcc { src } => emit_imul_reg_acc(&mut e, src),
+            // ONE side exit, and it is the divide guard rather than a memory reason: the operands
+            // are registers, so nothing here can fault on an address. The guard fires BEFORE any
+            // home or flag is written, so the exit leaves the instruction un-started -- the same
+            // contract `X87Eligibility` has, and for the same kind of reason (a property of the
+            // data, not of the address).
+            DirectKind::DivReg { src, signed } => {
+                let side = e.label();
+                let guard = e.label();
+                emit_div_reg(&mut e, src, signed, guard);
+                side_exit_reason_stubs.push((guard, side, SideExitReason::DivideGuard));
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
             DirectKind::TestImmReg { dst, imm, width } => {
                 emit_test_imm_reg(&mut e, dst, imm, width);
             }
@@ -4130,6 +4154,133 @@ fn emit_mul_reg(e: &mut Encoder, src: u8) {
     emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
     emit_clear_pending(e);
+}
+
+/// IMUL r/m32, one-operand SIGNED multiply, register form (0xF7 /5).
+///
+/// `emit_mul_reg`'s body with the SIGNED primitive, and the two are written out separately for
+/// the reason `mul_r32` and `imul_r32` are: the overflow rules differ (the full product failing
+/// to sign-extend back from the low half, against the high half being nonzero), so a shared body
+/// parameterised on the sub-opcode would make picking the wrong one a one-character edit.
+///
+/// The operand shuffle carries the same `src == 0` / `src == 2` argument `emit_mul_reg` states:
+/// the multiplicand is read out of its home AFTER RAX is loaded and BEFORE either home is
+/// written, and no home is RAX or RDX, so a `IMUL EAX` or an `IMUL EDX` still reads the
+/// pre-instruction value.
+fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
+    e.mov_r32_r32(Reg::RAX, home(0));
+    e.imul_r32(home(src));
+    e.mov_r32_r32(home(0), Reg::RAX);
+    e.mov_r32_r32(home(2), Reg::RDX);
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+}
+
+/// DIV (0xF7 /6) and IDIV (0xF7 /7) r/m32, register form.
+///
+/// # Keeping #DE out of the host
+///
+/// This is the only lowering whose guest instruction has an architectural fault, and the fault is
+/// raised by the HOST divide instruction rather than by a guard we choose to run. A guest divide
+/// that reached a host `div` with a zero divisor would raise a host #DE on the JIT stack --
+/// SIGFPE / EXCEPTION_INT_DIVIDE_BY_ZERO inside the emulator process, not a guest fault. So the
+/// whole design is: prove the host divide cannot fault, then run it.
+///
+/// The guard may be CONSERVATIVE but never permissive. A side exit ends the native run AT this
+/// instruction with nothing done, and the interpreter re-executes it whole -- raising #DE by its
+/// own rules if that is what the guest's operands call for. So the guard has to be a SUFFICIENT
+/// condition for the host divide's safety, and only its cost argues for making it tight.
+///
+/// ## DIV (/6): the guard is EXACTLY the interpreter's fault set
+///
+/// `cmp edx, ecx; jae exit` before a 32-bit `div ecx` covers both of `CpuGsw::div`'s unsigned
+/// error returns and nothing else:
+///
+/// * divisor zero -- `edx >= 0` is unsigned-true for every EDX, so a zero divisor ALWAYS exits.
+///   The zero test is subsumed rather than omitted.
+/// * quotient overflow -- the interpreter's rule is `EDX:EAX / divisor > 0xffff_ffff`, and that
+///   holds if and only if `EDX >= divisor`. Forward: `EDX >= divisor` gives
+///   `EDX*2^32 + EAX >= divisor*2^32`, so the quotient is at least 2^32. Backward:
+///   `EDX <= divisor - 1` gives `EDX*2^32 + EAX <= (divisor-1)*2^32 + (2^32 - 1)
+///   = divisor*2^32 - 1 < divisor*2^32`, so the quotient is at most 2^32 - 1.
+///
+/// It is also the condition the host `div` itself faults on, which is the point.
+///
+/// ## IDIV (/7): divide at SIXTY-FOUR bits, then compare
+///
+/// A host 32-bit `idiv` faults on exactly the quotient-overflow case the guest defines, and there
+/// is no cheap exact predicate for it on the operands. At 64 bits there is no predicate to find:
+/// with `|divisor| >= 2` the quotient is at most `|dividend| / 2 <= 2^62`, so `idiv rcx` cannot
+/// overflow, and the guest's own 32-bit range rule becomes a COMPARISON on the answer. That is
+/// also a transliteration of the interpreter, which computes `i64 / i64` and then range-checks --
+/// so the quotient and the remainder agree by construction rather than by a re-derivation.
+///
+/// Three guards, in order:
+///
+/// 1. `divisor == 0` -- the interpreter's first error return, and the host's first fault.
+/// 2. `divisor == -1` -- CONSERVATIVE, and the only place this function refuses more than the
+///    interpreter faults on. It exists to remove `i64::MIN / -1`, the sole remaining 64-bit
+///    overflow, without a 64-bit immediate compare against the dividend. What it costs is a side
+///    exit on a legal `IDIV` by -1, which is a negation nothing emits; `side_exit_divide_guard`
+///    is the always-on evidence for whether that stays true, and if it ever does not, the exact
+///    form is `divisor == -1 && dividend == i64::MIN`.
+/// 3. quotient outside `i32` -- the interpreter's range check, done after the divide as
+///    `movsxd rcx, eax; cmp rax, rcx`. The divide has run by then, but it has written only RAX
+///    and RDX, which are emitter scratch, so the exit still leaves the instruction un-started.
+///
+/// # Flags
+///
+/// Both forms leave the guest's arithmetic flags ARCHITECTURALLY UNDEFINED, and `CpuGsw::div`
+/// implements that by touching neither `eflags` nor `pending_flags` -- so this emits no flag
+/// handling at all. That is not an omission: capturing the host divide's flags, or clearing the
+/// pending descriptor, would each diverge from the interpreter on a fixture that reads a lazy
+/// flag produced BEFORE the divide. The host divide does write host EFLAGS, which is harmless
+/// because the guest shadow is RBP and no block carries host flags across a slot boundary.
+fn emit_div_reg(e: &mut Encoder, src: u8, signed: bool, guard: Label) {
+    // 0x3 is the x86 above-or-equal / not-carry condition, 0x4 is zero, 0x5 is not-zero.
+    const JAE: u8 = 0x3;
+    const JE: u8 = 0x4;
+    const JNE: u8 = 0x5;
+    if signed {
+        // The divisor first and SIGN-extended: it is the one operand whose width changes.
+        e.movsxd_r64_r32(Reg::RCX, home(src));
+        // EDX:EAX assembled into RAX as one 64-bit dividend. `mov r32, r32` zero-extends, so the
+        // two halves compose with a shift and an OR rather than needing a mask.
+        e.mov_r32_r32(Reg::RAX, home(0));
+        e.mov_r32_r32(Reg::RDX, home(2));
+        // ModRM /4 is SHL.
+        e.shift_r64_imm8(4, Reg::RDX, 32);
+        e.or_r64_r64(Reg::RAX, Reg::RDX);
+        // Guard 1 and guard 2. `cmp_r64_imm32` sign-extends its immediate to 64 bits, so
+        // `u32::MAX` here is the 64-bit -1 and not 0x0000_0000_ffff_ffff.
+        e.cmp_r64_imm32(Reg::RCX, 0);
+        e.jcc(JE, guard);
+        e.cmp_r64_imm32(Reg::RCX, u32::MAX);
+        e.jcc(JE, guard);
+        // RDX still holds the shifted high half; `cqo` overwrites it with the dividend's sign,
+        // which is why the assembly above had to finish first.
+        e.cqo();
+        e.idiv_r64(Reg::RCX);
+        // Guard 3. RCX is free here -- the divisor has been consumed -- and the divide has
+        // written only RAX and RDX, so this exit is still pre-effect.
+        e.movsxd_r64_r32(Reg::RCX, Reg::RAX);
+        e.cmp_r64_r64(Reg::RAX, Reg::RCX);
+        e.jcc(JNE, guard);
+    } else {
+        e.mov_r32_r32(Reg::RCX, home(src));
+        e.mov_r32_r32(Reg::RAX, home(0));
+        e.mov_r32_r32(Reg::RDX, home(2));
+        // The whole unsigned guard, both fault conditions: see the derivation above.
+        e.alu_r32_r32(7, Reg::RDX, Reg::RCX);
+        e.jcc(JAE, guard);
+        e.div_r32(Reg::RCX);
+    }
+    // Quotient to EAX, remainder to EDX, exactly as `CpuGsw::div`'s Dword arms write them. The
+    // signed form's `edx` is the low half of a 64-bit remainder whose magnitude is below the
+    // divisor's, so the truncation is the interpreter's own `remainder as u32`.
+    e.mov_r32_r32(home(0), Reg::RAX);
+    e.mov_r32_r32(home(2), Reg::RDX);
 }
 
 fn emit_test_imm_reg(e: &mut Encoder, dst: u8, imm: u32, width: MemoryWidth) {

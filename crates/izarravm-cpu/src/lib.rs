@@ -1175,6 +1175,8 @@ pub struct DirectStallSnapshot {
     pub links_cleared: Vec<(&'static str, u64)>,
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
+    /// Lowered DIV/IDIV guard refusals. See `BlockCacheStats`.
+    pub side_exit_divide_guard: u64,
     /// Interpreter call-out exits, split by shape. See `BlockCacheStats`.
     pub side_exit_callout_step_break: u64,
     pub side_exit_callout_abnormal: u64,

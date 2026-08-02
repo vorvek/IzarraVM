@@ -862,11 +862,41 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // already the DirectKind::raw_clocks default. This is the opposite of 0x0FAF, where
                 // the interpreter charges clocks(9) and the default undercharges by 7.
                 if opcode == 0xf7 && m.reg == 5 {
-                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                    return match insn.operand? {
+                        // The REGISTER form, added by the rejected-row campaign's F7 slice. It
+                        // shares this arm with the memory form rather than sitting in its own
+                        // `if` because everything that makes the memory form correct here --
+                        // `opcode == 0xf7` excluding the byte IMUL, the position BELOW /4
+                        // excluding an unsigned multiply, the Word gate excluding a 66-prefixed
+                        // encoding -- is exactly what makes the register form correct, and
+                        // splitting them would invite one of the three to be re-derived wrongly.
+                        DecodedOperand::Reg(src) => Some(DirectKind::ImulRegAcc { src }),
+                        DecodedOperand::Mem(addr) => Some(DirectKind::ImulMemAcc {
+                            addr: direct_addr(addr)?,
+                        }),
+                    };
+                }
+                // DIV (/6) and IDIV (/7) r/m32, REGISTER form. The two are ONE arm because the
+                // emitter's two bodies are selected by `signed` and both are separately tested;
+                // what must not be widened is the pair of ENCODER primitives behind them.
+                //
+                // MEMORY is deliberately absent, and the reason is the fault rather than the
+                // address. A memory DIV can side-exit for two independent reasons -- the read's
+                // own guards and the divide guard -- at the same slot, and the second must not be
+                // reachable before the first has been proved not to fire. Both fixtures' memory
+                // rows are under the campaign's 100k floor (doom 28,078; quake 95,839 + 57,491),
+                // so the shape is left unbuilt rather than built untested.
+                //
+                // No `raw_clocks`: group 3 charges `clocks(2)` for every sub-opcode and both
+                // operand forms, which is the `_ => 2` default. No `width`: the `OperandSize::Word`
+                // gate at the top of `classify` excludes 0xf7, exactly as for `MulReg`.
+                if opcode == 0xf7 && matches!(m.reg, 6 | 7) {
+                    let DecodedOperand::Reg(src) = insn.operand? else {
                         return None;
                     };
-                    return Some(DirectKind::ImulMemAcc {
-                        addr: direct_addr(addr)?,
+                    return Some(DirectKind::DivReg {
+                        src,
+                        signed: m.reg == 7,
                     });
                 }
                 if m.reg != 0 {
