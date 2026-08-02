@@ -57,15 +57,49 @@
 //! sit at their own address and BOTH roles step them interpreted, so the native role's descriptor
 //! is the one driving its `SETO`/`SETS`.
 //!
-//! The two tests are deliberately split so the mutation fails twice, on different assertions:
-//! `..._matches_the_interpreter` owns the raw `pending_flags` compare and fails on `lazy flags`,
-//! `..._leaves_behind_...` excludes it and fails on `registers`, i.e. on a guest-visible byte.
+//! The two pairs of tests are deliberately split so the mutation fails on two different KINDS of
+//! assertion: `..._matches_the_interpreter` compares the architectural flag word at the block exit,
+//! `..._leaves_behind_...` compares nothing flag-shaped until an interpreted instruction has read
+//! the descriptor, so its failure is a guest-visible BYTE.
 //!
-//! Mutation record. Applied by hand, observed against the WHOLE crate, and restored.
+//! ## Mutation record
 //!
-//! | mutation | caught by | assertion |
-//! |---|---|---|
-//! | `emit_pending_inc_dec`'s Word `width_tag` -> `0x200` | both tests, every SF/OF row | see the two tests' doc comments |
+//! `emit_pending_inc_dec`'s Word `width_tag` -> `0x200`, applied by hand, run against the WHOLE
+//! crate (never a filter -- a filtered run is what let this survive in the first place), and
+//! restored. **4 failed, 1324 passed**, and the 1324 is exactly the pre-addition baseline, so the
+//! blast radius is these four tests and nothing else in the crate.
+//!
+//! All four fail first on the `0x7fff` INC row, which is the one that moves SF and OF together.
+//! Verbatim, the first assertion each produced:
+//!
+//! ```text
+//! the_word_memory_inc_dec_descriptor_matches_the_interpreter
+//! assertion `left == right` failed: inc word [0x3010] operand=0x7fff cf=0 pending=false: EFLAGS
+//!   left: 534
+//!  right: 2710
+//!
+//! the_word_register_inc_dec_descriptor_matches_the_interpreter
+//! assertion `left == right` failed: inc r16 dst=0 operand=0x7fff cf=0 pending=false: EFLAGS
+//!   left: 534
+//!  right: 2710
+//!
+//! the_descriptor_a_word_memory_inc_dec_leaves_behind_drives_the_next_flag_reader
+//! assertion `left == right` failed: inc word [0x3010] operand=0x7fff cf=0 -> readers: after the
+//! readers: registers
+//!
+//! the_descriptor_a_word_register_inc_dec_leaves_behind_drives_the_next_flag_reader
+//! assertion `left == right` failed: inc r16 dst=0 operand=0x7fff cf=0 -> readers: after the
+//! readers: registers
+//! ```
+//!
+//! 534 is `0x216` and 2710 is `0xa96`: the interpreter has SF (bit 7) and OF (bit 11) and the
+//! mutated native role has neither, with PF, AF and IF identical in both. That is the prediction
+//! above, confirmed -- and note that CF and ZF do NOT appear, which is why a row chosen for ZF
+//! would have passed under the mutation.
+//!
+//! The two `registers` failures are the same fact one instruction later: EBX and EDX come back
+//! `0xdead_0000` on the native role against `0xdead_0001` on the interpreter, i.e. `seto bl` and
+//! `sets dl` each wrote a 0 where the guest defines a 1.
 
 use super::*;
 
@@ -413,7 +447,7 @@ fn operands(is_dec: bool) -> &'static [u16] {
 // ---------------------------------------------------------------------------------------------
 
 /// Under the `0x200` mutation this fails first at
-/// `inc word [0x3010] operand=0x7fff cf=0 pending=false: lazy flags`.
+/// `inc word [0x3010] operand=0x7fff cf=0 pending=false: EFLAGS`, 534 against 2710.
 #[test]
 fn the_word_memory_inc_dec_descriptor_matches_the_interpreter() {
     for is_dec in [false, true] {
@@ -431,7 +465,9 @@ fn the_word_memory_inc_dec_descriptor_matches_the_interpreter() {
                     lowered(
                         &body,
                         seed,
-                        &format!("{name} word [{OPERAND:#x}] operand={operand:#06x} cf={cf} pending={pending}"),
+                        &format!(
+                            "{name} word [{OPERAND:#x}] operand={operand:#06x} cf={cf} pending={pending}"
+                        ),
                     );
                 }
             }
@@ -441,7 +477,8 @@ fn the_word_memory_inc_dec_descriptor_matches_the_interpreter() {
 
 /// Under the `0x200` mutation this fails first at
 /// `inc word [0x3010] operand=0x7fff cf=0 -> readers: after the readers: registers`, with the
-/// native role's EBX holding `0xdead_00a3` (SETO wrote 0) against the interpreter's `0xdead_0001`.
+/// native role's EBX and EDX holding `0xdead_0000` (SETO and SETS each wrote a 0) against the
+/// interpreter's `0xdead_0001`.
 #[test]
 fn the_descriptor_a_word_memory_inc_dec_leaves_behind_drives_the_next_flag_reader() {
     for is_dec in [false, true] {
@@ -470,7 +507,7 @@ fn the_descriptor_a_word_memory_inc_dec_leaves_behind_drives_the_next_flag_reade
 /// on the descriptor.
 ///
 /// Under the `0x200` mutation this fails first at
-/// `inc r16 dst=0 operand=0x7fff cf=0 pending=false: lazy flags`.
+/// `inc r16 dst=0 operand=0x7fff cf=0 pending=false: EFLAGS`, 534 against 2710.
 #[test]
 fn the_word_register_inc_dec_descriptor_matches_the_interpreter() {
     for is_dec in [false, true] {
@@ -501,7 +538,7 @@ fn the_word_register_inc_dec_descriptor_matches_the_interpreter() {
 }
 
 /// Under the `0x200` mutation this fails first at
-/// `inc r16 dst=0 operand=0x7fff cf=0 -> readers: after the readers: registers`.
+/// `inc r16 dst=0 operand=0x7fff cf=0 -> readers: after the readers: registers`, EBX and EDX again.
 #[test]
 fn the_descriptor_a_word_register_inc_dec_leaves_behind_drives_the_next_flag_reader() {
     for is_dec in [false, true] {

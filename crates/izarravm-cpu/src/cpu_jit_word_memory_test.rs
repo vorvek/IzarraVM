@@ -91,6 +91,11 @@
 //! flagged for its own change rather than fixed in passing. It is written down because the two
 //! tables are byte-identical for four lines and the next person to mutate one will land on the
 //! wrong one exactly as this did.
+//!
+//! **CLOSED** by `cpu_jit_word_inc_dec_test.rs`, and the verdict there is worth carrying back: the
+//! emitted code was CORRECT and only unmeasured, so that file is a pure test addition and no
+//! emitted byte moved. The same mutation now fails four tests and passes 1324, the exact
+//! pre-addition baseline.
 
 use super::*;
 
