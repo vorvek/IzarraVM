@@ -2119,6 +2119,11 @@ fn group3_dword_neg_register_form_is_lowered() {
     );
     // The F7 slice's three. Their differential cover is `cpu_jit_f7_group_test.rs`; what this
     // pins is ADMISSION, which is what the negative list above would otherwise be silent about.
+    //
+    // Note what the fixture's shape says on top of that: `compile_leading_block` puts the tested
+    // opcode at the block's ENTRY slot, so this is also the standing demonstration that a `DivReg`
+    // can be slot 0 in production. A guard exit there retires zero instructions with EIP unmoved;
+    // `emit_div_reg`'s "guard exit at the block's ENTRY slot" note carries the liveness argument.
     for (code, name) in [
         ([0xf7u8, 0xebu8], "IMUL EBX"),
         ([0xf7, 0xf3], "DIV EBX"),

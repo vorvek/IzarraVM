@@ -4237,6 +4237,36 @@ fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
 /// pending descriptor, would each diverge from the interpreter on a fixture that reads a lazy
 /// flag produced BEFORE the divide. The host divide does write host EFLAGS, which is harmless
 /// because the guest shadow is RBP and no block carries host flags across a slot boundary.
+///
+/// # A guard exit at the block's ENTRY slot, and what stops it looping
+///
+/// Recorded because it is the one shape of this exit that is not obviously terminating, and
+/// because what saves it is machinery that predates this slice and could be "tidied" away by
+/// someone who does not know anything depends on it.
+///
+/// A `DivReg` really can be a block's FIRST slot in production -- nothing in `classify` or the
+/// compile loop prevents it, and `compile_leading_block(&[0xf7, 0xf3])` builds exactly that. A
+/// guard exit there retires ZERO instructions and leaves EIP where it entered, so on its own it
+/// would re-dispatch the same block, refuse again, and never make progress.
+///
+/// TWO independent mechanisms stop that, and BOTH are needed because each covers a case the
+/// other does not:
+///
+/// * **Mid-run.** The exit reports `DirectBlockOutcome::Prefix` (run.rs, the `if side_exit` tail
+///   of `run_direct_block`), which becomes `DirectContinuation::Prefix` and sets
+///   `direct_runtime.skip_direct_once`. The next loop iteration's admission gate consumes that
+///   latch with a `mem::take` and returns `ContinuationDispatch::Skipped`, so the INTERPRETER
+///   executes the divide -- and raises #DE if the operands call for it.
+/// * **At a run boundary.** `run_budgeted_inner` clears `skip_direct_once` on entry, so a guard
+///   exit that ends a run does not carry its latch forward. It does not need to: that loop's
+///   `first` flag always interprets a run's first instruction, and the Direct dispatcher is only
+///   consulted on continuations.
+///
+/// This is not new with DIV -- any slot-0 side exit has the same shape, and a memory guard on an
+/// entry-slot `Load` reaches it today. What IS new is that this is the first exit reason that is
+/// a pure property of the DATA with no address component, so it can fire on a block that will
+/// never bind differently, arbitrarily often. That makes the liveness argument worth stating
+/// where the guard is rather than leaving it implicit in the run loop.
 fn emit_div_reg(e: &mut Encoder, src: u8, signed: bool, guard: Label) {
     // 0x3 is the x86 above-or-equal / not-carry condition, 0x4 is zero, 0x5 is not-zero.
     const JAE: u8 = 0x3;
