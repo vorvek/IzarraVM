@@ -579,11 +579,22 @@ impl CompiledBlock {
         u32::from(self.raw_clocks)
     }
 
-    /// How many interpreter call-out slots this block carries, of any class. The
-    /// `MAX_BLOCK_CALLOUT_SLOTS` budget bound counts THIS; the two class splits below are what
-    /// `compute_iteration_upper` prices, because a port slot and a memory slot cost wildly
-    /// different amounts of bus traffic and pricing both at the worst of the two would inflate
-    /// every doom port block by eight dword accesses it cannot make.
+    /// How many interpreter call-out slots this block carries, of any class.
+    ///
+    /// TEST-ONLY, and the gate is the point rather than tidiness. Nothing in the budget path reads
+    /// this: `compute_iteration_upper` prices the two CLASS splits below, because a port slot and
+    /// a memory slot cost wildly different amounts of bus traffic and pricing both at the worst of
+    /// the two would inflate every doom port block by eight dword accesses it cannot make; and the
+    /// `MAX_BLOCK_CALLOUT_SLOTS` cap is applied during the compile walk, against a local, before a
+    /// `CompiledBlock` exists. Its one live caller is `invoke_native_entry`'s trap guard
+    /// (`cpu_jit_direct_execution_test.rs`), which refuses to enter a call-out-bearing block
+    /// through a path that does not publish `CpuGsw::native_callout`.
+    ///
+    /// It is a DERIVED value -- `port() + memory()` -- so it can never disagree with the split it
+    /// sums, and an assertion comparing the two is vacuous. The place that can genuinely notice a
+    /// classless slot is `BlockCache::install`, where the compile walk's independently accumulated
+    /// total is still in hand.
+    #[cfg(test)]
     pub(crate) fn callout_slots(&self) -> u32 {
         self.callout_slots.total()
     }

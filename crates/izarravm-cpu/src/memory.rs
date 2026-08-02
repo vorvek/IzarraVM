@@ -258,9 +258,18 @@ impl CpuGsw {
     ///   is refused rather than mirrored. No fixture and no 32-bit persona reaches it.
     /// * `fast_map_serve_enabled` — without it `write_linear_fragment` falls to `translate_linear`,
     ///   which is the page walk this exists to exclude.
-    /// * `esp` 4-aligned — makes every one of the eight accesses 4-aligned, which is simultaneously
-    ///   what `lookup_access` requires, what keeps each dword page-local (so the paged cross-page
-    ///   splitter is unreachable), and what makes `check_alignment`'s CPL-3 `#AC` unreachable.
+    /// * `esp` 4-aligned — this clause covers `check_alignment`'s CPL-3 `#AC` and NOTHING ELSE.
+    ///   It does NOT establish that the eight accesses are 4-aligned in LINEAR space, and an
+    ///   earlier version of this comment claimed it did: `segment_linear_range` adds
+    ///   `descriptor.base`, so an SS with base 2 and ESP 0x1000 puts the first slot at linear
+    ///   0xFFE, which is neither 4-aligned nor page-local. What actually excludes that -- and the
+    ///   paged cross-page splitter behind it -- is `FastMap::lookup_access` itself, which rejects
+    ///   `linear & 3 != 0` and `offset + width > PAGE_SIZE` before it looks at anything else
+    ///   (jit/fast_map.rs). **Those two rejections are load-bearing for this pre-check, not
+    ///   incidental to it.** Removing them as redundant -- they look redundant from the emitted
+    ///   store's side, which guards alignment itself -- would let a based-SS frame reach
+    ///   `write_memory_bus_width` unaligned, take `write_paged_cross_page`, and split into
+    ///   fragments this function never proved resident.
     /// * `segment_linear_range` per slot — the SS limit and the writability of the descriptor, the
     ///   same call `push`/`pop` will make, evaluated for every slot including the ones an ESP WRAP
     ///   sends to the far end of the address space. Wrapping is not special-cased: the offsets are

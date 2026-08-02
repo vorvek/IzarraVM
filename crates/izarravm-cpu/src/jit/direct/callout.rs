@@ -388,6 +388,11 @@ impl CallOutSlotCounts {
         u32::from(self.0 >> 4)
     }
 
+    /// The two counts summed. TEST-ONLY, and gated for the same reason
+    /// `CompiledBlock::callout_slots` is: nothing in the budget path reads a total, because
+    /// `compute_iteration_upper` prices the two classes separately, and asserting this against the
+    /// pair it sums is vacuous. See that accessor's comment for where the real check lives.
+    #[cfg(test)]
     pub(super) fn total(self) -> u32 {
         self.port() + self.memory()
     }

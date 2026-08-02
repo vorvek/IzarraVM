@@ -1395,12 +1395,20 @@ impl CpuGsw {
         // worst any block can present, and it dominates `compute_iteration_upper`'s
         // `memory_slots * CALL_OUT_STACK_FRAME_DWORDS * dword_data_upper` term by construction
         // (`memory_slots <= MAX_BLOCK_CALLOUT_SLOTS`, and `max_store` is the max over every width
-        // and both the RAM and Mode13h dials, so it is `>= dword_data_upper`). Folding it into the
-        // per-instruction term instead would multiply it by `MAX_BLOCK_INSTRUCTIONS` -- 256
-        // store-costs of headroom rather than 32 -- and this bound DIVIDES the run's remaining
-        // budget to pick the chain quota, so inflating it shortens every chain in the cache,
-        // call-out-bearing or not. A bound that over-dominates is a throughput bug the same way an
-        // under-dominating one is a correctness bug.
+        // and both the RAM and Mode13h dials, so it is `>= dword_data_upper`). Per instruction
+        // would multiply it by `MAX_BLOCK_INSTRUCTIONS` -- 256 store-costs of headroom rather than
+        // 32 -- for a term whose whole job is to be the smallest value that still dominates.
+        //
+        // What that choice does NOT buy, corrected by review because the first version of this
+        // comment claimed it did: this bound does not throttle anything. `global_block_upper` is
+        // read at exactly two places (`run_direct_block`), the memo store and the
+        // `debug_assert!(per_hop_estimate <= global_block_upper)` beside it. The chain quota's
+        // DIVISOR is `per_hop_estimate`, which is `iteration_upper` -- the block's own cost -- and
+        // has been since the per-hop re-pricing landed. So in a release build inflating this eight
+        // times over would change no guest-visible behaviour at all; it would only make the debug
+        // assertion weaker. Keeping it tight is hygiene, not throughput: the assertion is the only
+        // thing standing between a future budget term and a silently unbounded hop, and a bound
+        // with 8x slack in it stops catching the thing it exists to catch.
         //
         // Zero for the x87 class, and that is the same by-construction fact the core term uses:
         // x87 and call-out slots never share a block (the compile walk refuses the mix in either
@@ -1451,12 +1459,16 @@ impl CpuGsw {
         // Every call-out slot belongs to exactly ONE class, so the two class terms below cover the
         // whole population. A helper that was neither -- the shape a fourth `CallOutHelper` takes
         // if someone adds it without choosing a class -- would be charged NOTHING here and would
-        // silently under-budget its block. This is the only place that could notice, so it does.
-        debug_assert_eq!(
-            block.callout_port_slots() + block.callout_memory_slots(),
-            block.callout_slots(),
-            "a call-out slot belongs to neither the port class nor the memory class"
-        );
+        // silently under-budget its block.
+        //
+        // That invariant is checked at `BlockCache::install` (jit/direct.rs) and NOT here, and the
+        // difference is whether the check can fail. Install compares the two class counts against
+        // `Compilation::callout_slots`, which the compile walk accumulates INDEPENDENTLY from
+        // `kind.is_call_out()` while the class counts come from `kind.call_out_helper()` -- two
+        // derivations, so they can disagree. Any check at this level cannot: `CompiledBlock` stores
+        // only the packed pair and `callout_slots()` is defined as `port() + memory()`, so
+        // asserting their sum against it compares a value with itself. A `debug_assert_eq!` doing
+        // exactly that shipped here and was deleted by review; do not reintroduce it.
         // CALL-OUT DOMINANCE. A call-out slot's charge is RUNTIME, so `block.raw_clocks()` --
         // which is the sum of the baked per-kind constants -- does not contain it and the bound
         // would not cover it.
@@ -1803,8 +1815,14 @@ impl CpuGsw {
                 // by MAX_CHAIN_BLOCKS hops of (real hop cost - entry cost); `brk_cap` and the
                 // scaled-bus term still end the run, one block late instead of 10-40x early.
                 //
-                // `global_block_upper` stays live below as the x87 crossing guard's input and as
-                // the memoised two-entry table; only the divisor changes here.
+                // `global_block_upper` stays live below as the memoised two-entry table and as the
+                // input to the `debug_assert!` on the next line, and as NOTHING ELSE -- those two
+                // are its complete consumer set. An earlier version of this comment also called it
+                // "the x87 crossing guard's input"; that consumer does not exist and the claim was
+                // deleted by review. The practical consequence is worth stating where someone
+                // tuning `compute_global_block_upper` will read it: in a RELEASE build that
+                // function's result is dead except for the memo, so changing it moves no guest
+                // number and no wall number. Only the divisor below does.
                 let per_hop_estimate = iteration_upper.max(1);
                 debug_assert!(per_hop_estimate <= global_block_upper.max(1));
                 let additional = available
