@@ -45,6 +45,11 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "direct_map_invalidations",
     "direct_page_hits",
     "direct_page_misses",
+    "fast_map_wipes_a20",
+    "fast_map_wipes_admission",
+    "fast_map_wipes_direct_data_map",
+    "fast_map_wipes_direct_map",
+    "fast_map_wipes_tlb_flush",
     "fetch_page_hits",
     "fetch_page_misses",
     "flag_materializations",
@@ -117,6 +122,10 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "poll_skip_spans",
     "rep_string_fast_iterations",
     "rep_string_iterations",
+    "rmw_census_enabled",
+    "rmw_census_reads",
+    "rmw_census_rmw_pairs",
+    "rmw_census_writes",
     "slow_prefetch_refills",
     "smc_heat_chunks_hot",
     "smc_heat_demotions",
@@ -365,11 +374,28 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         hits: 113,
         misses: 114,
     };
+    // Built field by field, never from `default()`: `census_enabled` reads the environment, so a
+    // `default()` here would make the assertions depend on whether the census happens to be
+    // armed in the shell that runs the test.
+    let fast_map_audit = izarravm_cpu::FastMapAuditCounters {
+        wipes_direct_map: 115,
+        wipes_direct_data_map: 116,
+        wipes_a20: 117,
+        wipes_tlb_flush: 118,
+        wipes_admission: 119,
+        census_reads: 120,
+        census_writes: 121,
+        census_rmw_pairs: 122,
+        census_enabled: true,
+        last_read_insn: 0,
+        last_read_page: u32::MAX,
+    };
 
     let report = bench::perf_counters_json(
         &perf,
         izarravm_cpu::PollSkipMemoryCounters::default(),
         fast_map_probe,
+        fast_map_audit,
     );
     let object = report.as_object().unwrap();
     let keys: Vec<_> = object.keys().map(String::as_str).collect();
@@ -387,6 +413,15 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         ("monitor_resident_core_clocks", 111),
         ("interp_fast_map_hits", 113),
         ("interp_fast_map_misses", 114),
+        ("fast_map_wipes_direct_map", 115),
+        ("fast_map_wipes_direct_data_map", 116),
+        ("fast_map_wipes_a20", 117),
+        ("fast_map_wipes_tlb_flush", 118),
+        ("fast_map_wipes_admission", 119),
+        ("rmw_census_reads", 120),
+        ("rmw_census_writes", 121),
+        ("rmw_census_rmw_pairs", 122),
+        ("rmw_census_enabled", 1),
     ] {
         assert_eq!(
             object[key].as_u64(),
@@ -399,6 +434,11 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         &PerfCounters::default(),
         izarravm_cpu::PollSkipMemoryCounters::default(),
         izarravm_cpu::FastMapProbeCounters::default(),
+        izarravm_cpu::FastMapAuditCounters {
+            census_enabled: false,
+            last_read_page: 0,
+            ..Default::default()
+        },
     );
     let zero_object = zeros.as_object().unwrap();
     assert_eq!(zero_object.len(), PERF_COUNTER_KEYS.len());
@@ -520,6 +560,19 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
     } = izarravm_cpu::PollSkipMemoryCounters::default();
     let izarravm_cpu::FastMapProbeCounters { hits: _, misses: _ } =
         izarravm_cpu::FastMapProbeCounters::default();
+    let izarravm_cpu::FastMapAuditCounters {
+        wipes_direct_map: _,
+        wipes_direct_data_map: _,
+        wipes_a20: _,
+        wipes_tlb_flush: _,
+        wipes_admission: _,
+        census_reads: _,
+        census_writes: _,
+        census_rmw_pairs: _,
+        census_enabled: _,
+        last_read_insn: _,
+        last_read_page: _,
+    } = izarravm_cpu::FastMapAuditCounters::default();
 }
 
 #[test]

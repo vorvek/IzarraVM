@@ -1493,6 +1493,144 @@ fn fast_map_write_hit_still_invalidates_watched_code() {
     assert_eq!(bus.memory[CODE as usize], 0xcc);
 }
 
+/// The N5 read/write/RMW shape census (`IZARRAVM_RMW_CENSUS`) must count what it claims to
+/// count, because a verdict rests on the ratio it produces. Three shapes, one fixture:
+///
+/// - a plain read and a plain store on the SAME page but in DIFFERENT instructions are two
+///   accesses and ZERO read-modify-write pairs (the instruction epoch, not just the page, has to
+///   match -- otherwise every store into a page the previous instruction read would score),
+/// - a read then a store at the same address WITHIN one instruction is one pair,
+/// - a read then a store to a DIFFERENT page within one instruction is not (page equality is the
+///   condition an interleaved entry would exploit; different pages are different table indices).
+///
+/// `perf.instructions` stands in for the interpreter's instruction epoch here exactly as it does
+/// in production: it is constant for the duration of one instruction and bumped between them.
+#[cfg(feature = "jit")]
+#[test]
+fn rmw_census_counts_same_instruction_same_page_pairs_only() {
+    let mut bus = TestBus::with_memory(vec![0u8; 0x8000]);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw {
+        rmw_census_enabled: true,
+        ..Default::default()
+    };
+
+    let read = |cpu: &mut CpuGsw, bus: &mut TestBus, at: u32| {
+        cpu.read_memory_sized(
+            bus,
+            SegmentIndex::Ds,
+            at,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+    };
+    let write = |cpu: &mut CpuGsw, bus: &mut TestBus, at: u32| {
+        cpu.write_memory_sized(
+            bus,
+            SegmentIndex::Ds,
+            at,
+            OperandSize::Dword,
+            1,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+    };
+
+    // Instruction 0: read 0x3000. Instruction 1: write 0x3000. Same page, different instructions.
+    read(&mut cpu, &mut bus, 0x3000);
+    cpu.perf.instructions += 1;
+    write(&mut cpu, &mut bus, 0x3000);
+    cpu.perf.instructions += 1;
+    assert_eq!(cpu.fast_map_audit_counters().census_rmw_pairs, 0);
+
+    // Instruction 2: read then write 0x3000. One pair.
+    read(&mut cpu, &mut bus, 0x3000);
+    write(&mut cpu, &mut bus, 0x3000);
+    cpu.perf.instructions += 1;
+    assert_eq!(cpu.fast_map_audit_counters().census_rmw_pairs, 1);
+
+    // Instruction 3: read 0x3000, write 0x4000. Same instruction, different page: not a pair.
+    read(&mut cpu, &mut bus, 0x3000);
+    write(&mut cpu, &mut bus, 0x4000);
+    cpu.perf.instructions += 1;
+
+    let audit = cpu.fast_map_audit_counters();
+    assert_eq!(audit.census_rmw_pairs, 1);
+    assert_eq!(audit.census_reads, 3);
+    assert_eq!(audit.census_writes, 3);
+    assert!(audit.census_enabled);
+}
+
+/// The census must cost the default build nothing it can observe: with the gate off, not one of
+/// its three tallies moves, while the ordinary data counters prove the fixture is not vacuous.
+#[cfg(feature = "jit")]
+#[test]
+fn rmw_census_stays_silent_when_the_gate_is_off() {
+    let mut bus = TestBus::with_memory(vec![0u8; 0x8000]);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw {
+        rmw_census_enabled: false,
+        ..Default::default()
+    };
+
+    for _ in 0..4 {
+        cpu.read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            0x3000,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+        cpu.write_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            0x3000,
+            OperandSize::Dword,
+            7,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+    }
+
+    let audit = cpu.fast_map_audit_counters();
+    assert_eq!(audit.census_reads, 0);
+    assert_eq!(audit.census_writes, 0);
+    assert_eq!(audit.census_rmw_pairs, 0);
+    assert!(!audit.census_enabled);
+    assert!(
+        cpu.perf_counters().data_direct_reads > 0,
+        "fixture is vacuous"
+    );
+    assert!(
+        cpu.perf_counters().data_direct_writes > 0,
+        "fixture is vacuous"
+    );
+}
+
+/// A20 toggles and TLB flushes wipe the whole FastMap but are NOT counted by
+/// `direct_map_invalidations` -- that counter sits on only two of the five wipe sites. The N5
+/// audit exists because nothing said so; this pins the gap rather than the fix.
+#[cfg(feature = "jit")]
+#[test]
+fn fast_map_wipe_causes_split_out_the_sites_direct_map_invalidations_misses() {
+    let mut cpu = CpuGsw::default();
+    cpu.note_direct_map_changed();
+    cpu.note_direct_data_map_changed();
+    cpu.note_direct_data_map_changed();
+    cpu.note_a20_changed();
+    cpu.flush_tlb_and_code_caches();
+
+    let audit = cpu.fast_map_audit_counters();
+    assert_eq!(audit.wipes_direct_map, 1);
+    assert_eq!(audit.wipes_direct_data_map, 2);
+    assert_eq!(audit.wipes_a20, 1);
+    assert_eq!(audit.wipes_tlb_flush, 1);
+    // The pre-existing counter sees three of those five wipes and misses two.
+    assert_eq!(cpu.perf_counters().direct_map_invalidations, 3);
+}
+
 /// `fast_map_population_enabled` gates population on `mode().uses_approximate_timing()`, and
 /// `fast_map_serve_enabled` (the interpreter serve path's cached mirror of that predicate) gates
 /// entry to `fast_map_data_slot` on the SAME condition; this asserts the consequence rather than

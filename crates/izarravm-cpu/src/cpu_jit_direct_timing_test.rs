@@ -1572,8 +1572,10 @@ fn grp3_imul_neighbouring_forms_remain_interpreter_only() {
     byte_imul.extend_from_slice(&TARGET.to_le_bytes());
     let mut word_imul = vec![0x66u8, 0xf7, 0xae]; // 66 F7 /5: IMUL word [esi+disp32]
     word_imul.extend_from_slice(&TARGET.to_le_bytes());
-    let reg_imul = vec![0xf7u8, 0xe9]; // F7 /5 mod=11: the REGISTER form, 1,379 exits, not lowered
-
+    // The F7 /5 REGISTER form used to be a fourth case here. The rejected-row campaign's Slice 2
+    // lowered it (`DirectKind::ImulRegAcc`), so its admission is now pinned positively in
+    // `group3_dword_neg_register_form_is_lowered` and its behaviour in `cpu_jit_f7_group_test.rs`.
+    // The three cases left are the ones that must NOT reach either /5 arm.
     for (code, why) in [
         (
             mul_mem,
@@ -1587,7 +1589,6 @@ fn grp3_imul_neighbouring_forms_remain_interpreter_only() {
             word_imul,
             "66-prefixed word IMUL: the OperandSize::Word gate is the only thing stopping it",
         ),
-        (reg_imul, "F7 /5 register form is deliberately not lowered"),
     ] {
         let mut memory = vec![0; 0x0004_0000];
         let mut block = code.clone();

@@ -216,6 +216,12 @@ fn differential_full(
 #[path = "cpu_jit_callout_matrix_test.rs"]
 mod callout_matrix;
 
+/// The rejected-row campaign's F7 group (Slice 2). Nested here for the same reason the call-out
+/// matrix is: it wants this module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`)
+/// rather than a third copy of it.
+#[path = "cpu_jit_f7_group_test.rs"]
+mod f7_group;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a

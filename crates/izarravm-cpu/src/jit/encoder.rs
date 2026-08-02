@@ -409,6 +409,57 @@ impl Encoder {
         self.modrm(0b11, 5, src.low3());
     }
 
+    /// `div src` (F7 /6, DIV r/m32 register form: EDX:EAX / src UNSIGNED, quotient to EAX and
+    /// remainder to EDX).
+    ///
+    /// **RAISES #DE** when `src` is zero or the quotient does not fit 32 bits, and a #DE inside
+    /// emitted code is a HOST exception on the JIT stack, not a guest fault. Every caller must
+    /// prove both conditions excluded before this is reached; `emit_div_reg` carries the proof.
+    /// Written out separately from `mul_r32`/`imul_r32` for the reason those two give about each
+    /// other -- but the stakes here are higher, because picking /6 where /4 was meant is not a
+    /// wrong answer, it is a process abort.
+    pub(crate) fn div_r32(&mut self, src: Reg) {
+        self.optional_rex(false, false, false, src.ext());
+        self.bytes.push(0xF7);
+        self.modrm(0b11, 6, src.low3());
+    }
+
+    /// `idiv src` (REX.W F7 /7, IDIV r/m64 register form: RDX:RAX / src SIGNED, quotient to RAX
+    /// and remainder to RDX).
+    ///
+    /// SIXTY-FOUR bit on purpose, and it is the whole reason the guest's 32-bit IDIV can be
+    /// lowered at all. The guest's dividend is 64 bits wide (EDX:EAX) and its quotient is 32, so
+    /// a host 32-bit IDIV faults on exactly the quotient-overflow case the guest defines -- which
+    /// would have to be predicted BEFORE the divide, and there is no cheap exact predicate for it.
+    /// At 64 bits the quotient always fits whenever `|src| >= 2`, so the overflow test becomes a
+    /// COMPARISON on the answer instead of a prediction. See `emit_div_reg`.
+    ///
+    /// Still raises #DE on a zero divisor, and on `i64::MIN / -1`; both are excluded by that
+    /// function's guards.
+    pub(crate) fn idiv_r64(&mut self, src: Reg) {
+        self.rex(true, false, false, src.ext());
+        self.bytes.push(0xF7);
+        self.modrm(0b11, 7, src.low3());
+    }
+
+    /// `cqo` (REX.W 99): sign-extend RAX across RDX, the 64-bit sibling of CDQ. The dividend
+    /// preparation `idiv_r64` requires; writes no flags.
+    pub(crate) fn cqo(&mut self) {
+        self.rex(true, false, false, false);
+        self.bytes.push(0x99);
+    }
+
+    /// `movsxd dst64, src32` (REX.W 63 /r): sign-extend a 32-bit register into a 64-bit one.
+    ///
+    /// The one place a guest dword becomes a host qword with its sign intact, which is what makes
+    /// a signed 32-bit divisor and a signed 32-bit quotient comparable against 64-bit values.
+    /// Writes no flags.
+    pub(crate) fn movsxd_r64_r32(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, dst.ext(), false, src.ext());
+        self.bytes.push(0x63);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
     /// `movsx dst32, byte [base + disp8]` (0F BE /r, MOVSX r32, r/m8: SIGN-extend). The signed
     /// sibling of `movzx_r32_byte_disp8`; the two differ only in the second opcode byte, so they
     /// are written out separately rather than sharing a parameterised helper where picking the

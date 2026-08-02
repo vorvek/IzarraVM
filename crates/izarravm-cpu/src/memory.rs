@@ -495,6 +495,37 @@ impl CpuGsw {
         Ok(())
     }
 
+    /// N5 census, read half. Called only behind a call-site `rmw_census_enabled` test (the
+    /// `barrier_census_active` pattern; the recorded lesson is that a gate inside the callee
+    /// still pays for the call on every one of hundreds of millions of accesses).
+    ///
+    /// Records the linear PAGE, not the address: the FastMap bias tables are indexed by
+    /// `linear >> 12`, so page equality is exactly the condition under which an interleaved
+    /// read+write entry would turn two cache-line touches into one.
+    #[inline]
+    #[cfg(feature = "jit")]
+    fn census_note_read(&mut self, linear: u32) {
+        let audit = &mut *self.jit_direct.fast_map_audit;
+        audit.census_reads += 1;
+        audit.last_read_insn = self.perf.instructions;
+        audit.last_read_page = linear >> 12;
+    }
+
+    /// N5 census, write half. A write counts as a read-modify-write when its own instruction
+    /// already read the same linear page. `perf.instructions` is the instruction epoch: it is
+    /// incremented once per retired instruction, so it is constant across every access one
+    /// instruction makes.
+    #[inline]
+    #[cfg(feature = "jit")]
+    fn census_note_write(&mut self, linear: u32) {
+        let instructions = self.perf.instructions;
+        let audit = &mut *self.jit_direct.fast_map_audit;
+        audit.census_writes += 1;
+        if audit.last_read_insn == instructions && audit.last_read_page == linear >> 12 {
+            audit.census_rmw_pairs += 1;
+        }
+    }
+
     #[inline]
     pub(super) fn record_data_read(&mut self, kind: BusAccessKind, direct: bool) {
         if kind == BusAccessKind::DataRead {
@@ -922,6 +953,10 @@ impl CpuGsw {
         linear: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
+        #[cfg(feature = "jit")]
+        if self.rmw_census_enabled {
+            self.census_note_read(linear);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -966,6 +1001,10 @@ impl CpuGsw {
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
+        #[cfg(feature = "jit")]
+        if self.rmw_census_enabled {
+            self.census_note_write(linear);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1211,6 +1250,13 @@ impl CpuGsw {
         if width == BusWidth::Byte {
             return self.read_linear_u8(bus, linear, kind).map(u32::from);
         }
+        // AFTER the byte delegation, never before: `read_linear_u8` counts its own access, and
+        // `read_paged_cross_page` splits a straddling access into page-local fragments that each
+        // arrive here, which is exactly one FastMap probe apiece.
+        #[cfg(feature = "jit")]
+        if self.rmw_census_enabled {
+            self.census_note_read(linear);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1238,6 +1284,11 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         if width == BusWidth::Byte {
             return self.write_linear_u8(bus, linear, value as u8, kind);
+        }
+        // After the byte delegation, for the reason `read_linear_fragment` documents.
+        #[cfg(feature = "jit")]
+        if self.rmw_census_enabled {
+            self.census_note_write(linear);
         }
         #[cfg(all(
             feature = "jit",

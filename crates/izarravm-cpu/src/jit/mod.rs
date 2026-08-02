@@ -82,6 +82,14 @@ pub(crate) struct JitState {
     /// published `table_base()` and per-page addresses Direct's emitted code bakes stay
     /// stable (the inner table/page allocations never reallocate on a field move).
     pub(crate) code_watch: Box<code_watch::NativeCodeWatch>,
+    /// N5 audit instrument. It lives HERE, behind the `Box<JitState>` the CPU already owns,
+    /// rather than as a `CpuGsw` field, for one measured reason: as a by-value `CpuGsw` field the
+    /// 80-byte block moved the pinned `pending_flags` offset 4488 -> 4568, and even boxed it still
+    /// moved it to 4496 (its own 8-byte pointer). Hanging it off an allocation `CpuGsw` already
+    /// has costs zero bytes there and leaves the pin exactly where it was. Same reasoning as
+    /// `direct_barrier_census` above, and the same clone behaviour: a clone gets a fresh block.
+    /// There is no FastMap to audit without this feature, so a non-jit build reports zeros.
+    pub(crate) fast_map_audit: Box<crate::FastMapAuditCounters>,
 }
 
 impl JitState {
@@ -91,6 +99,7 @@ impl JitState {
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
+            fast_map_audit: Box::default(),
         }
     }
 }
@@ -106,6 +115,7 @@ impl Clone for JitState {
             // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone
             // produced (its clone built a new cache with a new watch).
             code_watch: Box::default(),
+            fast_map_audit: Box::default(),
         }
     }
 }
