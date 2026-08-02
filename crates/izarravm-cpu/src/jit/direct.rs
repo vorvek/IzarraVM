@@ -3358,13 +3358,21 @@ impl DirectKind {
             // but plain RAM, so no mode-13 completion is ever emitted for it and registering a
             // mode-13 lane here would make the static snapshot disagree with the dynamic count.
             //
-            // Recorded because a mutation established it and the arm reads as live: THIS WHOLE
-            // FUNCTION IS CURRENTLY INERT. `emit_return` is called with `COUNTER_ALL` at both of
-            // its sites, and the only caller of the per-block fold below is `#[cfg(test)]` with no
-            // test using it, so every arm here is a declaration rather than a gate. That predates
-            // this kind. The arm is written for the value it would carry, matching `PushMem`
-            // exactly, so re-enabling the mask cannot silently drop this kind's write lane -- but
-            // no fixture can currently observe it, and none pretends to.
+            // Recorded because a mutation initially survived here and the write-off was WRONG in
+            // the direction that would have cost a future maintainer, so both halves are stated:
+            //
+            //  * RUNTIME: this function currently gates nothing. `emit_return` is called with
+            //    `COUNTER_ALL` at both of its sites, so every lane is copied into `NativeExit`
+            //    unconditionally and dropping an arm has no runtime consequence today. That
+            //    predates this kind.
+            //  * COVERAGE: the per-block fold IS live and IS tested.
+            //    `dynamic_counter_mask_tracks_only_reachable_outputs` (jit/direct_test.rs) asserts
+            //    the exact mask for a table of kinds, and this arm now has its own row there. The
+            //    mutation survived because that table was MISSING A ROW, not because the property
+            //    was unobservable -- the same gap slice 39 closed for the x87 arms.
+            //
+            // So a dropped arm is caught at compile-time-behaviour level even while the runtime
+            // gate is disabled, which is what the arm is for.
             Self::PushMem { .. } | Self::CallMem { .. } => COUNTER_RAM_DWORD_WRITE,
             _ => 0,
         }
