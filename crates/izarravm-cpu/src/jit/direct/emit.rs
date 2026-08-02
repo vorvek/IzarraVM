@@ -8,7 +8,7 @@ use super::*;
 // call sites below resolve identically on every target.
 mod mem;
 
-use mem::{emit_push_mem, emit_rmw_inc_dec};
+use mem::{emit_call_mem, emit_push_mem, emit_rmw_inc_dec};
 
 fn stack_addr(disp: u32) -> DirectAddr {
     DirectAddr {
@@ -1382,6 +1382,84 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.mov_r32_r32(Reg::RDX, home(dst));
                 // AFTER the side exit is published, the same faulting-push invariant `Call` keeps:
                 // a faulting push must leave ESP at its pre-instruction value.
+                e.alu_r32_imm32(5, home(4), 4);
+                completed += 1;
+                completed_raw += slot.kind.raw_clocks() as u16;
+                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
+                completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
+                completed_dword_reads += slot.kind.dword_reads();
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                    x87_entry_top.is_some(),
+                );
+                terminal = true;
+                break;
+            }
+            // CALL r/m32, MEMORY form. The read half is `PushMem`'s (two `MemorySideExits`, a
+            // RAM-only source with no read completion, the same parking slot); the tail is
+            // `CallReg`'s (publish the side exit, THEN `sub esp, 4`, then the dynamic path).
+            //
+            // The CS-limit check sits INSIDE `emit_call_mem`, between the target load and the
+            // stack store, which is the only position that satisfies both orderings this
+            // instruction has to respect at once: it needs the loaded target to compare, and it
+            // must precede every guest-visible mutation so a limit side exit lets the interpreter
+            // reproduce push-then-fault from an untouched state. `CallReg` puts it first because
+            // its target needs no load; `JmpMem` puts it after its load because it never mutates.
+            DirectKind::CallMem { addr, return_delta } => {
+                let side = e.label();
+                let source_reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                let stack_reasons =
+                    MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(4))));
+                let limit = memory.segments.cs.limit;
+                let limit_exit = (limit != u32::MAX).then(|| e.label());
+                emit_call_mem(
+                    &mut e,
+                    addr,
+                    return_delta,
+                    memory,
+                    source_reasons,
+                    stack_reasons,
+                    limit_exit.map(|label| (limit, label)),
+                );
+                if let Some(limit_exit) = limit_exit {
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
+                }
+                source_reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    true,
+                    memory.cpl3,
+                    false,
+                );
+                stack_reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    true,
+                    memory.cpl3,
+                    true,
+                );
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                // AFTER the side exit is published, the same faulting-push invariant `Call`,
+                // `CallReg` and `PushMem` all keep: a faulting push leaves ESP untouched. The
+                // target is live in RDX across this and stays live: `home(4)` is a GUEST_HOMES
+                // register, never a scratch one.
                 e.alu_r32_imm32(5, home(4), 4);
                 completed += 1;
                 completed_raw += slot.kind.raw_clocks() as u16;

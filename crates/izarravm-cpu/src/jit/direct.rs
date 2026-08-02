@@ -2737,6 +2737,37 @@ pub(crate) enum DirectKind {
         dst: u8,
         return_delta: u32,
     },
+    /// CALL r/m32, MEMORY form (0xFF /2, mod != 3): one dword read at `addr` for the target, one
+    /// dword store of the return EIP to SS:[ESP-4], ESP falls by 4, then EIP becomes the value
+    /// read. Doom's largest remaining rejected census row (1,847,385 attributed exits,
+    /// 3,076,346 interpreted executions per timedemo); quake has none at any width.
+    ///
+    /// Two addresses in two different segments, exactly `PushMem`'s shape, and the emit arm shares
+    /// its mechanism down to the parking slot. What is new is the combination: this is the first
+    /// kind that both WRITES memory and takes a dynamic successor.
+    ///
+    /// Three properties are load-bearing and each is inherited from a different sibling:
+    ///
+    /// * from `PushMem`, the source read is RAM-ONLY and emits no read-completion. A mode-13
+    ///   source would bump the dynamic read count before the STORE guards below it can still side
+    ///   exit, and `run.rs`'s `dword_reads - exit.mode13_dword_reads` would underflow. Refusing
+    ///   the aperture makes that unreachable rather than merely mis-ordered.
+    /// * from `CallReg`, the CS-limit check on the target runs BEFORE any mutation. The
+    ///   interpreter pushes first and faults only on the next fetch, so a native side exit must
+    ///   leave every guest byte untouched and let the interpreter reproduce push-then-fault.
+    /// * from `JmpMem`, the operand read happens BEFORE the push, matching the interpreter's own
+    ///   order (`execute_extended.rs` group 5 arm 2 reads the operand, then pushes). It matters
+    ///   for `call dword [esp+N]`, where the push would otherwise move the address being read.
+    ///
+    /// `raw_clocks` carries an explicit 7 with the rest of the group-5 control transfers.
+    ///
+    /// The Dword gate lives in `classify`, as it does for `JmpMem`: at Word size the interpreter
+    /// reads TWO bytes and masks EIP to 16 bits. `uses_stack` additionally routes the kind through
+    /// the stack-width matrix, which has no `CallMem16` arm, so the two refusals are independent.
+    CallMem {
+        addr: DirectAddr,
+        return_delta: u32,
+    },
     X87 {
         insn: NativeX87Insn,
         addr: Option<DirectAddr>,
@@ -2926,7 +2957,8 @@ impl DirectKind {
             | Self::Call16 { .. }
             | Self::Jmp { .. }
             | Self::JmpMem { .. }
-            | Self::CallReg { .. } => 7,
+            | Self::CallReg { .. }
+            | Self::CallMem { .. } => 7,
             // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
             // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
             Self::Ret { .. } | Self::Ret16 { .. } => 10,
@@ -3066,6 +3098,7 @@ impl DirectKind {
                     | Self::Ret { .. }
                     | Self::PushMem { .. }
                     | Self::JmpMem { .. }
+                    | Self::CallMem { .. }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword),
         ) + 2 * u8::from(x87_memory_access_is(
             self,
@@ -3139,6 +3172,7 @@ impl DirectKind {
                     | Self::Call { .. }
                     | Self::CallReg { .. }
                     | Self::PushMem { .. }
+                    | Self::CallMem { .. }
             ) || matches!(
                 self,
                 Self::AluMemDest {
@@ -3318,7 +3352,20 @@ impl DirectKind {
             // subtracting the mode-13 dynamic count from the static count, so no dynamic read
             // counter is emitted. `emit_rmw_inc_dec_dword` is the precedent: it reads and writes
             // and increments only the write lane.
-            Self::PushMem { .. } => COUNTER_RAM_DWORD_WRITE,
+            // `CallMem` joins `PushMem` and not the `Call`/`CallReg` arm above. The stack store is
+            // the same dword either kind writes, but the mode-13 write and dirty bits are absent
+            // for the same reason `PushMem` lacks them: the emitted store refuses every page kind
+            // but plain RAM, so no mode-13 completion is ever emitted for it and registering a
+            // mode-13 lane here would make the static snapshot disagree with the dynamic count.
+            //
+            // Recorded because a mutation established it and the arm reads as live: THIS WHOLE
+            // FUNCTION IS CURRENTLY INERT. `emit_return` is called with `COUNTER_ALL` at both of
+            // its sites, and the only caller of the per-block fold below is `#[cfg(test)]` with no
+            // test using it, so every arm here is a declaration rather than a gate. That predates
+            // this kind. The arm is written for the value it would carry, matching `PushMem`
+            // exactly, so re-enabling the mask cannot silently drop this kind's write lane -- but
+            // no fixture can currently observe it, and none pretends to.
+            Self::PushMem { .. } | Self::CallMem { .. } => COUNTER_RAM_DWORD_WRITE,
             _ => 0,
         }
     }
@@ -3339,7 +3386,8 @@ impl DirectKind {
             | Self::TestImmMem { addr, .. }
             | Self::RmwIncDec { addr, .. }
             | Self::PushMem { addr, .. }
-            | Self::JmpMem { addr, .. } => Some(addr.segment),
+            | Self::JmpMem { addr, .. }
+            | Self::CallMem { addr, .. } => Some(addr.segment),
             Self::X87 {
                 insn,
                 addr: Some(addr),
@@ -3398,7 +3446,8 @@ impl DirectKind {
             | Self::Call { .. }
             | Self::Call16 { .. }
             | Self::CallReg { .. }
-            | Self::PushMem { .. } => Some(SegmentIndex::Ss),
+            | Self::PushMem { .. }
+            | Self::CallMem { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -3439,6 +3488,7 @@ impl DirectKind {
                 | Self::Ret16 { .. }
                 | Self::PushMem { .. }
                 | Self::CallReg { .. }
+                | Self::CallMem { .. }
         )
     }
 
@@ -3453,6 +3503,7 @@ impl DirectKind {
                 | Self::Ret16 { .. }
                 | Self::Jcc { .. }
                 | Self::CallReg { .. }
+                | Self::CallMem { .. }
         )
     }
 
@@ -4475,6 +4526,7 @@ fn compile_with_instruction_limit(
                 | DirectKind::Ret16 { .. }
                 | DirectKind::JmpMem { .. }
                 | DirectKind::CallReg { .. }
+                | DirectKind::CallMem { .. }
         )
     );
     let successors = match slots.last().map(|slot| slot.kind) {
@@ -4500,7 +4552,8 @@ fn compile_with_instruction_limit(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
             | DirectKind::JmpMem { .. }
-            | DirectKind::CallReg { .. },
+            | DirectKind::CallReg { .. }
+            | DirectKind::CallMem { .. },
         ) => [None, None],
         _ => [Some(fallthrough), None],
     };

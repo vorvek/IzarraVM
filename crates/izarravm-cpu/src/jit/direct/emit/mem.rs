@@ -346,3 +346,142 @@ pub(super) fn emit_push_mem(
 ) {
     unreachable!("direct memory lowering is x86-64-only")
 }
+
+/// CALL r/m32 through memory (0xFF /2, mod != 3). Leaves the TARGET in RDX for the caller's
+/// dynamic path; the caller emits the `sub esp, 4` after publishing the side exit.
+///
+/// Structurally `emit_push_mem` with the two halves decoupled: there, the value read from the
+/// source IS the value stored; here the source read produces the branch target and the stored
+/// value is the return EIP. Both accesses stay RAM-only for `emit_push_mem`'s reason, which is a
+/// COUNTER-ORDERING argument and not a conservatism: a mode-13 read completion increments the
+/// dynamic mode-13 read count the moment the read resolves, and the store guards below can still
+/// side exit afterwards, at which point `run.rs`'s `dword_reads - exit.mode13_dword_reads`
+/// underflows. `DirectKind::CallMem`'s `dynamic_counter_mask` registers only the RAM write lane,
+/// which is what makes that static/dynamic pair close.
+///
+/// The two accesses take DIFFERENT address wraps, again as in `emit_push_mem`: the operand takes
+/// the block's `memory.address_wrap` (Word whenever CS.D is 0), the stack cell takes `None`
+/// because the stack-width matrix has already restricted this kind to a 32-bit stack.
+///
+/// `cs_limit` is `Some` only for a finite CS limit. Its check runs between the target load and the
+/// first store, the single position that is both after the value exists and before any guest byte
+/// moves.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_call_mem(
+    e: &mut Encoder,
+    addr: DirectAddr,
+    return_delta: u32,
+    memory: MemoryEmitContext,
+    source_sides: MemorySideExits,
+    stack_sides: MemorySideExits,
+    cs_limit: Option<(u32, Label)>,
+) {
+    let map = memory.map.expect("native call-mem has fast-map bases");
+    let code_watch_tables = memory
+        .code_watch_tables
+        .expect("native call-mem has code-watch tables");
+
+    // The SOURCE read: the branch target. RAM only, and no read-completion counter.
+    emit_segmented_linear_address(
+        e,
+        addr,
+        MemoryWidth::Dword,
+        memory,
+        source_sides,
+        memory.address_wrap,
+    );
+    emit_wide_page_guard(e, MemoryWidth::Dword, source_sides.cross_page_or_alignment);
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+    // The masked KIND goes to RDI; RDX keeps the RAW flags byte for the permission check.
+    e.mov_r32_r32(Reg::RDI, Reg::RDX);
+    e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
+    e.jnz(source_sides.unavailable_or_kind);
+    // As in `emit_push_mem`, this is a privilege check and not bookkeeping: without it a ring-3
+    // `call dword [supervisor_page]` would read supervisor memory natively.
+    emit_read_permission_check(e, memory.cpl3, source_sides.permission);
+    emit_read_pointer(e, map, source_sides.unavailable_or_kind);
+    e.load_r32_disp8(Reg::RDI, Reg::RDI, 0);
+    // BEFORE the store, so a limit refusal leaves the guest byte-for-byte untouched and the
+    // interpreter's re-run reproduces the interpreter's own push-then-fault-on-next-fetch order.
+    if let Some((limit, limit_exit)) = cs_limit {
+        e.cmp_r32_imm32(Reg::RDI, limit);
+        e.jcc(7, limit_exit);
+    }
+    // Park it: the stack store's address and kind path clobbers RAX, RCX, RDX and RDI.
+    e.store_r64_disp32(Reg::RSP, STACK_PUSH_MEM_VALUE, Reg::RDI);
+
+    // The STACK write of the return EIP at SS:[ESP-4]. RAM only.
+    emit_segmented_linear_address(
+        e,
+        stack_addr(0u32.wrapping_sub(4)),
+        MemoryWidth::Dword,
+        memory,
+        stack_sides,
+        AddressWrap::None,
+    );
+    emit_wide_page_guard(e, MemoryWidth::Dword, stack_sides.cross_page_or_alignment);
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.mov_r32_r32(Reg::RDI, Reg::RDX);
+    e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
+    e.jnz(stack_sides.unavailable_or_kind);
+    emit_write_permission_check(e, memory.cpl3, stack_sides.permission);
+    emit_watched_store_guard(
+        e,
+        MemoryWidth::Dword,
+        map,
+        code_watch_tables,
+        stack_sides.code_watch,
+    );
+    // RCX MUST be recomputed: `emit_code_watch_branch` leaves one of three watch-probe
+    // intermediates in it, none of them the page index the bias lookup needs. `emit_push_mem` and
+    // `emit_rmw_inc_dec_dword` both recompute here for the same reason.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);
+    e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
+    e.jz(stack_sides.unavailable_or_kind);
+    e.add_r64_r64(Reg::RDX, Reg::RAX);
+    // The live guest EIP is still the block's entry EIP here, so `EipDelta` computes exactly the
+    // `registers.eip` the interpreter pushes -- the same value and the same way `CallReg` gets it.
+    emit_read_store_value(
+        e,
+        StoreSource::EipDelta(return_delta),
+        MemoryWidth::Dword,
+        Reg::RDI,
+    );
+    e.store_r32_disp8(Reg::RDX, 0, Reg::RDI);
+    emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
+    // The target back into RDX for `emit_completed_dynamic_path`. Nothing between the park and
+    // here preserved it; this is the only way to get it back.
+    e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_PUSH_MEM_VALUE);
+}
+
+// Both cfg variants for the reason `emit_push_mem` needs them: this is called directly from the
+// ungated `emit` match.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+pub(super) fn emit_call_mem(
+    _: &mut Encoder,
+    _: DirectAddr,
+    _: u32,
+    _: MemoryEmitContext,
+    _: MemorySideExits,
+    _: MemorySideExits,
+    _: Option<(u32, Label)>,
+) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
