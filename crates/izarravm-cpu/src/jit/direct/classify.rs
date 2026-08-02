@@ -92,6 +92,48 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // would need the immediate path checked as well as the operation path. `0x83`'s immediate is a
     // sign-extended imm8 at BOTH operand sizes, one `fetch_u8`, so its encoding is width-invariant
     // and only the operation had to be widened.
+    //
+    // THE SIXTEEN-BIT MEMORY ROWS (rejected-row campaign, slice 3) add `0xc7` and the four
+    // MOVZX/MOVSX opcodes. The domain question this list exists to answer is not "which opcode",
+    // it is which of two kinds of path a form lands on, and the two answer differently:
+    //
+    //  * Paths that CARRY a `MemoryWidth` end to end express Word already, and 0x89 and 0x8b have
+    //    been proving it in production since they were admitted -- `emit_store`'s Word arm is
+    //    `store_r16_disp8` plus `emit_dynamic_word_increment`, guarded by `emit_wide_page_guard`
+    //    at 2-byte alignment and by `emit_watched_store_guard`, whose `needs_alignment_guard`
+    //    branch probes the LAST byte of the access as well as the first. So a two-byte store
+    //    writes exactly two bytes, cannot straddle a page, and cannot slip past a code watch that
+    //    covers only its second byte. `0xc7`'s memory form is that same `Store`, and `0x83`'s is
+    //    `AluMemDest`, whose Word arms are complete at every stage (`movzx_r32_word_disp8` read,
+    //    `alu_r16_r16` candidate, descriptor tag 0x100, `store_r16_disp8` write-back, word
+    //    counters on both the RAM and the mode-13 path) and were simply never reachable.
+    //  * Paths that hard-code a 32-bit destination write cannot, and no allowlist entry fixes
+    //    that. MOVZX/MOVSX were the case here: `emit_load_extend` ended in `mov_r32_r32`, which
+    //    defines all 32 bits where a 66-prefixed form defines 16. The fix is the `dst_width`
+    //    field, not the admission -- see the MOVZX arm below.
+    //
+    // Still OUT for the second reason, and each would be a miscompile: `0xb8..=0xbf` and `0xc7`'s
+    // REGISTER form, both of which produce `MovImm`, whose `mov_r32_imm32(home(dst), imm)` has no
+    // width and would clobber the destination's high half. `0xc7` is on the list because its
+    // MEMORY form is the census row; its register form is refused inside its own arm. Neither
+    // fixture measures a `0xc7` register word row, so building `MovImm` a width would be an
+    // unmeasured admission with no row to attribute it to.
+    //
+    // THE SIXTEEN-BIT REGISTER SHIFT LANE (rejected-row campaign, slice 3b) adds `0xc1`, and it is
+    // the second kind of path above rather than the first: `Shift` hard-coded a 32-bit destination
+    // write until this slice gave it a `width` field, so the admission and the field are one
+    // change. Slice 3 is what asked -- lowering quake's `0x0FB6` memory-word row let its blocks
+    // extend one instruction further and stop on `shl cx, imm8` instead, relocating 30,692 exits
+    // onto `0xC1 /4` and costing quake +8.78% blocks installed and ~1% of wall.
+    //
+    // `0xd1` is the SAME classifier arm and is deliberately NOT admitted. That is not an
+    // oversight and the precedent is `0xf6`/`0xf7`, which share an arm with only the byte half on
+    // this list: neither fixture measures a `0xd1` word row, and the campaign's standing rule is
+    // that an unmeasured admission is a formation change with no census row to attribute it to.
+    // Leaving it out is safe in the direction that matters -- the gate refuses it, so it stays a
+    // barrier exactly as today, and no width can be got wrong on a path that is never reached.
+    // `0xd3` (the shift-by-CL group) is a different arm entirely and stays out for the same
+    // reason, with `emit_shift_cl` still Dword-only.
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
@@ -113,9 +155,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x99
                 | 0xa8
                 | 0xb0..=0xb7
+                | 0xc1
                 | 0xc2
                 | 0xc3
                 | 0xc6
+                | 0xc7
+                | 0x0fb6
+                | 0x0fb7
+                | 0x0fbe
+                | 0x0fbf
                 | 0xe8
                 | 0xe9
                 | 0xeb
@@ -191,13 +239,20 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // that truncation returns None for every two-byte opcode, so an arm added among the u8 arms
     // below (next to the 0x8a/0x8b MOV forms it most resembles) would be UNREACHABLE. Nothing
     // would fail; the lowering would simply never fire, and only the pre-flight counter would
-    // notice. It also has to stay BELOW the OperandSize::Word gate above: none of these four is in
-    // that gate's allowlist, so a 66-prefixed form is already rejected there, and it must be,
-    // because `write_gpr_sized` at Word merges into the low 16 bits instead of replacing all 32.
+    // notice. It also has to stay BELOW the OperandSize::Word gate above, but no longer because
+    // that gate refuses it: all four ARE now in the allowlist, and what makes that safe is the
+    // `dst_width` field below. An earlier version of this comment said the gate must refuse them
+    // "because `write_gpr_sized` at Word merges into the low 16 bits instead of replacing all
+    // 32". That statement of the hazard was exactly right and is now the statement of the fix:
+    // the merge is expressed rather than avoided.
     //
-    // `width` is the SOURCE width and comes from the sub-opcode, NOT from `operand_width`. That
-    // local reflects the DESTINATION size and is Dword for every admitted form here, so using it
-    // would turn every capture into a dword read.
+    // `width` is the SOURCE width and comes from the sub-opcode. `dst_width` is the DESTINATION
+    // width and comes from `operand_width`, i.e. from CS.D and the 0x66 prefix. They are
+    // independent -- `66 0F B6` is a byte source into a word destination -- and confusing them in
+    // either direction is a miscompile: `width` from `operand_width` turns every byte capture
+    // into a dword read; `dst_width` hard-coded to Dword clobbers the destination's high half on
+    // the 66-prefixed forms. The doom census ranks `0x0FB6` memory word at 1,442,795 exits and
+    // quake carries the same opcode at 31,216, which is what this pair of fields buys.
     if matches!(insn.opcode, 0x0fb6 | 0x0fb7 | 0x0fbe | 0x0fbf) {
         let m = insn.modrm?;
         let width = if matches!(insn.opcode, 0x0fb6 | 0x0fbe) {
@@ -218,12 +273,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 dst: m.reg,
                 src,
                 width,
+                dst_width: operand_width,
                 signed,
             });
         };
         return Some(DirectKind::LoadExtend {
             dst: m.reg,
             width,
+            dst_width: operand_width,
             signed,
             addr: direct_addr(addr)?,
             // Every one of the four interpreter arms returns clocks(3) (execute.rs). The
@@ -537,22 +594,31 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         lane: None,
                         width: operand_width,
                     }),
-                    // The MEMORY form stays Dword-only, and the width is a literal rather than
-                    // `operand_width` to say so. `emit_alu_mem_dest` reads its operand, runs
-                    // `emit_alu_preloaded` and writes the result back through `emit_store_value` at
-                    // the same width; the Word path through it has never been exercised and the
-                    // read/modify/write triple would need its own differential row. Admitting the
-                    // register form alone is what the census asks for -- `0x83 /5` word is a
-                    // REGISTER row -- so the memory form is left where it is.
-                    DecodedOperand::Mem(addr) if insn.operand_size == OperandSize::Dword => {
-                        Some(DirectKind::AluMemDest {
-                            op: m.reg,
-                            source: StoreSource::Imm(insn.imm),
-                            width: MemoryWidth::Dword,
-                            addr: direct_addr(addr)?,
-                        })
-                    }
-                    DecodedOperand::Mem(_) => None,
+                    // The MEMORY form now carries `operand_width`. It was Dword-only with the note
+                    // that "the Word path through it has never been exercised and the
+                    // read/modify/write triple would need its own differential row"; that row now
+                    // exists (`cpu_jit_word_memory_test.rs`) and this is what it certifies.
+                    //
+                    // 16-bit read-modify-write is both halves of the width hazard in one
+                    // instruction, and `emit_alu_mem_dest` already expressed both: the read is
+                    // `movzx_r32_word_disp8`, so the ALU sees a 16-bit operand and the lazy
+                    // descriptor's `a`/`b` are 16-bit values; the write-back is `store_r16_disp8`,
+                    // so the two adjacent bytes are untouched. `emit_alu_candidate` uses
+                    // `alu_r16_r16` -- a real 66-prefixed host instruction -- so CF and OF are the
+                    // 16-bit ones rather than a 32-bit operation's masked afterwards, and
+                    // `emit_commit_alu_candidate` tags the descriptor 0x100 for Word where it tags
+                    // 0x200 for Dword. Nothing in that path had to be built; it had no caller.
+                    //
+                    // ADC (/2) and SBB (/3) are already refused at Word above, so the one op class
+                    // with no word lane cannot reach here. This is quake's largest surviving row:
+                    // `0x83 /7` memory word at 162,440 exits, with doom carrying /5, /0 and /7
+                    // together at 12,192.
+                    DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
+                        op: m.reg,
+                        source: StoreSource::Imm(insn.imm),
+                        width: operand_width,
+                        addr: direct_addr(addr)?,
+                    }),
                 };
             }
             0x84 => {
@@ -741,6 +807,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     imm: insn.imm,
                 });
             }
+            // MOV r/m, imm (group 11). `0xc7`'s MEMORY form is now width-carrying: the doom census
+            // ranks `0xC7 /0` memory WORD at 742,811 exits and quake carries 240 of the same row.
+            //
+            // Three things had to line up and all three are the interpreter's, not a re-derivation:
+            //  * the IMMEDIATE. `decode` fetches it with `fetch_immediate(operand_size)`, which at
+            //    Word is `u32::from(fetch_u16(..))` -- zero-extended into the same `insn.imm`. So
+            //    `emit_read_store_value`'s `imm & 0xffff` for a Word `StoreSource::Imm` is exactly
+            //    the two bytes decode read, and the mask is a no-op rather than a truncation. This
+            //    is the check `0x81` is still refused for wanting; here it passes.
+            //  * the STORE. `write_operand_sized(.., Word, ..)` writes two bytes and touches no
+            //    third, which `emit_store`'s Word arm matches instruction for instruction.
+            //  * the CLOCKS. The interpreter's arm returns `Ok(clocks(2))` without consulting
+            //    `operand_size`, so the `raw_clocks: 2` below is right at both widths.
+            //
+            // The REGISTER form is refused at Word, and that is the whole asymmetry: it produces
+            // `MovImm`, which writes `home(dst)` with a 32-bit immediate move and has no width to
+            // narrow. Refusing is a missed lowering that no census row asks for; admitting would
+            // clobber the destination's high 16 bits.
             0xc6 | 0xc7 => {
                 let m = insn.modrm?;
                 if m.reg != 0 {
@@ -749,13 +833,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 let width = if opcode == 0xc6 {
                     MemoryWidth::Byte
                 } else {
-                    MemoryWidth::Dword
+                    operand_width
                 };
                 return match insn.operand? {
                     DecodedOperand::Reg(dst) if opcode == 0xc6 => Some(DirectKind::MovImmByte {
                         dst,
                         imm: insn.imm as u8,
                     }),
+                    DecodedOperand::Reg(_) if insn.operand_size == OperandSize::Word => None,
                     DecodedOperand::Reg(dst) => Some(DirectKind::MovImm { dst, imm: insn.imm }),
                     DecodedOperand::Mem(addr) => Some(DirectKind::Store {
                         source: StoreSource::Imm(insn.imm),
@@ -785,12 +870,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // architectural five-bit mask is applied in the emitter.
                 let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 };
                 if m.reg == 1 {
+                    // ROR at Word is REFUSED, and this guard is the only thing that stops it now
+                    // that 0xc1 is on the Word allowlist. `RotateRightReg` carries no width and its
+                    // emitter is `shift_r32_imm8(1, ..)` plus `emit_set_cf_only`, so a 66-prefixed
+                    // ROR routed through it would rotate 32 bits where the guest rotates 16 --
+                    // wrong result AND wrong CF, since the bit rotated into the MSB comes from bit
+                    // 31 instead of bit 15. Neither fixture measures a Word `0xC1 /1` row, so this
+                    // is a refusal with nothing to buy rather than a missed lowering worth the
+                    // second emitter lane.
+                    if insn.operand_size == OperandSize::Word {
+                        return None;
+                    }
                     return Some(DirectKind::RotateRightReg { dst, count });
                 }
                 return Some(DirectKind::Shift {
                     op: m.reg,
                     dst,
                     count,
+                    width: operand_width,
                 });
             }
             // Group 2 by CL. Sixth in the runtime-weighted reject audit: /7 alone is 807,607

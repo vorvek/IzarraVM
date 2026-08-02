@@ -338,18 +338,21 @@ fn movzx_memory_forms_match_the_interpreter_and_its_bus_clocks() {
     }
 }
 
+/// The 66-prefixed MOVZX/MOVSX forms are LOWERED as of the rejected-row campaign's Slice 3.
+///
+/// This test was `movzx_word_operand_forms_remain_interpreter_only` and asserted the opposite. The
+/// reason it gave for the refusal was correct and is worth keeping verbatim, because it is now the
+/// specification of the fix rather than of the gate: "`write_gpr_sized` at Word MERGES into the low
+/// 16 bits instead of replacing all 32, so lowering one as the 32-bit form would clobber the
+/// destination's high half." `DirectKind`'s `dst_width` field expresses that merge, and
+/// `cpu_jit_word_memory_test.rs` is the differential row that proves the emitted code performs it.
+/// What is left HERE is the admission pin: all six encodings must join the block.
+///
+/// The doom census ranks `0x0FB6` memory word at 1,442,795 exits, quake at 31,216. The REGISTER
+/// rows are in the same arm and are admitted with it; neither fixture measures one, so they are
+/// pinned here and nowhere else.
 #[test]
-fn movzx_word_operand_forms_remain_interpreter_only() {
-    // The four plain REGISTER forms used to be listed here as interpreter-only. They are lowered
-    // as of the MovExtendReg slice, so those rows are gone rather than the test being deleted:
-    // what is left is the 66-prefixed guard, which is the only thing this test was ever uniquely
-    // covering. The OperandSize::Word gate is all that stops these, and `write_gpr_sized` at Word
-    // MERGES into the low 16 bits instead of replacing all 32, so lowering one as the 32-bit form
-    // would clobber the destination's high half.
-    //
-    // Both operand forms are covered now. Before this slice only the 66-prefixed MEMORY forms
-    // were here, so the 66-prefixed REGISTER form -- the one the new lowering could actually
-    // reach -- had no guard at all.
+fn movzx_word_operand_forms_are_lowered() {
     const ENTRY: u32 = 0x101;
     for code in [
         vec![0x66u8, 0x0f, 0xb6, 0xd8], // 66 MOVZX bx, al: REGISTER form
@@ -391,10 +394,18 @@ fn movzx_word_operand_forms_remain_interpreter_only() {
             true,
             false,
         );
-        assert!(
-            jit::direct::compile(&mut cpu, ENTRY, true).is_none(),
-            "{code:02x?} must stay interpreter-only"
+        let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+            .unwrap_or_else(|| panic!("{code:02x?} must be lowered"));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{code:02x?}: the word form must join the block rather than end it"
         );
+        // The memory rows read ONE byte or ONE word, never a dword: `width` is the SOURCE width
+        // and comes from the sub-opcode, so a future edit passing `operand_width` there instead of
+        // to `dst_width` shows up as a dword read here.
+        assert_eq!(compilation.dword_reads, 0, "{code:02x?}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{code:02x?}: dword stores");
+        assert_eq!(compilation.word_stores, 0, "{code:02x?}: word stores");
     }
 }
 

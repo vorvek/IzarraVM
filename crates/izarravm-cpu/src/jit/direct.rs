@@ -7,6 +7,14 @@ mod callout;
 mod census;
 mod classify;
 mod emit;
+mod native_exit;
+
+/// Re-exported rather than moved-and-repathed: every one of these names is referenced as
+/// `jit::direct::X` from `run.rs`, `lib.rs` and the emitter, and the extraction is pure motion,
+/// so the paths must not move with the text.
+pub(crate) use native_exit::{
+    DirectEntryFn, NativeBlockTrace, NativeExit, SideExitReason, UnresolvedReason,
+};
 
 pub(crate) use callout::{
     CALL_OUT_STACK_FRAME_DWORDS, CallOutHelper, CallOutSlotCounts, CallOutTable,
@@ -2372,107 +2380,6 @@ impl std::fmt::Debug for BlockCache {
     }
 }
 
-pub(crate) type DirectEntryFn = unsafe extern "C" fn(*mut CpuGsw, u32, u32, *mut NativeExit);
-
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SideExitReason {
-    None = 0,
-    CrossPageOrAlignment = 1,
-    UnavailableOrKind = 2,
-    Permission = 3,
-    CodeWatch = 4,
-    /// The catch-all. The now-removed clif backend was its only remaining producer (two sites
-    /// in its `lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
-    /// side-exit growth across the x87 sweep and could not be attributed to any of its six
-    /// emitters. `allow(dead_code)` because no producer builds it anymore, and the discriminant
-    /// must keep its value regardless: `run.rs` still has a catch-all arm for it, and
-    /// renumbering would silently remap what emitted code stores.
-    #[allow(dead_code)]
-    Other = 5,
-    /// A CS segment-limit check on a computed control-transfer target: the five
-    /// `Ret`/`Ret16`/`JmpMem`/`CallReg` sites plus `MemorySideExits`' own limit stub.
-    SegmentLimit = 6,
-    /// An x87 slot's eligibility guard: a non-finite value, an Empty or Special tag, a
-    /// non-truncate rounding mode at a FIST, an out-of-range integer conversion, or a subnormal
-    /// at FSTP m80. Unlike every other reason here this one is a per-EXECUTION property of the
-    /// data, not a per-compile property of the address, so it can fire on a block that will
-    /// never bind differently.
-    X87Eligibility = 7,
-    /// An interpreter call-out slot reported an ABNORMAL status: the helper refused before any
-    /// guest-visible effect. EIP is at the call-out instruction and the run ends there, so the
-    /// interpreter re-executes it and delivers whatever it delivers today.
-    CallOutAbnormal = 8,
-    /// An interpreter call-out slot completed and the BUS asked for a step break (a port access
-    /// touched time-dependent device state). The run ends at the boundary AFTER the call-out,
-    /// which is exactly where `run_straight_line`'s post-instruction `requires_step_break` check
-    /// ends an interpreted continuation.
-    CallOutStepBreak = 9,
-    /// A lowered DIV or IDIV refused its operands. The guard fires on a superset of the
-    /// interpreter's #DE conditions, the run ends AT the instruction with nothing done, and the
-    /// interpreter re-executes it -- delivering #DE where the guest's rules say it must. A
-    /// per-EXECUTION property of the data like `X87Eligibility`, not a per-compile property of
-    /// the address, so it can fire on a block that will never bind differently.
-    DivideGuard = 10,
-}
-
-impl SideExitReason {
-    /// The largest discriminant emitted code can store, for the `run.rs` bound assertion.
-    pub(crate) const MAX: u32 = Self::DivideGuard as u32;
-}
-
-#[repr(u32)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnresolvedReason {
-    #[default]
-    None = 0,
-    StaticUnbound,
-    StaticHidden,
-    DynamicMissOrUnbound,
-    DynamicHidden,
-    /// The shared x87 re-entry pad refused the crossing: the target float block's baked entry TOP
-    /// does not match the CPU's live TOP, so its register cache cannot be entered for it.
-    X87TopMismatch,
-}
-
-/// Fetch replay retained for buses that observe individual code addresses. Production RAM timing
-/// uses the aggregate counters in `NativeExit` and leaves this trace disabled.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeBlockTrace {
-    pub(crate) linear: u32,
-    pub(crate) physical: u32,
-    pub(crate) repetitions: u32,
-    pub(crate) prefix_instructions: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeExit {
-    pub(crate) instructions: u64,
-    pub(crate) raw_clocks: u64,
-    // Byte counters use the low lane and word counters use the high lane. Native chain bounds
-    // keep both 32-bit lanes well below overflow while preserving the original exit layout.
-    pub(crate) byte_reads: u64,
-    pub(crate) dword_reads: u64,
-    pub(crate) weighted_fp_clocks: u64,
-    pub(crate) mode13_byte_reads: u64,
-    pub(crate) mode13_dword_reads: u64,
-    pub(crate) ram_byte_writes: u64,
-    pub(crate) ram_dword_writes: u64,
-    pub(crate) mode13_byte_writes: u64,
-    pub(crate) mode13_dword_writes: u64,
-    pub(crate) mode13_dirty_pages: u64,
-    pub(crate) side_exit: u64,
-    pub(crate) side_exit_reason: u32,
-    pub(crate) trace_len: u32,
-    pub(crate) linked_transfers: u32,
-    pub(crate) unresolved_reason: UnresolvedReason,
-    pub(crate) trace_ptr: usize,
-    pub(crate) dynamic_link_cell: usize,
-    pub(crate) dynamic_target_eip: u32,
-}
-
 // Compilation already owns emitted buffers and link cells. Boxing it would add an allocation to
 // every successful compile only to keep the two failure variants small.
 #[allow(clippy::large_enum_variant)]
@@ -2812,10 +2719,34 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
         addr: DirectAddr,
     },
+    /// SHL/SHR/SAL/SAR r/m, imm8, REGISTER form (0xC1 /4../7 and 0xD1 /4../7). `count` is the RAW
+    /// decoded immediate; the emitter applies the architectural five-bit mask.
+    ///
+    /// `width` is the operand size and is Byte-free: only Word and Dword can reach here, because
+    /// the byte opcodes 0xC0 and 0xD0 have no classify arm at all. It exists for the reason
+    /// `LoadExtend::dst_width` does -- a shift is a REGISTER-DESTINATION write, so a Dword-only
+    /// lowering of a 66-prefixed form clobbers the destination's high 16 bits where the
+    /// interpreter's `write_operand_sized(.., Word, ..)` merges into the low 16. That is a
+    /// miscompile, not a missed lowering, which is why the Word allowlist refused 0xC1 until this
+    /// field existed.
+    ///
+    /// **Every flag rule is the host's, at BOTH widths, and that is the whole argument for the
+    /// Word lane rather than a masked Dword one.** `CpuGsw::shift_rotate` computes CF from the
+    /// last bit shifted out of a `width`-wide operand, OF only at a masked count of exactly 1, and
+    /// SF/ZF/PF from the `width`-wide result. A 16-bit host shift does all four against its own
+    /// 16 bits, so `66 C1 /op` reproduces `BusWidth::Word` instruction for instruction; a 32-bit
+    /// host shift over a zero-extended operand would take CF from bit 31, SF from bit 31, and for
+    /// SAR would shift in zeros where the guest shifts in bit 15.
+    ///
+    /// No `raw_clocks` arm and none is owed: the interpreter's whole group-2 arm returns
+    /// `Ok(clocks(2))` without consulting `operand_size`, which IS the `_ => 2` default. This is
+    /// the `ImulMemAcc` situation rather than the `ImulMem` one -- adding an arm here would invent
+    /// a charge, as the Phase 5 call-out double-charge did in the other direction.
     Shift {
         op: u8,
         dst: u8,
         count: u8,
+        width: MemoryWidth,
     },
     /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
     /// admits ROR (/1) but routes it to `RotateRightReg`, because rotates do not define PF, ZF,
@@ -2846,27 +2777,35 @@ pub(crate) enum DirectKind {
         addr: DirectAddr,
         raw_clocks: u8,
     },
-    /// MOVZX/MOVSX r32, r/m8 or r/m16, MEMORY form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF).
+    /// MOVZX/MOVSX r16/r32, r/m8 or r/m16, MEMORY form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF).
     ///
     /// `width` is the SOURCE width and is only ever Byte or Word. This differs from `Load`, where
-    /// the source and destination widths are the same: here the destination is always the full
-    /// 32-bit register, which is the whole point of the instruction. Any shared code that reads
-    /// this field must treat it as the memory access width, never as the write-back width.
+    /// the source and destination widths are the same. Any shared code that reads this field must
+    /// treat it as the memory access width, never as the write-back width -- that is `dst_width`.
+    ///
+    /// `dst_width` is the DESTINATION width and is only ever Word or Dword. It is the operand
+    /// size, so the two fields are independent: `66 0F B6` is a Byte source into a Word
+    /// destination. Dword defines all 32 bits of the destination, which is the whole point of the
+    /// instruction; Word defines only the low 16 and PRESERVES the high 16, because the
+    /// interpreter's `write_gpr_sized(.., Word, ..)` is `write_gpr16`. Carrying it as a field
+    /// rather than assuming Dword is what admits the 66-prefixed forms at all: with a hard-coded
+    /// 32-bit write-back they are a miscompile, not a missed lowering.
     ///
     /// Deliberately NOT a flag on `Load`: `Load`'s emitter is a plain move, and an extending load
-    /// (zero/sign-extend to the full 32-bit destination) needs different emitted code, not a
-    /// conditional branch inside the same arm.
+    /// (zero/sign-extend into the destination) needs different emitted code, not a conditional
+    /// branch inside the same arm.
     LoadExtend {
         dst: u8,
         width: MemoryWidth,
+        dst_width: MemoryWidth,
         signed: bool,
         addr: DirectAddr,
         raw_clocks: u8,
     },
-    /// MOVZX/MOVSX r32, r8 or r16, REGISTER form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF, mod == 3).
+    /// MOVZX/MOVSX r16/r32, r8 or r16, REGISTER form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF, mod == 3).
     ///
-    /// `width` is the SOURCE width and is only ever Byte or Word; the destination is always the
-    /// full 32-bit register, which is the point of the instruction.
+    /// `width` is the SOURCE width and is only ever Byte or Word; `dst_width` is the destination
+    /// width and is only ever Word or Dword. Both mean exactly what `LoadExtend`'s do.
     ///
     /// `src` at Byte width is a BYTE-REGISTER index, so 4 to 7 mean AH, CH, DH and BH, the high
     /// byte of `home(src - 4)`. It is NOT a home index and shared code must never use it as one.
@@ -2881,6 +2820,7 @@ pub(crate) enum DirectKind {
         dst: u8,
         src: u8,
         width: MemoryWidth,
+        dst_width: MemoryWidth,
         signed: bool,
     },
     Store {

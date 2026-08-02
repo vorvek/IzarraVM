@@ -222,6 +222,18 @@ mod callout_matrix;
 #[path = "cpu_jit_f7_group_test.rs"]
 mod f7_group;
 
+/// The rejected-row campaign's sixteen-bit MEMORY rows (Slice 3). Nested here for the same reason
+/// the two modules above are: it wants this module's differential fixture (`ENTRY`, `STACK_TOP`,
+/// `flat_cpu`) rather than a fourth copy of it.
+#[path = "cpu_jit_word_memory_test.rs"]
+mod word_memory;
+
+/// The rejected-row campaign's sixteen-bit REGISTER shift lane (Slice 3b), the repair for the
+/// relocation Slice 3 created. Nested here for the reason the three modules above are: it wants
+/// this module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a fifth copy.
+#[path = "cpu_jit_word_shift_test.rs"]
+mod word_shift;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a
