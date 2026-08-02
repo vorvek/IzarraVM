@@ -71,12 +71,27 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
-    // `0xf7`, `0xa9`, `0xb8..=0xbf`, `0xc7`, `0x81`, `0x83`, `0x85`, `0x8d`, `0xa3`. Every one is
-    // the Dword sibling of an admitted byte form and its kind hard-codes Dword with no width
-    // field. `0x01`/`0x31` are worse still: `AluReg` does carry a width, but
-    // `emit_alu_preloaded`'s Word branch ignores `op`, hard-codes SUB and writes the result to a
-    // scratch register instead of the destination, which is correct only for the CMP forms
-    // `0x39`/`0x3b` already admitted here.
+    // `0xf7`, `0xa9`, `0xb8..=0xbf`, `0xc7`, `0x81`, `0x85`, `0x8d`, `0xa3`. Every one is the Dword
+    // sibling of an admitted byte form and its kind hard-codes Dword with no width field.
+    // `0x01`/`0x31` are worse still: `AluReg` does carry a width, but before the widening described
+    // below `emit_alu_preloaded`'s Word branch ignored `op`, hard-coded SUB and wrote the result to
+    // a scratch register instead of the destination, which is correct only for the CMP forms
+    // `0x39`/`0x3b` already admitted here. That branch now handles the whole non-carry op set with
+    // write-back, so `0x01`/`0x31` are a lowering waiting to be MEASURED rather than a hazard --
+    // but they are not admitted in this slice, because nothing in the census asks for them and an
+    // unmeasured admission is a formation change with no row to attribute it to.
+    //
+    // `0x83` WAS on that list and is now admitted, which is the second half of this slice. Its
+    // register form produces `AluImm`, which carries a `width` field as of this commit, and its
+    // memory form is refused inside the arm (see there). The census ranks `0x83 /5` word at
+    // 9,776,289 doom exits, forty-seven apart from `0x60` PUSHAD -- one function prologue, so the
+    // two must land together or neither's exits go anywhere.
+    //
+    // `0x81` stays OUT and the asymmetry is deliberate: its Word encoding carries a 16-bit
+    // immediate that `decode` fetches with `fetch_u16` into the same `insn.imm`, so admitting it
+    // would need the immediate path checked as well as the operation path. `0x83`'s immediate is a
+    // sign-extended imm8 at BOTH operand sizes, one `fetch_u8`, so its encoding is width-invariant
+    // and only the operation had to be widened.
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
@@ -87,6 +102,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x6a
                 | 0x70..=0x7f
                 | 0x80
+                | 0x83
                 | 0x84
                 | 0x88
                 | 0x89
@@ -333,12 +349,17 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         imm: insn.imm as u8,
                     });
                 }
+                // ALU accumulator forms with a full-width immediate (0x05/0x0d/.../0x3d). NOT in
+                // the Word allowlist above, so `operand_width` is Dword whenever this is reached;
+                // it is passed rather than hard-coded so the two `AluImm` producers state the width
+                // the same way.
                 5 => {
                     return Some(DirectKind::AluImm {
                         op,
                         dst: 0,
                         imm: insn.imm,
                         lane: None,
+                        width: operand_width,
                     });
                 }
                 _ => {}
@@ -350,6 +371,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     dst: opcode & 7,
                     is_dec: opcode >= 0x48,
                     width: operand_width,
+                });
+            }
+            // PUSHAD / POPAD, the MEMORY class of interpreter call-out slot. Ranked one and three
+            // in the post-Phase-5 census (9,776,336 and 7,005,733 doom dispatcher exits) and
+            // coupled to the `0x83 /5` word row below: the three are one function prologue and its
+            // epilogue, so lowering any one alone only relocates its exits onto the next
+            // instruction.
+            //
+            // A CALL-OUT rather than a lowering, and for a SIZE reason rather than a reachability
+            // one -- emitted code can reach guest memory perfectly well; eight guarded accesses per
+            // instruction is what does not fit a one-host-page block. `jit/direct/callout.rs`
+            // carries the class table, the two-phase resident-then-move design, and a note on the
+            // single-wide-guard shape that would beat this if the family is ever worth more wall.
+            //
+            // Dword only. Neither opcode is in the OperandSize::Word allowlist above, so PUSHA and
+            // POPA (the 16-bit forms, which move sixteen bytes rather than thirty-two) fall to
+            // `None` and stay barriers. The helper additionally refuses a 16-bit STACK (SS.B = 0)
+            // at run time, which is an orthogonal axis the allowlist cannot see.
+            //
+            // No ModRM, no `insn.operand`, no operand of any kind: both are register-file-implicit.
+            0x60 => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::PushAllDword,
+                });
+            }
+            0x61 => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::PopAllDword,
                 });
             }
             0x50..=0x57 => {
@@ -469,6 +518,13 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }
             0x81 | 0x83 => {
                 let m = insn.modrm?;
+                // ADC (/2) and SBB (/3) are refused at Word size and only there. They consume the
+                // incoming CF as an operand, which the Dword path handles with a branch on the
+                // EFLAGS shadow (`emit_carry_alu_preloaded`) that has no sixteen-bit twin. Refusing
+                // is a missed lowering; the census measures zero Word `0x83 /2` and `/3`.
+                if insn.operand_size == OperandSize::Word && matches!(m.reg, 2 | 3) {
+                    return None;
+                }
                 return match insn.operand? {
                     // `lane: None` here is deliberate and not a stub: `classify` has no `&CpuGsw`
                     // and no physical address, and a lane needs both. The compile loop attaches
@@ -479,13 +535,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         dst,
                         imm: insn.imm,
                         lane: None,
+                        width: operand_width,
                     }),
-                    DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
-                        op: m.reg,
-                        source: StoreSource::Imm(insn.imm),
-                        width: MemoryWidth::Dword,
-                        addr: direct_addr(addr)?,
-                    }),
+                    // The MEMORY form stays Dword-only, and the width is a literal rather than
+                    // `operand_width` to say so. `emit_alu_mem_dest` reads its operand, runs
+                    // `emit_alu_preloaded` and writes the result back through `emit_store_value` at
+                    // the same width; the Word path through it has never been exercised and the
+                    // read/modify/write triple would need its own differential row. Admitting the
+                    // register form alone is what the census asks for -- `0x83 /5` word is a
+                    // REGISTER row -- so the memory form is left where it is.
+                    DecodedOperand::Mem(addr) if insn.operand_size == OperandSize::Dword => {
+                        Some(DirectKind::AluMemDest {
+                            op: m.reg,
+                            source: StoreSource::Imm(insn.imm),
+                            width: MemoryWidth::Dword,
+                            addr: direct_addr(addr)?,
+                        })
+                    }
+                    DecodedOperand::Mem(_) => None,
                 };
             }
             0x84 => {

@@ -386,3 +386,59 @@ fn cdq_matches_the_interpreter_across_both_sign_boundaries_and_widths() {
         }
     }
 }
+
+/// `0x83 /op r16, imm8` at Word operand size -- the native half of the rejected-row campaign's
+/// Slice 1, and the first WRITING word ALU form the emitter carries.
+///
+/// The census ranks `0x83 /5` SUB word at 9,776,289 doom dispatcher exits, forty-seven from
+/// PUSHAD; the whole non-carry sub-op set is swept because they share one emitter arm and one
+/// classifier arm, so covering only `/5` would leave five siblings emitted and untested.
+///
+/// Three properties this has to catch and a Dword lowering would not:
+///
+/// * the destination's HIGH SIXTEEN BITS must survive. Every seed below carries a recognisable
+///   high half, and a lowering that wrote the result back with a 32-bit `mov` clobbers it.
+/// * the flags are SIXTEEN-BIT flags. The seeds straddle 0x8000 and 0xffff so CF, OF and SF differ
+///   between the 16-bit and 32-bit answers rather than agreeing by luck.
+/// * the immediate is a SIGN-EXTENDED imm8, so a negative one must be masked to sixteen bits
+///   before the operation and not after.
+#[test]
+fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
+    // (sub-op, name). ADC (/2) and SBB (/3) are deliberately absent: `classify` refuses them at
+    // Word size because they consume the incoming CF as an operand, and
+    // `word_size_0x83_carry_and_memory_forms_stay_refused` is what pins that.
+    let ops: [(u8, &str); 6] = [
+        (0, "add"),
+        (1, "or"),
+        (4, "and"),
+        (5, "sub"),
+        (6, "xor"),
+        (7, "cmp"),
+    ];
+    // High halves that must be preserved, low halves at the sixteen-bit corners.
+    let seeds: [u32; 6] = [
+        0xdead_0000,
+        0xdead_0001,
+        0xdead_7fff,
+        0xdead_8000,
+        0xdead_ffff,
+        0xffff_000f,
+    ];
+    // Sign-extended imm8s: zero, one, the positive and negative extremes.
+    let imms: [u8; 5] = [0x00, 0x01, 0x7f, 0x80, 0xff];
+
+    for (op, name) in ops {
+        for seed in seeds {
+            for imm in imms {
+                for (eflags, live_pending) in [(0x202u32, false), (0x8d5, true)] {
+                    let body = [0x66u8, 0x83, 0xc0 | (op << 3) | 1, imm];
+                    let context = format!(
+                        "0x83 /{op} {name} cx,{imm:#04x} seed={seed:#010x} \
+                         eflags={eflags:#x} pending={live_pending}"
+                    );
+                    differential_with(&body, eflags, live_pending, seed, &context);
+                }
+            }
+        }
+    }
+}

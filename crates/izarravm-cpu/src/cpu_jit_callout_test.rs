@@ -778,3 +778,312 @@ fn the_helper_folds_the_chains_float_clocks_into_the_device_timestamp() {
     );
     assert_eq!(cpu.fp_rem, 0, "preview scaling consumed the float carry");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The MEMORY class helpers, driven directly.
+//
+// The emitted-slot cover for these lives in the differential matrix; this section is about the
+// HELPER's own contract -- the charge, and the fail-closed pre-check clause by clause. Every
+// refusal row asserts zero partial effects on all four channels the helper could touch: the
+// register file, guest RAM, the bus trace and the clock counter.
+// ---------------------------------------------------------------------------------------------
+
+/// Eight distinct, high-bit-bearing register values. Distinct so a PUSHAD that pushed them in the
+/// wrong ORDER, or a POPAD that loaded them into the wrong destinations, is visible; a fixture of
+/// zeroes would pass against both.
+const FRAME_SEED: [u32; 8] = [
+    0x1111_0001,
+    0x2222_0002,
+    0x3333_0003,
+    0x4444_0004,
+    0x5555_0005,
+    0x6666_0006,
+    0x7777_0007,
+    0x8888_0008,
+];
+
+/// A CPU whose stack frame is RESIDENT in the FastMap, which is what
+/// `call_out_stack_frame_resident` requires before either memory helper will move anything.
+///
+/// Residency is established through real guest accesses rather than by populating the map
+/// directly, because `lookup_access` compares the entry's mapping epoch against
+/// `data_write_pages.mapping_epoch()` -- an entry installed behind the DirectPageCache's back is
+/// not servable, and the fixture would then measure the refusal instead of the mechanism. This is
+/// also exactly how the map is populated in production: the interpreter touches the stack once and
+/// the next call-out finds it there.
+fn resident_stack_cpu() -> (CpuGsw, TestBus) {
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.refresh_fast_map_serve_gate();
+    cpu.registers.gpr = FRAME_SEED;
+    cpu.registers.set_esp(STACK_TOP);
+    for page in [(STACK_TOP - 0x1000) & !0xfff, STACK_TOP & !0xfff] {
+        let value = cpu
+            .read_memory_bus_width(
+                &mut bus,
+                SegmentIndex::Ss,
+                page,
+                BusWidth::Dword,
+                BusAccessKind::DataRead,
+            )
+            .expect("fixture warm read");
+        cpu.write_memory_bus_width(
+            &mut bus,
+            SegmentIndex::Ss,
+            page,
+            BusWidth::Dword,
+            value,
+            BusAccessKind::DataWrite,
+        )
+        .expect("fixture warm write");
+    }
+    bus.trace = BusTrace::default();
+    cpu.elapsed_clocks = 0;
+    (cpu, bus)
+}
+
+/// Assert the helper touched NOTHING, on every channel it could have.
+fn assert_no_partial_effects(
+    cpu: &CpuGsw,
+    bus: &TestBus,
+    before: &(Registers, Vec<u8>, u8),
+    context: &str,
+) {
+    assert_eq!(cpu.registers, before.0, "{context}: registers");
+    assert_eq!(bus.memory, before.1, "{context}: guest RAM");
+    assert_eq!(bus.trace.elapsed_clocks(), 0, "{context}: bus clocks");
+    assert_eq!(cpu.elapsed_clocks, 0, "{context}: core clocks");
+    // Snapshotted rather than asserted at zero: `resident_stack_cpu` warms the map with real guest
+    // writes, which legitimately record pages. What must not move is the count ACROSS the helper.
+    assert_eq!(cpu.written_count, before.2, "{context}: written pages");
+}
+
+#[test]
+fn the_pushad_helper_moves_exactly_what_the_interpreters_own_pushad_moves() {
+    // The oracle is `push_all_gpr` itself -- the SAME function the interpreter's 0x60 arm calls,
+    // driven on a twin from the same state. That is the point of factoring it out of the opcode
+    // arm: the claim "the call-out does what the interpreter does" is a claim about one body with
+    // two callers, not about two implementations agreeing.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    let (mut twin, mut twin_bus) = resident_stack_cpu();
+
+    let status = jit::direct::push_all_dword_for_test(&mut cpu, &mut bus);
+    twin.push_all_gpr(&mut twin_bus, OperandSize::Dword)
+        .expect("the twin's PUSHAD must succeed");
+
+    assert!(status >= 0, "a resident frame must not be abnormal");
+    assert_eq!(
+        status & 0xffff_ffff,
+        i64::from(PUSH_ALL_CORE_CLOCKS),
+        "the helper must return the interpreter's own raw charge"
+    );
+    assert_eq!(cpu.registers, twin.registers, "registers");
+    assert_eq!(bus.memory, twin_bus.memory, "guest RAM");
+    assert_eq!(
+        bus.trace.elapsed_clocks(),
+        twin_bus.trace.elapsed_clocks(),
+        "bus clocks"
+    );
+    // The helper charges nothing itself; the caller folds the returned clocks into the block's
+    // runtime lane and `run_direct_block` scales the whole lane once.
+    assert_eq!(cpu.elapsed_clocks, 0, "the helper charged clocks");
+    assert_eq!(
+        cpu.registers.esp(),
+        STACK_TOP - 32,
+        "ESP must have moved by the whole frame"
+    );
+}
+
+#[test]
+fn the_popad_helper_loads_exactly_what_the_interpreters_own_popad_loads() {
+    // The register-file-mutating helper, against the same one-body oracle. Eight distinct values
+    // in the frame, so a helper that loaded them in the wrong order matches on ESP and fails on
+    // the register compare.
+    let frame: [u32; 8] = [
+        0xaaaa_0007,
+        0xbbbb_0006,
+        0xcccc_0005,
+        0xdddd_0004,
+        0xeeee_0003,
+        0xffff_0002,
+        0x9999_0001,
+        0x8888_0000,
+    ];
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    let (mut twin, mut twin_bus) = resident_stack_cpu();
+    let base = STACK_TOP - 32;
+    for (target_bus, target_cpu) in [(&mut bus, &mut cpu), (&mut twin_bus, &mut twin)] {
+        for (index, value) in frame.iter().enumerate() {
+            let at = base as usize + index * 4;
+            target_bus.memory[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        target_cpu.registers.set_esp(base);
+    }
+
+    let status = jit::direct::pop_all_dword_for_test(&mut cpu, &mut bus);
+    twin.pop_all_gpr(&mut twin_bus, OperandSize::Dword)
+        .expect("the twin's POPAD must succeed");
+
+    assert!(status >= 0, "a resident frame must not be abnormal");
+    assert_eq!(
+        status & 0xffff_ffff,
+        i64::from(POP_ALL_CORE_CLOCKS),
+        "the helper must return the interpreter's own raw charge"
+    );
+    assert_eq!(cpu.registers, twin.registers, "registers");
+    assert_eq!(cpu.registers.eax(), frame[7], "EAX comes from the top slot");
+    assert_eq!(cpu.registers.edi(), frame[0], "EDI comes from the bottom");
+    assert_eq!(
+        cpu.registers.esp(),
+        STACK_TOP,
+        "ESP advances over the whole frame, discarded slot included"
+    );
+    assert_eq!(
+        bus.trace.elapsed_clocks(),
+        twin_bus.trace.elapsed_clocks(),
+        "bus clocks"
+    );
+    assert_eq!(cpu.elapsed_clocks, 0, "the helper charged clocks");
+}
+
+#[test]
+fn a_pushad_frame_that_is_not_resident_is_refused_with_zero_partial_effects() {
+    // The residency clause, and the state EVERY PUSHAD is in the first time its stack page is
+    // touched: no warm-up, so `lookup_access` misses and the whole frame is refused. Fail-closed
+    // costs the guest one call-out; the interpreter then executes the instruction whole.
+    let mut cpu = flat_cpu();
+    cpu.registers.gpr = FRAME_SEED;
+    cpu.registers.set_esp(STACK_TOP);
+    let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+    bus.direct_pages_enabled = true;
+    let before = (cpu.registers.clone(), bus.memory.clone(), cpu.written_count);
+
+    let status = jit::direct::push_all_dword_for_test(&mut cpu, &mut bus);
+
+    assert!(status < 0, "a non-resident frame must be refused");
+    assert_no_partial_effects(&cpu, &bus, &before, "non-resident");
+}
+
+#[test]
+fn a_pushad_frame_that_hits_watched_code_is_refused_with_zero_partial_effects() {
+    // THE hazard. A push landing on watched code would reach `note_code_write_hit` with a compiled
+    // block live on the stack, which is the situation `note_code_write_inner`'s proof rules out.
+    // Here the watch is a DECODED LINE rather than a compiled block -- `code_write_watched` is the
+    // disjunction of the two, so either establishes it, and a decode line needs no block cache.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    // Decode an instruction inside the frame the PUSHAD is about to write, so
+    // `decode_cache.range_hits_code` reports the range as watched.
+    let target = STACK_TOP - 16;
+    bus.memory[target as usize] = 0x90; // NOP
+    cpu.set_eip(target);
+    cpu.fetch_decoded(&mut bus, target).unwrap();
+    cpu.set_eip(ENTRY);
+    bus.trace = BusTrace::default();
+    cpu.elapsed_clocks = 0;
+    let written_before = cpu.written_count;
+    let before = (cpu.registers.clone(), bus.memory.clone(), cpu.written_count);
+
+    let status = jit::direct::push_all_dword_for_test(&mut cpu, &mut bus);
+
+    assert!(status < 0, "a watched frame must be refused");
+    assert_eq!(cpu.registers, before.0, "watched: registers");
+    assert_eq!(bus.memory, before.1, "watched: guest RAM");
+    assert_eq!(bus.trace.elapsed_clocks(), 0, "watched: bus clocks");
+    assert_eq!(cpu.elapsed_clocks, 0, "watched: core clocks");
+    assert_eq!(
+        cpu.written_count, written_before,
+        "watched: written-page bookkeeping"
+    );
+}
+
+#[test]
+fn a_pushad_that_would_read_the_frame_is_not_refused_by_the_code_watch() {
+    // What stops the row above from being vacuous in the wrong direction: the code-watch clause is
+    // asked only for a WRITE. POPAD reads the same watched bytes and must be accepted, because a
+    // read cannot reach `note_code_write` at all.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    let target = STACK_TOP - 16;
+    bus.memory[target as usize] = 0x90;
+    cpu.set_eip(target);
+    cpu.fetch_decoded(&mut bus, target).unwrap();
+    cpu.set_eip(ENTRY);
+    cpu.registers.set_esp(STACK_TOP - 32);
+    bus.trace = BusTrace::default();
+    cpu.elapsed_clocks = 0;
+
+    let status = jit::direct::pop_all_dword_for_test(&mut cpu, &mut bus);
+
+    assert!(status >= 0, "a READ of watched bytes must be accepted");
+    assert_eq!(cpu.registers.esp(), STACK_TOP);
+}
+
+#[test]
+fn a_sixteen_bit_stack_pushad_is_refused_with_zero_partial_effects() {
+    // SS.B = 0 addresses through SP alone and POPAD then merges the discarded slot's high half
+    // into ESP. `push_all_gpr` handles both, but the pre-check's address arithmetic would have to
+    // fork to match, so the population is refused rather than mirrored.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    assert!(
+        !cpu.stack_is_32bit(),
+        "the fixture must have a 16-bit stack"
+    );
+    let before = (cpu.registers.clone(), bus.memory.clone(), cpu.written_count);
+
+    let status = jit::direct::push_all_dword_for_test(&mut cpu, &mut bus);
+
+    assert!(status < 0, "a 16-bit stack must be refused");
+    assert_no_partial_effects(&cpu, &bus, &before, "16-bit stack");
+}
+
+#[test]
+fn an_unaligned_stack_pointer_pushad_is_refused_with_zero_partial_effects() {
+    // Four-byte alignment is what makes every slot page-local, servable by `lookup_access`, and
+    // safe from `check_alignment`'s CPL-3 `#AC`. One clause, three hazards.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    cpu.registers.set_esp(STACK_TOP - 2);
+    let before = (cpu.registers.clone(), bus.memory.clone(), cpu.written_count);
+
+    let status = jit::direct::push_all_dword_for_test(&mut cpu, &mut bus);
+
+    assert!(status < 0, "an unaligned ESP must be refused");
+    assert_no_partial_effects(&cpu, &bus, &before, "unaligned ESP");
+}
+
+#[test]
+fn a_stack_limit_violation_pushad_is_refused_with_zero_partial_effects() {
+    // The SS limit, checked per slot with the SAME call `push` will make. The interpreter would
+    // discover this by FAULTING part-way with sub-pushes already committed; the pre-check finds it
+    // before anything moves, which is the whole reason the pre-check exists.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.limit = STACK_TOP - 16;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    let before = (cpu.registers.clone(), bus.memory.clone(), cpu.written_count);
+
+    let status = jit::direct::push_all_dword_for_test(&mut cpu, &mut bus);
+
+    assert!(status < 0, "a frame past the SS limit must be refused");
+    assert_no_partial_effects(&cpu, &bus, &before, "SS limit");
+}
+
+#[test]
+fn an_esp_wrap_pushad_is_refused_with_zero_partial_effects() {
+    // ESP below thirty-two sends the frame's lower slots to the far end of the address space by
+    // `wrapping_sub`, exactly as `push` would. The pre-check does not special-case the wrap: it
+    // evaluates every wrapped offset, and here the wrapped pages are not resident, so the frame is
+    // refused whole rather than half written.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    cpu.registers.set_esp(16);
+    let before = (cpu.registers.clone(), bus.memory.clone(), cpu.written_count);
+
+    let status = jit::direct::push_all_dword_for_test(&mut cpu, &mut bus);
+
+    assert!(status < 0, "a wrapping frame must be refused");
+    assert_no_partial_effects(&cpu, &bus, &before, "ESP wrap");
+}

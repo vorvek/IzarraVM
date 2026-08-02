@@ -576,55 +576,12 @@ impl CpuGsw {
                 Ok(clocks(4))
             }
             0x60 => {
-                // PUSHA / PUSHAD: push AX, CX, DX, BX, the pre-instruction SP, BP, SI, DI.
-                // A fault on ANY of the eight pushes restores (E)SP to the
-                // pre-instruction value (386 PRM: PUSHA restores ESP so the
-                // instruction restarts whole; individual committed sub-pushes
-                // are just re-written on the restart).
-                let sp_snapshot = self.read_gpr_sized(4, operand_size);
-                let esp_before = self.registers.esp();
-                let push_all = |cpu: &mut Self, bus: &mut B| -> ExecResult<()> {
-                    for index in [0u8, 1, 2, 3] {
-                        let value = cpu.read_gpr_sized(index, operand_size);
-                        cpu.push(bus, value, operand_size)?;
-                    }
-                    cpu.push(bus, sp_snapshot, operand_size)?;
-                    for index in [5u8, 6, 7] {
-                        let value = cpu.read_gpr_sized(index, operand_size);
-                        cpu.push(bus, value, operand_size)?;
-                    }
-                    Ok(())
-                };
-                if let Err(fault) = push_all(self, bus) {
-                    if self.stack_is_32bit() {
-                        self.registers.set_esp(esp_before);
-                    } else {
-                        self.write_gpr16(4, esp_before as u16);
-                    }
-                    return Err(fault);
-                }
-                Ok(clocks(18))
+                self.push_all_gpr(bus, operand_size)?;
+                Ok(clocks(PUSH_ALL_CORE_CLOCKS))
             }
             0x61 => {
-                // POPA / POPAD: pop DI, SI, BP, discard the SP slot, then BX, DX, CX, AX.
-                for index in [7u8, 6, 5] {
-                    let value = self.pop(bus, operand_size)?;
-                    self.write_gpr_sized(index, operand_size, value);
-                }
-                let discarded = self.pop(bus, operand_size)?; // SP slot, SP advances over it
-                for index in [3u8, 2, 1, 0] {
-                    let value = self.pop(bus, operand_size)?;
-                    self.write_gpr_sized(index, operand_size, value);
-                }
-                // On a 16-bit stack (SS.B=0), POPAD leaves SP advanced but lets the
-                // discarded saved-ESP slot's high half land in ESP[31:16]. Verified
-                // against the 80386 vectors; the register loads above are unaffected.
-                if !self.stack_is_32bit() && matches!(operand_size, OperandSize::Dword) {
-                    let advanced = self.registers.esp();
-                    self.registers
-                        .set_esp((discarded & 0xffff_0000) | (advanced & 0xffff));
-                }
-                Ok(clocks(18))
+                self.pop_all_gpr(bus, operand_size)?;
+                Ok(clocks(POP_ALL_CORE_CLOCKS))
             }
             0x68 => {
                 // PUSH imm16/32: `decode` fetched the full-width immediate into `insn.imm`.
@@ -771,6 +728,80 @@ impl CpuGsw {
     /// `mul`/`div`/`inc_dec` verbatim. Each arm mirrors its former fused handler exactly — same
     /// operand wiring, same write-back gating (CMP and TEST compute flags only), same #DE/#UD fault
     /// points, same clocks — so behavior and the bytes consumed stay byte-for-byte unchanged.
+    /// The whole architectural body of `PUSHA`/`PUSHAD` (0x60), factored out of the opcode arm so
+    /// the JIT's `PushAllDword` call-out slot runs THIS code rather than a copy of it. Two
+    /// consumers, one body: the exact-clocks and exact-effects claims the call-out makes are then
+    /// claims about a shared function, not about two implementations agreeing.
+    ///
+    /// Push AX, CX, DX, BX, the pre-instruction SP, BP, SI, DI. A fault on ANY of the eight pushes
+    /// restores (E)SP to the pre-instruction value (386 PRM: PUSHA restores ESP so the instruction
+    /// restarts whole; individual committed sub-pushes are just re-written on the restart). There
+    /// is NO pre-validation of the eight-slot range: the interpreter discovers a fault by taking
+    /// it, part-way, with sub-pushes already committed to memory. That is why the call-out cannot
+    /// simply run this and hope — see `call_out_stack_frame_resident`, which is the pre-check the
+    /// interpreter does not have and the call-out must.
+    pub(crate) fn push_all_gpr<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        let sp_snapshot = self.read_gpr_sized(4, operand_size);
+        let esp_before = self.registers.esp();
+        let push_all = |cpu: &mut Self, bus: &mut B| -> ExecResult<()> {
+            for index in [0u8, 1, 2, 3] {
+                let value = cpu.read_gpr_sized(index, operand_size);
+                cpu.push(bus, value, operand_size)?;
+            }
+            cpu.push(bus, sp_snapshot, operand_size)?;
+            for index in [5u8, 6, 7] {
+                let value = cpu.read_gpr_sized(index, operand_size);
+                cpu.push(bus, value, operand_size)?;
+            }
+            Ok(())
+        };
+        if let Err(fault) = push_all(self, bus) {
+            if self.stack_is_32bit() {
+                self.registers.set_esp(esp_before);
+            } else {
+                self.write_gpr16(4, esp_before as u16);
+            }
+            return Err(fault);
+        }
+        Ok(())
+    }
+
+    /// The whole architectural body of `POPA`/`POPAD` (0x61); see `push_all_gpr` for why it is a
+    /// function rather than an opcode arm.
+    ///
+    /// Pop DI, SI, BP, discard the SP slot, then BX, DX, CX, AX. Unlike PUSHA there is no restore
+    /// on fault at all: a fault part-way leaves the registers already loaded and (E)SP already
+    /// advanced, which is the architectural behaviour and another reason the call-out pre-checks
+    /// instead of retrying.
+    pub(crate) fn pop_all_gpr<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        for index in [7u8, 6, 5] {
+            let value = self.pop(bus, operand_size)?;
+            self.write_gpr_sized(index, operand_size, value);
+        }
+        let discarded = self.pop(bus, operand_size)?; // SP slot, SP advances over it
+        for index in [3u8, 2, 1, 0] {
+            let value = self.pop(bus, operand_size)?;
+            self.write_gpr_sized(index, operand_size, value);
+        }
+        // On a 16-bit stack (SS.B=0), POPAD leaves SP advanced but lets the
+        // discarded saved-ESP slot's high half land in ESP[31:16]. Verified
+        // against the 80386 vectors; the register loads above are unaffected.
+        if !self.stack_is_32bit() && matches!(operand_size, OperandSize::Dword) {
+            let advanced = self.registers.esp();
+            self.registers
+                .set_esp((discarded & 0xffff_0000) | (advanced & 0xffff));
+        }
+        Ok(())
+    }
+
     fn execute_group_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,

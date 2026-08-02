@@ -4,8 +4,25 @@
 //! Interpreter CALL-OUT slots: running one instruction through the interpreter from inside a
 //! native block, then resuming the same block.
 //!
-//! Phase 5 carries exactly one opcode here, `0xEC` (IN AL,DX). Every other barrier opcode still
-//! ends its block; this module is the mechanism, `classify`'s single `0xec` arm is the policy.
+//! Three opcodes live here: `0xEC` (IN AL,DX), `0x60` (PUSHAD) and `0x61` (POPAD). Every other
+//! barrier opcode still ends its block; this module is the mechanism, `classify`'s three arms are
+//! the policy.
+//!
+//! The three fall into TWO CLASSES with different reachable sets, and almost every design decision
+//! below is really a decision about which class an opcode is in:
+//!
+//! | class | member | why a call-out rather than a lowering | touches |
+//! |---|---|---|---|
+//! | port | `0xEC` | emitted code cannot reach `CpuBus::read_io` at all | one device, one GPR byte |
+//! | memory | `0x60`, `0x61` | code size: eight guarded accesses per instruction | eight stack dwords, eight GPRs |
+//!
+//! The memory class is the one that justifies the mechanism beyond port IO, and the justification
+//! is a SIZE argument, not a reachability one: emitted code can reach guest memory perfectly well.
+//! A lowered PUSHAD is eight guarded stores -- eight address computations, eight fast-map probes,
+//! eight permission checks, eight code-watch guards and eight side-exit stub sets -- against a
+//! one-host-page block budget that `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` already caps at four
+//! instructions for slots of that shape. A call-out is a fixed ~60 bytes whatever the instruction
+//! does. See the module-level note at the end of this comment for the shape that WOULD beat it.
 //!
 //! # Why a call-out at all
 //!
@@ -54,7 +71,64 @@
 //! precedes the status branch precisely so the abnormal path reaches `shared_return` -- which
 //! stores homes -- with correct values instead of writing clobbered registers over good memory.
 //!
-//! # The abnormal set (exactly three producers)
+//! # The reload contract, RE-DERIVED for a helper that mutates the register file
+//!
+//! `0xEC` writes one byte of one register. `POPAD` writes EIGHT registers including ESP, and
+//! `PUSHAD` writes ESP. The reload above was written for the first and has to be shown sufficient
+//! for the second rather than assumed to carry over. It is, and here is the whole derivation:
+//!
+//! 1. **Coverage.** `GUEST_HOMES` is all eight GPRs (R8-R14 plus RBX, indices 0..8), the reload
+//!    loop is `for (index, home) in GUEST_HOMES.into_iter().enumerate()` with no filter, and it
+//!    runs on every path before the status branch. So every register a helper can write is
+//!    reloaded. There is no partial-set optimisation to get wrong, and `emit_store_homes` on the
+//!    way IN is the same whole set, so the helper reads current values for all eight -- which
+//!    `0xEC` did not need (it read only DX) and `PUSHAD` does.
+//! 2. **Nothing else is cached.** The only other guest state a block body holds in a host register
+//!    is EFLAGS, shadowed in RBP. Neither PUSHAD nor POPAD writes a flag (386 PRM: both are
+//!    flag-transparent), so the shadow stays current and must NOT be reloaded -- reloading it
+//!    would be the bug, because RBP is the authority mid-block, not memory.
+//! 3. **The lazy-flag descriptor survives.** `PendingFlags` carries VALUES (`tag`, `a`, `b`,
+//!    `result`), not register references, so a pending descriptor produced before the call still
+//!    evaluates to the same flags after POPAD has overwritten the registers those values came
+//!    from. Had it carried register indices, POPAD would have silently corrupted every lazy flag
+//!    in flight and no reload could have fixed it.
+//! 4. **Stack addressing follows.** Later slots' stack addresses are emitted relative to
+//!    `home(4)`, which the reload has just refreshed from `registers.gpr[4]`, so a `push` after a
+//!    `PUSHAD` in the same block addresses the post-PUSHAD ESP. Nothing bakes an ESP value.
+//! 5. **EIP is untouched** by both helpers, so the block-body invariant (`EIP` holds the entry
+//!    value throughout, advanced only on exit paths) is unbroken and both exits still advance it
+//!    exactly once.
+//!
+//! Conclusion: the existing contract is sufficient, unchanged, for a register-file-mutating
+//! helper. The mutation that proves it is dropping any one entry from the reload loop, which now
+//! fails the POPAD differential on `registers` as well as the port tests on AL.
+//!
+//! # The abnormal set, memory class (`0x60`, `0x61`)
+//!
+//! ONE producer, and it is a pre-check rather than a discovered failure:
+//! `CpuGsw::call_out_stack_frame_resident` (memory.rs) refuses unless all eight dwords of the
+//! frame can be moved through the FastMap serve path with no page walk, no fault and no
+//! code-watch hit. Its clause-by-clause enumeration -- 16-bit stack, unarmed FastMap, unaligned
+//! ESP, SS limit (including an ESP WRAP), absent/read-only/wrong-CPL page, stale mapping epoch, a
+//! frame CROSSING A PAGE BOUNDARY onto a second page that is not resident, the Mode13h aperture,
+//! and watched code -- lives at that function, next to the predicates it evaluates.
+//!
+//! Two things make the refusal cheap rather than a loss. It is `&self` and touches nothing, so a
+//! refused call-out has ZERO partial effects by construction, exactly like the port class's
+//! privilege refusal. And the cost of being wrong is one call-out: the native run ends at the
+//! instruction, the interpreter executes PUSHAD or POPAD whole -- page walk, fault delivery,
+//! partial frame and all -- at the same boundary a pre-slice barrier produced.
+//!
+//! The privilege gate the port class carries is DELIBERATELY ABSENT here, and the difference is
+//! the TSS. `0xEC`'s refusal exists because `check_io_permission` probes the IO-permission bitmap
+//! through `read_system_linear`, which page-walks. PUSHAD and POPAD are unprivileged instructions
+//! with no such probe: their only privilege-sensitive decision is page protection, and that is
+//! made by `FastMap::lookup_access` against the LIVE CPL and CR0.WP inside the pre-check, which
+//! fails closed to a refusal. So a CPL-3 or IOPL-restricted guest keeps its PUSHAD call-outs; only
+//! a block carrying a PORT call-out is refused entry by `run_direct_block`, which is why the
+//! dispatch gate is keyed on `callout_port_slots()` rather than on `callout_slots()`.
+//!
+//! # The abnormal set, port class (`0xEC`) -- exactly three producers
 //!
 //! 1. **The permission-checked port, refused up front.** When `is_v86_mode() || CPL > IOPL`,
 //!    `check_io_permission` would probe the TSS bitmap through `read_system_linear` -- and under
@@ -126,11 +200,35 @@
 //!
 //! # Self-modifying code
 //!
-//! A call-out cannot reach `note_code_write`, and after the privilege refusal above the argument
-//! needs no caveat: the TSS probe was the only memory access on this path and it is now
-//! unreachable. `write_gpr8` is register state and `read_io` writes no guest memory, so the path
-//! contains no guest memory access at all. `debug_assert`ed by comparing the written-page
+//! **Port class.** `0xEC` cannot reach `note_code_write`, and after the privilege refusal above
+//! the argument needs no caveat: the TSS probe was the only memory access on this path and it is
+//! now unreachable. `write_gpr8` is register state and `read_io` writes no guest memory, so the
+//! path contains no guest memory access at all. `debug_assert`ed by comparing the written-page
 //! bookkeeping across the whole remaining body.
+//!
+//! **Memory class.** `0x60` really does write thirty-two bytes of guest memory, so the argument
+//! cannot be "no access" and is instead "no WATCHED access". `call_out_stack_frame_resident`
+//! evaluates `code_write_watched(physical, 4)` for each of the eight stores and refuses the whole
+//! frame if any is watched, which makes `finish_fast_map_write`'s `changed && watched` gate
+//! provably false for all eight -- so `note_code_write_hit` is not called and the "no compiled
+//! block is mid-execution" proof in `note_code_write_inner` is not put to the test. The same
+//! pre-check excludes the page walk, which is the OTHER way this path could have written guest
+//! memory (accessed/dirty bits) and reached that proof by the back door. `record_write_page` still
+//! runs, exactly as it does for the interpreter's own PUSHAD, and is bookkeeping rather than
+//! invalidation.
+//!
+//! # Why not lower PUSHAD natively, and what would change the answer
+//!
+//! Recorded because it is the honest alternative rather than to close it off. A lowered PUSHAD as
+//! eight ordinary `Store` slots is not close: it would blow both the one-host-page budget and
+//! `MAX_BLOCK_STACK_ACCESSES`. But PUSHAD writes a CONTIGUOUS, 4-aligned 32-byte range, so the
+//! shape that would win is ONE guard over the whole range -- the same all-or-nothing trick
+//! `MemoryWidth::Tbyte` already plays for a ten-byte x87 store -- followed by eight plain `mov`s
+//! and one counter add, which is of the order of two hundred bytes. What that needs and this slice
+//! does not build: a 32-byte guard width, a code-watch guard over a range wider than one watch
+//! chunk, and a native answer for PUSHAD's restore-(E)SP-on-fault rule. If this family is ever
+//! measured to be worth more wall than the call-out buys, that is the shape to build, not a bigger
+//! call-out.
 //!
 //! # Unwinding
 //!
@@ -144,8 +242,12 @@
 
 use super::emit::{emit_store_homes, gpr_offset};
 use super::*;
-use crate::IN_AL_DX_CORE_CLOCKS;
+use crate::{IN_AL_DX_CORE_CLOCKS, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS};
 use izarravm_bus::{BusWidth, CpuBus};
+
+/// How many dwords `PUSHAD`/`POPAD` move. Eight registers, one dword each -- the SP slot included,
+/// which POPAD reads and discards.
+pub(crate) const CALL_OUT_STACK_FRAME_DWORDS: u32 = 8;
 
 /// The ABI emitted code calls a helper through. `extern "C"` and NOT `extern "C-unwind"`: see the
 /// unwinding note in the module docs -- the nounwind guarantee is load-bearing, because a panic
@@ -169,6 +271,10 @@ pub(crate) struct CallOutTable {
     pub(crate) bus: *mut (),
     /// `CallOutHelper::PortReadAlDx`, as a `usize` so the emitted load is one plain quadword.
     pub(crate) port_read_al_dx: usize,
+    /// `CallOutHelper::PushAllDword`.
+    pub(crate) push_all_dword: usize,
+    /// `CallOutHelper::PopAllDword`.
+    pub(crate) pop_all_dword: usize,
 }
 
 impl Default for CallOutTable {
@@ -176,6 +282,8 @@ impl Default for CallOutTable {
         Self {
             bus: core::ptr::null_mut(),
             port_read_al_dx: 0,
+            push_all_dword: 0,
+            pop_all_dword: 0,
         }
     }
 }
@@ -206,7 +314,87 @@ impl CallOutTable {
         Self {
             bus: (bus as *mut B).cast::<()>(),
             port_read_al_dx: port_read_al_dx::<B> as CallOutFn as usize,
+            push_all_dword: push_all_dword::<B> as CallOutFn as usize,
+            pop_all_dword: pop_all_dword::<B> as CallOutFn as usize,
         }
+    }
+}
+
+/// Which interpreter path a `DirectKind::CallOut` slot routes through. One variant per admitted
+/// opcode, never a catch-all: `callout::helper_offset` matches this exhaustively, so adding an
+/// opcode to `classify` without an execute path is a compile error rather than a silent misroute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallOutHelper {
+    /// `0xEC` IN AL,DX.
+    PortReadAlDx,
+    /// `0x60` PUSHAD.
+    PushAllDword,
+    /// `0x61` POPAD.
+    PopAllDword,
+}
+
+impl CallOutHelper {
+    /// True for the PORT class: helpers that can reach `check_io_permission`, and therefore the
+    /// TSS bitmap probe whose page walk is why `run_direct_block` refuses to enter such a block in
+    /// the privileged state. False for the memory class, which has no privileged probe at all --
+    /// its page-protection decision is made inside `call_out_stack_frame_resident` against the
+    /// live CPL, and fails closed to a refusal. Keeping this a method rather than a `matches!` at
+    /// the two call sites is what makes a fourth helper choose its class deliberately.
+    pub(crate) fn probes_io_permission(self) -> bool {
+        match self {
+            Self::PortReadAlDx => true,
+            Self::PushAllDword | Self::PopAllDword => false,
+        }
+    }
+
+    /// True for the MEMORY class: helpers that move `CALL_OUT_STACK_FRAME_DWORDS` dwords of guest
+    /// stack, which `compute_iteration_upper` has to price as bus traffic the block's static
+    /// access counters do not contain.
+    pub(crate) fn moves_a_stack_frame(self) -> bool {
+        match self {
+            Self::PortReadAlDx => false,
+            Self::PushAllDword | Self::PopAllDword => true,
+        }
+    }
+}
+
+/// The per-class interpreter call-out slot counts, packed into ONE byte.
+///
+/// Two counts, each bounded by `MAX_BLOCK_CALLOUT_SLOTS` (4), so each fits a nibble. Packed rather
+/// than carried as two `u8` fields because `CompiledBlock` is memcpy'd several times per Direct
+/// entry and `compiled_block_stays_small_enough_to_copy_per_entry` pins its size at 120 bytes --
+/// that byte budget is exactly full, so a second field costs eight bytes of alignment padding on
+/// every one of ~47 M entries in a Quake run. The packing is a size decision rather than a
+/// cleverness: each accessor is one mask or one shift, and the total is one add.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CallOutSlotCounts(u8);
+
+impl CallOutSlotCounts {
+    pub(super) fn new(port: u8, memory: u8) -> Self {
+        debug_assert!(
+            port <= 0xf && memory <= 0xf,
+            "MAX_BLOCK_CALLOUT_SLOTS bounds both counts well below a nibble"
+        );
+        Self((port & 0xf) | ((memory & 0xf) << 4))
+    }
+
+    /// Slots whose helper can reach `check_io_permission`; see `CallOutHelper::probes_io_permission`.
+    pub(super) fn port(self) -> u32 {
+        u32::from(self.0 & 0xf)
+    }
+
+    /// Slots whose helper moves a guest stack frame; see `CallOutHelper::moves_a_stack_frame`.
+    pub(super) fn memory(self) -> u32 {
+        u32::from(self.0 >> 4)
+    }
+
+    /// The two counts summed. TEST-ONLY, and gated for the same reason
+    /// `CompiledBlock::callout_slots` is: nothing in the budget path reads a total, because
+    /// `compute_iteration_upper` prices the two classes separately, and asserting this against the
+    /// pair it sums is vacuous. See that accessor's comment for where the real check lives.
+    #[cfg(test)]
+    pub(super) fn total(self) -> u32 {
+        self.port() + self.memory()
     }
 }
 
@@ -219,6 +407,8 @@ pub(crate) const STATUS_STEP_BREAK_BIT: u32 = 32;
 fn helper_offset(helper: CallOutHelper) -> i32 {
     let field = match helper {
         CallOutHelper::PortReadAlDx => core::mem::offset_of!(CallOutTable, port_read_al_dx),
+        CallOutHelper::PushAllDword => core::mem::offset_of!(CallOutTable, push_all_dword),
+        CallOutHelper::PopAllDword => core::mem::offset_of!(CallOutTable, pop_all_dword),
     };
     (core::mem::offset_of!(CpuGsw, native_callout) + field) as i32
 }
@@ -330,6 +520,152 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // exact-clocks claim cannot drift out from under this module.
     i64::from(IN_AL_DX_CORE_CLOCKS)
         | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+}
+
+/// Resolve the published bus for a helper instantiation, or `None` if the window is not open.
+///
+/// # Safety
+///
+/// Same contract as each helper's: `cpu.native_callout` must have been published by
+/// `CallOutTable::publish::<B>` for this exact `B`, and the returned reference must not outlive
+/// the native entry.
+#[inline]
+unsafe fn published_bus<'a, B: CpuBus>(cpu: &CpuGsw) -> Option<&'a mut B> {
+    let bus_ptr = cpu.native_callout.bus;
+    debug_assert!(
+        !bus_ptr.is_null(),
+        "a call-out slot ran without a published bus"
+    );
+    if bus_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: by the caller's contract.
+    Some(unsafe { &mut *bus_ptr.cast::<B>() })
+}
+
+/// `0x60` PUSHAD through the interpreter's own stack path.
+///
+/// TWO PHASES, and the split is the whole design. Phase one PROVES the eight-dword frame movable
+/// (`call_out_stack_frame_resident`) without touching anything; phase two runs `push_all_gpr`, the
+/// interpreter's own body, which phase one has made incapable of walking a page table, faulting,
+/// or reaching `note_code_write`. A refusal in phase one is `STATUS_ABNORMAL` with literally
+/// nothing done, so the native run ends at the instruction and the interpreter executes PUSHAD
+/// whole -- the same boundary a pre-slice PUSHAD barrier produced.
+///
+/// The `Err` arm of phase two is UNREACHABLE given phase one and is written as a restore anyway.
+/// What phase one cannot exclude by construction is a `CpuBus::charge_direct_ram_memory` that
+/// errors on a resident RAM page; no bus in tree can (`MachineBus` returns `Ok` unconditionally,
+/// and so does the trait default). If one ever did, the restore puts (E)SP and the whole register
+/// file back, so the interpreter's re-execution writes the same bytes to the same addresses and
+/// the only residue is a duplicated bus charge for the sub-pushes that completed -- a timing
+/// divergence on an unreachable path, disclosed rather than hidden.
+///
+/// # Safety
+///
+/// See `port_read_al_dx`.
+unsafe extern "C" fn push_all_dword<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    _prefix_raw_clocks: u64,
+    _prefix_weighted_fp_clocks: u64,
+) -> i64 {
+    // SAFETY: by the contract above, `cpu` is the live CPU and no other reference to it is alive
+    // across the call (emitted code holds only its ADDRESS, in R15).
+    let cpu = unsafe { &mut *cpu };
+    // SAFETY: `publish::<B>` stored a `*mut B` for the same `B` this instantiation was selected
+    // for, and the CPU and the bus are disjoint.
+    let Some(bus) = (unsafe { published_bus::<B>(cpu) }) else {
+        return STATUS_ABNORMAL;
+    };
+    cpu.jit_direct.note_callout_executed();
+
+    // The clock-prefix arguments are ignored, and that is a fact about the reachable set rather
+    // than an omission. `port_read_al_dx` previews them because `CpuBus::read_io` takes a guest
+    // timestamp; nothing on this helper's path does. Phase one refuses the Mode13h aperture, so
+    // the only bus entry point phase two reaches is `charge_direct_ram_memory`, which takes an
+    // address, a width and a kind. No device observes the time at which these stores happen, so
+    // there is no timestamp to get wrong.
+    if !cpu.call_out_stack_frame_resident(CALL_OUT_STACK_FRAME_DWORDS, true) {
+        return STATUS_ABNORMAL;
+    }
+    let registers = cpu.registers.clone();
+    if cpu.push_all_gpr(bus, OperandSize::Dword).is_err() {
+        debug_assert!(
+            false,
+            "a resident PUSHAD frame faulted inside a call-out slot"
+        );
+        cpu.registers = registers;
+        return STATUS_ABNORMAL;
+    }
+
+    // The SAME constant the interpreter's `0x60` arm charges, and the same step-break question
+    // `run_straight_line` asks after every interpreted instruction. Both are shared rather than
+    // restated so the exact-clocks claim cannot drift out from under this module.
+    i64::from(PUSH_ALL_CORE_CLOCKS)
+        | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+}
+
+/// `0x61` POPAD through the interpreter's own stack path. Same two-phase shape as
+/// `push_all_dword`, with `write = false`: the frame is READ, so there is no code-watch clause to
+/// satisfy and no `note_code_write` to reach -- what phase one still has to exclude is the page
+/// walk (which WRITES accessed bits, and can therefore reach `note_code_write` by that route) and
+/// the fault, because `pop_all_gpr` does not restore on fault at all and a partial POPAD would
+/// leave eight registers half loaded.
+///
+/// This helper MUTATES THE GUEST REGISTER FILE -- eight registers plus ESP, where `0xEC` wrote one
+/// byte of one. That is carried entirely by the emitted slot's unconditional whole-set reload; see
+/// the reload derivation in the module docs.
+///
+/// # Safety
+///
+/// See `port_read_al_dx`.
+unsafe extern "C" fn pop_all_dword<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    _prefix_raw_clocks: u64,
+    _prefix_weighted_fp_clocks: u64,
+) -> i64 {
+    // SAFETY: as `push_all_dword`.
+    let cpu = unsafe { &mut *cpu };
+    // SAFETY: as `push_all_dword`.
+    let Some(bus) = (unsafe { published_bus::<B>(cpu) }) else {
+        return STATUS_ABNORMAL;
+    };
+    cpu.jit_direct.note_callout_executed();
+
+    if !cpu.call_out_stack_frame_resident(CALL_OUT_STACK_FRAME_DWORDS, false) {
+        return STATUS_ABNORMAL;
+    }
+    let registers = cpu.registers.clone();
+    if cpu.pop_all_gpr(bus, OperandSize::Dword).is_err() {
+        debug_assert!(
+            false,
+            "a resident POPAD frame faulted inside a call-out slot"
+        );
+        cpu.registers = registers;
+        return STATUS_ABNORMAL;
+    }
+
+    i64::from(POP_ALL_CORE_CLOCKS) | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+}
+
+/// Drive `push_all_dword` exactly as an emitted slot does, for the helper-level tests.
+#[cfg(test)]
+pub(crate) fn push_all_dword_for_test<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> i64 {
+    cpu.native_callout = CallOutTable::publish(bus);
+    // SAFETY: the table was just published for this exact `B`, and `cpu` is not otherwise
+    // borrowed across the call.
+    let status = unsafe { push_all_dword::<B>(cpu as *mut CpuGsw, 0, 0) };
+    cpu.native_callout = CallOutTable::default();
+    status
+}
+
+/// Drive `pop_all_dword` exactly as an emitted slot does, for the helper-level tests.
+#[cfg(test)]
+pub(crate) fn pop_all_dword_for_test<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> i64 {
+    cpu.native_callout = CallOutTable::publish(bus);
+    // SAFETY: as `push_all_dword_for_test`.
+    let status = unsafe { pop_all_dword::<B>(cpu as *mut CpuGsw, 0, 0) };
+    cpu.native_callout = CallOutTable::default();
+    status
 }
 
 /// Drive the helper exactly as an emitted slot does -- publish, call, clear -- so a test can
