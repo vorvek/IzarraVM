@@ -1931,6 +1931,85 @@ fn a_call_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor()
     );
 }
 
+/// The MEMORY form of `0xFF /2`: `call dword [0x800]`, doom's largest rejected census row.
+///
+/// The accounting pin the emitter cannot state for itself. `CallMem` is the first kind that is a
+/// terminal with a dynamic successor AND a memory read AND a memory store at once, so it has to
+/// register in four accessors that no single sibling exercises together, and three of the four are
+/// silent when wrong:
+///
+/// * `raw_clocks` 7. Group-5 arm 2 charges `clocks(7)` for both operand forms
+///   (`execute_extended.rs`), and a missing arm rides the `_ => 2` default and undercharges every
+///   indirect call by 5 with nothing else in the tree able to see it.
+/// * `dword_reads` 1 AND `dword_stores` 1. `CallReg` has the store and no read; `JmpMem` has the
+///   read and no store. Only this kind has both, and the static counts are what `run.rs` subtracts
+///   the dynamic mode-13 counts from.
+/// * `dynamic_successor` with `successors == [None, None]`. Dropping either registration compiles
+///   a working-looking block whose call never links, or one that statically binds a phantom edge
+///   into the bytes after the call that a stale dynamically-bound cell can transfer into.
+#[test]
+fn a_call_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0x15, 0x00, 0x08, 0x00, 0x00, // call dword [0x800]
+    ]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "two fillers plus the call, and nothing past it: CallMem is a terminal"
+    );
+    assert_eq!(
+        compilation.span.guest_len, 8,
+        "the span must end AT the call: two one-byte fillers plus the six-byte FF /2 disp32 form"
+    );
+    assert_eq!(
+        compilation.raw_clocks, 11,
+        "two 2-clock INCs plus a 7-clock CallMem"
+    );
+    assert_eq!(compilation.dword_reads, 1, "the target dword");
+    assert_eq!(compilation.dword_stores, 1, "the return-address push");
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+    assert!(
+        compilation.dynamic_successor,
+        "without this, link_sources never learns the cell and every call exits to the dispatcher \
+         forever"
+    );
+    assert_eq!(compilation.successors, [None, None]);
+}
+
+/// A `CallMem` at the block ENTRY compiles as a ONE-instruction block, and that is the whole
+/// mechanism of this slice rather than an edge case.
+///
+/// The census attributes 1,847,385 doom exits to entry points whose compile walk stopped at this
+/// opcode, and their mean native prefix is 1.86 instructions -- under the three-slot minimum. What
+/// admits them is `slots.len() < 3 && !terminal`: a terminal excuses the minimum. Before the
+/// lowering the walk produced a non-terminal prefix of one or two slots and the whole entry became
+/// a `StructuralReject`, so every static link into it stayed unbound forever. After it, the same
+/// entry compiles and its links bind.
+#[test]
+fn a_call_through_memory_at_the_block_entry_compiles_as_a_one_instruction_block() {
+    let (mut cpu, mut bus) = fixture(&[
+        0xff, 0x15, 0x00, 0x08, 0x00, 0x00, // call dword [0x800], AT THE ENTRY
+    ]);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 1,
+        "a terminal excuses the three-slot minimum, which is what turns these census entries from \
+         permanent structural rejections into compiled blocks"
+    );
+    assert_eq!(compilation.span.guest_len, 6);
+    assert_eq!(compilation.raw_clocks, 7);
+    assert!(compilation.dynamic_successor);
+}
+
 /// The stack-access cap interacting with a terminal `CallReg`: `MAX_BLOCK_STACK_ACCESSES` is 4,
 /// and the compile loop's cap check runs BEFORE the slot that would cross it is admitted.
 ///
@@ -2000,4 +2079,62 @@ fn call_through_a_register_respects_the_stack_access_cap() {
         );
         assert!(call_block.dynamic_successor);
     }
+}
+
+/// The same cap for the MEMORY form, and the only fixture that can see `CallMem` in `uses_stack()`
+/// at all.
+///
+/// `uses_stack` has two effects for this kind and BOTH are masked by something else on the default
+/// path, which is why this fixture is built the way it is rather than copied from its `CallReg`
+/// sibling:
+///
+/// * the stack-width admission matrix, masked by `classify`'s own Dword gate. Either check alone
+///   refuses the Word form, so `word_size_call_through_memory_stays_refused` cannot see this one
+///   go missing.
+/// * `MAX_BLOCK_STACK_ACCESSES`, masked by the HOST-PAGE length search. A mutation established
+///   that directly: with `CallMem` dropped from `uses_stack` the call does join as a fifth stack
+///   access, the block's emitted code then overflows a host page, and `compile_with_page_len`'s
+///   binary search cuts it back to the same four instructions the cap would have produced. The
+///   two bounds are indistinguishable through `compile`.
+///
+/// So this compiles through `compile_with_page_len_for_test` with a page of 1 MiB, which cannot
+/// bind, leaving the stack-access cap as the only thing that can stop the block. That also records
+/// a real property of the shipped emitter worth knowing on its own: a five-slot block whose last
+/// slot is a `CallMem` does not fit one host page.
+#[test]
+fn call_through_memory_respects_the_stack_access_cap() {
+    // Four pushes plus the call is five stack accesses. The fifth is refused, so the call splits
+    // into its own block.
+    let (mut cpu, mut bus) = fixture(&[
+        0x50, // push eax
+        0x51, // push ecx
+        0x52, // push edx
+        0x53, // push ebx
+        0xff, 0x15, 0x00, 0x08, 0x00, 0x00, // call dword [0x800]
+    ]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3, ENTRY + 4],
+    );
+
+    let pushes = compiled(jit::direct::compile_with_page_len_for_test(
+        &mut cpu,
+        ENTRY,
+        true,
+        1 << 20,
+    ));
+    assert_eq!(
+        pushes.span.instructions, 4,
+        "the fourth push hits the cap; the call itself is refused and never joins this block, and \
+         with a 1 MiB page nothing but the cap can be what refused it"
+    );
+    assert_eq!(pushes.span.guest_len, 4);
+
+    let call_block = compiled(jit::direct::compile(&mut cpu, ENTRY + 4, true));
+    assert_eq!(
+        call_block.span.instructions, 1,
+        "the call re-forms as its own one-slot block"
+    );
+    assert!(call_block.dynamic_successor);
 }

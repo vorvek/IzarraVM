@@ -234,6 +234,12 @@ mod word_memory;
 #[path = "cpu_jit_word_shift_test.rs"]
 mod word_shift;
 
+/// The sixteen-bit INC/DEC lazy-flag descriptor, the survivor `word_memory`'s header recorded and
+/// left for its own change. Nested here for the reason the four modules above are: it wants this
+/// module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a sixth copy.
+#[path = "cpu_jit_word_inc_dec_test.rs"]
+mod word_inc_dec;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a

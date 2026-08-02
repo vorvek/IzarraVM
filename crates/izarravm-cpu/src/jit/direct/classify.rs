@@ -1073,16 +1073,44 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // stack-width admission matrix in the compile loop, which refuses it for lack of a
                 // `CallReg16` mapping arm, the same PushMem precedent that guards PUSH r/m32.
                 //
-                // The MEMORY form is not lowered: the census measures zero occurrences of it, and
-                // lowering it would add a guarded load lane for nothing.
+                // The MEMORY form IS lowered now, as `CallMem`. The "census measures zero
+                // occurrences" note this comment used to carry was true when `CallReg` landed and
+                // is not any more: the post-Phase-5 census ranks `0xFF /2` memory dword as doom's
+                // largest rejected row, 1,847,385 attributed exits over 3,076,346 interpreted
+                // executions per timedemo. Quake still measures zero at any width, so that fixture
+                // is a control for this arm rather than a second sample.
+                //
+                // The Dword gate is `JmpMem`'s, for `JmpMem`'s reason and not by analogy: `0xff`
+                // sits in the `OperandSize::Word` allowlist above, so a 66-prefixed `FF /2` in
+                // 32-bit code reaches here at Word size, where the interpreter reads TWO bytes and
+                // masks EIP to 16 bits.
+                //
+                // It is REDUNDANT TODAY and is kept anyway, stated plainly because a mutation
+                // proved it: `CallMem` is `uses_stack()`, so the Word form also reaches the
+                // stack-width admission matrix, which has no `CallMem16` arm and refuses it in
+                // both stack widths. Deleting either check alone leaves the Word form refused by
+                // the other, so `word_size_call_through_memory_stays_refused` cannot distinguish
+                // them and does not claim to. What the gate is for is the case the matrix stops
+                // covering the moment anyone adds a `CallMem16` mapping arm: the pushed return
+                // address and the READ WIDTH of the target are independent, and only this gate
+                // constrains the second. `JmpMem` has no matrix at all -- it is not a stack kind --
+                // so there the same check is the only one there is.
                 if m.reg == 2 {
-                    let DecodedOperand::Reg(dst) = insn.operand? else {
-                        return None;
-                    };
                     let return_delta = lin
                         .wrapping_add(u32::from(insn.len))
                         .wrapping_sub(entry_lin);
-                    return Some(DirectKind::CallReg { dst, return_delta });
+                    return match insn.operand? {
+                        DecodedOperand::Reg(dst) => Some(DirectKind::CallReg { dst, return_delta }),
+                        DecodedOperand::Mem(addr) => {
+                            if insn.operand_size != OperandSize::Dword {
+                                return None;
+                            }
+                            Some(DirectKind::CallMem {
+                                addr: direct_addr(addr)?,
+                                return_delta,
+                            })
+                        }
+                    };
                 }
                 if m.reg == 6 {
                     let DecodedOperand::Mem(addr) = insn.operand? else {

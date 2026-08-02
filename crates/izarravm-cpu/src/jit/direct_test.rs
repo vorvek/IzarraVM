@@ -236,6 +236,11 @@ fn dynamic_counter_mask_tracks_only_reachable_outputs() {
         },
         addr: Some(addr),
     });
+    let push_mem = slot(DirectKind::PushMem { addr });
+    let call_mem = slot(DirectKind::CallMem {
+        addr,
+        return_delta: 6,
+    });
 
     assert_eq!(
         dynamic_counter_mask(&[byte_store]),
@@ -279,6 +284,29 @@ fn dynamic_counter_mask_tracks_only_reachable_outputs() {
     assert_eq!(
         dynamic_counter_mask(&[x87_qword_write]),
         COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
+    );
+    // The two-address memory-writing kinds, uncovered here before slice 4 exactly as the x87 arm
+    // was before slice 39. A `CallMem` mutation that dropped its arm from `dynamic_counter_mask`
+    // SURVIVED a sixteen-mutation matrix over the whole crate, and the survivor was written off as
+    // "the facility is inert" — half true (both `emit_return` sites pass `COUNTER_ALL`, so there is
+    // no runtime consequence today) and wrong about the part that matters: the fold is live and
+    // this test is its coverage, so the survivor was a MISSING ROW, not an unobservable property.
+    //
+    // Both are the NARROW mask, and that is the assertion rather than bookkeeping. `Call` and
+    // `CallReg` carry `COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY` on top, because their
+    // store goes through `emit_store`, which has a mode-13 branch. These two write through
+    // `emit_push_mem`/`emit_call_mem`, which refuse every page kind but plain RAM, so no mode-13
+    // completion is ever emitted for them and claiming those lanes would make the static
+    // registration disagree with the dynamic count.
+    assert_eq!(dynamic_counter_mask(&[push_mem]), COUNTER_RAM_DWORD_WRITE);
+    assert_eq!(dynamic_counter_mask(&[call_mem]), COUNTER_RAM_DWORD_WRITE);
+    // And the READ lane stays clear on both: `run.rs` derives RAM reads by subtracting the mode-13
+    // dynamic count from the static one, so a read lane registered here against an emitter that
+    // never increments it underflows that subtraction.
+    assert_eq!(
+        dynamic_counter_mask(&[push_mem, call_mem])
+            & (COUNTER_MODE13_BYTE_READ | COUNTER_MODE13_DWORD_READ),
+        0
     );
 }
 

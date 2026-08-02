@@ -47,8 +47,8 @@ pub(crate) enum SideExitReason {
     /// renumbering would silently remap what emitted code stores.
     #[allow(dead_code)]
     Other = 5,
-    /// A CS segment-limit check on a computed control-transfer target: the five
-    /// `Ret`/`Ret16`/`JmpMem`/`CallReg` sites plus `MemorySideExits`' own limit stub.
+    /// A CS segment-limit check on a computed control-transfer target: the six
+    /// `Ret`/`Ret16`/`JmpMem`/`CallReg`/`CallMem` sites plus `MemorySideExits`' own limit stub.
     SegmentLimit = 6,
     /// An x87 slot's eligibility guard: a non-finite value, an Empty or Special tag, a
     /// non-truncate rounding mode at a FIST, an out-of-range integer conversion, or a subnormal
