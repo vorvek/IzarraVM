@@ -971,6 +971,7 @@ impl CpuGsw {
         if was_enabled == enabled {
             return;
         }
+        self.jit_direct.fast_map_audit.wipes_admission += 1;
         #[cfg(all(
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")

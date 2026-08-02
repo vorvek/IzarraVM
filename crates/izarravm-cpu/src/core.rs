@@ -151,6 +151,10 @@ impl CpuGsw {
         // mappings are rebuilt from the current translation and permissions.
         self.data_read_pages.invalidate();
         self.data_write_pages.invalidate();
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.fast_map_audit.wipes_tlb_flush += 1;
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -187,12 +191,20 @@ impl CpuGsw {
     pub fn note_a20_changed(&mut self) {
         self.invalidate_code_caches();
         self.invalidate_direct_pages();
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.fast_map_audit.wipes_a20 += 1;
+        }
     }
 
     pub fn note_direct_map_changed(&mut self) {
         self.invalidate_code_caches();
         self.invalidate_direct_pages();
         self.perf.direct_map_invalidations += 1;
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.fast_map_audit.wipes_direct_map += 1;
+        }
     }
 
     /// Drop cached data pointers after a device aperture changes without
@@ -209,6 +221,10 @@ impl CpuGsw {
         ))]
         self.jit_fast_map.invalidate_all();
         self.perf.direct_map_invalidations += 1;
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.fast_map_audit.wipes_direct_data_map += 1;
+        }
     }
 
     /// The decode cache's current generation. Advances on every cache invalidation (CS/paging/mode
@@ -725,12 +741,33 @@ impl CpuGsw {
         self.fast_map_probe
     }
 
+    /// N5 audit instrument: whole-map wipe causes plus the env-gated read/write/RMW shape
+    /// census. The counters live behind `JitState` rather than on `CpuGsw` so the instrument
+    /// costs the interpreter's pinned hot-field layout nothing; see `JitState::fast_map_audit`
+    /// for the measurement that forced that. Reset by `reset_perf_counters` like the others.
+    pub fn fast_map_audit_counters(&self) -> FastMapAuditCounters {
+        #[cfg(feature = "jit")]
+        let counters = *self.jit_direct.fast_map_audit;
+        #[cfg(not(feature = "jit"))]
+        let counters = FastMapAuditCounters::default();
+        FastMapAuditCounters {
+            // The live gate is the bare `CpuGsw` byte, not the stored copy; report that one so a
+            // reader of the JSON cannot mistake an unarmed run for an armed one that saw nothing.
+            census_enabled: self.rmw_census_enabled,
+            ..counters
+        }
+    }
+
     /// Zero the host-side performance counters, including the memory-poll
     /// subset stored outside `PerfCounters` (see `PollSkipMemoryCounters`).
     pub fn reset_perf_counters(&mut self) {
         self.perf = PerfCounters::default();
         self.poll_skip_memory = PollSkipMemoryCounters::default();
         self.fast_map_probe = FastMapProbeCounters::default();
+        #[cfg(feature = "jit")]
+        {
+            *self.jit_direct.fast_map_audit = FastMapAuditCounters::default();
+        }
     }
 
     #[cfg(feature = "jit")]

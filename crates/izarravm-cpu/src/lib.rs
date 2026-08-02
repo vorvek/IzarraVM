@@ -1001,6 +1001,95 @@ impl PartialEq for FastMapProbeCounters {
 }
 impl Eq for FastMapProbeCounters {}
 
+/// Gate for the read/write/RMW shape census below (`IZARRAVM_RMW_CENSUS=1`). Cached after the
+/// first check like `ud_trace_enabled`, so the per-access gate is one relaxed load and never a
+/// syscall. Measurement-only.
+fn rmw_census_default() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("IZARRAVM_RMW_CENSUS").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+/// Audit instrument for the deferred FastMap-interleaving item (N5). Two independent questions
+/// share one struct because both are diagnostic and both must stay off the pinned hot-field
+/// layout: they live at the `CpuGsw` tail for exactly the reason `FastMapProbeCounters`
+/// documents, NOT in `PerfCounters`.
+///
+/// The `wipes_*` half is always on. Every one of them sits on a cold path that already does a
+/// whole-map wipe (a 1 MiB memset plus two direct-page-cache invalidations), so one increment is
+/// unmeasurable beside it. They exist because `PerfCounters::direct_map_invalidations` counts
+/// only TWO of the five call sites that actually wipe `jit_fast_map` -- it is an undercount, not
+/// a wipe total, and nothing before this instrument said so.
+///
+/// The `census_*` half is gated at the call site on `census_enabled`, following the
+/// `barrier_census_active` pattern: the interpreter's per-access data path must not pay for a
+/// disabled instrument. It answers "how often does one guest instruction need BOTH the read and
+/// the write bias for the SAME linear page" -- the only access shape an interleaved
+/// read+write FastMap entry would help, since interleaving halves page density (8 pages per
+/// cache line to 4) for every access that needs only one of the two.
+#[derive(Debug, Clone, Copy)]
+pub struct FastMapAuditCounters {
+    /// `note_direct_map_changed`: a bus/PCI memory-decode change rebuilt the direct RAM map.
+    pub wipes_direct_map: u64,
+    /// `note_direct_data_map_changed`: the VGA direct-write token moved (a plane/mode register
+    /// write), so RAM entries must leave with the VGA entries.
+    pub wipes_direct_data_map: u64,
+    /// `note_a20_changed`: the A20 gate toggled. NOT counted by `direct_map_invalidations`.
+    pub wipes_a20: u64,
+    /// `flush_tlb_and_code_caches`: CR3/CR0/paging-state change. NOT counted by
+    /// `direct_map_invalidations`.
+    pub wipes_tlb_flush: u64,
+    /// A direct-execution admission transition (`finish_direct_execution_transition`). NOT
+    /// counted by `direct_map_invalidations`.
+    pub wipes_admission: u64,
+    /// Interpreter page-local data reads seen by the census. One per emitted-equivalent FastMap
+    /// probe: a cross-page access is split into page-local fragments upstream, and each fragment
+    /// is one probe.
+    pub census_reads: u64,
+    /// Interpreter page-local data writes seen by the census, same one-probe-per-count rule.
+    pub census_writes: u64,
+    /// Census writes whose own instruction had already read the SAME linear page. This is the
+    /// read-modify-write share, defined at page granularity because that is the granularity the
+    /// bias tables are indexed at.
+    pub census_rmw_pairs: u64,
+    /// Whether the census half is armed. Read from `IZARRAVM_RMW_CENSUS` once per process.
+    pub census_enabled: bool,
+    /// Instrument scratch, not a counter: `perf.instructions` at the last census read. Constant
+    /// across one instruction's accesses, which is what makes the same-instruction test a plain
+    /// compare. Public only so out-of-crate consumers can name every field of this struct.
+    pub last_read_insn: u64,
+    /// Instrument scratch, not a counter: linear page of the last census read. `u32::MAX` is
+    /// unreachable for `linear >> 12`, so it is the never-matches initial value.
+    pub last_read_page: u32,
+}
+
+impl Default for FastMapAuditCounters {
+    fn default() -> Self {
+        Self {
+            wipes_direct_map: 0,
+            wipes_direct_data_map: 0,
+            wipes_a20: 0,
+            wipes_tlb_flush: 0,
+            wipes_admission: 0,
+            census_reads: 0,
+            census_writes: 0,
+            census_rmw_pairs: 0,
+            census_enabled: rmw_census_default(),
+            last_read_insn: 0,
+            last_read_page: u32::MAX,
+        }
+    }
+}
+
+impl PartialEq for FastMapAuditCounters {
+    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for FastMapAuditCounters {}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
     pub name: &'static str,
@@ -1447,6 +1536,18 @@ pub struct CpuGsw {
     /// Lever 1 hit/miss counters, at the tail for the same layout reason; see
     /// `FastMapProbeCounters`.
     fast_map_probe: FastMapProbeCounters,
+    /// The N5 census gate, hoisted OUT of the boxed counter block below and kept here as a bare
+    /// byte. This is the only part of the instrument the interpreter's per-access path reads, and
+    /// reading it through the box would cost a second dependent load on 1.9 G doom accesses for
+    /// an instrument that is off. A `bool` is one byte of alignment 1 and lands in an existing
+    /// padding hole, so it leaves `pending_flags` on its pin -- measured, not assumed.
+    /// The N5 census gate, and the ONLY part of that instrument with a `CpuGsw` field: it is what
+    /// the interpreter's per-access path reads, and reaching it through `jit_direct` (where the
+    /// counters live) would cost a dependent load on 1.9 G doom accesses for an instrument that is
+    /// off. A `bool` is one byte of alignment 1 and lands in an existing padding hole, so it
+    /// leaves `pending_flags` on its pinned offset -- measured, not assumed. The counters
+    /// themselves are `JitState::fast_map_audit`; see that field for why they are not here.
+    rmw_census_enabled: bool,
 }
 
 impl Default for CpuGsw {
@@ -1516,6 +1617,7 @@ impl Default for CpuGsw {
             ))]
             fast_map_serve_enabled: FastMapServeGate::default(),
             fast_map_probe: FastMapProbeCounters::default(),
+            rmw_census_enabled: rmw_census_default(),
         }
     }
 }

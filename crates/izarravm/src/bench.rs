@@ -18,6 +18,9 @@ struct BenchRun {
     /// Lever 1 (interpreter FastMap serve path) hit/miss subset, stored outside PerfCounters on
     /// the CPU for the same layout-preservation reason; see FastMapProbeCounters.
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
+    /// N5 audit subset (FastMap wipe causes plus the env-gated RMW shape census), stored outside
+    /// PerfCounters for the same layout-preservation reason; see FastMapAuditCounters.
+    fast_map_audit: izarravm_cpu::FastMapAuditCounters,
     machine_profile: MachineHostProfileSnapshot,
     cpu_profile: CpuProfileSnapshot,
 }
@@ -92,6 +95,7 @@ fn run_bench_one_profiled(
         perf,
         poll_skip_memory: machine.cpu().poll_skip_memory(),
         fast_map_probe: machine.cpu().fast_map_probe_counters(),
+        fast_map_audit: machine.cpu().fast_map_audit_counters(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
     })
@@ -938,6 +942,7 @@ fn write_profile_json(
                 &profiled.perf,
                 profiled.poll_skip_memory,
                 profiled.fast_map_probe,
+                profiled.fast_map_audit,
             ),
         },
     });
@@ -949,6 +954,7 @@ pub(super) fn perf_counters_json(
     perf: &PerfCounters,
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
+    fast_map_audit: izarravm_cpu::FastMapAuditCounters,
 ) -> serde_json::Value {
     json!({
         "instructions": perf.instructions,
@@ -986,6 +992,17 @@ pub(super) fn perf_counters_json(
         "direct_data_pointer_writes": perf.direct_data_pointer_writes,
         "interp_fast_map_hits": fast_map_probe.hits,
         "interp_fast_map_misses": fast_map_probe.misses,
+        "fast_map_wipes_direct_map": fast_map_audit.wipes_direct_map,
+        "fast_map_wipes_direct_data_map": fast_map_audit.wipes_direct_data_map,
+        "fast_map_wipes_a20": fast_map_audit.wipes_a20,
+        "fast_map_wipes_tlb_flush": fast_map_audit.wipes_tlb_flush,
+        "fast_map_wipes_admission": fast_map_audit.wipes_admission,
+        // As 0/1 rather than a bool: every value in this object is a counter, and the key
+        // inventory test asserts a zeroed report reads `Some(0)` for all of them.
+        "rmw_census_enabled": u64::from(fast_map_audit.census_enabled),
+        "rmw_census_reads": fast_map_audit.census_reads,
+        "rmw_census_writes": fast_map_audit.census_writes,
+        "rmw_census_rmw_pairs": fast_map_audit.census_rmw_pairs,
         "fetch_page_hits": perf.fetch_page_hits,
         "fetch_page_misses": perf.fetch_page_misses,
         "slow_prefetch_refills": perf.slow_prefetch_refills,

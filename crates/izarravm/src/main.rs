@@ -939,6 +939,7 @@ fn write_hdd_profile_json(
             perf,
             machine.cpu().poll_skip_memory(),
             machine.cpu().fast_map_probe_counters(),
+            machine.cpu().fast_map_audit_counters(),
         ),
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
