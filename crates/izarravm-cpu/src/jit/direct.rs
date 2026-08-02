@@ -2719,10 +2719,34 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
         addr: DirectAddr,
     },
+    /// SHL/SHR/SAL/SAR r/m, imm8, REGISTER form (0xC1 /4../7 and 0xD1 /4../7). `count` is the RAW
+    /// decoded immediate; the emitter applies the architectural five-bit mask.
+    ///
+    /// `width` is the operand size and is Byte-free: only Word and Dword can reach here, because
+    /// the byte opcodes 0xC0 and 0xD0 have no classify arm at all. It exists for the reason
+    /// `LoadExtend::dst_width` does -- a shift is a REGISTER-DESTINATION write, so a Dword-only
+    /// lowering of a 66-prefixed form clobbers the destination's high 16 bits where the
+    /// interpreter's `write_operand_sized(.., Word, ..)` merges into the low 16. That is a
+    /// miscompile, not a missed lowering, which is why the Word allowlist refused 0xC1 until this
+    /// field existed.
+    ///
+    /// **Every flag rule is the host's, at BOTH widths, and that is the whole argument for the
+    /// Word lane rather than a masked Dword one.** `CpuGsw::shift_rotate` computes CF from the
+    /// last bit shifted out of a `width`-wide operand, OF only at a masked count of exactly 1, and
+    /// SF/ZF/PF from the `width`-wide result. A 16-bit host shift does all four against its own
+    /// 16 bits, so `66 C1 /op` reproduces `BusWidth::Word` instruction for instruction; a 32-bit
+    /// host shift over a zero-extended operand would take CF from bit 31, SF from bit 31, and for
+    /// SAR would shift in zeros where the guest shifts in bit 15.
+    ///
+    /// No `raw_clocks` arm and none is owed: the interpreter's whole group-2 arm returns
+    /// `Ok(clocks(2))` without consulting `operand_size`, which IS the `_ => 2` default. This is
+    /// the `ImulMemAcc` situation rather than the `ImulMem` one -- adding an arm here would invent
+    /// a charge, as the Phase 5 call-out double-charge did in the other direction.
     Shift {
         op: u8,
         dst: u8,
         count: u8,
+        width: MemoryWidth,
     },
     /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
     /// admits ROR (/1) but routes it to `RotateRightReg`, because rotates do not define PF, ZF,

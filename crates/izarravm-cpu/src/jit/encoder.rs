@@ -950,6 +950,26 @@ impl Encoder {
         self.bytes.push(count);
     }
 
+    /// A 16-bit group-2 immediate shift (`66 [REX] C1 /op ib`).
+    ///
+    /// The 16-bit width is the whole point, exactly as it is for `alu_r16_imm16`: an x86-64 16-bit
+    /// shift writes only the low 16 bits and PRESERVES bits 31 to 16, which is `write_gpr16`'s
+    /// `(slot & 0xffff_0000) | value`. It also computes every flag against the 16-bit operand --
+    /// CF from bit 15 for a left shift and bit 0 for a right one, SF from bit 15, ZF and PF from
+    /// the 16-bit result -- so the host does the width narrowing the interpreter's `BusWidth::Word`
+    /// does, rather than the emitter having to reconstruct it.
+    ///
+    /// The count byte is passed through verbatim; the host applies the architectural five-bit mask
+    /// itself, at Word size as at Dword, and the caller must not pre-mask differently.
+    pub(crate) fn shift_r16_imm8(&mut self, op: u8, dst: Reg, count: u8) {
+        assert!(op < 8, "shift group must fit three bits");
+        self.bytes.push(0x66);
+        self.optional_rex(false, false, false, dst.ext());
+        self.bytes.push(0xC1);
+        self.modrm(0b11, op, dst.low3());
+        self.bytes.push(count);
+    }
+
     /// A 32-bit SHLD/SHRD register form. `count=None` selects CL; otherwise the supplied imm8 is
     /// encoded verbatim and the host applies the architectural five-bit count mask.
     pub(crate) fn double_shift_r32(&mut self, left: bool, dst: Reg, src: Reg, count: Option<u8>) {

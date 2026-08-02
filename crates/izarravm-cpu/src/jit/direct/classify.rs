@@ -118,6 +118,22 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // MEMORY form is the census row; its register form is refused inside its own arm. Neither
     // fixture measures a `0xc7` register word row, so building `MovImm` a width would be an
     // unmeasured admission with no row to attribute it to.
+    //
+    // THE SIXTEEN-BIT REGISTER SHIFT LANE (rejected-row campaign, slice 3b) adds `0xc1`, and it is
+    // the second kind of path above rather than the first: `Shift` hard-coded a 32-bit destination
+    // write until this slice gave it a `width` field, so the admission and the field are one
+    // change. Slice 3 is what asked -- lowering quake's `0x0FB6` memory-word row let its blocks
+    // extend one instruction further and stop on `shl cx, imm8` instead, relocating 30,692 exits
+    // onto `0xC1 /4` and costing quake +8.78% blocks installed and ~1% of wall.
+    //
+    // `0xd1` is the SAME classifier arm and is deliberately NOT admitted. That is not an
+    // oversight and the precedent is `0xf6`/`0xf7`, which share an arm with only the byte half on
+    // this list: neither fixture measures a `0xd1` word row, and the campaign's standing rule is
+    // that an unmeasured admission is a formation change with no census row to attribute it to.
+    // Leaving it out is safe in the direction that matters -- the gate refuses it, so it stays a
+    // barrier exactly as today, and no width can be got wrong on a path that is never reached.
+    // `0xd3` (the shift-by-CL group) is a different arm entirely and stays out for the same
+    // reason, with `emit_shift_cl` still Dword-only.
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
@@ -139,6 +155,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x99
                 | 0xa8
                 | 0xb0..=0xb7
+                | 0xc1
                 | 0xc2
                 | 0xc3
                 | 0xc6
@@ -853,12 +870,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // architectural five-bit mask is applied in the emitter.
                 let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 };
                 if m.reg == 1 {
+                    // ROR at Word is REFUSED, and this guard is the only thing that stops it now
+                    // that 0xc1 is on the Word allowlist. `RotateRightReg` carries no width and its
+                    // emitter is `shift_r32_imm8(1, ..)` plus `emit_set_cf_only`, so a 66-prefixed
+                    // ROR routed through it would rotate 32 bits where the guest rotates 16 --
+                    // wrong result AND wrong CF, since the bit rotated into the MSB comes from bit
+                    // 31 instead of bit 15. Neither fixture measures a Word `0xC1 /1` row, so this
+                    // is a refusal with nothing to buy rather than a missed lowering worth the
+                    // second emitter lane.
+                    if insn.operand_size == OperandSize::Word {
+                        return None;
+                    }
                     return Some(DirectKind::RotateRightReg { dst, count });
                 }
                 return Some(DirectKind::Shift {
                     op: m.reg,
                     dst,
                     count,
+                    width: operand_width,
                 });
             }
             // Group 2 by CL. Sixth in the runtime-weighted reject audit: /7 alone is 807,607

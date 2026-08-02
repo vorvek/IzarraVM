@@ -351,6 +351,142 @@ fn the_word_size_0xc7_register_form_stays_refused() {
     }
 }
 
+/// `0xC1` at Word size: the four shift sub-ops of the REGISTER form are lowered.
+///
+/// The admission half of the rejected-row campaign's Slice 3b. Quake's `0xC1 /7` SAR (63,039
+/// exits) and `0xC1 /4` SHL (62,934, the row Slice 3's MOVZX lowering relocated 30,692 exits onto)
+/// clear the campaign's 100k floor only as a pair, and the wall argument is the Slice 3 ladder's
+/// rather than the census's.
+///
+/// Every sub-op listed separately rather than as a range, for the reason the `0x83` table gives.
+/// `/6` in particular is the undocumented SAL alias of `/4`: the interpreter handles it in a
+/// `4 | 6` arm and the host encodes it identically, so a range would hide the one member whose
+/// correctness is an aliasing claim rather than a decode claim.
+#[test]
+fn word_size_shift_forms_are_lowered() {
+    // ModRM 0xc0 | (op << 3) | 1 -- destination CX, sub-op in `reg`.
+    let cases: &[(&str, u8)] = &[("/4 shl", 4), ("/5 shr", 5), ("/6 sal", 6), ("/7 sar", 7)];
+
+    for &(label, op) in cases {
+        let form = [0x66u8, 0xc1, 0xc0 | (op << 3) | 1, 0x03];
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        // A register shift touches no memory at any width.
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// The group-2 shapes that stay refused at Word size, and the boundary that keeps them out.
+///
+/// Three separate refusals share this table, and they are refused in three different places:
+///
+/// * **The four ROTATES of `0xC1` itself.** `/0` ROL, `/2` RCL and `/3` RCR have never had a
+///   classify arm at any width. `/1` ROR does, and it is refused at Word by a guard added with
+///   this slice -- `RotateRightReg` carries no width and emits `shift_r32_imm8(1, ..)`, so a
+///   66-prefixed ROR routed through it would rotate 32 bits and take CF from bit 31 instead of
+///   bit 15. That guard is the only thing standing between the new allowlist entry and a
+///   miscompile, which is why it has a row here and a mutation in the differential file.
+/// * **`0xD1`, the shift-by-one form.** It shares `0xC1`'s classify arm, so it is refused by the
+///   allowlist alone. Deliberate: neither fixture measures a `0xD1` word row, and the campaign's
+///   standing rule is that an unmeasured admission is a formation change with no census row to
+///   attribute it to. The precedent for admitting one member of a shared arm and refusing the
+///   other is `0xf6`/`0xf7`.
+/// * **`0xD3`, the shift-by-CL group.** A different arm, still Dword-only: `emit_shift_cl` has no
+///   sixteen-bit lane and would be a second emitter primitive.
+///
+/// The MEMORY form of `0xC1` is here too, at BOTH operand sizes, because its refusal is neither
+/// the allowlist's nor new -- the classify arm binds `DecodedOperand::Reg` and returns None for
+/// anything else. Pinning both sizes is what says the Word entry did not widen it by accident.
+#[test]
+fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
+    let cases: &[(&str, &[u8])] = &[
+        ("0xc1 /0 rol cx,imm8", &[0x66, 0xc1, 0xc1, 0x03]),
+        ("0xc1 /1 ror cx,imm8", &[0x66, 0xc1, 0xc9, 0x03]),
+        ("0xc1 /2 rcl cx,imm8", &[0x66, 0xc1, 0xd1, 0x03]),
+        ("0xc1 /3 rcr cx,imm8", &[0x66, 0xc1, 0xd9, 0x03]),
+        ("0xd1 /4 shl cx,1", &[0x66, 0xd1, 0xe1]),
+        ("0xd1 /7 sar cx,1", &[0x66, 0xd1, 0xf9]),
+        ("0xd3 /4 shl cx,cl", &[0x66, 0xd3, 0xe1]),
+        ("0xd3 /7 sar cx,cl", &[0x66, 0xd3, 0xf9]),
+        (
+            "0xc1 /4 shl word [m],imm8",
+            &[0x66, 0xc1, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03],
+        ),
+        (
+            "0xc1 /4 shl dword [m],imm8",
+            &[0xc1, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03],
+        ),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        map_word_operand_page(&mut cpu, &mut bus);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused, so the block is the three fillers"
+        );
+    }
+}
+
+/// The DWORD `0xC1` register form is unaffected by the Word admission.
+///
+/// Both the shift lane and `/1` ROR must still lower at Dword. The ROR row is the one that
+/// matters: the refusal this slice added is keyed on `insn.operand_size == OperandSize::Word`, and
+/// a guard written one character wider -- refusing the opcode outright, or testing the wrong
+/// polarity -- would silently retire the existing Dword ROR lowering and no other test in the tree
+/// asserts its admission.
+#[test]
+fn the_dword_group_two_register_forms_are_unaffected() {
+    let cases: &[(&str, &[u8])] = &[
+        ("0xc1 /1 ror ecx,imm8", &[0xc1, 0xc9, 0x03]),
+        ("0xc1 /4 shl ecx,imm8", &[0xc1, 0xe1, 0x03]),
+        ("0xc1 /7 sar ecx,imm8", &[0xc1, 0xf9, 0x03]),
+        ("0xd1 /1 ror ecx,1", &[0xd1, 0xc9]),
+        ("0xd1 /4 shl ecx,1", &[0xd1, 0xe1]),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the dword form must still join the block"
+        );
+    }
+}
+
 /// A Word near JMP rides the control-target clamp, exactly as the Word CALL does.
 ///
 /// The taken target is baked as an unmasked delta from the block entry while the interpreter

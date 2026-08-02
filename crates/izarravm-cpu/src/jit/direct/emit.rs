@@ -484,7 +484,12 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
             }
-            DirectKind::Shift { op, dst, count } => emit_shift(&mut e, op, dst, count),
+            DirectKind::Shift {
+                op,
+                dst,
+                count,
+                width,
+            } => emit_shift(&mut e, op, dst, count, width),
             DirectKind::RotateRightReg { dst, count } => emit_rotate_right_reg(&mut e, dst, count),
             DirectKind::DoubleShiftReg {
                 left,
@@ -4425,12 +4430,59 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
     emit_logic_live_af(e);
 }
 
-fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
+/// Group-2 immediate shift (0xC1 /4../7, 0xD1 /4../7), register destination, Word or Dword.
+///
+/// **The two widths differ in ONE instruction and nothing else, and that is the finding rather
+/// than a convenience.** Everything below the shift -- which flags are `defined`, the eager
+/// publish to `eflags`, the `emit_clear_pending` -- is width-invariant because
+/// `CpuGsw::shift_rotate` routes both widths through the same `set_shift_result_flags`, which
+/// materializes and writes live at either width. Only the host shift itself has to narrow, and a
+/// 66-prefixed `C1 /op` narrows all four flag derivations at once:
+///
+/// | flag | guest at Word (`shift_rotate` + `set_shift_result_flags`) | `66 C1 /op` |
+/// |---|---|---|
+/// | CF | the last bit shifted out: bit 15 for SHL/SAL, bit 0 for SHR/SAR | same, from the 16-bit operand |
+/// | OF | only at a masked count of 1: SHL `msb(result) ^ CF` with msb at bit 15; SHR `msb(ORIGINAL)`; SAR always 0 | same, and the host leaves OF undefined above count 1 exactly where the interpreter leaves the previous value in place |
+/// | SF | bit 15 of the result | same |
+/// | ZF / PF | the 16-bit result; PF over its low byte | same |
+/// | AF | untouched at both widths -- `set_shift_result_flags` re-writes the value it read | not in `defined`, so RBP's AF survives |
+///
+/// A masked-Dword lowering gets every one of those wrong: CF from bit 31, SF from bit 31, ZF over
+/// 32 bits, and SAR shifting in zeros where the guest shifts in bit 15.
+///
+/// **A count of 0 emits NOTHING, at both widths, and that is load-bearing.** `shift_rotate`
+/// returns before touching the value or a flag ("a zero count affects no flags at all"), so no
+/// flag moves, no descriptor is created and no live descriptor is destroyed -- and the
+/// write-back the interpreter still performs is `write_gpr16(dst, value & 0xffff)` over the value
+/// it just read, i.e. the identity. Emitting the host shift with a count of 0 would be wrong in
+/// the other direction only for the flags, but emitting the `defined` merge below would publish
+/// RBP to `eflags` and clear a descriptor the guest keeps.
+///
+/// The five-bit mask is applied HERE rather than passed through, so the `count == 0` and
+/// `count == 1` shapes are selected on the architectural count. `classify` stores the immediate
+/// raw, so testing `raw_count` would misread `shl ax, 32` as a shift by 32 instead of the no-op
+/// it is.
+///
+/// **Counts of 16 to 31 at Word are architecturally UNDEFINED for a 16-bit operand** (Intel
+/// documents results and flags as undefined once the count reaches the operand size) and are
+/// still lowered, deliberately. The reference this tree matches is its own interpreter, and the
+/// two agree across the whole range: a sweep of SHL/SHR/SAR over ten operand values and every
+/// count 1..=31 on this host reproduced `shift_rotate`'s single-bit loop -- result, CF, OF, SF,
+/// ZF and PF -- with zero mismatches. `word_shifts_match_the_interpreter_for_every_count` pins
+/// that as a test rather than an assumption, so a host that disagreed would fail the suite loudly
+/// instead of miscompiling quietly.
+fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidth) {
     let count = raw_count & 0x1f;
     if count == 0 {
         return;
     }
-    e.shift_r32_imm8(op, home(dst), count);
+    match width {
+        MemoryWidth::Word => e.shift_r16_imm8(op, home(dst), count),
+        MemoryWidth::Dword => e.shift_r32_imm8(op, home(dst), count),
+        MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("group-2 immediate shifts reach the emitter only at Word or Dword")
+        }
+    }
     let mut defined = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
     if count == 1 {
         defined |= crate::FLAG_OF;

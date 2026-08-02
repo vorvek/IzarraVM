@@ -228,6 +228,12 @@ mod f7_group;
 #[path = "cpu_jit_word_memory_test.rs"]
 mod word_memory;
 
+/// The rejected-row campaign's sixteen-bit REGISTER shift lane (Slice 3b), the repair for the
+/// relocation Slice 3 created. Nested here for the reason the three modules above are: it wants
+/// this module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a fifth copy.
+#[path = "cpu_jit_word_shift_test.rs"]
+mod word_shift;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a

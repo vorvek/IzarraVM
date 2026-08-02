@@ -463,6 +463,30 @@ fn variable_shift_form_has_known_bytes() {
     assert_eq!(e.finish(), vec![0xD3, 0xEA, 0x41, 0xD3, 0xE9]);
 }
 
+/// `shift_r16_imm8` against its Dword sibling, byte for byte.
+///
+/// The 0x66 prefix must come BEFORE the REX byte -- a REX that precedes a legacy prefix is
+/// ignored by the CPU, so `41 66 C1 E1 03` would shift CX instead of R9W and the miscompile would
+/// be silent. The extended-register rows are the only ones that can see that ordering, which is
+/// why both an extended and a non-extended destination are pinned for each shape.
+#[test]
+fn sixteen_bit_immediate_shift_has_known_bytes() {
+    let mut e = Encoder::new();
+    e.shift_r16_imm8(4, Reg::RCX, 3); // shl cx, 3
+    e.shift_r16_imm8(4, Reg::R9, 3); // shl r9w, 3
+    e.shift_r16_imm8(5, Reg::RDX, 1); // shr dx, 1
+    e.shift_r16_imm8(7, Reg::R12, 31); // sar r12w, 31
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x66, 0xC1, 0xE1, 0x03, //
+            0x66, 0x41, 0xC1, 0xE1, 0x03, //
+            0x66, 0xC1, 0xEA, 0x01, //
+            0x66, 0x41, 0xC1, 0xFC, 0x1F,
+        ]
+    );
+}
+
 #[test]
 fn double_shift_forms_have_known_bytes() {
     let mut e = Encoder::new();
