@@ -4173,12 +4173,6 @@ fn a_mid_block_call_through_memory_matches_the_interpreter() {
     // accumulated read and write counts into these two counters and into the bus charge, so this
     // says the emitted code actually performed one of each at runtime rather than merely
     // declaring it at compile time.
-    //
-    // What it deliberately does NOT claim: it cannot see `DirectKind::dynamic_counter_mask`.
-    // `emit_return` takes `COUNTER_ALL` at both call sites, so every lane is copied out
-    // unconditionally and dropping an arm changes nothing a RUNTIME fixture can observe. That
-    // arm's coverage lives in `dynamic_counter_mask_tracks_only_reachable_outputs`
-    // (jit/direct_test.rs), which asserts the mask directly and now carries a `CallMem` row.
     assert_eq!(
         native.perf_counters().jit_native_load_hits - loads_before,
         1,

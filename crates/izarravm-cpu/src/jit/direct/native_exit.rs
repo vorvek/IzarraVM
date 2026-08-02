@@ -21,11 +21,11 @@
 //! silently remaps what a stale compiled block reports. `SideExitReason::MAX` exists so `run.rs`
 //! can bound-assert what it reads rather than trusting it.
 //!
-//! What deliberately did NOT come along: the `COUNTER_*` masks and `dynamic_counter_fields`,
-//! which name `NativeExit` field offsets but are keyed by the emitter's own stack layout
-//! (`STACK_*`) and are consumed by `DirectKind::dynamic_counter_mask` at sixty-nine sites. They
-//! are emitter shape, not exit ABI, and moving them would have made this commit something other
-//! than pure motion.
+//! What deliberately did NOT come along: `dynamic_counter_fields`, which names `NativeExit` field
+//! offsets but pairs each one with a slot in the emitter's own stack layout (`STACK_*`). It is
+//! emitter shape, not exit ABI, and moving it would have made this commit something other than
+//! pure motion. (It once sat beside a family of `COUNTER_*` bit masks naming the same lanes; those
+//! were deleted when the per-kind mask they fed turned out never to reach the emitter.)
 
 use crate::CpuGsw;
 
