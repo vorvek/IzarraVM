@@ -3561,11 +3561,11 @@ fn dynamic_counter_fields() -> [(i8, usize); 7] {
 /// which a lowered access can disagree with the interpreter about which segment it uses.
 ///
 /// Census evidence for the admitted set (`.bench/results/rejected-rows-20260802/slice5`): SS
-/// carries 19,552,517 doom exits — 97.63% of doom's whole rejected class — ES 580 more, and GS
-/// 1,170 on quake. DS and FS measure zero on both fixtures but share the mechanism exactly: the
-/// five data segments are handled uniformly by `SEGMENT_ORDER`, `segment_bit`, `SegmentLayout.data`
-/// and `segment_access_supported`, with no per-segment arm anywhere, so splitting them would be a
-/// distinction the code does not make.
+/// carries 19,552,517 doom exits across two rows — 97.63% of doom's whole rejected class — ES 718
+/// more across seven, and GS 1,170 on quake. DS and FS measure zero on both fixtures but share the
+/// mechanism exactly: the five data segments are handled uniformly by `SEGMENT_ORDER`,
+/// `segment_bit`, `SegmentLayout.data` and `segment_access_supported`, with no per-segment arm
+/// anywhere, so splitting them would be a distinction the code does not make.
 ///
 /// **CS is refused, explicitly rather than by omission**, and it is the only refusal here that
 /// costs measured exits (12,674 doom, on `0xFF /4` `jmp dword [cs:m]`; zero on quake). Two reasons,

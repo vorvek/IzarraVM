@@ -6249,14 +6249,27 @@ fn a_load_through_an_override_pins_that_segment_against_a_guest_reload() {
 /// wants. Both die in `segment_access_supported`, consulted from `kind_segment_access_supported`
 /// on every slot and again from `SegmentLayout::capture` at the end of the walk:
 ///
-///  * a null data segment installs `SegmentRegister::default()` — `access == 0`, so the present bit
-///    is clear (`control.rs`: "a later memory access through it faults with #GP(0)"), and
+///  * a segment loaded with a null selector installs `SegmentRegister::default()` — `access == 0`,
+///    so the present bit is clear (`control.rs:1248`: "a later memory access through it faults with
+///    #GP(0)"), and
 ///  * a CODE descriptor in a data segment register fails the `!write || (!code && writable)` clause
 ///    on any store.
 ///
 /// The refusal is **fail-closed and it is a `Retry`, not a `StructuralReject`**: no block forms, no
 /// rejected span is installed, and the interpreter executes the instruction and takes whatever
 /// fault its own rules say. That is what every already-admitted DS and SS access does today.
+///
+/// **A NEVER-LOADED FS or GS is a different case and is NOT refused, deliberately.**
+/// `Registers::default` seeds all six data segments with `SegmentRegister::real(0)` — access 0x93,
+/// present, writable, base 0, limit 0xFFFF — so a guest that enters protected mode without ever
+/// loading FS has a perfectly accessible FS descriptor and an override through it COMPILES. That is
+/// correct twice over: the JIT and the interpreter read the same `registers.segment(segment)`, so
+/// they form the same linear address and take the same limit fault; and it matches real silicon,
+/// where entering protected mode does not reload the descriptor caches. The compile-time check is
+/// strictly stricter than the interpreter's runtime one, never looser. What keeps that safe over
+/// time is not this fixture but
+/// `a_load_through_an_override_pins_that_segment_against_a_guest_reload`, which pins the block
+/// against the moment the guest finally does load the segment.
 ///
 /// Each case carries a control that differs ONLY in the descriptor, so the refusal cannot be the
 /// override's doing, the opcode's, or the fixture's shape.
@@ -6347,9 +6360,18 @@ fn an_override_naming_an_inaccessible_segment_refuses_to_compile_at_all() {
 /// the vector off the OVERRIDDEN segment too -- **#SS(12) for an SS override, #GP(13) otherwise**
 /// -- which is the architectural rule, reached with no code written for it.
 ///
-/// Both halves are load-bearing. The SS case pins the vector split; the FS case pins that the
-/// guard fires on a segment the DEFAULT would have allowed, so it is the override being checked
-/// and not DS.
+/// Both halves are load-bearing, and each pins something the other cannot.
+///
+///  * The **FS** case pins that the guard fires on a segment the DEFAULT would have allowed. The
+///    operand is `[disp32]`, whose default segment is a flat 64 KB DS that admits offset 0x1800
+///    without complaint; only the override moves it onto the short-limit FS. Drop the decode fold
+///    and this half stops side-exiting at all.
+///  * The **SS** case pins the vector SPLIT, and it is measured rather than tabulated: the two
+///    vectors have distinct real-mode IVT handlers, and the assertion reads the delivered vector
+///    back out of EIP after the interpreter's re-run. An earlier draft asserted
+///    `segment_limit_fault(segment)` against a loop constant, which is a table test of a `const fn`
+///    wearing a fixture's name -- it never touched either role's state and would have passed with
+///    the whole slice reverted.
 #[test]
 fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_segment() {
     const ENTRY: u32 = 0x100;
@@ -6358,6 +6380,8 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
     const INITIAL_ESP: u32 = 0x0f00;
     // One byte short of the four the load needs: `max_start = limit - 3` refuses OFFSET.
     const SHORT_LIMIT: u32 = OFFSET + 2;
+    // Indexed by `vector - 12`: #SS then #GP.
+    const HANDLER_OFFSET: [u32; 2] = [0x0300, 0x0380];
 
     for (segment, prefix, base, vector) in [
         (SegmentIndex::Ss, 0x36u8, 0x0800u32, 12u32),
@@ -6377,6 +6401,15 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
         // vacuously.
         let payload = (base + OFFSET) as usize;
         memory[payload..payload + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        // Real-mode IVT entries for #SS(12) and #GP(13), at DISTINCT handler offsets in segment 0.
+        // This is what turns the vector claim into a measurement: the vector is read back out of
+        // EIP after the fault is delivered, rather than asserted from a table of loop constants.
+        let handler = HANDLER_OFFSET[usize::try_from(vector).unwrap() - 12];
+        for (v, offset) in [(12u32, HANDLER_OFFSET[0]), (13, HANDLER_OFFSET[1])] {
+            let slot = (v * 4) as usize;
+            memory[slot..slot + 2].copy_from_slice(&(offset as u16).to_le_bytes());
+            memory[slot + 2..slot + 4].copy_from_slice(&0u16.to_le_bytes());
+        }
 
         let mut native = segment_override_cpu();
         let mut interp = segment_override_cpu();
@@ -6470,8 +6503,7 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
         );
 
         // The fault itself is the INTERPRETER's, taken on the re-run, and it is the same fault on
-        // both roles. Deriving the vector from `segment_limit_fault` rather than asserting a
-        // hard-coded number keeps this a statement about the override selecting the segment.
+        // both roles.
         let native_step = native.cycle(&mut native_bus);
         let interp_step = interp.cycle(&mut interp_bus);
         assert_eq!(
@@ -6496,15 +6528,24 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
             native.registers.eip, LOAD,
             "{segment:?}: the interpreter's re-run must have taken the fault and vectored away"
         );
+        // THE VECTOR SPLIT, measured. EIP now holds whichever IVT handler the delivered vector
+        // named, and the two handlers are distinct, so this reads the vector out of the machine
+        // rather than asserting it from the loop's own constants. An SS override must take
+        // #SS(12) and an FS override #GP(13) -- the architectural rule, which falls out of the
+        // decode fold putting the override into `addr.segment` before `segment_limit_fault` ever
+        // sees it. Cross-checked against `segment_limit_fault`'s own answer so that a change to
+        // either the delivery path or the classifier alone breaks this.
+        assert_eq!(
+            native.registers.eip, handler,
+            "{segment:?}: the fault must vector through IVT[{vector}]"
+        );
         assert!(
             matches!(
                 segment_limit_fault(segment),
-                InternalFault::Exception {
-                    vector: v,
-                    error_code: Some(0)
-                } if u32::from(v) == vector
+                InternalFault::Exception { vector: v, error_code: Some(0) }
+                    if u32::from(v) == vector
             ),
-            "{segment:?}: the vector must follow the OVERRIDDEN segment, #SS for SS and #GP else"
+            "{segment:?}: and the classifier must name the same vector the machine delivered"
         );
     }
 }
