@@ -36,6 +36,13 @@
 //!   page-crossing compare dead for the three self-aligning widths. So the watch fixture below
 //!   asserts the transactional exit rather than a straddle, which cannot be constructed.
 //!
+//! Both of those bullets are the same structural fact seen twice, and it is worth stating in the
+//! direction that is easy to get backwards: **the Word path is guarded MORE tightly than the Dword
+//! path, not less.** `emit_wide_page_guard` refuses every odd address, which makes a page straddle
+//! impossible and the crossing compare provably dead; the same refusal is what confines the access
+//! to one watch chunk. A reviewer arriving at "sixteen-bit memory forms" primed to look for a
+//! weaker guard will find a stricter one.
+//!
 //! Mutation record for this file. Nine, all applied by hand, observed, and restored; the failing
 //! assertion quoted is the FIRST one each produced.
 //!
@@ -59,10 +66,31 @@
 //! `0x83` row, and they fail on different assertions -- guest RAM for the write, lazy flags for the
 //! read. Neither alone would have covered the other.
 //!
-//! One mutation that did NOT fail was tried and discarded as mis-aimed rather than recorded as a
-//! survivor: `emit_pending_inc_dec`'s Word `width_tag`, reached by a string match that hit the
-//! wrong one of the two identical `width_tag` tables. It belongs to `RmwIncDec`, which this slice
-//! does not touch. Anyone re-running these must check which table they edited.
+//! A tenth mutation was tried, did not fail, and is recorded here in CORRECTED form. An earlier
+//! version of this note called it "mis-aimed rather than a survivor" and attributed it to
+//! `RmwIncDec`. Both halves of that were wrong, and top-tier review caught the attribution.
+//!
+//! The mutation is `emit_pending_inc_dec`'s Word `width_tag` -> `0x200`, reached by a string match
+//! that hit the wrong one of two four-line-identical `width_tag` tables (the other is
+//! `emit_commit_alu_candidate`'s, which IS this slice's and IS caught, row seven above).
+//!
+//! * **The attribution.** `emit_pending_inc_dec` has FOUR calling functions, not one:
+//!   `emit_rmw_inc_dec` (memory RMW, Word or Dword from the kind), `emit_rmw_inc_dec_dword`
+//!   (Dword literal), `emit_inc_dec_reg` (register INC/DEC -- two textual call sites, one per
+//!   width arm) and `emit_inc_dec_reg8` (Byte literal). So the Word tag serves `RmwIncDec` at Word
+//!   AND `IncDecReg` at Word, and both are production-reachable: `0xff` and `0x40..=0x4f` are both
+//!   on classify's Word allowlist.
+//! * **It is a genuine SURVIVOR, not merely off-target.** The original check ran only the
+//!   `word_memory` filter. Re-run against the whole crate it still passes: **1313 passed, 0
+//!   failed.** Nothing in the tree covers the lazy-flag descriptor WIDTH of a sixteen-bit INC or
+//!   DEC, so `66 FF /0` (INC m16) and `66 40` (INC AX) would build a descriptor claiming a dword
+//!   operation over word operands, and the divergence only surfaces when a later instruction reads
+//!   a flag lazily.
+//!
+//! That gap is PRE-EXISTING and outside this slice -- nothing here touches INC or DEC -- so it is
+//! flagged for its own change rather than fixed in passing. It is written down because the two
+//! tables are byte-identical for four lines and the next person to mutate one will land on the
+//! wrong one exactly as this did.
 
 use super::*;
 
