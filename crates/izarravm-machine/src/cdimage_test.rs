@@ -163,3 +163,46 @@ fn cue_reads_cdg_audio_as_a_plain_red_book_frame() {
     assert_eq!(img.read_audio_frame(0).unwrap()[0], 0xC1);
     assert_eq!(img.read_audio_frame(1).unwrap()[0], 0xC2);
 }
+
+#[test]
+fn pregap_advances_the_lba_timeline_without_consuming_bytes() {
+    // Track 1: 2 data sectors. Track 2: audio, preceded by a 2-frame PREGAP
+    // that exists on the disc timeline but has no bytes in the BIN.
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               PREGAP 00:00:02\n\
+               INDEX 01 00:00:02\n";
+    let mut bin = vec![0u8; 2 * DATA_SECTOR + 3 * RAW_SECTOR];
+    bin[2 * DATA_SECTOR] = 0xBB;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    let t1 = img.tracks()[0];
+    let t2 = img.tracks()[1];
+    assert_eq!((t1.start_lba, t1.sectors), (0, 2));
+    // The 2-frame pregap pushes track 2 to LBA 4, but its bytes still start
+    // right after track 1's in the BIN.
+    assert_eq!(t2.start_lba, 4);
+    assert_eq!(t2.sectors, 3);
+    assert_eq!(img.read_audio_frame(4).unwrap()[0], 0xBB);
+    assert_eq!(img.total_sectors(), 7);
+}
+
+#[test]
+fn index00_pregap_folds_into_the_preceding_track() {
+    // Track 2 declares INDEX 00 one frame before INDEX 01: those bytes ARE in
+    // the file, and belong to track 1's span. Pinning the documented policy.
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 00 00:00:02\n\
+               INDEX 01 00:00:03\n";
+    let bin = vec![0u8; 3 * DATA_SECTOR + 2 * RAW_SECTOR];
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    let t1 = img.tracks()[0];
+    let t2 = img.tracks()[1];
+    // Track 1 runs to track 2's INDEX 01, absorbing the INDEX 00 pregap frame.
+    assert_eq!((t1.start_lba, t1.sectors), (0, 3));
+    assert_eq!(t2.start_lba, 3);
+}

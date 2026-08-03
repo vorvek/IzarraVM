@@ -228,8 +228,12 @@ impl CdImage {
         // 2352 for AUDIO and MODE1/2352. The track frame addresses stay the
         // logical (sector-count) timeline regardless of byte size.
         let mut tracks = Vec::with_capacity(parsed.len());
-        let mut total_sectors = 0u32;
         let mut image_offset = 0usize;
+        // Two timelines. `disc_lba` is what the guest sees, and PREGAP frames
+        // advance it without any bytes behind them. The CUE's INDEX addresses
+        // are positions in the file, so a track's byte span still comes from
+        // the delta between consecutive INDEX 01 values.
+        let mut disc_lba = 0u32;
         for (i, p) in parsed.iter().enumerate() {
             let raw = p.mode.raw_size();
             // Sector count: the span to the next track's start frame, or the
@@ -246,21 +250,22 @@ impl CdImage {
                     bin.len()
                 ));
             }
+            disc_lba += p.pregap_frames;
             tracks.push(Track {
                 number: p.number,
                 mode: p.mode,
-                start_lba: p.start_frame,
+                start_lba: disc_lba,
                 sectors,
                 image_offset,
             });
             image_offset += span;
-            total_sectors = total_sectors.max(p.start_frame + sectors);
+            disc_lba += sectors;
         }
 
         Ok(Self {
             backing: Backing::Bytes(bin),
             tracks,
-            total_sectors,
+            total_sectors: disc_lba,
         })
     }
 
@@ -408,17 +413,25 @@ struct CueTrack {
     number: u8,
     mode: TrackMode,
     start_frame: u32,
+    /// Frames declared by PREGAP: present on the disc timeline, absent from the
+    /// file. They shift this track and everything after it to a higher LBA
+    /// without consuming any bytes.
+    pregap_frames: u32,
 }
 
 /// Parse a CUE sheet into its track list. Recognizes `TRACK n MODE1/2048`,
 /// `MODE1/2352`, `MODE1/2448`, `MODE2/2048`, `MODE2/2336`, `MODE2/2352`,
 /// `AUDIO`, and `CDG`, with each track's `INDEX 01 MM:SS:FF` start. The
-/// `FILE` and `PREGAP`/`INDEX 00` lines are accepted and ignored: a
-/// single-BIN CUE keeps every track in one file, and INDEX 00 pregap is
-/// folded into the preceding track's data on most rips.
+/// `FILE` line is accepted and ignored: a single-BIN CUE keeps every track in
+/// one file. `PREGAP` and `INDEX 00` both mean different things: PREGAP is
+/// not stored in the file and advances the disc LBA timeline by itself
+/// (handled in `from_cue`), while INDEX 00 addresses bytes that ARE in the
+/// file and are folded into the preceding track's span by only ever reading
+/// INDEX 01 here.
 fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
     let mut tracks: Vec<CueTrack> = Vec::new();
     let mut pending: Option<(u8, TrackMode)> = None;
+    let mut pending_pregap = 0u32;
 
     for line in cue.lines() {
         let mut words = line.split_whitespace();
@@ -444,6 +457,13 @@ fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
                     None => return Err(format!("missing TRACK mode in '{line}'")),
                 };
                 pending = Some((number, mode));
+                pending_pregap = 0;
+            }
+            "PREGAP" => {
+                let msf = words
+                    .next()
+                    .ok_or_else(|| format!("missing PREGAP time in '{line}'"))?;
+                pending_pregap = parse_msf(msf)?;
             }
             "INDEX" => {
                 let idx: u8 = words.next().and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -461,8 +481,10 @@ fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
                     number,
                     mode,
                     start_frame: frame,
+                    pregap_frames: pending_pregap,
                 });
                 pending = None;
+                pending_pregap = 0;
             }
             _ => {}
         }
