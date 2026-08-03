@@ -224,9 +224,13 @@ impl CdImage {
     /// [`CdImage::from_cue_files`] for the common one-file sheet: every track
     /// is bound to `bin` regardless of what the sheet's FILE lines name.
     pub fn from_cue(cue: &str, bin: Vec<u8>) -> Result<Self, String> {
-        let parsed = parse_cue(cue)?;
-        let name = parsed.0.first().cloned().unwrap_or_default();
-        Self::build(parsed, &[(name, bin)], true)
+        let (_names, mut tracks) = parse_cue(cue)?;
+        // One BIN: every track binds to it regardless of what the sheet's FILE
+        // lines name, so flatten every track onto the single file up front.
+        for track in &mut tracks {
+            track.file_index = 0;
+        }
+        Self::build(tracks, &[bin.as_slice()])
     }
 
     /// Mount from a CUE sheet and the files it names. Each FILE opens a new
@@ -234,13 +238,27 @@ impl CdImage {
     /// LBA timeline runs continuously across all of them. A track that is last
     /// in its file runs to that file's end.
     pub fn from_cue_files(cue: &str, files: Vec<(String, Vec<u8>)>) -> Result<Self, String> {
-        let parsed = parse_cue(cue)?;
-        Self::build(parsed, &files, false)
+        let (names, tracks) = parse_cue(cue)?;
+        // Resolve each FILE the sheet names to the bytes the caller supplied,
+        // in sheet order. Borrowed slices, not owned copies: a CUE may legally
+        // name the same file twice (that's how a sheet declares two tracks
+        // living in one file), and an owned copy would clone those bytes once
+        // per mention instead of once per file.
+        let mut file_bytes: Vec<&[u8]> = Vec::with_capacity(names.len());
+        for name in &names {
+            let found = files
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
+            file_bytes.push(found.1.as_slice());
+        }
+        Self::build(tracks, &file_bytes)
     }
 
-    /// Shared track-table construction for both CUE entry points. `single_file`
-    /// forces every track onto `files[0]`, which is what the one-BIN
-    /// `from_cue` wrapper means by binding every track to the same bytes.
+    /// Shared track-table construction for both CUE entry points. `file_bytes`
+    /// is indexed by each track's `file_index`; `from_cue` stamps every track
+    /// to index 0 against its single-element slice before calling in, so this
+    /// function never needs to know which entry point built its input.
     ///
     /// The INDEX addresses give each track's start in sectors (frames), so a
     /// track's sector count is the delta to the next track's start *within the
@@ -256,32 +274,14 @@ impl CdImage {
     /// positions within a file, so a track's byte span still comes from the
     /// delta between consecutive INDEX 01 values *in that file*. This
     /// derivation assumes tracks within a single file appear in non-decreasing
-    /// INDEX 01 order (the `saturating_sub` above silently floors an
-    /// out-of-order pair to zero sectors instead of erroring); a sheet that
-    /// violates this, within one file, mounts with a track table and
-    /// `total_sectors` that no longer match the on-disc reality.
-    fn build(
-        parsed: (Vec<String>, Vec<CueTrack>),
-        files: &[(String, Vec<u8>)],
-        single_file: bool,
-    ) -> Result<Self, String> {
-        let (names, tracks_in) = parsed;
+    /// INDEX 01 order (the `n.start_frame.saturating_sub(p.start_frame)` below
+    /// silently floors an out-of-order pair to zero sectors instead of
+    /// erroring); a sheet that violates this, within one file, mounts with a
+    /// track table and `total_sectors` that no longer match the on-disc
+    /// reality.
+    fn build(tracks_in: Vec<CueTrack>, file_bytes: &[&[u8]]) -> Result<Self, String> {
         if tracks_in.is_empty() {
             return Err("CUE sheet declared no tracks".to_string());
-        }
-
-        // Resolve each FILE the sheet names to the bytes the caller supplied.
-        let mut file_bytes: Vec<&[u8]> = Vec::new();
-        if single_file {
-            file_bytes.push(files.first().map(|f| f.1.as_slice()).unwrap_or(&[]));
-        } else {
-            for name in &names {
-                let found = files
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                    .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
-                file_bytes.push(found.1.as_slice());
-            }
         }
         if file_bytes.is_empty() {
             return Err("CUE sheet declared no FILE".to_string());
@@ -294,7 +294,7 @@ impl CdImage {
         let total_bytes = file_bytes.iter().map(|b| b.len()).sum();
         let mut concatenated: Vec<u8> = Vec::with_capacity(total_bytes);
         let mut file_base = Vec::with_capacity(file_bytes.len());
-        for bytes in &file_bytes {
+        for bytes in file_bytes {
             file_base.push(concatenated.len());
             concatenated.extend_from_slice(bytes);
         }
@@ -302,16 +302,20 @@ impl CdImage {
         let mut tracks = Vec::with_capacity(tracks_in.len());
         let mut disc_lba = 0u32;
         for (i, p) in tracks_in.iter().enumerate() {
-            let fi = if single_file { 0 } else { p.file_index };
+            let fi = p.file_index;
+            // `fi` is always in range here: `from_cue` stamps every track to
+            // index 0 against a one-element `file_bytes`, and
+            // `from_cue_files` builds one `file_bytes` entry per FILE that
+            // `parse_cue` drew `file_index` from, in the same order. This is
+            // a `.get()`-over-index habit, not a live ambiguity -- same as
+            // the bounds check in `read_data_sector`.
             let bytes = *file_bytes
                 .get(fi)
                 .ok_or_else(|| format!("track {} references an absent FILE", p.number))?;
             let raw = p.mode.raw_size();
             // The next track bounds this one only if it shares this file;
             // otherwise this track runs to its own file's end.
-            let next_in_file = tracks_in
-                .get(i + 1)
-                .filter(|n| single_file || n.file_index == fi);
+            let next_in_file = tracks_in.get(i + 1).filter(|n| n.file_index == fi);
             let sectors = match next_in_file {
                 Some(n) => n.start_frame.saturating_sub(p.start_frame),
                 None => ((bytes.len().saturating_sub(cursors[fi])) / raw) as u32,

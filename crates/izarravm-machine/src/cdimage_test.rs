@@ -276,3 +276,39 @@ fn cue_reports_a_file_it_was_not_given() {
         "error should name the file: {err}"
     );
 }
+
+#[test]
+fn cue_shares_one_file_across_two_tracks_then_a_third_in_another() {
+    // FILE A holds two tracks back-to-back; FILE B holds a third track alone.
+    // Track 1's span is bounded by track 2's INDEX 01 *within FILE A* (the
+    // `n.file_index == fi` comparison the per-file rework added actually
+    // evaluates true here); track 2 then runs to FILE A's own end, and
+    // track 3 runs to FILE B's end -- three different file-boundary cases
+    // in one sheet.
+    let cue = "FILE \"a.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:02\n\
+               FILE \"b.bin\" BINARY\n\
+               TRACK 03 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    // Track 1: 2 sectors of MODE1/2048 (4096 bytes). Track 2: 3 sectors of
+    // AUDIO (7056 bytes), filling the rest of FILE A exactly.
+    let mut a = vec![0u8; 2 * DATA_SECTOR + 3 * RAW_SECTOR];
+    a[0] = 0xA1; // track 1 marker
+    a[2 * DATA_SECTOR] = 0xA2; // track 2 marker, right after track 1's bytes
+    let mut b = vec![0u8; 2 * RAW_SECTOR];
+    b[0] = 0xB3; // track 3 marker
+    let files = vec![("a.bin".to_string(), a), ("b.bin".to_string(), b)];
+
+    let img = CdImage::from_cue_files(cue, files).unwrap();
+    assert_eq!(img.track_count(), 3);
+    assert_eq!((img.tracks()[0].start_lba, img.tracks()[0].sectors), (0, 2));
+    assert_eq!((img.tracks()[1].start_lba, img.tracks()[1].sectors), (2, 3));
+    assert_eq!((img.tracks()[2].start_lba, img.tracks()[2].sectors), (5, 2));
+    assert_eq!(img.total_sectors(), 7);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xA1);
+    assert_eq!(img.read_audio_frame(2).unwrap()[0], 0xA2);
+    assert_eq!(img.read_audio_frame(5).unwrap()[0], 0xB3);
+}
