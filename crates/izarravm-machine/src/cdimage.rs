@@ -56,6 +56,17 @@ impl TrackMode {
     pub fn is_audio(self) -> bool {
         matches!(self, TrackMode::Audio)
     }
+
+    /// Byte offset of the 2048-byte user payload inside one stored frame.
+    /// MODE1/2352 wraps the payload in 12 sync + 4 header bytes; MODE1/2048
+    /// stores it bare.
+    pub fn payload_offset(self) -> usize {
+        match self {
+            TrackMode::Mode1_2048 => 0,
+            TrackMode::Mode1_2352 => 16,
+            TrackMode::Audio => 0, // never read as data
+        }
+    }
 }
 
 /// One entry in the disc's track table.
@@ -238,12 +249,7 @@ impl CdImage {
             Backing::Bytes(bytes) => {
                 let raw = track.mode.raw_size();
                 let frame_off = track.image_offset + (lba - track.start_lba) as usize * raw;
-                // MODE1/2352 stores the 2048-byte user data at offset 16 (12
-                // sync + 4 header); MODE1/2048 stores it at the frame start.
-                let payload_off = match track.mode {
-                    TrackMode::Mode1_2352 => frame_off + 16,
-                    _ => frame_off,
-                };
+                let payload_off = frame_off + track.mode.payload_offset();
                 let slice = bytes.get(payload_off..payload_off + DATA_SECTOR)?;
                 let mut out = [0u8; DATA_SECTOR];
                 out.copy_from_slice(slice);
