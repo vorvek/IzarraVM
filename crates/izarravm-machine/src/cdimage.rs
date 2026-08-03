@@ -8,10 +8,13 @@
 //! - A plain ISO: one MODE1 data track of 2048-byte sectors. The image length
 //!   divides evenly by 2048 and every sector is a data sector.
 //! - A CUE sheet with one BIN file: a multi-track disc. The CUE names the BIN
-//!   and lists each track's MODE (MODE1/2048, MODE1/2352, MODE2/2048,
-//!   MODE2/2336, MODE2/2352, or AUDIO) and its start INDEX 01 as an MM:SS:FF
-//!   address. Data tracks read back 2048 logical bytes per sector; AUDIO
-//!   tracks read back the raw 2352-byte Red Book frame.
+//!   and lists each track's MODE (MODE1/2048, MODE1/2352, MODE1/2448,
+//!   MODE2/2048, MODE2/2336, MODE2/2352, AUDIO, or CDG) and its start
+//!   INDEX 01 as an MM:SS:FF address. Data tracks read back 2048 logical
+//!   bytes per sector; AUDIO tracks read back the raw 2352-byte Red Book
+//!   frame. MODE1/2448 and CDG store each frame with a 96-byte subchannel
+//!   tail appended (2352 + 96); the tail only grows the per-frame stride and
+//!   is discarded on read, so the payload offset matches the untailed mode.
 //!
 //! Sector framing: a 2048-byte data track stores the user data directly; a
 //! 2352-byte MODE1 track wraps each 2048-byte payload in the Red Book sync,
@@ -37,6 +40,8 @@ pub const DATA_SECTOR: usize = 2048;
 pub const RAW_SECTOR: usize = 2352;
 /// Bytes in a MODE2 frame stored without sync and header (subheader leads).
 pub const MODE2_SECTOR: usize = 2336;
+/// Bytes in a frame stored with its 96-byte subchannel tail (2352 + 96).
+pub const SUBCHANNEL_SECTOR: usize = 2448;
 /// Frames per second on a CD (the FF field of MM:SS:FF runs 0..75).
 pub const FRAMES_PER_SEC: u32 = 75;
 /// The 150-frame (2-second) lead-in offset: LBA 0 is absolute MSF 00:02:00.
@@ -58,6 +63,12 @@ pub enum TrackMode {
     Mode2_2352,
     /// Red Book CD-DA audio: raw 2352-byte stereo frames.
     Audio,
+    /// MODE1 data stored as 2448-byte frames: a 2352-byte Red Book frame
+    /// followed by a 96-byte subchannel tail that is discarded on read.
+    Mode1_2448,
+    /// CD+G audio: a 2352-byte Red Book frame followed by the 96-byte
+    /// subchannel tail carrying the graphics stream, which is discarded.
+    AudioCdg,
 }
 
 impl TrackMode {
@@ -67,11 +78,12 @@ impl TrackMode {
             TrackMode::Mode1_2048 | TrackMode::Mode2_2048 => DATA_SECTOR,
             TrackMode::Mode2_2336 => MODE2_SECTOR,
             TrackMode::Mode1_2352 | TrackMode::Mode2_2352 | TrackMode::Audio => RAW_SECTOR,
+            TrackMode::Mode1_2448 | TrackMode::AudioCdg => SUBCHANNEL_SECTOR,
         }
     }
 
     pub fn is_audio(self) -> bool {
-        matches!(self, TrackMode::Audio)
+        matches!(self, TrackMode::Audio | TrackMode::AudioCdg)
     }
 
     /// Byte offset of the 2048-byte user payload inside one stored frame, or
@@ -84,9 +96,9 @@ impl TrackMode {
         match self {
             TrackMode::Mode1_2048 | TrackMode::Mode2_2048 => Some(0),
             TrackMode::Mode2_2336 => Some(8),
-            TrackMode::Mode1_2352 => Some(16),
+            TrackMode::Mode1_2352 | TrackMode::Mode1_2448 => Some(16),
             TrackMode::Mode2_2352 => Some(24),
-            TrackMode::Audio => None,
+            TrackMode::Audio | TrackMode::AudioCdg => None,
         }
     }
 
@@ -98,7 +110,7 @@ impl TrackMode {
             TrackMode::Mode2_2352 => Some(18),
             TrackMode::Mode2_2336 => Some(2),
             TrackMode::Mode1_2048 | TrackMode::Mode1_2352 | TrackMode::Mode2_2048 => None,
-            TrackMode::Audio => None,
+            TrackMode::Audio | TrackMode::Mode1_2448 | TrackMode::AudioCdg => None,
         }
     }
 }
@@ -320,7 +332,10 @@ impl CdImage {
         let Backing::Bytes(bytes) = &self.backing else {
             return None;
         };
-        let frame_off = track.image_offset + (lba - track.start_lba) as usize * RAW_SECTOR;
+        let stride = track.mode.raw_size();
+        let frame_off = track.image_offset + (lba - track.start_lba) as usize * stride;
+        // A CD+G frame is 2448 bytes: the Red Book audio leads, the 96-byte
+        // subchannel tail follows and is not audio.
         let slice = bytes.get(frame_off..frame_off + RAW_SECTOR)?;
         let mut out = [0u8; RAW_SECTOR];
         out.copy_from_slice(slice);
@@ -396,11 +411,11 @@ struct CueTrack {
 }
 
 /// Parse a CUE sheet into its track list. Recognizes `TRACK n MODE1/2048`,
-/// `MODE1/2352`, `MODE2/2048`, `MODE2/2336`, `MODE2/2352`, and `AUDIO`, with
-/// each track's `INDEX 01 MM:SS:FF` start. The `FILE` and `PREGAP`/`INDEX 00`
-/// lines are accepted and ignored: a single-BIN CUE keeps every track in one
-/// file, and INDEX 00 pregap is folded into the preceding track's data on
-/// most rips.
+/// `MODE1/2352`, `MODE1/2448`, `MODE2/2048`, `MODE2/2336`, `MODE2/2352`,
+/// `AUDIO`, and `CDG`, with each track's `INDEX 01 MM:SS:FF` start. The
+/// `FILE` and `PREGAP`/`INDEX 00` lines are accepted and ignored: a
+/// single-BIN CUE keeps every track in one file, and INDEX 00 pregap is
+/// folded into the preceding track's data on most rips.
 fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
     let mut tracks: Vec<CueTrack> = Vec::new();
     let mut pending: Option<(u8, TrackMode)> = None;
@@ -422,7 +437,9 @@ fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
                     Some("MODE2/2048") => TrackMode::Mode2_2048,
                     Some("MODE2/2336") => TrackMode::Mode2_2336,
                     Some("MODE2/2352") => TrackMode::Mode2_2352,
+                    Some("MODE1/2448") => TrackMode::Mode1_2448,
                     Some("AUDIO") => TrackMode::Audio,
+                    Some("CDG") => TrackMode::AudioCdg,
                     Some(other) => return Err(format!("unsupported TRACK mode '{other}'")),
                     None => return Err(format!("missing TRACK mode in '{line}'")),
                 };

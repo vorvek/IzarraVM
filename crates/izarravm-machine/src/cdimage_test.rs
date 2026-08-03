@@ -140,3 +140,26 @@ fn xa_form2_sectors_are_not_readable_as_data() {
     assert!(img.read_data_sector(1).is_none());
     assert_eq!(img.read_data_sector(2).unwrap()[0], 0x03);
 }
+
+#[test]
+fn cue_discards_the_subchannel_tail_on_mode1_2448() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2448\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; 2 * SUBCHANNEL_SECTOR];
+    bin[16] = 0xA1; // sector 0 payload
+    bin[SUBCHANNEL_SECTOR + 16] = 0xA2; // sector 1 payload, one full 2448 stride on
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xA1);
+    assert_eq!(img.read_data_sector(1).unwrap()[0], 0xA2);
+}
+
+#[test]
+fn cue_reads_cdg_audio_as_a_plain_red_book_frame() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 CDG\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; 2 * SUBCHANNEL_SECTOR];
+    bin[0] = 0xC1;
+    bin[SUBCHANNEL_SECTOR] = 0xC2;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert!(img.tracks()[0].mode.is_audio());
+    assert_eq!(img.read_audio_frame(0).unwrap()[0], 0xC1);
+    assert_eq!(img.read_audio_frame(1).unwrap()[0], 0xC2);
+}
