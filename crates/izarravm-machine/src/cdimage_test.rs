@@ -126,11 +126,17 @@ fn xa_form2_sectors_are_not_readable_as_data() {
     // Form is per sector, not per track: submode bit 5 at frame offset 18 marks
     // Form 2, whose 2324-byte payload is streaming media, not a logical sector.
     let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n";
-    let mut bin = vec![0u8; 2 * RAW_SECTOR];
+    let mut bin = vec![0u8; 3 * RAW_SECTOR];
     bin[24] = 0x01; // sector 0: Form 1 (submode bit 5 clear)
     bin[RAW_SECTOR + 18] = 0x20; // sector 1: Form 2
     bin[RAW_SECTOR + 24] = 0x02;
+    // Sector 2: Form 1 with EOF (0x80) set. Only bit 5 selects Form 2 -- other
+    // submode bits (EOF 0x80, real-time 0x40, ...) are routine on real XA
+    // discs and must not be mistaken for the Form 2 flag.
+    bin[2 * RAW_SECTOR + 18] = 0x80;
+    bin[2 * RAW_SECTOR + 24] = 0x03;
     let img = CdImage::from_cue(cue, bin).unwrap();
     assert_eq!(img.read_data_sector(0).unwrap()[0], 0x01);
     assert!(img.read_data_sector(1).is_none());
+    assert_eq!(img.read_data_sector(2).unwrap()[0], 0x03);
 }

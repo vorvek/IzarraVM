@@ -97,7 +97,8 @@ impl TrackMode {
         match self {
             TrackMode::Mode2_2352 => Some(18),
             TrackMode::Mode2_2336 => Some(2),
-            _ => None,
+            TrackMode::Mode1_2048 | TrackMode::Mode1_2352 | TrackMode::Mode2_2048 => None,
+            TrackMode::Audio => None,
         }
     }
 }
@@ -288,6 +289,11 @@ impl CdImage {
                 // Form 2. A Form 2 sector carries a 2324-byte streaming payload,
                 // not a 2048-byte logical sector, so it reads as absent -- the
                 // same answer hardware gives for a data read of an audio track.
+                // The `bytes.get(..)?` below would also return None for a frame
+                // truncated mid-track, indistinguishable from a real Form 2
+                // rejection, but `from_cue`'s mount-time bounds check already
+                // guarantees every in-track LBA's frame fits inside the BIN, so
+                // that path is defense-in-depth, not a live ambiguity.
                 if let Some(submode) = track.mode.submode_offset()
                     && bytes.get(frame_off + submode)? & 0x20 != 0
                 {
