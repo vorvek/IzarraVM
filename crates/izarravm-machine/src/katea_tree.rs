@@ -98,6 +98,7 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
     "LABEL.EXE",
     "DELTREE.COM",
     "XCOPY.EXE",
+    "EDIT.COM",
     "GLIDE2X.OVL",
 ];
 
