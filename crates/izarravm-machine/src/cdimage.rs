@@ -288,8 +288,11 @@ impl CdImage {
         }
 
         // Each file keeps its own byte cursor; `disc_lba` runs across all of them.
+        // Size the backing up front: a disc's worth of bytes reallocated a few
+        // times during the concatenation is copying nobody needs to pay for.
         let mut cursors = vec![0usize; file_bytes.len()];
-        let mut concatenated: Vec<u8> = Vec::new();
+        let total_bytes = file_bytes.iter().map(|b| b.len()).sum();
+        let mut concatenated: Vec<u8> = Vec::with_capacity(total_bytes);
         let mut file_base = Vec::with_capacity(file_bytes.len());
         for bytes in &file_bytes {
             file_base.push(concatenated.len());
