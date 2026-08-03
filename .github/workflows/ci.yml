@@ -43,6 +43,45 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+        continue-on-error: true
+
+      # TEMPORARY DIAGNOSTICS -- not for merge. The izarravm bin target exits
+      # with STATUS_ACCESS_VIOLATION on this runner only, after every test
+      # reports ok. Default output interleaves four threads, so nothing
+      # identifies what was executing. These steps run regardless of the
+      # result above.
+      - name: Diag A -- single-threaded, unbuffered, full backtrace
+        if: always()
+        shell: pwsh
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          cargo test -p izarravm --bin izarravm -- --nocapture --test-threads=1
+          Write-Host "DIAG_A_EXIT=$LASTEXITCODE"
+          exit 0
+
+      - name: Diag B -- default threads, three attempts, exit code each
+        if: always()
+        shell: pwsh
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          for ($i = 1; $i -le 3; $i++) {
+            Write-Host "=== DIAG_B attempt $i ==="
+            cargo test -p izarravm --bin izarravm -- --nocapture
+            Write-Host "DIAG_B_ATTEMPT_${i}_EXIT=$LASTEXITCODE"
+          }
+          exit 0
+
+      - name: Diag C -- runner facts
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "cores=$env:NUMBER_OF_PROCESSORS"
+          Write-Host "temp=$env:TEMP"
+          rustc --version
+          Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List
+          exit 0
 
       - name: Build
         run: cargo build --workspace
