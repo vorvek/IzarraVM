@@ -14,6 +14,11 @@
 //! `IZARRAVM_RIP_PROFILE_DELAY_SECS=<n>` (default 0) delays sampling to skip
 //! BIOS/DOS boot and demo load.
 //!
+//! Samples are tagged with the boot profiler's active phase (see
+//! [`set_phase`]), so `--headless-boot-profile` gets a separate table per phase
+//! instead of one total smeared across POST, boot, idle and disk load. Runs that
+//! never call `set_phase` stay in phase 0 and report exactly as before.
+//!
 //! Suspend/resume sampling at 2 kHz costs a few percent of wall and skews
 //! nothing this is used for (relative shares, not absolute wall). Never build
 //! an A/B ladder against this profile.
@@ -23,7 +28,7 @@ use std::io::Write;
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -42,10 +47,25 @@ const CONTEXT_CONTROL_AMD64: u32 = 0x0010_0001;
 const SAMPLE_INTERVAL: Duration = Duration::from_micros(500);
 const MAX_SAMPLES: usize = 4 << 20;
 
+/// The phase every subsequent sample is attributed to. Written by the emulation
+/// thread at a phase boundary, read by the sampler thread with each sample: a
+/// relaxed `u32` either side, because a sample landing on the wrong side of a
+/// boundary costs one sample out of thousands and is not worth synchronizing.
+static ACTIVE_PHASE: AtomicU32 = AtomicU32::new(0);
+
+/// Attribute subsequent samples to `phase`. `--headless-boot-profile` calls this
+/// at every boundary; everything else leaves it at 0 and gets one table.
+pub fn set_phase(phase: u32) {
+    ACTIVE_PHASE.store(phase, Ordering::Relaxed);
+}
+
 pub struct Sampler {
     stop: Arc<AtomicBool>,
-    join: JoinHandle<Vec<u64>>,
+    join: JoinHandle<Vec<(u64, u32)>>,
     target: usize,
+    /// Phase id -> display name, for the per-phase report headings. Empty when
+    /// the caller never named any, which collapses the report to one table.
+    phase_names: Vec<(u32, String)>,
 }
 
 impl Sampler {
@@ -124,7 +144,7 @@ impl Sampler {
                         }
                     };
                     if let Some(rip) = rip {
-                        samples.push(rip);
+                        samples.push((rip, ACTIVE_PHASE.load(Ordering::Relaxed)));
                     }
                 }
                 if suspend_failures + context_failures > 0 {
@@ -138,11 +158,23 @@ impl Sampler {
             })
             .ok()?;
         eprintln!("riprofile: sampling armed (delay {delay}s, interval {SAMPLE_INTERVAL:?})");
+        ACTIVE_PHASE.store(0, Ordering::Relaxed);
         Some(Self {
             stop,
             join,
             target: target_addr,
+            phase_names: Vec::new(),
         })
+    }
+
+    /// Name the phases this run will pass through, so the report can head each
+    /// table with something readable. Ids not named here still report, under
+    /// their number.
+    pub fn name_phases(&mut self, names: &[(u32, &str)]) {
+        self.phase_names = names
+            .iter()
+            .map(|&(id, name)| (id, name.to_string()))
+            .collect();
     }
 
     pub fn stop_and_report(self, out_path: &Path) {
@@ -153,9 +185,14 @@ impl Sampler {
             eprintln!("riprofile: no samples collected");
             return;
         }
+        // Resolve symbols once over the whole run, then attribute per phase: an
+        // address costs a dbghelp round trip, and the same address recurs in
+        // every phase.
         let mut counts: HashMap<u64, u64> = HashMap::new();
-        for s in &samples {
-            *counts.entry(*s).or_default() += 1;
+        let mut per_phase: HashMap<u32, HashMap<u64, u64>> = HashMap::new();
+        for &(rip, phase) in &samples {
+            *counts.entry(rip).or_default() += 1;
+            *per_phase.entry(phase).or_default().entry(rip).or_default() += 1;
         }
 
         let process = unsafe { GetCurrentProcess() };
@@ -202,11 +239,9 @@ impl Sampler {
             }
         }
 
-        let mut by_func: HashMap<String, u64> = HashMap::new();
-        let mut by_site: HashMap<String, u64> = HashMap::new();
-        let mut by_file: HashMap<String, u64> = HashMap::new();
+        let mut resolved: HashMap<u64, (String, String, String)> = HashMap::new();
         let mut first_resolve_error = true;
-        for (&rip, &n) in &counts {
+        for &rip in counts.keys() {
             if first_resolve_error && resolve_symbol(process, rip).is_none() {
                 first_resolve_error = false;
                 eprintln!(
@@ -221,9 +256,7 @@ impl Sampler {
             let file = site
                 .rsplit_once(':')
                 .map_or(site.clone(), |(f, _)| f.into());
-            *by_func.entry(func).or_default() += n;
-            *by_site.entry(site).or_default() += n;
-            *by_file.entry(file).or_default() += n;
+            resolved.insert(rip, (func, site, file));
         }
 
         let total = samples.len() as u64;
@@ -233,23 +266,31 @@ impl Sampler {
              ({} unique addresses)\n\n",
             counts.len()
         ));
-        for (title, map, top) in [
-            ("BY FUNCTION", &by_func, 60),
-            ("BY FILE", &by_file, 40),
-            ("BY FILE:LINE", &by_site, 120),
-        ] {
-            let mut rows: Vec<_> = map.iter().collect();
-            rows.sort_by(|a, b| b.1.cmp(a.1));
-            report.push_str(&format!("== {title} ==\n"));
-            for (name, n) in rows.into_iter().take(top) {
+        report.push_str(&render_tables(&counts, &resolved));
+
+        // Per-phase tables, in phase order. Only emitted when the run actually
+        // crossed a boundary: a single-phase run would just repeat the total.
+        let mut phases: Vec<u32> = per_phase.keys().copied().collect();
+        phases.sort_unstable();
+        if phases.len() > 1 {
+            for phase in phases {
+                let Some(phase_counts) = per_phase.get(&phase) else {
+                    continue;
+                };
+                let phase_total: u64 = phase_counts.values().sum();
+                let name = self
+                    .phase_names
+                    .iter()
+                    .find(|(id, _)| *id == phase)
+                    .map(|(_, name)| name.as_str())
+                    .unwrap_or("unnamed");
                 report.push_str(&format!(
-                    "{:>7.3}%  {:>9}  {}\n",
-                    *n as f64 * 100.0 / total as f64,
-                    n,
-                    name
+                    "\n################ PHASE {phase} ({name}) — {phase_total} samples, \
+                     {:.2}% of the run ################\n\n",
+                    phase_total as f64 * 100.0 / total as f64,
                 ));
+                report.push_str(&render_tables(phase_counts, &resolved));
             }
-            report.push('\n');
         }
         match std::fs::File::create(out_path).and_then(|mut f| f.write_all(report.as_bytes())) {
             Ok(()) => eprintln!("riprofile: report written to {}", out_path.display()),
@@ -261,6 +302,49 @@ impl Sampler {
             }
         }
     }
+}
+
+/// Render the three ranked tables for one sample set. `resolved` maps an address
+/// to its `(function, file:line, file)` triple, resolved once for the whole run.
+fn render_tables(
+    counts: &HashMap<u64, u64>,
+    resolved: &HashMap<u64, (String, String, String)>,
+) -> String {
+    let mut by_func: HashMap<&str, u64> = HashMap::new();
+    let mut by_site: HashMap<&str, u64> = HashMap::new();
+    let mut by_file: HashMap<&str, u64> = HashMap::new();
+    let mut total = 0u64;
+    for (&rip, &n) in counts {
+        total += n;
+        let Some((func, site, file)) = resolved.get(&rip) else {
+            continue;
+        };
+        *by_func.entry(func.as_str()).or_default() += n;
+        *by_site.entry(site.as_str()).or_default() += n;
+        *by_file.entry(file.as_str()).or_default() += n;
+    }
+    let denominator = total.max(1) as f64;
+    let mut out = String::new();
+    for (title, map, top) in [
+        ("BY FUNCTION", &by_func, 60),
+        ("BY FILE", &by_file, 40),
+        ("BY FILE:LINE", &by_site, 120),
+    ] {
+        let mut rows: Vec<_> = map.iter().collect();
+        // Ties by name so two equal-weight rows cannot swap between runs.
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        out.push_str(&format!("== {title} ==\n"));
+        for (name, n) in rows.into_iter().take(top) {
+            out.push_str(&format!(
+                "{:>7.3}%  {:>9}  {}\n",
+                *n as f64 * 100.0 / denominator,
+                n,
+                name
+            ));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn resolve_symbol(process: HANDLE, rip: u64) -> Option<String> {

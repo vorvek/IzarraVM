@@ -26,6 +26,7 @@
 //!   [0..2] X   [2..4] Y   [4..6] W   [6..8] H   (rectangle, set before CRC)
 //!   [8..12] CRC result    [12] exit code (set before Exit)
 //!   [16] benchmark selector  [17..21] iterations  [21..25] aux  [25] status
+//!   [26] phase-mark id (set before Mark)
 
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
@@ -51,10 +52,18 @@ pub const REG_RESULT_ITER: usize = 17;
 pub const REG_RESULT_AUX: usize = 21;
 pub const REG_RESULT_STATUS: usize = 25;
 
+/// Phase-mark id the guest programs before `CMD_MARK`. Above the Neurketa
+/// result block, which ends at `REG_RESULT_STATUS`.
+pub const REG_MARK: usize = 26;
+
 /// Commands written to `PORT_COMMAND`.
 pub const CMD_CRC: u8 = 1;
 pub const CMD_SNAPSHOT: u8 = 2;
 pub const CMD_EXIT: u8 = 3;
+/// Record a phase boundary and keep running. Unlike `CMD_EXIT` this never stops
+/// the machine: the boot profiler needs the guest to say "Toka-DOS is up" from
+/// inside AUTOEXEC and then carry on to the workload being measured.
+pub const CMD_MARK: u8 = 4;
 
 const REG_FILE_SIZE: usize = 32;
 const _: () = assert!(REG_FILE_SIZE <= 256);
@@ -160,6 +169,11 @@ impl UnitTester {
     /// The exit code the guest programmed at `REG_EXIT`.
     pub fn exit_code(&self) -> u8 {
         self.regs[REG_EXIT]
+    }
+
+    /// The phase-mark id the guest programmed at `REG_MARK`.
+    pub fn mark_id(&self) -> u8 {
+        self.regs[REG_MARK]
     }
 
     /// Read a single register-file byte, 0 if the offset is out of range.

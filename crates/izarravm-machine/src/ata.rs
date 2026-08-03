@@ -307,6 +307,15 @@ impl AtaDisk {
         matches!(self.backing, Backing::Image(_))
     }
 
+    /// What the Katea read path has done since mount, or None for an
+    /// image-backed disk, which never touches the host filesystem to serve one.
+    pub fn katea_storage_counters(&self) -> Option<crate::katea_tree::KateaStorageCounters> {
+        match &self.backing {
+            Backing::Image(_) => None,
+            Backing::HostFolder(volume) => Some(volume.storage_counters()),
+        }
+    }
+
     /// Run the host-folder reconcile pass. A no-op for an image-backed disk.
     /// The machine calls this at eject/flush so anything held in the overlay is a
     /// final-pass materialized to the host folder.

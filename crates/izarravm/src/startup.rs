@@ -203,6 +203,14 @@ impl ResolvedStartup {
         &self.hardware
     }
 
+    /// The folder the GUI would mount as C:, after --c-drive, the config file,
+    /// and the portable/per-user default have all been applied. The boot
+    /// profiler mounts exactly this, so its numbers describe the machine the
+    /// user actually runs rather than a stand-in for it.
+    pub(super) fn c_drive(&self) -> &Path {
+        &self.config.dos.c_drive
+    }
+
     pub(super) fn load_global_glide_ovl(&self) -> Option<Vec<u8>> {
         load_state_glide_ovl(&self.state_dir)
     }

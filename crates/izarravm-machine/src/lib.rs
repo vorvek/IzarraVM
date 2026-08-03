@@ -153,6 +153,7 @@ use firmware_contract::{Bios32Call, install_boot_memory, patch_rom};
 pub use gameport::JoystickState;
 
 pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
+pub use katea_tree::KateaStorageCounters;
 pub use vga_wipe_census::{VgaWipeCensusSnapshot, VgaWipeKeyRow};
 
 pub use cdimage::CdImage;
@@ -532,6 +533,43 @@ pub struct MachineHostProfileSnapshot {
     pub phases: Vec<MachineProfilePhase>,
 }
 
+/// Phase-boundary ids recorded by the boot profiler. The host places `POST_END`
+/// and `IDLE_END`; the guest places the rest by writing the id to the unit
+/// tester's `REG_MARK` and issuing `CMD_MARK`.
+pub mod phase_mark {
+    /// The run's own start, placed by the profiler before the first instruction
+    /// so the POST phase has a left edge like every other phase.
+    pub const RUN_START: u8 = 255;
+    /// POST finished and the BIOS reached INT 19h. Host-side: no guest code of
+    /// ours runs inside the BIOS, and the first INT 19h is exact and free.
+    pub const POST_END: u8 = 0;
+    /// AUTOEXEC.BAT reached its end: Toka-DOS is up at the prompt.
+    pub const BOOT_END: u8 = 1;
+    /// The idle window elapsed. Host-side, because the phase being measured is
+    /// COMMAND.COM's own prompt loop with no guest code of ours running in it.
+    pub const IDLE_END: u8 = 2;
+    /// LOADTEST.COM reached its entry point, so COMMAND.COM has finished
+    /// parsing the command line and loading the image off Katea.
+    pub const EXEC_END: u8 = 3;
+    /// LOADTEST.COM finished reading its target file.
+    pub const LOAD_END: u8 = 4;
+}
+
+/// One phase boundary, with every counter the boot profiler attributes per
+/// phase snapshotted at the instant it fired. The profiler reports differences
+/// between consecutive marks, so POST cannot hide inside boot.
+#[derive(Debug, Clone)]
+pub struct PhaseMark {
+    pub id: u8,
+    pub wall: std::time::Instant,
+    pub master_ticks: u64,
+    pub elapsed_clocks: u64,
+    pub perf: izarravm_cpu::PerfCounters,
+    pub machine_phases: MachineHostProfileSnapshot,
+    /// None when C: is not a mounted host folder.
+    pub katea: Option<katea_tree::KateaStorageCounters>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MachineProfilePhaseKind {
     CpuBatch,
@@ -746,6 +784,14 @@ pub struct Machine {
     // PartialEq is unconditionally true so arming it cannot move canonical-state comparisons.
     vga_wipe_census: vga_wipe_census::VgaWipeCensus,
     host_profile: MachineHostProfile,
+    // Boot-profiler phase boundaries, off unless `enable_phase_marks` armed them.
+    // Diagnostic only, and recorded at most a handful of times per run (one INT
+    // 19h, four guest marks), so no hot path pays for the check.
+    phase_marks: Vec<PhaseMark>,
+    phase_marks_enabled: bool,
+    // Whether the POST->boot boundary has already been placed. A guest that
+    // re-enters INT 19h must not overwrite the first, real POST measurement.
+    post_phase_marked: bool,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
     // the resulting status is read back at 0xE3.
@@ -1069,6 +1115,9 @@ impl Machine {
             vga_wipe_census: vga_wipe_census::VgaWipeCensus::default(),
             direct_mapping_epoch: 1,
             host_profile: MachineHostProfile::default(),
+            phase_marks: Vec::new(),
+            phase_marks_enabled: false,
+            post_phase_marked: false,
             pending_toka_service: None,
             toka_service_status: 0,
             katea_root: None,
@@ -1332,6 +1381,58 @@ impl Machine {
 
     pub fn host_profile_snapshot(&self) -> MachineHostProfileSnapshot {
         self.host_profile.snapshot()
+    }
+
+    /// What the Katea host-folder read path has done since mount, or None when
+    /// C: is not a mounted host folder.
+    pub fn katea_storage_counters(&self) -> Option<katea_tree::KateaStorageCounters> {
+        self.ata.as_ref().and_then(|d| d.katea_storage_counters())
+    }
+
+    /// Arm boot-profiler phase-boundary recording. Off by default so an ordinary
+    /// run never allocates a mark or checks for one outside INT 19h and the unit
+    /// tester's deferred-command path, both of which are already cold.
+    pub fn enable_phase_marks(&mut self) {
+        self.phase_marks_enabled = true;
+        self.phase_marks.clear();
+        self.post_phase_marked = false;
+    }
+
+    /// The boundaries recorded so far, in the order they fired.
+    pub fn phase_marks(&self) -> &[PhaseMark] {
+        &self.phase_marks
+    }
+
+    /// Place a boundary the host decides, such as the end of the fixed idle
+    /// window. Guest-decided boundaries arrive through `CMD_MARK` instead.
+    pub fn record_host_phase_mark(&mut self, id: u8) {
+        self.note_phase_mark(id);
+    }
+
+    /// Snapshot every counter the profiler attributes per phase, at the instant
+    /// this boundary fired. Ignored unless `enable_phase_marks` armed recording.
+    pub(crate) fn note_phase_mark(&mut self, id: u8) {
+        if !self.phase_marks_enabled {
+            return;
+        }
+        self.phase_marks.push(PhaseMark {
+            id,
+            wall: std::time::Instant::now(),
+            master_ticks: self.master_ticks(),
+            elapsed_clocks: self.elapsed_clocks(),
+            perf: self.cpu.perf_counters().clone(),
+            machine_phases: self.host_profile.snapshot(),
+            katea: self.katea_storage_counters(),
+        });
+    }
+
+    /// Place the POST->boot boundary, once, at the first INT 19h.
+    pub(crate) fn note_post_phase_mark(&mut self) {
+        if !self.phase_marks_enabled || self.post_phase_marked {
+            return;
+        }
+        self.post_phase_marked = true;
+        self.note_phase_mark(phase_mark::POST_END);
     }
 
     /// Raw bus clocks charged by instruction fetches and data accesses since reset.

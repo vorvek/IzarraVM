@@ -1187,6 +1187,10 @@ impl Machine {
     /// Service INT 19h using the primary device selected by POST or the boot menu,
     /// followed by the Izarra fallback order. Power-on reaches this same planner.
     pub(super) fn handle_int19(&mut self) {
+        // POST is over the moment the BIOS asks to boot. This is the one phase
+        // boundary the guest cannot place for us -- no code of ours runs inside
+        // the BIOS -- and it costs nothing: INT 19h fires once per boot.
+        self.note_post_phase_mark();
         let primary = BootDevice::from_code(self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR));
         for device in primary.fallback_order() {
             if self.try_boot_device(device) {

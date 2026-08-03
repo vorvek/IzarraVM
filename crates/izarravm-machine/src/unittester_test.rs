@@ -154,3 +154,29 @@ fn benchmark_region_round_trips_through_the_host_helpers() {
     assert_eq!(ut.reg_u32(REG_RESULT_ITER), 40);
     assert_eq!(ut.reg_u32(REG_RESULT_AUX), 1899);
 }
+
+#[test]
+fn mark_id_round_trips_through_the_data_port() {
+    let mut ut = UnitTester::default();
+    ut.write_port(PORT_INDEX, REG_MARK as u8);
+    ut.write_port(PORT_DATA, 3);
+    assert_eq!(ut.mark_id(), 3);
+}
+
+#[test]
+fn mark_register_does_not_overlap_the_benchmark_block() {
+    // REG_RESULT_STATUS is the last Neurketa byte; the mark id must sit above it
+    // or a benchmark run would clobber the boot profiler's boundary id.
+    const { assert!(REG_MARK > REG_RESULT_STATUS) };
+    let mut ut = UnitTester::default();
+    ut.set_reg_u8(REG_RESULT_STATUS, 0xFF);
+    assert_eq!(ut.mark_id(), 0);
+}
+
+#[test]
+fn mark_command_is_latched_like_every_other_command() {
+    let mut ut = UnitTester::default();
+    ut.write_port(PORT_COMMAND, CMD_MARK);
+    assert_eq!(ut.take_pending(), Some(CMD_MARK));
+    assert_eq!(ut.take_pending(), None);
+}

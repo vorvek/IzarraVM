@@ -574,6 +574,15 @@ impl Machine {
                 }
                 None
             }
+            unittester::CMD_MARK => {
+                // Records a boot-profiler boundary and returns None, so the
+                // machine keeps running: the guest has to be able to say
+                // "Toka-DOS is up" from inside AUTOEXEC and then carry on into
+                // the workload being measured.
+                let id = self.unittester.mark_id();
+                self.note_phase_mark(id);
+                None
+            }
             unittester::CMD_EXIT => {
                 // Diagnostic trace only (IZARRAVM_FAULT_TRACE=1): the Doom repro
                 // needs to know whether the exit was a deliberate port write from
