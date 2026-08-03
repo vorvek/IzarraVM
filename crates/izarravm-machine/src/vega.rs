@@ -193,6 +193,11 @@ impl Vega {
         }
     }
 
+    /// Diagnostic only, for the wipe census: the index register in force for `port`.
+    pub(crate) fn port_index_selector(&self, port: u16) -> u8 {
+        self.vga.port_index_selector(port)
+    }
+
     pub(crate) fn direct_write_page(&mut self, physical_page: u32) -> Option<*mut u8> {
         if self.direct_write_token() == 0 {
             return None;

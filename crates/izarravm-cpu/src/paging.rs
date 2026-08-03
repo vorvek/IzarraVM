@@ -198,6 +198,13 @@ impl std::fmt::Debug for Tlb {
 
 // --- Direct Page Cache ---
 
+/// First physical byte of the legacy VGA graphics aperture, and one past its last. The single
+/// source of truth for the range: `FastMap` classifies a page as `PageKind::Mode13` by it, and
+/// `note_direct_data_map_changed` scopes its invalidation to it. `Bus::direct_page` hands out a
+/// video pointer for this range and for no other, which is what makes the scoping sound.
+pub(crate) const VGA_APERTURE_START: u32 = 0x000a_0000;
+pub(crate) const VGA_APERTURE_END: u32 = 0x000b_0000;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct DirectPageCacheEntry {
@@ -264,8 +271,19 @@ impl DirectPageCache {
         self.mapping_epoch = 0;
     }
 
+    /// Drop only the entries backed by `start..end`, keeping the cache's mapping epoch and every
+    /// other entry. Used for a device aperture that re-points without disturbing RAM: a full
+    /// `invalidate` would also zero the epoch, which is what makes every surviving FastMap entry
+    /// stop matching.
+    ///
+    /// RECORDED, NOT BUILT: this scans all 64 entries, and the VGA aperture is only 16 pages, which
+    /// can occupy only slots `0x20..=0x2F` (`slot` keeps bits 12..17 of the page). Walking those 16
+    /// slots instead would be a 4x cut on a path that runs twice per direct-write-token move --
+    /// 6.8M times in a doom timedemo. It is left unbuilt because it is worth roughly 0.1% of wall,
+    /// which is below this rig's layout confound and therefore cannot be validated on a ladder; it
+    /// belongs with whatever next change to this path can be. The physical-page equality test must
+    /// stay either way, because pages 256 KiB apart share a line.
     #[inline]
-    #[cfg(test)]
     pub(crate) fn invalidate_physical_range(&mut self, start: u32, end: u32) {
         for entry in &mut self.entries {
             if (start..end).contains(&entry.physical_page) {

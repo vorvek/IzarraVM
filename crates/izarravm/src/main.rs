@@ -935,6 +935,7 @@ fn write_hdd_profile_json(
             machine.cpu().direct_barrier_census_snapshot()
         ),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
+        "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
@@ -944,6 +945,40 @@ fn write_hdd_profile_json(
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
+}
+
+/// The VGA direct-write-token wipe attribution, or `null` when `IZARRAVM_VGA_WIPE_CENSUS` was not
+/// set. Transitions and gap buckets are emitted as sparse lists so a run that never moved the token
+/// does not carry a 64-cell matrix of zeros.
+fn vga_wipe_census_json(
+    snapshot: Option<izarravm_machine::VgaWipeCensusSnapshot>,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    json!({
+        "events": snapshot.events,
+        "key_overflow": snapshot.key_overflow,
+        "applies": snapshot.applies,
+        "applies_same_token": snapshot.applies_same_token,
+        "rows": snapshot.rows.iter().map(|row| json!({
+            "port": format!("0x{:03X}", row.port),
+            "selector": format!("0x{:02X}", row.selector),
+            "value": format!("0x{:02X}", row.value),
+            "count": row.count,
+        })).collect::<Vec<_>>(),
+        "transitions": snapshot.transitions.iter().enumerate().flat_map(|(before, row)| {
+            row.iter().copied().enumerate().filter(|&(_, count)| count != 0).map(move |(after, count)| {
+                json!({ "before": before, "after": after, "count": count })
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>(),
+        "gap_buckets": snapshot.gap_buckets.iter().copied().enumerate()
+            .filter(|&(_, count)| count != 0)
+            .map(|(bucket, count)| json!({
+                "min_instructions": 1u64 << bucket,
+                "count": count,
+            })).collect::<Vec<_>>(),
+    })
 }
 
 fn direct_barrier_census_json(

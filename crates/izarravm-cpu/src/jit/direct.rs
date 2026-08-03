@@ -3730,8 +3730,11 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 ///
 /// `0xEE` OUT DX,AL is quake's largest `non_continuable` row (1,198,302 static exits) and it is a
 /// POLICY refusal, not a semantic one — the call-out mechanism that serves `0xEC` IN would serve
-/// it, and `FastMap::invalidate_all` clears entries in place rather than reallocating, so the
-/// bases a running block baked stay valid across the whole-map wipe a VGA port write triggers.
+/// it, and every FastMap invalidation clears entries in place rather than reallocating, so the
+/// bases a running block baked stay valid across whatever a VGA port write triggers. (As of the
+/// aperture-scoping slice a VGA port write no longer triggers `invalidate_all` at all; it triggers
+/// `invalidate_vga_pages`, which also clears in place. The conclusion is unchanged, but do not
+/// re-open this on the old mechanism's name.)
 /// What stops it is not reachable from this predicate: `CpuBus::write_io` reaches every device's
 /// write path, and the call-out contract's "no WATCHED guest memory access while a block is live"
 /// proof would have to be re-established over all of them, not argued for one. Against that, the

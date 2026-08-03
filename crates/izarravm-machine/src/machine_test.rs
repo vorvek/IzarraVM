@@ -10,6 +10,42 @@ use super::cache_config::{CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK, cache_geom
 
 const BIOS_TEXT_WHITE: u8 = 0x3F;
 
+/// The half of the scoped VGA-aperture invalidation that lives on this side of the seam, and the
+/// one most likely to be reverted by accident because nothing else observes it locally: a
+/// direct-write-token move must NOT advance the global direct-mapping epoch.
+///
+/// The epoch is the "every cached host pointer is void" signal. A token move voids exactly the
+/// `0xA0000..0xAFFFF` aperture, and `CpuGsw::note_direct_data_map_changed` invalidates that range
+/// by hand — but it can only keep the surviving RAM entries if the epoch they are stamped with
+/// still matches. Advance the epoch here and the scoping is silently undone: every RAM entry stops
+/// matching on the next interpreter probe and the direct-page caches empty on their next insert.
+#[test]
+fn a_direct_write_token_move_leaves_the_direct_mapping_epoch_alone() {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xCD, 0x20])
+            .unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    assert_eq!(machine.vega.direct_write_token(), 1);
+    let epoch = machine.direct_mapping_epoch;
+    machine.direct_data_map_changed = false;
+
+    // Sequencer index 4 (memory mode), clearing the chain-4 bit: this is the one write doom makes
+    // when it leaves chained Mode 13h, and it drops the token off 1.
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x3C4, BusWidth::Byte, 0x04, false).unwrap();
+        bus.write_io(0x3C5, BusWidth::Byte, 0x06, false).unwrap();
+    });
+
+    assert_eq!(machine.vega.direct_write_token(), 0);
+    assert!(machine.direct_data_map_changed);
+    assert_eq!(machine.direct_mapping_epoch, epoch);
+
+    // The COARSE cause still advances it, so the two have not been conflated in the other
+    // direction: a real RAM re-decode must still void every cached pointer.
+    assert!(machine.set_vga_mode(0x0D));
+    assert_ne!(machine.direct_mapping_epoch, epoch);
+}
+
 #[test]
 fn jit_auto_admission_policy_defaults_on_only_when_available() {
     assert!(run::jit_auto_admit_policy(
@@ -374,6 +410,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         direct_map_changed: &mut machine.direct_map_changed,
         direct_data_map_changed: &mut machine.direct_data_map_changed,
         direct_mapping_epoch: &mut machine.direct_mapping_epoch,
+        vga_wipe_census: &mut machine.vga_wipe_census,
         core_clocks_so_far: 0,
         prior_runs_core_clocks: 0,
         timeline_at_batch_start: machine.timeline,

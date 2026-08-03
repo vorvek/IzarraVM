@@ -706,6 +706,20 @@ impl Vga {
             .then(|| mask.trailing_zeros() as usize)
     }
 
+    /// The index register in force for `port`, sampled BEFORE a write so an indexed data write can
+    /// be attributed to the register it actually lands on. Zero for a port that is not an indexed
+    /// data port. Diagnostic only: `write_port` reads these fields itself and does not call this.
+    pub fn port_index_selector(&self, port: u16) -> u8 {
+        match port {
+            0x3C5 => self.seq_index,
+            0x3CF => self.gc_index,
+            0x3C0 => self.attr.index,
+            0x3D1 | 0x3D3 | 0x3D5 | 0x3D7 if self.is_cga_personality() => self.crtc_index,
+            port if self.crtc_data_port_selected(port) => self.crtc_index,
+            _ => 0,
+        }
+    }
+
     /// Stable description of the current direct VGA write mapping. Zero means
     /// no mapping, one is canonical Mode 13h, and values two through five select
     /// a Mode X plane. The machine compares this across register writes so a

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::paging::{VGA_APERTURE_END, VGA_APERTURE_START};
 
 impl CpuGsw {
     pub fn reset(&mut self) {
@@ -142,7 +143,20 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_all();
+        self.record_fast_map_wipe_extent();
+    }
+
+    /// Wipe the FastMap and charge what it discarded to the audit counters. The extent is the only
+    /// honest price of a wipe: the entry count, not the call count.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn record_fast_map_wipe_extent(&mut self) {
+        let extent = self.jit_fast_map.invalidate_all();
+        self.jit_direct.fast_map_audit.wipe_pages_cleared += extent.pages;
+        self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
     }
 
     pub(super) fn flush_tlb_and_code_caches(&mut self) {
@@ -160,7 +174,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_all();
+        self.record_fast_map_wipe_extent();
         self.invalidate_translation_code_caches();
     }
 
@@ -207,19 +221,55 @@ impl CpuGsw {
         }
     }
 
-    /// Drop cached data pointers after a device aperture changes without
-    /// discarding decoded or compiled guest code. The bus mapping epoch is
-    /// global, so RAM entries from the previous epoch must leave with the VGA
-    /// entries even though their host pointers did not change.
+    /// Drop cached data pointers after the VGA direct-write aperture re-points, without discarding
+    /// decoded or compiled guest code -- and without discarding the RAM mappings, which is what
+    /// makes this worth having separately from `note_direct_map_changed`.
+    ///
+    /// SCOPE, and why it is exactly this. There are exactly two callers, and BOTH are gated on a
+    /// change in `Vega::direct_write_token`: the port-write path in `bus.rs`, and the INT 10h HLE
+    /// seam in `video.rs`. The second is the one a reader should worry about, since it wraps a
+    /// whole mode set -- but an INT 10h mode set routes separately through
+    /// `Machine::set_vga_mode_with_clear`, which raises the COARSE `mark_direct_map_changed`, and
+    /// the run loop tests that first. The token check there is a backstop, not the mode-set path.
+    ///
+    /// The only thing the token describes is which host bytes back physical pages
+    /// `0xA0000..0xAFFFF` for a data access. `Bus::direct_page` hands out a video pointer for that
+    /// range and for no other; every other page resolves through `direct_ram_bytes`, whose answer
+    /// is a function of the RAM lookup table, and that table is rebuilt only on a PCI
+    /// memory-decode change -- which routes through the COARSE `note_direct_map_changed` instead.
+    /// So an aperture-scoped invalidation is not an approximation of the global one for this cause.
+    /// It is equivalent to it.
+    ///
+    /// Because it is scoped, the machine must NOT advance the global direct-mapping epoch for this
+    /// cause, and `Machine::mark_direct_data_map_changed` does not. Advancing it would make every
+    /// surviving RAM entry stop matching on the next interpreter probe and would empty the
+    /// direct-page caches on their next insert -- exactly the coarse behaviour this replaces. The
+    /// two halves are one change; neither works alone.
+    ///
+    /// Aperture pages are reached through the FastMap's own VGA registry and through a
+    /// physical-range sweep of the direct-page caches, so a linear alias of the aperture is covered
+    /// however the guest got to it. Emitted native code never reads the epoch table -- its only
+    /// guard against a stale aperture mapping is the entry itself being cleared -- and the registry
+    /// sweep is what clears it.
+    ///
+    /// HISTORY: doom moves this token 3,425,430 times in one timedemo, all of them the Mode X map
+    /// mask (port 0x3C5, sequencer index 2) cycling planes 0-3. The global form threw away 43.3M
+    /// live entries doing it, 88.1% of them RAM whose host pointers had not moved.
+    /// Evidence: `.bench/results/fastmap-wipe-20260803/README.md`.
     pub fn note_direct_data_map_changed(&mut self) {
-        self.data_read_pages.invalidate();
-        self.data_write_pages.invalidate();
+        self.data_read_pages
+            .invalidate_physical_range(VGA_APERTURE_START, VGA_APERTURE_END);
+        self.data_write_pages
+            .invalidate_physical_range(VGA_APERTURE_START, VGA_APERTURE_END);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_all();
+        {
+            let extent = self.jit_fast_map.invalidate_vga_pages();
+            self.jit_direct.fast_map_audit.wipe_aperture_pages_cleared += extent.vga_pages;
+        }
         self.perf.direct_map_invalidations += 1;
         #[cfg(feature = "jit")]
         {
