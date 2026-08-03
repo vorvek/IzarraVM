@@ -577,7 +577,9 @@ impl Ad1848 {
     /// produced.
     pub fn tick_sample<B: FnMut() -> Option<u8>>(&mut self, fetch: B) -> bool {
         if let Some(frame) = self.render_frame(fetch) {
-            push_frame_capped(&mut self.rendered, frame);
+            // The WSS DAC has no drop counter yet; only the SB path is being
+            // instrumented in this batch.
+            let _ = push_frame_capped(&mut self.rendered, frame);
             true
         } else {
             false
