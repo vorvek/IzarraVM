@@ -7,6 +7,16 @@ use super::*;
 
 pub const OPL_NATIVE_HZ: u32 = 49_716;
 pub const DAC_HZ: u32 = 44_100;
+/// Ceiling on DAC-rate frames a source carries between render windows.
+///
+/// A source's input count comes from elapsed guest master ticks, which arrive
+/// in bursts as the emulation thread runs, while the window size comes from the
+/// OPL resampler under smooth host pacing. The two never agree frame-for-frame,
+/// so each source queues its surplus rather than discarding it and repeating a
+/// frame to cover the shortfall. 4410 frames is 100 ms at 44100 Hz -- far above
+/// ordinary jitter, so reaching it means the guest is genuinely outrunning the
+/// host drain, which is worth reporting rather than absorbing silently.
+pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 pub const PIT_INPUT_HZ: u32 = 1_193_182;
 pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 

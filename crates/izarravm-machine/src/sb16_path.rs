@@ -4,10 +4,11 @@
 use izarravm_audio::{Resampler, SbDsp, SbMixer};
 use izarravm_bus::Memory;
 use izarravm_core::SoundBlasterConfig;
+use std::collections::VecDeque;
 
 use crate::dma::DmaController;
 use crate::timeline::RatePhase;
-use crate::{DAC_HZ, OPL_NATIVE_HZ};
+use crate::{DAC_HZ, DAC_PENDING_FRAME_CAP, OPL_NATIVE_HZ};
 
 /// Per-second Sound Blaster diagnostics, enabled by `IZARRAVM_SB_DEBUG`.
 ///
@@ -25,6 +26,7 @@ struct SbTrace {
     irqs: u64,
     resampler_rebuilds: u64,
     last_dropped: u64,
+    pending_depth: usize,
 }
 
 impl SbTrace {
@@ -37,7 +39,7 @@ impl SbTrace {
     fn report(&mut self, dsp: &SbDsp, dma8: usize, dma16: usize) {
         let dropped = dsp.dropped_frames();
         eprintln!(
-            "[SB] playing={} rate={} out_rate={} bits={} stereo={} auto_init={} dma={} block={} remaining={} ticked/s={} rendered/s={} truncated/s={} padded/s={} irqs/s={} ring_drops/s={} resampler_rebuilds/s={}",
+            "[SB] playing={} rate={} out_rate={} bits={} stereo={} auto_init={} dma={} block={} remaining={} ticked/s={} rendered/s={} truncated/s={} padded/s={} irqs/s={} ring_drops/s={} resampler_rebuilds/s={} pending={}",
             dsp.is_playing(),
             dsp.rate_hz(),
             dsp.output_frame_rate(),
@@ -54,6 +56,7 @@ impl SbTrace {
             self.irqs,
             dropped.saturating_sub(self.last_dropped),
             self.resampler_rebuilds,
+            self.pending_depth,
         );
         self.last_dropped = dropped;
         self.micros = 0;
@@ -74,6 +77,9 @@ struct ActiveSb16Path {
     resampler_rate_hz: u32,
     render_phase: RatePhase,
     held_dac_frame: (i32, i32),
+    /// Resampled DAC-rate frames produced but not yet claimed by a render
+    /// window. See `render_voice` for why this has to persist across calls.
+    pending: VecDeque<(i32, i32)>,
     /// None when `IZARRAVM_SB_DEBUG` is unset, so every trace site is a null
     /// check on an Option rather than an env lookup or an argument build.
     trace: Option<SbTrace>,
@@ -196,6 +202,7 @@ impl Sb16Path {
             resampler_rate_hz: 0,
             render_phase: RatePhase::default(),
             held_dac_frame: (0, 0),
+            pending: VecDeque::new(),
             trace: SbTrace::enabled().then(SbTrace::default),
         };
         active.sample_stereo();
@@ -330,27 +337,53 @@ impl Sb16Path {
             let right = clamp_i16((i32::from(right) as f32 * voice_r) as i32);
             native.push((i32::from(left), i32::from(right)));
         }
-        let mut voice = active.resampler.process(&native);
-        let produced = voice.len();
+        let produced = active.resampler.process(&native);
+        let produced_len = produced.len();
+
+        // Carry the resampler's output across windows instead of forcing each
+        // window to consume exactly what it produced.
+        //
+        // `native_frames` is derived from elapsed guest master ticks, which
+        // arrive in bursts as the emulation thread runs; `window.output_frames`
+        // is the OPL resampler's count for the same window, driven by the
+        // smooth host pacing. The two never agree frame-for-frame, so a window
+        // where the guest ran long overproduces and one where it ran short
+        // underproduces -- even though they match on average. Discarding the
+        // surplus and repeating a frame to cover the shortfall turned that
+        // ordinary jitter into a torn stream: measured on a real Quake capture,
+        // ~14k frames discarded and ~14k repeated per second against 44.1k
+        // rendered, which is the crackle heard on every DSP title.
+        //
+        // Queuing the surplus turns the disagreement into a few frames of
+        // standing latency, and leaves padding for a genuine underrun.
+        let overflow = (active.pending.len() + produced_len).saturating_sub(DAC_PENDING_FRAME_CAP);
+        for _ in 0..overflow {
+            active.pending.pop_front();
+        }
+        active.pending.extend(produced);
+
+        let take = window.output_frames.min(active.pending.len());
+        let mut voice: Vec<(i32, i32)> = active.pending.drain(..take).collect();
+
         let mut held = if active.dsp.needs_output_tick() {
             active.held_dac_frame
         } else {
             (0, 0)
         };
-        voice.truncate(window.output_frames);
         if let Some(frame) = voice.last().copied() {
             held = frame;
         }
-        let before_pad = voice.len();
+        let short = window.output_frames - voice.len();
         voice.resize(window.output_frames, held);
         active.held_dac_frame = held;
         if let Some(trace) = &mut active.trace {
-            trace.rendered_frames += produced as u64;
-            // Surplus frames are discarded outright; shortfalls are filled by
-            // repeating `held`. Both are audible, and which one dominates says
-            // which side of the producer/consumer pair is running ahead.
-            trace.truncated_frames += produced.saturating_sub(before_pad) as u64;
-            trace.padded_frames += window.output_frames.saturating_sub(before_pad) as u64;
+            trace.rendered_frames += produced_len as u64;
+            // `truncated` now counts only frames lost to the carry-over cap --
+            // a real overrun, not per-window jitter. `padded` counts a genuine
+            // underrun: the queue ran dry and the last frame was held.
+            trace.truncated_frames += overflow as u64;
+            trace.padded_frames += short as u64;
+            trace.pending_depth = active.pending.len();
         }
         voice
     }
