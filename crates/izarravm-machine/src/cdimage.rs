@@ -54,6 +54,9 @@ pub enum TrackMode {
     Mode1_2048,
     /// MODE1 data stored as 2352-byte Red Book frames (payload at offset 16).
     Mode1_2352,
+    /// MODE1 data stored as 2448-byte frames: a 2352-byte Red Book frame
+    /// followed by a 96-byte subchannel tail that is discarded on read.
+    Mode1_2448,
     /// CD-XA MODE2 stored as bare 2048-byte Form 1 payloads.
     Mode2_2048,
     /// CD-XA MODE2 stored as 2336-byte frames: 8-byte subheader then payload.
@@ -63,9 +66,6 @@ pub enum TrackMode {
     Mode2_2352,
     /// Red Book CD-DA audio: raw 2352-byte stereo frames.
     Audio,
-    /// MODE1 data stored as 2448-byte frames: a 2352-byte Red Book frame
-    /// followed by a 96-byte subchannel tail that is discarded on read.
-    Mode1_2448,
     /// CD+G audio: a 2352-byte Red Book frame followed by the 96-byte
     /// subchannel tail carrying the graphics stream, which is discarded.
     AudioCdg,
