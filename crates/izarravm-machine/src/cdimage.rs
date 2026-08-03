@@ -239,11 +239,28 @@ impl CdImage {
     /// in its file runs to that file's end.
     pub fn from_cue_files(cue: &str, files: Vec<(String, Vec<u8>)>) -> Result<Self, String> {
         let (names, tracks) = parse_cue(cue)?;
+        // A repeated FILE name is not the "two tracks share one file" layout
+        // (that is a single FILE section followed by multiple TRACK/INDEX
+        // blocks, and file_index dedupes those naturally). It is a sheet
+        // whose *sections* repeat a name, and `build` cannot honor that: it
+        // resolves each section to its own `file_index` and always starts a
+        // new file_index's cursor at 0, so a second section for the same
+        // name would silently read back byte 0 of the file instead of that
+        // section's own INDEX 01 offset -- a wrong-data mount, not an error.
+        // No mainstream ripper emits this layout, so reject it loudly instead
+        // of trying to make it work.
+        let mut seen = std::collections::HashSet::with_capacity(names.len());
+        for name in &names {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(format!(
+                    "CUE names {name} in more than one FILE section; a file shared by \
+                     several tracks belongs in one FILE with multiple TRACK entries"
+                ));
+            }
+        }
         // Resolve each FILE the sheet names to the bytes the caller supplied,
-        // in sheet order. Borrowed slices, not owned copies: a CUE may legally
-        // name the same file twice (that's how a sheet declares two tracks
-        // living in one file), and an owned copy would clone those bytes once
-        // per mention instead of once per file.
+        // in sheet order. Borrowed slices, not owned copies: names are now
+        // unique per section (checked above), so this is one lookup per file.
         let mut file_bytes: Vec<&[u8]> = Vec::with_capacity(names.len());
         for name in &names {
             let found = files

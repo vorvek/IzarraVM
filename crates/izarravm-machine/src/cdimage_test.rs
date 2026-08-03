@@ -278,6 +278,31 @@ fn cue_reports_a_file_it_was_not_given() {
 }
 
 #[test]
+fn cue_rejects_a_file_name_repeated_across_two_file_sections() {
+    // Two separate FILE sections naming the same file is not the "two tracks,
+    // one file" layout (that's a single FILE section with multiple TRACK
+    // blocks, covered by `cue_shares_one_file_across_two_tracks_then_a_third_in_another`
+    // below). `build` cannot honor a repeated section: each section gets its
+    // own file_index and its own cursor starting at 0, so the second
+    // section's track would silently read back the first section's bytes
+    // instead of its own INDEX 01 offset. This must be rejected, not mounted.
+    let cue = "FILE \"shared.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"shared.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let files = vec![("shared.bin".to_string(), vec![0u8; 4 * RAW_SECTOR])];
+
+    let err = CdImage::from_cue_files(cue, files).unwrap_err();
+
+    assert!(
+        err.contains("shared.bin"),
+        "error should name the repeated file: {err}"
+    );
+}
+
+#[test]
 fn cue_shares_one_file_across_two_tracks_then_a_third_in_another() {
     // FILE A holds two tracks back-to-back; FILE B holds a third track alone.
     // Track 1's span is bounded by track 2's INDEX 01 *within FILE A* (the

@@ -2076,6 +2076,14 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
             })?;
             return CdImage::from_cue(&cue, bin).map_err(SessionFailure::new);
         }
+        // A CUE that names the same file across two separate FILE sections is
+        // rejected by `CdImage::from_cue_files` (a repeated section is not the
+        // legitimate two-tracks-one-file layout, which uses a single FILE
+        // section instead). So this dedup is not load-bearing for correctness
+        // -- the mount would already fail if this loop read the file twice
+        // and handed in two entries. It stays because it is still correct and
+        // still cheap: it saves the redundant disk read/copy for a large
+        // image before `from_cue_files` ever sees the list.
         let mut seen = HashSet::with_capacity(names.len());
         let mut files = Vec::with_capacity(names.len());
         for name in names {
