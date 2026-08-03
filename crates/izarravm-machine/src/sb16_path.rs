@@ -8,14 +8,7 @@ use std::collections::VecDeque;
 
 use crate::dma::DmaController;
 use crate::timeline::RatePhase;
-use crate::{DAC_HZ, OPL_NATIVE_HZ};
-
-/// Ceiling on the DAC-rate frames `render_voice` carries between windows.
-/// 4410 frames is 100 ms at 44100 Hz -- far above the few frames of ordinary
-/// per-window jitter, so hitting it means the guest is genuinely producing
-/// faster than the host is draining, which is worth reporting rather than
-/// absorbing. Oldest frames go first, matching the render ring's policy.
-const PENDING_FRAME_CAP: usize = 4410;
+use crate::{DAC_HZ, DAC_PENDING_FRAME_CAP, OPL_NATIVE_HZ};
 
 /// Per-second Sound Blaster diagnostics, enabled by `IZARRAVM_SB_DEBUG`.
 ///
@@ -363,7 +356,7 @@ impl Sb16Path {
         //
         // Queuing the surplus turns the disagreement into a few frames of
         // standing latency, and leaves padding for a genuine underrun.
-        let overflow = (active.pending.len() + produced_len).saturating_sub(PENDING_FRAME_CAP);
+        let overflow = (active.pending.len() + produced_len).saturating_sub(DAC_PENDING_FRAME_CAP);
         for _ in 0..overflow {
             active.pending.pop_front();
         }

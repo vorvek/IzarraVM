@@ -26,6 +26,7 @@ use izarravm_video::{
 pub use izarravm_video::{MARGO_ID_VALUE, VideoMode};
 #[cfg(test)]
 use izarravm_video::{Margo, Vga, VgaRaster};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 
@@ -73,7 +74,7 @@ pub struct CdAudioState {
 pub(crate) use ram_lookup::RamPageLookup;
 #[cfg(test)]
 pub(crate) use timing::PIT_INPUT_HZ;
-pub(crate) use timing::{DAC_HZ, OPL_NATIVE_HZ};
+pub(crate) use timing::{DAC_HZ, DAC_PENDING_FRAME_CAP, OPL_NATIVE_HZ};
 
 pub(crate) use cache_config::{
     CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_TIER_DISABLED_MASK, CacheLevelConfig, TierCost,
@@ -808,6 +809,12 @@ pub struct Machine {
     wss_resampler: Resampler,
     wss_rate_hz: u32, // input rate the wss_resampler is currently configured for
     wss_render_phase: RatePhase,
+    /// Resampled DAC-rate WSS frames produced but not yet claimed by a render
+    /// window, carried across calls for the same reason the SB16 voice carries
+    /// its own (see `sb16_path::Sb16Path::render_voice`): the codec's input
+    /// count comes from bursty guest ticks while the window size comes from the
+    /// host-paced OPL resampler, so surplus must queue rather than be dropped.
+    wss_pending: VecDeque<(i32, i32)>,
     /// Last DAC-rate frame delivered by the WSS stream.
     wss_hold: (i32, i32),
     wss_base: u16,     // I/O base of the 4-port config region (codec sits at base+4)
@@ -1096,6 +1103,7 @@ impl Machine {
             wss_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             wss_rate_hz: 0,
             wss_render_phase: RatePhase::default(),
+            wss_pending: VecDeque::new(),
             wss_hold: (0, 0),
             wss_base,
             wss_irq,
@@ -1824,7 +1832,10 @@ impl Machine {
         // resampled to the DAC rate. The codec is independent of the CT1745 mixer
         // (its I6/I7 DAC attenuation is already applied inside the frames), so it
         // is summed directly below WITHOUT the SB16 master/voice/outgain scaling.
-        let wss_out = if self.wss_enabled {
+        // The mix window is the OPL resampler's count for this wall-clock
+        // window; every other source has to land on it exactly.
+        let len = opl_out.len();
+        let wss_out: Vec<(i32, i32)> = if self.wss_enabled {
             self.sync_wss_resampler();
             let wss_native_count = if delta_ticks > 0 {
                 self.wss_render_phase
@@ -1839,8 +1850,23 @@ impl Machine {
                 .iter()
                 .map(|&(l, r)| (i32::from(l), i32::from(r)))
                 .collect();
-            self.wss_resampler.process(&wss_stereo)
+            let produced = self.wss_resampler.process(&wss_stereo);
+            // Same carry-over the SB16 voice uses: queue the surplus instead of
+            // letting the positional read below drop it, so per-window jitter
+            // costs a few frames of latency rather than a discarded frame and a
+            // repeated one. Oldest frames go first once the cap is reached.
+            let overflow =
+                (self.wss_pending.len() + produced.len()).saturating_sub(DAC_PENDING_FRAME_CAP);
+            for _ in 0..overflow {
+                self.wss_pending.pop_front();
+            }
+            self.wss_pending.extend(produced);
+            let take = len.min(self.wss_pending.len());
+            self.wss_pending.drain(..take).collect()
         } else {
+            // A disabled codec must not replay frames queued before it was
+            // switched off.
+            self.wss_pending.clear();
             Vec::new()
         };
 
@@ -1851,18 +1877,23 @@ impl Machine {
         // that is what the host sink consumes in real time. The DSP and WSS
         // streams are produced and drained on the GUEST clock, so a guest a few
         // percent short of real time hands back a few percent fewer frames every
-        // call. Taking `max()` here and reading the short stream positionally
-        // (`get(i).unwrap_or((0, 0))`) appended a hole of hard silence to the DAC
+        // call. Reading a short stream positionally with
+        // `get(i).unwrap_or((0, 0))` appended a hole of hard silence to the DAC
         // stream on every render -- a full-scale impulse ~1000 times a second at
         // the frontend's pump rate, which is exactly the "crackling" a 486 persona
         // at 96-99% of real time produced. Hold the last frame instead (what the
-        // DAC latch does on real hardware when its data is late) and clamp the
-        // window to the wall budget so the sink ring cannot drift into its
-        // high-water flush either.
-        // Known ceiling: a zero-order hold spreads a sustained shortfall as repeated
-        // samples (mild roughness). If that becomes audible, slew the resampler
-        // ratio off the ring depth instead of holding.
-        let len = opl_out.len();
+        // DAC latch does on real hardware when its data is late).
+        //
+        // The hold used to run constantly, because both guest-clocked streams
+        // were also forced to consume exactly one window's worth per call: the
+        // surplus from a long window was discarded and the next short window was
+        // padded out with repeats. A Quake capture measured ~14k frames dropped
+        // and ~14k repeated per second against 44.1k rendered -- the documented
+        // "zero-order hold spreads a sustained shortfall as repeated samples"
+        // ceiling, made far worse by throwing the other half away. Both streams
+        // now queue their surplus (`Sb16Path::render_voice` and `wss_pending`
+        // above), so the hold below is what it was meant to be: cover for a
+        // genuine underrun, not routine per-window jitter.
         // An idle source must fall silent rather than hold its last level forever,
         // so the latch is armed only while the channel still has output to make.
         let mut wss_hold = if self.wss_enabled && self.wss.is_playing() {

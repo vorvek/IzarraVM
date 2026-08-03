@@ -1808,3 +1808,69 @@ fn wss_port_window_edges_and_config_region_decode_through_the_bus() {
         );
     });
 }
+
+/// The WSS codec must queue the frames a render window did not claim, exactly
+/// as the SB16 voice does.
+///
+/// The codec's frame count comes from elapsed guest ticks (bursty) while the
+/// mix window comes from the host-paced OPL resampler, so the two disagree
+/// every call. `render_audio` reads the codec stream positionally, so anything
+/// past the window used to be dropped on the floor and the next short window
+/// covered with a repeated frame -- the same defect measured on the SB16 path,
+/// where a Quake capture showed ~14k frames discarded and ~14k repeated per
+/// second.
+#[test]
+fn wss_carries_frames_a_short_render_window_did_not_claim() {
+    let mut machine = test_machine();
+    // A rising ramp so queued frames are distinguishable from a held frame.
+    for i in 0..256u32 {
+        let sample = (i as u16).wrapping_mul(256);
+        let [lo, hi] = sample.to_le_bytes();
+        machine.write_physical_u8(0x1_0000 + i * 4, lo);
+        machine.write_physical_u8(0x1_0000 + i * 4 + 1, hi);
+        machine.write_physical_u8(0x1_0000 + i * 4 + 2, lo);
+        machine.write_physical_u8(0x1_0000 + i * 4 + 3, hi);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x58, false).unwrap(); // ch0: auto-init, read
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0xFF, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x03, false).unwrap(); // 1024 bytes
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
+
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C, false).unwrap(); // 16-bit stereo 48 kHz
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap();
+        wss_write_indirect(bus, 15, 0xFF);
+        wss_write_indirect(bus, 14, 0x00);
+        wss_write_indirect(bus, 9, 0x09); // PEN | ACAL
+        wss_write_indirect(bus, 6, 0x00);
+        wss_write_indirect(bus, 7, 0x00);
+    });
+
+    // Let the codec produce a healthy backlog of guest-clocked frames, then
+    // claim only a tiny window of them.
+    machine.advance_devices_clocks(200_000);
+    assert!(machine.wss_pending.is_empty(), "nothing queued yet");
+    let _ = machine.render_audio(16);
+
+    let carried = machine.wss_pending.len();
+    assert!(
+        carried > 0,
+        "frames past the window must be queued, not discarded"
+    );
+
+    // A second small window draws from the queue rather than re-deriving
+    // everything, so the backlog falls instead of being thrown away and rebuilt.
+    let _ = machine.render_audio(16);
+    assert!(
+        machine.wss_pending.len() < carried + 16,
+        "the queue must be drained by later windows, not grow unbounded \
+         (was {carried}, now {})",
+        machine.wss_pending.len()
+    );
+}
