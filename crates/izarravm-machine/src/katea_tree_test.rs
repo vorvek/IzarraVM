@@ -1575,6 +1575,21 @@ fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
 /// Names in `DOS_FOLDER_BINARIES` that are NOT in the committed image: they are
 /// supplied by a runner override at mount time (see `apply_overrides` in
 /// `lib.rs`), so the image has nothing to compare them against.
+///
+/// This list is an unenforced exemption: nothing here checks that an entry
+/// actually reaches an override call site. Before adding a name, trace it to
+/// its real override wiring and confirm the wiring exists -- do NOT add a name
+/// here just to make `dos_folder_list_matches_the_committed_image` pass. If
+/// `DOS_FOLDER_BINARIES` gained a name that is genuinely missing from the
+/// image (the EDIT.COM bug this guard exists to catch), the fix is to put the
+/// file in the image, not to exempt it here.
+///
+/// Worked example, `GLIDE2X.OVL`: `crates/izarravm/src/gui_session.rs`
+/// (`Session::initialize`) reads `self.spec.glide_ovl`, wraps it as
+/// `("GLIDE2X.OVL".to_string(), bytes)`, and passes it through
+/// `mount_hdd_folder_with_user_overrides` (`storage.rs`) to `apply_overrides`
+/// (`lib.rs`) -- a real, traceable path from a runner-supplied override to the
+/// overlay. That is the bar every entry here must clear.
 const OVERRIDE_SUPPLIED: &[&str] = &["GLIDE2X.OVL"];
 
 /// Walk the committed image's `C:\DOS` directory and return its 8.3 file names.
@@ -1605,20 +1620,26 @@ fn image_dos_folder_names() -> Vec<String> {
         le32(sector(fat_sector), byte_off % crate::katea_volume::SECTOR) & 0x0FFF_FFFF
     };
     let cluster_lba = |cluster: u32| part_start + first_data + (cluster - root_clus) * spc;
+    // Mirrors production's `extract_system_payload::read_chain` (`katea_volume.rs`):
+    // a chain that never reaches EOC within the disk's sector bound is a corrupt or
+    // cyclic FAT, not a shorter file. Panicking here (rather than silently returning
+    // the partial bytes collected so far) keeps that divergence visible instead of
+    // letting it masquerade as a `DOS_FOLDER_BINARIES` drift.
     let read_chain = |first: u32| -> Vec<u8> {
+        let max_clusters = img.len() / crate::katea_volume::SECTOR;
         let mut out = Vec::new();
         let mut c = first;
-        for _ in 0..(img.len() / crate::katea_volume::SECTOR) {
+        for _ in 0..max_clusters {
             for s in 0..spc {
                 out.extend_from_slice(sector(cluster_lba(c) + s));
             }
             let next = fat_entry(c);
             if next >= 0x0FFF_FFF8 {
-                break;
+                return out;
             }
             c = next;
         }
-        out
+        panic!("katea: cluster chain from {first} exceeds the disk; corrupt FAT")
     };
 
     // Find the DOS subdirectory entry in the root, then list its files.
