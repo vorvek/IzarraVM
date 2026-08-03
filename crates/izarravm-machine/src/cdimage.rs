@@ -7,14 +7,17 @@
 //!
 //! - A plain ISO: one MODE1 data track of 2048-byte sectors. The image length
 //!   divides evenly by 2048 and every sector is a data sector.
-//! - A CUE sheet with one BIN file: a multi-track disc. The CUE names the BIN
-//!   and lists each track's MODE (MODE1/2048, MODE1/2352, MODE1/2448,
+//! - A CUE sheet: a multi-track disc, either as one FILE shared by every
+//!   track ([`CdImage::from_cue`]) or one FILE per track
+//!   ([`CdImage::from_cue_files`], the common layout for a rip with CD audio).
+//!   The CUE lists each track's MODE (MODE1/2048, MODE1/2352, MODE1/2448,
 //!   MODE2/2048, MODE2/2336, MODE2/2352, AUDIO, or CDG) and its start
-//!   INDEX 01 as an MM:SS:FF address. Data tracks read back 2048 logical
-//!   bytes per sector; AUDIO tracks read back the raw 2352-byte Red Book
-//!   frame. MODE1/2448 and CDG store each frame with a 96-byte subchannel
-//!   tail appended (2352 + 96); the tail only grows the per-frame stride and
-//!   is discarded on read, so the payload offset matches the untailed mode.
+//!   INDEX 01 as an MM:SS:FF address relative to its own FILE. Data tracks
+//!   read back 2048 logical bytes per sector; AUDIO tracks read back the raw
+//!   2352-byte Red Book frame. MODE1/2448 and CDG store each frame with a
+//!   96-byte subchannel tail appended (2352 + 96); the tail only grows the
+//!   per-frame stride and is discarded on read, so the payload offset matches
+//!   the untailed mode.
 //!
 //! Sector framing: a 2048-byte data track stores the user data directly; a
 //! 2352-byte MODE1 track wraps each 2048-byte payload in the Red Book sync,
@@ -217,49 +220,106 @@ impl CdImage {
         })
     }
 
-    /// Mount from a CUE sheet and its single BIN file. `cue` is the sheet text;
-    /// `bin` is the raw image the sheet's `FILE` line names. The track table is
-    /// derived from the TRACK/INDEX lines; per-track sector counts come from the
-    /// span to the next track's start (the last track runs to the end of the BIN).
+    /// Mount from a CUE sheet and a single BIN. Convenience wrapper over
+    /// [`CdImage::from_cue_files`] for the common one-file sheet: every track
+    /// is bound to `bin` regardless of what the sheet's FILE lines name.
     pub fn from_cue(cue: &str, bin: Vec<u8>) -> Result<Self, String> {
         let parsed = parse_cue(cue)?;
-        if parsed.is_empty() {
+        let name = parsed.0.first().cloned().unwrap_or_default();
+        Self::build(parsed, &[(name, bin)], true)
+    }
+
+    /// Mount from a CUE sheet and the files it names. Each FILE opens a new
+    /// byte origin: a track's offsets are relative to its own file, while the
+    /// LBA timeline runs continuously across all of them. A track that is last
+    /// in its file runs to that file's end.
+    pub fn from_cue_files(cue: &str, files: Vec<(String, Vec<u8>)>) -> Result<Self, String> {
+        let parsed = parse_cue(cue)?;
+        Self::build(parsed, &files, false)
+    }
+
+    /// Shared track-table construction for both CUE entry points. `single_file`
+    /// forces every track onto `files[0]`, which is what the one-BIN
+    /// `from_cue` wrapper means by binding every track to the same bytes.
+    ///
+    /// The INDEX addresses give each track's start in sectors (frames), so a
+    /// track's sector count is the delta to the next track's start *within the
+    /// same file* (a track that is last in its file runs to that file's own
+    /// end at its own sector size). Byte offsets are the running sum of
+    /// preceding tracks' actual byte spans within their file, since a
+    /// mixed-mode file packs different sector sizes back to back: 2048 for
+    /// MODE1/2048, 2352 for AUDIO and MODE1/2352. The track frame addresses
+    /// stay the logical (sector-count) timeline regardless of byte size.
+    ///
+    /// Two timelines. `disc_lba` is what the guest sees, and PREGAP frames
+    /// advance it without any bytes behind them. The CUE's INDEX addresses are
+    /// positions within a file, so a track's byte span still comes from the
+    /// delta between consecutive INDEX 01 values *in that file*. This
+    /// derivation assumes tracks within a single file appear in non-decreasing
+    /// INDEX 01 order (the `saturating_sub` above silently floors an
+    /// out-of-order pair to zero sectors instead of erroring); a sheet that
+    /// violates this, within one file, mounts with a track table and
+    /// `total_sectors` that no longer match the on-disc reality.
+    fn build(
+        parsed: (Vec<String>, Vec<CueTrack>),
+        files: &[(String, Vec<u8>)],
+        single_file: bool,
+    ) -> Result<Self, String> {
+        let (names, tracks_in) = parsed;
+        if tracks_in.is_empty() {
             return Err("CUE sheet declared no tracks".to_string());
         }
 
-        // The INDEX addresses give each track's start in sectors (frames), so a
-        // track's sector count is the delta to the next track's start (the last
-        // runs to the end of the BIN at its own sector size). Byte offsets are the
-        // running sum of preceding tracks' actual byte spans, since a mixed-mode
-        // BIN packs different sector sizes back to back: 2048 for MODE1/2048,
-        // 2352 for AUDIO and MODE1/2352. The track frame addresses stay the
-        // logical (sector-count) timeline regardless of byte size.
-        let mut tracks = Vec::with_capacity(parsed.len());
-        let mut image_offset = 0usize;
-        // Two timelines. `disc_lba` is what the guest sees, and PREGAP frames
-        // advance it without any bytes behind them. The CUE's INDEX addresses
-        // are positions in the file, so a track's byte span still comes from
-        // the delta between consecutive INDEX 01 values. This derivation
-        // assumes tracks within a single BIN appear in non-decreasing INDEX 01
-        // order (the `saturating_sub` above silently floors an out-of-order
-        // pair to zero sectors instead of erroring); a sheet that violates
-        // this mounts with a track table and `total_sectors` that no longer
-        // match the on-disc reality.
+        // Resolve each FILE the sheet names to the bytes the caller supplied.
+        let mut file_bytes: Vec<&[u8]> = Vec::new();
+        if single_file {
+            file_bytes.push(files.first().map(|f| f.1.as_slice()).unwrap_or(&[]));
+        } else {
+            for name in &names {
+                let found = files
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
+                file_bytes.push(found.1.as_slice());
+            }
+        }
+        if file_bytes.is_empty() {
+            return Err("CUE sheet declared no FILE".to_string());
+        }
+
+        // Each file keeps its own byte cursor; `disc_lba` runs across all of them.
+        let mut cursors = vec![0usize; file_bytes.len()];
+        let mut concatenated: Vec<u8> = Vec::new();
+        let mut file_base = Vec::with_capacity(file_bytes.len());
+        for bytes in &file_bytes {
+            file_base.push(concatenated.len());
+            concatenated.extend_from_slice(bytes);
+        }
+
+        let mut tracks = Vec::with_capacity(tracks_in.len());
         let mut disc_lba = 0u32;
-        for (i, p) in parsed.iter().enumerate() {
+        for (i, p) in tracks_in.iter().enumerate() {
+            let fi = if single_file { 0 } else { p.file_index };
+            let bytes = *file_bytes
+                .get(fi)
+                .ok_or_else(|| format!("track {} references an absent FILE", p.number))?;
             let raw = p.mode.raw_size();
-            // Sector count: the span to the next track's start frame, or the
-            // bytes left in the BIN for the last track.
-            let sectors = match parsed.get(i + 1) {
+            // The next track bounds this one only if it shares this file;
+            // otherwise this track runs to its own file's end.
+            let next_in_file = tracks_in
+                .get(i + 1)
+                .filter(|n| single_file || n.file_index == fi);
+            let sectors = match next_in_file {
                 Some(n) => n.start_frame.saturating_sub(p.start_frame),
-                None => ((bin.len().saturating_sub(image_offset)) / raw) as u32,
+                None => ((bytes.len().saturating_sub(cursors[fi])) / raw) as u32,
             };
             let span = sectors as usize * raw;
-            if image_offset + span > bin.len() {
+            if cursors[fi] + span > bytes.len() {
                 return Err(format!(
-                    "track {} (offset {image_offset}, {span} bytes) runs past the BIN ({} bytes)",
+                    "track {} (offset {}, {span} bytes) runs past its file ({} bytes)",
                     p.number,
-                    bin.len()
+                    cursors[fi],
+                    bytes.len()
                 ));
             }
             disc_lba += p.pregap_frames;
@@ -268,14 +328,14 @@ impl CdImage {
                 mode: p.mode,
                 start_lba: disc_lba,
                 sectors,
-                image_offset,
+                image_offset: file_base[fi] + cursors[fi],
             });
-            image_offset += span;
+            cursors[fi] += span;
             disc_lba += sectors;
         }
 
         Ok(Self {
-            backing: Backing::Bytes(bin),
+            backing: Backing::Bytes(concatenated),
             tracks,
             total_sectors: disc_lba,
         })
@@ -429,28 +489,46 @@ struct CueTrack {
     /// file. They shift this track and everything after it to a higher LBA
     /// without consuming any bytes.
     pregap_frames: u32,
+    /// Index into the sheet's FILE list. Each FILE opens a new byte origin;
+    /// every TRACK until the next FILE belongs to it.
+    file_index: usize,
 }
 
-/// Parse a CUE sheet into its track list. Recognizes `TRACK n MODE1/2048`,
-/// `MODE1/2352`, `MODE1/2448`, `MODE2/2048`, `MODE2/2336`, `MODE2/2352`,
-/// `AUDIO`, and `CDG`, with each track's `INDEX 01 MM:SS:FF` start. The
-/// `FILE` line is accepted and ignored: a single-BIN CUE keeps every track in
-/// one file. `PREGAP` and `INDEX 00` both mean different things: PREGAP is
-/// not stored in the file and advances the disc LBA timeline by itself
-/// (handled in `from_cue`), while INDEX 00 addresses bytes that ARE in the
-/// file and are folded into the preceding track's span by only ever reading
+/// Parse a CUE sheet into its FILE list and track list. Recognizes
+/// `TRACK n MODE1/2048`, `MODE1/2352`, `MODE1/2448`, `MODE2/2048`,
+/// `MODE2/2336`, `MODE2/2352`, `AUDIO`, and `CDG`, with each track's
+/// `INDEX 01 MM:SS:FF` start. Each `FILE` line opens a new byte origin, named
+/// in the returned file list in sheet order; every track records which FILE
+/// it belongs to. `PREGAP` and `INDEX 00` both mean different things: PREGAP
+/// is not stored in the file and advances the disc LBA timeline by itself
+/// (handled in `build`), while INDEX 00 addresses bytes that ARE in the file
+/// and are folded into the preceding track's span by only ever reading
 /// INDEX 01 here.
-fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
+fn parse_cue(cue: &str) -> Result<(Vec<String>, Vec<CueTrack>), String> {
+    let mut files: Vec<String> = Vec::new();
     let mut tracks: Vec<CueTrack> = Vec::new();
     let mut pending: Option<(u8, TrackMode)> = None;
     let mut pending_pregap = 0u32;
 
     for line in cue.lines() {
-        let mut words = line.split_whitespace();
+        let trimmed = line.trim();
+        let mut words = trimmed.split_whitespace();
         let Some(keyword) = words.next() else {
             continue;
         };
         match keyword.to_ascii_uppercase().as_str() {
+            "FILE" => {
+                let rest = trimmed[keyword.len()..].trim_start();
+                let name = if let Some(rest) = rest.strip_prefix('"') {
+                    rest.split('"').next()
+                } else {
+                    rest.split_whitespace().next()
+                };
+                let name = name
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| format!("missing FILE name in '{line}'"))?;
+                files.push(name.to_string());
+            }
             "TRACK" => {
                 let number: u8 = words
                     .next()
@@ -494,6 +572,7 @@ fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
                     mode,
                     start_frame: frame,
                     pregap_frames: pending_pregap,
+                    file_index: files.len().saturating_sub(1),
                 });
                 pending = None;
                 pending_pregap = 0;
@@ -503,7 +582,7 @@ fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
     }
 
     tracks.sort_by_key(|t| t.number);
-    Ok(tracks)
+    Ok((files, tracks))
 }
 
 /// Convert an MM:SS:FF address to an absolute frame number on the BIN timeline.

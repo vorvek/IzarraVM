@@ -224,3 +224,55 @@ fn leading_pregap_on_the_first_track_still_shifts_its_start_lba() {
     assert_eq!(t1.sectors, 3);
     assert_eq!(img.total_sectors(), 5);
 }
+
+#[test]
+fn cue_binds_each_track_to_its_own_file() {
+    // A rip with the data track in one file and two audio tracks in their own
+    // files. Byte offsets restart at zero in each file; the LBA timeline does not.
+    let cue = "FILE \"data.bin\" BINARY\n\
+               TRACK 01 MODE2/2352\n\
+               INDEX 01 00:00:00\n\
+               FILE \"t2.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"t3.bin\" BINARY\n\
+               TRACK 03 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let mut data = vec![0u8; 2 * RAW_SECTOR];
+    data[24] = 0xD1;
+    let mut t2 = vec![0u8; 3 * RAW_SECTOR];
+    t2[0] = 0xE2;
+    let mut t3 = vec![0u8; 4 * RAW_SECTOR];
+    t3[0] = 0xE3;
+    let files = vec![
+        ("data.bin".to_string(), data),
+        ("t2.bin".to_string(), t2),
+        ("t3.bin".to_string(), t3),
+    ];
+
+    let img = CdImage::from_cue_files(cue, files).unwrap();
+    assert_eq!(img.track_count(), 3);
+    assert_eq!((img.tracks()[0].start_lba, img.tracks()[0].sectors), (0, 2));
+    assert_eq!((img.tracks()[1].start_lba, img.tracks()[1].sectors), (2, 3));
+    assert_eq!((img.tracks()[2].start_lba, img.tracks()[2].sectors), (5, 4));
+    assert_eq!(img.total_sectors(), 9);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xD1);
+    assert_eq!(img.read_audio_frame(2).unwrap()[0], 0xE2);
+    assert_eq!(img.read_audio_frame(5).unwrap()[0], 0xE3);
+}
+
+#[test]
+fn cue_reports_a_file_it_was_not_given() {
+    let cue = "FILE \"there.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"missing.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let files = vec![("there.bin".to_string(), vec![0u8; RAW_SECTOR])];
+    let err = CdImage::from_cue_files(cue, files).unwrap_err();
+    assert!(
+        err.contains("missing.bin"),
+        "error should name the file: {err}"
+    );
+}
