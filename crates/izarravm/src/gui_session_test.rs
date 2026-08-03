@@ -99,6 +99,34 @@ fn prepared_floppy_rejects_an_unknown_geometry_before_submission() {
 }
 
 #[test]
+fn cue_file_names_returns_every_file_in_sheet_order() {
+    let cue = concat!(
+        "FILE \"track01.bin\" BINARY\n",
+        "  TRACK 01 MODE1/2352\n",
+        "    INDEX 01 00:00:00\n",
+        "FILE track02.bin BINARY\n",
+        "  TRACK 02 AUDIO\n",
+        "    INDEX 00 00:00:00\n",
+        "    INDEX 01 00:02:00\n",
+        "FILE \"track03.bin\" BINARY\n",
+        "  TRACK 03 AUDIO\n",
+        "    INDEX 01 00:00:00\n",
+    );
+
+    assert_eq!(
+        cue_file_names(cue),
+        vec!["track01.bin", "track02.bin", "track03.bin"]
+    );
+}
+
+#[test]
+fn cue_file_names_is_empty_when_the_sheet_has_no_file_line() {
+    let cue = concat!("  TRACK 01 MODE1/2352\n", "    INDEX 01 00:00:00\n",);
+
+    assert!(cue_file_names(cue).is_empty());
+}
+
+#[test]
 fn startup_snapshot_contains_initial_media() {
     let scratch = TestScratch::new("initial-media");
     let source = FloppySource(scratch.path().join("boot.img"));

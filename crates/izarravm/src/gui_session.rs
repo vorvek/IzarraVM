@@ -5,7 +5,7 @@ use izarravm_audio::{AudioDebugSnapshot, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiConfig, MidiStatus};
 use izarravm_machine::{CdAudioState, CdImage, JoystickState, Machine, MachineProfile, StopReason};
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -2066,11 +2066,35 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
         let cue = std::fs::read_to_string(path).map_err(|err| {
             SessionFailure::new(format!("could not read CUE {}: {err}", path.display()))
         })?;
-        let bin_path = cue_bin_path(path, &cue);
-        let bin = std::fs::read(&bin_path).map_err(|err| {
-            SessionFailure::new(format!("could not read BIN {}: {err}", bin_path.display()))
-        })?;
-        CdImage::from_cue(&cue, bin).map_err(SessionFailure::new)
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let names = cue_file_names(&cue);
+        if names.is_empty() {
+            // No FILE line: the sibling .bin is the whole disc.
+            let bin_path = path.with_extension("bin");
+            let bin = std::fs::read(&bin_path).map_err(|err| {
+                SessionFailure::new(format!("could not read BIN {}: {err}", bin_path.display()))
+            })?;
+            return CdImage::from_cue(&cue, bin).map_err(SessionFailure::new);
+        }
+        let mut seen = HashSet::with_capacity(names.len());
+        let mut files = Vec::with_capacity(names.len());
+        for name in names {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                // The sheet named this file again for another track; it was
+                // already read once above.
+                continue;
+            }
+            let file_path = dir.join(&name);
+            let bytes = std::fs::read(&file_path).map_err(|err| {
+                SessionFailure::new(format!(
+                    "could not read {} named by {}: {err}",
+                    file_path.display(),
+                    path.display()
+                ))
+            })?;
+            files.push((name, bytes));
+        }
+        CdImage::from_cue_files(&cue, files).map_err(SessionFailure::new)
     } else {
         let bytes = std::fs::read(path).map_err(|err| {
             SessionFailure::new(format!("could not read CD image {}: {err}", path.display()))
@@ -2079,8 +2103,12 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
     }
 }
 
-fn cue_bin_path(cue_path: &Path, cue: &str) -> PathBuf {
-    let dir = cue_path.parent().unwrap_or_else(|| Path::new("."));
+/// Every file a CUE names, in sheet order. A name is returned as written; the
+/// caller resolves it against the CUE's own directory. An empty result means
+/// the sheet has no FILE line at all, which the caller treats as a single-BIN
+/// sheet named after the CUE.
+fn cue_file_names(cue: &str) -> Vec<String> {
+    let mut names = Vec::new();
     for line in cue.lines() {
         let trimmed = line.trim();
         if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("FILE") {
@@ -2093,10 +2121,10 @@ fn cue_bin_path(cue_path: &Path, cue: &str) -> PathBuf {
             rest.split_whitespace().next()
         };
         if let Some(name) = name.filter(|name| !name.is_empty()) {
-            return dir.join(name);
+            names.push(name.to_string());
         }
     }
-    cue_path.with_extension("bin")
+    names
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
