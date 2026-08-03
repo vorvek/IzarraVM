@@ -73,8 +73,17 @@ impl DmaChannel {
     /// Word address the slave (16-bit) drives: page in A23-A17, cur_addr (a word
     /// count) in A16-A1; A0 is tied low so transfers are always word-aligned.
     /// IBM PC/AT 16-bit DMA wiring: the slave's address counter counts words.
+    ///
+    /// The page register supplies A23-A17 from its bits **7-1**; bit 0 is not
+    /// wired, because A16 comes from the counter. Drivers still write the whole
+    /// `addr >> 16` byte (Linux's `set_dma_page` masks it to `& 0xfe`, Quake
+    /// does not bother), so the low bit must be dropped here rather than shifted
+    /// into A17 -- doing the latter counts the page twice and reads a 128 KB
+    /// window past the buffer. That was silent for the 8-bit channels, which
+    /// take `byte_address`, and silenced Quake, whose SB16 output runs on
+    /// channel 5.
     fn word_address(&self) -> u32 {
-        (u32::from(self.page) << 17) | (u32::from(self.cur_addr) << 1)
+        ((u32::from(self.page) & 0xFE) << 16) | (u32::from(self.cur_addr) << 1)
     }
 
     /// Shared per-transfer step: advance the address counter, decrement the count

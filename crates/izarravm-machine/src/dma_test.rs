@@ -10,6 +10,18 @@ use izarravm_core::{
 
 const TEST_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
 
+/// Physical byte address a 16-bit (slave) DMA channel drives, per the PC/AT
+/// wiring: the page register supplies A23-A17 from its bits 7-1 (bit 0 is
+/// ignored, because A16 comes from the counter) and the channel's word counter
+/// supplies A16-A1 with A0 tied low.
+///
+/// Drivers program it as Linux's `set_dma_addr` does -- page `addr >> 16`,
+/// counter `(addr >> 1) & 0xFFFF` -- so shifting the whole page byte left by 17
+/// would count the page twice and land a 128 KB window past the buffer.
+fn slave_byte_addr(page: u8, word_addr: u16) -> u32 {
+    ((u32::from(page) & 0xFE) << 16) | (u32::from(word_addr) << 1)
+}
+
 fn canonical_dma_payload(dma: &DmaController) -> Vec<u8> {
     let mut state = CanonicalStateWriter::new().unwrap();
     state
@@ -633,11 +645,11 @@ fn slave_channel_5_reads_word_little_endian_and_steps_in_words() {
     dma.write_port(0xC4, 0x00); // ...MSB -> word addr 0x0010
     dma.write_port(0xC6, 0x00); // slave ch1 count LSB
     dma.write_port(0xC6, 0x00); // ...MSB -> 0 (1 word transfer)
-    dma.write_port(0x8B, 0x01); // page -> byte base 0x01_0000 + (0x0010<<1)
+    dma.write_port(0x8B, 0x02); // page 0x02 -> A17 set, so the page really contributes
     dma.write_port(0xD4, 0x01); // unmask slave ch1 (channel 5)
 
     // Seed two bytes at the word-aligned byte address.
-    let byte_addr = (0x01u32 << 17) | (0x0010u32 << 1);
+    let byte_addr = slave_byte_addr(0x02, 0x0010);
     let mut mem = Memory::new(byte_addr as usize + 4).unwrap();
     mem.write_u8(byte_addr as usize, 0x34).unwrap();
     mem.write_u8(byte_addr as usize + 1, 0x12).unwrap();
@@ -657,10 +669,10 @@ fn slave_channel_5_auto_init_reloads_and_keeps_feeding() {
     dma.write_port(0xC4, 0x00);
     dma.write_port(0xC6, 0x01); // count 1 -> 2 word transfers per cycle
     dma.write_port(0xC6, 0x00);
-    dma.write_port(0x8B, 0x01); // page 0x01 -> byte base 0x2_0000
+    dma.write_port(0x8B, 0x02); // page 0x02 -> byte base 0x2_0000
     dma.write_port(0xD4, 0x01); // unmask slave ch1
 
-    let byte_addr = (0x01u32 << 17) | (0x0002u32 << 1);
+    let byte_addr = slave_byte_addr(0x02, 0x0002);
     let mut mem = Memory::new(byte_addr as usize + 4).unwrap();
     mem.write_u8(byte_addr as usize, 0x78).unwrap();
     mem.write_u8(byte_addr as usize + 1, 0x56).unwrap();
@@ -850,13 +862,13 @@ fn write_word_stores_little_endian_on_the_slave_path() {
         cur_addr: 0x0008,
         base_count: 0,
         cur_count: 0,
-        page: 0x01,
+        page: 0x02,
         mask: false,
         ..Default::default()
     };
     ch.set_mode(0x45); // single, write (kind 1)
 
-    let byte_addr = ((0x01u32 << 17) | (0x0008u32 << 1)) as usize;
+    let byte_addr = slave_byte_addr(0x02, 0x0008) as usize;
     let mut mem = Memory::new(byte_addr + 4).unwrap();
     ch.write_word(&mut mem, 0xBEEF).unwrap();
     assert_eq!(mem.read_u8(byte_addr).unwrap(), 0xEF, "low byte first");
@@ -1235,4 +1247,46 @@ fn a_rejected_block_cycle_does_not_latch_the_channel_active() {
     assert_eq!(dma.write_byte(2, &mut memory, 0x55), None);
     assert!(!dma.master.channels[2].active);
     assert_eq!(dma.master.channels[2].transfer_cycles, 0);
+}
+
+/// A 16-bit DMA buffer must be read from the address the driver programmed, not
+/// one page-shift further on. This is the defect that silenced Quake: it runs
+/// its SB16 output on channel 5 (16-bit, auto-init) and every counter looked
+/// healthy -- transfers ticking, IRQs firing, the resampler producing a full
+/// 44.1 kHz stream -- while the fetch came from the wrong 128 KB window, so the
+/// mixer received a region that happened to be zeros. Doom was unaffected
+/// because it drives the 8-bit path on channel 1.
+#[test]
+fn slave_channel_5_reads_the_buffer_the_driver_programmed() {
+    // A buffer whose page byte has bit 0 set, so a page-shift error moves the
+    // read somewhere else entirely rather than coincidentally landing right.
+    const BUF: u32 = 0x0003_4000;
+    let page = (BUF >> 16) as u8; // 0x03, exactly what a driver writes
+    let counter = ((BUF >> 1) & 0xFFFF) as u16;
+    assert_eq!(
+        slave_byte_addr(page, counter),
+        BUF,
+        "the reference formula must reproduce the programmed address"
+    );
+
+    let mut dma = DmaController::default();
+    dma.write_port(0xD6, 0x49); // slave ch1: single, read, auto-init off
+    dma.write_port(0xC4, (counter & 0xFF) as u8);
+    dma.write_port(0xC4, (counter >> 8) as u8);
+    dma.write_port(0xC6, 0x00); // count 0 -> one word
+    dma.write_port(0xC6, 0x00);
+    dma.write_port(0x8B, page);
+    dma.write_port(0xD4, 0x01); // unmask channel 5
+
+    // Size memory to just past the buffer: a read from the wrong window is out
+    // of range and fails outright rather than silently returning other data.
+    let mut mem = Memory::new(BUF as usize + 4).unwrap();
+    mem.write_u8(BUF as usize, 0xCD).unwrap();
+    mem.write_u8(BUF as usize + 1, 0xAB).unwrap();
+
+    assert_eq!(
+        dma.read_word(5, &mut mem),
+        Some(0xABCD),
+        "channel 5 must fetch from the programmed physical address"
+    );
 }
