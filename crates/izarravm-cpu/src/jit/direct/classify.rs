@@ -340,23 +340,6 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         addr: direct_addr(addr)?,
                     });
                 }
-                1 => {
-                    let m = insn.modrm?;
-                    return match insn.operand? {
-                        DecodedOperand::Reg(dst) => Some(DirectKind::AluReg {
-                            op,
-                            dst,
-                            src: m.reg,
-                            width: operand_width,
-                        }),
-                        DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
-                            op,
-                            source: StoreSource::Reg(m.reg),
-                            width: operand_width,
-                            addr: direct_addr(addr)?,
-                        }),
-                    };
-                }
                 3 => {
                     let m = insn.modrm?;
                     return match insn.operand? {
@@ -555,6 +538,43 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x6a => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Imm(crate::sign_extend_u8(insn.imm as u8)),
+                });
+            }
+            // THREE-operand IMUL, register source only: `IMUL r32, r/m32, imm32` (0x69) and
+            // `IMUL r32, r/m32, imm8` (0x6b). `decode` has already fetched the immediate and
+            // sign-extended the imm8 into `insn.imm`, so the two opcodes reach one kind.
+            //
+            // These are the rejected-row campaign's `non_continuable` rows, and lowering them
+            // takes TWO changes, not one. `block_continuable` (decode.rs) routes 0x69/0x6b to
+            // `DecodeGroup::Misc` -- the "heterogeneous one-off single-byte block", a decode
+            // CLASSIFICATION neighbourhood, not a semantic class -- and refuses the whole group
+            // bar TEST AL/AX,imm. The compile walk consults `insn.continuable` before it ever
+            // reaches `classify`, so this arm is dead without the walk's own admission
+            // (`jit_admits_non_continuable`, direct.rs) and that admission relocates the row onto
+            // `hard_boundary` without this arm. Neither half is worth landing alone.
+            //
+            // MEMORY form deliberately absent. It is a missed lowering, not a hazard: the `else`
+            // returns None and the instruction stays exactly the barrier it is today. Building it
+            // means an `ImulMemImm` alongside `ImulMem` with the full memory side-exit set, for a
+            // row the census measures at 473 quake exits and zero doom -- an unmeasured mechanism
+            // by this campaign's standing rule. The register row is doom's largest at 244,547.
+            //
+            // Below the `OperandSize::Word` gate, and 0x69/0x6b are absent from its allowlist, so
+            // a 66-prefixed encoding falls to None above and never reaches here. That is
+            // load-bearing rather than incidental: at Word the interpreter multiplies at sixteen
+            // bits and `write_gpr_sized(.., Word, ..)` PRESERVES the destination's high half,
+            // while the emitted `imul r32, r32, imm32` defines all thirty-two and computes CF/OF
+            // against the wrong width. Same argument as 0x0faf's arm above, same two failure
+            // modes.
+            0x69 | 0x6b => {
+                let m = insn.modrm?;
+                let DecodedOperand::Reg(src) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::ImulImm {
+                    dst: m.reg,
+                    src,
+                    imm: insn.imm,
                 });
             }
             0x80 => {

@@ -387,6 +387,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Test { a, b } => emit_test(&mut e, a, b),
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
+            DirectKind::ImulImm { dst, src, imm } => emit_imul_imm(&mut e, dst, src, imm),
             DirectKind::ImulMemAcc { addr } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
@@ -3930,6 +3931,27 @@ fn emit_imul(e: &mut Encoder, dst: u8, src: u8) {
     // multiply and writing the whole flags word back in one go: emit_logic_live_af is not needed
     // the way TEST needs it, because TEST leaves its own descriptor live for a later read while
     // IMUL clears pending_flags and commits the full word right away.
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+}
+
+/// IMUL r32, r/m32, imm — the three-operand form, register source (0x69 and 0x6B).
+///
+/// `dst = src * imm`, which is one host instruction because the host has the same three-operand
+/// encoding with the same truncation and the same CF/OF rule. The flag tail is `emit_imul`'s
+/// verbatim and correct for the same reason: the interpreter reaches BOTH the two-operand and the
+/// three-operand form through one `imul_truncated` (core.rs), which ends in
+/// `set_flag(FLAG_CF | FLAG_OF, significant)`. That mask has more than one bit set, so it cannot
+/// take the single-bit CF-override shortcut and instead materializes whatever was pending before
+/// writing just those two bits -- leaving SF/ZF/AF/PF exactly as they were.
+///
+/// Unlike `emit_imul` this reads a source it does not write, and no shuffle is needed for it:
+/// every operand is a `GUEST_HOMES` register (R8-R14 plus RBX), the host instruction reads `src`
+/// and writes `dst` in one go, and `src == dst` is the ordinary in-place multiply the guest
+/// encoding permits.
+fn emit_imul_imm(e: &mut Encoder, dst: u8, src: u8, imm: u32) {
+    e.imul_r32_r32_imm32(home(dst), home(src), imm);
     emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
     emit_clear_pending(e);
