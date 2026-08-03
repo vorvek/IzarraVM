@@ -203,6 +203,9 @@ pub struct SbDsp {
     // frame drops (fidelity may glitch, block counter/IRQ timing stay
     // correct). Cap and policy live in `pcm::push_frame_capped`.
     rendered: VecDeque<(i16, i16)>,
+    /// Frames evicted from `rendered` because the host path did not drain it
+    /// fast enough. Diagnostic only; never gates behavior.
+    dropped_frames: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +239,7 @@ impl Default for SbDsp {
             sbpro_stereo: false,
             adpcm: None,
             rendered: VecDeque::new(),
+            dropped_frames: 0,
         }
     }
 }
@@ -544,7 +548,9 @@ impl SbDsp {
         W: FnMut() -> Option<u16>,
     {
         if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
-            push_frame_capped(&mut self.rendered, frame);
+            if push_frame_capped(&mut self.rendered, frame) {
+                self.dropped_frames = self.dropped_frames.saturating_add(1);
+            }
             true
         } else {
             false
@@ -569,6 +575,11 @@ impl SbDsp {
     /// when the ring is empty (silent DSP = OPL passthrough).
     pub fn drain_frame(&mut self) -> Option<(i16, i16)> {
         self.rendered.pop_front()
+    }
+
+    /// Frames evicted from the render ring since power-on. Diagnostic only.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames
     }
 
     /// Output frames until the next block-completion IRQ edge. PCM stereo drains two block units

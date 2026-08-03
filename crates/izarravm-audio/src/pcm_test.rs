@@ -185,3 +185,17 @@ fn alaw_full_scale_reaches_near_full_magnitude() {
     assert_eq!(negative, -32_256, "A-law full-scale negative");
     assert!(positive > 30_000 && negative < -30_000, "near +/- full");
 }
+
+#[test]
+fn push_frame_capped_reports_the_drop() {
+    let mut ring = std::collections::VecDeque::new();
+    for i in 0..RENDER_RING_CAP {
+        assert!(
+            !push_frame_capped(&mut ring, (i as i16, 0)),
+            "no drop below the cap"
+        );
+    }
+    // At the cap the oldest frame is evicted, and the caller is told.
+    assert!(push_frame_capped(&mut ring, (0, 0)));
+    assert_eq!(ring.len(), RENDER_RING_CAP);
+}

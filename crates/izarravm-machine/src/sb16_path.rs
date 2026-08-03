@@ -9,6 +9,63 @@ use crate::dma::DmaController;
 use crate::timeline::RatePhase;
 use crate::{DAC_HZ, OPL_NATIVE_HZ};
 
+/// Per-second Sound Blaster diagnostics, enabled by `IZARRAVM_SB_DEBUG`.
+///
+/// The fields are chosen so the known failure modes are distinguishable from
+/// each other: whether the guest ever programmed the DSP at all, whether the
+/// producer and consumer accumulators drift, whether the render ring overflows,
+/// and whether the resampler is being rebuilt mid-stream.
+#[derive(Debug, Clone, Default)]
+struct SbTrace {
+    micros: u64,
+    ticked_frames: u64,
+    rendered_frames: u64,
+    truncated_frames: u64,
+    padded_frames: u64,
+    irqs: u64,
+    resampler_rebuilds: u64,
+    last_dropped: u64,
+}
+
+impl SbTrace {
+    /// Whether the trace is enabled. Read once at construction: an env lookup
+    /// per sample would itself distort what is being measured.
+    fn enabled() -> bool {
+        std::env::var_os("IZARRAVM_SB_DEBUG").is_some()
+    }
+
+    fn report(&mut self, dsp: &SbDsp, dma8: usize, dma16: usize) {
+        let dropped = dsp.dropped_frames();
+        eprintln!(
+            "[SB] playing={} rate={} out_rate={} bits={} stereo={} auto_init={} dma={} block={} remaining={} ticked/s={} rendered/s={} truncated/s={} padded/s={} irqs/s={} ring_drops/s={} resampler_rebuilds/s={}",
+            dsp.is_playing(),
+            dsp.rate_hz(),
+            dsp.output_frame_rate(),
+            if dsp.is_16bit() { 16 } else { 8 },
+            dsp.is_stereo(),
+            dsp.is_auto_init(),
+            if dsp.is_16bit() { dma16 } else { dma8 },
+            dsp.block_size(),
+            dsp.block_remaining(),
+            self.ticked_frames,
+            self.rendered_frames,
+            self.truncated_frames,
+            self.padded_frames,
+            self.irqs,
+            dropped.saturating_sub(self.last_dropped),
+            self.resampler_rebuilds,
+        );
+        self.last_dropped = dropped;
+        self.micros = 0;
+        self.ticked_frames = 0;
+        self.rendered_frames = 0;
+        self.truncated_frames = 0;
+        self.padded_frames = 0;
+        self.irqs = 0;
+        self.resampler_rebuilds = 0;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveSb16Path {
     dsp: SbDsp,
@@ -17,6 +74,9 @@ struct ActiveSb16Path {
     resampler_rate_hz: u32,
     render_phase: RatePhase,
     held_dac_frame: (i32, i32),
+    /// None when `IZARRAVM_SB_DEBUG` is unset, so every trace site is a null
+    /// check on an Option rather than an env lookup or an argument build.
+    trace: Option<SbTrace>,
 }
 
 impl ActiveSb16Path {
@@ -30,6 +90,9 @@ impl ActiveSb16Path {
         if rate != self.resampler_rate_hz {
             self.resampler = Resampler::new(rate, DAC_HZ);
             self.resampler_rate_hz = rate;
+            if let Some(trace) = &mut self.trace {
+                trace.resampler_rebuilds += 1;
+            }
         }
     }
 }
@@ -133,6 +196,7 @@ impl Sb16Path {
             resampler_rate_hz: 0,
             render_phase: RatePhase::default(),
             held_dac_frame: (0, 0),
+            trace: SbTrace::enabled().then(SbTrace::default),
         };
         active.sample_stereo();
         Self {
@@ -203,18 +267,21 @@ impl Sb16Path {
         if active.dsp.needs_output_tick() && rate > 0 {
             let is_16bit = active.dsp.is_16bit();
             let channel = if is_16bit { dma16 } else { dma8 };
-            if is_16bit {
+            let ticked = if is_16bit {
                 active.dsp.tick_n_samples(
                     due_frames as usize,
                     || None,
                     || dma.read_word(channel, memory),
-                );
+                )
             } else {
                 active.dsp.tick_n_samples(
                     due_frames as usize,
                     || dma.read_byte(channel, memory),
                     || None,
-                );
+                )
+            };
+            if let Some(trace) = &mut active.trace {
+                trace.ticked_frames += ticked as u64;
             }
             if active.dsp.take_irq() {
                 active.mixer.set_irq_status(active.dsp.is_16bit());
@@ -224,6 +291,15 @@ impl Sb16Path {
         if active.dsp.take_irq() {
             active.mixer.set_irq_status(active.dsp.is_16bit());
             irq = Some(Sb16Irq { line: irq_line });
+        }
+        if let Some(trace) = &mut active.trace {
+            if irq.is_some() {
+                trace.irqs += 1;
+            }
+            trace.micros += micros;
+            if trace.micros >= 1_000_000 {
+                trace.report(&active.dsp, dma8, dma16);
+            }
         }
         irq
     }
@@ -255,6 +331,7 @@ impl Sb16Path {
             native.push((i32::from(left), i32::from(right)));
         }
         let mut voice = active.resampler.process(&native);
+        let produced = voice.len();
         let mut held = if active.dsp.needs_output_tick() {
             active.held_dac_frame
         } else {
@@ -264,8 +341,17 @@ impl Sb16Path {
         if let Some(frame) = voice.last().copied() {
             held = frame;
         }
+        let before_pad = voice.len();
         voice.resize(window.output_frames, held);
         active.held_dac_frame = held;
+        if let Some(trace) = &mut active.trace {
+            trace.rendered_frames += produced as u64;
+            // Surplus frames are discarded outright; shortfalls are filled by
+            // repeating `held`. Both are audible, and which one dominates says
+            // which side of the producer/consumer pair is running ahead.
+            trace.truncated_frames += produced.saturating_sub(before_pad) as u64;
+            trace.padded_frames += window.output_frames.saturating_sub(before_pad) as u64;
+        }
         voice
     }
 
