@@ -48,6 +48,7 @@ mod sb16_path;
 mod timeline;
 mod timing;
 mod vega;
+mod vga_wipe_census;
 mod video;
 mod video_params;
 
@@ -151,6 +152,7 @@ use firmware_contract::{Bios32Call, install_boot_memory, patch_rom};
 pub use gameport::JoystickState;
 
 pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
+pub use vga_wipe_census::{VgaWipeCensusSnapshot, VgaWipeKeyRow};
 
 pub use cdimage::CdImage;
 pub use iso9660::{MAX_IMAGE_BYTES as CD_FOLDER_MAX_BYTES, build as build_cd_folder};
@@ -739,6 +741,9 @@ pub struct Machine {
     // Generation stamped onto every direct host pointer. Any change that can
     // replace or reinterpret a mapping advances it before another CPU batch.
     direct_mapping_epoch: u64,
+    // Env-gated attribution for the VGA direct-write-token wipe seam. Diagnostic only; its
+    // PartialEq is unconditionally true so arming it cannot move canonical-state comparisons.
+    vga_wipe_census: vga_wipe_census::VgaWipeCensus,
     host_profile: MachineHostProfile,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
@@ -1054,6 +1059,7 @@ impl Machine {
             pending_device_memory_write_range: None,
             direct_map_changed: false,
             direct_data_map_changed: false,
+            vga_wipe_census: vga_wipe_census::VgaWipeCensus::default(),
             direct_mapping_epoch: 1,
             host_profile: MachineHostProfile::default(),
             pending_toka_service: None,
@@ -1643,6 +1649,22 @@ impl Machine {
         self.direct_data_map_changed = true;
     }
 
+    /// Record one batch-boundary application of the direct-data-map wipe, when the census is armed.
+    /// Called from the run loop's two apply sites, immediately before the CPU is told.
+    pub(crate) fn note_vga_wipe_apply(&mut self) {
+        if !self.vga_wipe_census.enabled {
+            return;
+        }
+        let token = self.vega.direct_write_token();
+        let instructions = self.cpu.perf_counters().instructions;
+        self.vga_wipe_census.record_apply(token, instructions);
+    }
+
+    /// The VGA wipe census, or `None` when `IZARRAVM_VGA_WIPE_CENSUS` was not set.
+    pub fn vga_wipe_census_snapshot(&self) -> Option<vga_wipe_census::VgaWipeCensusSnapshot> {
+        self.vga_wipe_census.snapshot()
+    }
+
     fn set_a20_gate(&mut self, enabled: bool) {
         if self.keyboard.a20_enabled() != enabled {
             self.keyboard.set_a20(enabled);
@@ -2047,6 +2069,8 @@ struct MachineBus<'a> {
     direct_map_changed: &'a mut bool,
     direct_data_map_changed: &'a mut bool,
     direct_mapping_epoch: &'a mut u64,
+    // Env-gated attribution for the direct-write-token seam; see `vga_wipe_census`.
+    vga_wipe_census: &'a mut crate::vga_wipe_census::VgaWipeCensus,
     // A copy of the current read_io call's core_clocks_so_far argument (CPU core
     // clocks charged by prior instructions in this straight-line run, not
     // including the in-flight IN). Written at the top of every read_io call so a

@@ -83,6 +83,7 @@ impl Machine {
             direct_map_changed: &mut self.direct_map_changed,
             direct_data_map_changed: &mut self.direct_data_map_changed,
             direct_mapping_epoch: &mut self.direct_mapping_epoch,
+            vga_wipe_census: &mut self.vga_wipe_census,
             core_clocks_so_far: 0,
             prior_runs_core_clocks: 0,
             timeline_at_batch_start: self.timeline,
@@ -1875,8 +1876,25 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         let direct_write_before = self.vega.direct_write_token();
+        // Sampled BEFORE the write, because writing an index port is what moves the selector. Gated
+        // at the call site: disarmed, this is one bool test on a device port write.
+        let census_selector = if self.vga_wipe_census.enabled && self.vega.port_enabled(port) {
+            self.vega.port_index_selector(port)
+        } else {
+            0
+        };
         if self.vega.port_enabled(port) && self.vega.write_port(port, value as u8) {
-            if self.vega.direct_write_token() != direct_write_before {
+            let direct_write_after = self.vega.direct_write_token();
+            if direct_write_after != direct_write_before {
+                if self.vga_wipe_census.enabled {
+                    self.vga_wipe_census.record_token_change(
+                        port,
+                        census_selector,
+                        value as u8,
+                        direct_write_before,
+                        direct_write_after,
+                    );
+                }
                 self.mark_direct_data_map_changed();
                 *self.io_touched = true;
                 debug_assert!(*self.io_touched);

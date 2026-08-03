@@ -142,7 +142,20 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_all();
+        self.record_fast_map_wipe_extent();
+    }
+
+    /// Wipe the FastMap and charge what it discarded to the audit counters. The extent is the only
+    /// honest price of a wipe: the entry count, not the call count.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn record_fast_map_wipe_extent(&mut self) {
+        let extent = self.jit_fast_map.invalidate_all();
+        self.jit_direct.fast_map_audit.wipe_pages_cleared += extent.pages;
+        self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
     }
 
     pub(super) fn flush_tlb_and_code_caches(&mut self) {
@@ -160,7 +173,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_all();
+        self.record_fast_map_wipe_extent();
         self.invalidate_translation_code_caches();
     }
 
@@ -219,7 +232,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_all();
+        self.record_fast_map_wipe_extent();
         self.perf.direct_map_invalidations += 1;
         #[cfg(feature = "jit")]
         {

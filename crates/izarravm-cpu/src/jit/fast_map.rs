@@ -47,6 +47,15 @@ fn decode_kind(flags: u8) -> PageKind {
     }
 }
 
+/// What one whole-map invalidation discarded. Diagnostic only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WipeExtent {
+    /// Linear pages that were live and are now gone.
+    pub(crate) pages: u64,
+    /// The subset of those backed by the direct VGA aperture.
+    pub(crate) vga_pages: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PagePermissions {
     pub(crate) writable: bool,
@@ -509,10 +518,16 @@ impl FastMap {
         }
     }
 
-    /// Clear only pages installed since the previous global invalidation.
-    pub(crate) fn invalidate_all(&mut self) {
+    /// Clear only pages installed since the previous global invalidation. Returns what it threw
+    /// away, so the audit counters can price a wipe: `pages` is the whole cost, `vga_pages` the
+    /// part a VGA-scoped invalidation would still have had to pay.
+    pub(crate) fn invalidate_all(&mut self) -> WipeExtent {
         let Some(storage) = self.storage.as_mut() else {
-            return;
+            return WipeExtent::default();
+        };
+        let extent = WipeExtent {
+            pages: self.populated_pages.len() as u64,
+            vga_pages: self.vga_pages.len() as u64,
         };
         for page in self.populated_pages.drain(..) {
             let index = page as usize;
@@ -521,6 +536,7 @@ impl FastMap {
             FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
         }
         self.vga_pages.clear();
+        extent
     }
 
     #[cfg(test)]

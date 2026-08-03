@@ -1043,6 +1043,13 @@ pub struct FastMapAuditCounters {
     /// A direct-execution admission transition (`finish_direct_execution_transition`). NOT
     /// counted by `direct_map_invalidations`.
     pub wipes_admission: u64,
+    /// Live linear pages discarded, summed over every whole-map wipe from every cause. Divided by
+    /// the wipe total this is the average map size at wipe time, which is what a wipe costs: each
+    /// discarded page must be re-served through the slow lookup before it is fast again.
+    pub wipe_pages_cleared: u64,
+    /// The subset of `wipe_pages_cleared` backed by the direct VGA aperture. The remainder is what
+    /// a VGA-scoped invalidation would keep.
+    pub wipe_vga_pages_cleared: u64,
     /// Interpreter page-local data reads seen by the census. One per emitted-equivalent FastMap
     /// probe: a cross-page access is split into page-local fragments upstream, and each fragment
     /// is one probe.
@@ -1072,6 +1079,8 @@ impl Default for FastMapAuditCounters {
             wipes_a20: 0,
             wipes_tlb_flush: 0,
             wipes_admission: 0,
+            wipe_pages_cleared: 0,
+            wipe_vga_pages_cleared: 0,
             census_reads: 0,
             census_writes: 0,
             census_rmw_pairs: 0,

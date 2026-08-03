@@ -976,7 +976,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_all();
+        self.record_fast_map_wipe_extent();
         self.jit_direct.invalidate_translation();
     }
 
