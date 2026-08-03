@@ -206,7 +206,7 @@ def extract_from_image(img):
     return bytearray(img[0:512]), bytearray(vbr), dict(files)
 
 
-def main():
+def main(check: bool = False) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(here)
     kdir = os.path.join(repo, "toka-dos", "freedos", "kernel")
@@ -506,13 +506,45 @@ def main():
     assert img[part_off + 0x1FE] == 0x55 and img[part_off + 0x1FF] == 0xAA, "VBR signature missing"
     assert len(img) == DISK_SECTORS * BPS
 
+    summary = (f"tokados-hdd.img: {len(img)} bytes "
+               f"(part_start={PART_START}, part_sectors={PART_SECTORS}, "
+               f"spc={spc}, fatsz={fatsz}, clusters={count_of_clusters}, "
+               f"kernel={len(kernel)}, shell={len(shell)}, tokamous={len(tokamous)})")
+
+    # --check: prove the committed image still matches its inputs, without
+    # writing. The image is a build product of ~30 committed binaries plus
+    # LICENSE.TXT, which is generated from NOTICE and the kernel COPYING -- so
+    # editing NOTICE silently staled the shipped attribution file once already
+    # (the Cranelift credit outlived the dependency by 465 commits), and every
+    # file after it moved a cluster, which reads as 323 KB of mystery drift to
+    # anyone who rebuilds. Cheap to check, invisible when it rots.
+    if check:
+        if not os.path.exists(out):
+            print(f"FAIL: {out} does not exist", file=sys.stderr)
+            return 1
+        committed = open(out, "rb").read()
+        if committed == bytes(img):
+            print(f"tokados-hdd.img is reproducible from the tree ({len(img)} bytes)")
+            return 0
+        print("FAIL: the committed tokados-hdd.img does not match a build from "
+              "this tree.", file=sys.stderr)
+        if len(committed) != len(img):
+            print(f"  size {len(committed)} committed vs {len(img)} rebuilt",
+                  file=sys.stderr)
+        else:
+            differing = sum(1 for a, b in zip(committed, img) if a != b)
+            first = next(i for i, (a, b) in enumerate(zip(committed, img)) if a != b)
+            print(f"  {differing} bytes differ, first at {first:#x} "
+                  f"(sector {first // BPS})", file=sys.stderr)
+        print("  Rebuild it: python scripts/build-freedos-hdd-image.py",
+              file=sys.stderr)
+        return 1
+
     with open(out, "wb") as f:
         f.write(img)
-    print(f"tokados-hdd.img: {len(img)} bytes "
-          f"(part_start={PART_START}, part_sectors={PART_SECTORS}, "
-          f"spc={spc}, fatsz={fatsz}, clusters={count_of_clusters}, "
-          f"kernel={len(kernel)}, shell={len(shell)}, tokamous={len(tokamous)})")
+    print(summary)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(check="--check" in sys.argv[1:]))

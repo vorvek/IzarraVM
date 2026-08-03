@@ -29,6 +29,16 @@ jobs:
       - name: File policy
         run: python scripts/check_file_policy.py
 
+      # tokados-hdd.img is a build product of ~30 committed binaries plus a
+      # LICENSE.TXT generated from NOTICE and the kernel COPYING. Editing NOTICE
+      # staled the shipped attribution once already -- the Cranelift credit
+      # outlived the dependency by 465 commits -- and because every file after
+      # LICENSE.TXT then moves a cluster, it reads as 323 KB of mystery drift to
+      # the next person who rebuilds. Rebuilds nothing, just proves the image
+      # still matches its inputs.
+      - name: Disk image is reproducible
+        run: python scripts/build-freedos-hdd-image.py --check
+
       - name: Policy self-checks
         shell: pwsh
         run: |
