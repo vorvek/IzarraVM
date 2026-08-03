@@ -939,3 +939,16 @@ fn live_mode_switch_debits_credit_in_master_ticks() {
         "credit debt is only final-instruction overshoot, not mixed clock units"
     );
 }
+
+// TEMPORARY CI PROBE 3 -- not for merge. Brings this binary back to 128 tests
+// without reinstating the two e2e mount tests, to separate "the e2e tests are
+// special" from "128 tests in this binary crashes at exit".
+#[test]
+fn ci_probe_count_one() {
+    assert_eq!(1 + 1, 2);
+}
+
+#[test]
+fn ci_probe_count_two() {
+    assert_eq!(2 + 2, 4);
+}
