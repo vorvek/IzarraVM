@@ -823,7 +823,25 @@ VOID DoConfig(int nPass)
 
   if (nPass==0)
   {
-    HaltCpuWhileIdle = 0; /* init to "no HLT while idle" */
+    /* Modified by the Toka-DOS project, 2026: default 0 -> 1, "safe hooks"
+       (halt only while the kernel waits for CON character input). Upstream
+       FreeDOS defaults this off because entering and leaving HLT swings CPU
+       power draw and some real mainboards and supplies cannot filter the
+       transient -- see the IDLEHALT warning in docs/config.txt and the P90 HLT
+       erratum it cites. Toka-DOS is built only for IzarraVM, which ships its
+       own CPU, so that class does not exist here and the default that is right
+       for unknown hardware is the wrong one for ours.
+
+       It is worth a great deal here: a DOS prompt waiting for a keystroke is a
+       busy-wait, measured at ~580,000 poll iterations per guest second and
+       ~249 instructions each, so 1.44 G instructions per ten guest seconds of
+       doing nothing. Real silicon does not care; an emulator interpreting every
+       one of them does. Halting takes the idle phase from 0.219x real time to
+       21x, and its instruction count from 1,483,153,791 to 291,701.
+
+       Still overridable: SetIdleHalt below parses IDLEHALT=n, so IDLEHALT=0 in
+       CONFIG.SYS turns it back off. */
+    HaltCpuWhileIdle = 1;
 
 #ifdef MEMDISK_ARGS
     if (mdsk != NULL)
