@@ -1,7 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The rejected-row campaign's Slice 7: the THREE-OPERAND IMUL (0x69/0x6B, register source).
+//! The rejected-row campaign's Slice 7: the THREE-OPERAND IMUL (0x69/0x6B, register source) and
+//! the BYTE-LANE REGISTER ALU (`op r8, r8`, both operand orders, all eight operations).
 //!
 //! Every row runs the same guest bytes natively and through a block-free interpreter from
 //! identical state and compares registers (EIP included), lazy flags, EFLAGS, the halt latch,
@@ -9,12 +10,22 @@
 //! row: an opcode at a block's entry slot parks the block on the interpreter, so an
 //! entry-position fixture certifies nothing.
 //!
-//! What this file has to prove that a plain differential does not: **the three-operand IMUL needs
-//! TWO changes to lower**, and either alone is inert. The compile walk refuses a non-continuable
-//! instruction before `classify` is consulted, so the classify arm is dead without
-//! `jit_admits_non_continuable`; and the admission alone just moves the census row from the
-//! `non_continuable` arm to `hard_boundary`. `build` asserting three retired slots is what fails
-//! if either half is reverted.
+//! Two things this file has to prove that a plain differential does not:
+//!
+//! * **The three-operand IMUL needs TWO changes to lower**, and either alone is inert. The
+//!   compile walk refuses a non-continuable instruction before `classify` is consulted, so the
+//!   classify arm is dead without `jit_admits_non_continuable`; and the admission alone just
+//!   moves the census row from the `non_continuable` arm to `hard_boundary`. `build` asserting
+//!   three retired slots is what fails if either half is reverted.
+//! * **The byte lane is a different register file.** `dst`/`src` 4..=7 are AH/CH/DH/BH, the high
+//!   byte of the first four registers, which x86-64 cannot name alongside a REX prefix. The
+//!   high-byte rows below are the ones that fail if the emitter ever reaches its operands through
+//!   `home(index)` — index 5 is the host register holding guest EBP, so `cmp al, ch` would
+//!   compare against the wrong register at the wrong width and, for a writing op, corrupt EBP.
+//!
+//! The aliasing rows (`add al, ah`, `xor ch, ch`, `sub bl, bl`) are not decoration: two byte
+//! lanes of one 32-bit home, and one lane named twice. They are what fails if the emitter ever
+//! writes the destination before it has read the source.
 
 use super::*;
 
@@ -362,4 +373,155 @@ fn the_non_continuable_admission_is_narrow() {
     still_a_barrier(&[0xcf], "0xCF IRETD");
     still_a_barrier(&[0xee], "0xEE OUT DX,AL");
     still_a_barrier(&[0xf4], "0xF4 HLT");
+}
+
+// ---------------------------------------------------------------------------
+// The byte-lane register ALU.
+// ---------------------------------------------------------------------------
+
+/// ALU byte form 0 (`op r/m8, r8`): opcodes 0x00/0x08/0x10/0x18/0x20/0x28/0x30/0x38.
+/// `dst` is the r/m (a byte-register index) and `src` is the ModRM reg field.
+fn alu_byte_rm_dst(op: u8, dst: u8, src: u8) -> Vec<u8> {
+    vec![op << 3, 0b1100_0000 | (src << 3) | dst]
+}
+
+/// ALU byte form 2 (`op r8, r/m8`): opcodes 0x02/0x0A/0x12/0x1A/0x22/0x2A/0x32/0x3A.
+/// `dst` is the ModRM reg field and `src` is the r/m.
+fn alu_byte_reg_dst(op: u8, dst: u8, src: u8) -> Vec<u8> {
+    vec![(op << 3) | 2, 0b1100_0000 | (dst << 3) | src]
+}
+
+/// A seed whose eight registers carry DISTINCT bytes in every lane, so a lowering that read the
+/// wrong register, the wrong half, or the wrong width lands on a different value rather than
+/// coincidentally the right one. Index 4 (ESP) is included for completeness; `build` overwrites
+/// it, and no byte row below names ESP's lanes.
+fn byte_seed() -> Seed {
+    Seed::new([
+        0x1234_56f0, // eax: AL=f0 AH=56
+        0x2345_6701, // ecx: CL=01 CH=67
+        0x3456_787f, // edx: DL=7f DH=78
+        0x4567_8980, // ebx: BL=80 BH=89
+        0x5678_9aab, // esp (overwritten)
+        0x6789_abcd, // ebp
+        0x789a_bcde, // esi
+        0x89ab_cdef, // edi
+    ])
+}
+
+#[test]
+fn byte_lane_register_alu_matches_the_interpreter_in_both_operand_orders() {
+    // All eight operations, both operand orders, over a register pair set that covers the LOW
+    // lanes (0..=3 -> AL/CL/DL/BL) and the HIGH lanes (4..=7 -> AH/CH/DH/BH) in every
+    // combination of the two. CF is seeded both ways because ADC/SBB consume it.
+    for op in 0u8..8 {
+        for (dst, src) in [
+            (0u8, 1u8), // AL, CL   -- low, low
+            (0, 5),     // AL, CH   -- low destination, HIGH source
+            (5, 0),     // CH, AL   -- HIGH destination, low source
+            (4, 7),     // AH, BH   -- high, high
+            (3, 6),     // BL, DH
+            (7, 2),     // BH, DL
+        ] {
+            for eflags in [0x202u32, 0x203, 0x2d7] {
+                for pending in [false, true] {
+                    let mut seed = byte_seed().flags(eflags);
+                    if pending {
+                        seed = seed.pending();
+                    }
+                    let label =
+                        format!("op={op} dst={dst} src={src} eflags={eflags:#x} pending={pending}");
+                    differential(
+                        &alu_byte_rm_dst(op, dst, src),
+                        seed,
+                        &format!("byte form 0 {label}"),
+                    );
+                    differential(
+                        &alu_byte_reg_dst(op, dst, src),
+                        seed,
+                        &format!("byte form 2 {label}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_lane_register_alu_handles_lanes_of_the_same_home() {
+    // `add al, ah` names two byte lanes of ONE 32-bit home; `xor ch, ch` and `sub bl, bl` name
+    // one lane twice. Both fail if the emitter writes the destination before reading the source,
+    // and the same-lane rows are the ones whose result is a constant (0 for XOR/SUB) so a
+    // divergence shows up in the flags as well as the register.
+    for op in 0u8..8 {
+        for (dst, src) in [(0u8, 4u8), (4, 0), (1, 1), (5, 5), (3, 3), (2, 6)] {
+            for eflags in [0x202u32, 0x203] {
+                let seed = byte_seed().flags(eflags).pending();
+                let label = format!("op={op} dst={dst} src={src} eflags={eflags:#x}");
+                differential(
+                    &alu_byte_rm_dst(op, dst, src),
+                    seed,
+                    &format!("aliased form 0 {label}"),
+                );
+                differential(
+                    &alu_byte_reg_dst(op, dst, src),
+                    seed,
+                    &format!("aliased form 2 {label}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_lane_register_alu_leaves_the_rest_of_the_destination_alone() {
+    // The write-back must define EIGHT bits. `SUB BL, BL` zeroes BL and must leave BH and the
+    // upper sixteen bits of EBX exactly as seeded; a 32-bit write-back agrees on the lane and
+    // diverges here. Checked directly rather than only through the differential so the failure
+    // names the property.
+    let seed = byte_seed();
+    let mut roles = build(&alu_byte_rm_dst(5, 3, 3), seed);
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    assert_eq!(
+        roles.native.registers.gpr[3], 0x4567_8900,
+        "SUB BL,BL must clear only BL"
+    );
+
+    // And the high-byte mirror: `SUB BH, BH` clears bits 8..16 alone.
+    let mut roles = build(&alu_byte_rm_dst(5, 7, 7), seed);
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    assert_eq!(
+        roles.native.registers.gpr[3], 0x4567_0080,
+        "SUB BH,BH must clear only BH"
+    );
+}
+
+#[test]
+fn byte_lane_alu_memory_source_form_is_still_a_barrier() {
+    // `XOR AL, [EBX]` — 0x32 /r with mod = 0b00, quake's `0x32 /0` census row. The register arm
+    // must not have widened into the memory form: `AluMemSource`'s byte path is unreachable and
+    // incomplete (no byte lane in `emit_alu_preloaded`, and `byte_reads` does not count it), so
+    // admitting it here would be a miscompile rather than a lowering.
+    still_a_barrier(&[0x32, 0b0000_0011], "0x32 memory source");
+    still_a_barrier(&[0x3a, 0b0000_0011], "0x3A memory source");
+}
+
+#[test]
+fn sixteen_bit_byte_alu_register_form_is_still_a_barrier() {
+    // A 66-prefixed byte ALU. None of 0x00/0x02/../0x38/0x3A is in `classify`'s
+    // OperandSize::Word allowlist, so the prefixed encoding falls to None above the `match form`
+    // rather than reaching the new arms.
+    still_a_barrier(&[0x66, 0x38, 0b1100_0001], "66 0x38 register");
+    still_a_barrier(&[0x66, 0x3a, 0b1100_0001], "66 0x3A register");
 }

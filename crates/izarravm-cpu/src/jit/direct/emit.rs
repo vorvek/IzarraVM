@@ -326,6 +326,9 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::AluByteImm { op, dst, imm } => {
                 emit_alu_byte_imm(&mut e, op, dst, imm);
             }
+            DirectKind::AluRegByte { op, dst, src } => {
+                emit_alu_reg_byte(&mut e, op, dst, src);
+            }
             DirectKind::AluMemSource {
                 op,
                 dst,
@@ -3846,6 +3849,36 @@ fn emit_inc_dec_reg8(e: &mut Encoder, dst: u8, is_dec: bool) {
 fn emit_alu_byte_imm(e: &mut Encoder, op: u8, dst: u8, imm: u8) {
     emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RAX);
     e.mov_r32_imm32(Reg::RCX, u32::from(imm));
+    emit_alu_byte_preloaded(e, op);
+
+    if op != 7 {
+        emit_write_gpr8(e, dst, Reg::RDX);
+    }
+}
+
+/// The BYTE-LANE register ALU: `op r8, r8`, both operand orders.
+///
+/// `emit_alu_byte_imm`'s body with a second register read where it materialises an immediate, and
+/// the sharing is deliberate rather than incidental: the interpreter reaches ALU forms 0, 2 and 4
+/// through ONE `self.alu(op, a, b, BusWidth::Byte)` call in `execute_alu_decoded`, so the flags,
+/// the lazy descriptor and the truncation are the same operation on the same lane whatever the
+/// source is. Only where `a` and `b` come from differs, and the two orders are resolved by
+/// `classify` before this is reached (form 0 takes the r/m as the destination, form 2 the reg).
+///
+/// Both operands are read BEFORE anything is written, which is what makes the aliasing cases come
+/// out right without a special case: `add al, ah` and `xor ch, ch` name two byte lanes of ONE
+/// 32-bit home, and `cmp bl, bl` names one lane twice. The write-back through `emit_write_gpr8`
+/// touches only the destination lane's eight bits, exactly as `write_gpr8` does.
+///
+/// Three orderings carry the same hazards `emit_inc_dec_reg8` documents, and they are inherited
+/// rather than restated here: `emit_alu_byte_preloaded` captures host flags before recording the
+/// descriptor, and `emit_write_gpr8` runs AFTER both because it shifts its value register in
+/// place and clobbers the descriptor's recorded result if it runs before.
+///
+/// CMP (op 7) suppresses the write-back, matching `write_back = op != 7` in the interpreter's arm.
+fn emit_alu_reg_byte(e: &mut Encoder, op: u8, dst: u8, src: u8) {
+    emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RAX);
+    emit_read_store_value(e, StoreSource::Reg(src), MemoryWidth::Byte, Reg::RCX);
     emit_alu_byte_preloaded(e, op);
 
     if op != 7 {

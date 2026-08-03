@@ -240,7 +240,7 @@ mod word_shift;
 #[path = "cpu_jit_word_inc_dec_test.rs"]
 mod word_inc_dec;
 
-/// The rejected-row campaign's Slice 7: the three-operand IMUL (0x69/0x6B, register source).
+/// The rejected-row campaign's Slice 7: the three-operand IMUL and the byte-lane register ALU.
 /// Nested here for the reason the five modules above are: it wants this module's differential
 /// fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a seventh copy.
 #[path = "cpu_jit_slice7_test.rs"]

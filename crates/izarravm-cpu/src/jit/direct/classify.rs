@@ -319,9 +319,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             let op = (opcode >> 3) & 7;
             let form = opcode & 7;
             match form {
-                // Byte r/m destination, byte register source. Memory only: the register form
-                // needs a byte-lane `AluReg` that does not exist yet, and the point of this arm
-                // is the memory row.
+                // Byte r/m destination, byte register source. BOTH operand forms as of the
+                // rejected-row campaign's Slice 7: the register form is `AluRegByte`, the byte
+                // lane that "does not exist yet" once did not.
+                //
+                // Operand roles follow `execute_alu_decoded`'s form-0 arm exactly: `a` is the
+                // r/m (the destination, written back unless op is CMP) and `b` is `modrm.reg`.
+                // That is the OPPOSITE assignment from form 2 below, and getting it backwards is
+                // silent for the commutative ops and wrong for SUB/SBB/CMP — which is why the two
+                // arms name `dst` and `src` explicitly rather than sharing a helper.
                 //
                 // Width is a property of the form, not of the prefix — the interpreter's arm
                 // reads `read_operand_u8`/`read_gpr8` and charges the same `clocks(2)` as every
@@ -330,14 +336,63 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // Word-size allowlist above, so a 66-prefixed encoding never reaches this arm.
                 0 => {
                     let m = insn.modrm?;
-                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                    return match insn.operand? {
+                        DecodedOperand::Reg(dst) => Some(DirectKind::AluRegByte {
+                            op,
+                            dst,
+                            src: m.reg,
+                        }),
+                        DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
+                            op,
+                            source: StoreSource::Reg(m.reg),
+                            width: MemoryWidth::Byte,
+                            addr: direct_addr(addr)?,
+                        }),
+                    };
+                }
+                1 => {
+                    let m = insn.modrm?;
+                    return match insn.operand? {
+                        DecodedOperand::Reg(dst) => Some(DirectKind::AluReg {
+                            op,
+                            dst,
+                            src: m.reg,
+                            width: operand_width,
+                        }),
+                        DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
+                            op,
+                            source: StoreSource::Reg(m.reg),
+                            width: operand_width,
+                            addr: direct_addr(addr)?,
+                        }),
+                    };
+                }
+                // Byte register destination, byte r/m source — the form that had NO arm at all
+                // before Slice 7, in either operand shape. Register only.
+                //
+                // Roles are form 0's mirrored, and they follow `execute_alu_decoded`'s form-2 arm:
+                // `a` is `modrm.reg` (the destination, written back through `write_gpr8` unless op
+                // is CMP) and `b` is the r/m.
+                //
+                // The MEMORY form is deliberately absent and is a missed lowering rather than a
+                // hazard — the `else` returns None and the instruction stays the barrier it is
+                // today. `AluMemSource` looks as if it already covers it (its read match has a
+                // `MemoryWidth::Byte` arm) but that arm is UNREACHABLE and incomplete: it falls
+                // into `mov eax, home(dst)` and `emit_alu_preloaded`, which has no byte lane at
+                // all and would read a 32-bit register where a byte lane is meant, and
+                // `DirectKind::byte_reads` does not count `AluMemSource` either, so the bus
+                // accounting would be short a byte read. Building it is a second mechanism behind
+                // one census measurement (quake 21,686 exits on `0x32 /0`, doom zero); this arm
+                // is the register lane and nothing else.
+                2 => {
+                    let m = insn.modrm?;
+                    let DecodedOperand::Reg(src) = insn.operand? else {
                         return None;
                     };
-                    return Some(DirectKind::AluMemDest {
+                    return Some(DirectKind::AluRegByte {
                         op,
-                        source: StoreSource::Reg(m.reg),
-                        width: MemoryWidth::Byte,
-                        addr: direct_addr(addr)?,
+                        dst: m.reg,
+                        src,
                     });
                 }
                 3 => {

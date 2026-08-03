@@ -2335,6 +2335,29 @@ pub(crate) enum DirectKind {
         dst: u8,
         imm: u8,
     },
+    /// The BYTE-LANE register ALU: `op r8, r8` for the whole eight-operation set, both operand
+    /// orders (0x00/0x08/../0x38 with a register r/m, and 0x02/0x0A/../0x3A likewise).
+    ///
+    /// `dst` and `src` are BYTE-register indices, where 4..=7 are AH/CH/DH/BH — the high byte of
+    /// the first four 32-bit registers. That is the whole reason this cannot be `AluReg` with
+    /// `width: MemoryWidth::Byte`: `AluReg`'s emitter reaches its operands through `home(index)`,
+    /// which maps index 5 to the host register holding guest EBP, so a `cmp al, ch` lowered
+    /// through it would compare against the wrong register at the wrong width. x86-64 cannot name
+    /// AH/CH/DH/BH in an instruction that also carries a REX prefix, so the lane is reached by
+    /// shift-and-mask on the way in (`emit_read_store_value` at Byte) and by mask-shift-or on the
+    /// way out (`emit_write_gpr8`) — machinery `AluByteImm`, `TestByte` and the byte INC/DEC form
+    /// already share.
+    ///
+    /// A separate variant rather than a `width` field on `AluReg` for that reason and for the
+    /// `AluByteImm`/`AluImm` precedent: the byte forms are a different lane, not a narrower one,
+    /// and every accessor on this kind (`byte_reads`, `read_segment`, `uses_stack`, ...) wants the
+    /// register-only default. `raw_clocks` wants the `_ => 2` default too, and correctly — the
+    /// interpreter's `execute_alu_decoded` returns one `Ok(clocks(2))` for all six forms.
+    AluRegByte {
+        op: u8,
+        dst: u8,
+        src: u8,
+    },
     AluMemSource {
         op: u8,
         dst: u8,
