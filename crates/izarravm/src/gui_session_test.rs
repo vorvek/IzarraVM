@@ -911,3 +911,16 @@ fn live_mode_switch_debits_credit_in_master_ticks() {
         "credit debt is only final-instruction overshoot, not mixed clock units"
     );
 }
+
+// TEMPORARY CI PROBE -- not for merge. Two trivial tests that touch nothing,
+// to test whether merely adding tests to this binary perturbs a latent
+// exit-time crash that CI exposes and local runs do not.
+#[test]
+fn ci_probe_one() {
+    assert_eq!(1 + 1, 2);
+}
+
+#[test]
+fn ci_probe_two() {
+    assert_eq!(2 + 2, 4);
+}
