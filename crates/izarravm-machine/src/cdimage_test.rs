@@ -86,6 +86,254 @@ fn msf_round_trips_through_lba() {
 
 #[test]
 fn cue_rejects_unknown_mode() {
-    let cue = "TRACK 01 MODE2/2336\nINDEX 01 00:00:00\n";
+    let cue = "TRACK 01 MODE9/9999\nINDEX 01 00:00:00\n";
     assert!(CdImage::from_cue(cue, vec![0u8; RAW_SECTOR]).is_err());
+}
+
+#[test]
+fn cue_unwraps_mode2_2352_form1_payload() {
+    // CD-XA Form 1: 12 sync + 4 header + 8 subheader, so user data at offset 24.
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; RAW_SECTOR];
+    bin[24] = 0x5A;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.tracks()[0].mode, TrackMode::Mode2_2352);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x5A);
+}
+
+#[test]
+fn cue_unwraps_mode2_2336_payload() {
+    // No sync/header: the 8-byte subheader leads, so user data at offset 8.
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2336\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; MODE2_SECTOR];
+    bin[8] = 0x36;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.tracks()[0].mode, TrackMode::Mode2_2336);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x36);
+}
+
+#[test]
+fn cue_reads_mode2_2048_bare_payload() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2048\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; DATA_SECTOR];
+    bin[0] = 0x20;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x20);
+}
+
+#[test]
+fn xa_form2_sectors_are_not_readable_as_data() {
+    // Form is per sector, not per track: submode bit 5 at frame offset 18 marks
+    // Form 2, whose 2324-byte payload is streaming media, not a logical sector.
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; 3 * RAW_SECTOR];
+    bin[24] = 0x01; // sector 0: Form 1 (submode bit 5 clear)
+    bin[RAW_SECTOR + 18] = 0x20; // sector 1: Form 2
+    bin[RAW_SECTOR + 24] = 0x02;
+    // Sector 2: Form 1 with EOF (0x80) set. Only bit 5 selects Form 2 -- other
+    // submode bits (EOF 0x80, real-time 0x40, ...) are routine on real XA
+    // discs and must not be mistaken for the Form 2 flag.
+    bin[2 * RAW_SECTOR + 18] = 0x80;
+    bin[2 * RAW_SECTOR + 24] = 0x03;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x01);
+    assert!(img.read_data_sector(1).is_none());
+    assert_eq!(img.read_data_sector(2).unwrap()[0], 0x03);
+}
+
+#[test]
+fn cue_discards_the_subchannel_tail_on_mode1_2448() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2448\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; 2 * SUBCHANNEL_SECTOR];
+    bin[16] = 0xA1; // sector 0 payload
+    bin[SUBCHANNEL_SECTOR + 16] = 0xA2; // sector 1 payload, one full 2448 stride on
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xA1);
+    assert_eq!(img.read_data_sector(1).unwrap()[0], 0xA2);
+}
+
+#[test]
+fn cue_reads_cdg_audio_as_a_plain_red_book_frame() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 CDG\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; 2 * SUBCHANNEL_SECTOR];
+    bin[0] = 0xC1;
+    bin[SUBCHANNEL_SECTOR] = 0xC2;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert!(img.tracks()[0].mode.is_audio());
+    assert_eq!(img.read_audio_frame(0).unwrap()[0], 0xC1);
+    assert_eq!(img.read_audio_frame(1).unwrap()[0], 0xC2);
+}
+
+#[test]
+fn pregap_advances_the_lba_timeline_without_consuming_bytes() {
+    // Track 1: 2 data sectors. Track 2: audio, preceded by a 2-frame PREGAP
+    // that exists on the disc timeline but has no bytes in the BIN.
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               PREGAP 00:00:02\n\
+               INDEX 01 00:00:02\n";
+    let mut bin = vec![0u8; 2 * DATA_SECTOR + 3 * RAW_SECTOR];
+    bin[2 * DATA_SECTOR] = 0xBB;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    let t1 = img.tracks()[0];
+    let t2 = img.tracks()[1];
+    assert_eq!((t1.start_lba, t1.sectors), (0, 2));
+    // The 2-frame pregap pushes track 2 to LBA 4, but its bytes still start
+    // right after track 1's in the BIN.
+    assert_eq!(t2.start_lba, 4);
+    assert_eq!(t2.sectors, 3);
+    assert_eq!(img.read_audio_frame(4).unwrap()[0], 0xBB);
+    assert_eq!(img.total_sectors(), 7);
+}
+
+#[test]
+fn index00_pregap_folds_into_the_preceding_track() {
+    // Track 2 declares INDEX 00 one frame before INDEX 01: those bytes ARE in
+    // the file, and belong to track 1's span. Pinning the documented policy.
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 00 00:00:02\n\
+               INDEX 01 00:00:03\n";
+    let bin = vec![0u8; 3 * DATA_SECTOR + 2 * RAW_SECTOR];
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    let t1 = img.tracks()[0];
+    let t2 = img.tracks()[1];
+    // Track 1 runs to track 2's INDEX 01, absorbing the INDEX 00 pregap frame.
+    assert_eq!((t1.start_lba, t1.sectors), (0, 3));
+    assert_eq!(t2.start_lba, 3);
+}
+
+#[test]
+fn leading_pregap_on_the_first_track_still_shifts_its_start_lba() {
+    // A single-track sheet whose only track has a 2-frame PREGAP before its
+    // own INDEX 01. The loop applies `disc_lba += p.pregap_frames`
+    // unconditionally, with no `i == 0` special case, so this should push
+    // even the very first track off LBA 0.
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               PREGAP 00:00:02\n\
+               INDEX 01 00:00:00\n";
+    let bin = vec![0u8; 3 * DATA_SECTOR];
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    let t1 = img.tracks()[0];
+    assert_eq!(t1.start_lba, 2);
+    assert_eq!(t1.sectors, 3);
+    assert_eq!(img.total_sectors(), 5);
+}
+
+#[test]
+fn cue_binds_each_track_to_its_own_file() {
+    // A rip with the data track in one file and two audio tracks in their own
+    // files. Byte offsets restart at zero in each file; the LBA timeline does not.
+    let cue = "FILE \"data.bin\" BINARY\n\
+               TRACK 01 MODE2/2352\n\
+               INDEX 01 00:00:00\n\
+               FILE \"t2.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"t3.bin\" BINARY\n\
+               TRACK 03 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let mut data = vec![0u8; 2 * RAW_SECTOR];
+    data[24] = 0xD1;
+    let mut t2 = vec![0u8; 3 * RAW_SECTOR];
+    t2[0] = 0xE2;
+    let mut t3 = vec![0u8; 4 * RAW_SECTOR];
+    t3[0] = 0xE3;
+    let files = vec![
+        ("data.bin".to_string(), data),
+        ("t2.bin".to_string(), t2),
+        ("t3.bin".to_string(), t3),
+    ];
+
+    let img = CdImage::from_cue_files(cue, files).unwrap();
+    assert_eq!(img.track_count(), 3);
+    assert_eq!((img.tracks()[0].start_lba, img.tracks()[0].sectors), (0, 2));
+    assert_eq!((img.tracks()[1].start_lba, img.tracks()[1].sectors), (2, 3));
+    assert_eq!((img.tracks()[2].start_lba, img.tracks()[2].sectors), (5, 4));
+    assert_eq!(img.total_sectors(), 9);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xD1);
+    assert_eq!(img.read_audio_frame(2).unwrap()[0], 0xE2);
+    assert_eq!(img.read_audio_frame(5).unwrap()[0], 0xE3);
+}
+
+#[test]
+fn cue_reports_a_file_it_was_not_given() {
+    let cue = "FILE \"there.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"missing.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let files = vec![("there.bin".to_string(), vec![0u8; RAW_SECTOR])];
+    let err = CdImage::from_cue_files(cue, files).unwrap_err();
+    assert!(
+        err.contains("missing.bin"),
+        "error should name the file: {err}"
+    );
+}
+
+#[test]
+fn cue_rejects_a_file_name_repeated_across_two_file_sections() {
+    // Two separate FILE sections naming the same file is not the "two tracks,
+    // one file" layout (that's a single FILE section with multiple TRACK
+    // blocks, covered by `cue_shares_one_file_across_two_tracks_then_a_third_in_another`
+    // below). `build` cannot honor a repeated section: each section gets its
+    // own file_index and its own cursor starting at 0, so the second
+    // section's track would silently read back the first section's bytes
+    // instead of its own INDEX 01 offset. This must be rejected, not mounted.
+    let cue = "FILE \"shared.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"shared.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let files = vec![("shared.bin".to_string(), vec![0u8; 4 * RAW_SECTOR])];
+
+    let err = CdImage::from_cue_files(cue, files).unwrap_err();
+
+    assert!(
+        err.contains("shared.bin"),
+        "error should name the repeated file: {err}"
+    );
+}
+
+#[test]
+fn cue_shares_one_file_across_two_tracks_then_a_third_in_another() {
+    // FILE A holds two tracks back-to-back; FILE B holds a third track alone.
+    // Track 1's span is bounded by track 2's INDEX 01 *within FILE A* (the
+    // `n.file_index == fi` comparison the per-file rework added actually
+    // evaluates true here); track 2 then runs to FILE A's own end, and
+    // track 3 runs to FILE B's end -- three different file-boundary cases
+    // in one sheet.
+    let cue = "FILE \"a.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:02\n\
+               FILE \"b.bin\" BINARY\n\
+               TRACK 03 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    // Track 1: 2 sectors of MODE1/2048 (4096 bytes). Track 2: 3 sectors of
+    // AUDIO (7056 bytes), filling the rest of FILE A exactly.
+    let mut a = vec![0u8; 2 * DATA_SECTOR + 3 * RAW_SECTOR];
+    a[0] = 0xA1; // track 1 marker
+    a[2 * DATA_SECTOR] = 0xA2; // track 2 marker, right after track 1's bytes
+    let mut b = vec![0u8; 2 * RAW_SECTOR];
+    b[0] = 0xB3; // track 3 marker
+    let files = vec![("a.bin".to_string(), a), ("b.bin".to_string(), b)];
+
+    let img = CdImage::from_cue_files(cue, files).unwrap();
+    assert_eq!(img.track_count(), 3);
+    assert_eq!((img.tracks()[0].start_lba, img.tracks()[0].sectors), (0, 2));
+    assert_eq!((img.tracks()[1].start_lba, img.tracks()[1].sectors), (2, 3));
+    assert_eq!((img.tracks()[2].start_lba, img.tracks()[2].sectors), (5, 2));
+    assert_eq!(img.total_sectors(), 7);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xA1);
+    assert_eq!(img.read_audio_frame(2).unwrap()[0], 0xA2);
+    assert_eq!(img.read_audio_frame(5).unwrap()[0], 0xB3);
 }
