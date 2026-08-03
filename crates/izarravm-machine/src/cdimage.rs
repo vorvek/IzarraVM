@@ -59,7 +59,9 @@ impl TrackMode {
 
     /// Byte offset of the 2048-byte user payload inside one stored frame.
     /// MODE1/2352 wraps the payload in 12 sync + 4 header bytes; MODE1/2048
-    /// stores it bare.
+    /// stores it bare. An AUDIO track has no logical payload at all and
+    /// reports 0, a placeholder the data path never reaches: `read_data_sector`
+    /// returns None for an audio track before asking.
     pub fn payload_offset(self) -> usize {
         match self {
             TrackMode::Mode1_2048 => 0,
