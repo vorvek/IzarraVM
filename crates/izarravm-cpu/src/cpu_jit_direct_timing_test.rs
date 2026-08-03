@@ -2002,6 +2002,51 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
             terminal: false,
             eflags: 0x202,
         },
+        // Slice 7. These four are EXACT pins and that is the point of putting them here rather
+        // than leaving the charge to the slice's own accumulation ladder. A ladder that asserts
+        // the SCALED clock is one-sided: at four slots `floor((14n + 4) / 12)` catches an
+        // undercharge of 9 or of the `_ => 2` default, and misses an overcharge of 15 or 16,
+        // because those still floor to the same value. An exact `raw_clocks()` compare is
+        // two-sided by construction, and the review that caught the asymmetry is why both now
+        // exist. The standing rule this amends: an accumulation fixture is NECESSARY for a
+        // block-scaled charge and NOT SUFFICIENT -- it must be paired with an exact pin.
+        //
+        // `imul ebx, eax, imm` -- modrm 0b11_011_000 = 0xd8, reg = EBX is the destination and
+        // rm = EAX the source. clocks(14) for the three-operand form against the two-operand
+        // form's clocks(9) and the table default's 2, plus 2 each for the two register moves.
+        DirectTimingCase {
+            name: "three-operand imul register imm32",
+            opcode: &[0x69, 0xd8, 0x03, 0x00, 0x00, 0x00],
+            expected_raw_clocks: 14 + 2 + 2,
+            terminal: false,
+            eflags: 0x202,
+        },
+        DirectTimingCase {
+            name: "three-operand imul register imm8",
+            opcode: &[0x6b, 0xd8, 0x03],
+            expected_raw_clocks: 14 + 2 + 2,
+            terminal: false,
+            eflags: 0x202,
+        },
+        // The byte-lane register ALU, both operand orders. `execute_alu_decoded` returns one
+        // `Ok(clocks(2))` for all six ALU forms, so these ride the `_ => 2` default CORRECTLY --
+        // and the pin is what says so. Without it, "the default is right here" is an argument
+        // rather than a measurement, and an arm added later for the wrong reason would pass.
+        // `cmp cl, al` (form 0: rm is the destination) and `cmp al, cl` (form 2: reg is).
+        DirectTimingCase {
+            name: "byte alu register destination",
+            opcode: &[0x38, 0xc1],
+            expected_raw_clocks: 2 + 2 + 2,
+            terminal: false,
+            eflags: 0x202,
+        },
+        DirectTimingCase {
+            name: "byte alu register source",
+            opcode: &[0x3a, 0xc1],
+            expected_raw_clocks: 2 + 2 + 2,
+            terminal: false,
+            eflags: 0x202,
+        },
     ]
 }
 

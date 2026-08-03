@@ -2352,7 +2352,34 @@ pub(crate) enum DirectKind {
     /// `AluByteImm`/`AluImm` precedent: the byte forms are a different lane, not a narrower one,
     /// and every accessor on this kind (`byte_reads`, `read_segment`, `uses_stack`, ...) wants the
     /// register-only default. `raw_clocks` wants the `_ => 2` default too, and correctly — the
-    /// interpreter's `execute_alu_decoded` returns one `Ok(clocks(2))` for all six forms.
+    /// interpreter's `execute_alu_decoded` returns one `Ok(clocks(2))` for all six forms. That
+    /// default is PINNED rather than argued, in `direct_timing_cases`.
+    ///
+    /// # What this reaches, stated correctly
+    ///
+    /// **32-bit byte ALU, and only that.** The slice's first write-up justified this kind as
+    /// "ubiquitous in DOS-era software — text-mode tools, byte blitters, character loops",
+    /// explicitly discounting both benchmarks. That describes a population the arm CANNOT REACH,
+    /// and an adversarial review caught it. Two independent gates put 16-bit code out of range:
+    /// `try_direct_continuation` returns `Interpret` at every `!d` boundary, so no block is ever
+    /// compiled in a 16-bit code segment on any persona; and a `66`-prefixed byte ALU is refused
+    /// because none of `0x00`/`0x02`/…/`0x38`/`0x3A` is in `classify`'s `OperandSize::Word`
+    /// allowlist — which `sixteen_bit_byte_alu_register_form_is_still_a_barrier` locks in.
+    ///
+    /// So the honest claim is narrower and still worth having: this closes a byte-lane hole in
+    /// 32-bit protected-mode coverage that had been open since the ALU block was written, and it
+    /// is a PRECONDITION for the DOS-era population rather than a delivery of it. It becomes that
+    /// only if 16-bit blocks are ever admitted (Phase 4's persona-generality work), at which point
+    /// the allowlist has to take these opcodes too.
+    ///
+    /// **The allowlist doctrine is inconsistent here and that is a known tension, not an
+    /// oversight.** ALU form 4 (`0x04..=0x3c`), `0x88`, `0x8a`, `0xb0..=0xb7`, `0xc6`, `0xf6` and
+    /// `0x84` are all admitted at Word on the stated grounds that a byte form's width is a
+    /// property of the FORM and the prefix cannot leak past `classify`. Forms 0 and 2 satisfy that
+    /// argument identically — they carry a literal byte lane and no `operand_width` — so the only
+    /// thing keeping them out is the campaign's standing rule against unmeasured admissions. Left
+    /// out deliberately: admitting them would be a formation change with no census row to
+    /// attribute it to, and it belongs to whichever slice opens the 16-bit region as a whole.
     AluRegByte {
         op: u8,
         dst: u8,

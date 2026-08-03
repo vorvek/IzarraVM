@@ -3870,10 +3870,20 @@ fn emit_alu_byte_imm(e: &mut Encoder, op: u8, dst: u8, imm: u8) {
 /// 32-bit home, and `cmp bl, bl` names one lane twice. The write-back through `emit_write_gpr8`
 /// touches only the destination lane's eight bits, exactly as `write_gpr8` does.
 ///
-/// Three orderings carry the same hazards `emit_inc_dec_reg8` documents, and they are inherited
-/// rather than restated here: `emit_alu_byte_preloaded` captures host flags before recording the
-/// descriptor, and `emit_write_gpr8` runs AFTER both because it shifts its value register in
-/// place and clobbers the descriptor's recorded result if it runs before.
+/// **The ordering inside `emit_alu_byte_preloaded` is `emit_pending` THEN `emit_capture_flags`,**
+/// on both its branches and inside `emit_carry_alu_byte` — the descriptor is recorded first and
+/// the host flags captured after. That is the opposite of `emit_inc_dec_reg8`, whose comment
+/// makes the reverse order load-bearing, and the difference is worth stating rather than glossing:
+/// it is safe HERE only because `emit_pending` emits nothing but `mov`s and stores, so it writes
+/// no host flag between the `alu_r8_r8` and the capture. Adding anything that sets flags to
+/// `emit_pending` — a test, a compare, an add — would silently corrupt every byte ALU result's
+/// flags, and this function would be one of the callers it broke. (An earlier version of this
+/// comment stated the order backwards; the code has never had it either way but the claim was
+/// wrong, and a wrong claim about a flag window is an invitation.)
+///
+/// `emit_write_gpr8` runs AFTER both, because it shifts its value register in place and would
+/// clobber the descriptor's recorded result if it ran before. That hazard IS `emit_inc_dec_reg8`'s
+/// verbatim.
 ///
 /// CMP (op 7) suppresses the write-back, matching `write_back = op != 7` in the interpreter's arm.
 fn emit_alu_reg_byte(e: &mut Encoder, op: u8, dst: u8, src: u8) {

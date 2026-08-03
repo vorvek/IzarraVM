@@ -369,7 +369,8 @@ fn three_operand_imul_preserves_the_flags_it_does_not_define() {
     }
 }
 
-/// The CLOCK CHARGE, separated by accumulation.
+/// The CLOCK CHARGE, separated by accumulation -- **one half of a two-part check, and it is the
+/// one-sided half**.
 ///
 /// The three-operand IMUL charges `clocks(14)` where the two-operand form charges `clocks(9)` and
 /// `DirectKind::raw_clocks`' default returns 2. None of those errors is visible in a three-slot
@@ -381,6 +382,14 @@ fn three_operand_imul_preserves_the_flags_it_does_not_define() {
 ///
 /// One to four IMUL slots. At four the correct charge is `2 + 4*14 + 2 = 60` raw against 40 for
 /// `clocks(9)` and 16 for the default -- 5 scaled clocks against 3 and 1.
+///
+/// **What this cannot see, and what covers it.** The comparison is against the interpreter's
+/// accumulated clocks, so it is a floor comparison: `floor((14n + 4) / 12)` catches every
+/// UNDERCHARGE and misses an overcharge of 15 or 16, which floor to the same value at every slot
+/// count this fixture reaches. The two-sided half is the EXACT `raw_clocks()` pin in
+/// `cpu_jit_direct_timing_test.rs`'s `direct_timing_cases` table (`14 + 2 + 2` for both opcodes),
+/// which compares the charge itself rather than its scaled shadow. Neither is sufficient alone:
+/// the pin cannot see a scaling or accumulation error and the ladder cannot see an overcharge.
 #[test]
 fn three_operand_imul_charge_matches_the_interpreter_across_slot_counts() {
     for count in 1..=4usize {
@@ -462,12 +471,22 @@ fn byte_lane_register_alu_matches_the_interpreter_in_both_operand_orders() {
     // All eight operations, both operand orders, over a register pair set that covers the LOW
     // lanes (0..=3 -> AL/CL/DL/BL) and the HIGH lanes (4..=7 -> AH/CH/DH/BH) in every
     // combination of the two. CF is seeded both ways because ADC/SBB consume it.
+    //
+    // EVERY index appears as a DESTINATION at least once, and the row set is written out rather
+    // than generated so that stays checkable by reading. An earlier version claimed to cover all
+    // eight and never made index 6 (DH) a destination -- structurally identical to 4, 5 and 7
+    // under `emit_write_gpr8`'s `index - 4` lane, but "identical by construction" is the claim a
+    // matrix exists to stop anyone having to make.
     for op in 0u8..8 {
         for (dst, src) in [
             (0u8, 1u8), // AL, CL   -- low, low
             (0, 5),     // AL, CH   -- low destination, HIGH source
             (5, 0),     // CH, AL   -- HIGH destination, low source
             (4, 7),     // AH, BH   -- high, high
+            (6, 1),     // DH, CL   -- the destination index the first draft never exercised
+            (6, 4),     // DH, AH   -- and again with a high source
+            (2, 3),     // DL, BL
+            (1, 0),     // CL, AL
             (3, 6),     // BL, DH
             (7, 2),     // BH, DL
         ] {
@@ -502,7 +521,9 @@ fn byte_lane_register_alu_handles_lanes_of_the_same_home() {
     // and the same-lane rows are the ones whose result is a constant (0 for XOR/SUB) so a
     // divergence shows up in the flags as well as the register.
     for op in 0u8..8 {
-        for (dst, src) in [(0u8, 4u8), (4, 0), (1, 1), (5, 5), (3, 3), (2, 6)] {
+        // `(6, 6)` is DH against itself, the same-home row for the destination index the matrix
+        // above had to be widened to reach.
+        for (dst, src) in [(0u8, 4u8), (4, 0), (1, 1), (5, 5), (3, 3), (6, 6), (2, 6)] {
             for eflags in [0x202u32, 0x203] {
                 let seed = byte_seed().flags(eflags).pending();
                 let label = format!("op={op} dst={dst} src={src} eflags={eflags:#x}");
