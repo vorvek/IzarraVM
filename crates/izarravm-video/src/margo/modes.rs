@@ -15,6 +15,12 @@ pub struct VbeMode {
 
 /// The modes Margo lists, reports, and sets. Includes 8-bit indexed modes and
 /// 15bpp, 16bpp, and 32bpp direct-color modes.
+///
+/// Ordered ascending by mode number, which is what a real VBE BIOS returns from
+/// 4F00h and which places the OEM mode (0x150) after the VESA-defined ones.
+/// Guests that index the enumeration by position -- DOS Quake does -- see the
+/// standard modes in the order they expect. `vbe_mode_list_is_strictly_ascending`
+/// in `machine_margo_test.rs` pins this.
 pub const MARGO_VBE_MODES: &[VbeMode] = &[
     VbeMode {
         number: 0x100,
@@ -26,14 +32,6 @@ pub const MARGO_VBE_MODES: &[VbeMode] = &[
         number: 0x101,
         width: 640,
         height: 480,
-        bpp: 8,
-    },
-    // Proprietary VEGA/Margo OEM mode: 320x240x256, line-doubled to the display
-    // by the monitor/scaler. Used by the Izarra-BIOS graphical POST screen.
-    VbeMode {
-        number: 0x150,
-        width: 320,
-        height: 240,
         bpp: 8,
     },
     VbeMode {
@@ -101,6 +99,14 @@ pub const MARGO_VBE_MODES: &[VbeMode] = &[
         width: 1024,
         height: 768,
         bpp: 32,
+    },
+    // Proprietary VEGA/Margo OEM mode: 320x240x256, line-doubled to the display
+    // by the monitor/scaler. Used by the Izarra-BIOS graphical POST screen.
+    VbeMode {
+        number: 0x150,
+        width: 320,
+        height: 240,
+        bpp: 8,
     },
 ];
 
