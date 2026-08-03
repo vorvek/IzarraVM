@@ -236,6 +236,12 @@ pub fn run(
     if cpu_profile_stride.is_some() {
         crate::bench::print_cpu_profile(&machine.cpu().profile_snapshot());
     }
+    // IZARRAVM_DIRECT_BARRIER_CENSUS=1 ranks what stopped block formation. The
+    // `--hdd-folder` path already emitted this into its JSON; a boot profile
+    // needs it too, because on a 16-bit workload the ranking IS the question --
+    // `classify`'s Word allowlist was built for 32-bit game code, so what it
+    // refuses here is a different population entirely.
+    print_barrier_census(machine.cpu().direct_barrier_census_snapshot());
     let run = BootProfileRun {
         mode,
         rows: build_rows(machine.phase_marks()),
@@ -261,6 +267,63 @@ pub fn run(
     }
     Ok(())
 }
+
+/// Rank the structural stops that refused block formation, when the opt-in
+/// census collected any. Ranked by `runtime_hits` plus the two exit columns:
+/// per [[barrier-census-mispredicts-both-ways]], `unbound_exits` alone is not a
+/// ceiling and compile attempts (`hits`) must not drive prioritisation.
+fn print_barrier_census(snapshot: Option<izarravm_cpu::DirectBarrierCensusSnapshot>) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    if snapshot.rows.is_empty() {
+        println!();
+        println!("=== direct barrier census: no structural stops recorded ===");
+        return;
+    }
+    let mut rows = snapshot.rows;
+    rows.sort_by_key(|row| {
+        std::cmp::Reverse((
+            row.runtime_hits,
+            row.unbound_exits + row.dynamic_unbound_exits,
+        ))
+    });
+    let total_runtime: u64 = rows.iter().map(|row| row.runtime_hits).sum::<u64>().max(1);
+    println!();
+    println!("=== direct barrier census (top {BARRIER_CENSUS_ROWS} by runtime_hits) ===");
+    // `size` and `form` are carried because on a 16-bit workload they are the
+    // discriminating columns: a Word row refused here is a candidate for the
+    // allowlist, a Dword row is the pre-existing 32-bit population.
+    println!(
+        "{:<8} {:<20} {:<6} {:<8} {:>12} {:>7} {:>11} {:>11}",
+        "opcode", "stop", "size", "form", "runtime", "run%", "unbound", "dyn_unbound"
+    );
+    for row in rows.iter().take(BARRIER_CENSUS_ROWS) {
+        println!(
+            "{:<8} {:<20} {:<6} {:<8} {:>12} {:>6.2}% {:>11} {:>11}",
+            format_census_opcode(row.opcode),
+            row.stop_reason,
+            row.operand_size,
+            row.operand_form,
+            row.runtime_hits,
+            100.0 * row.runtime_hits as f64 / total_runtime as f64,
+            row.unbound_exits,
+            row.dynamic_unbound_exits,
+        );
+    }
+}
+
+/// Same rendering `bench::print_cpu_profile` uses, so a census row and a census
+/// opcode row can be read against each other without a mental conversion.
+fn format_census_opcode(opcode: u16) -> String {
+    if opcode & 0xff00 == 0x0f00 {
+        format!("0F {:02X}", opcode as u8)
+    } else {
+        format!("{opcode:02X}")
+    }
+}
+
+const BARRIER_CENSUS_ROWS: usize = 30;
 
 /// Tag subsequent RIP samples with `phase`. A no-op off Windows, where the
 /// sampler does not exist.
