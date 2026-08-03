@@ -1585,7 +1585,7 @@ fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
 /// file in the image, not to exempt it here.
 ///
 /// Worked example, `GLIDE2X.OVL`: `crates/izarravm/src/gui_session.rs`
-/// (`Session::initialize`) reads `self.spec.glide_ovl`, wraps it as
+/// (`MachineGeneration::initialize`) reads `self.spec.glide_ovl`, wraps it as
 /// `("GLIDE2X.OVL".to_string(), bytes)`, and passes it through
 /// `mount_hdd_folder_with_user_overrides` (`storage.rs`) to `apply_overrides`
 /// (`lib.rs`) -- a real, traceable path from a runner-supplied override to the
