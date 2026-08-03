@@ -1006,6 +1006,12 @@ STATIC struct table * LookUp(struct table *p, BYTE * token)
 */
 #define GetBiosTime() peekl(0, 0x46c)
 
+/* Modified by the Toka-DOS project, 2026: halt until the next interrupt.
+   PUSHF/STI/POPF around the HLT is exactly dosidle.asm's _DosIdle_hlt, so the
+   caller's interrupt flag is restored untouched and a HLT never runs masked. */
+void idle_hlt(void);
+#pragma aux idle_hlt = "pushf" "sti" "hlt" "popf" modify exact [];
+
 UWORD GetBiosKey(int timeout)
 {
   iregs r;
@@ -1016,7 +1022,30 @@ UWORD GetBiosKey(int timeout)
   {
     do
     {
-      /* optionally HLT here - timer will IRQ even if no keypress */
+      /* Modified by the Toka-DOS project, 2026: took upstream's "optionally
+         HLT here" and did it. Upstream leaves it out because entering and
+         leaving HLT swings CPU power draw, which some real mainboards and
+         cheap supplies cannot filter (see the IDLEHALT warning in
+         docs/config.txt, and the P90 HLT erratum it cites). IzarraVM ships its
+         own CPU, so that entire class does not exist here.
+
+         Without it this loop spins the keyboard poll at roughly 1.5 M
+         iterations per guest second, and the emulator interprets every one:
+         measured at 272,000,352 instructions and 8.3 s of WALL time for a
+         2-guest-second window at 586. Worse, the window is denominated in
+         guest seconds while the user waits in wall seconds, so the pause grew
+         the faster the emulated machine was -- 1.8 s at 486 against 8.3 s at
+         586, backwards. Halting collapses it to the ~18.2 Hz timer, so guest
+         time tracks real time and SkipConfigSeconds finally means seconds.
+
+         Correct on real hardware too, which is the bar for a vendored patch:
+         the timer IRQ fires regardless of keypress (upstream's own comment
+         says so) and IRQ1 wakes the halt on the very keystroke being waited
+         for, so neither the timeout nor the key is delayed. PUSHF/POPF around
+         it mirrors dosidle.asm's _DosIdle_hlt and leaves the caller's IF
+         exactly as found; the STI is what keeps a masked-interrupt HLT from
+         being a hang. */
+      idle_hlt();
       r.a.x = 0x0100;             /* are there keys available ? */
       init_call_intr(0x16, &r);
       if (!(r.flags & FLG_ZERO)) {

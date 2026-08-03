@@ -64,7 +64,15 @@ configstart:
 
 DLASortByDriveNo            db 0        ; sort disks by drive order
 InitDiskShowDriveAssignment db 1        ;
-SkipConfigSeconds           db 2        ;
+; Modified by the Toka-DOS project, 2026: 2 -> 3. This is the F5/F8 window, in
+; SECONDS OF GUEST TIME. It only became a meaningful number once GetBiosKey
+; halted instead of spinning (see config.c): before that the emulator spent 8.3
+; wall seconds interpreting a 2-guest-second window at 586 and 1.8 at 486, so
+; the pause grew the faster the emulated machine was. With the halt, guest time
+; tracks real time and this reads as 3 real seconds on every persona -- long
+; enough to actually catch F5 or F8, which is the entire point of the pause.
+; It is deliberate cost. Do not "optimize" it away.
+SkipConfigSeconds           db 3        ;
 ForceLBA                    db 0        ;
 GlobalEnableLBAsupport      db 1        ;
 BootHarddiskSeconds         db 0        ;
