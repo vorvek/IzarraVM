@@ -99,6 +99,102 @@ fn prepared_floppy_rejects_an_unknown_geometry_before_submission() {
 }
 
 #[test]
+fn cue_file_names_returns_every_file_in_sheet_order() {
+    let cue = concat!(
+        "FILE \"track01.bin\" BINARY\n",
+        "  TRACK 01 MODE1/2352\n",
+        "    INDEX 01 00:00:00\n",
+        "FILE track02.bin BINARY\n",
+        "  TRACK 02 AUDIO\n",
+        "    INDEX 00 00:00:00\n",
+        "    INDEX 01 00:02:00\n",
+        "FILE \"track03.bin\" BINARY\n",
+        "  TRACK 03 AUDIO\n",
+        "    INDEX 01 00:00:00\n",
+    );
+
+    assert_eq!(
+        cue_file_names(cue),
+        vec!["track01.bin", "track02.bin", "track03.bin"]
+    );
+}
+
+#[test]
+fn cue_file_names_is_empty_when_the_sheet_has_no_file_line() {
+    let cue = concat!("  TRACK 01 MODE1/2352\n", "    INDEX 01 00:00:00\n",);
+
+    assert!(cue_file_names(cue).is_empty());
+}
+
+#[test]
+fn load_cd_image_from_path_mounts_every_file_the_cue_names() {
+    // A two-FILE sheet: a MODE1/2048 data track in one file, an AUDIO track
+    // in another. This exercises the actual user-facing path end to end --
+    // directory joining relative to the CUE, one read per named file, and
+    // the hand-off to `CdImage::from_cue_files` -- not just `cue_file_names`
+    // in isolation.
+    const DATA_SECTOR: usize = 2048;
+    const RAW_SECTOR: usize = 2352;
+    let scratch = TestScratch::new("cue-multi-file");
+    let cue_path = scratch.path().join("disc.cue");
+    std::fs::write(
+        &cue_path,
+        "FILE \"data.bin\" BINARY\n\
+         TRACK 01 MODE1/2048\n\
+         INDEX 01 00:00:00\n\
+         FILE \"audio.bin\" BINARY\n\
+         TRACK 02 AUDIO\n\
+         INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let mut data = vec![0u8; 2 * DATA_SECTOR];
+    data[0] = 0xD1;
+    std::fs::write(scratch.path().join("data.bin"), &data).unwrap();
+    let mut audio = vec![0u8; 3 * RAW_SECTOR];
+    audio[0] = 0xA2;
+    std::fs::write(scratch.path().join("audio.bin"), &audio).unwrap();
+
+    let image = load_cd_image_from_path(&cue_path).unwrap();
+
+    assert_eq!(image.track_count(), 2);
+    assert_eq!(
+        (image.tracks()[0].start_lba, image.tracks()[0].sectors),
+        (0, 2)
+    );
+    assert_eq!(
+        (image.tracks()[1].start_lba, image.tracks()[1].sectors),
+        (2, 3)
+    );
+    assert_eq!(image.read_data_sector(0).unwrap()[0], 0xD1);
+    assert_eq!(image.read_audio_frame(2).unwrap()[0], 0xA2);
+}
+
+#[test]
+fn load_cd_image_from_path_errors_naming_the_missing_file() {
+    let scratch = TestScratch::new("cue-missing-file");
+    let cue_path = scratch.path().join("disc.cue");
+    std::fs::write(
+        &cue_path,
+        "FILE \"present.bin\" BINARY\n\
+         TRACK 01 AUDIO\n\
+         INDEX 01 00:00:00\n\
+         FILE \"absent.bin\" BINARY\n\
+         TRACK 02 AUDIO\n\
+         INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    std::fs::write(scratch.path().join("present.bin"), vec![0u8; 2352]).unwrap();
+    // absent.bin is deliberately never written.
+
+    let error = load_cd_image_from_path(&cue_path).unwrap_err();
+
+    assert!(
+        error.to_string().contains("absent.bin"),
+        "error should name the missing file: {error}"
+    );
+}
+
+#[test]
 fn startup_snapshot_contains_initial_media() {
     let scratch = TestScratch::new("initial-media");
     let source = FloppySource(scratch.path().join("boot.img"));
