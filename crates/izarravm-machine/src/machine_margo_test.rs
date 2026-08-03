@@ -402,18 +402,33 @@ fn vbe_controller_info_fills_the_block() {
     assert_eq!(read_u32(&mut machine, base + 0x06), 0); // OemStringPtr
     assert_eq!(read_u32(&mut machine, base + 0x0a), 1); // Capabilities
 
-    // VideoModePtr (seg:off) must point at the mode list, which lists every
-    // entry in MARGO_VBE_MODES (8bpp then hi-color then true-color) and ends
-    // with the 0xffff terminator.
+    // VideoModePtr (seg:off) must point at the mode list. Modes are listed in
+    // ascending numeric order, VESA-defined first and the OEM 320x240 mode
+    // (0x150) last, as a real VBE BIOS does -- then the 0xffff terminator.
     let ptr = read_u32(&mut machine, base + 0x0e);
     let list = (((ptr >> 16) & 0xffff) << 4) + (ptr & 0xffff);
     let expected = [
-        0x0100, 0x0101, 0x0150, 0x0103, 0x0105, 0x0110, 0x0111, 0x0113, 0x0114, 0x0116, 0x0117,
-        0x014a, 0x014c, 0x014e, 0xffff,
+        0x0100, 0x0101, 0x0103, 0x0105, 0x0110, 0x0111, 0x0113, 0x0114, 0x0116, 0x0117, 0x014a,
+        0x014c, 0x014e, 0x0150, 0xffff,
     ];
     for (i, &mode) in expected.iter().enumerate() {
         assert_eq!(read_u16(&mut machine, list + (i * 2) as u32), mode);
     }
+}
+
+/// A real VBE BIOS enumerates modes in ascending numeric order. Pinning the
+/// property (not just the current list) means a mode added out of order fails
+/// here rather than silently shifting every later guest-visible index.
+#[test]
+fn vbe_mode_list_is_strictly_ascending() {
+    let numbers: Vec<u16> = izarravm_video::MARGO_VBE_MODES
+        .iter()
+        .map(|mode| mode.number)
+        .collect();
+    assert!(
+        numbers.windows(2).all(|pair| pair[0] < pair[1]),
+        "MARGO_VBE_MODES must be sorted ascending, got {numbers:04x?}"
+    );
 }
 
 #[test]

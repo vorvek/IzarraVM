@@ -88,7 +88,10 @@ the legacy VGA aperture.
 Modes are selected through the VBE interface (section 5). The standard VESA mode
 numbers are honored so existing VESA software finds them. The 32-bit modes use
 numbers in the OEM range, since VESA never assigned standard numbers for 32-bit
-color.
+color. Mode `0x150` is a VEGA OEM mode: 320x240 at 8bpp, line-doubled to the
+display by the monitor, used by the Izarra-BIOS graphical POST. The mode list
+returned by `4F00h` is ordered ascending, so the OEM entries follow the
+VESA-defined ones.
 
 | Mode | Resolution | Depth | Pixel format | Bytes/pixel |
 |------|------------|-------|--------------|-------------|
@@ -105,6 +108,7 @@ color.
 | `0x14A` | 640x480 | 32 | X8R8G8B8 | 4 |
 | `0x14C` | 800x600 | 32 | X8R8G8B8 | 4 |
 | `0x14E` | 1024x768 | 32 | X8R8G8B8 | 4 |
+| `0x150` | 320x240 | 8 | Indexed | 1 |
 
 Scanline pitch is the visible width times bytes per pixel, with no padding. The
 largest surface, 1024x768 at 32-bit, is 3 MB, which leaves 1 MB of the frame
