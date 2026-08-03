@@ -1644,8 +1644,9 @@ impl Machine {
         self.direct_map_changed = true;
     }
 
+    /// The host-side twin of `MachineBus::mark_direct_data_map_changed`, for the INT 10h HLE seam.
+    /// Same contract, including that it does not advance the direct-mapping epoch.
     fn mark_direct_data_map_changed(&mut self) {
-        self.advance_direct_mapping_epoch();
         self.direct_data_map_changed = true;
     }
 

@@ -475,8 +475,12 @@ impl MachineBus<'_> {
         *self.direct_map_changed = true;
     }
 
+    /// The VGA direct-write aperture re-pointed. Deliberately does NOT advance the direct-mapping
+    /// epoch: the epoch is the "every cached host pointer is void" signal, and this event voids
+    /// exactly one range. `CpuGsw::note_direct_data_map_changed` invalidates that range by hand at
+    /// the batch boundary, and it can only do so while the epoch still matches the entries it is
+    /// keeping. See that function for why the range is the whole scope.
     fn mark_direct_data_map_changed(&mut self) {
-        self.advance_direct_mapping_epoch();
         *self.direct_data_map_changed = true;
     }
 

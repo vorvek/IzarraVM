@@ -25,8 +25,7 @@ const HAS_WRITE_BIAS: u8 = 0b0000_1000;
 const PAGE_WRITABLE: u8 = 0b0001_0000;
 const PAGE_USER: u8 = 0b0010_0000;
 
-const MODE13_BASE: u32 = 0x000a_0000;
-const MODE13_END: u32 = 0x000b_0000;
+use crate::paging::{VGA_APERTURE_END as MODE13_END, VGA_APERTURE_START as MODE13_BASE};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +46,14 @@ fn decode_kind(flags: u8) -> PageKind {
     }
 }
 
-/// What one whole-map invalidation discarded. Diagnostic only.
+/// What one invalidation discarded. Diagnostic only.
+///
+/// Both fields count entries that were **live at the moment they were cleared**, never list
+/// membership. That distinction is the whole value of the counter: `populated_pages` and
+/// `vga_pages` are registries that outlive the entries they name -- `invalidate_page` (INVLPG) and
+/// `invalidate_vga_pages` both clear an entry and leave it listed -- so counting the list would
+/// charge dead indices, and would charge an aperture page twice once the scoped sweep leaves it
+/// behind for the next global wipe to find.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct WipeExtent {
     /// Linear pages that were live and are now gone.
@@ -502,19 +508,31 @@ impl FastMap {
 
     /// Clear the compact set of linear aliases backed by the direct VGA aperture. Draining the
     /// registry lets an alias be listed again after the VGA plane or backing store changes.
-    #[cfg(test)]
-    pub(crate) fn invalidate_vga_pages(&mut self) {
+    ///
+    /// A linear page that has since been re-pointed away from the aperture is skipped rather than
+    /// cleared -- its entry is a RAM mapping now and the aperture move says nothing about it -- but
+    /// its registry bit is still dropped, so it is re-listed if it ever comes back.
+    ///
+    /// List membership in `populated_pages` is deliberately NOT dropped: an entry cleared here can
+    /// be re-populated without being pushed twice, and the next global invalidation still finds it.
+    pub(crate) fn invalidate_vga_pages(&mut self) -> WipeExtent {
         let Some(storage) = self.storage.as_mut() else {
-            return;
+            return WipeExtent::default();
         };
+        let mut cleared = 0;
         for page in self.vga_pages.drain(..) {
             let index = page as usize;
             if FastMapStorage::bit(&storage.live_pages, index)
                 && storage.flags[index] & KIND_MASK == PageKind::Mode13 as u8
             {
                 storage.clear_entry(index);
+                cleared += 1;
             }
             FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
+        }
+        WipeExtent {
+            pages: cleared,
+            vga_pages: cleared,
         }
     }
 
@@ -525,12 +543,18 @@ impl FastMap {
         let Some(storage) = self.storage.as_mut() else {
             return WipeExtent::default();
         };
-        let extent = WipeExtent {
-            pages: self.populated_pages.len() as u64,
-            vga_pages: self.vga_pages.len() as u64,
-        };
+        let mut extent = WipeExtent::default();
         for page in self.populated_pages.drain(..) {
             let index = page as usize;
+            // Liveness, not list membership: an index the scoped aperture sweep or an INVLPG
+            // already cleared is still listed here, and charging it again would inflate the very
+            // counter the aperture-scoping work is judged by.
+            if FastMapStorage::bit(&storage.live_pages, index) {
+                extent.pages += 1;
+                if storage.flags[index] & KIND_MASK == PageKind::Mode13 as u8 {
+                    extent.vga_pages += 1;
+                }
+            }
             storage.clear_entry(index);
             FastMapStorage::clear_bit(&mut storage.listed_pages, index);
             FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);

@@ -1043,13 +1043,23 @@ pub struct FastMapAuditCounters {
     /// A direct-execution admission transition (`finish_direct_execution_transition`). NOT
     /// counted by `direct_map_invalidations`.
     pub wipes_admission: u64,
-    /// Live linear pages discarded, summed over every whole-map wipe from every cause. Divided by
-    /// the wipe total this is the average map size at wipe time, which is what a wipe costs: each
-    /// discarded page must be re-served through the slow lookup before it is fast again.
+    /// Live linear pages discarded by a WHOLE-MAP wipe, summed over `wipes_direct_map`,
+    /// `wipes_a20`, `wipes_tlb_flush` and `wipes_admission`. Divided by the sum of those four this
+    /// is the average map size at wipe time, which is what a whole-map wipe costs: every discarded
+    /// page must be re-served through the slow lookup before it is fast again.
+    ///
+    /// Counts LIVENESS, not registry membership, so an entry an INVLPG or the aperture sweep
+    /// already cleared is not charged again. `wipes_direct_data_map` is deliberately NOT summed in
+    /// here -- see `wipe_aperture_pages_cleared` -- so that each counter divides by its own cause.
     pub wipe_pages_cleared: u64,
-    /// The subset of `wipe_pages_cleared` backed by the direct VGA aperture. The remainder is what
-    /// a VGA-scoped invalidation would keep.
+    /// The subset of `wipe_pages_cleared` backed by the direct VGA aperture. The remainder is the
+    /// RAM a scoped invalidation keeps and a whole-map wipe does not.
     pub wipe_vga_pages_cleared: u64,
+    /// Live aperture entries discarded by the SCOPED sweep in `note_direct_data_map_changed`.
+    /// Divided by `wipes_direct_data_map` this is the average number of `0xA0000..0xAFFFF` pages
+    /// resident when the VGA direct-write token moves -- the part of a token move that is real work
+    /// and cannot be scoped away, since those host pointers genuinely re-point.
+    pub wipe_aperture_pages_cleared: u64,
     /// Interpreter page-local data reads seen by the census. One per emitted-equivalent FastMap
     /// probe: a cross-page access is split into page-local fragments upstream, and each fragment
     /// is one probe.
@@ -1081,6 +1091,7 @@ impl Default for FastMapAuditCounters {
             wipes_admission: 0,
             wipe_pages_cleared: 0,
             wipe_vga_pages_cleared: 0,
+            wipe_aperture_pages_cleared: 0,
             census_reads: 0,
             census_writes: 0,
             census_rmw_pairs: 0,

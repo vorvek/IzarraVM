@@ -2576,8 +2576,59 @@ fn test_bus_compiled_window_applies_fixed_costs_and_vga_effects() {
     assert_eq!(bus.mode13_dword_writes, 3);
 }
 
+/// The defining property of the scoped VGA aperture invalidation: the aperture's cached pointers
+/// go, and NOTHING else does. A VGA register write cannot move a RAM host pointer, and keeping
+/// those is the entire win -- 88.1% of the 43.3M entries a doom timedemo used to discard here were
+/// RAM. The epoch check is the load-bearing half: `has_read_mapping` alone would still pass if the
+/// machine had advanced the global mapping epoch, and every surviving entry would then be dead on
+/// the next interpreter probe anyway.
 #[test]
-fn data_mapping_epoch_change_drops_ram_and_vga_direct_pages() {
+fn a_vga_aperture_change_drops_the_aperture_and_keeps_ram_live_at_the_same_epoch() {
+    let mut cpu = CpuGsw::default();
+    let mut bus = TestBus::with_memory(vec![0; 0x10_0000]);
+    bus.direct_pages_enabled = true;
+    bus.direct_pages_writable = true;
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x2000, BusAccessKind::DataRead)
+        .unwrap();
+    cpu.load_segment_real(SegmentIndex::Ds, 0xa000);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .unwrap();
+    let epoch = cpu.data_read_pages.mapping_epoch();
+    assert_eq!(epoch, bus.direct_mapping_epoch);
+
+    cpu.note_direct_data_map_changed();
+
+    // The aperture re-pointed: its pointers are void.
+    assert!(cpu.data_read_pages.get(0x000a_0000).is_none());
+    // RAM did not move, and the cache keeps the epoch that certifies the survivors.
+    assert!(cpu.data_read_pages.get(0x2000).is_some());
+    assert_eq!(cpu.data_read_pages.mapping_epoch(), epoch);
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        assert!(!cpu.jit_fast_map.has_read_mapping(0x000a_0000, 0x000a_0000));
+        assert!(cpu.jit_fast_map.has_read_mapping(0x2000, 0x2000));
+        assert!(
+            cpu.jit_fast_map
+                .has_read_mapping_at_epoch(0x2000, 0x2000, epoch)
+        );
+    }
+}
+
+/// The COARSE cause keeps its coarse scope. A bus/PCI memory-decode change really can move a RAM
+/// host pointer, so scoping the wrong one of the two would be silent corruption.
+#[test]
+fn a_bus_decode_change_still_drops_ram_and_vga_direct_pages() {
     let mut cpu = CpuGsw::default();
     let mut bus = TestBus::with_memory(vec![0; 0x10_0000]);
     bus.direct_pages_enabled = true;
@@ -2606,7 +2657,7 @@ fn data_mapping_epoch_change_drops_ram_and_vga_direct_pages() {
         assert!(cpu.jit_fast_map.has_read_mapping(0x000a_0000, 0x000a_0000));
     }
 
-    cpu.note_direct_data_map_changed();
+    cpu.note_direct_map_changed();
 
     assert!(cpu.data_read_pages.get(0x2000).is_none());
     assert!(cpu.data_read_pages.get(0x000a_0000).is_none());

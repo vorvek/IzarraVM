@@ -999,6 +999,7 @@ pub(super) fn perf_counters_json(
         "fast_map_wipes_admission": fast_map_audit.wipes_admission,
         "fast_map_wipe_pages_cleared": fast_map_audit.wipe_pages_cleared,
         "fast_map_wipe_vga_pages_cleared": fast_map_audit.wipe_vga_pages_cleared,
+        "fast_map_wipe_aperture_pages_cleared": fast_map_audit.wipe_aperture_pages_cleared,
         // As 0/1 rather than a bool: every value in this object is a counter, and the key
         // inventory test asserts a zeroed report reads `Some(0)` for all of them.
         "rmw_census_enabled": u64::from(fast_map_audit.census_enabled),
