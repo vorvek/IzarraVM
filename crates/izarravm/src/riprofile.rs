@@ -11,6 +11,13 @@
 //! entirely the Direct JIT's code arena, so the "<no symbol>" bucket doubles as
 //! the native-code share of wall time.
 //!
+//! That last sentence is only true when symbols actually loaded, and reading it
+//! when they did not inverts the answer: an unsymbolized run puts ~100% in
+//! "<no symbol>", which reads as "all native code" when it means "resolved
+//! nothing". Both the startup line (`SymType=3` is a loaded PDB) and the report
+//! header (unresolved address count and sample share) exist to make that
+//! distinction impossible to miss. A healthy idle-phase run resolves ~96%.
+//!
 //! `IZARRAVM_RIP_PROFILE_DELAY_SECS=<n>` (default 0) delays sampling to skip
 //! BIOS/DOS boot and demo load.
 //!
@@ -35,8 +42,8 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, GetThreadContext, IMAGEHLP_LINEW64, IMAGEHLP_MODULEW64, SYMBOL_INFOW,
-    SYMOPT_DEFERRED_LOADS, SYMOPT_LOAD_LINES, SYMOPT_UNDNAME, SymFromAddrW, SymGetLineFromAddrW64,
-    SymGetModuleInfoW64, SymInitializeW, SymLoadModuleExW, SymSetOptions,
+    SYMOPT_LOAD_LINES, SYMOPT_UNDNAME, SymFromAddrW, SymGetLineFromAddrW64, SymGetModuleInfoW64,
+    SymInitializeW, SymSetOptions,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
@@ -197,60 +204,73 @@ impl Sampler {
 
         let process = unsafe { GetCurrentProcess() };
         unsafe {
-            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-            if SymInitializeW(process, std::ptr::null(), 1) == 0 {
-                eprintln!("riprofile: SymInitializeW failed; dumping raw addresses");
-            }
-            // Invade-process enumeration can leave the main exe resolved by
-            // exports only (a Rust exe has none). Force-load its PDB.
-            let base = GetModuleHandleW(std::ptr::null());
+            // NO `SYMOPT_DEFERRED_LOADS`: deferred modules report `SymType = 5`
+            // (SymDeferred) and only try to find a PDB on the first query, so a
+            // missing or mismatched PDB surfaced as a per-address failure rather
+            // than as one diagnosable message at init. Loading eagerly costs one
+            // PDB parse at report time, off the measured path entirely.
+            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+
+            // The exe's own directory as the search path. dbghelp's default
+            // (NULL) is the CWD plus `_NT_SYMBOL_PATH`, and neither has to
+            // contain `target/profiling`, so a run started from anywhere but the
+            // build directory could only find the PDB through the absolute path
+            // baked into the image's debug directory.
             let mut path = [0u16; 1024];
             let len = GetModuleFileNameW(std::ptr::null_mut(), path.as_mut_ptr(), 1024);
-            if len > 0 {
-                let loaded = SymLoadModuleExW(
-                    process,
-                    std::ptr::null_mut(),
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    base as u64,
-                    0,
-                    std::ptr::null(),
-                    0,
+            let exe_dir = exe_directory(&path[..len as usize]);
+            let search = exe_dir.map_or(std::ptr::null(), |dir| dir.as_ptr());
+            if SymInitializeW(process, search, 1) == 0 {
+                eprintln!("riprofile: SymInitializeW failed; dumping raw addresses");
+            }
+
+            // `fInvadeProcess = 1` above ALREADY registered every loaded module,
+            // this exe included. Do NOT also call `SymLoadModuleExW` for it: a
+            // second registration at the same base re-registers the module with
+            // no symbol source, flipping SymType from SymPdb to 0 (SymNone), and
+            // every later `SymFromAddrW` inside the image then fails with 487
+            // (ERROR_INVALID_ADDRESS). That is what made the whole report land in
+            // the "<no symbol>" bucket, which reads as "all JIT arena" and is the
+            // exact opposite of the truth.
+            let base = GetModuleHandleW(std::ptr::null());
+            let mut info: IMAGEHLP_MODULEW64 = mem::zeroed();
+            info.SizeOfStruct = mem::size_of::<IMAGEHLP_MODULEW64>() as u32;
+            if SymGetModuleInfoW64(process, base as u64, &mut info) != 0 {
+                // SymType 3 is SymPdb. Anything else means the report's
+                // "<no symbol>" bucket is unresolved addresses, not native code,
+                // so say so rather than letting it be misread.
+                eprintln!(
+                    "riprofile: exe module base {:#x}, SymType={} (3=Pdb), lines={}",
+                    base as u64, info.SymType, info.LineNumbers
                 );
-                if loaded == 0 {
-                    let e = windows_sys::Win32::Foundation::GetLastError();
-                    if e != 0 {
-                        eprintln!("riprofile: SymLoadModuleExW failed (GetLastError={e})");
-                    }
-                }
-                let mut info: IMAGEHLP_MODULEW64 = mem::zeroed();
-                info.SizeOfStruct = mem::size_of::<IMAGEHLP_MODULEW64>() as u32;
-                if SymGetModuleInfoW64(process, base as u64, &mut info) != 0 {
+                if info.SymType != 3 {
                     eprintln!(
-                        "riprofile: exe module base {:#x}, SymType={}, lines={}",
-                        base as u64, info.SymType, info.LineNumbers
-                    );
-                } else {
-                    eprintln!(
-                        "riprofile: SymGetModuleInfoW64 failed (GetLastError={})",
-                        windows_sys::Win32::Foundation::GetLastError()
+                        "riprofile: WARNING no PDB loaded -- '<no symbol>' below means \
+                         UNRESOLVED, not JIT arena. Build with `--profile profiling`."
                     );
                 }
+            } else {
+                eprintln!(
+                    "riprofile: SymGetModuleInfoW64 failed (GetLastError={})",
+                    windows_sys::Win32::Foundation::GetLastError()
+                );
             }
         }
 
         let mut resolved: HashMap<u64, (String, String, String)> = HashMap::new();
-        let mut first_resolve_error = true;
-        for &rip in counts.keys() {
-            if first_resolve_error && resolve_symbol(process, rip).is_none() {
-                first_resolve_error = false;
-                eprintln!(
-                    "riprofile: first failed SymFromAddrW rip={rip:#x} GetLastError={}",
-                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
-                );
+        // Counted, not sampled: `counts` is a HashMap, so "the first address that
+        // failed" was whichever one iteration happened to reach first, and a
+        // single JIT-arena address failing is normal. Only the ratio says whether
+        // symbolization is healthy.
+        let mut unresolved_addrs = 0u64;
+        let mut unresolved_samples = 0u64;
+        for (&rip, &n) in &counts {
+            let symbol = resolve_symbol(process, rip);
+            if symbol.is_none() {
+                unresolved_addrs += 1;
+                unresolved_samples += n;
             }
-            let func = resolve_symbol(process, rip)
-                .unwrap_or_else(|| "<no symbol — JIT arena or foreign code>".into());
+            let func = symbol.unwrap_or_else(|| "<no symbol — JIT arena or foreign code>".into());
             let site =
                 resolve_line(process, rip).unwrap_or_else(|| format!("{func} (no line info)"));
             let file = site
@@ -260,11 +280,18 @@ impl Sampler {
         }
 
         let total = samples.len() as u64;
+        eprintln!(
+            "riprofile: {unresolved_addrs}/{} addresses unresolved, {:.2}% of samples",
+            counts.len(),
+            unresolved_samples as f64 * 100.0 / total.max(1) as f64,
+        );
         let mut report = String::new();
         report.push_str(&format!(
             "riprofile report — {total} samples at {SAMPLE_INTERVAL:?} \
-             ({} unique addresses)\n\n",
-            counts.len()
+             ({} unique addresses, {unresolved_addrs} unresolved carrying \
+             {:.2}% of samples)\n\n",
+            counts.len(),
+            unresolved_samples as f64 * 100.0 / total.max(1) as f64,
         ));
         report.push_str(&render_tables(&counts, &resolved));
 
@@ -346,6 +373,25 @@ fn render_tables(
     }
     out
 }
+
+/// The directory part of a UTF-16 module path, NUL-terminated for Win32. `None`
+/// when the path is empty or has no separator, which leaves the search path at
+/// dbghelp's default rather than pointing it somewhere wrong.
+fn exe_directory(path: &[u16]) -> Option<Vec<u16>> {
+    const SEP: u16 = b'\\' as u16;
+    const ALT_SEP: u16 = b'/' as u16;
+    let cut = path.iter().rposition(|&c| c == SEP || c == ALT_SEP)?;
+    if cut == 0 {
+        return None;
+    }
+    let mut dir = path[..cut].to_vec();
+    dir.push(0);
+    Some(dir)
+}
+
+#[cfg(test)]
+#[path = "riprofile_test.rs"]
+mod tests;
 
 fn resolve_symbol(process: HANDLE, rip: u64) -> Option<String> {
     const MAX_NAME: usize = 512;
