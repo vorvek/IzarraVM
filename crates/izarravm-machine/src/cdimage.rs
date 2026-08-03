@@ -109,8 +109,12 @@ impl TrackMode {
         match self {
             TrackMode::Mode2_2352 => Some(18),
             TrackMode::Mode2_2336 => Some(2),
-            TrackMode::Mode1_2048 | TrackMode::Mode1_2352 | TrackMode::Mode2_2048 => None,
-            TrackMode::Audio | TrackMode::Mode1_2448 | TrackMode::AudioCdg => None,
+            TrackMode::Mode1_2048
+            | TrackMode::Mode1_2352
+            | TrackMode::Mode2_2048
+            | TrackMode::Audio
+            | TrackMode::Mode1_2448
+            | TrackMode::AudioCdg => None,
         }
     }
 }
@@ -121,7 +125,10 @@ pub struct Track {
     /// 1-based track number as it appears in the TOC.
     pub number: u8,
     pub mode: TrackMode,
-    /// First user LBA of this track (the INDEX 01 address, lead-in removed).
+    /// First user LBA of this track on the disc timeline. Equal to this track's
+    /// INDEX 01 address only when no PREGAP precedes it (on this track or any
+    /// earlier one) -- a PREGAP shifts this LBA forward without changing the
+    /// INDEX 01 address itself.
     pub start_lba: u32,
     /// Sector count in this track.
     pub sectors: u32,
@@ -232,7 +239,12 @@ impl CdImage {
         // Two timelines. `disc_lba` is what the guest sees, and PREGAP frames
         // advance it without any bytes behind them. The CUE's INDEX addresses
         // are positions in the file, so a track's byte span still comes from
-        // the delta between consecutive INDEX 01 values.
+        // the delta between consecutive INDEX 01 values. This derivation
+        // assumes tracks within a single BIN appear in non-decreasing INDEX 01
+        // order (the `saturating_sub` above silently floors an out-of-order
+        // pair to zero sectors instead of erroring); a sheet that violates
+        // this mounts with a track table and `total_sectors` that no longer
+        // match the on-disc reality.
         let mut disc_lba = 0u32;
         for (i, p) in parsed.iter().enumerate() {
             let raw = p.mode.raw_size();

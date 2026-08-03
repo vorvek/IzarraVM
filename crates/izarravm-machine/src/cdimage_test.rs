@@ -206,3 +206,21 @@ fn index00_pregap_folds_into_the_preceding_track() {
     assert_eq!((t1.start_lba, t1.sectors), (0, 3));
     assert_eq!(t2.start_lba, 3);
 }
+
+#[test]
+fn leading_pregap_on_the_first_track_still_shifts_its_start_lba() {
+    // A single-track sheet whose only track has a 2-frame PREGAP before its
+    // own INDEX 01. The loop applies `disc_lba += p.pregap_frames`
+    // unconditionally, with no `i == 0` special case, so this should push
+    // even the very first track off LBA 0.
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               PREGAP 00:00:02\n\
+               INDEX 01 00:00:00\n";
+    let bin = vec![0u8; 3 * DATA_SECTOR];
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    let t1 = img.tracks()[0];
+    assert_eq!(t1.start_lba, 2);
+    assert_eq!(t1.sectors, 3);
+    assert_eq!(img.total_sectors(), 5);
+}
