@@ -1689,16 +1689,123 @@ fn prefix_gate_is_relative_to_the_code_segment_default_size() {
     assert!(!prefixes_supported_for(none, OperandSize::Dword, false));
     assert!(!prefixes_supported_for(oso, OperandSize::Word, false));
 
-    // Any other prefix is still unsupported in both widths.
-    let seg = Prefixes {
-        segment_override: Some(SegmentIndex::Es),
-        ..Prefixes::default()
-    };
+    // LOCK, REP/REPNE and the address-size override are still unsupported in both widths.
+    for (name, other) in [
+        (
+            "lock",
+            Prefixes {
+                lock: true,
+                ..Prefixes::default()
+            },
+        ),
+        (
+            "address size",
+            Prefixes {
+                address_size_override: true,
+                ..Prefixes::default()
+            },
+        ),
+        (
+            "rep",
+            Prefixes {
+                rep: Some(crate::RepKind::Repe),
+                ..Prefixes::default()
+            },
+        ),
+        (
+            "repne",
+            Prefixes {
+                rep: Some(crate::RepKind::Repne),
+                ..Prefixes::default()
+            },
+        ),
+    ] {
+        for d in [false, true] {
+            for size in [OperandSize::Word, OperandSize::Dword] {
+                let mut prefixes = other;
+                prefixes.operand_size_override = (size == OperandSize::Dword) != d;
+                assert!(
+                    !prefixes_supported_for(prefixes, size, d),
+                    "{name} must stay unsupported at d={d}"
+                );
+            }
+        }
+    }
+}
+
+/// The slice-6 admission: an explicit override naming one of the five DATA segments passes the
+/// gate at both operand sizes and in both code widths; a CS override does not.
+///
+/// The CS half is the load-bearing one. Refusing CS is a DECISION (12,674 doom exits stay a
+/// barrier), taken because CS is the only segment `SegmentLayout` homes twice — in its own `cs`
+/// field and at index 1 of `data` — so it is the only one where admitting a memory kind would make
+/// a lowered access depend on the two homes agreeing. A future edit that "tidied" the gate into
+/// admitting every `Option<SegmentIndex>` would silently take that decision back, and only this
+/// assertion would notice.
+#[test]
+fn the_prefix_gate_admits_the_five_data_segment_overrides_and_refuses_cs() {
     for d in [false, true] {
         for size in [OperandSize::Word, OperandSize::Dword] {
+            let expected_override = (size == OperandSize::Dword) != d;
+            for segment in [
+                SegmentIndex::Es,
+                SegmentIndex::Ss,
+                SegmentIndex::Ds,
+                SegmentIndex::Fs,
+                SegmentIndex::Gs,
+            ] {
+                assert!(
+                    prefixes_supported_for(
+                        Prefixes {
+                            operand_size_override: expected_override,
+                            segment_override: Some(segment),
+                            ..Prefixes::default()
+                        },
+                        size,
+                        d,
+                    ),
+                    "{segment:?} override must be admitted at d={d} size={size:?}"
+                );
+                // The operand-size clause still has to agree. Admitting the segment override must
+                // not turn the gate into "any prefix set containing one".
+                assert!(
+                    !prefixes_supported_for(
+                        Prefixes {
+                            operand_size_override: !expected_override,
+                            segment_override: Some(segment),
+                            ..Prefixes::default()
+                        },
+                        size,
+                        d,
+                    ),
+                    "{segment:?} override with the wrong operand-size override must refuse"
+                );
+                // ... and so does every other prefix, alongside the admitted override.
+                assert!(
+                    !prefixes_supported_for(
+                        Prefixes {
+                            operand_size_override: expected_override,
+                            segment_override: Some(segment),
+                            lock: true,
+                            ..Prefixes::default()
+                        },
+                        size,
+                        d,
+                    ),
+                    "{segment:?} override plus LOCK must refuse"
+                );
+            }
             assert!(
-                !prefixes_supported_for(seg, size, d),
-                "segment override d={d}"
+                !prefixes_supported_for(
+                    Prefixes {
+                        operand_size_override: expected_override,
+                        segment_override: Some(SegmentIndex::Cs),
+                        ..Prefixes::default()
+                    },
+                    size,
+                    d,
+                ),
+                "a CS override is refused explicitly, not by omission"
             );
         }
     }

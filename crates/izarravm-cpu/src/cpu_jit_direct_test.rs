@@ -5871,3 +5871,681 @@ fn cpl3_call_through_a_register_permission_side_exit_is_counted() {
     // Anti-vacuity: only the two fillers retired natively; the call itself never completed.
     assert_eq!(cpu.perf_counters().jit_direct_insns - insns_before, 2);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Slice 6 -- explicit segment overrides on lowered memory kinds.
+//
+// The admission is a change to `prefixes_supported_for` alone: `decode::parse_addressing_mode`
+// folds `segment_override` into `AddrMode.segment`, `classify::direct_addr` copies it verbatim,
+// and `read_segment`/`write_segment` return `addr.segment`. NOTHING in the tree exercised that
+// path natively before these fixtures, because the gate refused every override, so "the plumbing
+// is complete" was an argument and not a measurement. These make it a measurement.
+// ---------------------------------------------------------------------------------------------
+
+/// The five admitted segments with DISTINCT real-mode bases, so that reading or writing through
+/// the wrong one lands somewhere else entirely. The data lives clear of page 0, where the code
+/// sits: a store into the block's own page would take the code-watch side exit and the fixture
+/// would measure that instead of the segment.
+const OVERRIDE_CASES: [(SegmentIndex, u16, u8); 5] = [
+    (SegmentIndex::Es, 0x0040, 0x26),
+    (SegmentIndex::Ss, 0x0080, 0x36),
+    (SegmentIndex::Ds, 0x0000, 0x3e),
+    (SegmentIndex::Fs, 0x00c0, 0x64),
+    (SegmentIndex::Gs, 0x0100, 0x65),
+];
+
+fn segment_override_cpu() -> CpuGsw {
+    let mut cpu = fresh();
+    for (segment, selector, _) in OVERRIDE_CASES {
+        cpu.load_segment_real(segment, selector);
+    }
+    widen_stack_to_32_bit(&mut cpu);
+    cpu
+}
+
+/// A load and a store through an explicit segment override, executed NATIVELY in the middle of a
+/// block, differentially against a block-free interpreter -- once per admitted segment.
+///
+/// Three separate things make this non-vacuous, and all three are needed:
+///
+///  * **Mid-block.** The tested pair sits behind a NOP starter and an INC, because an opcode at a
+///    block's entry never executes natively and the emitter would go untested.
+///  * **The override is load-bearing.** Every segment gets a distinct base, and the payload at the
+///    overridden address differs from the payload at the DEFAULT segment's address, so a lowering
+///    that silently used DS reads the wrong dword. Native-vs-interpreter equality alone could not
+///    catch that -- both could be wrong together -- so the loaded value is asserted absolutely and
+///    the stored word is asserted to have landed at the overridden address.
+///  * **The store half is the doom row's shape.** `0x89 /6` `mov word [ss:m], si` carries 9,776,315
+///    doom exits and the load half `0x8B /2` `mov edx, [ss:m32]` another 9,776,202 -- together
+///    97.63% of doom's whole rejected class.
+#[test]
+fn a_mid_block_access_through_a_segment_override_matches_the_interpreter() {
+    // Well clear of the code page, and far enough apart that the five bases cannot alias.
+    const OFFSET: u32 = 0x1800;
+    const LOADED: u32 = 0xdead_beef;
+    const DECOY: u32 = 0x1111_2222;
+    const STORED: u16 = 0xc0de;
+
+    for (segment, selector, prefix) in OVERRIDE_CASES {
+        let base = u32::from(selector) << 4;
+        let mut code = vec![
+            0x90, // starter -- the entry position, deliberately not a tested opcode
+            0x40, // inc eax
+        ];
+        // mov edx, [seg:OFFSET] -- the 0x8B /2 row
+        code.push(prefix);
+        code.extend_from_slice(&[0x8b, 0x15]);
+        code.extend_from_slice(&OFFSET.to_le_bytes());
+        // mov word [seg:OFFSET+8], si -- the 0x89 /6 row, doom's prefix mask 97
+        code.push(prefix);
+        code.extend_from_slice(&[0x66, 0x89, 0x35]);
+        code.extend_from_slice(&(OFFSET + 8).to_le_bytes());
+        code.extend_from_slice(&[
+            0x43, // inc ebx
+            0xf4, // hlt
+        ]);
+
+        let mut memory = vec![0; 0x4000];
+        memory[0x100..0x100 + code.len()].copy_from_slice(&code);
+        let hit = (base + OFFSET) as usize;
+        memory[hit..hit + 4].copy_from_slice(&LOADED.to_le_bytes());
+        // The decoy sits where the DEFAULT segment would reach. DS is the default for a `[disp32]`
+        // operand, so the DS case has no decoy to place and is carried instead by the EBP fixture
+        // below, where the default is SS and the override genuinely moves the access.
+        if base != 0 {
+            memory[OFFSET as usize..OFFSET as usize + 4].copy_from_slice(&DECOY.to_le_bytes());
+        }
+
+        let mut interp = segment_override_cpu();
+        let mut native = segment_override_cpu();
+        let mut interp_bus = TestBus::with_memory(memory.clone());
+        let mut native_bus = TestBus::with_memory(memory);
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+        for cpu in [&mut interp, &mut native] {
+            cpu.registers.set_esp(0x0f00);
+            cpu.registers.set_esi(u32::from(STORED));
+        }
+        drive(&mut interp, &mut interp_bus);
+        drive(&mut native, &mut native_bus);
+        native.set_jit_auto_admit(true);
+        for _ in 0..3 {
+            native.halted = false;
+            native.registers.eip = 0x100;
+            drive(&mut native, &mut native_bus);
+        }
+        assert_eq!(
+            native.jit_direct.len(),
+            1,
+            "{segment:?}: one block installed"
+        );
+
+        for cpu in [&mut interp, &mut native] {
+            cpu.halted = false;
+            cpu.registers.eip = 0x100;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0x0f00);
+            cpu.registers.set_esi(u32::from(STORED));
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.memory[hit + 8..hit + 12].fill(0);
+            bus.trace = BusTrace::default();
+        }
+        let direct_before = native.perf_counters().jit_direct_insns;
+        let side_before = native.perf_counters().jit_direct_side_exits;
+
+        let interp_outcomes = drive(&mut interp, &mut interp_bus);
+        let native_outcomes = drive(&mut native, &mut native_bus);
+
+        assert_eq!(native_outcomes, interp_outcomes, "{segment:?}: outcomes");
+        assert_eq!(native, interp, "{segment:?}: whole CPU state");
+        assert_eq!(native_bus.memory, interp_bus.memory, "{segment:?}: RAM");
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "{segment:?}: aggregate bus clocks"
+        );
+
+        // The absolute controls: the OVERRIDE, not the default segment, chose both addresses.
+        assert_eq!(
+            native.registers.edx(),
+            LOADED,
+            "{segment:?}: the load must have read through the override, not through DS"
+        );
+        assert_eq!(
+            u16::from_le_bytes(native_bus.memory[hit + 8..hit + 10].try_into().unwrap()),
+            STORED,
+            "{segment:?}: the store must have landed at the overridden address"
+        );
+        assert_eq!(
+            u16::from_le_bytes(native_bus.memory[hit + 10..hit + 12].try_into().unwrap()),
+            0,
+            "{segment:?}: a Word store writes two bytes, not four"
+        );
+
+        // Anti-vacuity, and it is what makes every comparison above a statement about the EMITTER
+        // rather than about the interpreter compared with itself.
+        //
+        // The installed block starts at the INC, not at the NOP: `run_budgeted` retires a run's
+        // first instruction through `cycle_no_interrupt_check_with_budget` and only then takes a
+        // direct continuation, so the starter is interpreted and the block key is ENTRY+1. That is
+        // exactly what the starter is for -- it puts the overridden load and store at slots 2 and 3
+        // of a four-slot block, where the entry-position trap cannot hide an untested emitter arm.
+        let key = jit::direct::key_for(&native, 0x101, true).unwrap();
+        assert!(
+            matches!(
+                native.jit_direct.probe(key),
+                jit::direct::BlockProbe::Ready(_)
+            ),
+            "{segment:?}: the mid-block entry must be a live compiled block"
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - direct_before,
+            4,
+            "{segment:?}: the block must span inc/load/store/inc"
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_side_exits - side_before,
+            0,
+            "{segment:?}: neither overridden access may side-exit -- they must RUN natively"
+        );
+    }
+}
+
+/// The DS override where it is load-bearing: an EBP-based operand defaults to SS, and `3E` moves
+/// it to DS.
+///
+/// The case above cannot test DS. A `[disp32]` operand already defaults to DS, so the prefix is
+/// architecturally inert there and that fixture would pass with the override dropped on the floor.
+/// This one fails if the override is ignored, because the two segments have different bases.
+#[test]
+fn a_ds_override_on_a_stack_relative_operand_matches_the_interpreter() {
+    const LOADED: u32 = 0x5555_aaaa;
+    const DECOY: u32 = 0x1111_2222;
+    // DS base 0, SS base 0x800. EBP picks the offset; the segment picks which payload is reached.
+    const EBP: u32 = 0x1900;
+
+    let code = [
+        0x90, // starter
+        0x40, // inc eax
+        0x3e, 0x8b, 0x55, 0x00, // mov edx, [ds:ebp+0], MID-BLOCK
+        0x43, // inc ebx
+        0xf4, // hlt
+    ];
+    let mut memory = vec![0; 0x4000];
+    memory[0x100..0x100 + code.len()].copy_from_slice(&code);
+    memory[EBP as usize..EBP as usize + 4].copy_from_slice(&LOADED.to_le_bytes());
+    memory[(0x800 + EBP) as usize..(0x800 + EBP) as usize + 4]
+        .copy_from_slice(&DECOY.to_le_bytes());
+
+    let mut interp = segment_override_cpu();
+    let mut native = segment_override_cpu();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    for cpu in [&mut interp, &mut native] {
+        cpu.registers.set_esp(0x0f00);
+        cpu.registers.set_ebp(EBP);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        native.registers.set_ebp(EBP);
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(native.jit_direct.len(), 1);
+
+    for cpu in [&mut interp, &mut native] {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0x0f00);
+        cpu.registers.set_ebp(EBP);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.trace = BusTrace::default();
+    }
+    let direct_before = native.perf_counters().jit_direct_insns;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(
+        native.registers.edx(),
+        LOADED,
+        "the DS override must have moved the EBP-relative access off SS"
+    );
+    // Three, not four: the starter NOP is the run's first instruction and is interpreted, so the
+    // block is the inc/load/inc at ENTRY+1 and the override sits at its middle slot.
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 3);
+}
+
+/// The STALE-BASE hazard, on a segment that ONLY an override puts in the block.
+///
+/// `DirectKind::read_segment` carries a comment calling itself "a correctness site, not
+/// bookkeeping": a memory kind that answers `None` makes `kind_segment_access_supported` trivially
+/// true AND keeps the segment out of `SegmentLayout.used`, and `data_matches` SKIPS unused
+/// segments, so a cached block would keep matching after the guest reloads that segment and would
+/// read through the base baked into its emitted code.
+///
+/// Before this slice the comment was untestable for anything but DS and SS, because those are the
+/// only segments a lowered kind could name. **A mutation that made `Load` answer `None` survived
+/// the whole crate** — every other fixture either has a Store declaring the same segment (which
+/// puts the bit back in `used`) or uses DS, which the block reads anyway.
+///
+/// This fixture is the first that can see it. The block reads FS and nothing else touches FS, so
+/// the ONLY thing that can put FS in the pinned set is `Load::read_segment`. The guest then moves
+/// FS's base between two runs and the payload differs at the two bases, so a block that kept
+/// matching returns the old dword and a block that correctly refused to match returns the new one.
+#[test]
+fn a_load_through_an_override_pins_that_segment_against_a_guest_reload() {
+    const OFFSET: u32 = 0x1800;
+    const FIRST_SELECTOR: u16 = 0x00c0; // base 0x0c00
+    const SECOND_SELECTOR: u16 = 0x0140; // base 0x1400
+    const FIRST_PAYLOAD: u32 = 0x1111_1111;
+    const SECOND_PAYLOAD: u32 = 0x2222_2222;
+
+    let code = [
+        0x90, // starter
+        0x40, // inc eax
+        0x64, 0x8b, 0x15, 0x00, 0x18, 0x00, 0x00, // mov edx, [fs:0x1800] -- the ONLY FS user
+        0x43, // inc ebx
+        0xf4, // hlt
+    ];
+    let mut memory = vec![0; 0x4000];
+    memory[0x100..0x100 + code.len()].copy_from_slice(&code);
+    let first = ((u32::from(FIRST_SELECTOR) << 4) + OFFSET) as usize;
+    let second = ((u32::from(SECOND_SELECTOR) << 4) + OFFSET) as usize;
+    memory[first..first + 4].copy_from_slice(&FIRST_PAYLOAD.to_le_bytes());
+    memory[second..second + 4].copy_from_slice(&SECOND_PAYLOAD.to_le_bytes());
+
+    let mut interp = segment_override_cpu();
+    let mut native = segment_override_cpu();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    for cpu in [&mut interp, &mut native] {
+        cpu.load_segment_real(SegmentIndex::Fs, FIRST_SELECTOR);
+        cpu.registers.set_esp(0x0f00);
+    }
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        native.halted = false;
+        native.registers.eip = 0x100;
+        drive(&mut native, &mut native_bus);
+    }
+    assert_eq!(native.jit_direct.len(), 1);
+    assert_eq!(
+        native.registers.edx(),
+        FIRST_PAYLOAD,
+        "control: while FS still names the first base, the block must read the first payload"
+    );
+
+    // The guest reloads FS. The block's emitted code has the OLD base baked into it, so the only
+    // thing that can stop it running is FS being in the pinned set.
+    for cpu in [&mut interp, &mut native] {
+        cpu.load_segment_real(SegmentIndex::Fs, SECOND_SELECTOR);
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0x0f00);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.trace = BusTrace::default();
+    }
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native, interp);
+    assert_eq!(
+        native.registers.edx(),
+        SECOND_PAYLOAD,
+        "the reloaded FS must be honoured: a block that kept matching would return the payload at \
+         the STALE base, which is exactly what `read_segment`'s comment warns about"
+    );
+}
+
+/// The NULL-SELECTOR and ACCESS-RIGHTS hazards, and the point is the same as the limit fixture's:
+/// slice 6 invents no path for either, it merely reaches the existing one for the first time.
+///
+/// An override can name a segment that is null, or that cannot be accessed the way the instruction
+/// wants. Both die in `segment_access_supported`, consulted from `kind_segment_access_supported`
+/// on every slot and again from `SegmentLayout::capture` at the end of the walk:
+///
+///  * a segment loaded with a null selector installs `SegmentRegister::default()` — `access == 0`,
+///    so the present bit is clear (`control.rs:1248`: "a later memory access through it faults with
+///    #GP(0)"), and
+///  * a CODE descriptor in a data segment register fails the `!write || (!code && writable)` clause
+///    on any store.
+///
+/// The refusal is **fail-closed and it is a `Retry`, not a `StructuralReject`**: no block forms, no
+/// rejected span is installed, and the interpreter executes the instruction and takes whatever
+/// fault its own rules say. That is what every already-admitted DS and SS access does today.
+///
+/// **A NEVER-LOADED FS or GS is a different case and is NOT refused, deliberately.**
+/// `Registers::default` seeds all six data segments with `SegmentRegister::real(0)` — access 0x93,
+/// present, writable, base 0, limit 0xFFFF — so a guest that enters protected mode without ever
+/// loading FS has a perfectly accessible FS descriptor and an override through it COMPILES. That is
+/// correct twice over: the JIT and the interpreter read the same `registers.segment(segment)`, so
+/// they form the same linear address and take the same limit fault; and it matches real silicon,
+/// where entering protected mode does not reload the descriptor caches. The compile-time check is
+/// strictly stricter than the interpreter's runtime one, never looser. What keeps that safe over
+/// time is not this fixture but
+/// `a_load_through_an_override_pins_that_segment_against_a_guest_reload`, which pins the block
+/// against the moment the guest finally does load the segment.
+///
+/// Each case carries a control that differs ONLY in the descriptor, so the refusal cannot be the
+/// override's doing, the opcode's, or the fixture's shape.
+#[test]
+fn an_override_naming_an_inaccessible_segment_refuses_to_compile_at_all() {
+    const ENTRY: u32 = 0x100;
+    const NULL_SEGMENT: SegmentRegister = SegmentRegister {
+        selector: 0,
+        base: 0,
+        limit: 0,
+        access: 0,
+        default_size_32: false,
+    };
+
+    let load = [0x40, 0x41, 0x64, 0x8b, 0x15, 0x00, 0x08, 0x00, 0x00];
+    let store = [0x40, 0x41, 0x26, 0x89, 0x15, 0x00, 0x08, 0x00, 0x00];
+
+    for (label, code, segment, refused, admitted) in [
+        (
+            "null FS on a read",
+            load,
+            SegmentIndex::Fs,
+            NULL_SEGMENT,
+            SegmentRegister::flat(0x10, 0x93),
+        ),
+        (
+            "code-segment ES on a write",
+            store,
+            SegmentIndex::Es,
+            SegmentRegister::flat(0x18, 0x9b),
+            SegmentRegister::flat(0x10, 0x93),
+        ),
+    ] {
+        for (expect_block, descriptor) in [(false, refused), (true, admitted)] {
+            let mut memory = vec![0; 0x2000];
+            memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+            let mut bus = TestBus::with_memory(memory);
+            bus.direct_pages_enabled = true;
+
+            let mut cpu = flat_stack_cpu(ENTRY);
+            cpu.registers.set_segment(segment, descriptor);
+            for lin in [ENTRY, ENTRY + 1, ENTRY + 2] {
+                cpu.set_eip(lin);
+                cpu.fetch_decoded(&mut bus, lin).expect("fixture decode");
+            }
+            cpu.set_eip(ENTRY);
+            cpu.jit_direct.set_fast_map_enabled_for_test(true);
+            map_direct_page(
+                &mut cpu,
+                &mut bus,
+                0,
+                0,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                true,
+            );
+
+            match jit::direct::compile(&mut cpu, ENTRY, true) {
+                jit::direct::CompileOutcome::Compiled(compilation) => {
+                    assert!(expect_block, "{label}: must NOT have compiled");
+                    assert_eq!(
+                        compilation.span.instructions, 3,
+                        "{label} control: the block must span both INCs and the access"
+                    );
+                }
+                jit::direct::CompileOutcome::Retry => assert!(
+                    !expect_block,
+                    "{label} control: the accessible descriptor must compile"
+                ),
+                jit::direct::CompileOutcome::StructuralReject(_) => panic!(
+                    "{label}: an inaccessible segment must fail CLOSED as a Retry -- a structural \
+                     reject would install a rejected span and a page watch for a block that is \
+                     merely unformable in this segment state"
+                ),
+            }
+        }
+    }
+}
+
+/// The LIMIT hazard, and the point is that slice 6 invents NO fault path for it.
+///
+/// An override can name a segment whose limit excludes the access. Nothing new is needed:
+/// `emit_segmented_linear_address` already compares the effective address against
+/// `descriptor.limit - (width - 1)` for every segment whose limit is not 4 GB and jumps to the
+/// `SegmentLimit` side exit when it fails, and the side exit rolls back to the instruction
+/// boundary so the INTERPRETER re-executes and faults by its own rules. Because the override is
+/// folded into `addr.segment` at decode, the interpreter's `segment_limit_fault(segment)` picks
+/// the vector off the OVERRIDDEN segment too -- **#SS(12) for an SS override, #GP(13) otherwise**
+/// -- which is the architectural rule, reached with no code written for it.
+///
+/// Both halves are load-bearing, and each pins something the other cannot.
+///
+///  * The **FS** case pins that the guard fires on a segment the DEFAULT would have allowed. The
+///    operand is `[disp32]`, whose default segment is a flat 64 KB DS that admits offset 0x1800
+///    without complaint; only the override moves it onto the short-limit FS. Drop the decode fold
+///    and this half stops side-exiting at all.
+///  * The **SS** case pins the vector SPLIT, and it is measured rather than tabulated: the two
+///    vectors have distinct real-mode IVT handlers, and the assertion reads the delivered vector
+///    back out of EIP after the interpreter's re-run. An earlier draft asserted
+///    `segment_limit_fault(segment)` against a loop constant, which is a table test of a `const fn`
+///    wearing a fixture's name -- it never touched either role's state and would have passed with
+///    the whole slice reverted.
+#[test]
+fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_segment() {
+    const ENTRY: u32 = 0x100;
+    const LOAD: u32 = ENTRY + 2;
+    const OFFSET: u32 = 0x1800;
+    const INITIAL_ESP: u32 = 0x0f00;
+    // One byte short of the four the load needs: `max_start = limit - 3` refuses OFFSET.
+    const SHORT_LIMIT: u32 = OFFSET + 2;
+    // Indexed by `vector - 12`: #SS then #GP.
+    const HANDLER_OFFSET: [u32; 2] = [0x0300, 0x0380];
+
+    for (segment, prefix, base, vector) in [
+        (SegmentIndex::Ss, 0x36u8, 0x0800u32, 12u32),
+        (SegmentIndex::Fs, 0x64u8, 0x0c00u32, 13u32),
+    ] {
+        let mut code = vec![
+            0x40, // inc eax
+            0x41, // inc ecx
+        ];
+        code.push(prefix);
+        code.extend_from_slice(&[0x8b, 0x15]);
+        code.extend_from_slice(&OFFSET.to_le_bytes());
+        let mut memory = vec![0; 0x4000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        // A payload at the address the load WOULD reach. Without it EDX reads zero whether the
+        // load faulted or completed, and the "the load never happened" assertion below would hold
+        // vacuously.
+        let payload = (base + OFFSET) as usize;
+        memory[payload..payload + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        // Real-mode IVT entries for #SS(12) and #GP(13), at DISTINCT handler offsets in segment 0.
+        // This is what turns the vector claim into a measurement: the vector is read back out of
+        // EIP after the fault is delivered, rather than asserted from a table of loop constants.
+        let handler = HANDLER_OFFSET[usize::try_from(vector).unwrap() - 12];
+        for (v, offset) in [(12u32, HANDLER_OFFSET[0]), (13, HANDLER_OFFSET[1])] {
+            let slot = (v * 4) as usize;
+            memory[slot..slot + 2].copy_from_slice(&(offset as u16).to_le_bytes());
+            memory[slot + 2..slot + 4].copy_from_slice(&0u16.to_le_bytes());
+        }
+
+        let mut native = segment_override_cpu();
+        let mut interp = segment_override_cpu();
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+        for cpu in [&mut native, &mut interp] {
+            // Short enough to refuse the load, long enough that the SS case can still push the
+            // fault frame -- otherwise the SS half would measure a double fault instead.
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.limit = SHORT_LIMIT;
+            cpu.registers.set_segment(segment, descriptor);
+            cpu.registers.set_esp(INITIAL_ESP);
+            cpu.registers.eip = ENTRY;
+        }
+
+        for lin in [ENTRY, ENTRY + 1, LOAD] {
+            for (cpu, bus) in [
+                (&mut native, &mut native_bus),
+                (&mut interp, &mut interp_bus),
+            ] {
+                cpu.registers.eip = lin;
+                cpu.fetch_decoded(bus, lin).expect("fixture decode");
+            }
+        }
+        for cpu in [&mut native, &mut interp] {
+            cpu.registers.eip = ENTRY;
+        }
+        native.jit_direct.set_fast_map_enabled_for_test(true);
+        map_direct_page(
+            &mut native,
+            &mut native_bus,
+            0,
+            0,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+
+        let key = jit::direct::key_for(&native, ENTRY, true).unwrap();
+        assert!(matches!(
+            native.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let compilation = jit::direct::compile(&mut native, ENTRY, true).unwrap();
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{segment:?}: the limit is a RUNTIME guard, so the block must still span the load"
+        );
+        let id = native.jit_direct.install(&compilation).unwrap();
+        let block = native
+            .jit_direct
+            .block(id)
+            .expect("installed block must be live");
+
+        let side_exits = native.perf_counters().jit_direct_side_exits;
+        let limit_exits = native.direct_stall_snapshot().side_exit_segment_limit;
+        let insns_before = native.perf_counters().jit_direct_insns;
+
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap()
+        );
+        interp.cycle(&mut interp_bus).unwrap();
+        interp.cycle(&mut interp_bus).unwrap();
+
+        assert_eq!(native.registers, interp.registers, "{segment:?}: registers");
+        assert_eq!(
+            native.registers.eip, LOAD,
+            "{segment:?}: the side exit must leave EIP at the load, before any effect"
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_side_exits - side_exits,
+            1,
+            "{segment:?}: exactly one side exit"
+        );
+        assert_eq!(
+            native.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
+            1,
+            "{segment:?}: and it must be the SegmentLimit guard, not some other one"
+        );
+        // Anti-vacuity: the two fillers retired natively, the load did not.
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - insns_before,
+            2,
+            "{segment:?}"
+        );
+
+        // The fault itself is the INTERPRETER's, taken on the re-run, and it is the same fault on
+        // both roles.
+        let native_step = native.cycle(&mut native_bus);
+        let interp_step = interp.cycle(&mut interp_bus);
+        assert_eq!(
+            format!("{native_step:?}"),
+            format!("{interp_step:?}"),
+            "{segment:?}: the re-run must produce the same outcome on both roles"
+        );
+        assert_eq!(
+            native.registers, interp.registers,
+            "{segment:?}: post-fault"
+        );
+        assert_eq!(
+            native_bus.memory, interp_bus.memory,
+            "{segment:?}: post-fault RAM"
+        );
+        assert_eq!(
+            native.registers.edx(),
+            0,
+            "{segment:?}: the load must have FAULTED, not completed -- the payload is 0xdeadbeef"
+        );
+        assert_ne!(
+            native.registers.eip, LOAD,
+            "{segment:?}: the interpreter's re-run must have taken the fault and vectored away"
+        );
+        // THE VECTOR SPLIT, measured. EIP now holds whichever IVT handler the delivered vector
+        // named, and the two handlers are distinct, so this reads the vector out of the machine
+        // rather than asserting it from the loop's own constants. An SS override must take
+        // #SS(12) and an FS override #GP(13) -- the architectural rule, which falls out of the
+        // decode fold putting the override into `addr.segment` before `segment_limit_fault` ever
+        // sees it. Cross-checked against `segment_limit_fault`'s own answer so that a change to
+        // either the delivery path or the classifier alone breaks this.
+        assert_eq!(
+            native.registers.eip, handler,
+            "{segment:?}: the fault must vector through IVT[{vector}]"
+        );
+        assert!(
+            matches!(
+                segment_limit_fault(segment),
+                InternalFault::Exception { vector: v, error_code: Some(0) }
+                    if u32::from(v) == vector
+            ),
+            "{segment:?}: and the classifier must name the same vector the machine delivered"
+        );
+    }
+}

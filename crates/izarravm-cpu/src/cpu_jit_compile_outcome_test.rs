@@ -200,37 +200,48 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
     assert_eq!(row.runtime_hits, 0);
 }
 
-/// The prefix arm of the compile walk is ATTRIBUTED, not silent.
+/// The prefix arm of the compile walk is ATTRIBUTED, not silent — and, since slice 6, the arm is
+/// reached by a CS override rather than by any segment override.
 ///
 /// Before the completeness slice, `record_barrier` fired on the `HardBoundary` arm alone, so a
-/// block stopped by an unsupported prefix installed a rejected span with no census row. The
-/// control half is what makes this non-vacuous: the SAME opcode at the SAME position with no
-/// prefix is lowered and the block runs past it, so the row can only be the prefix's doing.
+/// block stopped by an unsupported prefix installed a rejected span with no census row.
+///
+/// TWO controls, and together they pin the whole admitted/refused split at ONE code site:
+///  * the SAME opcode at the SAME position with no prefix is lowered, so the row is the prefix's
+///    doing and not the load's;
+///  * the SAME opcode at the SAME position behind an **SS** override is ALSO lowered, so the row
+///    is specifically the CS override's doing and not "a segment override's". That is the slice-6
+///    decision expressed as a fixture: had the admission been written to take every segment, this
+///    test would fail on the CS half; had it been written to take none, it would fail on the SS
+///    half.
 #[test]
 fn barrier_census_attributes_the_prefix_refusal_arm() {
-    // `mov eax, [eax]`, once behind an explicit ES override and once bare.
-    let prefixed = [0x40, 0x41, 0x42, 0x43, 0x26, 0x8b, 0x00, 0x44, 0x45];
+    // `mov eax, [eax]`, behind a CS override, behind an SS override, and bare.
+    let prefixed = [0x40, 0x41, 0x42, 0x43, 0x2e, 0x8b, 0x00, 0x44, 0x45];
+    let ss_override = [0x40, 0x41, 0x42, 0x43, 0x36, 0x8b, 0x00, 0x44, 0x45];
     let bare = [0x40, 0x41, 0x42, 0x43, 0x8b, 0x00, 0x44, 0x45, 0x46];
     let addresses: Vec<_> = (0..9u32).map(|offset| ENTRY + offset).collect();
 
-    let (mut control_cpu, mut control_bus) = fixture(&bare);
-    control_cpu.enable_direct_barrier_census(true);
-    warm(&mut control_cpu, &mut control_bus, &addresses);
-    let control = compiled(jit::direct::compile(&mut control_cpu, ENTRY, true));
-    assert!(
-        control.span.instructions > 5,
-        "control: the unprefixed load must be lowered so the walk runs past it, got {} slots",
-        control.span.instructions
-    );
-    assert!(
-        control_cpu
-            .direct_barrier_census_snapshot()
-            .expect("enabled census snapshot")
-            .rows
-            .iter()
-            .all(|row| row.opcode != 0x8b),
-        "control: the unprefixed load must not be a barrier at all"
-    );
+    for (label, code) in [("bare", bare.as_slice()), ("ss override", &ss_override)] {
+        let (mut control_cpu, mut control_bus) = fixture(code);
+        control_cpu.enable_direct_barrier_census(true);
+        warm(&mut control_cpu, &mut control_bus, &addresses);
+        let control = compiled(jit::direct::compile(&mut control_cpu, ENTRY, true));
+        assert!(
+            control.span.instructions > 5,
+            "control {label}: the load must be lowered so the walk runs past it, got {} slots",
+            control.span.instructions
+        );
+        assert!(
+            control_cpu
+                .direct_barrier_census_snapshot()
+                .expect("enabled census snapshot")
+                .rows
+                .iter()
+                .all(|row| row.opcode != 0x8b),
+            "control {label}: the load must not be a barrier at all"
+        );
+    }
 
     let (mut cpu, mut bus) = fixture(&prefixed);
     cpu.enable_direct_barrier_census(true);
@@ -238,7 +249,7 @@ fn barrier_census_attributes_the_prefix_refusal_arm() {
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(
         compilation.span.instructions, 4,
-        "the prefixed load must stop the walk at the four INCs"
+        "the CS-prefixed load must stop the walk at the four INCs"
     );
 
     let snapshot = cpu
@@ -250,9 +261,12 @@ fn barrier_census_attributes_the_prefix_refusal_arm() {
         .find(|row| row.opcode == 0x8b)
         .expect("the prefix refusal must produce a census row");
     assert_eq!(row.stop_reason, "prefix_unsupported");
-    assert_ne!(
-        row.prefix_mask, 0,
-        "the row must name the prefix that refused it"
+    // `(segment_index(Cs) + 1) << 5` = 64. Asserted to the value rather than as "non-zero": the
+    // census reader decodes this mask to name the segment, and doom's surviving CS-override row is
+    // read off it.
+    assert_eq!(
+        row.prefix_mask, 64,
+        "the row must name CS as the prefix that refused it"
     );
     assert_eq!(row.hits, 1);
     assert_eq!(row.native_prefix_instructions, 4);
