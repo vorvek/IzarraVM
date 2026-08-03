@@ -682,6 +682,20 @@ pub(crate) struct KateaTreeVolume {
     /// Read-path attribution for the boot profiler. `Cell` because `read_sector`
     /// is `&self`; the emulation thread owns the volume, so no sharing is implied.
     counters: std::cell::Cell<KateaStorageCounters>,
+    /// One open read handle for the host file most recently served, so a
+    /// sequential read pays one `File::open` instead of one per 512-byte sector.
+    /// A single entry is the right size: DOS reads one file at a time through one
+    /// handle, so the hit rate on a game load is ~100%, and a second entry would
+    /// only pay off for an access pattern DOS cannot produce.
+    ///
+    /// `RefCell` for the same reason `counters` is a `Cell`: `read_sector` is
+    /// `&self` and the emulation thread owns the volume.
+    ///
+    /// INVALIDATION: `reconcile_mode` clears this on entry. It is the single
+    /// funnel for every host mutation (`atomic_write`, `fs::rename`, deletes), and
+    /// a stale handle matters because `File::open` shares delete and rename, so a
+    /// replaced file would otherwise keep reading its pre-write contents.
+    host_read_cache: std::cell::RefCell<Option<(PathBuf, File)>>,
 }
 
 /// What the Katea host-folder read path did, for the boot profiler's disk phases.
@@ -702,9 +716,14 @@ pub struct KateaStorageCounters {
     /// `Instant::now` calls are not a hot-path tax.
     pub host_wall_ns: u64,
     /// Cluster-run table entries scanned to resolve data sectors. `data_sector`
-    /// searches `runs` linearly, so this is the read path's own search cost, in
-    /// units the mounted tree's size explains.
+    /// binary-searches the sorted `runs`, so this is now `log2(runs)` per sector
+    /// rather than the tree-size-dependent linear walk it was built to expose.
     pub run_scan_steps: u64,
+    /// Host `File::open` calls. Distinct from `host_file_reads` (which counts
+    /// SECTORS served from a host file) because the one-entry handle cache makes
+    /// them differ: their ratio is what says the cache is working. Before the
+    /// cache they were equal by construction.
+    pub host_file_opens: u64,
 }
 
 /// Katea's belief about one host-side entry (file or dir): where it lives, the
@@ -956,6 +975,7 @@ impl KateaTreeVolume {
             #[cfg(test)]
             atomic_write_bytes: 0,
             counters: std::cell::Cell::new(KateaStorageCounters::default()),
+            host_read_cache: std::cell::RefCell::new(None),
         })
     }
 
@@ -1119,6 +1139,12 @@ impl KateaTreeVolume {
     }
 
     fn reconcile_mode(&mut self, mode: ReconcileMode) {
+        // Drop the cached read handle before touching the host. This is the only
+        // funnel for host mutation -- `atomic_write`, `fs::rename`, deletes -- and
+        // `File::open` shares delete and rename on Windows, so a rewritten file
+        // would otherwise keep serving its pre-write contents through a handle
+        // that is still perfectly valid and now points at the wrong bytes.
+        self.host_read_cache.replace(None);
         // A guest-written sector that cannot be read back reads as zeros, and zeros
         // are not a safe input here: phase 2 reads a zeroed FAT entry as "chain
         // freed" and deletes the host file, `parse_dir` stops at the first zero
@@ -1640,14 +1666,29 @@ impl KateaTreeVolume {
     /// serving directory entries or lazy file bytes. A cluster in no run is free
     /// space (zeros).
     fn data_sector(&self, cluster: u32, sector_in_cluster: u32) -> [u8; SECTOR] {
-        // Counted, not just walked: this is a linear scan of every cluster run in
-        // the mounted tree on every data-sector read, so its cost grows with the
-        // size of the folder rather than with the bytes the guest asked for.
+        // `runs` is sorted by `first_cluster` (the constructor sorts it after
+        // `flatten`) and its ranges are disjoint and non-empty: `assign_dir` hands
+        // out clusters from one monotonically increasing counter, and
+        // `clusters_for` floors every count at 1, so `last >= first` always and no
+        // two runs overlap. Those three facts are exactly what makes a binary
+        // search return the same run the old linear `find` did -- for a cluster in
+        // some run, that run is the unique one, and for a cluster in none, the
+        // candidate fails the `last` test and it reads back as free space.
+        //
+        // This was a linear walk of the whole table on EVERY data sector, so its
+        // cost grew with the folder rather than with the bytes the guest asked
+        // for: measured at 778 steps per sector for a file deep in an 879-file
+        // tree, i.e. 28.4 M steps to load one 18 MB PAK, against 7.9 steps for a
+        // root-level file in a three-file folder.
         let mut steps = 0u64;
-        let found = self.runs.iter().find(|(first, last, _)| {
+        let candidate = self.runs.partition_point(|(first, _, _)| {
             steps += 1;
-            cluster >= *first && cluster <= *last
+            *first <= cluster
         });
+        let found = candidate
+            .checked_sub(1)
+            .and_then(|i| self.runs.get(i))
+            .filter(|(_, last, _)| cluster <= *last);
         let mut counters = self.counters.get();
         counters.run_scan_steps = counters.run_scan_steps.saturating_add(steps);
         self.counters.set(counters);
@@ -1673,7 +1714,13 @@ impl KateaTreeVolume {
                 let f = &self.files[*id];
                 let byte_off = u64::from(cluster_off) * u64::from(spc) * SECTOR as u64
                     + u64::from(sector_in_cluster) * SECTOR as u64;
-                read_source_span(&f.source, byte_off, f.size, &self.counters)
+                read_source_span(
+                    &f.source,
+                    byte_off,
+                    f.size,
+                    &self.counters,
+                    &self.host_read_cache,
+                )
             }
         }
     }
@@ -1736,6 +1783,7 @@ fn read_source_span(
     byte_off: u64,
     size: u32,
     counters: &std::cell::Cell<KateaStorageCounters>,
+    cache: &std::cell::RefCell<Option<(PathBuf, File)>>,
 ) -> [u8; SECTOR] {
     let mut out = [0u8; SECTOR];
     let valid = u64::from(size).saturating_sub(byte_off).min(SECTOR as u64) as usize;
@@ -1752,22 +1800,51 @@ fn read_source_span(
             out[..avail].copy_from_slice(&v[start..start + avail]);
         }
         FileSource::HostFile { path, .. } => {
-            // One open + seek + read per 512-byte sector. Timed and counted
-            // because that ratio, not the byte count, is what the boot profiler
-            // needs in order to price a guest-visible disk read.
+            // Seek + read on a cached handle, opening only when the path changes.
+            // This used to open the file afresh for every 512-byte sector: 36,503
+            // opens at ~41 us each, 1.50 s of pure host I/O, to load one 18 MB PAK.
+            //
+            // Timed and counted because the open-to-sector ratio, not the byte
+            // count, is what the boot profiler needs in order to price a
+            // guest-visible disk read.
             let started = std::time::Instant::now();
-            match File::open(path).and_then(|mut f| {
-                f.seek(SeekFrom::Start(byte_off))?;
-                f.read_exact(&mut out[..valid])
-            }) {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
-                    out = [0u8; SECTOR];
+            let mut opened = 0u64;
+            let mut slot = cache.borrow_mut();
+            let reusable = slot.as_ref().is_some_and(|(cached, _)| cached == path);
+            if !reusable {
+                // Drop the old handle before opening the new one, so at most one
+                // host file is held open at a time.
+                *slot = None;
+                match File::open(path) {
+                    Ok(file) => {
+                        opened = 1;
+                        *slot = Some((path.clone(), file));
+                    }
+                    Err(e) => eprintln!("katea: open {}: {e}", path.display()),
                 }
             }
+            match slot.as_mut() {
+                Some((_, file)) => {
+                    if let Err(e) = file
+                        .seek(SeekFrom::Start(byte_off))
+                        .and_then(|_| file.read_exact(&mut out[..valid]))
+                    {
+                        eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
+                        out = [0u8; SECTOR];
+                        // A failed read can leave the handle at an unknown offset,
+                        // and the file may have been truncated underneath us. Drop
+                        // it so the next sector re-opens rather than compounding.
+                        *slot = None;
+                    }
+                }
+                // The open failed and already logged; read back as zeros, exactly
+                // as the pre-cache path did for a vanished host file.
+                None => out = [0u8; SECTOR],
+            }
+            drop(slot);
             let mut tally = counters.get();
             tally.host_file_reads += 1;
+            tally.host_file_opens = tally.host_file_opens.saturating_add(opened);
             tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
             tally.host_wall_ns = tally
                 .host_wall_ns

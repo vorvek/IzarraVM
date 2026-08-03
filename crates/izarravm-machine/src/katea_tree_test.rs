@@ -1693,3 +1693,168 @@ fn dos_folder_list_matches_the_committed_image() {
         "DOS_FOLDER_BINARIES has drifted from the committed image's C:\\DOS"
     );
 }
+
+/// The binary search in `data_sector` must pick exactly the run the old linear
+/// `find` did, for every cluster the tree covers AND for the free space past it.
+/// Checked against a literal re-implementation of the linear scan rather than
+/// against expected bytes, so the property is "same answer", not "some answer".
+#[test]
+fn run_table_binary_search_agrees_with_a_linear_scan_over_every_cluster() {
+    let root = scratch("runsearch");
+    // Enough entries, at enough depths, that a wrong index lands on a wrong run
+    // rather than coincidentally on the right one.
+    for d in 0..6 {
+        let dir = root.join(format!("DIR{d}"));
+        fs::create_dir_all(&dir).unwrap();
+        for f in 0..7 {
+            fs::write(dir.join(format!("F{f}.BIN")), vec![(d * 7 + f) as u8; 900]).unwrap();
+        }
+    }
+    let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+    let img = izarravm_firmware::tokados_hdd_img();
+    let mut mbr = [0u8; 512];
+    mbr.copy_from_slice(&img[0..512]);
+    let mut vbr = [0u8; 512];
+    vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+    let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+
+    assert!(vol.runs.len() > 40, "want a table worth searching");
+    // The sortedness and disjointness the search relies on.
+    for pair in vol.runs.windows(2) {
+        assert!(
+            pair[0].0 <= pair[1].0,
+            "runs must be sorted by first_cluster"
+        );
+        assert!(pair[0].1 < pair[1].0, "runs must be disjoint and non-empty");
+    }
+
+    let highest = vol.runs.iter().map(|r| r.1).max().unwrap();
+    for cluster in 0..=highest + 8 {
+        let linear = vol
+            .runs
+            .iter()
+            .position(|(first, last, _)| cluster >= *first && cluster <= *last);
+        let searched = vol
+            .runs
+            .partition_point(|(first, _, _)| *first <= cluster)
+            .checked_sub(1)
+            .filter(|&i| cluster <= vol.runs[i].1);
+        assert_eq!(linear, searched, "disagreement at cluster {cluster}");
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The cached host handle must serve byte-identical data to a fresh open, and
+/// must actually collapse the opens: one per file, not one per 512-byte sector.
+#[test]
+fn cached_host_handle_serves_identical_bytes_with_one_open_per_file() {
+    let root = scratch("handlecache");
+    // Several clusters' worth, so one file spans many sectors.
+    let big: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let other: Vec<u8> = (0..40_000u32).map(|i| (i % 241) as u8).collect();
+    fs::write(root.join("BIG.BIN"), &big).unwrap();
+    fs::write(root.join("OTHER.BIN"), &other).unwrap();
+    let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+    let img = izarravm_firmware::tokados_hdd_img();
+    let mut mbr = [0u8; 512];
+    mbr.copy_from_slice(&img[0..512]);
+    let mut vbr = [0u8; 512];
+    vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+    let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+
+    // The tree does not carry host names, so identify each file by its first
+    // sector: the two payloads differ from byte 0 (modulo 251 against 241).
+    let find = |want: &[u8]| {
+        vol.tree()
+            .root
+            .files
+            .iter()
+            .find(|f| {
+                f.source.len() == want.len() as u64
+                    && vol.read_sector(vol.cluster_to_lba(f.first_cluster))[..] == want[..SECTOR]
+            })
+            .map(|f| f.first_cluster)
+            .expect("both payloads are in the tree")
+    };
+    let big_first = find(&big);
+    let other_first = find(&other);
+    assert_ne!(big_first, other_first, "the two payloads must be distinct");
+
+    let sectors = 40_000usize.div_ceil(SECTOR);
+    let before = vol.storage_counters();
+
+    // Read BIG.BIN straight through, then OTHER.BIN, then BIG.BIN again.
+    for (first, want) in [(big_first, &big), (other_first, &other), (big_first, &big)] {
+        for s in 0..sectors {
+            let lba = vol.cluster_to_lba(first) + s as u32;
+            let got = vol.read_sector(lba);
+            let start = s * SECTOR;
+            let end = (start + SECTOR).min(want.len());
+            assert_eq!(&got[..end - start], &want[start..end], "sector {s} differs");
+        }
+    }
+
+    let after = vol.storage_counters();
+    let served = after.host_file_reads - before.host_file_reads;
+    let opened = after.host_file_opens - before.host_file_opens;
+    assert_eq!(served as usize, sectors * 3, "every sector still counted");
+    // Three sequential whole-file passes over two distinct paths: one open each.
+    assert_eq!(opened, 3, "want one open per file pass, got {opened}");
+    assert!(
+        served > opened * 20,
+        "the cache must collapse opens: {served} sectors over {opened} opens"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A guest write that reconcile materializes to the host must be visible to the
+/// very next read. The cached handle would otherwise keep serving the file's
+/// pre-write bytes: on Windows `File::open` shares rename and delete, so the
+/// stale handle stays valid and simply points at the wrong content.
+#[test]
+fn reconcile_invalidates_the_cached_host_handle() {
+    let root = scratch("cacheinval");
+    fs::write(root.join("VICTIM.BIN"), vec![0xAAu8; 600]).unwrap();
+    let img = izarravm_firmware::tokados_hdd_img();
+    let mut mbr = [0u8; 512];
+    mbr.copy_from_slice(&img[0..512]);
+    let mut vbr = [0u8; 512];
+    vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+    let sys = vec![
+        ("KERNEL.SYS".to_string(), vec![0xEBu8; 100]),
+        ("COMMAND.COM".to_string(), vec![0u8; 50]),
+    ];
+    let mut vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+
+    let victim = vol
+        .tree()
+        .root
+        .files
+        .iter()
+        .find(|f| f.source.len() == 600)
+        .expect("VICTIM.BIN is in the tree")
+        .first_cluster;
+    let lba = vol.cluster_to_lba(victim);
+
+    // Prime the cache on the original contents.
+    assert_eq!(vol.read_sector(lba)[0], 0xAA);
+    assert!(vol.host_read_cache.borrow().is_some(), "cache is primed");
+
+    // Rewrite the host file behind Katea's back, then run the reconcile that is
+    // the documented invalidation point.
+    fs::write(root.join("VICTIM.BIN"), vec![0x5Cu8; 600]).unwrap();
+    vol.reconcile();
+    assert!(
+        vol.host_read_cache.borrow().is_none(),
+        "reconcile must drop the cached handle"
+    );
+    assert_eq!(
+        vol.read_sector(lba)[0],
+        0x5C,
+        "the next read must see the new host bytes, not the cached handle's"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
