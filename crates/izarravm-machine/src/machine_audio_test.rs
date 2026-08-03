@@ -712,9 +712,9 @@ fn sb_pro_stereo_auto_init_keeps_every_frame_in_a_large_batch() {
 fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
     let mut machine = test_machine();
     // 8 signed-LE stereo frames (32 bytes). The slave 8237A (channel 5)
-    // word-addresses its transfers, so page 0x01 at word addr 0 drives byte
-    // base (0x01 << 17) = 0x2_0000 (page in A23-A17, A0 tied low). Each frame
-    // is L = -1 (0xFFFF) then R = +1 (0x0001).
+    // word-addresses its transfers: the page supplies A23-A17 from its bits
+    // 7-1, so page 0x02 at word addr 0 drives byte base 0x2_0000 (A0 tied
+    // low). Each frame is L = -1 (0xFFFF) then R = +1 (0x0001).
     let frame: [u8; 4] = [0xFF, 0xFF, 0x01, 0x00];
     for i in 0..8 {
         for (j, &b) in frame.iter().enumerate() {
@@ -722,14 +722,14 @@ fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
         }
     }
     with_bus(&mut machine, |bus| {
-        // Slave ch5 (local ch1): word addr 0, page 0x8B=0x01, count 15 (16
+        // Slave ch5 (local ch1): word addr 0, page 0x8B=0x02, count 15 (16
         // words), auto-init read.
         bus.write_io(0xD6, BusWidth::Byte, 0x59, false).unwrap(); // slave ch1 mode: auto-init, read
         bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap(); // word addr 0
         bus.write_io(0xC6, BusWidth::Byte, 0x0F, false).unwrap();
         bus.write_io(0xC6, BusWidth::Byte, 0x00, false).unwrap(); // count 15 -> 16 words
-        bus.write_io(0x8B, BusWidth::Byte, 0x01, false).unwrap(); // page -> byte base 0x2_0000
+        bus.write_io(0x8B, BusWidth::Byte, 0x02, false).unwrap(); // page -> byte base 0x2_0000
         bus.write_io(0xD4, BusWidth::Byte, 0x01, false).unwrap(); // unmask slave ch1
         // Voice volume to unity (0 dB) so the exact -1/+1 samples survive the
         // CT1745 voice attenuation and the test stays about 16-bit decoding.
@@ -778,7 +778,7 @@ fn sb_16bit_dma_waits_for_the_first_sample_deadline_before_reading() {
         bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0xC6, BusWidth::Byte, 0x0F, false).unwrap();
         bus.write_io(0xC6, BusWidth::Byte, 0x00, false).unwrap();
-        bus.write_io(0x8B, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x8B, BusWidth::Byte, 0x02, false).unwrap();
         bus.write_io(0xD4, BusWidth::Byte, 0x01, false).unwrap();
         for &byte in &[0x41u8, 0x56, 0x22, 0xB6, 0x00, 0x03, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
@@ -815,7 +815,7 @@ fn short_16bit_dma_does_not_fabricate_silent_words() {
         bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0xC6, BusWidth::Byte, 0x02, false).unwrap();
         bus.write_io(0xC6, BusWidth::Byte, 0x00, false).unwrap();
-        bus.write_io(0x8B, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x8B, BusWidth::Byte, 0x02, false).unwrap();
         bus.write_io(0xD4, BusWidth::Byte, 0x01, false).unwrap();
         for &byte in &[0x41u8, 0x56, 0x22, 0xB0, 0x00, 0x07, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
