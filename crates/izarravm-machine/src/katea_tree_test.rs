@@ -1571,3 +1571,125 @@ fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Names in `DOS_FOLDER_BINARIES` that are NOT in the committed image: they are
+/// supplied by a runner override at mount time (see `apply_overrides` in
+/// `lib.rs`), so the image has nothing to compare them against.
+///
+/// This list is an unenforced exemption: nothing here checks that an entry
+/// actually reaches an override call site. Before adding a name, trace it to
+/// its real override wiring and confirm the wiring exists -- do NOT add a name
+/// here just to make `dos_folder_list_matches_the_committed_image` pass. If
+/// `DOS_FOLDER_BINARIES` gained a name that is genuinely missing from the
+/// image (the EDIT.COM bug this guard exists to catch), the fix is to put the
+/// file in the image, not to exempt it here.
+///
+/// Worked example, `GLIDE2X.OVL`: `crates/izarravm/src/gui_session.rs`
+/// (`MachineGeneration::initialize`) reads `self.spec.glide_ovl`, wraps it as
+/// `("GLIDE2X.OVL".to_string(), bytes)`, and passes it through
+/// `mount_hdd_folder_with_user_overrides` (`storage.rs`) to `apply_overrides`
+/// (`lib.rs`) -- a real, traceable path from a runner-supplied override to the
+/// overlay. That is the bar every entry here must clear.
+const OVERRIDE_SUPPLIED: &[&str] = &["GLIDE2X.OVL"];
+
+/// Walk the committed image's `C:\DOS` directory and return its 8.3 file names.
+/// Deliberately independent of `extract_system_payload`, which flattens the
+/// tree and so cannot answer "which directory was this in?".
+fn image_dos_folder_names() -> Vec<String> {
+    let img = izarravm_firmware::tokados_hdd_img();
+    let sector = |lba: u32| -> &[u8] {
+        let off = lba as usize * crate::katea_volume::SECTOR;
+        &img[off..off + crate::katea_volume::SECTOR]
+    };
+    let le16 = |s: &[u8], at: usize| u16::from_le_bytes([s[at], s[at + 1]]);
+    let le32 = |s: &[u8], at: usize| u32::from_le_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]]);
+
+    let part_start = le32(sector(0), 0x1BE + 8);
+    let vbr = sector(part_start);
+    let reserved = u32::from(le16(vbr, 0x0E));
+    let num_fats = u32::from(vbr[0x10]);
+    let fatsz = le32(vbr, 0x24);
+    let root_clus = le32(vbr, 0x2C);
+    let spc = u32::from(vbr[0x0D]);
+    let first_data = reserved + num_fats * fatsz;
+    let fat_base = part_start + reserved;
+
+    let fat_entry = |cluster: u32| -> u32 {
+        let byte_off = cluster as usize * 4;
+        let fat_sector = fat_base + (byte_off / crate::katea_volume::SECTOR) as u32;
+        le32(sector(fat_sector), byte_off % crate::katea_volume::SECTOR) & 0x0FFF_FFFF
+    };
+    let cluster_lba = |cluster: u32| part_start + first_data + (cluster - root_clus) * spc;
+    // Mirrors production's `extract_system_payload::read_chain` (`katea_volume.rs`):
+    // a chain that never reaches EOC within the disk's sector bound is a corrupt or
+    // cyclic FAT, not a shorter file. Panicking here (rather than silently returning
+    // the partial bytes collected so far) keeps that divergence visible instead of
+    // letting it masquerade as a `DOS_FOLDER_BINARIES` drift.
+    let read_chain = |first: u32| -> Vec<u8> {
+        let max_clusters = img.len() / crate::katea_volume::SECTOR;
+        let mut out = Vec::new();
+        let mut c = first;
+        for _ in 0..max_clusters {
+            for s in 0..spc {
+                out.extend_from_slice(sector(cluster_lba(c) + s));
+            }
+            let next = fat_entry(c);
+            if next >= 0x0FFF_FFF8 {
+                return out;
+            }
+            c = next;
+        }
+        panic!("katea: cluster chain from {first} exceeds the disk; corrupt FAT")
+    };
+
+    // Find the DOS subdirectory entry in the root, then list its files.
+    let mut dos_cluster = None;
+    for entry in read_chain(root_clus).chunks_exact(32) {
+        if entry[0] == 0x00 {
+            break;
+        }
+        if entry[0] == 0xE5 || entry[11] == 0x0F || entry[11] & 0x08 != 0 {
+            continue;
+        }
+        if entry[11] & 0x10 != 0 && crate::katea_volume::decode_83(&entry[0..11]) == "DOS" {
+            dos_cluster = Some((le16(entry, 0x14) as u32) << 16 | le16(entry, 0x1A) as u32);
+        }
+    }
+    let dos_cluster = dos_cluster.expect("committed image has no C:\\DOS directory");
+
+    let mut names = Vec::new();
+    for entry in read_chain(dos_cluster).chunks_exact(32) {
+        if entry[0] == 0x00 {
+            break;
+        }
+        if entry[0] == 0xE5 || entry[11] == 0x0F || entry[11] & 0x08 != 0 || entry[11] & 0x10 != 0 {
+            continue;
+        }
+        names.push(crate::katea_volume::decode_83(&entry[0..11]));
+    }
+    names
+}
+
+/// `DOS_FOLDER_BINARIES` and the committed image's `C:\DOS` are two hand-kept
+/// lists of the same thing (the image builder's `dos_files` is the other side).
+/// They drifted once already -- EDIT.COM shipped in the image's C:\DOS but was
+/// missing here, so the overlay left it at the root and off the PATH.
+#[test]
+fn dos_folder_list_matches_the_committed_image() {
+    let mut in_image: Vec<String> = image_dos_folder_names();
+    // HELLO.TXT is a data file filtered out of the overlay before placement.
+    in_image.retain(|name| name != "HELLO.TXT");
+    in_image.sort();
+
+    let mut declared: Vec<String> = DOS_FOLDER_BINARIES
+        .iter()
+        .filter(|name| !OVERRIDE_SUPPLIED.contains(name))
+        .map(|name| (*name).to_string())
+        .collect();
+    declared.sort();
+
+    assert_eq!(
+        declared, in_image,
+        "DOS_FOLDER_BINARIES has drifted from the committed image's C:\\DOS"
+    );
+}
