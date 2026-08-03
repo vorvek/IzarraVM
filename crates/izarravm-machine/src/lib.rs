@@ -568,6 +568,12 @@ pub struct PhaseMark {
     pub machine_phases: MachineHostProfileSnapshot,
     /// None when C: is not a mounted host folder.
     pub katea: Option<katea_tree::KateaStorageCounters>,
+    /// The sampled CPU census at this boundary, when `IZARRAVM_CPU_PROFILE`
+    /// armed it; `None` otherwise, so an unprofiled run pays nothing and reports
+    /// no empty tables. Differencing consecutive marks gives the per-phase
+    /// census the whole-run snapshot cannot: read as "the idle loop", a
+    /// whole-run census is an inference, and this makes it a measurement.
+    pub cpu_profile: Option<izarravm_cpu::CpuProfileSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1423,6 +1429,10 @@ impl Machine {
             perf: self.cpu.perf_counters().clone(),
             machine_phases: self.host_profile.snapshot(),
             katea: self.katea_storage_counters(),
+            cpu_profile: self
+                .cpu
+                .profiling_enabled()
+                .then(|| self.cpu.profile_snapshot()),
         });
     }
 

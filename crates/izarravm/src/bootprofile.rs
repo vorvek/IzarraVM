@@ -66,6 +66,100 @@ struct PhaseRow {
     direct_native_insns: u64,
     katea: KateaStorageCounters,
     machine_phases: Vec<(String, u64, u64)>,
+    /// This phase's slice of the sampled CPU census. `None` unless
+    /// `IZARRAVM_CPU_PROFILE` armed it.
+    census: Option<PhaseCensus>,
+}
+
+/// One phase's slice of the sampled CPU census: the difference between the two
+/// boundary snapshots.
+///
+/// Exact in all three tables. The group and opcode buckets difference exactly
+/// because a bucket present at the later mark either existed at the earlier one
+/// or started from zero, and the address table differences exactly because
+/// `hot_addrs` is the complete map rather than a truncated head.
+///
+/// This is the gap the harness shipped with. Its own header called the
+/// whole-run census "honest enough because idle dominates the instruction
+/// count", and flagged that a census read as "the idle loop" is an inference.
+/// With boot at 272 M instructions against idle's 1.44 G that inference was
+/// already thin, and with the kernel's idle halt on it is worthless. This
+/// replaces it with a measurement.
+#[derive(Debug, Clone, Default)]
+struct PhaseCensus {
+    stride: u64,
+    /// `(group, instructions, guest clocks, sample ns)`
+    groups: Vec<(&'static str, u64, u64, u64)>,
+    /// `(opcode, group, instructions, sample ns)`
+    opcodes: Vec<(u16, &'static str, u64, u64)>,
+    /// `(linear, samples)`, descending.
+    addrs: Vec<(u32, u64)>,
+}
+
+impl PhaseCensus {
+    fn instructions(&self) -> u64 {
+        self.groups.iter().map(|row| row.1).sum()
+    }
+}
+
+/// Difference two census snapshots into one phase. `None` when either boundary
+/// carries none, which is every run that did not arm `IZARRAVM_CPU_PROFILE`.
+fn census_delta(
+    before: Option<&izarravm_cpu::CpuProfileSnapshot>,
+    after: Option<&izarravm_cpu::CpuProfileSnapshot>,
+) -> Option<PhaseCensus> {
+    let (before, after) = (before?, after?);
+    let groups = after
+        .groups
+        .iter()
+        .map(|now| {
+            let then = before.groups.iter().find(|old| old.name == now.name);
+            (
+                now.name,
+                now.instructions
+                    .saturating_sub(then.map_or(0, |old| old.instructions)),
+                now.guest_core_clocks
+                    .saturating_sub(then.map_or(0, |old| old.guest_core_clocks)),
+                now.sample_wall_ns
+                    .saturating_sub(then.map_or(0, |old| old.sample_wall_ns)),
+            )
+        })
+        .collect();
+    let opcodes = after
+        .opcodes
+        .iter()
+        .map(|now| {
+            let then = before.opcodes.iter().find(|old| old.opcode == now.opcode);
+            (
+                now.opcode,
+                now.group,
+                now.instructions
+                    .saturating_sub(then.map_or(0, |old| old.instructions)),
+                now.sample_wall_ns
+                    .saturating_sub(then.map_or(0, |old| old.sample_wall_ns)),
+            )
+        })
+        .filter(|row| row.2 > 0)
+        .collect();
+    let earlier: std::collections::HashMap<u32, u64> = before.hot_addrs.iter().copied().collect();
+    let mut addrs: Vec<(u32, u64)> = after
+        .hot_addrs
+        .iter()
+        .map(|&(lin, samples)| {
+            (
+                lin,
+                samples.saturating_sub(earlier.get(&lin).copied().unwrap_or(0)),
+            )
+        })
+        .filter(|&(_, samples)| samples > 0)
+        .collect();
+    addrs.sort_by_key(|&(lin, samples)| (std::cmp::Reverse(samples), lin));
+    Some(PhaseCensus {
+        stride: after.sample_stride,
+        groups,
+        opcodes,
+        addrs,
+    })
 }
 
 impl PhaseRow {
@@ -268,6 +362,99 @@ pub fn run(
     Ok(())
 }
 
+const CENSUS_GROUP_ROWS: usize = 6;
+const CENSUS_OPCODE_ROWS: usize = 10;
+const CENSUS_ADDR_ROWS: usize = 12;
+
+/// Print the census one phase at a time. Every share is within its own phase,
+/// so a row reads as "this much of THIS phase" and never has to be divided back
+/// out of a whole-run total.
+fn print_phase_census(rows: &[PhaseRow]) {
+    if rows.iter().all(|row| row.census.is_none()) {
+        return;
+    }
+    println!();
+    println!("=== per-phase cpu census ===");
+    println!(
+        "shares are within the phase. the census forces interpretation, so a \
+         phase's native% here is 0 by construction;"
+    );
+    println!("read it against the native% in the table above, not instead of it.");
+    for row in rows {
+        let Some(census) = &row.census else { continue };
+        let instructions = census.instructions();
+        if !row.reached || instructions == 0 {
+            continue;
+        }
+        let sample_ns: u64 = census.groups.iter().map(|g| g.3).sum::<u64>().max(1);
+        println!();
+        println!(
+            "--- {} : {instructions} instructions, sample stride {} ---",
+            row.name, census.stride
+        );
+
+        let mut groups = census.groups.clone();
+        groups.sort_by_key(|g| std::cmp::Reverse(g.3));
+        println!(
+            "  {:<14} {:>13} {:>8} {:>12} {:>8}",
+            "group", "instr", "instr%", "sample_ms", "sample%"
+        );
+        for g in groups.iter().filter(|g| g.1 > 0).take(CENSUS_GROUP_ROWS) {
+            println!(
+                "  {:<14} {:>13} {:>7.2}% {:>12.3} {:>7.2}%",
+                g.0,
+                g.1,
+                100.0 * g.1 as f64 / instructions as f64,
+                g.3 as f64 / 1_000_000.0,
+                100.0 * g.3 as f64 / sample_ns as f64,
+            );
+        }
+
+        let mut opcodes = census.opcodes.clone();
+        opcodes.sort_by_key(|o| std::cmp::Reverse((o.3, o.2)));
+        println!(
+            "  {:<8} {:<14} {:>13} {:>8} {:>12}",
+            "opcode", "group", "instr", "instr%", "sample_ms"
+        );
+        for o in opcodes.iter().take(CENSUS_OPCODE_ROWS) {
+            println!(
+                "  {:<8} {:<14} {:>13} {:>7.2}% {:>12.3}",
+                format_census_opcode(o.0),
+                o.1,
+                o.2,
+                100.0 * o.2 as f64 / instructions as f64,
+                o.3 as f64 / 1_000_000.0,
+            );
+        }
+
+        let addr_total: u64 = census.addrs.iter().map(|&(_, n)| n).sum::<u64>().max(1);
+        println!(
+            "  {:<10} {:>9} {:>8}  region",
+            "linear", "samples", "phase%"
+        );
+        for &(lin, samples) in census.addrs.iter().take(CENSUS_ADDR_ROWS) {
+            println!(
+                "  {lin:08X}   {samples:>9} {:>7.2}%  {}",
+                100.0 * samples as f64 / addr_total as f64,
+                address_region(lin),
+            );
+        }
+    }
+}
+
+/// Which side of the Direct JIT's admission gates an address sits on.
+/// `key_for_phys` refuses 0xA0000..0x100000 outright, so labelling it here is
+/// what makes an address row legible against the coverage column beside it --
+/// a hot row in a refused region can never be helped by block admission.
+fn address_region(lin: u32) -> &'static str {
+    match lin {
+        0x000f_0000..0x0010_0000 => "BIOS ROM (JIT-refused)",
+        0x000c_0000..0x000f_0000 => "option ROM (JIT-refused)",
+        0x000a_0000..0x000c_0000 => "VGA aperture (JIT-refused)",
+        _ => "RAM",
+    }
+}
+
 /// Rank the structural stops that refused block formation, when the opt-in
 /// census collected any. Ranked by `runtime_hits` plus the two exit columns:
 /// per [[barrier-census-mispredicts-both-ways]], `unbound_exits` alone is not a
@@ -394,6 +581,7 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     direct_native_insns: 0,
                     katea: KateaStorageCounters::default(),
                     machine_phases: Vec::new(),
+                    census: None,
                 };
             };
             let katea = match (start.katea, end.katea) {
@@ -443,6 +631,7 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     .saturating_sub(start.perf.jit_direct_insns),
                 katea,
                 machine_phases,
+                census: census_delta(start.cpu_profile.as_ref(), end.cpu_profile.as_ref()),
             }
         })
         .collect()
@@ -603,6 +792,8 @@ fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: b
             println!("  {:<10} {}", row.name, cells.join("  "));
         }
     }
+
+    print_phase_census(&run.rows);
 
     if run.keystroke_injection_failed {
         println!();

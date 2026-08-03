@@ -913,6 +913,13 @@ impl CpuGsw {
         self.profile.snapshot()
     }
 
+    /// Whether the sampled bucket profiler is armed. The boot profiler asks
+    /// before snapshotting at a phase boundary, so an unprofiled run neither
+    /// pays for the clone nor reports empty per-phase tables.
+    pub fn profiling_enabled(&self) -> bool {
+        self.profile.is_enabled()
+    }
+
     /// Enable or disable the host-only Direct structural-stop census.
     pub fn enable_direct_barrier_census(&mut self, enabled: bool) {
         #[cfg(feature = "jit")]
