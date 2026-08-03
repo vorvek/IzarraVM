@@ -70,6 +70,7 @@ struct Roles {
     interp: CpuGsw,
     interp_bus: TestBus,
     block: jit::direct::CompiledBlock,
+    slots: usize,
 }
 
 /// Compile `mov esi,esi / body / mov edi,edi / hlt` at `ENTRY` on the native role, warm the same
@@ -80,12 +81,29 @@ struct Roles {
 /// with a two-slot prefix, which is under the `slots.len() < 3 && !terminal` minimum and is
 /// therefore returned as a structural reject rather than a short block.
 fn build(body: &[u8], seed: Seed) -> Roles {
+    build_n(&[body], seed)
+}
+
+/// `build` for a body of SEVERAL instructions, each given separately so the decode lines can be
+/// warmed at every start. `bodies.len() + 2` slots are expected in the compiled block.
+///
+/// This exists for the CLOCK CHARGE and nothing else. A raw-clock error inside one slot is
+/// invisible to a three-slot differential: the 586 dial divides the block's raw total by twelve
+/// and floors, so `2 + 14 + 2 = 18` and `2 + 9 + 2 = 13` are the same scaled clock. It takes
+/// accumulation to separate them, which is the lesson `cpu_jit_callout_matrix_test.rs` recorded
+/// when the Phase 5 call-out shipped a two-clock double-charge that every single-slot fixture
+/// agreed with. Four IMUL slots put 60 raw against 40, which is 5 scaled clocks against 3.
+fn build_n(bodies: &[&[u8]], seed: Seed) -> Roles {
     let mut code = LEAD.to_vec();
-    let body_at = ENTRY + code.len() as u32;
-    code.extend_from_slice(body);
-    let tail_at = ENTRY + code.len() as u32;
+    let mut starts = vec![ENTRY];
+    for body in bodies {
+        starts.push(ENTRY + code.len() as u32);
+        code.extend_from_slice(body);
+    }
+    starts.push(ENTRY + code.len() as u32);
     code.extend_from_slice(&TAIL);
     code.push(0xf4);
+    let slots = bodies.len() + 2;
 
     let mut memory = vec![0u8; 0x5000];
     // A NOP before the entry, so the block is reachable as a continuation as well as directly.
@@ -100,7 +118,6 @@ fn build(body: &[u8], seed: Seed) -> Roles {
         bus.direct_pages_enabled = true;
         bus.direct_page_clocks = true;
     }
-    let starts = [ENTRY, body_at, tail_at];
     for (cpu, bus) in [
         (&mut native, &mut native_bus),
         (&mut interp, &mut interp_bus),
@@ -125,8 +142,9 @@ fn build(body: &[u8], seed: Seed) -> Roles {
         jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
     };
     assert_eq!(
-        compilation.span.instructions, 3,
-        "the block must cover all three slots, so the tested opcode really ran natively"
+        usize::from(compilation.span.instructions),
+        slots,
+        "the block must cover every slot, so the tested opcode really ran natively"
     );
     let id = native
         .jit_direct
@@ -161,12 +179,17 @@ fn build(body: &[u8], seed: Seed) -> Roles {
         interp,
         interp_bus,
         block,
+        slots,
     }
 }
 
-/// Run all three slots natively, step the interpreter three times, and compare everything.
+/// Run every slot natively, step the interpreter the same number of times, and compare everything.
 fn differential(body: &[u8], seed: Seed, context: &str) {
-    let mut roles = build(body, seed);
+    run_and_compare(build(body, seed), context);
+}
+
+fn run_and_compare(mut roles: Roles, context: &str) {
+    let slots = roles.slots;
     let retired = roles.native.perf_counters().jit_direct_insns;
     assert!(
         roles
@@ -176,11 +199,11 @@ fn differential(body: &[u8], seed: Seed, context: &str) {
         "{context}: block did not run natively"
     );
     assert_eq!(
-        roles.native.perf_counters().jit_direct_insns - retired,
-        3,
-        "{context}: all three slots must retire natively"
+        usize::try_from(roles.native.perf_counters().jit_direct_insns - retired).unwrap(),
+        slots,
+        "{context}: every slot must retire natively"
     );
-    for _ in 0..3 {
+    for _ in 0..slots {
         roles.interp.cycle(&mut roles.interp_bus).unwrap();
     }
     assert_eq!(
@@ -343,6 +366,32 @@ fn three_operand_imul_preserves_the_flags_it_does_not_define() {
                 &format!("0x69 eflags={seed_eflags:#x} src={src_value:#x} imm={imm:#x}"),
             );
         }
+    }
+}
+
+/// The CLOCK CHARGE, separated by accumulation.
+///
+/// The three-operand IMUL charges `clocks(14)` where the two-operand form charges `clocks(9)` and
+/// `DirectKind::raw_clocks`' default returns 2. None of those errors is visible in a three-slot
+/// block: the 586 dial divides the block's raw total by twelve and floors, so 18, 13 and 6 raw
+/// all round to the same scaled clock, and the emitter's own `completed_raw` assertion cannot
+/// see it either because it sums the same accessor it checks. This is the shape that let the
+/// Phase 5 call-out ship a two-clock double-charge, and it is why that battery counts slots
+/// rather than checking one.
+///
+/// One to four IMUL slots. At four the correct charge is `2 + 4*14 + 2 = 60` raw against 40 for
+/// `clocks(9)` and 16 for the default -- 5 scaled clocks against 3 and 1.
+#[test]
+fn three_operand_imul_charge_matches_the_interpreter_across_slot_counts() {
+    for count in 1..=4usize {
+        // A different destination per slot so no slot feeds the next, and `imm` of 3 so nothing
+        // overflows and the flag path is the same on every row.
+        let bodies: Vec<Vec<u8>> = (0..count)
+            .map(|i| imul_imm32(u8::try_from(i).unwrap(), 3, 3))
+            .collect();
+        let refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+        let seed = Seed::new([7; 8]);
+        run_and_compare(build_n(&refs, seed), &format!("{count} IMUL slots"));
     }
 }
 
