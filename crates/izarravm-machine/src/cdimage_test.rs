@@ -86,6 +86,51 @@ fn msf_round_trips_through_lba() {
 
 #[test]
 fn cue_rejects_unknown_mode() {
-    let cue = "TRACK 01 MODE2/2336\nINDEX 01 00:00:00\n";
+    let cue = "TRACK 01 MODE9/9999\nINDEX 01 00:00:00\n";
     assert!(CdImage::from_cue(cue, vec![0u8; RAW_SECTOR]).is_err());
+}
+
+#[test]
+fn cue_unwraps_mode2_2352_form1_payload() {
+    // CD-XA Form 1: 12 sync + 4 header + 8 subheader, so user data at offset 24.
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; RAW_SECTOR];
+    bin[24] = 0x5A;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.tracks()[0].mode, TrackMode::Mode2_2352);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x5A);
+}
+
+#[test]
+fn cue_unwraps_mode2_2336_payload() {
+    // No sync/header: the 8-byte subheader leads, so user data at offset 8.
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2336\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; MODE2_SECTOR];
+    bin[8] = 0x36;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.tracks()[0].mode, TrackMode::Mode2_2336);
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x36);
+}
+
+#[test]
+fn cue_reads_mode2_2048_bare_payload() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2048\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; DATA_SECTOR];
+    bin[0] = 0x20;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x20);
+}
+
+#[test]
+fn xa_form2_sectors_are_not_readable_as_data() {
+    // Form is per sector, not per track: submode bit 5 at frame offset 18 marks
+    // Form 2, whose 2324-byte payload is streaming media, not a logical sector.
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; 2 * RAW_SECTOR];
+    bin[24] = 0x01; // sector 0: Form 1 (submode bit 5 clear)
+    bin[RAW_SECTOR + 18] = 0x20; // sector 1: Form 2
+    bin[RAW_SECTOR + 24] = 0x02;
+    let img = CdImage::from_cue(cue, bin).unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0x01);
+    assert!(img.read_data_sector(1).is_none());
 }

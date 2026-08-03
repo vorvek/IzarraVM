@@ -8,15 +8,22 @@
 //! - A plain ISO: one MODE1 data track of 2048-byte sectors. The image length
 //!   divides evenly by 2048 and every sector is a data sector.
 //! - A CUE sheet with one BIN file: a multi-track disc. The CUE names the BIN
-//!   and lists each track's MODE (MODE1/2048, MODE1/2352, or AUDIO/2352) and its
-//!   start INDEX 01 as an MM:SS:FF address. Data tracks read back 2048 logical
-//!   bytes per sector; AUDIO tracks read back the raw 2352-byte Red Book frame.
+//!   and lists each track's MODE (MODE1/2048, MODE1/2352, MODE2/2048,
+//!   MODE2/2336, MODE2/2352, or AUDIO) and its start INDEX 01 as an MM:SS:FF
+//!   address. Data tracks read back 2048 logical bytes per sector; AUDIO
+//!   tracks read back the raw 2352-byte Red Book frame.
 //!
 //! Sector framing: a 2048-byte data track stores the user data directly; a
-//! 2352-byte data track wraps each 2048-byte payload in the Red Book sync,
+//! 2352-byte MODE1 track wraps each 2048-byte payload in the Red Book sync,
 //! header, and ECC/EDC, so the user data sits at byte offset 16 of the frame.
-//! `read_data_sector` unwraps that so the ATAPI READ commands always hand back
-//! 2048-byte logical sectors regardless of the on-disc framing.
+//! A MODE2 (CD-XA) track adds an 8-byte subheader on top of that: MODE2/2352
+//! carries the full sync+header+subheader wrapper (payload at offset 24) and
+//! MODE2/2336 carries the subheader alone (payload at offset 8). CD-XA also
+//! has two *forms*, and form is a per-sector property rather than a per-track
+//! one: a Form 2 sector (streaming media, no logical payload) is detected via
+//! the submode byte and read as absent, the same as a data read of audio.
+//! `read_data_sector` unwraps all of this so the ATAPI READ commands always
+//! hand back 2048-byte logical sectors regardless of the on-disc framing.
 //!
 //! A third source, [`CdImage::from_folder`], mounts a host folder: the
 //! `iso9660` module materializes the metadata (PVD, path tables, directory
@@ -28,6 +35,8 @@
 pub const DATA_SECTOR: usize = 2048;
 /// Bytes in a raw Red Book frame (the on-disc sector for AUDIO and MODE1/2352).
 pub const RAW_SECTOR: usize = 2352;
+/// Bytes in a MODE2 frame stored without sync and header (subheader leads).
+pub const MODE2_SECTOR: usize = 2336;
 /// Frames per second on a CD (the FF field of MM:SS:FF runs 0..75).
 pub const FRAMES_PER_SEC: u32 = 75;
 /// The 150-frame (2-second) lead-in offset: LBA 0 is absolute MSF 00:02:00.
@@ -40,6 +49,13 @@ pub enum TrackMode {
     Mode1_2048,
     /// MODE1 data stored as 2352-byte Red Book frames (payload at offset 16).
     Mode1_2352,
+    /// CD-XA MODE2 stored as bare 2048-byte Form 1 payloads.
+    Mode2_2048,
+    /// CD-XA MODE2 stored as 2336-byte frames: 8-byte subheader then payload.
+    Mode2_2336,
+    /// CD-XA MODE2 stored as full 2352-byte frames: 12 sync + 4 header +
+    /// 8 subheader, so the Form 1 payload sits at offset 24.
+    Mode2_2352,
     /// Red Book CD-DA audio: raw 2352-byte stereo frames.
     Audio,
 }
@@ -48,8 +64,9 @@ impl TrackMode {
     /// Bytes this track occupies per sector in the backing image.
     pub fn raw_size(self) -> usize {
         match self {
-            TrackMode::Mode1_2048 => DATA_SECTOR,
-            TrackMode::Mode1_2352 | TrackMode::Audio => RAW_SECTOR,
+            TrackMode::Mode1_2048 | TrackMode::Mode2_2048 => DATA_SECTOR,
+            TrackMode::Mode2_2336 => MODE2_SECTOR,
+            TrackMode::Mode1_2352 | TrackMode::Mode2_2352 | TrackMode::Audio => RAW_SECTOR,
         }
     }
 
@@ -57,16 +74,30 @@ impl TrackMode {
         matches!(self, TrackMode::Audio)
     }
 
-    /// Byte offset of the 2048-byte user payload inside one stored frame.
-    /// MODE1/2352 wraps the payload in 12 sync + 4 header bytes; MODE1/2048
-    /// stores it bare. An AUDIO track has no logical payload at all and
-    /// reports 0, a placeholder the data path never reaches: `read_data_sector`
-    /// returns None for an audio track before asking.
-    pub fn payload_offset(self) -> usize {
+    /// Byte offset of the 2048-byte user payload inside one stored frame, or
+    /// None for a mode that has no logical payload at all. MODE1/2352 wraps the
+    /// payload in 12 sync + 4 header bytes; MODE2/2352 adds an 8-byte subheader
+    /// on top of that; MODE2/2336 carries the subheader alone; the /2048 forms
+    /// store the payload bare. An AUDIO track returns None -- a data read of
+    /// audio fails on hardware too.
+    pub fn payload_offset(self) -> Option<usize> {
         match self {
-            TrackMode::Mode1_2048 => 0,
-            TrackMode::Mode1_2352 => 16,
-            TrackMode::Audio => 0, // never read as data
+            TrackMode::Mode1_2048 | TrackMode::Mode2_2048 => Some(0),
+            TrackMode::Mode2_2336 => Some(8),
+            TrackMode::Mode1_2352 => Some(16),
+            TrackMode::Mode2_2352 => Some(24),
+            TrackMode::Audio => None,
+        }
+    }
+
+    /// Byte offset of the XA submode byte inside one stored frame, for the
+    /// modes that carry a subheader. Bit 5 (0x20) set marks a Form 2 sector.
+    /// MODE2/2048 has no subheader, so it has no submode byte.
+    pub fn submode_offset(self) -> Option<usize> {
+        match self {
+            TrackMode::Mode2_2352 => Some(18),
+            TrackMode::Mode2_2336 => Some(2),
+            _ => None,
         }
     }
 }
@@ -237,21 +268,32 @@ impl CdImage {
     }
 
     /// Read one 2048-byte logical data sector at `lba`. Returns None when the LBA
-    /// lands outside any track or in an AUDIO track (data reads of audio fail on
-    /// hardware too). MODE1/2352 frames are unwrapped to their 2048-byte payload.
+    /// lands outside any track, in an AUDIO track (data reads of audio fail on
+    /// hardware too), or on a CD-XA Form 2 sector (streaming media, not a
+    /// logical sector). MODE1/2352 and MODE2/2336/2352 frames are unwrapped to
+    /// their 2048-byte payload.
     ///
     /// For a folder mount, a host file read error never panics the device path:
     /// it is logged and served as a zero-filled sector instead.
     pub fn read_data_sector(&self, lba: u32) -> Option<[u8; DATA_SECTOR]> {
         let track = self.track_at_lba(lba)?;
-        if track.mode.is_audio() {
-            return None;
-        }
+        // An AUDIO track has no logical payload; hardware fails a data read of
+        // one too. This is the only audio guard -- it covers both backings.
+        let payload_offset = track.mode.payload_offset()?;
         match &self.backing {
             Backing::Bytes(bytes) => {
                 let raw = track.mode.raw_size();
                 let frame_off = track.image_offset + (lba - track.start_lba) as usize * raw;
-                let payload_off = frame_off + track.mode.payload_offset();
+                // Form is a per-sector property: an XA track may mix Form 1 and
+                // Form 2. A Form 2 sector carries a 2324-byte streaming payload,
+                // not a 2048-byte logical sector, so it reads as absent -- the
+                // same answer hardware gives for a data read of an audio track.
+                if let Some(submode) = track.mode.submode_offset()
+                    && bytes.get(frame_off + submode)? & 0x20 != 0
+                {
+                    return None;
+                }
+                let payload_off = frame_off + payload_offset;
                 let slice = bytes.get(payload_off..payload_off + DATA_SECTOR)?;
                 let mut out = [0u8; DATA_SECTOR];
                 out.copy_from_slice(slice);
@@ -348,10 +390,11 @@ struct CueTrack {
 }
 
 /// Parse a CUE sheet into its track list. Recognizes `TRACK n MODE1/2048`,
-/// `MODE1/2352`, and `AUDIO`, with each track's `INDEX 01 MM:SS:FF` start. The
-/// `FILE` and `PREGAP`/`INDEX 00` lines are accepted and ignored: a single-BIN
-/// CUE keeps every track in one file, and INDEX 00 pregap is folded into the
-/// preceding track's data on most rips.
+/// `MODE1/2352`, `MODE2/2048`, `MODE2/2336`, `MODE2/2352`, and `AUDIO`, with
+/// each track's `INDEX 01 MM:SS:FF` start. The `FILE` and `PREGAP`/`INDEX 00`
+/// lines are accepted and ignored: a single-BIN CUE keeps every track in one
+/// file, and INDEX 00 pregap is folded into the preceding track's data on
+/// most rips.
 fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
     let mut tracks: Vec<CueTrack> = Vec::new();
     let mut pending: Option<(u8, TrackMode)> = None;
@@ -370,6 +413,9 @@ fn parse_cue(cue: &str) -> Result<Vec<CueTrack>, String> {
                 let mode = match words.next().map(str::to_ascii_uppercase).as_deref() {
                     Some("MODE1/2048") => TrackMode::Mode1_2048,
                     Some("MODE1/2352") => TrackMode::Mode1_2352,
+                    Some("MODE2/2048") => TrackMode::Mode2_2048,
+                    Some("MODE2/2336") => TrackMode::Mode2_2336,
+                    Some("MODE2/2352") => TrackMode::Mode2_2352,
                     Some("AUDIO") => TrackMode::Audio,
                     Some(other) => return Err(format!("unsupported TRACK mode '{other}'")),
                     None => return Err(format!("missing TRACK mode in '{line}'")),
