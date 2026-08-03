@@ -25,6 +25,10 @@ pub const TYPE_COM: &[u8] = include_bytes!("../roms/dos/type.com");
 pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
 pub const RUNNER_COM: &[u8] = include_bytes!("../roms/dos/runner.com");
 pub const RUNNER_COM_SOURCE: &str = include_str!("../roms/dos/runner.asm");
+pub const MARK_COM: &[u8] = include_bytes!("../roms/dos/mark.com");
+pub const MARK_COM_SOURCE: &str = include_str!("../roms/dos/mark.asm");
+pub const LOADTEST_COM: &[u8] = include_bytes!("../roms/dos/loadtest.com");
+pub const LOADTEST_COM_SOURCE: &str = include_str!("../roms/dos/loadtest.asm");
 pub const EXIT42_COM: &[u8] = include_bytes!("../roms/dos/exit42.com");
 pub const EXIT42_COM_SOURCE: &str = include_str!("../roms/dos/exit42.asm");
 pub const HLTTEST_COM: &[u8] = include_bytes!("../roms/dos/hlttest.com");
@@ -170,6 +174,18 @@ pub fn echo_com() -> &'static [u8] {
 /// reports it to the unit-tester exit port. Overlaid onto C: as `RUNNER.COM`.
 pub fn runner_com() -> &'static [u8] {
     RUNNER_COM
+}
+
+/// Places a boot-profiler phase boundary and returns. Appended to AUTOEXEC.BAT
+/// by `--headless-boot-profile` to signal that Toka-DOS has finished loading.
+pub fn mark_com() -> &'static [u8] {
+    MARK_COM
+}
+
+/// The boot profiler's hard-drive load workload: reads a host-folder file end to
+/// end, bracketed by phase marks, then stops the machine.
+pub fn loadtest_com() -> &'static [u8] {
+    LOADTEST_COM
 }
 
 /// A test program that terminates with DOS exit code 42; the katea-run e2e fixture.

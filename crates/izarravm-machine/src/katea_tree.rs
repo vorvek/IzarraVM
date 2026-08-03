@@ -679,6 +679,32 @@ pub(crate) struct KateaTreeVolume {
     atomic_writes: u64,
     #[cfg(test)]
     atomic_write_bytes: u64,
+    /// Read-path attribution for the boot profiler. `Cell` because `read_sector`
+    /// is `&self`; the emulation thread owns the volume, so no sharing is implied.
+    counters: std::cell::Cell<KateaStorageCounters>,
+}
+
+/// What the Katea host-folder read path did, for the boot profiler's disk phases.
+///
+/// Deliberately counters rather than a `MachineProfilePhaseKind`: the host reads
+/// below happen inside the INT 13h service, which is already timed as `SoftInt`,
+/// so a phase would nest and double-count in `classified_wall_ns`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KateaStorageCounters {
+    /// Sectors the facade served to the guest, from any source.
+    pub sector_reads: u64,
+    /// Sectors whose bytes came out of a host file.
+    pub host_file_reads: u64,
+    /// Bytes read out of host files.
+    pub host_bytes: u64,
+    /// Wall nanoseconds spent inside host file reads. Timed per sector, which is
+    /// four orders of magnitude cooler than the instruction stream, so the two
+    /// `Instant::now` calls are not a hot-path tax.
+    pub host_wall_ns: u64,
+    /// Cluster-run table entries scanned to resolve data sectors. `data_sector`
+    /// searches `runs` linearly, so this is the read path's own search cost, in
+    /// units the mounted tree's size explains.
+    pub run_scan_steps: u64,
 }
 
 /// Katea's belief about one host-side entry (file or dir): where it lives, the
@@ -929,7 +955,13 @@ impl KateaTreeVolume {
             atomic_writes: 0,
             #[cfg(test)]
             atomic_write_bytes: 0,
+            counters: std::cell::Cell::new(KateaStorageCounters::default()),
         })
+    }
+
+    /// What the read path has done since mount. See [`KateaStorageCounters`].
+    pub(crate) fn storage_counters(&self) -> KateaStorageCounters {
+        self.counters.get()
     }
 
     /// How many file bodies `reconcile` has re-read. Test-only: the live path only
@@ -1551,6 +1583,9 @@ impl KateaTreeVolume {
     /// in-memory metadata except for `HostFile` data and spilled guest writes,
     /// read on demand. Out-of-range or unmapped sectors read back as zeros.
     pub(crate) fn read_sector(&self, lba: u32) -> [u8; SECTOR] {
+        let mut counters = self.counters.get();
+        counters.sector_reads += 1;
+        self.counters.set(counters);
         match self.store.get(lba) {
             Ok(Some(s)) => return s,
             Ok(None) => {}
@@ -1605,11 +1640,18 @@ impl KateaTreeVolume {
     /// serving directory entries or lazy file bytes. A cluster in no run is free
     /// space (zeros).
     fn data_sector(&self, cluster: u32, sector_in_cluster: u32) -> [u8; SECTOR] {
-        let Some(run) = self
-            .runs
-            .iter()
-            .find(|(first, last, _)| cluster >= *first && cluster <= *last)
-        else {
+        // Counted, not just walked: this is a linear scan of every cluster run in
+        // the mounted tree on every data-sector read, so its cost grows with the
+        // size of the folder rather than with the bytes the guest asked for.
+        let mut steps = 0u64;
+        let found = self.runs.iter().find(|(first, last, _)| {
+            steps += 1;
+            cluster >= *first && cluster <= *last
+        });
+        let mut counters = self.counters.get();
+        counters.run_scan_steps = counters.run_scan_steps.saturating_add(steps);
+        self.counters.set(counters);
+        let Some(run) = found else {
             return [0u8; SECTOR]; // free space
         };
         let cluster_off = cluster - run.0; // cluster index within the run
@@ -1631,7 +1673,7 @@ impl KateaTreeVolume {
                 let f = &self.files[*id];
                 let byte_off = u64::from(cluster_off) * u64::from(spc) * SECTOR as u64
                     + u64::from(sector_in_cluster) * SECTOR as u64;
-                read_source_span(&f.source, byte_off, f.size)
+                read_source_span(&f.source, byte_off, f.size, &self.counters)
             }
         }
     }
@@ -1689,7 +1731,12 @@ fn clone_source(s: &FileSource) -> FileSource {
 /// Same contract as `katea_volume::read_source_span`: a `HostFile` opens,
 /// seeks, and reads exactly the in-file portion on demand; an I/O error logs and
 /// reads back as zeros so a vanished/shrunk host file can't panic the guest.
-fn read_source_span(source: &FileSource, byte_off: u64, size: u32) -> [u8; SECTOR] {
+fn read_source_span(
+    source: &FileSource,
+    byte_off: u64,
+    size: u32,
+    counters: &std::cell::Cell<KateaStorageCounters>,
+) -> [u8; SECTOR] {
     let mut out = [0u8; SECTOR];
     let valid = u64::from(size).saturating_sub(byte_off).min(SECTOR as u64) as usize;
     if valid == 0 {
@@ -1705,6 +1752,10 @@ fn read_source_span(source: &FileSource, byte_off: u64, size: u32) -> [u8; SECTO
             out[..avail].copy_from_slice(&v[start..start + avail]);
         }
         FileSource::HostFile { path, .. } => {
+            // One open + seek + read per 512-byte sector. Timed and counted
+            // because that ratio, not the byte count, is what the boot profiler
+            // needs in order to price a guest-visible disk read.
+            let started = std::time::Instant::now();
             match File::open(path).and_then(|mut f| {
                 f.seek(SeekFrom::Start(byte_off))?;
                 f.read_exact(&mut out[..valid])
@@ -1715,6 +1766,13 @@ fn read_source_span(source: &FileSource, byte_off: u64, size: u32) -> [u8; SECTO
                     out = [0u8; SECTOR];
                 }
             }
+            let mut tally = counters.get();
+            tally.host_file_reads += 1;
+            tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
+            tally.host_wall_ns = tally
+                .host_wall_ns
+                .saturating_add(crate::duration_ns_u64(started.elapsed()));
+            counters.set(tally);
         }
     }
     out

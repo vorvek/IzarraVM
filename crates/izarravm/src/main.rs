@@ -7,6 +7,7 @@
 
 mod bench;
 mod bench_reference;
+mod bootprofile;
 mod cmos;
 mod crt;
 mod gui;
@@ -145,6 +146,18 @@ struct Cli {
     /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
     #[arg(long, requires = "hdd_folder")]
     expect_test_exit: bool,
+    /// Boot the C: drive exactly as the GUI does and attribute wall time per
+    /// boot phase: POST, boot, prompt idle, command exec, and disk load. Uses
+    /// the same folder the GUI would (see --c-drive). A profiler, not a ladder.
+    #[arg(long, group = "run_mode")]
+    headless_boot_profile: bool,
+    /// With --headless-boot-profile, the guest path the disk-load phase reads
+    /// (for example C:\UNISOUND.COM). Defaults to the largest root-level file.
+    #[arg(long, requires = "headless_boot_profile")]
+    load_file: Option<String>,
+    /// With --headless-boot-profile, guest seconds to sit at the DOS prompt.
+    #[arg(long, default_value_t = 10)]
+    idle_seconds: u64,
     /// Boot real FreeDOS from a temp Katea disk and run a single DOS program,
     /// exiting with its DOS exit code (the Katea replacement for --headless-run).
     #[arg(long, group = "run_mode")]
@@ -193,9 +206,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         izarravm_cpu::native_backend_available(),
     )?;
     set_process_execution_backend(execution_backend);
-    if cli.profile_json.is_some() && cli.headless_profile_exe.is_none() && cli.hdd_folder.is_none()
+    if cli.profile_json.is_some()
+        && cli.headless_profile_exe.is_none()
+        && cli.hdd_folder.is_none()
+        && !cli.headless_boot_profile
     {
-        return Err("--profile-json requires --headless-profile-exe or --hdd-folder".into());
+        return Err(
+            "--profile-json requires --headless-profile-exe, --hdd-folder, or \
+             --headless-boot-profile"
+                .into(),
+        );
     }
     let startup = ResolvedStartup::from_cli(&cli)?;
     let hardware = startup.hardware();
@@ -265,6 +285,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             cli.result_ppm.as_deref(),
             cli.profile_json.as_deref(),
             cli.expect_test_exit,
+        );
+    }
+
+    if cli.headless_boot_profile {
+        if let Some(path) = cli.profile_json.as_deref() {
+            validate_profile_json_parent(path)?;
+        }
+        return bootprofile::run(
+            startup.c_drive(),
+            hardware,
+            cli.load_file.as_deref(),
+            cli.idle_seconds,
+            cli.profile_json.as_deref(),
         );
     }
 
@@ -1493,7 +1526,7 @@ fn ascii_key(ch: char) -> Option<(u8, bool)> {
 
 /// Build the Set 1 scancode sequence for typing a character: the make and break
 /// of the key, wrapped in left-Shift make/break when the glyph needs Shift.
-fn ascii_to_set1(ch: char) -> Vec<u8> {
+pub(crate) fn ascii_to_set1(ch: char) -> Vec<u8> {
     let Some((make, shift)) = ascii_key(ch) else {
         return Vec::new();
     };

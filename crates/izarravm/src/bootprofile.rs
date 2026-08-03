@@ -1,0 +1,596 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! Boot-phase profiler: boots the user's real C: through the same Katea facade
+//! the GUI uses, and attributes wall time to each phase of the boot separately.
+//!
+//! The realtime gate answers "how fast does Doom run"; it overwrites AUTOEXEC to
+//! jump straight into the game, so POST, driver load, shell start and idle never
+//! happen. This answers the complementary question -- where does the wall time
+//! go before and around the game -- by cutting one run into five phases:
+//!
+//!   post      machine start        -> first INT 19h        (host-placed)
+//!   boot      first INT 19h        -> end of AUTOEXEC.BAT  (guest MARK 1)
+//!   idle      end of AUTOEXEC.BAT  -> idle window elapsed  (host-placed)
+//!   exec      idle window elapsed  -> LOADTEST.COM entry   (guest MARK 3)
+//!   diskload  LOADTEST.COM entry   -> file read to EOF     (guest MARK 4)
+//!
+//! `idle` is real COMMAND.COM prompt idle with no guest code of ours running in
+//! it, and `exec` is COMMAND.COM parsing a command line and loading an image off
+//! Katea. Both are workloads users feel and neither has ever been measured here.
+//!
+//! This is a profiler, NOT an A/B ladder. It runs once per persona, has no
+//! pairing, ordering or lock discipline, and its slicing perturbs the run loop.
+//! Never build an acceptance decision on it -- that is the realtime gate's job.
+
+use izarravm_core::{GswMode, HardwareProfile, MASTER_CLOCK_HZ};
+use izarravm_machine::{
+    KateaStorageCounters, Machine, MachineProfile, PhaseMark, StopReason, phase_mark,
+};
+use serde_json::json;
+use std::error::Error;
+use std::path::Path;
+
+/// Guest milliseconds per run slice. The host re-enters the run loop this often
+/// so it can notice a phase mark and act on it. It is also much closer to the
+/// GUI's shape (which paces in small slices) than one long run call would be.
+const SLICE_MILLIS: u64 = 5;
+
+/// Guest-time ceiling for reaching the end of AUTOEXEC.BAT. Generous: a cold
+/// boot with TOKAEMM and TOKACD is seconds of guest time, not minutes.
+const BOOT_CAP_SECONDS: u64 = 180;
+
+/// Guest-time ceiling for the exec + disk-load phases once keys are injected.
+const LOAD_CAP_SECONDS: u64 = 60;
+
+/// In-memory files overlaid onto the mounted C:, as Katea's mount API takes
+/// them: `(8.3 name, bytes)`.
+type SystemOverrides = Vec<(String, Vec<u8>)>;
+
+/// Phase ids handed to the RIP sampler, which tags each sample with the phase
+/// that was live when it fired.
+const RIP_PHASE_POST: u32 = 1;
+const RIP_PHASE_BOOT: u32 = 2;
+const RIP_PHASE_IDLE: u32 = 3;
+const RIP_PHASE_EXEC: u32 = 4;
+const RIP_PHASE_DISKLOAD: u32 = 5;
+
+/// One phase's slice of the run, as differences between its two boundary marks.
+#[derive(Debug, Clone)]
+struct PhaseRow {
+    name: &'static str,
+    reached: bool,
+    wall_seconds: f64,
+    guest_seconds: f64,
+    instructions: u64,
+    direct_native_insns: u64,
+    katea: KateaStorageCounters,
+    machine_phases: Vec<(String, u64, u64)>,
+}
+
+impl PhaseRow {
+    /// Guest seconds per wall second: 1.0 is real time, 0.24 is the sluggish
+    /// prompt the owner reported.
+    fn real_time_factor(&self) -> f64 {
+        if self.wall_seconds <= 0.0 {
+            return 0.0;
+        }
+        self.guest_seconds / self.wall_seconds
+    }
+
+    /// Share of this phase's instructions that ran as native code.
+    fn native_coverage(&self) -> f64 {
+        if self.instructions == 0 {
+            return 0.0;
+        }
+        self.direct_native_insns as f64 / self.instructions as f64
+    }
+}
+
+/// How the run ended, and what it managed to measure before that.
+struct BootProfileRun {
+    mode: GswMode,
+    rows: Vec<PhaseRow>,
+    stop: StopReason,
+    load_target: Option<String>,
+    /// Set when the injected keystrokes never produced a LOADTEST entry mark.
+    /// The disk phases fail soft: everything before them still reports.
+    keystroke_injection_failed: bool,
+    screen: String,
+}
+
+/// Run the whole boot profile for one persona.
+pub fn run(
+    dir: &Path,
+    hardware: &HardwareProfile,
+    load_file: Option<&str>,
+    idle_seconds: u64,
+    profile_json: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let mode = hardware.cpu;
+    let clock = mode.clock_rate();
+    let slice_clocks = clock
+        .clocks_for_fraction_floor(SLICE_MILLIS, 1000)
+        .max(1_000);
+
+    // Pick the disk-load target before booting, so a bad pick fails before the
+    // expensive part rather than after it.
+    let load_target = match load_file {
+        Some(explicit) => Some(explicit.to_string()),
+        None => auto_pick_load_target(dir)?,
+    };
+
+    let overrides = build_overrides(dir, load_target.as_deref())?;
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    machine.mount_hdd_folder_with_user_overrides(dir, overrides)?;
+    machine.enable_phase_marks();
+
+    // The same optional instruments --hdd-folder honours, so a phase table, a
+    // guest census and a RIP profile can all be collected in one run.
+    //
+    // The census is whole-run, not per-phase: it is a sampled histogram with no
+    // boundary support. That is honest enough here because idle dominates the
+    // instruction count, but a census read as "the idle loop" is an inference,
+    // not a measurement.
+    let cpu_profile_stride = std::env::var("IZARRAVM_CPU_PROFILE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let machine_profile = std::env::var_os("IZARRAVM_MACHINE_PROFILE").is_some();
+    if let Some(stride) = cpu_profile_stride {
+        machine.enable_host_profiling(stride);
+    } else if machine_profile {
+        machine.enable_machine_profiling();
+    }
+    #[cfg(windows)]
+    let rip_sampler = std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| {
+        let sampler = crate::riprofile::Sampler::start();
+        (sampler, path)
+    });
+
+    let start_wall = std::time::Instant::now();
+    machine.record_host_phase_mark(phase_mark::RUN_START);
+    set_rip_phase(RIP_PHASE_POST);
+
+    // Phases 1 and 2: POST, then boot, ending when AUTOEXEC.BAT runs MARK 1.
+    // POST_END lands inside this window; the sampler phase follows it.
+    let mut stop = StopReason::CycleLimit { requested: 0 };
+    let boot_cap = clock.clocks_for_fraction_floor(BOOT_CAP_SECONDS, 1);
+    let mut spent = 0u64;
+    let mut post_seen = false;
+    while spent < boot_cap && !has_mark(&machine, phase_mark::BOOT_END) {
+        let reason = machine.run_cycles(slice_clocks)?;
+        spent = spent.saturating_add(slice_clocks);
+        if !post_seen && has_mark(&machine, phase_mark::POST_END) {
+            post_seen = true;
+            set_rip_phase(RIP_PHASE_BOOT);
+        }
+        if let Some(terminal) = terminal_stop(&reason) {
+            stop = terminal;
+            break;
+        }
+    }
+
+    let reached_boot = has_mark(&machine, phase_mark::BOOT_END);
+    let mut keystroke_injection_failed = false;
+
+    if reached_boot {
+        // Phase 3: real COMMAND.COM prompt idle. Host-timed, because the point
+        // is to measure the shell's own loop with nothing of ours running in it.
+        set_rip_phase(RIP_PHASE_IDLE);
+        let idle_clocks = clock.clocks_for_fraction_floor(idle_seconds, 1);
+        let mut idled = 0u64;
+        while idled < idle_clocks {
+            let reason = machine.run_cycles(slice_clocks)?;
+            idled = idled.saturating_add(slice_clocks);
+            if let Some(terminal) = terminal_stop(&reason) {
+                stop = terminal;
+                break;
+            }
+        }
+        machine.record_host_phase_mark(phase_mark::IDLE_END);
+
+        // Phases 4 and 5: type the command, then let it read. Loading the image
+        // off Katea is itself the "load a program off the hard drive" case.
+        if let Some(target) = load_target.as_deref()
+            && !is_terminal(&stop)
+        {
+            set_rip_phase(RIP_PHASE_EXEC);
+            inject_command(&mut machine, &format!("C:\\LOADTEST.COM {target}"))?;
+            let load_cap = clock.clocks_for_fraction_floor(LOAD_CAP_SECONDS, 1);
+            let mut loaded = 0u64;
+            let mut exec_seen = false;
+            while loaded < load_cap && !has_mark(&machine, phase_mark::LOAD_END) {
+                let reason = machine.run_cycles(slice_clocks)?;
+                loaded = loaded.saturating_add(slice_clocks);
+                if !exec_seen && has_mark(&machine, phase_mark::EXEC_END) {
+                    exec_seen = true;
+                    set_rip_phase(RIP_PHASE_DISKLOAD);
+                }
+                if let Some(terminal) = terminal_stop(&reason) {
+                    stop = terminal;
+                    break;
+                }
+            }
+            // The documented soft failure: injected keys are the one part of
+            // this harness that depends on the guest cooperating.
+            keystroke_injection_failed = !exec_seen;
+        }
+    }
+
+    let wall = start_wall.elapsed();
+    #[cfg(windows)]
+    if let Some((Some(mut sampler), path)) = rip_sampler {
+        sampler.name_phases(&[
+            (RIP_PHASE_POST, "post"),
+            (RIP_PHASE_BOOT, "boot"),
+            (RIP_PHASE_IDLE, "idle"),
+            (RIP_PHASE_EXEC, "exec"),
+            (RIP_PHASE_DISKLOAD, "diskload"),
+        ]);
+        sampler.stop_and_report(Path::new(&path));
+    }
+
+    if cpu_profile_stride.is_some() {
+        crate::bench::print_cpu_profile(&machine.cpu().profile_snapshot());
+    }
+    let run = BootProfileRun {
+        mode,
+        rows: build_rows(machine.phase_marks()),
+        stop,
+        load_target,
+        keystroke_injection_failed,
+        screen: machine.screen_text().as_text(),
+    };
+    print_report(&run, wall, reached_boot, machine_profile);
+    if let Some(path) = profile_json {
+        write_json(path, &run, wall, dir)?;
+    }
+    // Katea buffers guest writes until a flush. Nothing here should have written
+    // anything, but skipping the flush would leave that unverifiable.
+    machine.flush_hdd_folder();
+    if !reached_boot {
+        return Err(format!(
+            "boot profile never reached the end of AUTOEXEC.BAT within {BOOT_CAP_SECONDS} \
+             guest seconds (stop={:?}); the screen text above shows how far it got",
+            run.stop
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Tag subsequent RIP samples with `phase`. A no-op off Windows, where the
+/// sampler does not exist.
+fn set_rip_phase(phase: u32) {
+    #[cfg(windows)]
+    crate::riprofile::set_phase(phase);
+    #[cfg(not(windows))]
+    let _ = phase;
+}
+
+fn has_mark(machine: &Machine, id: u8) -> bool {
+    machine.phase_marks().iter().any(|mark| mark.id == id)
+}
+
+fn is_terminal(stop: &StopReason) -> bool {
+    !matches!(stop, StopReason::CycleLimit { .. })
+}
+
+/// A slice's stop reason, if it ended the run rather than just the slice.
+fn terminal_stop(reason: &StopReason) -> Option<StopReason> {
+    match reason {
+        StopReason::CycleLimit { .. } => None,
+        other => Some(other.clone()),
+    }
+}
+
+/// Type a command at the DOS prompt and press Enter.
+fn inject_command(machine: &mut Machine, command: &str) -> Result<(), Box<dyn Error>> {
+    // One short slice per keystroke: COMMAND.COM has to poll INT 16h and echo
+    // the character before the next scancode pair arrives, or the type-ahead
+    // buffer swallows keys and the command line comes out mangled.
+    let per_key = machine
+        .profile()
+        .cpu
+        .clock_rate()
+        .clocks_for_fraction_floor(2, 1000)
+        .max(1_000);
+    for ch in command.chars().chain(std::iter::once('\r')) {
+        for code in crate::ascii_to_set1(ch) {
+            machine.inject_key_scancodes(&[code]);
+            machine.run_cycles(per_key)?;
+        }
+    }
+    Ok(())
+}
+
+/// Turn the recorded boundaries into one row per phase. A phase whose closing
+/// mark never fired reports `reached: false` rather than a wrong number.
+fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
+    const PHASES: [(&str, u8, u8); 5] = [
+        ("post", phase_mark::RUN_START, phase_mark::POST_END),
+        ("boot", phase_mark::POST_END, phase_mark::BOOT_END),
+        ("idle", phase_mark::BOOT_END, phase_mark::IDLE_END),
+        ("exec", phase_mark::IDLE_END, phase_mark::EXEC_END),
+        ("diskload", phase_mark::EXEC_END, phase_mark::LOAD_END),
+    ];
+    let find = |id: u8| marks.iter().find(|mark| mark.id == id);
+    PHASES
+        .iter()
+        .map(|&(name, from, to)| {
+            let (Some(start), Some(end)) = (find(from), find(to)) else {
+                return PhaseRow {
+                    name,
+                    reached: false,
+                    wall_seconds: 0.0,
+                    guest_seconds: 0.0,
+                    instructions: 0,
+                    direct_native_insns: 0,
+                    katea: KateaStorageCounters::default(),
+                    machine_phases: Vec::new(),
+                };
+            };
+            let katea = match (start.katea, end.katea) {
+                (Some(before), Some(after)) => KateaStorageCounters {
+                    sector_reads: after.sector_reads.saturating_sub(before.sector_reads),
+                    host_file_reads: after.host_file_reads.saturating_sub(before.host_file_reads),
+                    host_bytes: after.host_bytes.saturating_sub(before.host_bytes),
+                    host_wall_ns: after.host_wall_ns.saturating_sub(before.host_wall_ns),
+                    run_scan_steps: after.run_scan_steps.saturating_sub(before.run_scan_steps),
+                },
+                _ => KateaStorageCounters::default(),
+            };
+            let machine_phases = end
+                .machine_phases
+                .phases
+                .iter()
+                .map(|after| {
+                    let before = start
+                        .machine_phases
+                        .phases
+                        .iter()
+                        .find(|p| p.name == after.name);
+                    let (wall_ns, count) = match before {
+                        Some(before) => (
+                            after.wall_ns.saturating_sub(before.wall_ns),
+                            after.count.saturating_sub(before.count),
+                        ),
+                        None => (after.wall_ns, after.count),
+                    };
+                    (after.name.to_string(), wall_ns, count)
+                })
+                .collect();
+            PhaseRow {
+                name,
+                reached: true,
+                wall_seconds: end.wall.duration_since(start.wall).as_secs_f64(),
+                guest_seconds: end.master_ticks.saturating_sub(start.master_ticks) as f64
+                    / MASTER_CLOCK_HZ as f64,
+                instructions: end
+                    .perf
+                    .instructions
+                    .saturating_sub(start.perf.instructions),
+                direct_native_insns: end
+                    .perf
+                    .jit_direct_insns
+                    .saturating_sub(start.perf.jit_direct_insns),
+                katea,
+                machine_phases,
+            }
+        })
+        .collect()
+}
+
+/// Read the folder's real AUTOEXEC.BAT and append the boot-done mark, then
+/// overlay it along with the two guest helpers.
+///
+/// The host folder is never written. In user-folder mode the payload's own
+/// AUTOEXEC.BAT is dropped (it is the user's), and an override that is not in
+/// Katea's `DOS_FOLDER_BINARIES` list lands at the root with its 8.3 name
+/// reserved, so this copy shadows the host file rather than colliding with it.
+fn build_overrides(
+    dir: &Path,
+    load_target: Option<&str>,
+) -> Result<SystemOverrides, Box<dyn Error>> {
+    let host_autoexec = dir.join("AUTOEXEC.BAT");
+    let mut text = match std::fs::read(&host_autoexec) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        // No AUTOEXEC.BAT is legitimate: the mount seeds one, and the boot still
+        // has a shell to reach. Start from empty and add only our own line.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(Box::new(err)),
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push_str("\r\n");
+    }
+    // `@` so the mark does not echo: this line runs inside the boot being
+    // measured, and console output would put video and teletype work in it.
+    text.push_str(&format!("@C:\\MARK.COM {}\r\n", phase_mark::BOOT_END));
+
+    let mut overrides = vec![
+        ("AUTOEXEC.BAT".to_string(), text.into_bytes()),
+        (
+            "MARK.COM".to_string(),
+            izarravm_firmware::mark_com().to_vec(),
+        ),
+    ];
+    if load_target.is_some() {
+        overrides.push((
+            "LOADTEST.COM".to_string(),
+            izarravm_firmware::loadtest_com().to_vec(),
+        ));
+    }
+    Ok(overrides)
+}
+
+/// The largest root-level host file whose name is already a valid 8.3, so the
+/// name the guest sees is the name on disk. Katea mangles a colliding or
+/// over-long name, and a mangled target would silently read the wrong file.
+fn auto_pick_load_target(dir: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    let mut best: Option<(u64, String)> = None;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_uppercase();
+        if !is_plain_83(&name) {
+            continue;
+        }
+        // Our own overlays shadow the host copies, so they are served from RAM
+        // and would measure nothing.
+        if matches!(name.as_str(), "AUTOEXEC.BAT" | "MARK.COM" | "LOADTEST.COM") {
+            continue;
+        }
+        let len = entry.metadata()?.len();
+        if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
+            best = Some((len, name));
+        }
+    }
+    Ok(best.map(|(_, name)| format!("C:\\{name}")))
+}
+
+/// Whether `name` is already a canonical 8.3 name needing no mangling.
+fn is_plain_83(name: &str) -> bool {
+    let ok = |part: &str, limit: usize| {
+        !part.is_empty()
+            && part.len() <= limit
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_^$~!#%&-{}()@'`".contains(c))
+    };
+    match name.split_once('.') {
+        Some((stem, ext)) => ok(stem, 8) && ok(ext, 3) && !ext.contains('.'),
+        None => ok(name, 8),
+    }
+}
+
+fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: bool, phases: bool) {
+    println!();
+    println!("=== boot phase profile: {} ===", run.mode.canonical_name());
+    if let Some(target) = &run.load_target {
+        println!("disk-load target: {target}");
+    } else {
+        println!("disk-load target: none found (pass --load-file to name one)");
+    }
+    println!("stop: {:?}", run.stop);
+    println!("total wall: {:.3}s", wall.as_secs_f64());
+    println!();
+    println!(
+        "{:<10} {:>9} {:>9} {:>8} {:>10} {:>9} {:>9} {:>10} {:>9}",
+        "phase", "wall_s", "guest_s", "rt", "insns", "native%", "sectors", "hostreads", "host_ms"
+    );
+    for row in &run.rows {
+        if !row.reached {
+            println!("{:<10} {:>9}", row.name, "not reached");
+            continue;
+        }
+        println!(
+            "{:<10} {:>9.3} {:>9.3} {:>8.3} {:>10} {:>8.1}% {:>9} {:>9} {:>10.1}",
+            row.name,
+            row.wall_seconds,
+            row.guest_seconds,
+            row.real_time_factor(),
+            row.instructions,
+            row.native_coverage() * 100.0,
+            row.katea.sector_reads,
+            row.katea.host_file_reads,
+            row.katea.host_wall_ns as f64 / 1_000_000.0,
+        );
+    }
+    println!();
+    println!("rt = guest seconds per wall second; 1.000 is real time.");
+
+    // The run scan is only meaningful next to the sector count it multiplies.
+    for row in &run.rows {
+        if row.reached && row.katea.sector_reads > 0 {
+            println!(
+                "{:<10} {:.1} run-table steps per sector served, {} bytes over {} host reads",
+                row.name,
+                row.katea.run_scan_steps as f64 / row.katea.sector_reads as f64,
+                row.katea.host_bytes,
+                row.katea.host_file_reads,
+            );
+        }
+    }
+
+    if phases {
+        println!();
+        println!("machine phases per boot phase (wall ms / count):");
+        for row in &run.rows {
+            if !row.reached {
+                continue;
+            }
+            let cells: Vec<String> = row
+                .machine_phases
+                .iter()
+                .filter(|(_, wall_ns, _)| *wall_ns > 0)
+                .map(|(name, wall_ns, count)| {
+                    format!("{name} {:.1}/{count}", *wall_ns as f64 / 1_000_000.0)
+                })
+                .collect();
+            println!("  {:<10} {}", row.name, cells.join("  "));
+        }
+    }
+
+    if run.keystroke_injection_failed {
+        println!();
+        println!(
+            "NOTE: the injected keystrokes never reached LOADTEST.COM, so the exec and \
+             diskload phases did not run. Everything above them is unaffected."
+        );
+    }
+    if !reached_boot {
+        println!();
+        println!("--- screen at give-up ---");
+        println!("{}", run.screen);
+    }
+}
+
+fn write_json(
+    path: &Path,
+    run: &BootProfileRun,
+    wall: std::time::Duration,
+    workload: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let report = json!({
+        "schema": "izarravm-boot-phase-profile-v1",
+        "workload": workload.display().to_string(),
+        "mode": run.mode.canonical_name(),
+        "total_wall_seconds": wall.as_secs_f64(),
+        "stop": format!("{:?}", run.stop),
+        "load_target": run.load_target,
+        "keystroke_injection_failed": run.keystroke_injection_failed,
+        "phases": run.rows.iter().map(|row| json!({
+            "name": row.name,
+            "reached": row.reached,
+            "wall_seconds": row.wall_seconds,
+            "guest_seconds": row.guest_seconds,
+            "real_time_factor": row.real_time_factor(),
+            "instructions": row.instructions,
+            "direct_native_insns": row.direct_native_insns,
+            "direct_native_coverage": row.native_coverage(),
+            "katea": {
+                "sector_reads": row.katea.sector_reads,
+                "host_file_reads": row.katea.host_file_reads,
+                "host_bytes": row.katea.host_bytes,
+                "host_wall_ns": row.katea.host_wall_ns,
+                "run_scan_steps": row.katea.run_scan_steps,
+            },
+            "machine_phases": row.machine_phases.iter().map(|(name, wall_ns, count)| json!({
+                "name": name,
+                "wall_ns": wall_ns,
+                "count": count,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "bootprofile_test.rs"]
+mod tests;
