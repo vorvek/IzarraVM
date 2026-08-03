@@ -19,6 +19,33 @@
 //! it, and `exec` is COMMAND.COM parsing a command line and loading an image off
 //! Katea. Both are workloads users feel and neither has ever been measured here.
 //!
+//! # `boot` is SUPPOSED to be slow. Do not optimize it away.
+//!
+//! Essentially all of `boot` is the FreeDOS kernel's F5/F8 window: the pause
+//! that lets a user press F5 to skip CONFIG.SYS or F8 to single-step it. It
+//! looks exactly like a busy-wait in every profile because it IS a wait, on
+//! purpose, polling the keyboard so it can notice the key. Measured at 586:
+//! `SWITCHES=/F` (which skips the window) takes the phase from 272,000,352
+//! instructions and 8.324 s of wall to 1,567,521 and 0.050 s, and guest time
+//! with it, from 1.970 s to 0.035 s. So the guest is doing no work there, and
+//! anything else this phase measures is noise beside it.
+//!
+//! Deleting the wait is a product decision, not a performance one: `SWITCHES=/F`
+//! and `/N` both take the escape hatch away from the user in practice.
+//!
+//! The real defect is the WINDOW'S UNIT, not the wait. The kernel sets
+//! `SkipConfigSeconds db 2` (`kernel.asm:67`), i.e. two GUEST seconds -- but a
+//! human waits in WALL seconds, and the two diverge by exactly this emulator's
+//! interpretation overhead: 1.77 s of wall at 486 against 8.32 s at 586. The
+//! pause therefore grows the FASTER the emulated machine is, which is backwards,
+//! and is why 586 feels broken here while 486 feels fine. The byte cannot fix
+//! it -- whole seconds only, and any value that reads well on one persona reads
+//! badly on the other. What would is making the wait cheap, so guest time tracks
+//! real time through it: FreeDOS's `GetBiosKey` spins on INT 16h where the same
+//! `sti; hlt` its own `dosidle.asm` uses for `IDLEHALT` would serve. That is a
+//! kernel source patch (this project is licensed and set up for them), gated on
+//! an Open Watcom kernel rebuild plus a `tokados-hdd.img` regen.
+//!
 //! This is a profiler, NOT an A/B ladder. It runs once per persona, has no
 //! pairing, ordering or lock discipline, and its slicing perturbs the run loop.
 //! Never build an acceptance decision on it -- that is the realtime gate's job.
