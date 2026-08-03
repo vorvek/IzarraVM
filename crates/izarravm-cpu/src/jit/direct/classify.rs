@@ -319,9 +319,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             let op = (opcode >> 3) & 7;
             let form = opcode & 7;
             match form {
-                // Byte r/m destination, byte register source. Memory only: the register form
-                // needs a byte-lane `AluReg` that does not exist yet, and the point of this arm
-                // is the memory row.
+                // Byte r/m destination, byte register source. BOTH operand forms as of the
+                // rejected-row campaign's Slice 7: the register form is `AluRegByte`, the byte
+                // lane that "does not exist yet" once did not.
+                //
+                // Operand roles follow `execute_alu_decoded`'s form-0 arm exactly: `a` is the
+                // r/m (the destination, written back unless op is CMP) and `b` is `modrm.reg`.
+                // That is the OPPOSITE assignment from form 2 below, and getting it backwards is
+                // silent for the commutative ops and wrong for SUB/SBB/CMP — which is why the two
+                // arms name `dst` and `src` explicitly rather than sharing a helper.
                 //
                 // Width is a property of the form, not of the prefix — the interpreter's arm
                 // reads `read_operand_u8`/`read_gpr8` and charges the same `clocks(2)` as every
@@ -330,15 +336,19 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // Word-size allowlist above, so a 66-prefixed encoding never reaches this arm.
                 0 => {
                     let m = insn.modrm?;
-                    let DecodedOperand::Mem(addr) = insn.operand? else {
-                        return None;
+                    return match insn.operand? {
+                        DecodedOperand::Reg(dst) => Some(DirectKind::AluRegByte {
+                            op,
+                            dst,
+                            src: m.reg,
+                        }),
+                        DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
+                            op,
+                            source: StoreSource::Reg(m.reg),
+                            width: MemoryWidth::Byte,
+                            addr: direct_addr(addr)?,
+                        }),
                     };
-                    return Some(DirectKind::AluMemDest {
-                        op,
-                        source: StoreSource::Reg(m.reg),
-                        width: MemoryWidth::Byte,
-                        addr: direct_addr(addr)?,
-                    });
                 }
                 1 => {
                     let m = insn.modrm?;
@@ -356,6 +366,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                             addr: direct_addr(addr)?,
                         }),
                     };
+                }
+                // Byte register destination, byte r/m source — the form that had NO arm at all
+                // before Slice 7, in either operand shape. Register only.
+                //
+                // Roles are form 0's mirrored, and they follow `execute_alu_decoded`'s form-2 arm:
+                // `a` is `modrm.reg` (the destination, written back through `write_gpr8` unless op
+                // is CMP) and `b` is the r/m.
+                //
+                // The MEMORY form is deliberately absent and is a missed lowering rather than a
+                // hazard — the `else` returns None and the instruction stays the barrier it is
+                // today. `AluMemSource` looks as if it already covers it (its read match has a
+                // `MemoryWidth::Byte` arm) but that arm is UNREACHABLE and incomplete: it falls
+                // into `mov eax, home(dst)` and `emit_alu_preloaded`, which has no byte lane at
+                // all and would read a 32-bit register where a byte lane is meant, and
+                // `DirectKind::byte_reads` does not count `AluMemSource` either, so the bus
+                // accounting would be short a byte read. Building it is a second mechanism behind
+                // one census measurement (quake 21,686 exits on `0x32 /0`, doom zero); this arm
+                // is the register lane and nothing else.
+                2 => {
+                    let m = insn.modrm?;
+                    let DecodedOperand::Reg(src) = insn.operand? else {
+                        return None;
+                    };
+                    return Some(DirectKind::AluRegByte {
+                        op,
+                        dst: m.reg,
+                        src,
+                    });
                 }
                 3 => {
                     let m = insn.modrm?;
@@ -555,6 +593,43 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x6a => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Imm(crate::sign_extend_u8(insn.imm as u8)),
+                });
+            }
+            // THREE-operand IMUL, register source only: `IMUL r32, r/m32, imm32` (0x69) and
+            // `IMUL r32, r/m32, imm8` (0x6b). `decode` has already fetched the immediate and
+            // sign-extended the imm8 into `insn.imm`, so the two opcodes reach one kind.
+            //
+            // These are the rejected-row campaign's `non_continuable` rows, and lowering them
+            // takes TWO changes, not one. `block_continuable` (decode.rs) routes 0x69/0x6b to
+            // `DecodeGroup::Misc` -- the "heterogeneous one-off single-byte block", a decode
+            // CLASSIFICATION neighbourhood, not a semantic class -- and refuses the whole group
+            // bar TEST AL/AX,imm. The compile walk consults `insn.continuable` before it ever
+            // reaches `classify`, so this arm is dead without the walk's own admission
+            // (`jit_admits_non_continuable`, direct.rs) and that admission relocates the row onto
+            // `hard_boundary` without this arm. Neither half is worth landing alone.
+            //
+            // MEMORY form deliberately absent. It is a missed lowering, not a hazard: the `else`
+            // returns None and the instruction stays exactly the barrier it is today. Building it
+            // means an `ImulMemImm` alongside `ImulMem` with the full memory side-exit set, for a
+            // row the census measures at 473 quake exits and zero doom -- an unmeasured mechanism
+            // by this campaign's standing rule. The register row is doom's largest at 244,547.
+            //
+            // Below the `OperandSize::Word` gate, and 0x69/0x6b are absent from its allowlist, so
+            // a 66-prefixed encoding falls to None above and never reaches here. That is
+            // load-bearing rather than incidental: at Word the interpreter multiplies at sixteen
+            // bits and `write_gpr_sized(.., Word, ..)` PRESERVES the destination's high half,
+            // while the emitted `imul r32, r32, imm32` defines all thirty-two and computes CF/OF
+            // against the wrong width. Same argument as 0x0faf's arm above, same two failure
+            // modes.
+            0x69 | 0x6b => {
+                let m = insn.modrm?;
+                let DecodedOperand::Reg(src) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::ImulImm {
+                    dst: m.reg,
+                    src,
+                    imm: insn.imm,
                 });
             }
             0x80 => {

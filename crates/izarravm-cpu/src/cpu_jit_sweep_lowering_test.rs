@@ -240,6 +240,12 @@ mod word_shift;
 #[path = "cpu_jit_word_inc_dec_test.rs"]
 mod word_inc_dec;
 
+/// The rejected-row campaign's Slice 7: the three-operand IMUL and the byte-lane register ALU.
+/// Nested here for the reason the five modules above are: it wants this module's differential
+/// fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a seventh copy.
+#[path = "cpu_jit_slice7_test.rs"]
+mod slice7;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a

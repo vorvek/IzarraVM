@@ -381,6 +381,28 @@ impl Encoder {
         self.modrm(0b11, dst.low3(), src.low3());
     }
 
+    /// `imul dst, src, imm32` (69 /r id, IMUL r32, r/m32, imm32: dst = src * imm32, signed,
+    /// truncated to 32 bits). The three-operand form: `src` is READ and `dst` is WRITTEN, and the
+    /// two may be the same register.
+    ///
+    /// NO REX.W, and the reason is `imul_r32_r32`'s verbatim: the guest's three-operand IMUL
+    /// defines CF/OF from whether the 32-bit truncated result sign-extends back to the full
+    /// product (`imul_truncated`, core.rs), and the 64-bit form reports overflow against the
+    /// 64-bit product instead. `imul_r64_imm32` immediately below IS the REX.W form and is a
+    /// different instruction for a different purpose (the native cap check's scale multiply);
+    /// they are written out separately rather than sharing a `w` parameter so that picking the
+    /// wrong width is not a one-character edit.
+    ///
+    /// The `reg` field is the DESTINATION and `rm` is the source, which is the opposite of the
+    /// group-3 forms above where `reg` is the sub-opcode. REX.R therefore comes from `dst` and
+    /// REX.B from `src`.
+    pub(crate) fn imul_r32_r32_imm32(&mut self, dst: Reg, src: Reg, imm: u32) {
+        self.optional_rex(false, dst.ext(), false, src.ext());
+        self.bytes.push(0x69);
+        self.modrm(0b11, dst.low3(), src.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `mul src` (F7 /4, MUL r/m32 register form: EDX:EAX = EAX * src, UNSIGNED). Sets CF and OF
     /// together to whether the high half is nonzero, and leaves SF/ZF/AF/PF undefined, which is
     /// exactly the guest's one-operand MUL.

@@ -2335,6 +2335,56 @@ pub(crate) enum DirectKind {
         dst: u8,
         imm: u8,
     },
+    /// The BYTE-LANE register ALU: `op r8, r8` for the whole eight-operation set, both operand
+    /// orders (0x00/0x08/../0x38 with a register r/m, and 0x02/0x0A/../0x3A likewise).
+    ///
+    /// `dst` and `src` are BYTE-register indices, where 4..=7 are AH/CH/DH/BH — the high byte of
+    /// the first four 32-bit registers. That is the whole reason this cannot be `AluReg` with
+    /// `width: MemoryWidth::Byte`: `AluReg`'s emitter reaches its operands through `home(index)`,
+    /// which maps index 5 to the host register holding guest EBP, so a `cmp al, ch` lowered
+    /// through it would compare against the wrong register at the wrong width. x86-64 cannot name
+    /// AH/CH/DH/BH in an instruction that also carries a REX prefix, so the lane is reached by
+    /// shift-and-mask on the way in (`emit_read_store_value` at Byte) and by mask-shift-or on the
+    /// way out (`emit_write_gpr8`) — machinery `AluByteImm`, `TestByte` and the byte INC/DEC form
+    /// already share.
+    ///
+    /// A separate variant rather than a `width` field on `AluReg` for that reason and for the
+    /// `AluByteImm`/`AluImm` precedent: the byte forms are a different lane, not a narrower one,
+    /// and every accessor on this kind (`byte_reads`, `read_segment`, `uses_stack`, ...) wants the
+    /// register-only default. `raw_clocks` wants the `_ => 2` default too, and correctly — the
+    /// interpreter's `execute_alu_decoded` returns one `Ok(clocks(2))` for all six forms. That
+    /// default is PINNED rather than argued, in `direct_timing_cases`.
+    ///
+    /// # What this reaches, stated correctly
+    ///
+    /// **32-bit byte ALU, and only that.** The slice's first write-up justified this kind as
+    /// "ubiquitous in DOS-era software — text-mode tools, byte blitters, character loops",
+    /// explicitly discounting both benchmarks. That describes a population the arm CANNOT REACH,
+    /// and an adversarial review caught it. Two independent gates put 16-bit code out of range:
+    /// `try_direct_continuation` returns `Interpret` at every `!d` boundary, so no block is ever
+    /// compiled in a 16-bit code segment on any persona; and a `66`-prefixed byte ALU is refused
+    /// because none of `0x00`/`0x02`/…/`0x38`/`0x3A` is in `classify`'s `OperandSize::Word`
+    /// allowlist — which `sixteen_bit_byte_alu_register_form_is_still_a_barrier` locks in.
+    ///
+    /// So the honest claim is narrower and still worth having: this closes a byte-lane hole in
+    /// 32-bit protected-mode coverage that had been open since the ALU block was written, and it
+    /// is a PRECONDITION for the DOS-era population rather than a delivery of it. It becomes that
+    /// only if 16-bit blocks are ever admitted (Phase 4's persona-generality work), at which point
+    /// the allowlist has to take these opcodes too.
+    ///
+    /// **The allowlist doctrine is inconsistent here and that is a known tension, not an
+    /// oversight.** ALU form 4 (`0x04..=0x3c`), `0x88`, `0x8a`, `0xb0..=0xb7`, `0xc6`, `0xf6` and
+    /// `0x84` are all admitted at Word on the stated grounds that a byte form's width is a
+    /// property of the FORM and the prefix cannot leak past `classify`. Forms 0 and 2 satisfy that
+    /// argument identically — they carry a literal byte lane and no `operand_width` — so the only
+    /// thing keeping them out is the campaign's standing rule against unmeasured admissions. Left
+    /// out deliberately: admitting them would be a formation change with no census row to
+    /// attribute it to, and it belongs to whichever slice opens the 16-bit region as a whole.
+    AluRegByte {
+        op: u8,
+        dst: u8,
+        src: u8,
+    },
     AluMemSource {
         op: u8,
         dst: u8,
@@ -2358,6 +2408,30 @@ pub(crate) enum DirectKind {
     Imul {
         dst: u8,
         src: u8,
+    },
+    /// IMUL r32, r/m32, imm — the THREE-operand form, REGISTER source only (0x69 with a full-width
+    /// immediate, 0x6B with a sign-extended imm8). `dst = src * imm`, and `dst` may equal `src`.
+    ///
+    /// One variant for both opcodes because the interpreter reaches them through two arms that are
+    /// character-for-character identical past the immediate `decode` already sign-extended
+    /// (`execute_extended.rs`, the 0x69 and 0x6b arms): same `imul_truncated`, same
+    /// `write_gpr_sized`, same `clocks(14)`. The opcode difference is entirely a decode-time
+    /// question about how many immediate bytes to fetch, and `decode` has already answered it into
+    /// `insn.imm`.
+    ///
+    /// Separate from `Imul` rather than an `Option<u32>` source on it, for the reason `ImulMem`'s
+    /// comment gives about the same choice: the two charge DIFFERENT clocks (14 here against
+    /// `Imul`'s 9), so a shared discriminant would put the charge behind a guard inside one
+    /// `raw_clocks` arm where writing the bare pattern silently picks the wrong one.
+    ///
+    /// No `width` field: 0x69 and 0x6b are absent from `classify`'s `OperandSize::Word` allowlist,
+    /// so a 66-prefixed encoding never reaches the arm that builds this and the source is always a
+    /// dword. The MEMORY form is absent too — see the classify arm for why it is a missed lowering
+    /// rather than a hazard.
+    ImulImm {
+        dst: u8,
+        src: u8,
+        imm: u32,
     },
     /// BT r/m32, r32, REGISTER form only (0F A3 with mod == 0b11).
     ///
@@ -3005,6 +3079,14 @@ impl DirectKind {
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
             // forms share the arm because the interpreter charges them from one `Ok(clocks(9))`.
             Self::Imul { .. } | Self::ImulMem { .. } => 9,
+            // The THREE-operand IMUL charges clocks(14), not the two-operand form's clocks(9)
+            // (execute_extended.rs, the 0x69 and 0x6b arms), so it cannot share the arm above and
+            // it cannot ride the `_ => 2` default either -- that would under-charge it by TWELVE
+            // raw clocks, the largest single-arm error this table could carry. The Phase 5
+            // call-out double-charge is the precedent for why an omitted arm here is invisible to
+            // the emitter's own `completed_raw` assertion: that assertion sums this same
+            // accessor, so it agrees with itself whatever the arm returns.
+            Self::ImulImm { .. } => 14,
             _ => 2,
         }
     }
@@ -3595,6 +3677,72 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
         }
 }
 
+/// The backend's OWN answer to "may this instruction sit in the middle of a block", for the
+/// opcodes where the interpreter's answer (`DecodedInsn::continuable`, decided by
+/// `block_continuable` in decode.rs) is not a statement about this backend at all.
+///
+/// ## Why the two questions differ
+///
+/// `block_continuable` decides whether the INTERPRETER may chain an instruction into a
+/// `run_budgeted` straight-line run. The compile walk has always consulted it as if it were a
+/// statement about emittability, which it never was — the rejected-row campaign's Slice 5 census
+/// named the arm and found it holding the largest `non_continuable` rows on both fixtures. Its
+/// refusals fall into three kinds, and only the first is a property this backend must inherit:
+///
+///  * **Semantic.** IRET (0xCF), the far transfers (0x9A/0xEA/0xCA/0xCB/0xFF /3 and /5), INT/INTO
+///    (0xCC-0xCE) and HLT (0xF4) load CS, dispatch through the IDT or stop the machine. A block
+///    cannot run past them and `classify` refuses every one independently, so admitting them here
+///    would move a row between census arms and lower nothing.
+///  * **Device-visible.** The port forms. A write always sets `io_touched`, so the run must end at
+///    the boundary after it; the IN forms are admitted by `block_continuable` itself on the
+///    Approximate personas and reach this backend through a call-out slot that reproduces that
+///    boundary (`jit/direct/callout.rs`). OUT is a genuine policy refusal and NOT admitted here —
+///    see the audit note at the end.
+///  * **Classification artifact.** `route_group` sorts three-operand IMUL (0x69/0x6B) into
+///    `DecodeGroup::Misc`, the "heterogeneous one-off single-byte block", purely because of the
+///    opcode neighbourhood it shares with the BCD adjusts, INS/OUTS, AAM/AAD, SALC/XLAT and HLT.
+///    `block_continuable` then refuses the whole group bar TEST AL/AX,imm. Nothing about a signed
+///    multiply of a register by an immediate touches a port, changes CS, alters system state or
+///    can halt: it is a pure ALU form, strictly simpler than the `DecodeGroup::Alu` members
+///    `block_straight_line` admits wholesale, and its own `execute_extended.rs` arm is a read, a
+///    multiply and a register write. `block_continuable`'s comment already makes exactly this
+///    argument for TEST AL,imm ("a decode-classification artifact of the odd opcode neighborhood
+///    they share with the BCD/string/HLT one-offs, not a semantic property"); this is the same
+///    claim about the same bucket.
+///
+/// ## Why the fix lives HERE and not in `block_continuable`
+///
+/// Admitting 0x69/0x6B upstream would also lengthen the INTERPRETER's straight-line runs, which
+/// moves run boundaries, and run boundaries are where the machine services device events. That is
+/// a guest-TIMING change on the Approximate personas — legitimate under the state-exact contract,
+/// but it would have to be measured against the doom and quake oracles as its own slice. This
+/// predicate changes only which instructions a compiled block may contain, so the interpreter's
+/// batch structure is byte-identical by construction and the oracles cannot move for this reason.
+///
+/// ## What this does NOT do
+///
+/// It does not admit anything. `classify` remains the sole emittability authority: an opcode that
+/// passes here and has no classify arm stops the block at `PlannedInsn::HardBoundary` exactly as
+/// before, one census arm to the left. The two changes are only useful together, which is why the
+/// classify arm and this predicate landed in one commit.
+///
+/// ## The OUT audit, recorded rather than acted on
+///
+/// `0xEE` OUT DX,AL is quake's largest `non_continuable` row (1,198,302 static exits) and it is a
+/// POLICY refusal, not a semantic one — the call-out mechanism that serves `0xEC` IN would serve
+/// it, and `FastMap::invalidate_all` clears entries in place rather than reallocating, so the
+/// bases a running block baked stay valid across the whole-map wipe a VGA port write triggers.
+/// What stops it is not reachable from this predicate: `CpuBus::write_io` reaches every device's
+/// write path, and the call-out contract's "no WATCHED guest memory access while a block is live"
+/// proof would have to be re-established over all of them, not argued for one. Against that, the
+/// benefit is bounded by the same `io_touched` that motivates the interpreter's refusal — a write
+/// always sets it, so an admitted OUT would end the native run at the very next boundary and buy
+/// only the block's prefix plus its own compilation. It stays refused, and the reason is written
+/// down so the next slice re-opens it on the device-write proof rather than on the census rank.
+const fn jit_admits_non_continuable(opcode: u16) -> bool {
+    matches!(opcode, 0x69 | 0x6b)
+}
+
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
     let physical = cpu.decode_cache.line_phys_start(lin, d)?;
     key_for_phys(cpu, lin, d, physical)
@@ -3953,7 +4101,8 @@ fn compile_with_instruction_limit(
         // what the classifier could lower. That is why this has to be fixed before any of the
         // 16-bit admission work can produce a single native instruction.
         let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
-        if !prefixes_supported || !insn.continuable {
+        let continuable = insn.continuable || jit_admits_non_continuable(insn.opcode);
+        if !prefixes_supported || !continuable {
             // Attributed since the completeness slice. The two conditions are split rather than
             // folded, because they are different work: a prefix refusal names a prefix the
             // backend does not emit (the row's `prefix_mask` says which, and an explicit segment

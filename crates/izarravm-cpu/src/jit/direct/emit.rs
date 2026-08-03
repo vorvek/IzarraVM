@@ -326,6 +326,9 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::AluByteImm { op, dst, imm } => {
                 emit_alu_byte_imm(&mut e, op, dst, imm);
             }
+            DirectKind::AluRegByte { op, dst, src } => {
+                emit_alu_reg_byte(&mut e, op, dst, src);
+            }
             DirectKind::AluMemSource {
                 op,
                 dst,
@@ -387,6 +390,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Test { a, b } => emit_test(&mut e, a, b),
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
+            DirectKind::ImulImm { dst, src, imm } => emit_imul_imm(&mut e, dst, src, imm),
             DirectKind::ImulMemAcc { addr } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
@@ -3852,6 +3856,46 @@ fn emit_alu_byte_imm(e: &mut Encoder, op: u8, dst: u8, imm: u8) {
     }
 }
 
+/// The BYTE-LANE register ALU: `op r8, r8`, both operand orders.
+///
+/// `emit_alu_byte_imm`'s body with a second register read where it materialises an immediate, and
+/// the sharing is deliberate rather than incidental: the interpreter reaches ALU forms 0, 2 and 4
+/// through ONE `self.alu(op, a, b, BusWidth::Byte)` call in `execute_alu_decoded`, so the flags,
+/// the lazy descriptor and the truncation are the same operation on the same lane whatever the
+/// source is. Only where `a` and `b` come from differs, and the two orders are resolved by
+/// `classify` before this is reached (form 0 takes the r/m as the destination, form 2 the reg).
+///
+/// Both operands are read BEFORE anything is written, which is what makes the aliasing cases come
+/// out right without a special case: `add al, ah` and `xor ch, ch` name two byte lanes of ONE
+/// 32-bit home, and `cmp bl, bl` names one lane twice. The write-back through `emit_write_gpr8`
+/// touches only the destination lane's eight bits, exactly as `write_gpr8` does.
+///
+/// **The ordering inside `emit_alu_byte_preloaded` is `emit_pending` THEN `emit_capture_flags`,**
+/// on both its branches and inside `emit_carry_alu_byte` — the descriptor is recorded first and
+/// the host flags captured after. That is the opposite of `emit_inc_dec_reg8`, whose comment
+/// makes the reverse order load-bearing, and the difference is worth stating rather than glossing:
+/// it is safe HERE only because `emit_pending` emits nothing but `mov`s and stores, so it writes
+/// no host flag between the `alu_r8_r8` and the capture. Adding anything that sets flags to
+/// `emit_pending` — a test, a compare, an add — would silently corrupt every byte ALU result's
+/// flags, and this function would be one of the callers it broke. (An earlier version of this
+/// comment stated the order backwards; the code has never had it either way but the claim was
+/// wrong, and a wrong claim about a flag window is an invitation.)
+///
+/// `emit_write_gpr8` runs AFTER both, because it shifts its value register in place and would
+/// clobber the descriptor's recorded result if it ran before. That hazard IS `emit_inc_dec_reg8`'s
+/// verbatim.
+///
+/// CMP (op 7) suppresses the write-back, matching `write_back = op != 7` in the interpreter's arm.
+fn emit_alu_reg_byte(e: &mut Encoder, op: u8, dst: u8, src: u8) {
+    emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RAX);
+    emit_read_store_value(e, StoreSource::Reg(src), MemoryWidth::Byte, Reg::RCX);
+    emit_alu_byte_preloaded(e, op);
+
+    if op != 7 {
+        emit_write_gpr8(e, dst, Reg::RDX);
+    }
+}
+
 fn emit_alu_byte_preloaded(e: &mut Encoder, op: u8) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
 
@@ -3930,6 +3974,27 @@ fn emit_imul(e: &mut Encoder, dst: u8, src: u8) {
     // multiply and writing the whole flags word back in one go: emit_logic_live_af is not needed
     // the way TEST needs it, because TEST leaves its own descriptor live for a later read while
     // IMUL clears pending_flags and commits the full word right away.
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+}
+
+/// IMUL r32, r/m32, imm — the three-operand form, register source (0x69 and 0x6B).
+///
+/// `dst = src * imm`, which is one host instruction because the host has the same three-operand
+/// encoding with the same truncation and the same CF/OF rule. The flag tail is `emit_imul`'s
+/// verbatim and correct for the same reason: the interpreter reaches BOTH the two-operand and the
+/// three-operand form through one `imul_truncated` (core.rs), which ends in
+/// `set_flag(FLAG_CF | FLAG_OF, significant)`. That mask has more than one bit set, so it cannot
+/// take the single-bit CF-override shortcut and instead materializes whatever was pending before
+/// writing just those two bits -- leaving SF/ZF/AF/PF exactly as they were.
+///
+/// Unlike `emit_imul` this reads a source it does not write, and no shuffle is needed for it:
+/// every operand is a `GUEST_HOMES` register (R8-R14 plus RBX), the host instruction reads `src`
+/// and writes `dst` in one go, and `src == dst` is the ordinary in-place multiply the guest
+/// encoding permits.
+fn emit_imul_imm(e: &mut Encoder, dst: u8, src: u8, imm: u32) {
+    e.imul_r32_r32_imm32(home(dst), home(src), imm);
     emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
     emit_clear_pending(e);
