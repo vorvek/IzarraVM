@@ -304,12 +304,32 @@ function Invoke-RealtimeGateSelfTest {
     Assert-SelfTestThrows {
         Assert-UninstrumentedProfileSample ([pscustomobject]@{}) "legacy sample"
     } "missing a boolean"
+    # Both absolute floors are pinned here on purpose: they are ratchets derived
+    # from what the accepted baseline tree measures, so moving one without
+    # re-pinning the baseline (or the reverse) silently stops the gate asserting
+    # anything. Failing here is the intended way to notice.
     $policies = Get-WorkloadPolicies "Both"
     if ($policies.Count -ne 3 -or ($policies.name -join ",") -ne "doom-486,doom-586,quake-586" -or
-        $policies[0].minimum_real_time_factor -ne 3.5 -or
-        $policies[1].minimum_real_time_factor -ne 1.4 -or
-        $policies[2].minimum_real_time_factor -ne 1.4) {
+        $policies[0].minimum_real_time_factor -ne 2.15 -or
+        $policies[1].minimum_real_time_factor -ne 0.78 -or
+        $policies[2].minimum_real_time_factor -ne 1.4 -or
+        $policies[0].minimum_direct_native_coverage -ne 0.78 -or
+        $policies[1].minimum_direct_native_coverage -ne 0.82 -or
+        $policies[2].minimum_direct_native_coverage -ne 0.93) {
         throw "Both did not expand to the three workload-specific policies."
+    }
+    # A policy carrying its own coverage floor must use it; one without must fall
+    # back to the global, which is what the boundary fixture below relies on.
+    $perWorkloadCoverage = Get-CandidateSampleChecks `
+        ([pscustomobject]@{ minimum_real_time_factor = 1.4; minimum_direct_native_coverage = 0.78 }) `
+        @([pscustomobject]@{
+            direct_native_coverage = 0.79
+            direct_slow_exits_per_100_instructions = 0.0
+            real_time_factor = 1.5
+        })
+    if ($perWorkloadCoverage.coverage_passes -ne 1 -or
+        $perWorkloadCoverage.coverage_floor -ne 0.78) {
+        throw "A per-workload coverage floor was not honoured."
     }
     $singlePolicySelections = [ordered]@{
         Doom = "doom-486"
