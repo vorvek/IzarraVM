@@ -128,7 +128,7 @@ both devices on one line or channel is refused outright — nothing is written.
 last saved, so it tells you what the card is really doing even if something else
 moved it.
 
-### Why there is nothing to set in `izarravm.conf`
+### Why there is nothing to set in the machine config file
 
 There used to be. `[audio.sound_blaster] irq` and its neighbours were removed,
 because a config file cannot win an argument with NVRAM: the machine boots from
@@ -142,10 +142,19 @@ What stays in the file is what CMOS has no opinion about: whether each device is
 fitted at all (`enabled`), and the codec's I/O base (`base`), which is fixed
 board wiring rather than a resource anything can select.
 
-`--sb-irq`, `--sb-dma` and `--sb-high-dma` still work on the command line. They
-set the power-on values, which matters for headless runs, since those have no
-CMOS at all; in the GUI a saved assignment wins over them, the same way it wins
-over the config file.
+`--sb-irq`, `--sb-dma` and `--sb-high-dma` still work on the command line, and
+they are what a machine with no saved CMOS starts from — which is every headless
+run, since those never load one. On a machine that *has* been configured, the
+saved assignment wins, and the emulator says so:
+
+```
+WARN the saved CMOS overrode these flags; it is what the machine boots from.
+Change the CPU speed with GSWMODE or the BIOS setup panel (Del), and the sound
+card with SNDCTRL, both inside DOS -- or delete cmos.bin to start from the
+flags again  flags=--sb-irq 5
+```
+
+`--cpu` behaves the same way, for the same reason.
 
 ## Digital audio (Sound Blaster 16 compatible)
 

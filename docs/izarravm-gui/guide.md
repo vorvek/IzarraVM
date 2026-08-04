@@ -12,7 +12,7 @@ manual](../izarra-3000/user-manual.md) for what happens inside the guest.
 ## Starting it
 
 ```powershell
-cargo run -p izarravm -- --config examples/izarravm.toml
+cargo run -p izarravm -- --config examples/machine.toml
 ```
 
 See the README's Quick Start for the full set of headless and self-test
@@ -41,14 +41,37 @@ launch.
 
 The C: drive path itself is set at startup, not from inside the GUI: via
 `--c-drive`, `--dosroot`, or the `dos.c_drive` key in a `--config` TOML file
-such as `examples/izarravm.toml`. The GUI's "Open C: folder" control just
+such as `examples/machine.toml`. The GUI's "Open C: folder" control just
 opens your host file manager on whatever path is already configured (handy
 for dropping files onto the guest's hard disk, not a way to switch drives).
 
+## The two config files
+
+There are two, and they are not interchangeable:
+
+| | `izarravm.conf` | The machine config |
+| --- | --- | --- |
+| What it holds | Host-side GUI preferences | The machine's hardware |
+| Who writes it | The GUI, automatically | You |
+| Where it lives | Next to `c_drive/`, alongside `cmos.bin` | Anywhere; you name the path |
+| How it is read | Always, on startup | Only when you pass `--config <path>` |
+| Example | — | `examples/machine.toml` |
+
+Passing the GUI's own `izarravm.conf` to `--config` is refused with a message
+saying so, rather than a parse error about a key you did not know was
+significant.
+
+Note that a *third* thing holds machine settings, and it beats both files:
+`cmos.bin`, the machine's NVRAM, which is what it actually boots from. The CPU
+speed and the sound card's resources live there and are set from inside the
+guest; see [GSWMODE](../toka-dos/commands.md#gswmode) and
+[SNDCTRL](../toka-dos/commands.md#sndctrl). A `--cpu` or `--sb-irq` flag sets
+the power-on value for a machine that has never been configured; after that the
+saved value wins, and the emulator logs a warning naming the flags it ignored.
+
 ## izarravm.conf
 
-A TOML file holding GUI preferences that are meant to survive between runs,
-separate from the machine-hardware config you pass with `--config`:
+A TOML file holding GUI preferences that are meant to survive between runs:
 
 - Master volume
 - The CRT emulation style (below)

@@ -58,6 +58,10 @@ pub enum ConfigError {
         "audio.wss.irq {0} collides with audio.sound_blaster.irq {0}; the AD1848 and SB16 must use distinct PIC lines (real combo cards jumper them apart, e.g. SB16 IRQ7 vs WSS IRQ11)"
     )]
     WssSbIrqCollision(u8),
+    #[error(
+        "{path} holds the GUI's own preferences (it has a top-level `{key}` key), not a machine config. Those are two different files that have both been called izarravm.conf: the GUI writes its preferences next to the C: drive folder, while --config takes a machine description you write yourself (see examples/machine.toml). Point --config at the latter, or drop the flag to use the built-in defaults"
+    )]
+    GuiPrefsGivenAsMachineConfig { path: PathBuf, key: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +541,30 @@ pub const RETIRED_CMOS_KEYS: &[&[&str]] = &[
     &["audio", "wss", "dma"],
 ];
 
+/// Top-level keys that only ever appear in the GUI's preferences file. Used to
+/// recognise `--config <the GUI's own izarravm.conf>` and say so, rather than
+/// failing with a bare unknown-field error that names one key and explains
+/// nothing. They are `GuiPrefs` fields with no `AppConfig` counterpart, so a
+/// real machine config can never carry one.
+const GUI_PREFS_MARKER_KEYS: &[&str] = &[
+    "master_volume",
+    "amp_gain",
+    "pc_speaker_volume",
+    "crt_style",
+    "input_release",
+    "fullscreen_toggle",
+];
+
+/// `Some(key)` when a parsed document is the GUI's preferences file rather than
+/// a machine config.
+pub fn gui_prefs_marker(value: &toml::Value) -> Option<&'static str> {
+    let table = value.as_table()?;
+    GUI_PREFS_MARKER_KEYS
+        .iter()
+        .find(|key| table.contains_key(**key))
+        .copied()
+}
+
 /// Remove every [`RETIRED_CMOS_KEYS`] entry from a parsed config document,
 /// returning the dotted names of the ones that were actually present so the
 /// caller can say which keys it ignored.
@@ -577,6 +605,12 @@ impl AppConfig {
             source: Box::new(source),
         };
         let mut value = toml::from_str::<toml::Value>(&text).map_err(parse_error)?;
+        if let Some(key) = gui_prefs_marker(&value) {
+            return Err(ConfigError::GuiPrefsGivenAsMachineConfig {
+                path: path.to_owned(),
+                key,
+            });
+        }
         strip_retired_keys(&mut value);
         value.try_into::<Self>().map_err(parse_error)
     }

@@ -73,6 +73,12 @@ fn load_config_snapshot(
         path: path.to_owned(),
         source: Box::new(source),
     })?;
+    if let Some(key) = izarravm_core::gui_prefs_marker(&value) {
+        return Err(ConfigError::GuiPrefsGivenAsMachineConfig {
+            path: path.to_owned(),
+            key,
+        });
+    }
     let midi = value
         .get("audio")
         .and_then(|audio| audio.get("midi"))
@@ -165,6 +171,10 @@ pub(super) struct ResolvedStartup {
     config: AppConfig,
     hardware: HardwareProfile,
     host_input: HostInputPolicy,
+    /// The CMOS-owned hardware settings a flag asked for this run, kept apart
+    /// from `config` so the CMOS load can tell "the user typed this" from "this
+    /// is the built-in default".
+    requested: cmos::RequestedHardware,
     prefs: prefs::GuiPrefs,
     prefs_path: PathBuf,
     state_dir: PathBuf,
@@ -184,12 +194,22 @@ pub(super) struct GuiLaunch {
     pub(super) prefs_path: PathBuf,
 }
 
-#[derive(Debug)]
 pub(super) struct StartupError(ConfigError);
 
 impl fmt::Display for StartupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+/// Deliberately not derived. `fn main() -> Result<_, E>` reports the error with
+/// `Debug`, so a derived one prints the struct and hides the message -- and
+/// every one of these messages exists to tell the user which file to fix.
+impl fmt::Debug for StartupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Explicitly Display: an unqualified `self.0.fmt` inside a Debug impl
+        // resolves to Debug and prints the struct, which is the whole problem.
+        fmt::Display::fmt(&self.0, formatter)
     }
 }
 
@@ -229,7 +249,8 @@ impl ResolvedStartup {
     }
 
     pub(super) fn into_gui(self, rom: Vec<u8>, test_pattern: bool) -> GuiLaunch {
-        let rtc_setup = cmos::RtcSetup::from_c_root(&self.config.dos.c_drive);
+        let mut rtc_setup = cmos::RtcSetup::from_c_root(&self.config.dos.c_drive);
+        rtc_setup.requested = self.requested;
         let glide_ovl = self.load_global_glide_ovl();
         GuiLaunch {
             profile: MachineProfile::from_hardware_profile(&self.hardware),
@@ -319,6 +340,12 @@ fn resolve_with(
     }
     let hardware = HardwareProfile::from_config(&config)?;
     let host_input = HostInputPolicy::from_config(&config.input);
+    let requested = cmos::RequestedHardware {
+        cpu: cli.cpu,
+        sb_irq: cli.sb_irq,
+        sb_dma: cli.sb_dma,
+        sb_high_dma: cli.sb_high_dma,
+    };
     info!(
         cpu = %config.machine.cpu,
         hz = hardware.cpu.clock_rate().as_hz_f64(),
@@ -337,6 +364,7 @@ fn resolve_with(
         config,
         hardware,
         host_input,
+        requested,
         prefs: saved_prefs,
         prefs_path,
         state_dir: locations.state_dir.clone(),

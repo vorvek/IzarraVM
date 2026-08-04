@@ -9,6 +9,7 @@
 //! the main thread before the emulation thread starts, so the read is safe; if
 //! the host refuses a local offset, we fall back to UTC and log it.
 
+use izarravm_core::{GswMode, SbDma8, SbDma16, SbIrq};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use tracing::warn;
@@ -59,13 +60,68 @@ pub fn cmos_path(c_root: &Path) -> PathBuf {
     c_root.parent().unwrap_or(c_root).join("cmos.bin")
 }
 
+/// The hardware settings a command-line flag asked for THIS run, for the
+/// settings CMOS also owns.
+///
+/// These flags set power-on values, and a saved `cmos.bin` overrides them --
+/// which is correct (NVRAM is what the machine boots from) but invisible. A
+/// user who types `--sb-irq 5` and hears the card answer on 7 has no way to
+/// tell that a saved assignment beat them, so `apply` says so. Only flags that
+/// were actually typed are tracked; a default the user never asked for being
+/// overridden is not news.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestedHardware {
+    pub cpu: Option<GswMode>,
+    pub sb_irq: Option<SbIrq>,
+    pub sb_dma: Option<SbDma8>,
+    pub sb_high_dma: Option<SbDma16>,
+}
+
+impl RequestedHardware {
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    /// Name every flag whose value the loaded CMOS did not end up honouring.
+    fn overridden_by(self, machine: &izarravm_machine::Machine) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(cpu) = self.cpu
+            && machine.active_mode() != cpu
+        {
+            names.push(format!("--cpu {cpu}"));
+        }
+        // A machine built without the SB16 has no routing to disagree with, so
+        // an absent card is silence rather than a warning about every flag.
+        if let Some((irq, dma, high_dma)) = machine.sound_blaster_routing() {
+            if let Some(want) = self.sb_irq
+                && irq != want.line()
+            {
+                names.push(format!("--sb-irq {want}"));
+            }
+            if let Some(want) = self.sb_dma
+                && dma != want.channel()
+            {
+                names.push(format!("--sb-dma {want}"));
+            }
+            if let Some(want) = self.sb_high_dma
+                && high_dma != want.channel()
+            {
+                names.push(format!("--sb-high-dma {want}"));
+            }
+        }
+        names
+    }
+}
+
 /// Everything the emulation thread needs to bring the RTC online: the host
-/// seed time and where to load/persist `cmos.bin`. Read once on the main thread
-/// at startup and handed to the thread that builds the Machine.
+/// seed time, where to load/persist `cmos.bin`, and which hardware settings a
+/// flag asked for. Read once on the main thread at startup and handed to the
+/// thread that builds the Machine.
 #[derive(Debug, Clone)]
 pub struct RtcSetup {
     pub seed: SeedTime,
     pub cmos_path: PathBuf,
+    pub requested: RequestedHardware,
 }
 
 impl RtcSetup {
@@ -74,6 +130,7 @@ impl RtcSetup {
         Self {
             seed: read_host_time(),
             cmos_path: cmos_path(c_root),
+            requested: RequestedHardware::default(),
         }
     }
 
@@ -90,16 +147,37 @@ impl RtcSetup {
                     // Persist the defaulted, checksummed replacement.
                     save_cmos_file(&self.cmos_path, &machine.cmos_bytes());
                 }
+                self.warn_about_overridden_flags(machine);
             }
             None => {
                 // No saved CMOS: persist the defaulted image (with its fresh
-                // checksum) so the file exists for next run.
+                // checksum) so the file exists for next run. Nothing overrode
+                // the flags here -- this is the run where they set the machine
+                // up, and the image just written is what they set it to.
                 save_cmos_file(&self.cmos_path, &machine.cmos_bytes());
             }
         }
         let s = self.seed;
         machine.seed_rtc(
             s.year, s.month, s.day, s.weekday, s.hour, s.minute, s.second,
+        );
+    }
+
+    fn warn_about_overridden_flags(&self, machine: &izarravm_machine::Machine) {
+        if self.requested.is_empty() {
+            return;
+        }
+        let ignored = self.requested.overridden_by(machine);
+        if ignored.is_empty() {
+            return;
+        }
+        warn!(
+            path = %self.cmos_path.display(),
+            flags = %ignored.join(", "),
+            "the saved CMOS overrode these flags; it is what the machine boots \
+             from. Change the CPU speed with GSWMODE or the BIOS setup panel \
+             (Del), and the sound card with SNDCTRL, both inside DOS -- or \
+             delete cmos.bin to start from the flags again"
         );
     }
 }

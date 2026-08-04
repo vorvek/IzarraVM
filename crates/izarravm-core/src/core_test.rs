@@ -611,6 +611,64 @@ fn retired_cmos_keys_are_accepted_reported_and_ignored() {
     );
 }
 
+/// Two different files have both been called izarravm.conf: the one the GUI
+/// writes beside the C: drive, and the machine description you pass to
+/// --config. Pointing --config at the first is an easy mistake, and the bare
+/// unknown-field error it used to produce named one key and explained nothing.
+#[test]
+fn the_guis_own_preferences_file_is_recognised_and_named() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("izarravm.conf");
+    fs::write(
+        &path,
+        r#"
+            master_volume = 0.8
+            amp_gain = 120
+            crt_style = "subtle"
+        "#,
+    )
+    .unwrap();
+
+    let error = AppConfig::from_toml_path(&path).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("GUI"),
+        "the error should say which file this is: {message}"
+    );
+    assert!(
+        message.contains("master_volume"),
+        "and point at the key that gave it away: {message}"
+    );
+    assert!(
+        message.contains("examples/machine.toml"),
+        "and say what to pass instead: {message}"
+    );
+}
+
+/// The detector keys off fields a machine config cannot have, so a real one --
+/// even a complete one -- must never be mistaken for GUI preferences.
+#[test]
+fn a_real_machine_config_is_not_mistaken_for_gui_preferences() {
+    let value = toml::from_str::<toml::Value>(
+        r#"
+            [machine]
+            memory_mib = 16
+            video = "vega"
+
+            [audio.sound_blaster]
+            enabled = true
+
+            [audio.midi]
+            backend = "off"
+
+            [input]
+            keyboard = true
+        "#,
+    )
+    .unwrap();
+    assert_eq!(crate::gui_prefs_marker(&value), None);
+}
+
 /// A config file that never mentioned them is untouched, so the pass cannot
 /// invent a warning for a user who has done nothing wrong.
 #[test]

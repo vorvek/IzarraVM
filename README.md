@@ -83,11 +83,11 @@ what this hardware could ever have done rather than defects in emulation.
 cargo run -p izarravm -- --headless-config-check
 cargo run -p izarravm -- --headless-test-rom
 cargo run -p izarravm -- --headless-boot-suite
-cargo run -p izarravm -- --config examples/izarravm.toml
+cargo run -p izarravm -- --config examples/machine.toml
 ```
 
 For non-Windows hosts later, replace the `c_drive` path in
-`examples/izarravm.toml` or pass `--c-drive /path/to/dosroot`.
+`examples/machine.toml` or pass `--c-drive /path/to/dosroot`.
 
 By default the C: drive, `cmos.bin`, and `izarravm.conf` live under the per-user
 `~/.izarravm` directory, so launching the binary from any folder leaves nothing

@@ -901,3 +901,81 @@ fn headless_startup_resolves_toml_then_cli_hardware() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// The hardware flags have to survive the trip from the command line into the
+/// RTC setup, or the "your saved CMOS overrode this" warning has nothing to
+/// warn about. The values themselves reach the machine through the config; this
+/// second copy exists only to record that the user typed them, which is what
+/// separates "overridden" from "left at the default".
+#[test]
+fn typed_hardware_flags_reach_the_rtc_setup() {
+    let root = startup_test_dir("requested-flags");
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--cpu",
+        "386-slow",
+        "--sb-irq",
+        "5",
+        "--sb-high-dma",
+        "7",
+    ])
+    .unwrap();
+    let locations = StartupLocations {
+        state_dir: root.join("state"),
+        executable_dir: root.join("portable"),
+    };
+
+    let resolved = resolve_with(&cli, &locations, |_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "fixture has no preferences",
+        ))
+    })
+    .unwrap();
+    let launch = resolved.into_gui(Vec::new(), false);
+
+    assert_eq!(
+        launch.rtc_setup.requested,
+        crate::cmos::RequestedHardware {
+            cpu: Some(izarravm_core::GswMode::Gsw386Slow),
+            sb_irq: Some(izarravm_core::SbIrq::I5),
+            sb_dma: None,
+            sb_high_dma: Some(izarravm_core::SbDma16::D7),
+        },
+        "a flag left off the command line must stay None, or an untouched \
+         setting would be reported as overridden"
+    );
+}
+
+/// Pointing --config at the GUI preferences file is refused by name. The two
+/// have both been called izarravm.conf, so this is an easy mistake to make and
+/// a confusing one to diagnose from a bare unknown-field error.
+#[test]
+fn the_guis_preferences_file_is_refused_as_a_machine_config() {
+    let root = startup_test_dir("gui-prefs-as-config");
+    let config_path = root.join("izarravm.conf");
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let cli = Cli::try_parse_from(["izarravm", "--config", &config_arg]).unwrap();
+    let locations = StartupLocations {
+        state_dir: root.join("state"),
+        executable_dir: root.join("portable"),
+    };
+
+    let error = resolve_with(&cli, &locations, |path| {
+        if path == config_path {
+            Ok("master_volume = 0.8\ncrt_style = \"subtle\"\n".to_string())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fixture has no preferences",
+            ))
+        }
+    })
+    .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("master_volume") && message.contains("machine config"),
+        "the error must name the file and the key that gave it away: {message}"
+    );
+}
