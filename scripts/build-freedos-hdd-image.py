@@ -310,11 +310,11 @@ def main(check: bool = False) -> int:
                   b"SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
     # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH C:\DOS
     # lets the command-line tools (MOVE/SORT/MEM/...) and TOKAMOUS resolve from any
-    # current directory. SET BLASTER advertises the emulated SB16 (base 0x220, IRQ5,
+    # current directory. SET BLASTER advertises the emulated SB16 (base 0x220, IRQ7,
     # DMA1, high DMA5, wavetable MPU at 0x300, type 6 SB16). LH
     # loads the INT 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low load).
     autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n"
-                b"SET BLASTER=A220 I5 D1 H5 P300 T6\r\n"
+                b"SET BLASTER=A220 I7 D1 H5 P300 T6\r\n"
                 b"IZCDEX /I /D:TOKACD01 /L:D /Q\r\n"
                 b"LH TOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"

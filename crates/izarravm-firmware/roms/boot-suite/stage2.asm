@@ -452,21 +452,22 @@ test_sb_8bit_dma:
     out dx, al
     mov al, 0x00
     out dx, al
-    ; IRQ5 -> vector 0x0D (PIC base 0x08 set by test_timer). Install the handler
-    ; and unmask IRQ5 (clear IMR bit5), then spin until the handler bumps the
+    ; IRQ7 -> vector 0x0F (PIC base 0x08 set by test_timer). IRQ7 is the shipped
+    ; SoundBlasterConfig default. Install the handler and unmask IRQ7 (clear IMR
+    ; bit7), then spin until the handler bumps the
     ; counter. Playback is clock-driven, so the DSP sample clock in advance_devices
     ; edges the block-completion IRQ during the spin.
     xor ax, ax
     mov es, ax
-    mov word [es:0x34], irq5_handler
-    mov word [es:0x36], 0
+    mov word [es:0x3C], irq7_handler
+    mov word [es:0x3E], 0
     mov word [SB_DMA_TICKS], 0
     mov dx, PIC_DATA
     in al, dx
-    and al, 0xDF            ; clear bit5 -> unmask IRQ5
+    and al, 0x7F            ; clear bit7 -> unmask IRQ7
     out dx, al
     mov cx, 32
-    call wait_for_irq5
+    call wait_for_irq7
     jz .done                ; timeout (counter still 0) -> leave FAIL
     mov di, RESULT_BLOCK + (sb_8bit_dma_record - result_block_template)
     mov byte [di], 'P'
@@ -526,19 +527,19 @@ test_sb_16bit_dma:
     out dx, al
     mov al, 0x00
     out dx, al
-    ; IRQ5 -> vector 0x0D. Re-install the handler, reset the tick counter, and
-    ; unmask IRQ5. The 16-bit path edges the same block IRQ as the 8-bit one.
+    ; IRQ7 -> vector 0x0F. Re-install the handler, reset the tick counter, and
+    ; unmask IRQ7. The 16-bit path edges the same block IRQ as the 8-bit one.
     xor ax, ax
     mov es, ax
-    mov word [es:0x34], irq5_handler
-    mov word [es:0x36], 0
+    mov word [es:0x3C], irq7_handler
+    mov word [es:0x3E], 0
     mov word [SB_DMA_TICKS], 0
     mov dx, PIC_DATA
     in al, dx
-    and al, 0xDF            ; clear bit5 -> unmask IRQ5
+    and al, 0x7F            ; clear bit7 -> unmask IRQ7
     out dx, al
     mov cx, 16
-    call wait_for_irq5
+    call wait_for_irq7
     jz .done                ; timeout (counter still 0) -> leave FAIL
     mov di, RESULT_BLOCK + (sb_16bit_dma_record - result_block_template)
     mov byte [di], 'P'
@@ -581,10 +582,10 @@ test_pc_speaker:
     add word [RESULT_BLOCK + 10], 27
     ret
 
-; Shared: sti, then halt until an interrupt wakes the CPU and the IRQ5 handler
+; Shared: sti, then halt until an interrupt wakes the CPU and the IRQ7 handler
 ; has set SB_DMA_TICKS != 0. The running PIT bounds a missing-IRQ failure, so cx
-; is the wake budget. Leaves ZF clear when IRQ5 fired and set on timeout.
-wait_for_irq5:
+; is the wake budget. Leaves ZF clear when IRQ7 fired and set on timeout.
+wait_for_irq7:
     sti
 .spin:
     hlt
@@ -597,7 +598,7 @@ wait_for_irq5:
     ret
 
 ; IRQ5 handler: bump the tick counter, EOI the master PIC, iret.
-irq5_handler:
+irq7_handler:
     push ax
     inc word [SB_DMA_TICKS]
     mov al, 0x20

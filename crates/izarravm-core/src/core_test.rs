@@ -257,7 +257,7 @@ fn midi_receivers_and_fixed_guest_ports_are_unambiguous() {
 
 #[test]
 fn sound_blaster_config_defaults_when_absent_or_partial() {
-    // No [audio.sound_blaster] table: the hardware default (IRQ5/DMA1/DMA5).
+    // No [audio.sound_blaster] table: the shipped default (IRQ7/DMA1/DMA5).
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("izarravm.toml");
     fs::write(
@@ -275,7 +275,7 @@ fn sound_blaster_config_defaults_when_absent_or_partial() {
         config.audio.sound_blaster,
         SoundBlasterConfig {
             enabled: true,
-            irq: SbIrq::I5,
+            irq: SbIrq::I7,
             dma: SbDma8::D1,
             high_dma: SbDma16::D5
         }
@@ -289,13 +289,13 @@ fn sound_blaster_config_defaults_when_absent_or_partial() {
         r#"
             [audio.sound_blaster]
             enabled = true
-            irq = "7"
+            irq = "5"
         "#,
     )
     .unwrap();
     let config = AppConfig::from_toml_path(path).unwrap();
     assert!(config.audio.sound_blaster.enabled);
-    assert_eq!(config.audio.sound_blaster.irq, SbIrq::I7);
+    assert_eq!(config.audio.sound_blaster.irq, SbIrq::I5);
     assert_eq!(config.audio.sound_blaster.dma, SbDma8::D1);
     assert_eq!(config.audio.sound_blaster.high_dma, SbDma16::D5);
 }
@@ -303,7 +303,9 @@ fn sound_blaster_config_defaults_when_absent_or_partial() {
 #[test]
 fn wss_config_defaults_when_absent_or_partial() {
     // No [audio.wss] table: the codec is always present (enabled), at the
-    // WSS standard base 0x530 with IRQ7/DMA0 (chosen to dodge SB16 IRQ5/DMA1).
+    // WSS standard base 0x530 with IRQ11/DMA0 -- IRQ11 rather than the WSS
+    // standard IRQ7, which is yielded to the Sound Blaster, and DMA0 to dodge
+    // the SB16 DMA1.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("izarravm.toml");
     fs::write(
@@ -322,7 +324,7 @@ fn wss_config_defaults_when_absent_or_partial() {
         WssConfig {
             enabled: true,
             base: 0x530,
-            irq: WssIrq::I7,
+            irq: WssIrq::I11,
             dma: SbDma8::D0,
         }
     );

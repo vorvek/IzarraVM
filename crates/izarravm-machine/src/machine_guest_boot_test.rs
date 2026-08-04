@@ -17,8 +17,8 @@ fn sound_blaster_env_entries_default_config() {
     assert_eq!(
         entries,
         vec![
-            ("BLASTER".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
-            ("SETSOUND".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
+            ("BLASTER".to_string(), "A220 I7 D1 H5 P300 T6".to_string()),
+            ("SETSOUND".to_string(), "A220 I7 D1 H5 P300 T6".to_string()),
         ]
     );
 }
@@ -67,8 +67,8 @@ fn new_raw_program_seeds_psp_env_pointer_with_blaster() {
     assert_eq!(
         parse_env_block(&machine, env_seg),
         vec![
-            ("BLASTER".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
-            ("SETSOUND".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
+            ("BLASTER".to_string(), "A220 I7 D1 H5 P300 T6".to_string()),
+            ("SETSOUND".to_string(), "A220 I7 D1 H5 P300 T6".to_string()),
         ]
     );
 }
@@ -161,11 +161,12 @@ fn tokados_sndtst_delivers_sb_irq5_under_v86() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();
 
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::izarra_bios(),
-    )
-    .unwrap();
+    // Pinned to IRQ5 EXPLICITLY: the default is now IRQ7, and this fixture's
+    // guest code hooks vector 0x0D / unmasks master bit 5 by hand. Following the
+    // default would leave it asserting nothing while still passing.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.irq = izarravm_core::SbIrq::I5;
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.set_cmos_byte(0x11, 1); // disk-first
     machine
         .mount_hdd_folder_with(
@@ -202,11 +203,12 @@ fn tokados_vcpi_de0b_remaps_sb_irq5_vector() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();
 
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::izarra_bios(),
-    )
-    .unwrap();
+    // Pinned to IRQ5 EXPLICITLY: the default is now IRQ7, and this fixture's
+    // guest code hooks vector 0x0D / unmasks master bit 5 by hand. Following the
+    // default would leave it asserting nothing while still passing.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.irq = izarravm_core::SbIrq::I5;
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.set_cmos_byte(0x11, 1); // disk-first
     machine
         .mount_hdd_folder_with(
@@ -237,9 +239,11 @@ fn tokados_vcpi_de0b_remaps_sb_irq5_vector() {
 #[test]
 fn protected_mode_sb_dma_irq5_reaches_client_idt() {
     for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
-        let mut machine =
-            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PMIRQ5_COM)
-                .unwrap();
+        // Pinned to IRQ5 EXPLICITLY: the default is now IRQ7, and PMIRQ5.COM
+        // hooks the vector IRQ5 maps to by hand.
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        profile.sound_blaster.irq = izarravm_core::SbIrq::I5;
+        let mut machine = Machine::new_raw_program(profile, PMIRQ5_COM).unwrap();
         machine.set_mode(mode);
         let reason = machine
             .run_until_halt_or_cycles(mode.clock_hz() / 4)
@@ -286,8 +290,11 @@ fn lotura_reports_id_and_switches_mode_live() {
 
 #[test]
 fn izarra_bios_post_publishes_result_block() {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
-    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .unwrap();
     machine.mount_floppy(idle_boot_floppy_image()).unwrap();
     // The full-screen RLE background blit delays the POST step loop to ~10M
     // cycles, so the result block fills out later than the old mode-13h screen.

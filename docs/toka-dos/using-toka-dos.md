@@ -110,13 +110,15 @@ The stock startup script is short:
 @ECHO OFF
 PROMPT $P$G
 PATH C:\DOS
-SET BLASTER=A220 I5 D1 H5 P300 T6
+SET BLASTER=A220 I7 D1 H5 P300 T6
 LH TOKAMOUS
 ```
 
 `SET BLASTER` advertises the ReSonique 2's Sound Blaster-compatible digital
 audio to any program that looks for the environment variable (base 0x220,
-IRQ 5, 8-bit DMA 1, 16-bit DMA 5). See the
+IRQ 7, 8-bit DMA 1, 16-bit DMA 5). Toka-DOS regenerates the line from the
+machine's configuration, so it always matches the card's actual resources —
+unless you have hand-edited `AUTOEXEC.BAT`, which it leaves alone. See the
 [ReSonique 2 manual](../resonique2/manual.md) for what those numbers mean.
 `LH TOKAMOUS` loads the mouse driver high, into an upper memory block if
 [TOKAEMM](../tokaemm/manual.md) has one free, falling back to a normal load

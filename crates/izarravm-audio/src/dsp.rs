@@ -283,6 +283,43 @@ impl SbDsp {
     }
 
     /// Push a command/data byte into the interpreter; dispatches when complete.
+    /// Log every fully-assembled DSP command (`IZARRAVM_SB_CMD_TRACE`), with the
+    /// playback state it leaves behind.
+    ///
+    /// The per-second `[SB]` trace shows what the DSP is DOING; this shows what
+    /// the guest ASKED for, which is the half you need when a driver streams by
+    /// re-arming single-cycle blocks and simply stops. The read-port histogram
+    /// cannot answer it either, because commands are port WRITES.
+    ///
+    /// Commands arrive at a handful per block, so the cost here is irrelevant;
+    /// the gate is still read once rather than per call.
+    fn trace_command(&mut self, command: u8, args: &[u8]) {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        const LIMIT: u32 = 400;
+        if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_CMD_TRACE").is_some()) {
+            return;
+        }
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if n >= LIMIT {
+            return;
+        }
+        eprintln!(
+            "[SBCMD {n}] cmd={command:#04x} args={args:02x?} -> playing={} auto_init={} \
+             bits={} stereo={} rate={} block={} remaining={} irq_pending={}",
+            self.playing,
+            self.auto_init,
+            if self.dma_16bit { 16 } else { 8 },
+            self.stereo,
+            self.rate_hz,
+            self.block_size,
+            self.block_remaining,
+            self.irq_pending,
+        );
+    }
+
     fn write_command_byte(&mut self, byte: u8) {
         if let Some(mut pending) = self.pending.take() {
             pending.args.push(byte);
@@ -306,6 +343,7 @@ impl SbDsp {
 
     /// Execute a fully-assembled command with its argument bytes.
     fn dispatch(&mut self, command: u8, args: &[u8]) {
+        self.trace_command(command, args);
         match command {
             0x10 => self.direct_dac_byte = args.first().copied(),
             0xE4 => self.test_reg = args.first().copied().unwrap_or(0),
