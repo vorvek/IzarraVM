@@ -1012,3 +1012,53 @@ units_over_128=0 units_over_256=0 excl_units=0"
         ]
     );
 }
+
+#[test]
+fn key_injection_steps_parse_with_increasing_offsets() {
+    let steps = parse_key_injections("100:a;200:\r").unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].at_cycles, 100);
+    assert_eq!(steps[0].text, "a");
+    assert_eq!(steps[1].at_cycles, 200);
+    assert_eq!(steps[1].text, "\r", "\r must expand to a carriage return");
+    // Empty segments are skipped rather than being an error, so a trailing ';'
+    // from a shell loop does not fail the run.
+    assert_eq!(parse_key_injections("100:a;").unwrap().len(), 1);
+    assert!(parse_key_injections("").unwrap().is_empty());
+}
+
+#[test]
+fn key_injection_rejects_non_increasing_offsets() {
+    // Strictly increasing is what makes the schedule deterministic: a step at
+    // or before its predecessor would inject at a cycle already burned, so the
+    // keystroke would land at a run-dependent point and break equal-work.
+    assert!(parse_key_injections("200:a;200:b").is_err());
+    assert!(parse_key_injections("200:a;100:b").is_err());
+    assert!(
+        parse_key_injections("100").is_err(),
+        "missing ':' must fail"
+    );
+}
+
+#[test]
+fn scancode_groups_cover_named_keys_and_plain_text() {
+    // A bare modifier is the reason named keys exist: SHIFT is a make/break
+    // pair with no character behind it, and Prince of Persia advances its
+    // title screen on exactly that.
+    assert_eq!(
+        text_to_scancode_groups("{shift}").unwrap(),
+        vec![vec![0x2a, 0xaa]]
+    );
+    assert_eq!(
+        text_to_scancode_groups("{esc}").unwrap(),
+        vec![vec![0x01, 0x81]]
+    );
+    // Plain characters still go through the ASCII path, one group per key.
+    let mixed = text_to_scancode_groups("a{shift}").unwrap();
+    assert_eq!(mixed.len(), 2);
+    assert_eq!(mixed[1], vec![0x2a, 0xaa]);
+    assert_eq!(mixed[0], ascii_to_set1('a'));
+
+    assert!(text_to_scancode_groups("{nosuchkey}").is_err());
+    assert!(text_to_scancode_groups("{shift").is_err(), "unclosed brace");
+}

@@ -2128,6 +2128,17 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x0080..=0x008f, // DMA page registers
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
+        0x0240..=0x024f, // C/MS Game Blaster alternate bases, the two the 0x280 entry
+        0x0260..=0x026f, // below missed. Prince of Persia's sound detect sweeps base+3
+        // across the standard set and only stopped faulting at the
+        // LAST of them: the game still halted with
+        // CpuError("unsupported I/O port 0x0243") a second into its
+        // boot. 0x243 is the observed fault; 0x263 is the remaining
+        // standard base, added by symmetry so the next probe in the
+        // same sweep cannot halt the machine the same way. This
+        // chipset fixes the Sound Blaster at 0x220, so 0x240 and
+        // 0x260 hold no device and open bus is what the hardware
+        // does.
         0x0280..=0x028f, // C/MS Game Blaster alternate-base probe range (Prince of
         // Persia's sound detect reads 0x283 and must see open bus,
         // not a fault -- the port-0x201 joystick-stub precedent)

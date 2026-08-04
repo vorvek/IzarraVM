@@ -150,6 +150,12 @@ struct Cli {
     /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
     #[arg(long, requires = "hdd_folder")]
     expect_test_exit: bool,
+    /// With --hdd-folder, type keys at fixed guest-cycle offsets: `cycles:text`
+    /// steps separated by `;`, offsets strictly increasing, `\r` for Enter. For
+    /// games whose benchmark window sits behind a title screen or a menu. The
+    /// schedule is deterministic, so an equal-work comparison still holds.
+    #[arg(long, requires = "hdd_folder")]
+    inject_keys: Option<String>,
     /// Boot the C: drive exactly as the GUI does and attribute wall time per
     /// boot phase: POST, boot, prompt idle, command exec, and disk load. Uses
     /// the same folder the GUI would (see --c-drive). A profiler, not a ladder.
@@ -320,6 +326,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             cli.result_ppm.as_deref(),
             cli.profile_json.as_deref(),
             cli.expect_test_exit,
+            cli.inject_keys.as_deref(),
         );
     }
 
@@ -744,6 +751,97 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
     Ok(code)
 }
 
+/// One `--inject-keys` step: type `text` once the run has burned `at_cycles`
+/// guest cycles since start.
+struct KeyInjection {
+    at_cycles: u64,
+    text: String,
+}
+
+/// A stop that ends the whole run, as opposed to a slice merely using up its
+/// own cycle allowance. Only `CycleLimit` is a slice boundary; everything else
+/// (halt, TestExit, a CPU error) must propagate instead of being run past.
+fn non_cycle_stop(reason: &StopReason) -> Option<StopReason> {
+    match reason {
+        StopReason::CycleLimit { .. } => None,
+        other => Some(other.clone()),
+    }
+}
+
+/// Expand injection text into one scancode group per keypress. Plain characters
+/// go through `ascii_to_set1`; `{name}` names a key that has no ASCII spelling.
+///
+/// The modifiers are the reason this exists. Prince of Persia advances its title
+/// and cutscene screens on SHIFT, which is a bare make/break pair with no
+/// character behind it, so an ASCII-only path cannot express it at all.
+fn text_to_scancode_groups(text: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut groups = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix('{') {
+            let (name, after) = tail
+                .split_once('}')
+                .ok_or_else(|| format!("--inject-keys has an unclosed {{ in {text:?}"))?;
+            // Make and break for one key, matching `ascii_to_set1`'s shape.
+            let make: u8 = match name.to_ascii_lowercase().as_str() {
+                "shift" => 0x2a,
+                "ctrl" => 0x1d,
+                "alt" => 0x38,
+                "esc" => 0x01,
+                "space" => 0x39,
+                "enter" => 0x1c,
+                "up" => 0x48,
+                "down" => 0x50,
+                "left" => 0x4b,
+                "right" => 0x4d,
+                other => return Err(format!("--inject-keys: unknown key {{{other}}}").into()),
+            };
+            groups.push(vec![make, make | 0x80]);
+            rest = after;
+        } else {
+            let ch = rest.chars().next().expect("rest is non-empty");
+            let codes = ascii_to_set1(ch);
+            if codes.is_empty() {
+                return Err(format!("--inject-keys: no scancode for {ch:?}").into());
+            }
+            groups.push(codes);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    Ok(groups)
+}
+
+/// Parse `--inject-keys`: `cycles:text` steps separated by `;`, for example
+/// `200000000:\r;400000000:\r`. Cycles are absolute offsets from run start and
+/// must be strictly increasing, which is what makes the schedule deterministic:
+/// the same build replays the same keystroke at the same guest cycle every run,
+/// so the gate's equal-work comparison still holds.
+fn parse_key_injections(spec: &str) -> Result<Vec<KeyInjection>, Box<dyn Error>> {
+    let mut steps = Vec::new();
+    let mut previous: Option<u64> = None;
+    for raw in spec.split(';').filter(|s| !s.trim().is_empty()) {
+        let (cycles, text) = raw
+            .split_once(':')
+            .ok_or_else(|| format!("--inject-keys step {raw:?} is not <cycles>:<text>"))?;
+        let at_cycles: u64 = cycles.trim().parse()?;
+        if previous.is_some_and(|last| at_cycles <= last) {
+            return Err(format!(
+                "--inject-keys offsets must strictly increase; {at_cycles} does not follow {}",
+                previous.unwrap_or_default()
+            )
+            .into());
+        }
+        previous = Some(at_cycles);
+        // `\r` is the one escape worth having: a bare carriage return cannot
+        // survive a shell argument, and Enter is what dismisses a title screen.
+        steps.push(KeyInjection {
+            at_cycles,
+            text: text.replace("\\r", "\r").replace("\\n", "\n"),
+        });
+    }
+    Ok(steps)
+}
+
 /// Mount a host folder as C: through the Katea facade (real FreeDOS system files
 /// plus the folder's top-level files, read-only), run the BIOS so INT 19h boots
 /// it, and print the same diagnostics as `run_boot_hdd`. The lazy-facade analogue
@@ -758,6 +856,7 @@ fn run_boot_hdd_folder(
     result_ppm: Option<&Path>,
     profile_json: Option<&Path>,
     expect_test_exit: bool,
+    inject_keys: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(path) = profile_json {
         validate_profile_json_parent(path)?;
@@ -793,8 +892,61 @@ fn run_boot_hdd_folder(
     #[cfg(windows)]
     let rip_sampler =
         std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| (riprofile::Sampler::start(), path));
+    let injections = match inject_keys {
+        Some(spec) => parse_key_injections(spec)?,
+        None => Vec::new(),
+    };
     let start_wall = std::time::Instant::now();
-    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+    // The no-injection path stays ONE `run_until_halt_or_cycles` call, byte for
+    // byte what it was: slicing the run moves where the machine services device
+    // events, so the shipped Doom and Quake fixtures must not take this branch.
+    let stop_reason = if injections.is_empty() {
+        machine.run_until_halt_or_cycles(budget)?
+    } else {
+        let mut spent = 0u64;
+        let mut reason = None;
+        for step in &injections {
+            let slice = step.at_cycles.saturating_sub(spent).min(budget - spent);
+            if slice > 0 {
+                let stop = machine.run_until_halt_or_cycles(slice)?;
+                spent += slice;
+                if let Some(terminal) = non_cycle_stop(&stop) {
+                    reason = Some(terminal);
+                    break;
+                }
+            }
+            // One short slice per scancode, as `inject_command` does: the guest
+            // has to poll INT 16h and consume each key before the next arrives,
+            // or the type-ahead buffer swallows it.
+            let per_key = hardware
+                .cpu
+                .clock_rate()
+                .clocks_for_fraction_floor(2, 1000)
+                .max(1_000);
+            for group in text_to_scancode_groups(&step.text)? {
+                for code in group {
+                    machine.inject_key_scancodes(&[code]);
+                    let slice = per_key.min(budget.saturating_sub(spent));
+                    if slice == 0 {
+                        break;
+                    }
+                    let stop = machine.run_until_halt_or_cycles(slice)?;
+                    spent += slice;
+                    if let Some(terminal) = non_cycle_stop(&stop) {
+                        reason = Some(terminal);
+                        break;
+                    }
+                }
+            }
+            if reason.is_some() {
+                break;
+            }
+        }
+        match reason {
+            Some(terminal) => terminal,
+            None => machine.run_until_halt_or_cycles(budget.saturating_sub(spent))?,
+        }
+    };
     let wall = start_wall.elapsed();
     #[cfg(windows)]
     if let Some((Some(sampler), path)) = rip_sampler {
