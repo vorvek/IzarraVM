@@ -210,6 +210,38 @@ impl DmaChip {
         }
     }
 
+    /// Log 8237 mode-register programming (`IZARRAVM_SB_CMD_TRACE`, shared with
+    /// the DSP command trace so one run shows both halves of a transfer setup).
+    ///
+    /// The DSP's own auto-init flag and the DMA controller's are DIFFERENT bits,
+    /// and a driver can legitimately pair a single-cycle DSP command with an
+    /// auto-init DMA channel. Without this, `auto_init=false` in the `[SB]` line
+    /// is ambiguous about which half was meant.
+    fn trace_dma_mode(ci: usize, value: u8, ch: &DmaChannel) {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_CMD_TRACE").is_some()) {
+            return;
+        }
+        let kind = match ch.transfer_kind {
+            0 => "verify",
+            1 => "write(io->mem)",
+            2 => "read(mem->io)",
+            _ => "invalid",
+        };
+        eprintln!(
+            "[DMA] ch{ci} mode={value:#04x} kind={kind} auto_init={} decrement={} \
+             transfer_mode={} base_addr={:#06x} base_count={} page={:#04x} mask={}",
+            ch.auto_init,
+            ch.addr_decrement,
+            ch.transfer_mode,
+            ch.base_addr,
+            ch.base_count,
+            ch.page,
+            ch.mask,
+        );
+    }
+
     fn write_local(&mut self, local: u8, value: u8) {
         if let Some(ci) = Self::addr_channel(local) {
             self.write_addr(ci, value);
@@ -238,6 +270,7 @@ impl DmaChip {
                     // Mode register: bits 0-1 select the channel.
                     let ci = (value & 0x03) as usize;
                     self.channels[ci].set_mode(value);
+                    Self::trace_dma_mode(ci, value, &self.channels[ci]);
                 }
                 12 => self.hi_lo = false, // reset flip-flop
                 13 => self.master_clear(),

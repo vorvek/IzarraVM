@@ -12,8 +12,9 @@ card.
 
 | Section | Compatibility | Base port | IRQ | DMA |
 | --- | --- | --- | --- | --- |
-| Digital audio | Sound Blaster 16 / CT1745 mixer | `0x220` | 5 | 8-bit: 1, 16-bit: 5 |
+| Digital audio | Sound Blaster 16 / CT1745 mixer | `0x220` | 7 | 8-bit: 1, 16-bit: 5 |
 | FM synthesis | OPL3 (Yamaha YMF262) | `0x388` | n/a | n/a |
+| Codec | Windows Sound System (AD1848) | `0x530` | 11 | 0 |
 | Wavetable daughterboard header | MPU-401 | `0x300` | 9 | n/a |
 | Rear MIDI/game port | MPU-401 | `0x330` | 9 | n/a |
 
@@ -22,18 +23,63 @@ AdLib addresses. ReSonique 2 assigns separate fixed ports to its internal
 wavetable header and rear MIDI connection, so software can select either path
 explicitly. The rear 15-pin connector also carries the usual joystick signals.
 
+### Why the Sound Blaster sits on IRQ 7
+
+IRQ 5 is the Sound Blaster 16 factory setting, so it is the value you might
+expect here. ReSonique 2 ships on **IRQ 7** instead, because DOS software falls
+into two groups and only 7 satisfies both:
+
+- Programs that **read `BLASTER`** work on any line, since the variable always
+  describes the running configuration.
+- Programs that **hardwire an IRQ** almost always hardwire 7, because 7 was the
+  factory setting on the Sound Blaster 1.x and 2.0 that their drivers were
+  written against. Such a program on IRQ 5 never receives its interrupt: with
+  most drivers that means playback starts and then stops after the first DMA
+  block, giving a short click instead of sound.
+
+Hardwiring 5 is rare, because 5 only became a default with SB16-class cards, by
+which time reading `BLASTER` was standard practice. If you do hit a title that
+insists on 5, set it per machine — see below.
+
+Because the AD1848 codec cannot share a line with the Sound Blaster, it takes
+**IRQ 11** rather than the WSS standard IRQ 7. Real combo cards jumper the two
+apart in exactly this way.
+
 ## The BLASTER variable
 
 Toka-DOS sets it in `AUTOEXEC.BAT` so any Sound Blaster-aware program finds
 the card without probing:
 
 ```
-SET BLASTER=A220 I5 D1 H5 P300 T6
+SET BLASTER=A220 I7 D1 H5 P300 T6
 ```
 
-That's base address `0x220`, IRQ 5, 8-bit DMA channel 1, 16-bit DMA channel
+That's base address `0x220`, IRQ 7, 8-bit DMA channel 1, 16-bit DMA channel
 5, wavetable MPU port `0x300`, and card type 6 (Sound Blaster 16). These
 match the defaults above.
+
+Toka-DOS regenerates this line from the machine's configuration, so it follows
+whatever you set. It leaves a hand-edited `AUTOEXEC.BAT` alone, though — if you
+have customised yours, update the `BLASTER` line yourself after changing the
+card's resources, or the variable will advertise the old values.
+
+## Changing the card's resources
+
+Per machine, in `izarravm.conf`:
+
+```toml
+[audio.sound_blaster]
+irq = "5"          # 2, 5, 7 or 10
+
+[audio.wss]
+irq = "7"          # 7, 9, 10 or 11
+```
+
+`--sb-irq`, `--sb-dma` and `--sb-high-dma` do the same from the command line.
+The Sound Blaster and the codec must end up on different IRQ lines and
+different DMA channels; the emulator refuses to start otherwise rather than
+letting two devices fight over one line. If you move one device onto a line or
+channel the other already holds, move that other device in the same edit.
 
 ## Digital audio (Sound Blaster 16 compatible)
 

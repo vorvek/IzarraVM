@@ -293,11 +293,11 @@ fn idle_f2_publishes_8bit_status_and_22f_cross_acknowledges_it() {
     with_bus(&mut machine, |bus| {
         bus.write_io(0x22C, BusWidth::Byte, 0xF2, false).unwrap();
     });
-    assert!(!machine.pic.irr_bit(5));
+    assert!(!machine.pic.irr_bit(7));
 
     machine.advance_devices_ticks(0);
 
-    assert!(machine.pic.irr_bit(5));
+    assert!(machine.pic.irr_bit(7));
     let (status, cleared) = with_bus(&mut machine, |bus| {
         bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
         let status = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
@@ -309,7 +309,7 @@ fn idle_f2_publishes_8bit_status_and_22f_cross_acknowledges_it() {
     assert_eq!(status, 0x01);
     assert_eq!(cleared, 0x00);
     assert!(
-        machine.pic.irr_bit(5),
+        machine.pic.irr_bit(7),
         "the device ack does not clear the PIC"
     );
 }
@@ -326,7 +326,7 @@ fn f2_after_16bit_arm_publishes_16bit_status_and_22e_cross_acknowledges_it() {
 
     machine.advance_devices_ticks(0);
 
-    assert!(machine.pic.irr_bit(5));
+    assert!(machine.pic.irr_bit(7));
     let (status, cleared) = with_bus(&mut machine, |bus| {
         bus.write_io(0x224, BusWidth::Byte, 0x82, false).unwrap();
         let status = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
@@ -338,7 +338,7 @@ fn f2_after_16bit_arm_publishes_16bit_status_and_22e_cross_acknowledges_it() {
     assert_eq!(status, 0x02);
     assert_eq!(cleared, 0x00);
     assert!(
-        machine.pic.irr_bit(5),
+        machine.pic.irr_bit(7),
         "the device ack does not clear the PIC"
     );
 }
@@ -538,7 +538,7 @@ fn disabled_sb16_leaves_ports_dma_irq_and_voice_inert() {
 
     machine.advance_devices_clocks(200_000);
 
-    assert!(!machine.pic.irr_bit(5));
+    assert!(!machine.pic.irr_bit(7));
     assert!(machine.sb16.irq_deadline().is_none());
     assert_eq!(machine.dma_read_byte(1), Some(0x55));
     let (index, data, dsp_data) = with_bus(&mut machine, |bus| {
@@ -834,7 +834,7 @@ fn short_16bit_dma_does_not_fabricate_silent_words() {
     assert_eq!(out.len(), 3, "only the three DMA words become samples");
     assert_eq!(machine.sb16.test_block_remaining(), 5);
     assert!(
-        !machine.pic.irr_bit(5),
+        !machine.pic.irr_bit(7),
         "an incomplete DSP block has no IRQ"
     );
 }
@@ -903,7 +903,7 @@ fn wss_16bit_stereo_dma_plays_and_irqs_through_the_machine() {
 
     // The terminal-count interrupt reached the PIC on the WSS line (IRQ7).
     assert!(
-        machine.pic.irr_bit(7),
+        machine.pic.irr_bit(11),
         "WSS terminal count raised its IRQ on the configured line"
     );
 
@@ -985,7 +985,7 @@ fn wss_16bit_stereo_auto_init_refills_across_live_clock_changes() {
         assert_eq!(frame, pattern[index % pattern.len()], "frame {index}");
     }
     assert!(
-        machine.pic.irr_bit(7),
+        machine.pic.irr_bit(11),
         "auto-init terminal count raised IRQ7"
     );
     assert!(
@@ -1069,8 +1069,8 @@ fn wss_coexists_with_sb16_and_opl_without_cross_talk() {
 
     // No IRQ cross-talk: WSS fired IRQ7, the SB16 fired its mixer-selected
     // IRQ5, and neither stepped on the other.
-    assert!(machine.pic.irr_bit(7), "WSS raised IRQ7");
-    assert!(machine.pic.irr_bit(5), "SB16 raised its own IRQ5 line");
+    assert!(machine.pic.irr_bit(11), "WSS raised IRQ11");
+    assert!(machine.pic.irr_bit(7), "SB16 raised its own IRQ7 line");
 
     // No DMA cross-talk: the WSS drew from ch0, the SB16 from ch1; both single
     // channels reached terminal count on their own.
@@ -1138,7 +1138,7 @@ fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
         "auto-init keeps the block looping"
     );
     assert!(
-        machine.pic.irr_bit(5),
+        machine.pic.irr_bit(7),
         "the block edges latched IRR5 within their own step"
     );
     assert!(
@@ -1147,16 +1147,16 @@ fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
     );
     // Guest ISR: PIC acknowledge, device ack (0x22E read), then EOI.
     with_bus(&mut machine, |bus| {
-        assert_eq!(bus.acknowledge_interrupt(), Some(0x0D));
+        assert_eq!(bus.acknowledge_interrupt(), Some(0x0F));
         bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
         bus.write_io(0x20, BusWidth::Byte, 0x20, false).unwrap(); // OCW2 EOI
     });
-    assert!(!machine.pic.irr_bit(5), "IRR clear after the acknowledge");
+    assert!(!machine.pic.irr_bit(7), "IRR clear after the acknowledge");
     // Later edges arrive in a later advance and re-request the line: the
     // edge stream survives the ack instead of being lost with it.
     machine.advance_devices_clocks(200_000);
     assert!(
-        machine.pic.irr_bit(5),
+        machine.pic.irr_bit(7),
         "the next step's block edges re-request IRQ5"
     );
 }
@@ -1177,7 +1177,7 @@ fn wss_terminal_count_edge_forwards_within_its_advance() {
     // One advance spanning the whole 32-frame window plus slack.
     machine.advance_devices_clocks(200_000);
     assert!(
-        machine.pic.irr_bit(7),
+        machine.pic.irr_bit(11),
         "the terminal-count edge latched IRR7 within the step"
     );
     assert!(
@@ -1363,8 +1363,15 @@ fn wss_irq7_wakes_a_halted_cpu_via_fast_forward() {
     // IRQ7 unmasked, then sti;hlt. The run loop must fast-forward across the
     // codec's terminal-count window and deliver IRQ7 -- proving the wss_wake
     // estimator drives the machine, not just the wss.rs unit test.
+    // WSS pinned to IRQ7 rather than taken from the default, which is now IRQ11.
+    // This fixture's guest code programs the MASTER PIC and unmasks bit 7; IRQ11
+    // lives on the slave, so following the default would mean rewriting the
+    // cascade setup for no gain. The slave path already has its own coverage in
+    // `wss_honors_a_configured_slave_irq11_end_to_end`.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.wss.irq = izarravm_core::WssIrq::I7;
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
+        profile,
         // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
         rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
     )
@@ -1543,7 +1550,7 @@ fn wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge() {
         "underflow sets the internal sticky Status INT bit even with IEN clear"
     );
     assert!(
-        !machine.pic.irr_bit(7),
+        !machine.pic.irr_bit(11),
         "IEN clear forwards no pin edge, so the PIC line stays clear"
     );
 }
@@ -1778,15 +1785,15 @@ fn wss_port_window_edges_and_config_region_decode_through_the_bus() {
     // Pin the wss_offset window math (`port.checked_sub(base).filter(|o| o < 8)`)
     // at its boundaries through the machine bus, plus the config-region readback
     // the decode comment promises does not overlap the SB16/mixer/OPL ranges:
-    //   base+1 (0x531) -> IRQ7/DMA0 jumper byte 0x70,
+    //   base+1 (0x531) -> IRQ11/DMA0 jumper byte 0xB0,
     //   base+7 (0x537) -> decodes (Ok),
     //   base+8 (0x538) and base-1 (0x52F) -> Err(UnsupportedPort).
     let mut machine = test_machine();
     with_bus(&mut machine, |bus| {
         assert_eq!(
             bus.read_io(0x531, BusWidth::Byte, 0, false).unwrap(),
-            0x70,
-            "config region reads the IRQ7/DMA0 jumper byte"
+            0xB0,
+            "config region reads the IRQ11/DMA0 jumper byte"
         );
         assert!(
             bus.read_io(0x537, BusWidth::Byte, 0, false).is_ok(),

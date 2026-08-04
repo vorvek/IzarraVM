@@ -1554,7 +1554,12 @@ fn tokaemm_m4_mouse_wheel_under_v86() {
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m4_sb16_irq5_under_v86() {
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nSNDTST\r\n".to_vec();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    // Pinned to IRQ5 EXPLICITLY rather than taken from the default, which is now
+    // IRQ7. The whole point of this fixture is that IRQ5 lands on vector 13, the
+    // vector the monitor also uses for #GP; on IRQ7 there is no collision and it
+    // would quietly stop testing the discriminator while still passing.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.irq = izarravm_core::SbIrq::I5;
     let mut scenario = TokaEmmScenario::new(
         "tokaemm-m4s",
         profile,
@@ -1603,7 +1608,12 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
 #[ignore = "boots a full FreeDOS image (slow); run with --ignored"]
 fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nIRQ5IP0\r\n".to_vec();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    // Pinned to IRQ5 EXPLICITLY rather than taken from the default, which is now
+    // IRQ7. The whole point of this fixture is that IRQ5 lands on vector 13, the
+    // vector the monitor also uses for #GP; on IRQ7 there is no collision and it
+    // would quietly stop testing the discriminator while still passing.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.irq = izarravm_core::SbIrq::I5;
     let mut scenario = TokaEmmScenario::new(
         "tokaemm-ip0",
         profile,

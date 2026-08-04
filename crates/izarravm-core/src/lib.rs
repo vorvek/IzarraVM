@@ -55,7 +55,7 @@ pub enum ConfigError {
     )]
     WssSbDmaCollision(usize),
     #[error(
-        "audio.wss.irq {0} collides with audio.sound_blaster.irq {0}; the AD1848 and SB16 must use distinct PIC lines (real combo cards jumper them apart, e.g. WSS IRQ7 vs SB16 IRQ5)"
+        "audio.wss.irq {0} collides with audio.sound_blaster.irq {0}; the AD1848 and SB16 must use distinct PIC lines (real combo cards jumper them apart, e.g. SB16 IRQ7 vs WSS IRQ11)"
     )]
     WssSbIrqCollision(u8),
 }
@@ -159,14 +159,31 @@ pub fn parse_device_lines(text: &str) -> Vec<ConfigDeviceLine> {
     lines
 }
 
+/// IRQ line for the Sound Blaster DSP.
+///
+/// **Defaults to 7, not to the SB16-era 5.** Two populations of DOS software have
+/// to be satisfied at once, and only 7 satisfies both:
+///
+/// * Titles that HARDWIRE an IRQ overwhelmingly hardwire 7, because 7 was the
+///   factory default on the Sound Blaster 1.x/2.0 that their drivers were written
+///   against. Chess Housers is one: its driver hooks vector 0x0F and never looks
+///   at `BLASTER`, so on IRQ 5 its ISR never runs, nothing re-arms the DSP after
+///   the first high-speed block, and all you get is a ~15 ms click.
+/// * Titles that READ `BLASTER` follow whatever we advertise, so they are happy
+///   either way (`stock_autoexec` generates the line from this value).
+///
+/// Hardwiring 5 is rare, because 5 only became a default with SB16-class cards,
+/// by which time reading `BLASTER` was standard practice. DOSBox reached the same
+/// conclusion and ships `irq = 7`. A card exposing two IRQ lines at once would
+/// dodge the choice, but no real card does that, so it is not an option here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SbIrq {
     #[serde(rename = "2")]
     I2,
     #[serde(rename = "5")]
-    #[default]
     I5,
     #[serde(rename = "7")]
+    #[default]
     I7,
     #[serde(rename = "10")]
     I10,
@@ -221,16 +238,24 @@ impl FromStr for SbIrq {
 /// only partially overlaps `SbIrq` (which carries 2/5/7/10): WSS cannot use 2 or
 /// 5, and `SbIrq` cannot express 9 or 11. A dedicated enum keeps the codec's
 /// configurable lines faithful to the documented set.
+///
+/// **Defaults to 11 and yields 7 to the Sound Blaster.** WSS's own standard
+/// default is 7, and this used to take it precisely because `SbIrq` defaulted to
+/// 5 -- but that is the wrong way round for a DOS library. Far more titles hardwire
+/// the SB on 7 than hardwire the codec, and the two cannot share a line (see
+/// `ConfigError::WssSbIrqCollision`; real combo cards jumper them apart). 11 is
+/// chosen over 9 because IRQ 9 is the cascaded IRQ 2 and still catches software
+/// that pokes the old XT line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WssIrq {
     #[serde(rename = "7")]
-    #[default]
     I7,
     #[serde(rename = "9")]
     I9,
     #[serde(rename = "10")]
     I10,
     #[serde(rename = "11")]
+    #[default]
     I11,
 }
 
@@ -593,9 +618,12 @@ pub struct SoundBlasterConfig {
 
 impl Default for SoundBlasterConfig {
     fn default() -> Self {
+        // IRQ7, not the SB16-era IRQ5: see the SbIrq doc for why 7 is the value
+        // that satisfies both the titles that hardwire an IRQ and the ones that
+        // read BLASTER. WssConfig yields IRQ11 so the two do not collide.
         Self {
             enabled: true,
-            irq: SbIrq::I5,
+            irq: SbIrq::I7,
             dma: SbDma8::D1,
             high_dma: SbDma16::D5,
         }
@@ -614,9 +642,9 @@ pub struct WssConfig {
     /// base+4). Defaults to 0x530, the de-facto WSS standard base.
     #[serde(default = "default_wss_base")]
     pub base: u16,
-    /// Power-on IRQ line read back from the board config region. Defaults to IRQ7,
-    /// chosen to avoid the SB16 default (IRQ5). Uses `WssIrq`, which carries the
-    /// documented WSS lines 7/9/10/11.
+    /// Power-on IRQ line read back from the board config region. Defaults to IRQ11,
+    /// leaving IRQ7 to the Sound Blaster, which many DOS titles hardwire. Uses
+    /// `WssIrq`, which carries the documented WSS lines 7/9/10/11.
     #[serde(default)]
     pub irq: WssIrq,
     /// Power-on 8-bit DMA channel read back from the board config region. Defaults
@@ -628,11 +656,13 @@ pub struct WssConfig {
 
 impl Default for WssConfig {
     fn default() -> Self {
-        // base 0x530, IRQ7, DMA0 -- chosen to avoid the SB16 defaults (IRQ5/DMA1).
+        // base 0x530, IRQ11, DMA0 -- IRQ11 rather than the WSS standard IRQ7 so
+        // the Sound Blaster keeps 7, which far more DOS titles hardwire; DMA0
+        // avoids the SB16 default (DMA1).
         Self {
             enabled: true,
             base: 0x530,
-            irq: WssIrq::I7,
+            irq: WssIrq::I11,
             dma: SbDma8::D0,
         }
     }

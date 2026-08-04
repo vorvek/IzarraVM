@@ -233,7 +233,7 @@ fn place_environment_sits_one_paragraph_above_prog_top() {
         &mut mem,
         0x0100,
         0x1100,
-        &[("BLASTER", "A220 I5 D1 H5 P300 T6")],
+        &[("BLASTER", "A220 I7 D1 H5 P300 T6")],
     )
     .unwrap();
     assert_eq!(env_seg, 0x1101);
@@ -249,5 +249,5 @@ fn place_environment_sits_one_paragraph_above_prog_top() {
         s.push(b);
         i += 1;
     }
-    assert_eq!(s, b"BLASTER=A220 I5 D1 H5 P300 T6");
+    assert_eq!(s, b"BLASTER=A220 I7 D1 H5 P300 T6");
 }

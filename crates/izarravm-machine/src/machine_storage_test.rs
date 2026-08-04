@@ -361,8 +361,8 @@ fn nondefault_sound_blaster() -> SoundBlasterConfig {
 
 #[test]
 fn stock_autoexec_tracks_default_nondefault_and_disabled_sb_profiles() {
-    let base = b"@ECHO OFF\r\nSET BLASTER=A220 I5 D1 H5 P300 T6\r\n\
-SET SETSOUND=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
+    let base = b"@ECHO OFF\r\nSET BLASTER=A220 I7 D1 H5 P300 T6\r\n\
+SET SETSOUND=A220 I7 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
     assert_eq!(
         crate::storage::stock_autoexec(base, &SoundBlasterConfig::default()),
         base

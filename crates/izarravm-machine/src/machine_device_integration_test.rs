@@ -270,8 +270,13 @@ fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
     // must fast-forward across the DSP sample window (the new IRQ5 wake) and
     // deliver the block-completion IRQ5, so the handler runs and real emulated time
     // advances -- not a genuine no-wake halt. Setup mirrors the 8-bit probe.
+    // Pinned to IRQ5 EXPLICITLY: the default is now IRQ7, and this fixture's
+    // guest code hooks vector 0x0D / unmasks master bit 5 by hand. Following the
+    // default would leave it asserting nothing while still passing.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.irq = izarravm_core::SbIrq::I5;
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
+        profile,
         // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
         rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
     )
@@ -329,11 +334,11 @@ fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
 }
 
 #[test]
-fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
+fn sb16_creative_adpcm_decodes_over_dma_and_raises_its_irq() {
     // End-to-end SB16 Creative ADPCM: a guest arms 4-bit ADPCM-with-reference
     // (DSP command 0x75) over 8-bit DMA channel 1, the clock-driven producer
     // pulls the encoded bytes, decodes them through the DSP, and raises the
-    // 8-bit IRQ (IRQ5, the mixer default) at programmed block completion. Exercises the
+    // 8-bit IRQ (IRQ7, the mixer default) at programmed block completion. Exercises the
     // real DMA -> DSP decode -> PIC path, not just the codec in isolation.
     let mut machine = test_machine();
     // 16 encoded DMA bytes at 0x01_0000 (page 0x01): a reference seed (0x80)
@@ -366,10 +371,10 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
             .unwrap();
         machine.advance_devices_clocks(clocks);
     }
-    // The programmed-block IRQ latched on the SB16's default line (IRQ5).
+    // The programmed-block IRQ latched on the SB16's default line (IRQ7).
     assert!(
-        machine.pic.irr_bit(5),
-        "Creative ADPCM block raised the 8-bit IRQ5 at block completion"
+        machine.pic.irr_bit(7),
+        "Creative ADPCM block raised the 8-bit IRQ at block completion"
     );
     // Single-cycle playback stopped at the end of the block.
     assert!(
@@ -389,8 +394,13 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
 #[test]
 fn cli_hlt_is_a_genuine_halt() {
     // With interrupts off, HLT must still halt immediately, not spin.
+    // Pinned to IRQ5 EXPLICITLY: the default is now IRQ7, and this fixture's
+    // guest code hooks vector 0x0D / unmasks master bit 5 by hand. Following the
+    // default would leave it asserting nothing while still passing.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.sound_blaster.irq = izarravm_core::SbIrq::I5;
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
+        profile,
         rom_with_code(&[0xfa, 0xf4]), // cli; hlt
     )
     .unwrap();
