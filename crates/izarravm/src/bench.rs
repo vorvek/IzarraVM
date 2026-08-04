@@ -826,20 +826,21 @@ pub(super) fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
     }
 
     if !snapshot.hot_addrs.is_empty() {
-        let total_samples: u64 = snapshot
-            .hot_addrs
-            .iter()
-            .map(|&(_, s)| s)
-            .sum::<u64>()
-            .max(1);
+        // The snapshot carries every sampled address so the boot profiler can
+        // difference two of them; presentation takes the head. The percentage is
+        // the share within that head, which is what this column has always
+        // meant -- dividing by the full total would silently change it.
+        let head = &snapshot.hot_addrs[..snapshot.hot_addrs.len().min(HOT_ADDR_PRINT_LIMIT)];
+        let total_samples: u64 = head.iter().map(|&(_, s)| s).sum::<u64>().max(1);
         println!();
         println!(
-            "=== hot sampled addresses (top {}, sample_stride={}) ===",
+            "=== hot sampled addresses (top {} of {}, sample_stride={}) ===",
+            head.len(),
             snapshot.hot_addrs.len(),
             snapshot.sample_stride
         );
-        println!("{:<10} {:>9} {:>8}", "linear", "samples", "top64%");
-        for &(lin, samples) in &snapshot.hot_addrs {
+        println!("{:<10} {:>9} {:>8}", "linear", "samples", "head%");
+        for &(lin, samples) in head {
             println!(
                 "{lin:08X}   {samples:>9} {:>7.2}%",
                 100.0 * samples as f64 / total_samples as f64

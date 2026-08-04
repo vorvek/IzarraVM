@@ -19,6 +19,33 @@
 //! it, and `exec` is COMMAND.COM parsing a command line and loading an image off
 //! Katea. Both are workloads users feel and neither has ever been measured here.
 //!
+//! # `boot` is SUPPOSED to be slow. Do not optimize it away.
+//!
+//! Essentially all of `boot` is the FreeDOS kernel's F5/F8 window: the pause
+//! that lets a user press F5 to skip CONFIG.SYS or F8 to single-step it. It
+//! looks exactly like a busy-wait in every profile because it IS a wait, on
+//! purpose, polling the keyboard so it can notice the key. Measured at 586:
+//! `SWITCHES=/F` (which skips the window) takes the phase from 272,000,352
+//! instructions and 8.324 s of wall to 1,567,521 and 0.050 s, and guest time
+//! with it, from 1.970 s to 0.035 s. So the guest is doing no work there, and
+//! anything else this phase measures is noise beside it.
+//!
+//! Deleting the wait is a product decision, not a performance one: `SWITCHES=/F`
+//! and `/N` both take the escape hatch away from the user in practice.
+//!
+//! The real defect is the WINDOW'S UNIT, not the wait. The kernel sets
+//! `SkipConfigSeconds db 2` (`kernel.asm:67`), i.e. two GUEST seconds -- but a
+//! human waits in WALL seconds, and the two diverge by exactly this emulator's
+//! interpretation overhead: 1.77 s of wall at 486 against 8.32 s at 586. The
+//! pause therefore grows the FASTER the emulated machine is, which is backwards,
+//! and is why 586 feels broken here while 486 feels fine. The byte cannot fix
+//! it -- whole seconds only, and any value that reads well on one persona reads
+//! badly on the other. What would is making the wait cheap, so guest time tracks
+//! real time through it: FreeDOS's `GetBiosKey` spins on INT 16h where the same
+//! `sti; hlt` its own `dosidle.asm` uses for `IDLEHALT` would serve. That is a
+//! kernel source patch (this project is licensed and set up for them), gated on
+//! an Open Watcom kernel rebuild plus a `tokados-hdd.img` regen.
+//!
 //! This is a profiler, NOT an A/B ladder. It runs once per persona, has no
 //! pairing, ordering or lock discipline, and its slicing perturbs the run loop.
 //! Never build an acceptance decision on it -- that is the realtime gate's job.
@@ -66,6 +93,100 @@ struct PhaseRow {
     direct_native_insns: u64,
     katea: KateaStorageCounters,
     machine_phases: Vec<(String, u64, u64)>,
+    /// This phase's slice of the sampled CPU census. `None` unless
+    /// `IZARRAVM_CPU_PROFILE` armed it.
+    census: Option<PhaseCensus>,
+}
+
+/// One phase's slice of the sampled CPU census: the difference between the two
+/// boundary snapshots.
+///
+/// Exact in all three tables. The group and opcode buckets difference exactly
+/// because a bucket present at the later mark either existed at the earlier one
+/// or started from zero, and the address table differences exactly because
+/// `hot_addrs` is the complete map rather than a truncated head.
+///
+/// This is the gap the harness shipped with. Its own header called the
+/// whole-run census "honest enough because idle dominates the instruction
+/// count", and flagged that a census read as "the idle loop" is an inference.
+/// With boot at 272 M instructions against idle's 1.44 G that inference was
+/// already thin, and with the kernel's idle halt on it is worthless. This
+/// replaces it with a measurement.
+#[derive(Debug, Clone, Default)]
+struct PhaseCensus {
+    stride: u64,
+    /// `(group, instructions, guest clocks, sample ns)`
+    groups: Vec<(&'static str, u64, u64, u64)>,
+    /// `(opcode, group, instructions, sample ns)`
+    opcodes: Vec<(u16, &'static str, u64, u64)>,
+    /// `(linear, samples)`, descending.
+    addrs: Vec<(u32, u64)>,
+}
+
+impl PhaseCensus {
+    fn instructions(&self) -> u64 {
+        self.groups.iter().map(|row| row.1).sum()
+    }
+}
+
+/// Difference two census snapshots into one phase. `None` when either boundary
+/// carries none, which is every run that did not arm `IZARRAVM_CPU_PROFILE`.
+fn census_delta(
+    before: Option<&izarravm_cpu::CpuProfileSnapshot>,
+    after: Option<&izarravm_cpu::CpuProfileSnapshot>,
+) -> Option<PhaseCensus> {
+    let (before, after) = (before?, after?);
+    let groups = after
+        .groups
+        .iter()
+        .map(|now| {
+            let then = before.groups.iter().find(|old| old.name == now.name);
+            (
+                now.name,
+                now.instructions
+                    .saturating_sub(then.map_or(0, |old| old.instructions)),
+                now.guest_core_clocks
+                    .saturating_sub(then.map_or(0, |old| old.guest_core_clocks)),
+                now.sample_wall_ns
+                    .saturating_sub(then.map_or(0, |old| old.sample_wall_ns)),
+            )
+        })
+        .collect();
+    let opcodes = after
+        .opcodes
+        .iter()
+        .map(|now| {
+            let then = before.opcodes.iter().find(|old| old.opcode == now.opcode);
+            (
+                now.opcode,
+                now.group,
+                now.instructions
+                    .saturating_sub(then.map_or(0, |old| old.instructions)),
+                now.sample_wall_ns
+                    .saturating_sub(then.map_or(0, |old| old.sample_wall_ns)),
+            )
+        })
+        .filter(|row| row.2 > 0)
+        .collect();
+    let earlier: std::collections::HashMap<u32, u64> = before.hot_addrs.iter().copied().collect();
+    let mut addrs: Vec<(u32, u64)> = after
+        .hot_addrs
+        .iter()
+        .map(|&(lin, samples)| {
+            (
+                lin,
+                samples.saturating_sub(earlier.get(&lin).copied().unwrap_or(0)),
+            )
+        })
+        .filter(|&(_, samples)| samples > 0)
+        .collect();
+    addrs.sort_by_key(|&(lin, samples)| (std::cmp::Reverse(samples), lin));
+    Some(PhaseCensus {
+        stride: after.sample_stride,
+        groups,
+        opcodes,
+        addrs,
+    })
 }
 
 impl PhaseRow {
@@ -236,6 +357,12 @@ pub fn run(
     if cpu_profile_stride.is_some() {
         crate::bench::print_cpu_profile(&machine.cpu().profile_snapshot());
     }
+    // IZARRAVM_DIRECT_BARRIER_CENSUS=1 ranks what stopped block formation. The
+    // `--hdd-folder` path already emitted this into its JSON; a boot profile
+    // needs it too, because on a 16-bit workload the ranking IS the question --
+    // `classify`'s Word allowlist was built for 32-bit game code, so what it
+    // refuses here is a different population entirely.
+    print_barrier_census(machine.cpu().direct_barrier_census_snapshot());
     let run = BootProfileRun {
         mode,
         rows: build_rows(machine.phase_marks()),
@@ -261,6 +388,156 @@ pub fn run(
     }
     Ok(())
 }
+
+const CENSUS_GROUP_ROWS: usize = 6;
+const CENSUS_OPCODE_ROWS: usize = 10;
+const CENSUS_ADDR_ROWS: usize = 12;
+
+/// Print the census one phase at a time. Every share is within its own phase,
+/// so a row reads as "this much of THIS phase" and never has to be divided back
+/// out of a whole-run total.
+fn print_phase_census(rows: &[PhaseRow]) {
+    if rows.iter().all(|row| row.census.is_none()) {
+        return;
+    }
+    println!();
+    println!("=== per-phase cpu census ===");
+    println!(
+        "shares are within the phase. the census forces interpretation, so a \
+         phase's native% here is 0 by construction;"
+    );
+    println!("read it against the native% in the table above, not instead of it.");
+    for row in rows {
+        let Some(census) = &row.census else { continue };
+        let instructions = census.instructions();
+        if !row.reached || instructions == 0 {
+            continue;
+        }
+        let sample_ns: u64 = census.groups.iter().map(|g| g.3).sum::<u64>().max(1);
+        println!();
+        println!(
+            "--- {} : {instructions} instructions, sample stride {} ---",
+            row.name, census.stride
+        );
+
+        let mut groups = census.groups.clone();
+        groups.sort_by_key(|g| std::cmp::Reverse(g.3));
+        println!(
+            "  {:<14} {:>13} {:>8} {:>12} {:>8}",
+            "group", "instr", "instr%", "sample_ms", "sample%"
+        );
+        for g in groups.iter().filter(|g| g.1 > 0).take(CENSUS_GROUP_ROWS) {
+            println!(
+                "  {:<14} {:>13} {:>7.2}% {:>12.3} {:>7.2}%",
+                g.0,
+                g.1,
+                100.0 * g.1 as f64 / instructions as f64,
+                g.3 as f64 / 1_000_000.0,
+                100.0 * g.3 as f64 / sample_ns as f64,
+            );
+        }
+
+        let mut opcodes = census.opcodes.clone();
+        opcodes.sort_by_key(|o| std::cmp::Reverse((o.3, o.2)));
+        println!(
+            "  {:<8} {:<14} {:>13} {:>8} {:>12}",
+            "opcode", "group", "instr", "instr%", "sample_ms"
+        );
+        for o in opcodes.iter().take(CENSUS_OPCODE_ROWS) {
+            println!(
+                "  {:<8} {:<14} {:>13} {:>7.2}% {:>12.3}",
+                format_census_opcode(o.0),
+                o.1,
+                o.2,
+                100.0 * o.2 as f64 / instructions as f64,
+                o.3 as f64 / 1_000_000.0,
+            );
+        }
+
+        let addr_total: u64 = census.addrs.iter().map(|&(_, n)| n).sum::<u64>().max(1);
+        println!(
+            "  {:<10} {:>9} {:>8}  region",
+            "linear", "samples", "phase%"
+        );
+        for &(lin, samples) in census.addrs.iter().take(CENSUS_ADDR_ROWS) {
+            println!(
+                "  {lin:08X}   {samples:>9} {:>7.2}%  {}",
+                100.0 * samples as f64 / addr_total as f64,
+                address_region(lin),
+            );
+        }
+    }
+}
+
+/// Which side of the Direct JIT's admission gates an address sits on.
+/// `key_for_phys` refuses 0xA0000..0x100000 outright, so labelling it here is
+/// what makes an address row legible against the coverage column beside it --
+/// a hot row in a refused region can never be helped by block admission.
+fn address_region(lin: u32) -> &'static str {
+    match lin {
+        0x000f_0000..0x0010_0000 => "BIOS ROM (JIT-refused)",
+        0x000c_0000..0x000f_0000 => "option ROM (JIT-refused)",
+        0x000a_0000..0x000c_0000 => "VGA aperture (JIT-refused)",
+        _ => "RAM",
+    }
+}
+
+/// Rank the structural stops that refused block formation, when the opt-in
+/// census collected any. Ranked by `runtime_hits` plus the two exit columns:
+/// per [[barrier-census-mispredicts-both-ways]], `unbound_exits` alone is not a
+/// ceiling and compile attempts (`hits`) must not drive prioritisation.
+fn print_barrier_census(snapshot: Option<izarravm_cpu::DirectBarrierCensusSnapshot>) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    if snapshot.rows.is_empty() {
+        println!();
+        println!("=== direct barrier census: no structural stops recorded ===");
+        return;
+    }
+    let mut rows = snapshot.rows;
+    rows.sort_by_key(|row| {
+        std::cmp::Reverse((
+            row.runtime_hits,
+            row.unbound_exits + row.dynamic_unbound_exits,
+        ))
+    });
+    let total_runtime: u64 = rows.iter().map(|row| row.runtime_hits).sum::<u64>().max(1);
+    println!();
+    println!("=== direct barrier census (top {BARRIER_CENSUS_ROWS} by runtime_hits) ===");
+    // `size` and `form` are carried because on a 16-bit workload they are the
+    // discriminating columns: a Word row refused here is a candidate for the
+    // allowlist, a Dword row is the pre-existing 32-bit population.
+    println!(
+        "{:<8} {:<20} {:<6} {:<8} {:>12} {:>7} {:>11} {:>11}",
+        "opcode", "stop", "size", "form", "runtime", "run%", "unbound", "dyn_unbound"
+    );
+    for row in rows.iter().take(BARRIER_CENSUS_ROWS) {
+        println!(
+            "{:<8} {:<20} {:<6} {:<8} {:>12} {:>6.2}% {:>11} {:>11}",
+            format_census_opcode(row.opcode),
+            row.stop_reason,
+            row.operand_size,
+            row.operand_form,
+            row.runtime_hits,
+            100.0 * row.runtime_hits as f64 / total_runtime as f64,
+            row.unbound_exits,
+            row.dynamic_unbound_exits,
+        );
+    }
+}
+
+/// Same rendering `bench::print_cpu_profile` uses, so a census row and a census
+/// opcode row can be read against each other without a mental conversion.
+fn format_census_opcode(opcode: u16) -> String {
+    if opcode & 0xff00 == 0x0f00 {
+        format!("0F {:02X}", opcode as u8)
+    } else {
+        format!("{opcode:02X}")
+    }
+}
+
+const BARRIER_CENSUS_ROWS: usize = 30;
 
 /// Tag subsequent RIP samples with `phase`. A no-op off Windows, where the
 /// sampler does not exist.
@@ -331,6 +608,7 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     direct_native_insns: 0,
                     katea: KateaStorageCounters::default(),
                     machine_phases: Vec::new(),
+                    census: None,
                 };
             };
             let katea = match (start.katea, end.katea) {
@@ -380,6 +658,7 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     .saturating_sub(start.perf.jit_direct_insns),
                 katea,
                 machine_phases,
+                census: census_delta(start.cpu_profile.as_ref(), end.cpu_profile.as_ref()),
             }
         })
         .collect()
@@ -540,6 +819,8 @@ fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: b
             println!("  {:<10} {}", row.name, cells.join("  "));
         }
     }
+
+    print_phase_census(&run.rows);
 
     if run.keystroke_injection_failed {
         println!();

@@ -52,6 +52,10 @@ const DEFAULT_BOOT_FLOPPY_CYCLES: u64 = 50_000_000;
 /// than the bare floppy boot-sector run; --cycles tunes it for investigation.
 const DEFAULT_BOOT_HDD_CYCLES: u64 = 500_000_000;
 const CPU_OPCODE_PROFILE_PRINT_LIMIT: usize = 24;
+/// How many sampled addresses `print_cpu_profile` shows. The snapshot itself
+/// carries all of them, so the boot profiler can difference two snapshots into
+/// one phase; this is presentation only.
+const HOT_ADDR_PRINT_LIMIT: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "IzarraVM emulator scaffold")]

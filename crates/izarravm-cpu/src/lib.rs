@@ -1138,7 +1138,13 @@ pub struct CpuProfileSnapshot {
     pub sample_stride: u64,
     pub groups: Vec<CpuProfileBucket>,
     pub opcodes: Vec<CpuOpcodeProfileBucket>,
-    /// Hottest sampled instruction linear addresses, `(linear, samples)`, descending; top 64.
+    /// Every sampled instruction linear address, `(linear, samples)`, descending.
+    ///
+    /// Complete rather than a truncated head, because the boot profiler DIFFS two
+    /// of these to attribute one phase: an address that fell out of a head between
+    /// the two snapshots would read as having lost samples it never lost, and one
+    /// that entered it would read as having gained samples it already had. Only
+    /// the full map differences correctly. Printers take whatever head they want.
     pub hot_addrs: Vec<(u32, u64)>,
     /// SMC whole-cache flush sources, `(physical 64-byte block, flushes)`, descending; top 16.
     pub smc_flush_blocks: Vec<(u32, u64)>,
@@ -2099,6 +2105,12 @@ impl CpuProfileState {
         *self = Self::default();
     }
 
+    /// Whether sampling is armed. `sample_stride` cannot answer this: it
+    /// defaults to 1 and `enable` clamps with `.max(1)`, so it is never 0.
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     #[inline]
     fn sample_start(&self) -> Option<std::time::Instant> {
         (self.enabled && self.until_sample == 1).then(std::time::Instant::now)
@@ -2190,7 +2202,6 @@ impl CpuProfileState {
             .map(|(&lin, &samples)| (lin, samples))
             .collect::<Vec<_>>();
         hot_addrs.sort_by_key(|&(lin, samples)| (std::cmp::Reverse(samples), lin));
-        hot_addrs.truncate(64);
         let mut smc_flush_blocks = self
             .smc_flush_blocks
             .iter()

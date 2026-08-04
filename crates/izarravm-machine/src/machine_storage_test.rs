@@ -286,8 +286,8 @@ fn ensure_user_config_seeds_missing_files_only() {
     );
     assert_eq!(
         std::fs::read(dir.join("CONFIG.SYS")).unwrap(),
-        b"FILES=40\r\n",
-        "a missing CONFIG.SYS is seeded with the default"
+        crate::storage::stock_config(b"FILES=40\r\n"),
+        "a missing CONFIG.SYS is seeded with the default plus the emulator's additions"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -316,7 +316,7 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
     .unwrap();
     assert_eq!(
         std::fs::read(config_only.join("CONFIG.SYS")).unwrap(),
-        new_config
+        crate::storage::stock_config(new_config)
     );
     assert_eq!(
         std::fs::read(config_only.join("AUTOEXEC.BAT")).unwrap(),
@@ -345,6 +345,64 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
     assert_eq!(
         std::fs::read(autoexec_only.join("AUTOEXEC.BAT")).unwrap(),
         new_autoexec
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// A CONFIG.SYS still identical to the payload's own stock follows the emulator
+/// forward; anything the user has touched does not. This is the case that
+/// matters in practice -- the shipped `tokados-hdd.img` CONFIG.SYS is what a
+/// normal install has on disk, and before this it was outside the upgrade set,
+/// so no seeded change could ever reach an existing machine.
+#[test]
+fn ensure_user_config_upgrades_an_untouched_payload_config_but_not_an_edited_one() {
+    let base = std::env::temp_dir().join(format!("katea_cfg_payload_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let payload = b"FILES=40\r\nLASTDRIVE=D\r\nSHELL=C:\\DOS\\COMMAND.COM\r\n";
+    let autoexec = b"@ECHO OFF\r\n";
+
+    let untouched = base.join("untouched");
+    std::fs::create_dir_all(&untouched).unwrap();
+    std::fs::write(untouched.join("CONFIG.SYS"), payload).unwrap();
+    crate::storage::ensure_user_config(
+        &untouched,
+        payload,
+        autoexec,
+        &SoundBlasterConfig::default(),
+    )
+    .unwrap();
+    let upgraded = std::fs::read(untouched.join("CONFIG.SYS")).unwrap();
+    assert_eq!(upgraded, crate::storage::stock_config(payload));
+    assert!(
+        String::from_utf8_lossy(&upgraded).contains("IDLEHALT=1"),
+        "the upgrade is what turns the kernel's idle halt on"
+    );
+
+    // Idempotent: running again must not stack a second copy of the additions.
+    crate::storage::ensure_user_config(
+        &untouched,
+        payload,
+        autoexec,
+        &SoundBlasterConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(untouched.join("CONFIG.SYS")).unwrap(),
+        upgraded
+    );
+
+    let edited = base.join("edited");
+    std::fs::create_dir_all(&edited).unwrap();
+    let mut user = payload.to_vec();
+    user.extend_from_slice(b"DEVICE=C:\\MYDRIVER.SYS\r\n");
+    std::fs::write(edited.join("CONFIG.SYS"), &user).unwrap();
+    crate::storage::ensure_user_config(&edited, payload, autoexec, &SoundBlasterConfig::default())
+        .unwrap();
+    assert_eq!(
+        std::fs::read(edited.join("CONFIG.SYS")).unwrap(),
+        user,
+        "a CONFIG.SYS the user has edited is theirs and is never rewritten"
     );
 
     std::fs::remove_dir_all(&base).ok();

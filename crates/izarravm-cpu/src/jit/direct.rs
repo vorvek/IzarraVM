@@ -3746,6 +3746,31 @@ const fn jit_admits_non_continuable(opcode: u16) -> bool {
     matches!(opcode, 0x69 | 0x6b)
 }
 
+/// Opt-in admission level for the 16-bit / ROM spike. Default 0 is the shipped
+/// behaviour and nothing this gates can happen without the variable set.
+///
+///   1  admit 16-bit (CS.D = 0) code segments backed by ordinary RAM
+///   2  additionally admit the 0xC0000..0x100000 option-ROM + BIOS window
+///
+/// This exists to price a lever, not to ship: an idle DOS prompt spends 100% of
+/// its instructions in 16-bit code, and the hottest addresses in it are the BIOS
+/// INT 16h service in ROM, so the two gates below are the whole non-game
+/// workload. Level 2 deliberately stops at 0xC0000 and leaves 0xA0000..0xC0000
+/// (VGA memory) refused: that half of the window is a device aperture with read
+/// side effects, and it is the half the original guard was really about.
+///
+/// 586 only in practice, because `key_for_phys`'s persona clause below already
+/// refuses `!d` everywhere else, for the reason documented there.
+pub(crate) fn sixteen_bit_admission_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("IZARRAVM_JIT16")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0)
+    })
+}
+
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
     let physical = cpu.decode_cache.line_phys_start(lin, d)?;
     key_for_phys(cpu, lin, d, physical)
@@ -3791,7 +3816,14 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     }
     // The first direct slice has no page-kind guard in emitted code. Keep video and ROM code on
     // the interpreter until the shared fast map can prove a page is ordinary RAM.
-    if (0x000a_0000..0x0010_0000).contains(&physical) {
+    //
+    // The spike's level 2 lifts the ROM half of that window only (see
+    // `sixteen_bit_admission_level`): 0xC0000 and up is option ROM and the system BIOS, which is
+    // read-only storage with no side effects, while 0xA0000..0xC0000 is the VGA aperture the
+    // guard is really for and stays refused at every level.
+    if (0x000a_0000..0x0010_0000).contains(&physical)
+        && !(physical >= 0x000c_0000 && sixteen_bit_admission_level() >= 2)
+    {
         return None;
     }
     Some(BlockKey::new(lin, physical, cpu.jit_mode_key()))
