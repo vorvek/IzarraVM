@@ -18,6 +18,7 @@
 %define KB_PREFIX      0x00b1      ; pending E0 extended-key prefix
 %define KB_ALTGR       0x00b2      ; right Alt held
 %define KB_DEAD        0x00b3      ; pending dead-key accent id
+%define KB_NOHALT      0x00b4      ; UNHALT.COM: spin the key wait, do not halt
 %endif
 
 ; INT 09h: keyboard hardware ISR
@@ -345,8 +346,11 @@ int16:
     mov ds, bx
     mov bx, [KB_BUF_HEAD]
     cmp bx, [KB_BUF_TAIL]
+    mov bl, [KB_NOHALT]    ; MOV leaves the compare's ZF alone, and so does POP
     pop ds
     jne .read_ready        ; a key is already queued: take it, do not halt
+    test bl, bl
+    jnz .read_wait         ; UNHALT.COM set: spin, as a 1981 BIOS would
     ; Buffer empty: sleep until any interrupt rather than spinning the ring
     ; check. IRQ1 -> INT 09h enqueues the key and wakes this directly, so a
     ; keystroke is served no later than the spin served it; IRQ0 wakes it
@@ -405,9 +409,12 @@ int16:
     mov ds, bx
     mov bx, [KB_BUF_HEAD]
     cmp bx, [KB_BUF_TAIL]
+    mov bl, [KB_NOHALT]    ; read the flag while DS is still 0x40; MOV/POP keep ZF
     pop ds
     jne .read16_ready      ; a key is already queued: take it, do not halt
-    hlt                    ; empty: sleep until an IRQ (see the AH=00h note)
+    test bl, bl
+    jnz .read16_wait       ; UNHALT.COM set: spin (see the AH=00h note)
+    hlt                    ; empty: sleep until an IRQ
     jmp .read16_wait
 .read16_ready:
     push ds

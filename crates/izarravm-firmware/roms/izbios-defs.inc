@@ -27,6 +27,9 @@
 %define KB_PREFIX      0x00b1
 %define KB_ALTGR       0x00b2
 %define KB_DEAD        0x00b3
+; Set by UNHALT.COM to make the INT 16h keyboard wait spin instead of halt.
+; Zero (POST's default) means halt. See kbd-bios-core.inc.
+%define KB_NOHALT      0x00b4
 ; CMOS index of the persisted layout (MC146818 ports 0x70/0x71). en-US is 0.
 %define KB_CMOS_LAYOUT 0x10
 ; Bytes per layout block: 128 each for unshifted, shifted, and AltGr.
