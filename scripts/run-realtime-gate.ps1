@@ -34,14 +34,21 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # The one revision every formal candidate is measured against. Re-pinned from
-# 88ac6f20 (f79c86dc, 2026-07-12) to 294ba878 (7f043bb7, 2026-08-04): the old pin
+# 88ac6f20 (f79c86dc, 2026-07-12) to 8e238b06 (5817fb58, 2026-08-04): the old pin
 # sat 465 commits back and failed its own absolute thresholds worse than any
 # revision that could be measured against it, so the gate had become unpassable
 # for everyone rather than protective. Whoever re-pins this next must recalibrate
 # the per-workload floors in Get-WorkloadPolicy in the same commit -- they are
 # ratchets derived from what the pinned tree measures, and a pin moved without
 # them silently stops asserting anything.
-$acceptedBaselineTree = "294ba8788a9e86d18b1cfce006772cba416ee952"
+#
+# The floors below were measured on 294ba878 (7f043bb7) and carried to this pin
+# unchanged: the only difference between the two trees is the kernel's fallback
+# shell string, which lives in init-segment .data and is reached only when
+# CONFIG.SYS supplies no SHELL=. Both gate workloads supply one, so it cannot
+# move their throughput. The gate run that accepted this pin confirms that
+# rather than assuming it.
+$acceptedBaselineTree = "8e238b06ce6cb9c539df8d8bc30c10fe78baabf8"
 $highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 $minimumDirectCoverage = 0.90
 $maximumDirectExitsPer100 = 5.0
