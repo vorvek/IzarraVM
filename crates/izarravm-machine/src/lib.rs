@@ -1219,6 +1219,7 @@ impl Machine {
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.
         machine.set_cmos_byte(CMOS_GSW_MODE, machine.active_mode.register_code());
+        machine.rtc.set_memory_size(machine.profile.memory_mib);
         Ok(machine)
     }
 
@@ -1284,6 +1285,12 @@ impl Machine {
     /// checksummed so the host can persist a safe replacement.
     pub fn load_cmos(&mut self, bytes: &[u8; 64]) -> bool {
         let valid = self.rtc.load_nvram(bytes);
+        // Installed RAM is a property of THIS machine, not of the saved image: a
+        // real BIOS rewrites the memory-size bytes at POST every boot. Re-apply
+        // them so a cmos.bin carried over from a different --memory-mib (or
+        // written before those bytes were populated at all) cannot make the
+        // guest see the wrong amount of extended memory.
+        self.rtc.set_memory_size(self.profile.memory_mib);
         if let Some(mode) = GswMode::from_register_code(self.rtc.nvram_byte(0x12)) {
             self.set_mode(mode);
         }

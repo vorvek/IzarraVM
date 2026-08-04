@@ -27,6 +27,7 @@
 ;
 ; Build: nasm -f bin vcpisw.asm -o vcpisw.com
 cpu 386
+XMS_TEST_KB equ 64            ; 64 KB = 16 x 4 KB pages
 org 0x100
 %define OK 0xA5
 
@@ -67,8 +68,13 @@ start:
     jnz f_pres
     mov [free_v86], edx
 
-    ; Keep the largest XMS run locked throughout the VCPI mode switch. Its
-    ; allocation must not change the VCPI count or overlap a page from DE04.
+    ; Keep a 64 KB XMS block locked throughout the VCPI mode switch. XMS and
+    ; VCPI now share ONE pool (see tokaemm.asm), so the allocation MUST show up
+    ; in the VCPI free count -- it used to assert the count was unchanged, which
+    ; was the disjoint-pool contract. `free_v86` is then rebased to the
+    ; with-block-held count, which is the baseline every later DE03 compares to.
+    ; A page DE04 hands out still must not overlap the block: one pool, but
+    ; never the same page twice.
     mov ax, 0x4300
     int 0x2F
     cmp al, 0x80
@@ -77,13 +83,8 @@ start:
     int 0x2F
     mov [xms_entry], bx
     mov [xms_entry+2], es
-    mov ah, 0x08
-    call far [xms_entry]
-    or ax, ax
-    jz f_xms
-    mov [xms_largest], ax
-    mov dx, ax
     mov ah, 0x09
+    mov dx, XMS_TEST_KB
     call far [xms_entry]
     or ax, ax
     jz f_xms
@@ -94,14 +95,17 @@ start:
     jz f_xms
     mov [xms_base], bx
     mov [xms_base+2], dx
-    movzx eax, word [xms_largest]
+    mov eax, XMS_TEST_KB
     shl eax, 10
     add eax, [xms_base]
     mov [xms_end], eax
     mov ax, 0xDE03
     int 0x67
-    cmp edx, [free_v86]
+    mov ecx, [free_v86]
+    sub ecx, XMS_TEST_KB / 4      ; 4 KB pages the block consumed
+    cmp edx, ecx
     jne f_xms
+    mov [free_v86], edx           ; rebase: baseline while the block is held
     push cs
     pop es                         ; DE01's page-table buffer lives in this COM
 
@@ -298,7 +302,7 @@ v86_landing:
     jnz f_bal
     cmp edx, [free_v86]
     jne f_bal
-    mov ah, 0x0D                 ; unlock and release the full XMS run
+    mov ah, 0x0D                 ; unlock and release the 64 KB XMS block
     mov dx, [xms_handle]
     call far [xms_entry]
     or ax, ax

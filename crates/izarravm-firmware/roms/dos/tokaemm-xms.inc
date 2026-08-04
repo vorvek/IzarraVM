@@ -34,6 +34,15 @@ xms_2f_handler:
 xms_entry:
     cmp ah, 0xF0
     je xf_toka_pools
+    ; XMS 3.0 "any" functions. 00h reports version 3.00, so a caller is entitled
+    ; to these and a well-written one prefers 88h over 08h (08h is 16-bit KB and
+    ; saturates at 64 MB). Leaving them unimplemented while claiming 3.00 is what
+    ; made Chess Housers print "Memoria extendida: 0 Kb": it asked 88h, got
+    ; AX=0/BL=80h, and believed it.
+    cmp ah, 0x88
+    je xf_query_free_any
+    cmp ah, 0x89
+    je xf_alloc_any
     cmp ah, 0x12
     ja .unimpl                   ; 13h+ : not implemented
     push bx
@@ -72,21 +81,21 @@ xf_version:
     mov dl, [cs:hma_available]
     retf
 
-; F0h private pool query used by Toka-DOS MEM. F000h is the legacy totals
-; query. F001h also returns free VCPI KB in DX and uses a versioned magic.
+; F0h private pool query used by Toka-DOS MEM. Both AL=0 and AL=1 answer with
+; the legacy totals magic 'TK' now that XMS and VCPI share one pool.
+;
+; F001h used to return the split-pool magic 'TL' plus free VCPI KB in DX, and
+; MEM added that to the XMS free count (`if (toka_split_pools) xms_free +=
+; toka_vcpi_free_k;` in mem2.c). With one pool those are the SAME pages, so the
+; sum double-counted it, hit MEM's clamp at the category size, and reported the
+; whole category free with 0 K used. Answering 'TK' takes MEM's non-split path,
+; which uses the XMS free count alone -- the honest figure, and the same one
+; function 08h/88h return.
 xf_toka_pools:
-    cmp al, 1
-    je .split
     mov ax, 0x544B               ; 'TK'
     mov bx, [cs:xms_category_kb]
     mov cx, [cs:ems_category_kb]
-    retf
-.split:
-    mov ax, 0x544C               ; split-pool result
-    mov bx, [cs:xms_category_kb]
-    mov cx, [cs:ems_category_kb]
-    mov dx, [cs:vcpi_free]
-    shl dx, 2                    ; pages -> KB
+    xor dx, dx                   ; no separate VCPI pool to report
     retf
 
 ; 01h request HMA / 02h release HMA (a flag; no /HMAMIN gate).
@@ -162,6 +171,38 @@ xf_query_free:
     shl dx, 2
     xor bl, bl
     popf
+    retf
+
+; 88h query ANY free extended memory (XMS 3.0): EAX=largest free block in KB,
+; ECX=highest ending address of any memory block, EDX=total free KB, BL=0.
+; The 32-bit sibling of 08h, and the one a 3.0-aware caller reaches for first.
+; Pages are 4 KB and the counts are 16-bit page counts, so the KB values cannot
+; overflow 32 bits here; no saturation is needed (unlike 08h, which must live
+; inside a 16-bit AX).
+xf_query_free_any:
+    pushf
+    cli
+    call arena_longest_clear      ; AX = longest contiguous run in 4 KB pages
+    movzx eax, ax
+    shl eax, 2                    ; pages -> KB
+    movzx edx, word [cs:xms_free]
+    shl edx, 2                    ; pages -> KB
+    mov ecx, [cs:xms_pool_end]
+    dec ecx                       ; highest ending address, inclusive
+    xor bl, bl
+    popf
+    retf
+
+; 89h allocate ANY extended memory block (XMS 3.0): EDX=KB in -> DX=handle.
+; The pool is clamped to what arena_bmp indexes (24 MB), so any request whose
+; KB count does not fit a 16-bit DX cannot be satisfiable; refuse it as "not
+; enough memory" and otherwise hand straight to 09h, which is the same
+; allocator. Returning through xf_alloc keeps ONE allocation path.
+xf_alloc_any:
+    test edx, 0xFFFF0000
+    jz xf_alloc                   ; fits the 16-bit request DX takes
+    mov bl, 0xA0                  ; all extended memory is allocated
+    xor ax, ax
     retf
 
 ; 09h allocate EMB: DX=KB in -> DX=handle. The XMS pool is reserved in

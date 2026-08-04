@@ -569,6 +569,33 @@ impl Rtc {
         sum
     }
 
+    /// Publish the installed memory size in the CMOS bytes every PC/AT BIOS has
+    /// filled since 1984: 0x15/0x16 base KB, 0x17/0x18 extended KB above 1 MB,
+    /// and the POST-verified copy at 0x30/0x31.
+    ///
+    /// These read 0 before this existed, and plenty of DOS-era software asks the
+    /// CMOS directly rather than going through INT 15h or an XMS driver -- Chess
+    /// Housers' startup check reports "extended memory: 0 Kb" on exactly this,
+    /// in every CPU persona, while INT 15h AH=88h and XMS both answered
+    /// correctly. Both register pairs are written because software picks either.
+    ///
+    /// 0x17/0x18 sit inside the 0x10..=0x2D checksum window, so the checksum is
+    /// refreshed; 0x30/0x31 sit outside it. Extended KB saturates at 0xFFFF
+    /// (64 MB), which is the width of the field, not a limit of this model.
+    pub fn set_memory_size(&mut self, memory_mib: u16) {
+        const BASE_MEMORY_KB: u16 = 640;
+        let extended_kb = u32::from(memory_mib.saturating_sub(1))
+            .saturating_mul(1024)
+            .min(0xFFFF) as u16;
+        self.ram[0x15] = BASE_MEMORY_KB as u8;
+        self.ram[0x16] = (BASE_MEMORY_KB >> 8) as u8;
+        self.ram[0x17] = extended_kb as u8;
+        self.ram[0x18] = (extended_kb >> 8) as u8;
+        self.ram[0x30] = extended_kb as u8;
+        self.ram[0x31] = (extended_kb >> 8) as u8;
+        self.refresh_checksum();
+    }
+
     /// Recompute and store the NVRAM checksum at 0x2E (high) and 0x2F (low).
     pub fn refresh_checksum(&mut self) {
         let sum = self.checksum();
