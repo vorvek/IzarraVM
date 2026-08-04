@@ -15,6 +15,10 @@ authors.workspace = true
 # build for unsupported hosts and differential checks.
 default = ["jit"]
 jit = []
+# Diagnostic guest-store watchpoint (IZARRAVM_WATCH_WRITE). OFF by default: the check sits
+# on the store hot path, and leaving it compiled in measured ~10% on a 586 16-bit workload
+# even while disarmed. Build with `--features watch-write` when hunting a corruption.
+watch-write = []
 
 [dependencies]
 thiserror.workspace = true
