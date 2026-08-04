@@ -337,6 +337,7 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                 (Some(before), Some(after)) => KateaStorageCounters {
                     sector_reads: after.sector_reads.saturating_sub(before.sector_reads),
                     host_file_reads: after.host_file_reads.saturating_sub(before.host_file_reads),
+                    host_file_opens: after.host_file_opens.saturating_sub(before.host_file_opens),
                     host_bytes: after.host_bytes.saturating_sub(before.host_bytes),
                     host_wall_ns: after.host_wall_ns.saturating_sub(before.host_wall_ns),
                     run_scan_steps: after.run_scan_steps.saturating_sub(before.run_scan_steps),
@@ -504,15 +505,19 @@ fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: b
     println!();
     println!("rt = guest seconds per wall second; 1.000 is real time.");
 
-    // The run scan is only meaningful next to the sector count it multiplies.
+    // The run scan is only meaningful next to the sector count it multiplies, and
+    // the host opens only next to the sectors they serve: both are ratios, and
+    // both were one-per-sector before the read path was fixed.
     for row in &run.rows {
         if row.reached && row.katea.sector_reads > 0 {
             println!(
-                "{:<10} {:.1} run-table steps per sector served, {} bytes over {} host reads",
+                "{:<10} {:.1} run-table steps per sector served, {} bytes over {} host reads \
+                 in {} opens",
                 row.name,
                 row.katea.run_scan_steps as f64 / row.katea.sector_reads as f64,
                 row.katea.host_bytes,
                 row.katea.host_file_reads,
+                row.katea.host_file_opens,
             );
         }
     }
@@ -576,6 +581,7 @@ fn write_json(
             "katea": {
                 "sector_reads": row.katea.sector_reads,
                 "host_file_reads": row.katea.host_file_reads,
+                "host_file_opens": row.katea.host_file_opens,
                 "host_bytes": row.katea.host_bytes,
                 "host_wall_ns": row.katea.host_wall_ns,
                 "run_scan_steps": row.katea.run_scan_steps,
