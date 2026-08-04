@@ -18,13 +18,18 @@ SET BLASTER=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
 const STOCK_SB_IRQS: &[u8] = &[2, 5, 7, 10];
 const STOCK_SB_DMA8: &[usize] = &[0, 1, 3];
 const STOCK_SB_DMA16: &[usize] = &[5, 6, 7];
+const STOCK_MPU_PORTS: &[u16] = &[WAVETABLE_MPU_BASE, MIDI_MPU_BASE];
 
-fn routed_stock_autoexec(base: &[u8], routing: Option<(u8, usize, usize)>) -> Vec<u8> {
-    let value = routing.map(|(irq, dma, high_dma)| {
-        format!(
-            "A220 I{irq} D{dma} H{high_dma} P{:03X} T6",
-            WAVETABLE_MPU_BASE
-        )
+/// The routing a `SET BLASTER=` line advertises: the SB16's IRQ and two DMA
+/// channels, plus the MPU-401 port named in `P`. The MPU port is not part of
+/// `SoundBlasterConfig` because it is not a Sound Blaster property -- both
+/// MPU ports stay decoded regardless -- but it is part of the string, and
+/// SNDCTRL.COM can change it, so it travels alongside.
+type BlasterRouting = (u8, usize, usize, u16);
+
+fn routed_stock_autoexec(base: &[u8], routing: Option<BlasterRouting>) -> Vec<u8> {
+    let value = routing.map(|(irq, dma, high_dma, mpu_port)| {
+        format!("A220 I{irq} D{dma} H{high_dma} P{mpu_port:03X} T6")
     });
     let mut result = Vec::with_capacity(base.len());
     for line in base.split_inclusive(|byte| *byte == b'\n') {
@@ -57,17 +62,28 @@ fn routed_stock_autoexec(base: &[u8], routing: Option<(u8, usize, usize)>) -> Ve
 
 /// Apply the machine's Sound Blaster routing to an emulator-owned stock
 /// AUTOEXEC template. Repair uses the same helper as folder mounting.
-pub(super) fn stock_autoexec(base: &[u8], config: &izarravm_core::SoundBlasterConfig) -> Vec<u8> {
+pub(super) fn stock_autoexec(
+    base: &[u8],
+    config: &izarravm_core::SoundBlasterConfig,
+    mpu_port: u16,
+) -> Vec<u8> {
     routed_stock_autoexec(
         base,
         config.enabled.then_some((
             config.irq.line(),
             config.dma.channel(),
             config.high_dma.channel(),
+            mpu_port,
         )),
     )
 }
 
+/// Whether the file is byte-for-byte one of the templates the emulator itself
+/// writes, at any routing it could have chosen. Every routing has to be
+/// enumerated, because that is exactly what makes the file emulator-owned and
+/// therefore safe to rewrite: SNDCTRL.COM edits the `SET BLASTER=` line in
+/// place, and the result must still be recognised as ours or the tool's own
+/// edit would demote a stock file to user-owned.
 fn is_emulator_stock_autoexec(bytes: &[u8], current_base: &[u8]) -> bool {
     for base in [current_base, PREVIOUS_STOCK_AUTOEXEC_BAT] {
         if bytes == routed_stock_autoexec(base, None) {
@@ -76,8 +92,12 @@ fn is_emulator_stock_autoexec(bytes: &[u8], current_base: &[u8]) -> bool {
         for &irq in STOCK_SB_IRQS {
             for &dma in STOCK_SB_DMA8 {
                 for &high_dma in STOCK_SB_DMA16 {
-                    if bytes == routed_stock_autoexec(base, Some((irq, dma, high_dma))) {
-                        return true;
+                    for &mpu_port in STOCK_MPU_PORTS {
+                        if bytes
+                            == routed_stock_autoexec(base, Some((irq, dma, high_dma, mpu_port)))
+                        {
+                            return true;
+                        }
                     }
                 }
             }
@@ -94,6 +114,7 @@ pub(super) fn ensure_user_config(
     config_sys: &[u8],
     stock_autoexec_base: &[u8],
     sound_blaster: &izarravm_core::SoundBlasterConfig,
+    mpu_port: u16,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let config_path = dir.join("CONFIG.SYS");
@@ -106,7 +127,7 @@ pub(super) fn ensure_user_config(
     {
         std::fs::write(
             autoexec_path,
-            stock_autoexec(stock_autoexec_base, sound_blaster),
+            stock_autoexec(stock_autoexec_base, sound_blaster, mpu_port),
         )?;
     }
     Ok(())
@@ -348,7 +369,7 @@ impl Machine {
             .iter_mut()
             .find(|(name, _)| name.eq_ignore_ascii_case("AUTOEXEC.BAT"))
         {
-            *bytes = stock_autoexec(bytes, &self.profile.sound_blaster);
+            *bytes = stock_autoexec(bytes, &self.profile.sound_blaster, self.cmos_mpu_port());
         }
         apply_overrides(&mut system_files, overrides);
 
@@ -382,6 +403,7 @@ impl Machine {
             &payload_file(&payload, "CONFIG.SYS"),
             &payload_file(&payload, "AUTOEXEC.BAT"),
             &self.profile.sound_blaster,
+            self.cmos_mpu_port(),
         )?;
         let mut system_files = user_folder_overlay(payload.files);
         apply_overrides(&mut system_files, overrides);

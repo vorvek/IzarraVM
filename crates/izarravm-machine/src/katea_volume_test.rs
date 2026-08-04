@@ -64,6 +64,17 @@ fn extracts_the_embedded_image_payload() {
     );
     assert!(by_name.contains_key("TOKACD.SYS"), "TOKACD.SYS present");
     assert!(by_name.contains_key("IZCDEX.COM"), "IZCDEX.COM present");
+
+    // SNDCTRL.COM ships from the committed firmware binary, not from whatever
+    // the previous image happened to contain: a stale copy here would be a tool
+    // that writes an older CMOS layout than the host reads.
+    assert_eq!(
+        by_name.get("SNDCTRL.COM").map(|d| d.as_slice()),
+        Some(izarravm_firmware::sndctrl_com()),
+        "SNDCTRL.COM on the payload must be byte-identical to the committed \
+         binary (rebuild sndctrl.com, then regenerate roms/tokados-hdd.img \
+         via scripts/build-freedos-hdd-image.py)"
+    );
     let autoexec_text = String::from_utf8_lossy(autoexec);
     let izcdex_pos = autoexec_text
         .find("IZCDEX /I /D:TOKACD01 /L:D /Q")

@@ -75,6 +75,16 @@ impl SbMixer {
         }
     }
 
+    /// Re-point the card's IRQ line and DMA channels after construction, as a
+    /// guest write to mixer registers `0x80`/`0x81` would. Used to apply the
+    /// resource assignment SNDCTRL.COM persisted in CMOS, which the host has to
+    /// re-apply on every boot because the mixer is built before that NVRAM is
+    /// read back.
+    pub fn set_routing(&mut self, irq: u8, dma8: usize, dma16: usize) {
+        self.irq_setup = encode_irq(irq);
+        self.dma_setup = encode_dma(dma8, dma16);
+    }
+
     /// Decode the selected IRQ line from register `0x80`. Bit layout (Guide,
     /// "Configuring DMA and Interrupt Settings"): D0=IRQ2, D1=IRQ5, D2=IRQ7,
     /// D3=IRQ10. Only one bit is meaningful; if several are set the lowest set

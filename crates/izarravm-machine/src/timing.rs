@@ -127,8 +127,10 @@ impl Machine {
             } else {
                 0
             };
-            let wss_dma = self.wss_dma;
-            let wss_irq = self.wss_irq;
+            // Read live, not from a cached copy: the config register moves the
+            // codec's resources at runtime (SNDCTRL.COM does exactly that).
+            let wss_dma = self.wss.dma();
+            let wss_irq = self.wss.irq();
             // Run the sample clock whenever there is actual per-frame work pending:
             // either playback is armed (and the rate is valid), or the post-MCE ACI
             // window is still retiring (a driver clears MCE and polls ACI before
@@ -673,7 +675,7 @@ impl Machine {
         // 9/10/11) and the codec is enabled; frames_until_next_irq also returns
         // None when IEN is clear (the underflow then sets only the sticky Status
         // bit, no pin edge).
-        let wss_wake = if self.wss_enabled && self.pic.deliverable(self.wss_irq) {
+        let wss_wake = if self.wss_enabled && self.pic.deliverable(self.wss.irq()) {
             self.wss.frames_until_next_irq().and_then(|frames| {
                 self.timeline.cpu_clocks_until(
                     timeline::DeviceClock::Wss,

@@ -194,3 +194,6 @@ mod cd;
 
 #[path = "tokados_tokaemm_test.rs"]
 mod tokaemm;
+
+#[path = "tokados_sndctrl_test.rs"]
+mod sndctrl;

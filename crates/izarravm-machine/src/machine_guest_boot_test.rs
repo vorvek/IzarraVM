@@ -13,7 +13,7 @@ fn marker_boot_image(marker: u8, size: usize) -> Vec<u8> {
 
 #[test]
 fn sound_blaster_env_entries_default_config() {
-    let entries = sound_blaster_env_entries(&SoundBlasterConfig::default());
+    let entries = sound_blaster_env_entries(&SoundBlasterConfig::default(), WAVETABLE_MPU_BASE);
     assert_eq!(
         entries,
         vec![
@@ -32,7 +32,7 @@ fn sound_blaster_env_entries_non_default_routing() {
         high_dma: SbDma16::D5,
     };
     assert_eq!(
-        sound_blaster_env_entries(&config),
+        sound_blaster_env_entries(&config, WAVETABLE_MPU_BASE),
         vec![
             ("BLASTER".to_string(), "A220 I7 D3 H5 P300 T6".to_string()),
             ("SETSOUND".to_string(), "A220 I7 D3 H5 P300 T6".to_string()),
@@ -46,7 +46,7 @@ fn sound_blaster_env_entries_disabled_omits_the_string() {
         enabled: false,
         ..SoundBlasterConfig::default()
     };
-    assert!(sound_blaster_env_entries(&config).is_empty());
+    assert!(sound_blaster_env_entries(&config, WAVETABLE_MPU_BASE).is_empty());
 }
 
 #[test]

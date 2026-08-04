@@ -211,6 +211,26 @@ impl Sb16Path {
         }
     }
 
+    /// Re-point the card's IRQ/DMA routing. No-op when the SB16 path is
+    /// disabled, since there is no mixer to configure.
+    pub(crate) fn set_routing(&mut self, irq: u8, dma8: usize, dma16: usize) {
+        if let Some(active) = self.active.as_mut() {
+            active.mixer.set_routing(irq, dma8, dma16);
+        }
+    }
+
+    /// The routing the mixer currently answers on, or `None` when the path is
+    /// disabled. Read from the mixer registers rather than from any cached
+    /// copy, so it reflects a guest write to `0x80`/`0x81`.
+    pub(crate) fn routing(&self) -> Option<(u8, usize, usize)> {
+        let active = self.active.as_ref()?;
+        Some((
+            active.mixer.selected_irq(),
+            active.mixer.selected_dma_8(),
+            active.mixer.selected_dma_16(),
+        ))
+    }
+
     pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {
         let active = self.active.as_mut()?;
         if let Some(value) = active.mixer.read_port(port) {

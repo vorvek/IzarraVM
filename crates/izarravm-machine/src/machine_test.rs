@@ -581,6 +581,9 @@ mod atapi_timing;
 #[path = "machine_audio_test.rs"]
 mod audio;
 #[cfg(test)]
+#[path = "machine_audio_cmos_test.rs"]
+mod audio_cmos;
+#[cfg(test)]
 #[path = "machine_bios_clock_test.rs"]
 mod bios_clock;
 #[cfg(test)]

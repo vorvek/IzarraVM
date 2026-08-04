@@ -264,6 +264,33 @@ fn config_region_reports_id_version_and_irq_dma_jumpers() {
 }
 
 #[test]
+fn writing_the_config_region_repoints_resources_and_reinitialises_the_codec() {
+    // ReSonique 2's config register is writable, so a guest can move the codec
+    // without restarting the machine. Selecting resources must also quiesce it:
+    // a transfer left running would keep driving the channel the board just gave
+    // up. The board ID and the mirror offsets stay read-only.
+    let mut dev = Ad1848::new(Ad1848Config { irq: 11, dma: 0 });
+    assert_eq!(dev.read_port(1), 0xB0, "IRQ11/DMA0 readback");
+
+    // Arm a transfer so there is something live to interrupt.
+    write_indirect(&mut dev, IDX_LOWER_COUNT as u8, 8);
+    write_indirect(&mut dev, IDX_IFACE_CONFIG as u8, I9_ACAL | I9_PEN);
+    assert!(dev.is_playing(), "codec armed before the re-point");
+
+    dev.write_port(1, (7 << 4) | 3);
+    assert_eq!(dev.read_port(1), (7 << 4) | 3, "write selects IRQ7/DMA3");
+    assert!(
+        !dev.is_playing(),
+        "re-pointing re-initialises: playback stopped"
+    );
+    assert_eq!(dev.status() & 1, 0, "sticky INT cleared by the re-init");
+
+    let id = dev.read_port(0);
+    dev.write_port(0, 0xFF);
+    assert_eq!(dev.read_port(0), id, "board ID stays read-only");
+}
+
+#[test]
 fn pen_arms_only_with_nonzero_base_count() {
     let mut dev = Ad1848::default();
     // PEN set but base count still zero -> not armed.
