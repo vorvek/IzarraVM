@@ -69,7 +69,7 @@ fn load_config_snapshot(
         path: path.to_owned(),
         source,
     })?;
-    let value = toml::from_str::<toml::Value>(&text).map_err(|source| ConfigError::Parse {
+    let mut value = toml::from_str::<toml::Value>(&text).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
         source: Box::new(source),
     })?;
@@ -90,6 +90,19 @@ fn load_config_snapshot(
             mt32_pcm_rom: midi.is_some_and(|table| table.contains_key("mt32_pcm_rom")),
         },
     };
+    // Drop the settings CMOS owns now, and say so: a user who edited one of
+    // them is otherwise left watching the machine ignore their file, which is
+    // exactly the confusion that moving them to CMOS was meant to end.
+    let dropped = izarravm_core::strip_retired_keys(&mut value);
+    if !dropped.is_empty() {
+        warn!(
+            path = %path.display(),
+            keys = %dropped.join(", "),
+            "ignoring config keys the machine's CMOS now owns; \
+             set the CPU speed in the BIOS setup panel (Del) and the sound \
+             card's resources with SNDCTRL in DOS"
+        );
+    }
     let config = value
         .try_into::<AppConfig>()
         .map_err(|source| ConfigError::Parse {

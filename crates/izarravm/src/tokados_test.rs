@@ -197,3 +197,6 @@ mod tokaemm;
 
 #[path = "tokados_sndctrl_test.rs"]
 mod sndctrl;
+
+#[path = "tokados_gswmode_test.rs"]
+mod gswmode;

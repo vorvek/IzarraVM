@@ -295,20 +295,44 @@ SORT [/R] [/+num] [/A] [/?] [file]
 
 ## GSWMODE
 
-General Simulation Works's own tool: switches the GSW-586's live CPU speed
-class from inside DOS, without rebooting.
+General Simulation Works's own tool: switches the GSW-586's CPU speed class
+from inside DOS, without rebooting.
 
 ```
-GSWMODE 386-slow | 386 | 486 | 586
+GSWMODE 386-slow | 386 | 486 | 586 [/T]
 ```
 
-Mode names are case-insensitive. With no argument or an unrecognized one,
-GSWMODE prints usage and the *current* mode (read back live) and changes
-nothing:
+Mode names are case-insensitive. Given a valid mode, GSWMODE writes the
+matching code to the Lotura chipset's mode port, saves it in CMOS, and
+confirms:
 
 ```
-Usage: GSWMODE 386-slow|386|486|586
-Current mode: <mode>
+GSWMODE: switched to <mode>, saved.
+```
+
+The speed then **survives a reboot**, exactly as though you had set it in the
+[Del setup panel](../izbios/configuration-panel.md). Add `/T` to change the
+speed for this session only and leave the saved one alone:
+
+```
+GSWMODE 386-slow /T
+GSWMODE: switched to 386-slow for this session only.
+```
+
+That is the right switch for running one program slower without committing to
+it. Everything else about the machine's setup is remembered, so the speed is
+too unless you say otherwise.
+
+With no argument or an unrecognized one, GSWMODE prints usage and both speeds,
+and changes nothing. The two differ after a `/T`, which is the only time the
+distinction matters and exactly when you would want to see it:
+
+```
+Usage: GSWMODE 386-slow|386|486|586 [/T]
+  The speed is saved and survives a reboot; /T applies it
+  for this session only.
+Current mode: 386-slow
+Saved mode:   486
 ```
 
 The retired `286` name is rejected with a migration hint:
@@ -317,17 +341,9 @@ The retired `286` name is rejected with a migration hint:
 CPU mode '286' was removed; use '386-slow'.
 ```
 
-Given a valid mode, it writes the matching code straight to the Lotura
-chipset's mode port and confirms:
-
-```
-GSWMODE: switched to <mode>.
-```
-
-This is a **runtime-only** switch: it never touches CMOS, so the BIOS's
-saved boot-time speed (set from the [Tab boot menu](../izarra-3000/user-manual.md#the-tab-boot-menu)
-or the [Del setup panel](../izbios/configuration-panel.md)) is unaffected.
-Your next cold boot still starts at whatever speed you saved there.
+The [Tab boot menu](../izarra-3000/user-manual.md#the-tab-boot-menu) and the
+Del setup panel write the same CMOS byte, so all three agree about what the
+machine will start at next time.
 
 ## UNHALT
 
