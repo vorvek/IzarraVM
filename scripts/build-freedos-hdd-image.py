@@ -292,6 +292,8 @@ def main(check: bool = False) -> int:
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokacd.sys"), "rb").read()
     gswmode = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "gswmode.com"), "rb").read()
+    unhalt = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "unhalt.com"), "rb").read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). TOKAEMM
     # loads as the memory manager with its default 3 MiB EMS pool, and the system
@@ -384,6 +386,7 @@ def main(check: bool = False) -> int:
         ("TOKACD.SYS", tokacd, ATTR_ARCHIVE),
         ("IZCDEX.COM", izcdex, ATTR_ARCHIVE),
         ("GSWMODE.COM", gswmode, ATTR_ARCHIVE),
+        ("UNHALT.COM", unhalt, ATTR_ARCHIVE),
         ("MOVE.EXE", move, ATTR_ARCHIVE),
         ("SORT.EXE", sort, ATTR_ARCHIVE),
         ("MEM.EXE", mem, ATTR_ARCHIVE),

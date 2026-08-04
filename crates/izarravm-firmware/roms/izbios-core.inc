@@ -21,6 +21,10 @@ bios_start:
     mov word [KB_BUF_HEAD], KB_BUF_START
     mov word [KB_BUF_TAIL], KB_BUF_START
     mov byte [KB_FLAGS], 0
+    ; Halt (rather than spin) in the INT 16h key wait is the default; UNHALT.COM
+    ; flips this byte. Cleared explicitly rather than trusting zeroed RAM, so a
+    ; warm reset cannot carry the previous session's choice into this one.
+    mov byte [KB_NOHALT], 0
     ; Cache the keyboard layout from CMOS 0x10 into the BDA so the INT 09h ISR
     ; translates against the right table. Clamp out-of-range values to en-US (0).
     ; The setup page refreshes this byte live when it changes the layout.

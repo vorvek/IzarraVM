@@ -5,10 +5,14 @@
 
 ## The machine is slow / a game feels sluggish
 
-IzarraVM is early, and CPU performance is the weakest part of it today. The
-486 mode at 66 MHz is borderline for demanding software, and the full
-GSW-586 speed mode is not yet usable for real-time games. If a game feels
-wrong, try:
+Most games run at full speed, in the top GSW-586 mode included. Two things are
+worth separating before assuming a bug. The Izarra 3000 is a Pentium 200 MMX
+class machine, so anything that wanted more than that in period still wants more
+than that here: demanding 3D at high resolutions and frame rates, or late titles
+that recommended a Pentium II or higher, are outside what this hardware could
+ever have done. If instead a game feels wrong on hardware that should have coped,
+it is usually timing rather than throughput, since software written for a slower
+machine can misbehave on a faster one. Try:
 
 - **A slower CPU mode.** Counterintuitively, `GSWMODE 486` or even
   `GSWMODE 386` from the DOS prompt (see the [command
@@ -21,6 +25,19 @@ wrong, try:
   hardware. See the [VGA core](vga-core/README.md#limitations) and [VEGA
   technical reference, section 9](vega/vega-technical-reference.md#9-timing-and-fidelity)
   for where the video timing model is and isn't cycle-exact.
+
+## An old program hangs or behaves oddly while waiting for a key
+
+IzarraVM's BIOS halts the CPU when a program asks for a keystroke and none is
+ready, rather than spinning. That is invisible to almost everything, since a
+keypress wakes it immediately, but a program that masks the timer and keyboard
+interrupts before waiting, or that expects time to pass smoothly during the
+wait, can notice.
+
+Run `UNHALT` before the program (see the [command
+reference](toka-dos/commands.md#unhalt)) to put the BIOS back to spinning, and
+`UNHALT /H` to restore the default. Toka-DOS's own idle halt is separate:
+`IDLEHALT=0` in `CONFIG.SYS` turns that one off.
 
 ## A game doesn't detect my sound card
 
@@ -109,6 +126,20 @@ It reinstalls the Toka-DOS system files from the copy built into ROM,
 backing up your `CONFIG.SYS` and `AUTOEXEC.BAT` to `.OLD` files first rather
 than silently overwriting them. Anything else on your C: drive is left
 alone.
+
+You can also hold **F5** while the message
+
+```
+Press F8 to trace or F5 to skip CONFIG.SYS/AUTOEXEC.BAT
+```
+
+is on screen, for about two seconds, to boot with neither file processed. That
+is the quickest way back in when a line you added to `CONFIG.SYS` stops the
+machine booting. **F8** steps through `CONFIG.SYS` one line at a time instead,
+asking about each.
+
+Because F5 skips `AUTOEXEC.BAT` too, `PATH` is not set, so DOS tools need their
+full path: `C:\DOS\EDIT.COM CONFIG.SYS` rather than `EDIT CONFIG.SYS`.
 
 ## Where's the Distira / 3D programmer's guide?
 

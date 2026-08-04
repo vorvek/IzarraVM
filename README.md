@@ -15,9 +15,8 @@ system running in virtual-8086 mode under the machine's own memory manager.
 </p>
 
 The goal is to run early to mid 1990s DOS games as if the Izarra had reached
-store shelves. A growing set of games already runs, and the throttled CPU modes
-run at or near real-time on a modern host; the full-speed 586 mode is still
-being tuned.
+store shelves. It already runs a good deal of that era's software, and the work
+is ongoing.
 
 ## Origin
 
@@ -68,8 +67,15 @@ reproduces the Izarra 3000 exactly as it was built.
 The emulator boots to a usable DOS with sound, mouse, CD-ROM (ISO, CUE/BIN, or
 a host folder mounted as a disc), and floppy images. Legacy video personalities
 (CGA, EGA, VGA, Hercules) are modeled down to the register level, and the
-display goes through an optional, subtle CRT shader. Plenty of games run;
-plenty more don't yet. Compatibility work is ongoing.
+display goes through an optional, subtle CRT shader. Compatibility is already
+fairly broad, and the work continues.
+
+If a game you want to play does not run, or runs poorly where it should not,
+please [open an issue](https://github.com/vorvek/IzarraVM/issues). The Izarra
+3000 is a Pentium 200 MMX class machine, so anything that wanted more than that
+in period still wants more than that here. Demanding 3D at high resolutions and
+frame rates, or late titles that recommended a Pentium II or higher, are outside
+what this hardware could ever have done rather than defects in emulation.
 
 ## Quick Start
 

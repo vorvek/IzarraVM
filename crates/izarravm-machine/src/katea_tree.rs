@@ -88,6 +88,7 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
     "TOKACD.SYS",
     "IZCDEX.COM",
     "GSWMODE.COM",
+    "UNHALT.COM",
     "MOVE.EXE",
     "SORT.EXE",
     "MEM.EXE",

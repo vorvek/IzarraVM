@@ -18,6 +18,7 @@
 %define KB_PREFIX      0x00b1      ; pending E0 extended-key prefix
 %define KB_ALTGR       0x00b2      ; right Alt held
 %define KB_DEAD        0x00b3      ; pending dead-key accent id
+%define KB_NOHALT      0x00b4      ; UNHALT.COM: spin the key wait, do not halt
 %endif
 
 ; INT 09h: keyboard hardware ISR
@@ -345,8 +346,33 @@ int16:
     mov ds, bx
     mov bx, [KB_BUF_HEAD]
     cmp bx, [KB_BUF_TAIL]
+    mov bl, [KB_NOHALT]    ; MOV leaves the compare's ZF alone, and so does POP
     pop ds
-    je .read_wait          ; buffer empty: spin (IRQ fills it)
+    jne .read_ready        ; a key is already queued: take it, do not halt
+    test bl, bl
+    jnz .read_wait         ; UNHALT.COM set: spin, as a 1981 BIOS would
+    ; Buffer empty: sleep until any interrupt rather than spinning the ring
+    ; check. IRQ1 -> INT 09h enqueues the key and wakes this directly, so a
+    ; keystroke is served no later than the spin served it; IRQ0 wakes it
+    ; harmlessly and the check simply repeats. `sti` at the entry above is what
+    ; makes the halt safe -- a HLT with interrupts masked is a hang.
+    ;
+    ; Real AT BIOSes differ on this and both are period-plausible, so it is a
+    ; free choice for a clean-room ROM, and the emulator makes it lopsided: a
+    ; spinning wait is interpreted guest code, and DOS programs block here
+    ; constantly -- every menu, every "press any key". The kernel's own idle
+    ; halt (dosidle.asm, on by default in Toka-DOS) covers DOS input, INT 21h
+    ; AH=01/07/08; this covers everything that calls the BIOS directly, which
+    ; the kernel path never sees.
+    ;
+    ; Divergence worth knowing: a guest that masks IRQ0 AND IRQ1 and then blocks
+    ; here used to spin forever and now halts with nothing left to wake it, which
+    ; the emulator reports as a halt. Both are hung -- such a program can never
+    ; receive the key it is waiting for -- but the halt says so instead of
+    ; burning a core to hide it.
+    hlt
+    jmp .read_wait
+.read_ready:
     push ds
     ; FreeDOS's CONRead uses CX as its read-loop counter, so use BX (saved at
     ; entry, reloaded on the next line) as the DS-load scratch, not CX.
@@ -383,8 +409,14 @@ int16:
     mov ds, bx
     mov bx, [KB_BUF_HEAD]
     cmp bx, [KB_BUF_TAIL]
+    mov bl, [KB_NOHALT]    ; read the flag while DS is still 0x40; MOV/POP keep ZF
     pop ds
-    je .read16_wait
+    jne .read16_ready      ; a key is already queued: take it, do not halt
+    test bl, bl
+    jnz .read16_wait       ; UNHALT.COM set: spin (see the AH=00h note)
+    hlt                    ; empty: sleep until an IRQ
+    jmp .read16_wait
+.read16_ready:
     push ds
     ; Preserve CX (see the AH=00h .read note above): use BX as the DS-load scratch.
     mov bx, 0x0040

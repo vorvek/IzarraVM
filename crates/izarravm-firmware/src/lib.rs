@@ -78,6 +78,8 @@ pub const CDAUDIO_COM_SOURCE: &str = include_str!("../roms/dos/cdaudio.asm");
 pub const CDTIME_COM: &[u8] = include_bytes!("../roms/dos/cdtime.com");
 pub const CDTIME_COM_SOURCE: &str = include_str!("../roms/dos/cdtime.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
+pub const UNHALT_COM: &[u8] = include_bytes!("../roms/dos/unhalt.com");
+pub const UNHALT_COM_SOURCE: &str = include_str!("../roms/dos/unhalt.asm");
 pub const GSWMODE_COM_SOURCE: &str = include_str!("../roms/dos/gswmode.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
@@ -332,6 +334,21 @@ pub fn gpemul_com() -> &'static [u8] {
 /// (see build-freedos-hdd-image.py).
 pub fn gswmode_com() -> &'static [u8] {
     GSWMODE_COM
+}
+
+/// UNHALT.COM: makes the BIOS INT 16h keyboard wait spin instead of halting.
+///
+/// The wait halts by default (kbd-bios-core.inc), because a spinning wait is
+/// interpreted guest code and DOS programs block there constantly. A halt is
+/// not identical to a spin, though, and this is the escape for the difference:
+/// a program that masks IRQ0 and IRQ1 before blocking, or one that expects
+/// guest time to advance smoothly across the wait rather than in 18.2 Hz steps.
+///
+/// Not a TSR. The flag is a BDA byte (0040:00B4) that the ROM re-reads on every
+/// wait, so the tool sets it and exits; `UNHALT /H` puts it back. Ships on the
+/// Toka-DOS image (see build-freedos-hdd-image.py).
+pub fn unhalt_com() -> &'static [u8] {
+    UNHALT_COM
 }
 
 /// The direct UMB mechanism fixture: drives XMS 10h/11h/12h without

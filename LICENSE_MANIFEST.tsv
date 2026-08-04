@@ -33,6 +33,7 @@ crates/izarravm-firmware/roms/dos/tokaemm.sys	generated-guest-binary	IzarraVM pr
 crates/izarravm-firmware/roms/dos/type.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	0899410e755306edd63bafa1e44afe4dafe446f1d5d533d19c7b95c8a508b899
 crates/izarravm-firmware/roms/dos/umbmech.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	06e04e3855157df3215fd14bb84df0467e56fc230ecea3e22e2d6a40d0a545cc
 crates/izarravm-firmware/roms/dos/umbtest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	6d6511b1040256e62f7e9f9231a01077b89623de1285655a4e1ea20d408ac42a
+crates/izarravm-firmware/roms/dos/unhalt.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	82dc6645243b51946270f5516174a0ed9a41567a50f60f16737aad5b77e9bae1
 crates/izarravm-firmware/roms/dos/v86spike.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	cb9a380c1367c038c3d6b9101dd80abcefa1375515be4857d0d274572245c865
 crates/izarravm-firmware/roms/dos/vcpidet.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	701e71522453b1e6b8887ce302f4e8fe555fd9153dabedf781a86aa8d7e7c2a9
 crates/izarravm-firmware/roms/dos/vcpiif.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	61c18058cca4a4936775fe13918d14641e8eceffc7495c878fef4b7331cfefdd
@@ -41,15 +42,15 @@ crates/izarravm-firmware/roms/dos/vcpimem.com	generated-guest-binary	IzarraVM pr
 crates/izarravm-firmware/roms/dos/vcpisw.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	fb0325a2542d67859e88f127d0fdb6a5254b55135f2f9cc7d59863a7c3093776
 crates/izarravm-firmware/roms/dos/xmstest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	342504ed8fbfeed275906e830e91833fa97b583a5b97e5a1e64df270a8d4a211
 crates/izarravm-firmware/roms/i386dx25-test.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	ba3a1717b073d4c41b0c2f9f83aec51d082431251de1d3cb239d64c9d41c4932
-crates/izarravm-firmware/roms/izarra-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	d430a028484924c17a6cb31c5fdb6376dac188d2a5fc8a46ba67bb85a528510f
+crates/izarravm-firmware/roms/izarra-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	ffb586241bc6e8b63c2b4b86b25ffbba99dc0825a5c2895f271185f0dbdfb793
 crates/izarravm-firmware/roms/izbios-art.inc	generated-source	IzarraVM gen_art.py	GPL-3.0-only	9e9e9b94a787498051ccc3a89cf512bbf3e5ebc2c31d3a88b6bf194d5a09c853
 crates/izarravm-firmware/roms/izbios-logo.inc	generated-source	IzarraVM project artwork	GPL-3.0-only	55e62c1bb449c8c659e4f447d95885d2baa73c6363fb3d5a4767f9afdba227e1
-crates/izarravm-firmware/roms/kbd-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	2d716b3cda808703a7a87834abe7fe5db163877267d93df5868d63313fd441c4
+crates/izarravm-firmware/roms/kbd-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	e176b2599fb776dae0250c6ac684764554241dff633dd5a1591b9c99bc5bc52a
 crates/izarravm-firmware/roms/kbd-layout-meta.inc	generated-source	IzarraVM generator and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	dd14ec56ab17e55cb242a88154d9abb10b1ec7a88366f742147693702828d484
 crates/izarravm-firmware/roms/kbd-layouts.inc	generated-source	IzarraVM generator and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	51a5d737fd5cfac4c7d7d5c2376401536a7e427f098b84128b851130e03348b2
-crates/izarravm-firmware/roms/kbd-resident.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	2c5b0e9acebdb4a25b547dfc60259eb66743adb8d2e5ad2be66b7bccd196064f
+crates/izarravm-firmware/roms/kbd-resident.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	a2ab3ae9a6370e57bd3761e079c51c02808ceb77097efa7199c89aa5c9a38841
 crates/izarravm-firmware/roms/neurketa/neurketa.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	760cdddd2c5e3bcaaa378961fd08df89a8f8d68f01f522a512f4d27d8d7e7ca9
-crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	82ec60651d215af3e01e171823f5687ffa4142fb1c9939799bfa2a767ddaed42
+crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	afdb3de67eb4c0d26e35a7144b0fd3a4e103f96df1965d89a11edc0e326475c7
 crates/izarravm-machine/tests/fixtures/CBLEAK.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	9c0d52099a205491ceea7a17d850cb9a459d7d7c1580b8c8dd8f05099ca2b008
 crates/izarravm-machine/tests/fixtures/GFXCUR.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	611acec5ccda2c22c9add0e8a1d6809793068ebd8d6428df5fbb97f946176493
 crates/izarravm-machine/tests/fixtures/MTEST.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	4fc9fb2d6e67aa8fea1f789da7c97bf8a7d3dcc75595ef93843617deb4793fa9
