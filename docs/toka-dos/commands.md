@@ -329,6 +329,48 @@ saved boot-time speed (set from the [Tab boot menu](../izarra-3000/user-manual.m
 or the [Del setup panel](../izbios/configuration-panel.md)) is unaffected.
 Your next cold boot still starts at whatever speed you saved there.
 
+## UNHALT
+
+General Simulation Works's own tool: makes the BIOS keyboard wait spin instead
+of halting the CPU.
+
+```
+UNHALT      spin while waiting for a key
+UNHALT /H   halt while waiting (the default)
+UNHALT /?   usage
+```
+
+When a program asks the BIOS for a keystroke (INT 16h) and none is waiting,
+IzarraVM's BIOS halts the CPU until the next interrupt instead of spinning on
+the keyboard buffer. Pressing a key raises IRQ1 and wakes it immediately, so
+nothing responds any slower, but the emulator stops interpreting a busy loop
+that does nothing.
+
+BIOSes of the era did this both ways, so neither behaviour is unfaithful. A
+program can only tell the difference in two situations:
+
+- It masks the timer and keyboard interrupts and *then* waits for a key. A spin
+  loops forever; a halt has nothing left to wake it. Both are hung, since no key
+  can ever arrive, but they hang differently.
+- It expects time to pass smoothly across the wait rather than in steps of about
+  1/18 second.
+
+Neither is common. If a program misbehaves while waiting for input, run `UNHALT`
+before it:
+
+```
+UNHALT
+MYGAME
+```
+
+`UNHALT /H` restores halting without a reboot. The setting is not saved, so
+every reset starts out halting; put `UNHALT` in `AUTOEXEC.BAT` if a program
+needs it every time.
+
+This covers the **BIOS** keyboard wait only. Toka-DOS separately halts while DOS
+itself is waiting for input; to turn that off, put `IDLEHALT=0` in `CONFIG.SYS`
+and reboot.
+
 ## TOKAMOUS
 
 General Simulation Works's PS/2 mouse driver: a terminate-and-stay-resident
