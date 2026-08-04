@@ -135,8 +135,26 @@ struct config Config = {
   0,
   NFCBS,
   0,
-  "command.com",
-  " /P /E:256\r\n",
+  /* Modified by the Toka-DOS project, 2026: "command.com" -> the full
+     C:\DOS path, and the tail gained the same directory as an argument.
+     Upstream's bare name looks in the boot drive's ROOT, which is where
+     FreeDOS puts COMMAND.COM but Toka-DOS does not -- our root holds only
+     CONFIG.SYS and AUTOEXEC.BAT and every binary lives in C:\DOS (see
+     scripts/build-freedos-hdd-image.py). This default is only reached when
+     CONFIG.SYS supplies no SHELL=, which is exactly what pressing F5 does, so
+     the bare name made the F5 escape hatch strand the user at "Bad or missing
+     Command Interpreter" -- the one situation the hatch exists for.
+
+     The directory argument matters as much as the path: it is where FreeCOM
+     builds COMSPEC from, so without it a shell that loaded could still fail to
+     reload its transient part. Both now match the SHELL= line the shipped
+     CONFIG.SYS carries, so F5 lands in the same shell as a normal boot, minus
+     the drivers it was asked to skip.
+
+     C: rather than a driveless path deliberately: COMSPEC wants a drive
+     letter, and Toka-DOS's hard disk is always C: here. */
+  "C:\\DOS\\COMMAND.COM",
+  " C:\\DOS /P /E:256\r\n",
   NLAST,
   0,
   NSTACKS,

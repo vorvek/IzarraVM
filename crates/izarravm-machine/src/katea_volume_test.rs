@@ -21,9 +21,16 @@ fn extracts_the_embedded_image_payload() {
     // is now #ifdef DEBUG-gated (dropping its printf + format string in a
     // non-debug build); COMMAND.COM shrank because DEFAULT.lng's VER
     // /W,/D,/C copyright blocks were rewritten to drop FreeDOS branding.
+    //
+    // 70062 -> 70076: the fallback shell string grew from "command.com" plus
+    // " /P /E:256" to the full "C:\DOS\COMMAND.COM" plus " C:\DOS /P /E:256",
+    // which is 14 more bytes of .data. That default is what F5 (skip
+    // CONFIG.SYS) lands on, and the bare name pointed at the boot root, where
+    // Toka-DOS ships no COMMAND.COM. The idle-halt and F5-window patches in the
+    // same kernel added no net size: their four instruction bytes fit padding.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(70062),
+        Some(70076),
         "KERNEL.SYS size"
     );
     assert_eq!(
