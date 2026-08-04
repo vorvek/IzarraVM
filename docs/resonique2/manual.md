@@ -128,37 +128,36 @@ both devices on one line or channel is refused outright — nothing is written.
 last saved, so it tells you what the card is really doing even if something else
 moved it.
 
-### From the host instead
+### Why there is nothing to set in `izarravm.conf`
 
-`izarravm.conf` sets the power-on values for a machine that has no saved CMOS:
+There used to be. `[audio.sound_blaster] irq` and its neighbours were removed,
+because a config file cannot win an argument with NVRAM: the machine boots from
+CMOS, so once `SNDCTRL` had saved anything, editing those keys did nothing at
+all. A setting that silently does nothing is worse than one that is not there.
 
-```toml
-[audio.sound_blaster]
-irq = "5"          # 2, 5, 7 or 10
+Old config files still load. The retired keys are ignored, with a note in the
+log naming them.
 
-[audio.wss]
-irq = "7"          # 7, 9, 10 or 11
-```
+What stays in the file is what CMOS has no opinion about: whether each device is
+fitted at all (`enabled`), and the codec's I/O base (`base`), which is fixed
+board wiring rather than a resource anything can select.
 
-`--sb-irq`, `--sb-dma` and `--sb-high-dma` do the same from the command line.
-The Sound Blaster and the codec must end up on different IRQ lines and
-different DMA channels; the emulator refuses to start otherwise rather than
-letting two devices fight over one line.
-
-Once `SNDCTRL` has saved an assignment, **the saved one wins**: it is stored in
-the machine's CMOS, exactly like the CPU speed and the keyboard layout, and CMOS
-is what the machine boots from. Editing the config file after that changes
-nothing until the CMOS is cleared. This is the same behaviour as a real PC whose
-BIOS setup you have already been through.
+`--sb-irq`, `--sb-dma` and `--sb-high-dma` still work on the command line. They
+set the power-on values, which matters for headless runs, since those have no
+CMOS at all; in the GUI a saved assignment wins over them, the same way it wins
+over the config file.
 
 ## Digital audio (Sound Blaster 16 compatible)
 
 The CT1745-compatible mixer and DSP answer at `0x220`-`0x22F`, with the
-power-on IRQ and DMA defaults from the table above. These are configurable
-per machine through the emulator's config file or `--sb-irq`/`--sb-dma`/
-`--sb-high-dma` flags, in case a program insists on jumpering the card
-somewhere else, but Toka-DOS's shipped `BLASTER` line always matches
-whatever the running configuration actually is.
+power-on IRQ and DMA defaults from the table above. Both are movable, from
+inside DOS with [`SNDCTRL`](#changing-the-cards-resources), in case a program
+insists on jumpering the card somewhere else. Toka-DOS's `BLASTER` line always
+matches whatever the running configuration actually is.
+
+The mixer's Interrupt and DMA Setup registers (`0x80`/`0x81`) are writable by
+the guest, so a program that configures the card that way moves it too — the
+same path `SNDCTRL` uses.
 
 ## FM synthesis (OPL3)
 

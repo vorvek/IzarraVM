@@ -281,7 +281,9 @@ fn sound_blaster_config_defaults_when_absent_or_partial() {
         }
     );
 
-    // A partial table fills the omitted fields from their defaults.
+    // `enabled` is still the file to set -- whether the card is fitted is a
+    // property of the machine, not something the guest can change. The routing
+    // beside it is not: CMOS owns that now, so the key parses and is dropped.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("izarravm.toml");
     fs::write(
@@ -295,7 +297,11 @@ fn sound_blaster_config_defaults_when_absent_or_partial() {
     .unwrap();
     let config = AppConfig::from_toml_path(path).unwrap();
     assert!(config.audio.sound_blaster.enabled);
-    assert_eq!(config.audio.sound_blaster.irq, SbIrq::I5);
+    assert_eq!(
+        config.audio.sound_blaster.irq,
+        SbIrq::I7,
+        "audio.sound_blaster.irq is retired: the file cannot move the card"
+    );
     assert_eq!(config.audio.sound_blaster.dma, SbDma8::D1);
     assert_eq!(config.audio.sound_blaster.high_dma, SbDma16::D5);
 }
@@ -329,7 +335,8 @@ fn wss_config_defaults_when_absent_or_partial() {
         }
     );
 
-    // A partial table fills the omitted fields from their defaults.
+    // As with the Sound Blaster, `enabled` and `base` remain in the file; the
+    // codec IRQ is retired to CMOS and the key is dropped.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("izarravm.toml");
     fs::write(
@@ -344,16 +351,24 @@ fn wss_config_defaults_when_absent_or_partial() {
     let config = AppConfig::from_toml_path(path).unwrap();
     assert!(config.audio.wss.enabled);
     assert_eq!(config.audio.wss.base, 0x530);
-    assert_eq!(config.audio.wss.irq, WssIrq::I10);
-    assert_eq!(config.audio.wss.dma, SbDma8::D0);
+    assert_eq!(
+        config.audio.wss.irq,
+        WssIrq::I11,
+        "audio.wss.irq is retired: the file cannot move the codec"
+    );
+    assert_eq!(
+        config.audio.wss.dma,
+        SbDma8::D0,
+        "the retired DMA key must land on the CODEC default (0), not \
+         SbDma8::default() (1), which is the channel the SB16 holds"
+    );
 }
 
 #[test]
 fn wss_config_parses_overrides_when_present() {
-    // A full [audio.wss] table overrides every field, including disabling the
-    // codec, picking a non-default base, and the alias-driven IRQ/DMA enums.
-    // IRQ11 is one of the two documented WSS lines (9/11) that the SB16's
-    // `SbIrq` cannot express, so it also pins the dedicated `WssIrq` parse.
+    // The two fields the file still owns: whether the codec is fitted and where
+    // its config region decodes. The IRQ and DMA keys beside them are retired,
+    // so a file carrying all four still loads -- and moves only the first two.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("izarravm.toml");
     fs::write(
@@ -374,7 +389,7 @@ fn wss_config_parses_overrides_when_present() {
             enabled: false,
             base: 0x604,
             irq: WssIrq::I11,
-            dma: SbDma8::D3,
+            dma: SbDma8::D0,
         }
     );
 }
@@ -529,7 +544,83 @@ fn loads_toml_config() {
     .unwrap();
 
     let config = AppConfig::from_toml_path(path).unwrap();
-    assert_eq!(config.machine.cpu, GswMode::Gsw386);
+    assert_eq!(
+        config.machine.cpu,
+        GswMode::Gsw586,
+        "machine.cpu is retired to CMOS: the file parses but does not set it"
+    );
     assert_eq!(config.machine.video, VideoCard::Vega);
     assert_eq!(config.dos.c_drive, PathBuf::from("."));
+}
+
+/// Every key CMOS took over parses, is reported, and leaves the built-in
+/// power-on default in place. Parsing matters as much as ignoring: `AppConfig`
+/// denies unknown fields, so without the stripping pass an existing config file
+/// would stop loading altogether rather than quietly losing these keys.
+#[test]
+fn retired_cmos_keys_are_accepted_reported_and_ignored() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("izarravm.toml");
+    fs::write(
+        &path,
+        r#"
+            [machine]
+            cpu = "386-slow"
+            memory_mib = 16
+
+            [audio.sound_blaster]
+            irq = "2"
+            dma = "3"
+            high_dma = "7"
+
+            [audio.wss]
+            irq = "9"
+            dma = "1"
+        "#,
+    )
+    .unwrap();
+
+    let config = AppConfig::from_toml_path(&path).unwrap();
+    assert_eq!(config.machine.memory_mib, 16, "live keys still apply");
+    assert_eq!(config.machine.cpu, GswMode::Gsw586);
+    assert_eq!(config.audio.sound_blaster.irq, SbIrq::I7);
+    assert_eq!(config.audio.sound_blaster.dma, SbDma8::D1);
+    assert_eq!(config.audio.sound_blaster.high_dma, SbDma16::D5);
+    assert_eq!(config.audio.wss.irq, WssIrq::I11);
+    assert_eq!(config.audio.wss.dma, SbDma8::D0);
+
+    // The caller is told exactly which keys it ignored, so the warning can name
+    // them rather than leaving the user to wonder why nothing happened.
+    let mut value = toml::from_str::<toml::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut dropped = crate::strip_retired_keys(&mut value);
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        vec![
+            "audio.sound_blaster.dma",
+            "audio.sound_blaster.high_dma",
+            "audio.sound_blaster.irq",
+            "audio.wss.dma",
+            "audio.wss.irq",
+            "machine.cpu",
+        ]
+    );
+    assert!(
+        crate::strip_retired_keys(&mut value).is_empty(),
+        "a second pass has nothing left to drop"
+    );
+}
+
+/// A config file that never mentioned them is untouched, so the pass cannot
+/// invent a warning for a user who has done nothing wrong.
+#[test]
+fn stripping_reports_nothing_for_a_file_without_the_retired_keys() {
+    let mut value = toml::from_str::<toml::Value>(
+        r#"
+            [machine]
+            memory_mib = 16
+        "#,
+    )
+    .unwrap();
+    assert!(crate::strip_retired_keys(&mut value).is_empty());
 }

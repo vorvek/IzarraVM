@@ -1,8 +1,10 @@
 # This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 # SPDX-License-Identifier: GPL-3.0-only
 
+# The CPU speed class is NOT here: it lives in the machine's CMOS, set from the
+# BIOS setup panel (Del), the Tab boot menu, or GSWMODE inside DOS. A key here
+# could only ever disagree with what the machine actually boots at.
 [machine]
-cpu = "386"
 memory_mib = 16
 video = "vega"
 
@@ -11,11 +13,12 @@ c_drive = "R:\\La Colecci\u00f3n by Neville\\dosroot\\"
 
 [audio]
 
+# Whether the card is fitted is a property of the machine, so it stays here.
+# Its IRQ and DMA channels are not: they live in CMOS, and SNDCTRL in DOS is
+# what moves them. Same for [audio.wss], whose `base` stays because the codec's
+# I/O window is fixed board wiring rather than a resource anything selects.
 [audio.sound_blaster]
 enabled = true
-irq = "5"
-dma = "1"
-high_dma = "5"
 
 [audio.midi]
 backend = "off" # P330 receiver: off, external, or munt

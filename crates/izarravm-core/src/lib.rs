@@ -516,6 +516,55 @@ pub struct AppConfig {
     pub diagnostics: DiagnosticsConfig,
 }
 
+/// Settings that used to live in the config file and are now owned by the
+/// machine's CMOS instead.
+///
+/// They were removed because a config file cannot win an argument with NVRAM.
+/// CMOS is what the machine actually boots from, and it is written by the BIOS
+/// setup panel and by `SNDCTRL.COM`; once either of those has saved anything,
+/// editing the matching key here changed nothing at all. A setting that
+/// silently does nothing is worse than one that is absent, so these are absent.
+///
+/// They are *stripped* rather than rejected: an existing config file keeps
+/// loading, with a warning naming what was ignored. Each entry is the path to
+/// one key, outermost table first.
+pub const RETIRED_CMOS_KEYS: &[&[&str]] = &[
+    &["machine", "cpu"],
+    &["audio", "sound_blaster", "irq"],
+    &["audio", "sound_blaster", "dma"],
+    &["audio", "sound_blaster", "high_dma"],
+    &["audio", "wss", "irq"],
+    &["audio", "wss", "dma"],
+];
+
+/// Remove every [`RETIRED_CMOS_KEYS`] entry from a parsed config document,
+/// returning the dotted names of the ones that were actually present so the
+/// caller can say which keys it ignored.
+///
+/// This has to happen before deserialization, not after: the retired fields are
+/// `#[serde(skip)]`, which makes their names unknown, and `AppConfig` denies
+/// unknown fields. Without this pass an existing config file would stop loading
+/// altogether rather than quietly losing the keys it no longer owns.
+pub fn strip_retired_keys(value: &mut toml::Value) -> Vec<String> {
+    let mut dropped = Vec::new();
+    for path in RETIRED_CMOS_KEYS {
+        let (leaf, tables) = path.split_last().expect("retired key path is never empty");
+        let mut table = value.as_table_mut();
+        for name in tables {
+            table = match table.and_then(|t| t.get_mut(*name)) {
+                Some(next) => next.as_table_mut(),
+                None => None,
+            };
+        }
+        if let Some(table) = table
+            && table.remove(*leaf).is_some()
+        {
+            dropped.push(path.join("."));
+        }
+    }
+    dropped
+}
+
 impl AppConfig {
     pub fn from_toml_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -523,11 +572,13 @@ impl AppConfig {
             path: path.to_owned(),
             source,
         })?;
-
-        toml::from_str::<Self>(&text).map_err(|source| ConfigError::Parse {
+        let parse_error = |source: toml::de::Error| ConfigError::Parse {
             path: path.to_owned(),
             source: Box::new(source),
-        })
+        };
+        let mut value = toml::from_str::<toml::Value>(&text).map_err(parse_error)?;
+        strip_retired_keys(&mut value);
+        value.try_into::<Self>().map_err(parse_error)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -603,6 +654,14 @@ impl AppConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MachineConfig {
+    /// Power-on CPU speed class.
+    ///
+    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`]. It seeds
+    /// CMOS on a machine that has never been configured; after that the BIOS
+    /// setup panel (Del) and the Tab boot menu own it, and `GSWMODE` changes it
+    /// for the running session. `--cpu` still overrides this for headless runs,
+    /// which have no CMOS at all.
+    #[serde(skip)]
     pub cpu: GswMode,
     pub memory_mib: u16,
     pub video: VideoCard,
@@ -645,22 +704,28 @@ impl Default for DosConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct SoundBlasterConfig {
-    /// Whether the host constructs the SB16 audio path. Mirrors the former
-    /// `AudioConfig.sound_blaster: bool`.
-    #[serde(default = "default_true")]
+    /// Whether the host constructs the SB16 audio path. Whether the card is
+    /// fitted at all is a property of the machine, not a setting the guest can
+    /// change, so unlike the resources below it stays in the config file.
     pub enabled: bool,
-    /// Power-on IRQ line the CT1745 mixer selects (register 0x80). Applied once
-    /// at boot like `SBCONFIG`; a guest mixer reset restores the hardware
-    /// factory default (IRQ5).
-    #[serde(default)]
+    /// Power-on IRQ line the CT1745 mixer selects (register 0x80).
+    ///
+    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`]. The value
+    /// here is the power-on default that seeds CMOS on a machine that has never
+    /// been configured; after that, CMOS is what the machine boots with and
+    /// `SNDCTRL.COM` is what changes it. `--sb-irq` still overrides this for
+    /// headless runs, which have no CMOS at all.
+    #[serde(skip)]
     pub irq: SbIrq,
-    /// Power-on 8-bit DMA channel (register 0x81 low bits).
-    #[serde(default)]
+    /// Power-on 8-bit DMA channel (register 0x81 low bits). Not read from the
+    /// config file; see `irq`.
+    #[serde(skip)]
     pub dma: SbDma8,
-    /// Power-on 16-bit DMA channel (register 0x81 high bits).
-    #[serde(default)]
+    /// Power-on 16-bit DMA channel (register 0x81 high bits). Not read from the
+    /// config file; see `irq`.
+    #[serde(skip)]
     pub high_dma: SbDma16,
 }
 
@@ -679,26 +744,32 @@ impl Default for SoundBlasterConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct WssConfig {
     /// Whether the host constructs the Windows Sound System (AD1848 codec) path.
     /// The codec is always present on the ReSonique 2 combo card, so this defaults
     /// to enabled.
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// I/O base port of the four-port WSS config region (the AD1848 codec sits at
-    /// base+4). Defaults to 0x530, the de-facto WSS standard base.
-    #[serde(default = "default_wss_base")]
+    /// base+4). Defaults to 0x530, the de-facto WSS standard base. Stays in the
+    /// config file: the base is fixed board wiring, not a resource the guest can
+    /// select, so nothing else can disagree with it.
     pub base: u16,
     /// Power-on IRQ line read back from the board config region. Defaults to IRQ11,
-    /// leaving IRQ7 to the Sound Blaster, which many DOS titles hardwire. Uses
-    /// `WssIrq`, which carries the documented WSS lines 7/9/10/11.
-    #[serde(default)]
+    /// leaving IRQ7 to the Sound Blaster, which many DOS titles hardwire.
+    ///
+    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`] and
+    /// [`SoundBlasterConfig::irq`].
+    #[serde(skip)]
     pub irq: WssIrq,
     /// Power-on 8-bit DMA channel read back from the board config region. Defaults
-    /// to DMA0, chosen to avoid the SB16 default (DMA1). Reuses `SbDma8` (whose own
-    /// `Default` is DMA1, so the WSS default is supplied explicitly).
-    #[serde(default = "default_wss_dma")]
+    /// to DMA0, chosen to avoid the SB16 default (DMA1).
+    ///
+    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`]. Note that
+    /// the container-level `#[serde(default)]` is load-bearing here: this field's
+    /// default has to come from `WssConfig::default()` (DMA0), not from
+    /// `SbDma8::default()` (DMA1), which is the channel the Sound Blaster holds.
+    #[serde(skip)]
     pub dma: SbDma8,
 }
 
@@ -938,13 +1009,10 @@ fn default_true() -> bool {
     true
 }
 
-fn default_wss_base() -> u16 {
-    0x530
-}
-
-fn default_wss_dma() -> SbDma8 {
-    SbDma8::D0
-}
+// The per-field default helpers for the WSS base and DMA are gone: both
+// sections now take their defaults from the container's `Default` impl, which
+// is what a `#[serde(skip)]` field needs to inherit the right value (SbDma8's
+// own default is DMA1, the Sound Blaster's channel, not the codec's DMA0).
 
 fn normalize(value: &str) -> String {
     value
