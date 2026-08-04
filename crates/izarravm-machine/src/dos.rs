@@ -23,7 +23,10 @@ impl Machine {
     /// terminate/console-I/O surface services interrupts. For tests and
     /// benchmarks that need a quick runnable machine, not C: drive access.
     pub fn new_raw_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
-        let env_entries = sound_blaster_env_entries(&profile.sound_blaster);
+        // No CMOS on the raw-program path (there is no BIOS POST and no
+        // cmos.bin), so the MPU port is the power-on default rather than
+        // anything SNDCTRL.COM might have persisted.
+        let env_entries = sound_blaster_env_entries(&profile.sound_blaster, WAVETABLE_MPU_BASE);
         let mut rom = vec![0u8; BIOS_ROM_SIZE];
         let kb = izarravm_firmware::kbd_resident_bios();
         rom[..kb.len()].copy_from_slice(kb);
@@ -746,7 +749,7 @@ impl Machine {
             return 1; // no Katea host folder mounted
         };
         let sound_blaster = self.profile.sound_blaster;
-        let (config, autoexec) = default_config_pair(&sound_blaster);
+        let (config, autoexec) = default_config_pair(&sound_blaster, self.cmos_mpu_port());
         // Per-file, not atomic across the two: if AUTOEXEC's write fails after
         // CONFIG was already rewritten, the folder is left half-repaired (default
         // CONFIG, no live AUTOEXEC). No data is lost — both originals survive in

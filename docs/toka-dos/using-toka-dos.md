@@ -20,7 +20,7 @@ See C:\LICENSE.TXT for more.
 `C:\LICENSE.TXT` explains what Toka-DOS is actually built from: the FreeDOS
 kernel and FreeCOM shell, plus MOVE, SORT, MEM, and other tools from the
 FreeDOS project, all free software under the GNU GPL. General Simulation
-Works's own additions (`GSWMODE`, `TOKAMOUS`, `TOKAEMM.SYS`) are layered on
+Works's own additions (`GSWMODE`, `SNDCTRL`, `TOKAMOUS`, `TOKAEMM.SYS`) are layered on
 top of that stock FreeDOS base; the shell and kernel underneath are
 otherwise unmodified.
 
@@ -42,9 +42,10 @@ is hidden, so a plain `DIR` of C:\ shows only `CONFIG.SYS`, `AUTOEXEC.BAT`,
 ```
 C:\DOS\
     COMMAND.COM     GSWMODE.COM     MEM.EXE         FIND.EXE
-    TOKAMOUS.COM    MOVE.EXE        ATTRIB.EXE      LABEL.EXE
-    TOKAEMM.SYS     SORT.EXE        CHOICE.EXE      DELTREE.COM
-                    MORE.EXE        XCOPY.EXE       HELLO.TXT
+    TOKAMOUS.COM    SNDCTRL.COM     ATTRIB.EXE      LABEL.EXE
+    TOKAEMM.SYS     MOVE.EXE        CHOICE.EXE      DELTREE.COM
+                    SORT.EXE        MORE.EXE        XCOPY.EXE
+                                                    HELLO.TXT
 ```
 
 `AUTOEXEC.BAT` puts `C:\DOS` on the `PATH`, so every tool runs from any
@@ -143,3 +144,5 @@ overwritten.
   UMBs, and the V86 monitor underneath it.
 - [GSWMODE](commands.md#gswmode): change CPU speed class without leaving
   DOS.
+- [SNDCTRL](commands.md#sndctrl): move the sound card's IRQ and DMA
+  assignment without leaving DOS.

@@ -210,10 +210,28 @@ impl Ad1848 {
         }
     }
 
-    /// Set the IRQ/DMA jumper readback (the machine wires this from the core
-    /// `WssConfig` via `Ad1848Config`).
+    /// Set the selected IRQ/DMA resources (the machine wires this from the core
+    /// `WssConfig` via `Ad1848Config`, and from the CMOS block SNDCTRL.COM
+    /// owns). The guest can change the same selection through the config
+    /// register; see `write_port`.
     pub fn set_config(&mut self, config: Ad1848Config) {
         self.config = config;
+    }
+
+    /// The PIC line the codec's terminal-count interrupt currently forwards to.
+    ///
+    /// Read this at the point of use rather than caching it: the config
+    /// register is writable, so the selection moves at runtime, and a stale
+    /// copy would leave the codec reporting one line while interrupting on
+    /// another.
+    pub fn irq(&self) -> u8 {
+        self.config.irq
+    }
+
+    /// The 8237 channel the codec currently pulls playback bytes from. Same
+    /// caching caveat as [`Ad1848::irq`].
+    pub fn dma(&self) -> usize {
+        usize::from(self.config.dma)
     }
 
     // ---- Direct register (port) interface ---------------------------------
@@ -245,16 +263,38 @@ impl Ad1848 {
     /// Write one of the 8 device ports by `offset` (see `read_port`).
     pub fn write_port(&mut self, offset: u16, value: u8) {
         match offset {
-            0..=3 => {
-                // Config/ID region: resource selection is JUMPER-ONLY in this
-                // model. The board exposes a fixed IRQ/DMA readback (see
-                // `read_config`) and codec-aware detection keys solely off the I12
-                // revision, so a guest driver that expects to *select* IRQ/DMA by
-                // writing this region (the writable-config-register variant some
-                // real WSS board glue offers) has its writes intentionally dropped.
-                // There is no datasheet for this region (per the WSS README), so
-                // modelling it as writable would mean inventing an encoding; the
-                // read-back jumper model is the deliberate fidelity tradeoff.
+            // Config/ID region. Offset 1 SELECTS the codec's resources, in the
+            // same nibble encoding `read_config` reports them: high nibble IRQ,
+            // low nibble DMA. ReSonique 2 is the writable-config-register
+            // variant of the WSS board glue, which is how real WSS/SB combo
+            // chips behaved -- the OPTi 82C930 pairs WSS with SB Pro and lets a
+            // driver move between them at runtime, no power cycle.
+            //
+            // This used to drop the write and expose jumper-only resources, on
+            // the grounds that the region has no datasheet and a writable model
+            // would mean inventing an encoding. That reasoning does not survive
+            // contact with the read side: the readback encoding is already
+            // invented, so honouring the identical encoding on write invents
+            // nothing further -- and without it the codec is the one device on
+            // the card that cannot be re-pointed without restarting the machine,
+            // which is what SNDCTRL.COM would otherwise have to tell the user.
+            //
+            // Selecting resources RE-INITIALISES the codec, because a transfer
+            // left running would keep driving the channel the board no longer
+            // owns: playback stops, the count disarms, and the sticky INT and
+            // pending edge are cleared, exactly as a driver re-programming the
+            // board expects before it re-arms.
+            1 => {
+                self.config.irq = (value >> 4) & 0x0F;
+                self.config.dma = value & 0x0F;
+                self.playing = false;
+                self.current_count = 0;
+                self.irq_pending = false;
+                self.status &= !R2_INT;
+                self.regs[IDX_IFACE_CONFIG] &= !(I9_PEN | I9_CEN);
+            }
+            0 | 2 | 3 => {
+                // Board ID and the mirror offsets stay read-only.
             }
             4 => self.write_index(value),
             5 => self.write_indexed_data(value),

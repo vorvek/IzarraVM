@@ -46,8 +46,9 @@ manual](resonique2/manual.md):
 
 - **Digital audio / Sound Blaster**: should auto-detect via the `BLASTER`
   environment variable Toka-DOS sets in `AUTOEXEC.BAT`. If a game insists on
-  manual configuration, use base `220`, IRQ `5`, 8-bit DMA `1`, 16-bit DMA
-  `5`.
+  manual configuration, use base `220`, IRQ `7`, 8-bit DMA `1`, 16-bit DMA
+  `5`. Run `SNDCTRL /S` at the prompt to confirm what the card is actually
+  set to.
 - **FM music**: use the AdLib or OPL2/OPL3 option at port `388` if the game
   offers a choice. This is fully modeled.
 - **General MIDI / wavetable**: select MPU-401 output at port `300`. Toka-DOS
@@ -58,6 +59,23 @@ manual](resonique2/manual.md):
   Izarra 3000's rear MPU-401/gameport. In Settings, choose Munt as an emulator
   convenience or select the exact host destination connected to the receiver's
   MIDI IN side. See the [ReSonique 2 manual](resonique2/manual.md#midi-and-wavetable).
+
+### The game finds the card but plays a short click, then silence
+
+That is the signature of a game that **hardwires an IRQ** rather than reading
+`BLASTER`. Its interrupt handler is on a line the card is not using, so nothing
+re-arms the DSP after the first DMA block finishes.
+
+The card ships on IRQ 7 because that is what such games nearly always assume,
+but a few want IRQ 5. Move it and try again:
+
+```
+SNDCTRL /SBIRQ:5
+```
+
+The change takes effect immediately and is remembered across reboots. See
+[Changing the card's resources](resonique2/manual.md#changing-the-cards-resources)
+for the full-screen version and the other resources.
 
 ### Which ROM files does Munt need?
 

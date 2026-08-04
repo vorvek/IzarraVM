@@ -18,6 +18,11 @@ card.
 | Wavetable daughterboard header | MPU-401 | `0x300` | 9 | n/a |
 | Rear MIDI/game port | MPU-401 | `0x330` | 9 | n/a |
 
+Those are the **power-on defaults**, and the ones Toka-DOS advertises in
+`BLASTER`. The base ports are fixed; the IRQ and DMA columns are not — see
+[Changing the card's resources](#changing-the-cards-resources) for the tool that
+moves them.
+
 The digital and FM sections use their standard, fixed Sound Blaster and
 AdLib addresses. ReSonique 2 assigns separate fixed ports to its internal
 wavetable header and rear MIDI connection, so software can select either path
@@ -39,7 +44,7 @@ into two groups and only 7 satisfies both:
 
 Hardwiring 5 is rare, because 5 only became a default with SB16-class cards, by
 which time reading `BLASTER` was standard practice. If you do hit a title that
-insists on 5, set it per machine — see below.
+insists on 5, run `SNDCTRL` before it — that is what the tool is for.
 
 Because the AD1848 codec cannot share a line with the Sound Blaster, it takes
 **IRQ 11** rather than the WSS standard IRQ 7. Real combo cards jumper the two
@@ -60,12 +65,72 @@ match the defaults above.
 
 Toka-DOS regenerates this line from the machine's configuration, so it follows
 whatever you set. It leaves a hand-edited `AUTOEXEC.BAT` alone, though — if you
-have customised yours, update the `BLASTER` line yourself after changing the
-card's resources, or the variable will advertise the old values.
+have customised yours, `SNDCTRL` still rewrites the `SET BLASTER` line in place
+and leaves the rest of your file untouched.
 
 ## Changing the card's resources
 
-Per machine, in `izarravm.conf`:
+Run **`SNDCTRL`** from the DOS prompt. It is the card's own setup utility, the
+same thing you would have run on a real sound card of the period, and it is
+installed in `C:\DOS` on every Toka-DOS disk:
+
+```
+C:\> SNDCTRL
+```
+
+![The SNDCTRL configuration screen](sndctrl.png)
+
+Move between the values with the arrow keys or Tab, press Enter on one to
+choose from the list the hardware supports, then **F10** to apply. Esc leaves
+everything as it was. Values that do not apply to a device show as `*`.
+
+The lists only offer values that work. You will not be shown a line or channel
+the other device already holds, so there is no way to put the Sound Blaster and
+the codec on top of each other — the same rule the emulator enforces at startup,
+applied while you choose instead of after.
+
+Applying does four things:
+
+- **Moves the hardware immediately.** Both devices are re-pointed live, with no
+  reboot: the mixer's Interrupt and DMA Setup registers for the Sound Blaster,
+  the config register for the codec.
+- **Saves the choice in CMOS**, so it survives a power cycle and comes back on
+  the next boot.
+- **Updates `BLASTER` in the current environment**, so a game started from that
+  same prompt sees the new routing straight away.
+- **Rewrites the `SET BLASTER` line in `C:\AUTOEXEC.BAT`**, so the next boot
+  agrees.
+
+Existing variables are updated, never created. If you deliberately removed the
+`BLASTER` line, `SNDCTRL` says so and leaves it removed.
+
+### From the command line
+
+Every setting can be given as a switch, in which case `SNDCTRL` applies it and
+exits without drawing anything — useful from a batch file:
+
+```
+SNDCTRL /SBIRQ:5              Sound Blaster IRQ        2, 5, 7, 10
+SNDCTRL /SBDMAL:1             Sound Blaster 8-bit DMA  0, 1, 3
+SNDCTRL /SBDMAH:5             Sound Blaster 16-bit DMA 5, 6, 7
+SNDCTRL /WSSIRQ:11            Codec IRQ                7, 9, 10, 11
+SNDCTRL /WSSDMA:0             Codec DMA                0, 1, 3
+SNDCTRL /MPU:330              MPU-401 port             300, 330
+SNDCTRL /S                    show the current assignment, change nothing
+SNDCTRL /?                    usage
+```
+
+Switches combine: `SNDCTRL /SBIRQ:5 /MPU:330`. A value the hardware cannot
+select is refused with the list of ones it can, and a combination that would put
+both devices on one line or channel is refused outright — nothing is written.
+
+`SNDCTRL /S` reads the mixer and the codec back rather than reporting what was
+last saved, so it tells you what the card is really doing even if something else
+moved it.
+
+### From the host instead
+
+`izarravm.conf` sets the power-on values for a machine that has no saved CMOS:
 
 ```toml
 [audio.sound_blaster]
@@ -78,8 +143,13 @@ irq = "7"          # 7, 9, 10 or 11
 `--sb-irq`, `--sb-dma` and `--sb-high-dma` do the same from the command line.
 The Sound Blaster and the codec must end up on different IRQ lines and
 different DMA channels; the emulator refuses to start otherwise rather than
-letting two devices fight over one line. If you move one device onto a line or
-channel the other already holds, move that other device in the same edit.
+letting two devices fight over one line.
+
+Once `SNDCTRL` has saved an assignment, **the saved one wins**: it is stored in
+the machine's CMOS, exactly like the CPU speed and the keyboard layout, and CMOS
+is what the machine boots from. Editing the config file after that changes
+nothing until the CMOS is cleared. This is the same behaviour as a real PC whose
+BIOS setup you have already been through.
 
 ## Digital audio (Sound Blaster 16 compatible)
 

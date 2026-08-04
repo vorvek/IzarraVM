@@ -89,6 +89,7 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
     "IZCDEX.COM",
     "GSWMODE.COM",
     "UNHALT.COM",
+    "SNDCTRL.COM",
     "MOVE.EXE",
     "SORT.EXE",
     "MEM.EXE",

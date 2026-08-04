@@ -882,6 +882,12 @@ impl MachineGeneration {
             .into_iter()
             .map(|bytes| ("GLIDE2X.OVL".to_string(), bytes))
             .collect();
+        // CMOS BEFORE the mount, not after: the persisted NVRAM carries the
+        // sound-card routing SNDCTRL.COM saved, and mounting is what writes the
+        // matching `SET BLASTER=` line into an emulator-owned AUTOEXEC.BAT. With
+        // the mount first, that line is generated from the pre-CMOS profile and
+        // the tool's own edit is silently reverted on the next boot.
+        self.spec.rtc_setup.apply(&mut self.machine);
         self.machine
             .mount_hdd_folder_with_user_overrides(&self.spec.c_drive, overlays)
             .map_err(|err| {
@@ -890,7 +896,6 @@ impl MachineGeneration {
                     self.spec.c_drive.display()
                 ))
             })?;
-        self.spec.rtc_setup.apply(&mut self.machine);
         if let Some(index) = crate::host_keyboard_layout_index() {
             let mut cmos = self.machine.cmos_bytes();
             cmos[0x10] = index;

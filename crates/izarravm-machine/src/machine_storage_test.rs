@@ -277,6 +277,7 @@ fn ensure_user_config_seeds_missing_files_only() {
         b"FILES=40\r\n",
         b"@ECHO OFF\r\nSET BLASTER=A220 I5 D1 H5 P300 T6\r\n",
         &SoundBlasterConfig::default(),
+        WAVETABLE_MPU_BASE,
     )
     .unwrap();
     assert_eq!(
@@ -312,6 +313,7 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
         new_config,
         new_autoexec,
         &SoundBlasterConfig::default(),
+        WAVETABLE_MPU_BASE,
     )
     .unwrap();
     assert_eq!(
@@ -336,6 +338,7 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
         new_config,
         new_autoexec,
         &SoundBlasterConfig::default(),
+        WAVETABLE_MPU_BASE,
     )
     .unwrap();
     assert_eq!(
@@ -364,11 +367,11 @@ fn stock_autoexec_tracks_default_nondefault_and_disabled_sb_profiles() {
     let base = b"@ECHO OFF\r\nSET BLASTER=A220 I7 D1 H5 P300 T6\r\n\
 SET SETSOUND=A220 I7 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
     assert_eq!(
-        crate::storage::stock_autoexec(base, &SoundBlasterConfig::default()),
+        crate::storage::stock_autoexec(base, &SoundBlasterConfig::default(), WAVETABLE_MPU_BASE),
         base
     );
     assert_eq!(
-        crate::storage::stock_autoexec(base, &nondefault_sound_blaster()),
+        crate::storage::stock_autoexec(base, &nondefault_sound_blaster(), WAVETABLE_MPU_BASE),
         b"@ECHO OFF\r\nSET BLASTER=A220 I10 D3 H7 P300 T6\r\n\
 SET SETSOUND=A220 I10 D3 H7 P300 T6\r\nLH TOKAMOUS\r\n"
     );
@@ -377,7 +380,7 @@ SET SETSOUND=A220 I10 D3 H7 P300 T6\r\nLH TOKAMOUS\r\n"
         ..SoundBlasterConfig::default()
     };
     assert_eq!(
-        crate::storage::stock_autoexec(base, &disabled),
+        crate::storage::stock_autoexec(base, &disabled, WAVETABLE_MPU_BASE),
         b"@ECHO OFF\r\nLH TOKAMOUS\r\n"
     );
 }
@@ -394,24 +397,39 @@ fn ensure_user_config_migrates_only_exact_emulator_autoexec_variants() {
         ..SoundBlasterConfig::default()
     };
     let target_config = nondefault_sound_blaster();
-    let target = crate::storage::stock_autoexec(&current_base, &target_config);
+    let target = crate::storage::stock_autoexec(&current_base, &target_config, WAVETABLE_MPU_BASE);
     let variants = [
         current_base.clone(),
-        crate::storage::stock_autoexec(&current_base, &disabled),
-        crate::storage::stock_autoexec(&current_base, &SoundBlasterConfig::default()),
+        crate::storage::stock_autoexec(&current_base, &disabled, WAVETABLE_MPU_BASE),
+        crate::storage::stock_autoexec(
+            &current_base,
+            &SoundBlasterConfig::default(),
+            WAVETABLE_MPU_BASE,
+        ),
         crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT.to_vec(),
-        crate::storage::stock_autoexec(crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT, &disabled),
+        crate::storage::stock_autoexec(
+            crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT,
+            &disabled,
+            WAVETABLE_MPU_BASE,
+        ),
         crate::storage::stock_autoexec(
             crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT,
             &nondefault_sound_blaster(),
+            WAVETABLE_MPU_BASE,
         ),
     ];
     for (index, variant) in variants.into_iter().enumerate() {
         let dir = base_dir.join(format!("owned_{index}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("AUTOEXEC.BAT"), variant).unwrap();
-        crate::storage::ensure_user_config(&dir, b"FILES=40\r\n", &current_base, &target_config)
-            .unwrap();
+        crate::storage::ensure_user_config(
+            &dir,
+            b"FILES=40\r\n",
+            &current_base,
+            &target_config,
+            WAVETABLE_MPU_BASE,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(), target);
     }
 
@@ -420,8 +438,14 @@ fn ensure_user_config_migrates_only_exact_emulator_autoexec_variants() {
     let mut custom = current_base.clone();
     custom.extend_from_slice(b"REM USER CHANGE\r\n");
     std::fs::write(custom_dir.join("AUTOEXEC.BAT"), &custom).unwrap();
-    crate::storage::ensure_user_config(&custom_dir, b"FILES=40\r\n", &current_base, &target_config)
-        .unwrap();
+    crate::storage::ensure_user_config(
+        &custom_dir,
+        b"FILES=40\r\n",
+        &current_base,
+        &target_config,
+        WAVETABLE_MPU_BASE,
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read(custom_dir.join("AUTOEXEC.BAT")).unwrap(),
         custom
@@ -497,8 +521,11 @@ fn repair_uses_the_disabled_stock_autoexec() {
 
     assert_eq!(machine.toka_service_status, 0);
     let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
-    let expected =
-        crate::storage::stock_autoexec(&payload_file(&payload, "AUTOEXEC.BAT"), &sound_blaster);
+    let expected = crate::storage::stock_autoexec(
+        &payload_file(&payload, "AUTOEXEC.BAT"),
+        &sound_blaster,
+        WAVETABLE_MPU_BASE,
+    );
     assert_eq!(std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(), expected);
     assert_eq!(
         std::fs::read(dir.join("AUTOEXEC.OLD")).unwrap(),

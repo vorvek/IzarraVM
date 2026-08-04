@@ -129,11 +129,13 @@ pub(crate) use firmware_contract::address::{
     BIOS_INT_STUB_TABLE_LINEAR, BIOS_LEGACY_IRET_LINEAR, BIOS_POST_ERROR_LOG_ADDR,
     BIOS_POST_ERROR_LOG_COUNT_ADDR, BIOS_POST_ERROR_LOG_MAX, BIOS_ROM_IRET_SEG, BIOS_ROM_SEGMENT,
     BIOS_STUB_WINDOW_LEN, BIOS32_DIRECTORY_LINEAR, BIOS32_PCI_LINEAR, BIOS32_PCI_ROM_OFFSET,
-    CMOS_GSW_MODE, CMOS_PRIMARY_BOOT_DEVICE, CODEPAGE_FONT_WINDOW, CONVENTIONAL_MEMORY_TOP,
-    EBDA_CD_BOOTABLE_OFF, EBDA_LINEAR, EBDA_MOUSE_HANDLER_OFF, EBDA_MOUSE_PKT_SIZE_OFF,
-    EBDA_SEGMENT, INT10_FUNCTIONALITY_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
-    RESULT_BLOCK_ADDRESS, VGA_BIOS_FONT_TABLE_OFF, VGA_BIOS_INT43_FONT_ADDR, VGA_BIOS_SEGMENT,
-    VGA_BIOS_SPAN_SIZE, bios_int_stub_off,
+    CMOS_AUDIO_MAGIC, CMOS_AUDIO_MAGIC_VALUE, CMOS_GSW_MODE, CMOS_MPU_PORT,
+    CMOS_PRIMARY_BOOT_DEVICE, CMOS_SB_DMA8, CMOS_SB_DMA16, CMOS_SB_IRQ, CMOS_WSS_DMA, CMOS_WSS_IRQ,
+    CODEPAGE_FONT_WINDOW, CONVENTIONAL_MEMORY_TOP, EBDA_CD_BOOTABLE_OFF, EBDA_LINEAR,
+    EBDA_MOUSE_HANDLER_OFF, EBDA_MOUSE_PKT_SIZE_OFF, EBDA_SEGMENT,
+    INT10_FUNCTIONALITY_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET, RESULT_BLOCK_ADDRESS,
+    VGA_BIOS_FONT_TABLE_OFF, VGA_BIOS_INT43_FONT_ADDR, VGA_BIOS_SEGMENT, VGA_BIOS_SPAN_SIZE,
+    bios_int_stub_off,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -869,9 +871,12 @@ pub struct Machine {
     wss_pending: VecDeque<(i32, i32)>,
     /// Last DAC-rate frame delivered by the WSS stream.
     wss_hold: (i32, i32),
-    wss_base: u16,     // I/O base of the 4-port config region (codec sits at base+4)
-    wss_irq: u8,       // PIC line the codec's terminal-count interrupt forwards to
-    wss_dma: usize,    // byte-wide DMA channel the codec pulls playback bytes from
+    wss_base: u16, // I/O base of the 4-port config region (codec sits at base+4)
+    // NB: the codec's IRQ line and DMA channel are deliberately NOT cached
+    // here. They live in the Ad1848 itself and are read at the point of use
+    // (`self.wss.irq()` / `self.wss.dma()`), because the WSS config register is
+    // writable: a cached copy would leave the codec answering on the line it
+    // just gave up. The SB16 path takes the same approach via the mixer.
     wss_enabled: bool, // false drops all WSS work (port decode, tick, IRQ, render)
     trace: BusTrace,
     // CPU-domain work accounting kept for compatibility counters and benchmarks.
@@ -982,21 +987,21 @@ const MOUSE_GUEST_CENTER_Y: i32 = MOUSE_GUEST_MAX_Y / 2;
 
 /// Derive the DOS environment entries that advertise the Sound Blaster to
 /// auto-detecting games. `BLASTER` and `SETSOUND` carry the same value:
-/// `A220` (the fixed Resonique 2 base), `I`/`D`/`H` from the host config, and
-/// `T6` (the SB16 card type), and `P300` for the built-in wavetable MPU. Returns
-/// an empty list when the card is disabled, so no `BLASTER`
+/// `A220` (the fixed Resonique 2 base), `I`/`D`/`H` from the host config, `T6`
+/// (the SB16 card type), and `P` for whichever MPU-401 port is advertised
+/// (`0x300` wavetable header or `0x330` rear connector -- both stay decoded
+/// either way). Returns an empty list when the card is disabled, so no `BLASTER`
 /// leaks into a machine that has no SB16; the value always matches the routing
 /// the CT1745 mixer answers, since both are derived from the same config.
-fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String)> {
+fn sound_blaster_env_entries(config: &SoundBlasterConfig, mpu_port: u16) -> Vec<(String, String)> {
     if !config.enabled {
         return Vec::new();
     }
     let value = format!(
-        "A220 I{} D{} H{} P{:03X} T6",
+        "A220 I{} D{} H{} P{mpu_port:03X} T6",
         config.irq.line(),
         config.dma.channel(),
         config.high_dma.channel(),
-        WAVETABLE_MPU_BASE
     );
     vec![
         ("BLASTER".to_string(), value.clone()),
@@ -1035,11 +1040,15 @@ fn payload_file(payload: &katea_volume::SystemPayload, name: &str) -> Vec<u8> {
 }
 
 /// Default `(CONFIG.SYS, AUTOEXEC.BAT)` bytes from the committed image payload.
-fn default_config_pair(sound_blaster: &SoundBlasterConfig) -> (Vec<u8>, Vec<u8>) {
+fn default_config_pair(sound_blaster: &SoundBlasterConfig, mpu_port: u16) -> (Vec<u8>, Vec<u8>) {
     let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
     (
         payload_file(&payload, "CONFIG.SYS"),
-        storage::stock_autoexec(&payload_file(&payload, "AUTOEXEC.BAT"), sound_blaster),
+        storage::stock_autoexec(
+            &payload_file(&payload, "AUTOEXEC.BAT"),
+            sound_blaster,
+            mpu_port,
+        ),
     )
 }
 
@@ -1074,11 +1083,9 @@ impl Machine {
         // advance_devices DMA/IRQ feed (kept separate from the SB16's mixer).
         let wss_enabled = profile.wss.enabled;
         let wss_base = profile.wss.base;
-        let wss_irq = profile.wss.irq.line();
-        let wss_dma = profile.wss.dma.channel();
         let wss = Ad1848::new(Ad1848Config {
-            irq: wss_irq,
-            dma: wss_dma as u8,
+            irq: profile.wss.irq.line(),
+            dma: profile.wss.dma.channel() as u8,
         });
         let active_mode = profile.cpu;
         cpu.set_mode(active_mode);
@@ -1161,8 +1168,6 @@ impl Machine {
             wss_pending: VecDeque::new(),
             wss_hold: (0, 0),
             wss_base,
-            wss_irq,
-            wss_dma,
             wss_enabled,
             trace: {
                 let mut trace = BusTrace::default();
@@ -1220,6 +1225,7 @@ impl Machine {
         // cmos.bin then overwrites it with the user's saved choice.
         machine.set_cmos_byte(CMOS_GSW_MODE, machine.active_mode.register_code());
         machine.rtc.set_memory_size(machine.profile.memory_mib);
+        machine.seed_audio_cmos();
         Ok(machine)
     }
 
@@ -1280,6 +1286,123 @@ impl Machine {
         self.rtc.nvram()
     }
 
+    /// Write the machine profile's audio resource assignment into the CMOS block
+    /// SNDCTRL.COM owns, and stamp the magic byte. Called at construction so a
+    /// machine that has never run the tool still presents a complete, valid
+    /// block rather than zeros.
+    fn seed_audio_cmos(&mut self) {
+        let sb = self.profile.sound_blaster;
+        let wss = self.profile.wss;
+        self.rtc.set_nvram(CMOS_AUDIO_MAGIC, CMOS_AUDIO_MAGIC_VALUE);
+        self.rtc.set_nvram(CMOS_SB_IRQ, sb.irq.line());
+        self.rtc.set_nvram(CMOS_SB_DMA8, sb.dma.channel() as u8);
+        self.rtc
+            .set_nvram(CMOS_SB_DMA16, sb.high_dma.channel() as u8);
+        self.rtc.set_nvram(CMOS_WSS_IRQ, wss.irq.line());
+        self.rtc.set_nvram(CMOS_WSS_DMA, wss.dma.channel() as u8);
+        self.rtc.set_nvram(CMOS_MPU_PORT, 0);
+        self.rtc.refresh_checksum();
+    }
+
+    /// Read the CMOS audio block back into typed config, or `None` if it is not
+    /// a block this card could have written: no magic byte, a line or channel
+    /// the hardware cannot route to, or an IRQ/DMA collision between the two
+    /// devices. Nothing stops a guest from writing arbitrary bytes there, and
+    /// the whole block is one setting, so a single bad byte rejects all of it
+    /// rather than leaving half the card on stale routing.
+    fn read_audio_cmos(&self) -> Option<(SoundBlasterConfig, WssConfig)> {
+        if self.rtc.nvram_byte(CMOS_AUDIO_MAGIC) != CMOS_AUDIO_MAGIC_VALUE {
+            return None;
+        }
+        let sb = SoundBlasterConfig {
+            irq: izarravm_core::SbIrq::from_line(self.rtc.nvram_byte(CMOS_SB_IRQ))?,
+            dma: izarravm_core::SbDma8::from_channel(usize::from(
+                self.rtc.nvram_byte(CMOS_SB_DMA8),
+            ))?,
+            high_dma: izarravm_core::SbDma16::from_channel(usize::from(
+                self.rtc.nvram_byte(CMOS_SB_DMA16),
+            ))?,
+            ..self.profile.sound_blaster
+        };
+        let wss = WssConfig {
+            irq: izarravm_core::WssIrq::from_line(self.rtc.nvram_byte(CMOS_WSS_IRQ))?,
+            dma: izarravm_core::SbDma8::from_channel(usize::from(
+                self.rtc.nvram_byte(CMOS_WSS_DMA),
+            ))?,
+            ..self.profile.wss
+        };
+        // The same two collisions izarravm.conf rejects (ConfigError::WssSb*
+        // Collision): the AD1848 and the SB16 cannot share a PIC line or a DMA
+        // channel, and only matter when both devices are actually built.
+        if sb.enabled && wss.enabled {
+            if sb.irq.line() == wss.irq.line() {
+                return None;
+            }
+            if sb.dma.channel() == wss.dma.channel() {
+                return None;
+            }
+        }
+        Some((sb, wss))
+    }
+
+    /// Apply the CMOS audio block to the live devices AND to the machine
+    /// profile. The mixer and codec are built from the profile at construction,
+    /// before any persisted NVRAM has been read, so whatever SNDCTRL.COM last
+    /// saved has to be re-applied here or it would only take effect on the boot
+    /// after next.
+    ///
+    /// The profile is updated too, not just the devices, because it is what
+    /// every *description* of the card is derived from -- the `BLASTER` line
+    /// `stock_autoexec` writes into an emulator-owned AUTOEXEC.BAT, and the
+    /// environment `dos.rs` injects on the HLE path. Leaving it on the old
+    /// value is how the card ends up answering on one IRQ while `BLASTER`
+    /// advertises another.
+    ///
+    /// A block this card could not have written is treated as never configured
+    /// and reseeded from the profile, so neither a CMOS image predating the tool
+    /// nor a guest poking NVRAM directly can route the card somewhere it cannot
+    /// answer.
+    fn apply_audio_cmos(&mut self) {
+        let Some((sb, wss)) = self.read_audio_cmos() else {
+            self.seed_audio_cmos();
+            return;
+        };
+        self.profile.sound_blaster = sb;
+        self.profile.wss = wss;
+        self.sb16
+            .set_routing(sb.irq.line(), sb.dma.channel(), sb.high_dma.channel());
+        self.wss.set_config(izarravm_audio::Ad1848Config {
+            irq: wss.irq.line(),
+            dma: wss.dma.channel() as u8,
+        });
+    }
+
+    /// The IRQ line and the 8-bit/16-bit DMA channels the Sound Blaster mixer
+    /// currently answers on, or `None` when the card is not built. Live state,
+    /// not the profile: a guest write to mixer register `0x80`/`0x81` (which is
+    /// how `SNDCTRL.COM` moves the card) is reflected here immediately.
+    pub fn sound_blaster_routing(&self) -> Option<(u8, usize, usize)> {
+        self.sb16.routing()
+    }
+
+    /// The IRQ line and DMA channel the AD1848 codec currently answers on, or
+    /// `None` when it is not built. Live, for the same reason as
+    /// [`Machine::sound_blaster_routing`].
+    pub fn wss_routing(&self) -> Option<(u8, usize)> {
+        self.wss_enabled.then(|| (self.wss.irq(), self.wss.dma()))
+    }
+
+    /// The MPU-401 port SNDCTRL.COM selected: `0x300` (wavetable header) or
+    /// `0x330` (rear connector). Both ports stay decoded either way; this is
+    /// the one advertised in `BLASTER`.
+    pub fn cmos_mpu_port(&self) -> u16 {
+        if self.rtc.nvram_byte(CMOS_MPU_PORT) == 0 {
+            0x300
+        } else {
+            0x330
+        }
+    }
+
     /// Load a 64-byte CMOS image from a persisted cmos.bin. Returns false if its
     /// NVRAM checksum is bad; constructor-seeded defaults are retained and
     /// checksummed so the host can persist a safe replacement.
@@ -1291,6 +1414,7 @@ impl Machine {
         // written before those bytes were populated at all) cannot make the
         // guest see the wrong amount of extended memory.
         self.rtc.set_memory_size(self.profile.memory_mib);
+        self.apply_audio_cmos();
         if let Some(mode) = GswMode::from_register_code(self.rtc.nvram_byte(0x12)) {
             self.set_mode(mode);
         }

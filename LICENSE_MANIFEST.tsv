@@ -27,6 +27,7 @@ crates/izarravm-firmware/roms/dos/mark.com	generated-guest-binary	IzarraVM proje
 crates/izarravm-firmware/roms/dos/mousetst.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	84602006d02f20711d55c33ca57a1a3e3c058d2bf33376d0a220c177e7c4a7dd
 crates/izarravm-firmware/roms/dos/multihlt.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4c22b14d7ad173ad2067a4b97c5a7192201a299cc10a9d852fba38abe71e3756
 crates/izarravm-firmware/roms/dos/runner.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	7904c3a69a009d641d9531b8fd0d17b84991b05a6969e2591756aa84f354bf2b
+crates/izarravm-firmware/roms/dos/sndctrl.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	9184b24bb2485118897f27e1ddd6312631240a306919a106c0017b6879d27f43
 crates/izarravm-firmware/roms/dos/sndtst.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c47c99382715572e6f1335b28556c23afde8f1f4feb699d58f7d6aa8f7c00a0b
 crates/izarravm-firmware/roms/dos/tokacd.sys	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c061378edfb060d9dd5489971aebd6599ff3e4feb942d7689a0ee97257e60680
 crates/izarravm-firmware/roms/dos/tokaemm.sys	generated-guest-binary	IzarraVM project source	GPL-3.0-only	e55d6354ffca1c208d0fe8a6200ca4c0daa594a195d8d1c1c756b5b08b4fdf37
@@ -50,7 +51,7 @@ crates/izarravm-firmware/roms/kbd-layout-meta.inc	generated-source	IzarraVM gene
 crates/izarravm-firmware/roms/kbd-layouts.inc	generated-source	IzarraVM generator and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	51a5d737fd5cfac4c7d7d5c2376401536a7e427f098b84128b851130e03348b2
 crates/izarravm-firmware/roms/kbd-resident.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	a2ab3ae9a6370e57bd3761e079c51c02808ceb77097efa7199c89aa5c9a38841
 crates/izarravm-firmware/roms/neurketa/neurketa.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	760cdddd2c5e3bcaaa378961fd08df89a8f8d68f01f522a512f4d27d8d7e7ca9
-crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	4dc18539a4d9cefe9b0a247d4296a9f24378c646fd1d03728519e64ea7629ff4
+crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	9c3c5b262fe5013baf16a4f22e04eb3c337652eb6a2635edf8b981177971da38
 crates/izarravm-machine/tests/fixtures/CBLEAK.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	9c0d52099a205491ceea7a17d850cb9a459d7d7c1580b8c8dd8f05099ca2b008
 crates/izarravm-machine/tests/fixtures/GFXCUR.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	611acec5ccda2c22c9add0e8a1d6809793068ebd8d6428df5fbb97f946176493
 crates/izarravm-machine/tests/fixtures/MTEST.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	4fc9fb2d6e67aa8fea1f789da7c97bf8a7d3dcc75595ef93843617deb4793fa9
@@ -91,6 +92,7 @@ crates/izarravm/assets/izarra3000_logo.rgba	project-artwork	IzarraVM project	GPL
 docs/izarra-3000-chassis.jpg	project-artwork	IzarraVM project	GPL-3.0-only	2c1ee8644a0002171234ecf798805a544b6106017bbbe2416a8c7a3774c82720
 docs/izarra3000-logo.png	project-artwork	IzarraVM project	GPL-3.0-only	2533847bd1b9db59b06e6af6f70c83e94ebadec04195a5df9eff74507f78fb91
 docs/izarravm-screenshot.png	project-screenshot	IzarraVM project	GPL-3.0-only	cc5204840f4185cd4bfa50ef7a5650c9d7d51031ce8abdcb9502c21d16e10357
+docs/resonique2/sndctrl.png	project-screenshot	IzarraVM project	GPL-3.0-only	7a03094a1086619d5a4b51385fe1c7632189df8809aee06dcd37508c461bc824
 scripts/realtime-gate-inputs.json	benchmark-fixture-manifest	IzarraVM project	GPL-3.0-only	394d48133a154f86900f1f1f83cb7c5f35b3b19023e992449a8d6e7eba1413d4
 third_party/fluidr3mono/FluidR3Mono_GM.sf3	vendored-soundfont	FluidR3Mono from MuseScore	MIT	cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2
 third_party/fluidr3mono/FluidR3Mono_License.md	third-party-license-text	FluidR3Mono by Frank Wen and Michael Cowgill	MIT	09926f9451f751408abd65162c99343f840234d2a708584808fd46427633063f

@@ -80,6 +80,8 @@ pub const CDTIME_COM_SOURCE: &str = include_str!("../roms/dos/cdtime.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
 pub const UNHALT_COM: &[u8] = include_bytes!("../roms/dos/unhalt.com");
 pub const UNHALT_COM_SOURCE: &str = include_str!("../roms/dos/unhalt.asm");
+pub const SNDCTRL_COM: &[u8] = include_bytes!("../roms/dos/sndctrl.com");
+pub const SNDCTRL_COM_SOURCE: &str = include_str!("../roms/dos/sndctrl.asm");
 pub const GSWMODE_COM_SOURCE: &str = include_str!("../roms/dos/gswmode.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
@@ -349,6 +351,23 @@ pub fn gswmode_com() -> &'static [u8] {
 /// Toka-DOS image (see build-freedos-hdd-image.py).
 pub fn unhalt_com() -> &'static [u8] {
     UNHALT_COM
+}
+
+/// SNDCTRL.COM: the ReSonique 2 sound-card setup tool, run from inside the
+/// guest.
+///
+/// Moves the SB16 and AD1848 IRQ/DMA assignment with a text-mode interface (or
+/// from the command line), writes it to the live hardware, persists it in the
+/// CMOS block at 0x1B-0x21 with a refreshed NVRAM checksum, and rewrites the
+/// `BLASTER` line in both the master environment and `C:\AUTOEXEC.BAT`.
+///
+/// This exists because DOS titles split into two populations that cannot both
+/// be satisfied by one default: the ones that hardwire an IRQ (usually 7) and
+/// the ones that read `BLASTER`. On real hardware you moved a jumper or ran the
+/// card's own setup utility; this is that utility. Ships on the Toka-DOS image
+/// in `C:\DOS` (see build-freedos-hdd-image.py).
+pub fn sndctrl_com() -> &'static [u8] {
+    SNDCTRL_COM
 }
 
 /// The direct UMB mechanism fixture: drives XMS 10h/11h/12h without

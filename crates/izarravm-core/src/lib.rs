@@ -200,6 +200,20 @@ impl SbIrq {
         }
     }
 
+    /// The inverse of `line`: recover the variant from a raw line number, or
+    /// `None` if the card cannot route to it. Used to read the assignment back
+    /// out of the CMOS block `SNDCTRL.COM` writes, where the value is a plain
+    /// byte that a guest could have set to anything.
+    pub const fn from_line(line: u8) -> Option<Self> {
+        match line {
+            2 => Some(Self::I2),
+            5 => Some(Self::I5),
+            7 => Some(Self::I7),
+            10 => Some(Self::I10),
+            _ => None,
+        }
+    }
+
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::I2 => "2",
@@ -270,6 +284,18 @@ impl WssIrq {
         }
     }
 
+    /// The inverse of `line`, for reading the CMOS block back. See
+    /// [`SbIrq::from_line`].
+    pub const fn from_line(line: u8) -> Option<Self> {
+        match line {
+            7 => Some(Self::I7),
+            9 => Some(Self::I9),
+            10 => Some(Self::I10),
+            11 => Some(Self::I11),
+            _ => None,
+        }
+    }
+
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::I7 => "7",
@@ -324,6 +350,17 @@ impl SbDma8 {
         }
     }
 
+    /// The inverse of `channel`, for reading the CMOS block back. See
+    /// [`SbIrq::from_line`].
+    pub const fn from_channel(channel: usize) -> Option<Self> {
+        match channel {
+            0 => Some(Self::D0),
+            1 => Some(Self::D1),
+            3 => Some(Self::D3),
+            _ => None,
+        }
+    }
+
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::D0 => "0",
@@ -373,6 +410,17 @@ impl SbDma16 {
             Self::D5 => 5,
             Self::D6 => 6,
             Self::D7 => 7,
+        }
+    }
+
+    /// The inverse of `channel`, for reading the CMOS block back. See
+    /// [`SbIrq::from_line`].
+    pub const fn from_channel(channel: usize) -> Option<Self> {
+        match channel {
+            5 => Some(Self::D5),
+            6 => Some(Self::D6),
+            7 => Some(Self::D7),
+            _ => None,
         }
     }
 

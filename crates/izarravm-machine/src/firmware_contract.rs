@@ -44,6 +44,29 @@ pub(crate) mod address {
     pub(crate) const CMOS_PRIMARY_BOOT_DEVICE: usize = 0x11;
     pub(crate) const CMOS_GSW_MODE: usize = 0x12;
 
+    /// ReSonique 2 resource assignment, owned by `SNDCTRL.COM` in the guest and
+    /// re-applied by the host at every boot. 0x10-0x14 are the BIOS's own bytes
+    /// (keyboard layout, boot device, GSW mode, code page, COM1 debug) and
+    /// 0x15-0x18 are the AT memory-size bytes, so this block starts at 0x1B and
+    /// deliberately skips 0x19/0x1A, which are the AT extended drive types.
+    ///
+    /// Every byte here sits inside the 0x10..=0x2D checksum window, so anything
+    /// writing them -- host or guest -- has to refresh the checksum at 0x2E/0x2F
+    /// or the next boot discards the whole NVRAM as corrupt.
+    ///
+    /// `CMOS_AUDIO_MAGIC` distinguishes "never configured" from "configured to
+    /// something that happens to be zero"; a mismatch makes the host reseed the
+    /// block from the machine profile instead of trusting stale bytes.
+    pub(crate) const CMOS_AUDIO_MAGIC: usize = 0x1B;
+    pub(crate) const CMOS_AUDIO_MAGIC_VALUE: u8 = 0x52; // 'R' for ReSonique
+    pub(crate) const CMOS_SB_IRQ: usize = 0x1C;
+    pub(crate) const CMOS_SB_DMA8: usize = 0x1D;
+    pub(crate) const CMOS_SB_DMA16: usize = 0x1E;
+    pub(crate) const CMOS_WSS_IRQ: usize = 0x1F;
+    pub(crate) const CMOS_WSS_DMA: usize = 0x20;
+    /// 0 = wavetable header (0x300), 1 = rear MPU-401 (0x330).
+    pub(crate) const CMOS_MPU_PORT: usize = 0x21;
+
     pub(crate) const EBDA_SEGMENT: u16 = 0x9FC0;
     pub(crate) const EBDA_LINEAR: u32 = (EBDA_SEGMENT as u32) << 4;
     pub(crate) const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0002;

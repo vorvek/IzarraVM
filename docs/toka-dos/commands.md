@@ -371,6 +371,42 @@ This covers the **BIOS** keyboard wait only. Toka-DOS separately halts while DOS
 itself is waiting for input; to turn that off, put `IDLEHALT=0` in `CONFIG.SYS`
 and reboot.
 
+## SNDCTRL
+
+The [ReSonique 2](../resonique2/manual.md) sound card's own setup utility:
+moves the card's IRQ and DMA assignment from inside DOS, the way you would have
+run a real sound card's configuration program.
+
+```
+SNDCTRL                 full-screen configuration
+SNDCTRL /S              show the current assignment and exit
+SNDCTRL /SBIRQ:n        Sound Blaster IRQ         2, 5, 7, 10
+SNDCTRL /SBDMAL:n       Sound Blaster 8-bit DMA   0, 1, 3
+SNDCTRL /SBDMAH:n       Sound Blaster 16-bit DMA  5, 6, 7
+SNDCTRL /WSSIRQ:n       Windows Sound System IRQ  7, 9, 10, 11
+SNDCTRL /WSSDMA:n       Windows Sound System DMA  0, 1, 3
+SNDCTRL /MPU:nnn        MPU-401 port              300, 330
+SNDCTRL /?              usage
+```
+
+With no arguments it draws a configuration screen. Arrow keys or Tab move
+between values, Enter opens the list of values that resource supports, F10
+applies, Esc cancels. A `*` marks a value that does not apply to that device.
+Any switch on the command line is applied without drawing anything.
+
+Whichever way you set them, applying moves both devices **live** — neither
+needs a reboot — then saves the assignment in CMOS, updates `BLASTER` in the
+current environment, and rewrites the `SET BLASTER` line in `C:\AUTOEXEC.BAT`.
+
+The Sound Blaster and the Windows Sound System codec cannot share an IRQ line
+or a DMA channel. The full-screen lists simply omit whatever the other device
+holds; the command line refuses the combination and writes nothing.
+
+Most people need this for one reason: a game that hardwires an IRQ instead of
+reading `BLASTER`. The card ships on IRQ 7 because that is what such games
+almost always assume, but a few want IRQ 5. See
+[Why the Sound Blaster sits on IRQ 7](../resonique2/manual.md#why-the-sound-blaster-sits-on-irq-7).
+
 ## TOKAMOUS
 
 General Simulation Works's PS/2 mouse driver: a terminate-and-stay-resident
