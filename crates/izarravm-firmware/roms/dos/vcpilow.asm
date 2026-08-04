@@ -42,8 +42,15 @@ start:
     mov ah, 0x08
     call far [xms_entry]
     cmp ax, dx
-    ja f_xms
-    cmp dx, 2048
+    ja f_xms                      ; largest run cannot exceed the total
+    ; The pool must fit inside installed RAM -- which is what this fixture is
+    ; for. It used to assert `dx <= 2048`, i.e. the old hard 2 MB XMS_EMB_BYTES
+    ; cap; with XMS and VCPI sharing the whole extended category that ceiling is
+    ; gone, and encoding it here only re-asserted the defect being removed.
+    movzx ecx, dx
+    shl ecx, 10                   ; free KB -> bytes
+    add ecx, 0x100000             ; the pool starts above the first MB
+    cmp ecx, [ram_top]
     ja f_xms
 
     mov ax, 0xDE00
@@ -112,16 +119,18 @@ start:
     int 0x67
     cmp edx, [free0]
     jne f_count
+    ; F001h used to answer the split-pool magic 'TL' with free VCPI KB in DX.
+    ; XMS and VCPI now share one pool, so there is no second pool to report and
+    ; both subfunctions answer the totals magic 'TK' with DX = 0. A caller that
+    ; still summed DX onto the XMS free count would double-count the same pages.
     mov ax, 0xF001
     call far [xms_entry]
-    cmp ax, 0x544C
+    cmp ax, 0x544B
     jne f_report
     mov [report_total], bx
     mov [report_ems], cx
-    mov eax, [free0]
-    shl eax, 2
-    cmp dx, ax
-    jne f_report
+    test dx, dx
+    jnz f_report
     mov ax, 0xF000
     call far [xms_entry]
     cmp ax, 0x544B

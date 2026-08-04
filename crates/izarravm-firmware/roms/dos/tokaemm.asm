@@ -136,21 +136,43 @@ ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 ems_rm_lin:  dd 0
 ems_rm_phys: dd 0
 
-; ---- Disjoint XMS and VCPI pools. XMS keeps up to 2 MB for EMBs and VCPI
-; owns the rest of the extended category. The bitmaps use absolute 4 KB page
-; numbers over the 24 MB map (6144 bits). EMS owns a separate partition.
-XMS_EMB_BYTES equ 0x00200000
+; ---- ONE extended-memory pool, shared by XMS EMBs and VCPI on demand.
+;
+; This used to be a static split: XMS kept `XMS_EMB_BYTES` (2 MB) and VCPI owned
+; the remaining ~18 MB of a 24 MB machine. That is not how a real manager behaves
+; -- HIMEM+EMM386, 386MAX and QEMM all serve XMS, EMS and VCPI from a single pool
+; on demand -- and it broke ordinary DOS programs: XMS function 08h answered
+; "1952 KB free" on a 24 MB machine while MEM advertised the 20,480 KB category,
+; so anything asking for a few MB of XMS was refused against a nearly empty pool.
+;
+; Now both allocators work the SAME bitmap over the SAME range, first come first
+; served, which is the standard contract. `vcpi_bmp` and `vcpi_free` are aliases
+; rather than separate storage, so the VCPI side needed no edits: it already
+; indexed by absolute page number, and `fs` is the driver's data (see the
+; `mov fs, cx ; FS = driver data via the client's GDT` in the monitor), which is
+; the same storage `cs:` reaches from 16-bit code.
+;
+; The bitmap is 6144 bits = 6144 x 4 KB = 24 MB, so the pool is CLAMPED to that
+; at init; without the clamp a larger --memory-mib would index past the array and
+; corrupt whatever follows it. EMS still owns its own partition above the pool.
+ARENA_PAGES equ 6144              ; bits in arena_bmp; also the pool page ceiling
 align 4
 vcpi_pool_base: dd 0              ; first pool byte (4K-aligned)
 vcpi_pool_end:  dd 0              ; one past the last pool byte (4K-aligned)
-xms_free:       dw 0              ; free 4K pages in the XMS EMB pool
-vcpi_free:      dw 0              ; free 4K pages in the VCPI pool
+xms_free:       dw 0              ; free 4K pages in the shared pool
+vcpi_free       equ xms_free      ; alias: one pool, one free count
 vcpi_cursor:    dw 0              ; next-fit absolute-page scan cursor
 vcpi_pic_master: dw 8             ; DE0Ah/DE0Bh: current 8259 vector bases
 vcpi_pic_slave:  dw 0x70          ; (the DOS-default mapping until a client
                                   ;  reports a remap; store-and-report only)
-arena_bmp: times 768 db 0         ; one allocation bit per physical 4 KB page
-vcpi_bmp: times 768 db 0          ; one allocation bit per VCPI page
+arena_bmp: times 768 db 0         ; ALLOCATED bit per physical 4 KB page (shared)
+; VCPI OWNERSHIP bit per page. With disjoint pools, the address range alone told
+; you who owned a page, so this used to be the VCPI allocation bitmap. Sharing
+; one pool removes that: without an ownership bit, DE05's range check now spans
+; the XMS pages too and would happily free an EMB's page out from under its
+; owner. arena_bmp says "allocated", this says "allocated BY VCPI", and DE05
+; refuses any page it does not own.
+vcpi_bmp: times 768 db 0
 
 strategy:
     mov [cs:rh_ptr], bx
@@ -397,8 +419,10 @@ init:
     shr eax, 10
     mov [cs:xms_category_kb], ax
 
-    ; Page-align the allocatable category, retain up to 2 MB for XMS EMBs,
-    ; and give the remaining pages to VCPI.
+    ; Page-align the allocatable category and hand ALL of it to the one shared
+    ; pool: XMS EMBs and VCPI pages both allocate out of it, first come first
+    ; served. Clamped to what arena_bmp can index (ARENA_PAGES) so a machine
+    ; larger than the bitmap cannot walk off the end of it.
     mov eax, [cs:xms_pool_base]
     add eax, 0xFFF
     and eax, 0xFFFFF000
@@ -408,28 +432,25 @@ init:
     jbe .arena_bounds_ok
     mov eax, ebx
 .arena_bounds_ok:
+    ; Clamp the pool END to the last page the bitmap covers. The bitmap is
+    ; indexed by ABSOLUTE page number, so the ceiling is absolute too.
+    cmp ebx, ARENA_PAGES * 0x1000
+    jbe .arena_ceiling_ok
+    mov ebx, ARENA_PAGES * 0x1000
+.arena_ceiling_ok:
+    cmp eax, ebx                  ; a base above the ceiling yields an empty pool
+    jbe .arena_span_ok
+    mov eax, ebx
+.arena_span_ok:
     mov [cs:xms_pool_base], eax
-    mov edx, eax
-    add edx, XMS_EMB_BYTES
-    jc .xms_uses_all
-    cmp edx, ebx
-    jbe .xms_split_ok
-.xms_uses_all:
-    mov edx, ebx
-.xms_split_ok:
-    mov [cs:xms_pool_end], edx
-    mov [cs:vcpi_pool_base], edx
+    mov [cs:xms_pool_end], ebx
+    mov [cs:vcpi_pool_base], eax  ; same span; vcpi_bmp/vcpi_free are aliases
     mov [cs:vcpi_pool_end], ebx
-    mov ecx, edx
+    mov ecx, ebx
     sub ecx, eax
     shr ecx, 12
-    mov [cs:xms_free], cx
-    mov ecx, ebx
-    sub ecx, edx
-    shr ecx, 12
-    mov [cs:vcpi_free], cx
-    mov eax, edx
-    shr eax, 12
+    mov [cs:xms_free], cx         ; one free count for the shared pool
+    shr eax, 12                   ; next-fit cursor starts at the pool base
     mov [cs:vcpi_cursor], ax
 
     ; Hook INT 2Fh (chain) + own INT 67h outright (IVT at linear 0). The EMS
@@ -2329,12 +2350,13 @@ vcpi_page_alloc:
     mov eax, [fs:vcpi_pool_base]  ; wrap to the pool base
     shr eax, 12
 .test:
-    bt [fs:vcpi_bmp], eax
+    bt [fs:arena_bmp], eax        ; free in the SHARED pool?
     jnc .take
     inc eax
     jmp .scan
 .take:
-    bts [fs:vcpi_bmp], eax
+    bts [fs:arena_bmp], eax       ; claim it in the shared pool
+    bts [fs:vcpi_bmp], eax        ; and record VCPI as its owner
     dec word [fs:vcpi_free]
     lea edx, [eax+1]
     mov [fs:vcpi_cursor], dx
@@ -2353,9 +2375,10 @@ vcpi_page_free:
     cmp eax, [fs:vcpi_pool_end]
     jae .bad
     shr eax, 12
-    bt [fs:vcpi_bmp], eax
+    bt [fs:vcpi_bmp], eax         ; VCPI's own page? refuse an XMS EMB's page
     jnc .bad
     btr [fs:vcpi_bmp], eax
+    btr [fs:arena_bmp], eax       ; return it to the shared pool
     inc word [fs:vcpi_free]
     clc
     ret

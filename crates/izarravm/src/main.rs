@@ -178,6 +178,36 @@ struct Cli {
     dosroot: Option<PathBuf>,
 }
 
+/// Arm the diagnostic guest-store watchpoint from `IZARRAVM_WATCH_WRITE=<hex>[,<hex len>]`
+/// (PHYSICAL addresses, default length 0x100). Reports go to stderr, capped, naming the
+/// store route and the guest CS:IP that issued it. Answers "who wrote here?" for a memory
+/// corruption whose writer is not the obvious owner of the range -- the reason it exists is
+/// a guest that scribbled PCM over the DOS INT 21h dispatch stub. Off unless the variable
+/// is set, and the store path then pays one Relaxed load.
+fn arm_write_watch_from_env() {
+    let Some(spec) = std::env::var("IZARRAVM_WATCH_WRITE")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        return;
+    };
+    let mut parts = spec.split(',');
+    let parse = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok();
+    let Some(addr) = parts.next().and_then(parse) else {
+        eprintln!("watch-write: could not parse IZARRAVM_WATCH_WRITE={spec}");
+        return;
+    };
+    let len = parts.next().and_then(parse).unwrap_or(0x100);
+    if let Some(limit) = std::env::var("IZARRAVM_WATCH_WRITE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        izarravm_cpu::set_write_watch_limit(limit);
+    }
+    izarravm_cpu::set_write_watch(addr, len);
+    eprintln!("watch-write: armed over {addr:#08x}..{:#08x}", addr + len);
+}
+
 fn requested_execution_backend(
     interpreter: bool,
     native_backend_compiled: bool,
@@ -204,6 +234,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cli = Cli::parse();
+    arm_write_watch_from_env();
     let execution_backend = requested_execution_backend(
         cli.interpreter,
         izarravm_cpu::NATIVE_BACKEND_COMPILED,

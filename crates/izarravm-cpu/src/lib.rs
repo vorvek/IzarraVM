@@ -94,6 +94,97 @@ fn ud_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_FAULT_TRACE").is_some())
 }
 
+/// Diagnostic guest-store watchpoint (`IZARRAVM_WATCH_WRITE=<hex addr>[,<hex len>]`).
+/// Packed as `(addr << 32) | len`; zero means off, which is the shipped state. Read with a
+/// Relaxed load on the store path, so when it is off the cost is one load and one
+/// predictable branch -- no syscall, no `OnceLock` acquire. Set once from `main` before the
+/// run loop starts, never mutated after, so the Relaxed ordering carries no publication
+/// hazard. Observation only: the watch never alters a store's value or ordering.
+static WRITE_WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cap on watch reports, so a memset into the watched range cannot fill a disk. Deliberately
+/// generous by default: the FIRST writers into a low-memory range are DOS itself building its
+/// interrupt stubs at boot, so a small cap spends the whole budget before the guest under
+/// investigation has even started. Override with `IZARRAVM_WATCH_WRITE_LIMIT`.
+#[cfg(feature = "watch-write")]
+static WRITE_WATCH_REPORTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WRITE_WATCH_LIMIT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(WRITE_WATCH_REPORT_LIMIT_DEFAULT);
+const WRITE_WATCH_REPORT_LIMIT_DEFAULT: u32 = 200_000;
+
+/// Raise or lower the watch report cap. Zero restores the default.
+pub fn set_write_watch_limit(limit: u32) {
+    let limit = if limit == 0 {
+        WRITE_WATCH_REPORT_LIMIT_DEFAULT
+    } else {
+        limit
+    };
+    WRITE_WATCH_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Arm the store watchpoint over `[addr, addr + len)` in PHYSICAL space. A zero `len`
+/// disarms it.
+pub fn set_write_watch(addr: u32, len: u32) {
+    let packed = if len == 0 {
+        0
+    } else {
+        (u64::from(addr) << 32) | u64::from(len)
+    };
+    WRITE_WATCH.store(packed, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+#[cfg(feature = "watch-write")]
+pub(crate) fn write_watch_packed() -> u64 {
+    WRITE_WATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Does a store of `width` bytes at `physical` overlap the armed range? `packed` is the
+/// caller's already-loaded watch word, so the hot path pays the load exactly once.
+#[inline(always)]
+#[cfg(feature = "watch-write")]
+pub(crate) fn write_watch_hits(packed: u64, physical: u32, width: u32) -> bool {
+    if packed == 0 {
+        return false;
+    }
+    let base = (packed >> 32) as u32;
+    let len = packed as u32;
+    // Half-open overlap on u64 so a store straddling the 4 GiB wrap cannot alias in.
+    let store_end = u64::from(physical) + u64::from(width.max(1));
+    let watch_end = u64::from(base) + u64::from(len);
+    u64::from(physical) < watch_end && store_end > u64::from(base)
+}
+
+/// Report one watched store. Cold and rate-limited; `context` names the store path so a
+/// report can be tied back to the route that produced it.
+#[cfg(feature = "watch-write")]
+#[cold]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report_write_watch(
+    context: &str,
+    cs: u16,
+    eip: u32,
+    physical: u32,
+    width: u32,
+    value: u64,
+    es: u16,
+    edi: u32,
+    ds: u16,
+    esi: u32,
+) {
+    let seen = WRITE_WATCH_REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if seen >= WRITE_WATCH_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // ES:DI and DS:SI are here because the question a watchpoint on a corrupted range
+    // actually has to answer is not "which instruction stored" but "what pointer did the
+    // guest compute": a bad segment and a runaway offset need different fixes and are
+    // indistinguishable from the physical address alone.
+    eprintln!(
+        "watch-write[{seen}] {context} phys={physical:#08x} width={width} value={value:#x} \
+         from CS:IP={cs:04X}:{eip:08X} ES:DI={es:04X}:{edi:04X} DS:SI={ds:04X}:{esi:04X}"
+    );
+}
+
 /// Explicitly flush the diff-trace buffer. Call this once after a headless run loop
 /// returns (any `run_until_*` call), NOT per instruction. Measured gap without this:
 /// a run that fills the 64 KiB buffer but does not end on an exact flush boundary

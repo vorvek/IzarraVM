@@ -311,6 +311,28 @@ impl CpuGsw {
         Ok(())
     }
 
+    /// Diagnostic store watchpoint for the string paths. The bulk routes below hand whole
+    /// spans straight to the bus, bypassing the per-store checks in `memory.rs`, so a
+    /// `REP MOVS`/`REP STOS` into the watched range would otherwise be invisible.
+    #[cfg(feature = "watch-write")]
+    #[inline(always)]
+    fn watch_bulk_write(&self, context: &str, dst: u32, bytes: u32) {
+        if crate::write_watch_hits(crate::write_watch_packed(), dst, bytes) {
+            crate::report_write_watch(
+                context,
+                self.registers.cs().selector,
+                self.registers.eip,
+                dst,
+                bytes,
+                0,
+                self.registers.segment(SegmentIndex::Es).selector,
+                self.registers.edi(),
+                self.registers.segment(SegmentIndex::Ds).selector,
+                self.registers.esi(),
+            );
+        }
+    }
+
     fn finish_buffered_movs_first<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -319,6 +341,8 @@ impl CpuGsw {
         value: u32,
         address_size: AddressSize,
     ) -> ExecResult<FastStringResult> {
+        #[cfg(feature = "watch-write")]
+        self.watch_bulk_write("movs1", dst, width.bytes());
         let write = bus.write_memory_direct(dst, width, value, BusAccessKind::DataWrite)?;
         self.record_data_write(BusAccessKind::DataWrite, write.direct);
         self.adjust_index_register(6, address_size, width.bytes());
@@ -411,6 +435,8 @@ impl CpuGsw {
                             .map(Some);
                     }
                 }
+                #[cfg(feature = "watch-write")]
+                self.watch_bulk_write("movs", dst, bytes as u32);
                 let put = bus.write_memory_bytes_direct(
                     dst,
                     &buf[..bytes],
@@ -469,6 +495,8 @@ impl CpuGsw {
                 for chunk in buf[..bytes].chunks_mut(access) {
                     chunk.copy_from_slice(&pattern[..access]);
                 }
+                #[cfg(feature = "watch-write")]
+                self.watch_bulk_write("stos", dst, bytes as u32);
                 let put = bus.write_memory_bytes_direct(
                     dst,
                     &buf[..bytes],

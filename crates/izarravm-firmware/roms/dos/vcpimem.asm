@@ -11,6 +11,7 @@
 ;
 ; Build: nasm -f bin vcpimem.asm -o vcpimem.com
 cpu 386
+XMS_TEST_KB equ 64            ; 64 KB = 16 x 4 KB pages
 org 0x100
 %define OK 0xA5
 
@@ -32,15 +33,14 @@ start:
     cmp edx, 256
     jb f_count
 
-    ; Allocate and lock the whole largest XMS run. VCPI's free count must not
-    ; change, and its first allocated page must lie outside the XMS range.
-    mov ah, 0x08
-    call far [xms_entry]
-    or ax, ax
-    jz f_xms
-    mov [xms_largest], ax
+    ; Allocate and lock a 64 KB XMS block. XMS and VCPI now draw from ONE pool
+    ; (see the one-pool note in tokaemm.asm), so this must be visible on the
+    ; VCPI side: the free count drops by exactly the 16 pages the block took.
+    ; This used to allocate the whole largest run and assert the VCPI count did
+    ; NOT change, which was the disjoint-pool contract; under one pool that both
+    ; fails and drains the pool, leaving nothing for the DE04 steps below.
     mov ah, 0x09
-    mov dx, [xms_largest]
+    mov dx, XMS_TEST_KB
     call far [xms_entry]
     or ax, ax
     jz f_xms
@@ -51,7 +51,7 @@ start:
     jz f_xms
     mov [xms_page], bx
     mov [xms_page+2], dx
-    movzx eax, word [xms_largest]
+    mov eax, XMS_TEST_KB
     shl eax, 10
     add eax, [xms_page]
     mov [xms_end], eax
@@ -59,8 +59,11 @@ start:
     int 0x67
     or ah, ah
     jnz f_count
-    cmp edx, [free0]
+    mov ecx, [free0]
+    sub ecx, XMS_TEST_KB / 4      ; 4 KB pages consumed by the XMS block
+    cmp edx, ecx
     jne f_owner
+    mov [freeA], edx              ; baseline while the XMS block is held
 
     ; 1. DE02: highest page: nonzero, 4K-aligned, above 1 MB
     mov ax, 0xDE02
@@ -92,7 +95,7 @@ start:
     mov [page1], edx
     mov ax, 0xDE03
     int 0x67
-    mov ecx, [free0]
+    mov ecx, [freeA]
     dec ecx
     cmp edx, ecx
     jne f_alloc
@@ -107,7 +110,7 @@ start:
     jnz f_free
     mov ax, 0xDE03
     int 0x67
-    cmp edx, [free0]
+    cmp edx, [freeA]
     jne f_free
 
     ; DE05 must reject a page in the live XMS range.
@@ -117,7 +120,7 @@ start:
     or ah, ah
     jz f_owner
 
-    mov ah, 0x0D                 ; unlock and free the full XMS run
+    mov ah, 0x0D                 ; unlock and free the 64 KB XMS block
     mov dx, [xms_handle]
     call far [xms_entry]
     or ax, ax
@@ -128,10 +131,13 @@ start:
     or ax, ax
     jz f_xms
 
-    ; Hold a VCPI page and prove both XMS free-space results stay unchanged.
+    ; Hold a VCPI page and prove the XMS free TOTAL drops by that one page --
+    ; the same shared-pool property from the other side. (It used to assert the
+    ; XMS results were unchanged, which only held while the pools were split.
+    ; The largest-run figure is deliberately not asserted: which run shrinks
+    ; depends on where in the arena the page came from.)
     mov ah, 0x08
     call far [xms_entry]
-    mov [xms_largest], ax
     mov [xms_total], dx
     mov ax, 0xDE04
     int 0x67
@@ -140,9 +146,9 @@ start:
     mov [page1], edx
     mov ah, 0x08
     call far [xms_entry]
-    cmp ax, [xms_largest]
-    jne f_owner
-    cmp dx, [xms_total]
+    mov cx, [xms_total]
+    sub cx, 4                    ; one 4 KB page left the shared pool
+    cmp dx, cx
     jne f_owner
     mov edx, [page1]
     mov ax, 0xDE05
@@ -291,6 +297,7 @@ sig:
 
 align 4
 free0:  dd 0
+freeA:  dd 0
 maxpg:  dd 0
 page1:  dd 0
 xms_entry: dd 0

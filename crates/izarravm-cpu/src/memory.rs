@@ -1028,6 +1028,21 @@ impl CpuGsw {
         } else {
             self.translate_linear(bus, linear, true)?
         };
+        #[cfg(feature = "watch-write")]
+        if crate::write_watch_hits(crate::write_watch_packed(), physical, 1) {
+            crate::report_write_watch(
+                "byte",
+                self.registers.cs().selector,
+                self.registers.eip,
+                physical,
+                1,
+                u64::from(value),
+                self.registers.segment(SegmentIndex::Es).selector,
+                self.registers.edi(),
+                self.registers.segment(SegmentIndex::Ds).selector,
+                self.registers.esi(),
+            );
+        }
         if let Some(changed) =
             self.write_direct_byte_page_cached(bus, linear, physical, value, kind)?
         {
@@ -1299,6 +1314,21 @@ impl CpuGsw {
             return self.finish_fast_map_write(bus, physical, ptr, mode13, width, value, kind);
         }
         let physical = self.translate_linear(bus, linear, true)?;
+        #[cfg(feature = "watch-write")]
+        if crate::write_watch_hits(crate::write_watch_packed(), physical, width.bytes()) {
+            crate::report_write_watch(
+                "sized",
+                self.registers.cs().selector,
+                self.registers.eip,
+                physical,
+                width.bytes(),
+                u64::from(value),
+                self.registers.segment(SegmentIndex::Es).selector,
+                self.registers.edi(),
+                self.registers.segment(SegmentIndex::Ds).selector,
+                self.registers.esi(),
+            );
+        }
         // G2: same-value elision for sized stores. Probe the code watch first (side-effect free);
         // when the store misses all watched code this costs exactly what the old unconditional
         // note_code_write cost. On a direct-page hit we read the old bytes, write, and invalidate
