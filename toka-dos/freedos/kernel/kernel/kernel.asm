@@ -64,6 +64,17 @@ configstart:
 
 DLASortByDriveNo            db 0        ; sort disks by drive order
 InitDiskShowDriveAssignment db 1        ;
+; The F5/F8 window, in SECONDS OF GUEST TIME. Upstream's 2, deliberately kept.
+;
+; It only became a meaningful number once GetBiosKey halted instead of spinning
+; (see config.c): before that the emulator burned 8.3 wall seconds interpreting
+; this 2-guest-second window at 586 and 1.8 at 486, so the pause grew the FASTER
+; the emulated machine was, and looked far longer than it was specified to be.
+; With the halt, guest time tracks real time and this reads as 2 real seconds on
+; every persona -- which is what it always meant.
+;
+; It is deliberate cost: it is the window in which a user can press F5 to skip
+; CONFIG.SYS or F8 to single-step it. Do not "optimize" it away.
 SkipConfigSeconds           db 2        ;
 ForceLBA                    db 0        ;
 GlobalEnableLBAsupport      db 1        ;

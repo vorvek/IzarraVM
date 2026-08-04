@@ -268,7 +268,10 @@ STATIC void setup_int_vectors(void)
     plvec->isv = getvec(plvec->intno);
   for (i = 0x23; i <= 0x3f; i++)
     setvec(i, empty_handler);
-  HaltCpuWhileIdle = 0;
+  /* Modified by the Toka-DOS project, 2026: 0 -> 1, matching the default set in
+     config.c. This is the earlier of the two initializers; leaving it at 0
+     would idle-spin for the whole window between here and CONFIG.SYS. */
+  HaltCpuWhileIdle = 1;
   for (pvec = vectors; pvec < vectors + (sizeof vectors/sizeof *pvec); pvec++)
     setvec(pvec->intno, (intvec)MK_FP(FP_SEG(empty_handler), pvec->handleroff));
   pokeb(0, 0x30 * 4, 0xea);

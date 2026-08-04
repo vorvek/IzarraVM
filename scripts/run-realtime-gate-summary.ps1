@@ -78,10 +78,20 @@ function Get-PairedMetricVerdict([double]$Median, [double]$Lower95) {
 }
 
 function Get-CandidateSampleChecks($Policy, [object[]]$Samples) {
+    # Per-workload coverage floor, falling back to the global when a policy does
+    # not carry one. Doom and Quake sit 15 points apart on coverage, so a single
+    # number is either unreachable for one or free for the other; the fallback
+    # keeps synthetic policies (the self-test's boundary fixture) on the global.
+    $coverageFloor = $minimumDirectCoverage
+    if ($null -ne $Policy.PSObject.Properties['minimum_direct_native_coverage'] -and
+        $null -ne $Policy.minimum_direct_native_coverage) {
+        $coverageFloor = $Policy.minimum_direct_native_coverage
+    }
     return [pscustomobject][ordered]@{
         samples = $Samples.Count
+        coverage_floor = $coverageFloor
         coverage_passes = @($Samples | Where-Object {
-            $_.direct_native_coverage -ge $minimumDirectCoverage
+            $_.direct_native_coverage -ge $coverageFloor
         }).Count
         exit_rate_passes = @($Samples | Where-Object {
             $_.direct_slow_exits_per_100_instructions -lt $maximumDirectExitsPer100

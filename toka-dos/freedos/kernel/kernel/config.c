@@ -135,8 +135,26 @@ struct config Config = {
   0,
   NFCBS,
   0,
-  "command.com",
-  " /P /E:256\r\n",
+  /* Modified by the Toka-DOS project, 2026: "command.com" -> the full
+     C:\DOS path, and the tail gained the same directory as an argument.
+     Upstream's bare name looks in the boot drive's ROOT, which is where
+     FreeDOS puts COMMAND.COM but Toka-DOS does not -- our root holds only
+     CONFIG.SYS and AUTOEXEC.BAT and every binary lives in C:\DOS (see
+     scripts/build-freedos-hdd-image.py). This default is only reached when
+     CONFIG.SYS supplies no SHELL=, which is exactly what pressing F5 does, so
+     the bare name made the F5 escape hatch strand the user at "Bad or missing
+     Command Interpreter" -- the one situation the hatch exists for.
+
+     The directory argument matters as much as the path: it is where FreeCOM
+     builds COMSPEC from, so without it a shell that loaded could still fail to
+     reload its transient part. Both now match the SHELL= line the shipped
+     CONFIG.SYS carries, so F5 lands in the same shell as a normal boot, minus
+     the drivers it was asked to skip.
+
+     C: rather than a driveless path deliberately: COMSPEC wants a drive
+     letter, and Toka-DOS's hard disk is always C: here. */
+  "C:\\DOS\\COMMAND.COM",
+  " C:\\DOS /P /E:256\r\n",
   NLAST,
   0,
   NSTACKS,
@@ -823,7 +841,25 @@ VOID DoConfig(int nPass)
 
   if (nPass==0)
   {
-    HaltCpuWhileIdle = 0; /* init to "no HLT while idle" */
+    /* Modified by the Toka-DOS project, 2026: default 0 -> 1, "safe hooks"
+       (halt only while the kernel waits for CON character input). Upstream
+       FreeDOS defaults this off because entering and leaving HLT swings CPU
+       power draw and some real mainboards and supplies cannot filter the
+       transient -- see the IDLEHALT warning in docs/config.txt and the P90 HLT
+       erratum it cites. Toka-DOS is built only for IzarraVM, which ships its
+       own CPU, so that class does not exist here and the default that is right
+       for unknown hardware is the wrong one for ours.
+
+       It is worth a great deal here: a DOS prompt waiting for a keystroke is a
+       busy-wait, measured at ~580,000 poll iterations per guest second and
+       ~249 instructions each, so 1.44 G instructions per ten guest seconds of
+       doing nothing. Real silicon does not care; an emulator interpreting every
+       one of them does. Halting takes the idle phase from 0.219x real time to
+       21x, and its instruction count from 1,483,153,791 to 291,701.
+
+       Still overridable: SetIdleHalt below parses IDLEHALT=n, so IDLEHALT=0 in
+       CONFIG.SYS turns it back off. */
+    HaltCpuWhileIdle = 1;
 
 #ifdef MEMDISK_ARGS
     if (mdsk != NULL)
@@ -1006,6 +1042,12 @@ STATIC struct table * LookUp(struct table *p, BYTE * token)
 */
 #define GetBiosTime() peekl(0, 0x46c)
 
+/* Modified by the Toka-DOS project, 2026: halt until the next interrupt.
+   PUSHF/STI/POPF around the HLT is exactly dosidle.asm's _DosIdle_hlt, so the
+   caller's interrupt flag is restored untouched and a HLT never runs masked. */
+void idle_hlt(void);
+#pragma aux idle_hlt = "pushf" "sti" "hlt" "popf" modify exact [];
+
 UWORD GetBiosKey(int timeout)
 {
   iregs r;
@@ -1016,7 +1058,30 @@ UWORD GetBiosKey(int timeout)
   {
     do
     {
-      /* optionally HLT here - timer will IRQ even if no keypress */
+      /* Modified by the Toka-DOS project, 2026: took upstream's "optionally
+         HLT here" and did it. Upstream leaves it out because entering and
+         leaving HLT swings CPU power draw, which some real mainboards and
+         cheap supplies cannot filter (see the IDLEHALT warning in
+         docs/config.txt, and the P90 HLT erratum it cites). IzarraVM ships its
+         own CPU, so that entire class does not exist here.
+
+         Without it this loop spins the keyboard poll at roughly 1.5 M
+         iterations per guest second, and the emulator interprets every one:
+         measured at 272,000,352 instructions and 8.3 s of WALL time for a
+         2-guest-second window at 586. Worse, the window is denominated in
+         guest seconds while the user waits in wall seconds, so the pause grew
+         the faster the emulated machine was -- 1.8 s at 486 against 8.3 s at
+         586, backwards. Halting collapses it to the ~18.2 Hz timer, so guest
+         time tracks real time and SkipConfigSeconds finally means seconds.
+
+         Correct on real hardware too, which is the bar for a vendored patch:
+         the timer IRQ fires regardless of keypress (upstream's own comment
+         says so) and IRQ1 wakes the halt on the very keystroke being waited
+         for, so neither the timeout nor the key is delayed. PUSHF/POPF around
+         it mirrors dosidle.asm's _DosIdle_hlt and leaves the caller's IF
+         exactly as found; the STI is what keeps a masked-interrupt HLT from
+         being a hang. */
+      idle_hlt();
       r.a.x = 0x0100;             /* are there keys available ? */
       init_call_intr(0x16, &r);
       if (!(r.flags & FLG_ZERO)) {

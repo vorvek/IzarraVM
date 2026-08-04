@@ -86,41 +86,6 @@ fn is_emulator_stock_autoexec(bytes: &[u8], current_base: &[u8]) -> bool {
     false
 }
 
-/// The kernel's built-in idle halt, prepended to the payload's stock CONFIG.SYS.
-///
-/// A DOS prompt waiting for a keystroke is a busy-wait: measured on this
-/// emulator at ~580,000 poll iterations per guest second, ~249 instructions
-/// each, so 1.44 G instructions per ten guest seconds of doing nothing. Real
-/// hardware does not care; an emulator interpreting every one of them does.
-/// `IDLEHALT=1` is FreeDOS's own option (`kernel/dosidle.asm`) and halts only
-/// while the kernel waits for CON character input, which is exactly that case.
-/// Measured effect on the idle phase at 586: real-time factor 0.219 -> 21.27,
-/// and 1,483,153,791 retired instructions -> 291,701.
-///
-/// Level 1 rather than -1 deliberately. FreeDOS documents 1 as the "safe hooks"
-/// level; -1 additionally hooks INT 2Fh AX=1680 (release time slice), which DOS
-/// extenders and Windows use, and measured no better here (21.18 against 21.27).
-///
-/// The halt is genuine, not a timing shortcut: the guest executes HLT and any
-/// interrupt wakes it, so a keystroke's IRQ1 returns control exactly as on
-/// hardware. Under TOKAEMM the guest HLT faults to the monitor, whose `.hlt` arm
-/// runs a real `sti; hlt` at ring 0, so both driver configurations reach the
-/// same halt.
-const STOCK_CONFIG_IDLE_HALT: &[u8] =
-    b"REM Halt the CPU while DOS waits for input (FreeDOS kernel built-in).\r\nIDLEHALT=1\r\n";
-
-/// Apply the emulator's own additions to the payload's stock CONFIG.SYS, the way
-/// [`stock_autoexec`] does for AUTOEXEC. Kept as a transform rather than baked
-/// into `tokados-hdd.img` because that image does not currently rebuild
-/// byte-reproducibly from the tree, so regenerating it for one line would carry
-/// unrelated drift.
-pub(super) fn stock_config(base: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(base.len() + STOCK_CONFIG_IDLE_HALT.len());
-    result.extend_from_slice(STOCK_CONFIG_IDLE_HALT);
-    result.extend_from_slice(base);
-    result
-}
-
 /// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if absent. Exact current
 /// or previous emulator stock files follow profile changes. Other files remain
 /// user-owned.
@@ -132,17 +97,8 @@ pub(super) fn ensure_user_config(
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let config_path = dir.join("CONFIG.SYS");
-    // `config_sys` (the payload's own stock) joins the upgrade set alongside
-    // PREVIOUS_STOCK_CONFIG_SYS: a user still on the untouched payload file has
-    // expressed no preference, so they follow the emulator's stock forward. A
-    // CONFIG.SYS that matches neither is the user's and is never rewritten.
-    let existing = std::fs::read(&config_path).ok();
-    let follows_stock = match existing.as_deref() {
-        None => true,
-        Some(bytes) => bytes == PREVIOUS_STOCK_CONFIG_SYS || bytes == config_sys,
-    };
-    if follows_stock {
-        std::fs::write(config_path, stock_config(config_sys))?;
+    if !config_path.exists() || std::fs::read(&config_path)? == PREVIOUS_STOCK_CONFIG_SYS {
+        std::fs::write(config_path, config_sys)?;
     }
     let autoexec_path = dir.join("AUTOEXEC.BAT");
     if !autoexec_path.exists()

@@ -1858,3 +1858,100 @@ fn reconcile_invalidates_the_cached_host_handle() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// The kernel's compiled-in fallback shell must name a file the image actually
+/// ships, at the path it ships it at.
+///
+/// This default is only reached when CONFIG.SYS supplies no `SHELL=` -- which is
+/// exactly what pressing F5 at the boot prompt does. Upstream FreeDOS defaults
+/// it to a bare `command.com`, i.e. the boot drive's ROOT, and that is where
+/// FreeDOS puts COMMAND.COM. Toka-DOS does not: the root holds only CONFIG.SYS
+/// and AUTOEXEC.BAT and every binary lives in `C:\DOS`. So the stock default
+/// stranded anyone who pressed F5 at "Bad or missing Command Interpreter" --
+/// breaking the one escape hatch the F5 window exists to provide, and only in
+/// the situation where the user already believes something is wrong.
+///
+/// Asserted against the shipped image rather than the source so it survives a
+/// kernel rebuild, a vendored-source refresh, or a change to where the image
+/// builder places binaries -- any of which can reintroduce it.
+#[test]
+fn the_kernels_fallback_shell_exists_where_the_image_puts_it() {
+    let kernel = image_root_file("KERNEL.SYS");
+    let contains = |needle: &str| kernel.windows(needle.len()).any(|w| w == needle.as_bytes());
+
+    assert!(
+        contains(r"C:\DOS\COMMAND.COM"),
+        r"the kernel's fallback shell must be the full C:\DOS path"
+    );
+    assert!(
+        contains(r" C:\DOS /P"),
+        r"the fallback tail must pass the C:\DOS directory: it is what FreeCOM
+         builds COMSPEC from, so a shell that loads without it cannot reload
+         its own transient part"
+    );
+    assert!(
+        image_dos_folder_names().iter().any(|n| n == "COMMAND.COM"),
+        r"the image must actually ship COMMAND.COM in C:\DOS"
+    );
+}
+
+/// Read a root-directory file out of the committed image by 8.3 name.
+fn image_root_file(name: &str) -> Vec<u8> {
+    let img = izarravm_firmware::tokados_hdd_img();
+    let sector = |lba: u32| -> &[u8] {
+        let off = lba as usize * crate::katea_volume::SECTOR;
+        &img[off..off + crate::katea_volume::SECTOR]
+    };
+    let le16 = |s: &[u8], at: usize| u16::from_le_bytes([s[at], s[at + 1]]);
+    let le32 = |s: &[u8], at: usize| u32::from_le_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]]);
+
+    let part_start = le32(sector(0), 0x1BE + 8);
+    let vbr = sector(part_start);
+    let reserved = u32::from(le16(vbr, 0x0E));
+    let num_fats = u32::from(vbr[0x10]);
+    let fatsz = le32(vbr, 0x24);
+    let root_clus = le32(vbr, 0x2C);
+    let spc = u32::from(vbr[0x0D]);
+    let first_data = reserved + num_fats * fatsz;
+    let fat_base = part_start + reserved;
+    let fat_entry = |cluster: u32| -> u32 {
+        let byte_off = cluster as usize * 4;
+        let fat_sector = fat_base + (byte_off / crate::katea_volume::SECTOR) as u32;
+        le32(sector(fat_sector), byte_off % crate::katea_volume::SECTOR) & 0x0FFF_FFFF
+    };
+    let cluster_lba = |cluster: u32| part_start + first_data + (cluster - root_clus) * spc;
+    let read_chain = |first: u32, limit: usize| -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut c = first;
+        for _ in 0..img.len() / crate::katea_volume::SECTOR {
+            for s in 0..spc {
+                out.extend_from_slice(sector(cluster_lba(c) + s));
+            }
+            if out.len() >= limit {
+                out.truncate(limit);
+                return out;
+            }
+            let next = fat_entry(c);
+            if next >= 0x0FFF_FFF8 {
+                return out;
+            }
+            c = next;
+        }
+        panic!("katea: cluster chain from {first} exceeds the disk; corrupt FAT")
+    };
+
+    for entry in read_chain(root_clus, usize::MAX).chunks_exact(32) {
+        if entry[0] == 0x00 {
+            break;
+        }
+        if entry[0] == 0xE5 || entry[11] == 0x0F || entry[11] & 0x10 != 0 {
+            continue;
+        }
+        if crate::katea_volume::decode_83(&entry[0..11]) == name {
+            let first = (le16(entry, 0x14) as u32) << 16 | le16(entry, 0x1A) as u32;
+            let size = le32(entry, 0x1C) as usize;
+            return read_chain(first, size);
+        }
+    }
+    panic!("committed image has no root file named {name}");
+}
