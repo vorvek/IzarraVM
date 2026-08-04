@@ -37,6 +37,59 @@ impl TokaEmmScenario {
     }
 }
 
+/// Run the machine in fine bursts, reporting every sample point that lands with
+/// the CPU in V86, and stopping early once `done` is satisfied. Returns
+/// (samples in V86, whether `done` was reached).
+///
+/// Sampling `in_v86()` is the only way to observe V86 residency -- nothing
+/// counts it -- and it has two biases that make a coarse sample useless:
+///
+/// * A burst ends where the timing model puts a seam, and seams cluster on
+///   device deadlines and interrupt entries, which is exactly where the CPU is
+///   inside the ring-0 monitor. Measured over a default boot, only about 2% of
+///   200k-cycle sample points land in V86 at all.
+/// * The guest only *runs* while it has work. At an idle DOS prompt it halts,
+///   and the halt is taken in the monitor, so `in_v86()` reads false from then
+///   on, permanently.
+///
+/// Together those mean a handful of samples taken after the boot has settled
+/// will never see V86, however healthy the machine is. Sample finely, sample
+/// while the guest is busy, and judge on the accumulated count.
+fn sample_v86_while_busy(
+    machine: &mut Machine,
+    max_samples: u32,
+    mut on_v86_sample: impl FnMut(&Machine),
+    mut done: impl FnMut(&Machine) -> bool,
+) -> (u32, bool) {
+    const BURST: u64 = 200_000;
+    let mut in_v86_samples = 0;
+    for _ in 0..max_samples {
+        let stop = machine
+            .run_until_halt_or_cycles(BURST)
+            .expect("machine run");
+        if let StopReason::CpuError(message) = &stop {
+            panic!(
+                "CPU fault while sampling V86 residency: {message}\n{}",
+                machine.screen_text().as_text()
+            );
+        }
+        if machine.in_v86() {
+            in_v86_samples += 1;
+            on_v86_sample(machine);
+        }
+        if done(machine) {
+            return (in_v86_samples, true);
+        }
+    }
+    (in_v86_samples, false)
+}
+
+/// Enough V86 sample points to prove the guest really ran there, with room for
+/// the rate to move: a default boot yields around 50, so a healthy machine
+/// clears this by an order of magnitude, and a machine that stopped entering
+/// V86 at all fails loudly rather than passing an invariant vacuously.
+const MIN_V86_SAMPLES: u32 = 5;
+
 #[test]
 #[should_panic(expected = "expected exactly one TOKAEMM.SYS override")]
 fn tokaemm_scenario_rejects_missing_driver_override() {
@@ -772,45 +825,37 @@ fn tokaemm_m4_default_boot_runs_v86() {
         "seeded CONFIG.SYS lacks the expected defaults:\n{seeded}"
     );
 
-    let (stop, _) = run_until_toka_condition(&mut machine, 800_000_000, |machine| {
-        current_root_prompt(machine)
-            && machine
-                .screen_text()
-                .as_text()
-                .to_ascii_lowercase()
-                .contains("tokaemm:")
-    });
-    if let StopReason::CpuError(msg) = &stop {
-        let text = machine.screen_text().as_text();
-        panic!("CPU fault during the default V86 boot: {msg}\n{text}");
-    }
+    // V86 residency is observed DURING the boot, not after it. The boot is the
+    // work; once the prompt is up the guest halts and the CPU parks in the
+    // monitor, so a sample taken then reads false no matter how healthy the
+    // machine is. See sample_v86_while_busy.
+    let (in_v86_samples, reached) = sample_v86_while_busy(
+        &mut machine,
+        4_000,
+        |_| {},
+        |machine| {
+            current_root_prompt(machine)
+                && machine
+                    .screen_text()
+                    .as_text()
+                    .to_ascii_lowercase()
+                    .contains("tokaemm:")
+        },
+    );
     let text = machine.screen_text().as_text();
     let lower = text.to_ascii_lowercase();
-    // The cycle budget can expire while the CPU is transiently inside the
-    // ring-0 monitor (a reflected IRQ), where in_v86() reads false on a
-    // healthy boot. Re-sample over a few short bursts rather than
-    // asserting one instant.
-    let mut in_v86 = machine.in_v86();
-    for _ in 0..4 {
-        if in_v86 {
-            break;
-        }
-        machine
-            .run_until_halt_or_cycles(1_000_000)
-            .expect("machine re-sample run");
-        in_v86 = machine.in_v86();
-    }
     assert!(
-        current_root_prompt(&machine),
-        "no C:\\> prompt on the default boot (stop={stop:?}).\n{text}"
+        reached && current_root_prompt(&machine),
+        "no C:\\> prompt on the default boot.\n{text}"
     );
     assert!(
         lower.contains("tokaemm:"),
         "the TOKAEMM signon banner is missing.\n{text}"
     );
     assert!(
-        in_v86,
-        "the default boot must leave the guest running in V86 (stop={stop:?}).\n{text}"
+        in_v86_samples >= MIN_V86_SAMPLES,
+        "the default boot must run the guest in V86; only {in_v86_samples} of \
+         the sampled points were (needed {MIN_V86_SAMPLES}).\n{text}"
     );
     let prompts_before = lower.matches("c:\\>").count();
 
@@ -1305,35 +1350,29 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
     let machine = &mut scenario.machine;
 
     const FLAG_IF: u32 = 0x0000_0200;
-    const BURST: u64 = 20_000_000;
-    const BURSTS: u32 = 25; // 500M cycles total, well past the MEM prompt
 
-    let mut saw_v86 = false;
-    let mut stop = StopReason::CycleLimit { requested: 0 };
-    for _ in 0..BURSTS {
-        if matches!(stop, StopReason::CpuError(_)) {
-            break;
-        }
-        stop = machine
-            .run_until_halt_or_cycles(BURST)
-            .expect("machine run");
-        if machine.in_v86() {
-            saw_v86 = true;
+    // Every sample point that lands in V86 is one check of the invariant, so
+    // the fine sampling is not only what makes the test reliable -- it is what
+    // gives it teeth. The old 20M-cycle bursts got roughly one V86 sample per
+    // run, when they got one at all.
+    let (saw_v86_samples, _) = sample_v86_while_busy(
+        machine,
+        4_000,
+        |machine| {
             assert_ne!(
                 machine.cpu().registers.eflags & FLAG_IF,
                 0,
-                "real IF was 0 while the guest was in V86 mode (stop={stop:?})"
+                "real IF was 0 while the guest was in V86 mode"
             );
-        }
-    }
+        },
+        |_| false,
+    );
     let text = machine.screen_text().as_text();
 
-    if let StopReason::CpuError(msg) = &stop {
-        panic!("CPU fault during the IF-invariant boot: {msg}\n{text}");
-    }
     assert!(
-        saw_v86,
-        "the boot never entered V86 mode; the invariant was never exercised"
+        saw_v86_samples >= MIN_V86_SAMPLES,
+        "the boot never entered V86 mode; the invariant was never exercised \
+         ({saw_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
     );
 }
 
