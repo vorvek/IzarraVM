@@ -2730,6 +2730,19 @@ vcpi_dispatch:
     mov edx, [edx+2]              ; client GDT linear base
     and byte [edx+ecx+5], 0xFD    ; clear the TSS-busy type bit
     ltr word [eax+0x0E]
+    ; KNOWN INERT HOLE, left deliberately (2026-08-06). Falling through here
+    ; without an LTR leaves TR still selecting OUR 0x18 while the CLIENT's CR3
+    ; is live. Nothing in the tree reaches it: the VCPI spec says a client
+    ; always furnishes a TSS, vcpisw.asm furnishes 0x18, and a client runs at
+    ; CPL 0 so nothing reads the TSS body. It is recorded rather than turned
+    ; into a signal32 because a loud failure on a path no fixture exercises
+    ; could break a real client that legitimately passes TR=0, which would be
+    ; trading a latent non-issue for an active one.
+    ;
+    ; IF A GAME OR EXTENDER EVER MISBEHAVES AFTER A DE0C SWITCH, START HERE:
+    ; put a breakpoint or a signal32 on .no_tr and see whether it is taken.
+    ; The symptom would be a fault or a hang shortly after the client's first
+    ; ring transition or task switch, not at the switch itself.
 .no_tr:
     lldt word [eax+0x0C]          ; LLDT(0) is legal: null LDT
     mov ebx, [esi+16]             ; hand the guest's registers through
