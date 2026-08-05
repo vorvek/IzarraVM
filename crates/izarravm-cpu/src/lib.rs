@@ -1546,13 +1546,6 @@ pub struct CpuGsw {
     pub ldtr: SegmentRegister,
     pub tr: SegmentRegister,
     pub elapsed_clocks: u64,
-    // Where the last fatal CpuError was raised. Written by all three sites that
-    // turn an InternalFault into a fatal CpuError, so it can never name the
-    // wrong fault; read ONLY on the machine's fatal arm, so it can never name a
-    // fault on a run that did not fault. Both halves are needed: a fatal error
-    // leaves the machine resumable, and callers that ignore the stop reason
-    // (bootprofile's per-keystroke loop, the GUI worker) do resume it.
-    fault_site: FaultSite,
     // Core clocks charged by prior instructions in the CURRENT run_straight_line
     // run, not including the in-flight instruction. Mirrors run_straight_line's
     // local `total` at the point just before that instruction executes, so a port
@@ -1732,6 +1725,18 @@ pub struct CpuGsw {
     /// leaves `pending_flags` on its pinned offset -- measured, not assumed. The counters
     /// themselves are `JitState::fast_map_audit`; see that field for why they are not here.
     rmw_census_enabled: bool,
+    /// Where the last fatal `CpuError` was raised, for the machine's stop
+    /// report. Written by all three sites that turn an `InternalFault` into a
+    /// fatal `CpuError`, so it can never name the wrong fault; read ONLY on the
+    /// machine's fatal arm, so it can never name a fault on a run that did not
+    /// fault. Both halves are needed, because a fatal error leaves the machine
+    /// resumable and callers that ignore the stop reason (bootprofile's
+    /// per-keystroke loop, the GUI worker) do resume it.
+    ///
+    /// At the tail for the same layout reason as the fields above: this is
+    /// written once per run at most, and putting it mid-struct moved
+    /// `pending_flags` off its pinned offset and every hot field after it.
+    fault_site: FaultSite,
 }
 
 impl Default for CpuGsw {
@@ -1751,7 +1756,6 @@ impl Default for CpuGsw {
             ldtr: SegmentRegister::default(),
             tr: SegmentRegister::default(),
             elapsed_clocks: 0,
-            fault_site: FaultSite::default(),
             core_clocks_so_far: 0,
             #[cfg(feature = "jit")]
             native_callout: jit::direct::CallOutTable::default(),
@@ -1803,6 +1807,7 @@ impl Default for CpuGsw {
             fast_map_serve_enabled: FastMapServeGate::default(),
             fast_map_probe: FastMapProbeCounters::default(),
             rmw_census_enabled: rmw_census_default(),
+            fault_site: FaultSite::default(),
         }
     }
 }

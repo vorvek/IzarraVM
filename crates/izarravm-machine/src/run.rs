@@ -620,6 +620,64 @@ impl Machine {
         eprint!("{}", self.fault_trace_report(error));
     }
 
+    /// One line naming a fatal error, where it was raised, and the instruction
+    /// bytes there. Not env-gated, unlike the full dump above.
+    ///
+    /// An undecoded I/O port is fatal on purpose so a hardware gap stays
+    /// visible, which makes this line the whole diagnosis for the class of bug
+    /// it exists to catch. Gating it behind a variable meant a stop said only
+    /// which port, and every occurrence then cost a bespoke investigation.
+    /// `IZARRAVM_FAULT_TRACE` was there the whole time during the Prince of
+    /// Persia work and was never reached for.
+    ///
+    /// Latched on the SITE, not on a count. A fatal error does not stop the
+    /// machine and the GUI resumes it, so an unlatched line is an unbounded
+    /// flood from a re-faulting loop. A plain "once" would be worse than it
+    /// sounds in the other direction: the guest steps past and keeps faulting
+    /// elsewhere, and during bring-up the first fault is routinely a benign
+    /// probe while the one worth seeing is the third.
+    fn report_fatal_fault(&mut self, error: &CpuError) {
+        const DISTINCT_SITE_CAP: usize = 16;
+
+        let site = self.cpu.fault_site();
+        let key = site.map(|record| (record.cs.selector, record.eip));
+        if self.reported_fault_sites.contains(&key) {
+            return;
+        }
+        if self.reported_fault_sites.len() >= DISTINCT_SITE_CAP {
+            if self.reported_fault_sites.len() == DISTINCT_SITE_CAP {
+                self.reported_fault_sites.push(None);
+                eprintln!("fault: further fault sites suppressed after {DISTINCT_SITE_CAP}");
+            }
+            return;
+        }
+        self.reported_fault_sites.push(key);
+
+        let line = match site {
+            Some(record) => {
+                let linear = record.cs.base.wrapping_add(record.eip);
+                let moved = if record.cs_moved {
+                    " (CS moved during the instruction, bytes may not be its code)"
+                } else {
+                    ""
+                };
+                format!(
+                    "fault: {error} at CS:IP={:#06x}:{:#010x} linear={linear:#010x} \
+                     bytes=[{}]{moved}. Set IZARRAVM_FAULT_TRACE for the full dump.",
+                    record.cs.selector,
+                    record.eip,
+                    self.linear_bytes(linear, 8).trim_end(),
+                )
+            }
+            // The three sites that raise a fatal CpuError all record one, so
+            // this is not expected. Say the site is missing rather than
+            // printing live registers dressed up as the raise point.
+            None => format!("fault: {error} (no raise site recorded)"),
+        };
+        self.last_fault_line = Some(line.clone());
+        eprintln!("{line}");
+    }
+
     /// The body of `log_fault_trace`, returning what it would print. Split out
     /// so the report can be asserted: eight bare `eprintln!` calls had no seam,
     /// so nothing about this output was under test, including whether it was
@@ -1295,6 +1353,7 @@ impl Machine {
                     }
                 }
                 Err(error) => {
+                    self.report_fatal_fault(&error);
                     if fault_trace_enabled() {
                         self.log_fault_trace(&error);
                     }

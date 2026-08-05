@@ -155,6 +155,89 @@ fn the_fault_dump_reads_code_through_the_guest_page_tables() {
     );
 }
 
+/// The diagnosis has to arrive without anyone having set anything. That is the
+/// whole of T3, and it is a claim about the CALL SITE being unconditional, not
+/// about a formatter, so this drives a real machine to a real stop rather than
+/// calling the formatter and watching it format.
+///
+/// No test here touches IZARRAVM_FAULT_TRACE. The CPU-side gate latches in a
+/// OnceLock, so the first reader in a test binary fixes it process-wide, and
+/// mutating process env from a threaded harness is racy anyway.
+#[test]
+fn a_fatal_port_fault_reports_itself_without_any_env_var() {
+    const PROG: &[u8] = &[0xBA, 0x10, 0x20, 0xEC, 0xCD, 0x20];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    let line = machine
+        .last_fault_line()
+        .expect("a fatal stop must report itself with no env var set");
+    assert!(line.contains("0x2010"), "must name the port: {line}");
+    assert!(
+        line.contains("0x00000103"),
+        "must name the faulting instruction, not the one after it: {line}"
+    );
+    // The window opens ON the faulting instruction, so the first byte is its
+    // opcode: 0xEC is IN AL,DX. That byte is the datum the old report lacked,
+    // and having it is the difference between "port 0x2010 came from
+    // somewhere" and "an IN AL,DX did this".
+    assert!(
+        line.contains("bytes=[ec cd 20"),
+        "must carry the faulting instruction's own bytes: {line}"
+    );
+}
+
+/// The report is latched on the SITE. Without a latch it floods, because a
+/// fatal error leaves the machine resumable and callers do resume it; with a
+/// plain "print once" it would hide every later fault, and the interesting one
+/// is often not the first. Neither failure mode is visible by running the
+/// emulator once, so it is pinned here.
+#[test]
+fn the_fault_report_latches_per_site_not_per_run() {
+    // Both halves are driven for real, using the property that motivates the
+    // latch in the first place: a fatal error leaves the machine resumable, so
+    // calling run again continues the guest from where it stopped.
+
+    // Spinning on ONE bad port: mov dx,0x2010; in al,dx; jmp back to the IN.
+    // The second run re-enters at the JMP and faults at the same address.
+    const SPIN: &[u8] = &[0xBA, 0x10, 0x20, 0xEC, 0xEB, 0xFD];
+    let mut spinner =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), SPIN).unwrap();
+    spinner.run_until_halt_or_cycles(1_000_000).unwrap();
+    let first = spinner
+        .last_fault_line()
+        .expect("first fault reports")
+        .to_string();
+    assert!(first.contains("0x00000103"));
+    spinner.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert_eq!(
+        spinner.last_fault_line(),
+        Some(first.as_str()),
+        "a repeat at the same site must not re-report, or a spinning guest \
+         floods stderr for as long as it runs"
+    );
+
+    // TWO bad ports back to back. The second run faults one byte further on,
+    // which is a different site and must get through: hiding it would bury the
+    // fault that matters behind whichever one happened to come first.
+    const TWO: &[u8] = &[0xBA, 0x10, 0x20, 0xEC, 0xEC, 0xCD, 0x20];
+    let mut two =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), TWO).unwrap();
+    two.run_until_halt_or_cycles(1_000_000).unwrap();
+    let one = two
+        .last_fault_line()
+        .expect("first fault reports")
+        .to_string();
+    assert!(one.contains("0x00000103"));
+    two.run_until_halt_or_cycles(1_000_000).unwrap();
+    let other = two.last_fault_line().expect("second site reports");
+    assert!(
+        other.contains("0x00000104"),
+        "a fault at a different site must be reported, not swallowed: {other}"
+    );
+}
+
 /// The record must not survive into a run that did not fault. Nothing clears
 /// it, because a fatal CpuError leaves the machine resumable and callers that
 /// ignore the stop reason go on running it, so the guarantee is on the READ

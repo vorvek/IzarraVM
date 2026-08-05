@@ -102,6 +102,13 @@ impl Machine {
         bus.read_phys_u8(address).unwrap_or(0)
     }
 
+    /// The last fatal-fault line this machine reported, as printed to stderr.
+    /// Kept so the reporting is assertable: the line itself goes to stderr,
+    /// which a test cannot read.
+    pub fn last_fault_line(&self) -> Option<&str> {
+        self.last_fault_line.as_deref()
+    }
+
     /// Read one byte at a LINEAR address, walking the guest's own page tables
     /// when paging is on. `None` means the address is not mapped.
     ///

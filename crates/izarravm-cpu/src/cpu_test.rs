@@ -1838,8 +1838,13 @@ fn pending_flags_offset() {
     // function-pointer `usize`s (16 bytes) and this pin moves from 4472 to 4488 -- measured, not
     // derived. Three pointers rather than one dispatching trampoline is deliberate: the emitted
     // slot stays one plain quadword load and one indirect call, with no per-call-out branch on
-    // 20 M doom executions.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
+    // 20 M doom executions. The fatal-fault diagnostics slice adds `fault_site: FaultSite` to
+    // `CpuGsw` (an `Option` around a `SegmentRegister`, a `u32` and a `bool`; 24 bytes), moving
+    // this pin from 4488 to 4512 -- measured, not derived. Declaring it at the struct tail does
+    // NOT keep the pin, because repr(Rust) reorders fields by alignment: source position buys
+    // nothing here, so it is written at the tail for readability (it is cold, written at most
+    // once per run) rather than for layout.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

@@ -927,6 +927,13 @@ pub struct Machine {
     // Monotonic fixed-time duration advanced while HLT had parked the CPU. The
     // GUI uses this to distinguish an idle guest from a slow active CPU.
     halted_ticks: u64,
+    // Fatal-fault reporting state. `reported_fault_sites` is the latch: a fatal
+    // error leaves the machine resumable and the GUI resumes it, so a
+    // re-faulting loop would otherwise print thousands of identical lines a
+    // second. `last_fault_line` is what makes the reporting testable, since the
+    // line itself goes to stderr.
+    reported_fault_sites: Vec<Option<(u16, u32)>>,
+    last_fault_line: Option<String>,
     cpu: CpuGsw,
     // Per-mode cache model. A data access warms its tag state and the resolved tier
     // drives the charged wait-state (its per-mode tier costs are calibrated). Reset
@@ -1303,6 +1310,8 @@ impl Machine {
             pending_mode: None,
             timeline: Timeline::new(active_mode),
             halted_ticks: 0,
+            reported_fault_sites: Vec::new(),
+            last_fault_line: None,
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
