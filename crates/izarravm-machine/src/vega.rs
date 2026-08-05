@@ -17,6 +17,27 @@ use crate::video_params::{
 };
 use crate::{ActiveDisplay, DISTIRA_MMIO_BASE, MARGO_LFB_BASE, MARGO_MMIO_BASE};
 
+/// Margo's legacy extension index/data pair. Both sit in the VGA port block but
+/// are undefined on plain VGA, the same slot real SuperVGA chips took for their
+/// own extensions; the VGA core leaves them unclaimed, so `Vega` decodes them
+/// before delegating.
+///
+/// KEEP IN SYNC with `roms/izbios-vbepm.inc`, which hardcodes these numbers and
+/// the register indices below into the protected-mode stub. `vega_margo_ext_test`
+/// executes the assembled stub against this decode, so a drift between the two
+/// fails a test rather than silently producing a stub that writes nowhere.
+pub(crate) const MARGO_EXT_INDEX: u16 = 0x03cb;
+pub(crate) const MARGO_EXT_DATA: u16 = 0x03cd;
+
+pub(crate) const MARGO_EXT_SEGSEL_LO: u8 = 0x00;
+pub(crate) const MARGO_EXT_SEGSEL_HI: u8 = 0x01;
+pub(crate) const MARGO_EXT_DISPX_LO: u8 = 0x02;
+pub(crate) const MARGO_EXT_DISPX_HI: u8 = 0x03;
+pub(crate) const MARGO_EXT_DISPY_LO: u8 = 0x04;
+pub(crate) const MARGO_EXT_DISPY_HI: u8 = 0x05;
+/// Write bit 0 to latch (DISPX, DISPY) into the display start.
+pub(crate) const MARGO_EXT_DISPCTL: u8 = 0x06;
+
 #[derive(Debug)]
 pub(crate) struct Vega {
     vga: Box<Vga>,
@@ -25,6 +46,16 @@ pub(crate) struct Vega {
     margo_active: bool,
     margo_linear: bool,
     margo_bank: u16,
+    // Margo's legacy extension register file, addressed through the index/data
+    // pair at MARGO_EXT_INDEX/MARGO_EXT_DATA. It exists so the VBE 2.0
+    // protected-mode stub can be real code: a client that far-calls SetWindow
+    // has no INT 10h available, so the bank has to be reachable over I/O. The
+    // registers ALIAS the state the INT 10h path already owns rather than
+    // shadowing it, so a guest that sets the mode through INT 10h and then banks
+    // through the stub cannot observe two different windows.
+    margo_ext_index: u8,
+    margo_ext_disp_x: u16,
+    margo_ext_disp_y: u16,
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
@@ -39,6 +70,9 @@ impl Default for Vega {
             margo_active: false,
             margo_linear: false,
             margo_bank: 0,
+            margo_ext_index: 0,
+            margo_ext_disp_x: 0,
+            margo_ext_disp_y: 0,
             // Izarra has no PCI BIOS yet, so Distira powers on with its fixed
             // BAR decoded. Guest drivers may still rewrite command and BAR0.
             distira_command: 0x0002,
@@ -110,6 +144,66 @@ impl Vega {
             }
             0x01 => Ok(self.margo_bank),
             _ => Err(0x014f),
+        }
+    }
+
+    /// Compute a display start from a pixel coordinate and latch it. Shared by
+    /// `INT 10h 4F07h` and the extension register file's `DISPCTL` so the two
+    /// entry points cannot drift; the pitch and depth come from the active Margo
+    /// mode, which is why the arithmetic lives on the device and not in the
+    /// protected-mode stub.
+    pub(crate) fn program_display_start_xy(&mut self, x: u16, y: u16) -> bool {
+        let display = self.margo.display();
+        if u32::from(x) >= display.width {
+            return false;
+        }
+        let depth = izarravm_video::bytes_per_pixel(display.bpp);
+        let start = u64::from(y)
+            .saturating_mul(u64::from(display.pitch))
+            .saturating_add(u64::from(x).saturating_mul(u64::from(depth)));
+        if start > u64::from(u32::MAX) {
+            return false;
+        }
+        self.program_display_start(start as u32)
+    }
+
+    fn read_margo_ext(&self) -> u8 {
+        match self.margo_ext_index {
+            MARGO_EXT_SEGSEL_LO => self.margo_bank as u8,
+            MARGO_EXT_SEGSEL_HI => (self.margo_bank >> 8) as u8,
+            MARGO_EXT_DISPX_LO => self.margo_ext_disp_x as u8,
+            MARGO_EXT_DISPX_HI => (self.margo_ext_disp_x >> 8) as u8,
+            MARGO_EXT_DISPY_LO => self.margo_ext_disp_y as u8,
+            MARGO_EXT_DISPY_HI => (self.margo_ext_disp_y >> 8) as u8,
+            // DISPCTL is a strobe: the latch it fires has no state to read back,
+            // and the pending flag belongs to the frame boundary, not the guest.
+            _ => 0,
+        }
+    }
+
+    fn write_margo_ext(&mut self, value: u8) {
+        let wide = |half: u16, byte: u8, high: bool| {
+            if high {
+                (half & 0x00ff) | (u16::from(byte) << 8)
+            } else {
+                (half & 0xff00) | u16::from(byte)
+            }
+        };
+        match self.margo_ext_index {
+            MARGO_EXT_SEGSEL_LO => self.margo_bank = wide(self.margo_bank, value, false),
+            MARGO_EXT_SEGSEL_HI => self.margo_bank = wide(self.margo_bank, value, true),
+            MARGO_EXT_DISPX_LO => self.margo_ext_disp_x = wide(self.margo_ext_disp_x, value, false),
+            MARGO_EXT_DISPX_HI => self.margo_ext_disp_x = wide(self.margo_ext_disp_x, value, true),
+            MARGO_EXT_DISPY_LO => self.margo_ext_disp_y = wide(self.margo_ext_disp_y, value, false),
+            MARGO_EXT_DISPY_HI => self.margo_ext_disp_y = wide(self.margo_ext_disp_y, value, true),
+            MARGO_EXT_DISPCTL if value & 0x01 != 0 => {
+                // The latch applies at the next frame either way, so bit 7 (the
+                // caller's "wait for retrace" request) needs nothing here: real
+                // hardware does not stall the CPU for it, and neither does this.
+                let (x, y) = (self.margo_ext_disp_x, self.margo_ext_disp_y);
+                let _ = self.program_display_start_xy(x, y);
+            }
+            _ => {}
         }
     }
 
@@ -245,6 +339,11 @@ impl Vega {
     }
 
     pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {
+        match port {
+            MARGO_EXT_INDEX => return Some(self.margo_ext_index),
+            MARGO_EXT_DATA => return Some(self.read_margo_ext()),
+            _ => {}
+        }
         self.vga.read_port(port)
     }
 
@@ -253,6 +352,17 @@ impl Vega {
     }
 
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
+        match port {
+            MARGO_EXT_INDEX => {
+                self.margo_ext_index = value;
+                return true;
+            }
+            MARGO_EXT_DATA => {
+                self.write_margo_ext(value);
+                return true;
+            }
+            _ => {}
+        }
         self.vga.write_port(port, value)
     }
 

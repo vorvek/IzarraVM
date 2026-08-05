@@ -42,6 +42,7 @@ impl Machine {
             lpt: &mut self.lpt,
             lpt2: &mut self.lpt2,
             device_ports: &mut self.device_ports,
+            open_bus: &mut self.open_bus,
             pic: &mut self.pic,
             pit: &mut self.pit,
             keyboard: &mut self.keyboard,
@@ -1722,10 +1723,13 @@ impl CpuBus for MachineBus<'_> {
             }
             return Ok(u32::from(value));
         }
-        self.device_ports
-            .read_port(dma_page_register_port(port))
-            .map(u32::from)
-            .ok_or(BusError::UnsupportedPort { port })
+        if let Some(value) = self.device_ports.read_port(dma_page_register_port(port)) {
+            return Ok(u32::from(value));
+        }
+        // Nothing decoded it. Float the data lines high, as an ISA bus with no
+        // card driving them does; see `OpenBusPorts` for why this is not a fault.
+        self.open_bus.note(port, false)?;
+        Ok(u32::MAX >> (32 - width.bytes() * 8))
     }
 
     fn write_io(
@@ -2022,7 +2026,10 @@ impl CpuBus for MachineBus<'_> {
         {
             return Ok(());
         }
-        Err(BusError::UnsupportedPort { port })
+        // Nothing decoded it, so the write goes nowhere -- which is what happens
+        // on real hardware and is why Prince of Persia's OUT to 0x7421 must not
+        // stop the machine. See `OpenBusPorts`.
+        self.open_bus.note(port, true)
     }
 
     fn interrupt_pending(&self) -> bool {
@@ -2219,6 +2226,107 @@ impl DevicePorts {
         };
         *slot = value;
         true
+    }
+}
+
+/// Unclaimed-port accounting and policy.
+///
+/// A real ISA machine floats an unclaimed read to all-ones and swallows an
+/// unclaimed write; nothing faults. This machine used to raise a fatal
+/// `CpuError` on both, which had two costs. It diverged from the hardware, and
+/// it was a WORSE diagnostic than it looked: the run died at the FIRST port a
+/// guest probed, so every later probe stayed invisible. A detection sweep across
+/// eight bases reported one. SciTech's UVCONFIG died reading 0xC000 and Prince
+/// of Persia died WRITING 0x7421, and neither told you what else it would have
+/// touched.
+///
+/// So the default is now open bus, and the diagnostic is the port set this
+/// accumulates across the whole run. `IZARRAVM_PORT_FATAL=<hex>[,<hex>]` puts
+/// named ports back on the fatal path when you want the fault-site machinery to
+/// name the exact CS:IP behind one specific probe.
+#[derive(Debug, Default)]
+pub struct OpenBusPorts {
+    reads: u64,
+    writes: u64,
+    ports: std::collections::BTreeSet<u16>,
+    fatal: std::collections::BTreeSet<u16>,
+    reported: u32,
+}
+
+/// Stop naming new ports on stderr past this many, so a guest that sweeps a
+/// whole range reports its shape without flooding the log. The port set keeps
+/// accumulating either way; only the running commentary stops.
+const OPEN_BUS_REPORT_LIMIT: u32 = 32;
+
+impl OpenBusPorts {
+    /// Parse `IZARRAVM_PORT_FATAL`: comma-separated hex ports that keep the old
+    /// fatal behaviour.
+    pub fn from_env() -> Self {
+        let mut ports = Self::default();
+        let Ok(spec) = std::env::var("IZARRAVM_PORT_FATAL") else {
+            return ports;
+        };
+        for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            match u16::from_str_radix(token.trim_start_matches("0x"), 16) {
+                Ok(port) => {
+                    ports.fatal.insert(port);
+                }
+                Err(_) => eprintln!("port-fatal: ignoring {token:?} (want hex)"),
+            }
+        }
+        if !ports.fatal.is_empty() {
+            eprintln!("port-fatal: {} port(s) kept fatal", ports.fatal.len());
+        }
+        ports
+    }
+
+    fn note(&mut self, port: u16, write: bool) -> Result<(), BusError> {
+        if self.fatal.contains(&port) {
+            return Err(BusError::UnsupportedPort { port });
+        }
+        if write {
+            self.writes += 1;
+        } else {
+            self.reads += 1;
+        }
+        if self.ports.insert(port) && self.reported < OPEN_BUS_REPORT_LIMIT {
+            self.reported += 1;
+            let direction = if write { "write to" } else { "read from" };
+            eprintln!("open-bus: {direction} unclaimed port {port:#06x}");
+            if self.reported == OPEN_BUS_REPORT_LIMIT {
+                eprintln!("open-bus: further ports counted but not named");
+            }
+        }
+        Ok(())
+    }
+
+    /// Put `ports` back on the fatal path, the programmatic twin of
+    /// `IZARRAVM_PORT_FATAL`. Tests of the fatal-fault diagnostics use this
+    /// rather than the environment, which is process-global and would race the
+    /// rest of the suite.
+    pub fn set_fatal(&mut self, ports: &[u16]) {
+        self.fatal.extend(ports.iter().copied());
+    }
+
+    /// Whether `port` floated this run. This is the observable that replaced the
+    /// old `Err(UnsupportedPort)`: it still separates "a device decoded it and
+    /// answered 0xFF" from "nothing decoded it", which a bare read of 0xFF
+    /// cannot.
+    pub fn floated(&self, port: u16) -> bool {
+        self.ports.contains(&port)
+    }
+
+    pub fn reads(&self) -> u64 {
+        self.reads
+    }
+
+    pub fn writes(&self) -> u64 {
+        self.writes
+    }
+
+    /// Every distinct port that floated this run, in ascending order.
+    pub fn ports(&self) -> impl ExactSizeIterator<Item = u16> + '_ {
+        self.ports.iter().copied()
     }
 }
 

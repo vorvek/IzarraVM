@@ -1013,14 +1013,26 @@ units_over_128=0 units_over_256=0 excl_units=0"
     );
 }
 
+/// The keystroke text of a parsed step, for tests that only care about keys.
+fn injected_text(step: &Injection) -> &str {
+    match &step.event {
+        InjectionEvent::Keys(text) => text,
+        InjectionEvent::Mouse(_) => panic!("expected a key step"),
+    }
+}
+
 #[test]
 fn key_injection_steps_parse_with_increasing_offsets() {
     let steps = parse_key_injections("100:a;200:\r").unwrap();
     assert_eq!(steps.len(), 2);
     assert_eq!(steps[0].at_cycles, 100);
-    assert_eq!(steps[0].text, "a");
+    assert_eq!(injected_text(&steps[0]), "a");
     assert_eq!(steps[1].at_cycles, 200);
-    assert_eq!(steps[1].text, "\r", "\r must expand to a carriage return");
+    assert_eq!(
+        injected_text(&steps[1]),
+        "\r",
+        "\\r must expand to a carriage return"
+    );
     // Empty segments are skipped rather than being an error, so a trailing ';'
     // from a shell loop does not fail the run.
     assert_eq!(parse_key_injections("100:a;").unwrap().len(), 1);
@@ -1061,4 +1073,143 @@ fn scancode_groups_cover_named_keys_and_plain_text() {
 
     assert!(text_to_scancode_groups("{nosuchkey}").is_err());
     assert!(text_to_scancode_groups("{shift").is_err(), "unclosed brace");
+}
+
+/// The action of a parsed mouse step.
+fn injected_action(step: &Injection) -> &MouseAction {
+    match &step.event {
+        InjectionEvent::Mouse(action) => action,
+        InjectionEvent::Keys(_) => panic!("expected a mouse step"),
+    }
+}
+
+#[test]
+fn mouse_injection_parses_every_action() {
+    let steps =
+        parse_mouse_injections("100:home;200:move:-40,15;300:down;400:up;500:click").unwrap();
+    assert_eq!(steps.len(), 5);
+    assert!(matches!(injected_action(&steps[0]), MouseAction::Home));
+    assert!(matches!(
+        injected_action(&steps[1]),
+        MouseAction::Move { dx: -40, dy: 15 }
+    ));
+    assert!(matches!(injected_action(&steps[2]), MouseAction::Button(1)));
+    assert!(matches!(injected_action(&steps[3]), MouseAction::Button(0)));
+    assert!(matches!(injected_action(&steps[4]), MouseAction::Click));
+}
+
+#[test]
+fn mouse_injection_rejects_malformed_actions() {
+    assert!(parse_mouse_injections("100:wiggle").is_err());
+    assert!(
+        parse_mouse_injections("100:move:12").is_err(),
+        "move needs both axes"
+    );
+    assert!(parse_mouse_injections("100:move:a,b").is_err());
+    // The offset rule is shared with --inject-keys and matters for the same
+    // reason: a schedule that is not strictly increasing is not replayable.
+    assert!(parse_mouse_injections("200:home;100:click").is_err());
+}
+
+#[test]
+fn mouse_move_splits_into_packets_a_real_mouse_could_send() {
+    // inject_mouse_relative CLAMPS to +-255 rather than splitting, matching the
+    // hardware, so a move longer than one packet has to be split here or the
+    // pointer silently stops short.
+    let mut buttons = 0;
+    let packets = mouse_action_packets(&MouseAction::Move { dx: 600, dy: -20 }, &mut buttons);
+    assert_eq!(packets.len(), 3);
+    assert_eq!(packets.iter().map(|p| p.dx).sum::<i32>(), 600);
+    assert_eq!(packets.iter().map(|p| p.dy).sum::<i32>(), -20);
+    for p in &packets {
+        assert!(
+            p.dx.abs() <= 255 && p.dy.abs() <= 255,
+            "packet {},{} exceeds the PS/2 range",
+            p.dx,
+            p.dy
+        );
+    }
+
+    // A move that fits stays one packet.
+    let packets = mouse_action_packets(&MouseAction::Move { dx: 10, dy: 10 }, &mut buttons);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(
+        (packets[0].dx, packets[0].dy, packets[0].buttons),
+        (10, 10, 0)
+    );
+}
+
+#[test]
+fn mouse_buttons_are_held_across_moves_so_a_drag_is_a_drag() {
+    let mut buttons = 0;
+    let down = mouse_action_packets(&MouseAction::Button(1), &mut buttons);
+    assert_eq!(down.len(), 1);
+    assert_eq!(down[0].buttons, 1);
+    assert_eq!(buttons, 1, "the press must persist past its own packet");
+    // Motion while held carries the button, which is what makes it a drag
+    // rather than a press that lets go the moment the pointer moves.
+    let packets = mouse_action_packets(&MouseAction::Move { dx: 5, dy: 5 }, &mut buttons);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(
+        (packets[0].dx, packets[0].dy, packets[0].buttons),
+        (5, 5, 1)
+    );
+    let up = mouse_action_packets(&MouseAction::Button(0), &mut buttons);
+    assert_eq!(up[0].buttons, 0);
+    assert_eq!(buttons, 0);
+}
+
+#[test]
+fn mouse_home_sends_enough_packets_to_reach_the_corner() {
+    // Homing works by overshooting into the driver's own clamp, so the packet
+    // count has to cover the tallest space a guest may set up. At TOKAMOUS's
+    // default vertical ratio one packet is 127 pixels; a game asking for a
+    // ratio four times coarser gets 31, and 12 packets must still clear 480.
+    let mut buttons = 0;
+    let packets = mouse_action_packets(&MouseAction::Home, &mut buttons);
+    let coarsest_pixels_per_packet = 255 * 8 / 64;
+    assert!(
+        packets.len() as i32 * coarsest_pixels_per_packet >= 480,
+        "{} packets cannot cross a 480-pixel screen",
+        packets.len()
+    );
+    for p in &packets {
+        assert!(p.dx < 0 && p.dy < 0, "homing must drive toward the origin");
+    }
+}
+
+#[test]
+fn merged_schedule_orders_keys_and_mouse_by_offset() {
+    // The two flags are parsed separately but must fire in one time order, or a
+    // click scheduled between two keystrokes would arrive after both.
+    let merged = merged_injections(Some("100:a;300:b"), Some("200:click")).unwrap();
+    let offsets: Vec<u64> = merged.iter().map(|s| s.at_cycles).collect();
+    assert_eq!(offsets, vec![100, 200, 300]);
+    assert!(matches!(merged[1].event, InjectionEvent::Mouse(_)));
+    // Each flag alone still works, and neither flag means no schedule at all.
+    assert_eq!(merged_injections(Some("100:a"), None).unwrap().len(), 1);
+    assert_eq!(merged_injections(None, Some("100:home")).unwrap().len(), 1);
+    assert!(merged_injections(None, None).unwrap().is_empty());
+}
+
+#[test]
+fn click_holds_the_button_long_enough_for_a_frame_poll() {
+    // Regression: press and release one packet apart is 5 ms, and Grand Prix 2's
+    // startup menu never saw it -- the pointer was verified to be on the button
+    // and the click still did nothing, because the menu samples the button once
+    // a frame. The hold has to outlast a frame at any plausible rate.
+    let mut buttons = 0;
+    let packets = mouse_action_packets(&MouseAction::Click, &mut buttons);
+    assert_eq!(packets.len(), 2, "a click is one press and one release");
+    assert_eq!(packets[0].buttons, 1);
+    assert_eq!(packets[1].buttons, 0);
+    let slowest_frame_ms = 1000 / 24;
+    assert!(
+        packets[0].dwell_ms > slowest_frame_ms,
+        "a {} ms hold can fall between two polls",
+        packets[0].dwell_ms
+    );
+    // Nothing repeats during the hold: a real PS/2 mouse sends one packet per
+    // state change, and the driver latches it until the release arrives.
+    assert_eq!(buttons, 0, "a click must not leave the button held");
 }

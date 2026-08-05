@@ -105,6 +105,35 @@ pub const KBD_RESIDENT_BIOS_SEG: u16 = 0xf000;
 pub const IZARRA_BIOS: &[u8] = include_bytes!("../roms/izarra-bios.bin");
 pub const IZARRA_BIOS_SOURCE: &str = include_str!("../roms/izarra-bios.asm");
 pub const IZARRA_BIOS_DEFS_SOURCE: &str = include_str!("../roms/izbios-defs.inc");
+pub const IZARRA_BIOS_VBEPM_SOURCE: &str = include_str!("../roms/izbios-vbepm.inc");
+
+/// ROM offset of the VBE 2.0 protected-mode interface block that INT 10h
+/// AX=4F0Ah hands out, and of the word holding its length. The BIOS is mapped
+/// at `ROM_SEG` (0xF000), so the guest-visible far pointer is F000:F100.
+///
+/// The length is READ FROM THE ROM rather than duplicated here: `izbios-vbepm.inc`
+/// emits `vbe_pm_block_end - vbe_pm_block` in the two bytes just below the block,
+/// so a routine growing inside the stub cannot leave a stale constant behind.
+pub const IZARRA_BIOS_VBE_PM_OFFSET: u16 = 0xf100;
+/// Real-mode segment the 64 KiB BIOS shadow occupies, matching `ROM_SEG` in
+/// izbios-defs.inc.
+pub const IZARRA_BIOS_SEG: u16 = 0xf000;
+const IZARRA_BIOS_VBE_PM_LEN_OFFSET: usize = 0xf0fe;
+
+/// Length in bytes of the 4F0Ah block, the value the function returns in CX.
+pub fn izarra_bios_vbe_pm_len() -> u16 {
+    u16::from_le_bytes([
+        IZARRA_BIOS[IZARRA_BIOS_VBE_PM_LEN_OFFSET],
+        IZARRA_BIOS[IZARRA_BIOS_VBE_PM_LEN_OFFSET + 1],
+    ])
+}
+
+/// ROM offset of the NUL-terminated OEM identification string, which
+/// `VbeInfoBlock.OemStringPtr` points at. It sits immediately past the PM block
+/// so that neither offset has to be written down twice.
+pub fn izarra_bios_vbe_oem_string_offset() -> u16 {
+    IZARRA_BIOS_VBE_PM_OFFSET + izarra_bios_vbe_pm_len()
+}
 
 /// The five code-page fonts (437, 850, 860, 863, 865), each at 8x16, 8x14, then
 /// 8x8. Code-page-major: block `cp` at `cp * 9728`, sizes at 0 / 4096 / 7680.

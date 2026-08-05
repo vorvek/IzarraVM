@@ -377,7 +377,7 @@ fn tomb_shaped_vbe_granularity_divisor_is_nonzero() {
 
 #[test]
 fn vbe_controller_info_fills_the_block() {
-    let rom = rom_with_code(&[
+    let rom = izbios_rom_with_code(&[
         0xb8, 0x00, 0x40, // mov ax, 4000h
         0x8e, 0xc0, // mov es, ax
         0xbf, 0x00, 0x00, // mov di, 0
@@ -398,9 +398,25 @@ fn vbe_controller_info_fills_the_block() {
     assert_eq!(machine.read_physical_u8(base + 3), b'A');
     assert_eq!(read_u16(&mut machine, base + 0x04), 0x0200); // VbeVersion
     assert_eq!(read_u16(&mut machine, base + 0x12), 64); // TotalMemory (64 KB units)
-    // OemStringPtr is absent. Capabilities bit 0 advertises 6/8-bit DAC switching.
-    assert_eq!(read_u32(&mut machine, base + 0x06), 0); // OemStringPtr
+    // Capabilities bit 0 advertises 6/8-bit DAC switching.
     assert_eq!(read_u32(&mut machine, base + 0x0a), 1); // Capabilities
+
+    // OemStringPtr points into the ROM at a real NUL-terminated string.
+    let oem = read_u32(&mut machine, base + 0x06);
+    assert_eq!(oem >> 16, u32::from(izarravm_firmware::IZARRA_BIOS_SEG));
+    let oem_linear = ((oem >> 16) << 4) + (oem & 0xffff);
+    let text: Vec<u8> = (0..26)
+        .map(|i| machine.read_physical_u8(oem_linear + i))
+        .collect();
+    assert_eq!(&text, b"Izarra 3000 VEGA/Margo VBE");
+    assert_eq!(machine.read_physical_u8(oem_linear + 26), 0);
+
+    // The three VBE 2.0 OEM pointers at 0x16/0x1A/0x1E stay null. They are only
+    // interesting because the mode list used to start at 0x14 and fill them with
+    // mode numbers, which a VBE2 client would have followed as far pointers.
+    assert_eq!(read_u32(&mut machine, base + 0x16), 0); // OemVendorNamePtr
+    assert_eq!(read_u32(&mut machine, base + 0x1a), 0); // OemProductNamePtr
+    assert_eq!(read_u32(&mut machine, base + 0x1e), 0); // OemProductRevPtr
 
     // VideoModePtr (seg:off) must point at the mode list. Modes are listed in
     // ascending numeric order, VESA-defined first and the OEM 320x240 mode
@@ -875,4 +891,345 @@ pub(super) fn hardware_cursor_composites_through_the_apertures() {
     // packed CURSOR_POS encoding routes through the aperture.
     assert_eq!(argb[5 * 640 + 3], 0x00ff_0000); // FG decoded as red at (3,5)
     assert_eq!(argb[0], 0x0000_0000); // the origin is outside the cursor: black surface
+}
+
+/// Emit the index-then-data pair a guest uses to reach one Margo extension
+/// register. The protected-mode stub in `izbios-vbepm.inc` emits exactly this
+/// sequence, so these tests exercise the decode the stub depends on.
+fn push_margo_ext(code: &mut Vec<u8>, index: u8, value: u8) {
+    code.extend_from_slice(&[0xba, 0xcb, 0x03]); // mov dx, 3CBh (index)
+    code.extend_from_slice(&[0xb0, index]); // mov al, index
+    code.push(0xee); // out dx, al
+    code.extend_from_slice(&[0xba, 0xcd, 0x03]); // mov dx, 3CDh (data)
+    code.extend_from_slice(&[0xb0, value]); // mov al, value
+    code.push(0xee); // out dx, al
+}
+
+#[test]
+fn margo_ext_segsel_and_int10_window_are_one_register() {
+    // Both directions plus the physical effect. A test that only echoed the
+    // register back would pass against a private shadow copy that never moved
+    // the window, which is the whole failure this aliasing exists to prevent.
+    let mut code = vec![
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xd8, // mov ds, ax
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x01, // mov bx, 0101h (banked, no LFB)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x00, 0xa0, // mov ax, A000h
+        0x8e, 0xc0, // mov es, ax
+    ];
+    // Bank 2 through the extension registers, then store through the window.
+    push_margo_ext(&mut code, 0x00, 2); // SEGSEL_LO
+    push_margo_ext(&mut code, 0x01, 0); // SEGSEL_HI
+    code.extend_from_slice(&[0x26, 0xc6, 0x06, 0x00, 0x00, 0xaa]); // mov byte [es:0], AAh
+    code.extend_from_slice(&[
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0xbb, 0x00, 0x01, // mov bx, 0100h (get window A)
+        0xcd, 0x10, // int 10h
+        0x89, 0x16, 0x02, 0x05, // mov [0502h], dx
+        // Now the other direction: INT 10h sets the bank, the port reads it.
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0x31, 0xdb, // xor bx, bx (set window A)
+        0xba, 0x01, 0x00, // mov dx, 1
+        0xcd, 0x10, // int 10h
+        0xba, 0xcb, 0x03, // mov dx, 3CBh
+        0xb0, 0x00, // mov al, 0 (SEGSEL_LO)
+        0xee, // out dx, al
+        0xba, 0xcd, 0x03, // mov dx, 3CDh
+        0xec, // in al, dx
+        0xa2, 0x00, 0x05, // mov [0500h], al
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        rom_with_code(&code),
+    )
+    .unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    // The port write moved the real window: bank 2 is VRAM offset 0x20000.
+    assert_eq!(machine.margo().read_vram_u8(0x2_0000), 0xaa);
+    // ... and INT 10h reports the bank the port set.
+    assert_eq!(read_u16(&mut machine, 0x0502), 2);
+    // ... and the port reports the bank INT 10h set.
+    assert_eq!(machine.read_physical_u8(0x0500), 1);
+}
+
+#[test]
+fn margo_ext_dispctl_latches_the_same_start_as_int10() {
+    let mut code = vec![
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h (LFB)
+        0xcd, 0x10, // int 10h
+    ];
+    push_margo_ext(&mut code, 0x02, 0x00); // DISPX_LO = 0
+    push_margo_ext(&mut code, 0x03, 0x00); // DISPX_HI
+    push_margo_ext(&mut code, 0x04, 0xe0); // DISPY_LO = 480
+    push_margo_ext(&mut code, 0x05, 0x01); // DISPY_HI
+    push_margo_ext(&mut code, 0x06, 0x01); // DISPCTL: latch
+    code.push(0xf4); // hlt
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        rom_with_code(&code),
+    )
+    .unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    // Identical expectations to vbe_display_start_latches_on_the_next_margo_frame:
+    // same latch, reached through the port pair instead of INT 10h.
+    assert_eq!(machine.margo().display().start, 0);
+    assert!(machine.margo().display_start_pending());
+    machine.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ / 60);
+    assert_eq!(machine.margo().display().start, 640 * 480);
+}
+
+#[test]
+fn margo_ext_dispctl_without_bit0_does_not_latch() {
+    // The strobe condition has to be a real gate. Without this the DISPCTL arm
+    // could latch on any write and both of the tests above would still pass.
+    let mut code = vec![
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 4101h
+        0xcd, 0x10, // int 10h
+    ];
+    push_margo_ext(&mut code, 0x04, 0xe0); // DISPY_LO = 480
+    push_margo_ext(&mut code, 0x05, 0x01); // DISPY_HI
+    push_margo_ext(&mut code, 0x06, 0x80); // DISPCTL: retrace bit only, no latch
+    code.push(0xf4); // hlt
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        rom_with_code(&code),
+    )
+    .unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert!(!machine.margo().display_start_pending());
+    machine.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ / 60);
+    assert_eq!(machine.margo().display().start, 0);
+}
+
+/// A test ROM that keeps the real BIOS image and only replaces its reset entry
+/// with `code`. `rom_with_code`'s all-zero image cannot be used by anything that
+/// reads a fixed ROM structure -- the VBE 2.0 protected-mode block lives at
+/// 0xF100 and would be 176 bytes of zeros there.
+fn izbios_rom_with_code(code: &[u8]) -> Vec<u8> {
+    let mut rom = izarravm_firmware::IZARRA_BIOS.to_vec();
+    assert!(
+        code.len() < 0xf000,
+        "test code would overwrite the ROM tail"
+    );
+    rom[..code.len()].copy_from_slice(code);
+    rom
+}
+
+#[test]
+fn vbe_pm_interface_returns_the_rom_block() {
+    let rom = izbios_rom_with_code(&[
+        0xb8, 0x0a, 0x4f, // mov ax, 4F0Ah
+        0x31, 0xdb, // xor bx, bx (subfunction 0)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+    assert_eq!(
+        machine.cpu().registers.segment(SegmentIndex::Es).selector,
+        izarravm_firmware::IZARRA_BIOS_SEG
+    );
+    assert_eq!(
+        machine.cpu().registers.edi() as u16,
+        izarravm_firmware::IZARRA_BIOS_VBE_PM_OFFSET
+    );
+    let len = izarravm_firmware::izarra_bios_vbe_pm_len();
+    assert_eq!(machine.cpu().registers.ecx() as u16, len);
+    // The block has to be a real object, not just a plausible pointer: four
+    // in-range header offsets, all distinct, all below the reported length.
+    let base = (u32::from(izarravm_firmware::IZARRA_BIOS_SEG) << 4)
+        + u32::from(izarravm_firmware::IZARRA_BIOS_VBE_PM_OFFSET);
+    let header: Vec<u16> = (0..4)
+        .map(|i| read_u16(&mut machine, base + i * 2))
+        .collect();
+    for &offset in &header {
+        assert!(offset >= 8 && offset < len, "header offset {offset:#x}");
+    }
+    assert_eq!(
+        header
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
+}
+
+#[test]
+fn vbe_pm_interface_rejects_unknown_subfunctions() {
+    let rom = izbios_rom_with_code(&[
+        0xb8, 0x0a, 0x4f, // mov ax, 4F0Ah
+        0xbb, 0x01, 0x00, // mov bx, 1 (undefined subfunction)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
+}
+
+#[test]
+fn vbe_pm_stub_drives_the_margo_registers() {
+    // The point of 4F0Ah is that the client CALLS the returned code instead of
+    // going back through INT 10h. So this test does exactly that: it asks for
+    // the block, far-calls SetWindow out of it, and then checks the real window
+    // moved by storing through A000h and reading Margo's VRAM. Nothing here is
+    // emulated on the host side -- if the assembled stub or the port decode is
+    // wrong, the byte lands in the wrong bank.
+    let rom = izbios_rom_with_code(&[
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xd8, // mov ds, ax
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x01, // mov bx, 0101h (banked, no LFB)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x0a, 0x4f, // mov ax, 4F0Ah
+        0x31, 0xdb, // xor bx, bx
+        0xcd, 0x10, // int 10h
+        // Build a far pointer to block + [block+0] (the SetWindow offset).
+        0x89, 0xfe, // mov si, di
+        0x26, 0x8b, 0x04, // mov ax, [es:si]
+        0x01, 0xf8, // add ax, di
+        0xa3, 0x10, 0x05, // mov [0510h], ax
+        0x8c, 0xc0, // mov ax, es
+        0xa3, 0x12, 0x05, // mov [0512h], ax
+        // BH=0 set, BL=0 window A, DX=bank 5.
+        0x31, 0xdb, // xor bx, bx
+        0xba, 0x05, 0x00, // mov dx, 5
+        0xff, 0x1e, 0x10, 0x05, // call far [0510h]
+        0xb8, 0x00, 0xa0, // mov ax, A000h
+        0x8e, 0xc0, // mov es, ax
+        0x26, 0xc6, 0x06, 0x00, 0x00, 0x5a, // mov byte [es:0], 5Ah
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(2_000_000).unwrap(),
+        StopReason::Halted
+    );
+    // Bank 5 is VRAM offset 5 * 64 KB. Bank 0 would put it at 0.
+    assert_eq!(machine.margo().read_vram_u8(5 * 0x1_0000), 0x5a);
+    assert_eq!(machine.margo().read_vram_u8(0), 0);
+}
+
+#[test]
+fn vbe_pm_stub_set_display_start_latches_through_the_ports() {
+    let rom = izbios_rom_with_code(&[
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xd8, // mov ds, ax
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 4101h (LFB)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x0a, 0x4f, // mov ax, 4F0Ah
+        0x31, 0xdb, // xor bx, bx
+        0xcd, 0x10, // int 10h
+        // SetDisplayStart is the SECOND header word, at block+2.
+        0x89, 0xfe, // mov si, di
+        0x26, 0x8b, 0x44, 0x02, // mov ax, [es:si+2]
+        0x01, 0xf8, // add ax, di
+        0xa3, 0x10, 0x05, // mov [0510h], ax
+        0x8c, 0xc0, // mov ax, es
+        0xa3, 0x12, 0x05, // mov [0512h], ax
+        0x31, 0xdb, // xor bx, bx (set now)
+        0x31, 0xc9, // xor cx, cx (pixel x = 0)
+        0xba, 0xe0, 0x01, // mov dx, 480 (scan line)
+        0xff, 0x1e, 0x10, 0x05, // call far [0510h]
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(2_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert!(machine.margo().display_start_pending());
+    machine.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ / 60);
+    assert_eq!(machine.margo().display().start, 640 * 480);
+}
+
+#[test]
+fn vbe_pm_stub_set_palette_writes_the_dac() {
+    // The third routine in the block, and the one an 8bpp game leans on hardest.
+    // Entry order is blue, green, red, pad -- the reverse of the DAC's own write
+    // order -- so a stub that loaded the three bytes sequentially would produce
+    // a plausible palette with red and blue swapped, which no smoke test would
+    // notice. Hence distinct values per channel.
+    let mut code = vec![
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xd8, // mov ds, ax
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 4101h (LFB, 8bpp)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x0a, 0x4f, // mov ax, 4F0Ah
+        0x31, 0xdb, // xor bx, bx
+        0xcd, 0x10, // int 10h
+        // SetPrimaryPalette is the THIRD header word, at block+4.
+        0x89, 0xfe, // mov si, di
+        0x26, 0x8b, 0x44, 0x04, // mov ax, [es:si+4]
+        0x01, 0xf8, // add ax, di
+        0xa3, 0x10, 0x05, // mov [0510h], ax
+        0x8c, 0xc0, // mov ax, es (still the ROM segment)
+        0xa3, 0x12, 0x05, // mov [0512h], ax
+    ];
+    // Two entries at 0000:2000, each blue, green, red, pad.
+    for (offset, byte) in [0x01u8, 0x02, 0x03, 0x00, 0x04, 0x05, 0x06, 0x00]
+        .into_iter()
+        .enumerate()
+    {
+        let addr = 0x2000u16 + offset as u16;
+        code.extend_from_slice(&[0xc6, 0x06, addr as u8, (addr >> 8) as u8, byte]);
+    }
+    code.extend_from_slice(&[
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xc0, // mov es, ax (ES:DI now points at the table)
+        0xbf, 0x00, 0x20, // mov di, 2000h
+        0x31, 0xdb, // xor bx, bx (BL=0: set now)
+        0xb9, 0x02, 0x00, // mov cx, 2 (two entries)
+        0xba, 0x05, 0x00, // mov dx, 5 (first DAC index)
+        0xff, 0x1e, 0x10, 0x05, // call far [0510h]
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izbios_rom_with_code(&code),
+    )
+    .unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(2_000_000).unwrap(),
+        StopReason::Halted
+    );
+    // dac_entry is [r, g, b], the table is blue-first: entry 0 is B=1 G=2 R=3.
+    assert_eq!(machine.video().dac_entry(5), [3, 2, 1]);
+    assert_eq!(machine.video().dac_entry(6), [6, 5, 4]);
+    // The entry below the start index keeps the BIOS default palette, where 4 is
+    // red at 6-bit full scale. This is the check that DX is honoured: a stub
+    // that ignored it and always began at index 0 would still pass both
+    // assertions above while quietly overwriting the low entries.
+    assert_eq!(machine.video().dac_entry(4), [42, 0, 0]);
 }
