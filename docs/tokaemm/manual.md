@@ -3,10 +3,10 @@
 
 # TOKAEMM.SYS: Memory Manager
 
-TOKAEMM.SYS is General Simulation Works's memory manager for the Izarra
-3000: one driver providing extended memory (XMS), expanded memory (EMS),
-and upper memory blocks (UMBs), in the tradition of EMM386.EXE on a real
-386-or-better PC. This is its manual.
+TOKAEMM.SYS is the General Simulation Works memory manager for the Izarra
+3000. A single driver provides extended memory (XMS), expanded memory (EMS),
+upper memory blocks (UMBs), and the high memory area (HMA), in the manner of
+EMM386.EXE on a 386-or-better personal computer.
 
 ## Loading it
 
@@ -32,27 +32,32 @@ memory-size argument.
 
 | Argument | Effect |
 | --- | --- |
-| *(none)*, or `RAM` | Provide XMS, UMBs, HMA, and a 3 MiB EMS 4.0 pool with its page frame at segment `E000`. This is the shipped default. |
+| *(none)*, or `RAM` | Provides XMS, UMBs, HMA, and EMS 4.0 with its page frame at segment `E000`. This is the shipped default. |
 | `NOEMS` | Keep XMS, UMBs, and HMA, but disable the EMS page frame and page pool. `INT 67h` still reports the manager as present with zero EMS pages. |
 
-On the Izarra 3000's 24 MiB memory map, Toka-DOS reports 640 KiB of
-conventional memory, a 384 KiB upper region, a 20 MiB extended-memory
-category, and a separate 3 MiB EMS partition at the top of RAM. The first
-2 MiB of allocatable extended memory is reserved for XMS blocks. VCPI owns the
-rest. Under `NOEMS`, the EMS category is zero and those 3 MiB are added to the
-VCPI pool, making the extended-memory category 23 MiB.
+### How extended memory is divided
 
-The Toka-DOS MEM command combines free XMS and VCPI memory in its existing
-`Extended (XMS)` row. MEM and TOKAEMM are shipped as a matched pair. An older
-MEM used with this driver is safe, but it may show free VCPI pages as used.
+It is not divided. XMS blocks, VCPI pages, and EMS pages are all drawn from a
+single pool as they are requested, and memory returned by one interface becomes
+available to the others. There is no fixed EMS partition and no reserved XMS
+area.
+
+On a 24 MiB Izarra 3000, MEM reports 640K of conventional memory, a 384K upper
+region, and a 23,552K extended category, of which 21,925K is free after Toka-DOS
+and its drivers have loaded.
+
+**Note:** Because expanded memory is taken from the same pool, MEM does not
+print a separate `Expanded (EMS)` line. The `Extended (XMS)` line is marked with
+an asterisk and a footnote stating that EMS is simulated as required. This is
+the same reporting convention MS-DOS 6.22 uses with EMM386.
 
 ## Resident footprint
 
-TOKAEMM keeps about 23 KiB of code, state, its task structure, and its monitor
-stack in conventional memory. On machines with enough extended RAM, its seven
-page-directory and page-table pages use 28 KiB of reserved space at the start
-of the XMS category instead. The standard 24 MiB boot therefore leaves about
-600 KiB of conventional memory free.
+TOKAEMM occupies 29K of conventional memory for its code, its state, its task
+structure, and its monitor stack. Its page directory and six page tables require
+a further 28K, which on a machine with sufficient extended memory is reserved
+above the 1 MB line rather than below it. The standard 24 MiB configuration
+therefore leaves 593K of conventional memory free.
 
 The 1 MiB profile has no extended pages to reserve, so TOKAEMM keeps a low
 page-table fallback there. Loading the whole manager into a UMB would not help
@@ -72,8 +77,10 @@ and drivers rely on:
 - **A20 control**: global and local enable/disable, with nesting, plus a
   query function (03h-07h).
 - **Extended memory blocks**: allocate, free, resize, lock/unlock, and query
-  free space (08h-0Fh), through a 32-handle allocator over the dedicated XMS
-  pool. A normal Izarra 3000 provides up to 2 MiB for these blocks.
+  free space (08h-0Fh), through a 32-handle allocator. Blocks are allocated in
+  1 KB units from the shared pool described above, so the largest block
+  obtainable depends on what EMS and VCPI have taken, and function 08h reports
+  the largest free block separately from the total.
 - **Block moves**: the `INT 21h`-style bulk-copy function (0Bh) that moves
   data between conventional and extended memory, or between two extended
   blocks.
@@ -91,17 +98,41 @@ upper memory window with real extended RAM mapped in over the address hole
 above the video BIOS, so loading high genuinely frees conventional memory
 rather than faking it.
 
-The full upper memory region from `A0000` through `FFFFF` is 384 KiB. Video
-memory and ROMs occupy part of it. With the default EMS frame at `E000`,
-TOKAEMM can allocate 96 KiB of UMB space from `C800` through `DFFF`. `NOEMS`
-removes the frame and raises the allocatable UMB space to 160 KiB, from
-`C800` through `EFFF`.
+### The upper memory area
+
+The 384K region from `A000` through `FFFF` is reserved for adapters and system
+ROM. TOKAEMM converts the part of it that no device occupies into upper memory
+blocks, backed by real extended memory mapped in over the address hole.
+
+| Address range | Size | Contents |
+| --- | --- | --- |
+| `A000-AFFF` | 64K | VGA graphics buffer |
+| `B000-B7FF` | 32K | Monochrome text and Hercules graphics |
+| `B800-BFFF` | 32K | VGA text buffer |
+| `C000-C7FF` | 32K | Video BIOS |
+| `C800-DFFF` | 96K | Upper memory blocks |
+| `E000-EFFF` | 64K | EMS page frame, or upper memory blocks under `NOEMS` |
+| `F000-FFFF` | 64K | System BIOS |
+
+With the default EMS page frame at `E000`, TOKAEMM allocates 96K of upper
+memory from `C800` through `DFFF`. `NOEMS` removes the frame and raises the
+allocatable upper memory to 160K, from `C800` through `EFFF`.
+
+**Note:** The 32K at `B000-B7FF` is not converted to upper memory, although
+nothing occupies it while the display is in a colour mode. The video adapter
+decodes that range whenever a program selects monochrome text (`INT 10h` mode
+07h, as `MODE MONO` does), switches the adapter to its Hercules personality, or
+programs the graphics controller for a 128K aperture. A block loaded there would
+be overwritten without warning the moment any of those occurred, and the display
+would then be driven from memory the program no longer owns. Memory managers on
+other machines offer this range through an `I=B000-B7FF` switch; TOKAEMM does
+not, because on the Izarra 3000 the same adapter serves both purposes.
 
 ## EMS 4.0 (the RAM keyword)
 
 `DEVICE=C:\DOS\TOKAEMM.SYS RAM` turns on Lotus/Intel/Microsoft Expanded Memory
 Specification 4.0 support: a 64 KB page frame at segment `E000`, mapped in
-16 KB pages backed by a separate 3 MiB partition at the top of RAM. Software
+16 KB pages drawn from the shared pool as programs request them. Software
 that checks for EMS the standard way (looking for the `EMMXXXX0` device name)
 finds it, and `INT 67h` answers the LIM 4.0 function set: status, frame address,
 page counts, allocate/map/free/save/restore, and version.
