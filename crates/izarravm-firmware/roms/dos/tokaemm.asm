@@ -3337,7 +3337,6 @@ resident_core_end:
 TABLES_OFF        equ ((resident_core_end - $$) + 4095) & ~4095
 IMAGE_END_OFF     equ TABLES_OFF + 0x7000 + 0xFF0
 tables            equ $$ + TABLES_OFF
-resident_image_end equ $$ + IMAGE_END_OFF
 
 ; Nothing zero-fills this region any more. DOS used to do it incidentally, by
 ; loading a file that was long enough to cover it; now the file ends at
@@ -3351,12 +3350,29 @@ resident_image_end equ $$ + IMAGE_END_OFF
 ; (`mov word [eax], resident_core_end - 1`). Without this assert NASM truncates
 ; that limit silently.
 ;
-; This also closes a 15-byte hole the old assert left. It measured the emitted
-; image and permitted offsets up to 0xFFFF, but the kernel rounds the reported
-; break with `(FP_OFF(r_endaddr) + 15)/16` in 16-bit unsigned arithmetic
-; (`hdr/portab.h:353`, built with COMPILER=owwin), which wraps to 0 at 0xFFF1
-; and under-reserves by a whole 64 KB. INIT now reports a paragraph-aligned
-; address, so the rounding cannot overflow at all.
-%if (resident_core_end - $$) >= 0x10000
-    %error "TOKAEMM resident core exceeds the 16-bit driver offset limit"
+; The bound is 0xFFF0, NOT 0xFFFF, and the difference is the whole point. The
+; HIGH path reports this offset raw (`mov cx, resident_core_end`), and the
+; kernel rounds a reported break with `(FP_OFF(r_endaddr) + 15)/16` in 16-bit
+; unsigned arithmetic (`hdr/portab.h:353`, built with COMPILER=owwin). At
+; 0xFFF1 that sum wraps to 0x0000, the division yields 0, and DOS reserves ONE
+; paragraph for the whole driver.
+;
+; The old assert measured the emitted image instead, which happened to force
+; the core under 0x8000 and kept the high path 32 KB away from the window.
+; Removing the reservation from the file removed that accidental bound, so the
+; window has to be excluded explicitly or this change would have MOVED the
+; defect onto the path every machine takes rather than closing it. Today's core
+; is paragraph-aligned only by accident of the tail layout, and the next queued
+; item rearranges exactly that tail.
+%if (resident_core_end - $$) > 0xFFF0
+    %error "TOKAEMM resident core is past 0xFFF0; the kernel's (offset+15)/16 break rounding wraps"
+%endif
+
+; The fallback break is reported as a paragraph count, `IMAGE_END_OFF >> 4`, and
+; a shift truncates in silence. It is exact only because 0x7000 + 0xFF0 is a
+; multiple of 16. Widening the slack to 0xFFF, which is the very edit the
+; comment on TABLES_OFF warns about, would under-reserve by 15 bytes with no
+; diagnostic anywhere.
+%if IMAGE_END_OFF % 16
+    %error "TOKAEMM IMAGE_END_OFF must be a whole number of paragraphs; INIT reports it shifted"
 %endif
