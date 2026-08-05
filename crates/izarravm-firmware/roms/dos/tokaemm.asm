@@ -3225,6 +3225,17 @@ tables:
     ; the image inside the 64 KB driver offset ceiling.
     times 0x7000 + 0xFF0 db 0
 resident_image_end:
+; The reservation above now has ZERO margin: worst-case slack (0xFF0) plus the
+; seven pages (0x7000) is exactly 0x7FF0. That worst case is 0xFF0 only because
+; `tables` is itself page-aligned, which makes (base + tables) mod 4096 equal
+; base mod 4096, and base is a paragraph, so the round-up is at most 4096-16.
+; Drop the `align 4096` above and the bound becomes 0xFFF, which overruns the
+; reservation by 15 bytes and corrupts whatever DOS put after the driver, on
+; load addresses that depend on the boot's CONFIG.SYS ordering. Assert the
+; alignment rather than trusting the directive to survive an edit.
+%if (tables - $$) % 4096
+    %error "TOKAEMM tables: must stay 4096-aligned; the reservation's slack budget assumes it"
+%endif
 %if ($ - $$) >= 0x10000
     %error "TOKAEMM resident image exceeds the 16-bit driver offset limit"
 %endif
