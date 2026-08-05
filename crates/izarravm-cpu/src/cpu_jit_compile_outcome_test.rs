@@ -226,6 +226,15 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
 //    seen from opposite ends, and neither is observable alone;
 //  * making `installs_rejected_span` return true for every arm makes
 //    `a_dirty_segment_row_does_not_claim_the_rejected_span_map` credit an exit it has no claim on.
+//
+// Mutation record for the segment-write entry counter. All three fail
+// `a_segment_write_block_is_counted_at_the_dispatcher_entry`, and the last two are why that test
+// carries three cases rather than two:
+//
+//  * zeroing the increment in `run.rs` leaves the counter flat;
+//  * dropping `!self.dynamic_successor` from `is_segment_write_block` counts the RET-terminated
+//    block, which publishes `[None, None]` for an entirely different reason;
+//  * dropping `self.successors == [None, None]` counts nothing and misses the real one.
 
 /// Compile `code` with the census on and return the single barrier row's suffix.
 ///
@@ -401,6 +410,98 @@ fn a_dirty_segment_stop_is_censused_and_prices_its_own_removal() {
         "with the dirty rule disabled the scan walks through every later DS reader; with it \
          applied this reads 0, which is the counterfactual this number stands against"
     );
+}
+
+/// A block that overwrites a segment register is counted at the dispatcher entry.
+///
+/// `segment_writes != 0` makes `compile` publish `successors = [None, None]`, which makes
+/// `chain_eligible` false and clamps the quota to 1: the block can never chain, so every entry
+/// runs it alone and returns through the full prologue and epilogue. That is the cost the
+/// dirty-stop census cannot see, because it applies to EVERY block containing a segment write and
+/// not only to the ones the dirty rule stopped.
+///
+/// Driven through `try_run_direct_block_for_test` and NOT `invoke_native_entry`: the latter jumps
+/// straight to the block's entry pointer and never reaches `run_direct_block`'s exit accounting,
+/// so it would leave the counter at zero while the block ran perfectly.
+///
+/// The control is what makes this non-vacuous. It differs by ONE byte pair, `mov ds,ax` against a
+/// third increment, so nothing but the segment write can explain the difference.
+#[test]
+fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
+    // inc eax / inc ecx / mov ds,ax / <barrier>, against inc eax / inc ecx / inc edx / <barrier>.
+    let writes = [0x40, 0x41, 0x8e, 0xd8, DIRECT_BARRIER, 0x43, 0x44];
+    let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x43, 0x44, 0x45];
+    // The OTHER arm that publishes `[None, None]`: a terminal whose successor is dynamic. It is
+    // what makes the `!dynamic_successor` conjunct load-bearing, because a predicate written as
+    // `successors == [None, None]` alone would count this block and be wrong.
+    let ret = [0x40, 0x41, 0x42, 0xc3, 0x43, 0x44, 0x45];
+
+    for (label, code, offsets, expected) in [
+        (
+            "segment write",
+            writes.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            1,
+        ),
+        (
+            "fallthrough control",
+            control.as_slice(),
+            [0, 1, 2, 3, 4, 5].as_slice(),
+            0,
+        ),
+        (
+            "dynamic terminal control",
+            ret.as_slice(),
+            [0, 1, 2, 3, 4, 5].as_slice(),
+            0,
+        ),
+    ] {
+        let (mut cpu, mut bus) = fixture(code);
+        cpu.registers.set_esp(0x1000);
+        let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        // `install` refuses a key that is not already `Seen`, and `probe` is what registers it.
+        let key = jit::direct::key_for(&cpu, ENTRY, true).expect("entry key");
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        let id = cpu
+            .jit_direct
+            .install(&compilation)
+            .expect("fixture block installs");
+        let block = cpu.jit_direct.block(id).expect("live block");
+        assert_eq!(
+            block.is_segment_write_block(),
+            expected == 1,
+            "{label}: the derived predicate disagrees with the fixture"
+        );
+
+        cpu.registers.eip = ENTRY;
+        let ran = cpu
+            .try_run_direct_block_for_test(&mut bus, block)
+            .expect("fixture block runs");
+        assert!(ran, "{label}: the block must actually be entered");
+
+        let stalls = cpu.direct_stall_snapshot();
+        assert_eq!(
+            stalls.segment_write_block_head_entries, expected,
+            "{label}: segment-write head entries"
+        );
+        if expected == 1 {
+            assert!(
+                stalls.segment_write_block_head_insns >= 3,
+                "{label}: the instruction lane must carry the block's retired count, got {}",
+                stalls.segment_write_block_head_insns
+            );
+        } else {
+            assert_eq!(
+                stalls.segment_write_block_head_insns, 0,
+                "{label}: control must not deposit into the instruction lane"
+            );
+        }
+    }
 }
 
 /// A dirty-segment row must NOT claim its entry linear in the rejected-span map.

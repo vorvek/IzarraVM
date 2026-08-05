@@ -2101,6 +2101,14 @@ impl CpuGsw {
         let sixteen_bit = u64::from(block.span().key.mode_key & 1 == 0);
         self.perf.jit_direct_entries_sixteen_bit += sixteen_bit;
         self.perf.jit_direct_insns_sixteen_bit += sixteen_bit * instructions;
+        // Same shape and the same reasoning as the pair above: a widened predicate and two
+        // unconditional adds, because this is the hottest path in the backend. Lands in
+        // `DirectStallTally` rather than `PerfCounters`, which sits ahead of `pending_flags` in
+        // `CpuGsw` at an offset emitted code bakes.
+        self.jit_direct.note_segment_write_block_entry(
+            u64::from(block.is_segment_write_block()),
+            instructions,
+        );
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
         match exit.unresolved_reason {
             jit::direct::UnresolvedReason::None => {}

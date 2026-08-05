@@ -1320,6 +1320,16 @@ pub struct DirectStallSnapshot {
     pub callout_executed: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.
     pub reject_callout_privileged: u64,
+    /// Dispatcher entries whose HEAD block overwrites a segment register and is therefore barred
+    /// from publishing successors, plus the instructions they retired. Such a block can never
+    /// chain, so its quota is clamped to 1.
+    ///
+    /// Read `insns / entries` against the global `jit_direct_insns / jit_direct_entries`: that
+    /// ratio is what says whether these blocks are short because they cannot chain. The entry
+    /// count itself is an upper bound on removable entries and does NOT see chained arrivals, for
+    /// the reasons on `DirectStallTally`.
+    pub segment_write_block_head_entries: u64,
+    pub segment_write_block_head_insns: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

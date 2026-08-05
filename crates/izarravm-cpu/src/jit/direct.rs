@@ -442,6 +442,31 @@ impl CompiledBlock {
         self.span
     }
 
+    /// Whether this block was barred from publishing successors because it overwrites a segment
+    /// register.
+    ///
+    /// DERIVED, not stored, and that is a size decision rather than a stylistic one.
+    /// `compiled_block_stays_small_enough_to_copy_per_entry` pins `CompiledBlock` at 120 bytes
+    /// and the budget is exactly full, so a `bool` field would round the struct to 128 and cost
+    /// eight bytes on every per-entry memcpy. `CallOutSlotCounts` is bit-packed for the same
+    /// reason.
+    ///
+    /// The equivalence is exact rather than approximate. Only TWO arms of `compile`'s `successors`
+    /// match produce `[None, None]`: the segment-write arm, which is reached only when
+    /// `dynamic_successor` was already forced false by its own `!segment_write_block` term; and
+    /// the Ret/JmpMem/CallReg/CallMem arm, which is reached only when `segment_write_block` is
+    /// false and therefore sets `dynamic_successor` TRUE from the identical kind list. So the
+    /// second conjunct is what separates them, and nothing else in the function can produce the
+    /// pair.
+    ///
+    /// What this costs the block is not one extra boundary. `run_direct_block` computes
+    /// `chain_eligible` from `has_linked_successor`, so a block with no successors can never
+    /// chain and its quota is clamped to 1: every entry runs this block alone and returns through
+    /// the full prologue and epilogue.
+    pub(crate) fn is_segment_write_block(&self) -> bool {
+        self.successors == [None, None] && !self.dynamic_successor
+    }
+
     pub(crate) fn entry_ptr(&self) -> *const u8 {
         self.entry as *const u8
     }

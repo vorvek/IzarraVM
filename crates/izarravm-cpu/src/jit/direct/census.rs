@@ -352,6 +352,27 @@ pub(crate) struct DirectStallTally {
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
     pub reject_callout_privileged: u64,
+    /// Dispatcher entries whose HEAD block was barred from publishing successors because it
+    /// overwrites a segment register, and the instructions those entries retired.
+    ///
+    /// The name says `head` because that is the honest limit of what this can see, and the limit
+    /// matters more than the number. `run.rs` increments the entry counter once per DISPATCHER
+    /// ENTRY, attributed to the block the dispatcher entered. Inbound links to a segment-write
+    /// block are deliberately preserved (only its OUTBOUND edges are barred), so a segment-write
+    /// block reached as the tail of a chain increments nothing here. The undercount is exactly the
+    /// share of them that have an inbound link, which is not known.
+    ///
+    /// It is therefore an UPPER BOUND on removable entries read one way and an undercount of
+    /// affected blocks read another, and it must be reported against `jit_direct_entries` and
+    /// `jit_direct_chain_quota_entries` rather than alone. What lifting the bar would actually
+    /// remove is the SUCCESSOR's separate entry, which is counted under the successor's own
+    /// identity and is invisible from here; and some of the removed seams would reappear as
+    /// budget-quota exhaustion, because a longer chain drains `budget_quota` faster.
+    ///
+    /// The instruction lane is the useful half: `insns / entries` for this population against the
+    /// global figure says directly whether these blocks are short because they cannot chain.
+    pub segment_write_block_head_entries: u64,
+    pub segment_write_block_head_insns: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -948,6 +969,8 @@ impl crate::jit::JitState {
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
             callout_executed: self.stalls.callout_executed,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
+            segment_write_block_head_entries: self.stalls.segment_write_block_head_entries,
+            segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
         }
     }
 
@@ -995,6 +1018,15 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_reject_callout_privileged(&mut self) {
         self.stalls.reject_callout_privileged += 1;
+    }
+
+    /// BRANCHLESS, and on purpose: this sits beside `jit_direct_entries` on the hottest path in
+    /// the backend, next to the sixteen-bit split that is written the same way for the same
+    /// reason. The caller passes the predicate already widened, so both lanes are an unconditional
+    /// add and neither can mispredict.
+    pub(crate) fn note_segment_write_block_entry(&mut self, is_segment_write: u64, insns: u64) {
+        self.stalls.segment_write_block_head_entries += is_segment_write;
+        self.stalls.segment_write_block_head_insns += is_segment_write * insns;
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
