@@ -622,17 +622,64 @@ arena_release:
 ; free, both in GRANULES and both already rounded down to that type's boundary,
 ; so the answer is what arena_alloc could actually satisfy (386MAX QRY_PGCNT).
 ;
-; The walk itself lives in the ring-0 monitor as arena_query32 -- ONE
-; implementation, shared with the VCPI server's DE03, reached the same way the
-; XMS block move reaches the monitor's memcpy. Preserves BX/CX/SI/DI.
+; Served from the per-type cache RIGHT HERE on a hit. arena_gen and the cache
+; (arena_qc_gen/arena_qc_largest/arena_qc_total) are plain cs:-relative words,
+; exactly as readable from V86 as from the monitor -- same bytes, cs: here and
+; fs: there, the same trick the arena_bmp bitmap itself already relies on. A
+; hit costs a handful of compares and never enters the monitor: no int 0xC0,
+; so no round trip through the IDT for the case D1's memo exists to make
+; cheap. Only a MISS falls into the ring-0 walk, arena_query32, reached the
+; same way the XMS block move reaches the monitor's memcpy.
+;
+; No cli guard: unlike XMS's far-called entry points (xf_query_free's cli
+; guards against a caller whose own IF is still set when it calls in), this is
+; reached through INT 67h, and INT 67h delivery already clears VIF before any
+; handler runs -- including this one. No guest ISR can interleave with an EMS
+; call the way one could interleave with a far call, so there is nothing here
+; for cli to protect against. Preserves BX/CX/SI/DI.
 arena_query:
-    mov [cs:arena_q_type], bl
+    push bx
+    push si
+    push di
+    movzx si, bl                  ; type (0/2/4); also the byte offset into
+                                   ; arena_qc_largest/total (2 bytes/entry,
+                                   ; index = type/2, so 2*index == type). SI,
+                                   ; not CX: 16-bit addressing only takes
+                                   ; BX/BP/SI/DI as a base register. DI, not
+                                   ; BX, for the second offset below: BL is
+                                   ; still needed UNTOUCHED on a miss (it is
+                                   ; the monitor cookie's type argument), and
+                                   ; an earlier version of this routine
+                                   ; clobbered it here first -- BX doubles as
+                                   ; BL, so "type*2" silently became the type
+                                   ; byte arena_q_type was set to, corrupting
+                                   ; every VCPI/EMS miss into an out-of-range
+                                   ; alloc_lim read.
+    mov di, si
+    add di, di                    ; type*2: the byte offset into arena_qc_gen
+                                   ; (4 bytes/entry, index = type/2, so
+                                   ; 4*index == type*2)
+    mov ax, [cs:arena_gen]
+    mov dx, [cs:arena_gen+2]
+    cmp ax, [cs:arena_qc_gen + di]
+    jne .miss
+    cmp dx, [cs:arena_qc_gen + di + 2]
+    jne .miss
+    mov ax, [cs:arena_qc_largest + si]
+    mov dx, [cs:arena_qc_total + si]
+    jmp .out
+.miss:
+    mov [cs:arena_q_type], bl     ; bl is untouched since entry: the fix above
     push dx
     mov dx, 0x5154                ; 'TQ' monitor-call cookie
     int 0xC0
     pop dx
     mov ax, [cs:arena_q_largest]
     mov dx, [cs:arena_q_total]
+.out:
+    pop di
+    pop si
+    pop bx
     ret
 
 ; Resolve a move endpoint. in: BX=handle, [cs:xms_rv_off]=32-bit offset,
