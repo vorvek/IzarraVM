@@ -59,11 +59,29 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // `OperandSize` either, so every width decision downstream comes from the kind.
     //
     // The byte set is CLOSED over its shared classifier arms on purpose. `0x04..=0x3c` step 8 are
-    // all `form == 4` of the ALU group and reach one arm; `0xf6` is the byte half of the
+    // all `form == 4` of the ALU group and reach one arm; `0x00..=0x38` and `0x02..=0x3a` step 8
+    // are `form == 0` and `form == 2` and reach one arm each; `0xf6` is the byte half of the
     // `0xf6 | 0xf7` group arm, whose every Dword-producing path is keyed `opcode == 0xf7`.
     // Admitting one member of a shared arm while refusing its sibling would be arbitrary, and
     // what makes 16-bit blocks link is a CONTIGUOUS admissible region rather than any single
     // opcode.
+    //
+    // Forms 0 and 2 joined the set on the 16-bit campaign's first slice, and the reason they were
+    // not here before is that the 32-bit fixtures do not reach them: a barrier census over
+    // `.bench/bench16_c` at 586 with `IZARRAVM_JIT16=1` ranks byte-encoded opcodes at 14.73% of
+    // all 347,134,532 block-stopping hits, `0xfe` at 3.39% and `0x38` at 2.69% heading them.
+    // Both forms satisfy the structural rule above rather than bending it: form 0 produces
+    // `AluRegByte`, which has no width field at all, or `AluMemDest` carrying a literal
+    // `MemoryWidth::Byte`; form 2 produces `AluRegByte` for the register shape and refuses the
+    // memory shape inside its arm, so the `None` it already returns is what a 16-bit
+    // `0x0a /0 mem` keeps getting. `0xa0`, `0xa2` and `0xfe` are the same case one arm at a time
+    // (`Load`/`Store`/`IncDecReg`, every one a literal `MemoryWidth::Byte`).
+    //
+    // `0xa1` and `0xa3` sit between them in the opcode map and are the counterexample worth
+    // naming, because proximity is exactly how they would get swept in: both hard-code
+    // `MemoryWidth::Dword`, so admitting either at Word size moves four bytes where the guest
+    // moves two. They stay refused, as does `0xd0` -- not for a width reason, but because no
+    // classify arm exists for it, which makes listing it a no-op that reads like a lowering.
     //
     // `0x8c` is the one non-byte member and it is here for the same structural reason rather than
     // as an exception: its interpreter arm writes `OperandSize::Word` unconditionally, so the
@@ -137,7 +155,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
-            0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
+            0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38
+                | 0x02 | 0x0a | 0x12 | 0x1a | 0x22 | 0x2a | 0x32 | 0x3a
+                | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
                 | 0x40..=0x4f
                 | 0x50..=0x5f
                 | 0x68
@@ -153,6 +173,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8c
                 | 0x98
                 | 0x99
+                | 0xa0
+                | 0xa2
                 | 0xa8
                 | 0xb0..=0xb7
                 | 0xc1
@@ -169,6 +191,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xeb
                 | 0x0f80..=0x0f8f
                 | 0xf6
+                | 0xfe
                 | 0xff
         )
     {
