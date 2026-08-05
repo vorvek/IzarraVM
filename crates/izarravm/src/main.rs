@@ -852,12 +852,25 @@ fn non_cycle_stop(reason: &StopReason) -> Option<StopReason> {
     }
 }
 
+/// Which halves of a key's make/break pair a `{name}` token emits.
+enum KeyEdge {
+    /// Make then break: a tap, the default and what a bare `{name}` means.
+    Tap,
+    /// Make only, leaving the key down until a `Release` arrives.
+    Press,
+    /// Break only.
+    Release,
+}
+
 /// Expand injection text into one scancode group per keypress. Plain characters
 /// go through `ascii_to_set1`; `{name}` names a key that has no ASCII spelling.
 ///
 /// The modifiers are the reason this exists. Prince of Persia advances its title
 /// and cutscene screens on SHIFT, which is a bare make/break pair with no
 /// character behind it, so an ASCII-only path cannot express it at all.
+///
+/// `{+name}` presses without releasing and `{-name}` releases, which is how a
+/// schedule holds a key down across the steps between them.
 fn text_to_scancode_groups(text: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     let mut groups = Vec::new();
     let mut rest = text;
@@ -866,7 +879,20 @@ fn text_to_scancode_groups(text: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
             let (name, after) = tail
                 .split_once('}')
                 .ok_or_else(|| format!("--inject-keys has an unclosed {{ in {text:?}"))?;
-            // Make and break for one key, matching `ascii_to_set1`'s shape.
+            // A leading + or - splits the make and break apart so a key can be
+            // HELD across the steps between them. `{right}` is a tap and cannot
+            // express "keep running": the guest tracks key-down state from the
+            // scancode stream, so holding means a make with no break until the
+            // release is scheduled. Prince of Persia is the case in hand --
+            // `{shift}` to start the game, then `{+right}` so the prince runs
+            // instead of standing in the first room.
+            let (name, edge) = match name.strip_prefix('+') {
+                Some(held) => (held, KeyEdge::Press),
+                None => match name.strip_prefix('-') {
+                    Some(released) => (released, KeyEdge::Release),
+                    None => (name, KeyEdge::Tap),
+                },
+            };
             let make: u8 = match name.to_ascii_lowercase().as_str() {
                 "shift" => 0x2a,
                 "ctrl" => 0x1d,
@@ -880,7 +906,11 @@ fn text_to_scancode_groups(text: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
                 "right" => 0x4d,
                 other => return Err(format!("--inject-keys: unknown key {{{other}}}").into()),
             };
-            groups.push(vec![make, make | 0x80]);
+            groups.push(match edge {
+                KeyEdge::Tap => vec![make, make | 0x80],
+                KeyEdge::Press => vec![make],
+                KeyEdge::Release => vec![make | 0x80],
+            });
             rest = after;
         } else {
             let ch = rest.chars().next().expect("rest is non-empty");
