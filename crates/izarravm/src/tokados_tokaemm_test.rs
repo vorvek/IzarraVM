@@ -1731,3 +1731,58 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
          emmprobe.asm before believing the 0xE4 story.\n{text}"
     );
 }
+
+/// EMS still owns a static 3 MB partition (tokaemm.asm EMS_MAX_PAGES = 192
+/// pages) and ef_alloc requires a handle's pages to land in one contiguous
+/// run (ems_find_run). This fixture drains that partition with 32 equal-size
+/// handles, frees every other one to leave 16 isolated 6-page (96 KB) holes,
+/// and proves -- via a real INT 67h probe, not arithmetic -- that no run
+/// bigger than a hole survived. It then asks for 8 pages (128 KB): today no
+/// single free run is that big, so EMS must refuse even though 96 pages (12x
+/// the request) are free in total. Task 6 replaces the static partition with
+/// non-contiguous per-page backing off the shared arena, at which point the
+/// same request must succeed by scattering its 8 logical pages across the
+/// holes -- proved here by writing and reading back a per-page signature
+/// through the frame after mapping each one.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_ems_allocates_from_a_fragmented_shared_arena() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSFRAG\r\n".to_vec();
+
+    let profile = MachineProfile::gsw_386(24, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-emsfrag",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "EMSFRAG.COM".to_string(),
+                izarravm_firmware::emsfrag_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "fragmented-EMS allocation failed (stop={stop:?}); 0xEA is the \
+         defect this fixture exists to catch (EMS refused 8 pages while 96 \
+         were free, none of them contiguous), 0xE1-0xE9 name a setup or \
+         premise failure in the fixture itself (read emsfrag.asm), and \
+         0xEB-0xED mean EMS granted the pages but mapped one of them wrong \
+         -- read the failure-label block in emsfrag.asm before trusting any \
+         particular story.\n{text}"
+    );
+}
