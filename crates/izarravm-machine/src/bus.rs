@@ -78,6 +78,7 @@ impl Machine {
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             io_touched: &mut self.io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
+            opl_probe: &mut self.opl_probe,
             device_wrote_memory: &mut self.device_wrote_memory,
             pending_device_memory_write_range: &mut self.pending_device_memory_write_range,
             direct_map_changed: &mut self.direct_map_changed,
@@ -1517,7 +1518,11 @@ impl CpuBus for MachineBus<'_> {
                 *self.isa_io_clocks += isa_io_clocks(self.active_mode);
             }
             // The chip drives only the status byte on reads; data ports read open-bus.
-            return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
+            let value = self.opl.read_port(resolved).unwrap_or(0xff);
+            // Diagnostic only; records the guest's own port, not the resolved one.
+            self.opl_probe
+                .record_read(port, value, self.core_clocks_so_far);
+            return Ok(u32::from(value));
         }
         // DSP status reads are intentionally exact. SB reset/probe code polls
         // 0x22E for the reset ACK byte, so keeping that loop inside one
@@ -1735,7 +1740,19 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if let Some(opl_port) = opl_port(port) {
-            self.opl.write_port(opl_port, value as u8);
+            let byte = value as u8;
+            // Classify BEFORE the write: on a data port the destination register
+            // is whatever the matching address port latched earlier, and the
+            // write itself does not change that latch. Diagnostic only.
+            let bank = u8::from(matches!(opl_port, 0x038a | 0x038b));
+            let register = match opl_port {
+                0x0389 | 0x038b => Some(self.opl.selected_register(usize::from(bank))),
+                // An address-latch write addresses no register itself.
+                _ => None,
+            };
+            self.opl_probe
+                .record_write(port, bank, register, byte, self.core_clocks_so_far);
+            self.opl.write_port(opl_port, byte);
             return Ok(());
         }
         if matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {

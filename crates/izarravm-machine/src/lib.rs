@@ -722,6 +722,150 @@ fn fault_trace_enabled() -> bool {
     std::env::var_os("IZARRAVM_FAULT_TRACE").is_some()
 }
 
+/// Host-side tally of guest OPL (AdLib/OPL3) activity. Diagnostic ONLY: nothing
+/// here is read by an emulation decision, nothing here is canonical state, and
+/// the counters live on the bus rather than on `OplChip` because that chip
+/// derives `PartialEq`/`Eq` for state comparison.
+///
+/// It exists to answer one question that no existing counter can: when music is
+/// silent, is the guest failing to STRIKE notes, or striking them and losing
+/// them downstream? `key_on_writes` splits those two cases directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OplDiagnostics {
+    /// Writes to a data port (base+1 / base+3), whatever the register.
+    pub register_writes: u64,
+    /// Status-byte reads (base+0 / base+2).
+    pub status_reads: u64,
+    /// Status reads that returned a SET timer-overflow flag (bit 6 or bit 5).
+    /// A music driver paced by OPL timers advances its score on exactly these,
+    /// so a run with `status_reads` high and this at zero is a driver polling a
+    /// timer that never fires.
+    pub status_reads_timer_expired: u64,
+    /// Writes to primary register 0x04, the timer control/reset register.
+    pub timer_control_writes: u64,
+    /// Writes to 0xB0-0xB8 (either bank) with bit 5 SET: a voice being keyed on,
+    /// which is the closest thing to "a note was played" the chip has.
+    pub key_on_writes: u64,
+    /// The same registers with bit 5 CLEAR: a voice released.
+    pub key_off_writes: u64,
+}
+
+/// One recorded guest OPL access, for `IZARRAVM_OPL_TRACE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OplTraceEntry {
+    pub write: bool,
+    /// The port the GUEST used, before Sound Blaster alias resolution, so a
+    /// trace shows whether the game drove 0x388 or the SB mirror at 0x220.
+    pub port: u16,
+    /// Register bank, 0 or 1.
+    pub bank: u8,
+    /// Destination register for a data write, or `NO_REGISTER` for an address
+    /// latch write and for a status read.
+    pub register: u16,
+    /// Byte written, or the status byte returned on a read.
+    pub value: u8,
+    /// CPU core clocks elapsed when the access happened, which is what makes
+    /// the 80 us OPL timer window legible in the trace.
+    pub core_clocks: u64,
+}
+
+impl OplTraceEntry {
+    /// `register` value meaning "this access did not address a register".
+    pub const NO_REGISTER: u16 = 0x100;
+}
+
+/// Counters plus an optional capped access trace. `IZARRAVM_OPL_TRACE=<n>`
+/// records the first `n` accesses; unset records none and costs one `is_empty`
+/// style capacity check per access.
+///
+/// The trace exists because the counters can say detection FAILED but not WHY:
+/// AdLib detect turns on whether a status read returns clear before the timer
+/// window and set after it, and only the ordered sequence of writes, reads and
+/// elapsed clocks shows which half went wrong.
+#[derive(Debug, Default)]
+pub struct OplProbe {
+    counters: OplDiagnostics,
+    trace: Vec<OplTraceEntry>,
+    cap: usize,
+}
+
+impl OplProbe {
+    fn from_env() -> Self {
+        let cap = std::env::var("IZARRAVM_OPL_TRACE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        Self {
+            counters: OplDiagnostics::default(),
+            trace: Vec::new(),
+            cap,
+        }
+    }
+
+    pub fn counters(&self) -> OplDiagnostics {
+        self.counters
+    }
+
+    pub fn trace(&self) -> &[OplTraceEntry] {
+        &self.trace
+    }
+
+    fn push(&mut self, entry: OplTraceEntry) {
+        if self.trace.len() < self.cap {
+            self.trace.push(entry);
+        }
+    }
+
+    /// Record a status read returning `value`.
+    fn record_read(&mut self, port: u16, value: u8, core_clocks: u64) {
+        self.counters.status_reads += 1;
+        // Bits 6 and 5 are the timer-1 and timer-2 overflow flags.
+        if value & 0x60 != 0 {
+            self.counters.status_reads_timer_expired += 1;
+        }
+        self.push(OplTraceEntry {
+            write: false,
+            port,
+            bank: 0,
+            register: OplTraceEntry::NO_REGISTER,
+            value,
+            core_clocks,
+        });
+    }
+
+    /// Record a write of `value`. `register` is `None` for an address latch.
+    fn record_write(
+        &mut self,
+        port: u16,
+        bank: u8,
+        register: Option<u8>,
+        value: u8,
+        core_clocks: u64,
+    ) {
+        if let Some(index) = register {
+            self.counters.register_writes += 1;
+            if bank == 0 && index == 0x04 {
+                self.counters.timer_control_writes += 1;
+            }
+            if (0xb0..=0xb8).contains(&index) {
+                if value & 0x20 != 0 {
+                    self.counters.key_on_writes += 1;
+                } else {
+                    self.counters.key_off_writes += 1;
+                }
+            }
+        }
+        self.push(OplTraceEntry {
+            write: true,
+            port,
+            bank,
+            register: register.map_or(OplTraceEntry::NO_REGISTER, u16::from),
+            value,
+            core_clocks,
+        });
+    }
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -773,6 +917,10 @@ pub struct Machine {
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
     isa_io_batch_clocks: u64,
+    // Diagnostic-only OPL counters plus an optional access trace; see `OplProbe`.
+    // Never read by an emulation decision and never part of canonical state, so
+    // unlike `isa_io_batch_clocks` above it does not gate a canonical capture.
+    opl_probe: OplProbe,
     // Set only when a bus-side DMA block copy writes guest RAM without exposing
     // its destination range. Range-aware HLE and device paths notify the CPU directly.
     device_wrote_memory: bool,
@@ -1121,6 +1269,7 @@ impl Machine {
             last_int_vector: None,
             io_touched: false,
             isa_io_batch_clocks: 0,
+            opl_probe: OplProbe::from_env(),
             device_wrote_memory: false,
             pending_device_memory_write_range: None,
             direct_map_changed: false,
@@ -1916,6 +2065,27 @@ impl Machine {
         self.vga_wipe_census.snapshot()
     }
 
+    /// Guest OPL activity since power-on. Always collected: the counters are six
+    /// increments on a port path that already ends the CPU batch, which is many
+    /// orders of magnitude more expensive than the count.
+    pub fn opl_diagnostics(&self) -> OplDiagnostics {
+        self.opl_probe.counters()
+    }
+
+    /// The recorded OPL access trace, empty unless `IZARRAVM_OPL_TRACE` was set.
+    pub fn opl_trace(&self) -> &[OplTraceEntry] {
+        self.opl_probe.trace()
+    }
+
+    /// Arm the OPL access trace directly, bypassing `IZARRAVM_OPL_TRACE`.
+    ///
+    /// For tests: the environment is process-global, so a test that set the
+    /// variable would race every other test in the same binary.
+    #[doc(hidden)]
+    pub fn set_opl_trace_cap(&mut self, cap: usize) {
+        self.opl_probe.cap = cap;
+    }
+
     fn set_a20_gate(&mut self, enabled: bool) {
         if self.keyboard.a20_enabled() != enabled {
             self.keyboard.set_a20(enabled);
@@ -2338,6 +2508,9 @@ struct MachineBus<'a> {
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::isa_io_batch_clocks`.
     isa_io_clocks: &'a mut u64,
+    // Diagnostic-only OPL counters and trace. Points at `Machine::opl_probe`.
+    // Never read by any emulation decision; see `OplProbe`.
+    opl_probe: &'a mut OplProbe,
     device_wrote_memory: &'a mut bool,
     pending_device_memory_write_range: &'a mut Option<(u32, u32)>,
     direct_map_changed: &'a mut bool,
