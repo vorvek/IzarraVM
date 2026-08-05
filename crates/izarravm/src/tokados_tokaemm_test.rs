@@ -250,6 +250,32 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
             "small-memory pool probe failed with {memory_mib} MiB {emm_arg} \
              (stop={stop:?}); a 0xEn code names the failed step.\n{text}"
         );
+
+        // Which of the two table placements ran, read off the CPU rather than
+        // off anything the driver says about itself. CR3 is the page directory
+        // the monitor is actually using, so this cannot be satisfied by a
+        // driver that reports one thing and does another.
+        //
+        // Without this the fixture proved nothing about placement: it reads
+        // pool bounds only, and at 1 MiB the arena is empty so it takes its own
+        // empty-pool branch. Four of the six iterations run the high path, and
+        // nothing here could tell.
+        let cr3 = machine.cpu().control.cr3;
+        if memory_mib == 1 {
+            assert!(
+                cr3 < 0x0010_0000,
+                "at {memory_mib} MiB the tables must fall back into the driver \
+                 image below 1 MB, but CR3 is {cr3:#010x}. This is the ONLY \
+                 configuration that exercises the reserved-past-the-file \
+                 tables, so a high placement here means that path is untested."
+            );
+        } else {
+            assert!(
+                cr3 >= 0x0013_8000,
+                "at {memory_mib} MiB the tables must be reserved above the UMB \
+                 window, but CR3 is {cr3:#010x}"
+            );
+        }
     }
 }
 

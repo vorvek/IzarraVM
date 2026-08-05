@@ -451,10 +451,18 @@ init:
     ja .low_tables
     mov [cs:pd_lin], eax
     mov eax, edx
-    mov cx, resident_core_end
+    mov cx, resident_core_end     ; break offset, CS-relative
+    xor si, si                    ; no extra paragraphs beyond CS
     jmp .tables_selected
 .low_tables:
-    mov cx, resident_image_end
+    ; The in-image tables are reserved past the end of the FILE and past the
+    ; 64 KB offset ceiling, so the break cannot be expressed as cs:offset. Report
+    ; it as (cs + IMAGE_END_OFF/16):0 instead. The kernel computes the paragraph
+    ; count as FP_SEG(end) + (FP_OFF(end)+15)/16 - FP_SEG(driver), so an advanced
+    ; segment reserves exactly the same paragraphs a large offset would have, and
+    ; a zero offset cannot trip that 16-bit rounding.
+    xor cx, cx
+    mov si, IMAGE_END_OFF >> 4
 .tables_selected:
     mov [cs:xms_pool_base], eax
 
@@ -462,7 +470,9 @@ init:
     ; report only the low core when the page tables were reserved high.
     les bx, [cs:rh_ptr]
     mov [es:bx+14], cx
-    mov word [es:bx+16], cs
+    mov ax, cs
+    add ax, si
+    mov [es:bx+16], ax
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
     ; The arena always reaches the RAM top now: EMS draws from it on demand
@@ -3303,28 +3313,50 @@ mon_stack:
 mon_stack_top:
 resident_core_end:
 
-align 4096
-tables:
-    ; PD (1 page) + 6 PT (6 pages) = 0x7000, plus up to 0xFF0 of page-rounding slack
-    ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned, i.e. a
-    ; multiple of 16, which caps the worst-case slack at 4096-16 = 0xFF0 rather
-    ; than a full 0xFFF). Trimmed to this exact figure (D5): EMS's per-page chain
-    ; (ems_link) pushed resident_core_end past the 0x7000 boundary, and the
-    ; previously-unused 0x10 bytes of rounding-up-to-0x8000 padding is what kept
-    ; the image inside the 64 KB driver offset ceiling.
-    times 0x7000 + 0xFF0 db 0
-resident_image_end:
-; The reservation above now has ZERO margin: worst-case slack (0xFF0) plus the
-; seven pages (0x7000) is exactly 0x7FF0. That worst case is 0xFF0 only because
-; `tables` is itself page-aligned, which makes (base + tables) mod 4096 equal
-; base mod 4096, and base is a paragraph, so the round-up is at most 4096-16.
-; Drop the `align 4096` above and the bound becomes 0xFFF, which overruns the
-; reservation by 15 bytes and corrupts whatever DOS put after the driver, on
-; load addresses that depend on the boot's CONFIG.SYS ordering. Assert the
-; alignment rather than trusting the directive to survive an edit.
-%if (tables - $$) % 4096
-    %error "TOKAEMM tables: must stay 4096-aligned; the reservation's slack budget assumes it"
-%endif
-%if ($ - $$) >= 0x10000
-    %error "TOKAEMM resident image exceeds the 16-bit driver offset limit"
+; The paging tables are RESERVED, not emitted. Only the `.low_tables` fallback
+; uses this region, and even there the driver reaches it exclusively by LINEAR
+; address through `pd_lin` (a flat-selector dword read); nothing addresses it
+; with a 16-bit offset. So the bytes need to be memory DOS keeps for us, which
+; INIT arranges by reporting a break address past them, and they do not need to
+; sit inside the driver's 64 KB offset space, nor be shipped in the file.
+;
+; Emitting them cost 32,752 bytes of file and, worse, 32,752 bytes of the 64 KB
+; offset budget on EVERY configuration, to serve a path that only a 1 MiB
+; machine takes. That is what left the image 16 bytes under its ceiling.
+;
+; Rounded up to a page: PD (1 page) + 6 PT (6 pages) = 0x7000, plus up to 0xFF0
+; of page-rounding slack. `pd_lin` is round_up_4k(base + tables), and the load
+; base is only paragraph-aligned, so keeping TABLES_OFF itself 4096-aligned
+; makes (base + tables) mod 4096 equal base mod 4096, which caps the round-up at
+; 4096-16 = 0xFF0 rather than a full 0xFFF. The alignment and the slack figure
+; are load-bearing for each other; change neither alone.
+;
+; Written as offsets from `$$`, not as label expressions. In `-f bin` a label is
+; relocatable rather than scalar, so `&`, `>>` and `%if` on one are rejected
+; outright ("operator may only be applied to scalar values").
+TABLES_OFF        equ ((resident_core_end - $$) + 4095) & ~4095
+IMAGE_END_OFF     equ TABLES_OFF + 0x7000 + 0xFF0
+tables            equ $$ + TABLES_OFF
+resident_image_end equ $$ + IMAGE_END_OFF
+
+; Nothing zero-fills this region any more. DOS used to do it incidentally, by
+; loading a file that was long enough to cover it; now the file ends at
+; `resident_core_end`. `pm_init`'s `rep stosd` over exactly 0x7000 bytes at
+; `pd_lin` is therefore the ONLY thing that clears the tables, which makes it a
+; load-bearing invariant rather than belt and braces. Anything added here that
+; expects to start zeroed must zero itself.
+
+; The 16-bit offset limit binds on the CORE, which is what the driver addresses
+; with 16-bit offsets and what the GDT code selector's limit is built from
+; (`mov word [eax], resident_core_end - 1`). Without this assert NASM truncates
+; that limit silently.
+;
+; This also closes a 15-byte hole the old assert left. It measured the emitted
+; image and permitted offsets up to 0xFFFF, but the kernel rounds the reported
+; break with `(FP_OFF(r_endaddr) + 15)/16` in 16-bit unsigned arithmetic
+; (`hdr/portab.h:353`, built with COMPILER=owwin), which wraps to 0 at 0xFFF1
+; and under-reserves by a whole 64 KB. INIT now reports a paragraph-aligned
+; address, so the rounding cannot overflow at all.
+%if (resident_core_end - $$) >= 0x10000
+    %error "TOKAEMM resident core exceeds the 16-bit driver offset limit"
 %endif
