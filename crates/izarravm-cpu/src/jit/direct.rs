@@ -4299,6 +4299,8 @@ fn compile_with_instruction_limit(
                         stack_accesses,
                         memory_alu_slots,
                         callout_slots,
+                        dirty_segments,
+                        model_dirty: true,
                     },
                 );
             }
@@ -4331,6 +4333,8 @@ fn compile_with_instruction_limit(
                         stack_accesses,
                         memory_alu_slots,
                         callout_slots,
+                        dirty_segments,
+                        model_dirty: true,
                     },
                 );
             }
@@ -4356,6 +4360,8 @@ fn compile_with_instruction_limit(
                             stack_accesses,
                             memory_alu_slots,
                             callout_slots,
+                            dirty_segments,
+                            model_dirty: true,
                         },
                     );
                 }
@@ -4455,6 +4461,39 @@ fn compile_with_instruction_limit(
         // time that unrelated segment moves, or a spurious Retry out of `segment_access_supported`
         // for a descriptor nothing in the block reaches.
         if kind.pinned_segments() & dirty_segments != 0 {
+            // Censused since the dirty-stop slice, and it is the only `Boundary` arm that is.
+            // `CompileStop::Boundary` is five-way ambiguous (this rule, the walk's initializer,
+            // the two block caps and a terminal slot), so the recording has to sit AT the rule
+            // rather than being recovered from `stop` afterwards.
+            //
+            // Before this, admitting `MOV DS,r16` looked like it removed 18.4M census hits while
+            // the census showed nothing gained. It had not removed them, it had moved them here,
+            // where nothing was recording. That also reconciles the campaign's refuted
+            // relocation item: no row grew because the work left the censused population
+            // entirely.
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                record_structural_barrier(
+                    cpu,
+                    &insn,
+                    BarrierStop::DirtySegment,
+                    key,
+                    entry_lin,
+                    d,
+                    SuffixSeed {
+                        scan_start: next,
+                        prefix_instructions: slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                        callout_slots,
+                        dirty_segments,
+                        // The arm whose suffix prices the dirty rule's own removal, so it is the
+                        // one arm that must not apply it.
+                        model_dirty: false,
+                    },
+                );
+            }
             stop = CompileStop::Boundary;
             break;
         }

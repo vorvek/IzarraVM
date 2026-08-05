@@ -42,6 +42,64 @@ pub(super) struct SuffixSeed {
     pub(super) stack_accesses: u8,
     pub(super) memory_alu_slots: u8,
     pub(super) callout_slots: u8,
+    /// Segments the block had already overwritten when the barrier stopped it.
+    pub(super) dirty_segments: u8,
+    /// Whether the forward scan applies the dirty-segment rule at all.
+    ///
+    /// TRUE for every arm but one, because the rule survives lowering the opcode those arms name:
+    /// admitting `RCL r16,1` does not make a baked segment base any less stale.
+    ///
+    /// FALSE for `BarrierStop::DirtySegment`, and that arm is the whole reason this field exists.
+    /// Its suffix answers "how much longer would this block be if segment bases were DYNAMIC",
+    /// and disabling the rule is precisely what that change means. Left true, the scan would walk
+    /// forward from the barred instruction with the segment already dirty, stop at the first
+    /// following slot that pins it, and report a suffix near zero. The instrument built to rank
+    /// dynamic segment bases would then report that dynamic segment bases gain nothing.
+    pub(super) model_dirty: bool,
+}
+
+/// The segment a BARRED instruction would have overwritten, as a bitmask.
+///
+/// The forward scan counts the barrier as one slot of the counterfactual block, so if that
+/// instruction is itself a segment load then everything behind it runs with the segment already
+/// dirty. Without this the suffix over-reports for exactly the rows a segment slice would rank:
+/// `0x1f` POP DS alone is 10.3% of the census.
+///
+/// Read off the `DecodedInsn` and not off a `DirectKind`, because there is no kind: these are the
+/// forms `classify` refused, which is why they are barriers. `DirectKind::written_segment` covers
+/// the admitted ones (`LoadSegReal`) and this covers the rest, so the two are complements rather
+/// than duplicates.
+///
+/// `0x8e /1` is absent deliberately. `MOV CS, r/m16` raises #GP(0) rather than loading anything
+/// (execute.rs, the 0x8e arm), so it writes no segment and seeding one would model a transfer the
+/// guest never performs.
+fn barred_segment_write(insn: &DecodedInsn) -> u8 {
+    let segment = match insn.opcode {
+        // The register forms of `/0` and `/3` are lowered to `LoadSegReal`; the memory forms and
+        // the other three register forms are not, and all of them land here.
+        0x8e => match insn.modrm.map(|modrm| modrm.reg) {
+            Some(0) => SegmentIndex::Es,
+            Some(2) => SegmentIndex::Ss,
+            Some(3) => SegmentIndex::Ds,
+            Some(4) => SegmentIndex::Fs,
+            Some(5) => SegmentIndex::Gs,
+            _ => return 0,
+        },
+        // POP Sreg, then the two-byte POP FS/GS.
+        0x07 => SegmentIndex::Es,
+        0x17 => SegmentIndex::Ss,
+        0x1f => SegmentIndex::Ds,
+        0x0fa1 => SegmentIndex::Fs,
+        0x0fa9 => SegmentIndex::Gs,
+        // The far-pointer loads. Each writes its segment and a GPR in one instruction.
+        0xc4 => SegmentIndex::Es,
+        0xc5 => SegmentIndex::Ds,
+        0x0fb2 => SegmentIndex::Ss,
+        0x0fb4 => SegmentIndex::Fs,
+        0x0fb5 => SegmentIndex::Gs,
+        _ => return 0,
+    };
+    segment_bit(segment)
 }
 
 /// Record one structural stop into the barrier census, from ANY of the arms that can set
@@ -69,8 +127,12 @@ pub(super) fn record_structural_barrier(
     key: BlockKey,
     entry_lin: u32,
     d: bool,
-    seed: SuffixSeed,
+    mut seed: SuffixSeed,
 ) {
+    // Folded in HERE rather than at the three call sites, so a future arm cannot forget it. The
+    // call sites carry the compile walk's live mask; this adds the barred instruction's own write,
+    // which the walk never reached.
+    seed.dirty_segments |= barred_segment_write(insn);
     let suffix = census_native_suffix(cpu, key, entry_lin, d, seed);
     cpu.jit_direct.record_barrier(
         insn,
@@ -111,9 +173,11 @@ pub(super) fn record_structural_barrier(
 ///   be dead code no test could make fire. Left as a deliberate conservative FLOOR: it
 ///   under-reports, and an under-report cannot inflate a ranking. Closing it is a Quake-facing
 ///   change with no bearing on the 16-bit campaign.
-/// * The dirty-segment rule, and the seed for a barred instruction that would itself write a
-///   segment. Both belong to the dirty-stop slice, which needs the per-arm choice of whether to
-///   model the rule at all.
+/// * CLOSED, the dirty-segment rule, but PER ARM rather than unconditionally. See
+///   `SuffixSeed::model_dirty`: every arm but `DirtySegment` models it, and that one must not,
+///   because its suffix prices the rule's own removal. The seed also carries the barred
+///   instruction's own segment write, which the compile walk never reached
+///   (`barred_segment_write`).
 ///
 /// One residual the seed cannot express: the barrier is counted as one slot without knowing its
 /// kind, because `classify` refused it. So a barrier that would itself have been the block's first
@@ -132,6 +196,8 @@ fn census_native_suffix(
         mut stack_accesses,
         mut memory_alu_slots,
         mut callout_slots,
+        mut dirty_segments,
+        model_dirty,
     } = seed;
     let cs = cpu.registers.cs();
     let mut result = CensusSuffix::default();
@@ -192,12 +258,19 @@ fn census_native_suffix(
                         >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
             || (kind.is_call_out() && callout_slots == MAX_BLOCK_CALLOUT_SLOTS)
             || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
+            || (model_dirty && kind.pinned_segments() & dirty_segments != 0)
         {
             break;
         }
         stack_accesses += u8::from(kind.uses_stack());
         memory_alu_slots += u8::from(kind.is_memory_alu());
         callout_slots += u8::from(kind.is_call_out());
+        // Accumulated even when `model_dirty` is false. The mask costs nothing unread, and a scan
+        // that tracked it only when it was going to test it would go wrong the moment the flag
+        // became anything other than a constant per arm.
+        if let Some(segment) = kind.written_segment() {
+            dirty_segments |= segment_bit(segment);
+        }
         result.instructions += 1;
         lin = next;
         if kind.is_terminal() {
@@ -512,6 +585,26 @@ pub(crate) enum BarrierStop {
     /// run 586) and instrumented anyway, because "it reads zero" is a measurement and "nothing
     /// records it" is not.
     WordPersona,
+    /// The dirty-segment rule: a slot wanted a segment an earlier slot in the same block had
+    /// overwritten, so it would have baked a stale base or selector.
+    ///
+    /// THE ODD ONE OUT, in three ways that a reader ranking rows has to know about.
+    ///
+    /// It is a `CompileStop::Boundary` rather than a `Structural`, so the block it stopped is
+    /// compiled and installed rather than rejected. That is why it does not install a rejected
+    /// span (see `installs_rejected_span`) and why `unbound_exits` and `dynamic_unbound_exits`
+    /// are structurally zero for it. `runtime_hits` is near zero as well, because the barred
+    /// instruction becomes the ENTRY of the next block and gets compiled rather than retiring
+    /// through the interpreter. `snapshot` sorts on those columns, so these rows land last while
+    /// being the ones a segment slice is looking for. Read `hits` and the suffix instead.
+    ///
+    /// Its rows must be SUMMED, not ranked individually. The key is the shape of the instruction
+    /// that was barred -- the segment's USER -- so one structural cause spreads itself across
+    /// `0x8a`, `0x8b`, `0x88` and every other form that happens to touch the segment, rather than
+    /// concentrating in one row the way an opcode-coverage barrier does.
+    ///
+    /// Its suffix is computed with the dirty rule DISABLED. See `SuffixSeed::model_dirty`.
+    DirtySegment,
 }
 
 impl BarrierStop {
@@ -521,7 +614,26 @@ impl BarrierStop {
             Self::PrefixUnsupported => "prefix_unsupported",
             Self::NonContinuable => "non_continuable",
             Self::WordPersona => "word_persona",
+            Self::DirtySegment => "dirty_segment",
         }
+    }
+
+    /// Whether a stop on this arm leaves behind a `BlockState::Rejected` span that static and
+    /// dynamic exits can pile into.
+    ///
+    /// Every `CompileStop::Structural` arm does. `DirtySegment` does not: it is a
+    /// `CompileStop::Boundary`, and the key it leaves behind is Compiled, or Dormant when the
+    /// break landed with too few slots to install (`compile_with_instruction_limit`'s short-block
+    /// return). Never Rejected.
+    ///
+    /// So `record` must not write `rejected_barrier` for it. That map is keyed on entry linear
+    /// alone, and a linear claimed by a non-rejected block would hand a genuinely rejected block's
+    /// exits to the wrong row, in whichever direction the two happened to be recorded.
+    ///
+    /// Derived from the arm rather than passed in, because a call site that could get this wrong
+    /// is a call site that eventually will.
+    fn installs_rejected_span(self) -> bool {
+        !matches!(self, Self::DirtySegment)
     }
 }
 
@@ -668,7 +780,9 @@ impl DirectBarrierCensus {
             shape: BarrierShape::from_insn(insn),
             stop,
         };
-        self.rejected_barrier.insert(entry_linear, key);
+        if stop.installs_rejected_span() {
+            self.rejected_barrier.insert(entry_linear, key);
+        }
         // Register the shape so `note_interpreted` can find it with one probe and without ever
         // creating a row for an instruction that never barriered.
         self.runtime_hits.entry(key.shape).or_default();

@@ -214,6 +214,18 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
 // every x87 kind outright, so the compile walk's x87 caps are unreachable from it and any mirror
 // of them would be dead code no fixture could make fire. It is left as a conservative floor and
 // documented at `census_native_suffix`.
+//
+// Mutation record for the dirty-stop slice, same method:
+//
+//  * flipping the `DirtySegment` call site to `model_dirty: true` makes
+//    `a_dirty_segment_stop_is_censused_and_prices_its_own_removal` read 0 where it must read 3,
+//    which is the arm pricing its own fix at nothing;
+//  * dropping either the `barred_segment_write` fold-in OR the dirty test inside the scan makes
+//    `the_suffix_seed_carries_a_barred_segment_write` read 2 where it must read 0. The two share
+//    a test on purpose: a seed nothing reads and a reader with nothing seeded are the same bug
+//    seen from opposite ends, and neither is observable alone;
+//  * making `installs_rejected_span` return true for every arm makes
+//    `a_dirty_segment_row_does_not_claim_the_rejected_span_map` credit an exit it has no claim on.
 
 /// Compile `code` with the census on and return the single barrier row's suffix.
 ///
@@ -221,6 +233,11 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
 /// scan reads `decode_cache`, so an address that was never warmed ends the walk. That makes the
 /// expected value in each caller an exact number rather than a floor.
 fn barrier_suffix(code: &[u8], warm_offsets: &[u32]) -> u64 {
+    census_row_for(code, warm_offsets, u16::from(DIRECT_BARRIER)).native_suffix_instructions
+}
+
+/// The same, for a fixture whose barrier is a real opcode rather than the synthetic one.
+fn census_row_for(code: &[u8], warm_offsets: &[u32], opcode: u16) -> crate::DirectBarrierCensusRow {
     let (mut cpu, mut bus) = fixture(code);
     cpu.enable_direct_barrier_census(true);
     let addresses: Vec<_> = warm_offsets.iter().map(|offset| ENTRY + offset).collect();
@@ -232,10 +249,10 @@ fn barrier_suffix(code: &[u8], warm_offsets: &[u32]) -> u64 {
     let row = snapshot
         .rows
         .iter()
-        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
-        .expect("recorded structural stop");
+        .find(|row| row.opcode == opcode)
+        .unwrap_or_else(|| panic!("no census row for opcode {opcode:#x}"));
     assert_eq!(row.hits, 1, "fixture must record exactly one barrier hit");
-    row.native_suffix_instructions
+    row.clone()
 }
 
 /// The memory-ALU BLOCK cap, and it is the largest of the six divergences the suffix audit found.
@@ -346,6 +363,113 @@ fn census_suffix_respects_the_call_out_slot_cap() {
         barrier_suffix(&full, &offsets),
         0,
         "a full call-out budget must stop the scan at the next call-out"
+    );
+}
+
+/// The dirty-segment rule now leaves a census row, and that row's suffix prices the rule's own
+/// removal rather than re-applying it.
+///
+/// Before this, admitting `MOV DS,r16` looked like it deleted 18.4M census hits while the census
+/// showed nothing gained anywhere. The hits had not gone: the block now ends at the first later
+/// slot that wants the overwritten segment, which was a `CompileStop::Boundary` and so recorded
+/// nothing at all.
+///
+/// The suffix assertion is the whole test and it is a COUNTERFACTUAL, which is what lets it stand
+/// in for a comparison against a value the public surface cannot produce. Every instruction after
+/// the barrier reads through DS, so with `model_dirty` left true the scan would stop at the first
+/// of them and report 0. Reporting 3 is only possible with the rule disabled.
+#[test]
+fn a_dirty_segment_stop_is_censused_and_prices_its_own_removal() {
+    // inc eax / inc ecx / mov ds, ax / mov eax,[ebx] / mov ecx,[ebx] / mov edx,[ebx] / inc eax
+    //                                  ^ barred: DS is dirty and this slot pins it
+    let code = [
+        0x40, 0x41, 0x8e, 0xd8, 0x8b, 0x03, 0x8b, 0x0b, 0x8b, 0x13, 0x40,
+    ];
+    let offsets = [0, 1, 2, 4, 6, 8, 10];
+
+    let row = census_row_for(&code, &offsets, 0x8b);
+    assert_eq!(
+        row.stop_reason, "dirty_segment",
+        "the 0x8b row must be attributed to the dirty rule, not to opcode coverage"
+    );
+    assert_eq!(
+        row.native_prefix_instructions, 3,
+        "the two increments and the segment load are kept; the rule ends the block after them"
+    );
+    assert_eq!(
+        row.native_suffix_instructions, 3,
+        "with the dirty rule disabled the scan walks through every later DS reader; with it \
+         applied this reads 0, which is the counterfactual this number stands against"
+    );
+}
+
+/// A dirty-segment row must NOT claim its entry linear in the rejected-span map.
+///
+/// `rejected_barrier` is keyed on entry linear alone and answers "which barrier refused the block
+/// living here", so that a runtime exit into a rejected block can be charged back to an opcode.
+/// A dirty stop is a `CompileStop::Boundary`: the key it leaves behind is Compiled, or Dormant
+/// when the break landed with too few slots to install, but never Rejected. Letting it write that
+/// map would hand a genuinely rejected block's exits to whichever of the two happened to be
+/// recorded second.
+///
+/// Driven through `note_unbound_target`, which is the hook that reads the map, rather than by
+/// inspecting the map directly. That is the path the mis-attribution would actually take.
+#[test]
+fn a_dirty_segment_row_does_not_claim_the_rejected_span_map() {
+    let code = [
+        0x40, 0x41, 0x8e, 0xd8, 0x8b, 0x03, 0x8b, 0x0b, 0x8b, 0x13, 0x40,
+    ];
+    let offsets = [0, 1, 2, 4, 6, 8, 10];
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+
+    // An exit reporting a REJECTED target at the dirty block's own entry linear. If the dirty stop
+    // had registered there, this credits its row.
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.stop_reason == "dirty_segment")
+        .expect("recorded dirty-segment stop");
+    assert_eq!(
+        row.unbound_exits, 0,
+        "the dirty row took credit for a rejected-target exit it has no claim on"
+    );
+}
+
+/// The seed carries the BARRED instruction's own segment write.
+///
+/// `POP DS` is not lowered, so it is an ordinary barrier row, and the compile walk never reached
+/// its write. But the suffix prices "what if this barrier were lowered", and lowering a `POP DS`
+/// makes DS dirty for everything behind it. Without the seed the row over-reports, and `0x1f` is
+/// 10.3% of the 16-bit census.
+///
+/// The control changes ONLY the barrier byte, so the pair isolates `barred_segment_write` from
+/// everything else the scan does.
+#[test]
+fn the_suffix_seed_carries_a_barred_segment_write() {
+    // inc eax / inc ecx / inc edx / <barrier> / mov eax,[ebx] / inc eax
+    let pop_ds = [0x40, 0x41, 0x42, 0x1f, 0x8b, 0x03, 0x40];
+    let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x8b, 0x03, 0x40];
+    let offsets = [0, 1, 2, 3, 4, 6];
+
+    assert_eq!(
+        barrier_suffix(&control, &offsets),
+        2,
+        "control: a barrier that writes no segment leaves the scan free to walk the DS reader"
+    );
+    assert_eq!(
+        census_row_for(&pop_ds, &offsets, 0x1f).native_suffix_instructions,
+        0,
+        "POP DS dirties DS for the scan behind it, so the very next slot stops it"
     );
 }
 
