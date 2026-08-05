@@ -266,6 +266,7 @@ impl SbDsp {
     fn command_arity(command: u8) -> usize {
         match command {
             0x10 | 0xE4 => 1, // direct DAC / test-register write
+            0xE0 => 1,        // DSP identification: one byte in, its complement out
             0x40 => 1,        // set time constant
             0x41 => 2,        // set sample rate
             0x14 => 2,        // 8-bit single-cycle DMA output, length low/high
@@ -351,6 +352,16 @@ impl SbDsp {
                 self.queue_read(DSP_VERSION_HI);
                 self.queue_read(DSP_VERSION_LO);
             }
+            // DSP identification. The card returns the ONE'S COMPLEMENT of the
+            // byte it was given, which is how a driver confirms it is talking to
+            // a real DSP rather than an open bus that reads back what it wrote.
+            //
+            // Prince of Persia's Sound Blaster mode hangs without this: it sends
+            // 0xE0 0xC6 and polls the read-buffer status forever for the 0x39
+            // that never arrives. Worse than a missing reply, the unconsumed
+            // 0xC6 was then parsed as a fresh command, and 0xC0..=0xCF has arity
+            // 3, so the DSP sat waiting on two more bytes as well.
+            0xE0 => self.queue_read(!args.first().copied().unwrap_or(0)),
             0xE8 => self.queue_read(self.test_reg),
             0xD1 => self.speaker_on = true,
             0xD3 => self.speaker_on = false,
