@@ -235,7 +235,7 @@ fn census_native_suffix(
             || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
             || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
             || !(insn.continuable || jit_admits_non_continuable(insn.opcode))
-            || (insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586)
+            || (insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu))
         {
             break;
         }

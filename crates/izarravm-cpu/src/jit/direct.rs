@@ -3909,6 +3909,51 @@ pub(crate) fn sixteen_bit_admission_level() -> u8 {
     })
 }
 
+/// Seed for `JitState::word_at_486`, read once per process from `IZARRAVM_JIT16_486`.
+///
+/// Separate from `IZARRAVM_JIT16` on purpose: that one selects WHICH memory a 16-bit code segment
+/// may live in, and this one selects WHICH PERSONAS lower Word operands at all. They compose, and
+/// the A/B needs them independent — the doom-486 arm runs `IZARRAVM_JIT16=0` so that
+/// `try_direct_continuation` refuses every 16-bit boundary before a key is built, which isolates
+/// this flag's 32-bit half (66-prefixed word ops) exactly.
+pub(crate) fn word_at_486_default() -> bool {
+    static LEVEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("1")))
+}
+
+/// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
+///
+/// ONE predicate for what used to be three copies of `persona != I586`: the compile walk's Word
+/// refusal, `key_for_phys`'s 16-bit-segment refusal, and the census suffix scan's copy of the
+/// first. They have to move together. The compile walk and `key_for_phys` are COUPLED by
+/// construction — `key_for_phys` refuses the key precisely BECAUSE the walk would reject the first
+/// slot and install a rejected span for zero yield — so lifting either alone is wrong in a
+/// different direction: the walk alone is inert, the key alone is pure churn. The census copy is
+/// the one that would silently re-open a seventh divergence between the two walks.
+///
+/// The 16-bit half rests on an identity worth stating, because it is what lets one predicate serve
+/// both questions: `operand_size` follows CS.D opcode-independently, so in a CS.D = 0 segment
+/// EVERY instruction decodes at `Word`. "May a 16-bit segment be keyed" and "are Word operands
+/// admitted" are therefore the same question asked at two points.
+///
+/// The admitted set is I486 and I586, never the 386 class. Interpreted 386 already runs above 15x
+/// real time, so there is no throughput problem for the JIT to solve there, and admitting it would
+/// widen the blast radius of every Word lowering to a persona nobody benchmarks. `key_for_phys`
+/// already refuses every persona below I486 a few lines up, so the 386 class is doubly excluded;
+/// spelling it out here means a future 386 enablement cannot silently inherit Word admission.
+///
+/// Be honest about that arm: it is UNREACHABLE today and therefore UNTESTABLE. Flipping
+/// `I386 => false` to `true` fails nothing, because `key_for_phys`'s own persona check runs first
+/// and the compile walk is reached only through it. It is defence in depth against a future edit
+/// to that check, not a live guard, and no test should be written that pretends otherwise.
+fn word_operands_admitted(cpu: &CpuGsw) -> bool {
+    match cpu.persona() {
+        CpuPersona::I586 => true,
+        CpuPersona::I486 => cpu.jit_direct.word_at_486,
+        CpuPersona::I386 => false,
+    }
+}
+
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
     let physical = cpu.decode_cache.line_phys_start(lin, d)?;
     key_for_phys(cpu, lin, d, physical)
@@ -3946,7 +3991,7 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     //
     // The other V86-sensitive opcodes (PUSHF/POPF, CLI/STI, INT/IRET) still have no `classify`
     // arm, and V86 blocks stay key-separated by mode-key bit 2.
-    if !d && cpu.persona() != CpuPersona::I586 {
+    if !d && !word_operands_admitted(cpu) {
         return None;
     }
     if lin.wrapping_sub(0x000f_f000) < 0x400 {
@@ -4337,7 +4382,7 @@ fn compile_with_instruction_limit(
         // instructions as precise interpreter barriers in that mode.
         // Follow-up (dev_docs/specs/2026-07-15-smc-hardening-design.md, G1): with heat demotion
         // landed, A/B re-enabling 486 word ops - heat should now bound the churn this defends.
-        if insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586 {
+        if insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu) {
             // Attributed since the completeness slice, and expected to read ZERO on both shipped
             // fixtures because they run 586. Instrumented anyway: "this arm is dead on the
             // corpus" is a measurement worth having, and "nothing records it" is not the same

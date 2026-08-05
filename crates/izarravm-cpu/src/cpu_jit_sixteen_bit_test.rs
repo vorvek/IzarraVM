@@ -305,6 +305,40 @@ fn a_sixteen_bit_segment_is_admitted_on_i586_only() {
         "I486 must refuse a 16-bit code segment outright, not compile and then reject the slot"
     );
 
+    // The LIFTED arm, which is the whole reason the refusal above is now a policy rather than a
+    // constant. `key_for_phys`'s persona clause and the compile walk's Word refusal are one
+    // predicate, so flipping it here must move this key from None to Some without touching
+    // anything else. Without this the lifted path would ship with no coverage at all.
+    cpu.set_word_operands_at_486(true);
+    assert!(
+        jit::direct::key_for(&cpu, ENTRY, false).is_some(),
+        "with Word operands admitted at I486, a 16-bit segment must key like it does at I586"
+    );
+    cpu.set_word_operands_at_486(false);
+    assert!(
+        jit::direct::key_for(&cpu, ENTRY, false).is_none(),
+        "and the flag must be the only thing that moved it"
+    );
+
+    // The flag SURVIVES a clone, and this is not bookkeeping. `JitState::clone` deliberately drops
+    // the barrier census, so copying that shape for a COMPILE POLICY would make a clone silently
+    // compile differently from its origin. `CpuGsw::clone` is what the lockstep
+    // interpreter-versus-native comparisons build their second role from, so a dropped flag there
+    // compares a lifted CPU against an unlifted one and reports the disagreement as agreement.
+    // Both twins are re-warmed for the same reason the mode change above is: a clone does not
+    // carry the decode line, so an un-warmed twin refuses on `line_phys_start` and the assertion
+    // would pass against a build that dropped the flag entirely. The pair is what isolates it.
+    for (label, admitted, expect_key) in [("dropped", false, false), ("carried", true, true)] {
+        cpu.set_word_operands_at_486(admitted);
+        let mut twin = cpu.clone();
+        warm_sixteen_bit(&mut twin, &mut bus, &[ENTRY]);
+        assert_eq!(
+            jit::direct::key_for(&twin, ENTRY, false).is_some(),
+            expect_key,
+            "{label}: a clone must inherit the Word-admission policy, not revert to the default"
+        );
+    }
+
     // The positive control: a 486 must still admit 32-bit code, so the refusal is proven to key
     // on `!d` and not to have swallowed the persona's ordinary population. A separate CPU,
     // because the decode line is keyed on `d` and this one is warmed at `d == true`.

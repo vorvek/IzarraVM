@@ -71,6 +71,16 @@ pub(crate) mod x87_avx2_emit;
 /// surface unchanged.
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
+    /// Whether the Direct backend lowers `OperandSize::Word` operands below I586.
+    ///
+    /// A FIELD rather than a `OnceLock` env read like `sixteen_bit_admission_level`, and the
+    /// difference is testability rather than taste: a process-wide `OnceLock` cannot be flipped
+    /// per test, so the lifted arm would ship with no unit coverage at all while the two tests
+    /// that exist pin only the default arm. Seeded from env once by `word_at_486_default`, and
+    /// settable programmatically, exactly as `direct_barrier_census` is.
+    ///
+    /// Default FALSE, which is the shipped behaviour this slice does not change.
+    pub(crate) word_at_486: bool,
     pub(crate) direct_barrier_census: Option<Box<direct::DirectBarrierCensus>>,
     pub(crate) smc_heat: direct::SmcHeatMap,
     /// The native code watch, HOISTED out of `BlockCache` (Track C C1c-pre, design decision
@@ -96,6 +106,7 @@ impl JitState {
     pub(crate) fn new(direct: direct::BlockCache) -> Self {
         Self {
             direct,
+            word_at_486: direct::word_at_486_default(),
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
@@ -110,6 +121,12 @@ impl Clone for JitState {
     fn clone(&self) -> Self {
         Self {
             direct: self.direct.clone(),
+            // CARRIED, unlike the census below, and the asymmetry is deliberate. This is a
+            // COMPILE POLICY, not a diagnostic: `CpuGsw::clone` is what the lockstep
+            // interpreter-versus-native comparisons build their second role from, so a clone that
+            // silently reverted to the default arm would compare a lifted CPU against an unlifted
+            // one and report the disagreement as agreement.
+            word_at_486: self.word_at_486,
             direct_barrier_census: None,
             smc_heat: self.smc_heat.clone(),
             // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone

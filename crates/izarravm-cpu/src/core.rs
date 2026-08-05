@@ -970,6 +970,20 @@ impl CpuGsw {
         let _ = enabled;
     }
 
+    /// Admit `OperandSize::Word` operands to the Direct backend below I586.
+    ///
+    /// Seeded from `IZARRAVM_JIT16_486` at construction; this is the programmatic form the A/B
+    /// and the compile-outcome tests drive, so the lifted arm has coverage rather than shipping
+    /// as a path only an env var can reach.
+    pub fn set_word_operands_at_486(&mut self, enabled: bool) {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.word_at_486 = enabled;
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = enabled;
+    }
+
     /// Always available, unlike the census: see `DirectStallSnapshot`.
     pub fn direct_stall_snapshot(&self) -> crate::DirectStallSnapshot {
         #[cfg(feature = "jit")]

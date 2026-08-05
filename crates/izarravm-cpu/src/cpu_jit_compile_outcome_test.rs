@@ -412,6 +412,139 @@ fn a_dirty_segment_stop_is_censused_and_prices_its_own_removal() {
     );
 }
 
+/// The COMPILE WALK's Word refusal moves with the flag.
+///
+/// Distinct from the census test below and from the `key_for_phys` test in the sixteen-bit file,
+/// and all three are needed: the three gates are separate code sites and reverting any one of
+/// them alone must fail something. This one is the walk itself, exercised by putting the Word
+/// instruction MID-BLOCK in a 32-bit segment at I486, where `key_for_phys` admits the key and the
+/// walk is the only thing that can refuse the slot.
+#[test]
+fn the_compile_walk_word_refusal_moves_with_the_flag() {
+    // inc eax / inc ecx / inc edx / mov cx,ax / inc ebx / inc esp
+    let code = [0x40, 0x41, 0x42, 0x66, 0x89, 0xc1, 0x43, 0x44];
+    let offsets = [0u32, 1, 2, 3, 6, 7];
+
+    for (label, admitted, expected) in [("refused", false, 3), ("admitted", true, 6)] {
+        let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw486);
+        cpu.set_word_operands_at_486(admitted);
+        let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, expected,
+            "{label}: the walk must stop at the Word slot only while the flag refuses it"
+        );
+    }
+}
+
+/// The flag never admits the 386 class, whatever it is set to.
+///
+/// `key_for_phys` refuses every persona below I486 a few lines above the clause this slice
+/// touches, so the 386 case is already dead. Pinned anyway: the predicate spells I386 out
+/// explicitly so that a future 386 enablement cannot silently inherit Word admission, and that
+/// intent is worth a test rather than a comment.
+#[test]
+fn the_word_flag_never_admits_the_386_class() {
+    let code = [0x40, 0x41, 0x42, 0x66, 0x89, 0xc1, 0x43, 0x44];
+    let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw386);
+    cpu.set_word_operands_at_486(true);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    assert!(
+        jit::direct::key_for(&cpu, ENTRY, true).is_none(),
+        "the 386 class must stay refused with the flag on"
+    );
+}
+
+/// The census suffix scan carries the SAME Word predicate as the compile walk.
+///
+/// There are three copies of this policy: the compile walk, `key_for_phys`, and the forward scan
+/// in `census_native_suffix`. A slice that lifted the first two and forgot the third would
+/// re-open a seventh divergence between the two walks, days after six were closed, and on the
+/// exact arm the A/B is measuring.
+///
+/// It has to be tested at I486 with the flag flipped, because at I586 the predicate is true either
+/// way and the two arms are indistinguishable. The suffix instructions are 66-prefixed so their
+/// operand size is Word in a 32-bit segment, which is the same `OperandSize::Word` a CS.D = 0
+/// segment produces for every instruction.
+#[test]
+fn the_census_suffix_scan_shares_the_word_predicate() {
+    // inc eax / inc ecx / inc edx / <barrier> / mov cx,ax / mov dx,ax / inc eax
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        DIRECT_BARRIER,
+        0x66,
+        0x89,
+        0xc1,
+        0x66,
+        0x89,
+        0xc2,
+        0x40,
+    ];
+    let offsets = [0u32, 1, 2, 3, 4, 7, 10];
+
+    for (label, admitted, expected) in [("refused", false, 0), ("admitted", true, 3)] {
+        let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw486);
+        cpu.enable_direct_barrier_census(true);
+        cpu.set_word_operands_at_486(admitted);
+        let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+        let snapshot = cpu
+            .direct_barrier_census_snapshot()
+            .expect("enabled census snapshot");
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+            .expect("recorded structural stop");
+        assert_eq!(
+            row.native_suffix_instructions, expected,
+            "{label}: the scan must apply the same Word predicate the compile walk does"
+        );
+    }
+}
+
+/// The port opcodes are never admitted at `OperandSize::Word`, and this test is load-bearing
+/// rather than defensive.
+///
+/// `key_for_phys`'s V86 safety argument used to rest on three gates, "any ONE sufficient". One of
+/// them (`try_direct_continuation` refusing every 16-bit boundary) is already conditional on
+/// `IZARRAVM_JIT16`, so the argument really rests on two, and this is one of the two: an `IN` in a
+/// V86 16-bit segment must stay a barrier, because operand size follows CS.D opcode-independently
+/// and V86 code is always CS.D = 0.
+///
+/// That gate is a LIST under active change by this very campaign, and `0xEC` is the single largest
+/// row on PoP-586 at 25.6M runtime hits — a number that is a fault-path artifact, but one whose
+/// only warning lives in a git-ignored findings doc. A list defended by a document nobody reads is
+/// not defended. This pins it in the test suite instead.
+#[test]
+fn port_opcodes_are_never_admitted_at_word() {
+    for opcode in [0xecu8, 0xed, 0xee, 0xef] {
+        let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, opcode, 0x43, 0x44, 0x45]);
+        cpu.set_word_operands_at_486(true);
+        let addresses: Vec<_> = (0..7u32).map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        // The 0x66 prefix in a 32-bit segment is what makes the decoded operand size Word here;
+        // in real 16-bit code CS.D does it, and `classify` cannot tell the two apart.
+        let (mut word_cpu, mut word_bus) =
+            fixture(&[0x40, 0x41, 0x42, 0x66, opcode, 0x43, 0x44, 0x45]);
+        word_cpu.set_word_operands_at_486(true);
+        let word_addresses: Vec<_> = [0u32, 1, 2, 3, 5, 6, 7]
+            .iter()
+            .map(|offset| ENTRY + offset)
+            .collect();
+        warm(&mut word_cpu, &mut word_bus, &word_addresses);
+        let compilation = compiled(jit::direct::compile(&mut word_cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{opcode:#04x} at Word must stop the block at three slots, not be lowered"
+        );
+    }
+}
+
 /// A block that overwrites a segment register is counted at the dispatcher entry.
 ///
 /// `segment_writes != 0` makes `compile` publish `successors = [None, None]`, which makes
