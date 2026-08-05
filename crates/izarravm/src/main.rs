@@ -1124,6 +1124,19 @@ fn run_boot_hdd_folder(
     let rip_sampler =
         std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| (riprofile::Sampler::start(), path));
     let injections = merged_injections(inject_keys, inject_mouse)?;
+    // Periodic phase sampling, off unless IZARRAVM_PHASE_INTERVAL_MS names a guest-millisecond
+    // interval. Armed BEFORE the run and closed after it: the two host-placed edges below are
+    // what give the first and last periodic intervals a left and right boundary, and placing
+    // them outside the run means no `run_until_halt_or_cycles` boundary moves.
+    let phase_interval_ms = std::env::var("IZARRAVM_PHASE_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0);
+    if let Some(ms) = phase_interval_ms {
+        let per_ms = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1000);
+        machine.arm_periodic_phase_marks(per_ms.saturating_mul(ms), budget);
+        machine.record_host_phase_mark(izarravm_machine::phase_mark::BENCH_START);
+    }
     let start_wall = std::time::Instant::now();
     // The no-injection path stays ONE `run_until_halt_or_cycles` call, byte for
     // byte what it was: slicing the run moves where the machine services device
@@ -1201,6 +1214,12 @@ fn run_boot_hdd_folder(
             None => machine.run_until_halt_or_cycles(budget.saturating_sub(spent))?,
         }
     };
+    // Close the last periodic interval. Placed AFTER the run returns, so it cannot move a run
+    // boundary; without it the tail (up to one interval, plus everything after the final batch,
+    // plus the loop's several early returns) is never bounded on the right.
+    if phase_interval_ms.is_some() {
+        machine.record_host_phase_mark(izarravm_machine::phase_mark::BENCH_END);
+    }
     let wall = start_wall.elapsed();
     #[cfg(windows)]
     if let Some((Some(sampler), path)) = rip_sampler {
@@ -1394,6 +1413,7 @@ fn write_hdd_profile_json(
         "direct_barrier_census": direct_barrier_census_json(
             machine.cpu().direct_barrier_census_snapshot()
         ),
+        "phase_marks": phase_mark_series_json(machine.phase_marks()),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
@@ -1501,6 +1521,45 @@ fn direct_barrier_census_json(
             .map(|(label, count)| json!({ "kind": label, "count": count }))
             .collect::<Vec<_>>(),
     })
+}
+
+/// The periodic phase-mark series, as offsets from the first mark.
+///
+/// `Instant` is not serialisable, so wall is emitted as a nanosecond offset from `marks[0]`,
+/// the same shape the boot profiler's `build_rows` uses via `duration_since`.
+///
+/// Emits absolute counters, not deltas. Differencing consecutive entries is the consumer's job
+/// and keeps this honest: a delta series hides whether a counter went backwards, and several of
+/// these (`katea`, the perf counters) are cumulative by contract.
+///
+/// READ THE STALL COLUMNS BEFORE COMPARING INTERVALS. `stall_for_master_ticks` grants guest time
+/// for zero emulation work while the host burns real wall inside Katea, so a loading interval
+/// looks fast in raw wall-over-guest for an accounting reason rather than an emulation-rate one.
+/// Net out `katea_host_wall_ns` and `io_stall_ticks` first. The rt in this series is NOT the rt
+/// the realtime gate ratchets on.
+fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::Value {
+    let Some(first) = marks.first() else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    let rows: Vec<_> = marks
+        .iter()
+        .map(|mark| {
+            json!({
+                "id": mark.id,
+                "wall_offset_ns": mark.wall.duration_since(first.wall).as_nanos() as u64,
+                "master_ticks": mark.master_ticks,
+                "elapsed_clocks": mark.elapsed_clocks,
+                "instructions": mark.perf.instructions,
+                "jit_direct_insns": mark.perf.jit_direct_insns,
+                "jit_direct_entries": mark.perf.jit_direct_entries,
+                "io_stall_ticks": mark.io_stall_ticks,
+                "halted_ticks": mark.halted_ticks,
+                "katea_host_wall_ns": mark.katea.as_ref().map(|k| k.host_wall_ns),
+                "katea_sector_reads": mark.katea.as_ref().map(|k| k.sector_reads),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
 }
 
 fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json::Value {

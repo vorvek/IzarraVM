@@ -555,6 +555,18 @@ pub mod phase_mark {
     pub const EXEC_END: u8 = 3;
     /// LOADTEST.COM finished reading its target file.
     pub const LOAD_END: u8 = 4;
+    /// A periodic sample, placed from inside the run loop every N master ticks.
+    ///
+    /// DISTINCT from every id above, and it has to be: `has_mark` and `build_rows`
+    /// (bootprofile.rs) both first-match on id, so a periodic mark sharing an id with a
+    /// boundary would silently become that boundary and corrupt the boot profiler's phases.
+    /// Never arm the interval in the boot profiler for the same reason.
+    pub const PERIODIC: u8 = 200;
+    /// The benchmark run's own edges, placed by the host either side of the single
+    /// `run_until_halt_or_cycles` call so the first and last periodic intervals are closed.
+    /// Host-placed, so no run boundary moves.
+    pub const BENCH_START: u8 = 201;
+    pub const BENCH_END: u8 = 202;
 }
 
 /// One phase boundary, with every counter the boot profiler attributes per
@@ -570,6 +582,14 @@ pub struct PhaseMark {
     pub machine_phases: MachineHostProfileSnapshot,
     /// None when C: is not a mounted host folder.
     pub katea: Option<katea_tree::KateaStorageCounters>,
+    /// Guest ticks granted for I/O stalls and for HLT, at this boundary.
+    ///
+    /// Both are needed to read the series honestly. `stall_for_master_ticks` grants guest time
+    /// for ZERO emulation work while the host burns real wall inside Katea, so a loading phase
+    /// looks fast in raw rt for an accounting reason rather than an emulation-rate one. Netting
+    /// these out (with `katea.host_wall_ns`) is what makes two intervals comparable.
+    pub io_stall_ticks: u64,
+    pub halted_ticks: u64,
     /// The sampled CPU census at this boundary, when `IZARRAVM_CPU_PROFILE`
     /// armed it; `None` otherwise, so an unprofiled run pays nothing and reports
     /// no empty tables. Differencing consecutive marks gives the per-phase
@@ -1023,6 +1043,14 @@ pub struct Machine {
     // 19h, four guest marks), so no hot path pays for the check.
     phase_marks: Vec<PhaseMark>,
     phase_marks_enabled: bool,
+    /// Master-tick deadline for the next periodic sample, or `u64::MAX` when disarmed.
+    ///
+    /// A SENTINEL rather than a separate enable flag, so the run loop's disabled path is one
+    /// compare against a value it has already loaded. Gating at the call site rather than inside
+    /// the callee is the project rule for default-off instruments, and it matters here because a
+    /// non-inlined call would also block optimisation of the surrounding loop.
+    next_phase_mark_ticks: u64,
+    periodic_phase_mark_interval: u64,
     // Whether the POST->boot boundary has already been placed. A guest that
     // re-enters INT 19h must not overwrite the first, real POST measurement.
     post_phase_marked: bool,
@@ -1362,6 +1390,8 @@ impl Machine {
             host_profile: MachineHostProfile::default(),
             phase_marks: Vec::new(),
             phase_marks_enabled: false,
+            next_phase_mark_ticks: u64::MAX,
+            periodic_phase_mark_interval: 0,
             post_phase_marked: false,
             pending_toka_service: None,
             toka_service_status: 0,
@@ -1793,10 +1823,86 @@ impl Machine {
             perf: self.cpu.perf_counters().clone(),
             machine_phases: self.host_profile.snapshot(),
             katea: self.katea_storage_counters(),
+            io_stall_ticks: self.timeline.io_stall_ticks(),
+            halted_ticks: self.halted_ticks,
             cpu_profile: self
                 .cpu
                 .profiling_enabled()
                 .then(|| self.cpu.profile_snapshot()),
+        });
+    }
+
+    /// Arm periodic sampling from inside the run loop, every `interval_clocks` CPU clocks.
+    ///
+    /// `interval_clocks` of 0 disarms. Also arms `enable_phase_marks`, since a periodic mark is a
+    /// phase mark; call this INSTEAD of `enable_phase_marks`, never as well.
+    ///
+    /// Capacity is reserved up front from the caller's budget: a `Vec` realloc inside the run loop
+    /// is a memcpy that lands in whichever interval it falls in, which is exactly the kind of
+    /// cost that biases one phase against another.
+    pub fn arm_periodic_phase_marks(&mut self, interval_clocks: u64, budget_clocks: u64) {
+        self.phase_marks_enabled = true;
+        self.phase_marks.clear();
+        self.post_phase_marked = false;
+        // Converted HERE rather than by the caller: `master_ticks_for_cpu_clocks` is the
+        // timeline's own scaling and is not public, and the caller thinking in CPU clocks (the
+        // currency `run_until_halt_or_cycles` already takes) keeps one unit in the CLI.
+        let interval_ticks = self.timeline.master_ticks_for_cpu_clocks(interval_clocks);
+        let budget_ticks = self.timeline.master_ticks_for_cpu_clocks(budget_clocks);
+        if interval_ticks == 0 {
+            self.periodic_phase_mark_interval = 0;
+            self.next_phase_mark_ticks = u64::MAX;
+            return;
+        }
+        self.periodic_phase_mark_interval = interval_ticks;
+        self.next_phase_mark_ticks = self.timeline.now_ticks().saturating_add(interval_ticks);
+        let expected = (budget_ticks / interval_ticks).saturating_add(8) as usize;
+        self.phase_marks.reserve(expected.min(65_536));
+    }
+
+    /// The armed interval in master ticks. Test seam: the spacing assertion has to compare against
+    /// the value the sampler actually uses, not a re-derivation of it.
+    #[cfg(test)]
+    pub(crate) fn periodic_phase_mark_interval_for_test(&self) -> u64 {
+        self.periodic_phase_mark_interval
+    }
+
+    /// The periodic sample itself. COLD and never inlined: it sits one branch off the run loop,
+    /// which `run_until_tick` documents as layout-sensitive, and this project has measured
+    /// double-digit swings from layout in that loop.
+    ///
+    /// Deliberately LEANER than `note_phase_mark`, and the difference is load-bearing rather than
+    /// tidiness. That one takes a full `cpu_profile` snapshot whenever `IZARRAVM_CPU_PROFILE` is
+    /// armed -- which the hdd-folder benchmark path arms -- and that snapshot sorts `hot_addrs`,
+    /// an UNTRUNCATED map of every distinct sampled address, which only grows across a run. Since
+    /// `wall` is sampled first, mark k's snapshot cost is charged to interval k and grows
+    /// monotonically, so late intervals would carry more overhead than early ones. On a fixture
+    /// that loads and then renders, that reads as the render phase being slower than it is: the
+    /// instrument would amplify the very knee it exists to find. So `cpu_profile` is None here
+    /// unconditionally, and `machine_phases` (a per-mark Vec, all zero unless host profiling is
+    /// armed) is left empty.
+    #[cold]
+    #[inline(never)]
+    fn fire_periodic_phase_mark(&mut self) {
+        let now = self.timeline.now_ticks();
+        // A HLT fast-forward can jump several intervals at once. Advance past all of them and
+        // sample ONCE: firing per skipped interval would emit zero-wall duplicates, which read
+        // as infinite rt to any consumer that divides.
+        let interval = self.periodic_phase_mark_interval.max(1);
+        while self.next_phase_mark_ticks <= now {
+            self.next_phase_mark_ticks = self.next_phase_mark_ticks.saturating_add(interval);
+        }
+        self.phase_marks.push(PhaseMark {
+            id: phase_mark::PERIODIC,
+            wall: std::time::Instant::now(),
+            master_ticks: now,
+            elapsed_clocks: self.elapsed_clocks(),
+            perf: self.cpu.perf_counters().clone(),
+            machine_phases: MachineHostProfileSnapshot::default(),
+            katea: self.katea_storage_counters(),
+            io_stall_ticks: self.timeline.io_stall_ticks(),
+            halted_ticks: self.halted_ticks,
+            cpu_profile: None,
         });
     }
 
@@ -2836,6 +2942,10 @@ mod code_write_coherence_tests;
 #[cfg(test)]
 #[path = "machine_fault_site_test.rs"]
 mod fault_site_tests;
+
+#[cfg(test)]
+#[path = "phase_mark_test.rs"]
+mod phase_mark_tests;
 
 #[cfg(test)]
 #[path = "machine_test.rs"]

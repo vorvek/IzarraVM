@@ -860,6 +860,11 @@ impl Machine {
             self.cpu.note_device_memory_write();
         }
         while self.timeline.now_ticks() < deadline_ticks {
+            // Periodic sampling, gated on a sentinel that is `u64::MAX` when disarmed so this
+            // costs one compare against an already-live value. See `fire_periodic_phase_mark`.
+            if self.next_phase_mark_ticks <= self.timeline.now_ticks() {
+                self.fire_periodic_phase_mark();
+            }
             if self.direct_map_changed {
                 self.cpu.note_direct_map_changed();
                 self.direct_map_changed = false;
