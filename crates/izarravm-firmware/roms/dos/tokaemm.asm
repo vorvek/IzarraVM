@@ -264,8 +264,9 @@ interrupt:
 init:
     ; Parse the DEVICE= tail for a whole-token "NOEMS" argument.
     ; r_bpbptr (+18) points at the raw command line, driver path first
-    ; (FreeDOS init_device). Bare and RAM both use the default 3 MB EMS pool;
-    ; NOEMS wins regardless of token order because no other token sets it back.
+    ; (FreeDOS init_device). Bare and RAM both leave EMS enabled, drawing pages
+    ; from the shared arena on demand rather than a fixed-size pool; NOEMS wins
+    ; regardless of token order because no other token sets it back.
     push ds
     lds si, [es:bx+18]
 .p_path:                          ; skip the path token
