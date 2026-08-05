@@ -1213,3 +1213,38 @@ fn click_holds_the_button_long_enough_for_a_frame_poll() {
     // state change, and the driver latches it until the release arrives.
     assert_eq!(buttons, 0, "a click must not leave the button held");
 }
+
+#[test]
+fn held_keys_emit_only_the_edge_they_name() {
+    // A bare token is a tap: make then break.
+    assert_eq!(
+        text_to_scancode_groups("{right}").unwrap(),
+        vec![vec![0x4d, 0xcd]]
+    );
+    // `+` presses and does NOT release, which is the whole point -- the guest
+    // tracks key-down state from the scancode stream, so a tap cannot express
+    // "keep running". Prince of Persia's prince stands still under a tap and
+    // runs under a hold.
+    assert_eq!(
+        text_to_scancode_groups("{+right}").unwrap(),
+        vec![vec![0x4d]]
+    );
+    // `-` releases.
+    assert_eq!(
+        text_to_scancode_groups("{-right}").unwrap(),
+        vec![vec![0xcd]]
+    );
+    // The three must be distinguishable, or a schedule asking for a hold would
+    // silently get a tap.
+    let tap = text_to_scancode_groups("{right}").unwrap();
+    let press = text_to_scancode_groups("{+right}").unwrap();
+    assert_ne!(tap, press);
+    // Modifiers take the prefixes too, and the name still resolves.
+    assert_eq!(
+        text_to_scancode_groups("{+shift}").unwrap(),
+        vec![vec![0x2a]]
+    );
+    // An unknown name is still an error with the prefix stripped, not a silent
+    // fallthrough that would inject nothing.
+    assert!(text_to_scancode_groups("{+nosuchkey}").is_err());
+}
