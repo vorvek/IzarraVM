@@ -233,18 +233,27 @@ pub(crate) struct SegmentLayout {
 }
 
 impl SegmentLayout {
-    /// `used` is the PINNED set — every segment `data_matches` will compare on entry — while the
-    /// accessibility check below runs over the ACCESSED set only. The two used to be the same
-    /// mask; they came apart when `MovSegToReg` arrived, which needs a segment's selector pinned
-    /// without asserting anything about whether memory can be reached through it.
+    /// `pinned_segments` is the PINNED set — every segment `data_matches` will compare on entry —
+    /// while the accessibility check below runs over the ACCESSED set only. The two used to be the
+    /// same mask; they came apart when `MovSegToReg` arrived, which needs a segment's selector
+    /// pinned without asserting anything about whether memory can be reached through it.
+    ///
+    /// The caller accumulates the pinned set through `DirectKind::pinned_segments`, which is the
+    /// single definition of the question. This used to take the selector mask and OR the three
+    /// together here, which put the union in one place and the question in three.
     pub(crate) fn capture(
         cpu: &CpuGsw,
         read_segments: u8,
         write_segments: u8,
-        selector_segments: u8,
+        pinned_segments: u8,
     ) -> Option<Self> {
+        debug_assert_eq!(
+            pinned_segments & (read_segments | write_segments),
+            read_segments | write_segments,
+            "every accessed segment must also be pinned",
+        );
         let data = SEGMENT_ORDER.map(|segment| cpu.registers.segment(segment));
-        let used = read_segments | write_segments | selector_segments;
+        let used = pinned_segments;
         for segment in SEGMENT_ORDER {
             let bit = segment_bit(segment);
             if (read_segments | write_segments) & bit == 0 {
@@ -3332,6 +3341,25 @@ impl DirectKind {
         }
     }
 
+    /// Every segment whose descriptor this kind BAKES, as a bitmask: the union of the three
+    /// accessors above.
+    ///
+    /// One definition, because the question has three answers and the next reader will only
+    /// remember two. `MovSegToReg` is the case that proves it: it bakes DS's selector as a
+    /// compile-time constant and reports through `selector_segment` ALONE, with `read_segment` and
+    /// `write_segment` both `None`. Anything that asks "does this slot depend on segment S" by
+    /// consulting the read and write accessors gets the wrong answer for it, and the wrong answer
+    /// is a stale baked value rather than a fault.
+    ///
+    /// This is deliberately NOT the same question `kind_segment_access_supported` asks. That one
+    /// runs over the ACCESSED set, because a selector read asserts nothing about whether memory
+    /// can be reached through the segment: folding the two together would refuse to compile
+    /// `mov ax, fs` whenever FS is null, which is a legal instruction with a legal answer.
+    fn pinned_segments(self) -> u8 {
+        let bit = |segment: Option<SegmentIndex>| segment.map_or(0, segment_bit);
+        bit(self.read_segment()) | bit(self.write_segment()) | bit(self.selector_segment())
+    }
+
     fn write_segment(self) -> Option<SegmentIndex> {
         match self {
             Self::Store { addr, .. }
@@ -4074,7 +4102,7 @@ fn compile_with_instruction_limit(
     let mut dword_stores = 0u8;
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
-    let mut selector_segments = 0u8;
+    let mut pinned_segments = 0u8;
     let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
@@ -4387,15 +4415,17 @@ fn compile_with_instruction_limit(
         byte_stores = next_byte_stores;
         word_stores = next_word_stores;
         dword_stores = next_dword_stores;
+        // `read_segments` and `write_segments` stay separate because the accessibility check needs
+        // to know WHICH of the two a slot wants. `pinned_segments` is the other question, asked
+        // once here so that a kind which bakes a descriptor without accessing memory through it
+        // cannot be wired into some consumers and not others.
         if let Some(segment) = kind.read_segment() {
             read_segments |= segment_bit(segment);
         }
         if let Some(segment) = kind.write_segment() {
             write_segments |= segment_bit(segment);
         }
-        if let Some(segment) = kind.selector_segment() {
-            selector_segments |= segment_bit(segment);
-        }
+        pinned_segments |= kind.pinned_segments();
         has_wide_accesses |=
             kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
         // Attached HERE, at the last point before the slot is committed, not next to `classify`.
@@ -4442,7 +4472,7 @@ fn compile_with_instruction_limit(
         return CompileOutcome::Retry;
     };
     let Some(segment_layout) =
-        SegmentLayout::capture(cpu, read_segments, write_segments, selector_segments)
+        SegmentLayout::capture(cpu, read_segments, write_segments, pinned_segments)
     else {
         return CompileOutcome::Retry;
     };
