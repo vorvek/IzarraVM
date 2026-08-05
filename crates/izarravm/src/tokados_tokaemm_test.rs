@@ -250,6 +250,57 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
             "small-memory pool probe failed with {memory_mib} MiB {emm_arg} \
              (stop={stop:?}); a 0xEn code names the failed step.\n{text}"
         );
+
+        // Which of the two table placements ran, read off the CPU rather than
+        // off anything the driver says about itself. CR3 is the page directory
+        // the monitor is actually using, so this cannot be satisfied by a
+        // driver that reports one thing and does another.
+        //
+        // Without this the fixture proved nothing about placement: it reads
+        // pool bounds only, and at 1 MiB the arena is empty so it takes its own
+        // empty-pool branch. Four of the six iterations run the high path, and
+        // nothing here could tell.
+        let cr3 = machine.cpu().control.cr3;
+        if memory_mib == 1 {
+            // Bound the fallback against the driver's own load base, not just
+            // against 1 MB. "Below 1 MB" is satisfied by CR3 = 0, by tables
+            // sitting inside the core, and by tables over the IVT, none of
+            // which is what this path is supposed to do. The driver hooks
+            // INT 67h at INIT, so its load segment is readable straight out of
+            // the vector table, which is independent of anything the driver
+            // reports about itself.
+            //
+            // The two bounds mirror the driver's own EQUs, derived from the
+            // shipped image's length rather than copied as literals, so they
+            // follow automatically when the core grows: the file ends exactly
+            // at resident_core_end now that the reservation is not emitted.
+            let vector = 0x67 * 4 + 2;
+            let drv_seg = u32::from(machine.read_physical_u8(vector))
+                | (u32::from(machine.read_physical_u8(vector + 1)) << 8);
+            let base = drv_seg << 4;
+            let tables_off = (izarravm_firmware::tokaemm_sys().len() as u32).next_multiple_of(4096);
+            let image_end_off = tables_off + 0x7000 + 0xFF0;
+            assert!(
+                cr3 >= base + tables_off,
+                "at {memory_mib} MiB CR3 ({cr3:#010x}) is below the reservation \
+                 at {:#010x}, so the tables are inside the driver core, not in \
+                 the region reserved past the end of the file",
+                base + tables_off
+            );
+            assert!(
+                cr3 + 0x7000 <= base + image_end_off,
+                "at {memory_mib} MiB the seven tables at CR3 ({cr3:#010x}) run \
+                 past the reserved region ending {:#010x}, so DOS did not keep \
+                 all the memory the monitor is using",
+                base + image_end_off
+            );
+        } else {
+            assert!(
+                cr3 >= 0x0013_8000,
+                "at {memory_mib} MiB the tables must be reserved above the UMB \
+                 window, but CR3 is {cr3:#010x}"
+            );
+        }
     }
 }
 

@@ -562,3 +562,41 @@ fn per_vector_linear_stub_identity_posts_the_matching_service() {
     }
     assert_eq!(machine.pending_soft_int, Some(0x10));
 }
+
+/// TOKAEMM addresses itself with 16-bit offsets, so everything it can name has
+/// to fit under 64 KB. The paging tables are the exception: they are reserved
+/// past the end of the file and reached only by linear address through
+/// `pd_lin`, so the file length IS the resident core and the whole of the
+/// budget that new driver code competes for.
+///
+/// This exists because the driver spent a campaign at 16 bytes under the
+/// ceiling, which blocked every change that touched it. The reservation had
+/// been emitted into the file, charging 32,752 bytes of the budget on every
+/// configuration to serve a fallback only a 1 MiB machine takes.
+///
+/// Absolute figures, measured 2026-08-06, not a proportion of anything: a
+/// margin expressed as a fraction of the image grows when the image grows,
+/// which is precisely backwards for a ceiling.
+#[test]
+fn the_tokaemm_image_keeps_room_under_the_16_bit_driver_ceiling() {
+    const CEILING: usize = 0x10000;
+    // Measured 2026-08-06: 29,488 bytes. The bar is deliberately well under the
+    // ceiling rather than just below it, so that a change which eats the
+    // headroom is caught while there is still room to think about it.
+    const MAX: usize = 40_000;
+
+    let image = izarravm_firmware::tokaemm_sys();
+    assert!(
+        image.len() < CEILING,
+        "TOKAEMM is {} bytes, at or over the {CEILING}-byte 16-bit offset ceiling",
+        image.len()
+    );
+    assert!(
+        image.len() <= MAX,
+        "TOKAEMM has grown to {} bytes, past the {MAX}-byte bar. That is not a \
+         failure by itself, but the ceiling is {CEILING} and the last time this \
+         got tight it blocked all driver work. Re-measure and move the bar \
+         deliberately.",
+        image.len()
+    );
+}
