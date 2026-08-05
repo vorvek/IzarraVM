@@ -346,7 +346,7 @@ static void print_toka_summary(unsigned memfree, unsigned umbfree,
     print_normal_entry(_(2,1,"Conventional"), 640, 640 - conv_free,
 		       conv_free);
     print_normal_entry(_(2,2,"Upper"), 384, 384 - upper_free, upper_free);
-    print_normal_entry(toka_shared_pool ? "Extended (XMS)*"
+    print_normal_entry(toka_shared_pool ? _(2,26,"Extended (XMS)*")
 					: _(2,4,"Extended (XMS)"),
 		       toka_xms_category_k, toka_xms_category_k - xms_free,
 		       xms_free);

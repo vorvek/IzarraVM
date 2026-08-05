@@ -82,14 +82,15 @@ xf_version:
     retf
 
 ; F0h private pool query used by Toka-DOS MEM. Both AL=0 and AL=1 answer with
-; the legacy totals magic 'TK' now that XMS and VCPI share one pool.
+; the totals magic 'TK' now that XMS, VCPI and EMS share one pool.
 ;
 ; F001h used to return the split-pool magic 'TL' plus free VCPI KB in DX, and
-; MEM added that to the XMS free count (`if (toka_split_pools) xms_free +=
-; toka_vcpi_free_k;` in mem2.c). With one pool those are the SAME pages, so the
-; sum double-counted it, hit MEM's clamp at the category size, and reported the
-; whole category free with 0 K used. Answering 'TK' takes MEM's non-split path,
-; which uses the XMS free count alone -- the honest figure, and the same one
+; MEM added that on top of the XMS free count. With one pool those are the SAME
+; pages, so the sum double-counted it, hit MEM's clamp at the category size,
+; and reported the whole category free with 0 K used. 'TK' with DX=0 is the
+; only answer this function gives now: MEM reads it as toka_shared_pool, folds
+; the Expanded (EMS) row into one starred Extended (XMS) row, and reports that
+; row from the XMS free count alone -- the honest figure, and the same one
 ; function 08h/88h return.
 xf_toka_pools:
     mov ax, 0x544B               ; 'TK'
