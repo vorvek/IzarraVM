@@ -91,13 +91,20 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
     // `0xf7`, `0xa9`, `0xb8..=0xbf`, `0xc7`, `0x81`, `0x85`, `0x8d`, `0xa3`. Every one is the Dword
     // sibling of an admitted byte form and its kind hard-codes Dword with no width field.
-    // `0x01`/`0x31` are worse still: `AluReg` does carry a width, but before the widening described
-    // below `emit_alu_preloaded`'s Word branch ignored `op`, hard-coded SUB and wrote the result to
-    // a scratch register instead of the destination, which is correct only for the CMP forms
-    // `0x39`/`0x3b` already admitted here. That branch now handles the whole non-carry op set with
-    // write-back, so `0x01`/`0x31` are a lowering waiting to be MEASURED rather than a hazard --
-    // but they are not admitted in this slice, because nothing in the census asks for them and an
-    // unmeasured admission is a formation change with no row to attribute it to.
+    //
+    // THE WORD ALU REGISTER FORMS, forms 1 and 3, are the 16-bit campaign's second slice.
+    // `0x01`/`0x09`/`0x21`/`0x29`/`0x31` and `0x03`/`0x0b`/`0x23`/`0x2b`/`0x33` join `0x39`/`0x3b`,
+    // which have been carrying the Word lane as CMP since before this list existed. An older
+    // version of this comment called them "worse still" than the Dword siblings, because
+    // `emit_alu_preloaded`'s Word branch once ignored `op`, hard-coded SUB and wrote to a scratch
+    // register, which is correct only for CMP. That branch handles the whole non-carry op set
+    // with a `mov_r16_r16` write-back now, and `0x83` has been exercising exactly that write-back
+    // in production since its own slice, with a mutation record behind it. The census asked: a
+    // 16-bit workload ranks these ten rows near 19% of block-stopping hits.
+    //
+    // Three exclusions hold the boundary, and each is enforced in the ARM rather than by this
+    // list, because a list is the wrong place for a rule the next reader has to re-derive:
+    // ADC and SBB at Word (no carry-in lane), and both MEMORY shapes at Word (see the arms).
     //
     // `0x83` WAS on that list and is now admitted, which is the second half of this slice. Its
     // register form produces `AluImm`, which carries a `width` field as of this commit, and its
@@ -157,6 +164,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             insn.opcode,
             0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38
                 | 0x02 | 0x0a | 0x12 | 0x1a | 0x22 | 0x2a | 0x32 | 0x3a
+                | 0x01 | 0x09 | 0x21 | 0x29 | 0x31
+                | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
                 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
                 | 0x40..=0x4f
                 | 0x50..=0x5f
@@ -341,6 +350,29 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         if opcode < 0x40 {
             let op = (opcode >> 3) & 7;
             let form = opcode & 7;
+            // ADC and SBB have no Word lane, so refuse them here rather than leaving the
+            // allowlist as the only thing between them and a miscompile. They take the incoming
+            // CF as an OPERAND; `emit_alu_preloaded`'s Word lane masks both operands with `and`,
+            // which CLEARS host CF, then tags the descriptor as the SUB class. An admitted
+            // `66 11 /r` would compute `adc ax, bx` without the carry in and then evaluate its
+            // lazy CF as `a < b`.
+            //
+            // The reason this guard exists at all is that the rule stated above says the byte set
+            // is closed over its shared classifier arms, and this slice admits five of eight
+            // members of two shared arms. Without a guard here the next reader applying that rule
+            // lands the bug above in one line. `0x81 | 0x83` states the same refusal the same way.
+            //
+            // Forms 1 and 3 ONLY. The other forms in this group are byte-width by encoding and
+            // reach lanes that carry no `operand_width` at all, so their ADC and SBB members are
+            // correct at Word and are admitted: `0x10`/`0x18`/`0x12`/`0x1a` produce `AluRegByte`
+            // and `0x14`/`0x1c` produce `AluByteImm`. Widening this guard to the whole group
+            // refuses those six as collateral, which is a regression rather than a fix.
+            if insn.operand_size == OperandSize::Word
+                && matches!(form, 1 | 3)
+                && matches!(op, 2 | 3)
+            {
+                return None;
+            }
             match form {
                 // Byte r/m destination, byte register source. BOTH operand forms as of the
                 // rejected-row campaign's Slice 7: the register form is `AluRegByte`, the byte
@@ -382,6 +414,22 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                             src: m.reg,
                             width: operand_width,
                         }),
+                        // Word memory is refused for the WRITING ops and admitted for CMP, which
+                        // is the shape that already ships: `0x39` has been compiling word memory
+                        // in quake's renderer since before this slice, so `op != 7` here rather
+                        // than a blanket refusal, or that regresses.
+                        //
+                        // A missed lowering rather than a hazard, and the reason is economics.
+                        // `emit_wide_page_guard` refuses every odd word address, and 16-bit DOS
+                        // code has no alignment discipline. Today an odd operand simply ends the
+                        // block; admitted, it sits INSIDE the block and side-exits at that slot
+                        // on every execution, so nothing after it retires natively. Admit it when
+                        // a census row prices that exit.
+                        DecodedOperand::Mem(_)
+                            if insn.operand_size == OperandSize::Word && op != 7 =>
+                        {
+                            None
+                        }
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
                             op,
                             source: StoreSource::Reg(m.reg),
@@ -427,6 +475,16 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                             src,
                             width: operand_width,
                         }),
+                        // Refused at Word for form 1's reason, plus one of its own, and `op != 7`
+                        // for form 1's reason too: `0x3b` word memory ships in quake's renderer.
+                        // What is new is the COMBINATION of Word with a write-back after a memory
+                        // read, which nothing exercises today, since `AluMemSource` at Word only
+                        // ever reaches CMP. Both halves are certified separately, the pair is not.
+                        DecodedOperand::Mem(_)
+                            if insn.operand_size == OperandSize::Word && op != 7 =>
+                        {
+                            None
+                        }
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemSource {
                             op,
                             dst: m.reg,

@@ -3699,7 +3699,10 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
     // RDX holds the result, zero-extended because RAX was masked before the copy, which is what the
     // lazy evaluator wants for a Word descriptor.
     if matches!(width, MemoryWidth::Word) {
-        debug_assert!(
+        // Must fail in release too, since the emitter runs in the release JIT, and the failure
+        // this guards is silent: the `and` masks below clear host CF, so an ADC that reached here
+        // would compute without its carry in and then tag the descriptor as the SUB class.
+        assert!(
             !matches!(op, 2 | 3),
             "ADC/SBB take the incoming CF as an operand and have no word lane; classify refuses \
              them at Word size"
