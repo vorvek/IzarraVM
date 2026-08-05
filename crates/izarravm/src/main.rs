@@ -1157,6 +1157,7 @@ fn write_hdd_profile_json(
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
+        "sb_dsp": sb_dsp_json(machine.sb_dsp_diagnostics()),
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
@@ -1192,6 +1193,18 @@ fn opl_diagnostics_json(
             "clk": e.core_clocks,
             "us": e.pending_micros,
         })).collect::<Vec<_>>(),
+    })
+}
+
+/// Guest Sound Blaster DSP activity. `reset_acknowledges` against `resets` is
+/// what says whether the guest ever found the card at all.
+fn sb_dsp_json(sb: izarravm_machine::SbDspDiagnostics) -> serde_json::Value {
+    json!({
+        "resets": sb.resets,
+        "reset_acknowledges": sb.reset_acknowledges,
+        "command_bytes": sb.command_bytes,
+        "data_reads": sb.data_reads,
+        "status_reads": sb.status_reads,
     })
 }
 

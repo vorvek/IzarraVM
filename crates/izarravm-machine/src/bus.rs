@@ -1600,6 +1600,7 @@ impl CpuBus for MachineBus<'_> {
         if !matches!(port, 0x224 | 0x225)
             && let Some(value) = self.sb16.read_port(port)
         {
+            self.opl_probe.record_sb(port, false, value);
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pit.read_port(port) {
@@ -1818,6 +1819,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if !matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {
+            self.opl_probe.record_sb(port, true, value as u8);
             return Ok(());
         }
         if self

@@ -750,6 +750,27 @@ pub struct OplDiagnostics {
     pub key_off_writes: u64,
 }
 
+/// Host-side tally of guest Sound Blaster DSP activity. Diagnostic ONLY, and on
+/// the bus rather than on `SbDsp` for the same reason as `OplDiagnostics`: that
+/// chip derives `PartialEq` for state comparison.
+///
+/// `reset_acknowledges` is the one that matters. An SB detect writes 1 then 0 to
+/// the reset port, waits ~100 us, and expects to read 0xAA back from the data
+/// port. A run with resets but no acknowledges is a card the guest never found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SbDspDiagnostics {
+    /// Writes of 0 to 0x226, each starting a reset settle.
+    pub resets: u64,
+    /// Bytes written to the command port 0x22C, arguments included.
+    pub command_bytes: u64,
+    /// Reads of the data port 0x22A.
+    pub data_reads: u64,
+    /// Data-port reads that returned 0xAA, the reset acknowledge.
+    pub reset_acknowledges: u64,
+    /// Reads of the read-buffer status ports 0x22E/0x22F.
+    pub status_reads: u64,
+}
+
 /// One recorded guest OPL access, for `IZARRAVM_OPL_TRACE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OplTraceEntry {
@@ -790,6 +811,7 @@ impl OplTraceEntry {
 #[derive(Debug, Default)]
 pub struct OplProbe {
     counters: OplDiagnostics,
+    sb: SbDspDiagnostics,
     trace: Vec<OplTraceEntry>,
     cap: usize,
 }
@@ -802,6 +824,7 @@ impl OplProbe {
             .unwrap_or(0);
         Self {
             counters: OplDiagnostics::default(),
+            sb: SbDspDiagnostics::default(),
             trace: Vec::new(),
             cap,
         }
@@ -809,6 +832,28 @@ impl OplProbe {
 
     pub fn counters(&self) -> OplDiagnostics {
         self.counters
+    }
+
+    pub fn sb(&self) -> SbDspDiagnostics {
+        self.sb
+    }
+
+    /// Record a Sound Blaster DSP port access. `value` is the byte written, or
+    /// the byte the read returned.
+    fn record_sb(&mut self, port: u16, write: bool, value: u8) {
+        match (port, write) {
+            // Only the write of 0 starts the settle; the preceding 1 arms it.
+            (0x0226, true) if value == 0 => self.sb.resets += 1,
+            (0x022c, true) => self.sb.command_bytes += 1,
+            (0x022a, false) => {
+                self.sb.data_reads += 1;
+                if value == 0xaa {
+                    self.sb.reset_acknowledges += 1;
+                }
+            }
+            (0x022e | 0x022f, false) => self.sb.status_reads += 1,
+            _ => {}
+        }
     }
 
     pub fn trace(&self) -> &[OplTraceEntry] {
@@ -2077,6 +2122,11 @@ impl Machine {
     /// orders of magnitude more expensive than the count.
     pub fn opl_diagnostics(&self) -> OplDiagnostics {
         self.opl_probe.counters()
+    }
+
+    /// Guest Sound Blaster DSP activity since power-on.
+    pub fn sb_dsp_diagnostics(&self) -> SbDspDiagnostics {
+        self.opl_probe.sb()
     }
 
     /// The recorded OPL access trace, empty unless `IZARRAVM_OPL_TRACE` was set.
