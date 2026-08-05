@@ -929,6 +929,29 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
+    /// `MOV r16, imm16`, register destination. Defines bits 15..0 and leaves 31..16 alone, which
+    /// is what a guest `MOV r16, imm16` does and what a 32-bit move would get wrong.
+    ///
+    /// Deliberately `C7 /0` rather than the shorter `B8+r`. Both are legal, but the prefix order
+    /// is the hazard worth designing against: `66` must come BEFORE the REX, because a REX is
+    /// honoured only when it immediately precedes the opcode. Seven of the eight guest homes are
+    /// extended registers, so a `41 66 ...` sequence would not fault, it would silently address a
+    /// different host register and therefore a different GUEST register. Sitting in the
+    /// `C7`-shaped neighbourhood means this diffs cleanly against `alu_r16_imm16` and
+    /// `shift_r16_imm8` above, which already order their prefixes correctly, rather than against
+    /// `mov_r32_imm32`, which pushes its REX first because it has no `66` to order against.
+    ///
+    /// The register form uses `modrm(0b11, ..)` and so never needs a SIB byte, which matters for
+    /// the same reason it does in `alu_r16_imm16`: the guest ESP home is `Reg::R12`, whose
+    /// `low3()` is the SIB escape.
+    pub(crate) fn mov_r16_imm16(&mut self, dst: Reg, imm: u16) {
+        self.bytes.push(0x66);
+        self.optional_rex(false, false, false, dst.ext());
+        self.bytes.push(0xc7);
+        self.modrm(0b11, 0, dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// An 8-bit register-register ALU operation using AL, CL, DL, or BL.
     pub(crate) fn alu_r8_r8(&mut self, op: u8, dst: Reg, src: Reg) {
         const OPCODES: [u8; 8] = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];

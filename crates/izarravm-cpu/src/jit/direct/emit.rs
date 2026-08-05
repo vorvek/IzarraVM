@@ -204,18 +204,18 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 ExtendWidths::new(width, dst_width),
                 signed,
             ),
-            // The Word arm stages through RDX and narrows on the way out, which is the shape
-            // `MovSegToReg` below already uses and for its stated reason: the encoder has no
-            // 16-bit immediate form, and adding one would have to clone a 66-prefixed emitter
-            // rather than `mov_r32_imm32`, whose REX comes first because it has no 66 to order
-            // against. Seven of the eight guest homes are extended registers, so getting that
-            // order wrong writes a different guest register rather than faulting.
+            // One host instruction at each width. The Word arm staged through RDX when it landed,
+            // reusing `MovSegToReg`'s shape rather than adding an encoder form for one kind, and
+            // that measured wall-flat on bench16_c while the block structure improved: two host
+            // instructions per slot against the Dword arm's one, on an opcode common enough for
+            // the difference to cancel what the longer blocks bought. `mov_r16_imm16` exists for
+            // that measurement, and `MovSegToReg` keeps the staged shape because its value is a
+            // baked selector rather than a decoded immediate.
             DirectKind::MovImm { dst, imm, width } => match width {
                 MemoryWidth::Dword => e.mov_r32_imm32(home(dst), imm),
-                MemoryWidth::Word => {
-                    e.mov_r32_imm32(Reg::RDX, imm);
-                    emit_write_gpr16(&mut e, dst, Reg::RDX);
-                }
+                // `imm as u16` is exact rather than a truncation: `decode`'s `fetch_immediate`
+                // zero-extends a Word immediate, so bits 31..16 are already zero here.
+                MemoryWidth::Word => e.mov_r16_imm16(home(dst), imm as u16),
                 MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
                     unreachable!("classify produces MovImm only at Word or Dword")
                 }
