@@ -184,6 +184,13 @@ start:
     mov word [swst+0x14], 0x08    ; entry CS = client 16-bit code
 
     ; ---- 4. switch to protected mode ----
+    ; Re-entered for the SECOND round trip from v86_landing. Everything the
+    ; switch needs was built once, above, and survives a trip: DE01 filled PT0
+    ; and the server GDT trio and never writes them again, the PD/PT pages live
+    ; in this .COM, and rm_seg/rm_sp still describe the V86 stack the first
+    ; IRETD restored. Rebuilding any of it here would reset the client TSS
+    ; descriptor to available and make the second trip prove nothing.
+do_switch:
     mov ebp, 0x1BADB002           ; marker: must survive BOTH switches
     cli
     mov esi, [lin_base]
@@ -302,6 +309,30 @@ v86_landing:
     jnz f_bal
     cmp edx, [free_v86]
     jne f_bal
+
+    ; ---- the SECOND round trip ------------------------------------------
+    ; LTR sets the busy bit in the descriptor it loads, and a busy TSS makes
+    ; the next LTR of that selector #GP. The monitor clears the CLIENT's busy
+    ; bit before its LTR in .de0c, and that clear is invisible to a single
+    ; switch: the descriptor is still `available` the first time. Only a second
+    ; switch can observe it.
+    ;
+    ; Measured 2026-08-06: deleting that clear leaves every VCPI fixture here
+    ; green and takes DOOM under DOS/4GW down in the extender gate. The gate
+    ; needs games that are not in this repository and is hand-run, so without
+    ; the second trip below the property has no checked-in guard at all.
+    cmp byte [phase], 0
+    jne .finish
+    ; The precondition: trip 1 must actually have left our TSS descriptor busy.
+    ; Without this the fixture still passes when the descriptor was never
+    ; marked, which is the state in which the monitor's clear is a no-op and
+    ; the second trip proves nothing.
+    cmp byte [gdt+0x18+5], 0x8B   ; busy 32-bit TSS
+    jne f_busy
+    inc byte [phase]
+    jmp do_switch
+
+.finish:
     mov ah, 0x0D                 ; unlock and release the 64 KB XMS block
     mov dx, [xms_handle]
     call far [xms_entry]
@@ -324,6 +355,8 @@ f_ret:    mov al, 0xE5
           jmp sig
 f_bal:    mov al, 0xE6
           jmp sig
+f_busy:   mov al, 0xD0        ; trip 1 left the client TSS descriptor available,
+          jmp sig               ; so the monitor's busy-bit clear is untested
 f_xms:    mov al, 0xE7
 
 sig:
@@ -341,6 +374,7 @@ align 4
 lin_base:  dd 0
 pd_phys:   dd 0
 pt_phys:   dd 0
+phase:     db 0                  ; 0 = first round trip, 1 = second
 free_v86:  dd 0
 xms_entry: dd 0
 xms_base:  dd 0

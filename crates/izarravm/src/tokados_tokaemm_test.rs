@@ -307,11 +307,13 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
 /// A guest program install-checks XMS, allocates a 64 KB EMB,
 /// locks it, moves a pattern conventional->EMB->conventional, verifies it, then
 /// unlocks and frees — all in V86 under TOKAEMM's monitor (block MOVE traps to
-/// the monitor's flat memcpy). It then asserts two properties of the arena's
-/// shape: 08h reports the largest free block separately from the total, and a
-/// 1 KB request costs 1 KB rather than a whole page. XMSTEST.COM signals 0xA5
-/// (success) via the unit-tester exit port; any other code names the step that
-/// broke, and the fixture's own failure-label block is the key.
+/// the monitor's flat memcpy). XMSTEST.COM signals 0xA5 (success) via the
+/// unit-tester exit port; any other code names the step that broke, and the
+/// fixture's own failure-label block is the key.
+///
+/// The arena-SHAPE assertions this used to end with now live in XMSARENA.COM
+/// (see the test below). They were last, behind all fifteen steps here, so any
+/// regression above them reported an unrelated code and left them unrun.
 ///
 /// The config is NOEMS so host EMS reserves no extended RAM and the guest XMS
 /// driver owns all of it. EMS coexistence is covered separately.
@@ -352,7 +354,58 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         stop,
         StopReason::TestExit { code: 0xA5 },
         "XMS round-trip did not report success (stop={stop:?}); \
-             a 0xE0-0xF2 code names the failed step.\n{text}"
+             a 0xE0-0xEE code names the failed step.\n{text}"
+    );
+}
+
+/// The arena-SHAPE assertions, split out of XMSTEST so a regression anywhere in
+/// the XMS round trip cannot leave them unrun. 08h must report the largest free
+/// block separately from the total, and a 1 KB request must cost 1 KB rather
+/// than a whole page, which is what a 4 KB-page arena would charge.
+///
+/// XMSARENA.COM signals 0xA5 on success. 0xEF and 0xF0 are the two ASSERTIONS;
+/// 0xD0, 0xD1, 0xF1 and 0xF2 are setup, kept distinct so an absent driver or an
+/// arena too small to fragment can never be read as a failed assertion.
+///
+/// Same NOEMS config as the round-trip test above: under RAM, EMS draws from
+/// the same shared arena and the free totals the fixture reasons about move.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_m1b_xms_arena_shape_in_v86() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nXMSARENA\r\n".to_vec();
+
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-m1b",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "XMSARENA.COM".to_string(),
+                izarravm_firmware::xmsarena_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "arena shape did not report success (stop={stop:?}); 0xEF means 08h \
+             collapsed largest into total, 0xF0 means a 1 KB block did not cost \
+             1 KB, and anything else is setup.\n{text}"
     );
 }
 

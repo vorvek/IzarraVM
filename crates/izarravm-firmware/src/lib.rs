@@ -36,6 +36,9 @@ pub const HLTTEST_COM_SOURCE: &str = include_str!("../roms/dos/hlttest.asm");
 pub const MULTIHLT_COM: &[u8] = include_bytes!("../roms/dos/multihlt.com");
 pub const MULTIHLT_COM_SOURCE: &str = include_str!("../roms/dos/multihlt.asm");
 pub const XMSTEST_COM: &[u8] = include_bytes!("../roms/dos/xmstest.com");
+// No XMSARENA_COM_SOURCE: the sibling XMSTEST_COM_SOURCE has no consumer, and a
+// second unused const would just be more of the same.
+pub const XMSARENA_COM: &[u8] = include_bytes!("../roms/dos/xmsarena.com");
 pub const XMSTEST_COM_SOURCE: &str = include_str!("../roms/dos/xmstest.asm");
 pub const UMBTEST_COM: &[u8] = include_bytes!("../roms/dos/umbtest.com");
 pub const UMBTEST_COM_SOURCE: &str = include_str!("../roms/dos/umbtest.asm");
@@ -225,6 +228,15 @@ pub fn multihlt_com() -> &'static [u8] {
 /// V86 under TOKAEMM; a non-0xA5 exit code names the step that broke.
 pub fn xmstest_com() -> &'static [u8] {
     XMSTEST_COM
+}
+
+/// The XMS arena-SHAPE fixture: 08h must report the largest free block
+/// separately from the total, and a 1 KB request must cost 1 KB rather than a
+/// whole page. Split out of `xmstest_com` so a regression in the round trip
+/// cannot leave these two assertions unrun. Signals 0xA5 on success; 0xEF and
+/// 0xF0 are the assertions, every other code is setup.
+pub fn xmsarena_com() -> &'static [u8] {
+    XMSARENA_COM
 }
 
 /// The UMB fixture: with DOS=UMB, set the high-first allocation
