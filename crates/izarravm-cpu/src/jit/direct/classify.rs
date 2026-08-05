@@ -188,6 +188,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x01 | 0x09 | 0x21 | 0x29 | 0x31
                 | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
                 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
+                | 0x06 | 0x1e
                 | 0x40..=0x4f
                 | 0x50..=0x5f
                 | 0x68
@@ -687,6 +688,26 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x9c => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Flags { mask: u32::MAX },
+                });
+            }
+            // PUSH DS (0x1e) and PUSH ES (0x06), the read half of the segment family. Both are
+            // ordinary word stack stores of a value the block already pins: the selector is baked
+            // from the `SegmentLayout` in `emit_store`, exactly as `MovSegToReg` bakes one, and
+            // `selector_segment` reports the segment so `data_matches` refuses re-entry after a
+            // guest reload.
+            //
+            // PUSH SS (0x16) and PUSH CS (0x0e) are NOT here, and not for symmetry's sake. The
+            // census measures 36 and 18 hits against 17.9 million for DS, SS belongs to the family
+            // the write half excludes over the interrupt shadow, and CS would need the carve-out
+            // `selector_segment` documents. Closure over a shared arm is worth having when the arm
+            // is shared; this one is two lines.
+            0x1e | 0x06 => {
+                return Some(DirectKind::Push {
+                    source: StoreSource::Selector(if opcode == 0x1e {
+                        SegmentIndex::Ds
+                    } else {
+                        SegmentIndex::Es
+                    }),
                 });
             }
             0x68 => {

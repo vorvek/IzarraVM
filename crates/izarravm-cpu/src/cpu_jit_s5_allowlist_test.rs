@@ -176,6 +176,90 @@ fn word_size_0x83_register_forms_are_lowered() {
     }
 }
 
+/// `PUSH DS` and `PUSH ES` at Word size, the read half of the segment family.
+///
+/// One word store and no reads: the selector is a compile-time constant baked from the block's
+/// `SegmentLayout`, so the only memory the slot touches is the stack. `PUSH SS` and `PUSH CS` are
+/// asserted refused in the same table below rather than admitted for symmetry, and the reasons are
+/// different for each: SS belongs to the family the write half excludes over the interrupt shadow,
+/// and CS would need a carve-out because `selector_segment` deliberately keeps CS out of the
+/// pinned mask.
+#[test]
+fn word_size_push_segment_forms_are_lowered() {
+    for (label, opcode) in [("0x1e push ds", 0x1eu8), ("0x06 push es", 0x06)] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&[0x66, opcode]);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        // Two things this fixture does not give you by default, and both look identical to the
+        // opcode still being a barrier if you miss them.
+        //
+        // SS.B must be 0. `fresh()` sets `default_size_32` on CS and SS, and `stack_width_kind`
+        // implements no (SS.B = 1, Word) cell for any push at all -- `Push16` exists only for
+        // (SS.B = 0, Word), which is the cell real 16-bit code runs in.
+        //
+        // ESP must be live BEFORE compiling. The default of 0 puts the store page at 0xFFFFFFFE,
+        // which cannot resolve, and the block comes back Retry.
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = false;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.registers.set_esp(0x1000);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        assert_eq!(compilation.word_stores, 1, "{label}: word stores");
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// The segment pushes and pops that stay refused, all of them by the allowlist rather than by an
+/// arm, so this table is the right place for them.
+///
+/// SS.B and ESP are set up exactly as in the positive test above, and that is what makes these
+/// refusals ATTRIBUTABLE. Leave either alone and every row comes back at three instructions
+/// because no push can compile in that cell at all, and the table passes while proving nothing
+/// about the allowlist.
+#[test]
+fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
+    let cases: &[(&str, &[u8])] = &[
+        ("0x0e push cs", &[0x66, 0x0e]),
+        ("0x16 push ss", &[0x66, 0x16]),
+        ("0x1f pop ds", &[0x66, 0x1f]),
+        ("0x07 pop es", &[0x66, 0x07]),
+        ("0x17 pop ss", &[0x66, 0x17]),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = false;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.registers.set_esp(0x1000);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused at Word size, so the block is the three fillers"
+        );
+    }
+}
+
 /// `MOV r16, imm16` at Word size, the 16-bit campaign's fourth slice.
 ///
 /// All eight destinations, because `home()` is a table lookup and one case cannot see a

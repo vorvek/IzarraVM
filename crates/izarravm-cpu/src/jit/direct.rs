@@ -3009,6 +3009,11 @@ pub(crate) enum StoreSource {
     },
     Reg(u8),
     Imm(u32),
+    /// A segment register's SELECTOR, for `PUSH Sreg`. Resolved to an `Imm` at the top of
+    /// `emit_store`, which is where the `SegmentLayout` is in hand; `classify` cannot do it
+    /// because it has no CPU, and `stack_width_kind` must not, because resolving early would
+    /// throw away the segment identity that `selector_segment` needs to pin the descriptor.
+    Selector(SegmentIndex),
     EipDelta(u32),
 }
 
@@ -3337,6 +3342,22 @@ impl DirectKind {
             // at all, it rides the separate `cs` field, and `cs_matches` pins it for every block
             // unconditionally. Putting it in the mask would be inert at best.
             Self::MovSegToReg { segment, .. } if segment != SegmentIndex::Cs => Some(segment),
+            // `PUSH Sreg`. Reporting it here is what makes the lowering safe, not bookkeeping: the
+            // emitted code bakes the selector as a constant, so without this a block whose only
+            // mention of DS is `push ds` leaves DS out of `used`, `data_matches` skips it, and the
+            // block keeps matching after the guest reloads DS -- pushing the old selector forever.
+            // `PUSH CS` is not admitted, so the CS exclusion above needs no twin here.
+            Self::Push {
+                source: StoreSource::Selector(segment),
+            }
+            | Self::Push16 {
+                source: StoreSource::Selector(segment),
+            } if segment != SegmentIndex::Cs => Some(segment),
+            // `PUSH Sreg`. Reporting it here is what makes the lowering safe, not bookkeeping: the
+            // emitted code bakes the selector as a constant, so without this a block whose only
+            // mention of DS is `push ds` leaves DS out of `used`, `data_matches` skips it, and the
+            // block keeps matching after the guest reloads DS -- pushing the old selector forever.
+            // `PUSH CS` is not admitted, so the CS exclusion above needs no twin here.
             _ => None,
         }
     }

@@ -3140,6 +3140,15 @@ fn emit_store(
     sides: MemorySideExits,
     wrap: AddressWrap,
 ) {
+    // `PUSH Sreg`'s selector becomes an immediate here and nowhere earlier. This is the first
+    // point that holds the `SegmentLayout`, and the constant it bakes is the same one
+    // `data_matches` pins on entry, because both read the segment the block was captured under.
+    let source = match source {
+        StoreSource::Selector(segment) => {
+            StoreSource::Imm(u32::from(memory.segments.selector(segment)))
+        }
+        other => other,
+    };
     let map = memory.map.expect("native store has fast-map bases");
     let code_watch_tables = memory
         .code_watch_tables
@@ -3473,6 +3482,12 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
                 }
             },
         ),
+        // `emit_store` rewrites this to `Imm` before it can reach here, because that is the only
+        // caller with a `SegmentLayout` to resolve it from. Reaching this arm means a second store
+        // path grew and did not.
+        StoreSource::Selector(segment) => {
+            unreachable!("PUSH {segment:?} must be resolved to an immediate in emit_store")
+        }
         StoreSource::EipDelta(delta) => {
             // Word as well as Dword: a 16-bit CALL pushes the return IP as two bytes. The value
             // is computed the same way either width, from the LIVE eip plus the delta, and the

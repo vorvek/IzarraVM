@@ -1031,6 +1031,147 @@ fn direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() 
     }
 }
 
+/// `PUSH Sreg` bakes the block's pinned selector, and the answer must follow when the guest
+/// re-points the segment.
+///
+/// This is the hazard the read half of the segment slice turns on, and it is the same one
+/// `direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves` above pins for
+/// `0x8c`. `PUSH DS` touches no memory THROUGH DS, so neither `read_segment` nor `write_segment`
+/// names it; only `selector_segment` does. Drop that arm and DS falls out of the layout's `used`
+/// mask, `data_matches` skips it, and the hot block keeps pushing the selector it was compiled
+/// under no matter how many times the guest reloads DS. Nothing faults and no counter moves.
+///
+/// The pushed word is read straight back with `POP EBX` rather than inspected in RAM, so the
+/// assertion is on architectural state and a wrong push width would show up in ESP as well.
+#[test]
+fn direct_push_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() {
+    const CS_SELECTOR: u16 = 0x1234;
+    const DS_FIRST: u16 = 0x2258;
+    const DS_SECOND: u16 = 0x5678;
+    const STACK: u32 = 0x800;
+    let mut memory = vec![0; 0x1000];
+    memory[0x100] = 0x90;
+    memory[0x101..0x107].copy_from_slice(&[
+        // Filler first, so PUSH DS never lands on the block ENTRY, where it would not execute
+        // natively at all and the fixture would certify nothing.
+        0x89, 0xf6, // mov esi, esi
+        0x1e, // push ds
+        0x5b, // pop ebx
+        0x89, 0xd9, // mov ecx, ebx
+    ]);
+    memory[0x107] = 0xf4; // hlt
+    let initial = [0x1122_3344u32, 0x9999_9999, 0, 0xaabb_ccdd, 0, 0, 0, 0];
+    // A Dword push zero-extends the selector, and the Dword pop replaces EBX whole. Index 4 is
+    // ESP, which the push and pop must return to where it started.
+    let expect = |ds: u16| {
+        [
+            0x1122_3344u32,
+            u32::from(ds),
+            0,
+            u32::from(ds),
+            STACK,
+            0,
+            0,
+            0,
+        ]
+    };
+
+    let arm = |cpu: &mut CpuGsw, ds_selector: u16| {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr = initial;
+        cpu.registers.set_esp(STACK);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        make_data_segments_flat(cpu);
+        // A 32-bit STACK as well as 32-bit code. `stack_width_kind` refuses the (SS.B = 0, Dword)
+        // cell outright, and `make_data_segments_flat` leaves `default_size_32` alone, so without
+        // this the fixture asks for a cell that does not exist and the block never compiles --
+        // which looks exactly like the lowering being absent.
+        for segment in [SegmentIndex::Cs, SegmentIndex::Ss] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.default_size_32 = true;
+            cpu.registers.set_segment(segment, descriptor);
+        }
+        for (segment, selector) in [
+            (SegmentIndex::Cs, CS_SELECTOR),
+            (SegmentIndex::Ds, ds_selector),
+        ] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.selector = selector;
+            descriptor.base = 0;
+            descriptor.limit = u32::MAX;
+            cpu.registers.set_segment(segment, descriptor);
+        }
+    };
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    arm(&mut interp, DS_FIRST);
+    drive(&mut interp, &mut interp_bus);
+    arm(&mut native, DS_FIRST);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        arm(&mut native, DS_FIRST);
+        drive(&mut native, &mut native_bus);
+    }
+    assert!(
+        native.jit_direct.len() > 0,
+        "PUSH Sreg block did not compile: perf={:?}",
+        native.perf_counters()
+    );
+
+    for (round, ds) in [(0, DS_FIRST), (1, DS_SECOND)] {
+        // One settling drive per round, for the reason the 0x8c fixture above gives: round 1
+        // spends its first pass on the DS mismatch, retiring and recompiling the block.
+        arm(&mut native, ds);
+        drive(&mut native, &mut native_bus);
+        for cpu in [&mut interp, &mut native] {
+            arm(cpu, ds);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.trace = BusTrace::default();
+        }
+        let before = native.perf_counters().jit_direct_insns;
+        let interp_outcomes = drive(&mut interp, &mut interp_bus);
+        let native_outcomes = drive(&mut native, &mut native_bus);
+
+        assert_eq!(native_outcomes, interp_outcomes, "round {round} timing");
+        assert_eq!(native, interp, "round {round} CPU state");
+        assert_eq!(native.registers.gpr, expect(ds), "round {round} GPRs");
+        assert_eq!(
+            native.registers.esp(),
+            STACK,
+            "round {round}: the push and pop must leave ESP where it started"
+        );
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "round {round} bus timing"
+        );
+        // Four slots: filler, PUSH DS, POP EBX and the MOV, with the entry NOP interpreted.
+        // Pinned exactly, because a block that stopped short of the push would still compare equal
+        // against an interpreter running the same instruction.
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - before,
+            4,
+            "round {round}: PUSH DS did not retire natively: {:?}",
+            native.perf_counters()
+        );
+    }
+}
+
 /// ALU form 0 (byte r/m destination, byte register source) with a memory destination. Covers a
 /// non-writing op (CMP, op 7, which takes the read-only path in `emit_alu_mem_dest`) and three
 /// writing ops, and drives the byte source through the high lanes AH/BH as well as BL/CL, because
