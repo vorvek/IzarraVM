@@ -298,7 +298,8 @@ def main(check: bool = False) -> int:
         repo, "crates", "izarravm-firmware", "roms", "dos", "sndctrl.com"), "rb").read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). TOKAEMM
-    # loads as the memory manager with its default 3 MiB EMS pool, and the system
+    # loads as the memory manager, drawing EMS pages on demand from the same
+    # shared XMS/VCPI arena rather than a fixed-size pool, and the system
     # runs in V86 under its monitor. DOS=HIGH,UMB uses the HMA + TOKAEMM's UMBs,
     # while LASTDRIVE=D
     # covers A: floppy / C: HDD / D: CD-ROM without wasting CDS entries. The system

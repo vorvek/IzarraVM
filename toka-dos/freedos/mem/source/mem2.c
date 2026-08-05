@@ -118,12 +118,11 @@ static void print_normal_entry(char *text, unsigned long total,
 #define TOKA_MAP_ROWS    4
 #define TOKA_MAP_WIDTH   79
 #define TOKA_MAP_CELLS   (TOKA_MAP_ROWS * TOKA_MAP_WIDTH)
-#define TOKA_KIND_COUNT  4
+#define TOKA_KIND_COUNT  3
 #define TOKA_USED_BLOCK  0xB2
 #define TOKA_FREE_BLOCK  0xB0
 #define TOKA_CONV_ATTR   0x09
 #define TOKA_UPPER_ATTR  0x0B
-#define TOKA_EMS_ATTR    0x0D
 #define TOKA_XMS_ATTR    0x0A
 
 static int stdout_is_console(void)
@@ -266,7 +265,7 @@ static void print_toka_map(const unsigned long *totals,
 			   const unsigned long *free_k, int color)
 {
     static const uchar kind_attributes[TOKA_KIND_COUNT] = {
-	TOKA_CONV_ATTR, TOKA_UPPER_ATTR, TOKA_EMS_ATTR, TOKA_XMS_ATTR
+	TOKA_CONV_ATTR, TOKA_UPPER_ATTR, TOKA_XMS_ATTR
     };
     char blocks[TOKA_MAP_CELLS];
     uchar attributes[TOKA_MAP_CELLS];
@@ -307,16 +306,25 @@ static void print_toka_map(const unsigned long *totals,
     printf("  ");
     print_toka_color_sample("Upper", TOKA_UPPER_ATTR, color);
     printf("  ");
-    print_toka_color_sample("EMS", TOKA_EMS_ATTR, color);
-    printf("  ");
     print_toka_color_sample("XMS", TOKA_XMS_ATTR, color);
     printf("    %c used  %c free\n", TOKA_USED_BLOCK, TOKA_FREE_BLOCK);
 }
 
+/*
+ * TOKAEMM now serves EMS out of the same shared arena as XMS/VCPI (see
+ * dev_docs/2026-08-05-tokaemm-shared-pool-design.md section 2.8), so a
+ * separate "Expanded (EMS)" row here would double-count pages that are
+ * already covered by the extended row. This is only ever called when
+ * toka_shared_pool is set (normal_list() makes it a precondition of
+ * toka_summary), so the row-label test below is redundant today; it is
+ * written out anyway so the star stays tied to the flag rather than to the
+ * caller's gating. The matching footnote is printed at the end of
+ * normal_list(), gated on toka_summary, which is the stronger condition.
+ */
 static void print_toka_summary(unsigned memfree, unsigned umbfree,
-			       XMSINFO *xms, EMSINFO *ems)
+			       XMSINFO *xms)
 {
-    unsigned long conv_free, upper_free, ems_free, xms_free;
+    unsigned long conv_free, upper_free, xms_free;
     unsigned long totals[TOKA_KIND_COUNT], free_k[TOKA_KIND_COUNT];
     unsigned long total, free;
     int color;
@@ -327,12 +335,7 @@ static void print_toka_summary(unsigned memfree, unsigned umbfree,
     upper_free = umbfree;
     if (upper_free > 384)
 	upper_free = 384;
-    ems_free = (unsigned long)ems->free * 16UL;
-    if (ems_free > toka_ems_category_k)
-	ems_free = toka_ems_category_k;
     xms_free = round_kb(xms->free);
-    if (toka_split_pools)
-	xms_free += toka_vcpi_free_k;
     if (xms_free > toka_xms_category_k)
 	xms_free = toka_xms_category_k;
 
@@ -343,24 +346,22 @@ static void print_toka_summary(unsigned memfree, unsigned umbfree,
     print_normal_entry(_(2,1,"Conventional"), 640, 640 - conv_free,
 		       conv_free);
     print_normal_entry(_(2,2,"Upper"), 384, 384 - upper_free, upper_free);
-    print_normal_entry("Expanded (EMS)", toka_ems_category_k,
-		       toka_ems_category_k - ems_free, ems_free);
-    print_normal_entry(_(2,4,"Extended (XMS)"), toka_xms_category_k,
-		       toka_xms_category_k - xms_free, xms_free);
+    print_normal_entry(toka_shared_pool ? _(2,26,"Extended (XMS)*")
+					: _(2,4,"Extended (XMS)"),
+		       toka_xms_category_k, toka_xms_category_k - xms_free,
+		       xms_free);
     printf(      "----------------  --------   --------   --------\n");
 
     totals[0] = 640;
     totals[1] = 384;
-    totals[2] = toka_ems_category_k;
-    totals[3] = toka_xms_category_k;
+    totals[2] = toka_xms_category_k;
     free_k[0] = conv_free;
     free_k[1] = upper_free;
-    free_k[2] = ems_free;
-    free_k[3] = xms_free;
+    free_k[2] = xms_free;
     print_toka_map(totals, free_k, color);
 
-    total = 1024UL + toka_ems_category_k + toka_xms_category_k;
-    free = conv_free + upper_free + ems_free + xms_free;
+    total = 1024UL + toka_xms_category_k;
+    free = conv_free + upper_free + xms_free;
     print_normal_entry(_(2,5,"Total memory"), total, total - free, free);
     printf("\n");
     free = conv_free + upper_free;
@@ -533,19 +534,29 @@ static void normal_list(unsigned memfree, UPPERINFO *upper, int show_hma_free,
 	umbtotal=round_seg_kb(upper->total);
     }
 
+    /*
+     * TOKAEMM answers the F0h private query with 'TK' whether AL is 0 or 1
+     * (see tokaemm-xms.inc's xf_toka_pools) -- that is the whole handshake
+     * now that XMS, VCPI and EMS share one pool. The older 'TL' split magic,
+     * which used to mean "add a separate VCPI free count on top of XMS", is
+     * unreachable against this driver and is retired here rather than kept
+     * as dead code. toka_shared_pool records the magic alone; toka_summary
+     * additionally requires the EMS category size to agree, so a foreign
+     * driver that happens to answer the same magic by coincidence still
+     * can't trigger the shared-pool report on a mismatched EMS size.
+     */
     if ((memory == 639 || memory == 640) && ems != NULL
 	&& xms_available() == XMS_AVAILABLE_RESULT) {
 	xms_drv = get_xms_drv();
 	toka_magic = toka_xms_categories();
-	if ((toka_magic == TOKA_CATEGORY_MAGIC
-	     || toka_magic == TOKA_SPLIT_MAGIC)
+	toka_shared_pool = (toka_magic == TOKA_CATEGORY_MAGIC);
+	if (toka_shared_pool
 	    && (ulong)toka_ems_category_k == (ulong)ems->size * 16UL)
 	    toka_summary = TRUE;
-	toka_split_pools = toka_magic == TOKA_SPLIT_MAGIC;
     }
 
     if (toka_summary) {
-	print_toka_summary(memfree, umbfree, xms, ems);
+	print_toka_summary(memfree, umbfree, xms);
     } else {
 	printf("\n");
 	printf(_(2,0,"Memory Type         Total      Used       Free\n"));
@@ -600,6 +611,19 @@ static void normal_list(unsigned memfree, UPPERINFO *upper, int show_hma_free,
     }
 
     show_hma_info(show_hma_free);
+
+    /*
+     * Gated on toka_summary, not just toka_shared_pool: toka_summary is only
+     * true when print_toka_summary() actually ran and starred the extended
+     * row (see above), so the footnote can never appear over a report that
+     * still shows EMS as a separate row.
+     */
+    if (toka_summary) {
+	printf("\n%s\n", _(2,24,
+"*  TOKAEMM is using XMS memory to simulate EMS memory as needed."));
+	printf("%s\n", _(2,25,
+"   Free EMS memory may change as free XMS memory changes."));
+    }
 }
 
 /*

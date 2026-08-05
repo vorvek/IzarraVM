@@ -82,14 +82,15 @@ xf_version:
     retf
 
 ; F0h private pool query used by Toka-DOS MEM. Both AL=0 and AL=1 answer with
-; the legacy totals magic 'TK' now that XMS and VCPI share one pool.
+; the totals magic 'TK' now that XMS, VCPI and EMS share one pool.
 ;
 ; F001h used to return the split-pool magic 'TL' plus free VCPI KB in DX, and
-; MEM added that to the XMS free count (`if (toka_split_pools) xms_free +=
-; toka_vcpi_free_k;` in mem2.c). With one pool those are the SAME pages, so the
-; sum double-counted it, hit MEM's clamp at the category size, and reported the
-; whole category free with 0 K used. Answering 'TK' takes MEM's non-split path,
-; which uses the XMS free count alone -- the honest figure, and the same one
+; MEM added that on top of the XMS free count. With one pool those are the SAME
+; pages, so the sum double-counted it, hit MEM's clamp at the category size,
+; and reported the whole category free with 0 K used. 'TK' with DX=0 is the
+; only answer this function gives now: MEM reads it as toka_shared_pool, folds
+; the Expanded (EMS) row into one starred Extended (XMS) row, and reports that
+; row from the XMS free count alone -- the honest figure, and the same one
 ; function 08h/88h return.
 xf_toka_pools:
     mov ax, 0x544B               ; 'TK'
@@ -165,28 +166,25 @@ a20_off:
 xf_query_free:
     pushf
     cli
-    call arena_longest_clear      ; AX = longest contiguous run in 4 KB pages
-    mov dx, [cs:xms_free]
-    shl ax, 2                     ; pages -> KB
-    shl dx, 2
-    xor bl, bl
+    mov bl, ALLOC_XMS
+    call arena_query               ; AX = largest, DX = total, in 1 KB granules
+    xor bl, bl                    ; (granules ARE kilobytes for XMS)
     popf
     retf
 
 ; 88h query ANY free extended memory (XMS 3.0): EAX=largest free block in KB,
 ; ECX=highest ending address of any memory block, EDX=total free KB, BL=0.
 ; The 32-bit sibling of 08h, and the one a 3.0-aware caller reaches for first.
-; Pages are 4 KB and the counts are 16-bit page counts, so the KB values cannot
-; overflow 32 bits here; no saturation is needed (unlike 08h, which must live
-; inside a 16-bit AX).
+; Granules are 1 KB and the counts are 16-bit granule counts, so the KB values
+; cannot overflow 32 bits here; no saturation is needed (unlike 08h, which must
+; live inside a 16-bit AX).
 xf_query_free_any:
     pushf
     cli
-    call arena_longest_clear      ; AX = longest contiguous run in 4 KB pages
-    movzx eax, ax
-    shl eax, 2                    ; pages -> KB
-    movzx edx, word [cs:xms_free]
-    shl edx, 2                    ; pages -> KB
+    mov bl, ALLOC_XMS
+    call arena_query               ; AX = largest granules, DX = total granules
+    movzx eax, ax                 ; granules are kilobytes for XMS
+    movzx edx, dx
     mov ecx, [cs:xms_pool_end]
     dec ecx                       ; highest ending address, inclusive
     xor bl, bl
@@ -194,10 +192,10 @@ xf_query_free_any:
     retf
 
 ; 89h allocate ANY extended memory block (XMS 3.0): EDX=KB in -> DX=handle.
-; The pool is clamped to what arena_bmp indexes (24 MB), so any request whose
-; KB count does not fit a 16-bit DX cannot be satisfiable; refuse it as "not
-; enough memory" and otherwise hand straight to 09h, which is the same
-; allocator. Returning through xf_alloc keeps ONE allocation path.
+; The arena is clamped to what arena_bmp indexes (ARENA_GRANULES, ~22.75 MB),
+; so any request whose KB count does not fit a 16-bit DX cannot be satisfiable;
+; refuse it as "not enough memory" and otherwise hand straight to 09h, which is
+; the same allocator. Returning through xf_alloc keeps ONE allocation path.
 xf_alloc_any:
     test edx, 0xFFFF0000
     jz xf_alloc                   ; fits the 16-bit request DX takes
@@ -205,8 +203,8 @@ xf_alloc_any:
     xor ax, ax
     retf
 
-; 09h allocate EMB: DX=KB in -> DX=handle. The XMS pool is reserved in
-; 4 KB pages, while the handle retains the exact requested size for bounds.
+; 09h allocate EMB: DX=KB in -> DX=handle. Reserved in 1 KB arena granules, so
+; the request costs exactly what it asks for; no rounding, no padding.
 xf_alloc:
     push cx
     push si
@@ -215,14 +213,8 @@ xf_alloc:
     pushf
     cli
     mov [cs:xms_need_kb], dx
-    mov ax, dx
-    mov cx, ax
-    shr cx, 2
-    and ax, 3
-    jz .pages_ready
-    inc cx                        ; ceil(requested KB / 4)
-.pages_ready:
-    mov [cs:xms_need_pages], cx
+    mov cx, dx                    ; 1 KB granules: granules == requested KB
+    mov [cs:xms_need_gran], cx
     mov si, xms_table
     mov di, XMS_HANDLES
     xor bp, bp                    ; handle counter (1-based)
@@ -236,20 +228,19 @@ xf_alloc:
     mov bl, 0xA1                  ; out of handles
     jmp .fail
 .got:
-    call arena_find_clear_run     ; CX pages -> AX = absolute start page
+    mov bx, ALLOC_XMS
+    call arena_alloc               ; CX granules -> AX = first granule
     jc .oom
     mov di, ax
-    call arena_mark_xms
     mov byte [cs:si], 1
     mov byte [cs:si+1], 0
     mov ax, [cs:xms_need_kb]
     mov [cs:si+2], ax
     mov ax, di
-    shl ax, 2
-    mov [cs:si+4], ax             ; base_kb = absolute page * 4
-    mov ax, [cs:xms_need_pages]
-    mov [cs:si+6], ax
-    sub [cs:xms_free], ax
+    add ax, [cs:arena_base_kb]
+    mov [cs:si+4], ax             ; base_kb = arena base + granule index
+    mov ax, [cs:xms_need_gran]
+    mov [cs:si+6], ax             ; granules held
     mov dx, bp                    ; handle out
     mov ax, 1
     xor bl, bl
@@ -281,10 +272,9 @@ xf_free:
     cmp byte [cs:si+1], 0         ; locked?
     jne .locked
     mov ax, [cs:si+4]
-    shr ax, 2                     ; base_kb -> absolute page
+    sub ax, [cs:arena_base_kb]    ; base_kb -> granule index
     mov cx, [cs:si+6]
-    call arena_clear_xms
-    add [cs:xms_free], cx
+    call arena_release
     mov word [cs:si], 0
     mov word [cs:si+2], 0
     mov word [cs:si+4], 0
@@ -395,30 +385,22 @@ xf_resize:
     cmp bx, [cs:si+2]             ; same size?
     je .ok
     mov ax, [cs:si+4]
-    shr ax, 2                     ; old absolute start page
+    sub ax, [cs:arena_base_kb]
     mov cx, [cs:si+6]
-    call arena_clear_xms
-    add [cs:xms_free], cx
-    mov [cs:xms_need_kb], bx
-    mov ax, bx
-    mov cx, ax
-    shr cx, 2
-    and ax, 3
-    jz .pages_ready
-    inc cx
-.pages_ready:
-    mov [cs:xms_need_pages], cx
-    call arena_find_clear_run
+    call arena_release
+    mov [cs:xms_need_kb], bx      ; stash the size before BX becomes the type
+    mov cx, bx
+    mov [cs:xms_need_gran], cx
+    mov bx, ALLOC_XMS
+    call arena_alloc
     jc .restore
-    mov di, ax                    ; new absolute start page
-    call arena_mark_xms
-    sub [cs:xms_free], cx
+    mov di, ax
     mov ax, [cs:xms_need_kb]
     mov [cs:si+2], ax
     mov ax, di
-    shl ax, 2
+    add ax, [cs:arena_base_kb]
     mov [cs:si+4], ax
-    mov ax, [cs:xms_need_pages]
+    mov ax, [cs:xms_need_gran]
     mov [cs:si+6], ax
 .ok:
     mov ax, 1
@@ -430,10 +412,9 @@ xf_resize:
     retf
 .restore:
     mov ax, [cs:si+4]
-    shr ax, 2
+    sub ax, [cs:arena_base_kb]
     mov cx, [cs:si+6]
-    call arena_mark_xms
-    sub [cs:xms_free], cx
+    call arena_mark
     mov bl, 0xA0
     jmp .fail
 .fail:
@@ -544,131 +525,161 @@ slot_of:
     stc
     ret
 
-; First clear run in the XMS pool. in: CX = page count. out: AX = absolute
-; start page, CF clear; or CF set. Preserves BX/CX/DX/SI/DI.
-arena_find_clear_run:
+; --- the one arena allocator (386MAX ALLOCMEM, adapted) ---------------------
+; Allocate CX granules for allocation type BX (ALLOC_XMS / ALLOC_VCPI /
+; ALLOC_EMS, byte offsets into alloc_lim). out: AX = first granule, CF clear;
+; or CF set when no run of that size starts on that boundary.
+;
+; 386MAX rounds each candidate start up to the type's boundary with its
+; ALLOCMEM_LIM/ALLOCMEM_MSK pair and rescans from just past whatever blocked it;
+; same shape here. A zero-granule request succeeds at granule 0 without marking
+; anything, which is what a zero-KB XMS block has always received.
+; Preserves BX/CX/DX/SI/DI.
+arena_alloc:
     push bx
+    push cx
     push dx
     push si
     push di
-    mov bx, [cs:xms_pool_base]
-    mov ax, [cs:xms_pool_base+2]
-    shr bx, 12
-    shl ax, 4
-    or bx, ax                     ; BX = first absolute page
-    mov dx, [cs:xms_pool_end]
-    mov ax, [cs:xms_pool_end+2]
-    shr dx, 12
-    shl ax, 4
-    or dx, ax                     ; DX = one-past-last absolute page
-    jcxz .found_empty
-    xor si, si                    ; current clear-run length
-.scan:
-    cmp bx, dx
-    jae .none
-    bt word [cs:arena_bmp], bx
-    jc .allocated
-    test si, si
-    jnz .extend
-    mov di, bx                    ; start of this clear run
-.extend:
-    inc si
-    cmp si, cx
-    jae .found
-    jmp .next
-.allocated:
-    xor si, si
-.next:
-    inc bx
-    jmp .scan
-.found_empty:
-    mov di, bx
-.found:
+    jcxz .empty
+    mov di, [cs:alloc_lim + bx]   ; boundary - 1
+    xor si, si                    ; candidate granule
+.align:
+    add si, di                    ; round the candidate up to the boundary
     mov ax, di
-    pop di
-    pop si
-    pop dx
-    pop bx
-    clc
-    ret
-.none:
-    pop di
-    pop si
-    pop dx
-    pop bx
-    stc
-    ret
-
-; Longest clear run in the XMS pool. out: AX = page count. Preserves all
-; other registers used by the helper.
-arena_longest_clear:
-    push bx
-    push cx
-    push dx
-    push si
-    mov bx, [cs:xms_pool_base]
-    mov ax, [cs:xms_pool_base+2]
-    shr bx, 12
-    shl ax, 4
-    or bx, ax
-    mov dx, [cs:xms_pool_end]
-    mov ax, [cs:xms_pool_end+2]
-    shr dx, 12
-    shl ax, 4
-    or dx, ax
-    xor cx, cx                    ; current clear-run length
-    xor si, si                    ; longest clear-run length
-.scan:
-    cmp bx, dx
-    jae .done
-    bt word [cs:arena_bmp], bx
-    jc .allocated
-    inc cx
-    cmp cx, si
-    jbe .next
-    mov si, cx
-    jmp .next
-.allocated:
-    xor cx, cx
-.next:
-    inc bx
-    jmp .scan
-.done:
+    not ax
+    and si, ax
     mov ax, si
+    add ax, cx                    ; does the run still fit inside the arena?
+    jc .none
+    cmp ax, [cs:arena_granules]
+    ja .none
+    mov dx, si                    ; probe [si, si+cx)
+    mov bx, cx
+.probe:
+    bt word [cs:arena_bmp], dx
+    jc .busy
+    inc dx
+    dec bx
+    jnz .probe
+    mov ax, si
+    call arena_mark
+    clc
+    jmp .out
+.busy:
+    mov si, dx                    ; restart past the granule that blocked us
+    inc si
+    jmp .align
+.empty:
+    xor ax, ax
+    clc
+    jmp .out
+.none:
+    stc
+.out:
+    pop di                        ; POP leaves the flags alone, so CF survives
     pop si
     pop dx
     pop cx
     pop bx
     ret
 
-; Mark an XMS-owned run. in: AX = absolute start page, CX = page count.
-arena_mark_xms:
-    push bx
+; Mark CX granules from granule AX as allocated. Preserves every register.
+; Bumps arena_gen (D1): every query cache is invalid the instant the bitmap
+; changes, and this is one of the two 16-bit-side places it does.
+arena_mark:
+    push ax
     push cx
-    mov bx, ax
     jcxz .done
 .next:
-    bts word [cs:arena_bmp], bx
-    inc bx
-    loop .next
+    bts word [cs:arena_bmp], ax
+    inc ax
+    dec cx
+    jnz .next
+    inc dword [cs:arena_gen]
 .done:
     pop cx
-    pop bx
+    pop ax
     ret
 
-; Clear an XMS-owned run from the allocation bitmap.
-; in: AX = absolute start page, CX = page count.
-arena_clear_xms:
-    push bx
+; Release CX granules from granule AX. Preserves every register. Bumps
+; arena_gen (D1); see arena_mark.
+arena_release:
+    push ax
     push cx
-    mov bx, ax
     jcxz .done
 .next:
-    btr word [cs:arena_bmp], bx
-    inc bx
-    loop .next
+    btr word [cs:arena_bmp], ax
+    inc ax
+    dec cx
+    jnz .next
+    inc dword [cs:arena_gen]
 .done:
     pop cx
+    pop ax
+    ret
+
+; Free space for allocation type BL. out: AX = largest free run, DX = total
+; free, both in GRANULES and both already rounded down to that type's boundary,
+; so the answer is what arena_alloc could actually satisfy (386MAX QRY_PGCNT).
+;
+; Served from the per-type cache RIGHT HERE on a hit. arena_gen and the cache
+; (arena_qc_gen/arena_qc_largest/arena_qc_total) are plain cs:-relative words,
+; exactly as readable from V86 as from the monitor -- same bytes, cs: here and
+; fs: there, the same trick the arena_bmp bitmap itself already relies on. A
+; hit costs a handful of compares and never enters the monitor: no int 0xC0,
+; so no round trip through the IDT for the case D1's memo exists to make
+; cheap. Only a MISS falls into the ring-0 walk, arena_query32, reached the
+; same way the XMS block move reaches the monitor's memcpy.
+;
+; No cli guard: unlike XMS's far-called entry points (xf_query_free's cli
+; guards against a caller whose own IF is still set when it calls in), this is
+; reached through INT 67h, and INT 67h delivery already clears VIF before any
+; handler runs -- including this one. No guest ISR can interleave with an EMS
+; call the way one could interleave with a far call, so there is nothing here
+; for cli to protect against. Preserves BX/CX/SI/DI.
+arena_query:
+    push bx
+    push si
+    push di
+    movzx si, bl                  ; type (0/2/4); also the byte offset into
+                                   ; arena_qc_largest/total (2 bytes/entry,
+                                   ; index = type/2, so 2*index == type). SI,
+                                   ; not CX: 16-bit addressing only takes
+                                   ; BX/BP/SI/DI as a base register. DI, not
+                                   ; BX, for the second offset below: BL is
+                                   ; still needed UNTOUCHED on a miss (it is
+                                   ; the monitor cookie's type argument), and
+                                   ; an earlier version of this routine
+                                   ; clobbered it here first -- BX doubles as
+                                   ; BL, so "type*2" silently became the type
+                                   ; byte arena_q_type was set to, corrupting
+                                   ; every VCPI/EMS miss into an out-of-range
+                                   ; alloc_lim read.
+    mov di, si
+    add di, di                    ; type*2: the byte offset into arena_qc_gen
+                                   ; (4 bytes/entry, index = type/2, so
+                                   ; 4*index == type*2)
+    mov ax, [cs:arena_gen]
+    mov dx, [cs:arena_gen+2]
+    cmp ax, [cs:arena_qc_gen + di]
+    jne .miss
+    cmp dx, [cs:arena_qc_gen + di + 2]
+    jne .miss
+    mov ax, [cs:arena_qc_largest + si]
+    mov dx, [cs:arena_qc_total + si]
+    jmp .out
+.miss:
+    mov [cs:arena_q_type], bl     ; bl is untouched since entry: the fix above
+    push dx
+    mov dx, 0x5154                ; 'TQ' monitor-call cookie
+    int 0xC0
+    pop dx
+    mov ax, [cs:arena_q_largest]
+    mov dx, [cs:arena_q_total]
+.out:
+    pop di
+    pop si
     pop bx
     ret
 

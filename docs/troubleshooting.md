@@ -166,6 +166,42 @@ currently covers Margo (2D) only, and says so up front. The [technical
 reference's Distira section](vega/vega-technical-reference.md#10-distira-3d)
 is the current source of truth for what the 3D hardware answers.
 
+## Tracing a guest's `INT n` calls to a driver (development builds)
+
+This is a developer diagnostic, not something most players need. Like the
+`IZARRAVM_WATCH_WRITE` store watchpoint, it is compiled out of the default
+build, so a normal `cargo build` or release binary pays nothing for it.
+Build with the `int-trace` feature and set `IZARRAVM_INT_TRACE` to the
+vectors you want, in hex, comma separated:
+
+```
+cargo build --release -j8 -p izarravm --features int-trace
+IZARRAVM_INT_TRACE=67,21 ./target/release/izarravm --hdd-folder <path> --cpu gsw586 2>trace.log
+```
+
+Every traced `INT n` prints its arguments -- the register file at the moment
+of the call -- as soon as it fires, then a `  -> ` line with the handler's
+answer once execution returns to the instruction after it. Reading both
+halves is the point: the arguments alone can only show that a driver was
+called, not whether it answered correctly. This is how the TOKAEMM
+shared-pool defect was found. The arguments into `INT 67h` looked fine; the
+handler's answer carried `AH=88h`, where a reference EMM manager returns
+success.
+
+Two things to know before reading a log. The trace goes to stderr and runs
+to thousands of lines a second on a busy vector, so redirect it to a file as
+above rather than watching a console. And the address after `ret=` is the
+*return* site -- the instruction following the `INT`, not the `INT` itself --
+because that is what the answer half matches on, so subtract the
+instruction's length to find the call in a disassembly.
+
+Only one call is outstanding at a time. A handler that issues its own traced
+`INT` takes over the pending slot, and the outer call's `  -> ` line never
+appears: `INT 21h` opening a file calls `INT 13h`, and the example above
+traces vectors that nest like that in real guests. A traced `INT` with no
+answer under it means the call nested or the handler never returned, not
+that the handler answered with nothing.
+
 ## Next
 
 - [Izarra 3000 user manual](izarra-3000/user-manual.md)

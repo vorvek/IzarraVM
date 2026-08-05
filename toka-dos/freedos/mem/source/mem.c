@@ -535,12 +535,14 @@ typedef void far (*xms_drv_t)(void);
 void far (*xms_drv)(void);
 
 #define TOKA_CATEGORY_MAGIC 0x544B
-#define TOKA_SPLIT_MAGIC    0x544C
 
 static ushort toka_xms_category_k;
 static ushort toka_ems_category_k;
-static ushort toka_vcpi_free_k;
-static int toka_split_pools;
+/* True when the driver's F0h query answers the shared-pool magic. The name
+ * inverts what its predecessor toka_split_pools meant: that flag said "the
+ * driver keeps VCPI separate, add its free KB in"; this one says "XMS, VCPI
+ * and EMS all come from one pool, add nothing on top of the XMS figure". */
+static int toka_shared_pool;
 
 /*
  * The last segment address that is in conventional memory.
@@ -708,7 +710,6 @@ unsigned toka_xms_categories(void);
     "call dword ptr [xms_drv]" \
     "mov [toka_xms_category_k], bx" \
     "mov [toka_ems_category_k], cx" \
-    "mov [toka_vcpi_free_k], dx" \
 value [ax] modify [bx cx dx]
 
 unsigned check_8800(void);
@@ -947,7 +948,6 @@ static unsigned toka_xms_categories(void)
     asm mov magic, ax
     asm mov toka_xms_category_k, bx
     asm mov toka_ems_category_k, cx
-    asm mov toka_vcpi_free_k, dx
     asm pop dx
     asm pop cx
     asm pop bx

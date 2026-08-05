@@ -55,6 +55,10 @@ pub const VCPIDET_COM: &[u8] = include_bytes!("../roms/dos/vcpidet.com");
 pub const VCPIDET_COM_SOURCE: &str = include_str!("../roms/dos/vcpidet.asm");
 pub const VCPIMEM_COM: &[u8] = include_bytes!("../roms/dos/vcpimem.com");
 pub const VCPIMEM_COM_SOURCE: &str = include_str!("../roms/dos/vcpimem.asm");
+pub const EMMPROBE_COM: &[u8] = include_bytes!("../roms/dos/emmprobe.com");
+pub const EMMPROBE_COM_SOURCE: &str = include_str!("../roms/dos/emmprobe.asm");
+pub const EMSFRAG_COM: &[u8] = include_bytes!("../roms/dos/emsfrag.com");
+pub const EMSFRAG_COM_SOURCE: &str = include_str!("../roms/dos/emsfrag.asm");
 pub const VCPILOW_COM: &[u8] = include_bytes!("../roms/dos/vcpilow.com");
 pub const VCPILOW_COM_SOURCE: &str = include_str!("../roms/dos/vcpilow.asm");
 pub const VCPIIF_COM: &[u8] = include_bytes!("../roms/dos/vcpiif.com");
@@ -288,6 +292,16 @@ pub fn vcpidet_com() -> &'static [u8] {
 /// Signals 0xA5 / 0xEn.
 pub fn vcpimem_com() -> &'static [u8] {
     VCPIMEM_COM
+}
+
+/// The DOS/16M pool-overlap probe fixture.
+pub fn emmprobe_com() -> &'static [u8] {
+    EMMPROBE_COM
+}
+
+/// EMS allocation against a deliberately fragmented pool.
+pub fn emsfrag_com() -> &'static [u8] {
+    EMSFRAG_COM
 }
 
 /// Small-memory XMS/VCPI bounds and empty-pool fixture.

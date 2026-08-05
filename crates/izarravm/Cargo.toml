@@ -17,6 +17,8 @@ default = ["jit"]
 jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
 # Passthrough for the store watchpoint; see izarravm-cpu.
 watch-write = ["izarravm-cpu/watch-write"]
+# Passthrough for the guest INT n tracer; see izarravm-cpu.
+int-trace = ["izarravm-cpu/int-trace"]
 
 [dependencies]
 clap.workspace = true

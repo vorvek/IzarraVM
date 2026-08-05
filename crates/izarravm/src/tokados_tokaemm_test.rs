@@ -256,8 +256,11 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
 /// A guest program install-checks XMS, allocates a 64 KB EMB,
 /// locks it, moves a pattern conventional->EMB->conventional, verifies it, then
 /// unlocks and frees — all in V86 under TOKAEMM's monitor (block MOVE traps to
-/// the monitor's flat memcpy). XMSTEST.COM signals 0xA5 (success) via the
-/// unit-tester exit port; any other code names the step that broke.
+/// the monitor's flat memcpy). It then asserts two properties of the arena's
+/// shape: 08h reports the largest free block separately from the total, and a
+/// 1 KB request costs 1 KB rather than a whole page. XMSTEST.COM signals 0xA5
+/// (success) via the unit-tester exit port; any other code names the step that
+/// broke, and the fixture's own failure-label block is the key.
 ///
 /// The config is NOEMS so host EMS reserves no extended RAM and the guest XMS
 /// driver owns all of it. EMS coexistence is covered separately.
@@ -298,7 +301,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         stop,
         StopReason::TestExit { code: 0xA5 },
         "XMS round-trip did not report success (stop={stop:?}); \
-             a 0xEn code names the failed step.\n{text}"
+             a 0xE0-0xF2 code names the failed step.\n{text}"
     );
 }
 
@@ -1108,11 +1111,17 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         lower.contains("toka-dos is resident in the high memory area"),
         "MEM should use the Toka-DOS name for the HMA resident.\n{text}"
     );
+    // MS-DOS 6.22's shape for a manager that simulates EMS out of extended
+    // memory: no separate `Expanded (EMS)` row (a shared pool would be
+    // double-counted), one starred extended row instead.
+    assert!(
+        !text.contains("Expanded (EMS)"),
+        "MEM still prints a separate EMS row over a shared pool:\n{text}"
+    );
     for (label, total) in [
         ("Conventional", "640K"),
         ("Upper", "384K"),
-        ("Expanded (EMS)", "3,072K"),
-        ("Extended (XMS)", "20,480K"),
+        ("Extended (XMS)*", "23,552K"),
     ] {
         let line = text
             .lines()
@@ -1129,10 +1138,10 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("599K"),
-        "the high page tables should leave about 600 KiB conventional memory free.\n{text}"
+        Some("593K"),
+        "the high page tables should leave about 593 KiB conventional memory free.\n{text}"
     );
-    assert_extended_category(&screen, "20,480K", "20,132K");
+    assert_extended_category(&screen, "23,552K", "21,925K");
 
     let rows = memory_map_rows(&screen);
     assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
@@ -1144,7 +1153,10 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
     );
     assert!(map.iter().any(|(character, _)| *character == 0xB0));
     assert!(map.iter().any(|(character, _)| *character == 0xB2));
-    for (range, attribute) in [(0..8, 0x09), (8..13, 0x0B), (13..53, 0x0D), (53..316, 0x0A)] {
+    // Three bands now (conventional/upper/extended), not four: the shared
+    // pool folded EMS into the extended row, so the map's last band runs
+    // straight to the end instead of stopping short for a separate EMS slice.
+    for (range, attribute) in [(0..8, 0x09), (8..13, 0x0B), (13..316, 0x0A)] {
         assert!(
             map[range.clone()]
                 .iter()
@@ -1152,6 +1164,36 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
             "MEM map range {range:?} should use attribute {attribute:#04x}.\n{text}"
         );
     }
+}
+
+/// MS-DOS 6.22's MEM does not print an `Expanded (EMS)` row when the manager
+/// simulates EMS out of extended memory -- it prints one starred extended row
+/// and a footnote, because there is one pool and a second row would
+/// double-count it. TOKAEMM is that kind of manager now, so MEM must say so.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_mem_folds_ems_into_the_extended_row() {
+    let (_scenario, screen, stop) = run_mem_command("shared-pool", "");
+    let text = &screen.text;
+    if let StopReason::CpuError(msg) = &stop {
+        panic!("CPU fault while running MEM under V86: {msg}\n{text}");
+    }
+    assert!(
+        text.to_ascii_lowercase().contains("c:\\>"),
+        "no C:\\> prompt after MEM ran (stop={stop:?}).\n{text}"
+    );
+    assert!(
+        !text.contains("Expanded (EMS)"),
+        "MEM still prints a separate EMS row over a shared pool:\n{text}"
+    );
+    assert!(
+        text.contains("Extended (XMS)*"),
+        "MEM did not star the extended row:\n{text}"
+    );
+    assert!(
+        text.contains("simulate EMS memory as needed"),
+        "MEM did not print the shared-pool footnote:\n{text}"
+    );
 }
 
 #[test]
@@ -1169,7 +1211,7 @@ fn tokaemm_mem_noems_reports_combined_extended_free() {
         "no C:\\> prompt after MEM ran with NOEMS (stop={stop:?}).\n{}",
         screen.text
     );
-    assert_extended_category(&screen, "23,552K", "23,204K");
+    assert_extended_category(&screen, "23,552K", "21,925K");
 }
 
 #[test]
@@ -1278,8 +1320,8 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .find(|line| line.trim_start().starts_with("TOKAEMM "))
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(23K)"),
-        "TokaEMM should retain only its 23 KiB low core.\n{}",
+        tokaemm.contains("(29K)"),
+        "TokaEMM should retain only its 29 KiB low core.\n{}",
         screen.text
     );
     let free = screen
@@ -1289,8 +1331,8 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(599K)"),
-        "MEM /CLASSIFY should report about 600 KiB conventional free.\n{}",
+        Some("(593K)"),
+        "MEM /CLASSIFY should report about 593 KiB conventional free.\n{}",
         screen.text
     );
 }
@@ -1680,5 +1722,112 @@ fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
         "IRQ5 at IP==0 under V86 did not report success (stop={stop:?}); \
              0xE1 = DSP reset failed, a hang/CycleLimit or a foreign TestExit \
              code means the discriminator mis-routed the delivery.\n{text}"
+    );
+}
+
+/// DOS/16M decides whether XMS shares a pool with the other memory interfaces
+/// by taking every free XMS kilobyte and re-reading their free counts. TOKAEMM
+/// must answer honestly in both directions or a DOS/4GW client keeps the XMS
+/// block and finds the VCPI pool empty -- the `DOS/16M error: [23] no memory
+/// for VCPI page table` that this whole change exists to fix. EMS enabled: the
+/// NOEMS path was always honest because it probes VCPI DE03 instead.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_pool_overlap_is_visible_to_both_interfaces() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMMPROBE\r\n".to_vec();
+
+    let profile = MachineProfile::gsw_386(24, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-emmprobe",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "EMMPROBE.COM".to_string(),
+                izarravm_firmware::emmprobe_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "pool-overlap probe failed (stop={stop:?}); 0xE4 means the EMS free \
+         count did not move while XMS held the whole arena, and any other \
+         0xEn names a different step -- read the failure-label block in \
+         emmprobe.asm before believing the 0xE4 story.\n{text}"
+    );
+}
+
+/// EMS backs its pages from the shared arena (Task 6): `ems_page_alloc` takes
+/// one 16 KB page at a time off the same bitmap XMS and VCPI draw from, so a
+/// handle's logical pages need not land in one contiguous run. This fixture
+/// proves that against a deliberately fragmented pool: it reads the pool's
+/// actual free count (`AH=42h`; there is no fixed-192-page partition to pin a
+/// baseline to any more, and the pool need not even start fully free -- the
+/// shell's own XMS-swap block for running this child may already hold part
+/// of it, which is now normal since EMS and XMS share one pool), derives a
+/// uniform hole size from that total split across 32 handles, drains the
+/// pool with those handles, and frees every other one to leave 16 isolated
+/// same-size holes. A real `INT 67h AH=43h` probe for one page more than a
+/// single hole then doubles as a discriminator rather than a hard gate: on
+/// the non-contiguous allocator it always succeeds (satisfying it only costs
+/// one free page at a time, not a run), so the fixture releases that probe
+/// handle and moves on to a fresh, larger request -- proved to succeed by
+/// writing and reading back a per-page signature through the frame after
+/// mapping each of its logical pages.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_ems_allocates_from_a_fragmented_shared_arena() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSFRAG\r\n".to_vec();
+
+    let profile = MachineProfile::gsw_386(24, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-emsfrag",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "EMSFRAG.COM".to_string(),
+                izarravm_firmware::emsfrag_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "fragmented-EMS allocation failed (stop={stop:?}); 0xEA is the \
+         defect this fixture exists to catch (EMS refused a request that \
+         fit only non-contiguously, with plenty of pages free but none of \
+         them in one big enough run), 0xE1-0xE9 name a setup or premise \
+         failure in the fixture itself (read emsfrag.asm), and 0xEB-0xED \
+         mean EMS granted the pages but mapped one of them wrong -- read \
+         the failure-label block in emsfrag.asm before trusting any \
+         particular story.\n{text}"
     );
 }

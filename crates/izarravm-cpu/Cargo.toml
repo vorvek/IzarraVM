@@ -19,6 +19,11 @@ jit = []
 # on the store hot path, and leaving it compiled in measured ~10% on a 586 16-bit workload
 # even while disarmed. Build with `--features watch-write` when hunting a corruption.
 watch-write = []
+# Guest INT n tracer. Compiled out by default so the INT dispatch path pays
+# nothing; build with `--features int-trace` when you need to read a guest's
+# conversation with a driver (this is how the TOKAEMM shared-pool defect was
+# found). Armed by IZARRAVM_INT_TRACE=<hex vectors, comma separated>.
+int-trace = []
 
 [dependencies]
 thiserror.workspace = true

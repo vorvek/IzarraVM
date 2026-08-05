@@ -88,8 +88,9 @@ fn extracts_the_embedded_image_payload() {
     );
 
     // TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
-    // loads its 3 MB EMS pool with DOS=HIGH,UMB, so every default boot runs
-    // FreeDOS in V86 under the guest memory manager. BYTE compare, not a
+    // loads it (EMS pages drawn on demand from the shared arena) with
+    // DOS=HIGH,UMB, so every default boot runs FreeDOS in V86 under the
+    // guest memory manager. BYTE compare, not a
     // length compare: the driver's resident envelope is padded to a fixed
     // size, so two different builds are routinely the same length — a stale
     // tokados-hdd.img sailed through the old length check while every real

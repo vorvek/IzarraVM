@@ -83,12 +83,13 @@ xms_mv_dst: dd 0                  ;  via FS; the 16-bit V86 ABI has no
                                   ;  32-bit registers to pass them in)
 xms_slot_save: dw 0               ; 0Fh resize: keep the slot across find_gap (clobbers SI)
 xms_rv_off: dd 0                  ; resolve input: the endpoint's 32-bit offset
-xms_need_kb: dw 0                 ; find_gap input: KB wanted
-xms_need_pages: dw 0              ; rounded 4 KB pages reserved for that request
+xms_need_kb: dw 0                 ; arena_alloc input: KB wanted
+xms_need_gran: dw 0               ; 1 KB granules reserved for that request
+                                  ; (== requested KB; a 1 KB request costs 1 KB)
 
 ; 32 EMB handles. handle h (1-based) -> slot at xms_table + (h-1)*XMS_SLOT.
-; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_kb(w) +6 pages(w). Bases
-; are 4 KB-aligned; linear = base_kb << 10. The page count includes padding.
+; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_kb(w) +6 granules(w). Bases
+; are 1 KB-aligned; linear = base_kb << 10.
 XMS_HANDLES equ 32
 XMS_SLOT    equ 8
 xms_table: times XMS_HANDLES*XMS_SLOT db 0
@@ -109,22 +110,30 @@ UMB_SLOT  equ 6
 umb_table: times UMB_SLOTS*UMB_SLOT db 0
 
 ; ---- EMS state (resident; reached via cs: overrides from V86) ----
-; EMS is on by default and owns the top 3 MB of a 24 MB machine. NOEMS keeps
-; the manager frameless and returns that partition to VCPI.
-EMS_MAX_PAGES equ 192             ; 3 MB pool ceiling (16 KB pages)
+; EMS pages are 16 KB and come from the SHARED arena on demand, 16 granules at a
+; time (386MAX ALLOC_LIM @ALLOC_EMS). There is no EMS partition: the ceiling is
+; whatever the arena holds. `EMS_MAX_PAGES` is the bitmap's own ceiling, not a
+; reservation -- it sizes ems_link and nothing else.
+EMS_PAGE_GRANULES equ 16
+EMS_MAX_PAGES equ ARENA_GRANULES / EMS_PAGE_GRANULES   ; 1456
 EMS_FRAME_SEG equ 0xE000          ; page frame segment (4 slots x 16 KB)
 EMS_FRAME_LIN equ 0x000E0000
 EMS_HANDLES   equ 32
 ; handle slot: +0 inuse(b) +1 saved(b) +2 npages(w) +4 first(w) +6 pad(w)
-;              +8 saved_map(4w). Backing runs are CONTIGUOUS per handle
-; (logical page L -> backing page first+L); contiguity is invisible to apps.
-; Limit: a fragmented pool can 88h an alloc that per-page bookkeeping would satisfy.
-EMS_SLOT      equ 16
+;              +8 saved_map(4w) +16 cache_logical(w) +18 cache_backing(w).
+; Backing runs are NOT contiguous: +4 is the head of this handle's page chain in
+; ems_link, and logical page L is L links along it. The cache at +16/+18 is the
+; last resolved (logical, backing) pair, so a repeat map is O(1) and a forward
+; sequential sweep of an L-page handle costs O(L) in total rather than O(L^2).
+; +16 stores cache_logical+1 so the table's raw zeroed cold state (0) already
+; reads as cold without an INIT-time sentinel fill -- storing a bare 0xFFFF
+; sentinel would leave the zeroed table claiming logical page 0 is backed by
+; EMS page 0, which is some OTHER handle's memory, until the first ef_alloc
+; touched the slot (D4).
+EMS_SLOT      equ 20
 ems_on:      db 1                 ; 1 unless the command line contains NOEMS
-ems_pages:   dw 0                 ; total 16 KB pages (<= EMS_MAX_PAGES)
-ems_free:    dw 0                 ; free pages
+ems_pages:   dw 0                 ; total 16 KB pages the pool spans
 ems_category_kb: dw 0             ; private F0 query, pages converted to KB
-ems_phys_base: dd 0               ; runtime top-of-RAM backing pool base
 ems_disp:    dw 0                 ; dispatch scratch (mirrors xms_disp)
 umb_win_end: dw 0xF000            ; UMB window end segment (0xE000 with EMS on)
 ems_table: times EMS_HANDLES*EMS_SLOT db 0
@@ -135,44 +144,124 @@ ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 ; scratch so an ISR-driven remap can't race a move being staged.
 ems_rm_lin:  dd 0
 ems_rm_phys: dd 0
+; Per-EMS-page chain link: the next page in the same handle's chain, 0xFFFF at
+; the end. 386MAX threads its 16 KB pages exactly this way (PPAGELINK/PL_NEXT in
+; QMAX_I67.ASM). Only entries for allocated pages are meaningful -- the arena
+; bitmap, not a free chain, is what says whether a page is available (D6: see
+; ems_page_alloc/ems_page_free below for why this branch keeps no free list of
+; its own).
+ems_link: times EMS_MAX_PAGES dw 0xFFFF
 
-; ---- ONE extended-memory pool, shared by XMS EMBs and VCPI on demand.
+; ---- ONE extended-memory arena, shared by XMS EMBs, EMS pages and VCPI.
 ;
-; This used to be a static split: XMS kept `XMS_EMB_BYTES` (2 MB) and VCPI owned
-; the remaining ~18 MB of a 24 MB machine. That is not how a real manager behaves
-; -- HIMEM+EMM386, 386MAX and QEMM all serve XMS, EMS and VCPI from a single pool
-; on demand -- and it broke ordinary DOS programs: XMS function 08h answered
-; "1952 KB free" on a 24 MB machine while MEM advertised the 20,480 KB category,
-; so anything asking for a few MB of XMS was refused against a nearly empty pool.
+; 386MAX's model (QMAX_VMM.ASM): a single allocation bitmap over the managed
+; span -- its XMSBMAP, "each byte contains the XMS allocation and boundary
+; information about the corresponding 1KB block" -- and ONE allocator whose only
+; per-interface difference is the boundary a block must start on (its ALLOC_LIM
+; table: XMS 1 KB, VCPI 4 KB, EMS 16 KB). One bit per granule suffices here
+; because this machine models no physical discontiguity and no Windows 3.0
+; boundary workaround.
 ;
-; Now both allocators work the SAME bitmap over the SAME range, first come first
-; served, which is the standard contract. `vcpi_bmp` and `vcpi_free` are aliases
-; rather than separate storage, so the VCPI side needed no edits: it already
-; indexed by absolute page number, and `fs` is the driver's data (see the
-; `mov fs, cx ; FS = driver data via the client's GDT` in the monitor), which is
-; the same storage `cs:` reaches from 16-bit code.
+; The granule is 1 KB, so a granule index IS a kilobyte offset from the arena
+; base -- which is why an XMS handle can go on storing an absolute base_kb.
 ;
-; The bitmap is 6144 bits = 6144 x 4 KB = 24 MB, so the pool is CLAMPED to that
-; at init; without the clamp a larger --memory-mib would index past the array and
-; corrupt whatever follows it. EMS still owns its own partition above the pool.
-ARENA_PAGES equ 6144              ; bits in arena_bmp; also the pool page ceiling
-align 4
-vcpi_pool_base: dd 0              ; first pool byte (4K-aligned)
-vcpi_pool_end:  dd 0              ; one past the last pool byte (4K-aligned)
-xms_free:       dw 0              ; free 4K pages in the shared pool
-vcpi_free       equ xms_free      ; alias: one pool, one free count
-vcpi_cursor:    dw 0              ; next-fit absolute-page scan cursor
+; This replaced a 4 KB-page bitmap plus a hand-maintained `xms_free` counter.
+; The counter is gone deliberately: every free count is now DERIVED from the
+; bitmap by arena_query, and a derived count cannot drift from the allocation
+; state the way a decremented one can. A free count that could not move is
+; precisely what broke DOS/4GW -- DOS/16M probes for pool sharing by taking all
+; of XMS and re-reading the other interfaces (see the design note).
+;
+; Indices are POOL-RELATIVE, so the bitmap is sized for the pool and not for the
+; address space. BT/BTS/BTR take the full bit-string index, which the 386 treats
+; as SIGNED for a memory operand; ARENA_GRANULES stays well under 32767.
+ARENA_GRANULES  equ 23296         ; 22.75 MB ceiling, in 1 KB granules
+ARENA_BMP_BYTES equ ARENA_GRANULES / 8      ; 2912
+ARENA_PAGES     equ ARENA_GRANULES / 4      ; 4 KB pages over the same span
+
+; 386MAX ALLOC_LIM (QMAX_VMM.ASM:116), stored as boundary-1 so the value serves
+; as both the round-up addend and, complemented, the round-down mask. The
+; symbols are BYTE OFFSETS into the table, so a caller passes one in BX.
+ALLOC_XMS  equ 0
+ALLOC_VCPI equ 2
+ALLOC_EMS  equ 4
+alloc_lim: dw 1-1, 4-1, 16-1
+
+arena_base_kb:   dw 0             ; first arena kilobyte, absolute
+arena_granules:  dw 0             ; live granule count (<= ARENA_GRANULES)
+vcpi_cursor:     dw 0             ; next-fit 4 KB-page cursor, pool-relative
+ems_cursor:      dw 0             ; next-fit 16 KB-page cursor, pool-relative
+                                   ; (ems_page_alloc's own scan; see there)
+arena_q_type:    db 0             ; INT 0xC0 'TQ' argument: an ALLOC_* offset
+arena_q_largest: dw 0             ; ... and its two answers, in granules
+arena_q_total:   dw 0
+; Query memoization (D1). arena_query32 costs ~5-6 instructions per granule
+; and ARENA_GRANULES is ~23,000, so an uncached walk is ~110,000-140,000
+; monitor instructions.
+;
+; An earlier version of this comment justified the memo with a tick-loss
+; story: a walk this long, held under an interrupt guard, could outlast one
+; 54.9 ms IRQ0 tick and lose it to `vip`'s one-bit coalescing. That does not
+; hold up under a second look. Each AH=42h/DE03/etc. call closes its own
+; VIF=0 window with its own iret, so polling never accumulates one long
+; window out of many short ones, and a single ~140k-instruction walk of
+; bt/inc/cmp/jmp would need each instruction to average roughly 104 cycles at
+; 266 MHz to fill 54.9 ms -- about 60x more than those instructions actually
+; cost. (The coalescing hazard itself is real -- one-bit IRR, the PIT
+; forwarder's own comment, and a regression test that has caught it all
+; confirm that -- it just is not what this particular walk triggers.)
+;
+; The real cost is throughput, not fidelity: a program polling AH=42h once
+; per frame was measured burning about 6% of guest instruction throughput on
+; the walk alone. EMS AH=42h is a LIM function DOS programs call freely, so a
+; plain per-call walk was a real regression there, just not the one the
+; comment used to claim.
+;
+; Also closed off, so it does not get re-proposed later: an incrementally
+; maintained running total cannot replace the walk. `total` is per free SPAN,
+; rounded DOWN to the caller's type boundary before being summed (see
+; arena_query32's header comment), exactly as span-structure-dependent as
+; `largest` is, and degenerates to a plain running sum only for ALLOC_XMS,
+; whose 1 KB boundary can never leave a sub-granule remainder to round away.
+; A "just bump a counter on alloc/free" version would silently misreport
+; VCPI/EMS totals the moment the arena fragments.
+;
+; Fix: one generation counter, bumped by every bitmap mutator (arena_mark,
+; arena_release, vcpi_page_alloc, vcpi_page_free), and one cached (largest,
+; total) pair per allocation type (index = ALLOC_*/2), stamped with the
+; generation it was computed at. arena_query32 returns the cached pair when its
+; type's stamp matches the live generation, and only re-walks the bitmap on a
+; miss. The cache is still entirely DERIVED from the bitmap -- a miss recomputes
+; it from scratch -- so it cannot drift the way the retired hand-maintained
+; xms_free/ems_free counters could. A dword generation makes wraparound
+; (needing 2^32 bitmap mutations between two queries of the same type) a
+; non-concern; a word counter could theoretically alias within one long session.
+;
+; The stamps start at -1, NOT 0, for the same reason ems_backing_of's cache
+; stores cache_logical+1 (D4): a cache's cold state has to be wrong-looking, not
+; plausible. arena_gen starts at 0 and INIT never mutates the arena (it only
+; sizes it), so stamps of 0 would make the very first query of each type a
+; cache HIT on the never-written arena_qc_largest/arena_qc_total, answering
+; "zero free" without ever walking the bitmap. That is invisible on a normal
+; boot only because this build's shell allocates an XMS swap block before
+; anything queries; a CONFIG.SYS driver loaded after TOKAEMM that sizes itself
+; from XMS 08h would be told the machine has no extended memory. -1 cannot
+; collide until the generation wraps, which is the 2^32 argument above.
+arena_gen:        dd 0             ; bumped by every arena_bmp/vcpi_bmp mutation
+arena_qc_gen:     dd -1, -1, -1    ; per-type cache stamp (index = ALLOC_*/2);
+                                   ; -1 = never computed, see above
+arena_qc_largest: dw 0, 0, 0       ; ... and its cached answers, in granules
+arena_qc_total:   dw 0, 0, 0
 vcpi_pic_master: dw 8             ; DE0Ah/DE0Bh: current 8259 vector bases
 vcpi_pic_slave:  dw 0x70          ; (the DOS-default mapping until a client
-                                  ;  reports a remap; store-and-report only)
-arena_bmp: times 768 db 0         ; ALLOCATED bit per physical 4 KB page (shared)
-; VCPI OWNERSHIP bit per page. With disjoint pools, the address range alone told
-; you who owned a page, so this used to be the VCPI allocation bitmap. Sharing
-; one pool removes that: without an ownership bit, DE05's range check now spans
-; the XMS pages too and would happily free an EMB's page out from under its
-; owner. arena_bmp says "allocated", this says "allocated BY VCPI", and DE05
-; refuses any page it does not own.
-vcpi_bmp: times 768 db 0
+                                  ;  records its own)
+
+arena_bmp: times ARENA_BMP_BYTES db 0   ; ALLOCATED bit per 1 KB granule
+; VCPI OWNERSHIP bit per 4 KB page. arena_bmp says "allocated"; this says
+; "allocated BY VCPI". With one address range serving all three interfaces the
+; range alone no longer identifies an owner, so without this DE05 would happily
+; free an XMS block's or an EMS page's memory out from under it.
+vcpi_bmp: times ARENA_PAGES / 8 db 0
 
 strategy:
     mov [cs:rh_ptr], bx
@@ -211,8 +300,9 @@ interrupt:
 init:
     ; Parse the DEVICE= tail for a whole-token "NOEMS" argument.
     ; r_bpbptr (+18) points at the raw command line, driver path first
-    ; (FreeDOS init_device). Bare and RAM both use the default 3 MB EMS pool;
-    ; NOEMS wins regardless of token order because no other token sets it back.
+    ; (FreeDOS init_device). Bare and RAM both leave EMS enabled, drawing pages
+    ; from the shared arena on demand rather than a fixed-size pool; NOEMS wins
+    ; regardless of token order because no other token sets it back.
     push ds
     lds si, [es:bx+18]
 .p_path:                          ; skip the path token
@@ -375,40 +465,19 @@ init:
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
-    ; Keep at least 1 MB for XMS and VCPI when possible, then put
-    ; up to 3 MB of EMS at the top. On the 24 MB product profile this makes the
-    ; XMS category [1 MB,21 MB) and EMS [21 MB,24 MB).
-    mov ebx, edi                  ; default frameless: arena reaches RAM top
+    ; The arena always reaches the RAM top now: EMS draws from it on demand
+    ; instead of owning a partition above it. EMS enablement only decides
+    ; whether the page frame exists, and so whether the UMB window stops at
+    ; 0xE000 or runs to 0xF000.
+    mov ebx, edi
     cmp byte [cs:ems_on], 0
     je .ems_layout_done
     cmp byte [cs:umb_available], 0
-    je .ems_disable
-    mov eax, edi
-    sub eax, [cs:xms_pool_base]
-    jc .ems_disable
-    cmp eax, 0x00100000           ; retain a 1 MB extended-memory category
-    jbe .ems_disable
-    sub eax, 0x00100000
-    and eax, 0xFFFFC000           ; EMS pages are 16 KB
-    cmp eax, EMS_MAX_PAGES * 0x4000
-    jbe .ems_size_ok
-    mov eax, EMS_MAX_PAGES * 0x4000
-.ems_size_ok:
-    test eax, eax
-    jz .ems_disable
-    mov ebx, edi
-    sub ebx, eax                  ; EBX = EMS base / XMS category end
-    mov [cs:ems_phys_base], ebx
-    shr eax, 14
-    mov [cs:ems_pages], ax
-    mov [cs:ems_free], ax
-    shl ax, 4                     ; pages * 16 KB -> category KB
-    mov [cs:ems_category_kb], ax
-    mov word [cs:umb_win_end], EMS_FRAME_SEG
-    jmp .ems_layout_done
-.ems_disable:
+    jne .ems_frame_on
     mov byte [cs:ems_on], 0
-    mov [cs:ems_phys_base], edi
+    jmp .ems_layout_done
+.ems_frame_on:
+    mov word [cs:umb_win_end], EMS_FRAME_SEG
 .ems_layout_done:
     mov [cs:xms_pool_end], ebx
     mov eax, ebx
@@ -420,9 +489,9 @@ init:
     mov [cs:xms_category_kb], ax
 
     ; Page-align the allocatable category and hand ALL of it to the one shared
-    ; pool: XMS EMBs and VCPI pages both allocate out of it, first come first
-    ; served. Clamped to what arena_bmp can index (ARENA_PAGES) so a machine
-    ; larger than the bitmap cannot walk off the end of it.
+    ; arena: XMS EMBs, EMS pages and VCPI pages all allocate out of it, first
+    ; come first served. Clamped to what arena_bmp can index (ARENA_GRANULES) so
+    ; a machine larger than the bitmap cannot walk off the end of it.
     mov eax, [cs:xms_pool_base]
     add eax, 0xFFF
     and eax, 0xFFFFF000
@@ -432,8 +501,9 @@ init:
     jbe .arena_bounds_ok
     mov eax, ebx
 .arena_bounds_ok:
-    ; Clamp the pool END to the last page the bitmap covers. The bitmap is
-    ; indexed by ABSOLUTE page number, so the ceiling is absolute too.
+    ; Clamp to the span the granule bitmap covers. ARENA_PAGES * 0x1000 ==
+    ; ARENA_GRANULES * 0x400, so this byte ceiling is still correct now that
+    ; arena_bmp is indexed in 1 KB granules rather than 4 KB pages.
     cmp ebx, ARENA_PAGES * 0x1000
     jbe .arena_ceiling_ok
     mov ebx, ARENA_PAGES * 0x1000
@@ -444,14 +514,31 @@ init:
 .arena_span_ok:
     mov [cs:xms_pool_base], eax
     mov [cs:xms_pool_end], ebx
-    mov [cs:vcpi_pool_base], eax  ; same span; vcpi_bmp/vcpi_free are aliases
-    mov [cs:vcpi_pool_end], ebx
     mov ecx, ebx
     sub ecx, eax
-    shr ecx, 12
-    mov [cs:xms_free], cx         ; one free count for the shared pool
-    shr eax, 12                   ; next-fit cursor starts at the pool base
-    mov [cs:vcpi_cursor], ax
+    shr ecx, 10                   ; span in 1 KB granules
+    cmp ecx, ARENA_GRANULES       ; never index past the bitmap
+    jbe .arena_span_fits
+    mov ecx, ARENA_GRANULES
+.arena_span_fits:
+    mov [cs:arena_granules], cx
+    mov edx, eax
+    shr edx, 10
+    mov [cs:arena_base_kb], dx    ; arena base, absolute KB
+    mov word [cs:vcpi_cursor], 0
+    mov word [cs:ems_cursor], 0
+
+    ; EMS totals are DERIVED from the arena, not carved out of it. Free pages
+    ; are computed per call by arena_query; only the total is fixed at INIT.
+    xor ax, ax
+    cmp byte [cs:ems_on], 0
+    je .ems_total_done
+    mov ax, cx                    ; CX = arena granules
+    shr ax, 4                     ; -> whole 16 KB pages
+.ems_total_done:
+    mov [cs:ems_pages], ax
+    shl ax, 4                     ; pages * 16 KB -> category KB
+    mov [cs:ems_category_kb], ax
 
     ; Hook INT 2Fh (chain) + own INT 67h outright (IVT at linear 0). The EMS
     ; manager answers in BOTH modes: frameless is EMM386-NOEMS's contract.
@@ -592,9 +679,33 @@ ef_frame:                         ; 41h get page-frame segment -> BX
     xor bx, bx
     mov ah, 0x80                  ; frameless: EMM386-NOEMS convention
     iret
-ef_counts:                        ; 42h get page counts: BX=free, DX=total
-    mov bx, [cs:ems_free]
+; 42h get page counts: BX=free, DX=total. Free is DERIVED from the shared
+; arena every call; total was fixed at INIT. No interrupt guard: INT 67h
+; delivery already clears VIF before any handler runs (including this one),
+; so no guest ISR can interleave with the arena_query call below the way one
+; could interleave with a far-called XMS entry point -- xf_query_free's cli
+; guards against that case specifically, and does not apply here. A cache HIT
+; in arena_query costs a handful of compares and never enters the monitor at
+; all, so the frameless check runs FIRST and skips the query outright: no
+; reason to pay even that when the answer is always zero.
+ef_counts:
+    cmp byte [cs:ems_on], 0
+    jne .on
+    xor bx, bx                     ; frameless: no EMS pages are obtainable
+    mov dx, [cs:ems_pages]         ; (0 in this mode; see INIT's EMS-totals step)
+    xor ah, ah
+    iret
+.on:
+    push ax                        ; AL is not a defined output of 42h;
+                                    ; arena_query clobbers it as its
+                                    ; largest-free-run answer, which 42h
+                                    ; has no field for
+    mov bl, ALLOC_EMS
+    call arena_query               ; DX = total free granules for 16 KB blocks
+    shr dx, 4                      ; granules -> 16 KB pages
+    mov bx, dx
     mov dx, [cs:ems_pages]
+    pop ax
     xor ah, ah
     iret
 ef_version:                       ; 46h get version -> AL = BCD 4.0
@@ -602,23 +713,49 @@ ef_version:                       ; 46h get version -> AL = BCD 4.0
     xor ah, ah
     iret
 
-; 43h allocate: BX = pages -> DX = handle. Contiguous first-fit run.
+; 43h allocate: BX = pages -> DX = handle. Pages come one at a time from the
+; shared arena and are linked in logical order (386MAX ALLOCEMS), so backing is
+; non-contiguous by construction.
+;
+; D3: the free total is checked BEFORE any page is taken. A fresh arena_query
+; is cheap once D1's memo is warm, so there is no reason to pay for a
+; speculative take-then-unwind on the common failure path -- a caller probing
+; "how much can I get" by halving no longer pays for the answer twice. Once the
+; pre-check passes, the take loop below cannot fail (the pre-check already
+; proved that many boundary-aligned runs exist somewhere in the arena, and each
+; successful ems_page_alloc call removes exactly one); .unwind stays as a
+; safety net against a future accounting bug, not as the live failure path.
+;
+; D2: matches the discipline the routine this replaces used -- AX and DX are
+; pushed (AX is clobbered by arena_query/ems_page_alloc and is not a defined
+; output; DX is a working counter/handle and only a defined output on
+; success). On every exit, AX is popped back (not discarded) and DX is either
+; the new handle (success) or restored to the caller's original value (every
+; failure path) -- LIM says only the documented outputs change.
 ef_alloc:
     test bx, bx
     jz .zero
     cmp bx, [cs:ems_pages]
     ja .total
-    cmp bx, [cs:ems_free]
-    ja .nofree
-    push ax                       ; ems_find_run clobbers AX; AL is not an output
-    push dx                       ; DX is an output only on success (the handle)
+    push ax
+    push dx
     push si
     push cx
     push di
-    call ems_find_run             ; BX=need -> DI=first page, CF=no run
-    jc .frag
-    mov si, ems_table             ; first free handle slot
-    mov cx, EMS_HANDLES
+    push bp
+    push bx                       ; BX must survive as "pages wanted" through
+                                   ; the pre-check below. arena_query itself
+                                   ; PRESERVES bx; the save is needed because
+                                   ; the very next line, loading the type
+                                   ; argument into bl, is what destroys it
+    mov bl, ALLOC_EMS
+    call arena_query               ; DX = total free granules for 16 KB blocks
+    shr dx, 4                      ; granules -> 16 KB pages
+    pop bx
+    cmp bx, dx
+    ja .nofree                    ; D3: reject before taking a single page
+    mov si, ems_table             ; claim a handle slot BEFORE taking pages, so
+    mov cx, EMS_HANDLES           ; the common failure needs no unwind
     xor dx, dx                    ; handle counter (1-based below)
 .slot:
     inc dx
@@ -626,33 +763,76 @@ ef_alloc:
     je .got
     add si, EMS_SLOT
     loop .slot
+    pop bp
     pop di
     pop cx
     pop si
-    pop dx                        ; restore the caller's DX (the counter ran over it)
+    pop dx                        ; restore the caller's DX: the slot scan ran over it
     pop ax
     mov ah, 0x85                  ; no more handles
     iret
 .got:
+    mov word [cs:si+4], 0xFFFF    ; empty chain
+    mov di, 0xFFFF                ; DI = chain tail, 0xFFFF = none yet
+    mov bp, bx                    ; BP = pages still wanted; BX keeps npages
+.take:
+    call ems_page_alloc           ; -> AX = page index. The pre-check above
+    jc .unwind                    ; makes this a safety net, not the live path.
+    push bx
+    mov bx, ax
+    add bx, bx
+    mov word [cs:ems_link + bx], 0xFFFF   ; new tail terminates the chain
+    pop bx
+    cmp di, 0xFFFF
+    je .head
+    push bx
+    mov bx, di
+    add bx, bx
+    mov [cs:ems_link + bx], ax    ; link the old tail to it
+    pop bx
+    jmp .linked
+.head:
+    mov [cs:si+4], ax
+.linked:
+    mov di, ax
+    dec bp
+    jnz .take
     mov byte [cs:si], 1           ; inuse
     mov byte [cs:si+1], 0         ; saved = 0
     mov [cs:si+2], bx             ; npages
-    mov [cs:si+4], di             ; first backing page
-    sub [cs:ems_free], bx
+    mov word [cs:si+16], 0        ; cold cache (0 = cold; ems_backing_of stores
+                                   ; cache_logical+1, so the raw table's zeroed
+                                   ; cold state and an explicit reset agree)
+    pop bp
     pop di
     pop cx
     pop si
-    add sp, 2                     ; discard the saved DX: DX = the new handle
+    add sp, 2                     ; discard the saved DX: DX carries the handle
     pop ax
     xor ah, ah
     iret
-.frag:
+.unwind:
+    mov di, [cs:si+4]             ; give back every page we managed to take
+.uw:
+    cmp di, 0xFFFF
+    je .uw_done
+    mov ax, di
+    push bx
+    mov bx, di
+    add bx, bx
+    mov di, [cs:ems_link + bx]
+    pop bx
+    call ems_page_free
+    jmp .uw
+.uw_done:
+    mov word [cs:si+4], 0xFFFF
+.nofree:
+    pop bp
     pop di
     pop cx
     pop si
     pop dx
     pop ax
-.nofree:
     mov ah, 0x88                  ; insufficient free pages
     iret
 .total:
@@ -665,6 +845,17 @@ ef_alloc:
 ; 44h map: AL = physical slot 0-3, BX = logical page (0xFFFF unmaps),
 ; DX = handle. The bookkeeping is here; the PTE rewrite + TLB flush is the
 ; monitor's INT 0xC0 'PM' service (ring-0 work, like the XMS-move memcpy).
+;
+; Backing is a singly-linked forward chain (ems_link), not an array and not a
+; doubly-linked list: random access would want the latter, but a "prev" word
+; per page is another 2,912 bytes on top of ems_link's own 2,912, against the
+; 16 bytes of headroom left under the 64 KB driver ceiling (D5) -- the
+; structure is forced, not chosen for its own sake. ems_backing_of's per-slot
+; (logical, backing) cache is what keeps the common access patterns (forward
+; sequential sweep, double-buffering, ping-pong paging) cheap despite that: a
+; forward walk resumes from the cache instead of restarting, so those cost
+; O(L) in total rather than O(L^2); only a walk to a lower logical page than
+; the cache remembers restarts from the head.
 ef_map:
     cmp al, 3
     ja .badphys
@@ -676,8 +867,7 @@ ef_map:
     je .unmap
     cmp bx, [cs:si+2]             ; logical >= npages?
     jae .badlog
-    mov cx, [cs:si+4]
-    add cx, bx                    ; backing page = first + logical
+    call ems_backing_of           ; logical BX, slot SI -> CX = backing page
 .do:
     mov si, ax                    ; slot index: AL validated <= 3, mask AH away
     and si, 3
@@ -701,10 +891,12 @@ ef_map:
     mov ah, 0x8B                  ; physical page out of range
     iret
 
-; 45h release: DX = handle. Unmaps its frame slots, scrubs its pages from
-; every saved_map (a freed-and-reassigned page must not be reinstated by a
-; later 48h restore — mirrors the retired HLE's invalidate_freed), then
-; returns the run to the pool.
+; 45h release: DX = handle. Walks the handle's page chain (backing is no
+; longer contiguous, so there is no [first,first+npages) range to reason
+; about): unmaps any live frame slot showing that page, scrubs it from every
+; saved_map by exact match (a freed-and-reassigned page must not be reinstated
+; by a later 48h restore -- mirrors the retired HLE's invalidate_freed), and
+; returns it to the shared arena, one page at a time.
 ef_free:
     push si
     call ems_slot_of
@@ -714,19 +906,17 @@ ef_free:
     push cx
     push dx
     push di
-    mov di, [cs:si+4]             ; DI = first freed page
-    mov dx, di
-    add dx, [cs:si+2]             ; DX = end (exclusive)
-    xor bx, bx                    ; BX = physical slot 0..3
+    mov di, [cs:si+4]             ; walk this handle's chain
+.page:
+    cmp di, 0xFFFF
+    je .pages_done
+    xor bx, bx                    ; unmap any live frame slot showing this page
 .slots:
     push si
     mov si, bx
     add si, si
-    mov cx, [cs:ems_frame_map + si]
-    cmp cx, di
-    jb .ns
-    cmp cx, dx
-    jae .ns
+    cmp [cs:ems_frame_map + si], di
+    jne .ns
     mov word [cs:ems_frame_map + si], 0xFFFF
     mov al, bl
     mov cx, 0xFFFF
@@ -736,9 +926,9 @@ ef_free:
     inc bx
     cmp bx, 4
     jb .slots
-    push si                       ; scrub [DI,DX) from every saved_map
-    mov si, ems_table
-    mov cx, EMS_HANDLES
+    push si                       ; scrub this page from every saved_map, so a
+    mov si, ems_table             ; later 48h restore cannot reinstate a page
+    mov cx, EMS_HANDLES           ; that has been freed and reassigned
 .scrub:
     cmp byte [cs:si+1], 0         ; saved?
     je .nh
@@ -747,11 +937,8 @@ ef_free:
     add si, 8                     ; saved_map
     mov cx, 4
 .sm:
-    mov ax, [cs:si]
-    cmp ax, di
-    jb .smn
-    cmp ax, dx
-    jae .smn
+    cmp [cs:si], di
+    jne .smn
     mov word [cs:si], 0xFFFF
 .smn:
     add si, 2
@@ -762,8 +949,17 @@ ef_free:
     add si, EMS_SLOT
     loop .scrub
     pop si
-    mov ax, [cs:si+2]             ; release the run + the slot (its own saved
-    add [cs:ems_free], ax         ; context dies with saved=0)
+    mov ax, di                    ; release the page and step to the next
+    push bx
+    mov bx, di
+    add bx, bx
+    mov di, [cs:ems_link + bx]
+    pop bx
+    call ems_page_free
+    jmp .page
+.pages_done:
+    mov word [cs:si+4], 0xFFFF
+    mov word [cs:si+16], 0        ; cold cache (0 = cold; see ems_backing_of)
     mov byte [cs:si], 0
     mov byte [cs:si+1], 0
     pop di
@@ -936,9 +1132,9 @@ ems_slot_of:
     push ax
     mov ax, dx
     dec ax
-    shl ax, 4                     ; * EMS_SLOT
-    add ax, ems_table
-    mov si, ax
+    imul si, ax, EMS_SLOT         ; one instruction, 386-only, no register to
+                                   ; save: (handle-1) * EMS_SLOT fits SI cleanly
+    add si, ems_table
     pop ax
     cmp byte [cs:si], 0           ; inuse?
     je .bad
@@ -949,38 +1145,138 @@ ems_slot_of:
     stc
     ret
 
-; First-fit contiguous run of BX pages -> DI = first page, or CF set.
-; Restart-on-overlap over the handle slots (mirrors find_gap). Clobbers ax,cx,si.
-ems_find_run:
-    xor di, di                    ; cursor
-.restart:
-    mov ax, di
-    add ax, bx
-    cmp ax, [cs:ems_pages]
-    ja .none
-    mov si, ems_table
-    mov cx, EMS_HANDLES
+; Take one 16 KB EMS page from the shared arena. out: AX = EMS page index,
+; CF clear; or CF set when none is free. EMS page p occupies arena granules
+; [p*16, p*16+16), so its absolute kilobyte is arena_base_kb + p*16.
+; Preserves BX/CX/DX/SI/DI.
+;
+; D6: no EMS-private free chain (386MAX's PPAGELINK). A free list here would
+; need to stay synchronised with grabs XMS or VCPI make out of the SAME
+; bitmap, and neither of those interfaces has any reason to know or care that
+; a granule range it just took happened to be "EMS page N" -- the whole point
+; of one shared arena is that any of the three can take any part of it. Only
+; probing the live bits directly cannot go stale that way.
+;
+; That does not mean no cursor, though, and an earlier version of this
+; comment got that wrong. `arena_alloc` (used here originally) restarts its
+; scan from granule 0 on every call, because XMS requests are variably sized
+; and there is no fixed unit to remember a position for; EMS pages are always
+; the same size, so a next-fit cursor applies exactly the way it already does
+; for VCPI's `vcpi_cursor`. Its own scan below, `ems_cursor`-driven, mirrors
+; the monitor's vcpi_page_alloc. Without it, taking N pages one at a time from
+; an empty arena cost O(N^2) bit tests (each call rescanning past every
+; already-taken low page): a single AH=43h asking for most of the pool -- a
+; RAM disk or cache claiming all of EMS at once does exactly this -- could
+; hold VIF=0 for multiple 54.9 ms IRQ0 ticks at N in the high hundreds. That
+; is the real version of the hazard D1 addressed for the query path; this is
+; where it actually lived, in the allocator, one guest instruction (AH=43h),
+; not spread across many polls.
+ems_page_alloc:
+    push bx
+    push cx
+    push dx
+    push si
+    mov cx, [cs:arena_granules]
+    shr cx, 4                     ; whole 16 KB pages the arena covers
+    jz .none
+    mov ax, [cs:ems_cursor]
+    mov dx, cx                    ; candidate pages left to examine
 .scan:
-    cmp byte [cs:si], 0
-    je .next
-    mov ax, [cs:si+4]
-    add ax, [cs:si+2]             ; b.top = first + npages
-    cmp ax, di
-    jbe .next                     ; block below the cursor
-    mov ax, di
-    add ax, bx
-    cmp [cs:si+4], ax
-    jae .next                     ; block above cursor+need
-    mov di, [cs:si+4]
-    add di, [cs:si+2]             ; overlap: cursor = b.top, restart
-    jmp .restart
+    cmp ax, cx
+    jb .test
+    xor ax, ax                    ; wrap to the arena base
+.test:
+    mov si, ax
+    shl si, 4                     ; first granule of this candidate page
+    mov bx, EMS_PAGE_GRANULES
+.probe:
+    bt word [cs:arena_bmp], si
+    jc .next
+    inc si
+    dec bx
+    jnz .probe
+    jmp .take
 .next:
-    add si, EMS_SLOT
-    loop .scan
+    inc ax
+    dec dx
+    jnz .scan
+.none:
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    stc
+    ret
+.take:
+    mov si, ax                    ; SI = page index; recompute its first
+    shl si, 4                     ; granule (the probe above left SI at the
+    push ax                       ; page's end, not its start)
+    mov ax, si
+    mov cx, EMS_PAGE_GRANULES
+    call arena_mark                ; marks the 16 granules, bumps arena_gen
+    pop ax
+    mov si, ax                    ; next-fit cursor = page index + 1. AX
+    inc si                        ; cannot be a 16-bit addressing base (only
+                                   ; BX/BP/SI/DI can), so no LEA shortcut here
+                                   ; the way the 32-bit VCPI side has one.
+    mov [cs:ems_cursor], si       ; next-fit: resume just past this page
+    pop si
+    pop dx
+    pop cx
+    pop bx
     clc
     ret
-.none:
-    stc
+
+; Return one 16 KB EMS page to the shared arena. in: AX = EMS page index.
+; Preserves every register.
+ems_page_free:
+    push ax
+    push cx
+    shl ax, 4                     ; EMS page index -> granule index
+    mov cx, EMS_PAGE_GRANULES
+    call arena_release
+    pop cx
+    pop ax
+    ret
+
+; Logical page BX of the handle at SI -> CX = backing EMS page index. Walks the
+; handle's chain, resuming from the slot's (logical, backing) cache whenever the
+; cache is at or before the wanted logical page. Preserves AX/BX/DX/SI/DI/BP.
+;
+; The cache at [si+16]/[si+18] stores cache_logical+1 (0 = cold) rather than a
+; bare logical index with an 0xFFFF sentinel (D4): a raw-zeroed ems_table slot
+; then already reads as cold, with no INIT-time sentinel fill needed, and an
+; explicit reset (ef_alloc, ef_free) just stores 0 instead of a magic value.
+ems_backing_of:
+    push ax
+    mov cx, [cs:si+4]             ; chain head
+    xor ax, ax                    ; logical index CX currently stands at
+    cmp word [cs:si+16], 0
+    je .walk                      ; cold cache
+    mov ax, [cs:si+16]
+    dec ax                        ; decode: stored value is cache_logical+1
+    cmp ax, bx
+    ja .fromhead                  ; cache is past us: restart from the head
+    mov cx, [cs:si+18]
+    jmp .walk
+.fromhead:
+    xor ax, ax
+    mov cx, [cs:si+4]
+.walk:
+    cmp ax, bx
+    je .done
+    push bx
+    mov bx, cx
+    add bx, bx
+    mov cx, [cs:ems_link + bx]
+    pop bx
+    inc ax
+    jmp .walk
+.done:
+    inc ax                        ; encode: cache_logical+1, 0 stays "cold"
+    mov [cs:si+16], ax
+    mov [cs:si+18], cx
+    pop ax
     ret
 
 ; Monitor remap of one frame slot. AL = slot 0-3, CX = backing page index or
@@ -997,9 +1293,13 @@ ems_remap_slot:
     mov word [cs:ems_rm_lin+2], EMS_FRAME_LIN >> 16   ; high word = 0x000E
     cmp cx, 0xFFFF
     je .unmap
-    movzx eax, cx                 ; backing = runtime base + page*16K
+    movzx eax, cx                 ; backing = arena base + page * 16 KB
     shl eax, 14
-    add eax, [cs:ems_phys_base]
+    push edx
+    movzx edx, word [cs:arena_base_kb]
+    shl edx, 10
+    add eax, edx
+    pop edx
     mov [cs:ems_rm_phys], eax
     jmp .go
 .unmap:
@@ -1128,11 +1428,19 @@ idt:
     IDTGATE irq_s14               ; 0x76 IRQ14 ATA
     IDTGATE irq_s15               ; 0x77 IRQ15 / slave-spurious
 %assign v 0x78
-%rep (0x100 - 0x78)
-    IDTGATE deflt_%[v]            ; 0x78..0xFF: the rest of the software-INT
+%rep (0xC0 - 0x78)
+    IDTGATE deflt_%[v]            ; 0x78..0xBF: the rest of the software-INT
                                   ;             space (DOS 0x20-0x2E, EMS 0x67,
                                   ;             multiplex 0x2F, user vectors) ->
                                   ;             reflect to the guest's own IVT
+%assign v v+1
+%endrep
+    IDTGATE intc0_entry           ; 0xC0: TOKAEMM-private monitor calls
+%assign v 0xC1
+%rep (0x100 - 0xC1)
+    IDTGATE deflt_%[v]            ; 0xC1..0xFF: the rest of the software-INT
+                                  ;             space -> reflect to the guest's
+                                  ;             own IVT
 %assign v v+1
 %endrep
 idt_end:
@@ -1557,6 +1865,8 @@ monitor_body:
     je .intn_memcpy
     cmp word [esp+20], 0x4D50    ; guest DX == 'PM' (EMS frame remap)?
     je .intn_remap
+    cmp word [esp+20], 0x5154    ; guest DX == 'TQ' (arena free query)?
+    je .intn_query
     jmp .intn_reflect            ; foreign INT 0xC0: reflect like any other
 .intn_memcpy:
     add word [ebp], 2            ; skip past INT 0xC0
@@ -1565,6 +1875,13 @@ monitor_body:
 .intn_remap:
     add word [ebp], 2
     call frame_remap
+    jmp .done_gp
+.intn_query:
+    add word [ebp], 2
+    mov bl, [fs:arena_q_type]
+    call arena_query32
+    mov [fs:arena_q_largest], ax
+    mov [fs:arena_q_total], dx
     jmp .done_gp
 .intn_reflect:
     add word [ebp], 2            ; return IP = past INT n
@@ -1990,7 +2307,15 @@ deflt_%[v]:
 %assign v v+1
 %endrep
 %assign v 0x78
-%rep (0x100 - 0x78)
+%rep (0xC0 - 0x78)
+deflt_%[v]:
+    pushad
+    mov ebx, v
+    jmp deflt_common
+%assign v v+1
+%endrep
+%assign v 0xC1
+%rep (0x100 - 0xC1)
 deflt_%[v]:
     pushad
     mov ebx, v
@@ -2051,6 +2376,44 @@ int67_entry:
 .reflect:
     mov ebx, 0x67
     jmp deflt_common              ; re-loads DS/FS: harmless
+
+; ---- Vector 0xC0 (TOKAEMM-private monitor calls). Reached through the static
+; IDT only when the guest's live IOPL is 3; below that, INT n is IOPL-sensitive
+; in V86 and the call arrives through vec13_entry's .intn path, which performs
+; the same cookie split. The frame's saved CS:IP is already past the INT on this
+; path (software-INT gate dispatch), so no IP advance -- unlike .intn's fault
+; frame. A foreign INT 0xC0 reflects to the guest's own handler. ----
+intc0_entry:
+    pushad
+    mov ax, 0x10
+    mov ds, ax                    ; flat: deliver_exception nulled the segments
+    mov ax, 0x20
+    mov fs, ax                    ; FS = driver data
+    cmp word [esp+20], 0x544D     ; guest DX == 'TM' (XMS-move memcpy)?
+    je .memcpy
+    cmp word [esp+20], 0x4D50     ; ... 'PM' (EMS frame remap)?
+    je .remap
+    cmp word [esp+20], 0x5154     ; ... 'TQ' (arena free query)?
+    je .query
+    mov ebx, 0xC0                 ; foreign: reflect like any other vector.
+    jmp deflt_common              ; (re-loads DS/FS: harmless; deflt_common
+                                   ; expects the pushad frame still on the
+                                   ; stack, exactly like int67_entry's .reflect)
+.memcpy:
+    call flat_memcpy
+    popad
+    iretd
+.remap:
+    call frame_remap
+    popad
+    iretd
+.query:
+    mov bl, [fs:arena_q_type]
+    call arena_query32
+    mov [fs:arena_q_largest], ax
+    mov [fs:arena_q_total], dx
+    popad
+    iretd
 
 ; ---- VCPI 1.0 server dispatch (INT 67h AH=DEh, AL = subfunction).
 ; presence + the query/page-pool/system-register/PIC set (DE00, DE02-DE0B).
@@ -2139,9 +2502,9 @@ vcpi_dispatch:
     ret
 
 .de02:                            ; max physical memory address: EDX = the
-    mov eax, [fs:vcpi_pool_end]   ; highest 4K page DE04 could ever return,
-    cmp eax, [fs:vcpi_pool_base]
-    je .de02_empty
+    mov eax, [fs:xms_pool_end]    ; highest 4K page DE04 could ever return,
+    cmp eax, [fs:xms_pool_base]   ; (vcpi_pool_base/end are gone -- the arena's
+    je .de02_empty                ; own bounds mean the same thing now)
     sub eax, 0x1000               ; 12 LSBs zero (spec: both sides mask)
     mov [esi+20], eax
     mov byte [esi+29], 0
@@ -2152,8 +2515,20 @@ vcpi_dispatch:
     ret
 
 .de03:                            ; free 4K page count -> EDX
-    movzx eax, word [fs:vcpi_free]
-    mov [esi+20], eax
+    push ebx
+    push esi                      ; arena_query32 clobbers esi as its scan
+                                   ; cursor; esi is this dispatch's pushad-frame
+                                   ; pointer and must survive for the [esi+20]
+                                   ; write below (the plan's original draft
+                                   ; wrote through esi AFTER the call, using
+                                   ; whatever scan position esi was left at)
+    mov bl, ALLOC_VCPI
+    call arena_query32             ; DX = total free granules for 4 KB blocks
+    movzx edx, dx
+    shr edx, 2                    ; granules -> 4 KB pages
+    pop esi
+    mov [esi+20], edx
+    pop ebx
     mov byte [esi+29], 0
     ret
 
@@ -2334,55 +2709,200 @@ vcpi_dr_buf:
     add eax, edx
     ret
 
-; Allocate the lowest free pool page from the next-fit cursor. -> EAX = the
-; page's physical address, CF clear; or CF set (pool exhausted). The scan
-; terminates because vcpi_free > 0 guarantees a clear bit inside the pool
-; range. BT/BTS take the full bit index (bit-string form). Clobbers ecx, edx.
+; Arena free-space walk (386MAX QRY_PGCNT). in: BL = an ALLOC_* offset, FS =
+; driver data. out: AX = largest free run, DX = total free, both in granules
+; rounded down to that type's boundary. Clobbers eax, ebx, ecx, edx, esi, edi
+; on a cache miss; a cache hit only touches eax, ecx, edx (every caller already
+; saves/restores conservatively around this call, so either is safe to observe).
+;
+; Each maximal clear span is measured from its boundary-ALIGNED start and its
+; length rounded down, so a span too small or too misaligned to host a block of
+; this type contributes nothing. The number a caller gets is a number it can
+; spend, which is the whole point of reporting it.
+;
+; The cursor always resumes at the span's END once the span has been scored --
+; not partway through it. An earlier draft resumed at aligned_start + the
+; rounded-down length, which stalls forever on a span whose usable tail is
+; shorter than one boundary unit (that remainder rounds down to zero granules,
+; so the cursor advanced by zero and re-entered the very same span next
+; iteration). The end of the span is always strictly past where the span began,
+; so resuming there is what actually guarantees termination.
+;
+; D1 memo: the walk below costs ~5-6 instructions per granule (~23,000 of
+; them), so a naive per-call walk is the single most expensive thing a guest
+; can trigger through a LIM/XMS status call. Check the per-type cache first;
+; only fall into the walk on a miss, and stamp the cache with the generation
+; the answer is valid for before returning. See arena_gen's comment for why
+; this cannot drift from the bitmap the way a hand-maintained counter could.
+arena_query32:
+    movzx eax, bl                 ; save the type argument; bl is reused below
+    mov ecx, eax
+    shr ecx, 1                    ; ALLOC_* offsets are 0/2/4 -> cache index 0/1/2
+    mov edx, [fs:arena_gen]
+    cmp edx, [fs:arena_qc_gen + ecx*4]
+    jne .walk
+    movzx eax, word [fs:arena_qc_largest + ecx*2]
+    movzx edx, word [fs:arena_qc_total + ecx*2]
+    ret
+.walk:
+    push ecx                      ; cache index; needed again once the walk ends
+    movzx ebx, al                 ; al still holds the original type argument
+    movzx ebx, word [fs:alloc_lim + ebx]  ; boundary - 1
+    movzx ecx, word [fs:arena_granules]
+    xor edx, edx                  ; total
+    xor edi, edi                  ; largest
+    xor esi, esi                  ; scan cursor
+.next_span:
+    cmp esi, ecx
+    jae .done
+    bt [fs:arena_bmp], esi
+    jnc .span_start
+    inc esi                       ; skip an allocated granule
+    jmp .next_span
+.span_start:
+    mov eax, esi                  ; eax = span start
+.span_scan:
+    inc esi
+    cmp esi, ecx
+    jae .span_end
+    bt [fs:arena_bmp], esi
+    jnc .span_scan
+.span_end:                        ; esi = span end (exclusive), eax = span start
+    add eax, ebx                  ; align the span's usable start up
+    push ebx
+    not ebx
+    and eax, ebx
+    pop ebx
+    cmp eax, esi
+    jae .next_span                ; nothing usable: esi already holds the span
+                                   ; end, so the scan resumes there unmoved
+    push esi                      ; save the span end -- the cursor resumes
+                                   ; there regardless of how many boundary-sized
+                                   ; blocks the usable tail rounds down to
+    sub esi, eax                  ; esi = usable granules (unrounded)
+    xchg eax, esi                 ; eax = usable granules, esi = aligned start
+    push ebx
+    not ebx
+    and eax, ebx                  ; ... rounded down to the boundary
+    pop ebx
+    add edx, eax
+    cmp eax, edi
+    jbe .keep
+    mov edi, eax
+.keep:
+    pop esi                       ; resume at the span's end, not partway
+                                   ; through it -- see the header comment
+    jmp .next_span
+.done:
+    mov eax, edi
+    pop ecx                       ; cache index, saved before the walk started
+    mov [fs:arena_qc_largest + ecx*2], ax
+    mov [fs:arena_qc_total + ecx*2], dx
+    mov ebx, [fs:arena_gen]
+    mov [fs:arena_qc_gen + ecx*4], ebx
+    ret
+
+; Allocate one 4 KB VCPI page: four consecutive granules on a 4-granule
+; boundary (386MAX ALLOC_LIM @ALLOC_VCPI). -> EAX = physical address, CF clear;
+; or CF set when no such page is free. The scan is bounded by the arena's page
+; count rather than by a free counter, so a bookkeeping slip can no longer spin
+; forever the way the counter-driven version could.
 vcpi_page_alloc:
-    cmp word [fs:vcpi_free], 0
-    je .none
+    push ebx
+    push ecx
+    push edx
+    movzx ecx, word [fs:arena_granules]
+    shr ecx, 2                    ; whole 4 KB pages the arena covers
+    jz .none
     movzx eax, word [fs:vcpi_cursor]
-    mov ecx, [fs:vcpi_pool_end]
-    shr ecx, 12                   ; end page number (exclusive)
+    mov edx, ecx                  ; pages left to examine before giving up
 .scan:
     cmp eax, ecx
     jb .test
-    mov eax, [fs:vcpi_pool_base]  ; wrap to the pool base
-    shr eax, 12
+    xor eax, eax                  ; wrap to the arena base
 .test:
-    bt [fs:arena_bmp], eax        ; free in the SHARED pool?
+    mov ebx, eax
+    shl ebx, 2                    ; first granule of this page
+    bt [fs:arena_bmp], ebx
+    jc .next
+    inc ebx
+    bt [fs:arena_bmp], ebx
+    jc .next
+    inc ebx
+    bt [fs:arena_bmp], ebx
+    jc .next
+    inc ebx
+    bt [fs:arena_bmp], ebx
     jnc .take
+.next:
     inc eax
-    jmp .scan
-.take:
-    bts [fs:arena_bmp], eax       ; claim it in the shared pool
-    bts [fs:vcpi_bmp], eax        ; and record VCPI as its owner
-    dec word [fs:vcpi_free]
-    lea edx, [eax+1]
-    mov [fs:vcpi_cursor], dx
-    shl eax, 12
-    clc
-    ret
+    dec edx
+    jnz .scan
 .none:
+    pop edx
+    pop ecx
+    pop ebx
     stc
     ret
+.take:
+    mov ebx, eax
+    shl ebx, 2
+    bts [fs:arena_bmp], ebx
+    inc ebx
+    bts [fs:arena_bmp], ebx
+    inc ebx
+    bts [fs:arena_bmp], ebx
+    inc ebx
+    bts [fs:arena_bmp], ebx
+    bts [fs:vcpi_bmp], eax        ; record VCPI as this page's owner
+    inc dword [fs:arena_gen]      ; D1: invalidate every cached query
+    lea edx, [eax+1]
+    mov [fs:vcpi_cursor], dx
+    movzx ebx, word [fs:arena_base_kb]
+    shl ebx, 10                   ; arena base, linear
+    shl eax, 12
+    add eax, ebx                  ; -> the page's physical address
+    pop edx
+    pop ecx
+    pop ebx
+    clc
+    ret
 
-; Free the pool page at physical EAX (4K-aligned by the caller). CF set if
-; the address is outside the pool or the page is not allocated (double-free).
+; Free the 4 KB VCPI page at physical EAX (4K-aligned by the caller). CF set if
+; the address is outside the arena or the page is not one VCPI handed out --
+; which now includes any granule an XMS block or an EMS page owns.
 vcpi_page_free:
-    cmp eax, [fs:vcpi_pool_base]
+    push ebx
+    push ecx
+    movzx ecx, word [fs:arena_base_kb]
+    shl ecx, 10
+    sub eax, ecx
     jb .bad
-    cmp eax, [fs:vcpi_pool_end]
+    shr eax, 12                   ; 4 KB page index inside the arena
+    movzx ecx, word [fs:arena_granules]
+    shr ecx, 2
+    cmp eax, ecx
     jae .bad
-    shr eax, 12
-    bt [fs:vcpi_bmp], eax         ; VCPI's own page? refuse an XMS EMB's page
+    bt [fs:vcpi_bmp], eax
     jnc .bad
     btr [fs:vcpi_bmp], eax
-    btr [fs:arena_bmp], eax       ; return it to the shared pool
-    inc word [fs:vcpi_free]
+    mov ebx, eax
+    shl ebx, 2
+    btr [fs:arena_bmp], ebx
+    inc ebx
+    btr [fs:arena_bmp], ebx
+    inc ebx
+    btr [fs:arena_bmp], ebx
+    inc ebx
+    btr [fs:arena_bmp], ebx
+    inc dword [fs:arena_gen]      ; D1: invalidate every cached query
+    pop ecx
+    pop ebx
     clc
     ret
 .bad:
+    pop ecx
+    pop ebx
     stc
     ret
 
@@ -2428,7 +2948,16 @@ vcpi_pm_entry:
 .de03:                            ; free 4K page count -> EDX
     pushfd
     cli
-    movzx edx, word [fs:vcpi_free]
+    push eax                      ; AL must survive (only AH/EDX are outputs);
+                                   ; arena_query32 clobbers eax like
+                                   ; vcpi_page_alloc does below
+    push ebx
+    mov bl, ALLOC_VCPI
+    call arena_query32
+    movzx edx, dx
+    shr edx, 2
+    pop ebx
+    pop eax
     popfd
     xor ah, ah
     jmp .out
@@ -2777,9 +3306,25 @@ resident_core_end:
 align 4096
 tables:
     ; PD (1 page) + 6 PT (6 pages) = 0x7000, plus up to 0xFF0 of page-rounding slack
-    ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned) -> 0x8000.
-    times 0x8000 db 0
+    ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned, i.e. a
+    ; multiple of 16, which caps the worst-case slack at 4096-16 = 0xFF0 rather
+    ; than a full 0xFFF). Trimmed to this exact figure (D5): EMS's per-page chain
+    ; (ems_link) pushed resident_core_end past the 0x7000 boundary, and the
+    ; previously-unused 0x10 bytes of rounding-up-to-0x8000 padding is what kept
+    ; the image inside the 64 KB driver offset ceiling.
+    times 0x7000 + 0xFF0 db 0
 resident_image_end:
+; The reservation above now has ZERO margin: worst-case slack (0xFF0) plus the
+; seven pages (0x7000) is exactly 0x7FF0. That worst case is 0xFF0 only because
+; `tables` is itself page-aligned, which makes (base + tables) mod 4096 equal
+; base mod 4096, and base is a paragraph, so the round-up is at most 4096-16.
+; Drop the `align 4096` above and the bound becomes 0xFFF, which overruns the
+; reservation by 15 bytes and corrupts whatever DOS put after the driver, on
+; load addresses that depend on the boot's CONFIG.SYS ordering. Assert the
+; alignment rather than trusting the directive to survive an edit.
+%if (tables - $$) % 4096
+    %error "TOKAEMM tables: must stay 4096-aligned; the reservation's slack budget assumes it"
+%endif
 %if ($ - $$) >= 0x10000
     %error "TOKAEMM resident image exceeds the 16-bit driver offset limit"
 %endif
