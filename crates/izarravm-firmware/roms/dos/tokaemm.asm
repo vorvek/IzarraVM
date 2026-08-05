@@ -1097,6 +1097,20 @@ ems_slot_of:
 ; CF clear; or CF set when none is free. EMS page p occupies arena granules
 ; [p*16, p*16+16), so its absolute kilobyte is arena_base_kb + p*16.
 ; Preserves BX/CX/DX/SI/DI.
+;
+; D6: no EMS-private free chain (386MAX's PPAGELINK), by design. A free list
+; here would need to stay synchronised with grabs XMS or VCPI make out of the
+; SAME bitmap, and neither of those interfaces has any reason to know or care
+; that a granule range it just took happened to be "EMS page N" -- the whole
+; point of one shared arena is that any of the three can take any part of it.
+; `arena_alloc` probing the live bits directly cannot go stale that way. Cost:
+; unlike VCPI's `vcpi_cursor`, there is no next-fit cursor here, so a caller
+; draining N pages sequentially from an empty arena pays roughly O(N^2) bit
+; tests (measured, not just argued: emsfrag's ~1450-page drain on the 24 MB
+; profile still finishes in well under a second). Not worth a cursor here --
+; D3's pre-check is what protects the actually-expensive case (a request that
+; cannot be satisfied), and real EMS usage allocates far fewer pages per
+; handle than a deliberately adversarial fragmentation fixture does.
 ems_page_alloc:
     push bx
     push cx
