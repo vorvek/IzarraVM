@@ -367,9 +367,9 @@ f_resize:   mov al, 0xED
             jmp sig
 f_large:    mov al, 0xEE
             jmp sig
-; 0xE0-0xEE are already claimed (f_noxms through f_large below), so the two
-; new codes go just past them rather than at the plan's originally-picked
-; 0xE0/0xEF (0xE0 collides with f_noxms; see the commit message).
+; 0xE0-0xEE are already claimed (f_noxms above through f_large just above), so
+; the two new codes go just past them rather than at the plan's originally-
+; picked 0xE0/0xEF (0xE0 collides with f_noxms; see the commit message).
 f_largest:  mov al, 0xEF
             jmp sig
 f_gran:     mov al, 0xF0
