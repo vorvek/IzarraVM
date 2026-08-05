@@ -2287,6 +2287,25 @@ pub(crate) enum DirectKind {
         dst: u8,
         segment: SegmentIndex,
     },
+    /// `MOV Sreg, r16` (0x8E, register source) in REAL MODE or V86, where a segment load is
+    /// `base = selector << 4` with no descriptor fetch and no fault path. DS and ES only.
+    ///
+    /// Emitted inline rather than as a call-out, and the call-out was the first design. Two things
+    /// ruled it out: the call-out ABI is `(cpu, prefix_raw_clocks, weighted_fp_clocks)` with all
+    /// three arguments taken, so there is no channel to name the segment and the source register,
+    /// and `emit_call_out` spills and reloads all eight guest homes around the call, which is
+    /// roughly 27 host instructions against this form's eight for an instruction the target
+    /// workload runs 17.8 million times.
+    ///
+    /// Going inline costs one protection the call-out gave for free, and it is a miscompile rather
+    /// than a missed lowering: `self_loop` is gated on `callout_slots == 0`, so a call-out slot
+    /// disqualified the block from the self-loop shape automatically. A self-loop re-enters the
+    /// body natively without the prologue, so a slot BEFORE this write re-executes AFTER it
+    /// against a baked base the write invalidated. The compile loop bars the shape explicitly.
+    LoadSegReal {
+        segment: SegmentIndex,
+        src: u8,
+    },
     /// `SETcc r8` (0F 90..9F, register destination). The guest condition encoding is x86's own,
     /// so the emitted `setcc` takes it unchanged; `condition()` in the interpreter is the same
     /// truth table the host flags implement. Register form only: a memory destination is a byte
@@ -3097,6 +3116,13 @@ impl DirectKind {
             // separate them, which is what the Task 2 matrix does (`call_out_charge_matches_the_
             // interpreter_across_slot_counts`, one to four slots).
             Self::CallOut { .. } => 0,
+            // Matches the interpreter's clocks(7) for 0x8E (`execute.rs`, the arm that ends in
+            // `load_segment_arming_ss_shadow`). The `_ => 2` default would under-charge by 5, and
+            // the CallOut note above is the precedent for why that is invisible from inside the
+            // emitter: `completed_raw` sums this same function, so the end-of-emit assertion
+            // agrees with itself whatever this returns. Only an interpreter differential that
+            // ACCUMULATES across slot counts separates a wrong arm from a right one.
+            Self::LoadSegReal { .. } => 7,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
             // forms share the arm because the interpreter charges them from one `Ok(clocks(9))`.
@@ -3379,6 +3405,24 @@ impl DirectKind {
     fn pinned_segments(self) -> u8 {
         let bit = |segment: Option<SegmentIndex>| segment.map_or(0, segment_bit);
         bit(self.read_segment()) | bit(self.write_segment()) | bit(self.selector_segment())
+    }
+
+    /// The segment REGISTER this kind overwrites, which is a different question from all three
+    /// accessors above and must not be folded into any of them.
+    ///
+    /// `write_segment` names the segment a slot stores THROUGH, and it feeds
+    /// `segment_access_supported(.., write = true)` -- "can this descriptor be written through",
+    /// not "is this register being replaced". Reporting the load there would ask the wrong
+    /// question and, via `pinned_segments`, drag the segment into `used`, making `data_matches`
+    /// compare an entry value the slot never reads and retiring the block on every entry-DS
+    /// change. `LoadSegReal` bakes NOTHING, so it belongs in none of the pinned set.
+    ///
+    /// Consumed only by the compile walk's dirty-segment rule.
+    fn written_segment(self) -> Option<SegmentIndex> {
+        match self {
+            Self::LoadSegReal { segment, .. } => Some(segment),
+            _ => None,
+        }
     }
 
     fn write_segment(self) -> Option<SegmentIndex> {
@@ -3998,6 +4042,22 @@ fn stack_width_kind(
                 },
             }
         }
+        // The segment load is emitted as `base = selector << 4` with no descriptor fetch, which is
+        // what a segment load IS in real mode and V86 (`load_segment_real`) and is nothing like
+        // what it is in protected mode: a GDT/LDT fetch with type, privilege and present checks
+        // that can raise #GP or #NP (`load_protected_segment`). Admitting one in protected mode
+        // would compute a real-mode base for a descriptor-table segment and skip every check.
+        //
+        // The refusal has to be HERE and not in the mode key. The key stops a block compiled in
+        // one mode from being ENTERED in another; it says nothing about which mode the block was
+        // compiled in. What the key then adds is that this refusal is sufficient rather than
+        // merely necessary: a block admitted under real mode can never later run under protected.
+        // V86 is admitted deliberately -- `.bench/prince_c` runs V86 under JEMMEX, and V86 takes
+        // the real-mode path in `load_segment_checked` before the protected-mode branch is even
+        // considered.
+        DirectKind::LoadSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
+            return None;
+        }
         other => other,
     };
     match (kind, cpu.stack_is_32bit(), operand_size) {
@@ -4124,6 +4184,11 @@ fn compile_with_instruction_limit(
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
     let mut pinned_segments = 0u8;
+    // Segments this block has already overwritten, and how many such writes it carries. The mask
+    // ends slots that would bake a stale value; the count bars the two block shapes that would
+    // re-enter or leave the block without a segment check (see `self_loop` and `successors`).
+    let mut dirty_segments = 0u8;
+    let mut segment_writes = 0usize;
     let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
@@ -4351,6 +4416,27 @@ fn compile_with_instruction_limit(
             stop = CompileStop::Retry;
             break;
         }
+        // The dirty-segment rule. Every base and selector a block uses is a compile-time
+        // immediate, so once a slot overwrites a segment register every later slot that bakes
+        // anything from that segment would bake a stale value. Those become the block's end.
+        //
+        // `pinned_segments` is the test rather than `read_segment | write_segment`, and that is
+        // the whole point of it existing: `MovSegToReg` bakes a SELECTOR and reports through
+        // `selector_segment` alone, so the two-accessor spelling would let `mov ds,ax / mov bx,ds`
+        // answer with the selector from compile time.
+        //
+        // `Boundary` and not `Retry`: the prefix before the write is perfectly good code and
+        // should be kept. Retry would throw the whole block away and re-walk it to the same place.
+        //
+        // ABOVE every accumulator, not merely above the dirty one. A slot barred here never joins
+        // the block, so letting it reach `read_segments` or `pinned_segments` first would pin a
+        // segment the block does not use: extra `data_matches` comparisons and a retirement every
+        // time that unrelated segment moves, or a spurious Retry out of `segment_access_supported`
+        // for a descriptor nothing in the block reaches.
+        if kind.pinned_segments() & dirty_segments != 0 {
+            stop = CompileStop::Boundary;
+            break;
+        }
         if kind.is_x87()
             && (x87_slots == MAX_X87_SLOTS || slots.len() >= MAX_X87_BLOCK_INSTRUCTIONS)
         {
@@ -4447,6 +4533,11 @@ fn compile_with_instruction_limit(
             write_segments |= segment_bit(segment);
         }
         pinned_segments |= kind.pinned_segments();
+        // AFTER the test above, never before, or the write would bar itself.
+        if let Some(segment) = kind.written_segment() {
+            dirty_segments |= segment_bit(segment);
+            segment_writes += 1;
+        }
         has_wide_accesses |=
             kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
         // Attached HERE, at the last point before the slot is committed, not next to `classify`.
@@ -4504,7 +4595,24 @@ fn compile_with_instruction_limit(
     // exit multiplied the static total, double-counting one and dropping the other. Refusing the
     // self-loop SHAPE (not the block) leaves the block compiled and correct, just re-entered per
     // iteration like every non-loop block.
+    //
+    // A segment write bars the shape for a different and more serious reason, and the reason it
+    // needs its own term is that it USED to be covered by accident: the write was going to be a
+    // call-out, and `callout_slots == 0` would have disqualified the block for free. Emitting it
+    // inline removes that cover. A self-loop re-enters the body natively through a bare `jnz`
+    // back to `body_offset`, not through the prologue, so a slot BEFORE the write runs again
+    // AFTER it against a base the write invalidated. The dirty rule is a straight-line walk and a
+    // back-edge makes "before the write" also "after the write":
+    //
+    //     L: mov al, [si]   ; DS-relative, baked base
+    //        mov ds, bx     ; DS := BX
+    //        dec cx
+    //        jnz L          ; iteration 2 reads through the OLD base
+    //
+    // Silent wrong address, no fault, no counter. Barring the shape leaves the block compiled and
+    // correct, re-entered per iteration like any other.
     let self_loop = callout_slots == 0
+        && segment_writes == 0
         && matches!(
             slots.last().map(|slot| slot.kind),
             Some(DirectKind::Jcc { taken_delta: 0, .. })
@@ -4571,17 +4679,34 @@ fn compile_with_instruction_limit(
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
     };
-    let dynamic_successor = matches!(
-        slots.last().map(|slot| slot.kind),
-        Some(
-            DirectKind::Ret { .. }
-                | DirectKind::Ret16 { .. }
-                | DirectKind::JmpMem { .. }
-                | DirectKind::CallReg { .. }
-                | DirectKind::CallMem { .. }
-        )
-    );
+    // A block that overwrites a segment register publishes NO successors, static or dynamic.
+    //
+    // The argument this replaces was that such a block could not link anyway, because it exits
+    // with a different segment than it entered and `link_compatible` demands equal snapshots.
+    // That compares the wrong two things: `link_compatible` compares the two blocks'
+    // COMPILE-TIME ENTRY snapshots, and on the pass that compiles them the write is very often a
+    // no-op -- `mov ds, ax` where AX already holds DS is the ordinary "reload DS with what it
+    // has" case. The edge links, and then a LINKED successor runs no segment check at all: a
+    // chained transfer jumps into the successor's body without returning to `run_direct_block`,
+    // so its `data_matches` never executes. A later entry with a different AX writes DS and jumps
+    // straight into a body baked against the old base.
+    //
+    // Barring both edges makes the property true by construction. Inbound links stay safe: the
+    // source's snapshot equality plus the root's `all_data_matches` still pin the entry state.
+    let segment_write_block = segment_writes != 0;
+    let dynamic_successor = !segment_write_block
+        && matches!(
+            slots.last().map(|slot| slot.kind),
+            Some(
+                DirectKind::Ret { .. }
+                    | DirectKind::Ret16 { .. }
+                    | DirectKind::JmpMem { .. }
+                    | DirectKind::CallReg { .. }
+                    | DirectKind::CallMem { .. }
+            )
+        );
     let successors = match slots.last().map(|slot| slot.kind) {
+        _ if segment_write_block => [None, None],
         Some(DirectKind::Jcc { taken_delta, .. }) => [
             Some(fallthrough),
             (!self_loop).then_some(LinkTarget {

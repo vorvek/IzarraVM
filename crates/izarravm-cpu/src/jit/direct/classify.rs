@@ -202,6 +202,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8a
                 | 0x8b
                 | 0x8c
+                | 0x8e
                 | 0x98
                 | 0x99
                 | 0xa0
@@ -928,6 +929,37 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     return None;
                 };
                 return Some(DirectKind::MovSegToReg { dst, segment });
+            }
+            // MOV Sreg, r16, the write half of the segment family. DS and ES only, register
+            // source only, and REAL MODE or V86 only -- the mode gate is not here because
+            // `classify` has no CPU; it lives beside the `stack_width_kind` call, which is where
+            // PUSHF's V86 refusal lives for the same reason.
+            //
+            // `/1` (CS), `/6` and `/7` are refused HERE rather than left off the allowlist,
+            // because they are not loads at all: the interpreter raises #GP(0) for each
+            // (`execute.rs`, the 0x8e arm). Lowering them would turn a fault into a silent write,
+            // and 0x8c is NOT the symmetric case to copy -- `MOV r16, CS` is legal where
+            // `MOV CS, r16` is not.
+            //
+            // `/2` (SS) is refused for a reason of its own: loading SS arms a one-instruction
+            // interrupt shadow (`load_segment_arming_ss_shadow`), which the interpreter consumes
+            // at the start of the NEXT instruction. A native block never passes through that
+            // point, so a block that continued after an SS load would hold the shadow open across
+            // every remaining slot -- a guest-visible change in where an interrupt is delivered.
+            // The census measures 1,303 SS hits against 17.8 million for DS.
+            //
+            // FS and GS are absent for census reasons alone and would be safe to add.
+            0x8e => {
+                let m = insn.modrm?;
+                let segment = match m.reg {
+                    0 => SegmentIndex::Es,
+                    3 => SegmentIndex::Ds,
+                    _ => return None,
+                };
+                let DecodedOperand::Reg(src) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::LoadSegReal { segment, src });
             }
             0x8d => {
                 let m = insn.modrm?;

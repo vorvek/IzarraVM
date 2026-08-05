@@ -224,6 +224,39 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // `OperandSize::Word` whatever the prefix says. `mov_r32_imm32` into the scratch
             // first because there is no 16-bit immediate form on the encoder and none is worth
             // adding for one kind; the upper half of RDX is dead either way.
+            // `MOV Sreg, r16` in real mode or V86: the five field writes `load_segment_real`
+            // performs, and nothing else. `set_segment` is one array-element assignment, and the
+            // only extra work `load_segment_real` does is a CS-only code-cache invalidation that
+            // DS and ES never reach.
+            //
+            // Every constant comes from `SegmentRegister::real` rather than being written out
+            // here, so the two cannot drift. Only `base = selector << 4` is duplicated, and a
+            // differential pins it.
+            //
+            // The limit and access stores are NOT redundant on the grounds that this is real mode.
+            // Unreal mode is exactly a real-mode segment carrying a protected-mode limit, and
+            // `load_segment_real` stamps the limit back to 0xFFFF unconditionally. Skipping it
+            // would leave a 4 GB limit live, and `emit_segmented_linear_address` omits the limit
+            // compare entirely when the limit is `u32::MAX`, so the divergence would go on to
+            // suppress limit faults in later blocks rather than staying local.
+            DirectKind::LoadSegReal { segment, src } => {
+                const REAL: SegmentRegister = SegmentRegister::real(0);
+                let base = segment_field_base(segment);
+                e.mov_r32_r32(Reg::RAX, home(src));
+                e.and_r32_imm32(Reg::RAX, 0xffff);
+                // The selector is stored BEFORE the shift turns RAX into the base.
+                e.store_r16_disp32(Reg::R15, base + selector_offset(), Reg::RAX);
+                // One 16-bit store covers `access` and `default_size_32`, which are adjacent.
+                // `default_size_32` lands as 0x00, a valid `bool` bit pattern.
+                e.mov_r32_imm32(
+                    Reg::RDX,
+                    u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
+                );
+                e.store_u32_imm_disp32(Reg::R15, base + limit_offset(), REAL.limit);
+                e.store_r16_disp32(Reg::R15, base + access_offset(), Reg::RDX);
+                e.shift_r32_imm8(4, Reg::RAX, 4);
+                e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
+            }
             DirectKind::MovSegToReg { dst, segment } => {
                 let selector = memory.segments.selector(segment);
                 e.mov_r32_imm32(Reg::RDX, u32::from(selector));
@@ -3593,6 +3626,41 @@ pub(super) fn gpr_offset(index: usize) -> i32 {
     (core::mem::offset_of!(CpuGsw, registers)
         + core::mem::offset_of!(Registers, gpr)
         + index * core::mem::size_of::<u32>()) as i32
+}
+
+/// Byte offset from the `CpuGsw` pointer in R15 to a segment's descriptor.
+///
+/// `SegmentIndex::index` is the mapping `set_segment` itself uses, so the emitter and the
+/// interpreter cannot disagree about which slot they mean. `direct.rs` carries a second copy of
+/// the same mapping for `SegmentLayout.data`; the two agree today and the const assertion below
+/// keeps them that way, but this uses the one the write path uses.
+fn segment_field_base(segment: SegmentIndex) -> i32 {
+    (core::mem::offset_of!(CpuGsw, registers)
+        + core::mem::offset_of!(Registers, segments)
+        + segment.index() * core::mem::size_of::<SegmentRegister>()) as i32
+}
+
+fn selector_offset() -> i32 {
+    core::mem::offset_of!(SegmentRegister, selector) as i32
+}
+
+fn base_offset() -> i32 {
+    core::mem::offset_of!(SegmentRegister, base) as i32
+}
+
+fn limit_offset() -> i32 {
+    core::mem::offset_of!(SegmentRegister, limit) as i32
+}
+
+/// `access` and `default_size_32` are adjacent, and the emitter writes both with one 16-bit
+/// store. The assertion is what makes that legal rather than lucky.
+fn access_offset() -> i32 {
+    const _: () = assert!(
+        core::mem::offset_of!(SegmentRegister, default_size_32)
+            == core::mem::offset_of!(SegmentRegister, access) + 1,
+        "LoadSegReal writes access and default_size_32 as one 16-bit store",
+    );
+    core::mem::offset_of!(SegmentRegister, access) as i32
 }
 
 fn eip_offset() -> i32 {

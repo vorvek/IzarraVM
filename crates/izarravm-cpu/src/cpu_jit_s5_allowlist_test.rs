@@ -260,6 +260,102 @@ fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
     }
 }
 
+/// `MOV DS, r16` and `MOV ES, r16` at Word size, the write half of the segment family.
+///
+/// `flat_fixture` is real mode with big limits, which is the mode this lowering is admitted in.
+#[test]
+fn word_size_load_segment_forms_are_lowered() {
+    // ModRM 0xc0 | (reg << 3) | rm, register source AX.
+    for (label, reg) in [("/0 mov es,ax", 0u8), ("/3 mov ds,ax", 3)] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&[0x66, 0x8e, 0xc0 | (reg << 3)]);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        // The load touches no guest memory at all: it writes a CPU field, not the bus.
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// The `0x8e` shapes that stay refused, all inside the classifier arm rather than by the
+/// allowlist, so each would keep passing if the allowlist entry were reverted.
+///
+/// `/1`, `/6` and `/7` are the ones that matter most: they are not segment loads at all. The
+/// interpreter raises #GP(0) for each, so lowering them would turn a fault into a silent write.
+/// `/2` is SS, refused over the one-instruction interrupt shadow a native block cannot honour.
+/// The memory form is refused because the slice is the register shape and nothing else.
+#[test]
+fn word_size_load_segment_shapes_outside_the_slice_stay_refused() {
+    let cases: &[(&str, &[u8])] = &[
+        ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8]),
+        ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0]),
+        ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8]),
+        ("/2 mov ss,ax arms the shadow", &[0x66, 0x8e, 0xd0]),
+        ("/4 mov fs,ax is out of scope", &[0x66, 0x8e, 0xe0]),
+        ("/5 mov gs,ax is out of scope", &[0x66, 0x8e, 0xe8]),
+        (
+            "/3 memory form",
+            &[0x66, 0x8e, 0x1d, 0x00, 0x20, 0x00, 0x00],
+        ),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        map_word_operand_page(&mut cpu, &mut bus);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused, so the block is the three fillers"
+        );
+    }
+}
+
+/// `MOV Sreg, r16` stays refused in PROTECTED mode, where a segment load is a descriptor fetch
+/// with type, privilege and present checks rather than `selector << 4`.
+///
+/// The refusal lives beside the `stack_width_kind` call because `classify` has no CPU. The mode
+/// key is what makes it sufficient once made -- a block admitted in real mode can never be
+/// entered in protected mode -- but the key alone would not stop the block being COMPILED here,
+/// which is the failure this pins.
+#[test]
+fn the_protected_mode_load_segment_form_stays_refused() {
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&[0x66, 0x8e, 0xd8]);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    cpu.control.cr0 |= CR0_PE;
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "protected mode must stay refused, so the block is the three fillers"
+    );
+}
+
 /// `MOV r16, imm16` at Word size, the 16-bit campaign's fourth slice.
 ///
 /// All eight destinations, because `home()` is a table lookup and one case cannot see a
