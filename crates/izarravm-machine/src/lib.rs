@@ -2785,5 +2785,9 @@ const BIOS_BASE_MEMORY_KIB: u16 = 640;
 mod code_write_coherence_tests;
 
 #[cfg(test)]
+#[path = "machine_fault_site_test.rs"]
+mod fault_site_tests;
+
+#[cfg(test)]
 #[path = "machine_test.rs"]
 mod tests;

@@ -1488,6 +1488,51 @@ impl Eq for FastMapServeGate {}
 #[cfg(feature = "jit")]
 impl Eq for DirectRuntimeState {}
 
+/// Where a fatal `CpuError` was raised, for the machine's stop report.
+///
+/// A fatal error is an emulator concept, not an x86 one: the CPU reports it and
+/// the run loop turns it into a `StopReason`. Until this existed the only
+/// address available at that point was whatever EIP happened to hold, which for
+/// a completed decode is the instruction AFTER the faulting one, because EIP
+/// advances at fetch. Every `CS:IP` this project printed for a fatal port fault
+/// was therefore one instruction late, which is what made an unsupported-port
+/// stop cost a bespoke investigation every time.
+///
+/// Diagnostic only. Nothing here is guest state, and rewinding the real EIP
+/// instead is not an option: a fatal error does not stop the machine (the run
+/// loop returns `Ok(StopReason::CpuError)` with everything intact) and the GUI
+/// resumes it, so a rewind would pin a guest on the faulting instruction
+/// forever instead of stepping past it.
+#[derive(Debug, Clone, Copy)]
+pub struct FaultSiteRecord {
+    /// CS as it stood at the raise site. Trustworthy as the faulting
+    /// instruction's segment unless `cs_moved`.
+    pub cs: SegmentRegister,
+    /// The faulting instruction's FIRST byte.
+    pub eip: u32,
+    /// CS changed during the instruction that faulted (a far transfer), so
+    /// `cs.base` describes the destination and not the code that faulted. Never
+    /// true for the port class: IN and OUT cannot change CS.
+    pub cs_moved: bool,
+}
+
+/// Newtype so the record can live in `CpuGsw` without joining its equality.
+/// `CpuGsw` derives `PartialEq` and whole-CPU equality is load-bearing (the
+/// budgeted-REP against atomic differential in `cpu_strings_segments_test`
+/// compares two CPUs outright), so a bare field would make two CPUs that
+/// executed the same code compare unequal over a diagnostic. Same reason and
+/// same shape as `CallOutTable`'s impl.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FaultSite(pub Option<FaultSiteRecord>);
+
+impl PartialEq for FaultSite {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for FaultSite {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuGsw {
     pub registers: Registers,
@@ -1501,6 +1546,13 @@ pub struct CpuGsw {
     pub ldtr: SegmentRegister,
     pub tr: SegmentRegister,
     pub elapsed_clocks: u64,
+    // Where the last fatal CpuError was raised. Written by all three sites that
+    // turn an InternalFault into a fatal CpuError, so it can never name the
+    // wrong fault; read ONLY on the machine's fatal arm, so it can never name a
+    // fault on a run that did not fault. Both halves are needed: a fatal error
+    // leaves the machine resumable, and callers that ignore the stop reason
+    // (bootprofile's per-keystroke loop, the GUI worker) do resume it.
+    fault_site: FaultSite,
     // Core clocks charged by prior instructions in the CURRENT run_straight_line
     // run, not including the in-flight instruction. Mirrors run_straight_line's
     // local `total` at the point just before that instruction executes, so a port
@@ -1699,6 +1751,7 @@ impl Default for CpuGsw {
             ldtr: SegmentRegister::default(),
             tr: SegmentRegister::default(),
             elapsed_clocks: 0,
+            fault_site: FaultSite::default(),
             core_clocks_so_far: 0,
             #[cfg(feature = "jit")]
             native_callout: jit::direct::CallOutTable::default(),

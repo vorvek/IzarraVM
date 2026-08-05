@@ -149,8 +149,14 @@ impl CpuGsw {
             // saved host continuation is stale; IRET restarts from guest code and refetches.
             self.rep_resume_active = false;
             self.rep_execution.resume = None;
-            self.hardware_interrupt(bus, vector)
-                .map_err(|fault| match fault {
+            // No faulting instruction to name here: the fault is in delivery of
+            // an asynchronous interrupt taken at an instruction boundary, so the
+            // boundary itself IS the right answer and must not be rewound.
+            let site_eip = self.registers.eip;
+            let site_cs = self.registers.cs().selector;
+            if let Err(fault) = self.hardware_interrupt(bus, vector) {
+                self.record_fault_site(site_eip, site_cs);
+                return Err(match fault {
                     InternalFault::Cpu(error) => error,
                     // A fault raised while `hardware_interrupt` (which calls
                     // `deliver_exception`) was building the IRQ's own frame is a
@@ -163,7 +169,8 @@ impl CpuGsw {
                         original_vector: vector,
                         nested_vector,
                     },
-                })?;
+                });
+            }
             let charged = self.scale_clocks(61);
             self.elapsed_clocks += charged;
             return Ok(Some(CycleOutcome {
@@ -449,8 +456,18 @@ impl CpuGsw {
                 if self.registers.cs().selector != start_cs {
                     self.load_segment_real(SegmentIndex::Cs, start_cs);
                 }
-                self.deliver_exception(bus, vector, error_code, false)
-                    .map_err(|fault| match fault {
+                // The rewind above already put CS:EIP back on the faulting
+                // instruction, and deliver_exception loads CS and sets EIP last,
+                // after the IDT read, the stack switch and every push. So every
+                // error path out of it still has the rewound value here.
+                // Caveat for whoever reads the report: cpl and SS:ESP have moved
+                // by then, so the surrounding ring0/stack context is the inner
+                // stack mid-delivery, not the faulting code's.
+                let site_eip = self.registers.eip;
+                let site_cs = self.registers.cs().selector;
+                if let Err(fault) = self.deliver_exception(bus, vector, error_code, false) {
+                    self.record_fault_site(site_eip, site_cs);
+                    return Err(match fault {
                         InternalFault::Cpu(error) => error,
                         // As above: a fault raised while building `vector`'s own frame
                         // (e.g. the ring-0 stack access that was the actual dossier bug)
@@ -462,13 +479,26 @@ impl CpuGsw {
                             original_vector: vector,
                             nested_vector,
                         },
-                    })?;
+                    });
+                }
                 CycleOutcome {
                     core_clocks: 59,
                     halted: false,
                 }
             }
-            Err(InternalFault::Cpu(error)) => return Err(error),
+            Err(InternalFault::Cpu(error)) => {
+                // Note start_eip, NOT self.registers.eip: EIP has already
+                // advanced past the instruction by fetch time, so the live value
+                // names the next instruction. The architectural EIP is left
+                // alone on purpose. Rewinding it the way the Exception arm does
+                // would be wrong here, because a fatal error does not stop the
+                // machine (the run loop returns Ok(StopReason::CpuError) with
+                // everything intact) and the GUI resumes it, so a rewind would
+                // pin the guest on the faulting instruction instead of stepping
+                // past it.
+                self.record_fault_site(start_eip, start_cs);
+                return Err(error);
+            }
         };
 
         let charged = self.scale_clocks(outcome.core_clocks);
