@@ -10,10 +10,12 @@ use super::*;
 /// the report pointed one instruction PAST the IN or OUT. Prince of Persia was
 /// investigated for hours off a CS:IP that was a return address.
 ///
-/// Both assertions are load-bearing. Checking the address alone would also pass
-/// if the IN never ran at all (a decode refusal, a segment fault, any earlier
-/// stop), so the port is checked too: the fixture must not be able to pass by
-/// never reaching the instruction it is about.
+/// The address and the port are both load-bearing. Checking the address alone
+/// would also pass if the IN never ran at all (a decode refusal, a segment
+/// fault, any earlier stop), so the port is checked too: the fixture must not
+/// be able to pass by never reaching the instruction it is about. The third
+/// assertion, on cs_moved, is documentation rather than a guard: this fixture
+/// runs in real mode, where nothing here can move CS.
 #[test]
 fn a_fatal_port_fault_names_the_faulting_instruction_not_the_next_one() {
     // 0x100: BA 10 20  mov dx, 0x2010    <- 0x2010 is decoded by nothing
@@ -210,10 +212,17 @@ fn the_fault_report_latches_per_site_not_per_run() {
         .expect("first fault reports")
         .to_string();
     assert!(first.contains("0x00000103"));
+    // Clear the record before the second run. Asserting the line is UNCHANGED
+    // would not test the latch at all: a re-report at the same site rebuilds a
+    // byte-identical string, so the assertion passes whether the latch runs or
+    // not (verified: disabling the latch left that version green). Clearing
+    // first makes a re-report visible, and also catches a fixture whose second
+    // run silently never faulted.
+    spinner.last_fault_line = None;
     spinner.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(
         spinner.last_fault_line(),
-        Some(first.as_str()),
+        None,
         "a repeat at the same site must not re-report, or a spinning guest \
          floods stderr for as long as it runs"
     );
@@ -238,17 +247,29 @@ fn the_fault_report_latches_per_site_not_per_run() {
     );
 }
 
-/// The record must not survive into a run that did not fault. Nothing clears
-/// it, because a fatal CpuError leaves the machine resumable and callers that
-/// ignore the stop reason go on running it, so the guarantee is on the READ
-/// side: only the fatal arm consults the field. This pins the machine-visible
-/// half of that, namely that a clean run reports nothing.
+/// A clean run must leave nothing behind for a reporter to pick up. Nothing
+/// clears the field, because a fatal CpuError leaves the machine resumable and
+/// callers that ignore the stop reason go on running it, so the real guarantee
+/// is on the READ side: only the fatal arm consults it.
+///
+/// Honest scope: this is a WEAK test, and the reason is worth keeping. Deleting
+/// all three record calls leaves it green, because nothing in the fixture ever
+/// writes the field and the assertion then just reads `FaultSite::default()`.
+/// What it does catch is a `record_fault_site` call that wandered onto a
+/// non-fault path. The stop-reason assertion is load-bearing for a different
+/// reason: without it the test also passes when the program never ran at all
+/// and the machine merely hit the cycle limit.
 #[test]
 fn a_run_that_did_not_fault_records_no_fault_site() {
     // mov ax,0x4c00; int 21h -- exits cleanly, touches no port.
     const PROG: &[u8] = &[0xB8, 0x00, 0x4C, 0xCD, 0x21];
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
-    machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert!(
+        matches!(stop, StopReason::DosExit { .. }),
+        "the program must actually have run and exited, got {stop:?}"
+    );
     assert!(machine.cpu().fault_site().is_none());
+    assert!(machine.last_fault_line().is_none());
 }

@@ -608,14 +608,16 @@ impl Machine {
     }
 
     /// Log a fatal `CpuError` that stopped the run loop (env-gated, see
-    /// `fault_trace_enabled`). Reports whatever CS:IP the CPU shows at the
-    /// error site: for the V86-sensitive-op / selector-load faults this is the
-    /// faulting guest instruction directly (the error is raised before any
-    /// exception delivery runs), and for a fault raised while the TOKAEMM
-    /// monitor is running ring-0 PM code it is the monitor's own CS:IP (the
-    /// V86 guest CS:IP the monitor was servicing is on its stack, not
-    /// reachable here without walking the ring-0 stack frame -- noted as the
-    /// gap rather than adding a paging-aware stack walk to this trace).
+    /// `fault_trace_enabled`). Anchored on the CPU's recorded raise site, so the
+    /// address and the byte window are the faulting instruction rather than the
+    /// one after it.
+    ///
+    /// Which CONTEXT that instruction belongs to is a separate question this
+    /// does not answer: for a fault raised while the TOKAEMM monitor is running
+    /// ring-0 PM code it is the monitor's own instruction, and the V86 guest
+    /// CS:IP the monitor was servicing is on its stack, not reachable here
+    /// without a paging-aware stack walk. Noted as the gap rather than papered
+    /// over.
     fn log_fault_trace(&mut self, error: &CpuError) {
         eprint!("{}", self.fault_trace_report(error));
     }
@@ -640,13 +642,23 @@ impl Machine {
         const DISTINCT_SITE_CAP: usize = 16;
 
         let site = self.cpu.fault_site();
-        let key = site.map(|record| (record.cs.selector, record.eip));
+        // The error is part of the key, not just the address. A driver-detect
+        // sweep is one instruction walking a port range (`in al,dx; inc dx; jmp`)
+        // and faults at a SINGLE address on every port it touches, so keying on
+        // the address alone would name the first port and hide the rest, which
+        // is the same failure this latch was chosen over a plain print-once to
+        // avoid. The cap below still bounds the flood.
+        let key = ReportedFault {
+            site: site.map(|record| (record.cs.selector, record.eip)),
+            error: error.to_string(),
+        };
         if self.reported_fault_sites.contains(&key) {
             return;
         }
         if self.reported_fault_sites.len() >= DISTINCT_SITE_CAP {
             if self.reported_fault_sites.len() == DISTINCT_SITE_CAP {
-                self.reported_fault_sites.push(None);
+                // One past the cap, so this branch is reachable exactly once.
+                self.reported_fault_sites.push(ReportedFault::sentinel());
                 eprintln!("fault: further fault sites suppressed after {DISTINCT_SITE_CAP}");
             }
             return;
@@ -729,10 +741,15 @@ impl Machine {
         );
         let linear_eip = cs_base.wrapping_add(eip);
         let start = linear_eip.saturating_sub(32);
+        // Count derived from the clamped start, not a fixed 32. Near the bottom
+        // of the address space `saturating_sub` shortens the window, and a fixed
+        // count would print bytes past the header's own end and into the
+        // at/after window, so the label would stop describing the payload.
+        let before_len = linear_eip - start;
         let _ = writeln!(
             out,
             "fault trace: bytes before EIP [{start:#010x}..{linear_eip:#010x}): {}",
-            self.linear_bytes(start, 32)
+            self.linear_bytes(start, before_len)
         );
         let _ = writeln!(
             out,
@@ -748,6 +765,7 @@ impl Machine {
         let esp = self.cpu.registers.esp();
         let stack_linear = ss_base.wrapping_add(esp);
         let sb_start = stack_linear.saturating_sub(128);
+        let stack_before_dwords = (stack_linear - sb_start) / 4;
         let _ = writeln!(
             out,
             "fault trace: SS:ESP={:#06x}:{esp:#010x} linear={stack_linear:#010x}",
@@ -759,7 +777,7 @@ impl Machine {
         let _ = writeln!(
             out,
             "fault trace: stack before ESP: {}",
-            self.linear_dwords(sb_start, 32)
+            self.linear_dwords(sb_start, stack_before_dwords)
         );
         let _ = writeln!(
             out,

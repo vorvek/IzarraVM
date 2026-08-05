@@ -918,6 +918,25 @@ impl OplProbe {
     }
 }
 
+/// One entry in the fatal-fault report latch: a raise site plus the error seen
+/// there. The sentinel (no site, empty error) is pushed once at the cap to mark
+/// that the suppression notice has been printed; it cannot collide with a real
+/// entry, because a real one always carries an error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportedFault {
+    site: Option<(u16, u32)>,
+    error: String,
+}
+
+impl ReportedFault {
+    fn sentinel() -> Self {
+        Self {
+            site: None,
+            error: String::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -932,7 +951,7 @@ pub struct Machine {
     // re-faulting loop would otherwise print thousands of identical lines a
     // second. `last_fault_line` is what makes the reporting testable, since the
     // line itself goes to stderr.
-    reported_fault_sites: Vec<Option<(u16, u32)>>,
+    reported_fault_sites: Vec<ReportedFault>,
     last_fault_line: Option<String>,
     cpu: CpuGsw,
     // Per-mode cache model. A data access warms its tag state and the resolved tier

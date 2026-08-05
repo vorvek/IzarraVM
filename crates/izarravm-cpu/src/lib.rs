@@ -1501,8 +1501,8 @@ impl Eq for DirectRuntimeState {}
 /// Diagnostic only. Nothing here is guest state, and rewinding the real EIP
 /// instead is not an option: a fatal error does not stop the machine (the run
 /// loop returns `Ok(StopReason::CpuError)` with everything intact) and the GUI
-/// resumes it, so a rewind would pin a guest on the faulting instruction
-/// forever instead of stepping past it.
+/// resumes it once a frame, so a rewind would pin a guest on the faulting
+/// instruction indefinitely instead of stepping past it.
 #[derive(Debug, Clone, Copy)]
 pub struct FaultSiteRecord {
     /// CS as it stood at the raise site. Trustworthy as the faulting

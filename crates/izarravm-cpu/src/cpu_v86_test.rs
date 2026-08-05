@@ -696,7 +696,10 @@ fn v86_io_bitmap_check_reads_through_a_non_identity_mapped_tss() {
 /// before it, would name code that had already retired successfully.
 ///
 /// Watched failing: dropping the record call on this path leaves `fault_site`
-/// as None and the expect below fires.
+/// as None and the expect below fires. The two ADDRESS assertions were not, and
+/// cannot be here: an `IdtLimit` refusal happens before delivery touches CS or
+/// EIP, so recording live registers instead of the boundary snapshot leaves them
+/// green. Same honest caveat as the nested-delivery fixture below.
 #[test]
 fn a_fatal_fault_delivering_an_irq_reports_the_boundary_it_was_taken_at() {
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0x90, 0xf4], &[0x00]);

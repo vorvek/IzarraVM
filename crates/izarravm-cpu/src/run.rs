@@ -152,10 +152,11 @@ impl CpuGsw {
             // No faulting instruction to name here: the fault is in delivery of
             // an asynchronous interrupt taken at an instruction boundary, so the
             // boundary itself IS the right answer and must not be rewound.
-            let site_eip = self.registers.eip;
-            let site_cs = self.registers.cs().selector;
+            let boundary_eip = self.registers.eip;
             if let Err(fault) = self.hardware_interrupt(bus, vector) {
-                self.record_fault_site(site_eip, site_cs);
+                // cs_moved is false by construction: an IRQ is taken at a
+                // boundary, so no instruction was mid-flight to move CS.
+                self.record_fault_site(boundary_eip, false);
                 return Err(match fault {
                     InternalFault::Cpu(error) => error,
                     // A fault raised while `hardware_interrupt` (which calls
@@ -452,21 +453,28 @@ impl CpuGsw {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
+                // Captured BEFORE the rewind, because the rewind destroys the
+                // evidence. `load_segment_real` installs a fabricated real-mode
+                // descriptor (base = selector << 4), which is wrong in protected
+                // mode, and it makes the selectors match, so comparing them
+                // afterwards would report "CS did not move" while handing the
+                // byte dump an invented base. That is the exact plausible-but-
+                // wrong-hex failure this whole change exists to remove.
+                let cs_was_moved = self.registers.cs().selector != start_cs;
                 self.set_eip(start_eip);
-                if self.registers.cs().selector != start_cs {
+                if cs_was_moved {
                     self.load_segment_real(SegmentIndex::Cs, start_cs);
                 }
                 // The rewind above already put CS:EIP back on the faulting
                 // instruction, and deliver_exception loads CS and sets EIP last,
-                // after the IDT read, the stack switch and every push. So every
-                // error path out of it still has the rewound value here.
+                // after the IDT read, the stack switch and every push, so every
+                // error path out of it still has the rewound value. That makes
+                // start_eip/start_cs the site directly, with no snapshot needed.
                 // Caveat for whoever reads the report: cpl and SS:ESP have moved
                 // by then, so the surrounding ring0/stack context is the inner
                 // stack mid-delivery, not the faulting code's.
-                let site_eip = self.registers.eip;
-                let site_cs = self.registers.cs().selector;
                 if let Err(fault) = self.deliver_exception(bus, vector, error_code, false) {
-                    self.record_fault_site(site_eip, site_cs);
+                    self.record_fault_site(start_eip, cs_was_moved);
                     return Err(match fault {
                         InternalFault::Cpu(error) => error,
                         // As above: a fault raised while building `vector`'s own frame
@@ -496,7 +504,8 @@ impl CpuGsw {
                 // everything intact) and the GUI resumes it, so a rewind would
                 // pin the guest on the faulting instruction instead of stepping
                 // past it.
-                self.record_fault_site(start_eip, start_cs);
+                let cs_moved = self.registers.cs().selector != start_cs;
+                self.record_fault_site(start_eip, cs_moved);
                 return Err(error);
             }
         };

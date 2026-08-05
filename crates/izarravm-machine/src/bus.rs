@@ -123,31 +123,55 @@ impl Machine {
     /// failing, so the reader believes them. It has already been made once,
     /// against Doom under JemmEx, which maps non-identity.
     ///
-    /// One limit remains, and callers should not paper over it: an unbacked but
-    /// MAPPED address reads as 0xFF here, because that is what the bus fills
-    /// for open bus and for anything past installed RAM. `None` distinguishes
-    /// untranslatable, not unbacked.
+    /// Two limits remain, and callers should not paper over them. An unbacked
+    /// but MAPPED address reads as 0xFF, because that is what the bus fills for
+    /// open bus and for anything past installed RAM, so `None` distinguishes
+    /// untranslatable and not unbacked. And a byte inside the VGA aperture is
+    /// fetched through the normal read path, which loads the VGA read latches:
+    /// dumping there is not free of guest-visible effect, on a machine the GUI
+    /// can resume.
     pub fn read_linear_u8(&mut self, linear: u32) -> Option<u8> {
         if self.cpu.control.cr0 & 0x8000_0000 == 0 {
             return Some(self.read_physical_u8(linear));
         }
         let directory = self.cpu.control.cr3 & !0xfff;
-        let pde = self.read_physical_u32(directory + (linear >> 22) * 4);
+        let pde = self.walk_entry(directory + (linear >> 22) * 4);
         if pde & 1 == 0 {
             return None;
         }
         let physical = if pde & 0x80 != 0 {
             // PSE: a 4 MB page maps its whole range from the directory entry,
-            // with no page table to consult.
+            // with no page table to consult. Note this does not consult CR4.PSE,
+            // so a guest that sets bit 7 on a machine without PSE is
+            // mistranslated here. Inherited from the walker this replaced, and
+            // left alone rather than silently diverging from it.
             (pde & 0xffc0_0000) | (linear & 0x003f_ffff)
         } else {
-            let pte = self.read_physical_u32((pde & !0xfff) + ((linear >> 12) & 0x3ff) * 4);
+            let pte = self.walk_entry((pde & !0xfff) + ((linear >> 12) & 0x3ff) * 4);
             if pte & 1 == 0 {
                 return None;
             }
             (pte & !0xfff) | (linear & 0xfff)
         };
         Some(self.read_physical_u8(physical))
+    }
+
+    /// One page-table entry, assembled from four byte reads.
+    ///
+    /// Not `read_physical_u32`, which goes through `read_memory` and charges bus
+    /// clocks: `elapsed_clocks` is the currency every performance comparison in
+    /// this project is measured in, and a diagnostic must not move it. Four byte
+    /// reads take the uncharged path, which is also what the walker this
+    /// replaced did. Reading a dword here would additionally A20-gate the entry
+    /// fetch while the data byte below stays ungated, so the two halves of one
+    /// translation would disagree about A20.
+    fn walk_entry(&mut self, address: u32) -> u32 {
+        u32::from_le_bytes([
+            self.read_physical_u8(address),
+            self.read_physical_u8(address.wrapping_add(1)),
+            self.read_physical_u8(address.wrapping_add(2)),
+            self.read_physical_u8(address.wrapping_add(3)),
+        ])
     }
 
     pub fn read_physical_u16(&mut self, address: u32) -> u16 {

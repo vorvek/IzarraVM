@@ -804,14 +804,23 @@ impl CpuGsw {
     /// instruction's first byte; CS is taken live because `finish_instruction`
     /// only receives a bare selector and widening that `#[inline]` signature to
     /// carry a 16-byte descriptor would cost the retire path for a cold
-    /// diagnostic. `start_cs` is compared, not stored, so a far transfer during
-    /// the faulting instruction is declared rather than silently mis-based.
-    pub(crate) fn record_fault_site(&mut self, start_eip: u32, start_cs: u16) {
-        let cs = self.registers.cs();
+    /// diagnostic.
+    ///
+    /// `cs_moved` is passed in rather than derived here. Deriving it by
+    /// comparing selectors is wrong on the exception arm, where the rewind has
+    /// already reloaded CS and made them match while leaving a fabricated
+    /// real-mode base behind: the caller is the only place that still knows.
+    ///
+    /// Cold and never inlined. `finish_instruction` is `#[inline]` with six call
+    /// sites, one of them the retire path of every straight-line run, and this
+    /// codebase has a documented layout and code-growth sensitivity there.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn record_fault_site(&mut self, start_eip: u32, cs_moved: bool) {
         self.fault_site = FaultSite(Some(FaultSiteRecord {
-            cs,
+            cs: self.registers.cs(),
             eip: start_eip,
-            cs_moved: cs.selector != start_cs,
+            cs_moved,
         }));
     }
 
