@@ -700,3 +700,41 @@ fn dsp_reset_clears_adpcm_state() {
     dsp.write_port(0x226, 0x00); // reset settle
     assert!(dsp.adpcm.is_none(), "reset drops ADPCM state");
 }
+
+#[test]
+fn dsp_identification_returns_the_ones_complement_of_its_argument() {
+    // Command 0xE0 takes one byte and returns its bitwise NOT. That is how a
+    // driver tells a real DSP from an open bus reading back what it wrote, so
+    // returning the argument unchanged would defeat the whole point of it.
+    let mut dsp = SbDsp::default();
+    dsp.write_port(0x22C, 0xE0);
+    dsp.write_port(0x22C, 0xC6);
+    assert!(dsp.data_available(), "the reply must be queued immediately");
+    assert_eq!(dsp.read_port(0x22A), Some(0x39), "0xC6 complements to 0x39");
+
+    // A second round with a different argument, so a hardcoded 0x39 fails.
+    dsp.write_port(0x22C, 0xE0);
+    dsp.write_port(0x22C, 0x00);
+    assert_eq!(dsp.read_port(0x22A), Some(0xFF));
+}
+
+#[test]
+fn dsp_identification_consumes_its_argument_byte() {
+    // The argument must be eaten by 0xE0, not left to be parsed as a fresh
+    // command. Prince of Persia sends 0xE0 0xC6; with the wrong arity the 0xC6
+    // was read as a command of its own, and 0xC0..=0xCF has arity 3, so the DSP
+    // then sat waiting for two more bytes while the game polled forever.
+    let mut dsp = SbDsp::default();
+    dsp.write_port(0x22C, 0xE0);
+    dsp.write_port(0x22C, 0xC6);
+    let _ = dsp.read_port(0x22A);
+
+    // The DSP must be idle now and ready for an unrelated command.
+    dsp.write_port(0x22C, 0xE1);
+    assert_eq!(
+        dsp.read_port(0x22A),
+        Some(DSP_VERSION_HI),
+        "a following command must dispatch, not be swallowed as an argument"
+    );
+    assert_eq!(dsp.read_port(0x22A), Some(DSP_VERSION_LO));
+}

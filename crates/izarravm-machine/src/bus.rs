@@ -78,6 +78,7 @@ impl Machine {
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             io_touched: &mut self.io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
+            opl_probe: &mut self.opl_probe,
             device_wrote_memory: &mut self.device_wrote_memory,
             pending_device_memory_write_range: &mut self.pending_device_memory_write_range,
             direct_map_changed: &mut self.direct_map_changed,
@@ -1517,7 +1518,21 @@ impl CpuBus for MachineBus<'_> {
                 *self.isa_io_clocks += isa_io_clocks(self.active_mode);
             }
             // The chip drives only the status byte on reads; data ports read open-bus.
-            return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
+            //
+            // In the Approximate class the chip has not been stepped since the
+            // batch started, so read the PREDICTED status instead of the live
+            // one -- see `predicted_opl_status`. The Accurate 386 class advances
+            // devices per instruction and keeps the live byte, byte-identically.
+            let (value, pending_micros) =
+                if self.lazy_port_reads && matches!(resolved, 0x0388 | 0x038a) {
+                    self.predicted_opl_status()
+                } else {
+                    (self.opl.read_port(resolved).unwrap_or(0xff), 0)
+                };
+            // Diagnostic only; records the guest's own port, not the resolved one.
+            self.opl_probe
+                .record_read(port, value, self.core_clocks_so_far, pending_micros);
+            return Ok(u32::from(value));
         }
         // DSP status reads are intentionally exact. SB reset/probe code polls
         // 0x22E for the reset ACK byte, so keeping that loop inside one
@@ -1585,6 +1600,7 @@ impl CpuBus for MachineBus<'_> {
         if !matches!(port, 0x224 | 0x225)
             && let Some(value) = self.sb16.read_port(port)
         {
+            self.opl_probe.record_sb(port, false, value);
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pit.read_port(port) {
@@ -1735,7 +1751,19 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if let Some(opl_port) = opl_port(port) {
-            self.opl.write_port(opl_port, value as u8);
+            let byte = value as u8;
+            // Classify BEFORE the write: on a data port the destination register
+            // is whatever the matching address port latched earlier, and the
+            // write itself does not change that latch. Diagnostic only.
+            let bank = u8::from(matches!(opl_port, 0x038a | 0x038b));
+            let register = match opl_port {
+                0x0389 | 0x038b => Some(self.opl.selected_register(usize::from(bank))),
+                // An address-latch write addresses no register itself.
+                _ => None,
+            };
+            self.opl_probe
+                .record_write(port, bank, register, byte, self.core_clocks_so_far);
+            self.opl.write_port(opl_port, byte);
             return Ok(());
         }
         if matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {
@@ -1791,6 +1819,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if !matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {
+            self.opl_probe.record_sb(port, true, value as u8);
             return Ok(());
         }
         if self
@@ -2128,6 +2157,17 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x0080..=0x008f, // DMA page registers
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
+        0x0240..=0x024f, // C/MS Game Blaster alternate bases, the two the 0x280 entry
+        0x0260..=0x026f, // below missed. Prince of Persia's sound detect sweeps base+3
+        // across the standard set and only stopped faulting at the
+        // LAST of them: the game still halted with
+        // CpuError("unsupported I/O port 0x0243") a second into its
+        // boot. 0x243 is the observed fault; 0x263 is the remaining
+        // standard base, added by symmetry so the next probe in the
+        // same sweep cannot halt the machine the same way. This
+        // chipset fixes the Sound Blaster at 0x220, so 0x240 and
+        // 0x260 hold no device and open bus is what the hardware
+        // does.
         0x0280..=0x028f, // C/MS Game Blaster alternate-base probe range (Prince of
         // Persia's sound detect reads 0x283 and must see open bus,
         // not a fault -- the port-0x201 joystick-stub precedent)

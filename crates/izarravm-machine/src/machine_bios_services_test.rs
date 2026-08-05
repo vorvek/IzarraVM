@@ -2115,26 +2115,39 @@ fn game_port_aliases_share_joystick_state_and_charge_deadlines() {
 
 #[test]
 fn cms_probe_range_reads_open_bus_not_a_fault() {
-    // Ports 0x280-0x28F are the C/MS Game Blaster's alternate probe base.
-    // With no card there, a read must see open bus (0xFF) so a sound-detect
-    // routine concludes "nothing present" -- not an UnsupportedPort fault
-    // that halts the machine headless. Prince of Persia (PRINCE ADLIB) reads
-    // 0x283 during its scan; regression guard for the passive-port entry.
+    // Ports 0x240-0x24F, 0x260-0x26F and 0x280-0x28F are the C/MS Game
+    // Blaster's alternate probe bases. With no card there, a read must see
+    // open bus (0xFF) so a sound-detect routine concludes "nothing present"
+    // -- not an UnsupportedPort fault that halts the machine headless.
+    //
+    // Prince of Persia reads base+3 at each one. The 0x280 entry landed first
+    // and covered only the LAST address in that sweep, so PRINCE SBLAST still
+    // halted with CpuError("unsupported I/O port 0x0243") a second into boot.
+    // 0x223 needs no entry here: the Sound Blaster owns 0x220-0x22F already.
     let mut m = int15_machine(16);
     let mut bus = m.make_bus();
-    for port in [0x0280u16, 0x0283, 0x028f] {
+    for port in [
+        0x0240u16, 0x0243, 0x024f, 0x0260, 0x0263, 0x026f, 0x0280, 0x0283, 0x028f,
+    ] {
         assert_eq!(
             bus.read_io(port, BusWidth::Byte, 0, false).unwrap(),
             0xff,
             "port {port:#06x} must read open bus"
         );
     }
-    // The stub stays bounded: one past the top still faults, so genuinely
-    // unclaimed ISA reads elsewhere keep surfacing as real faults.
-    assert!(matches!(
-        bus.read_io(0x0290, BusWidth::Byte, 0, false),
-        Err(BusError::UnsupportedPort { port }) if port == 0x0290
-    ));
+    // The stubs stay bounded, including the gap BETWEEN the new ranges: a
+    // genuinely unclaimed ISA read elsewhere must still surface as a real
+    // fault, or this stub would mask the next missing device instead of
+    // reporting it.
+    for port in [0x0250u16, 0x0270, 0x0290] {
+        assert!(
+            matches!(
+                bus.read_io(port, BusWidth::Byte, 0, false),
+                Err(BusError::UnsupportedPort { port: faulted }) if faulted == port
+            ),
+            "port {port:#06x} must still fault"
+        );
+    }
 }
 
 #[test]

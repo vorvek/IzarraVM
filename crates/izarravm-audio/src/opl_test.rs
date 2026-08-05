@@ -957,3 +957,20 @@ fn address_data_ports_store_registers() {
     assert_eq!(opl.register(0x20), 0x2f);
     assert_eq!(opl.read_port(0x388), Some(opl.status()));
 }
+
+#[test]
+fn selected_register_reports_the_latched_address_per_bank() {
+    // The bus needs this to tell WHICH register a data-port write lands in,
+    // because a data write does not carry the index itself. Per bank: the two
+    // latches are independent, and confusing them would misattribute every
+    // OPL3 secondary-bank write.
+    let mut opl = OplChip::default();
+    opl.write_port(0x0388, 0xb0);
+    opl.write_port(0x038a, 0x04);
+    assert_eq!(opl.selected_register(0), 0xb0);
+    assert_eq!(opl.selected_register(1), 0x04);
+    // A data write leaves the latch alone, so a run of writes to one register
+    // keeps reporting that register.
+    opl.write_port(0x0389, 0x20);
+    assert_eq!(opl.selected_register(0), 0xb0);
+}
