@@ -100,7 +100,10 @@ fn word_size_byte_forms_are_lowered() {
 ///   here: a case in this table would keep passing if the allowlist entry were reverted, which is
 ///   the opposite of what this table is for.
 ///
-/// `0xb8..=0xbf` stays, and it is now the only `MovImm` producer this list still guards.
+/// `0xb8..=0xbf` has gone too, to `word_size_mov_imm_register_forms_are_lowered`. After that
+/// slice this list guards no `MovImm` producer at all: `0xc7`'s register form is the other one and
+/// it is refused inside the classifier arm, so it has `the_word_size_0xc7_register_form_stays_refused`
+/// rather than a row here.
 #[test]
 fn word_size_dword_siblings_stay_refused() {
     let cases: &[(&str, &[u8])] = &[
@@ -109,8 +112,6 @@ fn word_size_dword_siblings_stay_refused() {
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0]),
         ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10]),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12]),
-        ("0xb8 mov eax,imm", &[0x66, 0xb8, 0x34, 0x12]),
-        ("0xbf mov edi,imm", &[0x66, 0xbf, 0x34, 0x12]),
         ("0xf7 /0 test r/m,imm", &[0x66, 0xf7, 0xc1, 0x34, 0x12]),
     ];
 
@@ -172,6 +173,38 @@ fn word_size_0x83_register_forms_are_lowered() {
         assert_eq!(compilation.word_stores, 0, "{label}: word stores");
         assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
         assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// `MOV r16, imm16` at Word size, the 16-bit campaign's fourth slice.
+///
+/// All eight destinations, because `home()` is a table lookup and one case cannot see a
+/// mis-indexed entry. `0xbc` (SP) and `0xbf` (DI) are the two that matter most: SP's home is R12,
+/// the SIB-escape register, and DI's is RBX, the ONE guest home that is not an extended register
+/// and so the only encoding that takes no REX at all.
+#[test]
+fn word_size_mov_imm_register_forms_are_lowered() {
+    for dst in 0..8u8 {
+        let form = [0x66u8, 0xb8 + dst, 0x34, 0x12];
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "0xb8+{dst}: the word form must join the block rather than end it"
+        );
+        // A register move touches no memory at any width.
+        assert_eq!(compilation.word_reads, 0, "0xb8+{dst}: word reads");
+        assert_eq!(compilation.word_stores, 0, "0xb8+{dst}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "0xb8+{dst}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "0xb8+{dst}: dword stores");
     }
 }
 

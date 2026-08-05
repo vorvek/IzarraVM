@@ -2249,9 +2249,17 @@ pub(crate) enum DirectKind {
         dst: u8,
         src: u8,
     },
+    /// `MOV r, imm` with a register destination, both operand sizes. The `width` is the
+    /// operand size and it decides how much of the destination the write DEFINES: a Word
+    /// form writes bits 15..0 and leaves 31..16 exactly as the interpreter's
+    /// `write_gpr_sized(.., Word, ..)` leaves them. Without the field the Word form lowers
+    /// as a 32-bit move, which zeroes the upper half rather than preserving it -- `decode`
+    /// zero-extends the immediate, so the wrong bits are zeros rather than garbage, which
+    /// makes the miscompile quiet on any guest whose upper half happened to be clear.
     MovImm {
         dst: u8,
         imm: u32,
+        width: MemoryWidth,
     },
     /// `MOV r16, Sreg` (0x8C, register destination). The selector is baked as a compile-time
     /// constant, which is sound because the block's `SegmentLayout` pins the whole descriptor:

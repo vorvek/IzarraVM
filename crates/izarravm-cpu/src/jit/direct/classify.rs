@@ -89,8 +89,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
-    // `0xf7`, `0xa9`, `0xb8..=0xbf`, `0xc7`, `0x81`, `0x85`, `0x8d`, `0xa3`. Every one is the Dword
-    // sibling of an admitted byte form and its kind hard-codes Dword with no width field.
+    // `0xf7`, `0xa9`, `0xc7`, `0x81`, `0x85`, `0x8d`, `0xa3`. Every one is the Dword sibling of an
+    // admitted byte form and its kind hard-codes Dword with no width field.
+    //
+    // `0xb8..=0xbf` WAS on that list and is the 16-bit campaign's fourth slice. It left the same
+    // way `0x83` and `0xc7` did, by growing the width field the list existed to compensate for:
+    // `MovImm` now carries one and `emit`'s Word arm stages the immediate through RDX and narrows
+    // with `emit_write_gpr16`, which defines sixteen bits and preserves the rest exactly as
+    // `write_gpr_sized(.., Word, ..)` does. `0xc7`'s REGISTER form still produces `MovImm` and is
+    // still refused at Word, by the arm rather than by this list, so it keeps its own test.
     //
     // THE WORD ALU REGISTER FORMS, forms 1 and 3, are the 16-bit campaign's second slice.
     // `0x01`/`0x09`/`0x21`/`0x29`/`0x31` and `0x03`/`0x0b`/`0x23`/`0x2b`/`0x33` join `0x39`/`0x3b`,
@@ -200,6 +207,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xa2
                 | 0xa8
                 | 0xb0..=0xb7
+                | 0xb8..=0xbf
                 | 0xc1
                 | 0xd1
                 | 0xc2
@@ -976,6 +984,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 return Some(DirectKind::MovImm {
                     dst: opcode - 0xb8,
                     imm: insn.imm,
+                    width: operand_width,
                 });
             }
             // MOV r/m, imm (group 11). `0xc7`'s MEMORY form is now width-carrying: the doom census
@@ -1012,7 +1021,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         imm: insn.imm as u8,
                     }),
                     DecodedOperand::Reg(_) if insn.operand_size == OperandSize::Word => None,
-                    DecodedOperand::Reg(dst) => Some(DirectKind::MovImm { dst, imm: insn.imm }),
+                    DecodedOperand::Reg(dst) => Some(DirectKind::MovImm {
+                        dst,
+                        imm: insn.imm,
+                        width: MemoryWidth::Dword,
+                    }),
                     DecodedOperand::Mem(addr) => Some(DirectKind::Store {
                         source: StoreSource::Imm(insn.imm),
                         width,

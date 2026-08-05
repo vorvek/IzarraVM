@@ -473,6 +473,32 @@ fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
     }
 }
 
+/// `MOV r16, imm16` at Word operand size, the 16-bit campaign's fourth slice.
+///
+/// Every destination is swept because `home()` is a table lookup: `GUEST_HOMES` is
+/// `[R8, R9, R10, R11, R12, R13, R14, RBX]`, so seven of the eight are extended registers and
+/// exactly one, EDI's, is not. A lowering that emitted its prefixes in the wrong order writes a
+/// DIFFERENT guest register rather than faulting, and the pair that would swap under it is
+/// `0xbb` (EBX, R11) and `0xbf` (EDI, RBX). `0xbc` covers R12, the SIB-escape register.
+///
+/// The seeded high halves are the whole test. `decode` zero-extends the immediate, so with a
+/// zero upper half the correct Word lowering and a plain 32-bit move produce identical state and
+/// the slice's entire mutation is invisible. The differential compares registers, lazy flags,
+/// EFLAGS, core clocks, bus clocks and whole guest RAM, and MOV touches no flags at all, so the
+/// register comparison is what carries this.
+#[test]
+fn word_mov_immediate_matches_the_interpreter_for_every_destination() {
+    for dst in 0..8u8 {
+        for imm in [0x0000u16, 0x0001, 0x7fff, 0x8000, 0xffff] {
+            // ECX and EAX are the two the harness seeds, and both carry a recognisable high half
+            // so a widened write shows up whichever of them the destination happens to be.
+            let body = [0x66u8, 0xb8 + dst, (imm & 0xff) as u8, (imm >> 8) as u8];
+            let context = format!("0xb8+{dst} mov r16,{imm:#06x}");
+            differential_full(&body, 0x202, false, 0xdead_beef, 0xfeed_face, &context);
+        }
+    }
+}
+
 /// The ALU REGISTER forms 1 and 3 at Word operand size, the 16-bit campaign's second slice.
 ///
 /// `0x83` above proves the emitter's word lane through an immediate. What is new here is a second

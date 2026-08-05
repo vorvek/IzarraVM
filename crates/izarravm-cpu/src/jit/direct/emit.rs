@@ -204,7 +204,22 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 ExtendWidths::new(width, dst_width),
                 signed,
             ),
-            DirectKind::MovImm { dst, imm } => e.mov_r32_imm32(home(dst), imm),
+            // The Word arm stages through RDX and narrows on the way out, which is the shape
+            // `MovSegToReg` below already uses and for its stated reason: the encoder has no
+            // 16-bit immediate form, and adding one would have to clone a 66-prefixed emitter
+            // rather than `mov_r32_imm32`, whose REX comes first because it has no 66 to order
+            // against. Seven of the eight guest homes are extended registers, so getting that
+            // order wrong writes a different guest register rather than faulting.
+            DirectKind::MovImm { dst, imm, width } => match width {
+                MemoryWidth::Dword => e.mov_r32_imm32(home(dst), imm),
+                MemoryWidth::Word => {
+                    e.mov_r32_imm32(Reg::RDX, imm);
+                    emit_write_gpr16(&mut e, dst, Reg::RDX);
+                }
+                MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("classify produces MovImm only at Word or Dword")
+                }
+            },
             // Sixteen bits only, upper half preserved: the interpreter's 0x8c arm stores at
             // `OperandSize::Word` whatever the prefix says. `mov_r32_imm32` into the scratch
             // first because there is no 16-bit immediate form on the encoder and none is worth
