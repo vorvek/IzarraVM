@@ -337,6 +337,17 @@ impl Timeline {
         )
     }
 
+    /// Microseconds a `cpu_clocks` advance WOULD produce, without performing it.
+    ///
+    /// Same arithmetic as the `microseconds` field of `advance_master_ticks`,
+    /// run on a copy of the phase accumulator, so a peek and the real advance
+    /// that follows it cannot disagree. `preview_cpu_clocks` is the precedent.
+    pub(crate) fn preview_microseconds(self, cpu_clocks: u64) -> u64 {
+        let ticks = self.master_ticks_for_cpu_clocks(cpu_clocks);
+        let mut microseconds = self.microseconds;
+        microseconds.advance(ticks, MICROSECOND_HZ)
+    }
+
     pub(crate) fn cpu_clocks_until(
         self,
         clock: DeviceClock,

@@ -767,6 +767,11 @@ pub struct OplTraceEntry {
     /// CPU core clocks elapsed when the access happened, which is what makes
     /// the 80 us OPL timer window legible in the trace.
     pub core_clocks: u64,
+    /// For a status read in the Approximate class: the microseconds of
+    /// un-applied device time the prediction was taken at. Zero elsewhere.
+    /// This is the number that says whether a read could POSSIBLY have seen an
+    /// 80 us timer expire.
+    pub pending_micros: u64,
 }
 
 impl OplTraceEntry {
@@ -817,7 +822,7 @@ impl OplProbe {
     }
 
     /// Record a status read returning `value`.
-    fn record_read(&mut self, port: u16, value: u8, core_clocks: u64) {
+    fn record_read(&mut self, port: u16, value: u8, core_clocks: u64, pending_micros: u64) {
         self.counters.status_reads += 1;
         // Bits 6 and 5 are the timer-1 and timer-2 overflow flags.
         if value & 0x60 != 0 {
@@ -830,6 +835,7 @@ impl OplProbe {
             register: OplTraceEntry::NO_REGISTER,
             value,
             core_clocks,
+            pending_micros,
         });
     }
 
@@ -862,6 +868,7 @@ impl OplProbe {
             register: register.map_or(OplTraceEntry::NO_REGISTER, u16::from),
             value,
             core_clocks,
+            pending_micros: 0,
         });
     }
 }
