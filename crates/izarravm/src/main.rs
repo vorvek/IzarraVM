@@ -1156,6 +1156,7 @@ fn write_hdd_profile_json(
         ),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
+        "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
@@ -1165,6 +1166,32 @@ fn write_hdd_profile_json(
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
+}
+
+/// Guest OPL activity for the run. `key_on_writes` against
+/// `status_reads_timer_expired` is what this exists for: silent music with
+/// key-ons present means notes were struck and lost downstream, while silent
+/// music with polls but no expiries means the driver's tick never fired.
+fn opl_diagnostics_json(
+    opl: izarravm_machine::OplDiagnostics,
+    trace: &[izarravm_machine::OplTraceEntry],
+) -> serde_json::Value {
+    json!({
+        "register_writes": opl.register_writes,
+        "status_reads": opl.status_reads,
+        "status_reads_timer_expired": opl.status_reads_timer_expired,
+        "timer_control_writes": opl.timer_control_writes,
+        "key_on_writes": opl.key_on_writes,
+        "key_off_writes": opl.key_off_writes,
+        "trace": trace.iter().map(|e| json!({
+            "w": e.write,
+            "port": e.port,
+            "bank": e.bank,
+            "reg": e.register,
+            "val": e.value,
+            "clk": e.core_clocks,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// The VGA direct-write-token wipe attribution, or `null` when `IZARRAVM_VGA_WIPE_CENSUS` was not

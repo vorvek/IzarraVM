@@ -1065,6 +1065,17 @@ impl OplChip {
         }
     }
 
+    /// The latched register address for `bank`, so a caller can tell WHICH
+    /// register the next data-port write will land in.
+    ///
+    /// Read-only on purpose. The one caller is the bus's OPL diagnostic
+    /// counters, and they live there rather than here because this chip derives
+    /// `PartialEq`/`Eq` for state comparison: a counter field would make two
+    /// chips in identical audible state compare unequal.
+    pub fn selected_register(&self, bank: usize) -> u8 {
+        self.address[bank & 1]
+    }
+
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         match port {
             0x0388 => self.address[0] = value,

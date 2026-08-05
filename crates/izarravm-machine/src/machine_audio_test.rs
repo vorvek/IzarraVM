@@ -1881,3 +1881,90 @@ fn wss_carries_frames_a_short_render_window_did_not_claim() {
         machine.wss_pending.len()
     );
 }
+
+#[test]
+fn opl_diagnostics_classify_writes_reads_and_key_state() {
+    // The counters exist to answer "did the guest strike any notes", so the
+    // key-on/key-off split is the load-bearing part: 0xB0-0xB8 bit 5 is KEY ON,
+    // and the same register with the bit clear is a release, not a note.
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        // Key ON channel 0.
+        bus.write_io(0x0388, BusWidth::Byte, 0xb0, false).unwrap();
+        bus.write_io(0x0389, BusWidth::Byte, 0x20, false).unwrap();
+        // Key OFF the same channel: same register, bit 5 clear.
+        bus.write_io(0x0388, BusWidth::Byte, 0xb0, false).unwrap();
+        bus.write_io(0x0389, BusWidth::Byte, 0x00, false).unwrap();
+        // Timer control, primary bank register 0x04.
+        bus.write_io(0x0388, BusWidth::Byte, 0x04, false).unwrap();
+        bus.write_io(0x0389, BusWidth::Byte, 0x80, false).unwrap();
+        // A status read.
+        bus.read_io(0x0388, BusWidth::Byte, 0, false).unwrap();
+    });
+
+    let opl = machine.opl_diagnostics();
+    assert_eq!(opl.key_on_writes, 1, "one keyed-on voice");
+    assert_eq!(opl.key_off_writes, 1, "one released voice");
+    assert_eq!(opl.timer_control_writes, 1);
+    // Three DATA writes; the four address latches address no register and must
+    // not be counted as register traffic.
+    assert_eq!(opl.register_writes, 3);
+    assert_eq!(opl.status_reads, 1);
+}
+
+#[test]
+fn opl_diagnostics_count_the_sound_blaster_aliases_and_keep_the_guest_port() {
+    // 0x220-0x223 mirror the OPL. A game driving the SB alias is doing OPL
+    // traffic and must be counted, or a Sound Blaster title would look silent
+    // to the counters while playing perfectly well.
+    let mut machine = test_machine();
+    machine.set_opl_trace_cap(8);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0220, BusWidth::Byte, 0xb1, false).unwrap();
+        bus.write_io(0x0221, BusWidth::Byte, 0x20, false).unwrap();
+    });
+
+    assert_eq!(machine.opl_diagnostics().key_on_writes, 1);
+    let trace = machine.opl_trace();
+    assert_eq!(trace.len(), 2);
+    // The trace keeps the port the GUEST used, NOT the resolved 0x388/0x389,
+    // so a reader can tell whether the game drove the AdLib ports or the SB
+    // mirror. Resolving here would destroy the only evidence of which.
+    assert_eq!(trace[0].port, 0x0220);
+    assert_eq!(trace[1].port, 0x0221);
+    assert_eq!(
+        trace[0].register,
+        OplTraceEntry::NO_REGISTER,
+        "an address latch addresses no register"
+    );
+    assert_eq!(trace[1].register, 0xb1);
+    assert_eq!(trace[1].value, 0x20);
+}
+
+#[test]
+fn opl_trace_is_off_by_default_and_respects_its_cap() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0388, BusWidth::Byte, 0x04, false).unwrap();
+    });
+    assert!(
+        machine.opl_trace().is_empty(),
+        "tracing must stay off unless armed"
+    );
+    // Counters are always collected, tracing or not.
+    assert_eq!(machine.opl_diagnostics().register_writes, 0);
+
+    let mut capped = test_machine();
+    capped.set_opl_trace_cap(3);
+    with_bus(&mut capped, |bus| {
+        for _ in 0..10 {
+            bus.read_io(0x0388, BusWidth::Byte, 0, false).unwrap();
+        }
+    });
+    assert_eq!(capped.opl_trace().len(), 3, "the cap bounds the trace");
+    assert_eq!(
+        capped.opl_diagnostics().status_reads,
+        10,
+        "counting must continue after the trace fills"
+    );
+}
