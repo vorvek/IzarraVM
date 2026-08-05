@@ -608,42 +608,154 @@ impl Machine {
     }
 
     /// Log a fatal `CpuError` that stopped the run loop (env-gated, see
-    /// `fault_trace_enabled`). Reports whatever CS:IP the CPU shows at the
-    /// error site: for the V86-sensitive-op / selector-load faults this is the
-    /// faulting guest instruction directly (the error is raised before any
-    /// exception delivery runs), and for a fault raised while the TOKAEMM
-    /// monitor is running ring-0 PM code it is the monitor's own CS:IP (the
-    /// V86 guest CS:IP the monitor was servicing is on its stack, not
-    /// reachable here without walking the ring-0 stack frame -- noted as the
-    /// gap rather than adding a paging-aware stack walk to this trace).
+    /// `fault_trace_enabled`). Anchored on the CPU's recorded raise site, so the
+    /// address and the byte window are the faulting instruction rather than the
+    /// one after it.
+    ///
+    /// Which CONTEXT that instruction belongs to is a separate question this
+    /// does not answer: for a fault raised while the TOKAEMM monitor is running
+    /// ring-0 PM code it is the monitor's own instruction, and the V86 guest
+    /// CS:IP the monitor was servicing is on its stack, not reachable here
+    /// without a paging-aware stack walk. Noted as the gap rather than papered
+    /// over.
     fn log_fault_trace(&mut self, error: &CpuError) {
-        let cs = self.cpu.registers.cs().selector;
-        let eip = self.cpu.registers.eip;
-        let cs_base = self.cpu.registers.cs().base;
-        eprintln!(
+        eprint!("{}", self.fault_trace_report(error));
+    }
+
+    /// One line naming a fatal error, where it was raised, and the instruction
+    /// bytes there. Not env-gated, unlike the full dump above.
+    ///
+    /// An undecoded I/O port is fatal on purpose so a hardware gap stays
+    /// visible, which makes this line the whole diagnosis for the class of bug
+    /// it exists to catch. Gating it behind a variable meant a stop said only
+    /// which port, and every occurrence then cost a bespoke investigation.
+    /// `IZARRAVM_FAULT_TRACE` was there the whole time during the Prince of
+    /// Persia work and was never reached for.
+    ///
+    /// Latched on the SITE, not on a count. A fatal error does not stop the
+    /// machine and the GUI resumes it, so an unlatched line is an unbounded
+    /// flood from a re-faulting loop. A plain "once" would be worse than it
+    /// sounds in the other direction: the guest steps past and keeps faulting
+    /// elsewhere, and during bring-up the first fault is routinely a benign
+    /// probe while the one worth seeing is the third.
+    fn report_fatal_fault(&mut self, error: &CpuError) {
+        const DISTINCT_SITE_CAP: usize = 16;
+
+        let site = self.cpu.fault_site();
+        // The error is part of the key, not just the address. A driver-detect
+        // sweep is one instruction walking a port range (`in al,dx; inc dx; jmp`)
+        // and faults at a SINGLE address on every port it touches, so keying on
+        // the address alone would name the first port and hide the rest, which
+        // is the same failure this latch was chosen over a plain print-once to
+        // avoid. The cap below still bounds the flood.
+        let key = ReportedFault {
+            site: site.map(|record| (record.cs.selector, record.eip)),
+            error: error.to_string(),
+        };
+        if self.reported_fault_sites.contains(&key) {
+            return;
+        }
+        if self.reported_fault_sites.len() >= DISTINCT_SITE_CAP {
+            if self.reported_fault_sites.len() == DISTINCT_SITE_CAP {
+                // One past the cap, so this branch is reachable exactly once.
+                self.reported_fault_sites.push(ReportedFault::sentinel());
+                eprintln!("fault: further fault sites suppressed after {DISTINCT_SITE_CAP}");
+            }
+            return;
+        }
+        self.reported_fault_sites.push(key);
+
+        let line = match site {
+            Some(record) => {
+                let linear = record.cs.base.wrapping_add(record.eip);
+                let moved = if record.cs_moved {
+                    " (CS moved during the instruction, bytes may not be its code)"
+                } else {
+                    ""
+                };
+                // "faulting CS:IP", not "CS:IP": the CLI prints its own CS:IP
+                // line for every stop, and that one is the live register, which
+                // for a fault is the NEXT instruction. Two unlabelled addresses
+                // differing by an instruction length is how this bug gets made
+                // a second time.
+                format!(
+                    "fault: {error} at faulting CS:IP={:#06x}:{:#010x} linear={linear:#010x} \
+                     bytes=[{}]{moved}. Set IZARRAVM_FAULT_TRACE for the full dump.",
+                    record.cs.selector,
+                    record.eip,
+                    self.linear_bytes(linear, 8).trim_end(),
+                )
+            }
+            // The three sites that raise a fatal CpuError all record one, so
+            // this is not expected. Say the site is missing rather than
+            // printing live registers dressed up as the raise point.
+            None => format!("fault: {error} (no raise site recorded)"),
+        };
+        self.last_fault_line = Some(line.clone());
+        eprintln!("{line}");
+    }
+
+    /// The body of `log_fault_trace`, returning what it would print. Split out
+    /// so the report can be asserted: eight bare `eprintln!` calls had no seam,
+    /// so nothing about this output was under test, including whether it was
+    /// reading memory correctly. It was not (see `read_linear_u8`).
+    pub(crate) fn fault_trace_report(&mut self, error: &CpuError) -> String {
+        use std::fmt::Write as _;
+
+        // Anchor on the recorded raise site, not on the live registers. EIP has
+        // already advanced past the faulting instruction by the time a fatal
+        // error propagates, so anchoring on it puts the whole dump one
+        // instruction late: the byte window would start after the instruction
+        // being investigated and leave it buried at an unknown offset in the
+        // "before" block, which x86 gives no way to parse backwards. This is
+        // only reached on the fatal arm, which is what makes reading the field
+        // safe (nothing clears it, and a fatal error leaves the machine
+        // resumable).
+        let site = self.cpu.fault_site();
+        let (cs_register, eip) = match site {
+            Some(record) => (record.cs, record.eip),
+            None => (self.cpu.registers.cs(), self.cpu.registers.eip),
+        };
+        let cs = cs_register.selector;
+        let cs_base = cs_register.base;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
             "fault trace: {error} at CS:IP={cs:#06x}:{eip:#010x} v86={} ring0={}",
             self.cpu.is_v86_mode(),
             self.cpu.is_ring0_protected(),
         );
-        eprintln!(
+        if site.is_some_and(|record| record.cs_moved) {
+            let _ = writeln!(
+                out,
+                "fault trace: CS CHANGED during the faulting instruction, so the \
+                 base below describes the destination and the byte window may not \
+                 be the code that faulted"
+            );
+        }
+        let _ = writeln!(
+            out,
             "fault trace: CS base={cs_base:#010x} limit={:#010x} linear EIP={:#010x}",
-            self.cpu.registers.cs().limit,
+            cs_register.limit,
             cs_base.wrapping_add(eip),
         );
         let linear_eip = cs_base.wrapping_add(eip);
-        let mut bytes_before = String::new();
         let start = linear_eip.saturating_sub(32);
-        for addr in start..linear_eip {
-            bytes_before.push_str(&format!("{:02x} ", self.read_physical_u8(addr)));
-        }
-        eprintln!(
-            "fault trace: bytes before EIP [{start:#010x}..{linear_eip:#010x}): {bytes_before}"
+        // Count derived from the clamped start, not a fixed 32. Near the bottom
+        // of the address space `saturating_sub` shortens the window, and a fixed
+        // count would print bytes past the header's own end and into the
+        // at/after window, so the label would stop describing the payload.
+        let before_len = linear_eip - start;
+        let _ = writeln!(
+            out,
+            "fault trace: bytes before EIP [{start:#010x}..{linear_eip:#010x}): {}",
+            self.linear_bytes(start, before_len)
         );
-        let mut bytes_after = String::new();
-        for addr in linear_eip..linear_eip.saturating_add(32) {
-            bytes_after.push_str(&format!("{:02x} ", self.read_physical_u8(addr)));
-        }
-        eprintln!("fault trace: bytes at/after EIP [{linear_eip:#010x}..): {bytes_after}");
+        let _ = writeln!(
+            out,
+            "fault trace: bytes at/after EIP [{linear_eip:#010x}..): {}",
+            self.linear_bytes(linear_eip, 32)
+        );
         // Dump the guest stack (128 bytes each direction) using SS base + ESP.
         let ss_base = self
             .cpu
@@ -652,24 +764,62 @@ impl Machine {
             .base;
         let esp = self.cpu.registers.esp();
         let stack_linear = ss_base.wrapping_add(esp);
-        let mut stack_before = String::new();
         let sb_start = stack_linear.saturating_sub(128);
-        for addr in (sb_start..stack_linear).step_by(4) {
-            stack_before.push_str(&format!("{:08x} ", self.read_physical_u32(addr)));
-        }
-        eprintln!(
+        let stack_before_dwords = (stack_linear - sb_start) / 4;
+        let _ = writeln!(
+            out,
             "fault trace: SS:ESP={:#06x}:{esp:#010x} linear={stack_linear:#010x}",
             self.cpu
                 .registers
                 .segment(izarravm_cpu::SegmentIndex::Ss)
                 .selector
         );
-        eprintln!("fault trace: stack before ESP: {stack_before}");
-        let mut stack_after = String::new();
-        for addr in (stack_linear..stack_linear.saturating_add(128)).step_by(4) {
-            stack_after.push_str(&format!("{:08x} ", self.read_physical_u32(addr)));
+        let _ = writeln!(
+            out,
+            "fault trace: stack before ESP: {}",
+            self.linear_dwords(sb_start, stack_before_dwords)
+        );
+        let _ = writeln!(
+            out,
+            "fault trace: stack at/after ESP: {}",
+            self.linear_dwords(stack_linear, 32)
+        );
+        out
+    }
+
+    /// `count` bytes from a LINEAR address, hex, `--` where the address is not
+    /// mapped. An unmapped byte has to be visibly absent: printing a zero for it
+    /// puts a plausible value in front of someone about to make a decision.
+    fn linear_bytes(&mut self, linear: u32, count: u32) -> String {
+        let mut out = String::with_capacity(count as usize * 3);
+        for index in 0..count {
+            match self.read_linear_u8(linear.wrapping_add(index)) {
+                Some(byte) => out.push_str(&format!("{byte:02x} ")),
+                None => out.push_str("-- "),
+            }
         }
-        eprintln!("fault trace: stack at/after ESP: {stack_after}");
+        out
+    }
+
+    /// `count` dwords from a LINEAR address, assembled byte by byte rather than
+    /// through a dword read: a dword can straddle a page boundary, and its two
+    /// halves can then live in unrelated frames, which a single translation of
+    /// the base address would silently get wrong.
+    fn linear_dwords(&mut self, linear: u32, count: u32) -> String {
+        let mut out = String::with_capacity(count as usize * 9);
+        for index in 0..count {
+            let base = linear.wrapping_add(index * 4);
+            let bytes: Vec<Option<u8>> = (0..4)
+                .map(|offset| self.read_linear_u8(base.wrapping_add(offset)))
+                .collect();
+            if let [Some(b0), Some(b1), Some(b2), Some(b3)] = bytes[..] {
+                let value = u32::from_le_bytes([b0, b1, b2, b3]);
+                out.push_str(&format!("{value:08x} "));
+            } else {
+                out.push_str("-------- ");
+            }
+        }
+        out
     }
 
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
@@ -1226,6 +1376,7 @@ impl Machine {
                     }
                 }
                 Err(error) => {
+                    self.report_fatal_fault(&error);
                     if fault_trace_enabled() {
                         self.log_fault_trace(&error);
                     }

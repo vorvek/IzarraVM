@@ -793,6 +793,37 @@ impl CpuGsw {
         &self.perf
     }
 
+    /// Where the last fatal `CpuError` was raised. Read this ONLY when the run
+    /// actually stopped on one: nothing clears it, and a fatal error leaves the
+    /// machine resumable, so on any other stop it describes an older fault.
+    pub fn fault_site(&self) -> Option<FaultSiteRecord> {
+        self.fault_site.0
+    }
+
+    /// Record the raise site of a fatal `CpuError`. `start_eip` is the faulting
+    /// instruction's first byte; CS is taken live because `finish_instruction`
+    /// only receives a bare selector and widening that `#[inline]` signature to
+    /// carry a 16-byte descriptor would cost the retire path for a cold
+    /// diagnostic.
+    ///
+    /// `cs_moved` is passed in rather than derived here. Deriving it by
+    /// comparing selectors is wrong on the exception arm, where the rewind has
+    /// already reloaded CS and made them match while leaving a fabricated
+    /// real-mode base behind: the caller is the only place that still knows.
+    ///
+    /// Cold and never inlined. `finish_instruction` is `#[inline]` with six call
+    /// sites, one of them the retire path of every straight-line run, and this
+    /// codebase has a documented layout and code-growth sensitivity there.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn record_fault_site(&mut self, start_eip: u32, cs_moved: bool) {
+        self.fault_site = FaultSite(Some(FaultSiteRecord {
+            cs: self.registers.cs(),
+            eip: start_eip,
+            cs_moved,
+        }));
+    }
+
     /// Lever 1 (interpreter FastMap serve path) hit/miss counters, stored outside
     /// `PerfCounters` at the `CpuGsw` tail (see `FastMapProbeCounters` for why). Reset
     /// alongside the other counters by `reset_perf_counters`.

@@ -918,6 +918,25 @@ impl OplProbe {
     }
 }
 
+/// One entry in the fatal-fault report latch: a raise site plus the error seen
+/// there. The sentinel (no site, empty error) is pushed once at the cap to mark
+/// that the suppression notice has been printed; it cannot collide with a real
+/// entry, because a real one always carries an error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportedFault {
+    site: Option<(u16, u32)>,
+    error: String,
+}
+
+impl ReportedFault {
+    fn sentinel() -> Self {
+        Self {
+            site: None,
+            error: String::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -927,6 +946,13 @@ pub struct Machine {
     // Monotonic fixed-time duration advanced while HLT had parked the CPU. The
     // GUI uses this to distinguish an idle guest from a slow active CPU.
     halted_ticks: u64,
+    // Fatal-fault reporting state. `reported_fault_sites` is the latch: a fatal
+    // error leaves the machine resumable and the GUI resumes it, so a
+    // re-faulting loop would otherwise print thousands of identical lines a
+    // second. `last_fault_line` is what makes the reporting testable, since the
+    // line itself goes to stderr.
+    reported_fault_sites: Vec<ReportedFault>,
+    last_fault_line: Option<String>,
     cpu: CpuGsw,
     // Per-mode cache model. A data access warms its tag state and the resolved tier
     // drives the charged wait-state (its per-mode tier costs are calibrated). Reset
@@ -1303,6 +1329,8 @@ impl Machine {
             pending_mode: None,
             timeline: Timeline::new(active_mode),
             halted_ticks: 0,
+            reported_fault_sites: Vec::new(),
+            last_fault_line: None,
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
@@ -2783,6 +2811,10 @@ const BIOS_BASE_MEMORY_KIB: u16 = 640;
 #[cfg(test)]
 #[path = "machine_code_write_coherence_test.rs"]
 mod code_write_coherence_tests;
+
+#[cfg(test)]
+#[path = "machine_fault_site_test.rs"]
+mod fault_site_tests;
 
 #[cfg(test)]
 #[path = "machine_test.rs"]

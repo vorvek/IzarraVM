@@ -989,41 +989,13 @@ fn run_boot_hdd_folder(
         });
         let target = dump_override.or_else(|| snapshot.hot_addrs.first().map(|&(t, _)| (t, 0x180)));
         if let Some((top, dump_len)) = target {
-            let read_u32 = |machine: &mut Machine, addr: u32| -> u32 {
-                u32::from_le_bytes([
-                    machine.read_physical_u8(addr),
-                    machine.read_physical_u8(addr.wrapping_add(1)),
-                    machine.read_physical_u8(addr.wrapping_add(2)),
-                    machine.read_physical_u8(addr.wrapping_add(3)),
-                ])
-            };
-            let read_linear = |machine: &mut Machine, lin: u32| -> Option<u8> {
-                if machine.cpu().control.cr0 & 0x8000_0000 == 0 {
-                    return Some(machine.read_physical_u8(lin));
-                }
-                let cr3 = machine.cpu().control.cr3 & !0xfff;
-                let pde = read_u32(machine, cr3 + (lin >> 22) * 4);
-                if pde & 1 == 0 {
-                    return None;
-                }
-                let physical = if pde & 0x80 != 0 {
-                    (pde & 0xffc0_0000) | (lin & 0x003f_ffff)
-                } else {
-                    let pte = read_u32(machine, (pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4);
-                    if pte & 1 == 0 {
-                        return None;
-                    }
-                    (pte & !0xfff) | (lin & 0xfff)
-                };
-                Some(machine.read_physical_u8(physical))
-            };
             let start = top.saturating_sub(0x40) & !0xf;
             println!();
             println!("=== bytes around hottest address {top:08X} (paging-walked linear) ===");
             for row in 0..dump_len.div_ceil(16) {
                 let base = start + row * 16;
                 let bytes: Vec<String> = (0..16)
-                    .map(|i| match read_linear(&mut machine, base + i) {
+                    .map(|i| match machine.read_linear_u8(base + i) {
                         Some(byte) => format!("{byte:02X}"),
                         None => "--".to_string(),
                     })

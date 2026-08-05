@@ -856,9 +856,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // function-pointer `usize`s (16 bytes) and this pin moves from 4472 to 4488 -- measured, not
     // derived. Three pointers rather than one dispatching trampoline is deliberate: the emitted
     // slot stays one plain quadword load and one indirect call, with no per-call-out branch on
-    // 20 M doom executions.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
+    // 20 M doom executions. The fatal-fault diagnostics slice adds `fault_site: FaultSite` to
+    // `CpuGsw` (24 bytes), moving this pin from 4488 to 4512 -- measured, not derived. It carries
+    // no architectural state and is deliberately absent from both canonical payloads.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
 }
