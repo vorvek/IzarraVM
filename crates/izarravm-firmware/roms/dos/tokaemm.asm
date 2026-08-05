@@ -103,6 +103,22 @@ UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
 UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
 UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment); the window
                                   ; ends at the runtime umb_win_end
+
+; The top of the UMB backing is ALSO where the paging tables and the allocatable
+; arena begin. Naming it separately is not decoration: an attempt to reclaim
+; space by shrinking the UMB window walked `pd_lin` straight onto the memory it
+; had just freed, because the same expression means both "end of the window" and
+; "base of everything above it". Anything that moves the window must decide,
+; explicitly, whether this anchor moves with it.
+ARENA_PHYS_BASE equ UMB_PHYS_BASE + UMB_BYTES
+
+; PD (1 page) + 6 PT (6 pages). Read at three sites that must agree: INIT's
+; high-path fit check, `pm_init`'s zero-fill, and the `IMAGE_END_OFF`
+; reservation the `.low_tables` break address is built from. They were three
+; separate literals; a change that grew one and not the others would either
+; leave the tail unzeroed or hand DOS back memory the monitor is still paging
+; through.
+TABLES_BYTES  equ 0x7000
 umb_available: db 0               ; backing fits inside detected physical RAM
 ; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
 UMB_SLOTS equ 8
@@ -431,10 +447,10 @@ init:
     jb .no_hma
     mov byte [cs:hma_available], 1
 .no_hma:
-    cmp edi, UMB_PHYS_BASE + UMB_BYTES
+    cmp edi, ARENA_PHYS_BASE
     jb .no_umb
     mov byte [cs:umb_available], 1
-    mov eax, UMB_PHYS_BASE + UMB_BYTES
+    mov eax, ARENA_PHYS_BASE
     jmp .arena_base
 .no_umb:
     mov word [cs:umb_win_end], UMB_SEG_BASE
@@ -445,7 +461,7 @@ init:
     ; 1 MiB profile, but normal machines reserve these aligned pages before
     ; the allocatable XMS/VCPI arena instead.
     mov edx, eax
-    add edx, 0x7000
+    add edx, TABLES_BYTES
     jc .low_tables
     cmp edx, edi
     ja .low_tables
@@ -1470,7 +1486,7 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     mov esp, ebx                  ; monitor ring-0 stack (driver-resident)
     mov edi, ebp                  ; high RAM is not guaranteed to start clear
     xor eax, eax
-    mov ecx, 0x7000 / 4
+    mov ecx, TABLES_BYTES / 4
     rep stosd
     ; PD[0..5] -> the six PTs that follow the PD (each PT maps 4 MiB), so the
     ; identity map covers 0..24 MiB and the XMS-move memcpy can reach every EMB.
@@ -2460,6 +2476,22 @@ vcpi_dispatch:
 ; offset in EBX. The copy covers PT0 entries 0..0x10F -- the whole V86
 ; window this monitor furnishes (first MB + the 64K A20/HMA window), which
 ; also maps the entire low server core (code, data, GDT, TSS, and stack).
+;
+; THAT LAST CLAUSE IS A CONSTRAINT, NOT AN OBSERVATION. Every structure the CPU
+; reads implicitly while a guest runs -- the TSS (SS0/ESP0 on a ring change, and
+; the I/O permission bitmap on every V86 port access), the GDT, the IDT and the
+; ring-0 stack -- must live inside linear 0..0x10FFFF, because the CPU reads
+; them under whatever CR3 is live and the monitor does not choose all of those.
+; A VCPI client installs its own via DE0C, and the GUEST can install one of its
+; own too: MOV CR3 from V86 faults #GP, monitor_body routes it to .op_mov_cr_r,
+; and .wcr3 honours it before .done_gp's IRETD returns to V86 with that paging
+; live. Only these 0x110 furnished entries are guaranteed present in such a
+; context. A server structure above 1 MB would take a #PF whose own delivery
+; needs that same structure: a triple fault, under a zero-limit IDT, with
+; nothing to read afterwards.
+;
+; Two attempts to move the TSS out of the driver image were cut on exactly this
+; (2026-08-06). Do not move any of these structures up without re-deriving it.
 ; The server page tables may be reserved above 1 MB, but DE0C reads pd_lin
 ; from low server data before switching back to the server CR3.
 ; Software-defined PTE bits 9-11 are cleared in the copy (spec p.6; the
@@ -3335,7 +3367,7 @@ resident_core_end:
 ; relocatable rather than scalar, so `&`, `>>` and `%if` on one are rejected
 ; outright ("operator may only be applied to scalar values").
 TABLES_OFF        equ ((resident_core_end - $$) + 4095) & ~4095
-IMAGE_END_OFF     equ TABLES_OFF + 0x7000 + 0xFF0
+IMAGE_END_OFF     equ TABLES_OFF + TABLES_BYTES + 0xFF0
 tables            equ $$ + TABLES_OFF
 
 ; Nothing zero-fills this region any more. DOS used to do it incidentally, by
