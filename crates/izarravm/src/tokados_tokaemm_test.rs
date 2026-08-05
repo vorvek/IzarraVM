@@ -256,8 +256,11 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
 /// A guest program install-checks XMS, allocates a 64 KB EMB,
 /// locks it, moves a pattern conventional->EMB->conventional, verifies it, then
 /// unlocks and frees — all in V86 under TOKAEMM's monitor (block MOVE traps to
-/// the monitor's flat memcpy). XMSTEST.COM signals 0xA5 (success) via the
-/// unit-tester exit port; any other code names the step that broke.
+/// the monitor's flat memcpy). It then asserts two properties of the arena's
+/// shape: 08h reports the largest free block separately from the total, and a
+/// 1 KB request costs 1 KB rather than a whole page. XMSTEST.COM signals 0xA5
+/// (success) via the unit-tester exit port; any other code names the step that
+/// broke, and the fixture's own failure-label block is the key.
 ///
 /// The config is NOEMS so host EMS reserves no extended RAM and the guest XMS
 /// driver owns all of it. EMS coexistence is covered separately.
@@ -298,7 +301,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         stop,
         StopReason::TestExit { code: 0xA5 },
         "XMS round-trip did not report success (stop={stop:?}); \
-             a 0xEn code names the failed step.\n{text}"
+             a 0xE0-0xF2 code names the failed step.\n{text}"
     );
 }
 

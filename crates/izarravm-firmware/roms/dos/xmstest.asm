@@ -6,8 +6,10 @@
 ; Install-check (INT 2Fh 4300) -> get entry (4310) -> version -> alloc 64 KB ->
 ; lock -> move a pattern conventional->EMB -> move EMB->conventional -> verify ->
 ; unlock -> free, then repeat the move at the end of a near-full EMB and verify
-; a failed growth leaves the old allocation intact. Success is 0xA5; 0xEn
-; names the step that broke.
+; a failed growth leaves the old allocation intact. Two arena-shape assertions
+; close it out: 08h must report largest separately from total, and a 1 KB
+; request must cost 1 KB. Success is 0xA5; any other code names the step that
+; broke -- 0xE0-0xEE for the round trip, 0xEF-0xF2 for the arena-shape steps.
 ;
 ; Build: nasm -f bin xmstest.asm -o xmstest.com
 cpu 386
@@ -270,62 +272,73 @@ start:
 
     ; --- 08h must distinguish LARGEST from TOTAL -------------------------
     ; XMS 08h returns AX = largest free block and DX = total free -- the figure
-    ; DOS/16M-family loaders size their requests from. Fragment the arena with
-    ; two blocks, free the lower one, and the largest must then be strictly
-    ; less than the total.
+    ; DOS/16M-family loaders size their requests from. Allocate two 64 KB
+    ; blocks, free the lower one, and the largest must then be strictly less
+    ; than the total. Either allocation order works: whichever block the
+    ; allocator places second, freeing the other leaves an interior hole, so
+    ; this does not depend on the placement policy.
     ;
-    ; NOTE: this does NOT currently fail. 64 KB blocks are 4 KB-page-aligned,
-    ; and any hole that shape can create is one the 4 KB bitmap can already
-    ; represent exactly -- AX (arena_longest_clear, a bit-scan max) and DX
-    ; (xms_free, a counter kept in lockstep with every arena_mark_xms/
-    ; arena_clear_xms call) are sum-vs-max over the SAME bitmap, so AX < DX
-    ; holds whenever there is more than one free run, at ANY page granularity.
-    ; Verified empirically: this block runs clean through to the 1 KB check
-    ; below on today's driver. It is not a defect-discriminating red test --
-    ; it is a forward regression guard on the largest/total relationship that
-    ; Task 4's arena_query must keep honoring. The actual pre-Task-4 defect is
-    ; the 1 KB request below.
+    ; This is a FORWARD GUARD, not a red-before-the-rewrite test -- it passes
+    ; on today's driver and must keep passing. AX comes from
+    ; arena_longest_clear (a bit-scan max) and DX from xms_free (a running
+    ; count kept in lockstep with every arena_mark_xms/arena_clear_xms), so
+    ; the two are max-vs-sum over the SAME bitmap and AX < DX holds whenever
+    ; more than one free run exists, at ANY granularity. Granularity cannot
+    ; break this relationship, which is why the 1 KB check below, not this
+    ; one, is the assertion that currently fails. Kept because the 1 KB-granule
+    ; rewrite replaces both sides of it with one arena_query, and that query
+    ; must not collapse largest into total.
     mov ah, 0x09                  ; low block, 64 KB
     mov dx, 64
     call far [entry]
     or ax, ax
-    jz f_gran
+    jz f_frag
     mov [frag_lo], dx
-    mov ah, 0x09                  ; a second block pins a hole below it
+    mov ah, 0x09                  ; a second block pins a hole against it
     mov dx, 64
     call far [entry]
     or ax, ax
-    jz f_gran
+    jz f_frag
     mov [frag_hi], dx
     mov ah, 0x0A                  ; release the low block -> interior hole
     mov dx, [frag_lo]
     call far [entry]
     or ax, ax
-    jz f_gran
+    jz f_frag
     mov ah, 0x08
     call far [entry]
+    or ax, ax
+    jz f_frag                     ; nothing free at all: not this assertion
     cmp ax, dx
     jae f_largest                 ; largest == total: the hole is invisible
     mov ah, 0x0A
     mov dx, [frag_hi]
     call far [entry]
     or ax, ax
-    jz f_gran
+    jz f_frag
 
     ; --- a 1 KB request must cost 1 KB ------------------------------------
     ; 386MAX allocates XMS on a 1 KB boundary (ALLOC_LIM @ALLOC_XMS). A 4 KB
     ; page arena rounds a 1 KB block up and burns 4 KB of the reported total.
+    ; This is the assertion that is currently red. Nothing but the allocation
+    ; runs between the two 08h calls, and xf_alloc's only charge against the
+    ; total is the pages it takes, so the difference is the rounding and
+    ; nothing else -- 0xF0 means granularity and never anything else.
     mov ah, 0x08
     call far [entry]
+    or ax, ax
+    jz f_gsetup
     mov [gran_before], dx
     mov ah, 0x09
     mov dx, 1
     call far [entry]
     or ax, ax
-    jz f_gran
+    jz f_gsetup
     mov [gran_handle], dx
     mov ah, 0x08
     call far [entry]
+    or ax, ax
+    jz f_gsetup
     mov ax, [gran_before]
     sub ax, dx                    ; kilobytes the 1 KB block actually consumed
     cmp ax, 1
@@ -334,7 +347,7 @@ start:
     mov dx, [gran_handle]
     call far [entry]
     or ax, ax
-    jz f_gran
+    jz f_gsetup
 
     mov al, OK
     jmp sig
@@ -367,12 +380,25 @@ f_resize:   mov al, 0xED
             jmp sig
 f_large:    mov al, 0xEE
             jmp sig
-; 0xE0-0xEE are already claimed (f_noxms above through f_large just above), so
-; the two new codes go just past them rather than at the plan's originally-
-; picked 0xE0/0xEF (0xE0 collides with f_noxms; see the commit message).
-f_largest:  mov al, 0xEF
+; Codes are assigned in the order steps were ADDED, so this block is in neither
+; program order nor numeric order: 0xE8 (f_free) sits at the bottom because it
+; alone falls through into sig. 0xE0-0xEE were all claimed before the
+; arena-shape steps arrived, so those continue at 0xEF. The exit code is a
+; plain byte and 0xA5 (success) is the only reserved value, so the next step
+; added takes 0xF3. Never recycle a code -- a stale one makes the harness name
+; the wrong step.
+;
+; 0xEF and 0xF0 are the two ASSERTIONS; 0xF1 and 0xF2 are the setup around
+; them, split off so an arena that could not be fragmented, or a 1 KB block
+; that could not be allocated at all, never reports as a failed assertion.
+; (Same split, and the same reason, as emmprobe.asm's f_xms_* codes.)
+f_largest:  mov al, 0xEF        ; ASSERTION: 08h collapsed largest into total
             jmp sig
-f_gran:     mov al, 0xF0
+f_gran:     mov al, 0xF0        ; ASSERTION: a 1 KB block did not cost 1 KB
+            jmp sig
+f_frag:     mov al, 0xF1        ; setup: could not fragment the arena
+            jmp sig
+f_gsetup:   mov al, 0xF2        ; setup: could not size or place the 1 KB block
             jmp sig
 f_free:     mov al, 0xE8
 
@@ -386,10 +412,10 @@ sig:
     out 0xE6, al                 ; CMD_EXIT
 .h: jmp .h
 
-entry:   dd 0
-handle:  dw 0
-large_kb: dw 0
-large_off: dd 0
+entry:       dd 0
+handle:      dw 0
+large_kb:    dw 0
+large_off:   dd 0
 frag_lo:     dw 0
 frag_hi:     dw 0
 gran_before: dw 0
