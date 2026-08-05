@@ -1682,3 +1682,49 @@ fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
              code means the discriminator mis-routed the delivery.\n{text}"
     );
 }
+
+/// DOS/16M decides whether XMS shares a pool with the other memory interfaces
+/// by taking every free XMS kilobyte and re-reading their free counts. TOKAEMM
+/// must answer honestly in both directions or a DOS/4GW client keeps the XMS
+/// block and finds the VCPI pool empty -- the `DOS/16M error: [23] no memory
+/// for VCPI page table` that this whole change exists to fix. EMS enabled: the
+/// NOEMS path was always honest because it probes VCPI DE03 instead.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_pool_overlap_is_visible_to_both_interfaces() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMMPROBE\r\n".to_vec();
+
+    let profile = MachineProfile::gsw_386(24, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-emmprobe",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "EMMPROBE.COM".to_string(),
+                izarravm_firmware::emmprobe_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "pool-overlap probe failed (stop={stop:?}); 0xE4 means the EMS free \
+         count did not move while XMS held the whole arena, and any other \
+         0xEn names a different step -- read the failure-label block in \
+         emmprobe.asm before believing the 0xE4 story.\n{text}"
+    );
+}
