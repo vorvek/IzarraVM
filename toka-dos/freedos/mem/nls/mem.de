@@ -51,6 +51,8 @@
 2.21:HMA kann nicht verwendet werden: Kein XMS Treiber geladen\n
 2.22:Int 15h Speicher
 2.23:Kein Int 15h Speicher (Fehler %02xh)\n
+2.24:*  TOKAEMM benutzt XMS-Speicher, um EMS-Speicher nach Bedarf zu simulieren.
+2.25:   Freier EMS-Speicher kann sich mit freiem XMS-Speicher „ndern.
 # block types
 3.0:
 3.1:frei

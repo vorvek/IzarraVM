@@ -535,12 +535,11 @@ typedef void far (*xms_drv_t)(void);
 void far (*xms_drv)(void);
 
 #define TOKA_CATEGORY_MAGIC 0x544B
-#define TOKA_SPLIT_MAGIC    0x544C
 
 static ushort toka_xms_category_k;
 static ushort toka_ems_category_k;
 static ushort toka_vcpi_free_k;
-static int toka_split_pools;
+static int toka_shared_pool;
 
 /*
  * The last segment address that is in conventional memory.

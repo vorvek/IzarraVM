@@ -1111,11 +1111,17 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         lower.contains("toka-dos is resident in the high memory area"),
         "MEM should use the Toka-DOS name for the HMA resident.\n{text}"
     );
+    // MS-DOS 6.22's shape for a manager that simulates EMS out of extended
+    // memory: no separate `Expanded (EMS)` row (a shared pool would be
+    // double-counted), one starred extended row instead.
+    assert!(
+        !text.contains("Expanded (EMS)"),
+        "MEM still prints a separate EMS row over a shared pool:\n{text}"
+    );
     for (label, total) in [
         ("Conventional", "640K"),
         ("Upper", "384K"),
-        ("Expanded (EMS)", "3,072K"),
-        ("Extended (XMS)", "20,480K"),
+        ("Extended (XMS)*", "23,552K"),
     ] {
         let line = text
             .lines()
@@ -1132,10 +1138,10 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("599K"),
-        "the high page tables should leave about 600 KiB conventional memory free.\n{text}"
+        Some("593K"),
+        "the high page tables should leave about 593 KiB conventional memory free.\n{text}"
     );
-    assert_extended_category(&screen, "20,480K", "20,132K");
+    assert_extended_category(&screen, "23,552K", "21,925K");
 
     let rows = memory_map_rows(&screen);
     assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
@@ -1147,7 +1153,10 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
     );
     assert!(map.iter().any(|(character, _)| *character == 0xB0));
     assert!(map.iter().any(|(character, _)| *character == 0xB2));
-    for (range, attribute) in [(0..8, 0x09), (8..13, 0x0B), (13..53, 0x0D), (53..316, 0x0A)] {
+    // Three bands now (conventional/upper/extended), not four: the shared
+    // pool folded EMS into the extended row, so the map's last band runs
+    // straight to the end instead of stopping short for a separate EMS slice.
+    for (range, attribute) in [(0..8, 0x09), (8..13, 0x0B), (13..316, 0x0A)] {
         assert!(
             map[range.clone()]
                 .iter()
@@ -1155,6 +1164,36 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
             "MEM map range {range:?} should use attribute {attribute:#04x}.\n{text}"
         );
     }
+}
+
+/// MS-DOS 6.22's MEM does not print an `Expanded (EMS)` row when the manager
+/// simulates EMS out of extended memory -- it prints one starred extended row
+/// and a footnote, because there is one pool and a second row would
+/// double-count it. TOKAEMM is that kind of manager now, so MEM must say so.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_mem_folds_ems_into_the_extended_row() {
+    let (_scenario, screen, stop) = run_mem_command("shared-pool", "");
+    let text = &screen.text;
+    if let StopReason::CpuError(msg) = &stop {
+        panic!("CPU fault while running MEM under V86: {msg}\n{text}");
+    }
+    assert!(
+        text.to_ascii_lowercase().contains("c:\\>"),
+        "no C:\\> prompt after MEM ran (stop={stop:?}).\n{text}"
+    );
+    assert!(
+        !text.contains("Expanded (EMS)"),
+        "MEM still prints a separate EMS row over a shared pool:\n{text}"
+    );
+    assert!(
+        text.contains("Extended (XMS)*"),
+        "MEM did not star the extended row:\n{text}"
+    );
+    assert!(
+        text.contains("simulate EMS memory as needed"),
+        "MEM did not print the shared-pool footnote:\n{text}"
+    );
 }
 
 #[test]
@@ -1172,7 +1211,7 @@ fn tokaemm_mem_noems_reports_combined_extended_free() {
         "no C:\\> prompt after MEM ran with NOEMS (stop={stop:?}).\n{}",
         screen.text
     );
-    assert_extended_category(&screen, "23,552K", "23,204K");
+    assert_extended_category(&screen, "23,552K", "21,925K");
 }
 
 #[test]
@@ -1281,8 +1320,8 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .find(|line| line.trim_start().starts_with("TOKAEMM "))
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(23K)"),
-        "TokaEMM should retain only its 23 KiB low core.\n{}",
+        tokaemm.contains("(29K)"),
+        "TokaEMM should retain only its 29 KiB low core.\n{}",
         screen.text
     );
     let free = screen
@@ -1292,8 +1331,8 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(599K)"),
-        "MEM /CLASSIFY should report about 600 KiB conventional free.\n{}",
+        Some("(593K)"),
+        "MEM /CLASSIFY should report about 593 KiB conventional free.\n{}",
         screen.text
     );
 }
