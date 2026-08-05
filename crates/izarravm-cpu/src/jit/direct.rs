@@ -29,7 +29,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use izarravm_core::CpuPersona;
 
-use census::{BarrierStop, record_structural_barrier};
+use census::{BarrierStop, SuffixSeed, record_structural_barrier};
 // The stall/census TAXONOMY lives in `census.rs` beside the builder that already consumed it
 // (`stall_snapshot`, `snapshot`), moved verbatim to keep this file under the source-line ceiling.
 // Re-exported from here because every out-of-module path names them through `jit::direct`.
@@ -4292,11 +4292,14 @@ fn compile_with_instruction_limit(
                     reason,
                     key,
                     entry_lin,
-                    next,
                     d,
-                    slots.len(),
-                    stack_accesses,
-                    memory_alu_slots,
+                    SuffixSeed {
+                        scan_start: next,
+                        prefix_instructions: slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                        callout_slots,
+                    },
                 );
             }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
@@ -4321,11 +4324,14 @@ fn compile_with_instruction_limit(
                     BarrierStop::WordPersona,
                     key,
                     entry_lin,
-                    next,
                     d,
-                    slots.len(),
-                    stack_accesses,
-                    memory_alu_slots,
+                    SuffixSeed {
+                        scan_start: next,
+                        prefix_instructions: slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                        callout_slots,
+                    },
                 );
             }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
@@ -4343,11 +4349,14 @@ fn compile_with_instruction_limit(
                         BarrierStop::HardBoundary,
                         key,
                         entry_lin,
-                        next,
                         d,
-                        slots.len(),
-                        stack_accesses,
-                        memory_alu_slots,
+                        SuffixSeed {
+                            scan_start: next,
+                            prefix_instructions: slots.len(),
+                            stack_accesses,
+                            memory_alu_slots,
+                            callout_slots,
+                        },
                     );
                 }
                 stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);

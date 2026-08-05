@@ -20,6 +20,30 @@ struct CensusSuffix {
     instructions: usize,
 }
 
+/// The compile walk's live accumulators at the moment a barrier stopped it, handed to the forward
+/// scan so the scan can stop where the real walk would.
+///
+/// A STRUCT rather than more positional arguments. `record_structural_barrier` carried eleven,
+/// two of them adjacent `u32`s (`entry_lin` and `next`) that an earlier review of this campaign
+/// caught being confused for one another. Every accumulator here is a small integer and three are
+/// `u8`, so positional passing had no type safety left to offer.
+///
+/// `scan_start` rides here for that reason specifically rather than for tidiness: it is the second
+/// of those two `u32`s, and naming it at every call site is what stops the confusion recurring.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SuffixSeed {
+    /// Linear address the forward scan begins at: the instruction AFTER the barrier, which is
+    /// where the counterfactual block would carry on.
+    pub(super) scan_start: u32,
+    /// Slots the block had already committed. The forward scan's slot count is
+    /// `prefix_instructions + 1 + suffix`: the prefix, the barrier itself counterfactually
+    /// lowered, and the suffix so far.
+    pub(super) prefix_instructions: usize,
+    pub(super) stack_accesses: u8,
+    pub(super) memory_alu_slots: u8,
+    pub(super) callout_slots: u8,
+}
+
 /// Record one structural stop into the barrier census, from ANY of the arms that can set
 /// `CompileStop::Structural`.
 ///
@@ -38,54 +62,89 @@ struct CensusSuffix {
 /// pass — `compile_with_page_len` re-enters this walk once per binary-search step and converts
 /// any structural reject it sees into a `Retry`, so a shorter pass can neither install a
 /// rejection nor be allowed to double-count a row.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn record_structural_barrier(
     cpu: &mut CpuGsw,
     insn: &DecodedInsn,
     stop: BarrierStop,
     key: BlockKey,
     entry_lin: u32,
-    next: u32,
     d: bool,
-    prefix_instructions: usize,
-    stack_accesses: u8,
-    memory_alu_slots: u8,
+    seed: SuffixSeed,
 ) {
-    let suffix = census_native_suffix(
-        cpu,
-        key,
-        entry_lin,
-        next,
-        d,
-        prefix_instructions,
-        stack_accesses,
-        memory_alu_slots,
-    );
+    let suffix = census_native_suffix(cpu, key, entry_lin, d, seed);
     cpu.jit_direct.record_barrier(
         insn,
         BarrierObservation {
             entry_linear: entry_lin,
-            native_prefix: prefix_instructions,
+            native_prefix: seed.prefix_instructions,
             native_suffix: suffix.instructions,
             stop,
         },
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Walk forward from a barrier and count how many more instructions the block WOULD have carried
+/// had that barrier been lowered.
+///
+/// This is `max_native_suffix`'s and `native_suffix_instructions`' only source, which makes it a
+/// ranking column: a row that reports a long suffix is claiming a long block is being lost. So the
+/// scan has one correctness property, and it is not "does it look like the compile walk" but
+/// **does it stop where the compile walk would**. Anywhere the two disagree, the column lies in a
+/// direction the reader cannot see.
+///
+/// The audit that produced the current form found SIX divergences. Three are closed here, one is
+/// deliberately left open, and two belong to the dirty-segment slice:
+///
+/// * CLOSED, the memory-ALU BLOCK cap. `compile_with_instruction_limit` breaks at its LOOP TOP on
+///   `memory_alu_slots != 0 && slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, regardless of
+///   what the next instruction turns out to be. This scan applied the same bound only when the
+///   next kind was ITSELF memory-ALU, so a barrier whose prefix held one read-modify-write slot
+///   over-reported by up to 28 instructions against a 32-instruction ceiling. That was the largest
+///   error in the column and it is the one the 32-bit rows were ranked on.
+/// * CLOSED, the call-out slot cap.
+/// * CLOSED, `jit_admits_non_continuable`. The compile walk takes `insn.continuable ||
+///   jit_admits_non_continuable(opcode)`; this scan took the bare flag, truncating any suffix that
+///   reached an IMUL-with-immediate.
+/// * OPEN BY DESIGN, x87. The `kind.is_x87()` break below refuses EVERY x87 slot, while the
+///   compile walk admits up to `MAX_X87_SLOTS` within `MAX_X87_BLOCK_INSTRUCTIONS`. That makes the
+///   x87 block cap and the x87/call-out mixing refusal unreachable here, so mirroring them would
+///   be dead code no test could make fire. Left as a deliberate conservative FLOOR: it
+///   under-reports, and an under-report cannot inflate a ranking. Closing it is a Quake-facing
+///   change with no bearing on the 16-bit campaign.
+/// * The dirty-segment rule, and the seed for a barred instruction that would itself write a
+///   segment. Both belong to the dirty-stop slice, which needs the per-arm choice of whether to
+///   model the rule at all.
+///
+/// One residual the seed cannot express: the barrier is counted as one slot without knowing its
+/// kind, because `classify` refused it. So a barrier that would itself have been the block's first
+/// memory-ALU or call-out slot does not arm those caps. Bounded by one slot and always in the
+/// over-reporting direction.
 fn census_native_suffix(
     cpu: &CpuGsw,
     key: BlockKey,
     entry_lin: u32,
-    mut lin: u32,
     d: bool,
-    prefix_instructions: usize,
-    mut stack_accesses: u8,
-    mut memory_alu_slots: u8,
+    seed: SuffixSeed,
 ) -> CensusSuffix {
+    let SuffixSeed {
+        scan_start: mut lin,
+        prefix_instructions,
+        mut stack_accesses,
+        mut memory_alu_slots,
+        mut callout_slots,
+    } = seed;
     let cs = cpu.registers.cs();
     let mut result = CensusSuffix::default();
     while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
+        // The compile walk's LOOP-TOP caps, which fire before the next instruction is even
+        // decoded and so cannot be folded into the per-kind refusals below. `>=` rather than the
+        // compile walk's `==` because `prefix_instructions` arrives from a caller rather than
+        // being counted up from zero here; the two agree wherever the compile walk can reach.
+        if memory_alu_slots != 0
+            && prefix_instructions + 1 + result.instructions >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS
+        {
+            break;
+        }
         let Some(insn) = cpu.decode_cache.get(lin, d) else {
             break;
         };
@@ -109,7 +168,7 @@ fn census_native_suffix(
             .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
             || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
             || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
-            || !insn.continuable
+            || !(insn.continuable || jit_admits_non_continuable(insn.opcode))
             || (insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586)
         {
             break;
@@ -131,12 +190,14 @@ fn census_native_suffix(
                 && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
                     || prefix_instructions + 1 + result.instructions
                         >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
+            || (kind.is_call_out() && callout_slots == MAX_BLOCK_CALLOUT_SLOTS)
             || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
         {
             break;
         }
         stack_accesses += u8::from(kind.uses_stack());
         memory_alu_slots += u8::from(kind.is_memory_alu());
+        callout_slots += u8::from(kind.is_call_out());
         result.instructions += 1;
         lin = next;
         if kind.is_terminal() {

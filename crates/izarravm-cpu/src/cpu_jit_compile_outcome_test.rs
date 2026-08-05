@@ -200,6 +200,155 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
     assert_eq!(row.runtime_hits, 0);
 }
 
+// Mutation record for the suffix-agreement slice, each verified by hand against this tree. Every
+// fix is covered by exactly ONE test, and no mutation moved a test other than its own:
+//
+//  * dropping the loop-top memory-ALU cap makes `census_suffix_respects_the_memory_alu_block_cap`
+//    read 5 where it must read 0;
+//  * dropping the call-out slot cap makes `census_suffix_respects_the_call_out_slot_cap` read 2
+//    where it must read 0;
+//  * restoring the bare `!insn.continuable` makes
+//    `census_suffix_admits_the_non_continuable_imul_forms` read 0 where it must read 3.
+//
+// The x87 divergence has NO test here, deliberately and not by omission: the forward scan refuses
+// every x87 kind outright, so the compile walk's x87 caps are unreachable from it and any mirror
+// of them would be dead code no fixture could make fire. It is left as a conservative floor and
+// documented at `census_native_suffix`.
+
+/// Compile `code` with the census on and return the single barrier row's suffix.
+///
+/// `warm_offsets` is the instruction start list, and it is what BOUNDS the suffix: the forward
+/// scan reads `decode_cache`, so an address that was never warmed ends the walk. That makes the
+/// expected value in each caller an exact number rather than a floor.
+fn barrier_suffix(code: &[u8], warm_offsets: &[u32]) -> u64 {
+    let (mut cpu, mut bus) = fixture(code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = warm_offsets.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+        .expect("recorded structural stop");
+    assert_eq!(row.hits, 1, "fixture must record exactly one barrier hit");
+    row.native_suffix_instructions
+}
+
+/// The memory-ALU BLOCK cap, and it is the largest of the six divergences the suffix audit found.
+///
+/// `compile_with_instruction_limit` breaks at its LOOP TOP on `memory_alu_slots != 0 &&
+/// slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, before the next instruction is decoded and
+/// regardless of what that instruction turns out to be. The forward scan applied the same bound
+/// only when the next kind was ITSELF memory-ALU, so any barrier whose prefix held one
+/// read-modify-write slot over-reported its suffix by up to 28 instructions against a
+/// 32-instruction ceiling — on the very column the campaign ranks rows by.
+///
+/// The two fixtures are `add [ebx], eax` and `add eax, ecx`: SAME opcode, SAME length, differing
+/// only in the ModRM mod field. So the pair isolates `is_memory_alu` and nothing else, and a
+/// lowering change that moved either form would fail here rather than silently re-diverge.
+#[test]
+fn census_suffix_respects_the_memory_alu_block_cap() {
+    let offsets = [0, 2, 3, 4, 5, 6, 7, 8, 9];
+    let memory = [
+        0x01,
+        0x03,
+        0x40,
+        0x41,
+        DIRECT_BARRIER,
+        0x42,
+        0x43,
+        0x44,
+        0x45,
+        0x46,
+    ];
+    let register = [
+        0x01,
+        0xc8,
+        0x40,
+        0x41,
+        DIRECT_BARRIER,
+        0x42,
+        0x43,
+        0x44,
+        0x45,
+        0x46,
+    ];
+
+    assert_eq!(
+        barrier_suffix(&register, &offsets),
+        5,
+        "control: with no memory-ALU slot in the prefix the cap is not armed and the scan reaches \
+         every warmed instruction after the barrier"
+    );
+    // Three prefix slots plus the barrier itself is already MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS, so
+    // the counterfactual block is full before the scan takes a single step. The cap bounds
+    // `prefix + 1 + suffix`, NOT the suffix alone.
+    assert_eq!(
+        barrier_suffix(&memory, &offsets),
+        0,
+        "one memory-ALU slot in the prefix arms the loop-top cap"
+    );
+}
+
+/// The compile walk admits two non-continuable opcodes that the forward scan refused.
+///
+/// `block_continuable` (decode.rs) says no to `0x69`/`0x6b`, and the compile walk overrides it
+/// with `insn.continuable || jit_admits_non_continuable(insn.opcode)`. The scan took the bare
+/// flag, so any suffix that reached an IMUL-with-immediate was truncated there. This
+/// UNDER-reported, which is the safer direction but still a disagreement.
+///
+/// A refusal would stop the walk rather than skip the instruction, so the failing value is 0 and
+/// not 2. That is what makes one assertion enough.
+#[test]
+fn census_suffix_admits_the_non_continuable_imul_forms() {
+    // `inc eax / inc ecx / inc edx / <barrier> / imul eax, eax, 5 / inc ebx / inc esp`
+    let offsets = [0, 1, 2, 3, 4, 7, 8];
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        DIRECT_BARRIER,
+        0x6b,
+        0xc0,
+        0x05,
+        0x43,
+        0x44,
+    ];
+
+    assert_eq!(
+        barrier_suffix(&code, &offsets),
+        3,
+        "the IMUL must be counted AND walked through to the two instructions behind it"
+    );
+}
+
+/// The call-out slot cap.
+///
+/// PUSHA and POPA are `DirectKind::CallOut` and are deliberately NOT `uses_stack`, which is what
+/// lets this fixture exercise `MAX_BLOCK_CALLOUT_SLOTS` in isolation: both caps are 4, so a kind
+/// that counted against each would leave the test unable to say which one fired.
+#[test]
+fn census_suffix_respects_the_call_out_slot_cap() {
+    let offsets = [0, 1, 2, 3, 4, 5, 6];
+    let full = [0x60, 0x61, 0x60, 0x61, DIRECT_BARRIER, 0x60, 0x40];
+    let spare = [0x60, 0x61, 0x60, 0x40, DIRECT_BARRIER, 0x60, 0x40];
+
+    assert_eq!(
+        barrier_suffix(&spare, &offsets),
+        2,
+        "control: three call-out slots in the prefix leaves room for the one behind the barrier"
+    );
+    assert_eq!(
+        barrier_suffix(&full, &offsets),
+        0,
+        "a full call-out budget must stop the scan at the next call-out"
+    );
+}
+
 /// The prefix arm of the compile walk is ATTRIBUTED, not silent — and, since slice 6, the arm is
 /// reached by a CS override rather than by any segment override.
 ///
