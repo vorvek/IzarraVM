@@ -52,6 +52,58 @@ start:
     cmp edx, 256
     jb f_novcpi
 
+    ; --- cross-interface consistency: all three describe ONE pool ----------
+    ; This is the check that was missing, not a nice-to-have: every existing
+    ; assertion in this fixture derives its own baseline from whatever EMS/
+    ; VCPI report and only checks that the SAME number moves and recovers, so
+    ; a manager that reports a consistently WRONG figure -- corrupted but
+    ; internally self-consistent -- passes every one of them. A real instance
+    ; of exactly this shipped and was caught only by an unrelated benchmark:
+    ; a register clobber made EMS's `AH=42h` answer 26 pages (416 KB) against
+    ; an actual pool near 22,000 KB, and both this fixture and emsfrag passed
+    ; anyway, because each only checked bx against ITS OWN prior reading.
+    ;
+    ; The fix is to check the three interfaces against EACH OTHER, which is
+    ; what this fixture's premise (`DOS/16M error: ... no memory for VCPI
+    ; page table`) is actually about: XMS `AH=08h` DX (total free KB), VCPI
+    ; `DE03` EDX (total free 4 KB pages) and EMS `AH=42h` BX (total free
+    ; 16 KB pages) all describe the same shared arena, so `VCPI*4` and
+    ; `EMS*16` must each land close under the XMS KB figure.
+    ;
+    ; "Close under", not exact, and NOT a hardcoded page count (that re-pins
+    ; the fixture to one profile, the trap emsfrag's own baseline just
+    ; escaped): arena_query32 rounds each free SPAN's usable region up to the
+    ; type's boundary at the start and down to a multiple of it at the end,
+    ; so a coarser type can under-report a finer one -- never over-report --
+    ; by up to 2*(boundary-1) KB PER FREE SPAN (boundary in KB: VCPI 4, EMS
+    ; 16). At this point in the program at most the shell's own startup usage
+    ; has touched the pool, so more than a handful of spans would be
+    ; surprising; the tolerances below assume up to 8, an order of magnitude
+    ; of headroom over the realistic 1-3, while staying two orders of
+    ; magnitude below the ~21,000 KB gap the corruption above actually
+    ; produced. A single unsigned compare on (xms_kb - interface_kb) catches
+    ; both directions at once: an interface reporting MORE than XMS wraps
+    ; that subtraction to a huge unsigned value, which fails the same "> TOL"
+    ; test a too-large shortfall does.
+    VCPI_TOL_KB equ 2 * (4  - 1) * 8   ; = 48  KB (6 KB/span  * 8 spans)
+    EMS_TOL_KB  equ 2 * (16 - 1) * 8   ; = 240 KB (30 KB/span * 8 spans)
+    mov ah, 0x08                  ; DX = total free KB (AX = largest, unused
+    call far [xms_entry]          ; here -- this check only needs the total)
+    movzx edx, dx
+    mov [xms_total0], edx
+    mov eax, [vcpi_free0]
+    shl eax, 2                    ; VCPI 4 KB pages -> KB
+    mov ecx, [xms_total0]
+    sub ecx, eax                  ; wraps huge if eax > ecx (VCPI over-reports)
+    cmp ecx, VCPI_TOL_KB
+    ja f_xagree_vcpi0
+    movzx eax, word [ems_free0]
+    shl eax, 4                    ; EMS 16 KB pages -> KB
+    mov ecx, [xms_total0]
+    sub ecx, eax
+    cmp ecx, EMS_TOL_KB
+    ja f_xagree_ems0
+
     ; --- grab every free XMS kilobyte -------------------------------------
     ; ONE allocation only takes every free kilobyte while the arena is a single
     ; unbroken run, so require largest == total first. Nothing else holds an
@@ -128,6 +180,30 @@ start:
     cmp edx, [vcpi_free0]
     jne f_vcpi_back
 
+    ; --- cross-interface consistency again, post-release -------------------
+    ; The two checks just above prove EMS and VCPI recovered to their OWN
+    ; prior readings; they say nothing about whether XMS's own total also
+    ; came back, since nothing else re-reads it after the grab. bx/edx are
+    ; already proven == ems_free0/vcpi_free0 by the two checks above, so
+    ; reusing those instead of re-reading 42h/DE03 a third time is exact, not
+    ; an approximation.
+    mov ah, 0x08
+    call far [xms_entry]          ; DX = total free KB, post-release
+    movzx edx, dx
+    mov [xms_total0], edx
+    mov eax, [vcpi_free0]
+    shl eax, 2
+    mov ecx, [xms_total0]
+    sub ecx, eax
+    cmp ecx, VCPI_TOL_KB
+    ja f_xagree_vcpi1
+    movzx eax, word [ems_free0]
+    shl eax, 4
+    mov ecx, [xms_total0]
+    sub ecx, eax
+    cmp ecx, EMS_TOL_KB
+    ja f_xagree_ems1
+
     mov al, OK
     jmp sig
 
@@ -162,6 +238,19 @@ f_xms_alloc: mov al, 0xEC
              jmp sig
 f_emm_err:   mov al, 0xED
              jmp sig
+; Cross-interface consistency (new): baseline codes stop at 0xEF, post-
+; release at 0xF1, deliberately past every code above rather than woven in
+; among them, so a failure here reads unambiguously as "the three interfaces
+; disagree with each other," never as one more step in the grab/release
+; sequence.
+f_xagree_vcpi0: mov al, 0xEE      ; baseline: VCPI*4 KB vs XMS total KB
+                jmp sig
+f_xagree_ems0:  mov al, 0xEF      ; baseline: EMS*16 KB vs XMS total KB
+                jmp sig
+f_xagree_vcpi1: mov al, 0xF0      ; post-release: same check, same reason
+                jmp sig
+f_xagree_ems1:  mov al, 0xF1
+                jmp sig
 
 ; AL = exit code -> unit-tester exit port, then stop the machine.
 sig:
@@ -177,6 +266,7 @@ sig:
 align 4
 xms_entry:   dd 0
 vcpi_free0:  dd 0
+xms_total0:  dd 0                 ; reused at baseline and at post-release
 xms_handle:  dw 0
 xms_grab_kb: dw 0
 ems_free0:   dw 0

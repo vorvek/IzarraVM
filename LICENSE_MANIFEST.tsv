@@ -12,7 +12,7 @@ crates/izarravm-firmware/roms/dos/cdprot.com	generated-guest-binary	IzarraVM pro
 crates/izarravm-firmware/roms/dos/cdtest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c7df137b61df15960b111a313dada79d92e85a076f8d16afcc3b28f6428c4603
 crates/izarravm-firmware/roms/dos/cdtime.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	f5cbb4268baf525b1027522ec64e5b65d6b637703c107bd611004d786b33b44d
 crates/izarravm-firmware/roms/dos/echo.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4afb3163a32df36aaa90b742ef9f08a40a6ab9feec1d117fb6bfe9dd04626a7a
-crates/izarravm-firmware/roms/dos/emmprobe.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	17a9576f523036ebc36d639964b31102a4fd925471481c42de20631d62527586
+crates/izarravm-firmware/roms/dos/emmprobe.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	cb5a0e68137738b50216263c09606bb918e02d4a73d811ebfbe2e76f2512db70
 crates/izarravm-firmware/roms/dos/emsfrag.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	f1a5b3b2f9215822b0c82b5514b3c3d83449500c32c5013695d3dbff84d1b21b
 crates/izarravm-firmware/roms/dos/emsnone.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	f3425782f72e2c89589596f3718b1d3adefa09e4c4257a0bad3ca718da0f70c4
 crates/izarravm-firmware/roms/dos/emstest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	fe10d47e224629ac000ebd374997b7541003a33814d8c714f0184f01f307799b
