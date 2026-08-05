@@ -1732,18 +1732,23 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// EMS still owns a static 3 MB partition (tokaemm.asm EMS_MAX_PAGES = 192
-/// pages) and ef_alloc requires a handle's pages to land in one contiguous
-/// run (ems_find_run). This fixture drains that partition with 32 equal-size
-/// handles, frees every other one to leave 16 isolated 6-page (96 KB) holes,
-/// and proves -- via a real INT 67h probe, not arithmetic -- that no run
-/// bigger than a hole survived. It then asks for 8 pages (128 KB): today no
-/// single free run is that big, so EMS must refuse even though 96 pages (12x
-/// the request) are free in total. Task 6 replaces the static partition with
-/// non-contiguous per-page backing off the shared arena, at which point the
-/// same request must succeed by scattering its 8 logical pages across the
-/// holes -- proved here by writing and reading back a per-page signature
-/// through the frame after mapping each one.
+/// EMS backs its pages from the shared arena (Task 6): `ems_page_alloc` takes
+/// one 16 KB page at a time off the same bitmap XMS and VCPI draw from, so a
+/// handle's logical pages need not land in one contiguous run. This fixture
+/// proves that against a deliberately fragmented pool: it reads the pool's
+/// actual free count (`AH=42h`; there is no fixed-192-page partition to pin a
+/// baseline to any more, and the pool need not even start fully free -- the
+/// shell's own XMS-swap block for running this child may already hold part
+/// of it, which is now normal since EMS and XMS share one pool), derives a
+/// uniform hole size from that total split across 32 handles, drains the
+/// pool with those handles, and frees every other one to leave 16 isolated
+/// same-size holes. A real `INT 67h AH=43h` probe for one page more than a
+/// single hole then doubles as a discriminator rather than a hard gate: on
+/// the non-contiguous allocator it always succeeds (satisfying it only costs
+/// one free page at a time, not a run), so the fixture releases that probe
+/// handle and moves on to a fresh, larger request -- proved to succeed by
+/// writing and reading back a per-page signature through the frame after
+/// mapping each of its logical pages.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_ems_allocates_from_a_fragmented_shared_arena() {
@@ -1778,11 +1783,12 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         stop,
         StopReason::TestExit { code: 0xA5 },
         "fragmented-EMS allocation failed (stop={stop:?}); 0xEA is the \
-         defect this fixture exists to catch (EMS refused 8 pages while 96 \
-         were free, none of them contiguous), 0xE1-0xE9 name a setup or \
-         premise failure in the fixture itself (read emsfrag.asm), and \
-         0xEB-0xED mean EMS granted the pages but mapped one of them wrong \
-         -- read the failure-label block in emsfrag.asm before trusting any \
+         defect this fixture exists to catch (EMS refused a request that \
+         fit only non-contiguously, with plenty of pages free but none of \
+         them in one big enough run), 0xE1-0xE9 name a setup or premise \
+         failure in the fixture itself (read emsfrag.asm), and 0xEB-0xED \
+         mean EMS granted the pages but mapped one of them wrong -- read \
+         the failure-label block in emsfrag.asm before trusting any \
          particular story.\n{text}"
     );
 }

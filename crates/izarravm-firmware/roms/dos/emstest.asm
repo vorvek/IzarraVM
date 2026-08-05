@@ -36,15 +36,22 @@ start:
     cmp bx, 0xE000
     jne f_frame
 
-    ; 3. page counts (42h): total = free = 192 (the default 3 MB pool)
+    ; 3. page counts (42h): EMS now shares the arena with XMS/VCPI (Task 6),
+    ; so the total is no longer the fixed 192-page partition, and free is not
+    ; guaranteed to equal total even at the top of this program -- something
+    ; else (e.g. the shell's own XMS-swap block for running this child) may
+    ; already hold part of the pool, which is expected now that they share
+    ; one. Record both as this run's baseline instead of pinning a constant;
+    ; steps 12 and 14 check the DELTA against that baseline.
     mov ah, 0x42
     int 0x67
     or ah, ah
     jnz f_counts
-    cmp dx, 192
-    jne f_counts
-    cmp bx, 192
-    jne f_counts
+    cmp bx, dx
+    ja f_counts                   ; free > total is an impossible state
+    cmp bx, 16                    ; need enough headroom to allocate 4 pages
+    jb f_counts                   ; and still prove a count that moves
+    mov [ems_free0], bx
 
     ; 4. allocate 4 logical pages (43h) -> DX = handle
     mov ah, 0x43
@@ -133,12 +140,15 @@ start:
     cmp dword [es:0], PAT_B
     jne f_restore
 
-    ; 12. counts reflect the allocation (42h): free = 188 of 192
+    ; 12. counts reflect the allocation (42h): free dropped by exactly the 4
+    ; pages this program holds, from the baseline step 3 recorded.
     mov ah, 0x42
     int 0x67
     or ah, ah
     jnz f_counts2
-    cmp bx, 188
+    mov ax, [ems_free0]
+    sub ax, 4
+    cmp bx, ax
     jne f_counts2
 
     ; 13. pages for the handle (4Ch) = 4; open handles (4Bh) = 1
@@ -164,7 +174,7 @@ start:
     jnz f_free
     mov ah, 0x42
     int 0x67
-    cmp bx, 192
+    cmp bx, [ems_free0]
     jne f_free
     mov ah, 0x4B
     int 0x67
@@ -213,3 +223,4 @@ sig:
 .h: jmp .h
 
 handle: dw 0
+ems_free0: dw 0

@@ -3,95 +3,102 @@
 
 ; emsfrag.com: EMS allocation out of a deliberately fragmented pool.
 ;
-; Once Task 6 lands, EMS loses its static 3 MB partition and backs each
-; handle's logical pages one at a time off the same shared arena XMS and VCPI
-; already draw from (386MAX's ALLOCEMS: pop pages off a chain, no contiguity
-; requirement). Today, EMS still owns that static partition outright
-; (EMS_MAX_PAGES = 192 16 KB pages, tokaemm.asm ef_alloc/ems_find_run) and a
-; handle's pages must land in ONE contiguous run.
+; Task 6 backs each handle's logical pages one at a time off the same shared
+; arena XMS and VCPI draw from (386MAX's ALLOCEMS: pop pages off a chain, no
+; contiguity requirement) instead of the old static 3 MB partition
+; (EMS_MAX_PAGES = 192 16 KB pages) that required a handle's pages to land in
+; ONE contiguous run.
 ;
 ; A first draft of this fixture fragmented the shared XMS/VCPI arena (via
 ; INT 2Fh 4300/4310 and XMS AH=08h/09h) and then asked EMS for pages,
-; expecting the arena's holes to starve the request. That cannot work: EMS's
-; static partition sits physically above the arena (tokaemm.asm INIT computes
-; xms_pool_end = ems_phys_base) and ef_alloc never calls arena_alloc -- it
-; only walks ems_table. Proof, not assertion: the sibling emmprobe.asm fixture
-; already demonstrates this split. It grabs every free XMS kilobyte and checks
-; whether the EMS free count moves; today it fails at its own 0xE4 ("EMS free
-; did not move") specifically BECAUSE EMS is not on the arena yet. Fragmenting
-; the arena therefore proves nothing about EMS's allocator -- it only proves
-; what emmprobe.asm already proves, and does not touch the memory ef_alloc
-; actually searches.
+; expecting the arena's holes to starve the request. That could never work on
+; the pre-fix driver: EMS's static partition sat physically above the arena
+; and ef_alloc never called arena_alloc. So this fixture fragments EMS's OWN
+; pool through EMS's OWN interface (INT 67h AH=43h/45h) instead, which stays
+; meaningful on both sides of the change.
 ;
-; So this fixture fragments EMS's OWN pool through EMS's OWN interface
-; (INT 67h AH=43h/45h), which is the only interface wired to what ef_alloc
-; searches today, and which after Task 6 will draw from the arena instead.
+; Draining the pool used to mean 32 handles of a fixed 6 pages (32*6 ==
+; EMS_MAX_PAGES == 192, chosen so the drain empties the pool with nothing left
+; over). Post-fix, EMS draws from the WHOLE shared arena -- about 1456 pages on
+; the 24 MB profile, not 192 -- and that total is no longer a compile-time
+; constant: the pool is not even guaranteed to start fully free (COMMAND.COM's
+; own XMS-swap block for running this child, if the shell was built with
+; XMS-Swap support, legitimately holds part of it, and that is now NORMAL
+; because EMS and XMS share one pool). So the baseline reads the pool's actual
+; FREE count (AH=42h, BX) and derives the drain geometry from that instead of
+; from a hardcoded 192:
+;   hole_pages = free / EMS_HANDLES (32), remainder = free mod EMS_HANDLES.
+;   Handle 0 (an EVEN index, so the punch below never frees it) also carries
+;   the remainder, so every ODD-indexed "hole" handle is exactly hole_pages --
+;   uniform hole sizes are what let a single "hole_pages + 1" probe below mean
+;   anything.
 ;
-; TASK 6 MUST EDIT THIS FIXTURE, not merely watch it go green. Three things
-; below are pinned to the pre-fix world. Each fails loudly instead of passing
-; for the wrong reason, which is the intended failure mode, but each has to be
-; re-derived before this can ever report 0xA5:
-;   0xE4  the baseline pins the pool at 192 pages. Task 6 derives ems_pages
-;         from the arena (about 1456 on the 24 MB profile). Read the total from
-;         AH=42h and split it across EMS_HANDLES instead. Do NOT just delete
-;         the check: draining EXACTLY the pool is what leaves no contiguous
-;         tail, and a tail satisfies the request without any fragmentation.
-;   0xE6  the drain is 32 * 6, which empties a 192-page pool and nothing else.
-;   0xE9  the premise probe requires AH=43h(7) to FAIL, which holds only while
-;         the allocator demands contiguity. After Task 6 it SUCCEEDS, so the
-;         probe has to become a discriminator (fails -> pre-fix, expect 0xEA
-;         below; succeeds -> post-fix, release it and require the real request
-;         to succeed) rather than the hard gate it is today.
-;
-; Shape: EMS_MAX_PAGES is a fixed 192-page pool and EMS_HANDLES is a fixed 32
-; slots (both from tokaemm.asm), and 32 * 6 = 192 exactly, so a drain of 32
-; handles of 6 pages each empties the pool completely with no leftover
-; contiguous tail -- the exact flaw both superseded designs missed: an
-; untouched remainder anywhere satisfies the request without exercising
-; fragmentation at all. Freeing every other handle then leaves 16 free runs of
-; 6 pages (96 KB) each, none of which can satisfy an 8-page (128 KB) request,
-; while 16 * 6 = 96 pages are free in total -- twelve times what is asked for.
-;
-; The premise (no run >= 7 pages survives the punch) is proved by an actual
-; INT 67h AH=43h(7) probe, not by trusting the arithmetic above: if a 7-page
-; run existed, the probe would succeed and the fixture stops with a premise
-; code distinct from the defect code, rather than silently drawing the wrong
-; conclusion from the real 8-page request that follows.
+; The premise probe (does a run bigger than one hole exist?) used to be a hard
+; gate: it had to FAIL, because the old allocator demanded a contiguous run and
+; no single 6-page hole could satisfy a 7-page ask. Once backing is
+; non-contiguous that stops being true: EMS only ever takes pages one at a
+; time now (ems_page_alloc, 16 granules per call), so "hole_pages + 1 pages"
+; is satisfiable the instant hole_pages+1 free 16 KB units exist ANYWHERE in
+; the pool -- which they do, since the 16 punched holes total far more than
+; that. So the probe is a DISCRIMINATOR, not a gate:
+;   fails (0x88)  -> the driver still demands contiguity; a bigger WANT_PAGES
+;                    request cannot possibly do better, so signal the defect
+;                    (0xEA) directly without even trying it.
+;   succeeds      -> backing is non-contiguous. Free the probe's handle back
+;                    (it only existed to prove the point) and make the real,
+;                    dedicated WANT_PAGES request, then prove per-page
+;                    signatures survive it.
 ;
 ; Signals 0xA5 (success) via the unit-tester exit port; 0xEn names the step.
-; 0xEA is the headline code: EMS refused an 8-page request while 96 pages
+; 0xEA is the headline code: EMS refused a request while enough total pages
 ; were free, because none of them were contiguous -- the defect Task 6 fixes.
 ;
 ; Build: nasm -f bin emsfrag.asm -o emsfrag.com
 cpu 386
-EMS_HOLE_PAGES    equ 6               ; pages per drain handle == the max single
-                                      ; free run once every other is freed
-EMS_DRAIN_HANDLES equ 32              ; == tokaemm.asm EMS_HANDLES; also drains
-                                      ; the pool exactly (32*6 == EMS_MAX_PAGES)
-WANT_PAGES        equ 8               ; 128 KB; > EMS_HOLE_PAGES so no single
-                                      ; hole can satisfy it, and comfortably
-                                      ; less than the 96 pages left free
+EMS_DRAIN_HANDLES equ 32              ; == tokaemm.asm EMS_HANDLES
 FRAME_SEG         equ 0xE000          ; tokaemm.asm EMS_FRAME_SEG (fixed frame)
 org 0x100
 %define OK 0xA5
 
 start:
-    ; --- baseline: the pool must be exactly the fixed shape this fixture
-    ; drains, and nothing must already hold a page -----------------------
+    ; --- baseline: read the pool's ACTUAL free count. That is the working
+    ; total for this fixture, not the fixed grand total (AH=42h's DX): the
+    ; shared arena is not guaranteed to start fully free now that EMS draws on
+    ; the same pool XMS does, and that is expected, not a setup error. -------
     mov ah, 0x42                  ; get page counts: BX=free, DX=total
     int 0x67
     or ah, ah
     jnz f_noems
     cmp bx, dx
-    jne f_baseline_dirty          ; something already holds EMS pages
-    cmp dx, EMS_DRAIN_HANDLES * EMS_HOLE_PAGES
-    jne f_baseline_shape          ; pool is not the fixed 192-page shape
+    ja f_baseline_dirty           ; free > total is an impossible/corrupt state
+    cmp bx, EMS_DRAIN_HANDLES * 2 ; need >=2 pages/handle or the hole/probe
+    jb f_baseline_shape           ; geometry below is not meaningful
 
-    ; --- drain: 32 handles of 6 pages each, empties the pool exactly ----
+    mov ax, bx                    ; AX = free pages at baseline
+    xor dx, dx
+    mov cx, EMS_DRAIN_HANDLES
+    div cx                        ; AX = free / 32, DX = free mod 32
+    mov [hole_pages], ax
+    mov [remainder], dx
+
+    mov ax, [hole_pages]          ; want_pages ~= 1.5x a hole: bigger than any
+    mov cx, ax                    ; single hole, comfortably under the total
+    shr cx, 1                     ; free left after the punch (16 holes' worth)
+    add ax, cx
+    inc ax
+    mov [want_pages], ax
+
+    ; --- drain: EMS_DRAIN_HANDLES handles. Index 0 (even, so the punch below
+    ; never frees it) also carries the remainder, so every ODD index is
+    ; exactly hole_pages -- the uniform hole size the discriminator needs. ---
     xor si, si
 .drain:
+    mov bx, [hole_pages]
+    or si, si
+    jnz .drain_alloc
+    add bx, [remainder]
+.drain_alloc:
     mov ah, 0x43
-    mov bx, EMS_HOLE_PAGES
     int 0x67
     or ah, ah
     jnz f_drain
@@ -110,9 +117,8 @@ start:
     jnz f_drain_incomplete
 
     ; --- punch holes: free every other handle (odd table index) --------
-    ; equal-size handles + alternating release == 16 isolated 6-page holes,
-    ; none adjacent (their neighbours are still-allocated 6-page walls), so
-    ; no leftover contiguous run survives anywhere in the pool.
+    ; equal-size handles + alternating release == 16 isolated hole_pages
+    ; holes, none adjacent (their neighbours are still-allocated walls).
     mov si, 1
 .punch:
     mov bx, si
@@ -132,31 +138,32 @@ start:
     int 0x67
     or ah, ah
     jnz f_emm_err
-    cmp bx, WANT_PAGES
+    cmp bx, [want_pages]
     jb f_premise_total
 
-    ; a run one page bigger than a single hole must NOT be allocatable, or
-    ; the punch did not create the fragmentation this fixture depends on.
+    ; --- discriminator: one page bigger than a single hole ---------------
     mov ah, 0x43
-    mov bx, EMS_HOLE_PAGES + 1
+    mov bx, [hole_pages]
+    inc bx
     int 0x67
     or ah, ah
-    jz f_premise_run              ; succeeded: a bigger run exists than meant
-    cmp ah, 0x88
-    jne f_emm_err                 ; some other EMM status, not the expected one
-
-    ; --- the real test: today this must be refused; after Task 6 it must
-    ; succeed by scattering the 8 logical pages across the 16 free holes --
-    mov ah, 0x43
-    mov bx, WANT_PAGES
-    int 0x67
-    or ah, ah
-    jz .allocated
+    jz .probe_ok
     cmp ah, 0x88
     je f_refused                  ; THE DEFECT: contiguous-only allocator
-    jmp f_emm_err
+    jmp f_premise_status          ; some other EMM status, not one of the two
+                                   ; the discriminator knows how to read
+.probe_ok:
+    mov ah, 0x45                  ; release the probe's handle (DX, still set
+    int 0x67                      ; from the successful 43h above): it only
+    or ah, ah                     ; existed to prove the point
+    jnz f_emm_err
 
-.allocated:
+    ; --- the real test: scatter want_pages logical pages across the holes -
+    mov ah, 0x43
+    mov bx, [want_pages]
+    int 0x67
+    or ah, ah
+    jnz f_emm_err
     mov [ems_handle], dx
 
     ; --- prove the mapping: signature each logical page, then verify -----
@@ -176,7 +183,7 @@ start:
     mov [es:0], ax
     mov [es:0x3FFE], ax           ; and again at the page's last word
     inc si
-    cmp si, WANT_PAGES
+    cmp si, [want_pages]
     jb .write
 
     xor si, si
@@ -197,7 +204,7 @@ start:
     cmp [es:0x3FFE], ax
     jne f_verify
     inc si
-    cmp si, WANT_PAGES
+    cmp si, [want_pages]
     jb .read
 
     ; --- release everything ----------------------------------------------
@@ -230,10 +237,10 @@ f_emm_err:           mov al, 0xE2
                      jmp sig
 
 ; --- baseline shape: the pool is not what this fixture was built for ----
-f_baseline_dirty:    mov al, 0xE3   ; something already held EMS pages
+f_baseline_dirty:    mov al, 0xE3   ; free > total: impossible/corrupt state
                      jmp sig
-f_baseline_shape:    mov al, 0xE4   ; total pages != 192; drain math would lie
-                     jmp sig
+f_baseline_shape:    mov al, 0xE4   ; free pool too small for this fixture's
+                     jmp sig        ; per-handle geometry (< 2 pages/handle)
 
 ; --- drain: could not empty the pool as designed -------------------------
 f_drain:             mov al, 0xE5   ; a drain-loop alloc failed early
@@ -248,12 +255,12 @@ f_punch:             mov al, 0xE7
 ; --- premise: the fixture's own setup did not achieve its precondition --
 f_premise_total:     mov al, 0xE8   ; not enough total free after punching
                      jmp sig
-f_premise_run:       mov al, 0xE9   ; a bigger-than-hole run survived the punch
-                     jmp sig        ; (NOT the defect: the fixture's own setup)
+f_premise_status:    mov al, 0xE9   ; discriminator probe returned neither
+                     jmp sig        ; success nor 0x88
 
 ; --- THE DEFECT: this is the code Task 6 exists to stop producing -------
-f_refused:           mov al, 0xEA   ; EMS refused 8 pages with 96 free: no
-                     jmp sig        ; single free run was big enough
+f_refused:           mov al, 0xEA   ; EMS refused hole_pages+1 pages while
+                     jmp sig        ; enough were free: no single run big enough
 
 ; --- reachable only once EMS actually grants the fragmented request -----
 f_map:               mov al, 0xEB
@@ -276,5 +283,8 @@ sig:
     out 0xE6, al                  ; CMD_EXIT
 .h: jmp .h
 
+hole_pages:  dw 0
+remainder:   dw 0
+want_pages:  dw 0
 ems_handle:  dw 0
 ems_handles: times EMS_DRAIN_HANDLES dw 0

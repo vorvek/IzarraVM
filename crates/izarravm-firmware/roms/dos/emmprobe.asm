@@ -76,27 +76,35 @@ start:
     mov [xms_handle], dx
 
     ; --- both counts must now read (near) zero ----------------------------
-    ; "Near": the arena can retain a sub-page tail that no 16 KB EMS page or
-    ; 4 KB VCPI page fits in, so demand only that each dropped below one
-    ; sixteenth of its baseline, which no honest shared pool can fail and no
-    ; static partition can pass. An INT 67h status failure here is an EMM
-    ; error, not the defect -- keep it out of the codes that name the defect.
+    ; Absolute page-count ceilings, not a proportion of the baseline (Task 6
+    ; step 12). A "drop below 1/16 of baseline" bar scales the WRONG way --
+    ; tolerance grows with installed RAM, so on a big enough machine a
+    ; regression that leaves a real megabyte of pool unshared would still
+    ; read as a pass. Measured directly with the tracer against the Task 6
+    ; driver, 2026-08-05, 24 MB profile (IZARRAVM_INT_TRACE=67, one XMS grab
+    ; that empties the arena's one remaining contiguous run per the guard
+    ; above): EMS post-grab BX and VCPI post-grab EDX both read EXACTLY 0 --
+    ; a single grab of the one free run leaves nothing behind at any
+    ; granularity, which is what the shared bitmap makes possible now. The
+    ; ceilings below are that measured 0 plus a small fixed margin, matched
+    ; in KB across the two units (8 EMS pages = 128 KB, 32 VCPI pages = 128
+    ; KB) rather than scaled by pool size, so growing the arena cannot loosen
+    ; this test. An INT 67h status failure here is an EMM error, not the
+    ; defect -- keep it out of the codes that name the defect.
+    EMS_RESIDUE_MAX  equ 8         ; 16 KB pages;  128 KB margin above the 0
+    VCPI_RESIDUE_MAX equ 32        ; 4 KB pages;   measured residue (see above)
     mov ah, 0x42
     int 0x67
     or ah, ah
     jnz f_emm_err
-    mov ax, [ems_free0]
-    shr ax, 4
-    cmp bx, ax
+    cmp bx, EMS_RESIDUE_MAX
     jae f_ems_hold                ; EMS free did not move -> the defect
 
     mov ax, 0xDE03
     int 0x67
     or ah, ah
     jnz f_emm_err
-    mov eax, [vcpi_free0]
-    shr eax, 4
-    cmp edx, eax
+    cmp edx, VCPI_RESIDUE_MAX
     jae f_vcpi_hold               ; VCPI free did not move
 
     ; --- release, and both counts must come back exactly -------------------

@@ -584,6 +584,8 @@ arena_alloc:
     ret
 
 ; Mark CX granules from granule AX as allocated. Preserves every register.
+; Bumps arena_gen (D1): every query cache is invalid the instant the bitmap
+; changes, and this is one of the two 16-bit-side places it does.
 arena_mark:
     push ax
     push cx
@@ -593,12 +595,14 @@ arena_mark:
     inc ax
     dec cx
     jnz .next
+    inc dword [cs:arena_gen]
 .done:
     pop cx
     pop ax
     ret
 
-; Release CX granules from granule AX. Preserves every register.
+; Release CX granules from granule AX. Preserves every register. Bumps
+; arena_gen (D1); see arena_mark.
 arena_release:
     push ax
     push cx
@@ -608,6 +612,7 @@ arena_release:
     inc ax
     dec cx
     jnz .next
+    inc dword [cs:arena_gen]
 .done:
     pop cx
     pop ax
