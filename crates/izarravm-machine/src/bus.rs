@@ -102,6 +102,47 @@ impl Machine {
         bus.read_phys_u8(address).unwrap_or(0)
     }
 
+    /// Read one byte at a LINEAR address, walking the guest's own page tables
+    /// when paging is on. `None` means the address is not mapped.
+    ///
+    /// Host-side diagnostics only, and deliberately not the CPU's own
+    /// `translate_linear`: that one is not a probe. It sets CR2 on a miss,
+    /// issues charged page-walk bus reads, and writes accessed bits back into
+    /// guest memory through a path that reaches `note_code_write`. A dump that
+    /// mutates the state it is dumping is worse than no dump.
+    ///
+    /// Reading a linear address as if it were physical is the bug this exists
+    /// to stop, and it is a quiet one: it returns plausible bytes rather than
+    /// failing, so the reader believes them. It has already been made once,
+    /// against Doom under JemmEx, which maps non-identity.
+    ///
+    /// One limit remains, and callers should not paper over it: an unbacked but
+    /// MAPPED address reads as 0xFF here, because that is what the bus fills
+    /// for open bus and for anything past installed RAM. `None` distinguishes
+    /// untranslatable, not unbacked.
+    pub fn read_linear_u8(&mut self, linear: u32) -> Option<u8> {
+        if self.cpu.control.cr0 & 0x8000_0000 == 0 {
+            return Some(self.read_physical_u8(linear));
+        }
+        let directory = self.cpu.control.cr3 & !0xfff;
+        let pde = self.read_physical_u32(directory + (linear >> 22) * 4);
+        if pde & 1 == 0 {
+            return None;
+        }
+        let physical = if pde & 0x80 != 0 {
+            // PSE: a 4 MB page maps its whole range from the directory entry,
+            // with no page table to consult.
+            (pde & 0xffc0_0000) | (linear & 0x003f_ffff)
+        } else {
+            let pte = self.read_physical_u32((pde & !0xfff) + ((linear >> 12) & 0x3ff) * 4);
+            if pte & 1 == 0 {
+                return None;
+            }
+            (pte & !0xfff) | (linear & 0xfff)
+        };
+        Some(self.read_physical_u8(physical))
+    }
+
     pub fn read_physical_u16(&mut self, address: u32) -> u16 {
         let mut bus = self.make_bus();
         bus.read_memory(address, BusWidth::Word, BusAccessKind::DataRead)

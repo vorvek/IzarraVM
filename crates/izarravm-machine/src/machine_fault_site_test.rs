@@ -44,6 +44,117 @@ fn a_fatal_port_fault_names_the_faulting_instruction_not_the_next_one() {
     );
 }
 
+/// The byte dump used to hand a LINEAR address to `read_physical_u8`, which
+/// does no page walk, so under paging it printed whatever happened to sit at
+/// that physical address. It never said so; it printed plausible hex either
+/// way, which is the failure mode that makes a diagnostic worse than useless.
+///
+/// The fixture puts the faulting code in a page whose linear address is NOT its
+/// physical one, and plants a decoy at the physical address. The decoy is what
+/// makes this test able to fail: without it, an unfixed dump reading the
+/// physical address would find zeros, and "not the instruction" and "zeros"
+/// would be indistinguishable from a correct read of an unmapped page. The
+/// precondition assertion pins that the decoy really is where the broken path
+/// would look.
+#[test]
+fn the_fault_dump_reads_code_through_the_guest_page_tables() {
+    const PD: u32 = 0x1000;
+    const PT: u32 = 0x2000;
+    // Linear page 5 is mapped to a frame at 0x9000, so linear != physical for
+    // the code the dump has to find.
+    const CODE_LINEAR: u32 = 0x5000;
+    const CODE_FRAME: u32 = 0x9000;
+    // mov edx,0x2010; in al,dx; hlt. CS here is a 32-bit descriptor, so the
+    // immediate is four bytes: the 16-bit encoding would swallow the IN as part
+    // of it and the fixture would run off into unmapped memory.
+    const PROG: [u8; 7] = [0xBA, 0x10, 0x20, 0x00, 0x00, 0xEC, 0xF4];
+    const DECOY: u8 = 0xA5;
+
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4]).unwrap();
+    machine.write_physical_u32(PD, PT | 7);
+    // Identity-map the whole first 4 MB, so nothing in the fixture can take a
+    // page fault for an unrelated reason, and override exactly one page.
+    for page in 0u32..1024 {
+        let pte = if page == CODE_LINEAR >> 12 {
+            CODE_FRAME | 7
+        } else {
+            (page << 12) | 7
+        };
+        machine.write_physical_u32(PT + page * 4, pte);
+    }
+    for (offset, byte) in PROG.iter().enumerate() {
+        machine.write_physical_u8(CODE_FRAME + offset as u32, *byte);
+    }
+    // The decoy sits where the unfixed, identity-assuming dump would read.
+    for offset in 0..PROG.len() as u32 {
+        machine.write_physical_u8(CODE_LINEAR + offset, DECOY);
+    }
+    assert_eq!(
+        machine.read_physical_u8(CODE_LINEAR),
+        DECOY,
+        "precondition: the physical address must hold the decoy, or this test \
+         cannot tell a paging-aware read from an identity-assuming one"
+    );
+
+    machine.cpu.control.cr3 = PD;
+    machine.cpu.control.cr0 |= 0x8000_0001;
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x08, 0x9b));
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        machine
+            .cpu
+            .registers
+            .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+    }
+    machine.cpu.registers.eip = CODE_LINEAR;
+    // No IDT is set up here, so a timer IRQ arriving mid-fixture would stop the
+    // run on a nested delivery fault before the IN is ever reached. Mask it;
+    // this fixture is about the dump, not about interrupt delivery.
+    machine.cpu.registers.eflags &= !0x200;
+
+    let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert!(
+        matches!(&stop, StopReason::CpuError(text) if text.contains("0x2010")),
+        "expected the undecoded-port stop, got {stop:?}"
+    );
+
+    let error = CpuError::Bus(izarravm_bus::BusError::UnsupportedPort { port: 0x2010 });
+    let report = machine.fault_trace_report(&error);
+    let at_eip = report
+        .lines()
+        .find(|line| line.contains("bytes at/after EIP"))
+        .expect("the report must carry the bytes at EIP");
+    let before_eip = report
+        .lines()
+        .find(|line| line.contains("bytes before EIP"))
+        .expect("the report must carry the bytes before EIP");
+
+    // The window opens ON the IN, so at/after starts with the IN and the HLT
+    // behind it, and the MOV that set up DX is in the window before. All of it
+    // lives in the mapped frame, so none of it is reachable without the walk.
+    assert!(
+        at_eip.contains("ec f4"),
+        "the dump must walk the page tables to the real instruction, got: {at_eip}"
+    );
+    assert!(
+        before_eip.contains("ba 10 20 00 00"),
+        "the preceding window must walk too, got: {before_eip}"
+    );
+    assert!(
+        !at_eip.contains("a5") && !before_eip.contains("a5"),
+        "the dump read the physical address instead of translating:\n{before_eip}\n{at_eip}"
+    );
+}
+
 /// The record must not survive into a run that did not fault. Nothing clears
 /// it, because a fatal CpuError leaves the machine resumable and callers that
 /// ignore the stop reason go on running it, so the guarantee is on the READ
