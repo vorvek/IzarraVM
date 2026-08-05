@@ -661,8 +661,13 @@ impl Machine {
                 } else {
                     ""
                 };
+                // "faulting CS:IP", not "CS:IP": the CLI prints its own CS:IP
+                // line for every stop, and that one is the live register, which
+                // for a fault is the NEXT instruction. Two unlabelled addresses
+                // differing by an instruction length is how this bug gets made
+                // a second time.
                 format!(
-                    "fault: {error} at CS:IP={:#06x}:{:#010x} linear={linear:#010x} \
+                    "fault: {error} at faulting CS:IP={:#06x}:{:#010x} linear={linear:#010x} \
                      bytes=[{}]{moved}. Set IZARRAVM_FAULT_TRACE for the full dump.",
                     record.cs.selector,
                     record.eip,

@@ -576,6 +576,32 @@ fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
         }),
         "{result:?}"
     );
+
+    // The raise site recorded for the machine's stop report must be the
+    // instruction that faulted, and must be recorded exactly once. The
+    // exception arm rewinds EIP before delivery, and `deliver_exception` loads
+    // CS and sets EIP last, so the rewound value is still live on every error
+    // path out of it. Rewinding a second time here would be wrong, and reading
+    // the live registers instead would report whatever delivery had reached.
+    // This one has been watched failing: deleting the record call on the nested
+    // path drops it to None.
+    let site = cpu2
+        .fault_site()
+        .expect("a nested delivery fault must record its raise site");
+    // These two have NOT been watched failing, and the honest reason is worth
+    // more than the appearance of a guard. In this scenario the nested fault is
+    // the frame push's own #PF, which happens before delivery reaches either the
+    // CS load or the EIP write, so the pre-delivery snapshot and the live
+    // registers are equal and no mutation tried could separate them (recording
+    // live registers here, and moving `set_eip` ahead of the CS load in
+    // `deliver_exception`, both left this green). They pin the invariant for a
+    // future change that advances EIP earlier in delivery. Treat them as
+    // documentation with teeth, not as a proven guard.
+    assert_eq!(
+        site.eip, start_eip,
+        "the site must be the faulting instruction, not a point inside delivery"
+    );
+    assert_eq!(site.cs.selector, start_cs);
 }
 
 #[test]
@@ -661,4 +687,41 @@ fn v86_io_bitmap_check_reads_through_a_non_identity_mapped_tss() {
         "the I/O-bitmap trap must be read through the aliased TSS mapping"
     );
     assert_eq!(cpu.registers.cs().selector, R0_CS);
+}
+
+/// The third site that raises a fatal `CpuError` is interrupt delivery, and it
+/// is the one where the faulting-instruction rule does NOT apply: an IRQ is
+/// asynchronous and is taken at an instruction boundary, so the boundary itself
+/// is the right thing to report. Rewinding it, or reporting the instruction
+/// before it, would name code that had already retired successfully.
+///
+/// Watched failing: dropping the record call on this path leaves `fault_site`
+/// as None and the expect below fires.
+#[test]
+fn a_fatal_fault_delivering_an_irq_reports_the_boundary_it_was_taken_at() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0x90, 0xf4], &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+    // Shrink the IDT so vector 0x30's gate is out of range: delivery then fails
+    // with IdtLimit, which is fatal rather than a deliverable exception.
+    cpu.idtr.limit = 0x20;
+    cpu.set_flag(FLAG_IF, true);
+    bus.pending_irq = Some(0x30);
+
+    let boundary_eip = cpu.registers.eip;
+    let boundary_cs = cpu.registers.cs().selector;
+    let result = cpu.service_pending_interrupt(&mut bus);
+
+    assert!(
+        matches!(result, Err(CpuError::IdtLimit { vector: 0x30 })),
+        "{result:?}"
+    );
+    let site = cpu
+        .fault_site()
+        .expect("a fatal fault in IRQ delivery must record its raise site");
+    assert_eq!(
+        site.eip, boundary_eip,
+        "an asynchronous interrupt has no faulting instruction, so the site is \
+         the boundary the IRQ was taken at"
+    );
+    assert_eq!(site.cs.selector, boundary_cs);
 }
