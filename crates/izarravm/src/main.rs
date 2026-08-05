@@ -1190,6 +1190,7 @@ fn opl_diagnostics_json(
             "reg": e.register,
             "val": e.value,
             "clk": e.core_clocks,
+            "us": e.pending_micros,
         })).collect::<Vec<_>>(),
     })
 }

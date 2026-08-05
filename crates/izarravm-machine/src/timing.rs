@@ -950,6 +950,36 @@ impl MachineBus<'_> {
         candidate_dots.checked_sub(current_dots)
     }
 
+    /// The OPL status byte at the current point in the batch, without stepping
+    /// the chip. The lazy-path analogue of `predicted_beam`, and it exists for
+    /// the same reason: in the Approximate class devices only advance at batch
+    /// end, so a status read taken mid-batch would otherwise report the state
+    /// the chip had when the batch STARTED.
+    ///
+    /// That is not a nicety. AdLib detection starts timer 1 (one 80 us step),
+    /// runs a fixed delay loop, then reads status ONCE. The delay loop is pure
+    /// computation, so it never ends the batch, and the read used to see the
+    /// pre-delay flags and conclude no card was present -- which is why AdLib
+    /// music was silent on 486 and 586 while the exact-timing 386 modes, whose
+    /// devices advance per instruction, played it fine.
+    ///
+    /// Unlike `predicted_beam` this folds in `isa_io_clocks`. The batch-end
+    /// advance adds that accrual to the batch total, and it is charged ONLY on
+    /// OPL polls, so including it here is what makes the peek agree with the
+    /// advance that follows -- and excluding it from the beam peek stays right
+    /// for the same reason.
+    ///
+    /// With nothing pending this is exactly `OplChip::status()`: `expired_after`
+    /// with a zero elapsed reduces to the live `expired` flag, because `advance`
+    /// leaves `accumulated_us` below one step.
+    /// Returns the predicted byte and the microseconds it was predicted at, so
+    /// the OPL trace can record what the read actually saw.
+    pub(super) fn predicted_opl_status(&self) -> (u8, u64) {
+        let clocks = self.in_batch_clocks().saturating_add(*self.isa_io_clocks);
+        let micros = self.timeline_at_batch_start.preview_microseconds(clocks);
+        (self.opl.status_after(micros), micros)
+    }
+
     /// Batch-scoped CPU clocks elapsed so far. Beam and PIT predictions share
     /// this conversion so they use the same core total, bus scaling, and carry.
     fn in_batch_clocks(&self) -> u64 {

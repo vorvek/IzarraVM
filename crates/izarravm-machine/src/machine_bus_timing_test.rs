@@ -980,9 +980,13 @@ fn opl_status_read_sets_io_touched_in_every_cpu_mode() {
 }
 
 #[test]
-fn opl_status_read_returns_the_live_status_byte_in_approximate_mode() {
-    // 486/586 still use exact OPL status reads. Pin the byte value as well
-    // as the batch-ending behavior on an active timer.
+fn opl_status_read_matches_the_live_byte_when_no_device_time_is_pending() {
+    // The Approximate class predicts the status byte from un-applied device
+    // time (see `predicted_opl_status`). With NOTHING pending -- which is the
+    // case here, because run_cycles below commits the advance before the read
+    // -- the prediction must reduce exactly to the live byte: `expired_after(0)`
+    // is the live `expired` flag, since `advance` leaves `accumulated_us` below
+    // one step. Pin that equality, and the batch-ending behaviour with it.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw486);
     with_bus(&mut machine, |bus| {
@@ -2381,4 +2385,76 @@ fn port_61_reports_out_gate_enable_and_refresh() {
         saw_low,
         "refresh bit (4) pulses low once per refresh period"
     );
+}
+
+#[test]
+fn opl_status_read_predicts_the_timer_from_un_applied_batch_time() {
+    // In the Approximate class devices advance only at batch end, so a status
+    // read taken mid-batch used to report the state the chip had when the batch
+    // STARTED. AdLib detection starts timer 1 (one 80us step), runs a fixed
+    // delay loop that never ends the batch because it is pure computation, then
+    // reads status ONCE -- and always saw the pre-delay flags.
+    //
+    // The third read_io argument is the CPU's in-batch core clocks, which is
+    // what the prediction converts to elapsed microseconds.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap(); // latch reg 0x04
+        bus.write_io(0x389, BusWidth::Byte, 0x80, false).unwrap(); // reset flags
+        bus.write_io(0x388, BusWidth::Byte, 0x02, false).unwrap(); // latch reg 0x02
+        bus.write_io(0x389, BusWidth::Byte, 0xff, false).unwrap(); // preset: one step
+        bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap(); // latch reg 0x04
+        bus.write_io(0x389, BusWidth::Byte, 0x21, false).unwrap(); // unmask + start
+    });
+
+    // Immediately: the 80us step cannot have elapsed, so no overflow yet.
+    let immediate = with_bus(&mut machine, |bus| {
+        bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap()
+    });
+    assert_eq!(
+        immediate & 0x40,
+        0,
+        "timer 1 cannot have expired at zero time"
+    );
+
+    // A whole millisecond of in-batch CPU clocks later, still without any batch
+    // end, the read must see the overflow. 66_000 clocks is ~1 ms at 66 MHz,
+    // comfortably past the single 80 us step.
+    let predicted = with_bus(&mut machine, |bus| {
+        bus.read_io(0x388, BusWidth::Byte, 66_000, false).unwrap()
+    });
+    assert_ne!(
+        predicted & 0x40,
+        0,
+        "timer 1 overflow must be visible from un-applied batch time; without \
+         the prediction this read returns the stale batch-start flags and AdLib \
+         detection fails on every fast persona"
+    );
+    assert_ne!(
+        predicted & 0x80,
+        0,
+        "the IRQ bit accompanies an unmasked overflow"
+    );
+}
+
+#[test]
+fn opl_status_read_stays_live_in_the_accurate_class() {
+    // The 386 class advances devices per instruction, so there is never
+    // un-applied time to predict from and the byte must stay exactly live --
+    // the prediction is an Approximate-class path only. A control for the test
+    // above: same sequence, same in-batch clocks, no overflow conjured.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x388, BusWidth::Byte, 0x02, false).unwrap();
+        bus.write_io(0x389, BusWidth::Byte, 0xff, false).unwrap();
+        bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap();
+        bus.write_io(0x389, BusWidth::Byte, 0x21, false).unwrap();
+    });
+    let value = with_bus(&mut machine, |bus| {
+        bus.read_io(0x388, BusWidth::Byte, 66_000, false).unwrap()
+    });
+    let live = u32::from(machine.opl.status());
+    assert_eq!(value, live, "the Accurate class must read the live byte");
 }

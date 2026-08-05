@@ -1518,10 +1518,20 @@ impl CpuBus for MachineBus<'_> {
                 *self.isa_io_clocks += isa_io_clocks(self.active_mode);
             }
             // The chip drives only the status byte on reads; data ports read open-bus.
-            let value = self.opl.read_port(resolved).unwrap_or(0xff);
+            //
+            // In the Approximate class the chip has not been stepped since the
+            // batch started, so read the PREDICTED status instead of the live
+            // one -- see `predicted_opl_status`. The Accurate 386 class advances
+            // devices per instruction and keeps the live byte, byte-identically.
+            let (value, pending_micros) =
+                if self.lazy_port_reads && matches!(resolved, 0x0388 | 0x038a) {
+                    self.predicted_opl_status()
+                } else {
+                    (self.opl.read_port(resolved).unwrap_or(0xff), 0)
+                };
             // Diagnostic only; records the guest's own port, not the resolved one.
             self.opl_probe
-                .record_read(port, value, self.core_clocks_so_far);
+                .record_read(port, value, self.core_clocks_so_far, pending_micros);
             return Ok(u32::from(value));
         }
         // DSP status reads are intentionally exact. SB reset/probe code polls
