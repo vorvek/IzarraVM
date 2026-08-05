@@ -984,6 +984,17 @@ impl CpuGsw {
         let _ = enabled;
     }
 
+    /// Set the 16-bit code-segment admission level (see `sixteen_bit_admission_level`).
+    /// Seeded from `IZARRAVM_JIT16`; this is the programmatic form fixtures drive.
+    pub fn set_sixteen_bit_admission_level(&mut self, level: u8) {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.sixteen_bit_level = level;
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = level;
+    }
+
     /// Always available, unlike the census: see `DirectStallSnapshot`.
     pub fn direct_stall_snapshot(&self) -> crate::DirectStallSnapshot {
         #[cfg(feature = "jit")]

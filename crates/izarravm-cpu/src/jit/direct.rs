@@ -3884,41 +3884,67 @@ const fn jit_admits_non_continuable(opcode: u16) -> bool {
     matches!(opcode, 0x69 | 0x6b)
 }
 
-/// Opt-in admission level for the 16-bit / ROM spike. Default 0 is the shipped
-/// behaviour and nothing this gates can happen without the variable set.
+/// Admission level for 16-bit code segments. **DEFAULT 1 since the 486 measurement**; it used to
+/// be 0, and the doc comment used to say "this exists to price a lever, not to ship".
 ///
+///   0  refuse every 16-bit code segment (the old default, still the off switch)
 ///   1  admit 16-bit (CS.D = 0) code segments backed by ordinary RAM
 ///   2  additionally admit the 0xC0000..0x100000 option-ROM + BIOS window
 ///
-/// This exists to price a lever, not to ship: an idle DOS prompt spends 100% of
-/// its instructions in 16-bit code, and the hottest addresses in it are the BIOS
-/// INT 16h service in ROM, so the two gates below are the whole non-game
-/// workload. Level 2 deliberately stops at 0xC0000 and leaves 0xA0000..0xC0000
-/// (VGA memory) refused: that half of the window is a device aperture with read
-/// side effects, and it is the half the original guard was really about.
+/// Level 2 deliberately stops at 0xC0000 and leaves 0xA0000..0xC0000 (VGA memory) refused: that
+/// half of the window is a device aperture with read side effects, and it is the half the original
+/// guard was really about.
 ///
-/// 586 only in practice, because `key_for_phys`'s persona clause below already
-/// refuses `!d` everywhere else, for the reason documented there.
+/// **Level 2 is measured WASTE and should not be used.** On a PoP boot it produces 531 extra
+/// compile attempts and ZERO extra installs, because `install`'s page-cover check wants a RAM
+/// direct page and ROM is not one. The admission gate and the installer disagree about the same
+/// window. Fix or retire it; do not set it hoping for BIOS coverage.
+///
+/// What flipping the default to 1 buys and costs, measured on a quiet box, min-of-N:
+///
+///   * PoP-486, a real-mode game: coverage 1.03% -> 74.47%, 9.68 native insns/entry, wall NEUTRAL,
+///     framebuffer bit-identical over 4e9 cycles.
+///   * quake-586: **+4.14% slower**. Its 16-bit code is 55% of entries at 2.431 insns/entry, i.e.
+///     DOS/BIOS/extender glue in blocks too short to amortise a dispatcher entry.
+///
+/// That split is a WORKLOAD SHAPE, not a persona: real-mode game loops win, a 32-bit game's 16-bit
+/// glue loses.
+///
+/// Defaulted ON at parity deliberately, and the reasoning is pre-release reasoning: there is no
+/// version out, so a default is a development posture rather than a promise to anyone. On costs a
+/// measured 4% on one workload and buys exposure of the 16-bit path to every fixture, every gate
+/// run and every future slice, which is how the remaining coverage work gets found and how each
+/// lowering lands as upside instead of paying down a deficit. Revisit the trade before a release,
+/// not before then. Closing the quake gap is the next objective.
 pub(crate) fn sixteen_bit_admission_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
         std::env::var("IZARRAVM_JIT16")
             .ok()
             .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or(0)
+            .unwrap_or(1)
     })
 }
 
 /// Seed for `JitState::word_at_486`, read once per process from `IZARRAVM_JIT16_486`.
 ///
+/// **DEFAULT ON since the 486 measurement.** Set `IZARRAVM_JIT16_486=0` to refuse.
+///
 /// Separate from `IZARRAVM_JIT16` on purpose: that one selects WHICH memory a 16-bit code segment
 /// may live in, and this one selects WHICH PERSONAS lower Word operands at all. They compose, and
-/// the A/B needs them independent — the doom-486 arm runs `IZARRAVM_JIT16=0` so that
-/// `try_direct_continuation` refuses every 16-bit boundary before a key is built, which isolates
-/// this flag's 32-bit half (66-prefixed word ops) exactly.
+/// keeping them independent is what let the two halves be measured apart — an
+/// `IZARRAVM_JIT16=0` arm isolates this flag's 32-bit half (66-prefixed word ops) exactly, because
+/// `try_direct_continuation` then refuses every 16-bit boundary before a key is built.
+///
+/// The design that introduced this said to DELETE the knob when the default flipped, so a
+/// temporary switch could not become permanent surface. It stays, deliberately, for two reasons
+/// the design did not know yet: the flip ships a measured ~4% regression on quake-586, so an
+/// escape hatch is worth its surface until coverage work closes that; and the differential tests
+/// that cover the refusing arm at I486 have no other way to reach it once the lift is
+/// unconditional. Delete it when quake-586 is back at parity, not before.
 pub(crate) fn word_at_486_default() -> bool {
     static LEVEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("1")))
+    *LEVEL.get_or_init(|| !matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("0")))
 }
 
 /// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
@@ -4005,7 +4031,7 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     // read-only storage with no side effects, while 0xA0000..0xC0000 is the VGA aperture the
     // guard is really for and stays refused at every level.
     if (0x000a_0000..0x0010_0000).contains(&physical)
-        && !(physical >= 0x000c_0000 && sixteen_bit_admission_level() >= 2)
+        && !(physical >= 0x000c_0000 && cpu.jit_direct.sixteen_bit_level >= 2)
     {
         return None;
     }

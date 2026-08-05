@@ -81,6 +81,12 @@ pub(crate) struct JitState {
     ///
     /// Default FALSE, which is the shipped behaviour this slice does not change.
     pub(crate) word_at_486: bool,
+    /// Admission level for 16-bit code segments, seeded from `IZARRAVM_JIT16`.
+    ///
+    /// A field for the same reason `word_at_486` is one: the `OnceLock` behind it is process-wide,
+    /// so a fixture cannot exercise both arms, and the level-0 early-out in `try_direct_continuation`
+    /// would have lost its only cover the moment the default moved off 0.
+    pub(crate) sixteen_bit_level: u8,
     pub(crate) direct_barrier_census: Option<Box<direct::DirectBarrierCensus>>,
     pub(crate) smc_heat: direct::SmcHeatMap,
     /// The native code watch, HOISTED out of `BlockCache` (Track C C1c-pre, design decision
@@ -107,6 +113,7 @@ impl JitState {
         Self {
             direct,
             word_at_486: direct::word_at_486_default(),
+            sixteen_bit_level: direct::sixteen_bit_admission_level(),
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
@@ -127,6 +134,7 @@ impl Clone for JitState {
             // silently reverted to the default arm would compare a lifted CPU against an unlifted
             // one and report the disagreement as agreement.
             word_at_486: self.word_at_486,
+            sixteen_bit_level: self.sixteen_bit_level,
             direct_barrier_census: None,
             smc_heat: self.smc_heat.clone(),
             // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone

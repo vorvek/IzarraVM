@@ -1105,11 +1105,11 @@ impl CpuGsw {
         // `narrow_invalidate`, sets `generation = 0`, and the live generation is never 0, so such a
         // line can only come back through `put`.
         //
-        // IZARRAVM_JIT16 (default 0) lifts this for the 16-bit admission spike; see
+        // IZARRAVM_JIT16 (default 1 since the 486 measurement) gates this; see
         // `jit::direct::sixteen_bit_admission_level`. `key_for_phys` still refuses `!d` on every
         // persona but 586, and `jit_mode_key` bit 0 is CS.D, so a 16-bit block and a 32-bit block
         // at one linear address can never collide on a key.
-        if !d && jit::direct::sixteen_bit_admission_level() == 0 {
+        if !d && self.jit_direct.sixteen_bit_level == 0 {
             return Ok(DirectContinuation::Interpret);
         }
         if !self.mode().uses_approximate_timing() {

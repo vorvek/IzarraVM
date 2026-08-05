@@ -838,11 +838,15 @@ fn barrier_census_attributes_the_word_persona_arm() {
 
     let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw486);
     cpu.enable_direct_barrier_census(true);
+    // EXPLICIT since the default flipped. The arm still exists and is still reachable; what
+    // changed is that reaching it is now a policy choice rather than a property of the persona,
+    // and a fixture that leaned on the default would silently stop testing the arm.
+    cpu.set_word_operands_at_486(false);
     warm(&mut cpu, &mut bus, &addresses);
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(
         compilation.span.instructions, 4,
-        "the Word instruction must stop the walk on a non-586 persona"
+        "the Word instruction must stop the walk while the policy refuses it"
     );
     let row = cpu
         .direct_barrier_census_snapshot()

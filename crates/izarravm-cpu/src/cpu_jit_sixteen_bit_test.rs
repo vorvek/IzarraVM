@@ -300,6 +300,9 @@ fn a_sixteen_bit_segment_is_admitted_on_i586_only() {
     cpu.set_eip(ENTRY);
     warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY]);
     assert_eq!(cpu.persona(), CpuPersona::I486);
+    // EXPLICIT: the default admits since the 486 measurement, so the refusing arm has to be asked
+    // for. Left implicit, this assertion would test the default rather than the mechanism.
+    cpu.set_word_operands_at_486(false);
     assert!(
         jit::direct::key_for(&cpu, ENTRY, false).is_none(),
         "I486 must refuse a 16-bit code segment outright, not compile and then reject the slot"
