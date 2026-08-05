@@ -1272,7 +1272,6 @@ fn run_worker(
 ) -> WorkerStop {
     let mut audio_debt = 0.0;
     let mut speed_wall = Duration::ZERO;
-    let mut speed_executed = 0u64;
     let mut speed_halted = 0u64;
     let mut speed_advanced = 0u64;
     let mut credit: i64 = 0;
@@ -1280,6 +1279,7 @@ fn run_worker(
     let mut last_media = last_pace;
     let mut published_seq = u64::MAX;
     let mut last_frame_gen: Option<u64> = None;
+    let mut keys = ScriptedKeys::from_env(generation.machine.master_ticks());
 
     loop {
         loop {
@@ -1330,6 +1330,13 @@ fn run_worker(
         let budget = credit.max(0) as u64;
         let mut terminal_stop = false;
         let mut consumed_ticks = 0u64;
+        // The same three splits the on-screen speed indicator is built from, kept per
+        // slice so the runtime profile can report the indicator beside the true realtime
+        // factor. They disagree by construction: the indicator drops halted and stalled
+        // ticks, so a guest that idles reads below 100% while the machine is dead on time.
+        let mut slice_executed = 0u64;
+        let mut slice_halted = 0u64;
+        let mut slice_stalled = 0u64;
         if budget > 0 {
             let before = generation.machine.master_ticks();
             let stall_before = generation.machine.io_stall_ticks();
@@ -1362,11 +1369,13 @@ fn run_worker(
                 .machine
                 .halted_ticks()
                 .saturating_sub(halted_before);
-            speed_executed =
-                speed_executed.saturating_add(ran.saturating_sub(stalled).saturating_sub(halted));
-            speed_halted = speed_halted.saturating_add(halted.saturating_add(halt_top_up));
+            slice_executed = ran.saturating_sub(stalled).saturating_sub(halted);
+            slice_halted = halted.saturating_add(halt_top_up);
+            slice_stalled = stalled;
+            speed_halted = speed_halted.saturating_add(slice_halted);
             speed_advanced = speed_advanced.saturating_add(consumed_ticks);
         }
+        keys.pump(&mut generation.machine);
         let run_finished = Instant::now();
         credit = settle_credit(
             credit,
@@ -1381,9 +1390,8 @@ fn run_worker(
         last_media = run_finished;
         if speed_wall >= SPEED_SAMPLE_INTERVAL {
             (generation.speed_ratio, generation.speed_idle) =
-                speed_sample(speed_executed, speed_halted, speed_advanced, speed_wall);
+                speed_sample(speed_halted, speed_advanced, speed_wall);
             speed_wall = Duration::ZERO;
-            speed_executed = 0;
             speed_halted = 0;
             speed_advanced = 0;
         }
@@ -1482,7 +1490,12 @@ fn run_worker(
                 audio_finished.duration_since(run_finished),
                 before_sleep.duration_since(audio_finished),
                 sleep,
-                consumed_ticks,
+                SliceTicks {
+                    advanced: consumed_ticks,
+                    executed: slice_executed,
+                    halted: slice_halted,
+                    stalled: slice_stalled,
+                },
                 credit,
                 seq,
                 published_before,
@@ -1568,17 +1581,21 @@ fn emulation_should_sleep(credit: i64, terminal_stop: bool) -> bool {
     terminal_stop || credit <= 0
 }
 
-fn speed_sample(
-    executed_ticks: u64,
-    halted_ticks: u64,
-    advanced_ticks: u64,
-    wall: Duration,
-) -> (f64, bool) {
+/// The window's speed readout: how much guest time the machine delivered per unit
+/// of wall time, capped at 1.0 because the pacing credit will not let it run ahead.
+///
+/// The ratio counts every tick the guest advanced through, halted ones included.
+/// It used to count only ticks that retired work, which made the readout `1 -
+/// halted_share`: Prince of Persia idles about 20% of a 486 second waiting on its
+/// frame timer, so it displayed "Speed 80%" while the machine was dead on real
+/// time, and that reads as a 20% emulator problem that does not exist. A guest
+/// that idles is reported by `idle`, which is the affordance for it.
+fn speed_sample(halted_ticks: u64, advanced_ticks: u64, wall: Duration) -> (f64, bool) {
     let idle =
         advanced_ticks != 0 && u128::from(halted_ticks) * 10 >= u128::from(advanced_ticks) * 9;
     let wall_ticks = wall.as_secs_f64() * MASTER_CLOCK_HZ as f64;
     let ratio = if wall_ticks > 0.0 {
-        (executed_ticks as f64 / wall_ticks).min(1.0)
+        (advanced_ticks as f64 / wall_ticks).min(1.0)
     } else {
         0.0
     };
@@ -1589,6 +1606,106 @@ fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+/// One scancode every 2 ms of guest time, the spacing `--inject-keys` uses: the
+/// guest has to poll INT 16h and consume each code before the next arrives, or
+/// the type-ahead buffer swallows it.
+const SCRIPTED_KEY_SPACING_TICKS: u64 = MASTER_CLOCK_HZ * 2 / 1000;
+
+/// Deterministic scripted keystrokes for the GUI worker, armed by
+/// `IZARRAVM_GUI_INJECT_KEYS`. Profiling the window needs the same reach that
+/// `--inject-keys` gives the headless path -- the workloads worth profiling are
+/// games whose play sits behind a title screen -- and a human pressing a key
+/// cannot be replayed. Steps are `<guest_ms>:<text>` separated by `;`, offsets
+/// strictly increasing, and the text spelling is `--inject-keys`'s, `{shift}`
+/// and all.
+///
+/// The offsets are GUEST MILLISECONDS, not the CPU clocks `--inject-keys` takes.
+/// The GUI paces to real time, so guest milliseconds are both what the wall
+/// clock shows and the one unit that stays put when the persona changes.
+struct ScriptedKeys {
+    origin_ticks: u64,
+    due: VecDeque<(u64, Vec<u8>)>,
+    pending: VecDeque<u8>,
+    last_key_ticks: u64,
+}
+
+impl ScriptedKeys {
+    fn from_env(origin_ticks: u64) -> Self {
+        let idle = Self {
+            origin_ticks,
+            due: VecDeque::new(),
+            pending: VecDeque::new(),
+            last_key_ticks: 0,
+        };
+        let Ok(spec) = std::env::var("IZARRAVM_GUI_INJECT_KEYS") else {
+            return idle;
+        };
+        match parse_scripted_keys(&spec) {
+            Ok(due) => Self { due, ..idle },
+            Err(message) => {
+                warn!(%message, "ignoring IZARRAVM_GUI_INJECT_KEYS");
+                idle
+            }
+        }
+    }
+
+    fn pump(&mut self, machine: &mut Machine) {
+        if self.due.is_empty() && self.pending.is_empty() {
+            return;
+        }
+        let elapsed = machine.master_ticks().saturating_sub(self.origin_ticks);
+        while self.due.front().is_some_and(|(at, _)| *at <= elapsed) {
+            let (_, codes) = self.due.pop_front().expect("front was just checked");
+            self.pending.extend(codes);
+        }
+        if elapsed.saturating_sub(self.last_key_ticks) < SCRIPTED_KEY_SPACING_TICKS {
+            return;
+        }
+        if let Some(code) = self.pending.pop_front() {
+            machine.inject_key_scancodes(&[code]);
+            self.last_key_ticks = elapsed;
+        }
+    }
+}
+
+fn parse_scripted_keys(spec: &str) -> Result<VecDeque<(u64, Vec<u8>)>, String> {
+    let mut steps = VecDeque::new();
+    let mut previous: Option<u64> = None;
+    for raw in spec.split(';').filter(|step| !step.trim().is_empty()) {
+        let (millis, text) = raw
+            .split_once(':')
+            .ok_or_else(|| format!("step {raw:?} is not <guest_ms>:<text>"))?;
+        let at_millis: u64 = millis
+            .trim()
+            .parse()
+            .map_err(|_| format!("step {raw:?} has a non-numeric offset"))?;
+        if previous.is_some_and(|last| at_millis <= last) {
+            return Err(format!(
+                "offsets must strictly increase; {at_millis} does not follow {}",
+                previous.unwrap_or_default()
+            ));
+        }
+        previous = Some(at_millis);
+        let codes = crate::text_to_scancode_groups(&text.replace("\\r", "\r"))
+            .map_err(|error| error.to_string())?
+            .concat();
+        steps.push_back((at_millis.saturating_mul(MASTER_CLOCK_HZ / 1000), codes));
+    }
+    Ok(steps)
+}
+
+/// One emulation slice's guest time, split the way the on-screen speed indicator
+/// splits it. `advanced` is every master tick the machine moved through; the other
+/// three partition it into ticks that retired guest work, ticks the CPU sat halted,
+/// and ticks it stalled on device I/O.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SliceTicks {
+    advanced: u64,
+    executed: u64,
+    halted: u64,
+    stalled: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RuntimeProfileMetrics {
     emulation_work_wall_ns: u64,
@@ -1597,6 +1714,9 @@ struct RuntimeProfileMetrics {
     presentation_backpressure_wall_ns: u64,
     throttle_sleep_wall_ns: u64,
     guest_master_ticks: u64,
+    executed_master_ticks: u64,
+    halted_master_ticks: u64,
+    stalled_master_ticks: u64,
     current_pacing_credit_ticks: i64,
     max_catchup_credit_ticks: u64,
     max_throttle_ahead_ticks: u64,
@@ -1629,8 +1749,11 @@ impl RuntimeProfileMetrics {
             .saturating_add(duration_ns(duration));
     }
 
-    fn record_guest_ticks(&mut self, ticks: u64) {
-        self.guest_master_ticks = self.guest_master_ticks.saturating_add(ticks);
+    fn record_ticks(&mut self, ticks: SliceTicks) {
+        self.guest_master_ticks = self.guest_master_ticks.saturating_add(ticks.advanced);
+        self.executed_master_ticks = self.executed_master_ticks.saturating_add(ticks.executed);
+        self.halted_master_ticks = self.halted_master_ticks.saturating_add(ticks.halted);
+        self.stalled_master_ticks = self.stalled_master_ticks.saturating_add(ticks.stalled);
     }
 
     fn observe_credit(&mut self, credit: i64) {
@@ -1668,8 +1791,16 @@ struct RuntimeProfileReport {
     presentation_backpressure_wall_ns: u64,
     throttle_sleep_wall_ns: u64,
     guest_master_ticks: u64,
+    executed_master_ticks: u64,
+    halted_master_ticks: u64,
+    stalled_master_ticks: u64,
     wall_master_ticks: u64,
     guest_realtime_factor: f64,
+    /// What the window's speed readout shows: executed ticks over wall ticks, capped
+    /// at 1.0. Compare it against `guest_realtime_factor` -- when the machine is on
+    /// time this reads `1 - halted_share`, so an idling guest looks slow when it is not.
+    speed_indicator_ratio: f64,
+    halted_share_of_guest_time: f64,
     uncapped_wall_guest_lag_ticks: i64,
     uncapped_wall_guest_lag_seconds: f64,
     total_guest_realtime_factor: f64,
@@ -1739,8 +1870,20 @@ impl RuntimeProfileReport {
             presentation_backpressure_wall_ns: metrics.presentation_backpressure_wall_ns,
             throttle_sleep_wall_ns: metrics.throttle_sleep_wall_ns,
             guest_master_ticks: metrics.guest_master_ticks,
+            executed_master_ticks: metrics.executed_master_ticks,
+            halted_master_ticks: metrics.halted_master_ticks,
+            stalled_master_ticks: metrics.stalled_master_ticks,
             wall_master_ticks,
             guest_realtime_factor: realtime_factor(metrics.guest_master_ticks, wall_master_ticks),
+            speed_indicator_ratio: realtime_factor(
+                metrics.executed_master_ticks,
+                wall_master_ticks,
+            )
+            .min(1.0),
+            halted_share_of_guest_time: realtime_factor(
+                metrics.halted_master_ticks,
+                metrics.guest_master_ticks,
+            ),
             uncapped_wall_guest_lag_ticks,
             uncapped_wall_guest_lag_seconds: uncapped_wall_guest_lag_ticks as f64
                 / ticks_per_second,
@@ -1873,7 +2016,7 @@ impl RuntimeProfiler {
         audio: Duration,
         frame: Duration,
         sleep: Duration,
-        guest_ticks: u64,
+        ticks: SliceTicks,
         credit: i64,
         current_seq: u64,
         published_seq: u64,
@@ -1885,8 +2028,8 @@ impl RuntimeProfiler {
         self.total.record_work(emulation, audio, frame);
         self.interval.record_sleep(sleep);
         self.total.record_sleep(sleep);
-        self.interval.record_guest_ticks(guest_ticks);
-        self.total.record_guest_ticks(guest_ticks);
+        self.interval.record_ticks(ticks);
+        self.total.record_ticks(ticks);
         self.interval.observe_credit(credit);
         self.total.observe_credit(credit);
         self.interval

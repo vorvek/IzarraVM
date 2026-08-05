@@ -941,24 +941,27 @@ fn frame_publish_skips_static_graphics_after_ack() {
 #[test]
 fn speed_sample_marks_exactly_ninety_percent_hlt_as_idle() {
     let wall = Duration::from_secs(1);
-    assert!(!speed_sample(100, 899, 1_000, wall).1);
-    assert!(speed_sample(100, 900, 1_000, wall).1);
-    assert!(
-        !speed_sample(0, 0, 1_000, wall).1,
-        "I/O wait is not HLT idle"
-    );
+    assert!(!speed_sample(899, 1_000, wall).1);
+    assert!(speed_sample(900, 1_000, wall).1);
+    assert!(!speed_sample(0, 1_000, wall).1, "I/O wait is not HLT idle");
 }
 
 #[test]
 fn speed_sample_caps_active_throughput_at_realtime() {
-    let (ratio, idle) = speed_sample(
-        MASTER_CLOCK_HZ.saturating_mul(2),
-        0,
-        MASTER_CLOCK_HZ.saturating_mul(2),
-        Duration::from_secs(1),
-    );
+    let (ratio, idle) = speed_sample(0, MASTER_CLOCK_HZ.saturating_mul(2), Duration::from_secs(1));
     assert_eq!(ratio, 1.0);
     assert!(!idle);
+}
+
+#[test]
+fn speed_sample_reports_realtime_for_a_guest_that_halts() {
+    // Prince of Persia on a 486 idles ~20% of every second waiting on its frame
+    // timer while the machine keeps perfect real time. Measured: guest realtime
+    // factor 1.000 against a readout of 0.801, which is exactly 1 - the halted
+    // share. The readout must follow delivered guest time, not retired work.
+    let (ratio, idle) = speed_sample(MASTER_CLOCK_HZ / 5, MASTER_CLOCK_HZ, Duration::from_secs(1));
+    assert_eq!(ratio, 1.0);
+    assert!(!idle, "20% halted is not idle");
 }
 
 #[test]

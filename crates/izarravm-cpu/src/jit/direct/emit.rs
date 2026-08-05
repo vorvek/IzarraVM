@@ -204,11 +204,59 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 ExtendWidths::new(width, dst_width),
                 signed,
             ),
-            DirectKind::MovImm { dst, imm } => e.mov_r32_imm32(home(dst), imm),
+            // One host instruction at each width. The Word arm staged through RDX when it landed,
+            // reusing `MovSegToReg`'s shape rather than adding an encoder form for one kind, and
+            // that measured wall-flat on bench16_c while the block structure improved: two host
+            // instructions per slot against the Dword arm's one, on an opcode common enough for
+            // the difference to cancel what the longer blocks bought. `mov_r16_imm16` exists for
+            // that measurement, and `MovSegToReg` keeps the staged shape because its value is a
+            // baked selector rather than a decoded immediate.
+            DirectKind::MovImm { dst, imm, width } => match width {
+                MemoryWidth::Dword => e.mov_r32_imm32(home(dst), imm),
+                // `imm as u16` is exact rather than a truncation: `decode`'s `fetch_immediate`
+                // zero-extends a Word immediate, so bits 31..16 are already zero here.
+                MemoryWidth::Word => e.mov_r16_imm16(home(dst), imm as u16),
+                MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                    unreachable!("classify produces MovImm only at Word or Dword")
+                }
+            },
             // Sixteen bits only, upper half preserved: the interpreter's 0x8c arm stores at
             // `OperandSize::Word` whatever the prefix says. `mov_r32_imm32` into the scratch
             // first because there is no 16-bit immediate form on the encoder and none is worth
             // adding for one kind; the upper half of RDX is dead either way.
+            // `MOV Sreg, r16` in real mode or V86: the five field writes `load_segment_real`
+            // performs, and nothing else. `set_segment` is one array-element assignment, and the
+            // only extra work `load_segment_real` does is a CS-only code-cache invalidation that
+            // DS and ES never reach.
+            //
+            // Every constant comes from `SegmentRegister::real` rather than being written out
+            // here, so the two cannot drift. Only `base = selector << 4` is duplicated, and a
+            // differential pins it.
+            //
+            // The limit and access stores are NOT redundant on the grounds that this is real mode.
+            // Unreal mode is exactly a real-mode segment carrying a protected-mode limit, and
+            // `load_segment_real` stamps the limit back to 0xFFFF unconditionally. Skipping it
+            // would leave a 4 GB limit live, and `emit_segmented_linear_address` omits the limit
+            // compare entirely when the limit is `u32::MAX`, so the divergence would go on to
+            // suppress limit faults in later blocks rather than staying local.
+            DirectKind::LoadSegReal { segment, src } => {
+                const REAL: SegmentRegister = SegmentRegister::real(0);
+                let base = segment_field_base(segment);
+                e.mov_r32_r32(Reg::RAX, home(src));
+                e.and_r32_imm32(Reg::RAX, 0xffff);
+                // The selector is stored BEFORE the shift turns RAX into the base.
+                e.store_r16_disp32(Reg::R15, base + selector_offset(), Reg::RAX);
+                // One 16-bit store covers `access` and `default_size_32`, which are adjacent.
+                // `default_size_32` lands as 0x00, a valid `bool` bit pattern.
+                e.mov_r32_imm32(
+                    Reg::RDX,
+                    u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
+                );
+                e.store_u32_imm_disp32(Reg::R15, base + limit_offset(), REAL.limit);
+                e.store_r16_disp32(Reg::R15, base + access_offset(), Reg::RDX);
+                e.shift_r32_imm8(4, Reg::RAX, 4);
+                e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
+            }
             DirectKind::MovSegToReg { dst, segment } => {
                 let selector = memory.segments.selector(segment);
                 e.mov_r32_imm32(Reg::RDX, u32::from(selector));
@@ -3125,6 +3173,15 @@ fn emit_store(
     sides: MemorySideExits,
     wrap: AddressWrap,
 ) {
+    // `PUSH Sreg`'s selector becomes an immediate here and nowhere earlier. This is the first
+    // point that holds the `SegmentLayout`, and the constant it bakes is the same one
+    // `data_matches` pins on entry, because both read the segment the block was captured under.
+    let source = match source {
+        StoreSource::Selector(segment) => {
+            StoreSource::Imm(u32::from(memory.segments.selector(segment)))
+        }
+        other => other,
+    };
     let map = memory.map.expect("native store has fast-map bases");
     let code_watch_tables = memory
         .code_watch_tables
@@ -3458,6 +3515,12 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
                 }
             },
         ),
+        // `emit_store` rewrites this to `Imm` before it can reach here, because that is the only
+        // caller with a `SegmentLayout` to resolve it from. Reaching this arm means a second store
+        // path grew and did not.
+        StoreSource::Selector(segment) => {
+            unreachable!("PUSH {segment:?} must be resolved to an immediate in emit_store")
+        }
         StoreSource::EipDelta(delta) => {
             // Word as well as Dword: a 16-bit CALL pushes the return IP as two bytes. The value
             // is computed the same way either width, from the LIVE eip plus the delta, and the
@@ -3563,6 +3626,41 @@ pub(super) fn gpr_offset(index: usize) -> i32 {
     (core::mem::offset_of!(CpuGsw, registers)
         + core::mem::offset_of!(Registers, gpr)
         + index * core::mem::size_of::<u32>()) as i32
+}
+
+/// Byte offset from the `CpuGsw` pointer in R15 to a segment's descriptor.
+///
+/// `SegmentIndex::index` is the mapping `set_segment` itself uses, so the emitter and the
+/// interpreter cannot disagree about which slot they mean. `direct.rs` carries a second copy of
+/// the same mapping for `SegmentLayout.data`; the two agree today and the const assertion below
+/// keeps them that way, but this uses the one the write path uses.
+fn segment_field_base(segment: SegmentIndex) -> i32 {
+    (core::mem::offset_of!(CpuGsw, registers)
+        + core::mem::offset_of!(Registers, segments)
+        + segment.index() * core::mem::size_of::<SegmentRegister>()) as i32
+}
+
+fn selector_offset() -> i32 {
+    core::mem::offset_of!(SegmentRegister, selector) as i32
+}
+
+fn base_offset() -> i32 {
+    core::mem::offset_of!(SegmentRegister, base) as i32
+}
+
+fn limit_offset() -> i32 {
+    core::mem::offset_of!(SegmentRegister, limit) as i32
+}
+
+/// `access` and `default_size_32` are adjacent, and the emitter writes both with one 16-bit
+/// store. The assertion is what makes that legal rather than lucky.
+fn access_offset() -> i32 {
+    const _: () = assert!(
+        core::mem::offset_of!(SegmentRegister, default_size_32)
+            == core::mem::offset_of!(SegmentRegister, access) + 1,
+        "LoadSegReal writes access and default_size_32 as one 16-bit store",
+    );
+    core::mem::offset_of!(SegmentRegister, access) as i32
 }
 
 fn eip_offset() -> i32 {
@@ -3699,7 +3797,10 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
     // RDX holds the result, zero-extended because RAX was masked before the copy, which is what the
     // lazy evaluator wants for a Word descriptor.
     if matches!(width, MemoryWidth::Word) {
-        debug_assert!(
+        // Must fail in release too, since the emitter runs in the release JIT, and the failure
+        // this guards is silent: the `and` masks below clear host CF, so an ADC that reached here
+        // would compute without its carry in and then tag the descriptor as the SUB class.
+        assert!(
             !matches!(op, 2 | 3),
             "ADC/SBB take the incoming CF as an operand and have no word lane; classify refuses \
              them at Word size"

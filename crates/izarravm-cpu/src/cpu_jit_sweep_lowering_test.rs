@@ -436,7 +436,7 @@ fn cdq_matches_the_interpreter_across_both_sign_boundaries_and_widths() {
 fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
     // (sub-op, name). ADC (/2) and SBB (/3) are deliberately absent: `classify` refuses them at
     // Word size because they consume the incoming CF as an operand, and
-    // `word_size_0x83_carry_and_memory_forms_stay_refused` is what pins that.
+    // `word_size_0x83_carry_forms_stay_refused` is what pins that.
     let ops: [(u8, &str); 6] = [
         (0, "add"),
         (1, "or"),
@@ -468,6 +468,104 @@ fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
                     );
                     differential_with(&body, eflags, live_pending, seed, &context);
                 }
+            }
+        }
+    }
+}
+
+/// `MOV r16, imm16` at Word operand size, the 16-bit campaign's fourth slice.
+///
+/// Every destination is swept because `home()` is a table lookup: `GUEST_HOMES` is
+/// `[R8, R9, R10, R11, R12, R13, R14, RBX]`, so seven of the eight are extended registers and
+/// exactly one, EDI's, is not. A lowering that emitted its prefixes in the wrong order writes a
+/// DIFFERENT guest register rather than faulting, and the pair that would swap under it is
+/// `0xbb` (EBX, R11) and `0xbf` (EDI, RBX). `0xbc` covers R12, the SIB-escape register.
+///
+/// The seeded high halves are the whole test. `decode` zero-extends the immediate, so with a
+/// zero upper half the correct Word lowering and a plain 32-bit move produce identical state and
+/// the slice's entire mutation is invisible. The differential compares registers, lazy flags,
+/// EFLAGS, core clocks, bus clocks and whole guest RAM, and MOV touches no flags at all, so the
+/// register comparison is what carries this.
+#[test]
+fn word_mov_immediate_matches_the_interpreter_for_every_destination() {
+    for dst in 0..8u8 {
+        for imm in [0x0000u16, 0x0001, 0x7fff, 0x8000, 0xffff] {
+            // ECX and EAX are the two the harness seeds, and both carry a recognisable high half
+            // so a widened write shows up whichever of them the destination happens to be.
+            let body = [0x66u8, 0xb8 + dst, (imm & 0xff) as u8, (imm >> 8) as u8];
+            let context = format!("0xb8+{dst} mov r16,{imm:#06x}");
+            differential_full(&body, 0x202, false, 0xdead_beef, 0xfeed_face, &context);
+        }
+    }
+}
+
+/// The ALU REGISTER forms 1 and 3 at Word operand size, the 16-bit campaign's second slice.
+///
+/// `0x83` above proves the emitter's word lane through an immediate. What is new here is a second
+/// register operand, which is one instruction of difference in `emit_alu`, and the operand ROLES,
+/// which the two forms assign oppositely: form 1's destination is the r/m and form 3's is the
+/// ModRM reg. Getting that backwards is silent for ADD/OR/AND/XOR and wrong for SUB and CMP, so
+/// both forms are swept rather than one standing in for the other.
+///
+/// The three properties `0x83`'s sweep names apply unchanged, and the seeds carry recognisable
+/// high halves and sixteen-bit corner low halves for the same reasons. CMP is included as the
+/// control: it writes nothing, so a failure on the other five is the write-back and not the
+/// operation. ADC (/2) and SBB (/3) are absent because `classify` refuses them at Word size in the
+/// arm itself; `word_size_alu_carry_forms_stay_refused` pins that.
+#[test]
+fn word_alu_register_forms_match_the_interpreter_for_every_admitted_op() {
+    // (sub-op, form-1 opcode, form-3 opcode, name).
+    let ops: [(u8, u8, u8, &str); 6] = [
+        (0, 0x01, 0x03, "add"),
+        (1, 0x09, 0x0b, "or"),
+        (4, 0x21, 0x23, "and"),
+        (5, 0x29, 0x2b, "sub"),
+        (6, 0x31, 0x33, "xor"),
+        (7, 0x39, 0x3b, "cmp"),
+    ];
+    // (ECX, EAX). Both halves matter: the high halves must survive on the destination and must
+    // NOT leak into the operation from the source, which is what the masks in the word lane are
+    // for. The low halves straddle 0x8000 and 0xffff so CF, OF and SF differ between the 16-bit
+    // and 32-bit answers rather than agreeing by luck.
+    let seeds: [(u32, u32); 5] = [
+        (0xdead_0000, 0xbeef_0001),
+        (0xdead_7fff, 0xbeef_0001),
+        (0xdead_8000, 0xbeef_ffff),
+        (0xdead_ffff, 0xbeef_8000),
+        (0xdead_0001, 0xbeef_ffff),
+    ];
+
+    for (op, form1, form3, name) in ops {
+        for (ecx, eax) in seeds {
+            for (eflags, live_pending) in [(0x202u32, false), (0x8d5, true)] {
+                // Form 1 is `op r/m16, r16`: ModRM r/m = CX is the destination, reg = AX.
+                let body = [0x66u8, form1, 0xc1];
+                let context = format!(
+                    "{form1:#04x} /{op} {name} cx,ax ecx={ecx:#010x} eax={eax:#010x} \
+                     eflags={eflags:#x} pending={live_pending}"
+                );
+                differential_full(&body, eflags, live_pending, ecx, eax, &context);
+
+                // Form 3 is `op r16, r/m16`: ModRM reg = CX is the destination, r/m = AX. The
+                // same registers in the same roles as form 1, so a role mix-up shows as the two
+                // forms disagreeing rather than as both being wrong the same way.
+                let body = [0x66u8, form3, 0xc8];
+                let context = format!(
+                    "{form3:#04x} /{op} {name} cx,ax ecx={ecx:#010x} eax={eax:#010x} \
+                     eflags={eflags:#x} pending={live_pending}"
+                );
+                differential_full(&body, eflags, live_pending, ecx, eax, &context);
+
+                // Destination aliased to source, the case only the register forms have. `xor
+                // cx,cx` and `sub cx,cx` are the idioms that actually appear in 16-bit code, and
+                // a lane that staged the operand through a scratch register would still pass the
+                // unaliased rows above.
+                let body = [0x66u8, form1, 0xc9];
+                let context = format!(
+                    "{form1:#04x} /{op} {name} cx,cx aliased ecx={ecx:#010x} \
+                     eflags={eflags:#x} pending={live_pending}"
+                );
+                differential_full(&body, eflags, live_pending, ecx, eax, &context);
             }
         }
     }

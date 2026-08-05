@@ -588,10 +588,34 @@ fn byte_lane_alu_memory_source_form_is_still_a_barrier() {
 }
 
 #[test]
-fn sixteen_bit_byte_alu_register_form_is_still_a_barrier() {
-    // A 66-prefixed byte ALU. None of 0x00/0x02/../0x38/0x3A is in `classify`'s
-    // OperandSize::Word allowlist, so the prefixed encoding falls to None above the `match form`
-    // rather than reaching the new arms.
-    still_a_barrier(&[0x66, 0x38, 0b1100_0001], "66 0x38 register");
-    still_a_barrier(&[0x66, 0x3a, 0b1100_0001], "66 0x3A register");
+fn sixteen_bit_byte_alu_register_form_matches_its_unprefixed_encoding() {
+    // A 66-prefixed byte ALU. This asserted `still_a_barrier` until the 16-bit campaign's first
+    // slice put 0x00/0x02/../0x38/0x3A in `classify`'s OperandSize::Word allowlist, and what it
+    // pinned was a CONSEQUENCE of that allowlist rather than a safety property of its own.
+    //
+    // A 16-bit code segment is the case that matters -- `operand_size` comes from CS.D alone, so
+    // every instruction there reports Word, byte forms included -- and the 66 prefix is the same
+    // condition reachable from 32-bit code. The prefix is inert on a byte-operand form: the
+    // interpreter's arm reads `read_operand_u8`/`read_gpr8` without consulting `operand_size`,
+    // and the classifier produces `AluRegByte`, which carries no width to get wrong. So the
+    // prefixed encoding must not merely compile, it must land on the interpreter's exact state,
+    // which is what a differential asserts and `still_a_barrier` never could.
+    //
+    // `run_and_compare` requires every slot to retire natively, so this cannot pass by quietly
+    // falling back to the interpreter the way a weaker assertion would.
+    let seed = byte_seed();
+    for op in 0..8u8 {
+        for (dst, src) in [(0u8, 4u8), (4, 0), (3, 3), (7, 7), (2, 6)] {
+            for eflags in [0x202u32, 0x203] {
+                let seed = seed.flags(eflags).pending();
+                let label = format!("op={op} dst={dst} src={src} eflags={eflags:#x}");
+                let mut form0 = vec![0x66];
+                form0.extend_from_slice(&alu_byte_rm_dst(op, dst, src));
+                differential(&form0, seed, &format!("66 form 0 {label}"));
+                let mut form2 = vec![0x66];
+                form2.extend_from_slice(&alu_byte_reg_dst(op, dst, src));
+                differential(&form2, seed, &format!("66 form 2 {label}"));
+            }
+        }
+    }
 }

@@ -82,12 +82,13 @@ fn word_size_byte_forms_are_lowered() {
 /// later edit replaces the opcode list with a range, every positive fixture above still passes
 /// and only this one fails.
 ///
-/// `0x01` and `0x31` remain refused for a reason that has SOFTENED rather than gone: the Word
-/// branch of `emit_alu_preloaded` no longer hard-codes SUB and no longer drops the result into a
-/// scratch register -- it handles the whole non-carry op set with a `mov_r16_r16` write-back, as
-/// the `0x83` slice needed. They stay out because nothing has measured them, not because they
-/// would miscompile; admitting an unmeasured opcode is a formation change with no census row to
-/// attribute it to.
+/// `0x01` and `0x31` were here and have gone, with the rest of the ALU register forms 1 and 3.
+/// The reason they stayed was that nothing had measured them, not that they would miscompile; a
+/// 16-bit workload now ranks the ten rows near 19% of block-stopping hits. What replaced them is
+/// `word_size_alu_register_forms_are_lowered` plus two negative tests, because this slice moved
+/// its boundary INTO the classifier arm: `word_size_alu_carry_forms_stay_refused` and
+/// `word_size_alu_memory_shapes_stay_refused` would both keep passing if the allowlist entries
+/// were reverted, so they cannot live in this table.
 ///
 /// Two opcodes have moved OUT of this list as the rejected-row campaign measured them, and each
 /// left a differently-shaped remainder behind:
@@ -99,7 +100,10 @@ fn word_size_byte_forms_are_lowered() {
 ///   here: a case in this table would keep passing if the allowlist entry were reverted, which is
 ///   the opposite of what this table is for.
 ///
-/// `0xb8..=0xbf` stays, and it is now the only `MovImm` producer this list still guards.
+/// `0xb8..=0xbf` has gone too, to `word_size_mov_imm_register_forms_are_lowered`. After that
+/// slice this list guards no `MovImm` producer at all: `0xc7`'s register form is the other one and
+/// it is refused inside the classifier arm, so it has `the_word_size_0xc7_register_form_stays_refused`
+/// rather than a row here.
 #[test]
 fn word_size_dword_siblings_stay_refused() {
     let cases: &[(&str, &[u8])] = &[
@@ -108,11 +112,7 @@ fn word_size_dword_siblings_stay_refused() {
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0]),
         ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10]),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12]),
-        ("0xb8 mov eax,imm", &[0x66, 0xb8, 0x34, 0x12]),
-        ("0xbf mov edi,imm", &[0x66, 0xbf, 0x34, 0x12]),
         ("0xf7 /0 test r/m,imm", &[0x66, 0xf7, 0xc1, 0x34, 0x12]),
-        ("0x01 add r/m,r", &[0x66, 0x01, 0xc1]),
-        ("0x31 xor r/m,r", &[0x66, 0x31, 0xc1]),
     ];
 
     for &(label, form) in cases {
@@ -173,6 +173,377 @@ fn word_size_0x83_register_forms_are_lowered() {
         assert_eq!(compilation.word_stores, 0, "{label}: word stores");
         assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
         assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// `PUSH DS` and `PUSH ES` at Word size, the read half of the segment family.
+///
+/// One word store and no reads: the selector is a compile-time constant baked from the block's
+/// `SegmentLayout`, so the only memory the slot touches is the stack. `PUSH SS` and `PUSH CS` are
+/// asserted refused in the same table below rather than admitted for symmetry, and the reasons are
+/// different for each: SS belongs to the family the write half excludes over the interrupt shadow,
+/// and CS would need a carve-out because `selector_segment` deliberately keeps CS out of the
+/// pinned mask.
+#[test]
+fn word_size_push_segment_forms_are_lowered() {
+    for (label, opcode) in [("0x1e push ds", 0x1eu8), ("0x06 push es", 0x06)] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&[0x66, opcode]);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        // Two things this fixture does not give you by default, and both look identical to the
+        // opcode still being a barrier if you miss them.
+        //
+        // SS.B must be 0. `fresh()` sets `default_size_32` on CS and SS, and `stack_width_kind`
+        // implements no (SS.B = 1, Word) cell for any push at all -- `Push16` exists only for
+        // (SS.B = 0, Word), which is the cell real 16-bit code runs in.
+        //
+        // ESP must be live BEFORE compiling. The default of 0 puts the store page at 0xFFFFFFFE,
+        // which cannot resolve, and the block comes back Retry.
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = false;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.registers.set_esp(0x1000);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        assert_eq!(compilation.word_stores, 1, "{label}: word stores");
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// The segment pushes and pops that stay refused, all of them by the allowlist rather than by an
+/// arm, so this table is the right place for them.
+///
+/// SS.B and ESP are set up exactly as in the positive test above, and that is what makes these
+/// refusals ATTRIBUTABLE. Leave either alone and every row comes back at three instructions
+/// because no push can compile in that cell at all, and the table passes while proving nothing
+/// about the allowlist.
+#[test]
+fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
+    let cases: &[(&str, &[u8])] = &[
+        ("0x0e push cs", &[0x66, 0x0e]),
+        ("0x16 push ss", &[0x66, 0x16]),
+        ("0x1f pop ds", &[0x66, 0x1f]),
+        ("0x07 pop es", &[0x66, 0x07]),
+        ("0x17 pop ss", &[0x66, 0x17]),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = false;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.registers.set_esp(0x1000);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused at Word size, so the block is the three fillers"
+        );
+    }
+}
+
+/// `MOV DS, r16` and `MOV ES, r16` at Word size, the write half of the segment family.
+///
+/// `flat_fixture` is real mode with big limits, which is the mode this lowering is admitted in.
+#[test]
+fn word_size_load_segment_forms_are_lowered() {
+    // ModRM 0xc0 | (reg << 3) | rm, register source AX.
+    for (label, reg) in [("/0 mov es,ax", 0u8), ("/3 mov ds,ax", 3)] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&[0x66, 0x8e, 0xc0 | (reg << 3)]);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        // The load touches no guest memory at all: it writes a CPU field, not the bus.
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// The `0x8e` shapes that stay refused, all inside the classifier arm rather than by the
+/// allowlist, so each would keep passing if the allowlist entry were reverted.
+///
+/// `/1`, `/6` and `/7` are the ones that matter most: they are not segment loads at all. The
+/// interpreter raises #GP(0) for each, so lowering them would turn a fault into a silent write.
+/// `/2` is SS, refused over the one-instruction interrupt shadow a native block cannot honour.
+/// The memory form is refused because the slice is the register shape and nothing else.
+#[test]
+fn word_size_load_segment_shapes_outside_the_slice_stay_refused() {
+    let cases: &[(&str, &[u8])] = &[
+        ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8]),
+        ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0]),
+        ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8]),
+        ("/2 mov ss,ax arms the shadow", &[0x66, 0x8e, 0xd0]),
+        ("/4 mov fs,ax is out of scope", &[0x66, 0x8e, 0xe0]),
+        ("/5 mov gs,ax is out of scope", &[0x66, 0x8e, 0xe8]),
+        (
+            "/3 memory form",
+            &[0x66, 0x8e, 0x1d, 0x00, 0x20, 0x00, 0x00],
+        ),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        map_word_operand_page(&mut cpu, &mut bus);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused, so the block is the three fillers"
+        );
+    }
+}
+
+/// `MOV Sreg, r16` stays refused in PROTECTED mode, where a segment load is a descriptor fetch
+/// with type, privilege and present checks rather than `selector << 4`.
+///
+/// The refusal lives beside the `stack_width_kind` call because `classify` has no CPU. The mode
+/// key is what makes it sufficient once made -- a block admitted in real mode can never be
+/// entered in protected mode -- but the key alone would not stop the block being COMPILED here,
+/// which is the failure this pins.
+#[test]
+fn the_protected_mode_load_segment_form_stays_refused() {
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&[0x66, 0x8e, 0xd8]);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    cpu.control.cr0 |= CR0_PE;
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "protected mode must stay refused, so the block is the three fillers"
+    );
+}
+
+/// `MOV r16, imm16` at Word size, the 16-bit campaign's fourth slice.
+///
+/// All eight destinations, because `home()` is a table lookup and one case cannot see a
+/// mis-indexed entry. `0xbc` (SP) and `0xbf` (DI) are the two that matter most: SP's home is R12,
+/// the SIB-escape register, and DI's is RBX, the ONE guest home that is not an extended register
+/// and so the only encoding that takes no REX at all.
+#[test]
+fn word_size_mov_imm_register_forms_are_lowered() {
+    for dst in 0..8u8 {
+        let form = [0x66u8, 0xb8 + dst, 0x34, 0x12];
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "0xb8+{dst}: the word form must join the block rather than end it"
+        );
+        // A register move touches no memory at any width.
+        assert_eq!(compilation.word_reads, 0, "0xb8+{dst}: word reads");
+        assert_eq!(compilation.word_stores, 0, "0xb8+{dst}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "0xb8+{dst}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "0xb8+{dst}: dword stores");
+    }
+}
+
+/// The ALU register forms 1 and 3 at Word size, the 16-bit campaign's second slice.
+///
+/// Every opcode is listed on its own rather than looped over a range, for the reason the tables
+/// above give: the classifier decides `2 | 3` separately and a range would hide a member.
+#[test]
+fn word_size_alu_register_forms_are_lowered() {
+    // Form 1 is `op r/m16, r16` and form 3 is `op r16, r/m16`. ModRM 0xc1 names CX and AX either
+    // way round, which is enough to compile; the differential tests exercise the operand roles.
+    let cases: &[(&str, u8)] = &[
+        ("0x01 add r/m,r", 0x01),
+        ("0x09 or r/m,r", 0x09),
+        ("0x21 and r/m,r", 0x21),
+        ("0x29 sub r/m,r", 0x29),
+        ("0x31 xor r/m,r", 0x31),
+        ("0x03 add r,r/m", 0x03),
+        ("0x0b or r,r/m", 0x0b),
+        ("0x23 and r,r/m", 0x23),
+        ("0x2b sub r,r/m", 0x2b),
+        ("0x33 xor r,r/m", 0x33),
+    ];
+
+    for &(label, opcode) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&[0x66, opcode, 0xc1]);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        // A register ALU form touches no memory whatever the width says.
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// ADC and SBB in forms 1 and 3 stay refused at Word size, and the guard is inside the classifier
+/// arm rather than in the allowlist.
+///
+/// This is the boundary that matters most in the whole slice. The allowlist alone would not hold
+/// it: the file's stated rule is that the byte set is closed over its shared classifier arms, and
+/// the slice admits five of eight members of two shared arms, so the next reader closing the
+/// family lands a silent miscompile in one line. `emit_alu_preloaded`'s Word lane masks both
+/// operands with `and`, which CLEARS host CF, then tags the descriptor as the SUB class: an
+/// admitted `66 11 /r` computes `adc` without its carry in and evaluates its lazy CF as `a < b`.
+#[test]
+fn word_size_alu_carry_forms_stay_refused() {
+    let cases: &[(&str, &[u8])] = &[
+        ("0x11 adc r/m16,r16", &[0x66, 0x11, 0xc1]),
+        ("0x19 sbb r/m16,r16", &[0x66, 0x19, 0xc1]),
+        ("0x13 adc r16,r/m16", &[0x66, 0x13, 0xc1]),
+        ("0x1b sbb r16,r/m16", &[0x66, 0x1b, 0xc1]),
+    ];
+
+    for &(label, form) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused at Word size, so the block is the three fillers"
+        );
+    }
+}
+
+/// The MEMORY shapes of forms 1 and 3 stay refused at Word size while their Dword shapes ship.
+///
+/// A missed lowering rather than a hazard, and the reason is economics rather than semantics:
+/// `emit_wide_page_guard` refuses every odd word address, and 16-bit DOS code has no alignment
+/// discipline. Refused, an odd operand ends the block. Admitted, it sits inside the block and
+/// side-exits at that slot on every execution, so nothing after it retires natively. The Dword
+/// rows in the same arms must keep compiling, which is the second half of what this asserts.
+///
+/// CMP is the exception and it is load-bearing rather than an inconsistency: `0x39` and `0x3b`
+/// have been compiling word memory in quake's renderer since before this slice, and they do not
+/// write back, so they are not the new combination. A blanket refusal here regressed
+/// `quake_word_renderer_families_match_interpreter_state_flags_memory_and_timing`, which is what
+/// caught it.
+#[test]
+fn word_size_alu_memory_shapes_stay_refused() {
+    let cases: &[(&str, &[u8], &[u8])] = &[
+        (
+            "0x01 add m,r",
+            &[0x66, 0x01, 0x0d, 0x00, 0x20, 0x00, 0x00],
+            &[0x01, 0x0d, 0x00, 0x20, 0x00, 0x00],
+        ),
+        (
+            "0x03 add r,m",
+            &[0x66, 0x03, 0x0d, 0x00, 0x20, 0x00, 0x00],
+            &[0x03, 0x0d, 0x00, 0x20, 0x00, 0x00],
+        ),
+        (
+            "0x33 xor r,m",
+            &[0x66, 0x33, 0x0d, 0x00, 0x20, 0x00, 0x00],
+            &[0x33, 0x0d, 0x00, 0x20, 0x00, 0x00],
+        ),
+    ];
+    // The CMP pair is the control: word memory, no write-back, admitted before this slice and
+    // still admitted after it. If a future edit turns the `op != 7` guard into a blanket refusal
+    // these two fail here rather than only in the quake renderer fixture.
+    for (label, form) in [
+        ("0x39 cmp m,r", [0x66, 0x39, 0x0d, 0x00, 0x20, 0x00, 0x00]),
+        ("0x3b cmp r,m", [0x66, 0x3b, 0x0d, 0x00, 0x20, 0x00, 0x00]),
+    ] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        map_word_operand_page(&mut cpu, &mut bus);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: word memory CMP must stay admitted"
+        );
+        assert_eq!(compilation.word_reads, 1, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+    }
+
+    for &(label, word_form, dword_form) in cases {
+        for (form, expected, width) in [(word_form, 3, "word"), (dword_form, 4, "dword")] {
+            let mut code = vec![0x40, 0x41, 0x42];
+            code.extend_from_slice(form);
+            let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+            map_word_operand_page(&mut cpu, &mut bus);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
+
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(
+                compilation.span.instructions, expected,
+                "{label} at {width} size"
+            );
+        }
     }
 }
 
@@ -368,26 +739,37 @@ fn word_size_shift_forms_are_lowered() {
     let cases: &[(&str, u8)] = &[("/4 shl", 4), ("/5 shr", 5), ("/6 sal", 6), ("/7 sar", 7)];
 
     for &(label, op) in cases {
-        let form = [0x66u8, 0xc1, 0xc0 | (op << 3) | 1, 0x03];
-        let mut code = vec![0x40, 0x41, 0x42];
-        code.extend_from_slice(&form);
-        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
-        warm(
-            &mut cpu,
-            &mut bus,
-            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
-        );
+        // `0xc1` takes an imm8 and `0xd1` supplies an implicit 1, and the arm they share turns
+        // both into the same `Shift`. Both encodings are asserted because the allowlist entries
+        // are separate: dropping either one leaves the other passing.
+        let forms: [(&str, Vec<u8>); 2] = [
+            ("0xc1", vec![0x66, 0xc1, 0xc0 | (op << 3) | 1, 0x03]),
+            ("0xd1", vec![0x66, 0xd1, 0xc0 | (op << 3) | 1]),
+        ];
+        for (opcode, form) in forms {
+            let mut code = vec![0x40, 0x41, 0x42];
+            code.extend_from_slice(&form);
+            let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
 
-        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-        assert_eq!(
-            compilation.span.instructions, 4,
-            "{label}: the word form must join the block rather than end it"
-        );
-        // A register shift touches no memory at any width.
-        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
-        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
-        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
-        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(
+                compilation.span.instructions, 4,
+                "{opcode} {label}: the word form must join the block rather than end it"
+            );
+            // A register shift touches no memory at any width.
+            assert_eq!(compilation.word_reads, 0, "{opcode} {label}: word reads");
+            assert_eq!(compilation.word_stores, 0, "{opcode} {label}: word stores");
+            assert_eq!(compilation.dword_reads, 0, "{opcode} {label}: dword reads");
+            assert_eq!(
+                compilation.dword_stores, 0,
+                "{opcode} {label}: dword stores"
+            );
+        }
     }
 }
 
@@ -401,11 +783,10 @@ fn word_size_shift_forms_are_lowered() {
 ///   66-prefixed ROR routed through it would rotate 32 bits and take CF from bit 31 instead of
 ///   bit 15. That guard is the only thing standing between the new allowlist entry and a
 ///   miscompile, which is why it has a row here and a mutation in the differential file.
-/// * **`0xD1`, the shift-by-one form.** It shares `0xC1`'s classify arm, so it is refused by the
-///   allowlist alone. Deliberate: neither fixture measures a `0xD1` word row, and the campaign's
-///   standing rule is that an unmeasured admission is a formation change with no census row to
-///   attribute it to. The precedent for admitting one member of a shared arm and refusing the
-///   other is `0xf6`/`0xf7`.
+/// * **The four ROTATES of `0xD1`.** Same three-way split as `0xC1`'s, and they matter more now
+///   that the opcode is on the allowlist: `/1` ROR reaches the Word guard through `0xD1` far more
+///   often than through `0xC1`, and `/2` RCL is the largest single row in the 16-bit census at
+///   10.91%, so it is the shape most likely to be admitted by a hurried edit.
 /// * **`0xD3`, the shift-by-CL group.** A different arm, still Dword-only: `emit_shift_cl` has no
 ///   sixteen-bit lane and would be a second emitter primitive.
 ///
@@ -419,8 +800,10 @@ fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
         ("0xc1 /1 ror cx,imm8", &[0x66, 0xc1, 0xc9, 0x03]),
         ("0xc1 /2 rcl cx,imm8", &[0x66, 0xc1, 0xd1, 0x03]),
         ("0xc1 /3 rcr cx,imm8", &[0x66, 0xc1, 0xd9, 0x03]),
-        ("0xd1 /4 shl cx,1", &[0x66, 0xd1, 0xe1]),
-        ("0xd1 /7 sar cx,1", &[0x66, 0xd1, 0xf9]),
+        ("0xd1 /0 rol cx,1", &[0x66, 0xd1, 0xc1]),
+        ("0xd1 /1 ror cx,1", &[0x66, 0xd1, 0xc9]),
+        ("0xd1 /2 rcl cx,1", &[0x66, 0xd1, 0xd1]),
+        ("0xd1 /3 rcr cx,1", &[0x66, 0xd1, 0xd9]),
         ("0xd3 /4 shl cx,cl", &[0x66, 0xd3, 0xe1]),
         ("0xd3 /7 sar cx,cl", &[0x66, 0xd3, 0xf9]),
         (

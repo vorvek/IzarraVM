@@ -1031,6 +1031,325 @@ fn direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() 
     }
 }
 
+/// `PUSH Sreg` bakes the block's pinned selector, and the answer must follow when the guest
+/// re-points the segment.
+///
+/// This is the hazard the read half of the segment slice turns on, and it is the same one
+/// `direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves` above pins for
+/// `0x8c`. `PUSH DS` touches no memory THROUGH DS, so neither `read_segment` nor `write_segment`
+/// names it; only `selector_segment` does. Drop that arm and DS falls out of the layout's `used`
+/// mask, `data_matches` skips it, and the hot block keeps pushing the selector it was compiled
+/// under no matter how many times the guest reloads DS. Nothing faults and no counter moves.
+///
+/// The pushed word is read straight back with `POP EBX` rather than inspected in RAM, so the
+/// assertion is on architectural state and a wrong push width would show up in ESP as well.
+#[test]
+fn direct_push_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() {
+    const CS_SELECTOR: u16 = 0x1234;
+    const DS_FIRST: u16 = 0x2258;
+    const DS_SECOND: u16 = 0x5678;
+    const STACK: u32 = 0x800;
+    let mut memory = vec![0; 0x1000];
+    memory[0x100] = 0x90;
+    memory[0x101..0x107].copy_from_slice(&[
+        // Filler first, so PUSH DS never lands on the block ENTRY, where it would not execute
+        // natively at all and the fixture would certify nothing.
+        0x89, 0xf6, // mov esi, esi
+        0x1e, // push ds
+        0x5b, // pop ebx
+        0x89, 0xd9, // mov ecx, ebx
+    ]);
+    memory[0x107] = 0xf4; // hlt
+    let initial = [0x1122_3344u32, 0x9999_9999, 0, 0xaabb_ccdd, 0, 0, 0, 0];
+    // A Dword push zero-extends the selector, and the Dword pop replaces EBX whole. Index 4 is
+    // ESP, which the push and pop must return to where it started.
+    let expect = |ds: u16| {
+        [
+            0x1122_3344u32,
+            u32::from(ds),
+            0,
+            u32::from(ds),
+            STACK,
+            0,
+            0,
+            0,
+        ]
+    };
+
+    let arm = |cpu: &mut CpuGsw, ds_selector: u16| {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr = initial;
+        cpu.registers.set_esp(STACK);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        make_data_segments_flat(cpu);
+        // A 32-bit STACK as well as 32-bit code. `stack_width_kind` refuses the (SS.B = 0, Dword)
+        // cell outright, and `make_data_segments_flat` leaves `default_size_32` alone, so without
+        // this the fixture asks for a cell that does not exist and the block never compiles --
+        // which looks exactly like the lowering being absent.
+        for segment in [SegmentIndex::Cs, SegmentIndex::Ss] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.default_size_32 = true;
+            cpu.registers.set_segment(segment, descriptor);
+        }
+        for (segment, selector) in [
+            (SegmentIndex::Cs, CS_SELECTOR),
+            (SegmentIndex::Ds, ds_selector),
+        ] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.selector = selector;
+            descriptor.base = 0;
+            descriptor.limit = u32::MAX;
+            cpu.registers.set_segment(segment, descriptor);
+        }
+    };
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    arm(&mut interp, DS_FIRST);
+    drive(&mut interp, &mut interp_bus);
+    arm(&mut native, DS_FIRST);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        arm(&mut native, DS_FIRST);
+        drive(&mut native, &mut native_bus);
+    }
+    assert!(
+        native.jit_direct.len() > 0,
+        "PUSH Sreg block did not compile: perf={:?}",
+        native.perf_counters()
+    );
+
+    for (round, ds) in [(0, DS_FIRST), (1, DS_SECOND)] {
+        // One settling drive per round, for the reason the 0x8c fixture above gives: round 1
+        // spends its first pass on the DS mismatch, retiring and recompiling the block.
+        arm(&mut native, ds);
+        drive(&mut native, &mut native_bus);
+        for cpu in [&mut interp, &mut native] {
+            arm(cpu, ds);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.trace = BusTrace::default();
+        }
+        let before = native.perf_counters().jit_direct_insns;
+        let interp_outcomes = drive(&mut interp, &mut interp_bus);
+        let native_outcomes = drive(&mut native, &mut native_bus);
+
+        assert_eq!(native_outcomes, interp_outcomes, "round {round} timing");
+        assert_eq!(native, interp, "round {round} CPU state");
+        assert_eq!(native.registers.gpr, expect(ds), "round {round} GPRs");
+        assert_eq!(
+            native.registers.esp(),
+            STACK,
+            "round {round}: the push and pop must leave ESP where it started"
+        );
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "round {round} bus timing"
+        );
+        // Four slots: filler, PUSH DS, POP EBX and the MOV, with the entry NOP interpreted.
+        // Pinned exactly, because a block that stopped short of the push would still compare equal
+        // against an interpreter running the same instruction.
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - before,
+            4,
+            "round {round}: PUSH DS did not retire natively: {:?}",
+            native.perf_counters()
+        );
+    }
+}
+
+/// `MOV DS, r16` in real mode writes the WHOLE descriptor, not just the base.
+///
+/// The starting DS is UNREAL: base 0, limit 0xFFFF_FFFF, which is what a game gets after a
+/// protected-mode excursion sets a 4 GB limit and drops back. `load_segment_real` stamps
+/// `limit = 0xFFFF` and `access = 0x93` unconditionally, so a lowering that wrote only the
+/// selector and the base would leave the 4 GB limit live. That is not a local error:
+/// `emit_segmented_linear_address` omits its limit compare entirely when the limit is
+/// `u32::MAX`, so the divergence would go on to suppress limit faults in later blocks.
+///
+/// With a plain real-mode starting DS this test passes whether or not the limit and access
+/// stores exist, which is the whole reason the seed is unreal.
+///
+/// The full-state comparison against the interpreter is what covers all five fields; nothing here
+/// re-states `SegmentRegister::real`, so the test cannot drift with it.
+#[test]
+fn direct_load_segment_real_writes_the_whole_descriptor() {
+    let mut memory = vec![0; 0x1000];
+    memory[0x100] = 0x90;
+    memory[0x101..0x109].copy_from_slice(&[
+        // Filler, so the load is never the block ENTRY.
+        0x89, 0xf6, // mov esi, esi
+        0x8e, 0xd8, // mov ds, ax
+        0x89, 0xff, // mov edi, edi
+        0x89, 0xdb, // mov ebx, ebx
+    ]);
+    memory[0x109] = 0xf4; // hlt
+
+    let arm = |cpu: &mut CpuGsw, selector: u16| {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr = [u32::from(selector), 0, 0, 0, 0, 0, 0, 0];
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        make_data_segments_flat(cpu);
+        let mut cs = cpu.registers.segment(SegmentIndex::Cs);
+        cs.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        // The unreal seed. `make_data_segments_flat` already set limit to u32::MAX; spell out the
+        // access byte too so the starting descriptor differs from the real-mode one in more than
+        // one field.
+        let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+        ds.selector = 0x1111;
+        ds.base = 0;
+        ds.limit = u32::MAX;
+        ds.access = 0x9b;
+        ds.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Ds, ds);
+    };
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    // Both roles get a settling drive before anything is compared. Without one on the interpreter
+    // its decode caches are cold for the first compared round, which changes where its
+    // straight-line runs break and makes the outcome lists differ in SHAPE rather than in state.
+    arm(&mut interp, 0x1234);
+    drive(&mut interp, &mut interp_bus);
+    arm(&mut native, 0x1234);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        arm(&mut native, 0x1234);
+        drive(&mut native, &mut native_bus);
+    }
+    assert!(
+        native.jit_direct.len() > 0,
+        "MOV DS,r16 block did not compile: perf={:?}",
+        native.perf_counters()
+    );
+
+    // The corners a `selector << 4` base can get wrong, plus zero.
+    for selector in [0x0000u16, 0x00b8, 0xa000, 0xffff] {
+        arm(&mut native, selector);
+        drive(&mut native, &mut native_bus);
+        for cpu in [&mut interp, &mut native] {
+            arm(cpu, selector);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.trace = BusTrace::default();
+        }
+        let before = native.perf_counters().jit_direct_insns;
+        let interp_outcomes = drive(&mut interp, &mut interp_bus);
+        let native_outcomes = drive(&mut native, &mut native_bus);
+
+        assert_eq!(
+            native_outcomes, interp_outcomes,
+            "selector {selector:#06x} timing"
+        );
+        assert_eq!(native, interp, "selector {selector:#06x} CPU state");
+        assert_eq!(
+            native.registers.segment(SegmentIndex::Ds),
+            SegmentRegister::real(selector),
+            "selector {selector:#06x}: the descriptor must be exactly the real-mode one"
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - before,
+            4,
+            "selector {selector:#06x}: MOV DS did not retire natively: {:?}",
+            native.perf_counters()
+        );
+    }
+}
+
+/// A DS-relative access AFTER a DS write ends the block, and the one before it keeps its baked
+/// base.
+///
+/// This is the dirty-segment rule, and its failure mode is a silent wrong address rather than a
+/// missed lowering: every base a block uses is a compile-time immediate, so a slot that survived
+/// past the write would read through the segment the block was COMPILED under.
+///
+/// The assertion is the retired-slot count rather than the loaded value, because the value alone
+/// cannot tell "the rule worked" from "the block never compiled". Three slots retire natively:
+/// the filler, the pre-write load, and the write. The post-write load is the boundary.
+#[test]
+fn direct_load_segment_real_ends_the_block_at_the_next_dependent_slot() {
+    let mut memory = vec![0; 0x2000];
+    memory[0x100] = 0x90;
+    memory[0x101..0x10b].copy_from_slice(&[
+        0x89, 0xf6, // mov esi, esi            filler
+        0x8a, 0x1d, 0x00, 0x10, 0x00,
+        0x00, // mov bl, [0x1000]   DS-relative, before the write
+        0x8e, 0xd8, // mov ds, ax              DS := AX
+    ]);
+    // The post-write DS-relative load, which must NOT join the block.
+    memory[0x10b..0x111].copy_from_slice(&[0x8a, 0x0d, 0x00, 0x10, 0x00, 0x00]);
+    memory[0x111] = 0xf4; // hlt
+    memory[0x1000] = 0x5a;
+
+    let arm = |cpu: &mut CpuGsw| {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr = [0x0000_0000, 0, 0, 0, 0, 0, 0, 0];
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        make_data_segments_flat(cpu);
+        let mut cs = cpu.registers.segment(SegmentIndex::Cs);
+        cs.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    };
+
+    let mut native = fresh();
+    let mut native_bus = TestBus::with_memory(memory);
+    native_bus.direct_pages_enabled = true;
+    native_bus.direct_page_clocks = true;
+
+    arm(&mut native);
+    drive(&mut native, &mut native_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..4 {
+        arm(&mut native);
+        drive(&mut native, &mut native_bus);
+    }
+    assert!(
+        native.jit_direct.len() > 0,
+        "block did not compile: perf={:?}",
+        native.perf_counters()
+    );
+
+    arm(&mut native);
+    let before = native.perf_counters().jit_direct_insns;
+    drive(&mut native, &mut native_bus);
+    assert_eq!(
+        native.perf_counters().jit_direct_insns - before,
+        3,
+        "the slot after the DS write must be the block boundary: {:?}",
+        native.perf_counters()
+    );
+}
+
 /// ALU form 0 (byte r/m destination, byte register source) with a memory destination. Covers a
 /// non-writing op (CMP, op 7, which takes the read-only path in `emit_alu_mem_dest`) and three
 /// writing ops, and drives the byte source through the high lanes AH/BH as well as BL/CL, because

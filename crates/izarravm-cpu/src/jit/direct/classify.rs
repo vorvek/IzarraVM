@@ -59,11 +59,29 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // `OperandSize` either, so every width decision downstream comes from the kind.
     //
     // The byte set is CLOSED over its shared classifier arms on purpose. `0x04..=0x3c` step 8 are
-    // all `form == 4` of the ALU group and reach one arm; `0xf6` is the byte half of the
+    // all `form == 4` of the ALU group and reach one arm; `0x00..=0x38` and `0x02..=0x3a` step 8
+    // are `form == 0` and `form == 2` and reach one arm each; `0xf6` is the byte half of the
     // `0xf6 | 0xf7` group arm, whose every Dword-producing path is keyed `opcode == 0xf7`.
     // Admitting one member of a shared arm while refusing its sibling would be arbitrary, and
     // what makes 16-bit blocks link is a CONTIGUOUS admissible region rather than any single
     // opcode.
+    //
+    // Forms 0 and 2 joined the set on the 16-bit campaign's first slice, and the reason they were
+    // not here before is that the 32-bit fixtures do not reach them: a barrier census over
+    // `.bench/bench16_c` at 586 with `IZARRAVM_JIT16=1` ranks byte-encoded opcodes at 14.73% of
+    // all 347,134,532 block-stopping hits, `0xfe` at 3.39% and `0x38` at 2.69% heading them.
+    // Both forms satisfy the structural rule above rather than bending it: form 0 produces
+    // `AluRegByte`, which has no width field at all, or `AluMemDest` carrying a literal
+    // `MemoryWidth::Byte`; form 2 produces `AluRegByte` for the register shape and refuses the
+    // memory shape inside its arm, so the `None` it already returns is what a 16-bit
+    // `0x0a /0 mem` keeps getting. `0xa0`, `0xa2` and `0xfe` are the same case one arm at a time
+    // (`Load`/`Store`/`IncDecReg`, every one a literal `MemoryWidth::Byte`).
+    //
+    // `0xa1` and `0xa3` sit between them in the opcode map and are the counterexample worth
+    // naming, because proximity is exactly how they would get swept in: both hard-code
+    // `MemoryWidth::Dword`, so admitting either at Word size moves four bytes where the guest
+    // moves two. They stay refused, as does `0xd0` -- not for a width reason, but because no
+    // classify arm exists for it, which makes listing it a no-op that reads like a lowering.
     //
     // `0x8c` is the one non-byte member and it is here for the same structural reason rather than
     // as an exception: its interpreter arm writes `OperandSize::Word` unconditionally, so the
@@ -71,15 +89,29 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
-    // `0xf7`, `0xa9`, `0xb8..=0xbf`, `0xc7`, `0x81`, `0x85`, `0x8d`, `0xa3`. Every one is the Dword
-    // sibling of an admitted byte form and its kind hard-codes Dword with no width field.
-    // `0x01`/`0x31` are worse still: `AluReg` does carry a width, but before the widening described
-    // below `emit_alu_preloaded`'s Word branch ignored `op`, hard-coded SUB and wrote the result to
-    // a scratch register instead of the destination, which is correct only for the CMP forms
-    // `0x39`/`0x3b` already admitted here. That branch now handles the whole non-carry op set with
-    // write-back, so `0x01`/`0x31` are a lowering waiting to be MEASURED rather than a hazard --
-    // but they are not admitted in this slice, because nothing in the census asks for them and an
-    // unmeasured admission is a formation change with no row to attribute it to.
+    // `0xf7`, `0xa9`, `0xc7`, `0x81`, `0x85`, `0x8d`, `0xa3`. Every one is the Dword sibling of an
+    // admitted byte form and its kind hard-codes Dword with no width field.
+    //
+    // `0xb8..=0xbf` WAS on that list and is the 16-bit campaign's fourth slice. It left the same
+    // way `0x83` and `0xc7` did, by growing the width field the list existed to compensate for:
+    // `MovImm` now carries one and `emit`'s Word arm stages the immediate through RDX and narrows
+    // with `emit_write_gpr16`, which defines sixteen bits and preserves the rest exactly as
+    // `write_gpr_sized(.., Word, ..)` does. `0xc7`'s REGISTER form still produces `MovImm` and is
+    // still refused at Word, by the arm rather than by this list, so it keeps its own test.
+    //
+    // THE WORD ALU REGISTER FORMS, forms 1 and 3, are the 16-bit campaign's second slice.
+    // `0x01`/`0x09`/`0x21`/`0x29`/`0x31` and `0x03`/`0x0b`/`0x23`/`0x2b`/`0x33` join `0x39`/`0x3b`,
+    // which have been carrying the Word lane as CMP since before this list existed. An older
+    // version of this comment called them "worse still" than the Dword siblings, because
+    // `emit_alu_preloaded`'s Word branch once ignored `op`, hard-coded SUB and wrote to a scratch
+    // register, which is correct only for CMP. That branch handles the whole non-carry op set
+    // with a `mov_r16_r16` write-back now, and `0x83` has been exercising exactly that write-back
+    // in production since its own slice, with a mutation record behind it. The census asked: a
+    // 16-bit workload ranks these ten rows near 19% of block-stopping hits.
+    //
+    // Three exclusions hold the boundary, and each is enforced in the ARM rather than by this
+    // list, because a list is the wrong place for a rule the next reader has to re-derive:
+    // ADC and SBB at Word (no carry-in lane), and both MEMORY shapes at Word (see the arms).
     //
     // `0x83` WAS on that list and is now admitted, which is the second half of this slice. Its
     // register form produces `AluImm`, which carries a `width` field as of this commit, and its
@@ -126,18 +158,37 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // extend one instruction further and stop on `shl cx, imm8` instead, relocating 30,692 exits
     // onto `0xC1 /4` and costing quake +8.78% blocks installed and ~1% of wall.
     //
-    // `0xd1` is the SAME classifier arm and is deliberately NOT admitted. That is not an
-    // oversight and the precedent is `0xf6`/`0xf7`, which share an arm with only the byte half on
-    // this list: neither fixture measures a `0xd1` word row, and the campaign's standing rule is
-    // that an unmeasured admission is a formation change with no census row to attribute it to.
-    // Leaving it out is safe in the direction that matters -- the gate refuses it, so it stays a
-    // barrier exactly as today, and no width can be got wrong on a path that is never reached.
-    // `0xd3` (the shift-by-CL group) is a different arm entirely and stays out for the same
-    // reason, with `emit_shift_cl` still Dword-only.
+    // `0xd1` is the SAME classifier arm and is now admitted with it, which is the 16-bit
+    // campaign's third slice. It was held out while no fixture measured a `0xd1` word row; one
+    // does now, and it is the largest single opcode in that census at 21.86% of 260,594,435
+    // block-stopping hits.
+    //
+    // No emitter work, and the reason is stronger than a shared arm: `0xd1` and `0xc1` with an
+    // immediate of 1 produce the SAME `DirectKind::Shift`, and `shift_r16_imm8` has no by-one
+    // encoding at all, so `66 D1 /4` assembles as the bytes `66 C1 E1 01`. `DirectInsn` carries
+    // only `lin`, `len`, `weighted_fp_clocks` and `kind`, and the compile loop reads
+    // `insn.opcode` in exactly two places, neither of which separates the two. The clock charge
+    // is the same 2 down both paths because the interpreter's group-2 arm returns one
+    // `clocks(2)` for the whole `0xc0..=0xd3` range without discriminating.
+    //
+    // What it buys is a QUARTER of that 21.86%: the arm admits register `/4`, `/5` and `/7` only,
+    // which the census splits at 10.75%. `/2` RCL register word is 10.91% on its own, larger than
+    // every admitted shift together, and it is the other half of the `shl ax,1` / `rcl dx,1`
+    // idiom that shifts a 32-bit quantity through two 16-bit registers. Expect the exits this
+    // removes to relocate straight onto RCL. It has no arm at any width and would need the
+    // incoming CF loaded before the rotate, so it is a real slice rather than a list entry.
+    //
+    // `0xd3` (the shift-by-CL group) is a different arm entirely and stays out, with
+    // `emit_shift_cl` still Dword-only.
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
-            0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
+            0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38
+                | 0x02 | 0x0a | 0x12 | 0x1a | 0x22 | 0x2a | 0x32 | 0x3a
+                | 0x01 | 0x09 | 0x21 | 0x29 | 0x31
+                | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
+                | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
+                | 0x06 | 0x1e
                 | 0x40..=0x4f
                 | 0x50..=0x5f
                 | 0x68
@@ -151,11 +202,16 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8a
                 | 0x8b
                 | 0x8c
+                | 0x8e
                 | 0x98
                 | 0x99
+                | 0xa0
+                | 0xa2
                 | 0xa8
                 | 0xb0..=0xb7
+                | 0xb8..=0xbf
                 | 0xc1
+                | 0xd1
                 | 0xc2
                 | 0xc3
                 | 0xc6
@@ -169,6 +225,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xeb
                 | 0x0f80..=0x0f8f
                 | 0xf6
+                | 0xfe
                 | 0xff
         )
     {
@@ -318,6 +375,29 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         if opcode < 0x40 {
             let op = (opcode >> 3) & 7;
             let form = opcode & 7;
+            // ADC and SBB have no Word lane, so refuse them here rather than leaving the
+            // allowlist as the only thing between them and a miscompile. They take the incoming
+            // CF as an OPERAND; `emit_alu_preloaded`'s Word lane masks both operands with `and`,
+            // which CLEARS host CF, then tags the descriptor as the SUB class. An admitted
+            // `66 11 /r` would compute `adc ax, bx` without the carry in and then evaluate its
+            // lazy CF as `a < b`.
+            //
+            // The reason this guard exists at all is that the rule stated above says the byte set
+            // is closed over its shared classifier arms, and this slice admits five of eight
+            // members of two shared arms. Without a guard here the next reader applying that rule
+            // lands the bug above in one line. `0x81 | 0x83` states the same refusal the same way.
+            //
+            // Forms 1 and 3 ONLY. The other forms in this group are byte-width by encoding and
+            // reach lanes that carry no `operand_width` at all, so their ADC and SBB members are
+            // correct at Word and are admitted: `0x10`/`0x18`/`0x12`/`0x1a` produce `AluRegByte`
+            // and `0x14`/`0x1c` produce `AluByteImm`. Widening this guard to the whole group
+            // refuses those six as collateral, which is a regression rather than a fix.
+            if insn.operand_size == OperandSize::Word
+                && matches!(form, 1 | 3)
+                && matches!(op, 2 | 3)
+            {
+                return None;
+            }
             match form {
                 // Byte r/m destination, byte register source. BOTH operand forms as of the
                 // rejected-row campaign's Slice 7: the register form is `AluRegByte`, the byte
@@ -359,6 +439,22 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                             src: m.reg,
                             width: operand_width,
                         }),
+                        // Word memory is refused for the WRITING ops and admitted for CMP, which
+                        // is the shape that already ships: `0x39` has been compiling word memory
+                        // in quake's renderer since before this slice, so `op != 7` here rather
+                        // than a blanket refusal, or that regresses.
+                        //
+                        // A missed lowering rather than a hazard, and the reason is economics.
+                        // `emit_wide_page_guard` refuses every odd word address, and 16-bit DOS
+                        // code has no alignment discipline. Today an odd operand simply ends the
+                        // block; admitted, it sits INSIDE the block and side-exits at that slot
+                        // on every execution, so nothing after it retires natively. Admit it when
+                        // a census row prices that exit.
+                        DecodedOperand::Mem(_)
+                            if insn.operand_size == OperandSize::Word && op != 7 =>
+                        {
+                            None
+                        }
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
                             op,
                             source: StoreSource::Reg(m.reg),
@@ -404,6 +500,16 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                             src,
                             width: operand_width,
                         }),
+                        // Refused at Word for form 1's reason, plus one of its own, and `op != 7`
+                        // for form 1's reason too: `0x3b` word memory ships in quake's renderer.
+                        // What is new is the COMBINATION of Word with a write-back after a memory
+                        // read, which nothing exercises today, since `AluMemSource` at Word only
+                        // ever reaches CMP. Both halves are certified separately, the pair is not.
+                        DecodedOperand::Mem(_)
+                            if insn.operand_size == OperandSize::Word && op != 7 =>
+                        {
+                            None
+                        }
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemSource {
                             op,
                             dst: m.reg,
@@ -583,6 +689,26 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x9c => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Flags { mask: u32::MAX },
+                });
+            }
+            // PUSH DS (0x1e) and PUSH ES (0x06), the read half of the segment family. Both are
+            // ordinary word stack stores of a value the block already pins: the selector is baked
+            // from the `SegmentLayout` in `emit_store`, exactly as `MovSegToReg` bakes one, and
+            // `selector_segment` reports the segment so `data_matches` refuses re-entry after a
+            // guest reload.
+            //
+            // PUSH SS (0x16) and PUSH CS (0x0e) are NOT here, and not for symmetry's sake. The
+            // census measures 36 and 18 hits against 17.9 million for DS, SS belongs to the family
+            // the write half excludes over the interrupt shadow, and CS would need the carve-out
+            // `selector_segment` documents. Closure over a shared arm is worth having when the arm
+            // is shared; this one is two lines.
+            0x1e | 0x06 => {
+                return Some(DirectKind::Push {
+                    source: StoreSource::Selector(if opcode == 0x1e {
+                        SegmentIndex::Ds
+                    } else {
+                        SegmentIndex::Es
+                    }),
                 });
             }
             0x68 => {
@@ -804,6 +930,37 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 };
                 return Some(DirectKind::MovSegToReg { dst, segment });
             }
+            // MOV Sreg, r16, the write half of the segment family. DS and ES only, register
+            // source only, and REAL MODE or V86 only -- the mode gate is not here because
+            // `classify` has no CPU; it lives beside the `stack_width_kind` call, which is where
+            // PUSHF's V86 refusal lives for the same reason.
+            //
+            // `/1` (CS), `/6` and `/7` are refused HERE rather than left off the allowlist,
+            // because they are not loads at all: the interpreter raises #GP(0) for each
+            // (`execute.rs`, the 0x8e arm). Lowering them would turn a fault into a silent write,
+            // and 0x8c is NOT the symmetric case to copy -- `MOV r16, CS` is legal where
+            // `MOV CS, r16` is not.
+            //
+            // `/2` (SS) is refused for a reason of its own: loading SS arms a one-instruction
+            // interrupt shadow (`load_segment_arming_ss_shadow`), which the interpreter consumes
+            // at the start of the NEXT instruction. A native block never passes through that
+            // point, so a block that continued after an SS load would hold the shadow open across
+            // every remaining slot -- a guest-visible change in where an interrupt is delivered.
+            // The census measures 1,303 SS hits against 17.8 million for DS.
+            //
+            // FS and GS are absent for census reasons alone and would be safe to add.
+            0x8e => {
+                let m = insn.modrm?;
+                let segment = match m.reg {
+                    0 => SegmentIndex::Es,
+                    3 => SegmentIndex::Ds,
+                    _ => return None,
+                };
+                let DecodedOperand::Reg(src) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::LoadSegReal { segment, src });
+            }
             0x8d => {
                 let m = insn.modrm?;
                 let DecodedOperand::Mem(addr) = insn.operand? else {
@@ -880,6 +1037,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 return Some(DirectKind::MovImm {
                     dst: opcode - 0xb8,
                     imm: insn.imm,
+                    width: operand_width,
                 });
             }
             // MOV r/m, imm (group 11). `0xc7`'s MEMORY form is now width-carrying: the doom census
@@ -916,7 +1074,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         imm: insn.imm as u8,
                     }),
                     DecodedOperand::Reg(_) if insn.operand_size == OperandSize::Word => None,
-                    DecodedOperand::Reg(dst) => Some(DirectKind::MovImm { dst, imm: insn.imm }),
+                    DecodedOperand::Reg(dst) => Some(DirectKind::MovImm {
+                        dst,
+                        imm: insn.imm,
+                        width: MemoryWidth::Dword,
+                    }),
                     DecodedOperand::Mem(addr) => Some(DirectKind::Store {
                         source: StoreSource::Imm(insn.imm),
                         width,
