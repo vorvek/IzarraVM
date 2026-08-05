@@ -870,6 +870,19 @@ impl CpuGsw {
                 // INT n. IOPL-sensitive in V86 (checked here, exactly as the fused handler did,
                 // before the delivery). `decode` fetched the vector into `imm`.
                 let vector = insn.imm as u8;
+                #[cfg(feature = "int-trace")]
+                if crate::int_trace::is_traced(vector) {
+                    crate::int_trace::on_entry(
+                        vector,
+                        self.registers.cs().selector,
+                        self.registers.eip,
+                        self.pushad_image(),
+                        self.registers.segment(SegmentIndex::Ds).selector,
+                        self.registers.segment(SegmentIndex::Es).selector,
+                        self.is_v86_mode(),
+                        self.iopl(),
+                    );
+                }
                 // In V86 a below-IOPL `INT n` faults to the monitor, but the emulator's HLE
                 // BIOS/DOS services (INT 10h video, INT 13h disk, …) are driven from
                 // `interrupt_acknowledge`, which the fault path would otherwise skip — so the

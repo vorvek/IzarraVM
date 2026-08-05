@@ -44,6 +44,13 @@ jobs:
         run: |
           pwsh -NoProfile -File scripts/run-realtime-gate.ps1 -SelfTest
           cargo check -p izarravm --no-default-features
+          # int-trace is off by default, so the workspace clippy/test steps below
+          # compile neither the tracer nor its tests. The check proves the feature
+          # still wires up through izarravm; the test proves the module still works,
+          # and is what stops a rename of parse_vectors from leaving int_trace_test.rs
+          # uncompiled behind a green CI. `cargo check` alone builds no test target.
+          cargo check -p izarravm --features int-trace
+          cargo test -p izarravm-cpu --features int-trace int_trace
 
       - name: Format
         run: cargo fmt --check

@@ -534,6 +534,15 @@ impl CpuGsw {
     }
 
     pub(super) fn begin_instruction(&mut self) {
+        #[cfg(feature = "int-trace")]
+        if crate::int_trace::armed() {
+            crate::int_trace::on_instruction(
+                self.registers.cs().selector,
+                self.registers.eip,
+                self.pushad_image(),
+                self.flag(FLAG_CF),
+            );
+        }
         // A 486 prefetch queue is a snapshot: writes to already fetched bytes are
         // not observed until control flow or the next refill invalidates the queue.
         if self.written_pages_overflow {
@@ -1043,6 +1052,22 @@ impl CpuGsw {
 
     pub(super) fn read_gpr32(&self, index: u8) -> u32 {
         self.registers.gpr[usize::from(index & 7)]
+    }
+
+    /// EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI — the encoder's register order, so
+    /// an index into this array is the same index the ModRM fields use.
+    #[cfg(feature = "int-trace")]
+    pub(super) fn pushad_image(&self) -> [u32; 8] {
+        [
+            self.read_gpr32(0),
+            self.read_gpr32(1),
+            self.read_gpr32(2),
+            self.read_gpr32(3),
+            self.read_gpr32(4),
+            self.read_gpr32(5),
+            self.read_gpr32(6),
+            self.read_gpr32(7),
+        ]
     }
 
     pub(super) fn write_gpr32(&mut self, index: u8, value: u32) {
