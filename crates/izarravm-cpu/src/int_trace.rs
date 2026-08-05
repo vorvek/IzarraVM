@@ -5,7 +5,7 @@
 //!
 //! Prints both halves of a guest's call into a driver: the arguments at the
 //! `INT` instruction, and the answer when execution returns to the instruction
-//! after it. Both halves matter — the TOKAEMM shared-pool defect was a handler
+//! after it. Both halves matter. The TOKAEMM shared-pool defect was a handler
 //! returning `AH=88h` where a reference manager returned success, which the
 //! argument side alone could not have shown.
 //!
@@ -19,7 +19,7 @@
 //!   printed. This is not a corner case: `INT 21h` opening a file calls
 //!   `INT 13h`, and a bare FreeDOS boot traced at `10,13,21` loses 2 of 704
 //!   answers exactly that way. A traced `INT` with no `  -> ` under it means
-//!   the call nested or the handler never returned — never that the handler
+//!   the call nested or the handler never returned, never that the handler
 //!   answered with nothing. A slot stack would close this and is deliberately
 //!   not built; the pairs that do survive are what a driver conversation gets
 //!   read from.
@@ -29,7 +29,7 @@
 //!
 //! The slot is one process-global pair, so a process driving more than one
 //! `CpuGsw` would interleave two guests into one trace. That is the
-//! instrument's assumption, not an oversight — it is armed by hand for a
+//! instrument's assumption, not an oversight: it is armed by hand for a
 //! single-machine run.
 
 use std::sync::OnceLock;
@@ -42,7 +42,7 @@ const NO_PENDING: u64 = u64::MAX;
 /// `Relaxed` on both statics below. They carry their own values and publish no
 /// other memory, so there is no happens-before for an acquire/release pair to
 /// establish; the same reasoning `WRITE_WATCH` records in `lib.rs`. Observation
-/// only — nothing here feeds back into guest state.
+/// only; nothing here feeds back into guest state.
 static PENDING: AtomicU64 = AtomicU64::new(NO_PENDING);
 /// Mirrors `PENDING != NO_PENDING` so the per-instruction hook reads one
 /// relaxed bool instead of a 64-bit compare against a value it usually ignores.
@@ -79,7 +79,7 @@ pub(crate) fn is_traced(vector: u8) -> bool {
 }
 
 /// Record the arguments of an `INT n` and arm the return-site report.
-/// `return_eip` is the address the handler will come back to — the caller has
+/// `return_eip` is the address the handler will come back to, because the caller has
 /// already advanced EIP past the instruction, so it is simply the current EIP.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_entry(

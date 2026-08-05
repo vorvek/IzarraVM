@@ -1054,7 +1054,7 @@ impl CpuGsw {
         self.registers.gpr[usize::from(index & 7)]
     }
 
-    /// EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI — the encoder's register order, so
+    /// EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI in the encoder's register order, so
     /// an index into this array is the same index the ModRM fields use.
     #[cfg(feature = "int-trace")]
     pub(super) fn pushad_image(&self) -> [u32; 8] {
