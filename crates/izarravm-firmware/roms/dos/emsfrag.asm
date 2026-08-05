@@ -41,12 +41,12 @@
 ; is satisfiable the instant hole_pages+1 free 16 KB units exist ANYWHERE in
 ; the pool -- which they do, since the 16 punched holes total far more than
 ; that. So the probe is a DISCRIMINATOR, not a gate:
-;   fails (0x88)  -> the driver still demands contiguity; a bigger WANT_PAGES
+;   fails (0x88)  -> the driver still demands contiguity; a bigger want_pages
 ;                    request cannot possibly do better, so signal the defect
 ;                    (0xEA) directly without even trying it.
 ;   succeeds      -> backing is non-contiguous. Free the probe's handle back
 ;                    (it only existed to prove the point) and make the real,
-;                    dedicated WANT_PAGES request, then prove per-page
+;                    dedicated want_pages request, then prove per-page
 ;                    signatures survive it.
 ;
 ; Signals 0xA5 (success) via the unit-tester exit port; 0xEn names the step.
