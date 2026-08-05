@@ -150,6 +150,17 @@ fn shift_form(word: bool, op: u8, dst: u8, count: u8) -> Vec<u8> {
     bytes
 }
 
+/// `0xD1`, the shift-by-one encoding. Two bytes plus the prefix, with no immediate: the count is
+/// architectural, and `classify` supplies it as `if opcode == 0xd1 { 1 }`.
+fn shift_by_one_form(word: bool, op: u8, dst: u8) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if word {
+        bytes.push(0x66);
+    }
+    bytes.extend_from_slice(&[0xd1, 0xc0 | (op << 3) | dst]);
+    bytes
+}
+
 /// A distinct byte at every address, so a stray write of any width is visible in the whole-RAM
 /// compare rather than hidden by a zero fill matching a zero store.
 fn memory_fill() -> Vec<u8> {
@@ -439,6 +450,39 @@ fn word_shifts_match_the_interpreter_for_every_count() {
                     seed,
                     &context,
                 );
+            }
+        }
+    }
+}
+
+/// `0xD1`, the shift-by-one encoding, executed rather than merely admitted.
+///
+/// The 16-bit campaign's third slice put `0xd1` on the Word allowlist, and the whole argument for
+/// it costing no emitter work is that `0xd1` and `0xc1` with an immediate of 1 produce the same
+/// `DirectKind::Shift`. That argument has exactly one line of its own to get wrong,
+/// `let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 }`, and until this test nothing
+/// executed it: every other `0xD1` fixture asserts block length only.
+///
+/// The failure it guards is silent. `decode` leaves `insn.imm` at its default for `0xd0..=0xd3`,
+/// so a lowering that read the immediate instead of supplying 1 gets count 0, `emit_shift`
+/// returns without emitting anything, and the shift disappears with every flag left untouched.
+/// Both roles would agree on a wrong answer if the interpreter shared the mistake; it does not,
+/// so the two diverge and this fails.
+///
+/// Count 1 is also the one count where OF is architecturally DEFINED for a shift, so the flag
+/// consumers matter here as much as the register result. Both widths are swept: `0xD1` at Dword
+/// shipped before this slice and must not move.
+#[test]
+fn shift_by_one_matches_the_interpreter_at_both_widths() {
+    for (label, op) in SUB_OPS {
+        for word in [true, false] {
+            for operand in [0x0001u16, 0x4000, 0x8001, 0x7fff, 0xffff, 0x1234] {
+                let seed = Seed::new().gpr(1, u32::from(operand));
+                let osz = if word { "word" } else { "dword" };
+                let context = format!("0xd1 {label} cx={operand:#06x} osz={osz} (consumed)");
+                let mut body = shift_by_one_form(word, op, 1);
+                body.extend_from_slice(&consumer_bytes());
+                lowered(&body, CONSUMED_SLOTS, seed, &context);
             }
         }
     }

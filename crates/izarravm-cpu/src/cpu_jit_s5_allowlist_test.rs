@@ -526,26 +526,37 @@ fn word_size_shift_forms_are_lowered() {
     let cases: &[(&str, u8)] = &[("/4 shl", 4), ("/5 shr", 5), ("/6 sal", 6), ("/7 sar", 7)];
 
     for &(label, op) in cases {
-        let form = [0x66u8, 0xc1, 0xc0 | (op << 3) | 1, 0x03];
-        let mut code = vec![0x40, 0x41, 0x42];
-        code.extend_from_slice(&form);
-        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
-        warm(
-            &mut cpu,
-            &mut bus,
-            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
-        );
+        // `0xc1` takes an imm8 and `0xd1` supplies an implicit 1, and the arm they share turns
+        // both into the same `Shift`. Both encodings are asserted because the allowlist entries
+        // are separate: dropping either one leaves the other passing.
+        let forms: [(&str, Vec<u8>); 2] = [
+            ("0xc1", vec![0x66, 0xc1, 0xc0 | (op << 3) | 1, 0x03]),
+            ("0xd1", vec![0x66, 0xd1, 0xc0 | (op << 3) | 1]),
+        ];
+        for (opcode, form) in forms {
+            let mut code = vec![0x40, 0x41, 0x42];
+            code.extend_from_slice(&form);
+            let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
 
-        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-        assert_eq!(
-            compilation.span.instructions, 4,
-            "{label}: the word form must join the block rather than end it"
-        );
-        // A register shift touches no memory at any width.
-        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
-        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
-        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
-        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(
+                compilation.span.instructions, 4,
+                "{opcode} {label}: the word form must join the block rather than end it"
+            );
+            // A register shift touches no memory at any width.
+            assert_eq!(compilation.word_reads, 0, "{opcode} {label}: word reads");
+            assert_eq!(compilation.word_stores, 0, "{opcode} {label}: word stores");
+            assert_eq!(compilation.dword_reads, 0, "{opcode} {label}: dword reads");
+            assert_eq!(
+                compilation.dword_stores, 0,
+                "{opcode} {label}: dword stores"
+            );
+        }
     }
 }
 
@@ -559,11 +570,10 @@ fn word_size_shift_forms_are_lowered() {
 ///   66-prefixed ROR routed through it would rotate 32 bits and take CF from bit 31 instead of
 ///   bit 15. That guard is the only thing standing between the new allowlist entry and a
 ///   miscompile, which is why it has a row here and a mutation in the differential file.
-/// * **`0xD1`, the shift-by-one form.** It shares `0xC1`'s classify arm, so it is refused by the
-///   allowlist alone. Deliberate: neither fixture measures a `0xD1` word row, and the campaign's
-///   standing rule is that an unmeasured admission is a formation change with no census row to
-///   attribute it to. The precedent for admitting one member of a shared arm and refusing the
-///   other is `0xf6`/`0xf7`.
+/// * **The four ROTATES of `0xD1`.** Same three-way split as `0xC1`'s, and they matter more now
+///   that the opcode is on the allowlist: `/1` ROR reaches the Word guard through `0xD1` far more
+///   often than through `0xC1`, and `/2` RCL is the largest single row in the 16-bit census at
+///   10.91%, so it is the shape most likely to be admitted by a hurried edit.
 /// * **`0xD3`, the shift-by-CL group.** A different arm, still Dword-only: `emit_shift_cl` has no
 ///   sixteen-bit lane and would be a second emitter primitive.
 ///
@@ -577,8 +587,10 @@ fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
         ("0xc1 /1 ror cx,imm8", &[0x66, 0xc1, 0xc9, 0x03]),
         ("0xc1 /2 rcl cx,imm8", &[0x66, 0xc1, 0xd1, 0x03]),
         ("0xc1 /3 rcr cx,imm8", &[0x66, 0xc1, 0xd9, 0x03]),
-        ("0xd1 /4 shl cx,1", &[0x66, 0xd1, 0xe1]),
-        ("0xd1 /7 sar cx,1", &[0x66, 0xd1, 0xf9]),
+        ("0xd1 /0 rol cx,1", &[0x66, 0xd1, 0xc1]),
+        ("0xd1 /1 ror cx,1", &[0x66, 0xd1, 0xc9]),
+        ("0xd1 /2 rcl cx,1", &[0x66, 0xd1, 0xd1]),
+        ("0xd1 /3 rcr cx,1", &[0x66, 0xd1, 0xd9]),
         ("0xd3 /4 shl cx,cl", &[0x66, 0xd3, 0xe1]),
         ("0xd3 /7 sar cx,cl", &[0x66, 0xd3, 0xf9]),
         (

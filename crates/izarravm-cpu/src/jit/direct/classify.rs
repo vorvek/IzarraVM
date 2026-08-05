@@ -151,14 +151,28 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // extend one instruction further and stop on `shl cx, imm8` instead, relocating 30,692 exits
     // onto `0xC1 /4` and costing quake +8.78% blocks installed and ~1% of wall.
     //
-    // `0xd1` is the SAME classifier arm and is deliberately NOT admitted. That is not an
-    // oversight and the precedent is `0xf6`/`0xf7`, which share an arm with only the byte half on
-    // this list: neither fixture measures a `0xd1` word row, and the campaign's standing rule is
-    // that an unmeasured admission is a formation change with no census row to attribute it to.
-    // Leaving it out is safe in the direction that matters -- the gate refuses it, so it stays a
-    // barrier exactly as today, and no width can be got wrong on a path that is never reached.
-    // `0xd3` (the shift-by-CL group) is a different arm entirely and stays out for the same
-    // reason, with `emit_shift_cl` still Dword-only.
+    // `0xd1` is the SAME classifier arm and is now admitted with it, which is the 16-bit
+    // campaign's third slice. It was held out while no fixture measured a `0xd1` word row; one
+    // does now, and it is the largest single opcode in that census at 21.86% of 260,594,435
+    // block-stopping hits.
+    //
+    // No emitter work, and the reason is stronger than a shared arm: `0xd1` and `0xc1` with an
+    // immediate of 1 produce the SAME `DirectKind::Shift`, and `shift_r16_imm8` has no by-one
+    // encoding at all, so `66 D1 /4` assembles as the bytes `66 C1 E1 01`. `DirectInsn` carries
+    // only `lin`, `len`, `weighted_fp_clocks` and `kind`, and the compile loop reads
+    // `insn.opcode` in exactly two places, neither of which separates the two. The clock charge
+    // is the same 2 down both paths because the interpreter's group-2 arm returns one
+    // `clocks(2)` for the whole `0xc0..=0xd3` range without discriminating.
+    //
+    // What it buys is a QUARTER of that 21.86%: the arm admits register `/4`, `/5` and `/7` only,
+    // which the census splits at 10.75%. `/2` RCL register word is 10.91% on its own, larger than
+    // every admitted shift together, and it is the other half of the `shl ax,1` / `rcl dx,1`
+    // idiom that shifts a 32-bit quantity through two 16-bit registers. Expect the exits this
+    // removes to relocate straight onto RCL. It has no arm at any width and would need the
+    // incoming CF loaded before the rotate, so it is a real slice rather than a list entry.
+    //
+    // `0xd3` (the shift-by-CL group) is a different arm entirely and stays out, with
+    // `emit_shift_cl` still Dword-only.
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
@@ -187,6 +201,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xa8
                 | 0xb0..=0xb7
                 | 0xc1
+                | 0xd1
                 | 0xc2
                 | 0xc3
                 | 0xc6
