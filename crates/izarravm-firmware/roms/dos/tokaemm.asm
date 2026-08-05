@@ -212,8 +212,20 @@ arena_q_total:   dw 0
 ; xms_free/ems_free counters could. A dword generation makes wraparound
 ; (needing 2^32 bitmap mutations between two queries of the same type) a
 ; non-concern; a word counter could theoretically alias within one long session.
+;
+; The stamps start at -1, NOT 0, for the same reason ems_backing_of's cache
+; stores cache_logical+1 (D4): a cache's cold state has to be wrong-looking, not
+; plausible. arena_gen starts at 0 and INIT never mutates the arena (it only
+; sizes it), so stamps of 0 would make the very first query of each type a
+; cache HIT on the never-written arena_qc_largest/arena_qc_total, answering
+; "zero free" without ever walking the bitmap. That is invisible on a normal
+; boot only because this build's shell allocates an XMS swap block before
+; anything queries; a CONFIG.SYS driver loaded after TOKAEMM that sizes itself
+; from XMS 08h would be told the machine has no extended memory. -1 cannot
+; collide until the generation wraps, which is the 2^32 argument above.
 arena_gen:        dd 0             ; bumped by every arena_bmp/vcpi_bmp mutation
-arena_qc_gen:     dd 0, 0, 0       ; per-type cache stamp (index = ALLOC_*/2)
+arena_qc_gen:     dd -1, -1, -1    ; per-type cache stamp (index = ALLOC_*/2);
+                                   ; -1 = never computed, see above
 arena_qc_largest: dw 0, 0, 0       ; ... and its cached answers, in granules
 arena_qc_total:   dw 0, 0, 0
 vcpi_pic_master: dw 8             ; DE0Ah/DE0Bh: current 8259 vector bases
