@@ -2139,13 +2139,14 @@ fn cms_probe_range_reads_open_bus_not_a_fault() {
     // genuinely unclaimed ISA read elsewhere must still surface as a real
     // fault, or this stub would mask the next missing device instead of
     // reporting it.
+    // Unclaimed ports float rather than fault now, so "decoded" and "not
+    // decoded" are told apart by the open-bus port set instead of by an error.
+    // Reading 0xFF alone would not do it: a decoded stub answers 0xFF too.
     for port in [0x0250u16, 0x0270, 0x0290] {
+        assert_eq!(bus.read_io(port, BusWidth::Byte, 0, false), Ok(0xff));
         assert!(
-            matches!(
-                bus.read_io(port, BusWidth::Byte, 0, false),
-                Err(BusError::UnsupportedPort { port: faulted }) if faulted == port
-            ),
-            "port {port:#06x} must still fault"
+            bus.open_bus.floated(port),
+            "port {port:#06x} must reach open bus, not a stub"
         );
     }
 }
@@ -2190,11 +2191,9 @@ fn vmware_backdoor_probe_reads_open_bus_not_a_fault() {
     // magic-number behavior grafted on).
     bus.write_io(0x5658, BusWidth::Dword, 0x564d_5868, false)
         .unwrap();
-    // The stub stays bounded: one past the top still faults.
-    assert!(matches!(
-        bus.read_io(0x565c, BusWidth::Byte, 0, false),
-        Err(BusError::UnsupportedPort { port }) if port == 0x565c
-    ));
+    // The stub stays bounded: one past the top is not decoded, so it floats.
+    assert_eq!(bus.read_io(0x565c, BusWidth::Byte, 0, false), Ok(0xff));
+    assert!(bus.open_bus.floated(0x565c));
 }
 
 #[test]

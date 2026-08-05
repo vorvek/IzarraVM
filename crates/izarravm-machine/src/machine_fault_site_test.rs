@@ -3,9 +3,16 @@
 
 use super::*;
 
-/// An access to an undecoded port is fatal on purpose, so that a hardware gap
-/// stays visible instead of open-bussing into a silent divergence. That makes
-/// the stop report the whole diagnosis, and until this test it named the wrong
+/// An access to an undecoded port USED TO BE fatal by default. It is not any
+/// more -- real hardware floats an unclaimed read and swallows an unclaimed
+/// write, and stopping on the first one hid every later probe (see
+/// `bus::OpenBusPorts`). The fatal path survives as an opt-in, which is exactly
+/// what these tests need and what they arm with `set_fatal_ports`: it is the
+/// only path that records a `fault_site`, and chasing which instruction probes
+/// one specific port is still worth doing.
+///
+/// When a port IS fatal, the stop reports the whole diagnosis, and until this
+/// test it named the wrong
 /// instruction: EIP advances at fetch, and the fatal path did not rewind it, so
 /// the report pointed one instruction PAST the IN or OUT. Prince of Persia was
 /// investigated for hours off a CS:IP that was a return address.
@@ -26,6 +33,9 @@ fn a_fatal_port_fault_names_the_faulting_instruction_not_the_next_one() {
 
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    // Opt 0x2010 back onto the fatal path; open bus does not stop, and a stop is
+    // what carries the fault site this test is about.
+    machine.set_fatal_ports(&[0x2010]);
     let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
     assert!(
@@ -74,6 +84,7 @@ fn the_fault_dump_reads_code_through_the_guest_page_tables() {
 
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4]).unwrap();
+    machine.set_fatal_ports(&[0x2010]);
     machine.write_physical_u32(PD, PT | 7);
     // Identity-map the whole first 4 MB, so nothing in the fixture can take a
     // page fault for an unrelated reason, and override exactly one page.
@@ -170,6 +181,9 @@ fn a_fatal_port_fault_reports_itself_without_any_env_var() {
     const PROG: &[u8] = &[0xBA, 0x10, 0x20, 0xEC, 0xCD, 0x20];
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    // Opt 0x2010 back onto the fatal path; open bus does not stop, and a stop is
+    // what carries the fault site this test is about.
+    machine.set_fatal_ports(&[0x2010]);
     machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
     let line = machine
@@ -206,6 +220,7 @@ fn the_fault_report_latches_per_site_not_per_run() {
     const SPIN: &[u8] = &[0xBA, 0x10, 0x20, 0xEC, 0xEB, 0xFD];
     let mut spinner =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), SPIN).unwrap();
+    spinner.set_fatal_ports(&[0x2010]);
     spinner.run_until_halt_or_cycles(1_000_000).unwrap();
     let first = spinner
         .last_fault_line()
@@ -233,6 +248,7 @@ fn the_fault_report_latches_per_site_not_per_run() {
     const TWO: &[u8] = &[0xBA, 0x10, 0x20, 0xEC, 0xEC, 0xCD, 0x20];
     let mut two =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), TWO).unwrap();
+    two.set_fatal_ports(&[0x2010]);
     two.run_until_halt_or_cycles(1_000_000).unwrap();
     let one = two
         .last_fault_line()
@@ -265,6 +281,9 @@ fn a_run_that_did_not_fault_records_no_fault_site() {
     const PROG: &[u8] = &[0xB8, 0x00, 0x4C, 0xCD, 0x21];
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    // Opt 0x2010 back onto the fatal path; open bus does not stop, and a stop is
+    // what carries the fault site this test is about.
+    machine.set_fatal_ports(&[0x2010]);
     let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert!(
         matches!(stop, StopReason::DosExit { .. }),

@@ -2076,8 +2076,36 @@ impl Machine {
             0x07 => self.vbe_display_start(),
             0x08 => self.vbe_dac_format(),
             0x09 => self.vbe_palette_data(),
+            0x0a => self.vbe_protected_mode_interface(),
             _ => {}
         }
+    }
+
+    /// VBE 2.0 function 0Ah: hand back the protected-mode interface block. The
+    /// caller far-calls the routines inside it directly, with no INT 10h
+    /// involved, so unlike every other function here the answer is an ADDRESS
+    /// of real code rather than an emulated effect -- see `izbios-vbepm.inc`.
+    ///
+    /// NASCAR Racing 2 is why this exists. It asks 4F00h, then 4F0Ah, and treats
+    /// an unsupported 4F0Ah as "no VESA driver" and exits, without ever trying
+    /// to set a mode.
+    fn vbe_protected_mode_interface(&mut self) {
+        // BL selects the subfunction; only 00h (return the table) is defined.
+        if self.cpu.registers.ebx() as u8 != 0x00 {
+            self.set_vbe_status(0x014f);
+            return;
+        }
+        let offset = izarravm_firmware::IZARRA_BIOS_VBE_PM_OFFSET;
+        let length = izarravm_firmware::izarra_bios_vbe_pm_len();
+        self.cpu.registers.set_segment(
+            SegmentIndex::Es,
+            SegmentRegister::real(izarravm_firmware::IZARRA_BIOS_SEG),
+        );
+        self.cpu.registers.set_edi(u32::from(offset));
+        self.cpu
+            .registers
+            .set_ecx((self.cpu.registers.ecx() & 0xffff_0000) | u32::from(length));
+        self.set_vbe_status(0x004f);
     }
 
     fn vbe_controller_info(&mut self) {
@@ -2089,15 +2117,29 @@ impl Machine {
         block[0x0a..0x0e].copy_from_slice(&1u32.to_le_bytes()); // 6/8-bit DAC switching
         block[0x12..0x14].copy_from_slice(&64u16.to_le_bytes()); // TotalMemory: 64 * 64 KB = 4 MB
 
-        // The mode list lives inside the block at offset 0x14. VideoModePtr is a
-        // real-mode far pointer the guest decodes as seg:off, so it carries the
-        // ES selector, not the linear base. vbe_block_ptr() uses the base for the
-        // write-side physical address; in real mode the two agree (base = selector << 4).
-        let list_offset = di.wrapping_add(0x14);
+        // OemStringPtr, into the ROM. A card-identification string is what
+        // SciTech's tools and several games read to decide what they are talking
+        // to, and a null pointer here is a far pointer to the interrupt table.
+        let oem_ptr = (u32::from(izarravm_firmware::IZARRA_BIOS_SEG) << 16)
+            | u32::from(izarravm_firmware::izarra_bios_vbe_oem_string_offset());
+        block[0x06..0x0a].copy_from_slice(&oem_ptr.to_le_bytes());
+
+        // The mode list lives in the block's reserved scratch area at 0x22, where
+        // period BIOSes put it. It USED TO sit at 0x14, which is fine in a VBE
+        // 1.2 block and is OemSoftwareRev + the three OEM pointers in a VBE 2.0
+        // one -- so a VBE2 client read mode numbers as far pointers. The three
+        // OEM pointers stay null, which the spec allows; what it does not allow
+        // is them holding 0x0100, 0x0101, 0x0103.
+        //
+        // VideoModePtr is a real-mode far pointer the guest decodes as seg:off,
+        // so it carries the ES selector, not the linear base. vbe_block_ptr()
+        // uses the base for the write-side physical address; in real mode the
+        // two agree (base = selector << 4).
+        let list_offset = di.wrapping_add(0x22);
         let video_mode_ptr = (u32::from(es) << 16) | u32::from(list_offset);
         block[0x0e..0x12].copy_from_slice(&video_mode_ptr.to_le_bytes());
 
-        let mut pos = 0x14;
+        let mut pos = 0x22;
         for mode in MARGO_VBE_MODES {
             block[pos..pos + 2].copy_from_slice(&mode.number.to_le_bytes());
             pos += 2;
@@ -2154,17 +2196,9 @@ impl Machine {
 
         match self.cpu.registers.ebx() as u8 {
             0x00 | 0x80 => {
-                let display = self.vega.margo_display();
                 let x = self.cpu.registers.ecx() as u16;
                 let y = self.cpu.registers.edx() as u16;
-                let depth = bytes_per_pixel(display.bpp);
-                let start = u64::from(y)
-                    .saturating_mul(u64::from(display.pitch))
-                    .saturating_add(u64::from(x).saturating_mul(u64::from(depth)));
-                if u32::from(x) >= display.width
-                    || start > u64::from(u32::MAX)
-                    || !self.vega.program_display_start(start as u32)
-                {
+                if !self.vega.program_display_start_xy(x, y) {
                     self.set_vbe_status(0x014f);
                     return;
                 }

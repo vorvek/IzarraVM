@@ -57,6 +57,14 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 int13_rom_entry:
     iret
 
+; VBE 2.0 protected-mode interface block at ROM offset 0xF100, so INT 10h
+; AX=4F0Ah can hand the client the far pointer F000:F100. The offset is fixed
+; rather than derived because Rust has to name it (IZARRA_BIOS_VBE_PM_OFFSET)
+; and the ROM ships as a checked-in binary; `vbe_pm_block_sits_at_its_fixed_rom_offset`
+; asserts the assembled bytes really are here.
+    times 0xf0fe - ($ - $$) db 0
+%include "izbios-vbepm.inc"
+
 ; Reset vector at 0xFFFF0 (file offset 0xFFF0 in a 64 KiB ROM). The exact-64K
 ; tail and the far jump to ROM_SEG:reset mirror the other Izarra ROMs.
     times 0xfff0 - ($ - $$) db 0

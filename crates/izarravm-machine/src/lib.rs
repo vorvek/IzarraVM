@@ -1052,6 +1052,9 @@ pub struct Machine {
     // LPT2 (0x278-0x27A, IRQ5). Same printer model as LPT1.
     lpt2: lpt::Lpt,
     device_ports: DevicePorts,
+    // Unclaimed-port accounting; see bus::OpenBusPorts. Carries the whole run's
+    // port set, so it lives on the machine rather than the per-batch bus.
+    open_bus: bus::OpenBusPorts,
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
     keyboard: keyboard::Keyboard8042,
@@ -1372,6 +1375,7 @@ impl Machine {
             lpt: lpt::Lpt::default(),
             lpt2: lpt::Lpt::lpt2(),
             device_ports: DevicePorts::default(),
+            open_bus: bus::OpenBusPorts::from_env(),
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             keyboard: keyboard::Keyboard8042::default(),
@@ -1844,6 +1848,22 @@ impl Machine {
 
     /// Feed Set 1 scancodes to the keyboard controller (make on press, break on
     /// release). The controller schedules the wire transfer and IRQ1 deadline.
+    /// Unclaimed-port accounting for this run: how many reads floated to
+    /// all-ones, how many writes went nowhere, and which ports. A guest probing
+    /// hardware this machine does not model shows up here instead of stopping
+    /// the run; see `bus::OpenBusPorts`.
+    /// Put `ports` back on the fatal path instead of floating them. The
+    /// programmatic twin of `IZARRAVM_PORT_FATAL`, for chasing which
+    /// instruction probes one specific port: the fatal path records a
+    /// `fault_site`, and open bus by design does not stop to.
+    pub fn set_fatal_ports(&mut self, ports: &[u16]) {
+        self.open_bus.set_fatal(ports);
+    }
+
+    pub fn open_bus_ports(&self) -> &bus::OpenBusPorts {
+        &self.open_bus
+    }
+
     pub fn inject_key_scancodes(&mut self, codes: &[u8]) {
         self.keyboard.push_scancodes(codes);
     }
@@ -2529,6 +2549,7 @@ struct MachineBus<'a> {
     lpt: &'a mut lpt::Lpt,
     lpt2: &'a mut lpt::Lpt,
     device_ports: &'a mut DevicePorts,
+    open_bus: &'a mut bus::OpenBusPorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
     keyboard: &'a mut keyboard::Keyboard8042,

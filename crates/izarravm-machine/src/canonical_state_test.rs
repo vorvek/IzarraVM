@@ -2480,8 +2480,12 @@ fn pci_config_bar_partial_writes_preserve_probe_and_decode_state() {
     write_pci_port(&mut machine, 0xe000, BusWidth::Byte, 0x08);
     assert_eq!(read_pci_port(&mut machine, 0xe000, BusWidth::Byte), 0x08);
     {
+        // One window up from the BAR nothing decodes, so the read floats. The
+        // open-bus set is what proves that: the value alone cannot, since a
+        // decoded register may answer 0xFF too.
         let mut bus = machine.make_bus();
-        assert!(bus.read_io(0xf000, BusWidth::Byte, 0, false).is_err());
+        assert_eq!(bus.read_io(0xf000, BusWidth::Byte, 0, false), Ok(0xff));
+        assert!(bus.open_bus.floated(0xf000));
     }
 
     write_pci_port(

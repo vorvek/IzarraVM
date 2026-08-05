@@ -1558,9 +1558,11 @@ fn wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge() {
 #[test]
 fn wss_disabled_leaves_its_ports_undecoded() {
     // With the codec disabled, its config/codec ports must NOT decode at all:
-    // 0x530-0x537 is not in known_passive_ports(), so the bus must return
-    // Err(UnsupportedPort) for both reads and writes -- not a swallowed error
-    // and not a stale latched value. Contrast with the enabled machine, which
+    // 0x530-0x537 is not in known_passive_ports(), so the bus must send both
+    // reads and writes to open bus -- not to a stale latched value. Reading
+    // 0xFF is not enough on its own to show that, since a decoded stub answers
+    // 0xFF too, so each check also asks whether the port floated. Contrast with
+    // the enabled machine, which
     // answers the I12 revision read with 0x0A, so the test proves the gate
     // toggles real decode rather than relying on an error either way.
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
@@ -1571,28 +1573,23 @@ fn wss_disabled_leaves_its_ports_undecoded() {
     let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
     with_bus(&mut machine, |bus| {
         // A write to the index port must not decode.
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C, false)
+            .unwrap();
         assert!(
-            matches!(
-                bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C, false),
-                Err(BusError::UnsupportedPort { port }) if port == WSS_CODEC
-            ),
+            bus.open_bus.floated(WSS_CODEC),
             "disabled WSS index write does not decode"
         );
         // A read of the data port (where an enabled codec would surface the
         // I12 revision) must not decode either.
+        assert_eq!(bus.read_io(WSS_DATA, BusWidth::Byte, 0, false), Ok(0xff));
         assert!(
-            matches!(
-                bus.read_io(WSS_DATA, BusWidth::Byte, 0, false),
-                Err(BusError::UnsupportedPort { port }) if port == WSS_DATA
-            ),
+            bus.open_bus.floated(WSS_DATA),
             "disabled WSS data read does not decode"
         );
         // The window edges (base+7) are likewise undecoded.
+        assert_eq!(bus.read_io(0x537, BusWidth::Byte, 0, false), Ok(0xff));
         assert!(
-            matches!(
-                bus.read_io(0x537, BusWidth::Byte, 0, false),
-                Err(BusError::UnsupportedPort { port }) if port == 0x537
-            ),
+            bus.open_bus.floated(0x537),
             "disabled WSS upper window edge does not decode"
         );
     });
@@ -1787,7 +1784,7 @@ fn wss_port_window_edges_and_config_region_decode_through_the_bus() {
     // the decode comment promises does not overlap the SB16/mixer/OPL ranges:
     //   base+1 (0x531) -> IRQ11/DMA0 jumper byte 0xB0,
     //   base+7 (0x537) -> decodes (Ok),
-    //   base+8 (0x538) and base-1 (0x52F) -> Err(UnsupportedPort).
+    //   base+8 (0x538) and base-1 (0x52F) -> nothing decodes them, so open bus.
     let mut machine = test_machine();
     with_bus(&mut machine, |bus| {
         assert_eq!(
@@ -1799,20 +1796,13 @@ fn wss_port_window_edges_and_config_region_decode_through_the_bus() {
             bus.read_io(0x537, BusWidth::Byte, 0, false).is_ok(),
             "base+7 is the last decoded WSS port"
         );
+        assert_eq!(bus.read_io(0x538, BusWidth::Byte, 0, false), Ok(0xff));
         assert!(
-            matches!(
-                bus.read_io(0x538, BusWidth::Byte, 0, false),
-                Err(BusError::UnsupportedPort { port }) if port == 0x538
-            ),
+            bus.open_bus.floated(0x538),
             "base+8 is past the 8-port window"
         );
-        assert!(
-            matches!(
-                bus.read_io(0x52F, BusWidth::Byte, 0, false),
-                Err(BusError::UnsupportedPort { port }) if port == 0x52F
-            ),
-            "base-1 is below the window"
-        );
+        assert_eq!(bus.read_io(0x52F, BusWidth::Byte, 0, false), Ok(0xff));
+        assert!(bus.open_bus.floated(0x52F), "base-1 is below the window");
     });
 }
 

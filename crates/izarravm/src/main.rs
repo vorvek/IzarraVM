@@ -156,6 +156,14 @@ struct Cli {
     /// schedule is deterministic, so an equal-work comparison still holds.
     #[arg(long, requires = "hdd_folder")]
     inject_keys: Option<String>,
+    /// With --hdd-folder, drive the mouse at fixed guest-cycle offsets:
+    /// `cycles:action` steps separated by `;`, offsets strictly increasing.
+    /// Actions are `home`, `move:<dx>,<dy>`, `down`, `up` and `click`. Deltas are
+    /// mickeys, not pixels (the INT 33h driver owns that ratio). For games whose
+    /// menus are mouse-only, which no keystroke schedule can reach. Combine with
+    /// --inject-keys freely; the two schedules merge by offset.
+    #[arg(long, requires = "hdd_folder")]
+    inject_mouse: Option<String>,
     /// Boot the C: drive exactly as the GUI does and attribute wall time per
     /// boot phase: POST, boot, prompt idle, command exec, and disk load. Uses
     /// the same folder the GUI would (see --c-drive). A profiler, not a ladder.
@@ -327,6 +335,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             cli.profile_json.as_deref(),
             cli.expect_test_exit,
             cli.inject_keys.as_deref(),
+            cli.inject_mouse.as_deref(),
         );
     }
 
@@ -751,11 +760,86 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
     Ok(code)
 }
 
-/// One `--inject-keys` step: type `text` once the run has burned `at_cycles`
-/// guest cycles since start.
-struct KeyInjection {
+/// One scheduled input event, fired once the run has burned `at_cycles` guest
+/// cycles since start. `--inject-keys` and `--inject-mouse` both parse into this
+/// and are merged into one offset-ordered schedule, so a game that needs a
+/// keystroke and a click can be driven by both at once.
+struct Injection {
     at_cycles: u64,
-    text: String,
+    event: InjectionEvent,
+}
+
+enum InjectionEvent {
+    Keys(String),
+    Mouse(MouseAction),
+}
+
+/// A `--inject-mouse` action, expressed in PS/2 packets rather than screen
+/// coordinates. `Machine::set_mouse_absolute` cannot be used here: it maps onto
+/// the GUI's 640x200 virtual space (`MOUSE_GUEST_MAX_Y` is 199), so it cannot
+/// address a 640x480 menu at all. Relative packets are also simply what the
+/// hardware sends.
+enum MouseAction {
+    /// Drive the pointer hard into the driver's minimum corner. The INT 33h
+    /// driver clamps to its own `min_x`/`min_y`, so where this lands is exact no
+    /// matter where the pointer started -- which is what lets a following `move`
+    /// address a known pixel without the harness tracking any state.
+    Home,
+    /// Relative motion in MICKEYS -- raw PS/2 counts, y positive downward --
+    /// not pixels. The harness cannot convert: how far a mickey moves the
+    /// pointer is the INT 33h driver's mickey-to-pixel ratio, which the guest
+    /// may change at any time through function 0Fh. At TOKAMOUS's defaults one
+    /// mickey is one pixel across and two are one pixel down, so a schedule is
+    /// derived once against a screenshot and then replays exactly.
+    Move { dx: i32, dy: i32 },
+    /// Press (1) or release (0) the left button, as a zero-motion packet.
+    Button(u8),
+    /// Press and release.
+    Click,
+}
+
+/// Guest milliseconds between injected mouse packets. The 8042 paces auxiliary
+/// bytes out at one per millisecond and a TOKAMOUS IntelliMouse packet is four
+/// bytes, so the guest can never drain faster than 250 packets/s; injecting
+/// quicker only grows the aux queue. 5 ms is the same 200 Hz ceiling the GUI's
+/// own `MOUSE_FLUSH_HZ` holds to.
+const MOUSE_PACKET_SPACING_MS: u64 = 5;
+
+/// Packets `MouseAction::Home` sends. Each carries the PS/2 9-bit maximum, which
+/// the INT 33h driver scales by its mickey-to-pixel ratio: at TOKAMOUS's
+/// defaults that is 255 px per packet horizontally and 127 vertically, but a
+/// game may set a coarser ratio through function 0Fh and homing has to overshoot
+/// under the worst one it plausibly picks. At a ratio of 64 -- four times
+/// coarser than the default vertical -- a packet is worth 31 pixels, so covering
+/// a 480-line screen needs 16. Twenty leaves margin and costs 100 ms of guest
+/// time, which is nothing against a schedule measured in guest seconds.
+const MOUSE_HOME_PACKETS: usize = 20;
+
+/// Largest motion one PS/2 packet can carry, so a longer move is split.
+/// `Machine::inject_mouse_relative` clamps rather than splits, matching real
+/// hardware, which means the splitting has to happen here.
+const MOUSE_PACKET_MAX_DELTA: i32 = 255;
+
+/// How long `click` holds the button down, in guest milliseconds.
+///
+/// A press and a release one packet apart is 5 ms, and that is NOT enough. A
+/// menu that samples the button once a frame simply never sees it: Grand Prix 2
+/// swallowed exactly that click on its startup menu, with the pointer verified
+/// to be on the button. Nothing repeats during the hold -- a real PS/2 mouse
+/// sends one packet per state change and the driver latches it -- so this is
+/// purely how long the two packets are separated by. 100 ms is a human click
+/// and clears any per-frame poll.
+const MOUSE_CLICK_HOLD_MS: u64 = 100;
+
+/// One injected PS/2 packet, plus how long to run the guest afterwards. The
+/// dwell is per-packet because a click's press has to outlast a frame while
+/// motion should stay at the aux-drain rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MousePacket {
+    dx: i32,
+    dy: i32,
+    buttons: u8,
+    dwell_ms: u64,
 }
 
 /// A stop that ends the whole run, as opposed to a slice merely using up its
@@ -811,35 +895,151 @@ fn text_to_scancode_groups(text: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     Ok(groups)
 }
 
-/// Parse `--inject-keys`: `cycles:text` steps separated by `;`, for example
-/// `200000000:\r;400000000:\r`. Cycles are absolute offsets from run start and
-/// must be strictly increasing, which is what makes the schedule deterministic:
-/// the same build replays the same keystroke at the same guest cycle every run,
-/// so the gate's equal-work comparison still holds.
-fn parse_key_injections(spec: &str) -> Result<Vec<KeyInjection>, Box<dyn Error>> {
+/// Split a `cycles:payload` schedule into its steps, checking that the offsets
+/// strictly increase. That check is what makes a schedule deterministic: the
+/// same build replays the same event at the same guest cycle every run, so a
+/// gate's equal-work comparison still holds.
+fn parse_injection_steps<'a>(
+    flag: &str,
+    spec: &'a str,
+) -> Result<Vec<(u64, &'a str)>, Box<dyn Error>> {
     let mut steps = Vec::new();
     let mut previous: Option<u64> = None;
     for raw in spec.split(';').filter(|s| !s.trim().is_empty()) {
-        let (cycles, text) = raw
+        let (cycles, payload) = raw
             .split_once(':')
-            .ok_or_else(|| format!("--inject-keys step {raw:?} is not <cycles>:<text>"))?;
+            .ok_or_else(|| format!("{flag} step {raw:?} is not <cycles>:<payload>"))?;
         let at_cycles: u64 = cycles.trim().parse()?;
         if previous.is_some_and(|last| at_cycles <= last) {
             return Err(format!(
-                "--inject-keys offsets must strictly increase; {at_cycles} does not follow {}",
+                "{flag} offsets must strictly increase; {at_cycles} does not follow {}",
                 previous.unwrap_or_default()
             )
             .into());
         }
         previous = Some(at_cycles);
-        // `\r` is the one escape worth having: a bare carriage return cannot
-        // survive a shell argument, and Enter is what dismisses a title screen.
-        steps.push(KeyInjection {
-            at_cycles,
-            text: text.replace("\\r", "\r").replace("\\n", "\n"),
-        });
+        steps.push((at_cycles, payload));
     }
     Ok(steps)
+}
+
+/// Parse `--inject-keys`: `cycles:text` steps separated by `;`, for example
+/// `200000000:\r;400000000:\r`.
+fn parse_key_injections(spec: &str) -> Result<Vec<Injection>, Box<dyn Error>> {
+    parse_injection_steps("--inject-keys", spec)?
+        .into_iter()
+        .map(|(at_cycles, text)| {
+            // `\r` is the one escape worth having: a bare carriage return cannot
+            // survive a shell argument, and Enter is what dismisses a title screen.
+            Ok(Injection {
+                at_cycles,
+                event: InjectionEvent::Keys(text.replace("\\r", "\r").replace("\\n", "\n")),
+            })
+        })
+        .collect()
+}
+
+/// Parse `--inject-mouse`: `cycles:action` steps separated by `;`, for example
+/// `6000000000:home;6100000000:move:320,386;6200000000:click`.
+fn parse_mouse_injections(spec: &str) -> Result<Vec<Injection>, Box<dyn Error>> {
+    parse_injection_steps("--inject-mouse", spec)?
+        .into_iter()
+        .map(|(at_cycles, action)| {
+            let action = match action.trim() {
+                "home" => MouseAction::Home,
+                "down" => MouseAction::Button(1),
+                "up" => MouseAction::Button(0),
+                "click" => MouseAction::Click,
+                other => {
+                    let deltas = other.strip_prefix("move:").ok_or_else(|| {
+                        format!(
+                            "--inject-mouse: unknown action {other:?} \
+                             (want home, move:<dx>,<dy>, down, up or click)"
+                        )
+                    })?;
+                    let (dx, dy) = deltas.split_once(',').ok_or_else(|| {
+                        format!("--inject-mouse: move needs <dx>,<dy>, got {deltas:?}")
+                    })?;
+                    MouseAction::Move {
+                        dx: dx.trim().parse()?,
+                        dy: dy.trim().parse()?,
+                    }
+                }
+            };
+            Ok(Injection {
+                at_cycles,
+                event: InjectionEvent::Mouse(action),
+            })
+        })
+        .collect()
+}
+
+/// Merge the two schedules into one ordered by offset. Each flag's own offsets
+/// already strictly increase; a key and a click may legitimately share an
+/// offset, and a stable sort then fires the key first.
+fn merged_injections(
+    inject_keys: Option<&str>,
+    inject_mouse: Option<&str>,
+) -> Result<Vec<Injection>, Box<dyn Error>> {
+    let mut merged = match inject_keys {
+        Some(spec) => parse_key_injections(spec)?,
+        None => Vec::new(),
+    };
+    if let Some(spec) = inject_mouse {
+        merged.extend(parse_mouse_injections(spec)?);
+    }
+    merged.sort_by_key(|step| step.at_cycles);
+    Ok(merged)
+}
+
+/// Expand one mouse action into the PS/2 packets that convey it. Each element is
+/// a `(dx, dy, buttons)` triple the caller injects one packet at a time, with a
+/// slice of guest time between them so the INT 74h ISR can consume each.
+///
+/// `buttons` is threaded through every packet, including motion, so a `down`,
+/// `move`, `up` sequence reads as a drag rather than a click that lets go.
+fn mouse_action_packets(action: &MouseAction, buttons: &mut u8) -> Vec<MousePacket> {
+    let packet = |dx, dy, mask| MousePacket {
+        dx,
+        dy,
+        buttons: mask,
+        dwell_ms: MOUSE_PACKET_SPACING_MS,
+    };
+    match action {
+        MouseAction::Home => {
+            vec![
+                packet(-MOUSE_PACKET_MAX_DELTA, -MOUSE_PACKET_MAX_DELTA, *buttons);
+                MOUSE_HOME_PACKETS
+            ]
+        }
+        MouseAction::Move { dx, dy } => {
+            let steps = (dx.abs().max(dy.abs()) as u64).div_ceil(MOUSE_PACKET_MAX_DELTA as u64);
+            let (mut left_x, mut left_y) = (*dx, *dy);
+            (0..steps)
+                .map(|_| {
+                    let step_x = left_x.clamp(-MOUSE_PACKET_MAX_DELTA, MOUSE_PACKET_MAX_DELTA);
+                    let step_y = left_y.clamp(-MOUSE_PACKET_MAX_DELTA, MOUSE_PACKET_MAX_DELTA);
+                    left_x -= step_x;
+                    left_y -= step_y;
+                    packet(step_x, step_y, *buttons)
+                })
+                .collect()
+        }
+        MouseAction::Button(mask) => {
+            *buttons = *mask;
+            vec![packet(0, 0, *mask)]
+        }
+        MouseAction::Click => {
+            *buttons = 0;
+            vec![
+                MousePacket {
+                    dwell_ms: MOUSE_CLICK_HOLD_MS,
+                    ..packet(0, 0, 1)
+                },
+                packet(0, 0, 0),
+            ]
+        }
+    }
 }
 
 /// Mount a host folder as C: through the Katea facade (real FreeDOS system files
@@ -857,6 +1057,7 @@ fn run_boot_hdd_folder(
     profile_json: Option<&Path>,
     expect_test_exit: bool,
     inject_keys: Option<&str>,
+    inject_mouse: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(path) = profile_json {
         validate_profile_json_parent(path)?;
@@ -892,10 +1093,7 @@ fn run_boot_hdd_folder(
     #[cfg(windows)]
     let rip_sampler =
         std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| (riprofile::Sampler::start(), path));
-    let injections = match inject_keys {
-        Some(spec) => parse_key_injections(spec)?,
-        None => Vec::new(),
-    };
+    let injections = merged_injections(inject_keys, inject_mouse)?;
     let start_wall = std::time::Instant::now();
     // The no-injection path stays ONE `run_until_halt_or_cycles` call, byte for
     // byte what it was: slicing the run moves where the machine services device
@@ -903,38 +1101,64 @@ fn run_boot_hdd_folder(
     let stop_reason = if injections.is_empty() {
         machine.run_until_halt_or_cycles(budget)?
     } else {
-        let mut spent = 0u64;
-        let mut reason = None;
-        for step in &injections {
-            let slice = step.at_cycles.saturating_sub(spent).min(budget - spent);
-            if slice > 0 {
-                let stop = machine.run_until_halt_or_cycles(slice)?;
-                spent += slice;
-                if let Some(terminal) = non_cycle_stop(&stop) {
-                    reason = Some(terminal);
-                    break;
-                }
-            }
-            // One short slice per scancode, as `inject_command` does: the guest
-            // has to poll INT 16h and consume each key before the next arrives,
-            // or the type-ahead buffer swallows it.
-            let per_key = hardware
+        let guest_ms = |ms: u64| {
+            hardware
                 .cpu
                 .clock_rate()
-                .clocks_for_fraction_floor(2, 1000)
-                .max(1_000);
-            for group in text_to_scancode_groups(&step.text)? {
-                for code in group {
-                    machine.inject_key_scancodes(&[code]);
-                    let slice = per_key.min(budget.saturating_sub(spent));
-                    if slice == 0 {
-                        break;
+                .clocks_for_fraction_floor(ms, 1000)
+                .max(1_000)
+        };
+        // One short slice per scancode, as `inject_command` does: the guest has
+        // to poll INT 16h and consume each key before the next arrives, or the
+        // type-ahead buffer swallows it. Mouse packets carry their own dwell,
+        // which is longer -- paced by the 8042's aux byte rate, and longer still
+        // for a click, which has to outlast a frame.
+        let per_key = guest_ms(2);
+        let mut spent = 0u64;
+        let mut reason = None;
+        let mut buttons = 0u8;
+        // Run `slice` more cycles, reporting a terminal stop. Returns false once
+        // the run is over, so the caller stops feeding it input.
+        let advance = |machine: &mut Machine,
+                       spent: &mut u64,
+                       reason: &mut Option<StopReason>,
+                       slice: u64|
+         -> Result<bool, Box<dyn Error>> {
+            let slice = slice.min(budget.saturating_sub(*spent));
+            if slice == 0 {
+                return Ok(false);
+            }
+            let stop = machine.run_until_halt_or_cycles(slice)?;
+            *spent += slice;
+            if let Some(terminal) = non_cycle_stop(&stop) {
+                *reason = Some(terminal);
+                return Ok(false);
+            }
+            Ok(true)
+        };
+        for step in &injections {
+            let gap = step.at_cycles.saturating_sub(spent);
+            if gap > 0 && !advance(&mut machine, &mut spent, &mut reason, gap)? {
+                break;
+            }
+            match &step.event {
+                InjectionEvent::Keys(text) => {
+                    for group in text_to_scancode_groups(text)? {
+                        for code in group {
+                            machine.inject_key_scancodes(&[code]);
+                            if !advance(&mut machine, &mut spent, &mut reason, per_key)? {
+                                break;
+                            }
+                        }
                     }
-                    let stop = machine.run_until_halt_or_cycles(slice)?;
-                    spent += slice;
-                    if let Some(terminal) = non_cycle_stop(&stop) {
-                        reason = Some(terminal);
-                        break;
+                }
+                InjectionEvent::Mouse(action) => {
+                    for packet in mouse_action_packets(action, &mut buttons) {
+                        machine.inject_mouse_relative(packet.dx, packet.dy, packet.buttons);
+                        let dwell = guest_ms(packet.dwell_ms);
+                        if !advance(&mut machine, &mut spent, &mut reason, dwell)? {
+                            break;
+                        }
                     }
                 }
             }
@@ -1028,6 +1252,20 @@ fn run_boot_hdd_folder(
     let ip = machine.cpu().registers.eip as u16;
     println!("folder: {}", dir.display());
     println!("stop: {stop_reason:?}");
+    // Ports nothing decoded. Silent when a run touches only modelled hardware,
+    // so a line here means the guest went looking for something that is not
+    // there -- which used to be a fatal stop and is now just a note.
+    let open_bus = machine.open_bus_ports();
+    if open_bus.reads() > 0 || open_bus.writes() > 0 {
+        let ports: Vec<String> = open_bus.ports().map(|p| format!("{p:#06x}")).collect();
+        println!(
+            "open-bus: {} read(s), {} write(s) across {} port(s): {}",
+            open_bus.reads(),
+            open_bus.writes(),
+            ports.len(),
+            ports.join(" ")
+        );
+    }
     println!("CS:IP = {cs:04X}:{ip:04X}");
     let mut at_7c00 = [0u8; 16];
     for (offset, byte) in at_7c00.iter_mut().enumerate() {
