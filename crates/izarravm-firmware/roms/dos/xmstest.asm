@@ -268,6 +268,74 @@ start:
     or ax, ax
     jz f_large
 
+    ; --- 08h must distinguish LARGEST from TOTAL -------------------------
+    ; XMS 08h returns AX = largest free block and DX = total free -- the figure
+    ; DOS/16M-family loaders size their requests from. Fragment the arena with
+    ; two blocks, free the lower one, and the largest must then be strictly
+    ; less than the total.
+    ;
+    ; NOTE: this does NOT currently fail. 64 KB blocks are 4 KB-page-aligned,
+    ; and any hole that shape can create is one the 4 KB bitmap can already
+    ; represent exactly -- AX (arena_longest_clear, a bit-scan max) and DX
+    ; (xms_free, a counter kept in lockstep with every arena_mark_xms/
+    ; arena_clear_xms call) are sum-vs-max over the SAME bitmap, so AX < DX
+    ; holds whenever there is more than one free run, at ANY page granularity.
+    ; Verified empirically: this block runs clean through to the 1 KB check
+    ; below on today's driver. It is not a defect-discriminating red test --
+    ; it is a forward regression guard on the largest/total relationship that
+    ; Task 4's arena_query must keep honoring. The actual pre-Task-4 defect is
+    ; the 1 KB request below.
+    mov ah, 0x09                  ; low block, 64 KB
+    mov dx, 64
+    call far [entry]
+    or ax, ax
+    jz f_gran
+    mov [frag_lo], dx
+    mov ah, 0x09                  ; a second block pins a hole below it
+    mov dx, 64
+    call far [entry]
+    or ax, ax
+    jz f_gran
+    mov [frag_hi], dx
+    mov ah, 0x0A                  ; release the low block -> interior hole
+    mov dx, [frag_lo]
+    call far [entry]
+    or ax, ax
+    jz f_gran
+    mov ah, 0x08
+    call far [entry]
+    cmp ax, dx
+    jae f_largest                 ; largest == total: the hole is invisible
+    mov ah, 0x0A
+    mov dx, [frag_hi]
+    call far [entry]
+    or ax, ax
+    jz f_gran
+
+    ; --- a 1 KB request must cost 1 KB ------------------------------------
+    ; 386MAX allocates XMS on a 1 KB boundary (ALLOC_LIM @ALLOC_XMS). A 4 KB
+    ; page arena rounds a 1 KB block up and burns 4 KB of the reported total.
+    mov ah, 0x08
+    call far [entry]
+    mov [gran_before], dx
+    mov ah, 0x09
+    mov dx, 1
+    call far [entry]
+    or ax, ax
+    jz f_gran
+    mov [gran_handle], dx
+    mov ah, 0x08
+    call far [entry]
+    mov ax, [gran_before]
+    sub ax, dx                    ; kilobytes the 1 KB block actually consumed
+    cmp ax, 1
+    jne f_gran
+    mov ah, 0x0A
+    mov dx, [gran_handle]
+    call far [entry]
+    or ax, ax
+    jz f_gran
+
     mov al, OK
     jmp sig
 
@@ -299,6 +367,13 @@ f_resize:   mov al, 0xED
             jmp sig
 f_large:    mov al, 0xEE
             jmp sig
+; 0xE0-0xEE are already claimed (f_noxms through f_large below), so the two
+; new codes go just past them rather than at the plan's originally-picked
+; 0xE0/0xEF (0xE0 collides with f_noxms; see the commit message).
+f_largest:  mov al, 0xEF
+            jmp sig
+f_gran:     mov al, 0xF0
+            jmp sig
 f_free:     mov al, 0xE8
 
 sig:
@@ -315,6 +390,10 @@ entry:   dd 0
 handle:  dw 0
 large_kb: dw 0
 large_off: dd 0
+frag_lo:     dw 0
+frag_hi:     dw 0
+gran_before: dw 0
+gran_handle: dw 0
 desc:
 d_len:    dd 0
 d_srch:   dw 0
