@@ -1844,7 +1844,11 @@ fn pending_flags_offset() {
     // NOT keep the pin, because repr(Rust) reorders fields by alignment: source position buys
     // nothing here, so it is written at the tail for readability (it is cold, written at most
     // once per run) rather than for layout.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    // The invalidation-scan counters (smc_scan_calls, smc_scan_keys) add two u64 fields to
+    // PerfCounters and move this pin from 4512 to 4528 -- measured, not derived. They belong in
+    // PerfCounters rather than at the CpuGsw tail because they have to appear in the probe JSON
+    // beside the other SMC counters, which is where the invalidation cost is read.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

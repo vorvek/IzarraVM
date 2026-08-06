@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Sparse 16-byte physical code watches for native stores.
+//! Sparse physical code watches for native stores, at `CHUNK_SHIFT` granularity.
 
 use std::collections::{HashMap, hash_map::Entry};
 
@@ -9,7 +9,38 @@ use crate::U32BuildHasher;
 
 const PAGE_SHIFT: u32 = 12;
 const PAGE_COUNT: usize = 1 << (32 - PAGE_SHIFT);
-const CHUNK_SHIFT: u32 = 4;
+/// Bytes per watched code granule, as a shift. The native store guard tests one bit per granule,
+/// so this is the resolution at which a guest store is judged to have hit code.
+///
+/// **Lowered from 4 (16 bytes) to 2 (4 bytes) on measurement.** At 16 bytes a store landing merely
+/// NEAR a compiled instruction is admitted to `invalidate_physical_range`, which then walks every
+/// block key on the page to find no overlap. Measured on NASCAR Racing 1 at 586: 5,702,773 such
+/// calls examining 4,471,919,398 keys, of which 473,846 overlapped, so 99.99% of that work was
+/// wasted and the function was 57.3% of wall.
+///
+/// Simulated skip rate against granularity, taken inside the real scan, counting the calls a watch
+/// of each width would never have admitted:
+///
+/// | bytes | 16 | 8 | 4 | 2 | 1 |
+/// |---|---|---|---|---|---|
+/// | NASCAR | 0.00% | 33.90% | **75.42%** | 83.27% | 94.08% |
+/// | Quake | 0.00% | 0.02% | 15.83% | 40.14% | 68.52% |
+/// | Doom | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% |
+///
+/// 4 bytes takes 80% of the available win for a quarter of byte granularity's footprint. Doom
+/// reads zero at every width because its invalidations are genuine renderer self-patches; there is
+/// nothing there to skip, so it pays the footprint and gains nothing. That is the trade.
+///
+/// `WatchPage` scales with this: `refs` is `[u32; CHUNKS_PER_PAGE]`, so a watched page goes from
+/// about 1 KiB to about 4 KiB. `acquire_range` and `release_range` also step four times as many
+/// granules per install and retire, which is compile-time work rather than per-store work.
+const CHUNK_SHIFT: u32 = 2;
+
+/// `CHUNK_SHIFT` for the emitter, which bakes it into the native store guard's bit index. Exported
+/// so there is ONE definition: the guard used to write the shift as a literal, and a literal that
+/// silently disagrees with the table it indexes is a miscompile rather than a build failure.
+/// Mirrors how `fast_map` exports `NATIVE_PAGE_SHIFT` for the same reason.
+pub(crate) const NATIVE_CHUNK_SHIFT: u32 = CHUNK_SHIFT;
 const CHUNKS_PER_PAGE: usize = 1 << (PAGE_SHIFT - CHUNK_SHIFT);
 const MASK_WORDS: usize = CHUNKS_PER_PAGE / u64::BITS as usize;
 const MAX_RECYCLED_PAGES: usize = 64;
@@ -19,6 +50,19 @@ const STICKY_LOW_PRECISE_PAGES: u32 = (2 << 20) >> PAGE_SHIFT;
 const MAX_STICKY_HIGH_PRECISE_PAGES: usize =
     MAX_STICKY_PRECISE_PAGES - STICKY_LOW_PRECISE_PAGES as usize;
 const PAGE_BITMAP_WORDS: usize = PAGE_COUNT / u64::BITS as usize;
+
+// The emitted store guard indexes a page's mask with `(address & 0xfff) >> CHUNK_SHIFT`, so the
+// mask has to hold every granule a page can contain. Both hold for any shift in 0..=6 and both
+// exist so a shift change that broke them would fail the build rather than index off the end of a
+// `WatchPage` at runtime, which is unobservable until the wrong bit answers.
+const _: () = assert!(
+    MASK_WORDS >= 1,
+    "a page's chunk mask needs at least one word"
+);
+const _: () = assert!(
+    (0xfff_usize >> CHUNK_SHIFT) < MASK_WORDS * u64::BITS as usize,
+    "the last byte of a page must index a bit inside the chunk mask"
+);
 
 type ChunkMask = [u64; MASK_WORDS];
 
@@ -276,8 +320,9 @@ pub(crate) struct NativeCodeWatch {
     table: Option<Box<[usize]>>,
     pages: HashMap<u32, Box<WatchPage>, U32BuildHasher>,
     inactive_pages: usize,
-    /// Identity-free zeroed pages retained across hot global clears. Sixty-four pages cost about
-    /// 68 KiB per watch and cover the observed code working set without unbounded growth.
+    /// Identity-free zeroed pages retained across hot global clears. Sixty-four pages cover the
+    /// observed code working set without unbounded growth. Their cost scales with `CHUNK_SHIFT`:
+    /// about 271 KiB per watch at 4-byte granules, against 68 KiB when granules were 16 bytes.
     #[allow(clippy::vec_box)]
     // Box addresses remain stable while native code can observe them.
     recycled_pages: Vec<Box<WatchPage>>,

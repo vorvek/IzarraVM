@@ -688,6 +688,12 @@ pub struct PerfCounters {
     /// registered lane start. The owning block survives and contributes no SMC heat; the narrow
     /// decode-line kill still runs.
     pub smc_lane_accepts: u64,
+    /// Calls into `invalidate_physical_range`'s overlap scan, and the block keys those calls
+    /// examined. `smc_scan_keys / smc_scan_calls` is the mean scan length. Both exist because a
+    /// profile share cannot say whether that function is slow per call or simply called often,
+    /// and the answer selects completely different fixes.
+    pub smc_scan_calls: u64,
+    pub smc_scan_keys: u64,
     /// Fail-closed rejections, split by which check refused. `width` is a write that starts at a
     /// lane but is not four bytes wide (a byte or word patch of the dword field); `address` is a
     /// write that overlaps a lane's bytes without starting on it (a straddle or partial overlap).
@@ -2892,18 +2898,20 @@ impl DecodeCache {
             let Some(insn) = line.insn else {
                 continue;
             };
-            let mut chunk = line.phys_start & !0xf;
-            let last = line.phys_start.wrapping_add(u32::from(insn.len) - 1) & !0xf;
-            loop {
-                expected.insert(chunk);
-                if chunk == last {
-                    break;
-                }
-                chunk = chunk.wrapping_add(16);
+            // Collect the code BYTES, not granule bases. This used to walk `& !0xf` in steps of
+            // 16, which asserted that a specific 16-byte base was watched -- a claim that is both
+            // too strong (it names bases the mark never touched once granules are smaller) and too
+            // weak (it never checks the granules that ARE marked). Bytes are the real invariant:
+            // every byte of a live decoded instruction must be watched at any granularity.
+            for offset in 0..u32::from(insn.len) {
+                expected.insert(line.phys_start.wrapping_add(offset));
             }
         }
-        for chunk in expected {
-            assert!(self.native_code_watch.is_watched(chunk));
+        for byte in expected {
+            assert!(
+                self.native_code_watch.is_watched(byte),
+                "decoded code byte {byte:#x} is not watched"
+            );
         }
     }
 

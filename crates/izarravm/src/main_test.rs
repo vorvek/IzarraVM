@@ -137,6 +137,8 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "smc_lane_reject_address",
     "smc_lane_reject_width",
     "smc_narrow_kills",
+    "smc_scan_calls",
+    "smc_scan_keys",
     "straight_line_runs",
 ];
 
@@ -477,6 +479,8 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         smc_narrow_kills: _,
         smc_lane_registrations: _,
         smc_lane_accepts: _,
+        smc_scan_calls: _,
+        smc_scan_keys: _,
         smc_lane_reject_width: _,
         smc_lane_reject_address: _,
         smc_heat_demotions: _,

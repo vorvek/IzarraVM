@@ -859,8 +859,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // 20 M doom executions. The fatal-fault diagnostics slice adds `fault_site: FaultSite` to
     // `CpuGsw` (24 bytes), moving this pin from 4488 to 4512 -- measured, not derived. It carries
     // no architectural state and is deliberately absent from both canonical payloads.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    // The invalidation-scan counters (smc_scan_calls, smc_scan_keys) add two u64 fields to
+    // PerfCounters and move this pin from 4512 to 4528 -- measured, not derived. They belong in
+    // PerfCounters rather than at the CpuGsw tail because they have to appear in the probe JSON
+    // beside the other SMC counters, which is where the invalidation cost is read.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4512);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
 }

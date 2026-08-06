@@ -1287,16 +1287,20 @@ fn physical_invalidation_removes_overlap_and_preserves_adjacent_blocks() {
 #[test]
 fn physical_invalidation_refcounts_shared_watch_chunks() {
     let mut cache = BlockCache::default();
+    // The two spans OVERLAP at 0x20_024..0x20_027 rather than merely sitting in one 16-byte
+    // granule, so the shared-ownership property holds at any granularity. The earlier form used
+    // adjacent 8-byte blocks at 0x20_020 and 0x20_028 and depended on both landing in the same
+    // 16-byte chunk, which stopped being true when granules shrank to 4 bytes.
     let first = BlockKey::new(0x1000, 0x20_020, 7);
-    let second = BlockKey::new(0x2000, 0x20_028, 7);
+    let second = BlockKey::new(0x2000, 0x20_024, 7);
     install_trivial(&mut cache, first, 8);
     install_trivial(&mut cache, second, 8);
     assert!(cache.range_hits_compiled_code(0x20_020, 16));
 
     assert_eq!(cache.retire_physical_range_for_test(first.physical, 1), 1);
     assert!(
-        cache.range_hits_compiled_code(first.physical, 1),
-        "the neighboring block still owns the shared 16-byte watch"
+        cache.range_hits_compiled_code(0x20_024, 1),
+        "the overlapping block still owns the shared watch granule"
     );
 
     assert_eq!(cache.retire_physical_range_for_test(second.physical, 1), 1);
@@ -1595,13 +1599,17 @@ fn smc_heat_accrues_only_on_actual_code_invalidation() {
     assert!(cpu.jit_direct.smc_heat.chunk_hot(key.physical, 0));
     assert_eq!(cpu.perf.smc_heat_chunks_hot, 1);
 
-    // A data byte sharing the same 16-byte chunk as cold code (the block watches only its own
-    // bytes) invalidates nothing, so it never heats the chunk and the block survives.
+    // A data byte sharing a watched granule with cold code, but outside the block's own span,
+    // invalidates nothing, so it never heats the granule and the block survives. The block is
+    // deliberately SHORTER than one granule so such a byte exists: with a 4-byte block on a
+    // 4-byte granule there is no unwatched byte in the granule at all, and this test would then
+    // pass because the write is never admitted rather than because it heats nothing.
     let mut cold = CpuGsw::default();
     let data_key = BlockKey::new(0x2000, 0x61_000, 7);
-    install_trivial(&mut cold.jit_direct, data_key, 4); // watches 0x61_000..0x61_003
+    install_trivial(&mut cold.jit_direct, data_key, 2); // watches 0x61_000..0x61_001
     for _ in 0..8 {
-        cold.note_code_write(0x61_004, 1); // same chunk 0x61_00, unwatched byte
+        // Admitted (its granule is watched) but outside the span.
+        cold.note_code_write(0x61_002, 1);
     }
     assert!(!cold.jit_direct.smc_heat.chunk_hot(data_key.physical, 0));
     assert_eq!(cold.perf.smc_heat_chunks_hot, 0);
