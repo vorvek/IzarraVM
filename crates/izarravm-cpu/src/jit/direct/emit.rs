@@ -3411,41 +3411,73 @@ fn emit_code_watch_table_branch(
     e.cmp_r64_imm32(Reg::RDX, 0);
     e.jz(unwatched);
 
-    // Probe EVERY granule the access can span, not just its first and last byte.
+    // Test every granule the access spans, in a sequence whose SIZE does not grow with the width.
     //
-    // This used to be exactly two probes, the first byte's granule and the last byte's. That is
-    // complete only while an access cannot span more than two granules, which held silently at the
-    // old 16-byte granularity: the widest access is Tbyte at 10 bytes, and `alignment_bytes()`
-    // pins it to 4, so a 4-aligned 10-byte store touched at most two 16-byte chunks. At 4-byte
-    // granules the same store touches THREE (base, base+4, base+8) and the middle one was never
-    // tested, so `FSTP TBYTE` over a cached instruction would commit natively, skip the
-    // invalidation entirely, and leave the stale decode line executing. Silent: no fault, no
-    // counter, no framebuffer divergence unless the overwritten code happened to run.
+    // The guard used to emit one `bt` probe per granule, which was correct but grew linearly:
+    // `FSTP TBYTE` at one-byte granularity became ten probes, and the full Doom loop emitted 4039
+    // bytes against a one-host-page install limit. That is not a test failure, it is blocks
+    // silently REFUSED for size on the oracles. An access at page offset `o` spanning `n` granules
+    // occupies bit range `[g, g + n)` of the page's mask, where `g = o >> CHUNK_SHIFT`; instead of
+    // probing each bit, load a window over the mask and test a shifted constant against it. One
+    // load, one dynamic shift, one AND, for EVERY width.
     //
-    // Stepping by exactly one granule keeps the offsets' position WITHIN a granule constant, so
-    // consecutive probes are consecutive granules and nothing between the first byte and the last
-    // can be skipped whatever the shift becomes. `emit_wide_page_guard` upstream guarantees the
-    // access does not cross a page, so every offset below stays on the first byte's page and the
-    // bit index stays inside the mask.
-    let granule = 1u32 << NATIVE_CHUNK_SHIFT;
-    let last_byte = width.bytes() - 1;
-    let mut offset = 0u32;
-    loop {
+    // `n` is computed here, at emit time, from the width alone. That is offset-independent only
+    // because `emit_wide_page_guard` refuses unaligned accesses and `CHUNK_SHIFT <= 2` keeps every
+    // aligned width inside one granule walk -- at a shift of 3 a 4-aligned Qword at offset 4 mod 8
+    // would span two granules while this formula says one, a MISSED invalidation. `code_watch.rs`
+    // const-asserts that precondition beside the shift itself.
+    let n = ((width.bytes() - 1) >> NATIVE_CHUNK_SHIFT) + 1;
+
+    if n == 1 {
+        // One granule, one probe: the window sequence below is bigger than a single `bt`, and byte
+        // stores dominate Doom's inner loop, so the whole change only SHRINKS emitted code if this
+        // case keeps the cheap form. At `CHUNK_SHIFT == 0` the granule index IS the page offset,
+        // so the shift is omitted entirely rather than emitted as `shr ecx, 0`.
         e.mov_r32_r32(Reg::RCX, Reg::RAX);
         e.and_r32_imm32(Reg::RCX, 0x0fff);
-        if offset != 0 {
-            e.add_r32_imm32(Reg::RCX, offset);
+        if NATIVE_CHUNK_SHIFT != 0 {
+            e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
         }
-        e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
         e.bt_r64_mem(Reg::RDX, Reg::RCX);
         e.jcc(2, watched);
-        if offset >= last_byte {
-            break;
-        }
-        // The final probe lands on the last byte rather than a granule step, so a width that is
-        // not a whole number of granules still has its tail granule covered.
-        offset = (offset + granule).min(last_byte);
+        e.jmp(unwatched);
+        return;
     }
+
+    // The multi-granule window. RCX and RDX ONLY, and that constraint is load-bearing: the natural
+    // third scratch would be RSI, and RSI is never free here. Integer blocks do not spill it (it
+    // is callee-saved and corrupting the Rust caller is UB) and float blocks keep the live x87
+    // status/tag pack in it, so the `FSTP TBYTE` path that motivates this design would corrupt FPU
+    // state on every guarded store. `r` is recomputable from RAX, so two registers suffice. RAX
+    // and RDI both survive; RDI is live across the guard in the read-modify-write and x87 paths.
+    // RDX is reloaded from the table at the top of every call, so clobbering it with the window is
+    // safe even though the second table's branch runs after the first's.
+    //
+    // The window is 32 bits, not 64. The highest real bit tested is `r + n - 1`, and `r <= 7` with
+    // `n <= 10` (Tbyte at one-byte granules), so `r + n - 1 <= 16 < 32`. A 32-bit load also
+    // shrinks the overhang past the last real mask byte to three bytes, which `ChunkMask`'s single
+    // pad word covers.
+    //
+    // The result is bit-exact against the probe loop it replaces, neither more nor less
+    // conservative: `(1 << n) - 1` shifted by `r` has set bits at exactly the positions of
+    // granules `g..g+n`, and every one of those bits is inside the loaded window because
+    // `b - (g & !7) = r + (b - g) <= 7 + 9 = 16 < 32`.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.and_r32_imm32(Reg::RCX, 0x0fff);
+    e.shift_r32_imm8(5, Reg::RCX, (3 + NATIVE_CHUNK_SHIFT) as u8);
+    // `mov edx, [rdx + rcx*1]` -- the window, unaligned, over the mask RDX points at.
+    e.load_r32_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+    // `r`, the first granule's bit position inside the window. The page mask is not needed: the
+    // final `and 7` keeps only bits below 3 + CHUNK_SHIFT, which is at most 5 and so well inside
+    // the page offset's twelve bits.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    if NATIVE_CHUNK_SHIFT != 0 {
+        e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
+    }
+    e.and_r32_imm32(Reg::RCX, 7);
+    e.shift_r32_cl(5, Reg::RDX);
+    e.and_r32_imm32(Reg::RDX, (1u32 << n) - 1);
+    e.jnz(watched);
     e.jmp(unwatched);
 }
 

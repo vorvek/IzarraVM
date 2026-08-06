@@ -559,8 +559,28 @@ fn straight_line_run_stops_at_a_page_crossing_instruction() {
             any(target_os = "windows", target_os = "linux")
         ))]
         {
-            assert!(cpu.decode_cache.native_code_watch.is_watched(0x0fff));
-            assert!(cpu.decode_cache.native_code_watch.is_watched(0x1000));
+            // The page-local instructions are cached, so their bytes are watched outright.
+            assert!(cpu.decode_cache.native_code_watch.is_watched(0x0ffd));
+            assert!(cpu.decode_cache.native_code_watch.is_watched(0x0ffe));
+            assert!(cpu.decode_cache.native_code_watch.is_watched(0x1001));
+
+            // The crossing MOV's own two bytes are a different matter: nothing caches them, so
+            // they are watched only when a granule wider than one byte SPILLS onto them from a
+            // cached neighbour. This used to assert both unconditionally, which passed on the
+            // accident of a 16-byte granule and would have kept passing for the wrong reason.
+            // Derive the expectation from the constant instead.
+            let granule = 1u32 << crate::jit::code_watch::NATIVE_CHUNK_SHIFT;
+            let granule_base = |physical: u32| physical & !(granule - 1);
+            assert_eq!(
+                cpu.decode_cache.native_code_watch.is_watched(0x0fff),
+                granule_base(0x0fff) == granule_base(0x0ffe),
+                "the MOV's opcode byte is watched exactly when it shares a granule with the INC"
+            );
+            assert_eq!(
+                cpu.decode_cache.native_code_watch.is_watched(0x1000),
+                granule_base(0x1000) == granule_base(0x1001),
+                "the MOV's immediate is watched exactly when it shares a granule with the HLT"
+            );
         }
 
         // Run once from 0xFFD: INC (0xFFD, first) + INC (0xFFE, continuation) run, then the MOV
