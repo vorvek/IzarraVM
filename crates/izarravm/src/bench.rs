@@ -1018,6 +1018,8 @@ pub(super) fn perf_counters_json(
         "smc_narrow_kills": perf.smc_narrow_kills,
         "smc_lane_registrations": perf.smc_lane_registrations,
         "smc_lane_accepts": perf.smc_lane_accepts,
+        "smc_scan_calls": perf.smc_scan_calls,
+        "smc_scan_keys": perf.smc_scan_keys,
         "smc_lane_reject_width": perf.smc_lane_reject_width,
         "smc_lane_reject_address": perf.smc_lane_reject_address,
         "smc_heat_demotions": perf.smc_heat_demotions,

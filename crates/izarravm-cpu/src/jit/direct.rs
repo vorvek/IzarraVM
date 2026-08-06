@@ -203,6 +203,10 @@ pub(crate) struct RangeInvalidation {
     pub(crate) lane_accepts: u32,
     pub(crate) lane_reject_width: u32,
     pub(crate) lane_reject_address: u32,
+    /// Block keys the overlap scan examined. The scan is O(keys registered on the written page)
+    /// and a self-modifying guest walks that list once per store, so this is the quantity that
+    /// decides whether this function is cheap or is the run. One add per page, not per key.
+    pub(crate) keys_scanned: u32,
 }
 
 /// Validated guest extent for one compiled block.
@@ -1354,6 +1358,9 @@ impl BlockCache {
             let step = remaining.min(page_remaining);
             if let Some(mut keys) = self.physical_keys.remove(&page) {
                 let mut survivor_count = 0;
+                result.keys_scanned = result
+                    .keys_scanned
+                    .saturating_add(u32::try_from(keys.len()).unwrap_or(u32::MAX));
                 for index in 0..keys.len() {
                     let key = keys[index];
                     let Some(state) = self.entries.get(&key).copied() else {

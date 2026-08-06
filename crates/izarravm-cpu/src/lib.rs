@@ -688,6 +688,12 @@ pub struct PerfCounters {
     /// registered lane start. The owning block survives and contributes no SMC heat; the narrow
     /// decode-line kill still runs.
     pub smc_lane_accepts: u64,
+    /// Calls into `invalidate_physical_range`'s overlap scan, and the block keys those calls
+    /// examined. `smc_scan_keys / smc_scan_calls` is the mean scan length. Both exist because a
+    /// profile share cannot say whether that function is slow per call or simply called often,
+    /// and the answer selects completely different fixes.
+    pub smc_scan_calls: u64,
+    pub smc_scan_keys: u64,
     /// Fail-closed rejections, split by which check refused. `width` is a write that starts at a
     /// lane but is not four bytes wide (a byte or word patch of the dword field); `address` is a
     /// write that overlaps a lane's bytes without starting on it (a straddle or partial overlap).

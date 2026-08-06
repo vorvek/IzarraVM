@@ -436,6 +436,8 @@ impl CpuGsw {
             heat_hit |= outcome.blocks != 0;
             lane_only = outcome.lane_accepts != 0 && outcome.blocks == 0;
             self.perf.smc_lane_accepts += u64::from(outcome.lane_accepts);
+            self.perf.smc_scan_calls += 1;
+            self.perf.smc_scan_keys += u64::from(outcome.keys_scanned);
             self.perf.smc_lane_reject_width += u64::from(outcome.lane_reject_width);
             self.perf.smc_lane_reject_address += u64::from(outcome.lane_reject_address);
         }
