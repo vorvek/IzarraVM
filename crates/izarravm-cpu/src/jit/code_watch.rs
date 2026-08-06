@@ -12,29 +12,46 @@ const PAGE_COUNT: usize = 1 << (32 - PAGE_SHIFT);
 /// Bytes per watched code granule, as a shift. The native store guard tests one bit per granule,
 /// so this is the resolution at which a guest store is judged to have hit code.
 ///
-/// **Lowered from 4 (16 bytes) to 2 (4 bytes) on measurement.** At 16 bytes a store landing merely
-/// NEAR a compiled instruction is admitted to `invalidate_physical_range`, which then walks every
-/// block key on the page to find no overlap. Measured on NASCAR Racing 1 at 586: 5,702,773 such
-/// calls examining 4,471,919,398 keys, of which 473,846 overlapped, so 99.99% of that work was
-/// wasted and the function was 57.3% of wall.
+/// **Lowered from 4 (16 bytes) to 2 (4 bytes) on measurement, and then to 0 (one byte) once the
+/// store guard stopped costing a probe per granule.** At 16 bytes a store landing merely NEAR a
+/// compiled instruction is admitted to `invalidate_physical_range`, which then walks every block
+/// key on the page to find no overlap. Measured on NASCAR Racing 1 at 586: 5,702,773 such calls
+/// examining 4,471,919,398 keys, of which 473,846 overlapped, so 99.99% of that work was wasted
+/// and the function was 57.3% of wall.
 ///
 /// Simulated skip rate against granularity, taken inside the real scan, counting the calls a watch
 /// of each width would never have admitted:
 ///
 /// | bytes | 16 | 8 | 4 | 2 | 1 |
 /// |---|---|---|---|---|---|
-/// | NASCAR | 0.00% | 33.90% | **75.42%** | 83.27% | 94.08% |
+/// | NASCAR | 0.00% | 33.90% | 75.42% | 83.27% | **94.08%** |
 /// | Quake | 0.00% | 0.02% | 15.83% | 40.14% | 68.52% |
 /// | Doom | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% |
 ///
-/// 4 bytes takes 80% of the available win for a quarter of byte granularity's footprint. Doom
-/// reads zero at every width because its invalidations are genuine renderer self-patches; there is
-/// nothing there to skip, so it pays the footprint and gains nothing. That is the trade.
+/// The last column was then measured rather than argued. NASCAR's real-time factor went 0.358 to
+/// 0.432, another 21% on top of what 4 bytes had already taken. Doom moved +0.8% in wall with its
+/// timedemo realtics EXACT, and Quake and GP2 stayed inside noise. Peak working set grew by 1.8 MB
+/// on the worst fixture. Doom reads zero skip at every width because its invalidations are genuine
+/// renderer self-patches; there is nothing there to skip, so it pays the footprint and gains
+/// nothing. That is the trade, and at 1.8 MB it is a cheap one.
+///
+/// Read the 1.8 MB as a fixture measurement, not as a bound. Worst-case RETENTION at one byte is
+/// about 20 MiB: `MAX_INACTIVE_PAGES` pages at roughly 16.9 KiB each, plus the recycled pool, plus
+/// the sticky precise masks. No fixture has come near it, but nothing in the code caps it lower.
+///
+/// What unlocked the last step was the emitted guard's SHAPE, not the table. The guard used to
+/// probe one mask bit per granule an access spans, so at one-byte granules `FSTP TBYTE` became ten
+/// probes and blocks blew the one-host-page install limit: the full Doom loop emitted 4039 bytes
+/// and five size tests failed, which on the oracles would have meant blocks silently REFUSED for
+/// size. `emit_code_watch_table_branch` now tests one 32-bit window over the mask for any span of
+/// two or more granules, which is constant-size in the access width, so byte granularity became
+/// strictly better instead of a trade against emitted size.
 ///
 /// `WatchPage` scales with this: `refs` is `[u32; CHUNKS_PER_PAGE]`, so a watched page goes from
-/// about 1 KiB to about 4 KiB. `acquire_range` and `release_range` also step four times as many
-/// granules per install and retire, which is compile-time work rather than per-store work.
-const CHUNK_SHIFT: u32 = 2;
+/// about 1 KiB at 16-byte granules to about 16.9 KiB at one byte. `acquire_range` and
+/// `release_range` also step one granule per BYTE per install and retire, which is compile-time
+/// work rather than per-store work.
+const CHUNK_SHIFT: u32 = 0;
 
 /// `CHUNK_SHIFT` for the emitter, which bakes it into the native store guard's bit index. Exported
 /// so there is ONE definition: the guard used to write the shift as a literal, and a literal that
@@ -64,9 +81,47 @@ const _: () = assert!(
     "the last byte of a page must index a bit inside the chunk mask"
 );
 
-type ChunkMask = [u64; MASK_WORDS];
+// The guard counts the granules an access spans at EMIT time, from the width alone:
+// `n = ((width.bytes() - 1) >> CHUNK_SHIFT) + 1`. That count is independent of the access's offset
+// only while the backend's alignment guarantee keeps every legal access inside one granule walk.
+// `emit_wide_page_guard` refuses unaligned accesses and the strongest alignment it promises is 4
+// bytes, so at a shift of 3 a 4-aligned Qword sitting at offset 4 mod 8 spans TWO granules while
+// the formula says one, and the second granule's bit is never tested. That is a missed
+// invalidation: no fault, no counter, nothing until the overwritten code runs. Pin the
+// precondition here, next to the shift it constrains, rather than in the emitter that consumes it.
+// Written against the granule SIZE rather than as `CHUNK_SHIFT <= 2` because at a shift of 0 the
+// latter compares against the type's minimum and clippy rejects it as always true.
+const _: () = assert!(
+    (1_usize << CHUNK_SHIFT) <= 4,
+    "the emitted guard's granule count is offset-independent only up to 4-byte granules"
+);
 
-static ALL_CHUNKS_WATCHED: ChunkMask = [u64::MAX; MASK_WORDS];
+/// A page's granule bits, plus ONE trailing word of padding that is never set.
+///
+/// The pad exists for the emitted guard. For any access spanning two or more granules the guard
+/// loads a 32-bit window over the mask starting at the byte holding the first granule's bit, so an
+/// access in the page's last granules reads up to three bytes past the last real mask byte; the
+/// pad makes that read land in storage this type owns. Nothing can write it: every mark path
+/// derives its bit index from `(physical & 0xfff) >> CHUNK_SHIFT`, which the const assert above
+/// pins inside the first `MASK_WORDS` words. Reading zeros out there can only report a MISS on
+/// bits that do not exist, and every real bit of the access is inside the window by construction.
+type ChunkMask = [u64; MASK_WORDS + 1];
+
+/// Every real granule of a page watched, with the pad word left CLEAR.
+///
+/// A coarse page is matched by pointer identity and the guard's window only ever tests bit
+/// positions that correspond to real granules, so the pad's value cannot change an answer either
+/// way. Zero is chosen so that EVERY `ChunkMask` in the program has a zero pad, which is what lets
+/// the `mask.iter().all(|word| *word == 0)` sweeps over recycled and reset masks keep iterating
+/// the whole array rather than carrying an exception for the last word. Written out by hand
+/// because the obvious `[u64::MAX; MASK_WORDS + 1]` would set the pad as well.
+static ALL_CHUNKS_WATCHED: ChunkMask = all_chunks_watched();
+
+const fn all_chunks_watched() -> ChunkMask {
+    let mut mask = [u64::MAX; MASK_WORDS + 1];
+    mask[MASK_WORDS] = 0;
+    mask
+}
 
 /// Generation-scoped decode marks for native stores. Marks are deliberately sticky until the
 /// decode cache is invalidated: an evicted line can leave a conservative false positive, but no
@@ -197,7 +252,7 @@ impl StickyDecodeCodeWatch {
             let mut mask = self
                 .recycled
                 .pop()
-                .unwrap_or_else(|| Box::new([0; MASK_WORDS]));
+                .unwrap_or_else(|| Box::new([0; MASK_WORDS + 1]));
             debug_assert!(mask.iter().all(|word| *word == 0));
             mask[word] |= bit;
             let pointer = std::ptr::from_mut(&mut *mask).expose_provenance();
@@ -289,7 +344,7 @@ const _: () = assert!(std::mem::offset_of!(WatchPage, mask) == 0);
 impl Default for WatchPage {
     fn default() -> Self {
         Self {
-            mask: [0; MASK_WORDS],
+            mask: [0; MASK_WORDS + 1],
             refs: [0; CHUNKS_PER_PAGE],
             active_chunks: 0,
         }
@@ -298,6 +353,9 @@ impl Default for WatchPage {
 
 impl WatchPage {
     fn reset(&mut self) {
+        // Iterates the padded length, which is safe precisely because the pad word is always
+        // zero: the `word_index * 64 + bit` index into `refs` would be out of bounds for it, and
+        // the inner loop never runs on a zero word, so it is never computed.
         for (word_index, word) in self.mask.iter_mut().enumerate() {
             let mut live = *word;
             while live != 0 {
@@ -322,7 +380,8 @@ pub(crate) struct NativeCodeWatch {
     inactive_pages: usize,
     /// Identity-free zeroed pages retained across hot global clears. Sixty-four pages cover the
     /// observed code working set without unbounded growth. Their cost scales with `CHUNK_SHIFT`:
-    /// about 271 KiB per watch at 4-byte granules, against 68 KiB when granules were 16 bytes.
+    /// about 1.1 MiB per watch at one-byte granules, against 271 KiB at 4 bytes and 68 KiB when
+    /// granules were 16 bytes.
     #[allow(clippy::vec_box)]
     // Box addresses remain stable while native code can observe them.
     recycled_pages: Vec<Box<WatchPage>>,

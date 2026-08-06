@@ -1599,18 +1599,28 @@ fn smc_heat_accrues_only_on_actual_code_invalidation() {
     assert!(cpu.jit_direct.smc_heat.chunk_hot(key.physical, 0));
     assert_eq!(cpu.perf.smc_heat_chunks_hot, 1);
 
-    // A data byte sharing a watched granule with cold code, but outside the block's own span,
-    // invalidates nothing, so it never heats the granule and the block survives. The block is
-    // deliberately SHORTER than one granule so such a byte exists: with a 4-byte block on a
-    // 4-byte granule there is no unwatched byte in the granule at all, and this test would then
-    // pass because the write is never admitted rather than because it heats nothing.
+    // The other half of G1, retargeted at byte granularity. There USED to be a "data byte sharing
+    // a watched granule with cold code but outside the block's own span" scenario, and this test
+    // pinned that such a byte was admitted to the scan and still heated nothing. At one-byte
+    // granules that scenario no longer exists: a watched granule IS a code byte, so there is no
+    // unwatched byte inside one to write.
+    //
+    // The analogous property at this granularity is the stronger one the granule change bought:
+    // a write to a byte the block does not cover is never ADMITTED at all. The scan is not
+    // entered (smc_scan_calls does not move), nothing heats, and the block survives Ready. If the
+    // guard's granularity ever widens again this assertion is the one that fails first.
     let mut cold = CpuGsw::default();
     let data_key = BlockKey::new(0x2000, 0x61_000, 7);
     install_trivial(&mut cold.jit_direct, data_key, 2); // watches 0x61_000..0x61_001
+    let scans_before = cold.perf.smc_scan_calls;
     for _ in 0..8 {
-        // Admitted (its granule is watched) but outside the span.
+        // Outside the span, and at byte granularity therefore outside the watch.
         cold.note_code_write(0x61_002, 1);
     }
+    assert_eq!(
+        cold.perf.smc_scan_calls, scans_before,
+        "a write outside the watched bytes must never reach the invalidation scan"
+    );
     assert!(!cold.jit_direct.smc_heat.chunk_hot(data_key.physical, 0));
     assert_eq!(cold.perf.smc_heat_chunks_hot, 0);
     assert!(matches!(
