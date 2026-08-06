@@ -61,6 +61,11 @@ use crate::{
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+use super::code_watch::NATIVE_CHUNK_SHIFT;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 use super::fast_map::{
     NATIVE_KIND_MASK, NATIVE_MODE13_KIND, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER,
     NATIVE_PAGE_WRITABLE, NATIVE_RAM_KIND, NATIVE_UNAVAILABLE_BIAS, NativeMapBases,

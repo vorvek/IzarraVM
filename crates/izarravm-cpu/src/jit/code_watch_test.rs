@@ -5,17 +5,34 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 
+/// Bytes per watched granule, read from the constant rather than written as a literal. Several
+/// tests below used to name granule bases like `0x100` or mask with `& !0xf`, which silently
+/// encoded a 16-byte granule; when `CHUNK_SHIFT` moved to 4-byte granules they all failed for a
+/// reason that had nothing to do with what they were testing. Derive it, and assert on the BYTES a
+/// range covers rather than on the granule bases it happens to land on.
+const GRANULE: u32 = 1 << CHUNK_SHIFT;
+
+/// The granule-aligned base of `physical`.
+fn granule_base(physical: u32) -> u32 {
+    physical & !(GRANULE - 1)
+}
+
 #[test]
 fn sticky_decode_marks_are_idempotent_and_cover_every_touched_chunk() {
     let mut watch = StickyDecodeCodeWatch::default();
-    watch.mark_range(0x10f, 34);
-    watch.mark_range(0x10f, 34);
+    let start = 0x10f;
+    let len = 34;
+    watch.mark_range(start, len);
+    watch.mark_range(start, len);
 
-    assert!(watch.is_watched(0x100));
-    assert!(watch.is_watched(0x110));
-    assert!(watch.is_watched(0x120));
-    assert!(watch.is_watched(0x130));
-    assert!(!watch.is_watched(0x140));
+    for byte in start..start + len {
+        assert!(
+            watch.is_watched(byte),
+            "{byte:#x} is inside the marked range"
+        );
+    }
+    assert!(!watch.is_watched(granule_base(start) - 1));
+    assert!(!watch.is_watched(granule_base(start + len - 1) + GRANULE));
     assert_eq!(watch.precise_pages(), 1);
     assert_eq!(watch.coarse_page_count(), 0);
 }
@@ -77,7 +94,7 @@ fn sticky_decode_published_mask_survives_map_rehash() {
 fn sticky_decode_randomized_marks_and_clears_match_an_independent_model() {
     fn chunks(physical: u32, len: u32) -> HashSet<u32> {
         (0..len)
-            .map(|offset| physical.wrapping_add(offset) & !0xf)
+            .map(|offset| granule_base(physical.wrapping_add(offset)))
             .collect()
     }
 
@@ -119,14 +136,15 @@ fn sticky_decode_randomized_marks_and_clears_match_an_independent_model() {
 fn marks_every_chunk_touched_and_clears_without_moving_the_table() {
     let mut watch = NativeCodeWatch::default();
     watch.acquire_range(0x1f, 2);
-    assert!(watch.is_watched(0x10));
+    assert!(watch.is_watched(0x1f));
     assert!(watch.is_watched(0x20));
-    assert!(!watch.is_watched(0x30));
+    assert!(!watch.is_watched(granule_base(0x1f) - 1));
+    assert!(!watch.is_watched(granule_base(0x20) + GRANULE));
 
     let base = watch.table_base();
     watch.clear();
     assert_eq!(watch.table_base(), base);
-    assert!(!watch.is_watched(0x10));
+    assert!(!watch.is_watched(0x1f));
     assert!(!watch.is_watched(0x20));
 
     watch.acquire_range(0x20, 1);
@@ -163,20 +181,32 @@ fn empty_and_inactive_native_watch_ranges_are_unwatched() {
 #[test]
 fn refcounted_ranges_keep_shared_chunks_until_the_last_owner_leaves() {
     let mut watch = NativeCodeWatch::default();
+    // The two ranges OVERLAP at bytes 0x108..0x10f, so they share coverage at any granule size.
+    // This used to rely on 0x100 and 0x108 landing in one 16-byte granule while the ranges were
+    // merely adjacent, which stopped being true at 4-byte granules.
     watch.acquire_range(0x100, 16);
     watch.acquire_range(0x108, 16);
     assert!(watch.is_watched(0x100));
+    assert!(watch.is_watched(0x108));
     assert!(watch.is_watched(0x110));
-    assert_eq!(watch.refcount(0x100), 2);
+    assert_eq!(
+        watch.refcount(0x108),
+        2,
+        "the overlapping bytes have two owners"
+    );
+    assert_eq!(watch.refcount(0x100), 1);
     assert_eq!(watch.refcount(0x110), 1);
 
     watch.release_range(0x100, 16);
-    assert!(watch.is_watched(0x100));
+    assert!(
+        watch.is_watched(0x108),
+        "the second range still owns the shared bytes"
+    );
     assert!(watch.is_watched(0x110));
-    assert_eq!(watch.refcount(0x100), 1);
+    assert_eq!(watch.refcount(0x108), 1);
 
     watch.release_range(0x108, 16);
-    assert!(!watch.is_watched(0x100));
+    assert!(!watch.is_watched(0x108));
     assert!(!watch.is_watched(0x110));
     assert_eq!(watch.active_pages(), 0);
 }
@@ -205,13 +235,13 @@ fn wrapping_range_owns_and_releases_both_end_pages() {
     let mut watch = NativeCodeWatch::default();
     let base = watch.table_base();
     watch.acquire_range(0xffff_fff8, 16);
-    assert!(watch.is_watched(0xffff_fff0));
+    assert!(watch.is_watched(0xffff_fff8));
     assert!(watch.is_watched(0));
     assert!(watch.range_watched(0xffff_fff8, 16));
     assert_eq!(watch.active_pages(), 2);
 
     watch.release_range(0xffff_fff8, 16);
-    assert!(!watch.is_watched(0xffff_fff0));
+    assert!(!watch.is_watched(0xffff_fff8));
     assert!(!watch.is_watched(0));
     assert_eq!(watch.active_pages(), 0);
     assert_eq!(watch.table_base(), base);
@@ -492,7 +522,7 @@ fn inactive_page_cache_is_bounded_without_limiting_active_pages() {
 fn randomized_operations_match_a_chunk_refcount_model() {
     fn chunks(physical: u32, len: u32) -> Vec<u32> {
         let mut result = (0..len)
-            .map(|offset| physical.wrapping_add(offset) & !0xf)
+            .map(|offset| granule_base(physical.wrapping_add(offset)))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();

@@ -3411,22 +3411,40 @@ fn emit_code_watch_table_branch(
     e.cmp_r64_imm32(Reg::RDX, 0);
     e.jz(unwatched);
 
-    e.mov_r32_r32(Reg::RCX, Reg::RAX);
-    e.and_r32_imm32(Reg::RCX, 0x0fff);
-    e.shift_r32_imm8(5, Reg::RCX, 4);
-    e.bt_r64_mem(Reg::RDX, Reg::RCX);
-    e.jcc(2, watched);
-    if width.needs_alignment_guard() {
+    // Probe EVERY granule the access can span, not just its first and last byte.
+    //
+    // This used to be exactly two probes, the first byte's granule and the last byte's. That is
+    // complete only while an access cannot span more than two granules, which held silently at the
+    // old 16-byte granularity: the widest access is Tbyte at 10 bytes, and `alignment_bytes()`
+    // pins it to 4, so a 4-aligned 10-byte store touched at most two 16-byte chunks. At 4-byte
+    // granules the same store touches THREE (base, base+4, base+8) and the middle one was never
+    // tested, so `FSTP TBYTE` over a cached instruction would commit natively, skip the
+    // invalidation entirely, and leave the stale decode line executing. Silent: no fault, no
+    // counter, no framebuffer divergence unless the overwritten code happened to run.
+    //
+    // Stepping by exactly one granule keeps the offsets' position WITHIN a granule constant, so
+    // consecutive probes are consecutive granules and nothing between the first byte and the last
+    // can be skipped whatever the shift becomes. `emit_wide_page_guard` upstream guarantees the
+    // access does not cross a page, so every offset below stays on the first byte's page and the
+    // bit index stays inside the mask.
+    let granule = 1u32 << NATIVE_CHUNK_SHIFT;
+    let last_byte = width.bytes() - 1;
+    let mut offset = 0u32;
+    loop {
         e.mov_r32_r32(Reg::RCX, Reg::RAX);
         e.and_r32_imm32(Reg::RCX, 0x0fff);
-        // The last-byte probe wants the access's actual SIZE, `bytes()`, not its alignment
-        // requirement `alignment_bytes()`: for Qword those differ (8 vs 4), and the guard
-        // upstream (`emit_wide_page_guard`) already guarantees a Qword access cannot cross a
-        // page, so this offset (base + 7) always lands on the same page as the first byte.
-        e.add_r32_imm32(Reg::RCX, width.bytes() - 1);
-        e.shift_r32_imm8(5, Reg::RCX, 4);
+        if offset != 0 {
+            e.add_r32_imm32(Reg::RCX, offset);
+        }
+        e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
         e.bt_r64_mem(Reg::RDX, Reg::RCX);
         e.jcc(2, watched);
+        if offset >= last_byte {
+            break;
+        }
+        // The final probe lands on the last byte rather than a granule step, so a width that is
+        // not a whole number of granules still has its tail granule covered.
+        offset = (offset + granule).min(last_byte);
     }
     e.jmp(unwatched);
 }

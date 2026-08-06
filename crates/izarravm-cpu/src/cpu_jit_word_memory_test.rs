@@ -31,7 +31,8 @@
 //! * **The code-watch LAST-BYTE probe is dead at Word, provably.** `emit_code_watch_table_branch`
 //!   probes the access's last byte as well as its first whenever `needs_alignment_guard()`. For
 //!   Word that second probe can never disagree with the first: the watch bitmap is indexed at
-//!   16-byte granularity (`(addr & 0xfff) >> 4`) and a 2-ALIGNED two-byte access lies inside one
+//!   `CHUNK_SHIFT` granularity (`(addr & 0xfff) >> CHUNK_SHIFT`) and a 2-ALIGNED two-byte
+//!   access lies inside one
 //!   16-byte chunk, so both bytes index the same bit. It is the same argument that makes the
 //!   page-crossing compare dead for the three self-aligning widths. So the watch fixture below
 //!   asserts the transactional exit rather than a straddle, which cannot be constructed.
@@ -622,7 +623,7 @@ fn a_misaligned_word_operand_exits_to_the_interpreter() {
 
 /// A word STORE into a watched chunk exits transactionally.
 ///
-/// The bitmap is indexed at 16-byte granularity, so a 2-aligned two-byte access is watched or not
+/// The bitmap is indexed at `CHUNK_SHIFT` granularity, so a 2-aligned two-byte access is watched or not
 /// as a unit -- see the module docs on why the last-byte probe cannot disagree with the first. What
 /// this row certifies is the part that is not a tautology: the exit happens BEFORE any byte is
 /// written, so `compare_state` at the guard sees the operand untouched, and the interpreter's own
