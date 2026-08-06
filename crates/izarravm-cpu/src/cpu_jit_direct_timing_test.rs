@@ -2798,8 +2798,15 @@ fn descriptor_change_selectively_recompiles_and_does_not_keep_a_stale_link() {
     );
 }
 
+/// Word admission is a POLICY now, not a persona constant, so this drives the policy explicitly
+/// instead of leaning on a default.
+///
+/// It used to be named `..._only_for_586` and asserted 3 slots at I486 unconditionally. That was
+/// true when the refusal was hard-coded; since the 486 measurement the default admits, and a test
+/// that reads the default cannot say whether the default or the mechanism moved. Setting the flag
+/// on both arms keeps it pinning the mechanism either way.
 #[test]
-fn word_renderer_slice_is_admitted_only_for_586() {
+fn word_renderer_slice_admission_follows_the_word_policy() {
     const ENTRY: u32 = 0x101;
     let code = [
         0x89, 0xc0, // mov eax,eax
@@ -2818,16 +2825,29 @@ fn word_renderer_slice_is_admitted_only_for_586() {
         ENTRY + 11,
     ];
 
-    for (mode, expected_instructions) in [(GswMode::Gsw486, 3), (GswMode::Gsw586, 6)] {
+    for (mode, word_at_486, expected_instructions) in [
+        // I486 refusing: the block stops AT the 66-prefixed slot, keeping the three before it.
+        (GswMode::Gsw486, false, 3),
+        // I486 admitting: identical to I586, which is the claim the 486 lift rests on.
+        (GswMode::Gsw486, true, 6),
+        // I586 is unconditional, so the flag must not move it in either direction.
+        (GswMode::Gsw586, false, 6),
+        (GswMode::Gsw586, true, 6),
+    ] {
         let mut memory = vec![0; 0x1000];
         memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
         let mut cpu = flat_stack_cpu(ENTRY);
         cpu.set_mode(mode);
+        cpu.set_word_operands_at_486(word_at_486);
         let mut bus = TestBus::with_memory(memory);
         decode_fixture(&mut cpu, &mut bus, &starts);
 
         let block = install_fixture_block(&mut cpu, ENTRY);
-        assert_eq!(block.span().instructions, expected_instructions, "{mode:?}");
+        assert_eq!(
+            block.span().instructions,
+            expected_instructions,
+            "{mode:?} word_at_486={word_at_486}"
+        );
     }
 }
 

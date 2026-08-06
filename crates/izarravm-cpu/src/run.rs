@@ -1088,11 +1088,12 @@ impl CpuGsw {
         d: bool,
         budget: ContinuationBudget,
     ) -> Result<DirectContinuation, CpuError> {
-        // A 16-bit code segment can NEVER produce a block: `key_for` refuses on `!d`, its very
-        // first test alongside `host_supported`. So on base this function already returned
-        // Interpret for every such boundary, but only after a decode-cache line lookup, a hotness
-        // mutation and the probe itself. Real mode, V86 and 16-bit protected mode are the whole
-        // population, and it is the whole population of a real-mode DOS guest.
+        // With the 16-bit level at 0 a 16-bit code segment can never produce a block (`key_for`
+        // then refuses on `!d`), so this function would return Interpret for every such boundary
+        // anyway -- but only after a decode-cache line lookup, a hotness mutation and the probe
+        // itself. This early-out removes that bookkeeping. Since `IZARRAVM_JIT16` defaulted to 1
+        // the level-0 arm is the OPT-OUT path rather than the shipped behaviour; the reasoning
+        // below is unchanged because it never depended on which arm is the default.
         //
         // Placed BEFORE `direct_hot` so the bookkeeping goes too. That is observationally
         // equivalent, and the reason is worth stating because it is the entire correctness case:
@@ -1105,11 +1106,12 @@ impl CpuGsw {
         // `narrow_invalidate`, sets `generation = 0`, and the live generation is never 0, so such a
         // line can only come back through `put`.
         //
-        // IZARRAVM_JIT16 (default 0) lifts this for the 16-bit admission spike; see
-        // `jit::direct::sixteen_bit_admission_level`. `key_for_phys` still refuses `!d` on every
-        // persona but 586, and `jit_mode_key` bit 0 is CS.D, so a 16-bit block and a 32-bit block
-        // at one linear address can never collide on a key.
-        if !d && jit::direct::sixteen_bit_admission_level() == 0 {
+        // IZARRAVM_JIT16 (default 1 since the 486 measurement) gates this; see
+        // `jit::direct::sixteen_bit_admission_level`. `key_for_phys` refuses `!d` wherever
+        // `word_operands_admitted` refuses Word lowering -- since the same measurement that is
+        // NEITHER 486 nor 586 by default, only the 386 class -- and `jit_mode_key` bit 0 is CS.D,
+        // so a 16-bit block and a 32-bit block at one linear address can never collide on a key.
+        if !d && self.jit_direct.sixteen_bit_level == 0 {
             return Ok(DirectContinuation::Interpret);
         }
         if !self.mode().uses_approximate_timing() {
@@ -2101,6 +2103,14 @@ impl CpuGsw {
         let sixteen_bit = u64::from(block.span().key.mode_key & 1 == 0);
         self.perf.jit_direct_entries_sixteen_bit += sixteen_bit;
         self.perf.jit_direct_insns_sixteen_bit += sixteen_bit * instructions;
+        // Same shape and the same reasoning as the pair above: a widened predicate and two
+        // unconditional adds, because this is the hottest path in the backend. Lands in
+        // `DirectStallTally` rather than `PerfCounters`, which sits ahead of `pending_flags` in
+        // `CpuGsw` at an offset emitted code bakes.
+        self.jit_direct.note_segment_write_block_entry(
+            u64::from(block.is_segment_write_block()),
+            instructions,
+        );
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
         match exit.unresolved_reason {
             jit::direct::UnresolvedReason::None => {}

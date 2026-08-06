@@ -200,6 +200,639 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
     assert_eq!(row.runtime_hits, 0);
 }
 
+// Mutation record for the suffix-agreement slice, each verified by hand against this tree. Every
+// fix is covered by exactly ONE test, and no mutation moved a test other than its own:
+//
+//  * dropping the loop-top memory-ALU cap makes `census_suffix_respects_the_memory_alu_block_cap`
+//    read 5 where it must read 0;
+//  * dropping the call-out slot cap makes `census_suffix_respects_the_call_out_slot_cap` read 2
+//    where it must read 0;
+//  * restoring the bare `!insn.continuable` makes
+//    `census_suffix_admits_the_non_continuable_imul_forms` read 0 where it must read 3.
+//
+// The x87 divergence has NO test here, deliberately and not by omission: the forward scan refuses
+// every x87 kind outright, so the compile walk's x87 caps are unreachable from it and any mirror
+// of them would be dead code no fixture could make fire. It is left as a conservative floor and
+// documented at `census_native_suffix`.
+//
+// Mutation record for the dirty-stop slice, same method:
+//
+//  * flipping the `DirtySegment` call site to `model_dirty: true` makes
+//    `a_dirty_segment_stop_is_censused_and_prices_its_own_removal` read 0 where it must read 3,
+//    which is the arm pricing its own fix at nothing;
+//  * dropping either the `barred_segment_write` fold-in OR the dirty test inside the scan makes
+//    `the_suffix_seed_carries_a_barred_segment_write` read 2 where it must read 0. The two share
+//    a test on purpose: a seed nothing reads and a reader with nothing seeded are the same bug
+//    seen from opposite ends, and neither is observable alone;
+//  * making `installs_rejected_span` return true for every arm makes
+//    `a_dirty_segment_row_does_not_claim_the_rejected_span_map` credit an exit it has no claim on.
+//
+// Mutation record for the segment-write entry counter. All three fail
+// `a_segment_write_block_is_counted_at_the_dispatcher_entry`, and the last two are why that test
+// carries three cases rather than two:
+//
+//  * zeroing the increment in `run.rs` leaves the counter flat;
+//  * dropping `!self.dynamic_successor` from `is_segment_write_block` counts the RET-terminated
+//    block, which publishes `[None, None]` for an entirely different reason;
+//  * dropping `self.successors == [None, None]` counts nothing and misses the real one.
+
+/// Compile `code` with the census on and return the single barrier row's suffix.
+///
+/// `warm_offsets` is the instruction start list, and it is what BOUNDS the suffix: the forward
+/// scan reads `decode_cache`, so an address that was never warmed ends the walk. That makes the
+/// expected value in each caller an exact number rather than a floor.
+fn barrier_suffix(code: &[u8], warm_offsets: &[u32]) -> u64 {
+    census_row_for(code, warm_offsets, u16::from(DIRECT_BARRIER)).native_suffix_instructions
+}
+
+/// The same, for a fixture whose barrier is a real opcode rather than the synthetic one.
+fn census_row_for(code: &[u8], warm_offsets: &[u32], opcode: u16) -> crate::DirectBarrierCensusRow {
+    let (mut cpu, mut bus) = fixture(code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = warm_offsets.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == opcode)
+        .unwrap_or_else(|| panic!("no census row for opcode {opcode:#x}"));
+    assert_eq!(row.hits, 1, "fixture must record exactly one barrier hit");
+    row.clone()
+}
+
+/// The memory-ALU BLOCK cap, and it is the largest of the six divergences the suffix audit found.
+///
+/// `compile_with_instruction_limit` breaks at its LOOP TOP on `memory_alu_slots != 0 &&
+/// slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, before the next instruction is decoded and
+/// regardless of what that instruction turns out to be. The forward scan applied the same bound
+/// only when the next kind was ITSELF memory-ALU, so any barrier whose prefix held one
+/// read-modify-write slot over-reported its suffix by up to 28 instructions against a
+/// 32-instruction ceiling — on the very column the campaign ranks rows by.
+///
+/// The two fixtures are `add [ebx], eax` and `add eax, ecx`: SAME opcode, SAME length, differing
+/// only in the ModRM mod field. So the pair isolates `is_memory_alu` and nothing else, and a
+/// lowering change that moved either form would fail here rather than silently re-diverge.
+#[test]
+fn census_suffix_respects_the_memory_alu_block_cap() {
+    let offsets = [0, 2, 3, 4, 5, 6, 7, 8, 9];
+    let memory = [
+        0x01,
+        0x03,
+        0x40,
+        0x41,
+        DIRECT_BARRIER,
+        0x42,
+        0x43,
+        0x44,
+        0x45,
+        0x46,
+    ];
+    let register = [
+        0x01,
+        0xc8,
+        0x40,
+        0x41,
+        DIRECT_BARRIER,
+        0x42,
+        0x43,
+        0x44,
+        0x45,
+        0x46,
+    ];
+
+    assert_eq!(
+        barrier_suffix(&register, &offsets),
+        5,
+        "control: with no memory-ALU slot in the prefix the cap is not armed and the scan reaches \
+         every warmed instruction after the barrier"
+    );
+    // Three prefix slots plus the barrier itself is already MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS, so
+    // the counterfactual block is full before the scan takes a single step. The cap bounds
+    // `prefix + 1 + suffix`, NOT the suffix alone.
+    assert_eq!(
+        barrier_suffix(&memory, &offsets),
+        0,
+        "one memory-ALU slot in the prefix arms the loop-top cap"
+    );
+}
+
+/// The compile walk admits two non-continuable opcodes that the forward scan refused.
+///
+/// `block_continuable` (decode.rs) says no to `0x69`/`0x6b`, and the compile walk overrides it
+/// with `insn.continuable || jit_admits_non_continuable(insn.opcode)`. The scan took the bare
+/// flag, so any suffix that reached an IMUL-with-immediate was truncated there. This
+/// UNDER-reported, which is the safer direction but still a disagreement.
+///
+/// A refusal would stop the walk rather than skip the instruction, so the failing value is 0 and
+/// not 2. That is what makes one assertion enough.
+#[test]
+fn census_suffix_admits_the_non_continuable_imul_forms() {
+    // `inc eax / inc ecx / inc edx / <barrier> / imul eax, eax, 5 / inc ebx / inc esp`
+    let offsets = [0, 1, 2, 3, 4, 7, 8];
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        DIRECT_BARRIER,
+        0x6b,
+        0xc0,
+        0x05,
+        0x43,
+        0x44,
+    ];
+
+    assert_eq!(
+        barrier_suffix(&code, &offsets),
+        3,
+        "the IMUL must be counted AND walked through to the two instructions behind it"
+    );
+}
+
+/// The call-out slot cap.
+///
+/// PUSHA and POPA are `DirectKind::CallOut` and are deliberately NOT `uses_stack`, which is what
+/// lets this fixture exercise `MAX_BLOCK_CALLOUT_SLOTS` in isolation: both caps are 4, so a kind
+/// that counted against each would leave the test unable to say which one fired.
+#[test]
+fn census_suffix_respects_the_call_out_slot_cap() {
+    let offsets = [0, 1, 2, 3, 4, 5, 6];
+    let full = [0x60, 0x61, 0x60, 0x61, DIRECT_BARRIER, 0x60, 0x40];
+    let spare = [0x60, 0x61, 0x60, 0x40, DIRECT_BARRIER, 0x60, 0x40];
+
+    assert_eq!(
+        barrier_suffix(&spare, &offsets),
+        2,
+        "control: three call-out slots in the prefix leaves room for the one behind the barrier"
+    );
+    assert_eq!(
+        barrier_suffix(&full, &offsets),
+        0,
+        "a full call-out budget must stop the scan at the next call-out"
+    );
+}
+
+/// The dirty-segment rule now leaves a census row, and that row's suffix prices the rule's own
+/// removal rather than re-applying it.
+///
+/// Before this, admitting `MOV DS,r16` looked like it deleted 18.4M census hits while the census
+/// showed nothing gained anywhere. The hits had not gone: the block now ends at the first later
+/// slot that wants the overwritten segment, which was a `CompileStop::Boundary` and so recorded
+/// nothing at all.
+///
+/// The suffix assertion is the whole test and it is a COUNTERFACTUAL, which is what lets it stand
+/// in for a comparison against a value the public surface cannot produce. Every instruction after
+/// the barrier reads through DS, so with `model_dirty` left true the scan would stop at the first
+/// of them and report 0. Reporting 3 is only possible with the rule disabled.
+#[test]
+fn a_dirty_segment_stop_is_censused_and_prices_its_own_removal() {
+    // inc eax / inc ecx / mov ds, ax / mov eax,[ebx] / mov ecx,[ebx] / mov edx,[ebx] / inc eax
+    //                                  ^ barred: DS is dirty and this slot pins it
+    let code = [
+        0x40, 0x41, 0x8e, 0xd8, 0x8b, 0x03, 0x8b, 0x0b, 0x8b, 0x13, 0x40,
+    ];
+    let offsets = [0, 1, 2, 4, 6, 8, 10];
+
+    let row = census_row_for(&code, &offsets, 0x8b);
+    assert_eq!(
+        row.stop_reason, "dirty_segment",
+        "the 0x8b row must be attributed to the dirty rule, not to opcode coverage"
+    );
+    assert_eq!(
+        row.native_prefix_instructions, 3,
+        "the two increments and the segment load are kept; the rule ends the block after them"
+    );
+    assert_eq!(
+        row.native_suffix_instructions, 3,
+        "with the dirty rule disabled the scan walks through every later DS reader; with it \
+         applied this reads 0, which is the counterfactual this number stands against"
+    );
+}
+
+/// The COMPILE WALK's Word refusal moves with the flag.
+///
+/// Distinct from the census test below and from the `key_for_phys` test in the sixteen-bit file,
+/// and all three are needed: the three gates are separate code sites and reverting any one of
+/// them alone must fail something. This one is the walk itself, exercised by putting the Word
+/// instruction MID-BLOCK in a 32-bit segment at I486, where `key_for_phys` admits the key and the
+/// walk is the only thing that can refuse the slot.
+#[test]
+fn the_compile_walk_word_refusal_moves_with_the_flag() {
+    // inc eax / inc ecx / inc edx / mov cx,ax / inc ebx / inc esp
+    let code = [0x40, 0x41, 0x42, 0x66, 0x89, 0xc1, 0x43, 0x44];
+    let offsets = [0u32, 1, 2, 3, 6, 7];
+
+    for (label, admitted, expected) in [("refused", false, 3), ("admitted", true, 6)] {
+        let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw486);
+        cpu.set_word_operands_at_486(admitted);
+        let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, expected,
+            "{label}: the walk must stop at the Word slot only while the flag refuses it"
+        );
+    }
+}
+
+/// The flag never admits the 386 class, whatever it is set to.
+///
+/// `key_for_phys` refuses every persona below I486 a few lines above the clause this slice
+/// touches, so the 386 case is already dead. Pinned anyway: the predicate spells I386 out
+/// explicitly so that a future 386 enablement cannot silently inherit Word admission, and that
+/// intent is worth a test rather than a comment.
+#[test]
+fn the_word_flag_never_admits_the_386_class() {
+    let code = [0x40, 0x41, 0x42, 0x66, 0x89, 0xc1, 0x43, 0x44];
+    let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw386);
+    cpu.set_word_operands_at_486(true);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    assert!(
+        jit::direct::key_for(&cpu, ENTRY, true).is_none(),
+        "the 386 class must stay refused with the flag on"
+    );
+}
+
+/// The census suffix scan carries the SAME Word predicate as the compile walk.
+///
+/// There are three copies of this policy: the compile walk, `key_for_phys`, and the forward scan
+/// in `census_native_suffix`. A slice that lifted the first two and forgot the third would
+/// re-open a seventh divergence between the two walks, days after six were closed, and on the
+/// exact arm the A/B is measuring.
+///
+/// It has to be tested at I486 with the flag flipped, because at I586 the predicate is true either
+/// way and the two arms are indistinguishable. The suffix instructions are 66-prefixed so their
+/// operand size is Word in a 32-bit segment, which is the same `OperandSize::Word` a CS.D = 0
+/// segment produces for every instruction.
+#[test]
+fn the_census_suffix_scan_shares_the_word_predicate() {
+    // inc eax / inc ecx / inc edx / <barrier> / mov cx,ax / mov dx,ax / inc eax
+    let code = [
+        0x40,
+        0x41,
+        0x42,
+        DIRECT_BARRIER,
+        0x66,
+        0x89,
+        0xc1,
+        0x66,
+        0x89,
+        0xc2,
+        0x40,
+    ];
+    let offsets = [0u32, 1, 2, 3, 4, 7, 10];
+
+    for (label, admitted, expected) in [("refused", false, 0), ("admitted", true, 3)] {
+        let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw486);
+        cpu.enable_direct_barrier_census(true);
+        cpu.set_word_operands_at_486(admitted);
+        let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+        let snapshot = cpu
+            .direct_barrier_census_snapshot()
+            .expect("enabled census snapshot");
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+            .expect("recorded structural stop");
+        assert_eq!(
+            row.native_suffix_instructions, expected,
+            "{label}: the scan must apply the same Word predicate the compile walk does"
+        );
+    }
+}
+
+/// The V86-sensitive opcodes stay compile barriers at `OperandSize::Word`, pinned per opcode.
+///
+/// V86 code is always CS.D = 0, so every instruction it executes decodes at Word. That makes the
+/// Word-size path the one that matters for V86 safety, and for five of these six opcodes the ONLY
+/// remaining gate is "no `classify` arm exists" -- a gate this campaign's whole method is to
+/// widen. A list defended by nothing but the absence of code needs a test that names each member,
+/// or the arm that admits one of them lands without anything failing.
+///
+/// PUSHF (0x9c) is the deliberate exception and the reason this is a table rather than a loop
+/// over interchangeable bytes: it HAS a classify arm (PUSHFD, a runtime-weighted top-five reject
+/// before it was lowered), and its V86 cover is `stack_width_kind`, which refuses
+/// `StoreSource::Flags` whenever `cpu.is_v86_mode()` because PUSHF checks IOPL in V86 and can
+/// raise #GP. Its Word arm is still refused by the allowlist, and the Dword control here proves
+/// the arm is live so this test cannot rot into "refused at every size" vacuity the way the port
+/// test once did.
+#[test]
+fn v86_sensitive_opcodes_stay_word_barriers() {
+    // (bytes, admitted_at_dword)
+    let table: &[(&[u8], bool)] = &[
+        (&[0x9c], true),        // PUSHF: lowered at Dword, allowlist-refused at Word
+        (&[0x9d], false),       // POPF: no classify arm
+        (&[0xfa], false),       // CLI: no classify arm
+        (&[0xfb], false),       // STI: no classify arm
+        (&[0xcd, 0x20], false), // INT imm8: no classify arm
+        (&[0xcf], false),       // IRET: no classify arm
+    ];
+    for (op, admitted_at_dword) in table {
+        for prefixed in [false, true] {
+            let mut code = vec![0x40, 0x41, 0x42];
+            let mut offsets = vec![0u32, 1, 2, 3];
+            if prefixed {
+                code.push(0x66);
+            }
+            code.extend_from_slice(op);
+            let tail_at = code.len() as u32;
+            code.extend_from_slice(&[0x43, 0x44, 0x45]);
+            offsets.extend_from_slice(&[tail_at, tail_at + 1, tail_at + 2]);
+
+            let (mut cpu, mut bus) = fixture(&code);
+            let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+            warm(&mut cpu, &mut bus, &addresses);
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            let first = op[0];
+            if !prefixed && *admitted_at_dword {
+                assert!(
+                    compilation.span.instructions > 3,
+                    "{first:#04x} at Dword has a classify arm and must not end the block;                      if this fails the Dword control is dead and the Word assertions below                      can no longer distinguish Word-refusal from always-refusal"
+                );
+            } else {
+                assert_eq!(
+                    compilation.span.instructions, 3,
+                    "{first:#04x} (prefixed={prefixed}) must stop the block at three slots"
+                );
+            }
+        }
+    }
+}
+
+/// The census suffix scan honours the x87 loop-top cap the compile walk applies.
+///
+/// Both x87 gates in the compile walk are armed by the PREFIX (`x87_slots != 0`), so the scan's
+/// blanket refusal of x87 kinds in the suffix never made them unreachable, and before the seed
+/// carried `x87_slots` a barrier whose prefix held one `FLD` reported a suffix bounded only by the
+/// 32-instruction ceiling instead of the 12-instruction x87 one. `max_native_suffix` is a ranking
+/// column, and the over-report landed on exactly the x87-adjacent population the campaign ranks.
+///
+/// The program is `FLD dword [ebx]`, three integer slots, the barrier, then twenty more admissible
+/// integer slots. Prefix is 4, so the x87 cap stops the scan at 12 - 4 - 1 = 7; without the cap it
+/// reads all 20. Proven non-vacuous by exactly that flip: with the seed's `x87_slots` forced to
+/// zero this assertion reads 20 and fails.
+#[test]
+fn the_census_suffix_scan_applies_the_x87_block_cap() {
+    let mut code = vec![0xd9, 0x03, 0x40, 0x41, 0x42, DIRECT_BARRIER];
+    let mut offsets = vec![0u32, 2, 3, 4, 5];
+    for extra in 0..20u32 {
+        code.push(0x40);
+        offsets.push(6 + extra);
+    }
+
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "the prefix must be FLD plus three integer slots, or the seed under test is not armed"
+    );
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+        .expect("recorded structural stop");
+    assert_eq!(
+        row.native_suffix_instructions, 7,
+        "an x87 slot in the prefix must bound the suffix by MAX_X87_BLOCK_INSTRUCTIONS"
+    );
+}
+
+/// The port opcodes are never admitted at `OperandSize::Word`, and this test is load-bearing
+/// rather than defensive.
+///
+/// `key_for_phys`'s V86 safety argument used to rest on three gates, "any ONE sufficient". One of
+/// them (`try_direct_continuation` refusing every 16-bit boundary) is already conditional on
+/// `IZARRAVM_JIT16`, so the argument really rests on two, and this is one of the two: an `IN` in a
+/// V86 16-bit segment must stay a barrier, because operand size follows CS.D opcode-independently
+/// and V86 code is always CS.D = 0.
+///
+/// That gate is a LIST under active change by this very campaign, and `0xEC` is the single largest
+/// row on PoP-586 at 25.6M runtime hits — a number that is a fault-path artifact, but one whose
+/// only warning lives in a git-ignored findings doc. A list defended by a document nobody reads is
+/// not defended. This pins it in the test suite instead.
+#[test]
+fn port_opcodes_are_never_admitted_at_word() {
+    for opcode in [0xecu8, 0xed, 0xee, 0xef] {
+        // The un-prefixed CONTROL, and it is asserted, not just built. An earlier revision
+        // constructed, configured and warmed this pair and then dropped it, so the test could not
+        // distinguish "refused at Word" from "refused at every size" -- it compiled cleanly and
+        // read like a positive control while asserting nothing.
+        //
+        // The control's meaning differs by opcode, and pretending otherwise is how the vacuity
+        // crept in. `0xEC` has a call-out helper (`CallOutHelper::PortReadAlDx`), so at Dword it
+        // is ADMITTED mid-block and the whole seven-slot program compiles as one span; its Word
+        // arm below therefore isolates the Word gate exactly. `0xED`/`0xEE`/`0xEF` have no
+        // `classify` arm at any size, so their un-prefixed arm stops at the same three slots and
+        // proves the stronger fact that carries their V86 safety: refused everywhere, with the
+        // Word gate as redundant cover rather than the only gate.
+        let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, opcode, 0x43, 0x44, 0x45]);
+        let addresses: Vec<_> = (0..7u32).map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        let dword = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        if opcode == 0xec {
+            assert_eq!(
+                dword.span.instructions, 7,
+                "IN AL,DX at Dword is a call-out slot and must not end the block"
+            );
+        } else {
+            assert_eq!(
+                dword.span.instructions, 3,
+                "{opcode:#04x} has no classify arm at any operand size"
+            );
+        }
+        // The 0x66 prefix in a 32-bit segment is what makes the decoded operand size Word here;
+        // in real 16-bit code CS.D does it, and `classify` cannot tell the two apart. The
+        // `set_word_operands_at_486` calls the earlier revision made were inert -- `fixture()`
+        // builds a 586, where Word operands are admitted unconditionally -- and are gone.
+        let (mut word_cpu, mut word_bus) =
+            fixture(&[0x40, 0x41, 0x42, 0x66, opcode, 0x43, 0x44, 0x45]);
+        let word_addresses: Vec<_> = [0u32, 1, 2, 3, 5, 6, 7]
+            .iter()
+            .map(|offset| ENTRY + offset)
+            .collect();
+        warm(&mut word_cpu, &mut word_bus, &word_addresses);
+        let compilation = compiled(jit::direct::compile(&mut word_cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{opcode:#04x} at Word must stop the block at three slots, not be lowered"
+        );
+    }
+}
+
+/// A block that overwrites a segment register is counted at the dispatcher entry.
+///
+/// `segment_writes != 0` makes `compile` publish `successors = [None, None]`, which makes
+/// `chain_eligible` false and clamps the quota to 1: the block can never chain, so every entry
+/// runs it alone and returns through the full prologue and epilogue. That is the cost the
+/// dirty-stop census cannot see, because it applies to EVERY block containing a segment write and
+/// not only to the ones the dirty rule stopped.
+///
+/// Driven through `try_run_direct_block_for_test` and NOT `invoke_native_entry`: the latter jumps
+/// straight to the block's entry pointer and never reaches `run_direct_block`'s exit accounting,
+/// so it would leave the counter at zero while the block ran perfectly.
+///
+/// The control is what makes this non-vacuous. It differs by ONE byte pair, `mov ds,ax` against a
+/// third increment, so nothing but the segment write can explain the difference.
+#[test]
+fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
+    // inc eax / inc ecx / mov ds,ax / <barrier>, against inc eax / inc ecx / inc edx / <barrier>.
+    let writes = [0x40, 0x41, 0x8e, 0xd8, DIRECT_BARRIER, 0x43, 0x44];
+    let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x43, 0x44, 0x45];
+    // The OTHER arm that publishes `[None, None]`: a terminal whose successor is dynamic. It is
+    // what makes the `!dynamic_successor` conjunct load-bearing, because a predicate written as
+    // `successors == [None, None]` alone would count this block and be wrong.
+    let ret = [0x40, 0x41, 0x42, 0xc3, 0x43, 0x44, 0x45];
+
+    for (label, code, offsets, expected) in [
+        (
+            "segment write",
+            writes.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            1,
+        ),
+        (
+            "fallthrough control",
+            control.as_slice(),
+            [0, 1, 2, 3, 4, 5].as_slice(),
+            0,
+        ),
+        (
+            "dynamic terminal control",
+            ret.as_slice(),
+            [0, 1, 2, 3, 4, 5].as_slice(),
+            0,
+        ),
+    ] {
+        let (mut cpu, mut bus) = fixture(code);
+        cpu.registers.set_esp(0x1000);
+        let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+        warm(&mut cpu, &mut bus, &addresses);
+        // `install` refuses a key that is not already `Seen`, and `probe` is what registers it.
+        let key = jit::direct::key_for(&cpu, ENTRY, true).expect("entry key");
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        let id = cpu
+            .jit_direct
+            .install(&compilation)
+            .expect("fixture block installs");
+        let block = cpu.jit_direct.block(id).expect("live block");
+        assert_eq!(
+            block.is_segment_write_block(),
+            expected == 1,
+            "{label}: the derived predicate disagrees with the fixture"
+        );
+
+        cpu.registers.eip = ENTRY;
+        let ran = cpu
+            .try_run_direct_block_for_test(&mut bus, block)
+            .expect("fixture block runs");
+        assert!(ran, "{label}: the block must actually be entered");
+
+        let stalls = cpu.direct_stall_snapshot();
+        assert_eq!(
+            stalls.segment_write_block_head_entries, expected,
+            "{label}: segment-write head entries"
+        );
+        if expected == 1 {
+            assert!(
+                stalls.segment_write_block_head_insns >= 3,
+                "{label}: the instruction lane must carry the block's retired count, got {}",
+                stalls.segment_write_block_head_insns
+            );
+        } else {
+            assert_eq!(
+                stalls.segment_write_block_head_insns, 0,
+                "{label}: control must not deposit into the instruction lane"
+            );
+        }
+    }
+}
+
+/// A dirty-segment row must NOT claim its entry linear in the rejected-span map.
+///
+/// `rejected_barrier` is keyed on entry linear alone and answers "which barrier refused the block
+/// living here", so that a runtime exit into a rejected block can be charged back to an opcode.
+/// A dirty stop is a `CompileStop::Boundary`: the key it leaves behind is Compiled, or Dormant
+/// when the break landed with too few slots to install, but never Rejected. Letting it write that
+/// map would hand a genuinely rejected block's exits to whichever of the two happened to be
+/// recorded second.
+///
+/// Driven through `note_unbound_target`, which is the hook that reads the map, rather than by
+/// inspecting the map directly. That is the path the mis-attribution would actually take.
+#[test]
+fn a_dirty_segment_row_does_not_claim_the_rejected_span_map() {
+    let code = [
+        0x40, 0x41, 0x8e, 0xd8, 0x8b, 0x03, 0x8b, 0x0b, 0x8b, 0x13, 0x40,
+    ];
+    let offsets = [0, 1, 2, 4, 6, 8, 10];
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+
+    // An exit reporting a REJECTED target at the dirty block's own entry linear. If the dirty stop
+    // had registered there, this credits its row.
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.stop_reason == "dirty_segment")
+        .expect("recorded dirty-segment stop");
+    assert_eq!(
+        row.unbound_exits, 0,
+        "the dirty row took credit for a rejected-target exit it has no claim on"
+    );
+}
+
+/// The seed carries the BARRED instruction's own segment write.
+///
+/// `POP DS` is not lowered, so it is an ordinary barrier row, and the compile walk never reached
+/// its write. But the suffix prices "what if this barrier were lowered", and lowering a `POP DS`
+/// makes DS dirty for everything behind it. Without the seed the row over-reports, and `0x1f` is
+/// 10.3% of the 16-bit census.
+///
+/// The control changes ONLY the barrier byte, so the pair isolates `barred_segment_write` from
+/// everything else the scan does.
+#[test]
+fn the_suffix_seed_carries_a_barred_segment_write() {
+    // inc eax / inc ecx / inc edx / <barrier> / mov eax,[ebx] / inc eax
+    let pop_ds = [0x40, 0x41, 0x42, 0x1f, 0x8b, 0x03, 0x40];
+    let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x8b, 0x03, 0x40];
+    let offsets = [0, 1, 2, 3, 4, 6];
+
+    assert_eq!(
+        barrier_suffix(&control, &offsets),
+        2,
+        "control: a barrier that writes no segment leaves the scan free to walk the DS reader"
+    );
+    assert_eq!(
+        census_row_for(&pop_ds, &offsets, 0x1f).native_suffix_instructions,
+        0,
+        "POP DS dirties DS for the scan behind it, so the very next slot stops it"
+    );
+}
+
 /// The prefix arm of the compile walk is ATTRIBUTED, not silent — and, since slice 6, the arm is
 /// reached by a CS override rather than by any segment override.
 ///
@@ -331,11 +964,15 @@ fn barrier_census_attributes_the_word_persona_arm() {
 
     let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw486);
     cpu.enable_direct_barrier_census(true);
+    // EXPLICIT since the default flipped. The arm still exists and is still reachable; what
+    // changed is that reaching it is now a policy choice rather than a property of the persona,
+    // and a fixture that leaned on the default would silently stop testing the arm.
+    cpu.set_word_operands_at_486(false);
     warm(&mut cpu, &mut bus, &addresses);
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(
         compilation.span.instructions, 4,
-        "the Word instruction must stop the walk on a non-586 persona"
+        "the Word instruction must stop the walk while the policy refuses it"
     );
     let row = cpu
         .direct_barrier_census_snapshot()

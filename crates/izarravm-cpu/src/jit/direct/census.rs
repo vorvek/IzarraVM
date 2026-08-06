@@ -20,6 +20,96 @@ struct CensusSuffix {
     instructions: usize,
 }
 
+/// The compile walk's live accumulators at the moment a barrier stopped it, handed to the forward
+/// scan so the scan can stop where the real walk would.
+///
+/// A STRUCT rather than more positional arguments. `record_structural_barrier` carried eleven,
+/// two of them adjacent `u32`s (`entry_lin` and `next`) that an earlier review of this campaign
+/// caught being confused for one another. Every accumulator here is a small integer and three are
+/// `u8`, so positional passing had no type safety left to offer.
+///
+/// `scan_start` rides here for that reason specifically rather than for tidiness: it is the second
+/// of those two `u32`s, and naming it at every call site is what stops the confusion recurring.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SuffixSeed {
+    /// Linear address the forward scan begins at: the instruction AFTER the barrier, which is
+    /// where the counterfactual block would carry on.
+    pub(super) scan_start: u32,
+    /// Slots the block had already committed. The forward scan's slot count is
+    /// `prefix_instructions + 1 + suffix`: the prefix, the barrier itself counterfactually
+    /// lowered, and the suffix so far.
+    pub(super) prefix_instructions: usize,
+    pub(super) stack_accesses: u8,
+    pub(super) memory_alu_slots: u8,
+    pub(super) callout_slots: u8,
+    /// x87 slots the block had already committed when the barrier stopped it. Non-zero arms BOTH
+    /// x87 gates in the compile walk -- the loop-top cap at `MAX_X87_BLOCK_INSTRUCTIONS` and the
+    /// x87/call-out mixing `Retry` -- and both are PREFIX-armed, so the scan's own refusal of x87
+    /// KINDS does not make them unreachable. Leaving this out was the review finding: a barrier
+    /// whose prefix held one `FLD` over-reported its suffix by up to 20 instructions against the
+    /// 12-instruction x87 ceiling, on exactly the x87-adjacent population (Quake) the campaign is
+    /// trying to rank.
+    pub(super) x87_slots: u8,
+    /// Segments the block had already overwritten when the barrier stopped it.
+    pub(super) dirty_segments: u8,
+    /// Whether the forward scan applies the dirty-segment rule at all.
+    ///
+    /// TRUE for every arm but one, because the rule survives lowering the opcode those arms name:
+    /// admitting `RCL r16,1` does not make a baked segment base any less stale.
+    ///
+    /// FALSE for `BarrierStop::DirtySegment`, and that arm is the whole reason this field exists.
+    /// Its suffix answers "how much longer would this block be if segment bases were DYNAMIC",
+    /// and disabling the rule is precisely what that change means. Left true, the scan would walk
+    /// forward from the barred instruction with the segment already dirty, stop at the first
+    /// following slot that pins it, and report a suffix near zero. The instrument built to rank
+    /// dynamic segment bases would then report that dynamic segment bases gain nothing.
+    pub(super) model_dirty: bool,
+}
+
+/// The segment a BARRED instruction would have overwritten, as a bitmask.
+///
+/// The forward scan counts the barrier as one slot of the counterfactual block, so if that
+/// instruction is itself a segment load then everything behind it runs with the segment already
+/// dirty. Without this the suffix over-reports for exactly the rows a segment slice would rank:
+/// `0x1f` POP DS alone is 10.3% of the census.
+///
+/// Read off the `DecodedInsn` and not off a `DirectKind`, because there is no kind: these are the
+/// forms `classify` refused, which is why they are barriers. `DirectKind::written_segment` covers
+/// the admitted ones (`LoadSegReal`) and this covers the rest, so the two are complements rather
+/// than duplicates.
+///
+/// `0x8e /1` is absent deliberately. `MOV CS, r/m16` raises #GP(0) rather than loading anything
+/// (execute.rs, the 0x8e arm), so it writes no segment and seeding one would model a transfer the
+/// guest never performs.
+fn barred_segment_write(insn: &DecodedInsn) -> u8 {
+    let segment = match insn.opcode {
+        // The register forms of `/0` and `/3` are lowered to `LoadSegReal`; the memory forms and
+        // the other three register forms are not, and all of them land here.
+        0x8e => match insn.modrm.map(|modrm| modrm.reg) {
+            Some(0) => SegmentIndex::Es,
+            Some(2) => SegmentIndex::Ss,
+            Some(3) => SegmentIndex::Ds,
+            Some(4) => SegmentIndex::Fs,
+            Some(5) => SegmentIndex::Gs,
+            _ => return 0,
+        },
+        // POP Sreg, then the two-byte POP FS/GS.
+        0x07 => SegmentIndex::Es,
+        0x17 => SegmentIndex::Ss,
+        0x1f => SegmentIndex::Ds,
+        0x0fa1 => SegmentIndex::Fs,
+        0x0fa9 => SegmentIndex::Gs,
+        // The far-pointer loads. Each writes its segment and a GPR in one instruction.
+        0xc4 => SegmentIndex::Es,
+        0xc5 => SegmentIndex::Ds,
+        0x0fb2 => SegmentIndex::Ss,
+        0x0fb4 => SegmentIndex::Fs,
+        0x0fb5 => SegmentIndex::Gs,
+        _ => return 0,
+    };
+    segment_bit(segment)
+}
+
 /// Record one structural stop into the barrier census, from ANY of the arms that can set
 /// `CompileStop::Structural`.
 ///
@@ -38,54 +128,110 @@ struct CensusSuffix {
 /// pass — `compile_with_page_len` re-enters this walk once per binary-search step and converts
 /// any structural reject it sees into a `Retry`, so a shorter pass can neither install a
 /// rejection nor be allowed to double-count a row.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn record_structural_barrier(
     cpu: &mut CpuGsw,
     insn: &DecodedInsn,
     stop: BarrierStop,
     key: BlockKey,
     entry_lin: u32,
-    next: u32,
     d: bool,
-    prefix_instructions: usize,
-    stack_accesses: u8,
-    memory_alu_slots: u8,
+    mut seed: SuffixSeed,
 ) {
-    let suffix = census_native_suffix(
-        cpu,
-        key,
-        entry_lin,
-        next,
-        d,
-        prefix_instructions,
-        stack_accesses,
-        memory_alu_slots,
-    );
+    // Folded in HERE rather than at the three call sites, so a future arm cannot forget it. The
+    // call sites carry the compile walk's live mask; this adds the barred instruction's own write,
+    // which the walk never reached.
+    seed.dirty_segments |= barred_segment_write(insn);
+    let suffix = census_native_suffix(cpu, key, entry_lin, d, seed);
     cpu.jit_direct.record_barrier(
         insn,
         BarrierObservation {
             entry_linear: entry_lin,
-            native_prefix: prefix_instructions,
+            native_prefix: seed.prefix_instructions,
             native_suffix: suffix.instructions,
             stop,
         },
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Walk forward from a barrier and count how many more instructions the block WOULD have carried
+/// had that barrier been lowered.
+///
+/// This is `max_native_suffix`'s and `native_suffix_instructions`' only source, which makes it a
+/// ranking column: a row that reports a long suffix is claiming a long block is being lost. So the
+/// scan has one correctness property, and it is not "does it look like the compile walk" but
+/// **does it stop where the compile walk would**. Anywhere the two disagree, the column lies in a
+/// direction the reader cannot see.
+///
+/// The audit that produced the current form found SIX divergences. Three are closed here, one is
+/// deliberately left open, and two belong to the dirty-segment slice:
+///
+/// * CLOSED, the memory-ALU BLOCK cap. `compile_with_instruction_limit` breaks at its LOOP TOP on
+///   `memory_alu_slots != 0 && slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, regardless of
+///   what the next instruction turns out to be. This scan applied the same bound only when the
+///   next kind was ITSELF memory-ALU, so a barrier whose prefix held one read-modify-write slot
+///   over-reported by up to 28 instructions against a 32-instruction ceiling. That was the largest
+///   error in the column and it is the one the 32-bit rows were ranked on.
+/// * CLOSED, the call-out slot cap.
+/// * CLOSED, `jit_admits_non_continuable`. The compile walk takes `insn.continuable ||
+///   jit_admits_non_continuable(opcode)`; this scan took the bare flag, truncating any suffix that
+///   reached an IMUL-with-immediate.
+/// * PARTLY CLOSED, x87. The `kind.is_x87()` break below still refuses EVERY x87 slot in the
+///   SUFFIX, a deliberate conservative floor for the kinds themselves. But both x87 gates in the
+///   compile walk are armed by the PREFIX (`x87_slots != 0`), not by the suffix, so "the scan
+///   never adds an x87 slot" never made them unreachable: a barrier whose prefix held an `FLD`
+///   over-reported by up to 20 instructions against the 12-instruction x87 ceiling. The seed now
+///   carries `x87_slots` and the scan mirrors the loop-top cap and the call-out mixing refusal.
+///   What remains open is only the suffix-side admission of x87 kinds, and THAT half genuinely
+///   can only under-report.
+/// * CLOSED, the dirty-segment rule, but PER ARM rather than unconditionally. See
+///   `SuffixSeed::model_dirty`: every arm but `DirtySegment` models it, and that one must not,
+///   because its suffix prices the rule's own removal. The seed also carries the barred
+///   instruction's own segment write, which the compile walk never reached
+///   (`barred_segment_write`).
+///
+/// One residual the seed cannot express: the barrier is counted as one slot without knowing its
+/// kind, because `classify` refused it. So a barrier that would itself have been the block's first
+/// memory-ALU or call-out slot does not arm those caps. Bounded by one slot and always in the
+/// over-reporting direction.
 fn census_native_suffix(
     cpu: &CpuGsw,
     key: BlockKey,
     entry_lin: u32,
-    mut lin: u32,
     d: bool,
-    prefix_instructions: usize,
-    mut stack_accesses: u8,
-    mut memory_alu_slots: u8,
+    seed: SuffixSeed,
 ) -> CensusSuffix {
+    let SuffixSeed {
+        scan_start: mut lin,
+        prefix_instructions,
+        mut stack_accesses,
+        mut memory_alu_slots,
+        mut callout_slots,
+        x87_slots,
+        mut dirty_segments,
+        model_dirty,
+    } = seed;
     let cs = cpu.registers.cs();
     let mut result = CensusSuffix::default();
     while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
+        // The compile walk's LOOP-TOP caps, which fire before the next instruction is even
+        // decoded and so cannot be folded into the per-kind refusals below. `>=` rather than the
+        // compile walk's `==` because `prefix_instructions` arrives from a caller rather than
+        // being counted up from zero here; the two agree wherever the compile walk can reach.
+        if memory_alu_slots != 0
+            && prefix_instructions + 1 + result.instructions >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS
+        {
+            break;
+        }
+        // The x87 loop-top cap, prefix-armed exactly like the memory-ALU one above: the compile
+        // walk breaks at `slots.len() == MAX_X87_BLOCK_INSTRUCTIONS` whenever the block already
+        // holds an x87 slot, before decoding the next instruction. `x87_slots` never grows during
+        // this scan (the `kind.is_x87()` refusal below sees to that), so testing the seed value is
+        // exact rather than conservative.
+        if x87_slots != 0
+            && prefix_instructions + 1 + result.instructions >= MAX_X87_BLOCK_INSTRUCTIONS
+        {
+            break;
+        }
         let Some(insn) = cpu.decode_cache.get(lin, d) else {
             break;
         };
@@ -109,8 +255,8 @@ fn census_native_suffix(
             .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
             || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
             || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
-            || !insn.continuable
-            || (insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586)
+            || !(insn.continuable || jit_admits_non_continuable(insn.opcode))
+            || (insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu))
         {
             break;
         }
@@ -131,12 +277,25 @@ fn census_native_suffix(
                 && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
                     || prefix_instructions + 1 + result.instructions
                         >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
+            || (kind.is_call_out() && callout_slots == MAX_BLOCK_CALLOUT_SLOTS)
+            // The x87/call-out mixing refusal's live half: a call-out into a block whose PREFIX
+            // holds an x87 slot is a `Retry` in the compile walk. The other half (an x87 slot
+            // after a call-out) stays dead here because the scan refuses x87 kinds outright.
+            || (kind.is_call_out() && x87_slots != 0)
             || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
+            || (model_dirty && kind.pinned_segments() & dirty_segments != 0)
         {
             break;
         }
         stack_accesses += u8::from(kind.uses_stack());
         memory_alu_slots += u8::from(kind.is_memory_alu());
+        callout_slots += u8::from(kind.is_call_out());
+        // Accumulated even when `model_dirty` is false. The mask costs nothing unread, and a scan
+        // that tracked it only when it was going to test it would go wrong the moment the flag
+        // became anything other than a constant per arm.
+        if let Some(segment) = kind.written_segment() {
+            dirty_segments |= segment_bit(segment);
+        }
         result.instructions += 1;
         lin = next;
         if kind.is_terminal() {
@@ -218,6 +377,27 @@ pub(crate) struct DirectStallTally {
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
     pub reject_callout_privileged: u64,
+    /// Dispatcher entries whose HEAD block was barred from publishing successors because it
+    /// overwrites a segment register, and the instructions those entries retired.
+    ///
+    /// The name says `head` because that is the honest limit of what this can see, and the limit
+    /// matters more than the number. `run.rs` increments the entry counter once per DISPATCHER
+    /// ENTRY, attributed to the block the dispatcher entered. Inbound links to a segment-write
+    /// block are deliberately preserved (only its OUTBOUND edges are barred), so a segment-write
+    /// block reached as the tail of a chain increments nothing here. The undercount is exactly the
+    /// share of them that have an inbound link, which is not known.
+    ///
+    /// It is therefore an UPPER BOUND on removable entries read one way and an undercount of
+    /// affected blocks read another, and it must be reported against `jit_direct_entries` and
+    /// `jit_direct_chain_quota_entries` rather than alone. What lifting the bar would actually
+    /// remove is the SUCCESSOR's separate entry, which is counted under the successor's own
+    /// identity and is invisible from here; and some of the removed seams would reappear as
+    /// budget-quota exhaustion, because a longer chain drains `budget_quota` faster.
+    ///
+    /// The instruction lane is the useful half: `insns / entries` for this population against the
+    /// global figure says directly whether these blocks are short because they cannot chain.
+    pub segment_write_block_head_entries: u64,
+    pub segment_write_block_head_insns: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -451,6 +631,32 @@ pub(crate) enum BarrierStop {
     /// run 586) and instrumented anyway, because "it reads zero" is a measurement and "nothing
     /// records it" is not.
     WordPersona,
+    /// The dirty-segment rule: a slot wanted a segment an earlier slot in the same block had
+    /// overwritten, so it would have baked a stale base or selector.
+    ///
+    /// THE ODD ONE OUT, in three ways that a reader ranking rows has to know about.
+    ///
+    /// It is a `CompileStop::Boundary` rather than a `Structural`, so the block it stopped is
+    /// compiled and installed rather than rejected. That is why it does not install a rejected
+    /// span (see `installs_rejected_span`) and why `unbound_exits` and `dynamic_unbound_exits`
+    /// are structurally zero for it. `runtime_hits` is UNREGISTERED by it, deliberately (the
+    /// column can still read non-zero for a shape that ALSO barriers under a genuine coverage
+    /// stop, since registration is shared by shape): the column
+    /// counts interpreted executions by SHAPE, and this variant's rows key on the segment's user
+    /// (`0x8a`, `0x8b`, memory forms), shapes that are fully lowered and executed constantly. An
+    /// address-based reading ("the barred instruction becomes the next block's entry, so it never
+    /// interprets") predicted near-zero and was wrong for a shape-keyed counter; `record` skips
+    /// the registration instead, so the column cannot mislead. `snapshot` sorts on those columns,
+    /// so these rows land last while being the ones a segment slice is looking for. Read `hits`
+    /// and the suffix instead.
+    ///
+    /// Its rows must be SUMMED, not ranked individually. The key is the shape of the instruction
+    /// that was barred -- the segment's USER -- so one structural cause spreads itself across
+    /// `0x8a`, `0x8b`, `0x88` and every other form that happens to touch the segment, rather than
+    /// concentrating in one row the way an opcode-coverage barrier does.
+    ///
+    /// Its suffix is computed with the dirty rule DISABLED. See `SuffixSeed::model_dirty`.
+    DirtySegment,
 }
 
 impl BarrierStop {
@@ -460,7 +666,26 @@ impl BarrierStop {
             Self::PrefixUnsupported => "prefix_unsupported",
             Self::NonContinuable => "non_continuable",
             Self::WordPersona => "word_persona",
+            Self::DirtySegment => "dirty_segment",
         }
+    }
+
+    /// Whether a stop on this arm leaves behind a `BlockState::Rejected` span that static and
+    /// dynamic exits can pile into.
+    ///
+    /// Every `CompileStop::Structural` arm does. `DirtySegment` does not: it is a
+    /// `CompileStop::Boundary`, and the key it leaves behind is Compiled, or Dormant when the
+    /// break landed with too few slots to install (`compile_with_instruction_limit`'s short-block
+    /// return). Never Rejected.
+    ///
+    /// So `record` must not write `rejected_barrier` for it. That map is keyed on entry linear
+    /// alone, and a linear claimed by a non-rejected block would hand a genuinely rejected block's
+    /// exits to the wrong row, in whichever direction the two happened to be recorded.
+    ///
+    /// Derived from the arm rather than passed in, because a call site that could get this wrong
+    /// is a call site that eventually will.
+    fn installs_rejected_span(self) -> bool {
+        !matches!(self, Self::DirtySegment)
     }
 }
 
@@ -607,10 +832,22 @@ impl DirectBarrierCensus {
             shape: BarrierShape::from_insn(insn),
             stop,
         };
-        self.rejected_barrier.insert(entry_linear, key);
+        if stop.installs_rejected_span() {
+            self.rejected_barrier.insert(entry_linear, key);
+        }
         // Register the shape so `note_interpreted` can find it with one probe and without ever
         // creating a row for an instruction that never barriered.
-        self.runtime_hits.entry(key.shape).or_default();
+        //
+        // EXCEPT for the dirty-segment rule. Its rows key on the segment's USER -- `0x8a`, `0x8b`
+        // and the other fully-lowered forms that happen to read the segment -- and
+        // `note_interpreted` counts by SHAPE, not by address. Registering those shapes would land
+        // every interpreted `MOV r,[mem]` in the guest in a barrier row, and `runtime_hits` is
+        // the column the campaign ranks by. The census's own history already records this failure
+        // mode once (`unbound_exits` ranking `0x8C` seven places above `0x38 /0`). The row keeps
+        // its compile-time attribution, which is what it exists to provide.
+        if stop != BarrierStop::DirtySegment {
+            self.runtime_hits.entry(key.shape).or_default();
+        }
         let row = self.rows.entry(key).or_default();
         row.hits = row.hits.saturating_add(1);
         row.native_prefix_instructions = row
@@ -773,6 +1010,8 @@ impl crate::jit::JitState {
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
             callout_executed: self.stalls.callout_executed,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
+            segment_write_block_head_entries: self.stalls.segment_write_block_head_entries,
+            segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
         }
     }
 
@@ -820,6 +1059,15 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_reject_callout_privileged(&mut self) {
         self.stalls.reject_callout_privileged += 1;
+    }
+
+    /// BRANCHLESS, and on purpose: this sits beside `jit_direct_entries` on the hottest path in
+    /// the backend, next to the sixteen-bit split that is written the same way for the same
+    /// reason. The caller passes the predicate already widened, so both lanes are an unconditional
+    /// add and neither can mispredict.
+    pub(crate) fn note_segment_write_block_entry(&mut self, is_segment_write: u64, insns: u64) {
+        self.stalls.segment_write_block_head_entries += is_segment_write;
+        self.stalls.segment_write_block_head_insns += is_segment_write * insns;
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {

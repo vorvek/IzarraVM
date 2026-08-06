@@ -443,7 +443,12 @@ fn sixteen_bit_boundaries_skip_the_direct_admission_path() {
     };
 
     // THE CASE: 16-bit CS. fresh16 leaves default_size_32 false.
+    //
+    // The level is now set EXPLICITLY. It used to be left at its default, which read 0 under
+    // `cargo test` and made the early-out fire for free. Since the 486 measurement the default is
+    // 1, so leaning on it would have quietly deleted this test's subject rather than failing.
     let mut cpu = fresh16();
+    cpu.set_sixteen_bit_admission_level(0);
     let mut bus = TestBus::with_memory(program());
     cpu.registers.eip = 0x100;
     cpu.registers.set_esp(0x0700);

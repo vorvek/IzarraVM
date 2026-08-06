@@ -29,7 +29,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use izarravm_core::CpuPersona;
 
-use census::{BarrierStop, record_structural_barrier};
+use census::{BarrierStop, SuffixSeed, record_structural_barrier};
 // The stall/census TAXONOMY lives in `census.rs` beside the builder that already consumed it
 // (`stall_snapshot`, `snapshot`), moved verbatim to keep this file under the source-line ceiling.
 // Re-exported from here because every out-of-module path names them through `jit::direct`.
@@ -440,6 +440,31 @@ impl CompiledBlock {
 
     pub(crate) fn span(&self) -> BlockSpan {
         self.span
+    }
+
+    /// Whether this block was barred from publishing successors because it overwrites a segment
+    /// register.
+    ///
+    /// DERIVED, not stored, and that is a size decision rather than a stylistic one.
+    /// `compiled_block_stays_small_enough_to_copy_per_entry` pins `CompiledBlock` at 120 bytes
+    /// and the budget is exactly full, so a `bool` field would round the struct to 128 and cost
+    /// eight bytes on every per-entry memcpy. `CallOutSlotCounts` is bit-packed for the same
+    /// reason.
+    ///
+    /// The equivalence is exact rather than approximate. Only TWO arms of `compile`'s `successors`
+    /// match produce `[None, None]`: the segment-write arm, which is reached only when
+    /// `dynamic_successor` was already forced false by its own `!segment_write_block` term; and
+    /// the Ret/JmpMem/CallReg/CallMem arm, which is reached only when `segment_write_block` is
+    /// false and therefore sets `dynamic_successor` TRUE from the identical kind list. So the
+    /// second conjunct is what separates them, and nothing else in the function can produce the
+    /// pair.
+    ///
+    /// What this costs the block is not one extra boundary. `run_direct_block` computes
+    /// `chain_eligible` from `has_linked_successor`, so a block with no successors can never
+    /// chain and its quota is clamped to 1: every entry runs this block alone and returns through
+    /// the full prologue and epilogue.
+    pub(crate) fn is_segment_write_block(&self) -> bool {
+        self.successors == [None, None] && !self.dynamic_successor
     }
 
     pub(crate) fn entry_ptr(&self) -> *const u8 {
@@ -3859,29 +3884,100 @@ const fn jit_admits_non_continuable(opcode: u16) -> bool {
     matches!(opcode, 0x69 | 0x6b)
 }
 
-/// Opt-in admission level for the 16-bit / ROM spike. Default 0 is the shipped
-/// behaviour and nothing this gates can happen without the variable set.
+/// Admission level for 16-bit code segments. **DEFAULT 1 since the 486 measurement**; it used to
+/// be 0, and the doc comment used to say "this exists to price a lever, not to ship".
 ///
+///   0  refuse every 16-bit code segment (the old default, still the off switch)
 ///   1  admit 16-bit (CS.D = 0) code segments backed by ordinary RAM
 ///   2  additionally admit the 0xC0000..0x100000 option-ROM + BIOS window
 ///
-/// This exists to price a lever, not to ship: an idle DOS prompt spends 100% of
-/// its instructions in 16-bit code, and the hottest addresses in it are the BIOS
-/// INT 16h service in ROM, so the two gates below are the whole non-game
-/// workload. Level 2 deliberately stops at 0xC0000 and leaves 0xA0000..0xC0000
-/// (VGA memory) refused: that half of the window is a device aperture with read
-/// side effects, and it is the half the original guard was really about.
+/// Level 2 deliberately stops at 0xC0000 and leaves 0xA0000..0xC0000 (VGA memory) refused: that
+/// half of the window is a device aperture with read side effects, and it is the half the original
+/// guard was really about.
 ///
-/// 586 only in practice, because `key_for_phys`'s persona clause below already
-/// refuses `!d` everywhere else, for the reason documented there.
+/// **Level 2 is measured WASTE and should not be used.** On a PoP boot it produces 531 extra
+/// compile attempts and ZERO extra installs, because `install`'s page-cover check wants a RAM
+/// direct page and ROM is not one. The admission gate and the installer disagree about the same
+/// window. Fix or retire it; do not set it hoping for BIOS coverage.
+///
+/// What flipping the default to 1 buys and costs, measured on a quiet box, min-of-N:
+///
+///   * PoP-486, a real-mode game: coverage 1.03% -> 74.47%, 9.68 native insns/entry, wall NEUTRAL,
+///     framebuffer bit-identical over 4e9 cycles.
+///   * quake-586: **+4.14% slower**. Its 16-bit code is 55% of entries at 2.431 insns/entry, i.e.
+///     DOS/BIOS/extender glue in blocks too short to amortise a dispatcher entry.
+///
+/// That split is a WORKLOAD SHAPE, not a persona: real-mode game loops win, a 32-bit game's 16-bit
+/// glue loses.
+///
+/// Defaulted ON at parity deliberately, and the reasoning is pre-release reasoning: there is no
+/// version out, so a default is a development posture rather than a promise to anyone. On costs a
+/// measured 4% on one workload and buys exposure of the 16-bit path to every fixture, every gate
+/// run and every future slice, which is how the remaining coverage work gets found and how each
+/// lowering lands as upside instead of paying down a deficit. Revisit the trade before a release,
+/// not before then. Closing the quake gap is the next objective.
 pub(crate) fn sixteen_bit_admission_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
         std::env::var("IZARRAVM_JIT16")
             .ok()
             .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or(0)
+            .unwrap_or(1)
     })
+}
+
+/// Seed for `JitState::word_at_486`, read once per process from `IZARRAVM_JIT16_486`.
+///
+/// **DEFAULT ON since the 486 measurement.** Set `IZARRAVM_JIT16_486=0` to refuse.
+///
+/// Separate from `IZARRAVM_JIT16` on purpose: that one selects WHICH memory a 16-bit code segment
+/// may live in, and this one selects WHICH PERSONAS lower Word operands at all. They compose, and
+/// keeping them independent is what let the two halves be measured apart — an
+/// `IZARRAVM_JIT16=0` arm isolates this flag's 32-bit half (66-prefixed word ops) exactly, because
+/// `try_direct_continuation` then refuses every 16-bit boundary before a key is built.
+///
+/// The design that introduced this said to DELETE the knob when the default flipped, so a
+/// temporary switch could not become permanent surface. It stays, deliberately, for two reasons
+/// the design did not know yet: the flip ships a measured ~4% regression on quake-586, so an
+/// escape hatch is worth its surface until coverage work closes that; and the differential tests
+/// that cover the refusing arm at I486 have no other way to reach it once the lift is
+/// unconditional. Delete it when quake-586 is back at parity, not before.
+pub(crate) fn word_at_486_default() -> bool {
+    static LEVEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| !matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("0")))
+}
+
+/// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
+///
+/// ONE predicate for what used to be three copies of `persona != I586`: the compile walk's Word
+/// refusal, `key_for_phys`'s 16-bit-segment refusal, and the census suffix scan's copy of the
+/// first. They have to move together. The compile walk and `key_for_phys` are COUPLED by
+/// construction — `key_for_phys` refuses the key precisely BECAUSE the walk would reject the first
+/// slot and install a rejected span for zero yield — so lifting either alone is wrong in a
+/// different direction: the walk alone is inert, the key alone is pure churn. The census copy is
+/// the one that would silently re-open a seventh divergence between the two walks.
+///
+/// The 16-bit half rests on an identity worth stating, because it is what lets one predicate serve
+/// both questions: `operand_size` follows CS.D opcode-independently, so in a CS.D = 0 segment
+/// EVERY instruction decodes at `Word`. "May a 16-bit segment be keyed" and "are Word operands
+/// admitted" are therefore the same question asked at two points.
+///
+/// The admitted set is I486 and I586, never the 386 class. Interpreted 386 already runs above 15x
+/// real time, so there is no throughput problem for the JIT to solve there, and admitting it would
+/// widen the blast radius of every Word lowering to a persona nobody benchmarks. `key_for_phys`
+/// already refuses every persona below I486 a few lines up, so the 386 class is doubly excluded;
+/// spelling it out here means a future 386 enablement cannot silently inherit Word admission.
+///
+/// Be honest about that arm: it is UNREACHABLE today and therefore UNTESTABLE. Flipping
+/// `I386 => false` to `true` fails nothing, because `key_for_phys`'s own persona check runs first
+/// and the compile walk is reached only through it. It is defence in depth against a future edit
+/// to that check, not a live guard, and no test should be written that pretends otherwise.
+fn word_operands_admitted(cpu: &CpuGsw) -> bool {
+    match cpu.persona() {
+        CpuPersona::I586 => true,
+        CpuPersona::I486 => cpu.jit_direct.word_at_486,
+        CpuPersona::I386 => false,
+    }
 }
 
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
@@ -3896,32 +3992,32 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     if !super::host_supported() || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586) {
         return None;
     }
-    // A 16-bit code segment is admitted on I586 only, and the persona clause is load-bearing
-    // rather than tidiness. Every instruction in such a segment decodes at `OperandSize::Word`
-    // (the size follows CS.D, not the opcode), and the compile loop structurally rejects Word on
-    // any persona but I586. On I486 the whole population would therefore reach `classify`, fail
-    // on its FIRST slot, and return a `StructuralReject`, which installs a rejected span and a
-    // physical-page watch for every hot 16-bit boundary. That is a real cost for a yield that is
-    // exactly zero. Refusing here keeps a 486 guest byte-identical by construction rather than
-    // by measurement.
+    // A 16-bit code segment is admitted wherever `word_operands_admitted` says Word operands are
+    // lowered, which since the 486 measurement is I486 and I586 BY DEFAULT. Every instruction in
+    // such a segment decodes at `OperandSize::Word` (the size follows CS.D, not the opcode), so
+    // where the policy refuses, the whole population would reach `classify`, fail on its FIRST
+    // slot, and install a rejected span plus a physical-page watch for every hot 16-bit boundary.
+    // Refusing the key here instead keeps that persona byte-identical by construction.
     //
     // The 16-bit population is real mode, V86 and 16-bit protected mode. V86 is deliberately IN,
-    // and the reason has CHANGED: it used to be that `classify` had no IN/OUT arm at all, which
-    // stopped being true when the interpreter call-out slot landed 0xEC. Three live gates carry
-    // the conclusion instead, any ONE of them sufficient:
+    // and 16-bit V86 BLOCKS EXIST in the shipped configuration -- an earlier revision of this
+    // comment said "no 16-bit block exists on any persona today", which was true while
+    // `try_direct_continuation` refused every `!d` boundary and stopped being true when
+    // `IZARRAVM_JIT16` defaulted to 1. The V86 conclusion now rests on per-opcode gates:
     //
-    //   1. `try_direct_continuation` (run.rs) returns `Interpret` for every `!d` boundary before
-    //      a key is ever built, so no 16-bit block exists on any persona today -- V86 included,
-    //      since a V86 code segment is always CS.D = 0.
-    //   2. `classify`'s Word-size allowlist excludes 0xEC, so even if a 16-bit block were built,
-    //      an IN in a CS.D = 0 segment decodes at `OperandSize::Word` and stays a barrier.
-    //   3. `run_direct_block` refuses to ENTER a call-out-bearing block whenever
-    //      `is_v86_mode() || CPL > IOPL`, so the slot cannot execute in V86 even if the first two
-    //      were somehow bypassed.
+    //   * The PORT opcodes (0xEC and family): two gates, either sufficient. `classify`'s
+    //     Word-size allowlist excludes them, so in a CS.D = 0 segment they stay barriers; and
+    //     `run_direct_block` refuses to ENTER a call-out-bearing block whenever
+    //     `is_v86_mode() || CPL > IOPL`, so the 0xEC call-out slot cannot execute in V86 even
+    //     compiled into a 32-bit block.
+    //   * PUSHF: its PUSHFD arm is refused by `stack_width_kind` in V86 (`StoreSource::Flags`,
+    //     IOPL check), and its Word form is off the allowlist.
+    //   * POPF, CLI, STI, INT, IRET: no `classify` arm at any size. That absence is now PINNED by
+    //     `v86_sensitive_opcodes_stay_word_barriers` (cpu_jit_compile_outcome_test.rs), because
+    //     an absence defended by nothing is exactly what a coverage campaign widens by accident.
     //
-    // The other V86-sensitive opcodes (PUSHF/POPF, CLI/STI, INT/IRET) still have no `classify`
-    // arm, and V86 blocks stay key-separated by mode-key bit 2.
-    if !d && cpu.persona() != CpuPersona::I586 {
+    // V86 blocks stay key-separated by mode-key bit 2.
+    if !d && !word_operands_admitted(cpu) {
         return None;
     }
     if lin.wrapping_sub(0x000f_f000) < 0x400 {
@@ -3935,7 +4031,7 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     // read-only storage with no side effects, while 0xA0000..0xC0000 is the VGA aperture the
     // guard is really for and stays refused at every level.
     if (0x000a_0000..0x0010_0000).contains(&physical)
-        && !(physical >= 0x000c_0000 && sixteen_bit_admission_level() >= 2)
+        && !(physical >= 0x000c_0000 && cpu.jit_direct.sixteen_bit_level >= 2)
     {
         return None;
     }
@@ -4292,11 +4388,17 @@ fn compile_with_instruction_limit(
                     reason,
                     key,
                     entry_lin,
-                    next,
                     d,
-                    slots.len(),
-                    stack_accesses,
-                    memory_alu_slots,
+                    SuffixSeed {
+                        scan_start: next,
+                        prefix_instructions: slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                        callout_slots,
+                        x87_slots,
+                        dirty_segments,
+                        model_dirty: true,
+                    },
                 );
             }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
@@ -4307,7 +4409,7 @@ fn compile_with_instruction_limit(
         // instructions as precise interpreter barriers in that mode.
         // Follow-up (dev_docs/specs/2026-07-15-smc-hardening-design.md, G1): with heat demotion
         // landed, A/B re-enabling 486 word ops - heat should now bound the churn this defends.
-        if insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586 {
+        if insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu) {
             // Attributed since the completeness slice, and expected to read ZERO on both shipped
             // fixtures because they run 586. Instrumented anyway: "this arm is dead on the
             // corpus" is a measurement worth having, and "nothing records it" is not the same
@@ -4321,11 +4423,17 @@ fn compile_with_instruction_limit(
                     BarrierStop::WordPersona,
                     key,
                     entry_lin,
-                    next,
                     d,
-                    slots.len(),
-                    stack_accesses,
-                    memory_alu_slots,
+                    SuffixSeed {
+                        scan_start: next,
+                        prefix_instructions: slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                        callout_slots,
+                        x87_slots,
+                        dirty_segments,
+                        model_dirty: true,
+                    },
                 );
             }
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
@@ -4343,11 +4451,17 @@ fn compile_with_instruction_limit(
                         BarrierStop::HardBoundary,
                         key,
                         entry_lin,
-                        next,
                         d,
-                        slots.len(),
-                        stack_accesses,
-                        memory_alu_slots,
+                        SuffixSeed {
+                            scan_start: next,
+                            prefix_instructions: slots.len(),
+                            stack_accesses,
+                            memory_alu_slots,
+                            callout_slots,
+                            x87_slots,
+                            dirty_segments,
+                            model_dirty: true,
+                        },
                     );
                 }
                 stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
@@ -4446,6 +4560,40 @@ fn compile_with_instruction_limit(
         // time that unrelated segment moves, or a spurious Retry out of `segment_access_supported`
         // for a descriptor nothing in the block reaches.
         if kind.pinned_segments() & dirty_segments != 0 {
+            // Censused since the dirty-stop slice, and it is the only `Boundary` arm that is.
+            // `CompileStop::Boundary` is five-way ambiguous (this rule, the walk's initializer,
+            // the two block caps and a terminal slot), so the recording has to sit AT the rule
+            // rather than being recovered from `stop` afterwards.
+            //
+            // Before this, admitting `MOV DS,r16` looked like it removed 18.4M census hits while
+            // the census showed nothing gained. It had not removed them, it had moved them here,
+            // where nothing was recording. That also reconciles the campaign's refuted
+            // relocation item: no row grew because the work left the censused population
+            // entirely.
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                record_structural_barrier(
+                    cpu,
+                    &insn,
+                    BarrierStop::DirtySegment,
+                    key,
+                    entry_lin,
+                    d,
+                    SuffixSeed {
+                        scan_start: next,
+                        prefix_instructions: slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                        callout_slots,
+                        x87_slots,
+                        dirty_segments,
+                        // The arm whose suffix prices the dirty rule's own removal, so it is the
+                        // one arm that must not apply it.
+                        model_dirty: false,
+                    },
+                );
+            }
             stop = CompileStop::Boundary;
             break;
         }
