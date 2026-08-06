@@ -417,12 +417,15 @@ fn a_wrapping_bp_operand_reads_the_masked_address() {
     let mut native = sixteen_bit_code_cpu(ENTRY);
     let mut interp_bus = sixteen_bit_bus(program());
     let mut native_bus = sixteen_bit_bus(program());
-    arm_native_sixteen_bit(&mut native, &mut native_bus, &[0x0000]);
+    // Warm (decode) before mapping the fast map: warming sticky-marks page 0 watched, and its E1
+    // sweep would clear `arm_native_sixteen_bit`'s fast-map entries for that same page (the
+    // bp-relative operand lands on it too) if the mark ran after they were populated.
     warm_sixteen_bit(
         &mut native,
         &mut native_bus,
         &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 5],
     );
+    arm_native_sixteen_bit(&mut native, &mut native_bus, &[0x0000]);
 
     let block = install_sixteen_bit_block(&mut native, ENTRY, 4);
 
@@ -554,12 +557,16 @@ fn a_word_addressed_x87_load_uses_the_masked_address() {
 
     let mut bus = sixteen_bit_bus(program());
     let mut cpu = sixteen_bit_code_cpu(ENTRY);
-    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000]);
+    // `warm_sixteen_bit` decodes code on page 0, which sticky-marks that page watched; its E1
+    // sweep would invalidate `arm_native_sixteen_bit`'s fast-map entries for the SAME page
+    // (the fld/fstp targets sit on it too) if it ran after them. Warm first so the mark is in
+    // place before the fast map is populated, matching production ordering.
     warm_sixteen_bit(
         &mut cpu,
         &mut bus,
         &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 6],
     );
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000]);
 
     let block = install_sixteen_bit_block(&mut cpu, ENTRY, 4);
 

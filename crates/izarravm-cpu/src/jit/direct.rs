@@ -67,7 +67,7 @@ use super::code_watch::NATIVE_CHUNK_SHIFT;
     any(target_os = "windows", target_os = "linux")
 ))]
 use super::fast_map::{
-    NATIVE_KIND_MASK, NATIVE_MODE13_KIND, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER,
+    NATIVE_KIND_MASK, NATIVE_MODE13_KIND, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER, NATIVE_PAGE_WATCHED,
     NATIVE_PAGE_WRITABLE, NATIVE_RAM_KIND, NATIVE_UNAVAILABLE_BIAS, NativeMapBases,
 };
 
@@ -919,10 +919,12 @@ impl BlockCache {
         }
     }
 
-    /// Install bytes produced after `probe` returned `Compile`.
+    /// Install bytes produced after `probe` returned `Compile`. Strict E2 watch edges land in
+    /// `pending_watch_edges` for the caller's fast-map sweep (watched-page-bit design D4).
     pub(crate) fn install(
         &mut self,
         watch: &mut NativeCodeWatch,
+        pending_watch_edges: &mut Vec<u32>,
         compilation: &Compilation,
     ) -> Option<BlockId> {
         let span = compilation.span;
@@ -1015,7 +1017,11 @@ impl BlockCache {
             dynamic_successor: compilation.dynamic_successor,
             successors: compilation.successors,
         };
-        watch.acquire_range(span.key.physical, u32::from(span.guest_len));
+        pending_watch_edges.extend(
+            watch
+                .acquire_range(span.key.physical, u32::from(span.guest_len))
+                .0,
+        );
         if index == self.blocks.len() {
             self.blocks.push(block);
             self.segment_layouts.push(compilation.segment_layout);
@@ -1071,9 +1077,18 @@ impl BlockCache {
     }
 
     /// Prevent repeated compilation attempts for a block the emitter cannot handle.
-    pub(crate) fn reject(&mut self, watch: &mut NativeCodeWatch, span: RejectedSpan) {
+    pub(crate) fn reject(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        pending_watch_edges: &mut Vec<u32>,
+        span: RejectedSpan,
+    ) {
         if self.entries.get(&span.key) == Some(&BlockState::Seen) {
-            watch.acquire_range(span.key.physical, u32::from(span.guest_len));
+            pending_watch_edges.extend(
+                watch
+                    .acquire_range(span.key.physical, u32::from(span.guest_len))
+                    .0,
+            );
             self.entries.insert(span.key, BlockState::Rejected(span));
         }
     }
@@ -3947,6 +3962,19 @@ pub(crate) fn word_at_486_default() -> bool {
     *LEVEL.get_or_init(|| !matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("0")))
 }
 
+/// Whether emitted stores test the fast-map `PAGE_WATCHED` bit and skip the code-watch guard on
+/// unwatched pages (`dev_docs/2026-08-06-watched-page-bit-design.md` D3). Default ON — the
+/// slice's intended behavior; `IZARRAVM_WATCH_PAGE_BIT=0` forces the pre-slice
+/// unconditional-guard behavior (byte-identical at the seven Group A sites; Group B keeps two
+/// masking no-ops — see `MemoryEmitContext::watch_page_bit`), which is what makes a
+/// single-binary A/B possible (the `IZARRAVM_JIT16_486` precedent). A `JitState` FIELD rather than a bare `OnceLock` read at the
+/// emit sites, for `word_at_486`'s reason: a process-wide gate cannot be flipped per test, and
+/// both emission arms need unit coverage.
+pub(crate) fn watch_page_bit_default() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_WATCH_PAGE_BIT").as_deref(), Ok("0")))
+}
+
 /// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
 ///
 /// ONE predicate for what used to be three copies of `persona != I586`: the compile walk's Word
@@ -4724,7 +4752,6 @@ fn compile_with_instruction_limit(
             break;
         }
     }
-
     if slots.is_empty()
         || (slots.len() < 3 && !slots.last().is_some_and(|slot| slot.kind.is_terminal()))
     {
@@ -4912,6 +4939,7 @@ fn compile_with_instruction_limit(
             map: map_bases,
             code_watch_tables,
             cpl3: memory_cpl3,
+            watch_page_bit: cpu.jit_direct.watch_page_bit,
             segments: segment_layout,
             address_wrap: if d {
                 emit::AddressWrap::None
@@ -5043,6 +5071,13 @@ struct MemoryEmitContext {
     map: Option<NativeMapBases>,
     code_watch_tables: Option<[usize; 2]>,
     cpl3: bool,
+    /// Whether store emitters test the fast-map PAGE_WATCHED bit and skip the code-watch guard
+    /// on unwatched pages (watched-page-bit design D3). From `JitState::watch_page_bit`. False
+    /// reproduces the pre-slice emission byte for byte at the seven Group A sites; the two
+    /// Group B sites keep their H6 kind-mask `and` on every arm (a behavioral no-op there,
+    /// kept unconditional so the arms cannot drift), so the off arm is semantics-identical but
+    /// two instructions per ALU/double-shift site larger than the pre-slice binary.
+    watch_page_bit: bool,
     segments: SegmentLayout,
     /// Whether a ModRM-derived effective address wraps at 64K.
     ///

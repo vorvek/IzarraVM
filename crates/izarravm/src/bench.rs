@@ -21,6 +21,9 @@ struct BenchRun {
     /// N5 audit subset (FastMap wipe causes plus the env-gated RMW shape census), stored outside
     /// PerfCounters for the same layout-preservation reason; see FastMapAuditCounters.
     fast_map_audit: izarravm_cpu::FastMapAuditCounters,
+    /// Watched-page-bit slice 0 subset (code-watch page-edge rates), stored on the watch types
+    /// for the same layout-preservation reason; see CodeWatchEdgeCounters.
+    code_watch_edges: izarravm_cpu::CodeWatchEdgeCounters,
     machine_profile: MachineHostProfileSnapshot,
     cpu_profile: CpuProfileSnapshot,
 }
@@ -96,6 +99,7 @@ fn run_bench_one_profiled(
         poll_skip_memory: machine.cpu().poll_skip_memory(),
         fast_map_probe: machine.cpu().fast_map_probe_counters(),
         fast_map_audit: machine.cpu().fast_map_audit_counters(),
+        code_watch_edges: machine.cpu().code_watch_edge_counters(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
     })
@@ -944,6 +948,7 @@ fn write_profile_json(
                 profiled.poll_skip_memory,
                 profiled.fast_map_probe,
                 profiled.fast_map_audit,
+                profiled.code_watch_edges,
             ),
         },
     });
@@ -956,8 +961,13 @@ pub(super) fn perf_counters_json(
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
     fast_map_audit: izarravm_cpu::FastMapAuditCounters,
+    code_watch_edges: izarravm_cpu::CodeWatchEdgeCounters,
 ) -> serde_json::Value {
     json!({
+        "code_watch_sticky_page_edges": code_watch_edges.sticky_page_edges,
+        "code_watch_block_page_edges": code_watch_edges.block_page_edges,
+        "code_watch_block_page_releases": code_watch_edges.block_page_releases,
+        "code_watch_sweep_cleared": code_watch_edges.sweep_cleared_entries,
         "instructions": perf.instructions,
         "decode_misses": perf.decode_misses,
         "decode_probes": perf.decode_probes,

@@ -24,6 +24,14 @@ const HAS_READ_BIAS: u8 = 0b0000_0100;
 const HAS_WRITE_BIAS: u8 = 0b0000_1000;
 const PAGE_WRITABLE: u8 = 0b0001_0000;
 const PAGE_USER: u8 = 0b0010_0000;
+/// The watched-page bit (design: `dev_docs/2026-08-06-watched-page-bit-design.md`). CLEAR
+/// promises that NEITHER code-watch table has an entry for this linear page's physical page, so
+/// an emitted store may skip the code-watch guard entirely. SET promises nothing — the full
+/// guard decides. Recomputed from both watch tables on EVERY `populate` (never carried through
+/// the `same_mapping` access-flags reuse), and kept honest at watch-add edges by
+/// `clear_entries_of_watch_edge_page`: a stale SET bit is a missed optimization, a stale CLEAR
+/// bit is a missed SMC invalidation.
+const PAGE_WATCHED: u8 = 0b0100_0000;
 
 use crate::paging::{VGA_APERTURE_END as MODE13_END, VGA_APERTURE_START as MODE13_BASE};
 
@@ -241,6 +249,8 @@ pub(crate) const NATIVE_MODE13_KIND: u8 = PageKind::Mode13 as u8;
 pub(crate) const NATIVE_PAGE_WRITABLE: u8 = PAGE_WRITABLE;
 #[allow(dead_code)]
 pub(crate) const NATIVE_PAGE_USER: u8 = PAGE_USER;
+#[allow(dead_code)]
+pub(crate) const NATIVE_PAGE_WATCHED: u8 = PAGE_WATCHED;
 
 impl FastMap {
     /// Resolve a populated linear mapping for the interpreter without revisiting the small TLB.
@@ -352,14 +362,21 @@ impl FastMap {
         })
     }
 
+    /// `page_watched` is the caller's answer to "does EITHER code-watch table hold an entry for
+    /// this physical page" (`CpuGsw::physical_page_watched`). It is a parameter rather than a
+    /// query this type makes itself because the watches live on `DecodeCache` and `JitState`,
+    /// and because every caller being forced to answer is what keeps the test fixtures honest
+    /// (design hazard H7): a fixture that populates around a watched page with `false` here is
+    /// wiring the exact miscompile the production sweep exists to prevent.
     pub(crate) fn populate_read(
         &mut self,
         linear: u32,
         physical: u32,
         page: DirectPage,
         permissions: PagePermissions,
+        page_watched: bool,
     ) -> bool {
-        self.populate(linear, physical, page, permissions, false)
+        self.populate(linear, physical, page, permissions, false, page_watched)
     }
 
     pub(crate) fn populate_write(
@@ -368,8 +385,9 @@ impl FastMap {
         physical: u32,
         page: DirectPage,
         permissions: PagePermissions,
+        page_watched: bool,
     ) -> bool {
-        self.populate(linear, physical, page, permissions, true)
+        self.populate(linear, physical, page, permissions, true, page_watched)
     }
 
     #[inline]
@@ -433,6 +451,7 @@ impl FastMap {
         page: DirectPage,
         permissions: PagePermissions,
         write: bool,
+        page_watched: bool,
     ) -> bool {
         let physical_page = physical & !PAGE_MASK;
         if page.ptr.is_null()
@@ -472,6 +491,12 @@ impl FastMap {
         if permissions.user {
             flags |= PAGE_USER;
         }
+        // Recomputed on EVERY populate, never carried through `access_flags` (design H4): a
+        // same-mapping refill after an edge sweep's `clear_entry` must observe the CURRENT watch
+        // state, not the byte the sweep just invalidated.
+        if page_watched {
+            flags |= PAGE_WATCHED;
+        }
         if write {
             storage.write_biases[index] = bias;
             flags |= HAS_WRITE_BIAS;
@@ -493,6 +518,39 @@ impl FastMap {
             self.vga_pages.push(index as u32);
         }
         true
+    }
+
+    /// The strict-edge sweep (watched-page-bit design D4, edges E1/E2): `physical_page_base`
+    /// just crossed unwatched -> watched in one of the code-watch tables, so every LIVE entry
+    /// mapping it whose `PAGE_WATCHED` bit is CLEAR must be invalidated before native code runs
+    /// again — the next emitted store through such an entry would skip the guard the new watch
+    /// needs. Entries whose bit is already SET are skipped (INV-W already holds for them),
+    /// which is what makes doom's once-per-generation re-mark churn affordable when the lazy
+    /// edges leave bits set. Invalidation, not patching: a cleared entry routes the in-flight
+    /// block's next store to the `unavailable_or_kind` side exit, and the refill recomputes the
+    /// bit (H4). Returns the number of entries cleared, for the edge counters.
+    ///
+    /// Dead listed entries carry `physical_pages == u32::MAX`, which never equals a real page
+    /// base, so the physical compare is the liveness filter as well as the match.
+    pub(crate) fn clear_unwatched_entries_of_physical_page(
+        &mut self,
+        physical_page_base: u32,
+    ) -> u64 {
+        let Some(storage) = self.storage.as_mut() else {
+            return 0;
+        };
+        let mut cleared = 0;
+        for &page in &self.populated_pages {
+            let index = page as usize;
+            if storage.physical_pages[index] != physical_page_base
+                || storage.flags[index] & PAGE_WATCHED != 0
+            {
+                continue;
+            }
+            storage.clear_entry(index);
+            cleared += 1;
+        }
+        cleared
     }
 
     /// Invalidate exactly one linear page. Its list membership remains until the next global
@@ -561,6 +619,16 @@ impl FastMap {
         }
         self.vga_pages.clear();
         extent
+    }
+
+    /// Whether the live entry for `linear` carries `PAGE_WATCHED` — the watched-page-bit
+    /// battery's inspector (a dead entry reads false).
+    #[cfg(test)]
+    pub(crate) fn page_watched_bit_for_test(&self, linear: u32) -> bool {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.storage
+            .as_ref()
+            .is_some_and(|storage| storage.flags[index] & PAGE_WATCHED != 0)
     }
 
     #[cfg(test)]

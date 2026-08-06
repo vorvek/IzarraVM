@@ -22,8 +22,8 @@ fn sticky_decode_marks_are_idempotent_and_cover_every_touched_chunk() {
     let mut watch = StickyDecodeCodeWatch::default();
     let start = 0x10f;
     let len = 34;
-    watch.mark_range(start, len);
-    watch.mark_range(start, len);
+    let _ = watch.mark_range(start, len);
+    let _ = watch.mark_range(start, len);
 
     for byte in start..start + len {
         assert!(
@@ -41,13 +41,13 @@ fn sticky_decode_marks_are_idempotent_and_cover_every_touched_chunk() {
 fn sticky_decode_pre_table_precise_and_coarse_marks_publish_and_clear() {
     let mut watch = StickyDecodeCodeWatch::default();
     let precise = 0x120;
-    watch.mark_range(precise, 1);
+    let _ = watch.mark_range(precise, 1);
     for page in 1..MAX_STICKY_PRECISE_PAGES as u32 {
-        watch.mark_range(page << PAGE_SHIFT, 1);
+        let _ = watch.mark_range(page << PAGE_SHIFT, 1);
     }
     let coarse = (MAX_STICKY_PRECISE_PAGES as u32) << PAGE_SHIFT;
-    watch.mark_range(coarse, 1);
-    watch.mark_range(coarse | 0x7f0, 1);
+    let _ = watch.mark_range(coarse, 1);
+    let _ = watch.mark_range(coarse | 0x7f0, 1);
     assert_eq!(watch.precise_pages(), MAX_STICKY_PRECISE_PAGES);
     assert_eq!(watch.coarse_page_count(), 1);
 
@@ -75,17 +75,17 @@ fn sticky_decode_pre_table_precise_and_coarse_marks_publish_and_clear() {
 fn sticky_decode_published_mask_survives_map_rehash() {
     let mut watch = StickyDecodeCodeWatch::default();
     let original = 0x10_020;
-    watch.mark_range(original, 1);
+    let _ = watch.mark_range(original, 1);
     let base = watch.table_base();
     let entry = unsafe { (base as *const usize).add((original >> PAGE_SHIFT) as usize) };
     let pointer = unsafe { *entry };
 
     for page in 0x20..0x820u32 {
-        watch.mark_range((page << PAGE_SHIFT) | 0x30, 1);
+        let _ = watch.mark_range((page << PAGE_SHIFT) | 0x30, 1);
     }
     assert_eq!(unsafe { *entry }, pointer);
     assert!(watch.is_watched(original));
-    watch.mark_range(original | 0xf0, 1);
+    let _ = watch.mark_range(original | 0xf0, 1);
     assert_eq!(unsafe { *entry }, pointer);
     assert!(watch.is_watched(original | 0xf0));
 }
@@ -121,7 +121,7 @@ fn sticky_decode_randomized_marks_and_clears_match_an_independent_model() {
                 (next(&mut seed) as u32) & 0x000f_ffff
             };
             let len = (next(&mut seed) % 80 + 1) as u32;
-            watch.mark_range(physical, len);
+            let _ = watch.mark_range(physical, len);
             expected.extend(chunks(physical, len));
         }
 
@@ -135,7 +135,7 @@ fn sticky_decode_randomized_marks_and_clears_match_an_independent_model() {
 #[test]
 fn marks_every_chunk_touched_and_clears_without_moving_the_table() {
     let mut watch = NativeCodeWatch::default();
-    watch.acquire_range(0x1f, 2);
+    let _ = watch.acquire_range(0x1f, 2);
     assert!(watch.is_watched(0x1f));
     assert!(watch.is_watched(0x20));
     assert!(!watch.is_watched(granule_base(0x1f) - 1));
@@ -147,11 +147,11 @@ fn marks_every_chunk_touched_and_clears_without_moving_the_table() {
     assert!(!watch.is_watched(0x1f));
     assert!(!watch.is_watched(0x20));
 
-    watch.acquire_range(0x20, 1);
+    let _ = watch.acquire_range(0x20, 1);
     assert_eq!(watch.table_base(), base);
     assert!(watch.is_watched(0x20));
 
-    watch.acquire_range(0x2f, 33);
+    let _ = watch.acquire_range(0x2f, 33);
     assert!(watch.range_watched(0x20, 1));
     assert!(watch.range_watched(0x40, 1));
     assert!(!watch.range_watched(0x50, 1));
@@ -166,7 +166,7 @@ fn empty_and_inactive_native_watch_ranges_are_unwatched() {
     let base = watch.table_base();
     assert!(!watch.range_watched(0x12_340, 1));
 
-    watch.acquire_range(0x12_340, 1);
+    let _ = watch.acquire_range(0x12_340, 1);
     assert!(watch.range_watched(0x12_340, 1));
     watch.release_range(0x12_340, 1);
     assert_eq!(watch.inactive_pages(), 1);
@@ -184,8 +184,8 @@ fn refcounted_ranges_keep_shared_chunks_until_the_last_owner_leaves() {
     // The two ranges OVERLAP at bytes 0x108..0x10f, so they share coverage at any granule size.
     // This used to rely on 0x100 and 0x108 landing in one 16-byte granule while the ranges were
     // merely adjacent, which stopped being true at 4-byte granules.
-    watch.acquire_range(0x100, 16);
-    watch.acquire_range(0x108, 16);
+    let _ = watch.acquire_range(0x100, 16);
+    let _ = watch.acquire_range(0x108, 16);
     assert!(watch.is_watched(0x100));
     assert!(watch.is_watched(0x108));
     assert!(watch.is_watched(0x110));
@@ -216,7 +216,7 @@ fn clear_removes_top_level_pointer_and_mark_republishes_it() {
     let mut watch = NativeCodeWatch::default();
     let physical = 0x12_310;
     let page = (physical >> PAGE_SHIFT) as usize;
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     let base = watch.table_base();
     // The returned base owns PAGE_COUNT entries for the lifetime of `watch`.
     let entry = unsafe { (base as *const usize).add(page) };
@@ -225,7 +225,7 @@ fn clear_removes_top_level_pointer_and_mark_republishes_it() {
     watch.clear();
     assert_eq!(unsafe { *entry }, 0);
 
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     assert_eq!(watch.table_base(), base);
     assert_ne!(unsafe { *entry }, 0);
 }
@@ -234,7 +234,7 @@ fn clear_removes_top_level_pointer_and_mark_republishes_it() {
 fn wrapping_range_owns_and_releases_both_end_pages() {
     let mut watch = NativeCodeWatch::default();
     let base = watch.table_base();
-    watch.acquire_range(0xffff_fff8, 16);
+    let _ = watch.acquire_range(0xffff_fff8, 16);
     assert!(watch.is_watched(0xffff_fff8));
     assert!(watch.is_watched(0));
     assert!(watch.range_watched(0xffff_fff8, 16));
@@ -251,7 +251,7 @@ fn wrapping_range_owns_and_releases_both_end_pages() {
 fn refcount_exceeds_u16_and_releases_exactly_once_per_owner() {
     let mut watch = NativeCodeWatch::default();
     for _ in 0..=u16::MAX {
-        watch.acquire_range(0x230, 1);
+        let _ = watch.acquire_range(0x230, 1);
     }
     assert_eq!(watch.refcount(0x230), u32::from(u16::MAX) + 1);
     for _ in 0..u16::MAX {
@@ -270,7 +270,7 @@ fn final_release_unpublishes_page_and_reactivation_keeps_table_base() {
     let mut watch = NativeCodeWatch::default();
     let physical = 0x45_670;
     let page = (physical >> PAGE_SHIFT) as usize;
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     let base = watch.table_base();
     let entry = unsafe { (base as *const usize).add(page) };
     let pointer = unsafe { *entry };
@@ -282,7 +282,7 @@ fn final_release_unpublishes_page_and_reactivation_keeps_table_base() {
     assert_eq!(watch.inactive_pages(), 1);
     assert_eq!(watch.pages.len(), 1);
 
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     assert_eq!(watch.table_base(), base);
     assert_eq!(unsafe { *entry }, pointer);
     assert_eq!(watch.inactive_pages(), 0);
@@ -292,7 +292,7 @@ fn final_release_unpublishes_page_and_reactivation_keeps_table_base() {
     assert_eq!(watch.inactive_pages(), 0);
     assert!(!watch.has_resident_pages());
 
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     watch.release_range(physical, 1);
     assert_eq!(watch.table_base(), base);
     assert_eq!(unsafe { *entry }, 0);
@@ -302,7 +302,7 @@ fn final_release_unpublishes_page_and_reactivation_keeps_table_base() {
 #[test]
 fn final_release_before_table_initialization_retains_no_page_identity() {
     let mut watch = NativeCodeWatch::default();
-    watch.acquire_range(0x12_340, 1);
+    let _ = watch.acquire_range(0x12_340, 1);
     watch.release_range(0x12_340, 1);
 
     assert_eq!(watch.active_pages(), 0);
@@ -317,8 +317,8 @@ fn partial_release_keeps_the_page_published_and_clears_only_its_bit() {
     let mut watch = NativeCodeWatch::default();
     let first = 0x45_610;
     let second = 0x45_630;
-    watch.acquire_range(first, 1);
-    watch.acquire_range(second, 1);
+    let _ = watch.acquire_range(first, 1);
+    let _ = watch.acquire_range(second, 1);
     let base = watch.table_base();
     let entry = unsafe { (base as *const usize).add((first >> PAGE_SHIFT) as usize) };
     assert_ne!(unsafe { *entry }, 0);
@@ -340,7 +340,7 @@ fn clear_unpublishes_every_active_page() {
     let mut watch = NativeCodeWatch::default();
     let physical = [0x1_010, 0x23_020, 0xffff_f030];
     for &address in &physical {
-        watch.acquire_range(address, 1);
+        let _ = watch.acquire_range(address, 1);
     }
     let base = watch.table_base();
     let entries = physical
@@ -363,8 +363,8 @@ fn clear_drains_mixed_active_and_inactive_pages() {
     let mut watch = NativeCodeWatch::default();
     let inactive = 0x12_340;
     let active = 0x45_670;
-    watch.acquire_range(inactive, 1);
-    watch.acquire_range(active, 1);
+    let _ = watch.acquire_range(inactive, 1);
+    let _ = watch.acquire_range(active, 1);
     let base = watch.table_base();
     let inactive_entry = unsafe { (base as *const usize).add((inactive >> PAGE_SHIFT) as usize) };
     let active_entry = unsafe { (base as *const usize).add((active >> PAGE_SHIFT) as usize) };
@@ -389,7 +389,7 @@ fn published_page_base_is_the_native_mask_base() {
     assert_eq!(std::mem::offset_of!(WatchPage, mask), 0);
     let mut watch = NativeCodeWatch::default();
     let physical = 0x34_560;
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     let base = watch.table_base();
     let pointer = unsafe { *(base as *const usize).add((physical >> PAGE_SHIFT) as usize) };
     let page = watch
@@ -404,12 +404,12 @@ fn published_page_base_is_the_native_mask_base() {
 fn published_pointer_handles_existing_acquire_and_release_without_moving() {
     let mut watch = NativeCodeWatch::default();
     let physical = 0x56_780;
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     let base = watch.table_base();
     let entry = unsafe { (base as *const usize).add((physical >> PAGE_SHIFT) as usize) };
     let pointer = unsafe { *entry };
 
-    watch.acquire_range(physical, 1);
+    let _ = watch.acquire_range(physical, 1);
     assert_eq!(unsafe { *entry }, pointer);
     assert_eq!(watch.refcount(physical), 2);
     watch.release_range(physical, 1);
@@ -423,13 +423,13 @@ fn published_pointer_handles_existing_acquire_and_release_without_moving() {
 fn published_pointer_survives_page_map_rehash() {
     let mut watch = NativeCodeWatch::default();
     let original = 0x10_020;
-    watch.acquire_range(original, 1);
+    let _ = watch.acquire_range(original, 1);
     let base = watch.table_base();
     let entry = unsafe { (base as *const usize).add((original >> PAGE_SHIFT) as usize) };
     let pointer = unsafe { *entry };
 
     for page in 0x20..0x220u32 {
-        watch.acquire_range((page << PAGE_SHIFT) | 0x30, 1);
+        let _ = watch.acquire_range((page << PAGE_SHIFT) | 0x30, 1);
     }
     assert_eq!(unsafe { *entry }, pointer);
     watch.release_range(original, 1);
@@ -442,8 +442,8 @@ fn recycled_page_changes_identity_without_retaining_bits_or_counts() {
     let mut watch = NativeCodeWatch::default();
     let old = 0x12_340;
     let new = 0x45_670;
-    watch.acquire_range(old, 1);
-    watch.acquire_range(old, 1);
+    let _ = watch.acquire_range(old, 1);
+    let _ = watch.acquire_range(old, 1);
     let base = watch.table_base();
     let old_entry = unsafe { (base as *const usize).add((old >> PAGE_SHIFT) as usize) };
     let old_pointer = unsafe { *old_entry };
@@ -451,7 +451,7 @@ fn recycled_page_changes_identity_without_retaining_bits_or_counts() {
     watch.clear();
     assert_eq!(unsafe { *old_entry }, 0);
     assert_eq!(watch.recycled_pages(), 1);
-    watch.acquire_range(new, 1);
+    let _ = watch.acquire_range(new, 1);
     let new_entry = unsafe { (base as *const usize).add((new >> PAGE_SHIFT) as usize) };
     assert_eq!(unsafe { *new_entry }, old_pointer);
     assert_eq!(watch.refcount(new), 1);
@@ -468,7 +468,7 @@ fn recycled_page_changes_identity_without_retaining_bits_or_counts() {
 fn recycled_pool_is_bounded_and_clone_starts_empty() {
     let mut watch = NativeCodeWatch::default();
     for page in 0..MAX_RECYCLED_PAGES as u32 + 17 {
-        watch.acquire_range((page << PAGE_SHIFT) | 0x10, 1);
+        let _ = watch.acquire_range((page << PAGE_SHIFT) | 0x10, 1);
     }
     watch.table_base();
     watch.clear();
@@ -488,7 +488,7 @@ fn inactive_page_cache_is_bounded_without_limiting_active_pages() {
     let base = watch.table_base();
     for page in 0..=MAX_INACTIVE_PAGES as u32 {
         let physical = (page << PAGE_SHIFT) | 0x10;
-        watch.acquire_range(physical, 1);
+        let _ = watch.acquire_range(physical, 1);
         watch.release_range(physical, 1);
         let entry = unsafe { (base as *const usize).add(page as usize) };
         assert_eq!(unsafe { *entry }, 0);
@@ -500,7 +500,7 @@ fn inactive_page_cache_is_bounded_without_limiting_active_pages() {
 
     let active_start = 0x2_000u32;
     for page in active_start..active_start + MAX_INACTIVE_PAGES as u32 + 1 {
-        watch.acquire_range((page << PAGE_SHIFT) | 0x20, 1);
+        let _ = watch.acquire_range((page << PAGE_SHIFT) | 0x20, 1);
     }
     assert_eq!(watch.active_pages(), MAX_INACTIVE_PAGES + 1);
     assert_eq!(watch.inactive_pages(), MAX_INACTIVE_PAGES);
@@ -554,7 +554,7 @@ fn randomized_operations_match_a_chunk_refcount_model() {
                 } else {
                     (next(&mut seed) as u32, (next(&mut seed) % 80 + 1) as u32)
                 };
-                watch.acquire_range(physical, len);
+                let _ = watch.acquire_range(physical, len);
                 owners.push((physical, len));
                 for chunk in chunks(physical, len) {
                     *expected.entry(chunk).or_default() += 1;
@@ -625,4 +625,97 @@ fn randomized_operations_match_a_chunk_refcount_model() {
             }
         }
     }
+}
+
+/// Slice 0 of the watched-page-bit design: the sticky edge counter counts EXACTLY the
+/// unwatched -> watched page transitions — new precise entries, and re-marks after a
+/// generation `clear()` (the doom pattern the counter exists to price) — and nothing else.
+/// A re-mark on a live page, published or not, is not an edge.
+#[test]
+fn sticky_page_edges_count_only_unwatched_to_watched_transitions() {
+    let mut watch = StickyDecodeCodeWatch::default();
+    assert_eq!(watch.page_edges(), 0);
+
+    let _ = watch.mark_range(0x1000, 4);
+    assert_eq!(watch.page_edges(), 1, "first mark on a page is the edge");
+    let _ = watch.mark_range(0x1200, 8);
+    assert_eq!(
+        watch.page_edges(),
+        1,
+        "re-mark on a live precise page is not"
+    );
+
+    let _ = watch.mark_range(0x2000, 1);
+    assert_eq!(watch.page_edges(), 2, "second page is its own edge");
+
+    let _ = watch.table_base();
+    let _ = watch.mark_range(0x1800, 1);
+    assert_eq!(
+        watch.page_edges(),
+        2,
+        "published-pointer re-mark is not an edge"
+    );
+
+    // The generation pattern: clear() empties the table, so the re-decode wave re-crosses the
+    // edge. The counter deliberately survives clear() — the churn is what it measures.
+    watch.clear();
+    let _ = watch.mark_range(0x1000, 1);
+    assert_eq!(watch.page_edges(), 3, "post-clear re-mark is a fresh edge");
+
+    watch.reset_edge_counter();
+    assert_eq!(watch.page_edges(), 0);
+}
+
+/// The block-watch twin: `active_chunks` 0 -> nonzero is the edge (fresh page or retained
+/// inactive page reactivating), a refcounted re-acquire on an active page is not, and each
+/// `release_range` that takes a page to zero counts once on the release side.
+#[test]
+fn block_page_edges_count_activations_reactivations_and_releases() {
+    let mut watch = NativeCodeWatch::default();
+    let _ = watch.acquire_range(0x3000, 16);
+    assert_eq!(watch.page_edges(), 1, "fresh page");
+    let _ = watch.acquire_range(0x3008, 16);
+    assert_eq!(
+        watch.page_edges(),
+        1,
+        "overlapping acquire on an active page is not an edge"
+    );
+
+    watch.release_range(0x3008, 16);
+    assert_eq!(watch.page_releases(), 0, "page still active");
+    watch.release_range(0x3000, 16);
+    assert_eq!(
+        watch.page_releases(),
+        1,
+        "last chunk released takes the page to zero"
+    );
+
+    let _ = watch.acquire_range(0x3000, 1);
+    assert_eq!(
+        watch.page_edges(),
+        2,
+        "re-acquire after removal is a fresh edge"
+    );
+
+    // With the table published, a release-to-zero RETAINS the page inactive; the reactivation
+    // arm is a distinct code path from the vacant insert and must count the same way.
+    let _ = watch.table_base();
+    watch.release_range(0x3000, 1);
+    assert_eq!(watch.page_releases(), 2);
+    let _ = watch.acquire_range(0x3004, 1);
+    assert_eq!(
+        watch.page_edges(),
+        3,
+        "retained-page reactivation is an edge"
+    );
+    let _ = watch.acquire_range(0x3005, 1);
+    assert_eq!(watch.page_edges(), 3, "published-pointer acquire is not");
+
+    // A range crossing a page boundary is one edge per fresh page it touches.
+    let _ = watch.acquire_range(0x4ffe, 4);
+    assert_eq!(watch.page_edges(), 5);
+
+    watch.reset_edge_counters();
+    assert_eq!(watch.page_edges(), 0);
+    assert_eq!(watch.page_releases(), 0);
 }

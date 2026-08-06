@@ -81,6 +81,10 @@ pub(crate) struct JitState {
     ///
     /// Default FALSE, which is the shipped behaviour this slice does not change.
     pub(crate) word_at_486: bool,
+    /// Whether emitted stores take the PAGE_WATCHED fast path (watched-page-bit design D3).
+    /// Seeded from `IZARRAVM_WATCH_PAGE_BIT` (default true); a field for `word_at_486`'s
+    /// testability reason, and CARRIED by clone for its lockstep-comparison reason.
+    pub(crate) watch_page_bit: bool,
     /// Admission level for 16-bit code segments, seeded from `IZARRAVM_JIT16`.
     ///
     /// A field for the same reason `word_at_486` is one: the `OnceLock` behind it is process-wide,
@@ -106,6 +110,10 @@ pub(crate) struct JitState {
     /// `direct_barrier_census` above, and the same clone behaviour: a clone gets a fresh block.
     /// There is no FastMap to audit without this feature, so a non-jit build reports zeros.
     pub(crate) fast_map_audit: Box<crate::FastMapAuditCounters>,
+    /// Strict E2 edge pages from the last `install`/`reject`, awaiting the fast-map sweep
+    /// (watched-page-bit design D4). Non-empty only between the acquiring call and its
+    /// `CpuGsw::sweep_block_watch_edges` drain; `install`/`reject` assert that.
+    pub(crate) pending_watch_edges: Vec<u32>,
 }
 
 impl JitState {
@@ -113,11 +121,13 @@ impl JitState {
         Self {
             direct,
             word_at_486: direct::word_at_486_default(),
+            watch_page_bit: direct::watch_page_bit_default(),
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
             fast_map_audit: Box::default(),
+            pending_watch_edges: Vec::new(),
         }
     }
 }
@@ -134,6 +144,7 @@ impl Clone for JitState {
             // silently reverted to the default arm would compare a lifted CPU against an unlifted
             // one and report the disagreement as agreement.
             word_at_486: self.word_at_486,
+            watch_page_bit: self.watch_page_bit,
             sixteen_bit_level: self.sixteen_bit_level,
             direct_barrier_census: None,
             smc_heat: self.smc_heat.clone(),
@@ -141,6 +152,7 @@ impl Clone for JitState {
             // produced (its clone built a new cache with a new watch).
             code_watch: Box::default(),
             fast_map_audit: Box::default(),
+            pending_watch_edges: Vec::new(),
         }
     }
 }
@@ -155,12 +167,21 @@ impl JitState {
         self.direct.probe(&mut self.code_watch, key)
     }
 
+    // No emptiness assertion here: consecutive installs/rejects WITHOUT native execution between
+    // them are harmless (edges just accumulate) and common in cache-level fixtures. The invariant
+    // that matters — INV-W, "no native code runs while edges are pending" — is enforced by the
+    // backstop DRAIN at the dispatch boundary (`run_direct_block` sweeps both watches on entry).
     pub(crate) fn install(&mut self, compilation: &direct::Compilation) -> Option<direct::BlockId> {
-        self.direct.install(&mut self.code_watch, compilation)
+        self.direct.install(
+            &mut self.code_watch,
+            &mut self.pending_watch_edges,
+            compilation,
+        )
     }
 
     pub(crate) fn reject(&mut self, span: direct::RejectedSpan) {
-        self.direct.reject(&mut self.code_watch, span);
+        self.direct
+            .reject(&mut self.code_watch, &mut self.pending_watch_edges, span);
     }
 
     pub(crate) fn retire_key_for_recompile(&mut self, key: direct::BlockKey) -> bool {
@@ -187,6 +208,34 @@ impl JitState {
         self.code_watch.table_base()
     }
 
+    pub(crate) fn code_watch_page_edges(&self) -> u64 {
+        self.code_watch.page_edges()
+    }
+
+    pub(crate) fn code_watch_page_releases(&self) -> u64 {
+        self.code_watch.page_releases()
+    }
+
+    pub(crate) fn code_watch_sweep_cleared(&self) -> u64 {
+        self.code_watch.sweep_cleared()
+    }
+
+    pub(crate) fn code_watch_page_is_watched(&self, page: u32) -> bool {
+        self.code_watch.page_is_watched(page)
+    }
+
+    pub(crate) fn take_watch_edge_pages(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_watch_edges)
+    }
+
+    pub(crate) fn note_watch_sweep_cleared(&mut self, cleared: u64) {
+        self.code_watch.note_sweep_cleared(cleared);
+    }
+
+    pub(crate) fn reset_code_watch_edge_counters(&mut self) {
+        self.code_watch.reset_edge_counters();
+    }
+
     pub(crate) fn range_hits_compiled_code(&self, physical: u32, width: u32) -> bool {
         self.code_watch.range_watched(physical, width)
     }
@@ -199,9 +248,15 @@ impl JitState {
             .blocks
     }
 
+    /// Test-only block-watch mark. Routes its strict edges through the SAME pending buffer the
+    /// production install/reject chokes use (design H7), so a fixture using this hook and then
+    /// `CpuGsw::sweep_block_watch_edges` (or the `mark_block_code_for_test` wrapper) exercises
+    /// the identical coherence path — a hook that bypassed the sweep would devacuate every
+    /// watched-store fixture built on it.
     #[cfg(test)]
     pub(crate) fn mark_code_range(&mut self, physical: u32, len: u8) {
-        self.code_watch.acquire_range(physical, u32::from(len));
+        let edges = self.code_watch.acquire_range(physical, u32::from(len));
+        self.pending_watch_edges.extend(edges.0);
     }
 
     /// Allocate the barrier census without going through `IZARRAVM_DIRECT_BARRIER_CENSUS`.

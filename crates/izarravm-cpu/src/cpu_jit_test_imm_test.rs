@@ -137,10 +137,13 @@ fn map_read_page(
         .direct_page(physical, BusAccessKind::DataRead)
         .unwrap()
         .unwrap();
-    assert!(
-        cpu.jit_fast_map
-            .populate_read(linear, physical, read, permissions)
-    );
+    assert!(cpu.jit_fast_map.populate_read(
+        linear,
+        physical,
+        read,
+        permissions,
+        cpu.physical_page_watched(physical)
+    ));
 }
 
 fn install_block(cpu: &mut CpuGsw) -> jit::direct::CompiledBlock {
@@ -916,10 +919,24 @@ fn read_only_and_watched_memory_is_read_without_store_side_effects() {
                 user: true,
             },
         );
+        // `mark_decode_code_for_test` routes through the same edge choke production uses (a
+        // bare `decode_cache.mark_code_range` leaves the E1 edge unswept, design H7). Its sweep
+        // then clears the READ entry `prepare_flat` populated before the page was watched (bit
+        // was clear), so re-populate it: reads never consult PAGE_WATCHED (design D5), all this
+        // needs is a LIVE entry again, not any particular bit value.
         fixture
             .native
-            .decode_cache
-            .mark_code_range(RAM_TARGET, width.bytes() as u8);
+            .mark_decode_code_for_test(RAM_TARGET, width.bytes() as u8);
+        map_read_page(
+            &mut fixture.native,
+            &mut fixture.native_bus,
+            RAM_TARGET,
+            RAM_TARGET,
+            jit::fast_map::PagePermissions {
+                writable: false,
+                user: true,
+            },
+        );
         let watch_exits = fixture.native.perf_counters().jit_direct_exit_code_watch;
         let invalidations = fixture.native.perf_counters().code_invalidations;
         let fixture = finish_and_compare(fixture, &format!("watched read-only {width:?}"));

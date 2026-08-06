@@ -148,18 +148,24 @@ fn warm_fast_map(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, physical: u32
         .direct_page(physical, BusAccessKind::DataRead)
         .unwrap()
         .unwrap();
-    assert!(
-        cpu.jit_fast_map
-            .populate_read(linear, physical, read, permissions)
-    );
+    assert!(cpu.jit_fast_map.populate_read(
+        linear,
+        physical,
+        read,
+        permissions,
+        cpu.physical_page_watched(physical)
+    ));
     let write = bus
         .direct_page(physical, BusAccessKind::DataWrite)
         .unwrap()
         .unwrap();
-    assert!(
-        cpu.jit_fast_map
-            .populate_write(linear, physical, write, permissions)
-    );
+    assert!(cpu.jit_fast_map.populate_write(
+        linear,
+        physical,
+        write,
+        permissions,
+        cpu.physical_page_watched(physical)
+    ));
 }
 
 /// Compile and install at `entry` under code-size `d`, asserting the fixture's shape. The parent

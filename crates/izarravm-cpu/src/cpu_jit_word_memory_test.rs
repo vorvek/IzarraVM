@@ -204,6 +204,7 @@ fn map_page(cpu: &mut CpuGsw, bus: &mut TestBus, page: u32) {
                 page,
                 host,
                 jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page),
             )
         } else {
             cpu.jit_fast_map.populate_read(
@@ -211,6 +212,7 @@ fn map_page(cpu: &mut CpuGsw, bus: &mut TestBus, page: u32) {
                 page,
                 host,
                 jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page),
             )
         };
         assert!(ok, "page {page:#x} must map");
@@ -253,14 +255,18 @@ fn build(body: &[u8], seed: Seed) -> Roles {
             cpu.set_eip(linear);
             cpu.fetch_decoded(bus, linear).unwrap();
         }
-        map_page(cpu, bus, OPERAND & !0xfff);
-        map_page(cpu, bus, (STACK_TOP - 4) & !0xfff);
         // BOTH roles are watched, not only the native one. The watch is guest-visible through the
         // interpreter's own SMC bookkeeping, so watching one role would compare two different
         // machines and the disagreement would be the fixture's, not the lowering's.
+        //
+        // Marked BEFORE `map_page`: the mark's E1 sweep invalidates any live fast-map entry on
+        // the marked physical page whose PAGE_WATCHED bit is clear, so marking after populating
+        // would immediately clear the entry `map_page` just installed (populate-then-mark trap).
         if let Some(at) = seed.watch {
-            cpu.decode_cache.mark_code_range(at, 1);
+            cpu.mark_decode_code_for_test(at, 1);
         }
+        map_page(cpu, bus, OPERAND & !0xfff);
+        map_page(cpu, bus, (STACK_TOP - 4) & !0xfff);
     }
 
     let key = jit::direct::key_for(&native, ENTRY, true).expect("entry key");

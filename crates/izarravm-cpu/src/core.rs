@@ -850,6 +850,113 @@ impl CpuGsw {
         }
     }
 
+    /// Whether EITHER code-watch table holds an entry for this physical address's page — the
+    /// value of the fast-map `PAGE_WATCHED` bit at fill time (watched-page-bit design D2).
+    /// Exists under every cfg (the interpreter fast map fills on all builds); reads false where
+    /// a watch type is compiled out.
+    pub(crate) fn physical_page_watched(&self, physical: u32) -> bool {
+        let page = physical >> 12;
+        #[allow(unused_variables)]
+        let watched = false;
+        #[cfg(feature = "jit")]
+        let watched = watched || self.jit_direct.code_watch_page_is_watched(page);
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let watched = watched || self.decode_cache.code_watch_page_is_watched(page);
+        watched
+    }
+
+    /// Drain and apply the sticky watch's strict E1 edges (watched-page-bit design D4): every
+    /// physical page that just crossed unwatched -> watched has its bit-clear fast-map entries
+    /// invalidated BEFORE native code can run again. Called immediately after the decode-cache
+    /// insert choke; a native block's interpreter callout can decode mid-block, so this must be
+    /// synchronous with the mark, not batched to a dispatch boundary.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn sweep_sticky_watch_edges(&mut self) {
+        let pages = self.decode_cache.take_watch_edge_pages();
+        if pages.is_empty() {
+            return;
+        }
+        let mut cleared = 0;
+        for page in pages {
+            cleared += self
+                .jit_fast_map
+                .clear_unwatched_entries_of_physical_page(page << 12);
+        }
+        self.decode_cache.note_watch_sweep_cleared(cleared);
+    }
+
+    /// The block-watch twin (E2), drained after `JitState::install` / `reject`.
+    #[cfg(feature = "jit")]
+    pub(crate) fn sweep_block_watch_edges(&mut self) {
+        let pages = self.jit_direct.take_watch_edge_pages();
+        if pages.is_empty() {
+            return;
+        }
+        let mut cleared = 0;
+        for page in pages {
+            cleared += self
+                .jit_fast_map
+                .clear_unwatched_entries_of_physical_page(page << 12);
+        }
+        self.jit_direct.note_watch_sweep_cleared(cleared);
+    }
+
+    /// Slice 0 of the watched-page-bit design (`dev_docs/2026-08-06-watched-page-bit-design.md`
+    /// D6): unwatched <-> watched page-edge rates for both code-watch tables — the design's
+    /// go/no-go instrument. Counters live on the watch types themselves so nothing on the store
+    /// or interpreter hot paths moves; collection here is a cold per-run read.
+    pub fn code_watch_edge_counters(&self) -> CodeWatchEdgeCounters {
+        #[allow(unused_mut)]
+        let mut counters = CodeWatchEdgeCounters::default();
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        {
+            counters.sticky_page_edges = self.decode_cache.code_watch_page_edges();
+            counters.sweep_cleared_entries += self.decode_cache.code_watch_sweep_cleared();
+        }
+        #[cfg(feature = "jit")]
+        {
+            counters.block_page_edges = self.jit_direct.code_watch_page_edges();
+            counters.block_page_releases = self.jit_direct.code_watch_page_releases();
+            counters.sweep_cleared_entries += self.jit_direct.code_watch_sweep_cleared();
+        }
+        counters
+    }
+
+    /// Test-only sticky mark that routes through the SAME edge choke production uses — mark
+    /// plus synchronous E1 sweep (design H7). Fixtures must use this, never
+    /// `decode_cache.mark_code_range` directly: a bare mark leaves the edge pending, which the
+    /// next mark's debug assertion catches, and a fixture that never swept would exercise a
+    /// coherence path production does not have.
+    #[cfg(all(
+        test,
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn mark_decode_code_for_test(&mut self, physical: u32, len: u8) {
+        self.decode_cache.mark_code_range(physical, len);
+        self.sweep_sticky_watch_edges();
+    }
+
+    /// The block-watch twin of `mark_decode_code_for_test` (design H7).
+    #[cfg(all(test, feature = "jit"))]
+    pub(crate) fn mark_block_code_for_test(&mut self, physical: u32, len: u8) {
+        self.jit_direct.mark_code_range(physical, len);
+        self.sweep_block_watch_edges();
+    }
+
     /// Zero the host-side performance counters, including the memory-poll
     /// subset stored outside `PerfCounters` (see `PollSkipMemoryCounters`).
     pub fn reset_perf_counters(&mut self) {
@@ -859,6 +966,15 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         {
             *self.jit_direct.fast_map_audit = FastMapAuditCounters::default();
+            self.jit_direct.reset_code_watch_edge_counters();
+        }
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        {
+            self.decode_cache.reset_code_watch_edge_counter();
         }
     }
 

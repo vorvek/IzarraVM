@@ -1844,6 +1844,7 @@ fn invlpg_invalidates_only_the_addressed_page_at_cpl0() {
                 mapping_epoch: 1,
             },
             permissions,
+            cpu.physical_page_watched(0x5040),
         ));
         assert!(cpu.jit_fast_map.populate_read(
             0x1000,
@@ -1856,6 +1857,7 @@ fn invlpg_invalidates_only_the_addressed_page_at_cpl0() {
                 mapping_epoch: 1,
             },
             permissions,
+            cpu.physical_page_watched(0x6000),
         ));
     }
     let mut bus = TestBus::with_memory(memory);

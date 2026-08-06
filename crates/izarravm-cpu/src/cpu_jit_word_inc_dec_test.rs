@@ -202,6 +202,7 @@ fn map_page(cpu: &mut CpuGsw, bus: &mut TestBus, page: u32) {
                 page,
                 host,
                 jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page),
             )
         } else {
             cpu.jit_fast_map.populate_read(
@@ -209,6 +210,7 @@ fn map_page(cpu: &mut CpuGsw, bus: &mut TestBus, page: u32) {
                 page,
                 host,
                 jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page),
             )
         };
         assert!(ok, "page {page:#x} must map");

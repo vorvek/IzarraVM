@@ -1009,6 +1009,30 @@ fn a_pushad_that_would_read_the_frame_is_not_refused_by_the_code_watch() {
     bus.memory[target as usize] = 0x90;
     cpu.set_eip(target);
     cpu.fetch_decoded(&mut bus, target).unwrap();
+    // The decode above sticky-marks the stack page as watched, whose E1 sweep invalidates the
+    // fast-map entries `resident_stack_cpu` just populated (their PAGE_WATCHED bit was clear).
+    // Re-touch the same pages the same way `resident_stack_cpu` did, so the fast map is
+    // repopulated AFTER the mark and its entries carry bit = 1, matching production ordering.
+    for page in [(STACK_TOP - 0x1000) & !0xfff, STACK_TOP & !0xfff] {
+        let value = cpu
+            .read_memory_bus_width(
+                &mut bus,
+                SegmentIndex::Ss,
+                page,
+                BusWidth::Dword,
+                BusAccessKind::DataRead,
+            )
+            .expect("fixture re-warm read");
+        cpu.write_memory_bus_width(
+            &mut bus,
+            SegmentIndex::Ss,
+            page,
+            BusWidth::Dword,
+            value,
+            BusAccessKind::DataWrite,
+        )
+        .expect("fixture re-warm write");
+    }
     cpu.set_eip(ENTRY);
     cpu.registers.set_esp(STACK_TOP - 32);
     bus.trace = BusTrace::default();

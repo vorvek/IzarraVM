@@ -1387,8 +1387,8 @@ fn cpu_code_write_uses_selective_direct_invalidation() {
     let adjacent = BlockKey::new(0x2000, 0x60_030, 7);
     install_trivial(&mut cpu.jit_direct, overlap, 16);
     install_trivial(&mut cpu.jit_direct, adjacent, 16);
-    cpu.decode_cache.mark_code_range(overlap.physical, 1);
-    cpu.jit_direct.mark_code_range(overlap.physical, 1);
+    cpu.mark_decode_code_for_test(overlap.physical, 1);
+    cpu.mark_block_code_for_test(overlap.physical, 1);
     cpu.decode_cache.invalidate_and_clear_code_marks();
     assert!(!cpu.decode_cache.range_hits_code(overlap.physical, 1));
 

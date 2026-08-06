@@ -113,7 +113,8 @@ fn differential_full(
             page,
             page,
             read,
-            jit::fast_map::PagePermissions::UNPAGED
+            jit::fast_map::PagePermissions::UNPAGED,
+            cpu.physical_page_watched(page)
         ));
         let write = bus
             .direct_page(page, BusAccessKind::DataWrite)
@@ -123,7 +124,8 @@ fn differential_full(
             page,
             page,
             write,
-            jit::fast_map::PagePermissions::UNPAGED
+            jit::fast_map::PagePermissions::UNPAGED,
+            cpu.physical_page_watched(page)
         ));
     }
 

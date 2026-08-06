@@ -277,6 +277,7 @@ fn build(body: &[u8], slots: u8, seed: Seed) -> Roles {
                     page,
                     host,
                     jit::fast_map::PagePermissions::UNPAGED,
+                    cpu.physical_page_watched(page),
                 )
             } else {
                 cpu.jit_fast_map.populate_read(
@@ -284,6 +285,7 @@ fn build(body: &[u8], slots: u8, seed: Seed) -> Roles {
                     page,
                     host,
                     jit::fast_map::PagePermissions::UNPAGED,
+                    cpu.physical_page_watched(page),
                 )
             };
             assert!(ok, "stack page {page:#x} must map");

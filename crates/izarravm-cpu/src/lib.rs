@@ -1209,6 +1209,30 @@ impl PartialEq for FastMapAuditCounters {
 }
 impl Eq for FastMapAuditCounters {}
 
+/// Slice 0 instrument for the watched-page-bit design
+/// (`dev_docs/2026-08-06-watched-page-bit-design.md`, D6): how often a physical page crosses the
+/// unwatched -> watched edge in each code-watch table, and how often a block-watch page releases
+/// back to zero. These are the strict-sweep (E1/E2) and lazy-edge (E3) frequencies the design's
+/// go/no-go gate reads. The increments sit at the decode-mark and block install/retire chokes;
+/// the store path is untouched. Counters live on the watch types themselves (the
+/// `FastMapProbeCounters` precedent: outside `PerfCounters`, so the arch-payload offset pin does
+/// not move) and are collected by `CpuGsw::code_watch_edge_counters`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CodeWatchEdgeCounters {
+    /// Sticky decode watch: new precise or coarse page entries. On doom this counts once per
+    /// page per decode generation — the churn the design's E1 skip rule exists to absorb.
+    pub sticky_page_edges: u64,
+    /// Block watch: `active_chunks` 0 -> nonzero transitions (fresh page or inactive-page
+    /// reactivation). Refcounted re-acquires on an active page do not count.
+    pub block_page_edges: u64,
+    /// Block watch: `active_chunks` reaching zero via `release_range` (whole-cache `clear()` is
+    /// deliberately not counted — it is a separate, rarer event with its own counters).
+    pub block_page_releases: u64,
+    /// Fast-map entries the strict-edge sweeps invalidated, both watches summed. Well below the
+    /// edge counts when the lazy-edge design is working (bits stay set, sweeps find nothing).
+    pub sweep_cleared_entries: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
     pub name: &'static str,
@@ -2862,7 +2886,15 @@ impl DecodeCache {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.native_code_watch.mark_range(physical, u32::from(len));
+        {
+            // Strict E1 edges park inside the watch and MUST be drained through
+            // `CpuGsw::sweep_sticky_watch_edges` before native code runs again (INV-W).
+            // Production drains synchronously after every decode insert (`fetch_decoded`) and
+            // again at native entry as a backstop, so accumulation across direct `put` calls in
+            // cache-mechanics fixtures is harmless.
+            let edges = self.native_code_watch.mark_range(physical, u32::from(len));
+            self.native_code_watch.stash_pending(edges);
+        }
         let first_page = physical >> 12;
         let last_page = physical.wrapping_add(u32::from(len).saturating_sub(1)) >> 12;
         for page in first_page..=last_page {
@@ -2891,6 +2923,60 @@ impl DecodeCache {
     ))]
     fn native_code_watch_table(&mut self) -> usize {
         self.native_code_watch.table_base()
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn code_watch_page_edges(&self) -> u64 {
+        self.native_code_watch.page_edges()
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn code_watch_sweep_cleared(&self) -> u64 {
+        self.native_code_watch.sweep_cleared()
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn reset_code_watch_edge_counter(&mut self) {
+        self.native_code_watch.reset_edge_counter();
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn code_watch_page_is_watched(&self, page: u32) -> bool {
+        self.native_code_watch.page_is_watched(page)
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn take_watch_edge_pages(&mut self) -> Vec<u32> {
+        self.native_code_watch.take_pending()
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn note_watch_sweep_cleared(&mut self, cleared: u64) {
+        self.native_code_watch.note_sweep_cleared(cleared);
     }
 
     #[cfg(all(
