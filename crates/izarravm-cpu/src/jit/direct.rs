@@ -3992,31 +3992,31 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     if !super::host_supported() || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586) {
         return None;
     }
-    // A 16-bit code segment is admitted on I586 only, and the persona clause is load-bearing
-    // rather than tidiness. Every instruction in such a segment decodes at `OperandSize::Word`
-    // (the size follows CS.D, not the opcode), and the compile loop structurally rejects Word on
-    // any persona but I586. On I486 the whole population would therefore reach `classify`, fail
-    // on its FIRST slot, and return a `StructuralReject`, which installs a rejected span and a
-    // physical-page watch for every hot 16-bit boundary. That is a real cost for a yield that is
-    // exactly zero. Refusing here keeps a 486 guest byte-identical by construction rather than
-    // by measurement.
+    // A 16-bit code segment is admitted wherever `word_operands_admitted` says Word operands are
+    // lowered, which since the 486 measurement is I486 and I586 BY DEFAULT. Every instruction in
+    // such a segment decodes at `OperandSize::Word` (the size follows CS.D, not the opcode), so
+    // where the policy refuses, the whole population would reach `classify`, fail on its FIRST
+    // slot, and install a rejected span plus a physical-page watch for every hot 16-bit boundary.
+    // Refusing the key here instead keeps that persona byte-identical by construction.
     //
     // The 16-bit population is real mode, V86 and 16-bit protected mode. V86 is deliberately IN,
-    // and the reason has CHANGED: it used to be that `classify` had no IN/OUT arm at all, which
-    // stopped being true when the interpreter call-out slot landed 0xEC. Three live gates carry
-    // the conclusion instead, any ONE of them sufficient:
+    // and 16-bit V86 BLOCKS EXIST in the shipped configuration -- an earlier revision of this
+    // comment said "no 16-bit block exists on any persona today", which was true while
+    // `try_direct_continuation` refused every `!d` boundary and stopped being true when
+    // `IZARRAVM_JIT16` defaulted to 1. The V86 conclusion now rests on per-opcode gates:
     //
-    //   1. `try_direct_continuation` (run.rs) returns `Interpret` for every `!d` boundary before
-    //      a key is ever built, so no 16-bit block exists on any persona today -- V86 included,
-    //      since a V86 code segment is always CS.D = 0.
-    //   2. `classify`'s Word-size allowlist excludes 0xEC, so even if a 16-bit block were built,
-    //      an IN in a CS.D = 0 segment decodes at `OperandSize::Word` and stays a barrier.
-    //   3. `run_direct_block` refuses to ENTER a call-out-bearing block whenever
-    //      `is_v86_mode() || CPL > IOPL`, so the slot cannot execute in V86 even if the first two
-    //      were somehow bypassed.
+    //   * The PORT opcodes (0xEC and family): two gates, either sufficient. `classify`'s
+    //     Word-size allowlist excludes them, so in a CS.D = 0 segment they stay barriers; and
+    //     `run_direct_block` refuses to ENTER a call-out-bearing block whenever
+    //     `is_v86_mode() || CPL > IOPL`, so the 0xEC call-out slot cannot execute in V86 even
+    //     compiled into a 32-bit block.
+    //   * PUSHF: its PUSHFD arm is refused by `stack_width_kind` in V86 (`StoreSource::Flags`,
+    //     IOPL check), and its Word form is off the allowlist.
+    //   * POPF, CLI, STI, INT, IRET: no `classify` arm at any size. That absence is now PINNED by
+    //     `v86_sensitive_opcodes_stay_word_barriers` (cpu_jit_compile_outcome_test.rs), because
+    //     an absence defended by nothing is exactly what a coverage campaign widens by accident.
     //
-    // The other V86-sensitive opcodes (PUSHF/POPF, CLI/STI, INT/IRET) still have no `classify`
-    // arm, and V86 blocks stay key-separated by mode-key bit 2.
+    // V86 blocks stay key-separated by mode-key bit 2.
     if !d && !word_operands_admitted(cpu) {
         return None;
     }
@@ -4395,6 +4395,7 @@ fn compile_with_instruction_limit(
                         stack_accesses,
                         memory_alu_slots,
                         callout_slots,
+                        x87_slots,
                         dirty_segments,
                         model_dirty: true,
                     },
@@ -4429,6 +4430,7 @@ fn compile_with_instruction_limit(
                         stack_accesses,
                         memory_alu_slots,
                         callout_slots,
+                        x87_slots,
                         dirty_segments,
                         model_dirty: true,
                     },
@@ -4456,6 +4458,7 @@ fn compile_with_instruction_limit(
                             stack_accesses,
                             memory_alu_slots,
                             callout_slots,
+                            x87_slots,
                             dirty_segments,
                             model_dirty: true,
                         },
@@ -4583,6 +4586,7 @@ fn compile_with_instruction_limit(
                         stack_accesses,
                         memory_alu_slots,
                         callout_slots,
+                        x87_slots,
                         dirty_segments,
                         // The arm whose suffix prices the dirty rule's own removal, so it is the
                         // one arm that must not apply it.

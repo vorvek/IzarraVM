@@ -507,6 +507,108 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
     }
 }
 
+/// The V86-sensitive opcodes stay compile barriers at `OperandSize::Word`, pinned per opcode.
+///
+/// V86 code is always CS.D = 0, so every instruction it executes decodes at Word. That makes the
+/// Word-size path the one that matters for V86 safety, and for five of these six opcodes the ONLY
+/// remaining gate is "no `classify` arm exists" -- a gate this campaign's whole method is to
+/// widen. A list defended by nothing but the absence of code needs a test that names each member,
+/// or the arm that admits one of them lands without anything failing.
+///
+/// PUSHF (0x9c) is the deliberate exception and the reason this is a table rather than a loop
+/// over interchangeable bytes: it HAS a classify arm (PUSHFD, a runtime-weighted top-five reject
+/// before it was lowered), and its V86 cover is `stack_width_kind`, which refuses
+/// `StoreSource::Flags` whenever `cpu.is_v86_mode()` because PUSHF checks IOPL in V86 and can
+/// raise #GP. Its Word arm is still refused by the allowlist, and the Dword control here proves
+/// the arm is live so this test cannot rot into "refused at every size" vacuity the way the port
+/// test once did.
+#[test]
+fn v86_sensitive_opcodes_stay_word_barriers() {
+    // (bytes, admitted_at_dword)
+    let table: &[(&[u8], bool)] = &[
+        (&[0x9c], true),        // PUSHF: lowered at Dword, allowlist-refused at Word
+        (&[0x9d], false),       // POPF: no classify arm
+        (&[0xfa], false),       // CLI: no classify arm
+        (&[0xfb], false),       // STI: no classify arm
+        (&[0xcd, 0x20], false), // INT imm8: no classify arm
+        (&[0xcf], false),       // IRET: no classify arm
+    ];
+    for (op, admitted_at_dword) in table {
+        for prefixed in [false, true] {
+            let mut code = vec![0x40, 0x41, 0x42];
+            let mut offsets = vec![0u32, 1, 2, 3];
+            if prefixed {
+                code.push(0x66);
+            }
+            code.extend_from_slice(op);
+            let tail_at = code.len() as u32;
+            code.extend_from_slice(&[0x43, 0x44, 0x45]);
+            offsets.extend_from_slice(&[tail_at, tail_at + 1, tail_at + 2]);
+
+            let (mut cpu, mut bus) = fixture(&code);
+            let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+            warm(&mut cpu, &mut bus, &addresses);
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            let first = op[0];
+            if !prefixed && *admitted_at_dword {
+                assert!(
+                    compilation.span.instructions > 3,
+                    "{first:#04x} at Dword has a classify arm and must not end the block;                      if this fails the Dword control is dead and the Word assertions below                      can no longer distinguish Word-refusal from always-refusal"
+                );
+            } else {
+                assert_eq!(
+                    compilation.span.instructions, 3,
+                    "{first:#04x} (prefixed={prefixed}) must stop the block at three slots"
+                );
+            }
+        }
+    }
+}
+
+/// The census suffix scan honours the x87 loop-top cap the compile walk applies.
+///
+/// Both x87 gates in the compile walk are armed by the PREFIX (`x87_slots != 0`), so the scan's
+/// blanket refusal of x87 kinds in the suffix never made them unreachable, and before the seed
+/// carried `x87_slots` a barrier whose prefix held one `FLD` reported a suffix bounded only by the
+/// 32-instruction ceiling instead of the 12-instruction x87 one. `max_native_suffix` is a ranking
+/// column, and the over-report landed on exactly the x87-adjacent population the campaign ranks.
+///
+/// The program is `FLD dword [ebx]`, three integer slots, the barrier, then twenty more admissible
+/// integer slots. Prefix is 4, so the x87 cap stops the scan at 12 - 4 - 1 = 7; without the cap it
+/// reads all 20. Proven non-vacuous by exactly that flip: with the seed's `x87_slots` forced to
+/// zero this assertion reads 20 and fails.
+#[test]
+fn the_census_suffix_scan_applies_the_x87_block_cap() {
+    let mut code = vec![0xd9, 0x03, 0x40, 0x41, 0x42, DIRECT_BARRIER];
+    let mut offsets = vec![0u32, 2, 3, 4, 5];
+    for extra in 0..20u32 {
+        code.push(0x40);
+        offsets.push(6 + extra);
+    }
+
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "the prefix must be FLD plus three integer slots, or the seed under test is not armed"
+    );
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+        .expect("recorded structural stop");
+    assert_eq!(
+        row.native_suffix_instructions, 7,
+        "an x87 slot in the prefix must bound the suffix by MAX_X87_BLOCK_INSTRUCTIONS"
+    );
+}
+
 /// The port opcodes are never admitted at `OperandSize::Word`, and this test is load-bearing
 /// rather than defensive.
 ///
@@ -523,15 +625,39 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 #[test]
 fn port_opcodes_are_never_admitted_at_word() {
     for opcode in [0xecu8, 0xed, 0xee, 0xef] {
+        // The un-prefixed CONTROL, and it is asserted, not just built. An earlier revision
+        // constructed, configured and warmed this pair and then dropped it, so the test could not
+        // distinguish "refused at Word" from "refused at every size" -- it compiled cleanly and
+        // read like a positive control while asserting nothing.
+        //
+        // The control's meaning differs by opcode, and pretending otherwise is how the vacuity
+        // crept in. `0xEC` has a call-out helper (`CallOutHelper::PortReadAlDx`), so at Dword it
+        // is ADMITTED mid-block and the whole seven-slot program compiles as one span; its Word
+        // arm below therefore isolates the Word gate exactly. `0xED`/`0xEE`/`0xEF` have no
+        // `classify` arm at any size, so their un-prefixed arm stops at the same three slots and
+        // proves the stronger fact that carries their V86 safety: refused everywhere, with the
+        // Word gate as redundant cover rather than the only gate.
         let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, opcode, 0x43, 0x44, 0x45]);
-        cpu.set_word_operands_at_486(true);
         let addresses: Vec<_> = (0..7u32).map(|offset| ENTRY + offset).collect();
         warm(&mut cpu, &mut bus, &addresses);
+        let dword = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        if opcode == 0xec {
+            assert_eq!(
+                dword.span.instructions, 7,
+                "IN AL,DX at Dword is a call-out slot and must not end the block"
+            );
+        } else {
+            assert_eq!(
+                dword.span.instructions, 3,
+                "{opcode:#04x} has no classify arm at any operand size"
+            );
+        }
         // The 0x66 prefix in a 32-bit segment is what makes the decoded operand size Word here;
-        // in real 16-bit code CS.D does it, and `classify` cannot tell the two apart.
+        // in real 16-bit code CS.D does it, and `classify` cannot tell the two apart. The
+        // `set_word_operands_at_486` calls the earlier revision made were inert -- `fixture()`
+        // builds a 586, where Word operands are admitted unconditionally -- and are gone.
         let (mut word_cpu, mut word_bus) =
             fixture(&[0x40, 0x41, 0x42, 0x66, opcode, 0x43, 0x44, 0x45]);
-        word_cpu.set_word_operands_at_486(true);
         let word_addresses: Vec<_> = [0u32, 1, 2, 3, 5, 6, 7]
             .iter()
             .map(|offset| ENTRY + offset)

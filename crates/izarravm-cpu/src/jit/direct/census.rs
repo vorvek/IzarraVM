@@ -42,6 +42,14 @@ pub(super) struct SuffixSeed {
     pub(super) stack_accesses: u8,
     pub(super) memory_alu_slots: u8,
     pub(super) callout_slots: u8,
+    /// x87 slots the block had already committed when the barrier stopped it. Non-zero arms BOTH
+    /// x87 gates in the compile walk -- the loop-top cap at `MAX_X87_BLOCK_INSTRUCTIONS` and the
+    /// x87/call-out mixing `Retry` -- and both are PREFIX-armed, so the scan's own refusal of x87
+    /// KINDS does not make them unreachable. Leaving this out was the review finding: a barrier
+    /// whose prefix held one `FLD` over-reported its suffix by up to 20 instructions against the
+    /// 12-instruction x87 ceiling, on exactly the x87-adjacent population (Quake) the campaign is
+    /// trying to rank.
+    pub(super) x87_slots: u8,
     /// Segments the block had already overwritten when the barrier stopped it.
     pub(super) dirty_segments: u8,
     /// Whether the forward scan applies the dirty-segment rule at all.
@@ -167,12 +175,14 @@ pub(super) fn record_structural_barrier(
 /// * CLOSED, `jit_admits_non_continuable`. The compile walk takes `insn.continuable ||
 ///   jit_admits_non_continuable(opcode)`; this scan took the bare flag, truncating any suffix that
 ///   reached an IMUL-with-immediate.
-/// * OPEN BY DESIGN, x87. The `kind.is_x87()` break below refuses EVERY x87 slot, while the
-///   compile walk admits up to `MAX_X87_SLOTS` within `MAX_X87_BLOCK_INSTRUCTIONS`. That makes the
-///   x87 block cap and the x87/call-out mixing refusal unreachable here, so mirroring them would
-///   be dead code no test could make fire. Left as a deliberate conservative FLOOR: it
-///   under-reports, and an under-report cannot inflate a ranking. Closing it is a Quake-facing
-///   change with no bearing on the 16-bit campaign.
+/// * PARTLY CLOSED, x87. The `kind.is_x87()` break below still refuses EVERY x87 slot in the
+///   SUFFIX, a deliberate conservative floor for the kinds themselves. But both x87 gates in the
+///   compile walk are armed by the PREFIX (`x87_slots != 0`), not by the suffix, so "the scan
+///   never adds an x87 slot" never made them unreachable: a barrier whose prefix held an `FLD`
+///   over-reported by up to 20 instructions against the 12-instruction x87 ceiling. The seed now
+///   carries `x87_slots` and the scan mirrors the loop-top cap and the call-out mixing refusal.
+///   What remains open is only the suffix-side admission of x87 kinds, and THAT half genuinely
+///   can only under-report.
 /// * CLOSED, the dirty-segment rule, but PER ARM rather than unconditionally. See
 ///   `SuffixSeed::model_dirty`: every arm but `DirtySegment` models it, and that one must not,
 ///   because its suffix prices the rule's own removal. The seed also carries the barred
@@ -196,6 +206,7 @@ fn census_native_suffix(
         mut stack_accesses,
         mut memory_alu_slots,
         mut callout_slots,
+        x87_slots,
         mut dirty_segments,
         model_dirty,
     } = seed;
@@ -208,6 +219,16 @@ fn census_native_suffix(
         // being counted up from zero here; the two agree wherever the compile walk can reach.
         if memory_alu_slots != 0
             && prefix_instructions + 1 + result.instructions >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS
+        {
+            break;
+        }
+        // The x87 loop-top cap, prefix-armed exactly like the memory-ALU one above: the compile
+        // walk breaks at `slots.len() == MAX_X87_BLOCK_INSTRUCTIONS` whenever the block already
+        // holds an x87 slot, before decoding the next instruction. `x87_slots` never grows during
+        // this scan (the `kind.is_x87()` refusal below sees to that), so testing the seed value is
+        // exact rather than conservative.
+        if x87_slots != 0
+            && prefix_instructions + 1 + result.instructions >= MAX_X87_BLOCK_INSTRUCTIONS
         {
             break;
         }
@@ -257,6 +278,10 @@ fn census_native_suffix(
                     || prefix_instructions + 1 + result.instructions
                         >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS))
             || (kind.is_call_out() && callout_slots == MAX_BLOCK_CALLOUT_SLOTS)
+            // The x87/call-out mixing refusal's live half: a call-out into a block whose PREFIX
+            // holds an x87 slot is a `Retry` in the compile walk. The other half (an x87 slot
+            // after a call-out) stays dead here because the scan refuses x87 kinds outright.
+            || (kind.is_call_out() && x87_slots != 0)
             || (kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES)
             || (model_dirty && kind.pinned_segments() & dirty_segments != 0)
         {
@@ -614,10 +639,16 @@ pub(crate) enum BarrierStop {
     /// It is a `CompileStop::Boundary` rather than a `Structural`, so the block it stopped is
     /// compiled and installed rather than rejected. That is why it does not install a rejected
     /// span (see `installs_rejected_span`) and why `unbound_exits` and `dynamic_unbound_exits`
-    /// are structurally zero for it. `runtime_hits` is near zero as well, because the barred
-    /// instruction becomes the ENTRY of the next block and gets compiled rather than retiring
-    /// through the interpreter. `snapshot` sorts on those columns, so these rows land last while
-    /// being the ones a segment slice is looking for. Read `hits` and the suffix instead.
+    /// are structurally zero for it. `runtime_hits` is UNREGISTERED by it, deliberately (the
+    /// column can still read non-zero for a shape that ALSO barriers under a genuine coverage
+    /// stop, since registration is shared by shape): the column
+    /// counts interpreted executions by SHAPE, and this variant's rows key on the segment's user
+    /// (`0x8a`, `0x8b`, memory forms), shapes that are fully lowered and executed constantly. An
+    /// address-based reading ("the barred instruction becomes the next block's entry, so it never
+    /// interprets") predicted near-zero and was wrong for a shape-keyed counter; `record` skips
+    /// the registration instead, so the column cannot mislead. `snapshot` sorts on those columns,
+    /// so these rows land last while being the ones a segment slice is looking for. Read `hits`
+    /// and the suffix instead.
     ///
     /// Its rows must be SUMMED, not ranked individually. The key is the shape of the instruction
     /// that was barred -- the segment's USER -- so one structural cause spreads itself across
@@ -806,7 +837,17 @@ impl DirectBarrierCensus {
         }
         // Register the shape so `note_interpreted` can find it with one probe and without ever
         // creating a row for an instruction that never barriered.
-        self.runtime_hits.entry(key.shape).or_default();
+        //
+        // EXCEPT for the dirty-segment rule. Its rows key on the segment's USER -- `0x8a`, `0x8b`
+        // and the other fully-lowered forms that happen to read the segment -- and
+        // `note_interpreted` counts by SHAPE, not by address. Registering those shapes would land
+        // every interpreted `MOV r,[mem]` in the guest in a barrier row, and `runtime_hits` is
+        // the column the campaign ranks by. The census's own history already records this failure
+        // mode once (`unbound_exits` ranking `0x8C` seven places above `0x38 /0`). The row keeps
+        // its compile-time attribution, which is what it exists to provide.
+        if stop != BarrierStop::DirtySegment {
+            self.runtime_hits.entry(key.shape).or_default();
+        }
         let row = self.rows.entry(key).or_default();
         row.hits = row.hits.saturating_add(1);
         row.native_prefix_instructions = row
