@@ -1214,13 +1214,17 @@ fn run_boot_hdd_folder(
             None => machine.run_until_halt_or_cycles(budget.saturating_sub(spent))?,
         }
     };
+    // The wall reading comes FIRST. `record_host_phase_mark` routes to the full mark, which
+    // takes a `cpu_profile` snapshot when profiling is armed -- the untruncated hot-address sort
+    // that is at its largest exactly here, at end of run -- and a run with both the sampler and
+    // `IZARRAVM_CPU_PROFILE` armed would otherwise absorb that snapshot into its headline wall.
+    let wall = start_wall.elapsed();
     // Close the last periodic interval. Placed AFTER the run returns, so it cannot move a run
     // boundary; without it the tail (up to one interval, plus everything after the final batch,
     // plus the loop's several early returns) is never bounded on the right.
     if phase_interval_ms.is_some() {
         machine.record_host_phase_mark(izarravm_machine::phase_mark::BENCH_END);
     }
-    let wall = start_wall.elapsed();
     #[cfg(windows)]
     if let Some((Some(sampler), path)) = rip_sampler {
         sampler.stop_and_report(std::path::Path::new(&path));
