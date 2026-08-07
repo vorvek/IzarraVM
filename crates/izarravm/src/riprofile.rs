@@ -18,6 +18,14 @@
 //! header (unresolved address count and sample share) exist to make that
 //! distinction impossible to miss. A healthy idle-phase run resolves ~96%.
 //!
+//! Resolution is nearest-PRECEDING-symbol: an address past a function's true
+//! end still inherits that function's name, so hot symbol-poor bytes inflate
+//! whatever small function happens to sit before them. The report header
+//! always carries the beyond-extent sample share (so a healthy report is
+//! distinguishable from one produced before this check existed), and the
+//! BEYOND-EXTENT table shows the top flagged addresses with raw RVAs, so that
+//! failure announces itself instead of minting a plausible-looking hot row.
+//!
 //! `IZARRAVM_RIP_PROFILE_DELAY_SECS=<n>` (default 0) delays sampling to skip
 //! BIOS/DOS boot and demo load.
 //!
@@ -203,6 +211,7 @@ impl Sampler {
         }
 
         let process = unsafe { GetCurrentProcess() };
+        let module_base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
         unsafe {
             // NO `SYMOPT_DEFERRED_LOADS`: deferred modules report `SymType = 5`
             // (SymDeferred) and only try to find a PDB on the first query, so a
@@ -232,16 +241,15 @@ impl Sampler {
             // (ERROR_INVALID_ADDRESS). That is what made the whole report land in
             // the "<no symbol>" bucket, which reads as "all JIT arena" and is the
             // exact opposite of the truth.
-            let base = GetModuleHandleW(std::ptr::null());
             let mut info: IMAGEHLP_MODULEW64 = mem::zeroed();
             info.SizeOfStruct = mem::size_of::<IMAGEHLP_MODULEW64>() as u32;
-            if SymGetModuleInfoW64(process, base as u64, &mut info) != 0 {
+            if SymGetModuleInfoW64(process, module_base, &mut info) != 0 {
                 // SymType 3 is SymPdb. Anything else means the report's
                 // "<no symbol>" bucket is unresolved addresses, not native code,
                 // so say so rather than letting it be misread.
                 eprintln!(
-                    "riprofile: exe module base {:#x}, SymType={} (3=Pdb), lines={}",
-                    base as u64, info.SymType, info.LineNumbers
+                    "riprofile: exe module base {module_base:#x}, SymType={} (3=Pdb), lines={}",
+                    info.SymType, info.LineNumbers
                 );
                 if info.SymType != 3 {
                     eprintln!(
@@ -264,13 +272,25 @@ impl Sampler {
         // symbolization is healthy.
         let mut unresolved_addrs = 0u64;
         let mut unresolved_samples = 0u64;
+        let mut beyond_samples = 0u64;
+        // (samples, rip, name, displacement, recorded size) for every address
+        // past its symbol's extent. These stay in the main tables under the
+        // preceding symbol's name — the 2026-08-06 doom-586 report is only
+        // comparable if attribution semantics hold still — and are ALSO listed
+        // raw so a hot symbol-poor gap can be seen instead of inferred.
+        let mut beyond_rows: Vec<(u64, u64, String, u64, u32)> = Vec::new();
         for (&rip, &n) in &counts {
             let symbol = resolve_symbol(process, rip);
             if symbol.is_none() {
                 unresolved_addrs += 1;
                 unresolved_samples += n;
             }
-            let func = symbol.unwrap_or_else(|| "<no symbol — JIT arena or foreign code>".into());
+            let (func, displacement, size) =
+                symbol.unwrap_or_else(|| ("<no symbol — JIT arena or foreign code>".into(), 0, 0));
+            if beyond_extent(displacement, size) {
+                beyond_samples += n;
+                beyond_rows.push((n, rip, func.clone(), displacement, size));
+            }
             let site =
                 resolve_line(process, rip).unwrap_or_else(|| format!("{func} (no line info)"));
             let file = site
@@ -285,15 +305,44 @@ impl Sampler {
             counts.len(),
             unresolved_samples as f64 * 100.0 / total.max(1) as f64,
         );
+        eprintln!(
+            "riprofile: {:.2}% of samples beyond the attributed symbol's extent",
+            beyond_samples as f64 * 100.0 / total.max(1) as f64,
+        );
         let mut report = String::new();
         report.push_str(&format!(
             "riprofile report — {total} samples at {SAMPLE_INTERVAL:?} \
              ({} unique addresses, {unresolved_addrs} unresolved carrying \
-             {:.2}% of samples)\n\n",
+             {:.2}% of samples, {:.2}% of samples beyond their symbol's \
+             recorded extent)\n\n",
             counts.len(),
             unresolved_samples as f64 * 100.0 / total.max(1) as f64,
+            beyond_samples as f64 * 100.0 / total.max(1) as f64,
         ));
         report.push_str(&render_tables(&counts, &resolved));
+
+        if !beyond_rows.is_empty() {
+            beyond_rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            report.push_str(&format!(
+                "== BEYOND-EXTENT — {:.2}% of samples sit past the recorded end of the \
+                 symbol the tables above attribute them to; those rows are guesses ==\n\
+                 (top {} of {} flagged addresses; rva = address - exe base \
+                 {module_base:#x}, for llvm-pdbutil)\n",
+                beyond_samples as f64 * 100.0 / total.max(1) as f64,
+                beyond_rows.len().min(40),
+                beyond_rows.len(),
+            ));
+            for (n, rip, func, displacement, size) in beyond_rows.iter().take(40) {
+                report.push_str(&format!(
+                    "{:>7.3}%  {:>9}  {rip:#014x}  rva {:#011x}  \
+                     +{displacement:#x} past {func} (size {size:#x})\n",
+                    *n as f64 * 100.0 / total.max(1) as f64,
+                    n,
+                    rip.wrapping_sub(module_base),
+                ));
+            }
+            report.push('\n');
+        }
 
         // Per-phase tables, in phase order. Only emitted when the run actually
         // crossed a boundary: a single-phase run would just repeat the total.
@@ -393,7 +442,10 @@ fn exe_directory(path: &[u16]) -> Option<Vec<u16>> {
 #[path = "riprofile_test.rs"]
 mod tests;
 
-fn resolve_symbol(process: HANDLE, rip: u64) -> Option<String> {
+/// Resolve `rip` to `(name, displacement, recorded_size)`. dbghelp answers with
+/// the nearest PRECEDING symbol however far past its end the address lies; the
+/// caller decides whether the displacement clears the recorded extent.
+fn resolve_symbol(process: HANDLE, rip: u64) -> Option<(String, u64, u32)> {
     const MAX_NAME: usize = 512;
     #[repr(C)]
     struct SymbolBuf {
@@ -408,8 +460,17 @@ fn resolve_symbol(process: HANDLE, rip: u64) -> Option<String> {
     (ok != 0).then(|| {
         let len = (buf.info.NameLen as usize).min(MAX_NAME);
         let name = unsafe { std::slice::from_raw_parts(buf.info.Name.as_ptr(), len) };
-        String::from_utf16_lossy(name)
+        (String::from_utf16_lossy(name), displacement, buf.info.Size)
     })
+}
+
+/// Whether a resolved RIP fell past the recorded extent of the symbol dbghelp
+/// attributed it to, which means the attribution is a guess about the gap after
+/// that symbol rather than the symbol itself. A zero recorded size means the
+/// PDB carried no extent and proves nothing either way; only a nonzero extent
+/// the displacement clears is evidence of misattribution.
+fn beyond_extent(displacement: u64, size: u32) -> bool {
+    size > 0 && displacement >= u64::from(size)
 }
 
 fn resolve_line(process: HANDLE, rip: u64) -> Option<String> {
