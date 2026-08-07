@@ -92,6 +92,13 @@ pub(crate) struct JitState {
     /// retired after #713 soaked — a field for `word_at_486`'s testability
     /// reason, and CARRIED by clone for its lockstep-comparison reason.
     pub(crate) watch_page_bit: bool,
+    /// Emitted stores probe the one-lookup store-bias table and route special pages through
+    /// the shared stub pad (`dev_docs/2026-08-07-one-lookup-store-design.md` D3/D4/D5).
+    /// Seeded from `IZARRAVM_ONE_LOOKUP_STORE` (default ON, `=0` restores the classify/resolve
+    /// emission wholesale); a FIELD for `word_at_486`'s testability reason, and CARRIED by
+    /// clone for `watch_page_bit`'s lockstep-comparison reason. Requires `r15_tables` — the
+    /// compile walk enforces that at the pad-build site.
+    pub(crate) one_lookup_store: bool,
     /// Admission level for 16-bit code segments, seeded from `IZARRAVM_JIT16`.
     ///
     /// A field for the same reason `word_at_486` is one: the `OnceLock` behind it is process-wide,
@@ -123,6 +130,14 @@ pub(crate) struct JitState {
     pub(crate) pending_watch_edges: Vec<u32>,
 }
 
+/// Seed for `JitState::one_lookup_store`, read once per process from
+/// `IZARRAVM_ONE_LOOKUP_STORE` (the retired `IZARRAVM_R15_TABLES` pattern: env knob for the
+/// single-binary A/B, deleted after soak).
+fn one_lookup_store_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("IZARRAVM_ONE_LOOKUP_STORE").as_deref(), Ok("0")))
+}
+
 impl JitState {
     pub(crate) fn new(direct: direct::BlockCache) -> Self {
         Self {
@@ -130,6 +145,7 @@ impl JitState {
             word_at_486: direct::word_at_486_default(),
             r15_tables: true,
             watch_page_bit: true,
+            one_lookup_store: one_lookup_store_default(),
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
@@ -154,6 +170,7 @@ impl Clone for JitState {
             word_at_486: self.word_at_486,
             r15_tables: self.r15_tables,
             watch_page_bit: self.watch_page_bit,
+            one_lookup_store: self.one_lookup_store,
             sixteen_bit_level: self.sixteen_bit_level,
             direct_barrier_census: None,
             smc_heat: self.smc_heat.clone(),

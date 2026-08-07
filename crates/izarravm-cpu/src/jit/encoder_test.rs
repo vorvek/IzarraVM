@@ -1217,6 +1217,33 @@ fn ret_near_known_bytes() {
 }
 
 #[test]
+fn and_r64_imm32_known_bytes() {
+    // and rdi, -4 -- REX.W = 0x48; 81; mod=11,reg=/4,rm=7 -> 0xE7; imm32 0xFFFFFFFC.
+    let mut e = Encoder::new();
+    e.and_r64_imm32(Reg::RDI, 0xFFFF_FFFC);
+    assert_eq!(e.finish(), vec![0x48, 0x81, 0xE7, 0xFC, 0xFF, 0xFF, 0xFF]);
+}
+
+#[test]
+fn pop_and_jmp_m64_disp32_known_bytes() {
+    // pop qword [rsp + 128] -- 8F /0; mod=10,rm=rsp needs SIB 0x24; disp32 128.
+    let mut e = Encoder::new();
+    e.pop_m64_disp32(Reg::RSP, 128);
+    assert_eq!(
+        e.finish(),
+        vec![0x8F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]
+    );
+
+    // jmp qword [rsp + 128] -- FF /4; same addressing.
+    let mut e = Encoder::new();
+    e.jmp_m64_disp32(Reg::RSP, 128);
+    assert_eq!(
+        e.finish(),
+        vec![0xFF, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00]
+    );
+}
+
+#[test]
 fn test_r8_low_imm8_known_bytes() {
     // test dil, 3 -- empty REX 0x40 selects DIL (without it, rm=7 at byte width is BH);
     // F6 /0 ib; modrm mod=11,reg=0,rm=7 -> 0xC7.

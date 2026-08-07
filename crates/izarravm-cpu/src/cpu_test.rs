@@ -1853,7 +1853,10 @@ fn pending_flags_offset() {
     // moving this pin from 4528 to 4576 -- measured, not derived. It must be a by-value CpuGsw
     // field: behind a Box the emitted load would need a second, dependent indirection, which is
     // half the point of the slice gone.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
+    // The one-lookup store slice grows the slots array to [usize; 24] (the store-bias table
+    // plus 17 stub-address slots, +144 bytes), moving this pin from 4576 to 4720 -- measured,
+    // not derived.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4720);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

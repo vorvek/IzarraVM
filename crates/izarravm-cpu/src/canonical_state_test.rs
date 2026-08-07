@@ -866,9 +866,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The R15 table-bases slice adds `native_table_slots: NativeTableSlots` ([usize; 6],
     // 48 bytes; host pointers, no architectural state, absent from both canonical payloads
     // via its always-equal PartialEq), moving this pin from 4528 to 4576 -- measured, not
-    // derived.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
+    // derived. The one-lookup store slice grows the slots array to [usize; 24] (the store-bias
+    // table plus 17 stub-address slots, +144 bytes), moving it from 4576 to 4720 -- measured,
+    // not derived.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4720);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4720);
 }
