@@ -613,6 +613,7 @@ fn map_word_operand_page(cpu: &mut CpuGsw, bus: &mut TestBus) {
                 page,
                 host,
                 jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page),
             )
         } else {
             cpu.jit_fast_map.populate_read(
@@ -620,6 +621,7 @@ fn map_word_operand_page(cpu: &mut CpuGsw, bus: &mut TestBus) {
                 page,
                 host,
                 jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page),
             )
         };
         assert!(populated, "the word operand page must map");

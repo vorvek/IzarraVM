@@ -238,7 +238,7 @@ fn native_rmw_watch_checks_overlap_and_both_touched_chunks() {
         }
         assert!(cpu.jit_direct.len() > 0);
 
-        cpu.decode_cache.mark_code_range(marked, 1);
+        cpu.mark_decode_code_for_test(marked, 1);
         bus.memory[target as usize..target as usize + 4].copy_from_slice(&1u32.to_le_bytes());
         bus.trace = BusTrace::default();
         arm_doom_loop(&mut cpu);
@@ -289,8 +289,16 @@ fn direct_doom_drawcolumn_runs_four_iterations_with_dec_rmw() {
     assert!(native.jit_direct.len() > 0, "Doom block did not compile");
     let root = jit::direct::compile(&mut native, GAME_LOOP_ENTRY, true)
         .expect("full Doom loop must remain directly compilable");
+    // A headroom canary under the real one-host-page install cap (4096), not a page-size claim.
+    // History: the per-granule watch probe once pushed this loop to 4039 bytes and the ceiling
+    // was 4000 after the window-probe fix. The watched-page bit (D3) consciously spends ~20
+    // bytes per store site on its re-read + skip test — measured 4007 on this loop — buying a
+    // 16-instruction hot-path saving per unwatched store; the design's carry-by-duplication
+    // first draft cost 4081 here and was rejected for exactly this canary. If this ceiling is
+    // hit again, check installs-refused-for-size before widening: growth that spends the LAST
+    // ~50 bytes of headroom starts refusing real store-dense blocks.
     assert!(
-        root.code.len() <= 4_000,
+        root.code.len() <= 4_050,
         "full Doom loop emitted {} bytes",
         root.code.len()
     );
@@ -1573,6 +1581,10 @@ fn run_watched_memory_alu(form: u8, same_value: bool) {
     ];
     decode_fixture(&mut native, &mut native_bus, &starts);
     decode_fixture(&mut interp, &mut interp_bus, &starts);
+    // Mark TARGET watched BEFORE populating its fast-map entry: the mark's E1 sweep clears any
+    // entry whose PAGE_WATCHED bit is clear, so populating first and marking after would
+    // invalidate the very entry the watched-store guard needs (populate-then-mark trap).
+    native.mark_decode_code_for_test(TARGET, width);
     map_direct_page(
         &mut native,
         &mut native_bus,
@@ -1583,7 +1595,6 @@ fn run_watched_memory_alu(form: u8, same_value: bool) {
         true,
     );
     let block = install_fixture_block(&mut native, ALU_MEM_ENTRY);
-    native.decode_cache.mark_code_range(TARGET, width);
     for cpu in [&mut native, &mut interp] {
         cpu.registers.gpr.fill(0);
         cpu.registers.set_ecx(source);

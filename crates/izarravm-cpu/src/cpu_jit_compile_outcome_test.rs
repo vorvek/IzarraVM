@@ -1754,7 +1754,7 @@ fn same_value_store_churn_accrues_no_heat() {
     const VALUE: u32 = 0xdead_beef;
     let (mut cpu, mut bus) = fixture(&[0x40, 0xf4]);
     bus.memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&VALUE.to_le_bytes());
-    cpu.decode_cache.mark_code_range(TARGET, 4);
+    cpu.mark_decode_code_for_test(TARGET, 4);
     // Baseline after fixture setup (set_mode counts one translation-cache invalidation).
     let invalidations = cpu.perf_counters().code_invalidations;
     for _ in 0..16 {
@@ -2324,6 +2324,12 @@ fn a_word_ret_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit
 
 #[path = "cpu_jit_s5_allowlist_test.rs"]
 mod s5_allowlist;
+
+#[path = "cpu_jit_coverage_matrix_test.rs"]
+mod coverage_matrix;
+
+#[path = "cpu_jit_watch_bit_test.rs"]
+mod watch_bit;
 
 /// The guard finding that blocked LEAVE from merging for a week, discharged.
 ///

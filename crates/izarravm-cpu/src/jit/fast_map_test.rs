@@ -30,6 +30,9 @@ fn ram_read_and_write_fill_independent_biases() {
             writable: false,
             user: true,
         },
+        // Bare-map tests have no code watches; the PAGE_WATCHED bit's own coverage lives with the
+        // watched-page-bit fixtures.
+        false,
     ));
     let read = map.entry(linear);
     assert_eq!(read.kind(), PageKind::Ram);
@@ -51,6 +54,7 @@ fn ram_read_and_write_fill_independent_biases() {
             writable: true,
             user: false,
         },
+        false,
     ));
     let write = map.entry(linear);
     assert_eq!(
@@ -81,6 +85,7 @@ fn interpreter_lookup_requires_a_live_bias_and_current_permissions() {
             writable: false,
             user: false,
         },
+        false,
     ));
     assert_eq!(
         map.lookup_physical(linear, MAPPING_EPOCH, false, false, false),
@@ -109,6 +114,7 @@ fn interpreter_lookup_requires_a_live_bias_and_current_permissions() {
             writable: false,
             user: false,
         },
+        false,
     ));
     assert_eq!(
         map.lookup_physical(linear, MAPPING_EPOCH, true, false, false),
@@ -158,6 +164,7 @@ fn access_rejects_a_mapping_from_an_old_bus_epoch() {
         physical,
         page(&mut bytes, physical, false),
         PagePermissions::UNPAGED,
+        false,
     ));
     assert!(map.has_read_mapping_at_epoch(linear, physical, MAPPING_EPOCH));
     assert!(!map.has_read_mapping_at_epoch(linear, physical, MAPPING_EPOCH + 1));
@@ -186,6 +193,7 @@ fn mode13_is_distinct_and_exposes_native_store_bias() {
         physical,
         page(&mut bytes, MODE13_BASE, true),
         PagePermissions::UNPAGED,
+        false,
     ));
     let entry = map.entry(linear);
     assert_eq!(entry.kind(), PageKind::Mode13);
@@ -199,6 +207,7 @@ fn mode13_is_distinct_and_exposes_native_store_bias() {
         physical,
         page(&mut bytes, MODE13_BASE, false),
         PagePermissions::UNPAGED,
+        false,
     ));
     assert_eq!(
         map.entry(linear).read_ptr(linear),
@@ -217,6 +226,7 @@ fn vga_invalidation_handles_aliases_and_refills_without_list_growth() {
         0x2000,
         page(&mut ram, 0x2000, true),
         PagePermissions::UNPAGED,
+        false,
     ));
 
     for _ in 0..3 {
@@ -225,6 +235,7 @@ fn vga_invalidation_handles_aliases_and_refills_without_list_growth() {
             MODE13_BASE,
             page(&mut vga, MODE13_BASE, true),
             PagePermissions::UNPAGED,
+            false,
         ));
         assert!(map.populate_read(
             PAGED_ALIAS,
@@ -234,6 +245,7 @@ fn vga_invalidation_handles_aliases_and_refills_without_list_growth() {
                 writable: true,
                 user: false,
             },
+            false,
         ));
         assert_eq!(map.vga_pages.len(), 2);
         assert_eq!(map.populated_pages.len(), 3);
@@ -260,12 +272,14 @@ fn invlpg_is_exact_and_refill_does_not_duplicate_population_list() {
         0x3000,
         page(&mut first, 0x3000, false),
         PagePermissions::UNPAGED,
+        false,
     ));
     assert!(map.populate_read(
         0x2000,
         0x4000,
         page(&mut second, 0x4000, false),
         PagePermissions::UNPAGED,
+        false,
     ));
     map.invalidate_page(0x1fff);
     assert_eq!(map.entry(0x1000).kind(), PageKind::Unavailable);
@@ -276,6 +290,7 @@ fn invlpg_is_exact_and_refill_does_not_duplicate_population_list() {
         0x3000,
         page(&mut first, 0x3000, false),
         PagePermissions::UNPAGED,
+        false,
     ));
     assert_eq!(map.populated_pages.len(), 2);
 }
@@ -290,12 +305,14 @@ fn global_invalidation_and_clone_leave_no_live_entries() {
         0x7000,
         page(&mut bytes, 0x7000, false),
         PagePermissions::UNPAGED,
+        false,
     ));
     assert!(map.populate_write(
         MODE13_BASE,
         MODE13_BASE,
         page(&mut vga, MODE13_BASE, true),
         PagePermissions::UNPAGED,
+        false,
     ));
     assert_eq!(map.vga_pages.len(), 1);
 
@@ -314,6 +331,7 @@ fn global_invalidation_and_clone_leave_no_live_entries() {
         MODE13_BASE,
         page(&mut vga, MODE13_BASE, true),
         PagePermissions::UNPAGED,
+        false,
     ));
     assert_eq!(map.populated_pages.len(), 1);
     assert_eq!(map.vga_pages.len(), 1);

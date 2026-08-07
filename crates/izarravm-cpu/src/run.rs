@@ -1169,6 +1169,10 @@ impl CpuGsw {
                     jit::direct::CompileOutcome::Compiled(compilation) => compilation,
                     jit::direct::CompileOutcome::StructuralReject(span) => {
                         self.jit_direct.reject(span);
+                        // E2 sweep before any native re-entry (watched-page-bit design D4): the
+                        // reject just acquired the span's watch, and a fast-map entry filled
+                        // before it must not keep a clear PAGE_WATCHED bit.
+                        self.sweep_block_watch_edges();
                         return Ok(DirectContinuation::Interpret);
                     }
                     jit::direct::CompileOutcome::Retry => {
@@ -1213,6 +1217,10 @@ impl CpuGsw {
                         .dormant(key, jit::direct::DormantReason::InstallFailed);
                     return Ok(DirectContinuation::Interpret);
                 };
+                // E2 sweep before this or any block runs (watched-page-bit design D4): the
+                // install just acquired the span's watch, and every fast-map entry filled
+                // before it whose PAGE_WATCHED bit is clear must be invalidated first.
+                self.sweep_block_watch_edges();
                 self.perf.jit_direct_blocks_installed += 1;
                 self.perf.smc_lane_registrations += compilation.imm_lane_count() as u64;
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
@@ -1680,6 +1688,20 @@ impl CpuGsw {
         bus_at_entry: u64,
         cap: u64,
     ) -> Result<DirectBlockOutcome, CpuError> {
+        // INV-W backstop drain (watched-page-bit design D4): no native code runs while strict
+        // watch edges are pending their fast-map sweep. The production chokes drain inline
+        // (install/reject and every decode insert), so both sweeps are no-op reads here; any
+        // OTHER path that marks or installs — test helpers drive several — self-heals at this
+        // boundary instead of executing against a stale clear bit. Mid-block callouts never
+        // re-enter here and rely on the decode-insert sweep alone, which is why that one must
+        // stay synchronous.
+        self.sweep_block_watch_edges();
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.sweep_sticky_watch_edges();
         if self.profile.enabled || diff_trace_enabled() {
             self.perf.jit_direct_reject_observer += 1;
             return Ok(DirectBlockOutcome::NotRun);

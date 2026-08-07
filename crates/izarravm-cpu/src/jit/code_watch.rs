@@ -123,6 +123,16 @@ const fn all_chunks_watched() -> ChunkMask {
     mask
 }
 
+/// Physical pages that just crossed the unwatched -> watched edge in one call into a watch
+/// table — the strict-edge signal of the watched-page-bit design (D4). The caller at the
+/// `CpuGsw` layer MUST feed every page here through the fast-map sweep before native code can
+/// run again; dropping one is the silent-SMC-miss miscompile class. Page NUMBERS
+/// (`physical >> 12`). Empty on the overwhelmingly common no-edge call, which allocates
+/// nothing (an empty `Vec` is a null pointer).
+#[derive(Default, Debug)]
+#[must_use = "every edge page must be swept through the fast map (INV-W)"]
+pub(crate) struct WatchPageEdges(pub(crate) Vec<u32>);
+
 /// Generation-scoped decode marks for native stores. Marks are deliberately sticky until the
 /// decode cache is invalidated: an evicted line can leave a conservative false positive, but no
 /// live decoded byte can become unwatched. This type has no release operation so it cannot be
@@ -136,6 +146,22 @@ pub(crate) struct StickyDecodeCodeWatch {
     #[allow(clippy::vec_box)]
     // Box addresses remain stable while native code can observe them.
     recycled: Vec<Box<ChunkMask>>,
+    /// Slice 0 of the watched-page-bit design: how often a page crosses unwatched -> watched
+    /// (a new precise or coarse entry). This is the strict-sweep (E1) frequency that design's
+    /// go/no-go gate reads, and on doom it counts once per page per decode GENERATION, because
+    /// `clear()` empties the table and the re-decode wave re-inserts. Diagnostic only; not
+    /// reset by `clear()` (the generation churn is exactly what it exists to measure).
+    page_edges: u64,
+    /// Fast-map entries the E1 sweep invalidated for this watch's edges. `sweep_cleared` well
+    /// below `page_edges` is the lazy-edge design working (bits stay set across generations, so
+    /// re-mark edges find nothing to clear).
+    sweep_cleared: u64,
+    /// Strict E1 edge pages awaiting the fast-map sweep. It lives HERE, inside the boxed watch,
+    /// rather than as a `DecodeCache` field, because `DecodeCache` sits inline in `CpuGsw` and a
+    /// 24-byte `Vec` there moves the pinned `pending_flags` offset (the `fast_map_audit`
+    /// precedent). Drained by `CpuGsw::sweep_sticky_watch_edges` — synchronously after every
+    /// production decode insert, and as the native-entry backstop drain.
+    pending_edges: Vec<u32>,
 }
 
 impl Default for StickyDecodeCodeWatch {
@@ -147,24 +173,31 @@ impl Default for StickyDecodeCodeWatch {
             coarse: vec![0; PAGE_BITMAP_WORDS].into_boxed_slice(),
             coarse_pages: Vec::new(),
             recycled: Vec::new(),
+            page_edges: 0,
+            sweep_cleared: 0,
+            pending_edges: Vec::new(),
         }
     }
 }
 
 impl StickyDecodeCodeWatch {
-    pub(crate) fn mark_range(&mut self, physical: u32, len: u32) {
+    pub(crate) fn mark_range(&mut self, physical: u32, len: u32) -> WatchPageEdges {
+        let mut edges = WatchPageEdges::default();
         if len == 0 {
-            return;
+            return edges;
         }
         let mut chunk = physical & !((1 << CHUNK_SHIFT) - 1);
         let last = physical.wrapping_add(len - 1) & !((1 << CHUNK_SHIFT) - 1);
         loop {
-            self.mark_chunk(chunk);
+            if let Some(page) = self.mark_chunk(chunk) {
+                edges.0.push(page);
+            }
             if chunk == last {
                 break;
             }
             chunk = chunk.wrapping_add(1 << CHUNK_SHIFT);
         }
+        edges
     }
 
     pub(crate) fn table_base(&mut self) -> usize {
@@ -211,7 +244,10 @@ impl StickyDecodeCodeWatch {
         }
     }
 
-    fn mark_chunk(&mut self, physical: u32) {
+    /// Returns `Some(page)` when this mark crossed the page's unwatched -> watched edge — the
+    /// strict E1 signal the caller must sweep — and `None` for every re-mark of an
+    /// already-watched page.
+    fn mark_chunk(&mut self, physical: u32) -> Option<u32> {
         let page = physical >> PAGE_SHIFT;
         let chunk = (physical & 0xfff) >> CHUNK_SHIFT;
         let word = (chunk / u64::BITS) as usize;
@@ -219,7 +255,7 @@ impl StickyDecodeCodeWatch {
         let published = self.table.as_ref().map(|table| table[page as usize]);
         if let Some(pointer) = published.filter(|pointer| *pointer != 0) {
             if pointer == Self::coarse_pointer() {
-                return;
+                return None;
             }
             debug_assert_eq!(
                 self.precise
@@ -231,12 +267,12 @@ impl StickyDecodeCodeWatch {
             // the owner check precedes construction of the mutable raw borrow.
             let mask = unsafe { &mut *std::ptr::with_exposed_provenance_mut::<ChunkMask>(pointer) };
             mask[word] |= bit;
-            return;
+            return None;
         }
 
         if self.coarse_page(page) {
             debug_assert!(published.is_none());
-            return;
+            return None;
         }
 
         if let Some(mask) = self.precise.get_mut(&page) {
@@ -244,8 +280,13 @@ impl StickyDecodeCodeWatch {
             if let Some(table) = self.table.as_mut() {
                 table[page as usize] = std::ptr::from_mut(&mut **mask).expose_provenance();
             }
-            return;
+            return None;
         }
+
+        // Both remaining branches create the page's FIRST entry: the unwatched -> watched edge.
+        // The earlier returns (published pointer, coarse bit, live precise mask) are re-marks of
+        // an already-watched page and deliberately do not count and do not sweep.
+        self.page_edges += 1;
 
         let low_page = page < STICKY_LOW_PRECISE_PAGES;
         if low_page || self.precise_high_pages < MAX_STICKY_HIGH_PRECISE_PAGES {
@@ -262,7 +303,7 @@ impl StickyDecodeCodeWatch {
                 // Publish only after the owned mask contains the new mark.
                 table[page as usize] = pointer;
             }
-            return;
+            return Some(page);
         }
 
         let bitmap_word = (page >> 6) as usize;
@@ -273,6 +314,7 @@ impl StickyDecodeCodeWatch {
         if let Some(table) = self.table.as_mut() {
             table[page as usize] = Self::coarse_pointer();
         }
+        Some(page)
     }
 
     fn coarse_page(&self, page: u32) -> bool {
@@ -281,6 +323,46 @@ impl StickyDecodeCodeWatch {
 
     fn coarse_pointer() -> usize {
         std::ptr::from_ref(&ALL_CHUNKS_WATCHED).expose_provenance()
+    }
+
+    pub(crate) fn page_edges(&self) -> u64 {
+        self.page_edges
+    }
+
+    pub(crate) fn note_sweep_cleared(&mut self, cleared: u64) {
+        self.sweep_cleared += cleared;
+    }
+
+    pub(crate) fn sweep_cleared(&self) -> u64 {
+        self.sweep_cleared
+    }
+
+    /// Park a `mark_range` return until the owner's sweep drains it. Accumulation across several
+    /// marks is fine — the drain clears everything pending — as long as no native code runs in
+    /// between, which the production chokes (sweep-after-put, native-entry drain) guarantee.
+    pub(crate) fn stash_pending(&mut self, edges: WatchPageEdges) {
+        self.pending_edges.extend(edges.0);
+    }
+
+    pub(crate) fn take_pending(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_edges)
+    }
+
+    pub(crate) fn reset_edge_counter(&mut self) {
+        self.page_edges = 0;
+        self.sweep_cleared = 0;
+    }
+
+    /// Whether ANY granule of this physical page carries a sticky mark — the per-page fact the
+    /// fast-map `PAGE_WATCHED` bit caches. Falls back to the precise/coarse maps when the
+    /// published table does not exist yet (interpreter-only phase): a fill taken before the
+    /// first `table_base` call must still see marks, or the page would carry a clear bit with
+    /// no later edge to correct it.
+    pub(crate) fn page_is_watched(&self, page: u32) -> bool {
+        if let Some(table) = &self.table {
+            return table[page as usize] != 0;
+        }
+        self.coarse_page(page) || self.precise.contains_key(&page)
     }
 
     #[cfg(test)]
@@ -385,10 +467,21 @@ pub(crate) struct NativeCodeWatch {
     #[allow(clippy::vec_box)]
     // Box addresses remain stable while native code can observe them.
     recycled_pages: Vec<Box<WatchPage>>,
+    /// Slice 0 of the watched-page-bit design: `active_chunks` 0 -> nonzero page transitions
+    /// (the strict E2 edge — a fresh page or a retained inactive page reactivating). Refcounted
+    /// re-acquires on an active page are not edges, which is exactly the claim about install
+    /// churn the counter exists to check.
+    page_edges: u64,
+    /// The E3 lazy edge: `active_chunks` reaching zero (published pointer cleared). Under
+    /// block-retire churn each release that later re-acquires pairs with a `page_edges` entry.
+    page_releases: u64,
+    /// Fast-map entries the E2 sweep invalidated for this watch's edges.
+    sweep_cleared: u64,
 }
 
 impl NativeCodeWatch {
-    pub(crate) fn acquire_range(&mut self, physical: u32, len: u32) {
+    pub(crate) fn acquire_range(&mut self, physical: u32, len: u32) -> WatchPageEdges {
+        let mut edges = WatchPageEdges::default();
         self.for_each_chunk(physical, len, |watch, chunk| {
             let page = chunk >> PAGE_SHIFT;
             let index = ((chunk & 0xfff) >> CHUNK_SHIFT) as usize;
@@ -409,10 +502,11 @@ impl NativeCodeWatch {
                 None
             } else {
                 let table_initialized = published.is_some();
-                let (pages, recycled_pages, inactive_pages) = (
+                let (pages, recycled_pages, inactive_pages, page_edges) = (
                     &mut watch.pages,
                     &mut watch.recycled_pages,
                     &mut watch.inactive_pages,
+                    &mut watch.page_edges,
                 );
                 match pages.entry(page) {
                     Entry::Occupied(mut entry) => {
@@ -431,6 +525,8 @@ impl NativeCodeWatch {
                             let first = Self::acquire_chunk(page_watch, index);
                             debug_assert!(first, "retained code-watch page must reactivate once");
                             *inactive_pages -= 1;
+                            *page_edges += 1;
+                            edges.0.push(page);
                             Some(std::ptr::from_mut(&mut **page_watch).expose_provenance())
                         } else {
                             debug_assert_ne!(page_watch.active_chunks, 0);
@@ -447,6 +543,8 @@ impl NativeCodeWatch {
                         debug_assert!(page_watch.refs.iter().all(|count| *count == 0));
                         let first = Self::acquire_chunk(&mut page_watch, index);
                         debug_assert!(first);
+                        *page_edges += 1;
+                        edges.0.push(page);
                         let pointer = std::ptr::from_mut(&mut *page_watch).expose_provenance();
                         entry.insert(page_watch);
                         table_initialized.then_some(pointer)
@@ -461,6 +559,7 @@ impl NativeCodeWatch {
                 table[page as usize] = pointer;
             }
         });
+        edges
     }
 
     pub(crate) fn release_range(&mut self, physical: u32, len: u32) {
@@ -492,6 +591,7 @@ impl NativeCodeWatch {
                 Self::release_chunk(page_watch, index)
             };
             if remove_page {
+                watch.page_releases += 1;
                 if let Some(table) = watch.table.as_mut() {
                     // Clear the published pointer before retaining or freeing its boxed owner.
                     table[page as usize] = 0;
@@ -663,6 +763,42 @@ impl NativeCodeWatch {
 
     pub(crate) fn has_resident_pages(&self) -> bool {
         !self.pages.is_empty()
+    }
+
+    pub(crate) fn page_edges(&self) -> u64 {
+        self.page_edges
+    }
+
+    pub(crate) fn page_releases(&self) -> u64 {
+        self.page_releases
+    }
+
+    pub(crate) fn note_sweep_cleared(&mut self, cleared: u64) {
+        self.sweep_cleared += cleared;
+    }
+
+    pub(crate) fn sweep_cleared(&self) -> u64 {
+        self.sweep_cleared
+    }
+
+    pub(crate) fn reset_edge_counters(&mut self) {
+        self.page_edges = 0;
+        self.page_releases = 0;
+        self.sweep_cleared = 0;
+    }
+
+    /// Whether ANY chunk of this physical page holds a live block reference — the per-page fact
+    /// the fast-map `PAGE_WATCHED` bit caches. Falls back to the pages map when the published
+    /// table does not exist yet, for the sticky twin's reason: a fill before the first
+    /// `table_base` call must still see live refcounts. Retained INACTIVE pages
+    /// (`active_chunks == 0`) are unwatched.
+    pub(crate) fn page_is_watched(&self, page: u32) -> bool {
+        if let Some(table) = &self.table {
+            return table[page as usize] != 0;
+        }
+        self.pages
+            .get(&page)
+            .is_some_and(|watch| watch.active_chunks != 0)
     }
 
     fn chunk_watched(&self, physical: u32) -> bool {

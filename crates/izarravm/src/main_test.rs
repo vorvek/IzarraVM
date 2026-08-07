@@ -27,6 +27,10 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "brk_step",
     "cache_tier_lookups",
     "code_invalidations",
+    "code_watch_block_page_edges",
+    "code_watch_block_page_releases",
+    "code_watch_sticky_page_edges",
+    "code_watch_sweep_cleared",
     "data_direct_reads",
     "data_direct_writes",
     "data_slow_reads",
@@ -399,11 +403,19 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         last_read_page: u32::MAX,
     };
 
+    let code_watch_edges = izarravm_cpu::CodeWatchEdgeCounters {
+        sticky_page_edges: 126,
+        block_page_edges: 127,
+        block_page_releases: 128,
+        sweep_cleared_entries: 129,
+    };
+
     let report = bench::perf_counters_json(
         &perf,
         izarravm_cpu::PollSkipMemoryCounters::default(),
         fast_map_probe,
         fast_map_audit,
+        code_watch_edges,
     );
     let object = report.as_object().unwrap();
     let keys: Vec<_> = object.keys().map(String::as_str).collect();
@@ -433,6 +445,10 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         ("rmw_census_writes", 121),
         ("rmw_census_rmw_pairs", 122),
         ("rmw_census_enabled", 1),
+        ("code_watch_sticky_page_edges", 126),
+        ("code_watch_block_page_edges", 127),
+        ("code_watch_block_page_releases", 128),
+        ("code_watch_sweep_cleared", 129),
     ] {
         assert_eq!(
             object[key].as_u64(),
@@ -450,6 +466,7 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
             last_read_page: 0,
             ..Default::default()
         },
+        izarravm_cpu::CodeWatchEdgeCounters::default(),
     );
     let zero_object = zeros.as_object().unwrap();
     assert_eq!(zero_object.len(), PERF_COUNTER_KEYS.len());
@@ -589,6 +606,12 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         last_read_insn: _,
         last_read_page: _,
     } = izarravm_cpu::FastMapAuditCounters::default();
+    let izarravm_cpu::CodeWatchEdgeCounters {
+        sticky_page_edges: _,
+        block_page_edges: _,
+        block_page_releases: _,
+        sweep_cleared_entries: _,
+    } = izarravm_cpu::CodeWatchEdgeCounters::default();
 }
 
 #[test]

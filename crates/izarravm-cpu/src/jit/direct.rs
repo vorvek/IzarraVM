@@ -67,7 +67,7 @@ use super::code_watch::NATIVE_CHUNK_SHIFT;
     any(target_os = "windows", target_os = "linux")
 ))]
 use super::fast_map::{
-    NATIVE_KIND_MASK, NATIVE_MODE13_KIND, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER,
+    NATIVE_KIND_MASK, NATIVE_MODE13_KIND, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER, NATIVE_PAGE_WATCHED,
     NATIVE_PAGE_WRITABLE, NATIVE_RAM_KIND, NATIVE_UNAVAILABLE_BIAS, NativeMapBases,
 };
 
@@ -919,10 +919,12 @@ impl BlockCache {
         }
     }
 
-    /// Install bytes produced after `probe` returned `Compile`.
+    /// Install bytes produced after `probe` returned `Compile`. Strict E2 watch edges land in
+    /// `pending_watch_edges` for the caller's fast-map sweep (watched-page-bit design D4).
     pub(crate) fn install(
         &mut self,
         watch: &mut NativeCodeWatch,
+        pending_watch_edges: &mut Vec<u32>,
         compilation: &Compilation,
     ) -> Option<BlockId> {
         let span = compilation.span;
@@ -1015,7 +1017,11 @@ impl BlockCache {
             dynamic_successor: compilation.dynamic_successor,
             successors: compilation.successors,
         };
-        watch.acquire_range(span.key.physical, u32::from(span.guest_len));
+        pending_watch_edges.extend(
+            watch
+                .acquire_range(span.key.physical, u32::from(span.guest_len))
+                .0,
+        );
         if index == self.blocks.len() {
             self.blocks.push(block);
             self.segment_layouts.push(compilation.segment_layout);
@@ -1071,9 +1077,18 @@ impl BlockCache {
     }
 
     /// Prevent repeated compilation attempts for a block the emitter cannot handle.
-    pub(crate) fn reject(&mut self, watch: &mut NativeCodeWatch, span: RejectedSpan) {
+    pub(crate) fn reject(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        pending_watch_edges: &mut Vec<u32>,
+        span: RejectedSpan,
+    ) {
         if self.entries.get(&span.key) == Some(&BlockState::Seen) {
-            watch.acquire_range(span.key.physical, u32::from(span.guest_len));
+            pending_watch_edges.extend(
+                watch
+                    .acquire_range(span.key.physical, u32::from(span.guest_len))
+                    .0,
+            );
             self.entries.insert(span.key, BlockState::Rejected(span));
         }
     }
@@ -3591,165 +3606,8 @@ const fn segment_index(segment: SegmentIndex) -> usize {
     }
 }
 
-const GUEST_HOMES: [Reg; 8] = [
-    Reg::R8,
-    Reg::R9,
-    Reg::R10,
-    Reg::R11,
-    Reg::R12,
-    Reg::R13,
-    Reg::R14,
-    Reg::RBX,
-];
-pub(crate) const SAVED_HOST_REGS: [Reg; 7] = [
-    Reg::RBX,
-    Reg::RBP,
-    Reg::RDI,
-    Reg::R12,
-    Reg::R13,
-    Reg::R14,
-    Reg::R15,
-];
-const ARITH_FLAGS: u32 = crate::FLAG_CF
-    | crate::FLAG_PF
-    | crate::FLAG_AF
-    | crate::FLAG_ZF
-    | crate::FLAG_SF
-    | crate::FLAG_OF;
-const LOGIC_FLAGS: u32 = ARITH_FLAGS & !crate::FLAG_AF;
-
-#[cfg(target_os = "windows")]
-const CPU_ARG: Reg = Reg::RCX;
-#[cfg(not(target_os = "windows"))]
-const CPU_ARG: Reg = Reg::RDI;
-#[cfg(target_os = "windows")]
-const FLAGS_ARG: Reg = Reg::RDX;
-#[cfg(not(target_os = "windows"))]
-const FLAGS_ARG: Reg = Reg::RSI;
-#[cfg(target_os = "windows")]
-const QUOTA_ARG: Reg = Reg::R8;
-#[cfg(not(target_os = "windows"))]
-const QUOTA_ARG: Reg = Reg::RDX;
-#[cfg(target_os = "windows")]
-const EXIT_ARG: Reg = Reg::R9;
-#[cfg(not(target_os = "windows"))]
-const EXIT_ARG: Reg = Reg::RCX;
-
-// Base frame: 20 accounting and scratch slots at 8 bytes each, offsets 0 to
-// 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes.
-const BASE_STACK_LEN: u32 = 160;
-// One frame shape for every block, x87-bearing or not. A chained native
-// transfer jumps straight into a target block's body, skipping its
-// prologue, so the target's own epilogue always runs against whatever
-// frame the entering block's prologue built. If the two frame shapes
-// differ, that teardown pops the wrong bytes. On Windows the frame also
-// carries the saved-RSI slot below and the x87 XMM6-11 save area; RSI is
-// callee-saved there and doubles as the x87 tag-cache scratch register, and
-// none of the XMM6-11 registers are. On non-Windows RSI is not
-// callee-saved and there is no non-volatile XMM to save, so the frame is
-// just the base.
-#[cfg(target_os = "windows")]
-pub(crate) const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN + 8 + 6 * 16;
-#[cfg(not(target_os = "windows"))]
-pub(crate) const NATIVE_STACK_LEN: u32 = BASE_STACK_LEN;
-const STACK_QUOTA: i8 = 0;
-const STACK_ITERATIONS: i8 = 8;
-const STACK_RAM_BYTE_WRITES: i8 = 16;
-const STACK_RAM_DWORD_WRITES: i8 = 24;
-const STACK_MODE13_BYTE_WRITES: i8 = 32;
-const STACK_MODE13_DWORD_WRITES: i8 = 40;
-const STACK_MODE13_DIRTY_PAGES: i8 = 48;
-const STACK_EXIT: i8 = 56;
-const STACK_MODE13_BYTE_READS: i8 = 64;
-const STACK_MODE13_DWORD_READS: i8 = 72;
-const STACK_READ_KIND: i8 = 80;
-const STACK_WATCH_PAGE: i8 = STACK_READ_KIND;
-const STACK_WEIGHTED_FP_CLOCKS: i8 = 88;
-const STACK_INSTRUCTIONS: i8 = 96;
-const STACK_RAW_CLOCKS: i8 = 104;
-const STACK_BYTE_READS: i8 = 112;
-const STACK_DWORD_READS: i8 = 120;
-const STACK_ALU_ADDRESS_KIND: i32 = 128;
-const STACK_ALU_OLD_RESULT: i32 = 136;
-/// Where `emit_push_mem` parks the dword it read from the source operand, across the stack
-/// store's own address and kind path, which clobbers RAX, RCX, RDX and RDI. Those four are the
-/// whole scratch set: `GUEST_HOMES` is R8 to R14 plus RBX, R15 is the CPU pointer, RBP is the
-/// guest flag shadow, and RSI is host callee-saved and spilled only for x87 blocks.
-///
-/// Aliased onto the ALU slot deliberately. `PushMem` is not an ALU kind, the two never appear in
-/// one slot's emission, and every use of either is written and read inside a single slot. It must
-/// NOT be `STACK_READ_KIND`: `emit_code_watch_branch` writes `STACK_WATCH_PAGE`, which is the
-/// same slot, on the store's path.
-///
-/// 136 is outside disp8 range, so this slot is reached with the disp32 load and store forms.
-const STACK_PUSH_MEM_VALUE: i32 = STACK_ALU_OLD_RESULT;
-const STACK_ALU_FLAGS: i32 = 144;
-const STACK_SHIFT_COUNT: i32 = 152;
-// Beyond the base frame: the saved host RSI slot, then the x87 XMM6-11
-// save area right after it. Both Windows only, see NATIVE_STACK_LEN above.
-#[cfg(target_os = "windows")]
-const STACK_SAVED_RSI: i32 = BASE_STACK_LEN as i32;
-#[cfg(target_os = "windows")]
-const STACK_X87_XMM_BASE: i32 = STACK_SAVED_RSI + 8;
-// The saved-RSI slot and the XMM6-11 save area must both land inside the frame NATIVE_STACK_LEN
-// actually allocates. A wrong STACK_X87_XMM_BASE (a stale copy of an old constant, say) would
-// make the first XMM save overwrite the saved RSI slot and hand garbage RSI back to the Rust
-// caller, silently, since the frame-size test only checks the sub rsp / add rsp immediates
-// agree, not that the areas inside the frame do not collide.
-#[cfg(target_os = "windows")]
-const _: () = {
-    assert!(STACK_SAVED_RSI as u32 + 8 <= STACK_X87_XMM_BASE as u32);
-    assert!(
-        STACK_X87_XMM_BASE as u32 + emit::X87_NONVOLATILE_XMMS.len() as u32 * 16
-            <= NATIVE_STACK_LEN
-    );
-};
-
-/// The seven dynamic counter lanes, each pairing the emitter stack slot that accumulates it with
-/// the `NativeExit` field it is copied into on the way out.
-///
-/// The single source of truth for the SET and the ORDER of those lanes: `emit`'s prologue zeroes
-/// exactly these stack slots and `emit_return` copies exactly these slots out, so a lane can only
-/// ever be added or dropped in both places at once.
-///
-/// Every lane is unconditional. There was once a per-`DirectKind` mask that nominated a subset,
-/// but it never reached `emit_return`, which was always called with the all-bits constant; it was
-/// removed rather than wired up, because gating the copies would save about five stores per block
-/// exit — unmeasurable against this campaign's layout noise — on the hottest shared exit path,
-/// where a wrongly-cleared lane is a guest-visible bus-accounting error rather than a diagnostic
-/// one.
-fn dynamic_counter_fields() -> [(i8, usize); 7] {
-    [
-        (
-            STACK_RAM_BYTE_WRITES,
-            core::mem::offset_of!(NativeExit, ram_byte_writes),
-        ),
-        (
-            STACK_RAM_DWORD_WRITES,
-            core::mem::offset_of!(NativeExit, ram_dword_writes),
-        ),
-        (
-            STACK_MODE13_BYTE_WRITES,
-            core::mem::offset_of!(NativeExit, mode13_byte_writes),
-        ),
-        (
-            STACK_MODE13_DWORD_WRITES,
-            core::mem::offset_of!(NativeExit, mode13_dword_writes),
-        ),
-        (
-            STACK_MODE13_DIRTY_PAGES,
-            core::mem::offset_of!(NativeExit, mode13_dirty_pages),
-        ),
-        (
-            STACK_MODE13_BYTE_READS,
-            core::mem::offset_of!(NativeExit, mode13_byte_reads),
-        ),
-        (
-            STACK_MODE13_DWORD_READS,
-            core::mem::offset_of!(NativeExit, mode13_dword_reads),
-        ),
-    ]
-}
+mod frame;
+pub(crate) use frame::*;
 
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
@@ -3945,6 +3803,19 @@ pub(crate) fn sixteen_bit_admission_level() -> u8 {
 pub(crate) fn word_at_486_default() -> bool {
     static LEVEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| !matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("0")))
+}
+
+/// Whether emitted stores test the fast-map `PAGE_WATCHED` bit and skip the code-watch guard on
+/// unwatched pages (`dev_docs/2026-08-06-watched-page-bit-design.md` D3). Default ON — the
+/// slice's intended behavior; `IZARRAVM_WATCH_PAGE_BIT=0` forces the pre-slice
+/// unconditional-guard behavior (byte-identical at the seven Group A sites; Group B keeps two
+/// masking no-ops — see `MemoryEmitContext::watch_page_bit`), which is what makes a
+/// single-binary A/B possible (the `IZARRAVM_JIT16_486` precedent). A `JitState` FIELD rather than a bare `OnceLock` read at the
+/// emit sites, for `word_at_486`'s reason: a process-wide gate cannot be flipped per test, and
+/// both emission arms need unit coverage.
+pub(crate) fn watch_page_bit_default() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_WATCH_PAGE_BIT").as_deref(), Ok("0")))
 }
 
 /// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
@@ -4724,7 +4595,6 @@ fn compile_with_instruction_limit(
             break;
         }
     }
-
     if slots.is_empty()
         || (slots.len() < 3 && !slots.last().is_some_and(|slot| slot.kind.is_terminal()))
     {
@@ -4912,6 +4782,7 @@ fn compile_with_instruction_limit(
             map: map_bases,
             code_watch_tables,
             cpl3: memory_cpl3,
+            watch_page_bit: cpu.jit_direct.watch_page_bit,
             segments: segment_layout,
             address_wrap: if d {
                 emit::AddressWrap::None
@@ -5043,6 +4914,13 @@ struct MemoryEmitContext {
     map: Option<NativeMapBases>,
     code_watch_tables: Option<[usize; 2]>,
     cpl3: bool,
+    /// Whether store emitters test the fast-map PAGE_WATCHED bit and skip the code-watch guard
+    /// on unwatched pages (watched-page-bit design D3). From `JitState::watch_page_bit`. False
+    /// reproduces the pre-slice emission byte for byte at the seven Group A sites; the two
+    /// Group B sites keep their H6 kind-mask `and` on every arm (a behavioral no-op there,
+    /// kept unconditional so the arms cannot drift), so the off arm is semantics-identical but
+    /// two instructions per ALU/double-shift site larger than the pre-slice binary.
+    watch_page_bit: bool,
     segments: SegmentLayout,
     /// Whether a ModRM-derived effective address wraps at 64K.
     ///

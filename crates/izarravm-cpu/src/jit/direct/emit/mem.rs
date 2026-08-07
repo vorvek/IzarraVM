@@ -44,10 +44,22 @@ pub(super) fn emit_rmw_inc_dec(
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
     e.jnz(sides.unavailable_or_kind);
     e.place(valid);
+    if memory.watch_page_bit {
+        // D3's carry shape: RCX is dead here (the page index is recomputed after the join), so
+        // it carries the PAGE_WATCHED bit across the cpl3 permission check, which destroys the
+        // flags byte in RDX (H3).
+        e.mov_r32_r32(Reg::RCX, Reg::RDX);
+        e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_PAGE_WATCHED));
+    }
     emit_write_permission_check(e, memory.cpl3, sides.permission);
 
     // INC/DEC always changes its operand, so a watched chunk exits before any mutation.
     let unwatched = e.label();
+    if memory.watch_page_bit {
+        // The permission check clobbered host flags, so re-test the carried bit explicitly.
+        e.cmp_r32_imm32(Reg::RCX, 0);
+        e.jz(unwatched);
+    }
     emit_code_watch_branch(
         e,
         width,
@@ -170,9 +182,18 @@ fn emit_rmw_inc_dec_dword(
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
     e.jnz(sides.unavailable_or_kind);
+    if memory.watch_page_bit {
+        // D3's carry shape, as in the word arm above: RCX is recomputed after the join.
+        e.mov_r32_r32(Reg::RCX, Reg::RDX);
+        e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_PAGE_WATCHED));
+    }
     emit_write_permission_check(e, memory.cpl3, sides.permission);
 
     let unwatched = e.label();
+    if memory.watch_page_bit {
+        e.cmp_r32_imm32(Reg::RCX, 0);
+        e.jz(unwatched);
+    }
     emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
@@ -290,18 +311,31 @@ pub(super) fn emit_push_mem(
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
     e.jnz(stack_sides.unavailable_or_kind);
+    if memory.watch_page_bit {
+        // D3's carry shape: RCX is recomputed after the join either way.
+        e.mov_r32_r32(Reg::RCX, Reg::RDX);
+        e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_PAGE_WATCHED));
+    }
     emit_write_permission_check(e, memory.cpl3, stack_sides.permission);
-    emit_watched_store_guard(
+    let stack_unwatched = e.label();
+    if memory.watch_page_bit {
+        e.cmp_r32_imm32(Reg::RCX, 0);
+        e.jz(stack_unwatched);
+    }
+    emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
         map,
         code_watch_tables,
         stack_sides.code_watch,
+        stack_unwatched,
     );
+    e.place(stack_unwatched);
     // RCX MUST be recomputed here. `emit_code_watch_branch` leaves one of three watch-probe
-    // intermediates in it depending on which path reached the join, and none of them is the page
-    // index the bias lookup below needs. Without this the write-bias table is indexed with
-    // whichever intermediate the guest's address happened to produce.
+    // intermediates in it depending on which path reached the join (and the D3 skip path leaves
+    // the carried bit), and none of them is the page index the bias lookup below needs. Without
+    // this the write-bias table is indexed with whichever intermediate the guest's address
+    // happened to produce.
     // `emit_rmw_inc_dec_dword` recomputes immediately after its own watch join for this reason.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
@@ -435,17 +469,30 @@ pub(super) fn emit_call_mem(
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
     e.jnz(stack_sides.unavailable_or_kind);
+    if memory.watch_page_bit {
+        // D3's carry shape, exactly as `emit_push_mem`'s stack write.
+        e.mov_r32_r32(Reg::RCX, Reg::RDX);
+        e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_PAGE_WATCHED));
+    }
     emit_write_permission_check(e, memory.cpl3, stack_sides.permission);
-    emit_watched_store_guard(
+    let stack_unwatched = e.label();
+    if memory.watch_page_bit {
+        e.cmp_r32_imm32(Reg::RCX, 0);
+        e.jz(stack_unwatched);
+    }
+    emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
         map,
         code_watch_tables,
         stack_sides.code_watch,
+        stack_unwatched,
     );
+    e.place(stack_unwatched);
     // RCX MUST be recomputed: `emit_code_watch_branch` leaves one of three watch-probe
-    // intermediates in it, none of them the page index the bias lookup needs. `emit_push_mem` and
-    // `emit_rmw_inc_dec_dword` both recompute here for the same reason.
+    // intermediates in it (and the D3 skip path leaves the carried bit), none of them the page
+    // index the bias lookup needs. `emit_push_mem` and `emit_rmw_inc_dec_dword` both recompute
+    // here for the same reason.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);

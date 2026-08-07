@@ -98,18 +98,24 @@ fn map_direct_page(
         .direct_page(physical, BusAccessKind::DataRead)
         .unwrap()
         .unwrap();
-    assert!(
-        cpu.jit_fast_map
-            .populate_read(linear, physical, read, permissions)
-    );
+    assert!(cpu.jit_fast_map.populate_read(
+        linear,
+        physical,
+        read,
+        permissions,
+        cpu.physical_page_watched(physical)
+    ));
     let write = bus
         .direct_page(physical, BusAccessKind::DataWrite)
         .unwrap()
         .unwrap();
-    assert!(
-        cpu.jit_fast_map
-            .populate_write(linear, physical, write, permissions)
-    );
+    assert!(cpu.jit_fast_map.populate_write(
+        linear,
+        physical,
+        write,
+        permissions,
+        cpu.physical_page_watched(physical)
+    ));
 }
 
 fn install_block(cpu: &mut CpuGsw, linear: u32) -> jit::direct::CompiledBlock {
@@ -363,7 +369,17 @@ fn watched_double_shift_writes_exit_transactionally() {
             count,
             Some(RAM_TARGET),
         );
-        fixture.native.decode_cache.mark_code_range(RAM_TARGET, 4);
+        fixture.native.mark_decode_code_for_test(RAM_TARGET, 4);
+        // `prepare_flat` populated RAM_TARGET's fast-map entry before the mark above (bit was
+        // clear), so the mark's E1 sweep just invalidated it (populate-then-mark trap).
+        // Re-populate now that the mark is in effect, so the entry carries PAGE_WATCHED = 1.
+        map_direct_page(
+            &mut fixture.native,
+            &mut fixture.native_bus,
+            RAM_TARGET,
+            RAM_TARGET,
+            jit::fast_map::PagePermissions::UNPAGED,
+        );
         let registers = fixture.native.registers.clone();
         let pending = fixture.native.pending_flags;
         let memory = fixture.native_bus.memory.clone();

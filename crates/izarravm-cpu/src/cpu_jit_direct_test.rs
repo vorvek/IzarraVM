@@ -2140,6 +2140,7 @@ fn cpl3_fast_map_permission_side_exit_is_counted() {
             writable: true,
             user: false,
         },
+        cpu.physical_page_watched(0x300),
     ));
 
     let key = jit::direct::key_for(&cpu, READ_ENTRY, true).unwrap();
@@ -2380,10 +2381,32 @@ fn immediate_ram_store_watch_and_map_miss_side_exits_are_precise() {
         prime_direct_store_block(&mut native, &mut native_bus);
 
         if watched {
-            native.decode_cache.mark_code_range(TARGET, 1);
+            native.mark_decode_code_for_test(TARGET, 1);
             if expected_reason == Some(true) {
-                interp.decode_cache.mark_code_range(TARGET, 1);
+                interp.mark_decode_code_for_test(TARGET, 1);
             }
+            // The mark's E1 sweep invalidates the write-mapping `prime_direct_store_block` left
+            // for TARGET (populated before the page was watched, so its PAGE_WATCHED bit was
+            // clear). Re-populate it now that the mark is in effect, so the entry the test runs
+            // against carries bit = 1, matching what production ordering (mark before populate)
+            // would produce. The byte value is immaterial: it is overwritten with `initial` below.
+            let current = native
+                .read_memory_u8(
+                    &mut native_bus,
+                    SegmentIndex::Ds,
+                    TARGET,
+                    BusAccessKind::DataRead,
+                )
+                .expect("fixture re-warm read");
+            native
+                .write_memory_u8(
+                    &mut native_bus,
+                    SegmentIndex::Ds,
+                    TARGET,
+                    current,
+                    BusAccessKind::DataWrite,
+                )
+                .expect("fixture re-warm write");
         }
         if map_miss {
             native.jit_fast_map.invalidate_page(TARGET);
@@ -2758,6 +2781,11 @@ fn native_store_watch_covers_overlap_cross_chunk_and_same_value_cases() {
         bus.direct_pages_enabled = true;
         bus.direct_page_clocks = true;
         prime_direct_store_block(&mut cpu, &mut bus);
+        // Mark BEFORE populate: the mark's E1 sweep clears bit-clear entries, so populating
+        // first and marking after would immediately invalidate the entry this test depends on
+        // (populate-then-mark trap). Marking first means `physical_page_watched` below observes
+        // the mark and the populated entry carries the correct bit from the start.
+        cpu.mark_decode_code_for_test(marked, 1);
         let page = bus
             .direct_page(target, BusAccessKind::DataWrite)
             .unwrap()
@@ -2767,8 +2795,8 @@ fn native_store_watch_covers_overlap_cross_chunk_and_same_value_cases() {
             target,
             page,
             jit::fast_map::PagePermissions::UNPAGED,
+            cpu.physical_page_watched(target),
         ));
-        cpu.decode_cache.mark_code_range(marked, 1);
         let initial = if same_value { 0x1234_5678u32 } else { 0 };
         bus.memory[target as usize..target as usize + 4].copy_from_slice(&initial.to_le_bytes());
         bus.trace = BusTrace::default();
@@ -2908,7 +2936,22 @@ fn native_byte_store_watch_checks_chunk_and_same_value() {
         bus.direct_pages_enabled = true;
         bus.direct_page_clocks = true;
         prime_direct_store_block(&mut cpu, &mut bus);
-        cpu.decode_cache.mark_code_range(marked, 1);
+        cpu.mark_decode_code_for_test(marked, 1);
+        // `prime_direct_store_block` populated TARGET's write mapping before the mark above, so
+        // its PAGE_WATCHED bit was clear; the mark's E1 sweep then cleared the entry outright
+        // (populate-then-mark trap). Re-populate now that the mark is in effect so the entry the
+        // test runs against carries the current watched bit.
+        let page = bus
+            .direct_page(target, BusAccessKind::DataWrite)
+            .unwrap()
+            .unwrap();
+        assert!(cpu.jit_fast_map.populate_write(
+            target,
+            target,
+            page,
+            jit::fast_map::PagePermissions::UNPAGED,
+            cpu.physical_page_watched(target),
+        ));
         bus.memory[target as usize] = initial;
         bus.trace = BusTrace::default();
         arm_store_fixture(&mut cpu);
@@ -3244,20 +3287,26 @@ fn map_direct_page(
             .direct_page(physical, BusAccessKind::DataRead)
             .unwrap()
             .unwrap();
-        assert!(
-            cpu.jit_fast_map
-                .populate_read(linear, physical, page, permissions)
-        );
+        assert!(cpu.jit_fast_map.populate_read(
+            linear,
+            physical,
+            page,
+            permissions,
+            cpu.physical_page_watched(physical)
+        ));
     }
     if write {
         let page = bus
             .direct_page(physical, BusAccessKind::DataWrite)
             .unwrap()
             .unwrap();
-        assert!(
-            cpu.jit_fast_map
-                .populate_write(linear, physical, page, permissions)
-        );
+        assert!(cpu.jit_fast_map.populate_write(
+            linear,
+            physical,
+            page,
+            permissions,
+            cpu.physical_page_watched(physical)
+        ));
     }
 }
 
@@ -4930,7 +4979,7 @@ fn a_call_through_memory_whose_push_lands_on_watched_code_side_exits() {
     // the interpreter's own watch table, which is one of the two tables the emitted guard probes.
     // Marked on BOTH cpus so their invalidation work matches instruction for instruction.
     for cpu in [&mut native, &mut interp] {
-        cpu.decode_cache.mark_code_range(STACK_CELL, 4);
+        cpu.mark_decode_code_for_test(STACK_CELL, 4);
     }
 
     let side_exits = native.perf_counters().jit_direct_side_exits;
@@ -5030,6 +5079,7 @@ fn cpl3_call_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: true,
         },
+        native.physical_page_watched(0x800),
     ));
     let stack_cell = 0x1000u32.wrapping_sub(4);
     let stack_page = native_bus
@@ -5044,6 +5094,7 @@ fn cpl3_call_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: true,
         },
+        native.physical_page_watched(stack_cell),
     ));
 
     let key = jit::direct::key_for(&native, PHASE1_ENTRY, true).unwrap();
@@ -5125,6 +5176,7 @@ fn cpl3_call_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: false,
         },
+        cpu.physical_page_watched(0x300),
     ));
     // The STACK side must be explicitly PERMISSIVE, and that is load-bearing rather than setup
     // noise: without it the stack lane refuses too and the fixture cannot say which lane produced
@@ -5142,6 +5194,7 @@ fn cpl3_call_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: true,
         },
+        cpu.physical_page_watched(stack_cell),
     ));
 
     let key = jit::direct::key_for(&cpu, CALL_ENTRY, true).unwrap();
@@ -5482,6 +5535,7 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: true,
         },
+        native.physical_page_watched(0x800),
     ));
     let stack_addr = 0x1000u32.wrapping_sub(4);
     let stack_page = native_bus
@@ -5496,6 +5550,7 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: true,
         },
+        native.physical_page_watched(stack_addr),
     ));
 
     let key = jit::direct::key_for(&native, PHASE1_ENTRY, true).unwrap();
@@ -5584,6 +5639,7 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: false,
         },
+        cpu.physical_page_watched(0x300),
     ));
 
     // The STACK side must be explicitly PERMISSIVE, and this is the load-bearing half of the
@@ -5610,6 +5666,7 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
             writable: true,
             user: true,
         },
+        cpu.physical_page_watched(stack_addr),
     ));
 
     let key = jit::direct::key_for(&cpu, PUSH_ENTRY, true).unwrap();
@@ -6035,6 +6092,7 @@ fn cpl3_jmp_through_memory_permission_side_exit_is_counted() {
             writable: true,
             user: false,
         },
+        cpu.physical_page_watched(0x1300),
     ));
 
     let key = jit::direct::key_for(&cpu, JMP_ENTRY, true).unwrap();
@@ -6138,6 +6196,7 @@ fn cpl3_call_through_a_register_permission_side_exit_is_counted() {
             writable: true,
             user: false,
         },
+        cpu.physical_page_watched(stack_addr),
     ));
 
     let key = jit::direct::key_for(&cpu, CALL_ENTRY, true).unwrap();
@@ -6865,6 +6924,60 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
                     if u32::from(v) == vector
             ),
             "{segment:?}: and the classifier must name the same vector the machine delivered"
+        );
+    }
+}
+
+/// T4 of the watched-page-bit battery (the fast path really is fast): with the bit emission ON,
+/// an unwatched-by-bit store consults NOTHING — proven by deliberately constructing the
+/// incoherent state the strict-edge sweeps exist to prevent (a live bit-clear entry for a page
+/// the published tables say is watched, via a RAW `mark_range` that bypasses the sweep) and
+/// observing the store LAND natively with zero code-watch exits. The OFF arm emits the
+/// pre-slice unconditional guard against the identical state and takes the exit — which is what
+/// proves the ON arm's skip is the bit test, not an accident of the fixture.
+#[test]
+fn a_stale_clear_bit_skips_the_guard_and_the_off_arm_still_probes() {
+    let target = 0x4100u32;
+    for (bit_on, expected_watch_exits) in [(true, 0u64), (false, 1u64)] {
+        let mut cpu = fresh();
+        cpu.jit_direct.watch_page_bit = bit_on;
+        let mut bus = TestBus::with_memory(store_exit_program(target));
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        prime_direct_store_block(&mut cpu, &mut bus);
+        let page = bus
+            .direct_page(target, BusAccessKind::DataWrite)
+            .unwrap()
+            .unwrap();
+        assert!(cpu.jit_fast_map.populate_write(
+            target,
+            target,
+            page,
+            jit::fast_map::PagePermissions::UNPAGED,
+            cpu.physical_page_watched(target),
+        ));
+        assert!(!cpu.jit_fast_map.page_watched_bit_for_test(target));
+        // The raw mark: the published table gains the page, no sweep runs, the entry above
+        // keeps its clear bit. Production cannot reach this state — T1/T2 in
+        // `cpu_jit_watch_bit_test.rs` are what pin that — so constructing it is the only way
+        // to observe which of the two the emitted store believes.
+        let _ = cpu.decode_cache.native_code_watch.mark_range(target, 1);
+        bus.trace = BusTrace::default();
+        arm_store_fixture(&mut cpu);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+        let watch_exits = cpu.perf_counters().jit_direct_exit_code_watch;
+        drive(&mut cpu, &mut bus);
+        assert_eq!(
+            cpu.perf_counters().jit_direct_exit_code_watch - watch_exits,
+            expected_watch_exits,
+            "bit_on={bit_on}"
+        );
+        assert_eq!(
+            &bus.memory[target as usize..target as usize + 4],
+            &0x1234_5678u32.to_le_bytes(),
+            "bit_on={bit_on}: the store must land either way (natively or via the exit's re-run)"
         );
     }
 }

@@ -1910,6 +1910,111 @@ fn single_byte_f1_is_an_undefined_opcode() {
     );
 }
 
+/// End-to-end #UD delivery, the contract the raw-fault assertions above cannot see: a guest
+/// executing an undefined opcode must land in its own IVT[6] handler with the return frame's IP
+/// at the START of the invalid instruction, prefixes included. #UD is a FAULT (386 PRM 9.8), so
+/// the pushed CS:IP names the invalid instruction itself — that is what lets a real-mode handler
+/// inspect or emulate the opcode and IRET past it, and it is the same rewind contract the
+/// fault-site diagnostics were once one instruction late on.
+const UD_TRAP_CS: u16 = 0x0300;
+const UD_TRAP_IP: u16 = 0x0040;
+const UD_CODE_ORIGIN: u32 = 0x100;
+const UD_STACK_TOP: u32 = 0x8000;
+
+/// Run one `cycle` of `code` at `UD_CODE_ORIGIN` in real mode with IVT[6] pointed at the trap
+/// address. Delivery must not error `cycle`: the #DE battery in `cpu_test.rs` pins the same
+/// guest-deliverable-not-host-fatal rule for vector 0.
+fn ud_trap_cycle(code: &[u8], mode: GswMode) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0u8; 0x1_0000];
+    let origin = UD_CODE_ORIGIN as usize;
+    memory[origin..origin + code.len()].copy_from_slice(code);
+    // IVT[6] (bytes 24..28): IP then CS, little-endian.
+    memory[24..26].copy_from_slice(&UD_TRAP_IP.to_le_bytes());
+    memory[26..28].copy_from_slice(&UD_TRAP_CS.to_le_bytes());
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(mode);
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.load_segment_real(SegmentIndex::Ss, 0);
+    cpu.registers.eip = UD_CODE_ORIGIN;
+    cpu.registers.set_esp(UD_STACK_TOP);
+    let mut bus = TestBus::with_memory(memory);
+    let outcome = cpu
+        .cycle(&mut bus)
+        .expect("a delivered #UD must not error `cycle`");
+    assert!(!outcome.halted);
+    (cpu, bus)
+}
+
+fn assert_ud_frame(cpu: &CpuGsw, bus: &TestBus, faulting_ip: u16) {
+    assert_eq!(
+        cpu.registers.cs().selector,
+        UD_TRAP_CS,
+        "CS retargeted at IVT[6]"
+    );
+    assert_eq!(
+        cpu.registers.eip,
+        u32::from(UD_TRAP_IP),
+        "IP retargeted at IVT[6]"
+    );
+    // Real-mode interrupt frame, three words: FLAGS at SP+4, CS at SP+2, IP at SP.
+    assert_eq!(
+        cpu.registers.esp(),
+        UD_STACK_TOP - 6,
+        "three-word real-mode frame pushed"
+    );
+    let sp = (UD_STACK_TOP - 6) as usize;
+    let pushed_ip = u16::from_le_bytes([bus.memory[sp], bus.memory[sp + 1]]);
+    let pushed_cs = u16::from_le_bytes([bus.memory[sp + 2], bus.memory[sp + 3]]);
+    assert_eq!(pushed_cs, 0, "pushed CS is the faulting code segment");
+    assert_eq!(
+        pushed_ip, faulting_ip,
+        "#UD is a fault: the pushed IP must be the invalid instruction's START"
+    );
+}
+
+#[test]
+fn an_unmapped_two_byte_opcode_delivers_ud_through_ivt6_at_the_instruction_start() {
+    // `66 0F 0A`: an operand-size prefix ahead of an unmapped 0F byte (the same representative
+    // byte the raw-fault test above uses). The prefix is the point: decode consumed it before
+    // the second-byte fetch, so this pins the rewind across the prefix AND both opcode bytes,
+    // through the execute-time TwoByteFallback #UD path.
+    let (cpu, bus) = ud_trap_cycle(&[0x66, 0x0f, 0x0a, 0x90], GswMode::Gsw586);
+    assert_ud_frame(&cpu, &bus, UD_CODE_ORIGIN as u16);
+}
+
+#[test]
+fn a_never_gated_two_byte_opcode_delivers_the_same_ud_from_the_decode_gate() {
+    // `0F 05` is `IsaGeneration::Never`, so its #UD comes from `check_two_byte_isa_gate` at
+    // DECODE time, not from the fallback executor. Both stages must be guest-indistinguishable:
+    // same vector, same frame, same rewind.
+    let (cpu, bus) = ud_trap_cycle(&[0x0f, 0x05, 0x90], GswMode::Gsw586);
+    assert_ud_frame(&cpu, &bus, UD_CODE_ORIGIN as u16);
+}
+
+#[test]
+fn an_mmx_opcode_uds_on_the_486_persona_and_executes_on_the_586() {
+    // EMMS (`0F 77`). On the 486 persona the shared decode gate (`IsaGeneration::P55c`) must
+    // deliver the same guest-visible #UD as an unmapped byte — this is how era software probes
+    // for MMX without CPUID.
+    let (cpu, bus) = ud_trap_cycle(&[0x0f, 0x77, 0x90], GswMode::Gsw486);
+    assert_ud_frame(&cpu, &bus, UD_CODE_ORIGIN as u16);
+
+    // Control on the same bytes: the 586 persona is the P55C contract, so EMMS EXECUTES. Without
+    // this arm, a gate that #UD'd MMX everywhere would pass the assertion above.
+    let (cpu, _bus) = ud_trap_cycle(&[0x0f, 0x77, 0x90], GswMode::Gsw586);
+    assert_eq!(
+        cpu.registers.cs().selector,
+        0,
+        "EMMS must execute, not trap"
+    );
+    assert_eq!(
+        cpu.registers.eip,
+        UD_CODE_ORIGIN + 2,
+        "EIP advanced past EMMS"
+    );
+}
+
 #[test]
 fn cpuid_is_available_only_on_the_586_persona() {
     let code = [0x0f, 0xa2];

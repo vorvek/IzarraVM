@@ -99,12 +99,16 @@ impl CpuGsw {
         let Some(permissions) = self.fast_map_permissions(linear, physical, write) else {
             return false;
         };
+        // The PAGE_WATCHED bit's value at fill time (watched-page-bit design D2). Computed here,
+        // at the single production populate site, because the watches live on `decode_cache` and
+        // `jit_direct` and the fast map cannot see them.
+        let page_watched = self.physical_page_watched(physical);
         if write {
             self.jit_fast_map
-                .populate_write(linear, physical, page, permissions)
+                .populate_write(linear, physical, page, permissions, page_watched)
         } else {
             self.jit_fast_map
-                .populate_read(linear, physical, page, permissions)
+                .populate_read(linear, physical, page, permissions, page_watched)
         }
     }
 

@@ -325,6 +325,16 @@ impl CpuGsw {
             let inserted = self
                 .decode_cache
                 .put(lin, insn, cs.default_size_32, physical);
+            // E1 sweep, synchronous with the mark (watched-page-bit design D4): `put` may have
+            // crossed a page's unwatched -> watched edge, and a native block's CALLOUT can be
+            // the caller here, returning into emitted code that keeps storing — so the
+            // bit-clear fast-map entries must be gone before this function returns.
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            self.sweep_sticky_watch_edges();
             #[cfg(feature = "jit")]
             if let Some(slot) = inserted.evicted_slot {
                 if self.decode_cache.line_count() == self.jit_direct.decode_slot_count() {

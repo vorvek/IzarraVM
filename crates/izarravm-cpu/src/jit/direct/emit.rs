@@ -2385,20 +2385,18 @@ fn emit_x87_memory_pointer(
     e.place(valid);
 
     if write {
-        emit_write_permission_check(e, memory.cpl3, sides.permission);
-        emit_write_pointer(e, map, sides.unavailable_or_kind);
-        let unwatched = e.label();
-        emit_code_watch_branch(
+        // The same two D3 shapes as `emit_store`'s arms; RCX is the live page index the
+        // helper's re-read consumes.
+        emit_store_write_resolve(
             e,
             width,
             map,
             memory
                 .code_watch_tables
                 .expect("x87 store has code-watch tables"),
-            sides.code_watch,
-            unwatched,
+            memory,
+            sides,
         );
-        e.place(unwatched);
     } else {
         emit_read_permission_check(e, memory.cpl3, sides.permission);
         emit_read_pointer(e, map, sides.unavailable_or_kind);
@@ -2845,6 +2843,16 @@ fn emit_alu_mem_dest(
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
     e.jnz(sides.unavailable_or_kind);
     e.place(valid);
+    // D3 Group B (review F1): the flags byte is DEAD in RDX by the guard position below — RDX
+    // holds the ALU result candidate there, and testing THAT for bit 6 would skip SMC detection
+    // on guest data. So the bit rides beside the kind in the `STACK_ALU_ADDRESS_KIND` pack.
+    // cpl0 only: the fold consumes RDX, which the cpl3 permission check needs first, and no
+    // scratch survives to carry it (H3) — cpl3 blocks keep the unconditional guard.
+    let watch_fast = memory.watch_page_bit && !memory.cpl3;
+    if watch_fast {
+        e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
+        e.or_r32_r32(Reg::RDI, Reg::RDX);
+    }
     emit_write_permission_check(e, memory.cpl3, sides.permission);
 
     // Save the effective address and page kind before ADC/SBB load host flags into RAX. Nothing
@@ -2868,7 +2876,16 @@ fn emit_alu_mem_dest(
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     emit_write_pointer(e, map, sides.unavailable_or_kind);
+    let skip_guard = e.label();
+    if watch_fast {
+        // The candidate lives in the pending slots, not RDX, so the pack reload may clobber it.
+        e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
+        e.shift_r64_imm8(5, Reg::RDX, 32);
+        e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
+        e.jz(skip_guard);
+    }
     emit_watched_alu_result_guard(e, width, map, code_watch_tables, sides.code_watch);
+    e.place(skip_guard);
 
     emit_commit_alu_candidate(e, op, source, width);
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
@@ -2886,6 +2903,10 @@ fn emit_alu_mem_dest(
 
     e.load_r64_disp32(Reg::RCX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.shift_r64_imm8(5, Reg::RCX, 32);
+    // Unconditional kind masking (H6): the pack's upper word may carry PAGE_WATCHED beside the
+    // kind, and an unmasked equality compare would misroute every watched mode-13 ALU dest.
+    // Emitted on the bit-off arm too — a no-op there, and immune to the arms drifting apart.
+    e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_KIND_MASK));
     let mode13 = e.label();
     let done = e.label();
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
@@ -2960,6 +2981,13 @@ fn emit_double_shift_mem(
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
     e.jnz(sides.unavailable_or_kind);
     e.place(valid);
+    // D3 Group B, exactly as `emit_alu_mem_dest`: the candidate owns RDX at the guard position,
+    // so the bit rides the `STACK_ALU_ADDRESS_KIND` pack; cpl0 only (H3).
+    let watch_fast = memory.watch_page_bit && !memory.cpl3;
+    if watch_fast {
+        e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
+        e.or_r32_r32(Reg::RDI, Reg::RDX);
+    }
     emit_write_permission_check(e, memory.cpl3, sides.permission);
 
     // Save the effective address and page kind before computing the candidate. Architectural
@@ -2977,6 +3005,13 @@ fn emit_double_shift_mem(
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     emit_write_pointer(e, map, sides.unavailable_or_kind);
+    let skip_guard = e.label();
+    if watch_fast {
+        e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
+        e.shift_r64_imm8(5, Reg::RDX, 32);
+        e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
+        e.jz(skip_guard);
+    }
     emit_watched_alu_result_guard(
         e,
         MemoryWidth::Dword,
@@ -2984,6 +3019,7 @@ fn emit_double_shift_mem(
         code_watch_tables,
         sides.code_watch,
     );
+    e.place(skip_guard);
 
     emit_commit_double_shift_flags(e, count);
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
@@ -2995,6 +3031,8 @@ fn emit_double_shift_mem(
 
     e.load_r64_disp32(Reg::RCX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.shift_r64_imm8(5, Reg::RCX, 32);
+    // Unconditional kind masking (H6), as in `emit_alu_mem_dest`.
+    e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_KIND_MASK));
     let mode13 = e.label();
     let done = e.label();
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
@@ -3208,9 +3246,7 @@ fn emit_store(
     e.jmp(sides.unavailable_or_kind);
 
     e.place(ram);
-    emit_write_permission_check(e, memory.cpl3, sides.permission);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
-    emit_watched_store_guard(e, width, map, code_watch_tables, sides.code_watch);
+    emit_store_write_resolve(e, width, map, code_watch_tables, memory, sides);
     emit_store_value(e, source, width);
     match width {
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
@@ -3225,9 +3261,7 @@ fn emit_store(
     e.jmp(done);
 
     e.place(mode13);
-    emit_write_permission_check(e, memory.cpl3, sides.permission);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
-    emit_watched_store_guard(e, width, map, code_watch_tables, sides.code_watch);
+    emit_store_write_resolve(e, width, map, code_watch_tables, memory, sides);
     emit_store_value(e, source, width);
     match width {
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES),
@@ -3239,6 +3273,55 @@ fn emit_store(
     }
     emit_mode13_dirty_bit(e, map);
     e.place(done);
+}
+
+/// The permission check + write-pointer resolve + code-watch consultation shared by both of
+/// `emit_store`'s page-kind arms (and the x87 store pointer), in the two D3 emission shapes.
+///
+/// With the watched-page bit ON, the hot path RE-READS the flags byte through the page index
+/// still live in RCX and skips the full guard when `PAGE_WATCHED` is clear. Re-reading (one
+/// imm64 + one L1-hot byte load) rather than carrying the byte across the permission check is
+/// deliberate twice over: all four scratch registers are occupied at these sites, and the
+/// carry-by-duplication shape this replaced (a watched arm re-running the check + resolve) grew
+/// store-dense blocks past the one-host-page install limit — the doom drawcolumn fixture caught
+/// it. It is also what makes the cpl3 arm uniform (H3): the byte is re-read AFTER the check
+/// destroys RDX, so there is nothing to preserve. With the bit OFF this reproduces the
+/// pre-slice sequence exactly.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_store_write_resolve(
+    e: &mut Encoder,
+    width: MemoryWidth,
+    map: NativeMapBases,
+    code_watch_tables: [usize; 2],
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
+    emit_write_permission_check(e, memory.cpl3, sides.permission);
+    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    if memory.watch_page_bit {
+        // RCX is the page index from the kind classify — the permission check never touches it
+        // and the pointer resolve only reads it. RDX is dead (the store value loads later, and
+        // the guard re-derives its own scratches).
+        let unwatched = e.label();
+        e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+        e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+        e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
+        e.jz(unwatched);
+        emit_code_watch_branch(
+            e,
+            width,
+            map,
+            code_watch_tables,
+            sides.code_watch,
+            unwatched,
+        );
+        e.place(unwatched);
+    } else {
+        emit_watched_store_guard(e, width, map, code_watch_tables, sides.code_watch);
+    }
 }
 
 fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
