@@ -3665,6 +3665,14 @@ mod jit_r15_tables;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_store_bias_test.rs"]
+mod jit_store_bias;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_compile_outcome_test.rs"]
 mod jit_compile_outcome;
 

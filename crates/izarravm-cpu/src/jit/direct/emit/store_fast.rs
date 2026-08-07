@@ -23,14 +23,14 @@
 
 use super::*;
 
-use crate::jit::fast_map::{
-    NATIVE_STORE_BIAS_MODE13, NATIVE_STORE_BIAS_SUPERVISOR, NATIVE_STORE_BIAS_TAG_MASK,
-};
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 use super::mem::table_slot_offset;
+use crate::jit::fast_map::{
+    NATIVE_STORE_BIAS_MODE13, NATIVE_STORE_BIAS_SUPERVISOR, NATIVE_STORE_BIAS_TAG_MASK,
+};
 
 /// GPR store width index into the stub slot layout: byte 0, word 1, dword 2.
 #[cfg(all(
@@ -72,7 +72,13 @@ fn x87_width_index(width: MemoryWidth) -> usize {
 fn emit_store_bias_probe(e: &mut Encoder, map: NativeMapBases) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(e, true, TABLE_SLOT_STORE_BIASES, map.store_biases(), Reg::RDI);
+    emit_table_base(
+        e,
+        true,
+        TABLE_SLOT_STORE_BIASES,
+        map.store_biases(),
+        Reg::RDI,
+    );
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
 }
 
@@ -364,7 +370,7 @@ fn append_stub(
     stub: Vec<u8>,
 ) {
     // 16-byte-align each entry point; the filler is int3 so a stray fall-through faults loudly.
-    while *cursor % 16 != 0 {
+    while !(*cursor).is_multiple_of(16) {
         code.push(0xCC);
         *cursor += 1;
     }

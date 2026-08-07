@@ -135,7 +135,12 @@ pub(crate) struct JitState {
 /// single-binary A/B, deleted after soak).
 fn one_lookup_store_default() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("IZARRAVM_ONE_LOOKUP_STORE").as_deref(), Ok("0")))
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("IZARRAVM_ONE_LOOKUP_STORE").as_deref(),
+            Ok("0")
+        )
+    })
 }
 
 impl JitState {

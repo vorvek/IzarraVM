@@ -1229,18 +1229,12 @@ fn pop_and_jmp_m64_disp32_known_bytes() {
     // pop qword [rsp + 128] -- 8F /0; mod=10,rm=rsp needs SIB 0x24; disp32 128.
     let mut e = Encoder::new();
     e.pop_m64_disp32(Reg::RSP, 128);
-    assert_eq!(
-        e.finish(),
-        vec![0x8F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]
-    );
+    assert_eq!(e.finish(), vec![0x8F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]);
 
     // jmp qword [rsp + 128] -- FF /4; same addressing.
     let mut e = Encoder::new();
     e.jmp_m64_disp32(Reg::RSP, 128);
-    assert_eq!(
-        e.finish(),
-        vec![0xFF, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00]
-    );
+    assert_eq!(e.finish(), vec![0xFF, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00]);
 }
 
 #[test]

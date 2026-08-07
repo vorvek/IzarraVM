@@ -719,7 +719,10 @@ impl FastMap {
     #[cfg(test)]
     pub(crate) fn force_fast_store_bias_for_test(&mut self, linear: u32) {
         let index = (linear >> PAGE_SHIFT) as usize;
-        let storage = self.storage.as_mut().expect("entry populated before forcing");
+        let storage = self
+            .storage
+            .as_mut()
+            .expect("entry populated before forcing");
         let flags = storage.flags[index] & !PAGE_WATCHED;
         storage.store_biases[index] = derive_store_bias(flags, storage.write_biases[index]);
     }

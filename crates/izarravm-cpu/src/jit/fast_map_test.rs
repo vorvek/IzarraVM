@@ -528,4 +528,3 @@ fn a_same_mapping_refill_with_dropped_permissions_rederives_the_bias() {
         "the read refill's fresh permissions must reach the store bias (H2)"
     );
 }
-
