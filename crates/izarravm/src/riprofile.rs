@@ -20,10 +20,11 @@
 //!
 //! Resolution is nearest-PRECEDING-symbol: an address past a function's true
 //! end still inherits that function's name, so hot symbol-poor bytes inflate
-//! whatever small function happens to sit before them. The BEYOND-EXTENT table
-//! lists every sampled address whose displacement clears the symbol's recorded
-//! size, with raw RVAs, so that failure announces itself instead of minting a
-//! plausible-looking hot row.
+//! whatever small function happens to sit before them. The report header
+//! always carries the beyond-extent sample share (so a healthy report is
+//! distinguishable from one produced before this check existed), and the
+//! BEYOND-EXTENT table shows the top flagged addresses with raw RVAs, so that
+//! failure announces itself instead of minting a plausible-looking hot row.
 //!
 //! `IZARRAVM_RIP_PROFILE_DELAY_SECS=<n>` (default 0) delays sampling to skip
 //! BIOS/DOS boot and demo load.
@@ -210,6 +211,7 @@ impl Sampler {
         }
 
         let process = unsafe { GetCurrentProcess() };
+        let module_base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
         unsafe {
             // NO `SYMOPT_DEFERRED_LOADS`: deferred modules report `SymType = 5`
             // (SymDeferred) and only try to find a PDB on the first query, so a
@@ -239,16 +241,15 @@ impl Sampler {
             // (ERROR_INVALID_ADDRESS). That is what made the whole report land in
             // the "<no symbol>" bucket, which reads as "all JIT arena" and is the
             // exact opposite of the truth.
-            let base = GetModuleHandleW(std::ptr::null());
             let mut info: IMAGEHLP_MODULEW64 = mem::zeroed();
             info.SizeOfStruct = mem::size_of::<IMAGEHLP_MODULEW64>() as u32;
-            if SymGetModuleInfoW64(process, base as u64, &mut info) != 0 {
+            if SymGetModuleInfoW64(process, module_base, &mut info) != 0 {
                 // SymType 3 is SymPdb. Anything else means the report's
                 // "<no symbol>" bucket is unresolved addresses, not native code,
                 // so say so rather than letting it be misread.
                 eprintln!(
-                    "riprofile: exe module base {:#x}, SymType={} (3=Pdb), lines={}",
-                    base as u64, info.SymType, info.LineNumbers
+                    "riprofile: exe module base {module_base:#x}, SymType={} (3=Pdb), lines={}",
+                    info.SymType, info.LineNumbers
                 );
                 if info.SymType != 3 {
                     eprintln!(
@@ -264,7 +265,6 @@ impl Sampler {
             }
         }
 
-        let module_base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
         let mut resolved: HashMap<u64, (String, String, String)> = HashMap::new();
         // Counted, not sampled: `counts` is a HashMap, so "the first address that
         // failed" was whichever one iteration happened to reach first, and a
@@ -314,9 +314,11 @@ impl Sampler {
         report.push_str(&format!(
             "riprofile report — {total} samples at {SAMPLE_INTERVAL:?} \
              ({} unique addresses, {unresolved_addrs} unresolved carrying \
-             {:.2}% of samples)\n\n",
+             {:.2}% of samples, {:.2}% of samples beyond their symbol's \
+             recorded extent)\n\n",
             counts.len(),
             unresolved_samples as f64 * 100.0 / total.max(1) as f64,
+            beyond_samples as f64 * 100.0 / total.max(1) as f64,
         ));
         report.push_str(&render_tables(&counts, &resolved));
 
@@ -325,8 +327,11 @@ impl Sampler {
             report.push_str(&format!(
                 "== BEYOND-EXTENT — {:.2}% of samples sit past the recorded end of the \
                  symbol the tables above attribute them to; those rows are guesses ==\n\
-                 (rva = address - exe base {module_base:#x}, for llvm-pdbutil)\n",
+                 (top {} of {} flagged addresses; rva = address - exe base \
+                 {module_base:#x}, for llvm-pdbutil)\n",
                 beyond_samples as f64 * 100.0 / total.max(1) as f64,
+                beyond_rows.len().min(40),
+                beyond_rows.len(),
             ));
             for (n, rip, func, displacement, size) in beyond_rows.iter().take(40) {
                 report.push_str(&format!(
