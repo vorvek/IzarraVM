@@ -34,16 +34,45 @@ fn forward_slashes_are_accepted_too() {
 
 #[test]
 fn resolve_symbol_reports_a_nonzero_extent_for_a_live_function() {
-    use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitializeW};
-    use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // The beyond-extent guard treats a zero recorded size as "no extent, proves
     // nothing", so if this toolchain's PDBs ever stop carrying function extents
     // the guard is silently disarmed. Resolve a function from this very test
-    // binary and pin that the Size plumbing populates. This is the only dbghelp
-    // user in the test process (dbghelp is not thread-safe across concurrent
-    // sessions), and it cleans up its session.
+    // binary and pin that the Size plumbing populates.
     //
+    // In a CHILD PROCESS with one test thread: `SymInitializeW(fInvadeProcess
+    // = 1)` walks every loaded module under the loader lock while the parent
+    // harness's other threads load and unload DLLs (the audio-backend tests
+    // do), and dbghelp is not thread-safe — CI took a STATUS_ACCESS_VIOLATION
+    // with this test in flight beside the gui::session battery. The profiler
+    // itself never has this problem: it initializes dbghelp at report time,
+    // after the emulation thread has stopped.
+    if std::env::var_os("IZARRAVM_RIPROFILE_EXTENT_CHILD").is_some() {
+        resolve_extent_in_this_process();
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe path");
+    let output = std::process::Command::new(exe)
+        .args([
+            "riprofile::tests::resolve_symbol_reports_a_nonzero_extent_for_a_live_function",
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("IZARRAVM_RIPROFILE_EXTENT_CHILD", "1")
+        .output()
+        .expect("spawn the extent child");
+    assert!(
+        output.status.success(),
+        "extent child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn resolve_extent_in_this_process() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitializeW};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // The search path must be the exe's own directory, same as
     // `stop_and_report`: dbghelp's NULL default (CWD + _NT_SYMBOL_PATH) does
     // not contain the test binary's PDB, and this test fails from a NULL path.
