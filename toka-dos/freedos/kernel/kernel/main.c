@@ -26,10 +26,10 @@
 /* write to the Free Software Foundation, Inc.,                 */
 /* 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA.     */
 /****************************************************************/
-/* Modified by the Toka-DOS project, 2026: signon() prints toka_banner (the Toka-DOS
-   product line) instead of the FreeDOS copyright block; the full FreeDOS/Villani
-   copyright + GPL now ships in C:\LICENSE.TXT (see scripts/license_txt.py), which the
-   banner points to. */
+/* Modified by the Toka-DOS project, 2026: signon() paints a rainbow Toka-DOS boot
+   logo straight into B800:0 text RAM and prints a welcome box (build number, compile
+   date, copyright) instead of the FreeDOS copyright block; the full FreeDOS/Villani
+   copyright + GPL still ships in C:\LICENSE.TXT (see scripts/license_txt.py). */
 
 #include "portab.h"
 #include "init-mod.h"
@@ -41,9 +41,33 @@ static BYTE *mainRcsId =
     "$Id: main.c 1699 2012-01-16 20:45:44Z perditionc $";
 #endif
 
-static char toka_banner[] =
-    "\r\nToka-DOS 3.0 (C) 1997 General Simulation Works - tongue firmly in cheek.\n"
-    "See C:\\LICENSE.TXT for more.\n";
+/* Boot logo, drawn by signon() straight into B800:0 text RAM with a static
+   diagonal rainbow attribute. Substitution glyphs keep the source ASCII:
+   '%' = 0xB1 (medium shade), '#' = 0xDB (full block), ']' = 0xDD (left half). */
+static char toka_logo_r0[] = " %####### %#########  %######       %# %###     %##          %#";
+static char toka_logo_r1[] = "       %# %###      %###     %##    %# %###    %##          %###  %#####%##%##";
+static char toka_logo_r2[] = "       %# %###   %# %###       %#]  %# %###   %##          %#####   %#  %#%#%#";
+static char toka_logo_r3[] = "       %# %###  %## %###        %#] %# %###  %##            %#####  %#  %#  %#";
+static char toka_logo_r4[] = "       %# %###  %## %###        %## %# %### %##          %#  %#####";
+static char toka_logo_r5[] = "       %# %###  %## %###        %## %# %###%##          %#%#  %#####";
+static char toka_logo_r6[] = "       %# %###  %## %###        %#] %# %#####]         %#  %#  %#####";
+static char toka_logo_r7[] = "       %# %###   %# %###       %#]  %# %### %##       %#    %#  %#####";
+static char toka_logo_r8[] = "       %# %###      %###     %##    %# %###   %##    %#########  %#####";
+static char toka_logo_r9[] = "       %# %###        %######]      %# %###     %## %#        %#  %#####";
+
+/* Every row must fit 80 columns (81 bytes with NUL): a negative array size
+   is the loudest guard C89 offers. */
+#define TOKA_ROW_FITS(n) \
+  typedef char toka_logo_row_##n##_fits[(sizeof(toka_logo_r##n) <= 81) ? 1 : -1]
+TOKA_ROW_FITS(0); TOKA_ROW_FITS(1); TOKA_ROW_FITS(2); TOKA_ROW_FITS(3);
+TOKA_ROW_FITS(4); TOKA_ROW_FITS(5); TOKA_ROW_FITS(6); TOKA_ROW_FITS(7);
+TOKA_ROW_FITS(8); TOKA_ROW_FITS(9);
+
+static char *toka_logo[] = {
+  toka_logo_r0, toka_logo_r1, toka_logo_r2, toka_logo_r3, toka_logo_r4,
+  toka_logo_r5, toka_logo_r6, toka_logo_r7, toka_logo_r8, toka_logo_r9,
+};
+#define TOKA_LOGO_ROWS (sizeof(toka_logo) / sizeof(toka_logo[0]))
 
 struct _KernelConfig InitKernelConfig BSS_INIT({0});
 
@@ -415,37 +439,81 @@ STATIC VOID FsConfig(VOID)
   /* init_call_init_buffers(); done from CONFIG.C   */
 }
 
+STATIC VOID signon_box_edge(int left, int right)
+{
+  int i;
+  printf("%c", left);
+  for (i = 0; i < 77; i++)
+    printf("%c", 0xC4);
+  printf("%c\n", right);
+}
+
+STATIC VOID signon_box_text(char *s)
+{
+  int col = 2;
+  printf("%c ", 0xB3);
+  for (; *s && col < 78; s++, col++)   /* clamp: overlong text truncates, never shears the frame */
+    printf("%c", *s);
+  for (; col < 78; col++)
+    printf(" ");
+  printf("%c\n", 0xB3);
+}
+
 STATIC VOID signon()
 {
-  printf("%s", toka_banner);
-  printf("\r%S"
-         "Kernel compatibility %d.%d - "
-#if defined(__BORLANDC__)
-  "BORLANDC"
-#elif defined(__TURBOC__)
-  "TURBOC"
-#elif defined(_MSC_VER)
-  "MSC"
-#elif defined(__WATCOMC__)
-  "WATCOMC"
-#elif defined(__GNUC__)
-  "GNUC" /* this is hypothetical only */
-#else
-#error Unknown compiler
-  generate some bullshit error here, as the compiler should be known
-#endif
-#if defined (I386)
-    " - 80386 CPU required"
-#elif defined (I186)
-    " - 80186 CPU required"
-#endif
+  static char ramp[6] = { 0x0C, 0x0E, 0x0A, 0x0B, 0x09, 0x0D };
+  iregs r;
+  int row, col;
 
+  /* Mode 3 reset clears the POST screen and homes the cursor. */
+  r.a.x = 0x0003;
+  init_call_intr(0x10, &r);
+
+  /* The logo goes straight to text RAM: printf (INT 29h TTY) writes
+     attribute 07h only, and the rainbow is the point. */
+  for (row = 0; row < TOKA_LOGO_ROWS; row++)
+  {
+    char *p = toka_logo[row];
+    for (col = 0; p[col]; col++)
+    {
+      unsigned char glyph;
+      switch (p[col])
+      {
+        case '%': glyph = 0xB1; break;
+        case '#': glyph = 0xDB; break;
+        case ']': glyph = 0xDD; break;
+        default:  continue;
+      }
+      pokew(0xB800, (row * 80 + col) * 2,
+            ((UWORD)ramp[((col + 2 * row) / 7) % 6] << 8) | glyph);
+    }
+  }
+
+  /* Park the cursor under the logo (blank spacer row included) so the box
+     prints below the art instead of over it. */
+  r.a.x = 0x0200;
+  r.b.b.h = 0;
+  r.d.b.h = TOKA_LOGO_ROWS + 1;   /* row */
+  r.d.b.l = 0;                    /* col */
+  init_call_intr(0x10, &r);
+
+  signon_box_edge(0xDA, 0xBF);
+  signon_box_text(TOKA_BUILD_LINE_1);
+  signon_box_text(TOKA_BUILD_LINE_2);
+  signon_box_text("");
+  signon_box_text(TOKA_BUILD_LINE_3);
+  signon_box_edge(0xC3, 0xD9);    /* left tee: the box edge feeds the tree */
+
+  printf("%c%c> Kernel compatibility: %d.%d - "
+#if defined(__WATCOMC__)
+  "WATCOMC"
+#else
+#error unsupported compiler for the Toka-DOS signon
+#endif
 #ifdef WITHFAT32
   " - FAT32 support"
 #endif
-  "\n",
-         MK_FP(FP_SEG(LoL), FP_OFF(LoL->os_release)),
-         MAJOR_RELEASE, MINOR_RELEASE);
+  "\n", 0xC3, 0xC4, MAJOR_RELEASE, MINOR_RELEASE);
 }
 
 STATIC void kernel()
