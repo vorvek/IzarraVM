@@ -148,6 +148,8 @@ EMS_HANDLES   equ 32
 ; touched the slot (D4).
 EMS_SLOT      equ 20
 ems_on:      db 1                 ; 1 unless the command line contains NOEMS
+tree_mode:   db 0                 ; 1 when the command line contains /T (tree-
+                                  ; styled signon banner prefix)
 ems_pages:   dw 0                 ; total 16 KB pages the pool spans
 ems_category_kb: dw 0             ; private F0 query, pages converted to KB
 ems_disp:    dw 0                 ; dispatch scratch (mirrors xms_disp)
@@ -335,6 +337,20 @@ init:
     je .p_gap
     cmp ah, 2
     je .p_done
+    cmp al, '/'
+    jne .p_not_slash
+    lodsb
+    call cls_al
+    cmp ah, 1
+    je .p_gap                     ; bare "/" then separator
+    cmp ah, 2
+    je .p_done
+    and al, 0xDF
+    cmp al, 'T'
+    jne .p_skiptok
+    mov byte [cs:tree_mode], 1
+    jmp .p_skiptok                ; tolerate trailing junk (/TX): skip rest of token
+.p_not_slash:
     and al, 0xDF                  ; token first char, upcased
     cmp al, 'N'
     jne .p_skiptok
@@ -393,6 +409,16 @@ init:
     pop ds
 
     ; Signon banner. INT 29h works during device INIT, when INT 21h AH=09h is unreliable.
+    cmp byte [tree_mode], 0
+    je .b_plain
+    mov si, banner_tree
+.btl:
+    lodsb                         ; DS = CS here
+    test al, al
+    jz .b_plain
+    int 0x29
+    jmp .btl
+.b_plain:
     mov si, banner
 .bl:
     lodsb                         ; DS = CS here
@@ -3334,7 +3360,8 @@ a20_apply:
     mov cr3, eax
     ret
 
-banner: db 'TOKAEMM: XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
+banner_tree: db 0xC3, 0xC4, '>', ' ', 0
+banner: db 'TOKAEMM XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
 
 ; Debug failure signal via the unit-tester exit port (AL = code).
 signal32:
