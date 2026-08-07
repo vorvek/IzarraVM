@@ -46,25 +46,40 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
     user-visible through three independent paths, not only the banner that
     was removed. `QuietFlag` (backing plain `/Q`) has no other reader now,
     so plain `/Q` becomes visually equivalent to no `/Q` at all -- the
-    option is kept, not removed, for command-line compatibility.
-  - Replaces the fresh-install display (old: "IZCDEX installed." on its own
-    line, then a blank line, `Drive  Driver   Unit` header, and one
-    fixed-width row per drive) with a single restyled line, emitted by a
-    new `DisplayInstallLine` routine (next to `DisplayDrives`): optional
+    option is kept, not removed, for command-line compatibility; its
+    `HelpMsg` line is reworded to say so instead of the now-false "don't
+    display sign-on banner" (`/Q+` and `/QQ`'s lines are unchanged and
+    still accurate).
+  - Replaces the fresh-install display (old: `DrivesInstalled`, "IZCDEX
+    installed." on its own line, then `DisplayDrives` printing a blank
+    line, `Drive  Driver   Unit` header, and one fixed-width row per
+    drive) with a single restyled line, emitted by a new
+    `DisplayInstallLine` routine (next to `DisplayDrives`): optional
     tree-glyph prefix, then `IZCDEX installed. Assigned [n] drive(s): `,
     then a space-separated `[name letter:]` entry per assigned drive, then
-    CRLF. Reuses the file's own `MsgOut`/`Output`/`dz`/`dln`/`dlz` print
-    plumbing and the same self-modified-template technique `DriveLine` and
-    `DrivesAvail` already use (single ASCII digit added in place; a
-    `[name letter:]` template whose 8-byte driver-name field and drive
-    letter are overwritten in place per entry via `EntrySeen`, a new
-    install-transient BSS scratch flag). Two drives fit comfortably in 80
-    columns; 3+ simultaneously-assigned drives would wrap and are accepted
-    as-is (commented in `shsucdx.nsm`), since the stock `LASTDRIVE=D`
-    config caps a single `/D:` invocation to one drive. Only the genuine
-    fresh-install path changes: the already-resident add-drives/
-    remove-drives paths and the `/Q+` compact per-drive-letter display
-    still go through the original `DisplayDrives`, unchanged.
+    CRLF. `DrivesInstalled` lost its only caller (the removed `Output
+    DrivesInstalled` call in `Begin`) and is now unreferenced transient
+    data; left in place rather than deleted, per this being vendored
+    source in an already-discarded-after-install region.
+    `DisplayInstallLine` reuses the file's own
+    `MsgOut`/`Output`/`dz`/`dln`/`dlz` print plumbing and the same
+    self-modified-template technique `DriveLine` and `DrivesAvail`
+    already use for their per-drive/per-count fields: a single ASCII
+    digit written in place (`mov`, not `DrivesAvail`'s `add` -- the digit
+    is written unconditionally once per run either way, but `mov` stays
+    idempotent if this shape is ever called more than once, which matters
+    once a later task copies it), and a `[name letter:]` template whose
+    8-byte driver-name field and drive letter are overwritten in place
+    per entry. `EntrySeen` (new install-transient BSS scratch flag) only
+    tracks whether a separating space is needed before the next entry;
+    it plays no part in the name/letter overwrite itself. Two drives fit
+    comfortably in 80 columns; 3+ simultaneously-assigned drives would
+    wrap and are accepted as-is (commented in `shsucdx.nsm`), since the
+    stock `LASTDRIVE=D` config caps a single `/D:` invocation to one
+    drive. Only the genuine fresh-install path changes: the
+    already-resident add-drives/remove-drives paths and the `/Q+`
+    compact per-drive-letter display still go through the original
+    `DisplayDrives`, unchanged.
   - `HelpMsg` (`/?`) gains a synopsis `[/T]` and one description line for
     the new option.
 
