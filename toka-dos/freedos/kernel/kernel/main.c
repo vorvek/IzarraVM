@@ -443,7 +443,7 @@ STATIC VOID signon_box_edge(int left, int right)
 {
   int i;
   printf("%c", left);
-  for (i = 0; i < 77; i++)
+  for (i = 0; i < TOKA_BOX_W - 2; i++)
     printf("%c", 0xC4);
   printf("%c\n", right);
 }
@@ -452,9 +452,9 @@ STATIC VOID signon_box_text(char *s)
 {
   int col = 2;
   printf("%c ", 0xB3);
-  for (; *s && col < 78; s++, col++)   /* clamp: overlong text truncates, never shears the frame */
+  for (; *s && col < TOKA_BOX_W - 1; s++, col++)   /* clamp: overlong text truncates, never shears the frame */
     printf("%c", *s);
-  for (; col < 78; col++)
+  for (; col < TOKA_BOX_W - 1; col++)
     printf(" ");
   printf("%c\n", 0xB3);
 }
@@ -504,7 +504,7 @@ STATIC VOID signon()
   signon_box_text(TOKA_BUILD_LINE_3);
   signon_box_edge(0xC3, 0xD9);    /* left tee: the box edge feeds the tree */
 
-  printf("%c%c> Kernel compatibility: %d.%d - "
+  printf(TOKA_TREE_PREFIX "Kernel compatibility: %d.%d - "
 #if defined(__WATCOMC__)
   "WATCOMC"
 #else
@@ -513,7 +513,7 @@ STATIC VOID signon()
 #ifdef WITHFAT32
   " - FAT32 support"
 #endif
-  "\n", 0xC3, 0xC4, MAJOR_RELEASE, MINOR_RELEASE);
+  "\n", MAJOR_RELEASE, MINOR_RELEASE);
 }
 
 STATIC void kernel()

@@ -550,7 +550,6 @@ void DosDefinePartition(struct DriveParamS *driveParam,
 {
   ddt nddt;
   ddt *pddt = &nddt;
-  struct CHS chs;
 
   if (nUnits >= NDEV)
   {
@@ -604,24 +603,12 @@ void DosDefinePartition(struct DriveParamS *driveParam,
 
   if (InitKernelConfig.InitDiskShowDriveAssignment)
   {
-    char *ExtPri;
-    int num;
-
-    LBA_to_CHS(&chs, StartSector, driveParam);
-
-    ExtPri = "Pri";
-    num = PrimaryNum + 1;
-    if (extendedPartNo)
-    {
-      ExtPri = "Ext";
-      num = extendedPartNo;
-    }
-    printf("\r%c: HD%d, %s[%2d]", 'A' + nUnits,
-           (driveParam->driveno & 0x7f) + 1, ExtPri, num);
-
-    printCHS(", CHS= ", &chs);
-
-    printf(", start=%6lu MB, size=%6lu MB\n",
+    /* Modified by the Toka-DOS project, 2026: one tree-styled line per unit;
+       Pri/Ext and CHS details left out per the boot-screen spec. The leading
+       \r overwrites dsk_init()'s unterminated " - InitDisk" progress text
+       (initdisk.c dsk_init, ~line 1369), same as the printf it replaces. */
+    printf("\r" TOKA_TREE_PREFIX "%c: HD%d, start=%lu MB, size=%lu MB\n",
+           'A' + nUnits, (driveParam->driveno & 0x7f) + 1,
            StartSector / 2048, pEntry->NumSect / 2048);
   }
 

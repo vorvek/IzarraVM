@@ -1,6 +1,12 @@
 /* Included by initialisation functions */
 #define IN_INIT_MOD
 
+/* Modified by the Toka-DOS project, 2026: shared boot-screen styling for the
+   signon box (main.c) and the styled init lines (main.c, initdisk.c). The
+   tree prefix renders as an CP437 elbow: 0xC3 0xC4 '>'. */
+#define TOKA_BOX_W 79                          /* full frame width, columns */
+#define TOKA_TREE_PREFIX "\xC3\xC4> "
+
 #include "version.h"
 #include "date.h"
 #include "time.h"

@@ -30,7 +30,28 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
   feature set, command-line interface, and DOS redirector behavior stay intact.
 
 ## Local patches applied to the vendored source
-- Rebrand (Toka-DOS 3.0): kernel `hdr/version.h` (KVS banner), `kernel/main.c` (Toka signon banner, "General Simulation Works", tongue-in-cheek; the verbose FreeDOS/Villani copyright + GPL block was removed from the boot banner and replaced by a "See C:\LICENSE.TXT for more." pointer. The full GPL/copyright is preserved verbatim in C:\LICENSE.TXT, assembled by `scripts/license_txt.py` from the project NOTICE + kernel `COPYING` and shipped on the Katea C: payload); FreeCOM `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng` (product strings; GPL/copyright preserved). Each edited file carries a "modified by the Toka-DOS project, 2026" note.
+- Rebrand (Toka-DOS 3.0): kernel `hdr/version.h` (KVS banner; also adds the
+  `TOKA_BUILD_LINE_*` welcome-box strings -- `KERNEL_VERSION_STRING`/
+  `os_release` themselves are untouched), `kernel/kernel/init-mod.h` (shared
+  boot-screen styling constants -- `TOKA_BOX_W`, `TOKA_TREE_PREFIX` -- used by
+  both `main.c` and `initdisk.c`), `kernel/main.c` (`signon()` rewritten: a
+  rainbow TOKA logo via direct text-RAM writes, a CP437 welcome box (build
+  number + compile date + an Izarra SL line pointing at C:\LICENSE.TXT), and
+  a tree-styled kernel-compatibility line; the compiler `#if` chain that
+  picked the banner's compiler name is narrowed to Watcom-only, the
+  upstream BORLANDC/TURBOC/MSC/GNUC arms removed -- Toka-DOS only ships a
+  Watcom build, so this is a deliberate upstream divergence, not dead-code
+  drift), `kernel/kernel/initdisk.c` (the drive-assignment line restyled to
+  match the boot tree -- one `TOKA_TREE_PREFIX`-led line per unit, the Pri/Ext
+  partition tag and CHS geometry dropped per the boot-screen spec; the
+  verbose FreeDOS/Villani copyright + GPL block was removed from the boot
+  banner and replaced by a "See C:\LICENSE.TXT for more." pointer. The full
+  GPL/copyright is preserved verbatim in C:\LICENSE.TXT, assembled by
+  `scripts/license_txt.py` from the project NOTICE + kernel `COPYING` and
+  shipped on the Katea C: payload); FreeCOM `shell/ver.c` (shellname/shellver),
+  `VERSION.TXT`, `strings/DEFAULT.lng` (product strings; GPL/copyright
+  preserved). Each edited file carries a "modified by the Toka-DOS project,
+  2026" note.
 - Build fix: FreeCOM `shell/wlinker.bat` adds `op caseexact`. Open Watcom 2.0's wlink defaults to case-insensitive symbol resolution, which collides FreeCOM's libc toupper_/tolower_ with its own toUpper_/toLower_ (infinite recursion at the first console char-translation). Required for a working shell.
 - Build target: kernel built XCPU=86 XFAT=32 (8086 + FAT32 => DOS 7.10), no UPX. XCPU=386 is NOT usable (emits 386 opcodes, e.g. PUSH FS, the emulator lacks).
 - Toka-DOS changes the default `DIR` sort order. Upstream FreeCOM lists entries
