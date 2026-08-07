@@ -4760,7 +4760,10 @@ fn compile_with_instruction_limit(
     }
     // The read twin gates on `map_bases` ALONE (load design D2): a load-only block has no
     // code-watch tables, and the read stubs consult none. Same lazy build, same F5-style
-    // per-block fallback through `None`.
+    // per-block fallback through `None`. Deliberately looser than D2's "first load-bearing
+    // compile": any block with map bases builds the pad, so a store-only workload pays one
+    // small pad build it never calls into — cheaper than threading a has-reads bit through
+    // here, and the publish is idempotent.
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")

@@ -87,10 +87,12 @@ fn enter_cpl3(cpu: &mut CpuGsw) {
 /// a state only `force_fast_load_bias_for_test` can construct, because the derivation reads the
 /// same byte. The classic arm's permission check reads the flags byte against the identical
 /// state and refuses. Together the two arms prove the fast load path reads nothing but the one
-/// table. Fixture ordering per the design's F6 note: the page's REAL permissions never change
-/// (the interpreter's own walk stays user), so the differential targets the exit REASON, and no
-/// repopulate may intervene between the injection and the run (it would re-derive and poison
-/// the differential toward false failure).
+/// table. Fixture ordering (a simplification of the design's F6 prescription): the supervisor
+/// state is built by an explicit `populate_read` refill rather than a real permission flip, and
+/// the injection happens BEFORE the cpl3 compile — equivalent because the compile never touches
+/// the data page's entry. The binding constraint is unchanged: no repopulate may intervene
+/// between the injection and the run (it would re-derive and poison the differential toward
+/// false failure), and the differential targets the exit REASON since the real PTE stays user.
 #[test]
 fn a_fast_load_bias_overrides_the_flags_byte_and_the_classic_arm_still_checks() {
     for (one_lookup, expected_permission_exits) in [(true, 0u64), (false, 1u64)] {
@@ -349,10 +351,16 @@ fn a_ret_limit_exit_from_the_aperture_moves_no_mode13_lane() {
 
 /// The F1 park-domination cell: block A ends in a JmpMem through the APERTURE (its parking
 /// probe parks MODE13 and its completion charges A's own lane), and chains into block B, which
-/// ends in a RET through a SUPERVISOR RAM stack page at ring 0 — the strip-and-rejoin arm. The
-/// frame survives the chained transfer, so if B's RAM park does not dominate the strip arm, B's
-/// completion reads A's stale MODE13 and charges a phantom video read — caught here as a bus
-/// clock skew against the interpreter.
+/// ends in a RET through a SUPERVISOR RAM stack page at ring 0 — the strip-and-rejoin arm. If
+/// B's RAM park does not dominate the strip arm, B's completion reads A's stale MODE13 and
+/// charges a phantom video read — caught here as a bus clock skew against the interpreter
+/// (the park-hoist mutation reads 4 clocks high).
+///
+/// The cell does NOT assert that A->B chained: the stale value reaches B's frame either way,
+/// because consecutive native entries from one `drive` loop rebuild the frame at the SAME host
+/// RSP depth and the prologue zeroes only the seven counter lanes, never `STACK_READ_KIND` —
+/// so the differential survives a lost link. If a future change starts zeroing the slot per
+/// entry, this cell weakens to chained-only coverage and should gain a chain assert.
 #[test]
 fn a_chained_aperture_park_does_not_leak_into_a_supervisor_ret() {
     fn chain_program() -> Vec<u8> {
@@ -507,4 +515,133 @@ fn an_x87_load_from_a_dead_entry_resolves_through_the_read_stub() {
             "kill_entry={kill_entry}: the m64 value lands either way"
         );
     }
+}
+
+/// Round-2 review finding 1a: the counting stub's WORD variant was the one untested lane
+/// branch — the classic emission shared one `emit_mode13_read_completion`, so the trio's word
+/// cells covered the word lane for every site, but the counting stubs re-implement the
+/// width -> lane choice per stub and a wrong-lane mutation (word charged as dword) underflows
+/// run.rs's dword subtraction. A word load from the aperture at a lean site drives exactly that
+/// stub; the clock identity against the interpreter is the lane assert (the lane IS the video
+/// charge).
+#[test]
+fn a_word_aperture_load_charges_the_word_lane_through_the_counting_stub() {
+    let mut memory = vec![0; 0x000b_0000];
+    memory[0x100] = 0x90;
+    memory[0x101..0x108].copy_from_slice(&[0x66, 0x8b, 0x05, 0x04, 0x00, 0x0a, 0x00]); // mov ax,[0xa0004]
+    memory[0x108..0x10c].copy_from_slice(&[0x89, 0xc3, 0x89, 0xc1]); // mov ebx,eax; mov ecx,eax
+    memory[0x10c] = 0xf4;
+    memory[0x000a_0004..0x000a_0006].copy_from_slice(&0x5678u16.to_le_bytes());
+
+    let mut interp = fresh();
+    let mut native = fresh();
+    make_data_segments_flat(&mut interp);
+    make_data_segments_flat(&mut native);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    fn arm(cpu: &mut CpuGsw) {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+    }
+    arm(&mut interp);
+    drive(&mut interp, &mut interp_bus);
+    native.set_jit_auto_admit(true);
+    for _ in 0..4 {
+        arm(&mut native);
+        drive(&mut native, &mut native_bus);
+    }
+    assert!(
+        native.jit_direct.len() > 0,
+        "the word-load block must compile"
+    );
+
+    for cpu in [&mut interp, &mut native] {
+        arm(cpu);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    interp_bus.trace = BusTrace::default();
+    native_bus.trace = BusTrace::default();
+
+    drive(&mut interp, &mut interp_bus);
+    drive(&mut native, &mut native_bus);
+
+    assert_eq!(native.registers.eax() & 0xffff, 0x5678);
+    assert_eq!(native, interp);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks(),
+        "a word aperture load charged to the wrong lane skews the video charge"
+    );
+}
+
+/// Round-2 review finding 1c: the trio's PARK-ONLY stub was never entered by any cell. A RET
+/// through a DEAD stack entry (INVLPG between runs) drives it: probe -> poison -> park stub ->
+/// classify reads a cleared flags byte -> status 1 -> unavailable exit -> the interpreter
+/// re-runs the RET and heals the entry. The healed re-run then completes natively, which is
+/// what proves the exit came from the stub's status rather than a refused lowering.
+#[test]
+fn a_ret_through_a_dead_entry_resolves_through_the_park_stub() {
+    let mut memory = vec![0; 0x7000];
+    memory[0x100] = 0x90;
+    memory[0x101..0x106].copy_from_slice(&[0xb8, 0x78, 0x56, 0x34, 0x12]); // mov eax,imm32
+    memory[0x106] = 0xc3; // ret
+    memory[0x200] = 0xf4; // hlt
+    memory[0x3000..0x3004].copy_from_slice(&0x200u32.to_le_bytes());
+
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    fn arm(cpu: &mut CpuGsw) {
+        cpu.halted = false;
+        cpu.registers.eip = 0x100;
+        cpu.registers.set_esp(0x3000);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    }
+    cpu.set_jit_auto_admit(true);
+    for _ in 0..4 {
+        arm(&mut cpu);
+        drive(&mut cpu, &mut bus);
+    }
+    assert!(cpu.jit_direct.len() > 0, "the RET block must compile");
+
+    cpu.jit_fast_map.invalidate_page(0x3000);
+    assert_eq!(
+        cpu.jit_fast_map.load_bias_for_test(0x3000),
+        jit::fast_map::NATIVE_LOAD_BIAS_POISON,
+    );
+    arm(&mut cpu);
+    let unavailable = cpu.perf_counters().jit_direct_exit_unavailable_or_kind;
+    drive(&mut cpu, &mut bus);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_unavailable_or_kind - unavailable,
+        1,
+        "the dead entry must route through the park stub's status"
+    );
+    assert_eq!(
+        cpu.registers.eip, 0x201,
+        "and the RET must land after the heal"
+    );
+
+    // The healed entry completes natively: no further unavailable exits.
+    arm(&mut cpu);
+    let unavailable = cpu.perf_counters().jit_direct_exit_unavailable_or_kind;
+    drive(&mut cpu, &mut bus);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_unavailable_or_kind - unavailable,
+        0,
+    );
 }
