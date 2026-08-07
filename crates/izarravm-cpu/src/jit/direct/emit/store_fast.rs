@@ -13,7 +13,9 @@
 //! `call qword [r15 + slot]`.
 //!
 //! Stub calling convention: RAX = linear address, RDX = store value (GPR stubs), RDI = the
-//! probed entry, RCX = the linear page index. Every stub's prologue is
+//! probed entry. The page index is NOT part of the contract — every stub that needs it
+//! recomputes it from RAX, so a site may clobber RCX between probe and call. Every stub's
+//! prologue is
 //! `pop qword [rsp + STACK_STUB_RETURN]`, which parks the return address AND restores RSP to
 //! the frame level in one instruction — so every frame-offset helper (counters, watch guard,
 //! dirty bit) emits at its normal displacement inside the stub — and the epilogue is

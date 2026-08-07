@@ -835,3 +835,26 @@ fn misc_output_ios_selects_crtc_status_and_feature_ports() {
     assert!(vga.write_port(0x3BA, 0x05));
     assert_eq!(vga.read_port(0x3CA), Some(0x05));
 }
+
+/// The one-lookup store table's tag-bit precondition, pinned at the VGA end: BOTH aperture
+/// backings hand out 4096-aligned page pointers (`PageAlignedBytes` on `vram` and
+/// `mode13_linear`). Correctness never depends on this — a misaligned backing degrades every
+/// aperture store to the CPU's slow path — which is exactly why it needs a pin: reverting
+/// either field to a plain `Vec` would silently re-poison doom's Mode X stores while every
+/// behavioral test kept passing. The offsets these pointers are formed from are page
+/// multiples by the refusal checks beside the accessors, so base alignment is the whole
+/// obligation.
+#[test]
+fn both_vga_direct_page_backings_are_page_aligned() {
+    let mut vga = Vga::default();
+    assert_eq!(
+        vga.vram.as_mut_ptr() as usize % 4096,
+        0,
+        "vram (Mode X path)"
+    );
+    assert_eq!(
+        vga.mode13_linear.as_mut_ptr() as usize % 4096,
+        0,
+        "mode13_linear (chained 13h path)"
+    );
+}

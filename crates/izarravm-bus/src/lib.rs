@@ -60,7 +60,12 @@ impl PageAlignedBytes {
     pub fn zeroed(len: usize) -> Self {
         let raw = vec![0u8; len + Self::ALIGN];
         let start = raw.as_ptr().align_offset(Self::ALIGN);
-        debug_assert!(start < Self::ALIGN);
+        // `align_offset` is PERMITTED to return usize::MAX ("not possible to align"). No real
+        // allocator does that for a byte buffer, but this type's whole contract is "degrade,
+        // never fail" — a misaligned window is only a slow store path, while an out-of-range
+        // one would panic on first deref — so fall back to offset 0 rather than lean on the
+        // allocator's goodwill.
+        let start = if start >= Self::ALIGN { 0 } else { start };
         Self { raw, start, len }
     }
 }

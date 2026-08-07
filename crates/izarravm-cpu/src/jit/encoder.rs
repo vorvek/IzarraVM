@@ -1857,7 +1857,11 @@ impl Encoder {
         self.bytes.extend_from_slice(&disp32.to_le_bytes());
     }
 
-    /// `ret` (C3). Paired with `call_m64_disp32` by the shared store stubs.
+    /// `ret` (C3). Unit-tested but not emitted today: the shared store stubs were designed
+    /// around call/ret and BUILT on the pop/jmp-through-slot mechanism instead (which keeps
+    /// RSP at the frame level inside the stub), so this is kept for a future caller exactly
+    /// as `cmp_r64_imm32` is.
+    #[allow(dead_code)]
     pub(crate) fn ret_near(&mut self) {
         self.bytes.push(0xC3);
     }
@@ -1872,7 +1876,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
-    /// `pop qword [base + disp32]` (8F /0, mod=10). The slow store stubs use this as their
+    /// `pop qword [base + disp32]` (8F /0, mod=10). EVERY shared store stub uses this as its
     /// prologue: it moves the CALL's return address into a frame slot AND restores RSP to the
     /// frame level in one instruction, so every frame-offset helper emits at its normal
     /// displacement inside the stub. The displacement is computed against the RESTORED RSP:
