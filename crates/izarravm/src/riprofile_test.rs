@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use super::exe_directory;
+use super::{beyond_extent, exe_directory};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
@@ -30,6 +30,22 @@ fn forward_slashes_are_accepted_too() {
         narrow(&dir[..dir.len() - 1]),
         "D:/dev/IzarraVM/target/release"
     );
+}
+
+#[test]
+fn a_zero_recorded_size_is_not_evidence_of_misattribution() {
+    // The PDB carried no extent for the symbol; a displacement past nothing
+    // proves nothing.
+    assert!(!beyond_extent(0x40, 0));
+}
+
+#[test]
+fn beyond_extent_is_displacement_at_or_past_the_recorded_size() {
+    // A function of size S occupies [start, start+S): the last in-extent byte
+    // is at displacement S-1 and displacement S is already the gap after it.
+    assert!(!beyond_extent(0x3f, 0x40));
+    assert!(beyond_extent(0x40, 0x40));
+    assert!(beyond_extent(0x1000, 0x40));
 }
 
 #[test]
