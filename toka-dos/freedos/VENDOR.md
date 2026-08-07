@@ -28,6 +28,45 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
 - Local patch: `shsucdx.nsm` marks the altered source and changes only visible
   product strings from SHSUCDX to IZCDEX. The SHSUCDX v3 installation signature,
   feature set, command-line interface, and DOS redirector behavior stay intact.
+- Boot-screen restyle (2026), each site commented "modified by the Toka-DOS
+  project, 2026" in `shsucdx.nsm`:
+  - Adds a `/T` command-line option (`Options` dispatch table, kept in the
+    table's required ascending-ASCII order between `/S` and `/U`; `OptT`
+    near `OptV`) that sets a new transient BSS flag, `TreeMode`, following
+    the existing `/Q`/`QuietFlag` pattern. `/T` prefixes the install line
+    with the same CP437 tree glyph (`0xC3 0xC4 '>' ' '`) the kernel boot
+    tree and TOKAEMM/TOKAMOUS's own `/T` already use.
+  - Drops the install-time copyright/sign-on banner print (`CopyrightMsg`,
+    "take advantage of the photo op" in `Begin`) -- the 25-row boot-screen
+    budget has no room for it. `CopyrightMsg` itself is untouched and still
+    prints for `/?` (`DisplayHelp`); the file header (top of `shsucdx.nsm`)
+    still credits Jason Hood and, for the original v1.4b, John H. McCoy;
+    and the project's `NOTICE` (SHSUCDX line) is assembled verbatim into
+    `C:\LICENSE.TXT` by `scripts/license_txt.py`, so attribution stays
+    user-visible through three independent paths, not only the banner that
+    was removed. `QuietFlag` (backing plain `/Q`) has no other reader now,
+    so plain `/Q` becomes visually equivalent to no `/Q` at all -- the
+    option is kept, not removed, for command-line compatibility.
+  - Replaces the fresh-install display (old: "IZCDEX installed." on its own
+    line, then a blank line, `Drive  Driver   Unit` header, and one
+    fixed-width row per drive) with a single restyled line, emitted by a
+    new `DisplayInstallLine` routine (next to `DisplayDrives`): optional
+    tree-glyph prefix, then `IZCDEX installed. Assigned [n] drive(s): `,
+    then a space-separated `[name letter:]` entry per assigned drive, then
+    CRLF. Reuses the file's own `MsgOut`/`Output`/`dz`/`dln`/`dlz` print
+    plumbing and the same self-modified-template technique `DriveLine` and
+    `DrivesAvail` already use (single ASCII digit added in place; a
+    `[name letter:]` template whose 8-byte driver-name field and drive
+    letter are overwritten in place per entry via `EntrySeen`, a new
+    install-transient BSS scratch flag). Two drives fit comfortably in 80
+    columns; 3+ simultaneously-assigned drives would wrap and are accepted
+    as-is (commented in `shsucdx.nsm`), since the stock `LASTDRIVE=D`
+    config caps a single `/D:` invocation to one drive. Only the genuine
+    fresh-install path changes: the already-resident add-drives/
+    remove-drives paths and the `/Q+` compact per-drive-letter display
+    still go through the original `DisplayDrives`, unchanged.
+  - `HelpMsg` (`/?`) gains a synopsis `[/T]` and one description line for
+    the new option.
 
 ## Local patches applied to the vendored source
 - Rebrand (Toka-DOS 3.0): kernel `kernel/hdr/version.h` (KVS banner; also adds
