@@ -402,6 +402,9 @@ parse_tail:
     mov byte [bad_kind], 1
     stc
     ret
+.bad:
+    stc
+    ret
 .switch:
     inc si
     dec cx
@@ -413,16 +416,16 @@ parse_tail:
     mov [cur_kind], al
     mov al, [bx + 3]
     mov [cur_field], al
+    ; Kinds 2-3 are the value switches and MUST stay contiguous here -- this
+    ; is the range test that routes them; every other kind is a flag and
+    ; falls through to the .flag chain below, which must give it an explicit
+    ; arm (see the guard note at sw_table).
     cmp byte [cur_kind], 2
     jb .flag
-    cmp byte [cur_kind], 3      ; kinds 4 (boot) and 5 (tree) are flags too
+    cmp byte [cur_kind], 3
     ja .flag
     ; A value switch needs a ':' or '=' and then digits.
-    jcxz .no_value               ; jcxz's reach is a signed byte; .bad moved
-    jmp .have_value
-.no_value:
-    jmp .bad
-.have_value:
+    jcxz .bad
     mov al, [si]
     cmp al, ':'
     je .separator
@@ -470,12 +473,11 @@ parse_tail:
     jne .flag_tree
     mov byte [want_boot], 1
     jmp .next
-.flag_tree:                     ; only kind 5 (/T) reaches here
+.flag_tree:
+    cmp byte [cur_kind], 5      ; guard, not an else: an unrouted future kind
+    jne .bad                    ; must reject rather than silently become /T
     mov byte [tree_mode], 1
     jmp .next
-.bad:
-    stc
-    ret
 
 ; Copy the rest of the current token into `token` so the error can quote it.
 copy_bad_token:
@@ -2114,6 +2116,8 @@ flush_line:
     pop si
     ret
 
+; boot_report (below) renders these same fields in the two-row /B form; a new
+; field belongs in both.
 report:
     mov si, msg_head
     call print
@@ -2313,7 +2317,7 @@ boot_report:
     call copy_str
     mov si, msg_boot_midi_irq
     call copy_str
-    mov si, msg_crlf
+    mov si, s_crlf              ; linebuf-builder convention, same as report()
     call copy_str
     call flush_line
     ret
@@ -2359,6 +2363,9 @@ nm_mpu:    db 'MPU-401 port', 0
 
 ; Switch keyword, kind (0 usage, 1 status, 2 value, 3 MPU port, 4 boot
 ; summary, 5 tree style), field (unused by flag kinds).
+; Routing rule enforced in parse_tail: kinds 2-3 are the value switches and
+; MUST stay contiguous (parse_tail range-tests them); every other kind is a
+; flag and MUST get an explicit, guarded arm in the .flag chain.
 sw_table:
     dw sw_question
     db 0, 0
@@ -2527,15 +2534,19 @@ msg_wss_absent:  db '  Windows Sound System  not installed', 13, 10, 0
 msg_boot_tree:     db 0xC3, 0xC4, '>', ' ', 0
 msg_boot_gut:      db 0xB3, 0
 msg_boot_head:     db 'ReSonique2 Configuration [Run SNDCTRL to change]', 13, 10, 0
-msg_boot_ind:      db '     ', 0
+msg_boot_ind:      times 5 db ' '     ; 5-space indent, per the /T spec
+                   db 0
 msg_boot_sb:       db 'SB16 ', 0
 msg_boot_wss:      db 'WSS ', 0
 msg_boot_midi:     db 'MIDI ', 0
 msg_boot_absent:   db 'absent', 0
-msg_boot_gap:      db '   ', 0
-msg_boot_irq:      db ' I', 0        ; space precedes the letter; the letter
-msg_boot_dmal:     db ' D', 0        ; itself sits directly against its digit
-msg_boot_dmah:     db ' H', 0        ; (I7, not I 7) -- see boot_report
+msg_boot_gap:      times 3 db ' '     ; 3-space gap between device groups
+                   db 0
+; The space precedes the letter; the letter itself sits directly against its
+; digit (I7, not I 7) -- see boot_report, which appends the digits with u8dec.
+msg_boot_irq:      db ' I', 0
+msg_boot_dmal:     db ' D', 0
+msg_boot_dmah:     db ' H', 0
 msg_boot_midi_irq: db ' I9', 0       ; MPU IRQ is the fixed literal 9
 
 msg_saved:       db 'Applied to the hardware and saved in CMOS.', 13, 10, 0
