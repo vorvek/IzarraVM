@@ -1849,14 +1849,16 @@ fn pending_flags_offset() {
     // PerfCounters rather than at the CpuGsw tail because they have to appear in the probe JSON
     // beside the other SMC counters, which is where the invalidation cost is read.
     // The R15 table-bases slice adds `native_table_slots: NativeTableSlots` ([usize; 6],
-    // 48 bytes) so emitted code can load table bases R15-relative instead of baking imm64s,
-    // moving this pin from 4528 to 4576 -- measured, not derived. It must be a by-value CpuGsw
-    // field: behind a Box the emitted load would need a second, dependent indirection, which is
-    // half the point of the slice gone.
-    // The one-lookup store slice grows the slots array to [usize; 24] (the store-bias table
-    // plus 17 stub-address slots, +144 bytes), moving this pin from 4576 to 4720 -- measured,
-    // not derived.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4720);
+    // 48 bytes) so emitted code can load table bases R15-relative instead of baking imm64s --
+    // it must be a by-value CpuGsw field: behind a Box the emitted load would need a second,
+    // dependent indirection, which is half the point of the slice gone. Its first position
+    // (mid-struct, beside native_callout) moved this pin 4528 -> 4576, and the one-lookup
+    // slice's growth to [usize; 24] moved it again to 4720 -- where the quiet-window gate
+    // measured a uniform ~2-5% doom regression with byte-identical counters: every hot
+    // interpreter field after the array had shifted cache lines. The array now lives at the
+    // struct TAIL (fault_site's precedent) and this pin is back at its pre-R15 value --
+    // measured, not derived. Do not let this array migrate mid-struct again.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

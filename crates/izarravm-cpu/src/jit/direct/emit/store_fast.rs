@@ -177,8 +177,7 @@ pub(super) fn emit_store_fast(
         e.jnz(slow);
     } else {
         // Ring 0 stores through supervisor entries exactly as today's checkless cpl0 path
-        // does: strip the tags and rejoin the fast store. Mode13 entries go to their stub
-        // (which strips tags itself).
+        // does: strip the tags and rejoin the fast store.
         let m13 = e.label();
         e.test_r8_low_imm8(Reg::RDI, NATIVE_STORE_BIAS_MODE13 as u8);
         e.jnz(m13);
@@ -186,10 +185,31 @@ pub(super) fn emit_store_fast(
         e.jmp(fast_join);
         e.place(m13);
     }
-    e.call_m64_disp32(
-        Reg::R15,
-        table_slot_offset(store_stub_slot_m13(gpr_width_index(width))),
-    );
+    // The mode13 arm is INLINE, not the pad stub it first shipped as: doom's aperture stores
+    // are its hottest store class, and the stub's call / pop-into-slot / jmp-through-slot
+    // chain measured as a ~1.7% doom-586 wall cost at byte-identical counters (pinned pairs,
+    // quiet window) — indirection latency the instruction count never showed. The arm is
+    // cold bytes for every site that never touches the aperture; it is the exact sequence
+    // the m13 stub runs, minus the transfer.
+    e.and_r64_imm32(Reg::RDI, (NATIVE_STORE_BIAS_TAG_MASK as u32) ^ u32::MAX);
+    e.add_r64_r64(Reg::RDI, Reg::RAX);
+    match width {
+        MemoryWidth::Byte => e.store_r8_disp8(Reg::RDI, 0, Reg::RDX),
+        MemoryWidth::Word => e.store_r16_disp8(Reg::RDI, 0, Reg::RDX),
+        MemoryWidth::Dword => e.store_r32_disp8(Reg::RDI, 0, Reg::RDX),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("GPR stores are never 8- or 10-byte wide")
+        }
+    }
+    match width {
+        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES),
+        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES),
+        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("GPR stores are never 8- or 10-byte wide")
+        }
+    }
+    emit_mode13_dirty_bit(e, true, map);
     e.jmp(done);
 
     e.place(slow);
