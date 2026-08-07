@@ -430,11 +430,11 @@ program implementing the standard `INT 33h` mouse API (Microsoft Mouse
 compatible, plus the CuteMouse wheel extension).
 
 ```
-TOKAMOUS
+TOKAMOUS [/T]
 ```
 
-No arguments: it installs itself and returns to the prompt, or is loaded
-from `AUTOEXEC.BAT` with `LH TOKAMOUS` to load high into a
+It installs itself and returns to the prompt, or is loaded from
+`AUTOEXEC.BAT` with `LH TOKAMOUS` to load high into a
 [TOKAEMM](../tokaemm/manual.md) upper memory block when one is free. Once
 resident, it prints:
 
@@ -445,6 +445,15 @@ Toka-DOS mouse driver installed.
 and any mouse-aware DOS program talks to it through `INT 33h` from then on:
 cursor show/hide, position and button state, motion callbacks, and the
 wheel functions software checks for via CuteMouse's `AX=0x11` detection.
+
+`/T` (or `-T`) prefixes the signon line with the tree-styled connector used
+by the Toka-DOS boot screen instead:
+
+```
+├─> Toka-DOS mouse driver installed.
+```
+
+Off by default.
 
 ## Next
 

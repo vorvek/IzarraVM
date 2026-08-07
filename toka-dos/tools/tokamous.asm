@@ -1282,8 +1282,19 @@ packet_handler:
 resident_end:
 ; ---- install / TSR (transient: discarded by AH=31h KEEP) ----
 install:
-    ; /T or -T anywhere in the tail: tree-styled banner (Toka-DOS boot tree).
-    ; DOS tools took either lead-in (see sndctrl.asm's parse_tail).
+    ; Command-tail scan for /T or -T: TOKAMOUS takes no other arguments and
+    ; the only effect is a banner prefix, so this is a raw BYTE SWEEP over the
+    ; whole tail rather than the token-anchored parse sndctrl.asm's
+    ; parse_tail does. It does not check that the lead-in starts a token, so
+    ; an argument like X-TREME would also set tree_mode (the "-T" inside it
+    ; matches) -- deliberate, since there is nothing else on the tail for it
+    ; to misfire against.
+    ;
+    ; DOS tools took either lead-in (see sndctrl.asm's parse_tail). The
+    ; lead-in byte below is tested RAW, before any upcase: '/' (0x2F) and '-'
+    ; (0x2D) both fold to control characters under 'and 0xDF', so upcasing
+    ; first would kill both lead-ins. Only the switch letter ('T') is upcased,
+    ; once a lead-in has already matched.
     mov si, 0x81
     mov cl, [0x80]
     xor ch, ch
@@ -1291,9 +1302,9 @@ install:
     jcxz .t_done
     lodsb
     dec cx
-    cmp al, '/'                   ; RAW byte: '/'(0x2F) and '-'(0x2D) both
-    je .t_lead                    ; fold to control chars under 'and 0xDF',
-    cmp al, '-'                   ; so the lead-in test must run unupcased.
+    cmp al, '/'
+    je .t_lead
+    cmp al, '-'
     jne .t_scan
 .t_lead:
     jcxz .t_done
@@ -1331,11 +1342,11 @@ install:
     mov bx, 0x0100
     int 0x15
     cmp byte [tree_mode], 0
-    je .plain
+    je .t_plain
     mov ah, 0x09
     mov dx, banner_tree
     int 0x21
-.plain:
+.t_plain:
     mov ah, 0x09
     mov dx, banner
     int 0x21
@@ -1344,5 +1355,10 @@ install:
     int 0x21
 
 banner          db 'Toka-DOS mouse driver installed.', 13, 10, '$'
+; banner_tree and tree_mode MUST stay on this transient side of
+; resident_end: the KEEP paragraph count above is
+; (resident_end - start + 0x100 + 15) >> 4, so grouping either of these with
+; the resident state block near the top of the file would silently grow the
+; TSR by however many bytes they add -- nothing tests for that regression.
 banner_tree     db 0xC3, 0xC4, '>', ' ', '$'
 tree_mode       db 0
