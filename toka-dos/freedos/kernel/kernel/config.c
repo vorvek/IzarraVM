@@ -151,8 +151,10 @@ struct config Config = {
      directory as the shipped CONFIG.SYS SHELL= line -- the switches differ,
      though: this default keeps upstream's /E:256, while the shipped
      CONFIG.SYS asks for /E:2048 and /P=C:\AUTOEXEC.BAT rather than a bare /P,
-     so an F5 boot still gets a smaller 256-byte environment and re-runs
-     AUTOEXEC.BAT differently.
+     so an F5 boot still gets a smaller 256-byte environment and resolves
+     AUTOEXEC.BAT implicitly from the boot root rather than by name -- the
+     same file it resolves to on Toka-DOS, so the material difference is the
+     /E size and the implicit-vs-named path, not which file runs.
 
      C: rather than a driveless path deliberately: COMSPEC wants a drive
      letter, and Toka-DOS's hard disk is always C: here. */

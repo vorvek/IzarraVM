@@ -104,16 +104,27 @@ fn extracts_the_embedded_image_payload() {
          binary (rebuild sndctrl.com, then regenerate roms/tokados-hdd.img \
          via scripts/build-freedos-hdd-image.py)"
     );
+    // The actual dispatch order is set by the FOR list, not by where each
+    // labeled block sits in the file (a self-calling AUTOEXEC.BAT jumps to
+    // whichever label %1 names) -- pin the list itself rather than comparing
+    // block positions, or reordering the list would stay green while the
+    // boot order silently flipped.
     let autoexec_text = String::from_utf8_lossy(autoexec);
-    let izcdex_pos = autoexec_text
-        .find("IZCDEX /I /D:TOKACD01 /L:D /T")
-        .expect("default AUTOEXEC assigns the guest CD-ROM as D:");
-    let mouse_pos = autoexec_text
-        .find("LH TOKAMOUS")
-        .expect("default AUTOEXEC loads the mouse driver");
     assert!(
-        izcdex_pos < mouse_pos,
-        "default AUTOEXEC installs IZCDEX before the mouse driver"
+        autoexec_text.contains("FOR %%C IN (CDROM MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C"),
+        "default AUTOEXEC dispatches CDROM, then MOUSE, then SOUND, via the self-calling FOR loop"
+    );
+    assert!(
+        autoexec_text.contains("IZCDEX /I /D:TOKACD01 /L:D /T"),
+        "default AUTOEXEC's CDROM block assigns the guest CD-ROM as D:"
+    );
+    assert!(
+        autoexec_text.contains("LH TOKAMOUS /T"),
+        "default AUTOEXEC's MOUSE block loads the mouse driver high"
+    );
+    assert!(
+        autoexec_text.contains("SNDCTRL /B /T"),
+        "default AUTOEXEC's SOUND block prints the boot-time sound summary"
     );
 
     // TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
@@ -134,8 +145,8 @@ fn extracts_the_embedded_image_payload() {
     let config = by_name.get("CONFIG.SYS").expect("CONFIG.SYS present");
     let config_text = String::from_utf8_lossy(config);
     assert!(
-        config_text.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS RAM"),
-        "default CONFIG.SYS loads TOKAEMM from C:\\DOS"
+        config_text.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS RAM /T"),
+        "default CONFIG.SYS loads TOKAEMM from C:\\DOS with the tree-styled banner"
     );
     assert!(
         config_text.contains("DOS=HIGH,UMB"),

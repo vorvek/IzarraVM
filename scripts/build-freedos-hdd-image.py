@@ -323,18 +323,25 @@ def main(check: bool = False) -> int:
     # load). After the loop, the closed footer box (single-line CP437 border,
     # 78 cols including the corners) tells the user text mode is active and how
     # to reach the visual workbench; the whole boot stays within the 25-row
-    # screen budget (10 logo + 4 box + 5 tree lines + 1 sound line + 3 footer +
-    # 1 blank/prompt = 24, leaving row 25 for the shell prompt) so nothing
-    # scrolls the logo off row 0.
+    # screen budget (10 logo + 4 box + 5 tree lines + 2 ReSonique2 rows
+    # [heading + values] + 3 footer + 1 shell prompt = 25 -- the screen is
+    # exactly full; any component that grows a row must take one from another
+    # owner) so nothing scrolls the logo off row 0.
     footer_text = b"   Starting in text mode. Run TOKADESK to enable the visual workbench."
+    assert len(footer_text) <= 76, "footer_text must fit the 76-byte box interior"
+    footer_top = b"\xc6" + b"\xcd" * 76 + b"\xb8"
+    footer_middle = b"\xb3" + footer_text.ljust(76) + b"\xb3"
+    footer_bottom = b"\xd4" + b"\xcd" * 76 + b"\xbe"
+    for row in (footer_top, footer_middle, footer_bottom):
+        assert len(row) == 78, "each footer row must be exactly 78 bytes (corners + 76-wide interior)"
     autoexec = (b"@ECHO OFF\r\n"
                 b"IF NOT \"%1\"==\"\" GOTO %1\r\n"
                 b"PROMPT $P$G\r\nPATH C:\\DOS\r\n"
                 b"SET BLASTER=A220 I7 D1 H5 P300 T6\r\n"
                 b"FOR %%C IN (CDROM MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C\r\n"
-                b"ECHO \xc6" + b"\xcd" * 76 + b"\xb8\r\n"
-                b"ECHO \xb3" + footer_text.ljust(76) + b"\xb3\r\n"
-                b"ECHO \xd4" + b"\xcd" * 76 + b"\xbe\r\n"
+                b"ECHO " + footer_top + b"\r\n"
+                b"ECHO " + footer_middle + b"\r\n"
+                b"ECHO " + footer_bottom + b"\r\n"
                 b"GOTO END\r\n"
                 b":CDROM\r\n"
                 b"IZCDEX /I /D:TOKACD01 /L:D /T\r\n"
