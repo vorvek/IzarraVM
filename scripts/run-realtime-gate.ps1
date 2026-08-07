@@ -3075,10 +3075,14 @@ if ($PollSkipComparison) {
             quake_diagnostic = "fixed 6.2G cycle limit with exactly one 969-frame identity; never final-eligible"
         }
         acceptance = [ordered]@{
+            # Derived from Get-WorkloadPolicy so this evidence block cannot
+            # drift from the enforced floors: literals here survived TWO
+            # re-pins (the 3.5 was the pre-2026-08-04 aspirational floor) and
+            # published contradictory acceptance criteria into every summary.
             workload_real_time_factor_floors = [ordered]@{
-                doom_486 = 3.5
-                doom_586 = 1.4
-                quake_586 = 1.4
+                doom_486 = (Get-WorkloadPolicy "doom-486").minimum_real_time_factor
+                doom_586 = (Get-WorkloadPolicy "doom-586").minimum_real_time_factor
+                quake_586 = (Get-WorkloadPolicy "quake-586").minimum_real_time_factor
             }
             minimum_backend_median_ratio = 1.05
             minimum_backend_lower_95_ratio_exclusive = 1.0
@@ -3216,10 +3220,12 @@ $summary = [ordered]@{
     scope = "Headless Doom and Quake throughput only. GUI pacing and audio require separate validation."
     acceptance = [ordered]@{
         accepted_baseline_tree = $acceptedBaselineTree
+        # Derived, not literal — see the matching comment in the bakeoff
+        # branch's acceptance block.
         workload_real_time_factor_floors = [ordered]@{
-            doom_486 = 3.5
-            doom_586 = 1.4
-            quake_586 = 1.4
+            doom_486 = (Get-WorkloadPolicy "doom-486").minimum_real_time_factor
+            doom_586 = (Get-WorkloadPolicy "doom-586").minimum_real_time_factor
+            quake_586 = (Get-WorkloadPolicy "quake-586").minimum_real_time_factor
         }
         minimum_direct_native_coverage = $minimumDirectCoverage
         maximum_direct_slow_exits_per_100_instructions = $maximumDirectExitsPer100
