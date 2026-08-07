@@ -326,7 +326,9 @@ def main(check: bool = False) -> int:
     # screen budget (10 logo + 4 box + 5 tree lines + 2 ReSonique2 rows
     # [heading + values] + 3 footer + 1 shell prompt = 25 -- the screen is
     # exactly full; any component that grows a row must take one from another
-    # owner) so nothing scrolls the logo off row 0.
+    # owner) so nothing scrolls the logo off row 0. (the kernel welcome box is
+    # deliberately 79 -- TOKA_BOX_W in kernel/kernel/init-mod.h -- both match
+    # the approved mockup; they are not meant to align)
     footer_text = b"   Starting in text mode. Run TOKADESK to enable the visual workbench."
     assert len(footer_text) <= 76, "footer_text must fit the 76-byte box interior"
     footer_top = b"\xc6" + b"\xcd" * 76 + b"\xb8"

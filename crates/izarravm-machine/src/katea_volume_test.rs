@@ -170,13 +170,20 @@ fn extracts_the_embedded_image_payload() {
     // IZCDEX.COM and TOKAMOUS.COM have no committed reference binaries to
     // identity-pin (the build script may legitimately re-extract them), so
     // pin the /T feature's own bytes instead: the CP437 tree prefix and the
-    // one-line install text. A stale pre-styled copy fails here instead of
-    // silently unstyling the boot tree.
+    // one-line install text. The needle for the install text is the whole
+    // "IZCDEX installed. Assigned [" string, not just "drive(s)" -- the old
+    // pre-/T IZCDEX binary already contained "drive(s)" (from its DrivesAvail
+    // string), so that alone would not catch a stale pre-styled copy. A
+    // stale pre-styled copy fails here instead of silently unstyling the
+    // boot tree.
     let tree_prefix: &[u8] = &[0xC3, 0xC4, b'>', b' '];
+    let install_text: &[u8] = b"IZCDEX installed. Assigned [";
     let izcdex = by_name.get("IZCDEX.COM").expect("IZCDEX.COM present");
     assert!(
         izcdex.windows(tree_prefix.len()).any(|w| w == tree_prefix)
-            && izcdex.windows(8).any(|w| w == b"drive(s)"),
+            && izcdex
+                .windows(install_text.len())
+                .any(|w| w == install_text),
         "IZCDEX.COM on the payload lacks the /T tree prefix or the one-line \
          install text -- stale pre-styled binary in the image?"
     );
