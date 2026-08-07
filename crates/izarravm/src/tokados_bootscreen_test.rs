@@ -27,6 +27,20 @@
 
 use super::*;
 
+/// Render every screen row as `row NN: "escaped line"` via `{line:?}`, so a
+/// mismatch against a `\u{c3}`-style escaped needle shows up escaped too.
+/// Diffing an escaped needle against a dump of raw CP437 glyphs turns a
+/// one-space (or one-byte) difference into a needle-in-a-haystack search;
+/// escaping both sides makes the diff visible at a glance.
+fn dump_rows(lines: &[String]) -> String {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(row, line)| format!("row {row:2}: {line:?}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Boot from a host-folder facade with AUTOEXEC.BAT overridden, for tests
 /// that need to control exactly what the boot script runs rather than prove
 /// what the shipped one does. `mount_hdd_folder_with` still serves every
@@ -34,12 +48,21 @@ use super::*;
 /// swapped -- so this is the right tool for isolating batch-file mechanics,
 /// never for proving what the stock boot actually looks like (`boot_hdd`
 /// does that; see `stock_boot_paints_the_styled_init_screen` below).
+///
+/// Returns the `TokaScratch` guard alongside the machine (same shape as
+/// `TokaEmmScenario::_scratch` in `tokados_tokaemm_test.rs`): Katea's
+/// host-folder facade (`katea_tree.rs`) reads files under the scratch
+/// directory lazily, on demand, while the machine keeps running -- not just
+/// once at mount time -- so a caller that drops the guard at boot-return and
+/// then keeps driving the machine (e.g. injecting more keystrokes) would be
+/// reading a deleted directory. The guard's lifetime in the CALLER, not a
+/// comment in here, is what actually keeps the boot's backing files alive.
 fn boot_with_autoexec(
     label: &str,
     autoexec: Vec<u8>,
     cycles: u64,
     complete: impl FnMut(&Machine) -> bool,
-) -> (Machine, StopReason) {
+) -> (Machine, StopReason, TokaScratch) {
     let hdd_scratch = TokaScratch::new(label);
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
@@ -52,12 +75,8 @@ fn boot_with_autoexec(
             vec![("AUTOEXEC.BAT".to_string(), autoexec)],
         )
         .expect("mount Toka-DOS folder");
-    // hdd_scratch must outlive the boot: Katea's host-folder facade reads
-    // the directory lazily while the machine runs, not just at mount time,
-    // so dropping it early would pull the AUTOEXEC.BAT (and everything
-    // else) out from under a still-running boot.
     let (stop, _) = run_until_toka_condition(&mut machine, cycles, complete);
-    (machine, stop)
+    (machine, stop, hdd_scratch)
 }
 
 /// The self-calling AUTOEXEC pattern the styled boot relies on: FOR over a
@@ -69,7 +88,7 @@ fn boot_with_autoexec(
 fn autoexec_self_call_loop_dispatches_in_order() {
     let autoexec = b"@ECHO OFF\r\n\
 IF NOT \"%1\"==\"\" GOTO %1\r\n\
-ECHO SETUP\r\n\
+ECHO MARK-SETUP\r\n\
 FOR %%C IN (ALPHA BETA) DO CALL C:\\AUTOEXEC.BAT %%C\r\n\
 ECHO LOOPDONE\r\n\
 GOTO END\r\n\
@@ -82,14 +101,10 @@ GOTO END\r\n\
 :END\r\n"
         .to_vec();
 
-    let (machine, stop) = boot_with_autoexec(
-        "bootscreen-forcall",
-        autoexec,
-        800_000_000,
-        |machine| {
+    let (machine, stop, _hdd_scratch) =
+        boot_with_autoexec("bootscreen-forcall", autoexec, 800_000_000, |machine| {
             current_root_prompt(machine) && machine.screen_text().as_text().contains("LOOPDONE")
-        },
-    );
+        });
     let text = machine.screen_text().as_text();
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault during the self-calling AUTOEXEC loop: {msg}\n{text}");
@@ -101,16 +116,18 @@ GOTO END\r\n\
         );
     }
 
-    // SETUP must run exactly once: every sub-invocation carries %1 and jumps
-    // straight to its label via "IF NOT %1==... GOTO %1", skipping past
-    // ECHO SETUP entirely. If it printed once per FOR token instead of once
-    // for the top-level invocation, the dispatch would not actually be
+    // MARK-SETUP must run exactly once: every sub-invocation carries %1 and
+    // jumps straight to its label via "IF NOT %1==... GOTO %1", skipping past
+    // ECHO MARK-SETUP entirely. If it printed once per FOR token instead of
+    // once for the top-level invocation, the dispatch would not actually be
     // short-circuiting -- it would be falling through and re-running setup.
+    // (Named MARK-SETUP, matching the MARK-ALPHA/MARK-BETA convention below,
+    // so this assertion is never coupled to unrelated on-screen "SETUP" text.)
     assert_eq!(
-        text.matches("SETUP").count(),
+        text.matches("MARK-SETUP").count(),
         1,
-        "ECHO SETUP must run exactly once (the top-level invocation only), \
-         not once per FOR token (stop={stop:?}).\n{text}"
+        "ECHO MARK-SETUP must run exactly once (the top-level invocation \
+         only), not once per FOR token (stop={stop:?}).\n{text}"
     );
 
     // Assert ORDER, not just presence: ALPHA's label body must run (and print)
@@ -143,6 +160,13 @@ GOTO END\r\n\
 #[test]
 #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
 fn stock_boot_paints_the_styled_init_screen() {
+    // Measured cost of reaching C:\> on the full styled stock boot (rainbow
+    // art + kernel tree + TOKAEMM + IZCDEX + mouse + SNDCTRL /B + footer) is
+    // ~80M cycles at the 386 tier used here (`gsw_386`), so 700M is ~9x
+    // headroom, not a calibrated figure. Boot cost scales with the CPU tier
+    // (it is the timed F8/F5-style init window, not a fixed instruction
+    // count), so this budget is generous specifically for the slowest tier
+    // this fixture boots at.
     let (mut machine, stop, boot_cycles) = boot_hdd(700_000_000);
     let frame = machine.screen_text();
     let text = frame.as_text();
@@ -163,6 +187,10 @@ fn stock_boot_paints_the_styled_init_screen() {
     // non-space cells, not just the right characters sitting at the default
     // 0x07 attribute -- that would prove the ASCII art shape but not that
     // the color ramp write in signon() actually executed.
+    // TOKA_LOGO_ROWS (toka-dos/freedos/kernel/kernel/main.c) is 10 -- the
+    // rainbow ramp in signon() only ever writes rows 0..TOKA_LOGO_ROWS, so
+    // that fixed row count (not frame.rows, which is the whole 25-row
+    // screen) is the only region worth scanning for attribute diversity.
     let mut rainbow_attrs = std::collections::HashSet::new();
     for row in 0..10.min(frame.rows) {
         for col in 0..frame.columns {
@@ -172,11 +200,13 @@ fn stock_boot_paints_the_styled_init_screen() {
             }
         }
     }
+    let mut sorted_rainbow_attrs: Vec<u8> = rainbow_attrs.iter().copied().collect();
+    sorted_rainbow_attrs.sort_unstable();
     assert!(
         rainbow_attrs.len() >= 4,
         "rows 0-9 must show at least 4 distinct non-default (non-0x07) \
-         attributes on non-space cells (found {}); the rainbow ramp did not \
-         paint\n{text}",
+         attributes on non-space cells (found {}: {sorted_rainbow_attrs:02x?}); \
+         the rainbow ramp did not paint\n{text}",
         rainbow_attrs.len()
     );
 
@@ -206,7 +236,9 @@ fn stock_boot_paints_the_styled_init_screen() {
     for needle in exact_needles {
         assert!(
             lines.iter().any(|line| line.as_str() == needle),
-            "expected exact line not on the current 25-row screen: {needle:?}\n{text}"
+            "expected exact line not on the current 25-row screen: \
+             {needle:?}\n{}",
+            dump_rows(&lines)
         );
     }
 
@@ -217,11 +249,16 @@ fn stock_boot_paints_the_styled_init_screen() {
             .iter()
             .any(|line| line.starts_with("\u{C3}\u{C4}> C: HD1, start=") && line.ends_with(" MB")),
         "the C: drive tree line (with its varying size) is not on the \
-         current 25-row screen\n{text}"
+         current 25-row screen\n{}",
+        dump_rows(&lines)
     );
 
     // The footer box: opened by AUTOEXEC's epilogue after every tree line,
-    // so reordering the FOR list can never orphan the closer.
+    // so reordering the FOR list can never orphan the closer. Bytes must
+    // track scripts/build-freedos-hdd-image.py:330-336 (footer_top/
+    // footer_middle/footer_bottom), the generator that actually writes
+    // these rows into AUTOEXEC.BAT -- reconstructed here rather than
+    // hand-typed so the padding can't silently drift out of sync with it.
     let footer_bar = "\u{CD}".repeat(76);
     let footer_top = format!("\u{C6}{footer_bar}\u{B8}");
     let footer_bottom = format!("\u{D4}{footer_bar}\u{BE}");
@@ -232,7 +269,8 @@ fn stock_boot_paints_the_styled_init_screen() {
     for needle in [&footer_top, &footer_middle, &footer_bottom] {
         assert!(
             lines.iter().any(|line| line == needle),
-            "footer box line not on the current 25-row screen: {needle:?}\n{text}"
+            "footer box line not on the current 25-row screen: {needle:?}\n{}",
+            dump_rows(&lines)
         );
     }
 
@@ -253,9 +291,16 @@ fn stock_boot_paints_the_styled_init_screen() {
          {last_line:?}\n{text}"
     );
 
-    // FreeCOM's startup banner is silenced (Task 5): "XMS_Swap" (part of the
-    // VER banner's compiled-feature suffix) must not appear on the settled
-    // screen from the boot alone.
+    // FreeCOM's startup banner is silenced (Task 5): "XMS_Swap" (the
+    // ` - XMS_Swap` suffix cmd_ver() appends under FEATURE_XMS_SWAP, see
+    // toka-dos/freedos/freecom/shell/ver.c:56; this build compiles with
+    // XMS_SWAP=1) must not appear on the settled screen from the boot alone.
+    // On its own this negative match could pass vacuously (e.g. if it were
+    // pushed off-screen by unrelated scrolling); it stays a real proof only
+    // together with the zero-scroll assert just above, which already pins
+    // the logo to row 0 -- an extra startup banner would have scrolled that
+    // away first, so "logo still at row 0" plus "no XMS_Swap" together mean
+    // FreeCOM really did stay silent, not just that the banner scrolled out.
     assert!(
         !text.contains("XMS_Swap"),
         "XMS_Swap text appeared on the settled boot screen; FreeCOM's silent \
