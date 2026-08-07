@@ -23,7 +23,7 @@ use super::*;
 /// republishes before any slot-reading block can run.
 #[derive(Debug, Default)]
 pub(crate) struct NativeTableSlots {
-    pub(super) slots: [usize; 6 + 1 + STORE_STUB_COUNT],
+    pub(super) slots: [usize; 6 + 1 + STORE_STUB_COUNT + 1 + READ_STUB_COUNT],
 }
 
 pub(crate) const TABLE_SLOT_FLAGS: usize = 0;
@@ -58,6 +58,30 @@ pub(crate) const fn store_stub_slot_x87(width_index: usize, cpl3: bool) -> usize
     TABLE_SLOT_STORE_STUBS + 9 + width_index * 2 + cpl3 as usize
 }
 
+/// The one-lookup LOAD table (`FastMapStorage::load_biases`, load design D1). Appended AFTER
+/// the store slots — the array lives at the CpuGsw TAIL precisely so growth like this cannot
+/// move `pending_flags` or any hot interpreter field (the #719 layout-tax lesson; the pinned
+/// offset tests are this commit's proof).
+pub(crate) const TABLE_SLOT_LOAD_BIASES: usize = TABLE_SLOT_STORE_STUBS + STORE_STUB_COUNT;
+/// The read-resolve stub pad's published entry addresses (load design D4). Four stubs and
+/// WIDTH-INDEPENDENT, unlike the store pad's seventeen: with no watch guard (the store stubs'
+/// only width-dependent front piece) the read resolve is one shape per (family, cpl); the site
+/// keeps its own wide guard and does its own width-specific counting.
+pub(crate) const TABLE_SLOT_READ_STUBS: usize = TABLE_SLOT_LOAD_BIASES + 1;
+/// 2 GPR read-resolve stubs (cpl0/cpl3, park a bare kind) + 2 x87 read-resolve stubs
+/// (cpl0/cpl3, park the `kind << 32 | linear` pack).
+pub(crate) const READ_STUB_COUNT: usize = 2 + 2;
+
+/// Slot of the GPR read-resolve stub for a privilege arm.
+pub(crate) const fn read_stub_slot_gpr(cpl3: bool) -> usize {
+    TABLE_SLOT_READ_STUBS + cpl3 as usize
+}
+
+/// Slot of the x87 read-resolve stub for a privilege arm.
+pub(crate) const fn read_stub_slot_x87(cpl3: bool) -> usize {
+    TABLE_SLOT_READ_STUBS + 2 + cpl3 as usize
+}
+
 impl NativeTableSlots {
     /// Record `value` in `slot`. Idempotent by invariant; a republish that
     /// CHANGES a nonzero slot means a table base moved while emitted code
@@ -81,6 +105,7 @@ impl NativeTableSlots {
         self.publish(TABLE_SLOT_WRITE_BIASES, map.write_biases());
         self.publish(TABLE_SLOT_PHYSICAL_PAGES, map.physical_pages());
         self.publish(TABLE_SLOT_STORE_BIASES, map.store_biases());
+        self.publish(TABLE_SLOT_LOAD_BIASES, map.load_biases());
     }
 
     /// Publish the store-stub pad's entry addresses, in the pad's canonical order. Write-once
@@ -89,6 +114,14 @@ impl NativeTableSlots {
     pub(crate) fn publish_store_stubs(&mut self, addresses: [usize; STORE_STUB_COUNT]) {
         for (index, address) in addresses.into_iter().enumerate() {
             self.publish(TABLE_SLOT_STORE_STUBS + index, address);
+        }
+    }
+
+    /// Publish the read-resolve stub pad's entry addresses (load design D4), in the pad's
+    /// canonical order — the store pad's write-once contract verbatim.
+    pub(crate) fn publish_read_stubs(&mut self, addresses: [usize; READ_STUB_COUNT]) {
+        for (index, address) in addresses.into_iter().enumerate() {
+            self.publish(TABLE_SLOT_READ_STUBS + index, address);
         }
     }
 
