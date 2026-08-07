@@ -52,3 +52,14 @@
 #define xKVS(v,s,o) KVS(v,s,o)
 #define KERNEL_VERSION_STRING xKVS(KERNEL_VERSION, REVISION_SEQ, OEM_ID)
 
+/* Modified by the Toka-DOS project, 2026: the boot welcome box (main.c signon)
+   prints the build number and compile date as separate box lines instead of the
+   one-line KERNEL_VERSION_STRING, which stays intact for os_release. */
+#define TOKA_BUILD_LINE_1 "Welcome to Toka-DOS 3.0"
+#define xTOKA_STR(s) #s
+#define TOKA_STR(s) xTOKA_STR(s)
+#define TOKA_BUILD_LINE_2 \
+  "Kernel build 20" TOKA_STR(REVISION_SEQ) " - Compiled " __DATE__
+#define TOKA_BUILD_LINE_3 \
+  "(C) 1992-1997 Izarra SL - All Rights Reserved ** See LICENSE.TXT for more."
+
