@@ -63,6 +63,15 @@ TOKA_ROW_FITS(0); TOKA_ROW_FITS(1); TOKA_ROW_FITS(2); TOKA_ROW_FITS(3);
 TOKA_ROW_FITS(4); TOKA_ROW_FITS(5); TOKA_ROW_FITS(6); TOKA_ROW_FITS(7);
 TOKA_ROW_FITS(8); TOKA_ROW_FITS(9);
 
+/* Same idiom for the welcome-box strings (version.h): TOKA_BOX_TEXT_W (76,
+   init-mod.h) is the usable column count, so a fitting string plus its NUL
+   must be <= TOKA_BOX_TEXT_W + 1 bytes. Catches an overlong build line at
+   compile time instead of silently truncating it on screen. */
+typedef char toka_build_line_1_fits[
+  (sizeof(TOKA_BUILD_LINE_1) <= TOKA_BOX_TEXT_W + 1) ? 1 : -1];
+typedef char toka_build_line_2_fits[
+  (sizeof(TOKA_BUILD_LINE_2) <= TOKA_BOX_TEXT_W + 1) ? 1 : -1];
+
 static char *toka_logo[] = {
   toka_logo_r0, toka_logo_r1, toka_logo_r2, toka_logo_r3, toka_logo_r4,
   toka_logo_r5, toka_logo_r6, toka_logo_r7, toka_logo_r8, toka_logo_r9,

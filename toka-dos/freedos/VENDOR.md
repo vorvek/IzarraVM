@@ -34,17 +34,18 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
   the `TOKA_BUILD_LINE_*` welcome-box strings -- `KERNEL_VERSION_STRING`/
   `os_release` themselves are untouched), `kernel/kernel/init-mod.h`
   (boot-screen styling constants -- `TOKA_BOX_W`, `TOKA_TREE_PREFIX`, and
-  their derived `TOKA_BOX_INNER_W`/`TOKA_BOX_TEXT_END` -- shared between
-  `main.c` and `initdisk.c` within kernel-init only; userland `/T` tools each
-  carry their own copy of the prefix bytes, there is no project-wide single
-  source), `kernel/kernel/main.c` (`signon()` rewritten: a rainbow TOKA logo
-  via direct text-RAM writes, a CP437 welcome box (merged title line with
-  build number + compile date, plus an Izarra SL copyright line pointing at
-  C:\LICENSE.TXT), and a tree-styled kernel-compatibility line, all inside the
-  kernel's 25-row boot budget; the verbose FreeDOS/Villani copyright + GPL
-  block that used to print on the boot banner was removed and replaced by the
-  "See C:\LICENSE.TXT for more." pointer -- the full GPL/copyright is
-  preserved verbatim in C:\LICENSE.TXT, assembled by `scripts/license_txt.py`
+  their derived `TOKA_BOX_INNER_W`/`TOKA_BOX_TEXT_END`/`TOKA_BOX_TEXT_W` --
+  shared between `main.c` and `initdisk.c` within kernel-init only; userland
+  `/T` tools will each carry their own copy of the prefix bytes -- kernel-init
+  is not meant to be a project-wide single source), `kernel/kernel/main.c`
+  (`signon()` rewritten: a rainbow TOKA logo via direct text-RAM writes, a
+  CP437 welcome box (merged title line with build number + compile date, plus
+  an Izarra SL copyright line naming LICENSE.TXT, shipped at C:\LICENSE.TXT),
+  and a tree-styled kernel-compatibility line, all inside the kernel's 25-row
+  boot budget; the verbose FreeDOS/Villani copyright + GPL block that used to
+  print on the boot banner was removed and replaced by the "See LICENSE.TXT
+  for more." pointer -- the full GPL/copyright is preserved verbatim in
+  C:\LICENSE.TXT, assembled by `scripts/license_txt.py`
   from the project NOTICE + kernel `COPYING` and shipped on the Katea C:
   payload; the compiler `#if` chain that picked the banner's compiler name is
   narrowed to Watcom-only, the upstream BORLANDC/TURBOC/MSC/GNUC arms removed
@@ -62,8 +63,12 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
   ledger until now): kernel `kernel/kernel/config.c` (the `SHELL=` default
   changed from upstream's bare `command.com` to the full
   `C:\DOS\COMMAND.COM` path with tail ` C:\DOS /P /E:256`, ~line 138/156, so
-  the F5 config-bypass load matches the shipped CONFIG.SYS `SHELL=` line and
-  finds itself in `C:\DOS`; the `IDLEHALT` default changed from 0 to 1 at
+  the F5 config-bypass load points at the same interpreter and directory as
+  the shipped CONFIG.SYS `SHELL=` line and finds itself in `C:\DOS` too --
+  the switches differ, though: the built-in default keeps upstream's
+  `/E:256`, while the shipped CONFIG.SYS asks for `/E:2048`, so an F5 boot
+  still gets a smaller 256-byte environment; the `IDLEHALT` default changed
+  from 0 to 1 at
   ~line 844, "safe hooks" halt-on-CON-wait behavior, safe here because
   IzarraVM ships its own CPU and does not have the power-draw-transient
   hardware class upstream's off-by-default is guarding against; a new
@@ -234,15 +239,25 @@ involved.
 
 ### Layout note
 
-Stale as of this writing: `scripts/build-freedos-hdd-image.py` now supports a
-`C:\DOS` subdirectory (`dos_dir`), and the current image uses it -- KERNEL.SYS,
-CONFIG.SYS, AUTOEXEC.BAT, and LICENSE.TXT live in the C:\ root, while
-COMMAND.COM and every command-line tool (the rest of the eighteen-plus files
-above) live under `C:\DOS`. `CONFIG.SYS`'s `SHELL=` and `AUTOEXEC.BAT`'s
-`PATH` both point at `C:\DOS` (see `kernel/kernel/config.c`'s `SHELL=`
-default in the "Idle CPU behavior" entry above, which matches). The root
-directory itself needed a fix to become a proper multi-cluster chain
-(previously hardcoded to exactly cluster 2, which held at most 16 entries at
-this image's 1-sector-per-cluster geometry) to fit past the audit item 10
-(MEM) baseline of 12 files; that fix predates and is unrelated to the later
-`C:\DOS` subdirectory work.
+`scripts/build-freedos-hdd-image.py` builds a `C:\DOS` subdirectory -- the
+`dos_files` list (:385) is sized into
+`dos_first`/`dos_entries`/`dos_clusters` (:458-461) and linked into the root
+via the hardcoded `dir_entry(name11("DOS"), dos_first, 0, ATTR_SUBDIR)`
+(:470) -- and the current image uses it. The root holds KERNEL.SYS,
+CONFIG.SYS, AUTOEXEC.BAT, LICENSE.TXT, and that DOS subdirectory entry
+itself (5 entries, one cluster). `C:\DOS` holds COMMAND.COM, every
+command-line tool, the two drivers (TOKAEMM.SYS, TOKACD.SYS), and
+HELLO.TXT -- everything else in the eighteen-plus-file set above, not just
+the command-line tools. `CONFIG.SYS`'s `SHELL=` and `AUTOEXEC.BAT`'s `PATH`
+both point at `C:\DOS` (see `kernel/kernel/config.c`'s built-in `SHELL=`
+default in the "Idle CPU behavior" entry above, which points at the same
+interpreter and directory -- its switches differ, see that entry).
+
+Historical: the root directory once needed a fix to become a proper
+multi-cluster chain (previously hardcoded to exactly cluster 2, which held
+at most 16 entries at this image's 1-sector-per-cluster geometry) to fit
+past the audit item 10 (MEM) baseline of 12 files. That fix predates the
+`C:\DOS` subdirectory work and is no longer load-bearing for the root itself:
+now that the command-line tools and drivers live in `C:\DOS`, the shipped
+root is back down to 5 entries (a single cluster) and `C:\DOS` -- with its
+20 files plus `.`/`..` -- is the multi-cluster chain instead.

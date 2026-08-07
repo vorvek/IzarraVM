@@ -321,7 +321,7 @@ def main(check: bool = False) -> int:
                 b"IZCDEX /I /D:TOKACD01 /L:D /Q\r\n"
                 b"LH TOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"
-    # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
+    # The kernel signon points at "See LICENSE.TXT for more."; ship it on C:.
     license_txt = build_license_txt(repo)
 
     # --- FAT32 geometry for the partition -------------------------------------
@@ -367,7 +367,7 @@ def main(check: bool = False) -> int:
     # Only KERNEL.SYS, CONFIG.SYS and AUTOEXEC.BAT are truly forced to the root:
     # the boot sector loads KERNEL.SYS by root-directory name, and the kernel opens
     # CONFIG.SYS (then, via SHELL=, AUTOEXEC.BAT) from the boot-drive root. LICENSE.TXT
-    # stays at root too, because the kernel signon points at "See C:\LICENSE.TXT".
+    # stays at root too, because the kernel signon points at "See LICENSE.TXT".
     # Everything else -- COMMAND.COM and the command-line tools -- lives in C:\DOS so
     # a plain DIR of the root isn't buried under system files. KERNEL.SYS carries the
     # hidden+system+read-only attributes (0x27, the DOS convention for IO.SYS/
