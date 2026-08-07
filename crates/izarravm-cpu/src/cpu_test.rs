@@ -3650,6 +3650,14 @@ mod jit_direct;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_r15_tables_test.rs"]
+mod jit_r15_tables;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_compile_outcome_test.rs"]
 mod jit_compile_outcome;
 

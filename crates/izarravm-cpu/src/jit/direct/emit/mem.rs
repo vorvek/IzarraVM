@@ -608,3 +608,273 @@ pub(super) fn emit_call_mem(
 ) {
     unreachable!("direct memory lowering is x86-64-only")
 }
+
+// The table-base and code-watch emission helpers, moved verbatim from emit.rs for the same
+// source-line-ceiling reason as the rest of this file; pub(super) so emit.rs keeps reaching
+// them through use mem::*.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_read_pointer(
+    e: &mut Encoder,
+    r15_tables: bool,
+    map: NativeMapBases,
+    side: Label,
+) {
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_READ_BIASES,
+        map.read_biases(),
+        Reg::RDI,
+    );
+    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
+    e.jz(side);
+    e.add_r64_r64(Reg::RDI, Reg::RAX);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_write_pointer(
+    e: &mut Encoder,
+    r15_tables: bool,
+    map: NativeMapBases,
+    side: Label,
+) {
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_WRITE_BIASES,
+        map.write_biases(),
+        Reg::RDI,
+    );
+    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
+    e.jz(side);
+    e.add_r64_r64(Reg::RDI, Reg::RAX);
+}
+
+/// Load a table base into `dst`: R15-relative from `CpuGsw::native_table_slots`
+/// (7 bytes, hot L1) on the R15 arm, the baked 10-byte immediate otherwise.
+/// Identical pointer either way — the compile walk publishes exactly the values
+/// its `MemoryEmitContext` carries, before the block can be installed.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_table_base(
+    e: &mut Encoder,
+    r15_tables: bool,
+    slot: usize,
+    value: usize,
+    dst: Reg,
+) {
+    if r15_tables {
+        e.load_r64_disp32(dst, Reg::R15, table_slot_offset(slot));
+    } else {
+        e.mov_r64_imm64(dst, value as u64);
+    }
+}
+
+/// Offset of `CpuGsw::native_table_slots[slot]` from R15, computed the way
+/// `eip_offset` and friends are so the field's position is load-bearing only
+/// through `offset_of!`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn table_slot_offset(slot: usize) -> i32 {
+    (core::mem::offset_of!(CpuGsw, native_table_slots)
+        + core::mem::offset_of!(NativeTableSlots, slots)
+        + slot * core::mem::size_of::<usize>()) as i32
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_watched_store_guard(
+    e: &mut Encoder,
+    width: MemoryWidth,
+    r15_tables: bool,
+    map: NativeMapBases,
+    code_watch_tables: [usize; 2],
+    side: Label,
+) {
+    let unwatched = e.label();
+    emit_code_watch_branch(
+        e,
+        width,
+        r15_tables,
+        map,
+        code_watch_tables,
+        side,
+        unwatched,
+    );
+    e.place(unwatched);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_watched_alu_result_guard(
+    e: &mut Encoder,
+    width: MemoryWidth,
+    r15_tables: bool,
+    map: NativeMapBases,
+    code_watch_tables: [usize; 2],
+    side: Label,
+) {
+    let unwatched = e.label();
+    emit_code_watch_branch(
+        e,
+        width,
+        r15_tables,
+        map,
+        code_watch_tables,
+        side,
+        unwatched,
+    );
+    e.place(unwatched);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_code_watch_branch(
+    e: &mut Encoder,
+    width: MemoryWidth,
+    r15_tables: bool,
+    map: NativeMapBases,
+    code_watch_tables: [usize; 2],
+    watched: Label,
+    unwatched: Label,
+) {
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_PHYSICAL_PAGES,
+        map.physical_pages(),
+        Reg::RDX,
+    );
+    e.load_r32_sib_scale4(Reg::RCX, Reg::RDX, Reg::RCX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    e.store_r64_disp8(Reg::RSP, STACK_WATCH_PAGE, Reg::RCX);
+    let second = e.label();
+    emit_code_watch_table_branch(
+        e,
+        width,
+        r15_tables,
+        TABLE_SLOT_CODE_WATCH_STICKY,
+        code_watch_tables[0],
+        watched,
+        second,
+    );
+    e.place(second);
+    emit_code_watch_table_branch(
+        e,
+        width,
+        r15_tables,
+        TABLE_SLOT_CODE_WATCH_NATIVE,
+        code_watch_tables[1],
+        watched,
+        unwatched,
+    );
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(super) fn emit_code_watch_table_branch(
+    e: &mut Encoder,
+    width: MemoryWidth,
+    r15_tables: bool,
+    table_slot: usize,
+    code_watch_table: usize,
+    watched: Label,
+    unwatched: Label,
+) {
+    e.load_r64_disp8(Reg::RCX, Reg::RSP, STACK_WATCH_PAGE);
+    emit_table_base(e, r15_tables, table_slot, code_watch_table, Reg::RDX);
+    e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDX, 0);
+    e.jz(unwatched);
+
+    // Test every granule the access spans, in a sequence whose SIZE does not grow with the width.
+    //
+    // The guard used to emit one `bt` probe per granule, which was correct but grew linearly:
+    // `FSTP TBYTE` at one-byte granularity became ten probes, and the full Doom loop emitted 4039
+    // bytes against a one-host-page install limit. That is not a test failure, it is blocks
+    // silently REFUSED for size on the oracles. An access at page offset `o` spanning `n` granules
+    // occupies bit range `[g, g + n)` of the page's mask, where `g = o >> CHUNK_SHIFT`; instead of
+    // probing each bit, load a window over the mask and test a shifted constant against it. One
+    // load, one dynamic shift, one AND, for EVERY width.
+    //
+    // `n` is computed here, at emit time, from the width alone. That is offset-independent only
+    // because `emit_wide_page_guard` refuses unaligned accesses and `CHUNK_SHIFT <= 2` keeps every
+    // aligned width inside one granule walk -- at a shift of 3 a 4-aligned Qword at offset 4 mod 8
+    // would span two granules while this formula says one, a MISSED invalidation. `code_watch.rs`
+    // const-asserts that precondition beside the shift itself.
+    let n = ((width.bytes() - 1) >> NATIVE_CHUNK_SHIFT) + 1;
+
+    if n == 1 {
+        // One granule, one probe: the window sequence below is bigger than a single `bt`, and byte
+        // stores dominate Doom's inner loop, so the whole change only SHRINKS emitted code if this
+        // case keeps the cheap form. At `CHUNK_SHIFT == 0` the granule index IS the page offset,
+        // so the shift is omitted entirely rather than emitted as `shr ecx, 0`.
+        e.mov_r32_r32(Reg::RCX, Reg::RAX);
+        e.and_r32_imm32(Reg::RCX, 0x0fff);
+        if NATIVE_CHUNK_SHIFT != 0 {
+            e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
+        }
+        e.bt_r64_mem(Reg::RDX, Reg::RCX);
+        e.jcc(2, watched);
+        e.jmp(unwatched);
+        return;
+    }
+
+    // The multi-granule window. RCX and RDX ONLY, and that constraint is load-bearing: the natural
+    // third scratch would be RSI, and RSI is never free here. Integer blocks do not spill it (it
+    // is callee-saved and corrupting the Rust caller is UB) and float blocks keep the live x87
+    // status/tag pack in it, so the `FSTP TBYTE` path that motivates this design would corrupt FPU
+    // state on every guarded store. `r` is recomputable from RAX, so two registers suffice. RAX
+    // and RDI both survive; RDI is live across the guard in the read-modify-write and x87 paths.
+    // RDX is reloaded from the table at the top of every call, so clobbering it with the window is
+    // safe even though the second table's branch runs after the first's.
+    //
+    // The window is 32 bits, not 64. The highest real bit tested is `r + n - 1`, and `r <= 7` with
+    // `n <= 10` (Tbyte at one-byte granules), so `r + n - 1 <= 16 < 32`. A 32-bit load also
+    // shrinks the overhang past the last real mask byte to three bytes, which `ChunkMask`'s single
+    // pad word covers.
+    //
+    // The result is bit-exact against the probe loop it replaces, neither more nor less
+    // conservative: `(1 << n) - 1` shifted by `r` has set bits at exactly the positions of
+    // granules `g..g+n`, and every one of those bits is inside the loaded window because
+    // `b - (g & !7) = r + (b - g) <= 7 + 9 = 16 < 32`.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.and_r32_imm32(Reg::RCX, 0x0fff);
+    e.shift_r32_imm8(5, Reg::RCX, (3 + NATIVE_CHUNK_SHIFT) as u8);
+    // `mov edx, [rdx + rcx*1]` -- the window, unaligned, over the mask RDX points at.
+    e.load_r32_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+    // `r`, the first granule's bit position inside the window. The page mask is not needed: the
+    // final `and 7` keeps only bits below 3 + CHUNK_SHIFT, which is at most 5 and so well inside
+    // the page offset's twelve bits.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    if NATIVE_CHUNK_SHIFT != 0 {
+        e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
+    }
+    e.and_r32_imm32(Reg::RCX, 7);
+    e.shift_r32_cl(5, Reg::RDX);
+    e.and_r32_imm32(Reg::RDX, (1u32 << n) - 1);
+    e.jnz(watched);
+    e.jmp(unwatched);
+}
