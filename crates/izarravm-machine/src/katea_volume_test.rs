@@ -167,6 +167,28 @@ fn extracts_the_embedded_image_payload() {
         "default CONFIG.SYS caps LASTDRIVE at D (A: floppy, C: HDD, D: CD)"
     );
 
+    // IZCDEX.COM and TOKAMOUS.COM have no committed reference binaries to
+    // identity-pin (the build script may legitimately re-extract them), so
+    // pin the /T feature's own bytes instead: the CP437 tree prefix and the
+    // one-line install text. A stale pre-styled copy fails here instead of
+    // silently unstyling the boot tree.
+    let tree_prefix: &[u8] = &[0xC3, 0xC4, b'>', b' '];
+    let izcdex = by_name.get("IZCDEX.COM").expect("IZCDEX.COM present");
+    assert!(
+        izcdex.windows(tree_prefix.len()).any(|w| w == tree_prefix)
+            && izcdex.windows(8).any(|w| w == b"drive(s)"),
+        "IZCDEX.COM on the payload lacks the /T tree prefix or the one-line \
+         install text -- stale pre-styled binary in the image?"
+    );
+    let tokamous = by_name.get("TOKAMOUS.COM").expect("TOKAMOUS.COM present");
+    assert!(
+        tokamous
+            .windows(tree_prefix.len())
+            .any(|w| w == tree_prefix),
+        "TOKAMOUS.COM on the payload lacks the /T tree prefix -- stale \
+         pre-styled binary in the image?"
+    );
+
     // FreeDOS KERNEL.SYS is a raw binary, not an MZ: it begins with a short
     // JMP (0xEB) past the embedded BPB — the load-bearing first byte the boot
     // sector relies on.
