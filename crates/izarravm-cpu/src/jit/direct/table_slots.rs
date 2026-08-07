@@ -1,23 +1,12 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The write-once table-base slots emitted code loads R15-relative, and their env gate. Moved
+//! The write-once table-base slots emitted code loads R15-relative. Moved
 //! verbatim out of `direct.rs` to keep that file under the source-line ceiling; nothing here
 //! changed but the module boundary. `direct.rs` re-exports this module's contents
 //! (`use table_slots::*`), the `frame` precedent.
 
 use super::*;
-
-/// Whether emitted memory sites load their table bases R15-relative from
-/// `CpuGsw::native_table_slots` (7-byte L1-hot loads) instead of baking each
-/// base as a 10-byte `mov r64, imm64` (`dev_docs/2026-08-07-r15-table-bases-design.md`).
-/// Default ON; `IZARRAVM_R15_TABLES=0` restores immediate emission for the
-/// single-binary A/B. A `JitState` field for `watch_page_bit`'s reason: both
-/// emission arms need unit coverage and a process-wide gate cannot flip per test.
-pub(crate) fn r15_tables_default() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_R15_TABLES").as_deref(), Ok("0")))
-}
 
 /// The write-once table bases emitted code loads R15-relative when
 /// `JitState::r15_tables` is on: the four fast-map SoA arrays
