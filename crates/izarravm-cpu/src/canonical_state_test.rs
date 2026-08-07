@@ -863,8 +863,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // PerfCounters and move this pin from 4512 to 4528 -- measured, not derived. They belong in
     // PerfCounters rather than at the CpuGsw tail because they have to appear in the probe JSON
     // beside the other SMC counters, which is where the invalidation cost is read.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    // The R15 table-bases slice adds `native_table_slots: NativeTableSlots` ([usize; 6],
+    // 48 bytes; host pointers, no architectural state, absent from both canonical payloads
+    // via its always-equal PartialEq), moving this pin from 4528 to 4576 -- measured, not
+    // derived.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
 }

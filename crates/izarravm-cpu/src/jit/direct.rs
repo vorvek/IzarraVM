@@ -1617,6 +1617,18 @@ impl BlockCache {
         self.defer_short_for_test = enabled;
     }
 
+    /// Total emitted bytes across live blocks, for tests that assert an
+    /// emission-arm size difference (the R15 table-bases A/B).
+    #[cfg(test)]
+    pub(crate) fn total_live_code_len_for_test(&self) -> u64 {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.block_active[*index])
+            .map(|(_, block)| u64::from(block.code_len))
+            .sum()
+    }
+
     pub(crate) fn block_for_trace(
         &self,
         linear: u32,
@@ -3608,6 +3620,8 @@ const fn segment_index(segment: SegmentIndex) -> usize {
 
 mod frame;
 pub(crate) use frame::*;
+mod table_slots;
+pub(crate) use table_slots::*;
 
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
@@ -4705,6 +4719,21 @@ fn compile_with_instruction_limit(
     } else {
         return CompileOutcome::Retry;
     };
+    // Republish the bases this block would bake, BEFORE it can be installed:
+    // any block emitted on the R15 arm only ever runs after its own compile
+    // reached here, so the slots are current whenever such a block is live.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        if let Some(bases) = map_bases {
+            cpu.native_table_slots.publish_map(bases);
+        }
+        if let Some(tables) = code_watch_tables {
+            cpu.native_table_slots.publish_code_watch(tables);
+        }
+    }
     let fallthrough = LinkTarget {
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
@@ -4782,6 +4811,7 @@ fn compile_with_instruction_limit(
             map: map_bases,
             code_watch_tables,
             cpl3: memory_cpl3,
+            r15_tables: cpu.jit_direct.r15_tables,
             watch_page_bit: cpu.jit_direct.watch_page_bit,
             segments: segment_layout,
             address_wrap: if d {
@@ -4914,6 +4944,12 @@ struct MemoryEmitContext {
     map: Option<NativeMapBases>,
     code_watch_tables: Option<[usize; 2]>,
     cpl3: bool,
+    /// Whether memory sites load table bases from `CpuGsw::native_table_slots`
+    /// (`[r15 + disp32]`, 7 bytes) instead of baking each as a 10-byte imm64.
+    /// From `JitState::r15_tables`. Both arms load the identical pointer — the
+    /// publish site in the compile walk records exactly the values this
+    /// context carries — so the arms differ in encoding only.
+    r15_tables: bool,
     /// Whether store emitters test the fast-map PAGE_WATCHED bit and skip the code-watch guard
     /// on unwatched pages (watched-page-bit design D3). From `JitState::watch_page_bit`. False
     /// reproduces the pre-slice emission byte for byte at the seven Group A sites; the two

@@ -8,7 +8,10 @@ use super::*;
 // call sites below resolve identically on every target.
 mod mem;
 
-use mem::{emit_call_mem, emit_push_mem, emit_rmw_inc_dec};
+use mem::{
+    emit_call_mem, emit_code_watch_branch, emit_push_mem, emit_read_pointer, emit_rmw_inc_dec,
+    emit_table_base, emit_watched_alu_result_guard, emit_watched_store_guard, emit_write_pointer,
+};
 
 fn stack_addr(disp: u32) -> DirectAddr {
     DirectAddr {
@@ -2327,6 +2330,7 @@ fn emit_x87_slot(
             e,
             access.direction,
             x87_memory_width(access),
+            memory.r15_tables,
             memory.map.expect("x87 memory block has fast-map bases"),
         );
     }
@@ -2373,7 +2377,13 @@ fn emit_x87_memory_pointer(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2399,14 +2409,20 @@ fn emit_x87_memory_pointer(
         );
     } else {
         emit_read_permission_check(e, memory.cpl3, sides.permission);
-        emit_read_pointer(e, map, sides.unavailable_or_kind);
+        emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     }
 
     // Preserve the guest address and page kind across the x87 emitter while RDI remains the host
     // memory pointer. This stack slot is no longer needed by the completed code-watch probe.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_KIND_MASK));
     e.shift_r64_imm8(4, Reg::RDX, 32);
@@ -2422,6 +2438,7 @@ fn emit_x87_memory_completion(
     e: &mut Encoder,
     direction: NativeX87MemoryDirection,
     width: MemoryWidth,
+    r15_tables: bool,
     map: NativeMapBases,
 ) {
     // These dynamic counters MUST name the same width the static registration does. `run.rs`
@@ -2486,7 +2503,7 @@ fn emit_x87_memory_completion(
                     emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES);
                 }
             }
-            emit_mode13_dirty_bit(e, map);
+            emit_mode13_dirty_bit(e, r15_tables, map);
         }
     }
     e.place(done);
@@ -2529,7 +2546,13 @@ fn emit_ram_read_pointer_inner(
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
 
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2542,7 +2565,7 @@ fn emit_ram_read_pointer_inner(
     e.place(valid);
     e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RDI);
     emit_read_permission_check(e, memory.cpl3, sides.permission);
-    emit_read_pointer(e, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
 }
 
 #[cfg(all(
@@ -2833,7 +2856,13 @@ fn emit_alu_mem_dest(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2860,7 +2889,7 @@ fn emit_alu_mem_dest(
     e.shift_r64_imm8(4, Reg::RDI, 32);
     e.or_r64_r64(Reg::RDI, Reg::RAX);
     e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
-    emit_read_pointer(e, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
@@ -2875,7 +2904,7 @@ fn emit_alu_mem_dest(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     let skip_guard = e.label();
     if watch_fast {
         // The candidate lives in the pending slots, not RDX, so the pack reload may clobber it.
@@ -2884,14 +2913,21 @@ fn emit_alu_mem_dest(
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
         e.jz(skip_guard);
     }
-    emit_watched_alu_result_guard(e, width, map, code_watch_tables, sides.code_watch);
+    emit_watched_alu_result_guard(
+        e,
+        width,
+        memory.r15_tables,
+        map,
+        code_watch_tables,
+        sides.code_watch,
+    );
     e.place(skip_guard);
 
     emit_commit_alu_candidate(e, op, source, width);
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.store_r8_disp8(Reg::RDI, 0, Reg::RDX),
         MemoryWidth::Word => e.store_r16_disp8(Reg::RDI, 0, Reg::RDX),
@@ -2938,7 +2974,7 @@ fn emit_alu_mem_dest(
             unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, map);
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
     e.place(done);
 }
 
@@ -2971,7 +3007,13 @@ fn emit_double_shift_mem(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2995,7 +3037,7 @@ fn emit_double_shift_mem(
     e.shift_r64_imm8(4, Reg::RDI, 32);
     e.or_r64_r64(Reg::RDI, Reg::RAX);
     e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
-    emit_read_pointer(e, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
     e.store_r32_disp32(Reg::RSP, STACK_ALU_OLD_RESULT, Reg::RDX);
     emit_double_shift_candidate(e, left, src, count, Reg::RDX);
@@ -3004,7 +3046,7 @@ fn emit_double_shift_mem(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     let skip_guard = e.label();
     if watch_fast {
         e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
@@ -3015,6 +3057,7 @@ fn emit_double_shift_mem(
     emit_watched_alu_result_guard(
         e,
         MemoryWidth::Dword,
+        memory.r15_tables,
         map,
         code_watch_tables,
         sides.code_watch,
@@ -3025,7 +3068,7 @@ fn emit_double_shift_mem(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     e.load_r32_disp32(Reg::RDX, Reg::RSP, STACK_ALU_OLD_RESULT + 4);
     e.store_r32_disp8(Reg::RDI, 0, Reg::RDX);
 
@@ -3042,7 +3085,7 @@ fn emit_double_shift_mem(
     e.place(mode13);
     emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
     emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
-    emit_mode13_dirty_bit(e, map);
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
     e.place(done);
 }
 
@@ -3231,7 +3274,13 @@ fn emit_store(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -3271,7 +3320,7 @@ fn emit_store(
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, map);
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
     e.place(done);
 }
 
@@ -3300,19 +3349,26 @@ fn emit_store_write_resolve(
     sides: MemorySideExits,
 ) {
     emit_write_permission_check(e, memory.cpl3, sides.permission);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     if memory.watch_page_bit {
         // RCX is the page index from the kind classify — the permission check never touches it
         // and the pointer resolve only reads it. RDX is dead (the store value loads later, and
         // the guard re-derives its own scratches).
         let unwatched = e.label();
-        e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+        emit_table_base(
+            e,
+            memory.r15_tables,
+            TABLE_SLOT_FLAGS,
+            map.flags(),
+            Reg::RDX,
+        );
         e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
         e.jz(unwatched);
         emit_code_watch_branch(
             e,
             width,
+            memory.r15_tables,
             map,
             code_watch_tables,
             sides.code_watch,
@@ -3320,7 +3376,14 @@ fn emit_store_write_resolve(
         );
         e.place(unwatched);
     } else {
-        emit_watched_store_guard(e, width, map, code_watch_tables, sides.code_watch);
+        emit_watched_store_guard(
+            e,
+            width,
+            memory.r15_tables,
+            map,
+            code_watch_tables,
+            sides.code_watch,
+        );
     }
 }
 
@@ -3395,173 +3458,6 @@ fn emit_read_permission_check(e: &mut Encoder, memory_cpl3: bool, side: Label) {
         e.cmp_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_USER));
         e.jnz(side);
     }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-fn emit_read_pointer(e: &mut Encoder, map: NativeMapBases, side: Label) {
-    e.mov_r64_imm64(Reg::RDI, map.read_biases() as u64);
-    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
-    e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
-    e.jz(side);
-    e.add_r64_r64(Reg::RDI, Reg::RAX);
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-fn emit_write_pointer(e: &mut Encoder, map: NativeMapBases, side: Label) {
-    e.mov_r64_imm64(Reg::RDI, map.write_biases() as u64);
-    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
-    e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
-    e.jz(side);
-    e.add_r64_r64(Reg::RDI, Reg::RAX);
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-fn emit_watched_store_guard(
-    e: &mut Encoder,
-    width: MemoryWidth,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-    side: Label,
-) {
-    let unwatched = e.label();
-    emit_code_watch_branch(e, width, map, code_watch_tables, side, unwatched);
-    e.place(unwatched);
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-fn emit_watched_alu_result_guard(
-    e: &mut Encoder,
-    width: MemoryWidth,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-    side: Label,
-) {
-    let unwatched = e.label();
-    emit_code_watch_branch(e, width, map, code_watch_tables, side, unwatched);
-    e.place(unwatched);
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-fn emit_code_watch_branch(
-    e: &mut Encoder,
-    width: MemoryWidth,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-    watched: Label,
-    unwatched: Label,
-) {
-    e.mov_r32_r32(Reg::RCX, Reg::RAX);
-    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.physical_pages() as u64);
-    e.load_r32_sib_scale4(Reg::RCX, Reg::RDX, Reg::RCX);
-    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.store_r64_disp8(Reg::RSP, STACK_WATCH_PAGE, Reg::RCX);
-    let second = e.label();
-    emit_code_watch_table_branch(e, width, code_watch_tables[0], watched, second);
-    e.place(second);
-    emit_code_watch_table_branch(e, width, code_watch_tables[1], watched, unwatched);
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-fn emit_code_watch_table_branch(
-    e: &mut Encoder,
-    width: MemoryWidth,
-    code_watch_table: usize,
-    watched: Label,
-    unwatched: Label,
-) {
-    e.load_r64_disp8(Reg::RCX, Reg::RSP, STACK_WATCH_PAGE);
-    e.mov_r64_imm64(Reg::RDX, code_watch_table as u64);
-    e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
-    e.cmp_r64_imm32(Reg::RDX, 0);
-    e.jz(unwatched);
-
-    // Test every granule the access spans, in a sequence whose SIZE does not grow with the width.
-    //
-    // The guard used to emit one `bt` probe per granule, which was correct but grew linearly:
-    // `FSTP TBYTE` at one-byte granularity became ten probes, and the full Doom loop emitted 4039
-    // bytes against a one-host-page install limit. That is not a test failure, it is blocks
-    // silently REFUSED for size on the oracles. An access at page offset `o` spanning `n` granules
-    // occupies bit range `[g, g + n)` of the page's mask, where `g = o >> CHUNK_SHIFT`; instead of
-    // probing each bit, load a window over the mask and test a shifted constant against it. One
-    // load, one dynamic shift, one AND, for EVERY width.
-    //
-    // `n` is computed here, at emit time, from the width alone. That is offset-independent only
-    // because `emit_wide_page_guard` refuses unaligned accesses and `CHUNK_SHIFT <= 2` keeps every
-    // aligned width inside one granule walk -- at a shift of 3 a 4-aligned Qword at offset 4 mod 8
-    // would span two granules while this formula says one, a MISSED invalidation. `code_watch.rs`
-    // const-asserts that precondition beside the shift itself.
-    let n = ((width.bytes() - 1) >> NATIVE_CHUNK_SHIFT) + 1;
-
-    if n == 1 {
-        // One granule, one probe: the window sequence below is bigger than a single `bt`, and byte
-        // stores dominate Doom's inner loop, so the whole change only SHRINKS emitted code if this
-        // case keeps the cheap form. At `CHUNK_SHIFT == 0` the granule index IS the page offset,
-        // so the shift is omitted entirely rather than emitted as `shr ecx, 0`.
-        e.mov_r32_r32(Reg::RCX, Reg::RAX);
-        e.and_r32_imm32(Reg::RCX, 0x0fff);
-        if NATIVE_CHUNK_SHIFT != 0 {
-            e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
-        }
-        e.bt_r64_mem(Reg::RDX, Reg::RCX);
-        e.jcc(2, watched);
-        e.jmp(unwatched);
-        return;
-    }
-
-    // The multi-granule window. RCX and RDX ONLY, and that constraint is load-bearing: the natural
-    // third scratch would be RSI, and RSI is never free here. Integer blocks do not spill it (it
-    // is callee-saved and corrupting the Rust caller is UB) and float blocks keep the live x87
-    // status/tag pack in it, so the `FSTP TBYTE` path that motivates this design would corrupt FPU
-    // state on every guarded store. `r` is recomputable from RAX, so two registers suffice. RAX
-    // and RDI both survive; RDI is live across the guard in the read-modify-write and x87 paths.
-    // RDX is reloaded from the table at the top of every call, so clobbering it with the window is
-    // safe even though the second table's branch runs after the first's.
-    //
-    // The window is 32 bits, not 64. The highest real bit tested is `r + n - 1`, and `r <= 7` with
-    // `n <= 10` (Tbyte at one-byte granules), so `r + n - 1 <= 16 < 32`. A 32-bit load also
-    // shrinks the overhang past the last real mask byte to three bytes, which `ChunkMask`'s single
-    // pad word covers.
-    //
-    // The result is bit-exact against the probe loop it replaces, neither more nor less
-    // conservative: `(1 << n) - 1` shifted by `r` has set bits at exactly the positions of
-    // granules `g..g+n`, and every one of those bits is inside the loaded window because
-    // `b - (g & !7) = r + (b - g) <= 7 + 9 = 16 < 32`.
-    e.mov_r32_r32(Reg::RCX, Reg::RAX);
-    e.and_r32_imm32(Reg::RCX, 0x0fff);
-    e.shift_r32_imm8(5, Reg::RCX, (3 + NATIVE_CHUNK_SHIFT) as u8);
-    // `mov edx, [rdx + rcx*1]` -- the window, unaligned, over the mask RDX points at.
-    e.load_r32_sib(Reg::RDX, Reg::RDX, Reg::RCX);
-    // `r`, the first granule's bit position inside the window. The page mask is not needed: the
-    // final `and 7` keeps only bits below 3 + CHUNK_SHIFT, which is at most 5 and so well inside
-    // the page offset's twelve bits.
-    e.mov_r32_r32(Reg::RCX, Reg::RAX);
-    if NATIVE_CHUNK_SHIFT != 0 {
-        e.shift_r32_imm8(5, Reg::RCX, NATIVE_CHUNK_SHIFT as u8);
-    }
-    e.and_r32_imm32(Reg::RCX, 7);
-    e.shift_r32_cl(5, Reg::RDX);
-    e.and_r32_imm32(Reg::RDX, (1u32 << n) - 1);
-    e.jnz(watched);
-    e.jmp(unwatched);
 }
 
 /// MOVZX and MOVSX, register form. No memory access, no flags on any path, so the lazy-flag
@@ -3707,10 +3603,16 @@ fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_mode13_dirty_bit(e: &mut Encoder, map: NativeMapBases) {
+fn emit_mode13_dirty_bit(e: &mut Encoder, r15_tables: bool, map: NativeMapBases) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDI, map.physical_pages() as u64);
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_PHYSICAL_PAGES,
+        map.physical_pages(),
+        Reg::RDI,
+    );
     e.load_r32_sib_scale4(Reg::RDX, Reg::RDI, Reg::RCX);
     e.add_r32_imm32(Reg::RDX, 0u32.wrapping_sub(0x000a_0000));
     e.shift_r32_imm8(5, Reg::RDX, NATIVE_PAGE_SHIFT as u8);

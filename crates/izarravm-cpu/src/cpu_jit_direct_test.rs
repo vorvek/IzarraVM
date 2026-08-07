@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn fresh() -> CpuGsw {
+pub(super) fn fresh() -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw586);
     for segment in [
@@ -42,7 +42,7 @@ fn fresh_flat() -> CpuGsw {
     cpu
 }
 
-fn drive(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
+pub(super) fn drive(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
     let mut outcomes = Vec::new();
     for _ in 0..64 {
         let outcome = cpu.run_straight_line(bus, u64::MAX).unwrap();
@@ -2168,7 +2168,7 @@ fn cpl3_fast_map_permission_side_exit_is_counted() {
 
 const STORE_ENTRY: u32 = 0x1101;
 
-fn arm_store_fixture(cpu: &mut CpuGsw) {
+pub(super) fn arm_store_fixture(cpu: &mut CpuGsw) {
     cpu.halted = false;
     cpu.registers.eip = STORE_ENTRY - 1;
     cpu.registers.set_eax(0);
@@ -2187,7 +2187,7 @@ fn arm_store_fixture(cpu: &mut CpuGsw) {
     cpu.pending_flags = PendingFlags::default();
 }
 
-fn prime_direct_store_block(cpu: &mut CpuGsw, bus: &mut TestBus) {
+pub(super) fn prime_direct_store_block(cpu: &mut CpuGsw, bus: &mut TestBus) {
     cpu.set_jit_auto_admit(true);
     arm_store_fixture(cpu);
     drive(cpu, bus);
@@ -2755,7 +2755,7 @@ fn adjacent_data_store_outside_watched_chunks_stays_native() {
     }
 }
 
-fn store_exit_program(target: u32) -> Vec<u8> {
+pub(super) fn store_exit_program(target: u32) -> Vec<u8> {
     let mut memory = vec![0; 0x7000];
     memory[(STORE_ENTRY - 1) as usize] = 0x90;
     let mut code = vec![
