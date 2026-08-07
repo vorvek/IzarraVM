@@ -34,14 +34,37 @@ fn extracts_the_embedded_image_payload() {
     // failed sort-buffer allocation quiet when nobody asked for the sort, and
     // scanOrder() tracking its own argument start instead of reading the byte
     // in front of it. See toka-dos/freedos/VENDOR.md.
+    //
+    // 70076 -> 71084 (styled init screen): KERNEL.SYS grew net +1008 bytes.
+    // signon() replaced the old single-line "\r%S ..." banner with the
+    // rainbow boot logo (drawn straight into B800:0 text RAM) plus the
+    // welcome box, added signon_box_edge()/signon_box_text() box-drawing
+    // helpers, and initdisk.c's drive-assignment line now goes out through
+    // TOKA_TREE_PREFIX (the CP437 elbow "\xC3\xC4> ") instead of a bare
+    // printf. Those additions are only partly offset by what they replaced:
+    // the old "\r%S" signon format string and dsk_init()'s unterminated
+    // " - InitDisk" progress fragment (initdisk.c, ~line 1369) are both gone,
+    // the latter because a stray unanchored fragment would dangle ahead of
+    // the fixed-row tree lines whenever no DOS partition is found.
+    //
+    // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
+    // FreeCOM's startup ver() banner is now suppressed at both call sites so
+    // the styled boot tree owns the screen instead of racing FreeCOM's own
+    // signon: the /P (resident shell) branch's unconditional `cmd_ver(NULL)`
+    // in initialize() -- the path CONFIG.SYS's shipped
+    // `SHELL=...COMMAND.COM ... /P=C:\AUTOEXEC.BAT` line actually takes --
+    // and the non-/P `showinfo` block's `cmd_ver(NULL)` a few lines below it,
+    // which a COMMAND.COM invoked without /P (e.g. a nested interactive
+    // shell) still reaches. VER remains fully functional as an explicit
+    // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(70076),
+        Some(71084),
         "KERNEL.SYS size"
     );
     assert_eq!(
         by_name.get("COMMAND.COM").map(|d| d.len()),
-        Some(87495),
+        Some(87447),
         "COMMAND.COM size"
     );
     assert!(by_name.contains_key("CONFIG.SYS"), "CONFIG.SYS present");
@@ -83,7 +106,7 @@ fn extracts_the_embedded_image_payload() {
     );
     let autoexec_text = String::from_utf8_lossy(autoexec);
     let izcdex_pos = autoexec_text
-        .find("IZCDEX /I /D:TOKACD01 /L:D /Q")
+        .find("IZCDEX /I /D:TOKACD01 /L:D /T")
         .expect("default AUTOEXEC assigns the guest CD-ROM as D:");
     let mouse_pos = autoexec_text
         .find("LH TOKAMOUS")
@@ -139,10 +162,13 @@ fn extracts_the_embedded_image_payload() {
     let kernel = by_name.get("KERNEL.SYS").unwrap();
     assert_eq!(kernel[0], 0xEB, "KERNEL.SYS begins with a short JMP");
 
-    // The rebranded, trimmed signon banner is compiled into the kernel.
+    // The rebranded, trimmed signon banner is compiled into the kernel. The
+    // welcome box's copyright line (TOKA_BUILD_LINE_2 in version.h) supersedes
+    // the older single-line "General Simulation Works" byline the pre-styled
+    // kernel printed.
     let has = |needle: &str| kernel.windows(needle.len()).any(|w| w == needle.as_bytes());
     assert!(
-        has("General Simulation Works"),
+        has("Izarra SL"),
         "the rebranded signon company name is in the kernel"
     );
     assert!(

@@ -72,12 +72,13 @@ the immediately preceding stock version. Customized files are left alone. Add
 these lines manually when keeping a customized setup:
 
     DEVICEHIGH=C:\DOS\TOKACD.SYS
-    IZCDEX /I /D:TOKACD01 /L:D /Q
+    IZCDEX /I /D:TOKACD01 /L:D /T
 
 The first line belongs after `DOS=HIGH,UMB` in `CONFIG.SYS`; the second belongs
-after `SET BLASTER` and before `LH TOKAMOUS` in `AUTOEXEC.BAT`. BIOS Setup's
-Repair Toka-DOS command still backs up both files and restores the complete
-current defaults.
+after `SET BLASTER` and before `LH TOKAMOUS` in `AUTOEXEC.BAT`. `/T` is the
+optional boot-tree styling (a one-line tree-styled install banner instead of
+plain output); drop it for plain output. BIOS Setup's Repair Toka-DOS command
+still backs up both files and restores the complete current defaults.
 
 ## Adding a new guest tool
 
