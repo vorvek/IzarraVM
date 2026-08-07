@@ -1617,6 +1617,18 @@ impl BlockCache {
         self.defer_short_for_test = enabled;
     }
 
+    /// Total emitted bytes across live blocks, for tests that assert an
+    /// emission-arm size difference (the R15 table-bases A/B).
+    #[cfg(test)]
+    pub(crate) fn total_live_code_len_for_test(&self) -> u64 {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.block_active[*index])
+            .map(|(_, block)| u64::from(block.code_len))
+            .sum()
+    }
+
     pub(crate) fn block_for_trace(
         &self,
         linear: u32,
@@ -3818,6 +3830,86 @@ pub(crate) fn watch_page_bit_default() -> bool {
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_WATCH_PAGE_BIT").as_deref(), Ok("0")))
 }
 
+/// Whether emitted memory sites load their table bases R15-relative from
+/// `CpuGsw::native_table_slots` (7-byte L1-hot loads) instead of baking each
+/// base as a 10-byte `mov r64, imm64` (`dev_docs/2026-08-07-r15-table-bases-design.md`).
+/// Default ON; `IZARRAVM_R15_TABLES=0` restores immediate emission for the
+/// single-binary A/B. A `JitState` field for `watch_page_bit`'s reason: both
+/// emission arms need unit coverage and a process-wide gate cannot flip per test.
+pub(crate) fn r15_tables_default() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_R15_TABLES").as_deref(), Ok("0")))
+}
+
+/// The write-once table bases emitted code loads R15-relative when
+/// `JitState::r15_tables` is on: the four fast-map SoA arrays
+/// (`NativeMapBases`) and the two code-watch page tables, in the slot order
+/// `emit::table_slot_offset` indexes. Each source allocation is created once
+/// and never freed or moved for the CPU's life (fast_map.rs storage,
+/// code_watch.rs `table_base`), which is the same invariant the baked-imm64
+/// emission already depended on; `publish` merely re-states it where a
+/// violation would finally be VISIBLE instead of a silent miscompile.
+///
+/// Host pointers, not guest state: `Clone` resets to default and `PartialEq`
+/// ignores the slots, `CallOutTable`'s shape and reason. A cloned CPU gets a
+/// fresh `BlockCache` (its clone drops compiled blocks), so its first compile
+/// republishes before any slot-reading block can run.
+#[derive(Debug, Default)]
+pub(crate) struct NativeTableSlots {
+    slots: [usize; 6],
+}
+
+pub(crate) const TABLE_SLOT_FLAGS: usize = 0;
+pub(crate) const TABLE_SLOT_READ_BIASES: usize = 1;
+pub(crate) const TABLE_SLOT_WRITE_BIASES: usize = 2;
+pub(crate) const TABLE_SLOT_PHYSICAL_PAGES: usize = 3;
+pub(crate) const TABLE_SLOT_CODE_WATCH_STICKY: usize = 4;
+pub(crate) const TABLE_SLOT_CODE_WATCH_NATIVE: usize = 5;
+
+impl NativeTableSlots {
+    /// Record `value` in `slot`. Idempotent by invariant; a republish that
+    /// CHANGES a nonzero slot means a table base moved while emitted code
+    /// could still hold it, which the imm64 arm would miscompile silently.
+    pub(crate) fn publish(&mut self, slot: usize, value: usize) {
+        debug_assert!(
+            self.slots[slot] == 0 || self.slots[slot] == value,
+            "published table base changed: slot {slot} held {:#x}, now {value:#x}",
+            self.slots[slot],
+        );
+        self.slots[slot] = value;
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn publish_map(&mut self, map: NativeMapBases) {
+        self.publish(TABLE_SLOT_FLAGS, map.flags());
+        self.publish(TABLE_SLOT_READ_BIASES, map.read_biases());
+        self.publish(TABLE_SLOT_WRITE_BIASES, map.write_biases());
+        self.publish(TABLE_SLOT_PHYSICAL_PAGES, map.physical_pages());
+    }
+
+    pub(crate) fn publish_code_watch(&mut self, tables: [usize; 2]) {
+        self.publish(TABLE_SLOT_CODE_WATCH_STICKY, tables[0]);
+        self.publish(TABLE_SLOT_CODE_WATCH_NATIVE, tables[1]);
+    }
+}
+
+impl Clone for NativeTableSlots {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for NativeTableSlots {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for NativeTableSlots {}
+
 /// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
 ///
 /// ONE predicate for what used to be three copies of `persona != I586`: the compile walk's Word
@@ -4705,6 +4797,21 @@ fn compile_with_instruction_limit(
     } else {
         return CompileOutcome::Retry;
     };
+    // Republish the bases this block would bake, BEFORE it can be installed:
+    // any block emitted on the R15 arm only ever runs after its own compile
+    // reached here, so the slots are current whenever such a block is live.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        if let Some(bases) = map_bases {
+            cpu.native_table_slots.publish_map(bases);
+        }
+        if let Some(tables) = code_watch_tables {
+            cpu.native_table_slots.publish_code_watch(tables);
+        }
+    }
     let fallthrough = LinkTarget {
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
@@ -4782,6 +4889,7 @@ fn compile_with_instruction_limit(
             map: map_bases,
             code_watch_tables,
             cpl3: memory_cpl3,
+            r15_tables: cpu.jit_direct.r15_tables,
             watch_page_bit: cpu.jit_direct.watch_page_bit,
             segments: segment_layout,
             address_wrap: if d {
@@ -4914,6 +5022,12 @@ struct MemoryEmitContext {
     map: Option<NativeMapBases>,
     code_watch_tables: Option<[usize; 2]>,
     cpl3: bool,
+    /// Whether memory sites load table bases from `CpuGsw::native_table_slots`
+    /// (`[r15 + disp32]`, 7 bytes) instead of baking each as a 10-byte imm64.
+    /// From `JitState::r15_tables`. Both arms load the identical pointer — the
+    /// publish site in the compile walk records exactly the values this
+    /// context carries — so the arms differ in encoding only.
+    r15_tables: bool,
     /// Whether store emitters test the fast-map PAGE_WATCHED bit and skip the code-watch guard
     /// on unwatched pages (watched-page-bit design D3). From `JitState::watch_page_bit`. False
     /// reproduces the pre-slice emission byte for byte at the seven Group A sites; the two

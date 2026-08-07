@@ -34,7 +34,13 @@ pub(super) fn emit_rmw_inc_dec(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -63,6 +69,7 @@ pub(super) fn emit_rmw_inc_dec(
     emit_code_watch_branch(
         e,
         width,
+        memory.r15_tables,
         map,
         code_watch_tables,
         sides.code_watch,
@@ -76,12 +83,24 @@ pub(super) fn emit_rmw_inc_dec(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDI, map.read_biases() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_READ_BIASES,
+        map.read_biases(),
+        Reg::RDI,
+    );
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
-    e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_WRITE_BIASES,
+        map.write_biases(),
+        Reg::RDX,
+    );
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
@@ -145,7 +164,7 @@ pub(super) fn emit_rmw_inc_dec(
             emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
         }
     }
-    emit_mode13_dirty_bit(e, map);
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
     e.place(done);
 }
 
@@ -176,7 +195,13 @@ fn emit_rmw_inc_dec_dword(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -197,6 +222,7 @@ fn emit_rmw_inc_dec_dword(
     emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
+        memory.r15_tables,
         map,
         code_watch_tables,
         sides.code_watch,
@@ -206,12 +232,24 @@ fn emit_rmw_inc_dec_dword(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDI, map.read_biases() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_READ_BIASES,
+        map.read_biases(),
+        Reg::RDI,
+    );
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
-    e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_WRITE_BIASES,
+        map.write_biases(),
+        Reg::RDX,
+    );
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
@@ -275,7 +313,13 @@ pub(super) fn emit_push_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, source_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     // The masked KIND goes to RDI. RDX must keep the RAW flags byte, because
     // `emit_read_permission_check` below consumes it. Same split `emit_rmw_inc_dec_dword` uses.
@@ -288,7 +332,7 @@ pub(super) fn emit_push_mem(
     // exiting to the page fault. `emit_ram_read_pointer_inner` calls this in exactly this
     // position, between the kind check and the bias lookup.
     emit_read_permission_check(e, memory.cpl3, source_sides.permission);
-    emit_read_pointer(e, map, source_sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, source_sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDI, Reg::RDI, 0);
     // Park it: the stack store's address and kind path clobbers RAX, RCX, RDX and RDI.
     e.store_r64_disp32(Reg::RSP, STACK_PUSH_MEM_VALUE, Reg::RDI);
@@ -305,7 +349,13 @@ pub(super) fn emit_push_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, stack_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -325,6 +375,7 @@ pub(super) fn emit_push_mem(
     emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
+        memory.r15_tables,
         map,
         code_watch_tables,
         stack_sides.code_watch,
@@ -339,7 +390,13 @@ pub(super) fn emit_push_mem(
     // `emit_rmw_inc_dec_dword` recomputes immediately after its own watch join for this reason.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_WRITE_BIASES,
+        map.write_biases(),
+        Reg::RDX,
+    );
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(stack_sides.unavailable_or_kind);
@@ -430,7 +487,13 @@ pub(super) fn emit_call_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, source_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     // The masked KIND goes to RDI; RDX keeps the RAW flags byte for the permission check.
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
@@ -440,7 +503,7 @@ pub(super) fn emit_call_mem(
     // As in `emit_push_mem`, this is a privilege check and not bookkeeping: without it a ring-3
     // `call dword [supervisor_page]` would read supervisor memory natively.
     emit_read_permission_check(e, memory.cpl3, source_sides.permission);
-    emit_read_pointer(e, map, source_sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, source_sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDI, Reg::RDI, 0);
     // BEFORE the store, so a limit refusal leaves the guest byte-for-byte untouched and the
     // interpreter's re-run reproduces the interpreter's own push-then-fault-on-next-fetch order.
@@ -463,7 +526,13 @@ pub(super) fn emit_call_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, stack_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -483,6 +552,7 @@ pub(super) fn emit_call_mem(
     emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
+        memory.r15_tables,
         map,
         code_watch_tables,
         stack_sides.code_watch,
@@ -495,7 +565,13 @@ pub(super) fn emit_call_mem(
     // here for the same reason.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_WRITE_BIASES,
+        map.write_biases(),
+        Reg::RDX,
+    );
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(stack_sides.unavailable_or_kind);

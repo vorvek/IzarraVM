@@ -82,6 +82,10 @@ pub(crate) struct JitState {
     /// Default FALSE, which is the shipped behaviour this slice does not change.
     pub(crate) word_at_486: bool,
     /// Whether emitted stores take the PAGE_WATCHED fast path (watched-page-bit design D3).
+    /// Seeded from `IZARRAVM_R15_TABLES` (default true): emitted memory sites load table
+    /// bases R15-relative from `CpuGsw::native_table_slots` instead of baking imm64s. A
+    /// field for `word_at_486`'s reason (per-test flips, both arms unit-covered).
+    pub(crate) r15_tables: bool,
     /// Seeded from `IZARRAVM_WATCH_PAGE_BIT` (default true); a field for `word_at_486`'s
     /// testability reason, and CARRIED by clone for its lockstep-comparison reason.
     pub(crate) watch_page_bit: bool,
@@ -121,6 +125,7 @@ impl JitState {
         Self {
             direct,
             word_at_486: direct::word_at_486_default(),
+            r15_tables: direct::r15_tables_default(),
             watch_page_bit: direct::watch_page_bit_default(),
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
             direct_barrier_census: direct::barrier_census_default(),
@@ -144,6 +149,7 @@ impl Clone for JitState {
             // silently reverted to the default arm would compare a lifted CPU against an unlifted
             // one and report the disagreement as agreement.
             word_at_486: self.word_at_486,
+            r15_tables: self.r15_tables,
             watch_page_bit: self.watch_page_bit,
             sixteen_bit_level: self.sixteen_bit_level,
             direct_barrier_census: None,

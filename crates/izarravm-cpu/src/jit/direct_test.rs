@@ -2228,3 +2228,34 @@ fn link_clear_causes_close_on_the_aggregate() {
         "the cause split must sum to the aggregate it attributes"
     );
 }
+
+#[test]
+fn table_slots_are_host_state_not_guest_state() {
+    let mut slots = NativeTableSlots::default();
+    slots.publish(TABLE_SLOT_FLAGS, 0x1000);
+    // Never guest-visible: equality ignores the slots (canonical-state and
+    // lockstep comparisons must not diff host pointers), and a clone must not
+    // inherit pointers into another CPU's tables.
+    assert_eq!(slots, NativeTableSlots::default());
+    assert_eq!(slots.clone().slots, [0; 6]);
+}
+
+#[test]
+fn an_idempotent_republish_is_accepted() {
+    let mut slots = NativeTableSlots::default();
+    slots.publish(TABLE_SLOT_FLAGS, 0x1000);
+    slots.publish(TABLE_SLOT_FLAGS, 0x1000);
+    assert_eq!(slots.slots[TABLE_SLOT_FLAGS], 0x1000);
+}
+
+/// The write-once invariant's alarm must actually fire — a changed base with
+/// live emitted code is a miscompile on the imm64 arm and a desync on the R15
+/// arm, and this panic is the only place either becomes visible.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "published table base changed")]
+fn a_changed_republish_panics() {
+    let mut slots = NativeTableSlots::default();
+    slots.publish(TABLE_SLOT_FLAGS, 0x1000);
+    slots.publish(TABLE_SLOT_FLAGS, 0x2000);
+}

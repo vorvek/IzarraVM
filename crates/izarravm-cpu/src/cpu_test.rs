@@ -1848,7 +1848,12 @@ fn pending_flags_offset() {
     // PerfCounters and move this pin from 4512 to 4528 -- measured, not derived. They belong in
     // PerfCounters rather than at the CpuGsw tail because they have to appear in the probe JSON
     // beside the other SMC counters, which is where the invalidation cost is read.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    // The R15 table-bases slice adds `native_table_slots: NativeTableSlots` ([usize; 6],
+    // 48 bytes) so emitted code can load table bases R15-relative instead of baking imm64s,
+    // moving this pin from 4528 to 4576 -- measured, not derived. It must be a by-value CpuGsw
+    // field: behind a Box the emitted load would need a second, dependent indirection, which is
+    // half the point of the slice gone.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

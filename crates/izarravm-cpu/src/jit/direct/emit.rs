@@ -2327,6 +2327,7 @@ fn emit_x87_slot(
             e,
             access.direction,
             x87_memory_width(access),
+            memory.r15_tables,
             memory.map.expect("x87 memory block has fast-map bases"),
         );
     }
@@ -2373,7 +2374,13 @@ fn emit_x87_memory_pointer(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2399,14 +2406,20 @@ fn emit_x87_memory_pointer(
         );
     } else {
         emit_read_permission_check(e, memory.cpl3, sides.permission);
-        emit_read_pointer(e, map, sides.unavailable_or_kind);
+        emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     }
 
     // Preserve the guest address and page kind across the x87 emitter while RDI remains the host
     // memory pointer. This stack slot is no longer needed by the completed code-watch probe.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_KIND_MASK));
     e.shift_r64_imm8(4, Reg::RDX, 32);
@@ -2422,6 +2435,7 @@ fn emit_x87_memory_completion(
     e: &mut Encoder,
     direction: NativeX87MemoryDirection,
     width: MemoryWidth,
+    r15_tables: bool,
     map: NativeMapBases,
 ) {
     // These dynamic counters MUST name the same width the static registration does. `run.rs`
@@ -2486,7 +2500,7 @@ fn emit_x87_memory_completion(
                     emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES);
                 }
             }
-            emit_mode13_dirty_bit(e, map);
+            emit_mode13_dirty_bit(e, r15_tables, map);
         }
     }
     e.place(done);
@@ -2529,7 +2543,13 @@ fn emit_ram_read_pointer_inner(
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
 
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2542,7 +2562,7 @@ fn emit_ram_read_pointer_inner(
     e.place(valid);
     e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RDI);
     emit_read_permission_check(e, memory.cpl3, sides.permission);
-    emit_read_pointer(e, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
 }
 
 #[cfg(all(
@@ -2833,7 +2853,13 @@ fn emit_alu_mem_dest(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2860,7 +2886,7 @@ fn emit_alu_mem_dest(
     e.shift_r64_imm8(4, Reg::RDI, 32);
     e.or_r64_r64(Reg::RDI, Reg::RAX);
     e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
-    emit_read_pointer(e, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
@@ -2875,7 +2901,7 @@ fn emit_alu_mem_dest(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     let skip_guard = e.label();
     if watch_fast {
         // The candidate lives in the pending slots, not RDX, so the pack reload may clobber it.
@@ -2884,14 +2910,21 @@ fn emit_alu_mem_dest(
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
         e.jz(skip_guard);
     }
-    emit_watched_alu_result_guard(e, width, map, code_watch_tables, sides.code_watch);
+    emit_watched_alu_result_guard(
+        e,
+        width,
+        memory.r15_tables,
+        map,
+        code_watch_tables,
+        sides.code_watch,
+    );
     e.place(skip_guard);
 
     emit_commit_alu_candidate(e, op, source, width);
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.store_r8_disp8(Reg::RDI, 0, Reg::RDX),
         MemoryWidth::Word => e.store_r16_disp8(Reg::RDI, 0, Reg::RDX),
@@ -2938,7 +2971,7 @@ fn emit_alu_mem_dest(
             unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, map);
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
     e.place(done);
 }
 
@@ -2971,7 +3004,13 @@ fn emit_double_shift_mem(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -2995,7 +3034,7 @@ fn emit_double_shift_mem(
     e.shift_r64_imm8(4, Reg::RDI, 32);
     e.or_r64_r64(Reg::RDI, Reg::RAX);
     e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
-    emit_read_pointer(e, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
     e.store_r32_disp32(Reg::RSP, STACK_ALU_OLD_RESULT, Reg::RDX);
     emit_double_shift_candidate(e, left, src, count, Reg::RDX);
@@ -3004,7 +3043,7 @@ fn emit_double_shift_mem(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     let skip_guard = e.label();
     if watch_fast {
         e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
@@ -3015,6 +3054,7 @@ fn emit_double_shift_mem(
     emit_watched_alu_result_guard(
         e,
         MemoryWidth::Dword,
+        memory.r15_tables,
         map,
         code_watch_tables,
         sides.code_watch,
@@ -3025,7 +3065,7 @@ fn emit_double_shift_mem(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     e.load_r32_disp32(Reg::RDX, Reg::RSP, STACK_ALU_OLD_RESULT + 4);
     e.store_r32_disp8(Reg::RDI, 0, Reg::RDX);
 
@@ -3042,7 +3082,7 @@ fn emit_double_shift_mem(
     e.place(mode13);
     emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
     emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
-    emit_mode13_dirty_bit(e, map);
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
     e.place(done);
 }
 
@@ -3231,7 +3271,13 @@ fn emit_store(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -3271,7 +3317,7 @@ fn emit_store(
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, map);
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
     e.place(done);
 }
 
@@ -3300,19 +3346,26 @@ fn emit_store_write_resolve(
     sides: MemorySideExits,
 ) {
     emit_write_permission_check(e, memory.cpl3, sides.permission);
-    emit_write_pointer(e, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
     if memory.watch_page_bit {
         // RCX is the page index from the kind classify — the permission check never touches it
         // and the pointer resolve only reads it. RDX is dead (the store value loads later, and
         // the guard re-derives its own scratches).
         let unwatched = e.label();
-        e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+        emit_table_base(
+            e,
+            memory.r15_tables,
+            TABLE_SLOT_FLAGS,
+            map.flags(),
+            Reg::RDX,
+        );
         e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
         e.jz(unwatched);
         emit_code_watch_branch(
             e,
             width,
+            memory.r15_tables,
             map,
             code_watch_tables,
             sides.code_watch,
@@ -3320,7 +3373,14 @@ fn emit_store_write_resolve(
         );
         e.place(unwatched);
     } else {
-        emit_watched_store_guard(e, width, map, code_watch_tables, sides.code_watch);
+        emit_watched_store_guard(
+            e,
+            width,
+            memory.r15_tables,
+            map,
+            code_watch_tables,
+            sides.code_watch,
+        );
     }
 }
 
@@ -3401,8 +3461,14 @@ fn emit_read_permission_check(e: &mut Encoder, memory_cpl3: bool, side: Label) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_read_pointer(e: &mut Encoder, map: NativeMapBases, side: Label) {
-    e.mov_r64_imm64(Reg::RDI, map.read_biases() as u64);
+fn emit_read_pointer(e: &mut Encoder, r15_tables: bool, map: NativeMapBases, side: Label) {
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_READ_BIASES,
+        map.read_biases(),
+        Reg::RDI,
+    );
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(side);
@@ -3413,12 +3479,47 @@ fn emit_read_pointer(e: &mut Encoder, map: NativeMapBases, side: Label) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_write_pointer(e: &mut Encoder, map: NativeMapBases, side: Label) {
-    e.mov_r64_imm64(Reg::RDI, map.write_biases() as u64);
+fn emit_write_pointer(e: &mut Encoder, r15_tables: bool, map: NativeMapBases, side: Label) {
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_WRITE_BIASES,
+        map.write_biases(),
+        Reg::RDI,
+    );
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(side);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
+}
+
+/// Load a table base into `dst`: R15-relative from `CpuGsw::native_table_slots`
+/// (7 bytes, hot L1) on the R15 arm, the baked 10-byte immediate otherwise.
+/// Identical pointer either way — the compile walk publishes exactly the values
+/// its `MemoryEmitContext` carries, before the block can be installed.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_table_base(e: &mut Encoder, r15_tables: bool, slot: usize, value: usize, dst: Reg) {
+    if r15_tables {
+        e.load_r64_disp32(dst, Reg::R15, table_slot_offset(slot));
+    } else {
+        e.mov_r64_imm64(dst, value as u64);
+    }
+}
+
+/// Offset of `CpuGsw::native_table_slots[slot]` from R15, computed the way
+/// `eip_offset` and friends are so the field's position is load-bearing only
+/// through `offset_of!`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn table_slot_offset(slot: usize) -> i32 {
+    (core::mem::offset_of!(CpuGsw, native_table_slots)
+        + core::mem::offset_of!(NativeTableSlots, slots)
+        + slot * core::mem::size_of::<usize>()) as i32
 }
 
 #[cfg(all(
@@ -3428,12 +3529,21 @@ fn emit_write_pointer(e: &mut Encoder, map: NativeMapBases, side: Label) {
 fn emit_watched_store_guard(
     e: &mut Encoder,
     width: MemoryWidth,
+    r15_tables: bool,
     map: NativeMapBases,
     code_watch_tables: [usize; 2],
     side: Label,
 ) {
     let unwatched = e.label();
-    emit_code_watch_branch(e, width, map, code_watch_tables, side, unwatched);
+    emit_code_watch_branch(
+        e,
+        width,
+        r15_tables,
+        map,
+        code_watch_tables,
+        side,
+        unwatched,
+    );
     e.place(unwatched);
 }
 
@@ -3444,12 +3554,21 @@ fn emit_watched_store_guard(
 fn emit_watched_alu_result_guard(
     e: &mut Encoder,
     width: MemoryWidth,
+    r15_tables: bool,
     map: NativeMapBases,
     code_watch_tables: [usize; 2],
     side: Label,
 ) {
     let unwatched = e.label();
-    emit_code_watch_branch(e, width, map, code_watch_tables, side, unwatched);
+    emit_code_watch_branch(
+        e,
+        width,
+        r15_tables,
+        map,
+        code_watch_tables,
+        side,
+        unwatched,
+    );
     e.place(unwatched);
 }
 
@@ -3460,6 +3579,7 @@ fn emit_watched_alu_result_guard(
 fn emit_code_watch_branch(
     e: &mut Encoder,
     width: MemoryWidth,
+    r15_tables: bool,
     map: NativeMapBases,
     code_watch_tables: [usize; 2],
     watched: Label,
@@ -3467,14 +3587,36 @@ fn emit_code_watch_branch(
 ) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDX, map.physical_pages() as u64);
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_PHYSICAL_PAGES,
+        map.physical_pages(),
+        Reg::RDX,
+    );
     e.load_r32_sib_scale4(Reg::RCX, Reg::RDX, Reg::RCX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     e.store_r64_disp8(Reg::RSP, STACK_WATCH_PAGE, Reg::RCX);
     let second = e.label();
-    emit_code_watch_table_branch(e, width, code_watch_tables[0], watched, second);
+    emit_code_watch_table_branch(
+        e,
+        width,
+        r15_tables,
+        TABLE_SLOT_CODE_WATCH_STICKY,
+        code_watch_tables[0],
+        watched,
+        second,
+    );
     e.place(second);
-    emit_code_watch_table_branch(e, width, code_watch_tables[1], watched, unwatched);
+    emit_code_watch_table_branch(
+        e,
+        width,
+        r15_tables,
+        TABLE_SLOT_CODE_WATCH_NATIVE,
+        code_watch_tables[1],
+        watched,
+        unwatched,
+    );
 }
 
 #[cfg(all(
@@ -3484,12 +3626,14 @@ fn emit_code_watch_branch(
 fn emit_code_watch_table_branch(
     e: &mut Encoder,
     width: MemoryWidth,
+    r15_tables: bool,
+    table_slot: usize,
     code_watch_table: usize,
     watched: Label,
     unwatched: Label,
 ) {
     e.load_r64_disp8(Reg::RCX, Reg::RSP, STACK_WATCH_PAGE);
-    e.mov_r64_imm64(Reg::RDX, code_watch_table as u64);
+    emit_table_base(e, r15_tables, table_slot, code_watch_table, Reg::RDX);
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, 0);
     e.jz(unwatched);
@@ -3707,10 +3851,16 @@ fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_mode13_dirty_bit(e: &mut Encoder, map: NativeMapBases) {
+fn emit_mode13_dirty_bit(e: &mut Encoder, r15_tables: bool, map: NativeMapBases) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    e.mov_r64_imm64(Reg::RDI, map.physical_pages() as u64);
+    emit_table_base(
+        e,
+        r15_tables,
+        TABLE_SLOT_PHYSICAL_PAGES,
+        map.physical_pages(),
+        Reg::RDI,
+    );
     e.load_r32_sib_scale4(Reg::RDX, Reg::RDI, Reg::RCX);
     e.add_r32_imm32(Reg::RDX, 0u32.wrapping_sub(0x000a_0000));
     e.shift_r32_imm8(5, Reg::RDX, NATIVE_PAGE_SHIFT as u8);
