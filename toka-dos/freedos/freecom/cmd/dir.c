@@ -1,6 +1,11 @@
 /* $Id$
  *  DIR.C - dir internal command
  *
+ * Modified by the Toka-DOS project, 2026: DIR now sorts by name with
+ * directories first (the /O:NG order) by default, instead of listing the
+ * raw on-disk directory order. DIRCMD and an explicit /O still override it,
+ * and /O:U restores the unsorted listing.
+ *
  *  Comments:
  *
  *  01/29/97 (Tim Norman)
@@ -204,6 +209,10 @@
 #define DEFAULT_SORT_ORDER "NG"
 
 static unsigned char optOdir = 0;
+static int optOdefaulted;	/* the order in effect is Toka-DOS's default,
+							not one the user asked for: fall back to the
+							unsorted listing silently if the sort buffers
+							cannot be had */
 static char optOorderby[5]; /* Array: One byte longer than order methods,
 							the last unused orderby[] byte is zero
 							by design always
@@ -463,16 +472,28 @@ done:
     
 static int scanOrder(const char *p)
 {
+	const char *start;
+
+	optOdefaulted = 0;		/* reached from DIRCMD or /O --> user's choice */
+
 	if(!p || !*p)
 		p = DEFAULT_SORT_ORDER;
 
-restart:	
+restart:
+	start = p;
 	memset(optOorderby, 0, sizeof(optOorderby));
 	optOdir = 0;
 
 	if(p && *p) {
 		for(;;p++) {
-			int inverse = p[-1] == '-';
+			/* Toka-DOS: the "was the previous character a '-'?" test used to
+			   read p[-1] unconditionally, i.e. one byte in front of the
+			   string. Harmless for a command line, but DEFAULT_SORT_ORDER is
+			   a string literal and whatever the linker parks before it would
+			   silently invert the default order (Z-to-A) if it happened to be
+			   a '-'. Every DIR takes this path now, so don't look before the
+			   first character. */
+			int inverse = p != start && p[-1] == '-';
 			int option;
 			int i;
 			
@@ -1037,7 +1058,7 @@ static int dir_list(int pathlen
   if(optO)  {
     orderIndex = malloc(MAX_ORDER * sizeof(unsigned));
     if(!orderIndex) {
-    	error_out_of_memory();
+    	if(!optOdefaulted) error_out_of_memory();
     	optO = 0;
 	} else {
 #ifdef FARDATA
@@ -1048,7 +1069,7 @@ static int dir_list(int pathlen
 #endif
 		if(!orderArray) {
 			free(orderIndex);
-			error_out_of_dos_memory();
+			if(!optOdefaulted) error_out_of_dos_memory();
 			optO = 0;
 		}    	
 		orderCount = 0;
@@ -1279,6 +1300,12 @@ int cmd_dir (char * rest) {
   dispLFN = 0;
 #endif
   attrMay = ATTR_DEFAULT;
+
+  /* Toka-DOS default: sorted by name, directories first. Installed before
+     the DIRCMD and command line scans below so either one can override it
+     (/O:U goes back to the raw on-disk order). */
+  scanOrder(NULL);
+  optOdefaulted = 1;
 
   /* read the parameters from env */
   if ((argv = scanCmdline(p = getEnv("DIRCMD"), opt_dir, 0, &argc, &opts))

@@ -1093,11 +1093,11 @@ DIR [drive:][path][filename] [/P] [/W] [/A[[:]attributes]]
  attributes  D  Directories                R  Read-only files
              H  Hidden files               A  Files ready for archiving
              S  System files               -  Prefix meaning not
- /O         List by files in sorted order.
+ /O         List by files in sorted order.  Sorting is on by default.
  sortorder   N  By name (alphabetic)       S  By size (smallest first)
              E  By extension (alphabetic)  D  By date & time (earliest first)
              G  Group directories first    -  Prefix to reverse order
-             U  Unsorted		   Defaults to /ONG
+             U  Unsorted (on-disk order)   Defaults to /ONG
  /S         Displays files in specified directory and all subdirectories.
  /B         Uses bare format (no heading information or summary).
  /L         Uses lowercase.

@@ -722,3 +722,103 @@ fn tokaedit_edits_and_saves_a_file() {
         "saved HELLO bytes did not match the typed document body"
     );
 }
+
+/// DIR's default listing order: by name, directories grouped first, without
+/// the user giving `/O`. Stock FreeCOM lists entries in raw on-disk order and
+/// only sorts when asked; Toka-DOS installs the `/O:NG` order as the default
+/// (see `toka-dos/freedos/VENDOR.md`). The C: root is the fixture because its
+/// on-disk order (CONFIG.SYS, AUTOEXEC.BAT, LICENSE.TXT, then the DOS subdir
+/// entry, written in that sequence by `build-freedos-hdd-image.py`) is neither
+/// alphabetical nor directories-first, so an unsorted DIR cannot pass this.
+/// `DIR /O:U` must still get that raw order back.
+#[test]
+#[ignore = "boots a full DOS image from a FAT32 HDD (slow in debug); run with --ignored"]
+fn dir_defaults_to_name_order_with_directories_first() {
+    let (mut machine, stop, boot_cycles) = boot_hdd(500_000_000);
+    let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
+    assert!(
+        boot_text.contains("c:\\>"),
+        "no C:\\> prompt after {boot_cycles} requested cycles (stop={stop:?}).\n{boot_text}"
+    );
+
+    // CLS first, so each capture holds one listing and nothing scrolled up
+    // from the previous one.
+    let listing = |machine: &mut Machine, command: &str| -> Vec<String> {
+        for ch in "cls\r".chars().chain(command.chars()).chain(['\r']) {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type a DIR command");
+        }
+        run_until_toka_condition(machine, 40_000_000, |machine| {
+            current_root_prompt(machine)
+                && machine
+                    .screen_text()
+                    .as_text()
+                    .to_ascii_lowercase()
+                    .contains("bytes free")
+        });
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.to_ascii_lowercase().contains("license"),
+            "DIR did not list the C: root.\n{text}"
+        );
+        dir_entry_names(&text)
+    };
+
+    let sorted = listing(&mut machine, "dir c:\\");
+    let unsorted = listing(&mut machine, "dir c:\\ /o:u");
+
+    assert_eq!(
+        sorted,
+        vec!["DOS", "AUTOEXEC.BAT", "CONFIG.SYS", "LICENSE.TXT"],
+        "DIR without /O did not default to name order with directories first.\n\
+         DIR /O:U order was {unsorted:?}"
+    );
+    assert_ne!(
+        unsorted, sorted,
+        "DIR /O:U returned the sorted order, so the default sort proves nothing"
+    );
+    let mut same_entries = unsorted.clone();
+    same_entries.sort();
+    let mut expected_entries = sorted.clone();
+    expected_entries.sort();
+    assert_eq!(
+        same_entries, expected_entries,
+        "DIR /O:U listed a different set of entries, so the two captures are not comparable"
+    );
+}
+
+/// The entry names of a DIR listing, in the order DIR printed them. A wide-form
+/// row is `NAME     EXT      <DIR>  ...` or `NAME     EXT   1,234 ...`, with the
+/// 8.3 name in the first 12 columns; every other screen line (header, summary,
+/// prompt) is skipped.
+fn dir_entry_names(screen: &str) -> Vec<String> {
+    screen
+        .lines()
+        .filter_map(|line| {
+            let (name_field, rest) = line.split_at_checked(12)?;
+            if rest.trim().is_empty() {
+                return None;
+            }
+            let (stem, ext) = name_field.split_at(8);
+            let stem = stem.trim_end();
+            let ext = ext.trim();
+            if stem.is_empty()
+                || stem.starts_with(' ')
+                || !stem.bytes().all(|b| {
+                    b.is_ascii_uppercase() || b.is_ascii_digit() || b"_~-!@#$%^&(){}".contains(&b)
+                })
+            {
+                return None;
+            }
+            Some(if ext.is_empty() {
+                stem.to_string()
+            } else {
+                format!("{stem}.{ext}")
+            })
+        })
+        .collect()
+}

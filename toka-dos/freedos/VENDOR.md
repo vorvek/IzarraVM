@@ -33,6 +33,20 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
 - Rebrand (Toka-DOS 3.0): kernel `hdr/version.h` (KVS banner), `kernel/main.c` (Toka signon banner, "General Simulation Works", tongue-in-cheek; the verbose FreeDOS/Villani copyright + GPL block was removed from the boot banner and replaced by a "See C:\LICENSE.TXT for more." pointer. The full GPL/copyright is preserved verbatim in C:\LICENSE.TXT, assembled by `scripts/license_txt.py` from the project NOTICE + kernel `COPYING` and shipped on the Katea C: payload); FreeCOM `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng` (product strings; GPL/copyright preserved). Each edited file carries a "modified by the Toka-DOS project, 2026" note.
 - Build fix: FreeCOM `shell/wlinker.bat` adds `op caseexact`. Open Watcom 2.0's wlink defaults to case-insensitive symbol resolution, which collides FreeCOM's libc toupper_/tolower_ with its own toUpper_/toLower_ (infinite recursion at the first console char-translation). Required for a working shell.
 - Build target: kernel built XCPU=86 XFAT=32 (8086 + FAT32 => DOS 7.10), no UPX. XCPU=386 is NOT usable (emits 386 opcodes, e.g. PUSH FS, the emulator lacks).
+- Toka-DOS changes the default `DIR` sort order. Upstream FreeCOM lists entries
+  in raw on-disk order unless `/O` is given; Toka-DOS installs the `/O:NG`
+  order (by name, directories grouped first) in `cmd_dir()` before the DIRCMD
+  and command-line scans, so both still override it and `DIR /O:U` restores
+  the unsorted listing. Because the sort buffers (a 64 KiB DOS block plus a
+  ~3 KiB index) are now allocated on every `DIR`, the two allocation-failure
+  paths in `dir_list()` fall back to the unsorted listing *silently* when the
+  order was only the default, rather than printing an out-of-memory error for
+  a sort the user never asked for. `scanOrder()`'s reverse-order test no longer
+  reads the byte in front of its argument: for a command line that byte is
+  merely uninteresting, but the default order is a string literal, and a '-'
+  parked ahead of it by the linker would silently invert the listing to Z-to-A.
+  `strings/DEFAULT.lng` notes the new default in the `DIR` help; the other
+  language files are untouched.
 
 ## SP-3 userland vendored source
 - move:    github.com/FDOS/move    tag v3.5a  commit 1e2de517   (+ kitten 3b9947fc, tnyprntf 450ab904)

@@ -30,7 +30,7 @@ Some have a short and a long spelling that do the same thing: `MD`/`MKDIR`,
 | `DEL` / `ERASE` | `DEL [path]file [/P] [/V]` | Delete files (wildcards allowed). `/P` confirm each, `/V` list what was deleted. |
 | `REN` / `RENAME` | `REN [path]oldname newname` | Rename a file or directory. |
 | `TYPE` | `TYPE [path]file` | Print a text file to the screen. |
-| `DIR` | `DIR [path][file] [/P] [/W] [/A[:attrs]] [/O[:order]] [/S] [/B] [/L]` | List files. `/P` page, `/W` wide, `/S` recurse, `/B` bare names, `/A` filter by attribute, `/O` sort. Defaults come from the `DIRCMD` variable. |
+| `DIR` | `DIR [path][file] [/P] [/W] [/A[:attrs]] [/O[:order]] [/S] [/B] [/L]` | List files. `/P` page, `/W` wide, `/S` recurse, `/B` bare names, `/A` filter by attribute, `/O` sort. Listings are sorted by name with directories first unless you say otherwise; `/O:U` gives the raw on-disk order. Defaults come from the `DIRCMD` variable. |
 | `MD` / `MKDIR` | `MD [drive:]path` | Create a directory. |
 | `RD` / `RMDIR` | `RD [drive:]path` | Remove an empty directory. |
 | `CD` / `CHDIR` | `CD [drive:][path]` | Show or change the current directory; `CD -` returns to the previous one. |
