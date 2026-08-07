@@ -273,7 +273,7 @@ pub(super) fn emit_x87_store_pointer_fast(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_x87_kind_park(e: &mut Encoder, kind: u32) {
+pub(super) fn emit_x87_kind_park(e: &mut Encoder, kind: u32) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.mov_r32_imm32(Reg::RCX, kind);
     e.shift_r64_imm8(4, Reg::RCX, 32);
@@ -384,9 +384,9 @@ pub(crate) fn emit_store_stub_pad(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn append_stub(
+pub(super) fn append_stub(
     code: &mut Vec<u8>,
-    offsets: &mut [usize; STORE_STUB_COUNT],
+    offsets: &mut [usize],
     cursor: &mut usize,
     index: usize,
     stub: Vec<u8>,
@@ -407,7 +407,7 @@ fn append_stub(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_stub_prologue(e: &mut Encoder) {
+pub(super) fn emit_stub_prologue(e: &mut Encoder) {
     e.pop_m64_disp32(Reg::RSP, STACK_STUB_RETURN);
 }
 
@@ -415,7 +415,7 @@ fn emit_stub_prologue(e: &mut Encoder) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_stub_return(e: &mut Encoder) {
+pub(super) fn emit_stub_return(e: &mut Encoder) {
     e.jmp_m64_disp32(Reg::RSP, STACK_STUB_RETURN);
 }
 

@@ -10,7 +10,15 @@ mod mem;
 // The one-lookup store path (fast sites + the shared stub pad) lives in `emit/store_fast.rs`
 // for the same file-policy reason as `mem`.
 mod store_fast;
+// The one-lookup load path (lean/parking read sites + the read-resolve pad) lives in
+// `emit/load_fast.rs` for the same source-line-ceiling reason.
+mod load_fast;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+use load_fast::{emit_ram_read_pointer_fast, emit_read_probe_parking, emit_x87_read_pointer_fast};
 use mem::{
     emit_call_mem, emit_code_watch_branch, emit_push_mem, emit_read_pointer, emit_rmw_inc_dec,
     emit_table_base, emit_watched_alu_result_guard, emit_watched_store_guard, emit_write_pointer,
@@ -2390,6 +2398,13 @@ fn emit_x87_memory_pointer(
         emit_x87_store_pointer_fast(e, width, memory, sides);
         return;
     }
+    if !write && memory.one_lookup_load {
+        // The read twin (load design D5), same replacement scope: the fast arm parks the RAM
+        // pack, the read-resolve stub parks every other case, and the untouched completion
+        // does all width accounting from the pack.
+        emit_x87_read_pointer_fast(e, memory, sides);
+        return;
+    }
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
@@ -2537,6 +2552,14 @@ fn emit_ram_read_pointer(
     sides: MemorySideExits,
     wrap: AddressWrap,
 ) {
+    if memory.one_lookup_load {
+        // The lean one-lookup site REPLACES the pair below wholesale (load design D3a): its
+        // fast RAM arm writes no frame slot and its mode13 arms count inline or in the cold
+        // stub join, so composing it with the trailing completion would stale-read or
+        // double-count (design F5).
+        emit_ram_read_pointer_fast(e, width, addr, memory, sides, wrap);
+        return;
+    }
     emit_ram_read_pointer_inner(e, width, addr, memory, sides, wrap);
     emit_mode13_read_completion(e, width);
 }
@@ -2557,6 +2580,15 @@ fn emit_ram_read_pointer_inner(
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
+    }
+
+    if memory.one_lookup_load {
+        // The parking probe (load design D3b): kind parked in STACK_READ_KIND, pointer in RDI,
+        // NO counter moved — the direct callers of this `_inner` form (Ret/Ret16/JmpMem) run
+        // their CS-limit side exit and only then call `emit_mode13_read_completion`, and that
+        // deferred-increment ordering must survive the probe swap byte-identically.
+        emit_read_probe_parking(e, memory, sides);
+        return;
     }
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);

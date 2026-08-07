@@ -739,6 +739,12 @@ pub(crate) struct BlockCache {
     /// lazily, at the first store-bearing compile with the flag on, never replaced. `None`
     /// after a failed build makes that block fall back to the inline (gate-off) emission.
     store_stub_pad: Option<(super::exec_mem::ExecutableBuffer, [usize; STORE_STUB_COUNT])>,
+    /// The shared read-resolve stub pad (one-lookup load design D4). Same lifetime contract as
+    /// the two pads above, its own executable mapping because reads gate on `map_bases` alone —
+    /// a load-only block has NO code-watch tables, so the read pad must not ride the store
+    /// pad's build condition. `None` after a failed build makes that block fall back to the
+    /// inline (gate-off) read emission.
+    read_stub_pad: Option<(super::exec_mem::ExecutableBuffer, [usize; READ_STUB_COUNT])>,
     /// The `jit_cost_dial_epoch()` the cache above was computed under. The CPU cannot see a bus
     /// dial move, so the memo is keyed on the bus's own epoch rather than on an argument about
     /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
@@ -812,6 +818,7 @@ impl BlockCache {
             iteration_upper_cache: Vec::new(),
             x87_pad: None,
             store_stub_pad: None,
+            read_stub_pad: None,
             global_block_upper_epoch: 0,
             iteration_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
@@ -4751,6 +4758,37 @@ fn compile_with_instruction_limit(
                 _ => false,
             };
     }
+    // The read twin gates on `map_bases` ALONE (load design D2): a load-only block has no
+    // code-watch tables, and the read stubs consult none. Same lazy build, same F5-style
+    // per-block fallback through `None`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    let one_lookup_load;
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        one_lookup_load = cpu.jit_direct.one_lookup_load
+            && cpu.jit_direct.r15_tables
+            && match map_bases {
+                Some(bases) => match cpu.jit_direct.direct.read_stub_addresses(bases) {
+                    Some(addresses) => {
+                        cpu.native_table_slots.publish_read_stubs(addresses);
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            };
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    let one_lookup_load = false;
     #[cfg(not(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
@@ -4836,6 +4874,7 @@ fn compile_with_instruction_limit(
             r15_tables: cpu.jit_direct.r15_tables,
             watch_page_bit: cpu.jit_direct.watch_page_bit,
             one_lookup_store,
+            one_lookup_load,
             segments: segment_layout,
             address_wrap: if d {
                 emit::AddressWrap::None
@@ -4986,6 +5025,12 @@ struct MemoryEmitContext {
     /// falls back to the inline emission for that block) — and it requires `r15_tables`,
     /// because the stubs read every table through the R15 slots.
     one_lookup_store: bool,
+    /// Whether read sites emit the one-lookup probe (load design D3a/D3b/D5) instead of the
+    /// classify/permission/resolve front. From `JitState::one_lookup_load`, AND-ed at the
+    /// construction site with "the read pad actually built"; requires `r15_tables`. Fully
+    /// independent of `one_lookup_store`: disjoint sites, separate pads, so an A/B of either
+    /// slice leaves the other's emission untouched.
+    one_lookup_load: bool,
     segments: SegmentLayout,
     /// Whether a ModRM-derived effective address wraps at 64K.
     ///

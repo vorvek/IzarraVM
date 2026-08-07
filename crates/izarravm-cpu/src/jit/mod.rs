@@ -99,6 +99,13 @@ pub(crate) struct JitState {
     /// clone for `watch_page_bit`'s lockstep-comparison reason. Requires `r15_tables` — the
     /// compile walk enforces that at the pad-build site.
     pub(crate) one_lookup_store: bool,
+    /// Emitted reads probe the one-lookup load-bias table and route special pages through the
+    /// shared read-resolve pad (`dev_docs/2026-08-07-one-lookup-load-design.md` D3a/D3b/D5).
+    /// Seeded from `IZARRAVM_ONE_LOOKUP_LOAD` (default ON, `=0` restores the classify/resolve
+    /// read emission wholesale); a FIELD for `word_at_486`'s testability reason, CARRIED by
+    /// clone for the lockstep reason. Requires `r15_tables`; independent of `one_lookup_store`
+    /// so either slice A/Bs alone.
+    pub(crate) one_lookup_load: bool,
     /// Admission level for 16-bit code segments, seeded from `IZARRAVM_JIT16`.
     ///
     /// A field for the same reason `word_at_486` is one: the `OnceLock` behind it is process-wide,
@@ -143,6 +150,18 @@ fn one_lookup_store_default() -> bool {
     })
 }
 
+/// Seed for `JitState::one_lookup_load`, read once per process from
+/// `IZARRAVM_ONE_LOOKUP_LOAD` — the store knob's pattern, on its own retirement clock.
+fn one_lookup_load_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("IZARRAVM_ONE_LOOKUP_LOAD").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
 impl JitState {
     pub(crate) fn new(direct: direct::BlockCache) -> Self {
         Self {
@@ -151,6 +170,7 @@ impl JitState {
             r15_tables: true,
             watch_page_bit: true,
             one_lookup_store: one_lookup_store_default(),
+            one_lookup_load: one_lookup_load_default(),
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
@@ -176,6 +196,7 @@ impl Clone for JitState {
             r15_tables: self.r15_tables,
             watch_page_bit: self.watch_page_bit,
             one_lookup_store: self.one_lookup_store,
+            one_lookup_load: self.one_lookup_load,
             sixteen_bit_level: self.sixteen_bit_level,
             direct_barrier_census: None,
             smc_heat: self.smc_heat.clone(),
