@@ -549,9 +549,9 @@ int initialize(void)
 		showinfo = 0;
 /*		short_version(); */
 		/* Modified by the Toka-DOS project, 2026: the styled Toka-DOS boot
-		   tree owns the screen; the shell starts silently. cmd_ver stays
-		   fully functional for an explicit VER. This is the /P (resident
-		   shell) startup path -- the one CONFIG.SYS's SHELL=...
+		   tree owns the screen; the shell starts silently (see the showinfo
+		   block below for the VER-stays-functional note). This is the /P
+		   (resident shell) startup path -- the one CONFIG.SYS's SHELL=...
 		   /P=C:\AUTOEXEC.BAT line actually takes -- so the version print
 		   is dropped here rather than only in the showinfo block below. */
 
@@ -615,7 +615,10 @@ int initialize(void)
        functional for an explicit VER. (The everyday boot path takes the
        /P branch above instead -- see the comment there -- but a COMMAND.COM
        invoked without /P, e.g. a nested interactive shell, reaches showinfo
-       here and must stay silent too.) */
+       here and must stay silent too.) The empty if and showinfo's other
+       assignments are kept deliberately, to hold this hunk's shape close to
+       upstream -- a merge resolver should NOT delete them. Upstream's
+       commented-out short_version() / showcmds() scaffolding went with it. */
   }
 
   return E_None;
