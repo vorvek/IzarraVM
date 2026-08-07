@@ -321,6 +321,10 @@ init:
     ; (FreeDOS init_device). Bare and RAM both leave EMS enabled, drawing pages
     ; from the shared arena on demand rather than a fixed-size pool; NOEMS wins
     ; regardless of token order because no other token sets it back.
+    ; Also recognizes a whole-token "/T", order-independent like NOEMS, which
+    ; only selects the tree-styled signon banner prefix and touches nothing
+    ; else. DEVICE= parameters here use '/' lead-in only, by policy -- the '-'
+    ; alternative is reserved for the .COM tools' own command lines.
     push ds
     lds si, [es:bx+18]
 .p_path:                          ; skip the path token
@@ -337,7 +341,8 @@ init:
     je .p_gap
     cmp ah, 2
     je .p_done
-    cmp al, '/'
+    cmp al, '/'                   ; RAW byte, BEFORE the upcase below: '/' is
+                                  ; 0x2F and 'and 0xDF' would fold it to 0x0F
     jne .p_not_slash
     lodsb
     call cls_al
@@ -410,15 +415,15 @@ init:
 
     ; Signon banner. INT 29h works during device INIT, when INT 21h AH=09h is unreliable.
     cmp byte [tree_mode], 0
-    je .b_plain
+    je .bplain
     mov si, banner_tree
 .btl:
     lodsb                         ; DS = CS here
     test al, al
-    jz .b_plain
+    jz .bplain                    ; prefix done, fall into the plain banner
     int 0x29
     jmp .btl
-.b_plain:
+.bplain:
     mov si, banner
 .bl:
     lodsb                         ; DS = CS here
