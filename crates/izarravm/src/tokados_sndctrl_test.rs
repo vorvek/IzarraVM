@@ -184,11 +184,8 @@ fn sndctrl_status_reads_the_hardware_and_changes_nothing() {
 /// Like every fixture in this file, `boot_with_sndctrl` serves SNDCTRL.COM out
 /// of the *committed* `tokados-hdd.img` (`mount_hdd_folder` -> Katea's system
 /// payload), not the freshly assembled `sndctrl.com` sitting next to the
-/// source. This test is only green once an image containing a SNDCTRL.COM
-/// built with `/B` support is committed -- expected from the task that lands
-/// `tokados-hdd.img` onward. Until then it fails the same way a genuine
-/// regression would (`Unrecognised option: B`), which is the correct failure
-/// mode: it is `--ignored`, so it never runs unattended before that lands.
+/// source -- this test needs the committed image's SNDCTRL to already
+/// support `/B`, permanently, since that is the only binary it boots.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndctrl_boot_summary_tree_prints_two_rows_and_changes_nothing() {
@@ -226,8 +223,8 @@ fn sndctrl_boot_summary_tree_prints_two_rows_and_changes_nothing() {
 /// (no prefix at all on the heading line, no gutter before the indent) proves
 /// SNDCTRL itself withheld them.
 ///
-/// Same committed-image caveat as the /T case above: green only once the
-/// image embeds a `/B`-capable SNDCTRL.COM.
+/// Same committed-image note as the /T case above: this needs the committed
+/// image's SNDCTRL to already support `/B`, permanently.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndctrl_boot_summary_plain_has_no_tree_glyphs() {
