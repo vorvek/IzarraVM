@@ -604,10 +604,8 @@ void DosDefinePartition(struct DriveParamS *driveParam,
   if (InitKernelConfig.InitDiskShowDriveAssignment)
   {
     /* Modified by the Toka-DOS project, 2026: one tree-styled line per unit;
-       Pri/Ext and CHS details left out per the boot-screen spec. The leading
-       \r overwrites dsk_init()'s unterminated " - InitDisk" progress text
-       (initdisk.c dsk_init, ~line 1369), same as the printf it replaces. */
-    printf("\r" TOKA_TREE_PREFIX "%c: HD%d, start=%lu MB, size=%lu MB\n",
+       Pri/Ext and CHS details left out per the boot-screen spec. */
+    printf(TOKA_TREE_PREFIX "%c: HD%d, start=%lu MB, size=%lu MB\n",
            'A' + nUnits, (driveParam->driveno & 0x7f) + 1,
            StartSector / 2048, pEntry->NumSect / 2048);
   }
@@ -1368,7 +1366,12 @@ void ReadAllPartitionTables(void)
 /* disk initialization: returns number of units */
 COUNT dsk_init()
 {
-  printf(" - InitDisk");
+  /* Modified by the Toka-DOS project, 2026: dropped the unterminated
+     " - InitDisk" progress fragment (upstream prints it with no trailing
+     newline, expecting later kernel output on the same row). The styled
+     boot screen's tree lines are anchored to fixed rows in the 25-row
+     budget, so a stray fragment ahead of them would dangle whenever no DOS
+     partition is found. */
 
 #ifdef DEBUG
   {

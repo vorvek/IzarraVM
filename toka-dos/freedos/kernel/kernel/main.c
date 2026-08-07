@@ -443,7 +443,7 @@ STATIC VOID signon_box_edge(int left, int right)
 {
   int i;
   printf("%c", left);
-  for (i = 0; i < TOKA_BOX_W - 2; i++)
+  for (i = 0; i < TOKA_BOX_INNER_W; i++)
     printf("%c", 0xC4);
   printf("%c\n", right);
 }
@@ -452,9 +452,9 @@ STATIC VOID signon_box_text(char *s)
 {
   int col = 2;
   printf("%c ", 0xB3);
-  for (; *s && col < TOKA_BOX_W - 1; s++, col++)   /* clamp: overlong text truncates, never shears the frame */
+  for (; *s && col < TOKA_BOX_TEXT_END; s++, col++)   /* clamp: overlong text truncates, never shears the frame */
     printf("%c", *s);
-  for (; col < TOKA_BOX_W - 1; col++)
+  for (; col < TOKA_BOX_TEXT_END; col++)
     printf(" ");
   printf("%c\n", 0xB3);
 }
@@ -489,19 +489,17 @@ STATIC VOID signon()
     }
   }
 
-  /* Park the cursor under the logo (blank spacer row included) so the box
-     prints below the art instead of over it. */
+  /* Park the cursor under the logo so the box prints below the art instead
+     of over it. No spacer row: the 25-row budget has no room for one. */
   r.a.x = 0x0200;
   r.b.b.h = 0;
-  r.d.b.h = TOKA_LOGO_ROWS + 1;   /* row */
+  r.d.b.h = TOKA_LOGO_ROWS;       /* row */
   r.d.b.l = 0;                    /* col */
   init_call_intr(0x10, &r);
 
   signon_box_edge(0xDA, 0xBF);
   signon_box_text(TOKA_BUILD_LINE_1);
   signon_box_text(TOKA_BUILD_LINE_2);
-  signon_box_text("");
-  signon_box_text(TOKA_BUILD_LINE_3);
   signon_box_edge(0xC3, 0xD9);    /* left tee: the box edge feeds the tree */
 
   printf(TOKA_TREE_PREFIX "Kernel compatibility: %d.%d - "

@@ -30,28 +30,48 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
   feature set, command-line interface, and DOS redirector behavior stay intact.
 
 ## Local patches applied to the vendored source
-- Rebrand (Toka-DOS 3.0): kernel `hdr/version.h` (KVS banner; also adds the
-  `TOKA_BUILD_LINE_*` welcome-box strings -- `KERNEL_VERSION_STRING`/
-  `os_release` themselves are untouched), `kernel/kernel/init-mod.h` (shared
-  boot-screen styling constants -- `TOKA_BOX_W`, `TOKA_TREE_PREFIX` -- used by
-  both `main.c` and `initdisk.c`), `kernel/main.c` (`signon()` rewritten: a
-  rainbow TOKA logo via direct text-RAM writes, a CP437 welcome box (build
-  number + compile date + an Izarra SL line pointing at C:\LICENSE.TXT), and
-  a tree-styled kernel-compatibility line; the compiler `#if` chain that
-  picked the banner's compiler name is narrowed to Watcom-only, the
-  upstream BORLANDC/TURBOC/MSC/GNUC arms removed -- Toka-DOS only ships a
-  Watcom build, so this is a deliberate upstream divergence, not dead-code
-  drift), `kernel/kernel/initdisk.c` (the drive-assignment line restyled to
-  match the boot tree -- one `TOKA_TREE_PREFIX`-led line per unit, the Pri/Ext
-  partition tag and CHS geometry dropped per the boot-screen spec; the
-  verbose FreeDOS/Villani copyright + GPL block was removed from the boot
-  banner and replaced by a "See C:\LICENSE.TXT for more." pointer. The full
-  GPL/copyright is preserved verbatim in C:\LICENSE.TXT, assembled by
-  `scripts/license_txt.py` from the project NOTICE + kernel `COPYING` and
-  shipped on the Katea C: payload); FreeCOM `shell/ver.c` (shellname/shellver),
-  `VERSION.TXT`, `strings/DEFAULT.lng` (product strings; GPL/copyright
-  preserved). Each edited file carries a "modified by the Toka-DOS project,
-  2026" note.
+- Rebrand (Toka-DOS 3.0): kernel `kernel/hdr/version.h` (KVS banner; also adds
+  the `TOKA_BUILD_LINE_*` welcome-box strings -- `KERNEL_VERSION_STRING`/
+  `os_release` themselves are untouched), `kernel/kernel/init-mod.h`
+  (boot-screen styling constants -- `TOKA_BOX_W`, `TOKA_TREE_PREFIX`, and
+  their derived `TOKA_BOX_INNER_W`/`TOKA_BOX_TEXT_END` -- shared between
+  `main.c` and `initdisk.c` within kernel-init only; userland `/T` tools each
+  carry their own copy of the prefix bytes, there is no project-wide single
+  source), `kernel/kernel/main.c` (`signon()` rewritten: a rainbow TOKA logo
+  via direct text-RAM writes, a CP437 welcome box (merged title line with
+  build number + compile date, plus an Izarra SL copyright line pointing at
+  C:\LICENSE.TXT), and a tree-styled kernel-compatibility line, all inside the
+  kernel's 25-row boot budget; the verbose FreeDOS/Villani copyright + GPL
+  block that used to print on the boot banner was removed and replaced by the
+  "See C:\LICENSE.TXT for more." pointer -- the full GPL/copyright is
+  preserved verbatim in C:\LICENSE.TXT, assembled by `scripts/license_txt.py`
+  from the project NOTICE + kernel `COPYING` and shipped on the Katea C:
+  payload; the compiler `#if` chain that picked the banner's compiler name is
+  narrowed to Watcom-only, the upstream BORLANDC/TURBOC/MSC/GNUC arms removed
+  -- Toka-DOS only ships a Watcom build, so this is a deliberate upstream
+  divergence, not dead-code drift), `kernel/kernel/initdisk.c` (the
+  drive-assignment line restyled to match the boot tree -- one
+  `TOKA_TREE_PREFIX`-led line per unit, the Pri/Ext partition tag and CHS
+  geometry dropped per the boot-screen spec; the unterminated `" - InitDisk"`
+  progress fragment `dsk_init()` used to print ahead of it was also dropped,
+  since the styled screen has no free row for it to dangle on); FreeCOM
+  `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng`
+  (product strings; GPL/copyright preserved). Each edited file carries a
+  "modified by the Toka-DOS project, 2026" note.
+- Idle CPU behavior (predates the boot-screen campaign, missing from this
+  ledger until now): kernel `kernel/kernel/config.c` (the `SHELL=` default
+  changed from upstream's bare `command.com` to the full
+  `C:\DOS\COMMAND.COM` path with tail ` C:\DOS /P /E:256`, ~line 138/156, so
+  the F5 config-bypass load matches the shipped CONFIG.SYS `SHELL=` line and
+  finds itself in `C:\DOS`; the `IDLEHALT` default changed from 0 to 1 at
+  ~line 844, "safe hooks" halt-on-CON-wait behavior, safe here because
+  IzarraVM ships its own CPU and does not have the power-draw-transient
+  hardware class upstream's off-by-default is guarding against; a new
+  `idle_hlt()` inline-asm pragma at ~line 1045 wraps HLT in PUSHF/STI/POPF;
+  the CON character-input wait loop at ~line 1061 calls it) and
+  `kernel/kernel/main.c` (`HaltCpuWhileIdle` initialized to 1 at ~line 295,
+  ahead of CONFIG.SYS parsing, matching the config.c default so the window
+  between kernel entry and CONFIG.SYS is not spent busy-waiting either).
 - Build fix: FreeCOM `shell/wlinker.bat` adds `op caseexact`. Open Watcom 2.0's wlink defaults to case-insensitive symbol resolution, which collides FreeCOM's libc toupper_/tolower_ with its own toUpper_/toLower_ (infinite recursion at the first console char-translation). Required for a working shell.
 - Build target: kernel built XCPU=86 XFAT=32 (8086 + FAT32 => DOS 7.10), no UPX. XCPU=386 is NOT usable (emits 386 opcodes, e.g. PUSH FS, the emulator lacks).
 - Toka-DOS changes the default `DIR` sort order. Upstream FreeCOM lists entries
@@ -214,12 +234,15 @@ involved.
 
 ### Layout note
 
-All eighteen files (kernel/shell/config plus the userland tool set) live flat
-in the C:\ root; `scripts/build-freedos-hdd-image.py` has no subdirectory
-support (the FAT32 builder only ever writes a root directory and per-file
-cluster chains, no nested directory entries), so a `C:\DOS` layout was not
-attempted for this batch. The root directory itself needed a fix to become a
-proper multi-cluster chain (previously hardcoded to exactly cluster 2, which
-held at most 16 entries at this image's 1-sector-per-cluster geometry) to fit
-past the audit item 10 (MEM) baseline of 12 files; `CONFIG.SYS`/`AUTOEXEC.BAT`
-already point `PATH` at `C:\`, so no PATH change was needed.
+Stale as of this writing: `scripts/build-freedos-hdd-image.py` now supports a
+`C:\DOS` subdirectory (`dos_dir`), and the current image uses it -- KERNEL.SYS,
+CONFIG.SYS, AUTOEXEC.BAT, and LICENSE.TXT live in the C:\ root, while
+COMMAND.COM and every command-line tool (the rest of the eighteen-plus files
+above) live under `C:\DOS`. `CONFIG.SYS`'s `SHELL=` and `AUTOEXEC.BAT`'s
+`PATH` both point at `C:\DOS` (see `kernel/kernel/config.c`'s `SHELL=`
+default in the "Idle CPU behavior" entry above, which matches). The root
+directory itself needed a fix to become a proper multi-cluster chain
+(previously hardcoded to exactly cluster 2, which held at most 16 entries at
+this image's 1-sector-per-cluster geometry) to fit past the audit item 10
+(MEM) baseline of 12 files; that fix predates and is unrelated to the later
+`C:\DOS` subdirectory work.
