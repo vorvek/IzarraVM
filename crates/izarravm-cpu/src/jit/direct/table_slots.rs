@@ -21,9 +21,18 @@ use super::*;
 /// ignores the slots, `CallOutTable`'s shape and reason. A cloned CPU gets a
 /// fresh `BlockCache` (its clone drops compiled blocks), so its first compile
 /// republishes before any slot-reading block can run.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct NativeTableSlots {
     pub(super) slots: [usize; 6 + 1 + STORE_STUB_COUNT + 1 + READ_STUB_COUNT],
+}
+
+// Manual because `Default` is not derivable past 32 array elements.
+impl Default for NativeTableSlots {
+    fn default() -> Self {
+        Self {
+            slots: [0; 6 + 1 + STORE_STUB_COUNT + 1 + READ_STUB_COUNT],
+        }
+    }
 }
 
 pub(crate) const TABLE_SLOT_FLAGS: usize = 0;
@@ -63,23 +72,34 @@ pub(crate) const fn store_stub_slot_x87(width_index: usize, cpl3: bool) -> usize
 /// move `pending_flags` or any hot interpreter field (the #719 layout-tax lesson; the pinned
 /// offset tests are this commit's proof).
 pub(crate) const TABLE_SLOT_LOAD_BIASES: usize = TABLE_SLOT_STORE_STUBS + STORE_STUB_COUNT;
-/// The read-resolve stub pad's published entry addresses (load design D4). Four stubs and
-/// WIDTH-INDEPENDENT, unlike the store pad's seventeen: with no watch guard (the store stubs'
-/// only width-dependent front piece) the read resolve is one shape per (family, cpl); the site
-/// keeps its own wide guard and does its own width-specific counting.
+/// The read-resolve stub pad's published entry addresses (load design D4). Three families:
+///
+/// * COUNTING stubs for the lean sites, per GPR width x cpl (6): resolve AND move the mode13
+///   read lane on a mode13 success, so the site's slow join needs no completion bytes — the
+///   restructure the L8 size swap forced (the first-cut inline mode13 arm + cold completion
+///   made every read site ~40 bytes LARGER than the classic front; native mode13 reads exist
+///   only under chained 13h — Mode X produces no read fills, review F3 — so they are stub-cold
+///   by evidence, unlike the store side's doom-hot aperture writes).
+/// * PARK-ONLY stubs for the Ret/Ret16/JmpMem trio, per cpl (2): park the bare kind, never
+///   count — the trio's own deferred completion moves the lane after its CS-limit exit.
+/// * x87 stubs, per cpl (2): park the `kind << 32 | linear` pack for the untouched x87
+///   completion, never count.
 pub(crate) const TABLE_SLOT_READ_STUBS: usize = TABLE_SLOT_LOAD_BIASES + 1;
-/// 2 GPR read-resolve stubs (cpl0/cpl3, park a bare kind) + 2 x87 read-resolve stubs
-/// (cpl0/cpl3, park the `kind << 32 | linear` pack).
-pub(crate) const READ_STUB_COUNT: usize = 2 + 2;
+pub(crate) const READ_STUB_COUNT: usize = 6 + 2 + 2;
 
-/// Slot of the GPR read-resolve stub for a privilege arm.
-pub(crate) const fn read_stub_slot_gpr(cpl3: bool) -> usize {
-    TABLE_SLOT_READ_STUBS + cpl3 as usize
+/// Slot of the counting read stub for a GPR width (byte 0 / word 1 / dword 2) and privilege.
+pub(crate) const fn read_stub_slot_counting(width_index: usize, cpl3: bool) -> usize {
+    TABLE_SLOT_READ_STUBS + width_index * 2 + cpl3 as usize
+}
+
+/// Slot of the trio's park-only read stub for a privilege arm.
+pub(crate) const fn read_stub_slot_park(cpl3: bool) -> usize {
+    TABLE_SLOT_READ_STUBS + 6 + cpl3 as usize
 }
 
 /// Slot of the x87 read-resolve stub for a privilege arm.
 pub(crate) const fn read_stub_slot_x87(cpl3: bool) -> usize {
-    TABLE_SLOT_READ_STUBS + 2 + cpl3 as usize
+    TABLE_SLOT_READ_STUBS + 8 + cpl3 as usize
 }
 
 impl NativeTableSlots {

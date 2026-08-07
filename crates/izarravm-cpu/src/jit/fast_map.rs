@@ -815,7 +815,6 @@ impl FastMap {
     /// fast load path consults nothing but the load-bias table (the flags byte is the one thing
     /// the classic arm reads on that state and the fast arm must not).
     #[cfg(test)]
-    #[allow(dead_code)] // consumed by cpu_jit_load_bias_test.rs, landing in this branch's battery commit
     pub(crate) fn force_fast_load_bias_for_test(&mut self, linear: u32) {
         let index = (linear >> PAGE_SHIFT) as usize;
         let storage = self

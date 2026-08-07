@@ -4,14 +4,19 @@
 //! The one-lookup load path (`dev_docs/2026-08-07-one-lookup-load-design.md`): the lean read
 //! site (D3a) replacing `emit_ram_read_pointer`'s classic pair for its ten callers, the parking
 //! probe (D3b) for the Ret/Ret16/JmpMem trio, the x87 read-pointer probe (D5), and the shared
-//! read-resolve stub pad (D4) — the store pad's sibling, four stubs and WIDTH-INDEPENDENT
-//! because reads have no code-watch guard, the store stubs' only width-dependent front piece.
+//! read-resolve stub pad (D4) — the store pad's sibling: six counting stubs (GPR width x cpl,
+//! the only width dependence being the mode13 lane they move), two park-only trio stubs and
+//! two x87 pack stubs, ten against the store pad's seventeen because reads have no code-watch
+//! guard.
 //!
 //! The counter identity this file exists to preserve (design §2, the run.rs subtraction): RAM
 //! reads are counted STATICALLY at compile, only mode13 reads move dynamic lanes. So the lean
-//! fast RAM arm touches NO counter and NO frame slot; the inline mode13 arm moves exactly the
-//! width's read lane, after every side exit its access can take; the slow arm defers to the
-//! cold `emit_mode13_read_completion` over the kind the stub parked. The parking probe (trio)
+//! fast RAM arm touches NO counter and NO frame slot; every other lean case goes to a
+//! width-specific COUNTING stub that moves exactly the width's read lane on a mode13 success,
+//! after every status this access can refuse with (an emission-shape correction the L8 size
+//! swap forced: the first-cut inline mode13 arm plus a cold per-site completion made every
+//! read site ~40 bytes LARGER than the classic front, and native mode13 READS are stub-cold by
+//! evidence — Mode X produces no read fills, review F3). The parking probe (trio)
 //! moves nothing itself — the trio's own completion runs after their CS-limit side exit,
 //! exactly as the classic front ordered it, and the RAM-kind park sits at `fast_join` where it
 //! DOMINATES both native RAM arms, the untagged one and the cpl0 supervisor strip-rejoin
@@ -76,9 +81,9 @@ fn emit_read_status_dispatch(e: &mut Encoder, cpl3: bool, sides: MemorySideExits
 
 /// The D3a lean site, replacing the `emit_ram_read_pointer_inner` + `emit_mode13_read_completion`
 /// pair wholesale for the paired callers (design F5 composition constraint: never compose this
-/// with a trailing completion — the fast RAM arm writes no frame slot, and the inline mode13 arm
-/// already counted). Contract unchanged from the classic pair: RDI = host pointer, RAX
-/// preserved, RCX/RDX clobbered, every side exit resolved inside.
+/// with a trailing completion — the fast RAM arm writes no frame slot, and the counting stub
+/// already moved any mode13 lane). Contract unchanged from the classic pair: RDI = host
+/// pointer, RAX preserved, RCX/RDX clobbered, every side exit resolved inside.
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -98,11 +103,8 @@ pub(super) fn emit_ram_read_pointer_fast(
     }
     emit_load_bias_probe(e, map);
 
-    let aux = e.label();
     let slow = e.label();
-    let stub_ok = e.label();
     let done = e.label();
-    let fast_join = e.label();
     // BOTH privilege arms test both tag bits: a tagged entry's low bits are part of the VALUE,
     // so even a site allowed to read through it (cpl0 through a supervisor entry) must strip
     // them before forming the pointer — the store slice's round-one miscompile class.
@@ -110,58 +112,64 @@ pub(super) fn emit_ram_read_pointer_fast(
         Reg::RDI,
         (NATIVE_LOAD_BIAS_MODE13 | NATIVE_LOAD_BIAS_SUPERVISOR) as u8,
     );
-    e.jnz(aux);
-    e.place(fast_join);
-    e.add_r64_r64(Reg::RDI, Reg::RAX);
-    // NO counter and NO frame-slot write: RAM reads are static (design §2). The caller's load
-    // through RDI follows immediately and cannot fault.
-    e.jmp(done);
-
-    e.place(aux);
-    e.cmp_r64_imm32(Reg::RDI, u32::MAX);
-    e.jz(slow);
     if memory.cpl3 {
-        // Ring 3 may not read a supervisor entry at all — mode13 or plain, it takes the full
-        // check in the slow stub (which returns the permission status).
-        e.test_r8_low_imm8(Reg::RDI, NATIVE_LOAD_BIAS_SUPERVISOR as u8);
+        // At cpl3 EVERY tagged case — poison, supervisor (may not read), mode13 — goes to the
+        // counting stub, so the site has no aux arm at all. The stub classifies, permission-
+        // checks, resolves, and moves the mode13 lane itself on a mode13 success.
         e.jnz(slow);
+        e.add_r64_r64(Reg::RDI, Reg::RAX);
+        e.jmp(done);
     } else {
-        // Ring 0 reads through supervisor entries exactly as today's checkless cpl0 path does:
-        // strip the tags and rejoin the fast load.
-        let m13 = e.label();
+        let fast_join = e.label();
+        // At cpl0 the one native tagged case is supervisor RAM — today's checkless ring-0 read,
+        // and the COMMON case under a flat-model extender (design F1) — which strips and
+        // rejoins. Poison and mode13 go to the counting stub: native mode13 READS exist only
+        // under chained 13h (Mode X produces no read fills, review F3), so unlike the store
+        // side's doom-hot aperture writes they are stub-cold by evidence, and the inline arm
+        // the first cut carried made every read site ~40 bytes LARGER than the classic front
+        // (the L8 size swap caught it).
+        let aux = e.label();
+        e.jnz(aux);
+        e.place(fast_join);
+        e.add_r64_r64(Reg::RDI, Reg::RAX);
+        // NO counter and NO frame-slot write: RAM reads are static (design §2). The caller's
+        // load through RDI follows immediately and cannot fault.
+        e.jmp(done);
+        e.place(aux);
+        e.cmp_r64_imm32(Reg::RDI, u32::MAX);
+        e.jz(slow);
         e.test_r8_low_imm8(Reg::RDI, NATIVE_LOAD_BIAS_MODE13 as u8);
-        e.jnz(m13);
+        e.jnz(slow);
         e.and_r64_imm32(Reg::RDI, (NATIVE_LOAD_BIAS_TAG_MASK as u32) ^ u32::MAX);
         e.jmp(fast_join);
-        e.place(m13);
     }
-    // The mode13 arm, INLINE for the store slice's measured reason (the pad-stub transfer chain
-    // is latency the instruction counts cannot see). This increment is the ONLY dynamic counter
-    // on any native arm of this site, and it is legal exactly here: for every paired caller the
-    // helper is the last thing in the slot that can side-exit, so the increment is after the
-    // last exit (design D3a; the Ret trio, which breaks that property, uses the parking probe
-    // below instead).
-    e.and_r64_imm32(Reg::RDI, (NATIVE_LOAD_BIAS_TAG_MASK as u32) ^ u32::MAX);
-    e.add_r64_r64(Reg::RDI, Reg::RAX);
+
+    e.place(slow);
+    e.call_m64_disp32(
+        Reg::R15,
+        table_slot_offset(read_stub_slot_counting(
+            gpr_read_width_index(width),
+            memory.cpl3,
+        )),
+    );
+    emit_read_status_dispatch(e, memory.cpl3, sides, done);
+    e.place(done);
+}
+
+/// GPR read width index into the counting-stub slot layout: byte 0, word 1, dword 2.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn gpr_read_width_index(width: MemoryWidth) -> usize {
     match width {
-        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_READS),
-        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS),
-        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_READS),
+        MemoryWidth::Byte => 0,
+        MemoryWidth::Word => 1,
+        MemoryWidth::Dword => 2,
         MemoryWidth::Qword | MemoryWidth::Tbyte => {
             unreachable!("GPR memory reads are never 8- or 10-byte wide")
         }
     }
-    e.jmp(done);
-
-    e.place(slow);
-    e.call_m64_disp32(Reg::R15, table_slot_offset(read_stub_slot_gpr(memory.cpl3)));
-    emit_read_status_dispatch(e, memory.cpl3, sides, stub_ok);
-    e.place(stub_ok);
-    // Cold: the stub parked the kind it classified, and this is the deferred mode13 increment
-    // for a stub-resolved access — the same completion the classic pair ends with, reached only
-    // on stub success, after every status exit.
-    emit_mode13_read_completion(e, width);
-    e.place(done);
 }
 
 /// The D3b parking probe for the Ret/Ret16/JmpMem trio, emitted by
@@ -195,6 +203,8 @@ pub(super) fn emit_read_probe_parking(
     // the cpl0 supervisor strip-rejoin both pass — under a ring-0 flat-model extender the
     // supervisor arm is the COMMON case, and the prologue does not zero this chain-surviving
     // slot. RDX is dead at every trio site (each reloads it from RDI after the completion).
+    // Hoisting this park above `fast_join` is the F1 miscompile: the chain cell in the battery
+    // reads a 4-clock phantom video charge on a supervisor RET when it happens.
     e.mov_r32_imm32(Reg::RDX, u32::from(NATIVE_RAM_KIND));
     e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RDX);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
@@ -222,9 +232,12 @@ pub(super) fn emit_read_probe_parking(
     e.jmp(done);
 
     e.place(slow);
-    e.call_m64_disp32(Reg::R15, table_slot_offset(read_stub_slot_gpr(memory.cpl3)));
-    // The stub parked the kind on success; no completion here — the trio's own call runs after
-    // their limit check, on every arm equally.
+    e.call_m64_disp32(
+        Reg::R15,
+        table_slot_offset(read_stub_slot_park(memory.cpl3)),
+    );
+    // The PARK-ONLY stub: it parked the kind on success and moved no lane — the trio's own
+    // completion runs after their limit check, on every arm equally.
     emit_read_status_dispatch(e, memory.cpl3, sides, done);
     e.place(done);
 }
@@ -296,7 +309,7 @@ impl BlockCache {
 }
 
 /// One emitted read pad: the code bytes and each stub's offset, in the slot-layout order
-/// (`read_stub_slot_gpr`, then `read_stub_slot_x87`).
+/// (`read_stub_slot_counting`, then `read_stub_slot_park`, then `read_stub_slot_x87`).
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -314,13 +327,25 @@ pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
     let mut code = Vec::new();
     let mut offsets = [0usize; READ_STUB_COUNT];
     let mut cursor = 0usize;
+    let widths = [MemoryWidth::Byte, MemoryWidth::Word, MemoryWidth::Dword];
+    for width in widths {
+        for cpl3 in [false, true] {
+            append_stub(
+                &mut code,
+                &mut offsets,
+                &mut cursor,
+                read_stub_slot_counting(gpr_read_width_index(width), cpl3) - TABLE_SLOT_READ_STUBS,
+                emit_counting_read_stub(width, cpl3, map),
+            );
+        }
+    }
     for cpl3 in [false, true] {
         append_stub(
             &mut code,
             &mut offsets,
             &mut cursor,
-            read_stub_slot_gpr(cpl3) - TABLE_SLOT_READ_STUBS,
-            emit_gpr_read_stub(cpl3, map),
+            read_stub_slot_park(cpl3) - TABLE_SLOT_READ_STUBS,
+            emit_park_read_stub(cpl3, map),
         );
     }
     for cpl3 in [false, true] {
@@ -335,10 +360,78 @@ pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
     ReadStubPad { code, offsets }
 }
 
-/// The shared classify-and-park front of both read stubs: page index from RAX, flags byte into
-/// RDX (kept RAW for the permission check), kind split, unknown kinds to `status_unavailable`,
-/// and the classified kind staged in ECX for the caller's park. Falls through with RCX = the
-/// kind, RDX = the raw flags byte.
+/// The counting read stub for the LEAN sites: classify, permission (cpl3 variant only),
+/// read-bias resolve — and on a mode13 success, move the width's dynamic read lane ITSELF
+/// (the pop prologue put RSP at the frame level, so the increment helpers emit at their normal
+/// displacements). No park: the lean sites read no kind afterward, and keeping the frame slot
+/// untouched is what the R4 shape rule promises. The kind split happens BEFORE the resolve so
+/// the classified kind never needs to survive the page-index recompute — each kind gets its
+/// own resolve tail, and stub bytes are per-cache, not per-site.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) -> Vec<u8> {
+    let mut e = Encoder::new();
+    emit_stub_prologue(&mut e);
+    let ram = e.label();
+    let status_unavailable = e.label();
+    let status_permission = e.label();
+
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    emit_table_base(&mut e, true, TABLE_SLOT_FLAGS, map.flags(), Reg::RDX);
+    e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.mov_r32_r32(Reg::RDI, Reg::RDX);
+    e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
+    e.jz(ram);
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
+    e.jnz(status_unavailable);
+
+    // Fall-through: the mode13 resolve tail.
+    emit_read_permission_check(&mut e, cpl3, status_permission);
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    emit_read_pointer(&mut e, true, map, status_unavailable);
+    match width {
+        MemoryWidth::Byte => emit_dynamic_increment(&mut e, STACK_MODE13_BYTE_READS),
+        MemoryWidth::Word => emit_dynamic_word_increment(&mut e, STACK_MODE13_BYTE_READS),
+        MemoryWidth::Dword => emit_dynamic_increment(&mut e, STACK_MODE13_DWORD_READS),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("GPR memory reads are never 8- or 10-byte wide")
+        }
+    }
+    e.xor_r64_self(Reg::RCX);
+    emit_stub_return(&mut e);
+
+    e.place(ram);
+    emit_read_permission_check(&mut e, cpl3, status_permission);
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    emit_read_pointer(&mut e, true, map, status_unavailable);
+    e.xor_r64_self(Reg::RCX);
+    emit_stub_return(&mut e);
+
+    e.place(status_unavailable);
+    e.mov_r32_imm32(Reg::RCX, 1);
+    emit_stub_return(&mut e);
+    if cpl3 {
+        e.place(status_permission);
+        e.mov_r32_imm32(Reg::RCX, 2);
+        emit_stub_return(&mut e);
+    } else {
+        // `emit_read_permission_check` emits nothing at cpl0, so the label has no referent;
+        // place it on the shared return so the encoder's every-label-placed invariant holds.
+        e.place(status_permission);
+    }
+    e.finish()
+}
+
+/// The shared classify front of the two PARKING stub families (trio and x87): page index from
+/// RAX, flags byte into RDX (kept RAW for the permission check), kind split, unknown kinds to
+/// `status_unavailable`, and the classified kind staged in ECX for the caller's park. Falls
+/// through with RCX = the kind, RDX = the raw flags byte.
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -363,17 +456,18 @@ fn emit_read_stub_classify(e: &mut Encoder, map: NativeMapBases, status_unavaila
     e.place(staged);
 }
 
-/// The GPR read-resolve stub: classify, park the BARE kind in `STACK_READ_KIND` (the classic
-/// front's convention at emit.rs — what `emit_mode13_read_completion` compares), permission
-/// (cpl3 variant only), read-bias resolve. NO store, NO value spill (loads carry no value — the
-/// store slice's F1 hazard class is structurally absent) and NO counter: the site's cold
-/// completion or the trio's own completion moves the lane. Unlike the store x87 stub there is
-/// no watch guard writing the aliased `STACK_WATCH_PAGE`, so the park needs no staging slot.
+/// The trio's PARK-ONLY read stub: classify, park the BARE kind in `STACK_READ_KIND` (the
+/// classic front's convention at emit.rs — what `emit_mode13_read_completion` compares),
+/// permission (cpl3 variant only), read-bias resolve. NO store, NO value spill (loads carry no
+/// value — the store slice's F1 hazard class is structurally absent) and NO counter: the
+/// trio's own deferred completion moves the lane after the CS-limit check. Unlike the store
+/// x87 stub there is no watch guard writing the aliased `STACK_WATCH_PAGE`, so the park needs
+/// no staging slot.
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_gpr_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
+fn emit_park_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
     let mut e = Encoder::new();
     emit_stub_prologue(&mut e);
     let status_unavailable = e.label();
