@@ -27,7 +27,97 @@ pub enum BusError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memory {
-    data: Vec<u8>,
+    data: PageAlignedBytes,
+}
+
+/// Guest RAM's backing bytes, windowed to host-page (4096) alignment inside a deliberately
+/// over-allocated `Vec` — `align_offset` finds the boundary and every accessor sees only the
+/// aligned window, so the whole scheme stays inside this crate's `forbid(unsafe_code)`.
+///
+/// The alignment is a PERFORMANCE contract, not a correctness one: the CPU's one-lookup store
+/// table (`dev_docs/2026-08-07-one-lookup-store-design.md` D7) steals the low bits of each
+/// per-page host bias for its poison/tag encoding, which is only possible when every
+/// `DirectPage::ptr` handed out of this buffer is 4096-aligned; a misaligned backing silently
+/// degrades every page to the slow store path.
+///
+/// The window never moves: the `Vec` is sized once and never grown, so its allocation — and
+/// therefore `start` — is stable for the buffer's life, which is the same write-once contract
+/// the CPU's fast-map bias tables already lean on. `Clone` re-derives the offset in the fresh
+/// allocation rather than copying it.
+///
+/// Public because every buffer that backs a `DirectPage` needs it — guest RAM here, and both
+/// VGA buffers (`vram` for the Mode X path, `mode13_linear` for chained 13h) in
+/// izarravm-video, which would otherwise silently degrade doom's aperture stores.
+pub struct PageAlignedBytes {
+    raw: Vec<u8>,
+    start: usize,
+    len: usize,
+}
+
+impl PageAlignedBytes {
+    const ALIGN: usize = 4096;
+
+    pub fn zeroed(len: usize) -> Self {
+        let raw = vec![0u8; len + Self::ALIGN];
+        let start = raw.as_ptr().align_offset(Self::ALIGN);
+        debug_assert!(start < Self::ALIGN);
+        Self { raw, start, len }
+    }
+}
+
+impl Clone for PageAlignedBytes {
+    fn clone(&self) -> Self {
+        let mut copy = Self::zeroed(self.len);
+        copy.copy_from_slice(self);
+        copy
+    }
+}
+
+impl Default for PageAlignedBytes {
+    fn default() -> Self {
+        Self::zeroed(0)
+    }
+}
+
+impl From<Vec<u8>> for PageAlignedBytes {
+    /// Re-home plain bytes into an aligned window — the copy is the cost of the alignment
+    /// guarantee, so this is for construction-time use (test harnesses, one-shot loads), not
+    /// steady-state paths.
+    fn from(bytes: Vec<u8>) -> Self {
+        let mut buf = Self::zeroed(bytes.len());
+        buf.copy_from_slice(&bytes);
+        buf
+    }
+}
+
+impl PartialEq for PageAlignedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+
+impl Eq for PageAlignedBytes {}
+
+impl std::fmt::Debug for PageAlignedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageAlignedBytes")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for PageAlignedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.raw[self.start..self.start + self.len]
+    }
+}
+
+impl std::ops::DerefMut for PageAlignedBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.raw[self.start..self.start + self.len]
+    }
 }
 
 impl Memory {
@@ -42,7 +132,7 @@ impl Memory {
         }
 
         Ok(Self {
-            data: vec![0; size],
+            data: PageAlignedBytes::zeroed(size),
         })
     }
 

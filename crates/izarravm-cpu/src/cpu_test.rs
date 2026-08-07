@@ -2688,7 +2688,11 @@ fn a_bus_decode_change_still_drops_ram_and_vga_direct_pages() {
 
 #[derive(Default)]
 struct TestBus {
-    memory: Vec<u8>,
+    // Aligned like the production `Memory` backing, and for the same reason: `direct_page`
+    // below hands `memory.as_mut_ptr()` pages to the fast map, and an unaligned backing would
+    // silently poison every store-bias entry — the whole one-lookup fixture suite would pass
+    // while exercising only the slow path (the fixtures-that-cannot-fail trap, design D7).
+    memory: izarravm_bus::PageAlignedBytes,
     trace: BusTrace,
     pending_irq: Option<u8>,
     // Mirrors the machine's `io_touched`: set by any port access, so `requires_step_break`
@@ -2758,7 +2762,7 @@ struct TestBus {
 impl TestBus {
     fn with_memory(memory: Vec<u8>) -> Self {
         Self {
-            memory,
+            memory: memory.into(),
             trace: BusTrace::default(),
             pending_irq: None,
             io_touched: false,

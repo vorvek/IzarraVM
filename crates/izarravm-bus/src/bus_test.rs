@@ -306,3 +306,28 @@ fn io_bus_tracks_claimed_ports() {
     assert!(bus.is_claimed(0x22f));
     assert!(!bus.is_claimed(0x230));
 }
+
+/// The one-lookup store table's tag-bit precondition (design D7): every buffer that backs a
+/// `DirectPage` hands out 4096-aligned page pointers. Correctness never depends on this — a
+/// misaligned backing degrades to the CPU's slow store path — but a silently unaligned
+/// allocation would devacuate the whole fast-path fixture suite, so the contract is pinned
+/// here at the allocation.
+#[test]
+fn memory_backing_is_page_aligned() {
+    let mut memory = Memory::new(64 * 1024).unwrap();
+    assert_eq!(memory.as_mut_ptr() as usize % 4096, 0);
+    // Clones re-derive the alignment window in their own allocation rather than copying the
+    // original's offset.
+    let mut clone = memory.clone();
+    assert_eq!(clone.as_mut_ptr() as usize % 4096, 0);
+    assert_eq!(memory, clone);
+}
+
+#[test]
+fn page_aligned_bytes_from_vec_preserves_content_and_aligns() {
+    let bytes: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+    let mut buf = PageAlignedBytes::from(bytes.clone());
+    assert_eq!(buf.as_mut_ptr() as usize % 4096, 0);
+    assert_eq!(&buf[..], &bytes[..]);
+    assert_eq!(PageAlignedBytes::default().len(), 0);
+}
