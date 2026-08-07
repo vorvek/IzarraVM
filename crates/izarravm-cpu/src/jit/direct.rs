@@ -734,6 +734,11 @@ pub(crate) struct BlockCache {
     /// integer-into-float edge, so the cell stays on the zero portal and the exit reports
     /// `StaticUnbound` exactly as it did before this mechanism existed.
     x87_pad: Option<super::exec_mem::ExecutableBuffer>,
+    /// The shared store-stub pad (one-lookup store design D4), with each stub's offset in it.
+    /// Same lifetime contract as `x87_pad` above: its own executable mapping, built once,
+    /// lazily, at the first store-bearing compile with the flag on, never replaced. `None`
+    /// after a failed build makes that block fall back to the inline (gate-off) emission.
+    store_stub_pad: Option<(super::exec_mem::ExecutableBuffer, [usize; STORE_STUB_COUNT])>,
     /// The `jit_cost_dial_epoch()` the cache above was computed under. The CPU cannot see a bus
     /// dial move, so the memo is keyed on the bus's own epoch rather than on an argument about
     /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
@@ -806,6 +811,7 @@ impl BlockCache {
             global_block_upper_cache: [0; 2],
             iteration_upper_cache: Vec::new(),
             x87_pad: None,
+            store_stub_pad: None,
             global_block_upper_epoch: 0,
             iteration_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
@@ -4713,6 +4719,11 @@ fn compile_with_instruction_limit(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
+    let one_lookup_store;
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     {
         if let Some(bases) = map_bases {
             cpu.native_table_slots.publish_map(bases);
@@ -4720,7 +4731,31 @@ fn compile_with_instruction_limit(
         if let Some(tables) = code_watch_tables {
             cpu.native_table_slots.publish_code_watch(tables);
         }
+        // The one-lookup store shape needs the stub pad; build it lazily at the first
+        // store-bearing compile (both table sets exist here by construction) and publish its
+        // entry addresses. A failed build (F5) leaves the flag off for THIS block only.
+        one_lookup_store = cpu.jit_direct.one_lookup_store
+            && cpu.jit_direct.r15_tables
+            && match (map_bases, code_watch_tables) {
+                (Some(bases), Some(tables)) => {
+                    match cpu.jit_direct.direct.store_stub_addresses(bases, tables) {
+                        Some(addresses) => {
+                            cpu.native_table_slots.publish_store_stubs(addresses);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                // A storeless block never reaches a store emitter; keep the flag off so the
+                // emission arms cannot depend on an unpublished pad even by accident.
+                _ => false,
+            };
     }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    let one_lookup_store = false;
     let fallthrough = LinkTarget {
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
@@ -4800,6 +4835,7 @@ fn compile_with_instruction_limit(
             cpl3: memory_cpl3,
             r15_tables: cpu.jit_direct.r15_tables,
             watch_page_bit: cpu.jit_direct.watch_page_bit,
+            one_lookup_store,
             segments: segment_layout,
             address_wrap: if d {
                 emit::AddressWrap::None
@@ -4944,6 +4980,12 @@ struct MemoryEmitContext {
     /// kept unconditional so the arms cannot drift), so the off arm is semantics-identical but
     /// two instructions per ALU/double-shift site larger than the pre-slice binary.
     watch_page_bit: bool,
+    /// Whether store sites emit the one-lookup probe + shared-stub shape (design D3/D4/D5)
+    /// instead of the classify/resolve front. From `JitState::one_lookup_store`, AND-ed at the
+    /// construction site with "the stub pad actually built" (review F5: a failed pad build
+    /// falls back to the inline emission for that block) — and it requires `r15_tables`,
+    /// because the stubs read every table through the R15 slots.
+    one_lookup_store: bool,
     segments: SegmentLayout,
     /// Whether a ModRM-derived effective address wraps at 64K.
     ///

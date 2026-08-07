@@ -7,11 +7,19 @@ use super::*;
 // 5,000-line file-policy ceiling. Both cfg variants of every moved item went together, so the
 // call sites below resolve identically on every target.
 mod mem;
+// The one-lookup store path (fast sites + the shared stub pad) lives in `emit/store_fast.rs`
+// for the same file-policy reason as `mem`.
+mod store_fast;
 
 use mem::{
     emit_call_mem, emit_code_watch_branch, emit_push_mem, emit_read_pointer, emit_rmw_inc_dec,
     emit_table_base, emit_watched_alu_result_guard, emit_watched_store_guard, emit_write_pointer,
 };
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+use store_fast::{emit_store_fast, emit_x87_store_pointer_fast};
 
 fn stack_addr(disp: u32) -> DirectAddr {
     DirectAddr {
@@ -2375,6 +2383,14 @@ fn emit_x87_memory_pointer(
     // slots, so one of each pair is 4-aligned and the other is not by construction.
     emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
 
+    if write && memory.one_lookup_store {
+        // The one-lookup probe replaces the classify, the resolve AND the kind-pack tail
+        // below — the fast arms park `STACK_READ_KIND` from the statically-known kind, and
+        // the resolve stub parks it on the way out.
+        emit_x87_store_pointer_fast(e, width, memory, sides);
+        return;
+    }
+
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     emit_table_base(
@@ -3263,6 +3279,10 @@ fn emit_store(
         }
         other => other,
     };
+    if memory.one_lookup_store {
+        emit_store_fast(e, source, width, addr, memory, sides, wrap);
+        return;
+    }
     let map = memory.map.expect("native store has fast-map bases");
     let code_watch_tables = memory
         .code_watch_tables

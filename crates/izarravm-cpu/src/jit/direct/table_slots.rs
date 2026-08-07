@@ -23,7 +23,7 @@ use super::*;
 /// republishes before any slot-reading block can run.
 #[derive(Debug, Default)]
 pub(crate) struct NativeTableSlots {
-    pub(super) slots: [usize; 6],
+    pub(super) slots: [usize; 6 + 1 + STORE_STUB_COUNT],
 }
 
 pub(crate) const TABLE_SLOT_FLAGS: usize = 0;
@@ -32,6 +32,31 @@ pub(crate) const TABLE_SLOT_WRITE_BIASES: usize = 2;
 pub(crate) const TABLE_SLOT_PHYSICAL_PAGES: usize = 3;
 pub(crate) const TABLE_SLOT_CODE_WATCH_STICKY: usize = 4;
 pub(crate) const TABLE_SLOT_CODE_WATCH_NATIVE: usize = 5;
+/// The one-lookup store table (`FastMapStorage::store_biases`, design D1).
+pub(crate) const TABLE_SLOT_STORE_BIASES: usize = 6;
+/// The store-stub pad's published entry addresses (design D4), one slot per stub in the pad's
+/// canonical order; emitted sites `call qword [r15 + slot]` straight through them. The layout
+/// helpers below are the single source of the (family, width, cpl) -> slot mapping — the pad
+/// emitter records offsets in the identical order.
+pub(crate) const TABLE_SLOT_STORE_STUBS: usize = 7;
+/// 3 mode13 stubs (byte/word/dword) + 6 slow stubs (3 widths x cpl0/cpl3) + 8 x87 resolve
+/// stubs (word/dword/qword/tbyte x cpl0/cpl3).
+pub(crate) const STORE_STUB_COUNT: usize = 3 + 6 + 8;
+
+/// Slot of the mode13 fast stub for a GPR store width (byte 0 / word 1 / dword 2).
+pub(crate) const fn store_stub_slot_m13(width_index: usize) -> usize {
+    TABLE_SLOT_STORE_STUBS + width_index
+}
+
+/// Slot of the slow store stub for a GPR store width and privilege arm.
+pub(crate) const fn store_stub_slot_slow(width_index: usize, cpl3: bool) -> usize {
+    TABLE_SLOT_STORE_STUBS + 3 + width_index * 2 + cpl3 as usize
+}
+
+/// Slot of the x87 resolve-only stub (word 0 / dword 1 / qword 2 / tbyte 3).
+pub(crate) const fn store_stub_slot_x87(width_index: usize, cpl3: bool) -> usize {
+    TABLE_SLOT_STORE_STUBS + 9 + width_index * 2 + cpl3 as usize
+}
 
 impl NativeTableSlots {
     /// Record `value` in `slot`. Idempotent by invariant; a republish that
@@ -55,6 +80,16 @@ impl NativeTableSlots {
         self.publish(TABLE_SLOT_READ_BIASES, map.read_biases());
         self.publish(TABLE_SLOT_WRITE_BIASES, map.write_biases());
         self.publish(TABLE_SLOT_PHYSICAL_PAGES, map.physical_pages());
+        self.publish(TABLE_SLOT_STORE_BIASES, map.store_biases());
+    }
+
+    /// Publish the store-stub pad's entry addresses, in the pad's canonical order. Write-once
+    /// like every slot: the pad is built once per `BlockCache` and never replaced, so a changed
+    /// republish means a pad moved under live code and the debug_assert fires.
+    pub(crate) fn publish_store_stubs(&mut self, addresses: [usize; STORE_STUB_COUNT]) {
+        for (index, address) in addresses.into_iter().enumerate() {
+            self.publish(TABLE_SLOT_STORE_STUBS + index, address);
+        }
     }
 
     pub(crate) fn publish_code_watch(&mut self, tables: [usize; 2]) {

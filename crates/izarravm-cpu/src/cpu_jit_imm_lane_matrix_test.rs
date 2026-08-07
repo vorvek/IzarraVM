@@ -681,7 +681,7 @@ fn remapping_the_code_page_re_keys_instead_of_reusing_the_stale_lane() {
 
     // Whatever the block cache still holds, execution at ENTRY now follows the NEW frame.
     let mut interpreter = paged_cpu();
-    let mut interpreter_bus = test_bus(native_bus.memory.clone());
+    let mut interpreter_bus = test_bus(native_bus.memory.to_vec());
     decode_starts(
         &mut interpreter,
         &mut interpreter_bus,
@@ -1617,7 +1617,7 @@ fn the_smc_trace_does_not_disturb_lane_classification() {
         TraceScriptOutcome {
             lane_counters,
             ebp,
-            memory: bus.memory,
+            memory: bus.memory.to_vec(),
             report,
         }
     }

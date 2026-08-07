@@ -111,6 +111,17 @@ pub(super) const STACK_ALU_OLD_RESULT: i32 = 136;
 /// 136 is outside disp8 range, so this slot is reached with the disp32 load and store forms.
 pub(super) const STACK_PUSH_MEM_VALUE: i32 = STACK_ALU_OLD_RESULT;
 pub(super) const STACK_ALU_FLAGS: i32 = 144;
+/// Where a shared store stub parks its CALL's return address (one-lookup store design D4):
+/// the stub's `pop qword [rsp+..]` prologue moves the return address here and restores RSP to
+/// the frame level in one instruction, so every frame-offset helper emits unchanged inside the
+/// stub, and the epilogue is `jmp qword [rsp+..]`.
+///
+/// Aliased onto the ALU-flags slot by the `STACK_PUSH_MEM_VALUE` argument: the stubs are
+/// reached only from `Store` and x87-memory-pointer slot emission, neither of which touches
+/// the ALU scratch cluster, and every use of either slot is written and read inside a single
+/// slot's emission. The constraint this buys: an emitter that DOES use the ALU cluster
+/// (AluMemDest, double-shift, RMW) must not adopt the stub-call shape without moving this slot.
+pub(super) const STACK_STUB_RETURN: i32 = STACK_ALU_FLAGS;
 pub(super) const STACK_SHIFT_COUNT: i32 = 152;
 // Beyond the base frame: the saved host RSI slot, then the x87 XMM6-11
 // save area right after it. Both Windows only, see NATIVE_STACK_LEN above.

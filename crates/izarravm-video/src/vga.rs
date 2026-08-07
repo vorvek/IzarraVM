@@ -12,6 +12,8 @@
 
 use std::cell::{Cell, RefCell};
 
+use izarravm_bus::PageAlignedBytes;
+
 use crate::{
     DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
     VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS,
@@ -87,10 +89,14 @@ impl Default for Mode13ArgbCache {
 
 #[derive(Debug, Clone)]
 pub struct Vga {
-    pub(crate) vram: Vec<u8>,
+    // Both VRAM buffers back `DirectPage` pointers, so both live in 4096-aligned windows —
+    // the one-lookup store table's tag bits need every direct-page host pointer page-aligned,
+    // and `vram` (the Mode X path) is doom's, not just `mode13_linear` (chained 13h). A plain
+    // Vec here silently degrades every aperture store to the slow path.
+    pub(crate) vram: PageAlignedBytes,
     // Derived cache for the canonical chained Mode 13h layout. Planar VRAM is
     // authoritative; any write through a planar decode invalidates this cache.
-    pub(crate) mode13_linear: Vec<u8>,
+    pub(crate) mode13_linear: PageAlignedBytes,
     pub(crate) mode13_linear_valid: bool,
     // Direct CPU pages write the linear cache without passing through a byte
     // mutator. Keep it authoritative until a planar or noncanonical path needs
@@ -169,8 +175,8 @@ impl Default for Vga {
         }
 
         let mut vga = Self {
-            vram: vec![0; VGA_PLANAR_SIZE],
-            mode13_linear: vec![0; 0x10000],
+            vram: PageAlignedBytes::zeroed(VGA_PLANAR_SIZE),
+            mode13_linear: PageAlignedBytes::zeroed(0x10000),
             mode13_linear_valid: true,
             mode13_linear_authoritative: false,
             mode13_dirty_pages: Cell::new(0),

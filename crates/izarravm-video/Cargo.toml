@@ -11,4 +11,5 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+izarravm-bus = { path = "../izarravm-bus" }
 thiserror.workspace = true
