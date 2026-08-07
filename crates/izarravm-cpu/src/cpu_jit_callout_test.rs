@@ -849,7 +849,7 @@ fn resident_stack_cpu() -> (CpuGsw, TestBus) {
 fn assert_no_partial_effects(
     cpu: &CpuGsw,
     bus: &TestBus,
-    before: &(Registers, Vec<u8>, u8),
+    before: &(Registers, izarravm_bus::PageAlignedBytes, u8),
     context: &str,
 ) {
     assert_eq!(cpu.registers, before.0, "{context}: registers");

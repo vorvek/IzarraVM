@@ -1284,7 +1284,7 @@ fn direct_cross_page_push_exits_before_esp_commit() {
     assert_eq!(native.registers, interp.registers);
     assert_eq!(native.registers.eip, PUSH);
     assert_eq!(native.registers.esp(), INITIAL_ESP);
-    assert_eq!(native_bus.memory, pristine);
+    assert_eq!(&native_bus.memory[..], &pristine[..]);
     assert_eq!(
         native
             .perf_counters()

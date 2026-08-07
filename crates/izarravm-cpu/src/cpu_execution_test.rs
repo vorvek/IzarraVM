@@ -1139,7 +1139,7 @@ fn v86_paging_is_always_user_regardless_of_cs_low_bits() {
     // Same V86 task, a user-accessible page (frame 0x4000 via PTE[2], U/S=1):
     // translation succeeds, proving the fault above was the supervisor bit and
     // not some unrelated V86 restriction.
-    let mut memory = bus.memory;
+    let mut memory = bus.memory.to_vec();
     memory[0x2008..0x200c].copy_from_slice(&0x0000_4007u32.to_le_bytes());
     bus = TestBus::with_memory(memory);
     assert_eq!(

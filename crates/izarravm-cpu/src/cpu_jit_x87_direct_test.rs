@@ -2289,7 +2289,7 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     assert_eq!(direct.registers, before_registers);
     assert_eq!(direct.fpu, before_fpu);
     assert_eq!(direct.fp_rem, before_fp_rem);
-    assert_eq!(direct_bus.memory, memory);
+    assert_eq!(&direct_bus.memory[..], &memory[..]);
 
     let mut interpreter = x87_cpu(GswMode::Gsw586);
     arm(&mut interpreter, 0x0f7f);
