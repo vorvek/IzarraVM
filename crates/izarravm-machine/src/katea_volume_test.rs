@@ -48,7 +48,7 @@ fn extracts_the_embedded_image_payload() {
     assert!(by_name.contains_key("AUTOEXEC.BAT"), "AUTOEXEC.BAT present");
     assert!(by_name.contains_key("HELLO.TXT"), "HELLO.TXT present");
 
-    // The kernel signon points at "See C:\\LICENSE.TXT for more.", so the full
+    // The kernel signon points at "** See LICENSE.TXT for more.", so the full
     // FreeDOS / Toka-DOS licensing ships as a real file on the C: payload.
     let license = by_name.get("LICENSE.TXT").expect("LICENSE.TXT present");
     assert!(
