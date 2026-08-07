@@ -51,6 +51,9 @@ GOTO END\r\n\
         current_root_prompt(machine) && machine.screen_text().as_text().contains("LOOPDONE")
     });
     let text = machine.screen_text().as_text();
+    if let StopReason::CpuError(msg) = &stop {
+        panic!("CPU fault during the self-calling AUTOEXEC loop: {msg}\n{text}");
+    }
     if !current_root_prompt(&machine) || !text.contains("LOOPDONE") {
         panic!(
             "self-calling AUTOEXEC FOR/CALL/GOTO loop did not reach C:\\> with \
