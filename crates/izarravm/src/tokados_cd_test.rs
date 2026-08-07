@@ -332,30 +332,15 @@ fn guest_cd_components_reside_in_upper_memory() {
     );
 }
 
-#[test]
-#[ignore = "boots Toka-DOS and checks conventional memory with the CD stack loaded"]
-fn guest_cd_stack_keeps_about_600k_conventional_free() {
-    let (_scratch, stop, text) = run_cd_memory_command(
-        "conventional",
-        "LH TOKAMOUS\r\nMEM /CLASSIFY /NOSUMMARY",
-        |machine| {
-            current_root_prompt(machine)
-                && machine.screen_text().as_text().lines().any(|line| {
-                    line.trim_start().starts_with("Free")
-                        && line.split_whitespace().nth(4) == Some("(599K)")
-                })
-        },
-    );
-    if let StopReason::CpuError(msg) = &stop {
-        panic!("CPU fault while checking conventional memory: {msg}\n{text}");
-    }
-    let free = text
-        .lines()
-        .find(|line| line.trim_start().starts_with("Free"))
-        .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{text}"));
-    assert_eq!(
-        free.split_whitespace().nth(4),
-        Some("(599K)"),
-        "the CD stack should leave about 600 KiB of conventional memory free.\n{text}"
-    );
-}
+// There was a `guest_cd_stack_keeps_about_600k_conventional_free` here that
+// pinned MEM's free-conventional column to the literal "(599K)". It measured
+// nothing about the CD stack: free conventional is dominated by TOKAEMM's
+// resident size, and the number tracked TOKAEMM's shared-arena work down to
+// the byte (26,096 -> 596K, 29,376 -> 593K) while TOKACD and IZCDEX never left
+// upper memory. `guest_cd_components_reside_in_upper_memory` above is the real
+// invariant for this file, and `tokaemm_mem_plain_reports_conventional_memory`
+// in tokados_tokaemm_test.rs already pins 593K where the component that owns
+// the number lives. This was a stale second copy of that pin, and because its
+// completion predicate waited on the same literal, going stale cost a
+// 5M-cycle timeout and a "did not return to a complete shell state" message
+// instead of an assertion diff naming the value.
