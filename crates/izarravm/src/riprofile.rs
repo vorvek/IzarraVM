@@ -285,9 +285,8 @@ impl Sampler {
                 unresolved_addrs += 1;
                 unresolved_samples += n;
             }
-            let (func, displacement, size) = symbol.unwrap_or_else(|| {
-                ("<no symbol — JIT arena or foreign code>".into(), 0, 0)
-            });
+            let (func, displacement, size) =
+                symbol.unwrap_or_else(|| ("<no symbol — JIT arena or foreign code>".into(), 0, 0));
             if beyond_extent(displacement, size) {
                 beyond_samples += n;
                 beyond_rows.push((n, rip, func.clone(), displacement, size));

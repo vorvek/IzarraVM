@@ -56,7 +56,7 @@ fn resolve_symbol_reports_a_nonzero_extent_for_a_live_function() {
         0,
         "SymInitializeW failed"
     );
-    let rip = super::set_phase as usize as u64;
+    let rip = super::set_phase as *const () as usize as u64;
     let resolved = super::resolve_symbol(process, rip);
     unsafe { SymCleanup(process) };
     let (name, displacement, size) = resolved.expect("the test binary's own PDB must resolve");
