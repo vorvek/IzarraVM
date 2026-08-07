@@ -310,12 +310,12 @@ function Invoke-RealtimeGateSelfTest {
     # anything. Failing here is the intended way to notice.
     $policies = Get-WorkloadPolicies "Both"
     if ($policies.Count -ne 3 -or ($policies.name -join ",") -ne "doom-486,doom-586,quake-586" -or
-        $policies[0].minimum_real_time_factor -ne 2.15 -or
-        $policies[1].minimum_real_time_factor -ne 0.78 -or
+        $policies[0].minimum_real_time_factor -ne 2.65 -or
+        $policies[1].minimum_real_time_factor -ne 0.87 -or
         $policies[2].minimum_real_time_factor -ne 1.4 -or
-        $policies[0].minimum_direct_native_coverage -ne 0.78 -or
-        $policies[1].minimum_direct_native_coverage -ne 0.82 -or
-        $policies[2].minimum_direct_native_coverage -ne 0.93) {
+        $policies[0].minimum_direct_native_coverage -ne 0.90 -or
+        $policies[1].minimum_direct_native_coverage -ne 0.92 -or
+        $policies[2].minimum_direct_native_coverage -ne 0.95) {
         throw "Both did not expand to the three workload-specific policies."
     }
     # A policy carrying its own coverage floor must use it; one without must fall

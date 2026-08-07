@@ -34,21 +34,26 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # The one revision every formal candidate is measured against. Re-pinned from
-# 88ac6f20 (f79c86dc, 2026-07-12) to 8e238b06 (5817fb58, 2026-08-04): the old pin
-# sat 465 commits back and failed its own absolute thresholds worse than any
-# revision that could be measured against it, so the gate had become unpassable
-# for everyone rather than protective. Whoever re-pins this next must recalibrate
-# the per-workload floors in Get-WorkloadPolicy in the same commit -- they are
-# ratchets derived from what the pinned tree measures, and a pin moved without
-# them silently stops asserting anything.
+# 8e238b06 (5817fb58, 2026-08-04) to cbd650de (5e821a32, 2026-08-07): merges
+# #706-#713 deliberately changed the JIT admission mix (79f00626 defaulted the
+# 16-bit and 486-Word paths on), which doubles direct entries and side exits
+# per instruction while RAISING coverage (doom-486 0.78 -> 0.91) and doom
+# throughput (+16.8% / +7.0% paired). The old pin's paired slow-exits ratchet
+# therefore failed every candidate on an intended, kept change -- the gate had
+# stopped being protective, the same state that forced the 2026-08-04 re-pin.
+# quake-586 carries a real, documented -3.5% paired against the OLD pin
+# (dev_docs/2026-08-07-gate-red-diagnosis.md), accepted with the R15-offsets
+# slice named as its recovery; the floors below ratchet from the new baseline
+# so it cannot slide further unnoticed. Whoever re-pins this next must
+# recalibrate the per-workload floors in Get-WorkloadPolicy in the same commit
+# -- they are ratchets derived from what the pinned tree measures, and a pin
+# moved without them silently stops asserting anything.
 #
-# The floors below were measured on 294ba878 (7f043bb7) and carried to this pin
-# unchanged: the only difference between the two trees is the kernel's fallback
-# shell string, which lives in init-segment .data and is reached only when
-# CONFIG.SYS supplies no SHELL=. Both gate workloads supply one, so it cannot
-# move their throughput. The gate run that accepted this pin confirms that
-# rather than assuming it.
-$acceptedBaselineTree = "8e238b06ce6cb9c539df8d8bc30c10fe78baabf8"
+# The floors below were measured on 5e821a32 itself: gate run
+# 5e821a32d463-20260807-021454-57b54847, six pairs, quiet box, processor 8,
+# candidate role. The gate run that accepted this pin confirms them rather
+# than assuming it.
+$acceptedBaselineTree = "cbd650def00eeb076226162128c2cd9160b98a80"
 $highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 $minimumDirectCoverage = 0.90
 $maximumDirectExitsPer100 = 5.0
@@ -601,11 +606,11 @@ function Get-WorkloadPolicy([string]$Name) {
                 mode = "486"
                 cycle_budget = [uint64]8000000000
                 # Ratchets, set just under what the accepted baseline measures
-                # (rt 2.234-2.431, coverage 78.36%). The old 3.5 was aspirational
-                # and no revision ever met it, which made the gate unpassable
-                # rather than protective.
-                minimum_real_time_factor = 2.15
-                minimum_direct_native_coverage = 0.78
+                # (rt 2.762-2.922, coverage 91.33%, realtics 2969 all six
+                # samples; the realtics band is wider because realtics is
+                # session-local).
+                minimum_real_time_factor = 2.65
+                minimum_direct_native_coverage = 0.90
                 minimum_realtics = 2900
                 maximum_realtics = 3050
             }
@@ -615,9 +620,10 @@ function Get-WorkloadPolicy([string]$Name) {
                 name = $Name
                 mode = "586"
                 cycle_budget = [uint64]8000000000
-                # Baseline measures rt 0.813-0.875, coverage 83.22%.
-                minimum_real_time_factor = 0.78
-                minimum_direct_native_coverage = 0.82
+                # Baseline measures rt 0.911-0.961, coverage 93.22%, realtics
+                # 826 all six samples.
+                minimum_real_time_factor = 0.87
+                minimum_direct_native_coverage = 0.92
                 minimum_realtics = 820
                 maximum_realtics = 850
             }
@@ -627,10 +633,12 @@ function Get-WorkloadPolicy([string]$Name) {
                 name = $Name
                 mode = "586"
                 cycle_budget = [uint64]6200000000
-                # Baseline measures rt 1.462-1.587, coverage 93.97%. This is the
-                # one workload that already cleared both old absolutes.
+                # Baseline measures rt 1.470-1.567, coverage 96.26%. The rt
+                # floor stays 1.4 (same ~4% under the measured minimum as
+                # before); the paired checks against the new baseline are the
+                # tight layer, this absolute is the backstop.
                 minimum_real_time_factor = 1.4
-                minimum_direct_native_coverage = 0.93
+                minimum_direct_native_coverage = 0.95
                 minimum_realtics = $null
                 maximum_realtics = $null
             }
@@ -3067,10 +3075,14 @@ if ($PollSkipComparison) {
             quake_diagnostic = "fixed 6.2G cycle limit with exactly one 969-frame identity; never final-eligible"
         }
         acceptance = [ordered]@{
+            # Derived from Get-WorkloadPolicy so this evidence block cannot
+            # drift from the enforced floors: literals here survived TWO
+            # re-pins (the 3.5 was the pre-2026-08-04 aspirational floor) and
+            # published contradictory acceptance criteria into every summary.
             workload_real_time_factor_floors = [ordered]@{
-                doom_486 = 3.5
-                doom_586 = 1.4
-                quake_586 = 1.4
+                doom_486 = (Get-WorkloadPolicy "doom-486").minimum_real_time_factor
+                doom_586 = (Get-WorkloadPolicy "doom-586").minimum_real_time_factor
+                quake_586 = (Get-WorkloadPolicy "quake-586").minimum_real_time_factor
             }
             minimum_backend_median_ratio = 1.05
             minimum_backend_lower_95_ratio_exclusive = 1.0
@@ -3208,10 +3220,12 @@ $summary = [ordered]@{
     scope = "Headless Doom and Quake throughput only. GUI pacing and audio require separate validation."
     acceptance = [ordered]@{
         accepted_baseline_tree = $acceptedBaselineTree
+        # Derived, not literal — see the matching comment in the bakeoff
+        # branch's acceptance block.
         workload_real_time_factor_floors = [ordered]@{
-            doom_486 = 3.5
-            doom_586 = 1.4
-            quake_586 = 1.4
+            doom_486 = (Get-WorkloadPolicy "doom-486").minimum_real_time_factor
+            doom_586 = (Get-WorkloadPolicy "doom-586").minimum_real_time_factor
+            quake_586 = (Get-WorkloadPolicy "quake-586").minimum_real_time_factor
         }
         minimum_direct_native_coverage = $minimumDirectCoverage
         maximum_direct_slow_exits_per_100_instructions = $maximumDirectExitsPer100
