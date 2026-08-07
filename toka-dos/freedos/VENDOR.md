@@ -57,7 +57,9 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
   progress fragment `dsk_init()` used to print ahead of it was also dropped,
   since the styled screen has no free row for it to dangle on); FreeCOM
   `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng`
-  (product strings; GPL/copyright preserved). Each edited file carries a
+  (product strings; GPL/copyright preserved); FreeCOM
+  `shell/init.c` -- startup banner suppressed (silent start for the
+  Toka-DOS boot tree); VER unchanged. Each edited file carries a
   "modified by the Toka-DOS project, 2026" note.
 - Idle CPU behavior (predates the boot-screen campaign, missing from this
   ledger until now): kernel `kernel/kernel/config.c` (the `SHELL=` default
