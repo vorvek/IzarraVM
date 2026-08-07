@@ -1282,6 +1282,28 @@ packet_handler:
 resident_end:
 ; ---- install / TSR (transient: discarded by AH=31h KEEP) ----
 install:
+    ; /T or -T anywhere in the tail: tree-styled banner (Toka-DOS boot tree).
+    ; DOS tools took either lead-in (see sndctrl.asm's parse_tail).
+    mov si, 0x81
+    mov cl, [0x80]
+    xor ch, ch
+.t_scan:
+    jcxz .t_done
+    lodsb
+    dec cx
+    cmp al, '/'                   ; RAW byte: '/'(0x2F) and '-'(0x2D) both
+    je .t_lead                    ; fold to control chars under 'and 0xDF',
+    cmp al, '-'                   ; so the lead-in test must run unupcased.
+    jne .t_scan
+.t_lead:
+    jcxz .t_done
+    lodsb
+    dec cx
+    and al, 0xDF
+    cmp al, 'T'
+    jne .t_scan
+    mov byte [tree_mode], 1
+.t_done:
     push es
     xor ax, ax
     mov es, ax
@@ -1308,6 +1330,12 @@ install:
     mov ax, 0xC200
     mov bx, 0x0100
     int 0x15
+    cmp byte [tree_mode], 0
+    je .plain
+    mov ah, 0x09
+    mov dx, banner_tree
+    int 0x21
+.plain:
     mov ah, 0x09
     mov dx, banner
     int 0x21
@@ -1316,3 +1344,5 @@ install:
     int 0x21
 
 banner          db 'Toka-DOS mouse driver installed.', 13, 10, '$'
+banner_tree     db 0xC3, 0xC4, '>', ' ', '$'
+tree_mode       db 0
