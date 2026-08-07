@@ -2325,7 +2325,7 @@ fn a_word_ret_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit
 #[path = "cpu_jit_s5_allowlist_test.rs"]
 mod s5_allowlist;
 
-#[path = "cpu_jit_coverage_matrix.rs"]
+#[path = "cpu_jit_coverage_matrix_test.rs"]
 mod coverage_matrix;
 
 #[path = "cpu_jit_watch_bit_test.rs"]
