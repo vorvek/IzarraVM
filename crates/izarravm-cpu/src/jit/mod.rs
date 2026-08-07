@@ -81,13 +81,16 @@ pub(crate) struct JitState {
     ///
     /// Default FALSE, which is the shipped behaviour this slice does not change.
     pub(crate) word_at_486: bool,
-    /// Whether emitted stores take the PAGE_WATCHED fast path (watched-page-bit design D3).
-    /// Seeded from `IZARRAVM_R15_TABLES` (default true): emitted memory sites load table
-    /// bases R15-relative from `CpuGsw::native_table_slots` instead of baking imm64s. A
-    /// field for `word_at_486`'s reason (per-test flips, both arms unit-covered).
+    /// Emitted memory sites load table bases R15-relative from
+    /// `CpuGsw::native_table_slots` instead of baking imm64s. Always true in
+    /// production — the `IZARRAVM_R15_TABLES` A/B gate retired once the slice
+    /// measured (gate run 4227353445f1, PR #716) — and a FIELD so tests flip it
+    /// per-CPU and both emission arms keep unit coverage (`word_at_486`'s reason).
     pub(crate) r15_tables: bool,
-    /// Seeded from `IZARRAVM_WATCH_PAGE_BIT` (default true); a field for `word_at_486`'s
-    /// testability reason, and CARRIED by clone for its lockstep-comparison reason.
+    /// Emitted stores take the PAGE_WATCHED fast path (watched-page-bit design
+    /// D3). Always true in production — the `IZARRAVM_WATCH_PAGE_BIT` gate
+    /// retired after #713 soaked — a field for `word_at_486`'s testability
+    /// reason, and CARRIED by clone for its lockstep-comparison reason.
     pub(crate) watch_page_bit: bool,
     /// Admission level for 16-bit code segments, seeded from `IZARRAVM_JIT16`.
     ///
@@ -125,8 +128,8 @@ impl JitState {
         Self {
             direct,
             word_at_486: direct::word_at_486_default(),
-            r15_tables: direct::r15_tables_default(),
-            watch_page_bit: direct::watch_page_bit_default(),
+            r15_tables: true,
+            watch_page_bit: true,
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),

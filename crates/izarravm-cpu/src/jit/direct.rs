@@ -3819,19 +3819,6 @@ pub(crate) fn word_at_486_default() -> bool {
     *LEVEL.get_or_init(|| !matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("0")))
 }
 
-/// Whether emitted stores test the fast-map `PAGE_WATCHED` bit and skip the code-watch guard on
-/// unwatched pages (`dev_docs/2026-08-06-watched-page-bit-design.md` D3). Default ON — the
-/// slice's intended behavior; `IZARRAVM_WATCH_PAGE_BIT=0` forces the pre-slice
-/// unconditional-guard behavior (byte-identical at the seven Group A sites; Group B keeps two
-/// masking no-ops — see `MemoryEmitContext::watch_page_bit`), which is what makes a
-/// single-binary A/B possible (the `IZARRAVM_JIT16_486` precedent). A `JitState` FIELD rather than a bare `OnceLock` read at the
-/// emit sites, for `word_at_486`'s reason: a process-wide gate cannot be flipped per test, and
-/// both emission arms need unit coverage.
-pub(crate) fn watch_page_bit_default() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_WATCH_PAGE_BIT").as_deref(), Ok("0")))
-}
-
 /// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
 ///
 /// ONE predicate for what used to be three copies of `persona != I586`: the compile walk's Word
