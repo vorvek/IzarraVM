@@ -31,13 +31,13 @@ directory that holds the command interpreter and every tool.
 
 ```
 C:\
-    CONFIG.SYS      AUTOEXEC.BAT    LICENSE.TXT     DOS\
+    DOS\            AUTOEXEC.BAT    CONFIG.SYS      LICENSE.TXT
 ```
 
 `KERNEL.SYS` lives in the root too, because the boot sector loads it by name, but it
-is hidden, so a plain `DIR` of C:\ shows only `CONFIG.SYS`, `AUTOEXEC.BAT`,
-`LICENSE.TXT`, and the `DOS` folder. Everything you actually run lives in
-`C:\DOS`:
+is hidden, so a plain `DIR` of C:\ shows only the `DOS` folder, `AUTOEXEC.BAT`,
+`CONFIG.SYS`, and `LICENSE.TXT` — in that order, since `DIR` sorts by name and
+groups directories first. Everything you actually run lives in `C:\DOS`:
 
 ```
 C:\DOS\

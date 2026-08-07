@@ -28,6 +28,12 @@ fn extracts_the_embedded_image_payload() {
     // CONFIG.SYS) lands on, and the bare name pointed at the boot root, where
     // Toka-DOS ships no COMMAND.COM. The idle-halt and F5-window patches in the
     // same kernel added no net size: their four instruction bytes fit padding.
+    //
+    // 87422 -> 87495: DIR defaults to the /O:NG sort order, which costs the
+    // default-order install in cmd_dir(), the optOdefaulted flag that keeps a
+    // failed sort-buffer allocation quiet when nobody asked for the sort, and
+    // scanOrder() tracking its own argument start instead of reading the byte
+    // in front of it. See toka-dos/freedos/VENDOR.md.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
         Some(70076),
@@ -35,7 +41,7 @@ fn extracts_the_embedded_image_payload() {
     );
     assert_eq!(
         by_name.get("COMMAND.COM").map(|d| d.len()),
-        Some(87422),
+        Some(87495),
         "COMMAND.COM size"
     );
     assert!(by_name.contains_key("CONFIG.SYS"), "CONFIG.SYS present");
