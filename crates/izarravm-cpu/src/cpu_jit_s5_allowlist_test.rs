@@ -106,13 +106,19 @@ fn word_size_byte_forms_are_lowered() {
 /// rather than a row here.
 #[test]
 fn word_size_dword_siblings_stay_refused() {
+    // `0x81` and `0xf7 /0` left this table on 2026-08-08 (the wolf3d demo-workload census ranked
+    // them at 634M block-stopping hits each); their admissions are pinned by
+    // `word_size_0x81_register_forms_are_lowered` and
+    // `word_size_group3_test_forms_follow_the_slice` below.
     let cases: &[(&str, &[u8])] = &[
         ("0x05 add eax,imm", &[0x66, 0x05, 0x34, 0x12]),
-        ("0x81 /0 add r/m,imm16", &[0x66, 0x81, 0xc1, 0x34, 0x12]),
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0]),
         ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10]),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12]),
-        ("0xf7 /0 test r/m,imm", &[0x66, 0xf7, 0xc1, 0x34, 0x12]),
+        ("0xf7 /2 not r/m", &[0x66, 0xf7, 0xd1]),
+        ("0xf7 /3 neg r/m", &[0x66, 0xf7, 0xd9]),
+        ("0xf7 /4 mul r/m", &[0x66, 0xf7, 0xe1]),
+        ("0xf7 /6 div r/m", &[0x66, 0xf7, 0xf1]),
     ];
 
     for &(label, form) in cases {
@@ -176,17 +182,123 @@ fn word_size_0x83_register_forms_are_lowered() {
     }
 }
 
+/// `0x81` at Word size: the six non-carry sub-ops of the REGISTER form are lowered, exactly the
+/// `0x83` slice above with a two-byte immediate. The wolf3d demo-workload census asked for it:
+/// `0x81 /7` word register (CMP CX, imm16) is 634M block-stopping hits, the largest single row.
+/// ADC (/2) and SBB (/3) stay refused by the shared arm; the emitter's word lane masks both
+/// operands before a 66-prefixed `alu_r16_r16`, so the raw imm16 needs no admission-side care.
+#[test]
+fn word_size_0x81_register_forms_are_lowered() {
+    let cases: &[(&str, u8)] = &[
+        ("/0 add", 0),
+        ("/1 or", 1),
+        ("/4 and", 4),
+        ("/5 sub", 5),
+        ("/6 xor", 6),
+        ("/7 cmp", 7),
+    ];
+
+    for &(label, op) in cases {
+        let form = [0x66u8, 0x81, 0xc0 | (op << 3) | 1, 0x34, 0x12];
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
+        );
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+    }
+}
+
+/// `0x81` ADC and SBB keep their Word refusal after the opcode's admission: the shared arm's
+/// carry-in refusal, not the allowlist, is what holds them now, so this pins the arm.
+#[test]
+fn word_size_0x81_carry_forms_stay_refused() {
+    for (label, op) in [("/2 adc", 2u8), ("/3 sbb", 3)] {
+        let form = [0x66u8, 0x81, 0xc0 | (op << 3) | 1, 0x34, 0x12];
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: the carry forms have no word lane and must end the block"
+        );
+    }
+}
+
+/// Group 3's `/0` at Word size: the REGISTER form is lowered through `TestImmReg`'s word lane,
+/// the MEMORY form stays refused (no measured row), and both halves are what the gate's
+/// sub-opcode escape promises. The wolf3d census ranked the register form at 634M
+/// block-stopping hits.
+#[test]
+fn word_size_group3_test_forms_follow_the_slice() {
+    let register = [0x66u8, 0xf7, 0xc1, 0x34, 0x12];
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&register);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "test cx, imm16: the register form must join the block"
+    );
+    assert_eq!(compilation.word_reads, 0, "register form touches no memory");
+    assert_eq!(compilation.word_stores, 0, "register form touches no memory");
+
+    // MEMORY form: `test word [eax+0x10], imm16`.
+    let memory_form = [0x66u8, 0xf7, 0x40, 0x10, 0x34, 0x12];
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&memory_form);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "test word [mem], imm16: the memory form must stay refused"
+    );
+}
+
 /// `PUSH DS` and `PUSH ES` at Word size, the read half of the segment family.
 ///
 /// One word store and no reads: the selector is a compile-time constant baked from the block's
-/// `SegmentLayout`, so the only memory the slot touches is the stack. `PUSH SS` and `PUSH CS` are
-/// asserted refused in the same table below rather than admitted for symmetry, and the reasons are
-/// different for each: SS belongs to the family the write half excludes over the interrupt shadow,
-/// and CS would need a carve-out because `selector_segment` deliberately keeps CS out of the
-/// pinned mask.
+/// `SegmentLayout`, so the only memory the slot touches is the stack. `PUSH CS` joined on
+/// 2026-08-08 (158M wolf3d census hits): `SegmentLayout::selector` reads the separate `cs`
+/// field and `cs_matches` pins CS for every block unconditionally, so keeping CS out of the
+/// `selector_segment` mask stays correct. `PUSH SS` is asserted refused in the table below: it
+/// belongs to the family the write half excludes over the interrupt shadow.
 #[test]
 fn word_size_push_segment_forms_are_lowered() {
-    for (label, opcode) in [("0x1e push ds", 0x1eu8), ("0x06 push es", 0x06)] {
+    for (label, opcode) in [
+        ("0x1e push ds", 0x1eu8),
+        ("0x06 push es", 0x06),
+        ("0x0e push cs", 0x0e),
+    ] {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(&[0x66, opcode]);
         let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
@@ -231,7 +343,6 @@ fn word_size_push_segment_forms_are_lowered() {
 #[test]
 fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
     let cases: &[(&str, &[u8])] = &[
-        ("0x0e push cs", &[0x66, 0x0e]),
         ("0x16 push ss", &[0x66, 0x16]),
         ("0x1f pop ds", &[0x66, 0x1f]),
         ("0x07 pop es", &[0x66, 0x07]),

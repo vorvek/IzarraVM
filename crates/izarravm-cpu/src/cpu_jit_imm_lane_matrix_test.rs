@@ -1358,13 +1358,15 @@ fn code_segment_16(cpu: &mut CpuGsw) {
 /// instead of sleeping through it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlArm {
-    /// `classify` refuses the ADD outright: `0x81` is not in its `OperandSize::Word` allowlist
-    /// (the ALU-group immediate forms are excluded there by name), so the compile walk abandons
-    /// the block at that slot and `imm_lane_for` is never consulted. No block exists to run.
+    /// `classify` refuses the encoding outright, so the compile walk abandons the block at that
+    /// slot and `imm_lane_for` is never consulted. No block exists to run. No control takes this
+    /// arm since the 2026-08-08 `0x81` word admission, but it stays: the matrix's contract is
+    /// that each control PINS its arm, and the next admission or revocation re-uses it.
+    #[allow(dead_code)]
     RejectedBeforeTheLaneCheck,
     /// The block compiles, installs and is entered natively, and `imm_lane_for` DID see this ADD
-    /// and refused it — on the prefix and on the seven-byte length. This is the only control that
-    /// exercises the lane admission test itself.
+    /// and refused it — the word forms on their width, the prefix-carrying dword form on the
+    /// prefix and the seven-byte length.
     CompiledWithoutALane,
 }
 
@@ -1373,11 +1375,14 @@ enum ControlArm {
 /// - `66 81 /0` in a 32-bit segment: an operand-size override makes it `ADD r16, imm16`.
 /// - `81 /0` in a 16-bit segment: the same bytes as the Doom site, but the operand size follows
 ///   CS.D, so it is a word form with a two-byte immediate.
-/// - `66 81 /0` in a 16-bit segment: a genuine 32-bit ADD with a four-byte immediate, and the only
-///   one of the three that reaches `imm_lane_for`, which refuses it on the prefix and the length.
+/// - `66 81 /0` in a 16-bit segment: a genuine 32-bit ADD with a four-byte immediate.
 ///
-/// Each control pins which arm it lands on, so a classifier change that admitted any of them would
-/// fail here rather than pass quietly. All three must also execute correctly, patched or not.
+/// Since the 2026-08-08 `0x81` word admission all three COMPILE, and the property this row pins
+/// is that none of them registers a lane: a lane is Dword-only (`IMM_LANE_WIDTH` is four and
+/// `imm_lane_for` matches the width), so the two word forms and the prefix-carrying dword form
+/// all take `CompiledWithoutALane`. Each control pins its arm, so a lane-side change that started
+/// accepting any of them would fail here rather than pass quietly. All three must also execute
+/// correctly, patched or not — a patch of a lane-free immediate retires the block.
 #[test]
 fn sixteen_bit_add_forms_never_register_a_lane() {
     struct Control {
@@ -1397,7 +1402,7 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
             mode: GswMode::Gsw586,
             prefix: &[0x66, 0x81, 0xc5],
             imm_len: 2,
-            arm: ControlArm::RejectedBeforeTheLaneCheck,
+            arm: ControlArm::CompiledWithoutALane,
         },
         Control {
             label: "unprefixed word ADD in a 16-bit segment",
@@ -1405,7 +1410,7 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
             mode: GswMode::Gsw586,
             prefix: &[0x81, 0xc5],
             imm_len: 2,
-            arm: ControlArm::RejectedBeforeTheLaneCheck,
+            arm: ControlArm::CompiledWithoutALane,
         },
         Control {
             label: "0x66-prefixed dword ADD in a 16-bit segment",

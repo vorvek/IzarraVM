@@ -119,11 +119,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // 9,776,289 doom exits, forty-seven apart from `0x60` PUSHAD -- one function prologue, so the
     // two must land together or neither's exits go anywhere.
     //
-    // `0x81` stays OUT and the asymmetry is deliberate: its Word encoding carries a 16-bit
-    // immediate that `decode` fetches with `fetch_u16` into the same `insn.imm`, so admitting it
-    // would need the immediate path checked as well as the operation path. `0x83`'s immediate is a
-    // sign-extended imm8 at BOTH operand sizes, one `fetch_u8`, so its encoding is width-invariant
-    // and only the operation had to be widened.
+    // `0x81` joined on 2026-08-08 (the wolf3d demo-workload census ranked its `/7` word register
+    // form at 634M block-stopping hits, the single largest row). The immediate-path check the
+    // previous version of this comment demanded is satisfied by inspection of the emitter's word
+    // lane: `emit_alu` stages ANY immediate through `mov_r32_imm32(RCX, ..)` and the word lane
+    // masks BOTH operands with `and .., 0xffff` before the 66-prefixed `alu_r16_r16`, so a raw
+    // `fetch_u16` immediate (0..0xFFFF) computes exactly as `0x83`'s sign-extended imm8 already
+    // did. The arm below is shared with `0x83` and was width-complete before this admission:
+    // ADC/SBB word-refused, memory word form certified by `cpu_jit_word_memory_test.rs`.
     //
     // THE SIXTEEN-BIT MEMORY ROWS (rejected-row campaign, slice 3) add `0xc7` and the four
     // MOVZX/MOVSX opcodes. The domain question this list exists to answer is not "which opcode",
@@ -188,13 +191,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x01 | 0x09 | 0x21 | 0x29 | 0x31
                 | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
                 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
-                | 0x06 | 0x1e
+                | 0x06 | 0x0e | 0x1e
                 | 0x40..=0x4f
                 | 0x50..=0x5f
                 | 0x68
                 | 0x6a
                 | 0x70..=0x7f
                 | 0x80
+                | 0x81
                 | 0x83
                 | 0x84
                 | 0x88
@@ -203,6 +207,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8b
                 | 0x8c
                 | 0x8e
+                | 0x90
                 | 0x98
                 | 0x99
                 | 0xa0
@@ -228,6 +233,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xfe
                 | 0xff
         )
+        // Group 3's `/0` (TEST r/m16, imm16) is the ONE width-safe member of `0xf7`, so it is
+        // admitted by sub-opcode here rather than by adding `0xf7` to the list above: every other
+        // member's arm (NEG, MUL, IMUL, DIV) deliberately carries no width field and documents
+        // this gate as the ONLY thing keeping a word form out — listing the opcode wholesale
+        // would turn each of those comments into a miscompile. The wolf3d demo-workload census
+        // ranks the register form at 634M block-stopping hits; the word MEMORY form is refused
+        // inside the arm (no measured row).
+        && !(insn.opcode == 0xf7 && insn.modrm.is_some_and(|m| m.reg == 0))
     {
         return None;
     }
@@ -615,12 +628,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // refused at compile time by `uses_stack()` feeding the `stack_is_32bit` check,
             // NOT here. The 16-bit OPERAND-size form is refused by the OperandSize::Word
             // gate above, which does not list 0xc9.
-            // NOP. Deliberately NOT added to the OperandSize::Word allowlist above, and that is
-            // a measured decision rather than caution: `try_direct_continuation` returns
-            // Interpret for every `!d` boundary before a key is ever built (`run.rs`), so no
-            // 16-bit block exists on any persona today and the allowlist entry would be dead
-            // code that no counter could gate. Admitting it there belongs to the banked 16-bit
-            // admission work, not here.
+            // NOP. In the Word allowlist since 2026-08-08: the claim that "no 16-bit block exists
+            // on any persona" predated the JIT16 flip (wolf3d runs billions of 16-bit entries),
+            // and the wolf3d demo-workload census measured `0x90` word at 79M block-stopping
+            // hits. `Nop` emits nothing width-dependent.
             0x90 => {
                 return Some(DirectKind::Nop);
             }
@@ -697,17 +708,19 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // `selector_segment` reports the segment so `data_matches` refuses re-entry after a
             // guest reload.
             //
-            // PUSH SS (0x16) and PUSH CS (0x0e) are NOT here, and not for symmetry's sake. The
-            // census measures 36 and 18 hits against 17.9 million for DS, SS belongs to the family
-            // the write half excludes over the interrupt shadow, and CS would need the carve-out
-            // `selector_segment` documents. Closure over a shared arm is worth having when the arm
-            // is shared; this one is two lines.
-            0x1e | 0x06 => {
+            // PUSH SS (0x16) is NOT here: it belongs to the family the write half excludes over
+            // the interrupt shadow, and no census row measures it (36 hits when this arm was
+            // built). PUSH CS (0x0e) joined on 2026-08-08 when the wolf3d demo-workload census
+            // ranked it at 158M block-stopping hits: it needs NO `selector_segment` entry because
+            // CS is not in `SegmentLayout.data` at all — `SegmentLayout::selector` reads the
+            // separate `cs` field and `cs_matches` pins it for every block unconditionally, the
+            // same argument that already carries `mov r16, cs` through `MovSegToReg`.
+            0x0e | 0x1e | 0x06 => {
                 return Some(DirectKind::Push {
-                    source: StoreSource::Selector(if opcode == 0x1e {
-                        SegmentIndex::Ds
-                    } else {
-                        SegmentIndex::Es
+                    source: StoreSource::Selector(match opcode {
+                        0x0e => SegmentIndex::Cs,
+                        0x1e => SegmentIndex::Ds,
+                        _ => SegmentIndex::Es,
                     }),
                 });
             }
@@ -1236,10 +1249,17 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 if m.reg != 0 {
                     return None;
                 }
+                // `/0` TEST. `0xf6` is the byte form regardless of prefix; `0xf7` follows the
+                // operand size, and it is the only group-3 member the Word gate's sub-opcode
+                // escape lets through (see the gate) — `emit_test_preloaded` has carried a full
+                // Word lane (66-prefixed `test`, 0x100 descriptor tag) since the width field
+                // landed, with no caller until the wolf3d census ranked the register form at
+                // 634M block-stopping hits. The word MEMORY form stays refused: no fixture
+                // measures a row for it, and an unmeasured admission has no counter to gate it.
                 let width = if opcode == 0xf6 {
                     MemoryWidth::Byte
                 } else {
-                    MemoryWidth::Dword
+                    operand_width
                 };
                 return match insn.operand? {
                     DecodedOperand::Reg(dst) => Some(DirectKind::TestImmReg {
@@ -1247,11 +1267,16 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         imm: insn.imm,
                         width,
                     }),
-                    DecodedOperand::Mem(addr) => Some(DirectKind::TestImmMem {
-                        imm: insn.imm,
-                        width,
-                        addr: direct_addr(addr)?,
-                    }),
+                    DecodedOperand::Mem(addr) => {
+                        if width == MemoryWidth::Word {
+                            return None;
+                        }
+                        Some(DirectKind::TestImmMem {
+                            imm: insn.imm,
+                            width,
+                            addr: direct_addr(addr)?,
+                        })
+                    }
                 };
             }
             0xc2 | 0xc3 => {

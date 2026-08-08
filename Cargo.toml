@@ -28,7 +28,12 @@ authors = ["IzarraVM contributors"]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-strip = "symbols"
+# Line-table debug info (MSVC: richer PDB, identical codegen) so the
+# IZARRAVM_RIP_PROFILE sampler attributes wall to real functions and lines.
+# The publics-only PDB the stripped build produced attributed 25% of a
+# nascar-586 profile to a nearest-public btree drop-glue symbol.
+debug = "line-tables-only"
+strip = "none"
 
 [workspace.dependencies]
 bitflags = "2.6"

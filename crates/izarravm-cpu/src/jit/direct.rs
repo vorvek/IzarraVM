@@ -3506,18 +3506,16 @@ impl DirectKind {
             // emitted code bakes the selector as a constant, so without this a block whose only
             // mention of DS is `push ds` leaves DS out of `used`, `data_matches` skips it, and the
             // block keeps matching after the guest reloads DS -- pushing the old selector forever.
-            // `PUSH CS` is not admitted, so the CS exclusion above needs no twin here.
+            // `PUSH CS` (admitted 2026-08-08) is deliberately EXCLUDED by the guard, exactly like
+            // `MovSegToReg` above: CS is not in `SegmentLayout.data`, `SegmentLayout::selector`
+            // reads the separate `cs` field, and `cs_matches` pins it for every block
+            // unconditionally, so reporting it here would be inert at best.
             Self::Push {
                 source: StoreSource::Selector(segment),
             }
             | Self::Push16 {
                 source: StoreSource::Selector(segment),
             } if segment != SegmentIndex::Cs => Some(segment),
-            // `PUSH Sreg`. Reporting it here is what makes the lowering safe, not bookkeeping: the
-            // emitted code bakes the selector as a constant, so without this a block whose only
-            // mention of DS is `push ds` leaves DS out of `used`, `data_matches` skips it, and the
-            // block keeps matching after the guest reloads DS -- pushing the old selector forever.
-            // `PUSH CS` is not admitted, so the CS exclusion above needs no twin here.
             _ => None,
         }
     }
