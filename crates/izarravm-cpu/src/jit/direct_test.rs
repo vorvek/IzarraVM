@@ -1379,7 +1379,10 @@ fn physical_invalidation_window_skips_far_keys_and_reaches_span_tails() {
     // the sorted page index must examine zero keys and kill nothing.
     let result = cache.invalidate_physical_range(0x70_400, 4, false);
     assert_eq!(result.blocks, 0);
-    assert_eq!(result.keys_scanned, 0, "far keys must stay outside the window");
+    assert_eq!(
+        result.keys_scanned, 0,
+        "far keys must stay outside the window"
+    );
     assert!(matches!(cache.probe(low), BlockProbe::Ready(_)));
     assert!(matches!(cache.probe(high), BlockProbe::Ready(_)));
 

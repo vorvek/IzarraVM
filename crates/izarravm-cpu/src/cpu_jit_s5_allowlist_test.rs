@@ -265,7 +265,10 @@ fn word_size_group3_test_forms_follow_the_slice() {
         "test cx, imm16: the register form must join the block"
     );
     assert_eq!(compilation.word_reads, 0, "register form touches no memory");
-    assert_eq!(compilation.word_stores, 0, "register form touches no memory");
+    assert_eq!(
+        compilation.word_stores, 0,
+        "register form touches no memory"
+    );
 
     // MEMORY form: `test word [eax+0x10], imm16`.
     let memory_form = [0x66u8, 0xf7, 0x40, 0x10, 0x34, 0x12];

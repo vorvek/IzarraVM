@@ -1445,8 +1445,7 @@ impl BlockCache {
                 let window_low = physical.saturating_sub(page_keys.max_span.saturating_sub(1));
                 let window_high = physical.saturating_add(width);
                 let keys = &mut page_keys.keys;
-                let window_start =
-                    keys.partition_point(|tracked| tracked.physical < window_low);
+                let window_start = keys.partition_point(|tracked| tracked.physical < window_low);
                 let window_end = window_start
                     + keys[window_start..]
                         .partition_point(|tracked| tracked.physical < window_high);
@@ -2186,7 +2185,10 @@ impl BlockCache {
     /// page's invalidation window bound. Called when a key becomes
     /// Compiled/Rejected; `track_physical_key` has always run first.
     fn note_page_span(&mut self, key: BlockKey, guest_len: u32) {
-        if let Some(page) = self.physical_keys.get_mut(&(key.physical >> BLOCK_PAGE_SHIFT)) {
+        if let Some(page) = self
+            .physical_keys
+            .get_mut(&(key.physical >> BLOCK_PAGE_SHIFT))
+        {
             page.max_span = page.max_span.max(guest_len);
         }
     }
