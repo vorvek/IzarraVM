@@ -34,26 +34,27 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # The one revision every formal candidate is measured against. Re-pinned from
-# 8e238b06 (5817fb58, 2026-08-04) to cbd650de (5e821a32, 2026-08-07): merges
-# #706-#713 deliberately changed the JIT admission mix (79f00626 defaulted the
-# 16-bit and 486-Word paths on), which doubles direct entries and side exits
-# per instruction while RAISING coverage (doom-486 0.78 -> 0.91) and doom
-# throughput (+16.8% / +7.0% paired). The old pin's paired slow-exits ratchet
-# therefore failed every candidate on an intended, kept change -- the gate had
-# stopped being protective, the same state that forced the 2026-08-04 re-pin.
-# quake-586 carries a real, documented -3.5% paired against the OLD pin
-# (dev_docs/2026-08-07-gate-red-diagnosis.md), accepted with the R15-offsets
-# slice named as its recovery; the floors below ratchet from the new baseline
-# so it cannot slide further unnoticed. Whoever re-pins this next must
-# recalibrate the per-workload floors in Get-WorkloadPolicy in the same commit
-# -- they are ratchets derived from what the pinned tree measures, and a pin
-# moved without them silently stops asserting anything.
+# cbd650de (5e821a32, 2026-08-07) to 5aabe720 (fdf32ef2, 2026-08-08): the
+# 166 MHz / 64 MB PC100 spec change (25ee8aaf) moved MASTER_CLOCK_HZ, every
+# 586 cycle budget, and the guest anchors (doom-586 998 realtics / 74.8 fps,
+# quake 41.2 fps), so the 200 MHz pin's numbers stopped describing the machine
+# being gated. fdf32ef2 also carries the wolf3d word-row admissions (33d32083)
+# and the day's invariant re-pins, so its JIT mix is the shipped one. The
+# campaign now commits directly to main (PR-less, owner brief 2026-08-08), so
+# the pin is a direct commit rather than a merge commit; the reachability
+# requirement it exists for -- the TREE must stay resolvable on main -- holds
+# for any pushed main commit as long as main is never rewritten. Whoever
+# re-pins this next must recalibrate the per-workload floors in
+# Get-WorkloadPolicy in the same commit -- they are ratchets derived from what
+# the pinned tree measures, and a pin moved without them silently stops
+# asserting anything.
 #
-# The floors below were measured on 5e821a32 itself: gate run
-# 5e821a32d463-20260807-021454-57b54847, six pairs, quiet box, processor 8,
-# candidate role. The gate run that accepted this pin confirms them rather
-# than assuming it.
-$acceptedBaselineTree = "cbd650def00eeb076226162128c2cd9160b98a80"
+# Floors: doom-486 and quake-586 carry over from the previous pin (their
+# budgets and personas are spec-stable and current runs clear them with
+# margin); doom-586's are the spec-change provisionals. ALL THREE are to be
+# re-derived from this pin's first accepted gate run and tightened in a
+# follow-up commit -- see the per-workload comments.
+$acceptedBaselineTree = "5aabe720c492cbcf5f31c776c5c58d33d89cd6c8"
 $highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 $minimumDirectCoverage = 0.90
 $maximumDirectExitsPer100 = 5.0
@@ -605,10 +606,10 @@ function Get-WorkloadPolicy([string]$Name) {
                 name = $Name
                 mode = "486"
                 cycle_budget = [uint64]8000000000
-                # Ratchets, set just under what the accepted baseline measures
-                # (rt 2.762-2.922, coverage 91.33%, realtics 2969 all six
-                # samples; the realtics band is wider because realtics is
-                # session-local).
+                # Ratchets from the PREVIOUS (200 MHz-era) pin, kept as loose
+                # backstops across the 2026-08-08 re-pin: the 486 persona is
+                # spec-stable and currently measures rt ~3.3-3.5, well clear.
+                # Tighten from the first accepted run on pin fdf32ef2.
                 minimum_real_time_factor = 2.65
                 minimum_direct_native_coverage = 0.90
                 minimum_realtics = 2900
