@@ -865,7 +865,7 @@ function Invoke-RealtimeGateSelfTest {
     }
     $quakePolicy = [pscustomobject]@{
         name = "quake-586"
-        cycle_budget = [uint64]6200000000
+        cycle_budget = [uint64]5146000000
     }
     $syntheticQuakeCompletion = [pscustomobject]@{
         identity_count = 1
@@ -931,7 +931,7 @@ function Invoke-RealtimeGateSelfTest {
                 }
                 stop = [pscustomobject]@{
                     kind = "cycle_limit"
-                    requested = [uint64]6200000000
+                    requested = [uint64]5146000000
                 }
                 quake_timedemo_identity_count = 1
                 quake_timedemo = [pscustomobject]@{
@@ -1334,7 +1334,7 @@ function Invoke-RealtimeGateSelfTest {
         $sample | Add-Member -NotePropertyName gate_power_scheme_after `
             -NotePropertyValue $powerScheme
         $sample | Add-Member -NotePropertyName gate_argv `
-            -NotePropertyValue ([object[]]@("--cpu", "586", "--cycles", "6200000000"))
+            -NotePropertyValue ([object[]]@("--cpu", "586", "--cycles", "5146000000"))
         $sample | Add-Member -NotePropertyName gate_argv_sha256 `
             -NotePropertyValue ("a" * 64)
         $sample | Add-Member -NotePropertyName gate_executable_sha256 `
@@ -1351,7 +1351,7 @@ function Invoke-RealtimeGateSelfTest {
         if ($ObservationClass -ceq "production") {
             $sample.stop = [pscustomobject]@{
                 kind = "cycle_limit"
-                requested = [uint64]6200000000
+                requested = [uint64]5146000000
             }
             $sample.gate_termination_policy = "fixed_cycle_production"
             $sample.gate_fixture = $null

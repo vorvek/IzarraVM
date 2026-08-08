@@ -17,9 +17,9 @@ fn test_machine() -> Machine {
 fn timeline_uses_the_exact_quantum_for_every_mode() {
     for (mode, expected) in [
         (GswMode::Gsw586, 33),
-        (GswMode::Gsw486, 100),
-        (GswMode::Gsw386, 300),
-        (GswMode::Gsw386Slow, 900),
+        (GswMode::Gsw486, 83),
+        (GswMode::Gsw386, 249),
+        (GswMode::Gsw386Slow, 747),
     ] {
         let timeline = Timeline::new(mode);
         assert_eq!(timeline.ticks_per_cpu_clock(), expected);
@@ -38,9 +38,9 @@ fn mode_switch_preserves_elapsed_and_stall_time() {
     assert_eq!(timeline.now_ticks(), 400);
     assert_eq!(timeline.io_stall_ticks(), 70);
     assert_eq!(timeline.tsc_clocks(), 12);
-    assert_eq!(timeline.ticks_per_cpu_clock(), 900);
+    assert_eq!(timeline.ticks_per_cpu_clock(), 747);
     timeline.advance_cpu_clocks(1, DeviceRates::default());
-    assert_eq!(timeline.now_ticks(), 1_300);
+    assert_eq!(timeline.now_ticks(), 1_147);
     assert_eq!(timeline.tsc_clocks(), 13);
 }
 
@@ -54,13 +54,13 @@ fn tsc_clock_is_batch_invariant_and_resets_fraction_on_mode_change() {
         split.advance_master_ticks(ticks, DeviceRates::default());
     }
     assert_eq!(split, whole);
-    assert_eq!(whole.tsc_clocks(), 100);
+    assert_eq!(whole.tsc_clocks(), 121);
 
     whole.set_mode(GswMode::Gsw386);
     whole.advance_master_ticks(201, DeviceRates::default());
-    assert_eq!(whole.tsc_clocks(), 100);
+    assert_eq!(whole.tsc_clocks(), 121);
     whole.advance_master_ticks(99, DeviceRates::default());
-    assert_eq!(whole.tsc_clocks(), 101);
+    assert_eq!(whole.tsc_clocks(), 122);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn canonical_projection_pins_every_timeline_word() {
             102,
             2_550,
             34,
-            1_000_000_000,
+            1_132_000_000,
             2_040,
             1_071_000,
             136,
@@ -186,7 +186,7 @@ fn canonical_projection_rejects_each_invalid_timeline_invariant() {
     assert_eq!(
         quantum.canonical_state_capture().err().unwrap(),
         MachineCanonicalCaptureError::InconsistentTimelineQuantum {
-            expected: 300,
+            expected: 249,
             actual: 301,
         }
     );
@@ -198,7 +198,7 @@ fn canonical_projection_rejects_each_invalid_timeline_invariant() {
         MachineCanonicalCaptureError::InvalidTimelineRemainder {
             phase: "tsc",
             remainder: 300,
-            limit: 300,
+            limit: 249,
         }
     );
 
@@ -343,12 +343,12 @@ fn device_events_and_phases_are_batch_invariant() {
 #[test]
 fn cpu_clock_inverse_has_causal_and_budget_forms() {
     let timeline = Timeline::new(GswMode::Gsw386);
-    assert_eq!(timeline.cpu_clocks_for_master_ticks_floor(299), 0);
-    assert_eq!(timeline.cpu_clocks_for_master_ticks_ceil(299), 1);
-    assert_eq!(timeline.cpu_clocks_for_master_ticks_floor(300), 1);
-    assert_eq!(timeline.cpu_clocks_for_master_ticks_ceil(300), 1);
-    assert_eq!(timeline.cpu_clocks_for_master_ticks_floor(301), 1);
-    assert_eq!(timeline.cpu_clocks_for_master_ticks_ceil(301), 2);
+    assert_eq!(timeline.cpu_clocks_for_master_ticks_floor(248), 0);
+    assert_eq!(timeline.cpu_clocks_for_master_ticks_ceil(248), 1);
+    assert_eq!(timeline.cpu_clocks_for_master_ticks_floor(249), 1);
+    assert_eq!(timeline.cpu_clocks_for_master_ticks_ceil(249), 1);
+    assert_eq!(timeline.cpu_clocks_for_master_ticks_floor(250), 1);
+    assert_eq!(timeline.cpu_clocks_for_master_ticks_ceil(250), 2);
 }
 
 #[test]

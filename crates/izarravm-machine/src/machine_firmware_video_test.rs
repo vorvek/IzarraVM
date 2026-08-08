@@ -266,10 +266,10 @@ fn boot_image_emits_serial_records_and_result_block() {
 }
 
 #[test]
-fn boot_suite_timer_passes_at_native_200mhz() {
+fn boot_suite_timer_passes_at_native_166mhz() {
     // The boot suite is wall-time-bound: the timer test waits for ten IRQ0
     // edges and the PIT runs at a fixed rate regardless of the CPU clock. At
-    // the 200 MHz native default the cycle budget must scale to cover both the
+    // the 166 MHz native default the cycle budget must scale to cover both the
     // timer and the report's programmed serial baud.
     let profile = MachineProfile {
         cpu: GswMode::Gsw586,
@@ -297,7 +297,7 @@ fn boot_suite_timer_passes_at_native_200mhz() {
     assert_eq!(
         timer.status,
         izarravm_firmware::SuiteRecordStatus::Pass,
-        "timer.irq0 must pass at 200 MHz with the scaled budget"
+        "timer.irq0 must pass at 166 MHz with the scaled budget"
     );
 }
 

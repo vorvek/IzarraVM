@@ -1476,7 +1476,7 @@ fn populated_machine_control_timing_payload_pins_every_field_offset() {
         102,
         2_550,
         34,
-        1_000_000_000,
+        1_132_000_000,
         2_040,
         1_071_000,
         136,

@@ -29,7 +29,7 @@ fn cpu_mode_label_preserves_fractional_clock_rates() {
     );
     assert_eq!(
         cpu_mode_label(GswMode::Gsw586),
-        "GSW-586 - 586 mode - 200 MHz"
+        "GSW-586 - 586 mode - 166 MHz"
     );
 }
 

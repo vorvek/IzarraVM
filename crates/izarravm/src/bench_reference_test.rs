@@ -70,11 +70,11 @@ fn slow_386_targets_are_exactly_one_third_of_386() {
 fn hardware_reference_targets_stay_pinned() {
     assert_eq!(target("dhrystone", GswMode::Gsw386), 9200.0);
     assert_eq!(target("dhrystone", GswMode::Gsw486), 61_000.0);
-    assert_eq!(target("dhrystone", GswMode::Gsw586), 300_000.0);
+    assert_eq!(target("dhrystone", GswMode::Gsw586), 249_000.0);
     assert_eq!(target("whetstone", GswMode::Gsw486), 6.5);
-    assert_eq!(target("whetstone", GswMode::Gsw586), 34.5);
+    assert_eq!(target("whetstone", GswMode::Gsw586), 28.6);
     let p55c_dmips = target("dhrystone", GswMode::Gsw586) / VAX_DHRYSTONES_PER_SEC;
-    assert!((p55c_dmips - 170.7).abs() < 0.5);
+    assert!((p55c_dmips - 141.7).abs() < 0.5);
 }
 
 #[test]

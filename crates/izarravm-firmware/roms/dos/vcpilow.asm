@@ -25,9 +25,9 @@ start:
     shl ebx, 16
     add eax, ebx
     add eax, 0x100000
-    cmp eax, 0x1800000
+    cmp eax, 0x4000000
     jbe .top_ok
-    mov eax, 0x1800000
+    mov eax, 0x4000000
 .top_ok:
     mov [ram_top], eax
 

@@ -116,7 +116,7 @@ fn wavetable_timestamps_follow_the_exact_in_batch_master_tick() {
     let second = machine.take_wavetable_midi_message().unwrap();
     assert_eq!(first.guest_tick, expected[0]);
     assert_eq!(second.guest_tick, expected[1]);
-    assert!(first.guest_tick >= batch_start + 30 * 100);
+    assert!(first.guest_tick >= batch_start + 30 * 83);
     assert!(second.guest_tick > first.guest_tick);
 }
 

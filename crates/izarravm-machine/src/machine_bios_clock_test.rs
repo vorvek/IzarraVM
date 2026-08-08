@@ -321,11 +321,11 @@ fn tsc_counts_halted_and_storage_time_across_live_mode_changes() {
     let mut advanced = make_machine();
     advanced.stall_for_master_ticks(33 * 1_000);
     advanced.set_mode(GswMode::Gsw486);
-    advanced.advance_halted_ticks(100 * 2_000);
+    advanced.advance_halted_ticks(83 * 2_000);
     advanced.set_mode(GswMode::Gsw386);
-    advanced.stall_for_master_ticks(300 * 3_000);
+    advanced.stall_for_master_ticks(249 * 3_000);
     advanced.set_mode(GswMode::Gsw386Slow);
-    advanced.advance_halted_ticks(900 * 4_000);
+    advanced.advance_halted_ticks(747 * 4_000);
     advanced.set_mode(GswMode::Gsw586);
     assert_eq!(
         advanced.run_until_halt_or_cycles(1_000_000).unwrap(),

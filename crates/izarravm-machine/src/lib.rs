@@ -364,7 +364,7 @@ const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
         CpuPersona::I386 => 1,
         // (2 + 45) * 1/3 clocks at 66 MHz is about 237 ns per access.
         CpuPersona::I486 => 45,
-        // (2 + 75) * 7/30 clocks at 200 MHz is about 90 ns per access.
+        // (2 + 75) * 7/30 clocks at 166 MHz is about 108 ns per access.
         CpuPersona::I586 => 75,
     }
 }
