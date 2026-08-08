@@ -739,6 +739,12 @@ pub(crate) struct BlockCache {
     /// lazily, at the first store-bearing compile with the flag on, never replaced. `None`
     /// after a failed build makes that block fall back to the inline (gate-off) emission.
     store_stub_pad: Option<(super::exec_mem::ExecutableBuffer, [usize; STORE_STUB_COUNT])>,
+    /// The shared read-resolve stub pad (one-lookup load design D4). Same lifetime contract as
+    /// the two pads above, its own executable mapping because reads gate on `map_bases` alone —
+    /// a load-only block has NO code-watch tables, so the read pad must not ride the store
+    /// pad's build condition. `None` after a failed build makes that block fall back to the
+    /// inline (gate-off) read emission.
+    read_stub_pad: Option<(super::exec_mem::ExecutableBuffer, [usize; READ_STUB_COUNT])>,
     /// The `jit_cost_dial_epoch()` the cache above was computed under. The CPU cannot see a bus
     /// dial move, so the memo is keyed on the bus's own epoch rather than on an argument about
     /// who writes the dials. Reading one accessor and comparing beats six accessor calls, five
@@ -812,6 +818,7 @@ impl BlockCache {
             iteration_upper_cache: Vec::new(),
             x87_pad: None,
             store_stub_pad: None,
+            read_stub_pad: None,
             global_block_upper_epoch: 0,
             iteration_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
@@ -3628,6 +3635,9 @@ mod frame;
 pub(crate) use frame::*;
 mod table_slots;
 pub(crate) use table_slots::*;
+// The compile-walk -> emitter handoff structs, moved out for the source-line ceiling.
+mod emit_input;
+use emit_input::*;
 
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
@@ -4751,6 +4761,40 @@ fn compile_with_instruction_limit(
                 _ => false,
             };
     }
+    // The read twin gates on `map_bases` ALONE (load design D2): a load-only block has no
+    // code-watch tables, and the read stubs consult none. Same lazy build, same F5-style
+    // per-block fallback through `None`. Deliberately looser than D2's "first load-bearing
+    // compile": any block with map bases builds the pad, so a store-only workload pays one
+    // small pad build it never calls into — cheaper than threading a has-reads bit through
+    // here, and the publish is idempotent.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    let one_lookup_load;
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        one_lookup_load = cpu.jit_direct.one_lookup_load
+            && cpu.jit_direct.r15_tables
+            && match map_bases {
+                Some(bases) => match cpu.jit_direct.direct.read_stub_addresses(bases) {
+                    Some(addresses) => {
+                        cpu.native_table_slots.publish_read_stubs(addresses);
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            };
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    let one_lookup_load = false;
     #[cfg(not(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
@@ -4836,6 +4880,7 @@ fn compile_with_instruction_limit(
             r15_tables: cpu.jit_direct.r15_tables,
             watch_page_bit: cpu.jit_direct.watch_page_bit,
             one_lookup_store,
+            one_lookup_load,
             segments: segment_layout,
             address_wrap: if d {
                 emit::AddressWrap::None
@@ -4938,69 +4983,6 @@ fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
         (!read && !write)
             || segment_access_supported(cpu, cpu.registers.segment(segment), read, write)
     })
-}
-
-struct EmitInput<'a> {
-    slots: &'a [DirectInsn],
-    span: BlockSpan,
-    raw_clocks: u32,
-    weighted_fp_clocks: u32,
-    byte_reads: u8,
-    word_reads: u8,
-    dword_reads: u8,
-    byte_stores: u8,
-    word_stores: u8,
-    dword_stores: u8,
-    self_loop: bool,
-    x87_entry_top: Option<u8>,
-    memory: MemoryEmitContext,
-    link_cell_ptrs: [usize; 2],
-}
-
-struct EmittedCode {
-    code: Vec<u8>,
-    body_offset: usize,
-}
-
-#[derive(Clone, Copy)]
-struct MemoryEmitContext {
-    map: Option<NativeMapBases>,
-    code_watch_tables: Option<[usize; 2]>,
-    cpl3: bool,
-    /// Whether memory sites load table bases from `CpuGsw::native_table_slots`
-    /// (`[r15 + disp32]`, 7 bytes) instead of baking each as a 10-byte imm64.
-    /// From `JitState::r15_tables`. Both arms load the identical pointer — the
-    /// publish site in the compile walk records exactly the values this
-    /// context carries — so the arms differ in encoding only.
-    r15_tables: bool,
-    /// Whether store emitters test the fast-map PAGE_WATCHED bit and skip the code-watch guard
-    /// on unwatched pages (watched-page-bit design D3). From `JitState::watch_page_bit`. False
-    /// reproduces the pre-slice emission byte for byte at the seven Group A sites; the two
-    /// Group B sites keep their H6 kind-mask `and` on every arm (a behavioral no-op there,
-    /// kept unconditional so the arms cannot drift), so the off arm is semantics-identical but
-    /// two instructions per ALU/double-shift site larger than the pre-slice binary.
-    watch_page_bit: bool,
-    /// Whether store sites emit the one-lookup probe + shared-stub shape (design D3/D4/D5)
-    /// instead of the classify/resolve front. From `JitState::one_lookup_store`, AND-ed at the
-    /// construction site with "the stub pad actually built" (review F5: a failed pad build
-    /// falls back to the inline emission for that block) — and it requires `r15_tables`,
-    /// because the stubs read every table through the R15 slots.
-    one_lookup_store: bool,
-    segments: SegmentLayout,
-    /// Whether a ModRM-derived effective address wraps at 64K.
-    ///
-    /// A BLOCK property, not an address one. `decode` computes
-    /// `address_size = cs.default_size_32 XOR address_size_override`, and `prefixes_supported_for`
-    /// refuses the override outright, so within an admitted block the address size is a pure
-    /// function of CS.D, which the mode key pins.
-    ///
-    /// It lives here rather than on `DirectAddr` because that struct rides inside `Load`,
-    /// `Store`, `AluMemSource` and other kinds shared across many emit sites, and this
-    /// property is a block-wide fact, not a per-address one.
-    ///
-    /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
-    /// and is keyed separately, so all nine `stack_addr` call sites pass a literal.
-    address_wrap: emit::AddressWrap,
 }
 
 #[cfg(test)]
