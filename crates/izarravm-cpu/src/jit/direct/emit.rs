@@ -369,8 +369,9 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // result or in flags.
             //
             // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, so
-            // no guest register lives in it, and the ADD path through `emit_alu_preloaded`
-            // (op 0, Dword, writes `home(dst)`) neither reads nor writes it.
+            // no guest register lives in it, and RDX is dead by the time `emit_alu_preloaded`
+            // dispatches — every op path may clobber it (the CMP path stages its non-written
+            // result there) but none reads it on entry.
             DirectKind::AluImm {
                 op,
                 dst,

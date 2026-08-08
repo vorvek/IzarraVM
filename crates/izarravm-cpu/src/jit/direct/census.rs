@@ -373,6 +373,13 @@ pub(crate) struct DirectStallTally {
     /// DENOMINATOR the two counters above needed: an abnormal count of zero says nothing without
     /// it, because zero is also what a mechanism that never ran reports.
     pub callout_executed: u64,
+    /// G1 lane trials granted: hot-chunk compilations allowed through the heat gates on the
+    /// one-per-key-per-epoch budget (`lane_trial_enabled`), and how many of them installed a
+    /// lane-carrying block under a hot span. The gap between the two is trials that learned
+    /// their region is not lane-shaped. Here rather than `PerfCounters` for the layout reason on
+    /// this struct's doc.
+    pub lane_trials: u64,
+    pub lane_trial_installs: u64,
     /// Entries refused because a call-out-bearing block met the privilege state whose port reads
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
@@ -1012,6 +1019,8 @@ impl crate::jit::JitState {
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             segment_write_block_head_entries: self.stalls.segment_write_block_head_entries,
             segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
+            lane_trials: self.stalls.lane_trials,
+            lane_trial_installs: self.stalls.lane_trial_installs,
         }
     }
 

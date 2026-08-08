@@ -158,6 +158,13 @@ pub(crate) struct SmcTrace {
     class_narrow_kills: [u64; 4],
     class_wholesale: [u64; 4],
     class_newly_hot: [u64; 4],
+    /// Per-EVENT histogram of the overwritten instruction's shape, for the imm and disp classes
+    /// only. This is the mutable-lane shopping list the site rows cannot provide: a site's class
+    /// and identity FREEZE at its first hit (see the module docs), so a fixture whose hot sites
+    /// first appear as no-line hides every later imm-field patch identity from the ranked rows.
+    /// Keyed per event, this table is complete the way the class totals are. The key packs
+    /// (class, opcode, modrm reg or 0xFF, insn len, imm_len, disp_len, operand bytes).
+    shape_events: HashMap<u64, u64>,
 }
 
 impl SmcTrace {
@@ -213,6 +220,20 @@ impl SmcTrace {
         let index = class.index();
         self.events += 1;
         self.class_events[index] += 1;
+        if matches!(
+            class,
+            SmcFieldClass::ImmediateOnly | SmcFieldClass::DisplacementOnly
+        ) && let Some(identity) = identity
+        {
+            let key = (u64::from(index as u8) << 56)
+                | (u64::from(identity.opcode) << 40)
+                | (u64::from(identity.modrm.map_or(0xFF, |(_, reg, _)| reg)) << 32)
+                | (u64::from(identity.len) << 24)
+                | (u64::from(identity.imm_len) << 16)
+                | (u64::from(identity.disp_len) << 8)
+                | u64::from(identity.operand_bytes as u8);
+            *self.shape_events.entry(key).or_insert(0) += 1;
+        }
         self.class_blocks_killed[index] += u64::from(action.blocks_killed);
         self.class_narrow_kills[index] += u64::from(action.narrow_kills);
         self.class_wholesale[index] += u64::from(action.wholesale);
@@ -282,6 +303,30 @@ impl SmcTrace {
                 self.class_narrow_kills[index],
                 self.class_wholesale[index],
                 self.class_newly_hot[index],
+            ));
+        }
+        let mut shapes: Vec<(u64, u64)> = self.shape_events.iter().map(|(k, v)| (*k, *v)).collect();
+        // Events first, then the packed key, so the ranking is stable across runs.
+        shapes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        lines.push(
+            "smc_shape rank events class opcode modrm_reg insn_len imm_len disp_len operand_bytes"
+                .to_string(),
+        );
+        for (rank, (key, events)) in shapes.iter().take(24).enumerate() {
+            let modrm_reg = (key >> 32) & 0xFF;
+            lines.push(format!(
+                "smc_shape {rank} {events} {} {:#06x} {} {} {} {} {}",
+                CLASS_LABELS[((key >> 56) & 0xFF) as usize],
+                (key >> 40) & 0xFFFF,
+                if modrm_reg == 0xFF {
+                    "-".to_string()
+                } else {
+                    modrm_reg.to_string()
+                },
+                (key >> 24) & 0xFF,
+                (key >> 16) & 0xFF,
+                (key >> 8) & 0xFF,
+                key & 0xFF,
             ));
         }
         let mut ranked: Vec<&Site> = self.sites.values().collect();

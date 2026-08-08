@@ -445,3 +445,50 @@ fn overlapping_block_without_a_lane_retires_while_the_owner_survives() {
 /// `lane_fixture`) instead of duplicating it.
 #[path = "cpu_jit_imm_lane_matrix_test.rs"]
 mod matrix;
+
+/// The G1 lane trial's contract (`IZARRAVM_SMC_LANE_TRIAL`, default off — see
+/// `lane_trial_enabled` for the measured rationale), driven through the test override because
+/// the env gate is a process-global `OnceLock`: a hot entry chunk spends exactly one compile
+/// per key per epoch, and a lane-bearing compilation installs THROUGH the hot span. The
+/// lane-free demote arm is pinned by the G1 tests in cpu_jit_compile_outcome_test.rs.
+#[test]
+fn lane_trial_compiles_once_and_installs_through_a_hot_span() {
+    let mut cpu = flat_cpu();
+    let mut bus = test_bus(image(0x1111_2222));
+    decode_at(&mut cpu, &mut bus, &block_starts());
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.direct.set_lane_trial_for_test(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    cpu.sync_smc_heat();
+    for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat.bump(ENTRY, 1, 0);
+    }
+    let attempts = cpu.perf_counters().jit_direct_compile_attempts;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        cpu.perf_counters().jit_direct_compile_attempts,
+        attempts + 1,
+        "exactly the trial's one compile should be paid"
+    );
+    assert_eq!(
+        stalls.lane_trials, 1,
+        "the trial must be spent exactly once"
+    );
+    assert_eq!(
+        stalls.lane_trial_installs, 1,
+        "the lane-bearing block must install through the hot span"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed + 1
+    );
+    assert!(
+        matches!(cpu.jit_direct.probe(key), jit::direct::BlockProbe::Ready(_)),
+        "the installed trial block must answer the next probe"
+    );
+}

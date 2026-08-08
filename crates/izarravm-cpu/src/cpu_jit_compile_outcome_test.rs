@@ -1577,7 +1577,11 @@ fn smc_heat_pre_compile_gate_demotes_a_hot_entry_chunk() {
         cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
             .expect("gate");
     }
-    // The cheap entry-chunk gate refuses admission before a compile is even attempted.
+    // The cheap entry-chunk gate refuses admission before a compile is even attempted. The
+    // lane trial (`IZARRAVM_SMC_LANE_TRIAL`) is DEFAULT OFF by measurement, so the pre-trial
+    // behavior is also the shipped behavior; the trial's own semantics are pinned by
+    // `lane_trial_compiles_once_and_installs_through_a_hot_span` (cpu_jit_imm_lane_test.rs,
+    // whose fixtures are the proven lane-compiling environment).
     assert_eq!(
         cpu.perf_counters().jit_direct_compile_attempts,
         attempts,

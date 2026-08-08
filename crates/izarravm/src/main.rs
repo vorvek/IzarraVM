@@ -1593,6 +1593,8 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
         "segment_write_block_head_entries": snapshot.segment_write_block_head_entries,
         "segment_write_block_head_insns": snapshot.segment_write_block_head_insns,
+        "smc_lane_trials": snapshot.lane_trials,
+        "smc_lane_trial_installs": snapshot.lane_trial_installs,
     })
 }
 

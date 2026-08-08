@@ -1154,11 +1154,27 @@ impl CpuGsw {
                 // compile. Dormant (not Rejected) because Rejected would acquire watch ranges and
                 // keep the demoted page alive; existing valid blocks keep running and links only
                 // form to installed blocks, so a demoted region starves naturally.
+                //
+                // Lane-trial exception (`lane_trial_enabled` carries the full rationale): one
+                // compilation per key per heat epoch is allowed through this gate, so a
+                // steadily-patching region gets the chance to compile with mutable lanes. The
+                // pre-install span gate below is where a trial without lanes dies — the entry
+                // chunk is inside the span, so a hot entry ALWAYS reaches that check. One
+                // acknowledged deviation from the Dormant-only rule above: a trial whose
+                // compilation is STRUCTURALLY rejected reaches `reject(span)` on a churning
+                // chunk and acquires watch ranges — one-shot per span per epoch, accepted as
+                // the cost of learning the region's shape at all.
                 let heat_epoch = self.smc_heat_epoch();
                 self.sync_smc_heat();
+                let mut lane_trial = false;
                 if self.jit_direct.smc_heat.chunk_hot(key.physical, heat_epoch) {
-                    self.smc_heat_demote(key, heat_epoch);
-                    return Ok(DirectContinuation::Interpret);
+                    let jit = &mut *self.jit_direct;
+                    if jit.direct.lane_trial_spend(key, heat_epoch) {
+                        lane_trial = true;
+                    } else {
+                        self.smc_heat_demote(key, heat_epoch);
+                        return Ok(DirectContinuation::Interpret);
+                    }
                 }
                 let compile_start = std::time::Instant::now();
                 let outcome = jit::direct::compile(self, lin, d);
@@ -1204,13 +1220,29 @@ impl CpuGsw {
                 // G1 pre-install gate (full span): the compiled block may cover chunks past its
                 // entry that are churning even when the entry chunk is cold. Refuse installation
                 // and park it Dormant so the whole span runs on the interpreter.
+                //
+                // Lane-trial exception, second half: a hot span installs anyway when the
+                // compilation registered at least one mutable lane AND this continuation holds
+                // the key's trial (taken at the entry gate, or spent here for the
+                // entry-cold-but-span-hot case). A trial compilation with NO lanes lands in the
+                // demote arm exactly as before — it spent the epoch's attempt learning the
+                // region is not lane-shaped, which is the bound on churn.
                 if self.jit_direct.smc_heat.span_hot(
                     key.physical,
                     u32::from(compilation.span.guest_len),
                     heat_epoch,
                 ) {
-                    self.smc_heat_demote(key, heat_epoch);
-                    return Ok(DirectContinuation::Interpret);
+                    let lane_install = compilation.imm_lane_count() > 0 && {
+                        lane_trial || {
+                            let jit = &mut *self.jit_direct;
+                            jit.direct.lane_trial_spend(key, heat_epoch)
+                        }
+                    };
+                    if !lane_install {
+                        self.smc_heat_demote(key, heat_epoch);
+                        return Ok(DirectContinuation::Interpret);
+                    }
+                    lane_trial = true;
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {
                     self.jit_direct
@@ -1222,6 +1254,11 @@ impl CpuGsw {
                 // before it whose PAGE_WATCHED bit is clear must be invalidated first.
                 self.sweep_block_watch_edges();
                 self.perf.jit_direct_blocks_installed += 1;
+                // AFTER `install` succeeded, so an `InstallFailed` dormant park is never counted
+                // as the trial's success half (review note on the first placement).
+                if lane_trial {
+                    self.jit_direct.direct.note_lane_trial_install();
+                }
                 self.perf.smc_lane_registrations += compilation.imm_lane_count() as u64;
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the

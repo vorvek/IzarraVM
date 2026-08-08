@@ -1641,3 +1641,82 @@ fn the_smc_trace_does_not_disturb_lane_classification() {
     assert_eq!(off.ebp, on.ebp, "the guest result moved with the trace");
     assert_eq!(off.memory, on.memory, "guest memory moved with the trace");
 }
+
+// ============================================================================================
+// The widened `0x81 /r` lane family: every ALU-group member, not only /0 ADD.
+// ============================================================================================
+
+/// `doom_image` with the ModRM reg field parameterized: `81 /op EBP, immA` / `81 /op EDI, immB`
+/// at the same offsets, so `DOOM_LANE_A`/`DOOM_LANE_B` and `doom_starts` apply unchanged.
+fn family_image(op: u8, a: u32, b: u32) -> Vec<u8> {
+    let mut memory = vec![0u8; 0x5000];
+    let mut code = vec![0x89, 0xf6, 0x81, 0xc0 | (op << 3) | 5];
+    code.extend_from_slice(&a.to_le_bytes());
+    code.extend_from_slice(&[0x81, 0xc0 | (op << 3) | 7]);
+    code.extend_from_slice(&b.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory
+}
+
+/// Every `0x81 /r` group member takes a lane and its laned execution matches the block-free
+/// interpreter across patch cycles — the widening measured out of duke3d's SMC shape census
+/// (31.7M of its 37.2M imm-field patch events are `/3, /5, /2, /0`; the old lane admitted `/0`
+/// alone). Both carry polarities run: ADC (/2) and SBB (/3) consume the incoming CF, and a fixed
+/// arm state would leave one polarity of `emit_carry_alu_preloaded` unexecuted. CMP (/7) rides
+/// along as the non-writing member — the state compare is what validates it.
+#[test]
+fn widened_alu_family_lanes_match_the_interpreter() {
+    const SEED: u64 = 0x0808_2026_d00b_1e5e;
+    const ROUNDS: usize = 64;
+    for op in 1u8..=7 {
+        let mut rng = Prng::new(SEED ^ u64::from(op));
+        let mut native = flat_cpu();
+        let mut native_bus = test_bus(family_image(op, 1, 2));
+        decode_starts(&mut native, &mut native_bus, ENTRY, &doom_starts());
+        let id = install_with_d(&mut native, ENTRY, 4, true);
+        assert_eq!(
+            native.perf_counters().smc_lane_registrations,
+            2,
+            "op /{op}: both sites must take a lane; every assertion below would be vacuous"
+        );
+        let mut interpreter = flat_cpu();
+        let mut interpreter_bus = test_bus(family_image(op, 1, 2));
+        decode_starts(
+            &mut interpreter,
+            &mut interpreter_bus,
+            ENTRY,
+            &doom_starts(),
+        );
+        let mut pair = DoomPair {
+            native,
+            native_bus,
+            id,
+            interpreter,
+            interpreter_bus,
+        };
+        for round in 0..ROUNDS {
+            let (a, b, ebp, edi) = (rng.value(), rng.value(), rng.value(), rng.value());
+            pair.patch_both(DOOM_LANE_A, a);
+            pair.patch_both(DOOM_LANE_B, b);
+            pair.arm_both(ebp, edi);
+            let eflags = if round & 1 == 1 { 0x8d7 } else { 0x8d6 };
+            pair.native.registers.eflags = eflags;
+            pair.interpreter.registers.eflags = eflags;
+            pair.run_both(&format!(
+                "op /{op} seed {SEED:#x} round {round} a={a:#010x} b={b:#010x} \
+                 ebp={ebp:#010x} edi={edi:#010x} cf={}",
+                eflags & 1
+            ));
+        }
+        // A small deficit against 2*ROUNDS is expected, not suspicious: a round whose drawn
+        // value equals the value already in the field is skipped by the same-value dedup (G2)
+        // BEFORE the lane choke, so it neither accepts nor kills. The bound still proves the
+        // overwhelming majority of patches reached the lanes.
+        assert!(
+            pair.native.perf_counters().smc_lane_accepts >= 2 * (ROUNDS as u64) - 8,
+            "op /{op}: the rounds must actually reach the lane choke, accepts={}",
+            pair.native.perf_counters().smc_lane_accepts,
+        );
+    }
+}

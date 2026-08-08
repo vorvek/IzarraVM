@@ -141,10 +141,13 @@ const MAX_MEMORY_ALU_SLOTS: u8 = 3;
 /// all six anchors byte-identical, the chain quota shrinks (a chain hop is assumed costlier,
 /// so chains return to the dispatcher earlier), entries up about 136,000, roughly 8 ms of wall.
 pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
-/// Mutable imm32 lanes per block. One `ADD r32, imm32` slot claims one lane; slots past this
-/// cap keep their baked immediate, which is a missed optimisation and never a correctness
-/// question. Four covers both of the paired patch sites the SMC trace found in a single block.
-pub(crate) const MAX_BLOCK_IMM_LANES: usize = 4;
+/// Mutable imm32 lanes per block. One lane-admitted `0x81 /r` slot claims one lane; slots past
+/// this cap keep their baked immediate, which is a missed optimisation and never a correctness
+/// question. Four covered Doom's paired patch sites; duke3d's Build-engine patch bursts rewrite
+/// around ten sites per region per iteration (duke586-smc-trace-20260808.txt, the 0x2AFxxx site
+/// families), so a block spanning such a region needs the larger budget for its lanes to absorb
+/// the whole burst — one uncovered patched slot is enough to keep killing the block.
+pub(crate) const MAX_BLOCK_IMM_LANES: usize = 12;
 /// The only store width a lane accepts. The dword field is patched whole or not at all; a byte
 /// or word patch of it takes the normal invalidation path.
 pub(crate) const IMM_LANE_WIDTH: u32 = 4;
@@ -712,6 +715,15 @@ pub(crate) struct BlockCache {
     /// only at the SMC write choke. A recycled slot is refilled by `install`, so a retired
     /// occupant's lanes can never answer for its successor.
     block_imm_lanes: Vec<[u32; MAX_BLOCK_IMM_LANES]>,
+    /// G1 lane trial spend marks: the heat epoch in which `lane_trial_spend` last granted this
+    /// key its one compile-through-heat attempt (see `lane_trial_enabled` for the mechanism).
+    /// Stale epochs are simply overwritten on the next grant, so the map only ever holds one
+    /// entry per key that has EVER been hot — thousands on a Build-engine fixture, cleared with
+    /// the rest of the cache storage.
+    lane_trial_epochs: HashMap<BlockKey, u32>,
+    /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
+    /// so in-process tests of the trial path set this instead of the environment.
+    lane_trial_override: Option<bool>,
     block_portals: Vec<Arc<BlockPortal>>,
     link_cells: Vec<[Arc<LinkCell>; 2]>,
     link_sources: HashMap<usize, LinkSource<BlockId>>,
@@ -829,6 +841,8 @@ impl BlockCache {
             blocks: Vec::new(),
             segment_layouts: Vec::new(),
             block_imm_lanes: Vec::new(),
+            lane_trial_epochs: HashMap::default(),
+            lane_trial_override: None,
             block_portals: Vec::new(),
             link_cells: Vec::new(),
             link_sources: HashMap::new(),
@@ -1239,6 +1253,30 @@ impl BlockCache {
         if let Some(slot) = self.iteration_upper_cache.get_mut(index) {
             *slot = value;
         }
+    }
+
+    /// G1 lane trial: grant `key` its one compile-through-heat attempt for `epoch`, or refuse
+    /// because the knob is off or the attempt was already spent this epoch. Granting stamps, so
+    /// a caller that asks is committed to the attempt; asking twice in one epoch demotes.
+    pub(crate) fn lane_trial_spend(&mut self, key: BlockKey, epoch: u32) -> bool {
+        if !self.lane_trial_override.unwrap_or_else(lane_trial_enabled) {
+            return false;
+        }
+        let granted = self.lane_trial_epochs.insert(key, epoch) != Some(epoch);
+        if granted {
+            self.stalls.lane_trials += 1;
+        }
+        granted
+    }
+
+    /// A lane trial's compilation installed under a hot span: the mechanism's success half.
+    pub(crate) fn note_lane_trial_install(&mut self) {
+        self.stalls.lane_trial_installs += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lane_trial_for_test(&mut self, on: bool) {
+        self.lane_trial_override = Some(on);
     }
 
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
@@ -1919,6 +1957,7 @@ impl BlockCache {
         self.blocks.clear();
         self.segment_layouts.clear();
         self.block_imm_lanes.clear();
+        self.lane_trial_epochs.clear();
         self.link_cells.clear();
         self.link_sources.clear();
         self.outbound.clear();
@@ -2486,8 +2525,8 @@ pub(crate) enum DirectKind {
         op: u8,
         dst: u8,
         imm: u32,
-        /// Present only for the one shape `imm_lane_for` admits (`ADD r32, imm32`, opcode 0x81
-        /// reg-destination, no prefixes). When present the emitted form IGNORES `imm` and loads
+        /// Present only for the shapes `imm_lane_for` admits (the reg-destination `0x81 /r`
+        /// dword family, no prefixes). When present the emitted form IGNORES `imm` and loads
         /// the four immediate bytes out of guest RAM on every execution, so a guest patch of
         /// those bytes needs no recompile. `imm` still carries the value decoded at compile time
         /// and is what the non-lane form bakes.
@@ -3871,6 +3910,49 @@ pub(crate) fn sixteen_bit_admission_level() -> u8 {
     })
 }
 
+/// Whether a hot SMC chunk may spend one compile-through-heat "lane trial" per key per heat
+/// epoch (`IZARRAVM_SMC_LANE_TRIAL`, OFF unless set to a non-"0" value). Per KEY, not per
+/// chunk, deliberately: N entry points inside one 16-byte chunk buy N trials per epoch, which
+/// stays bounded and lets each entry's own lane coverage decide its fate.
+///
+/// DEFAULT OFF BY MEASUREMENT (2026-08-08, duke586-lanetrial-{0,1}.json): with only the imm
+/// lane family available, the trial fired 146,956 times and installed 61,216 lane blocks on
+/// duke3d-586 — and lost 5.5% of rt (0.2600 -> 0.2456), because Build's patch bursts mix
+/// lane-shaped 0x81 writes with disp-field 0x8A rewrites in the same chunks, so the trial's
+/// installs die to the writes its lanes cannot absorb and the compile+install+kill churn is
+/// pure cost. Re-measure after displacement lanes exist; until then this is an opt-in
+/// experiment, not a shipped path.
+///
+/// WHY THE TRIAL EXISTS. G1's admission gates and the mutable-lane mechanism deadlock against
+/// each other on a fixture whose patch loop never pauses: the gate refuses to compile while the
+/// chunk is hot, so no block exists, so no lanes register, so every patch narrow-kills decode
+/// lines and re-stamps the heat, forever. Duke3d spends 44.8% of its dispatcher seams exiting
+/// into exactly this state (dev_docs/2026-08-08-dispatch-tier-next.md). Doom never hit the
+/// deadlock only because its blocks compiled BEFORE the heat crossed the threshold.
+///
+/// The trial breaks the cycle with a bounded probe: one compilation per key per heat epoch is
+/// allowed THROUGH the hot gate; it installs only if it registered at least one mutable lane.
+/// From there the mechanism self-selects. If the lanes cover the guest's patches, the writes
+/// become `lane_accepts`, contribute no heat, the chunk cools at the next epoch, and admission
+/// normalizes. If they do not, the next patch kills the block, the key re-parks Dormant exactly
+/// as before, and the trial cannot re-fire until the epoch turns — worst case one extra compile
+/// and install per key per epoch.
+/// Whether `imm_lane_for` admits the whole `0x81 /r` reg dword family (`IZARRAVM_LANE_FAMILY`,
+/// on for every value except exactly "0") or only the original `/0 ADD` shape. The off arm
+/// exists for one-binary A/B measurement, the same contract as the JIT16 pair: both arms ship
+/// in one executable so a comparison carries no build-to-build variance.
+pub(crate) fn lane_family_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_LANE_FAMILY").as_deref(), Ok("0")))
+}
+
+pub(crate) fn lane_trial_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(
+        || matches!(std::env::var("IZARRAVM_SMC_LANE_TRIAL").as_deref(), Ok(v) if v != "0"),
+    )
+}
+
 /// Seed for `JitState::word_at_486`, read once per process from `IZARRAVM_JIT16_486`.
 ///
 /// **DEFAULT ON since the 486 measurement.** Set `IZARRAVM_JIT16_486=0` to refuse.
@@ -4140,12 +4222,15 @@ fn stack_width_kind(
 
 /// Admit a mutable imm32 lane for one slot, or refuse.
 ///
-/// The admitted shape is exactly one form and the checks are deliberately over-determined, each
-/// pinning a different property of the encoding:
+/// The admitted shape is the register-destination `0x81 /r` family (every ALU-group member, ADD
+/// through CMP) and the checks are deliberately over-determined, each pinning a different
+/// property of the encoding:
 ///
 /// - `opcode == 0x81` with a `DirectKind::AluImm` kind: the ALU group with a 32-bit immediate,
 ///   and `AluImm` is produced only from `DecodedOperand::Reg`, so the ModRM mode is 3.
-/// - `op == 0`: the `/0` ADD member. The other seven members of the group are out of scope.
+/// - `op` is carried through unchanged: the lane emit arm feeds the SAME `emit_alu_preloaded`
+///   dispatch the baked form uses, so every group member emits its own correct operation (see
+///   the op-binding comment in the body).
 /// - `OperandSize::Dword` plus `Prefixes::default()`: no operand-size override, no address-size
 ///   override, no segment override, no REP, and no LOCK. A LOCK'd patch is refused here rather
 ///   than relied on being impossible.
@@ -4167,13 +4252,36 @@ fn imm_lane_for(
     if lanes_used >= MAX_BLOCK_IMM_LANES {
         return None;
     }
+    // The family A/B arm: `op != 0` shapes are the 2026-08-08 widening, refusable at runtime so
+    // one binary measures both arms (see `lane_family_enabled`).
+    if !lane_family_enabled()
+        && !matches!(
+            kind,
+            DirectKind::AluImm {
+                op: 0,
+                width: MemoryWidth::Dword,
+                ..
+            }
+        )
+    {
+        return None;
+    }
     // `width: MemoryWidth::Dword` is matched rather than ignored. `IMM_LANE_WIDTH` is four and the
     // lane patches the field whole; a Word `AluImm` reads only two of those bytes, so admitting one
     // here would name a four-byte lane for a two-byte read. The `OperandSize::Dword` test below
     // already implies it for every kind `classify` produces, which is exactly why matching it here
     // costs nothing and closes the hole if that ever stops being true.
+    //
+    // `op` is bound rather than matched: every ALU op the kind carries is lane-safe, because the
+    // lane emit arm routes through the SAME `emit_alu_preloaded` the baked form uses, and that
+    // helper already dispatches the whole op set at Dword — carry ops (/2 ADC, /3 SBB) to
+    // `emit_carry_alu_preloaded`, CMP (/7) to the non-writing path. The original `op: 0` match
+    // was Doom's shape (its renderer patches `ADD r32, imm32` immediates); the duke3d SMC shape
+    // census (duke586-smc-shapes-20260808.txt) measured 31.7M of its 37.2M imm-field patch events
+    // on `0x81 /3, /5, /2, /0` — same kind, other ops — so the narrow match was leaving 85% of
+    // the lane-shaped patch volume killing blocks.
     let DirectKind::AluImm {
-        op: 0,
+        op,
         dst,
         imm,
         width: MemoryWidth::Dword,
@@ -4202,7 +4310,7 @@ fn imm_lane_for(
     };
     Some((
         DirectKind::AluImm {
-            op: 0,
+            op,
             dst,
             imm,
             lane: Some(lane),

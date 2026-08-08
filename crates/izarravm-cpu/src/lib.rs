@@ -1354,6 +1354,10 @@ pub struct DirectStallSnapshot {
     /// the reasons on `DirectStallTally`.
     pub segment_write_block_head_entries: u64,
     pub segment_write_block_head_insns: u64,
+    /// G1 lane trials granted and the subset that installed a lane-carrying block under a hot
+    /// span. See `DirectStallTally`.
+    pub lane_trials: u64,
+    pub lane_trial_installs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
