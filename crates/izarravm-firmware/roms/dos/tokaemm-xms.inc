@@ -12,6 +12,21 @@
 ; ============================================================================
 cpu 386
 
+; INT 15h hook: AH=88h answers 0 KB free extended with CF clear -- this driver
+; owns all of it (see the hook-install comment in tokaemm.asm). Everything
+; else chains to the BIOS.
+i15_handler:
+    cmp ah, 0x88
+    je .h88
+    jmp far [cs:old_15]
+.h88:
+    xor ax, ax
+    push bp
+    mov bp, sp
+    and word [bp+6], 0xFFFE      ; clear CF in the caller's stacked FLAGS
+    pop bp
+    iret
+
 ; INT 2Fh multiplex hook: XMS install-check (4300) / get-entry (4310); chain else.
 xms_2f_handler:
     cmp ax, 0x4300

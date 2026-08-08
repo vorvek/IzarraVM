@@ -72,6 +72,7 @@ vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
 
 ; ---- XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
+old_15:   dd 0                     ; previous INT 15h vector (chain target)
 xms_pool_base: dd 0               ; first byte available to XMS EMBs
 xms_pool_end:  dd 0               ; one past the dedicated XMS EMB pool
 xms_category_kb: dw 0             ; combined extended category for Toka-DOS MEM
@@ -694,6 +695,20 @@ init:
     mov [cs:old_2f], eax
     mov word [ds:0x2F*4], xms_2f_handler
     mov [ds:0x2F*4+2], cs
+    ; INT 15h too: once this driver owns all extended memory, AH=88h must
+    ; report 0 KB free (XMS spec section 2.4; HIMEM and JEMMEX both do this).
+    ; Leaving the raw BIOS answer visible double-counts the arena, and at
+    ; exactly 64 MB installed it feeds Borland 32RTM's 16-bit total-memory
+    ; math (64512 KB extended + 1024 KB base wraps to 0), which sent it into
+    ; an allocate-everything-then-free-everything spiral ending in a dead
+    ; idle -- found via TSUMERA in the extender gate, 2026-08-08. AH=0xE801
+    ; stays unhooked deliberately: it reports INSTALLED memory, no current
+    ; corpus member double-counts through it, and hooking it would change
+    ; MEM's hardware row.
+    mov eax, [ds:0x15*4]
+    mov [cs:old_15], eax
+    mov word [ds:0x15*4], i15_handler
+    mov [ds:0x15*4+2], cs
     mov word [ds:0x67*4], ems_int67
     mov [ds:0x67*4+2], cs
     pop ds
