@@ -580,18 +580,20 @@ fn per_vector_linear_stub_identity_posts_the_matching_service() {
 #[test]
 fn the_tokaemm_image_keeps_room_under_the_16_bit_driver_ceiling() {
     const CEILING: usize = 0x10000;
-    // Measured 2026-08-08: ~31.7 KB, after the arena and VCPI bitmaps moved
-    // into the system window at SYS_LIN_BASE (they were ~41.2 KB together in
-    // the core, and 29,552 in the 24 MB era). The bar is deliberately well
-    // under the ceiling rather than just below it, so that a change which eats
-    // the headroom is caught while there is still room to think about it.
+    // Measured 2026-08-08: ~24.0 KB, after all three RAM-scaled tables (the
+    // arena bitmap, the VCPI ownership bitmap, the EMS chain table) moved into
+    // the system window at SYS_LIN_BASE. They were ~41.2 KB together in the
+    // core; the 24 MB era was 29,552. The bar is deliberately well under the
+    // ceiling rather than just below it, so that a change which eats the
+    // headroom is caught while there is still room to think about it.
     //
     // It moves DOWN with a shrink, not only up with a growth: a bar left at
-    // 50,000 after this change would have stopped measuring anything. What it
-    // still guards is real -- ems_link is the one table left in the core that
-    // grows with installed RAM, at 128 bytes per megabyte, which is what puts
-    // the assemble-or-not wall at roughly 320 MB instead of the ~148 MB it was.
-    const MAX: usize = 36_000;
+    // 50,000 after this change would have stopped measuring anything.
+    //
+    // This figure no longer depends on installed RAM. Before the move the core
+    // grew ~288 bytes per megabyte of arena and stopped assembling entirely
+    // past roughly 148 MB, on the 0xFFF0 offset ceiling below.
+    const MAX: usize = 28_000;
 
     let image = izarravm_firmware::tokaemm_sys();
     assert!(

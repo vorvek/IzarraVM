@@ -170,7 +170,11 @@ ems_rm_phys: dd 0
 ; bitmap, not a free chain, is what says whether a page is available (D6: see
 ; ems_page_alloc/ems_page_free below for why this branch keeps no free list of
 ; its own).
-ems_link: times EMS_MAX_PAGES dw 0xFFFF
+; The per-EMS-page chain link table lives in the system window now, at
+; SYS_EMS_LINK. It was 8,064 bytes of resident core -- 20% of it -- and the
+; last table here that grew with installed RAM. 16-bit V86 code cannot name a
+; linear address that high, so ef_alloc/ef_free/ems_backing_of reach it through
+; the INT 0xC0 'TA' service, one call per guest EMS operation.
 
 ; ---- ONE extended-memory arena, shared by XMS EMBs, EMS pages and VCPI.
 ;
@@ -222,7 +226,8 @@ ARENA_PAGES     equ ARENA_GRANULES / 4      ; 4 KB pages over the same span
 SYS_LIN_BASE  equ 0xF8000000
 SYS_VCPI_BMP  equ 0                         ; VCPI ownership bit per 4 KB page
 SYS_ARENA_BMP equ SYS_VCPI_BMP + ARENA_PAGES / 8  ; ALLOCATED bit per 1 KB granule
-SYS_USED      equ SYS_ARENA_BMP + ARENA_BMP_BYTES
+SYS_EMS_LINK  equ SYS_ARENA_BMP + ARENA_BMP_BYTES ; next page in a handle's chain
+SYS_USED      equ SYS_EMS_LINK + EMS_MAX_PAGES * 2
 SYS_BYTES     equ (SYS_USED + 4095) & ~4095
 ; Physical layout of the reservation that follows the paging tables: one page
 ; for the window's own page table, then the data pages it maps.
@@ -259,16 +264,34 @@ arena_q_total:   dw 0
 ; have to know which path it came in on; the other services dodge that the same
 ; way. ONE cookie with a sub-function byte, not four cookies, because every
 ; cookie has to be added at BOTH dispatch sites.
-ASVC_ALLOC     equ 0
-ASVC_RELEASE   equ 1
-ASVC_MARK      equ 2
-ASVC_EMS_ALLOC equ 3
-ASVC_MAX       equ 3
+; The EMS sub-functions (4-7) are here rather than behind a cookie of their own
+; because every cookie costs a compare at BOTH dispatch sites; a sub-function
+; byte costs one table entry. They work in whole GUEST OPERATIONS -- build a
+; handle's chain, tear one down, resolve one logical page -- not in single
+; links, so EMS 43h/44h/45h each cost one monitor entry rather than one per
+; page. The chain WALK stays a walk; only its entry moved.
+ASVC_ALLOC       equ 0
+ASVC_RELEASE     equ 1
+ASVC_MARK        equ 2
+ASVC_EMS_ALLOC   equ 3
+ASVC_EMS_TAKE    equ 4            ; build a handle's page chain (EMS 43h)
+ASVC_EMS_GIVE    equ 5            ; release one and clear it (EMS 45h)
+ASVC_EMS_RESOLVE equ 6            ; logical -> backing, with the slot cache (44h)
+ASVC_EMS_NEXT    equ 7            ; one chain link (ef_free's scrub walk)
+ASVC_MAX         equ 7
 arena_svc_op:    db 0
 arena_svc_type:  db 0             ; ALLOC_* byte offset (alloc only)
-arena_svc_index: dw 0             ; granule/page index in, result index out
-arena_svc_count: dw 0             ; granule count
+arena_svc_index: dw 0             ; granule/page/slot index in, result out
+arena_svc_count: dw 0             ; granule count, or the wanted logical page
 arena_svc_fail:  db 0             ; 0 = success, 1 = could not be satisfied
+; ems_page_alloc32 clobbers every register a chain walk would want to keep, so
+; the EMS sub-functions carry their loop state here instead of in registers.
+; ebp specifically is NOT available: vec13_entry's .intn path holds
+; &frame.eip in it and .done_gp still needs it.
+ems_svc_slot:    dw 0
+ems_svc_tail:    dw 0
+ems_svc_cur:     dw 0
+ems_svc_left:    dw 0
 ; Query memoization (D1). arena_query32 costs ~5-6 instructions per granule
 ; and ARENA_GRANULES is ~64,500, so an uncached walk is ~320,000-390,000
 ; monitor instructions.
@@ -894,37 +917,22 @@ ef_alloc:
     mov ah, 0x85                  ; no more handles
     iret
 .got:
-    mov word [cs:si+4], 0xFFFF    ; empty chain
-    mov di, 0xFFFF                ; DI = chain tail, 0xFFFF = none yet
-    mov bp, bx                    ; BP = pages still wanted; BX keeps npages
-.take:
-    call ems_page_alloc           ; -> AX = page index. The pre-check above
-    jc .unwind                    ; makes this a safety net, not the live path.
-    push bx
-    mov bx, ax
-    add bx, bx
-    mov word [cs:ems_link + bx], 0xFFFF   ; new tail terminates the chain
-    pop bx
-    cmp di, 0xFFFF
-    je .head
-    push bx
-    mov bx, di
-    add bx, bx
-    mov [cs:ems_link + bx], ax    ; link the old tail to it
-    pop bx
-    jmp .linked
-.head:
-    mov [cs:si+4], ax
-.linked:
-    mov di, ax
-    dec bp
-    jnz .take
+    ; The whole take-and-chain loop is one monitor call now: ems_link is in the
+    ; system window. The service does its own unwind on failure, so the .unwind
+    ; block this used to need is gone, and so is the cold-cache reset (it sets
+    ; [si+16] itself, where the cache it feeds also lives).
+    mov [cs:arena_svc_index], si
+    mov [cs:arena_svc_count], bx  ; pages wanted
+    mov byte [cs:arena_svc_op], ASVC_EMS_TAKE
+    push dx
+    mov dx, 0x4154                ; 'TA' monitor-call cookie
+    int 0xC0
+    pop dx
+    cmp byte [cs:arena_svc_fail], 0
+    jne .nofree
     mov byte [cs:si], 1           ; inuse
     mov byte [cs:si+1], 0         ; saved = 0
     mov [cs:si+2], bx             ; npages
-    mov word [cs:si+16], 0        ; cold cache (0 = cold; ems_backing_of stores
-                                   ; cache_logical+1, so the raw table's zeroed
-                                   ; cold state and an explicit reset agree)
     pop bp
     pop di
     pop cx
@@ -933,21 +941,6 @@ ef_alloc:
     pop ax
     xor ah, ah
     iret
-.unwind:
-    mov di, [cs:si+4]             ; give back every page we managed to take
-.uw:
-    cmp di, 0xFFFF
-    je .uw_done
-    mov ax, di
-    push bx
-    mov bx, di
-    add bx, bx
-    mov di, [cs:ems_link + bx]
-    pop bx
-    call ems_page_free
-    jmp .uw
-.uw_done:
-    mov word [cs:si+4], 0xFFFF
 .nofree:
     pop bp
     pop di
@@ -1071,16 +1064,25 @@ ef_free:
     add si, EMS_SLOT
     loop .scrub
     pop si
-    mov ax, di                    ; release the page and step to the next
-    push bx
-    mov bx, di
-    add bx, bx
-    mov di, [cs:ems_link + bx]
-    pop bx
-    call ems_page_free
+    mov [cs:arena_svc_index], di  ; step to the next page in the chain. This is
+    mov byte [cs:arena_svc_op], ASVC_EMS_NEXT   ; the one per-link monitor call
+    push dx                        ; in the design, and it is on 45h release
+    mov dx, 0x4154                 ; only -- a path that already does a
+    int 0xC0                       ; frame_remap per live frame slot
+    pop dx
+    mov di, [cs:arena_svc_index]
     jmp .page
 .pages_done:
-    mov word [cs:si+4], 0xFFFF
+    ; Release every page and clear the chain in one call: ems_link is in the
+    ; system window. The unmap and saved_map scrub above stay here -- they touch
+    ; ems_frame_map and ems_table, both still resident -- so this walks the
+    ; chain first and only then hands it to the service to tear down.
+    mov [cs:arena_svc_index], si
+    mov byte [cs:arena_svc_op], ASVC_EMS_GIVE
+    push dx
+    mov dx, 0x4154
+    int 0xC0
+    pop dx
     mov word [cs:si+16], 0        ; cold cache (0 = cold; see ems_backing_of)
     mov byte [cs:si], 0
     mov byte [cs:si+1], 0
@@ -1291,56 +1293,28 @@ ems_page_alloc:
     stc
     ret
 
-; Return one 16 KB EMS page to the shared arena. in: AX = EMS page index.
-; Preserves every register.
-ems_page_free:
-    push ax
-    push cx
-    shl ax, 4                     ; EMS page index -> granule index
-    mov cx, EMS_PAGE_GRANULES
-    call arena_release
-    pop cx
-    pop ax
-    ret
+; The V86-side single-page free is gone: both callers (ef_alloc's unwind and
+; ef_free's walk) now hand whole chains to the monitor, which frees pages with
+; ems_page_free32 while it already has the chain in hand.
 
-; Logical page BX of the handle at SI -> CX = backing EMS page index. Walks the
-; handle's chain, resuming from the slot's (logical, backing) cache whenever the
-; cache is at or before the wanted logical page. Preserves AX/BX/DX/SI/DI/BP.
+; Logical page BX of the handle at SI -> CX = backing EMS page index.
+; Preserves AX/BX/DX/SI/DI/BP.
 ;
-; The cache at [si+16]/[si+18] stores cache_logical+1 (0 = cold) rather than a
-; bare logical index with an 0xFFFF sentinel (D4): a raw-zeroed ems_table slot
-; then already reads as cold, with no INIT-time sentinel fill needed, and an
-; explicit reset (ef_alloc, ef_free) just stores 0 instead of a magic value.
+; The walk itself is arena_svc's .resolve in the monitor, along with the
+; (logical, backing) slot cache that keeps a forward sequential sweep O(L)
+; rather than O(L^2); ems_link is in the system window and 16-bit code cannot
+; name it. This is one monitor entry per EMS 44h, not one per chain link -- and
+; 44h already made one for the frame remap, so the map path goes from one entry
+; to two, not from one to L.
 ems_backing_of:
-    push ax
-    mov cx, [cs:si+4]             ; chain head
-    xor ax, ax                    ; logical index CX currently stands at
-    cmp word [cs:si+16], 0
-    je .walk                      ; cold cache
-    mov ax, [cs:si+16]
-    dec ax                        ; decode: stored value is cache_logical+1
-    cmp ax, bx
-    ja .fromhead                  ; cache is past us: restart from the head
-    mov cx, [cs:si+18]
-    jmp .walk
-.fromhead:
-    xor ax, ax
-    mov cx, [cs:si+4]
-.walk:
-    cmp ax, bx
-    je .done
-    push bx
-    mov bx, cx
-    add bx, bx
-    mov cx, [cs:ems_link + bx]
-    pop bx
-    inc ax
-    jmp .walk
-.done:
-    inc ax                        ; encode: cache_logical+1, 0 stays "cold"
-    mov [cs:si+16], ax
-    mov [cs:si+18], cx
-    pop ax
+    push dx
+    mov [cs:arena_svc_index], si
+    mov [cs:arena_svc_count], bx
+    mov byte [cs:arena_svc_op], ASVC_EMS_RESOLVE
+    mov dx, 0x4154                ; 'TA' monitor-call cookie
+    int 0xC0
+    mov cx, [cs:arena_svc_index]
+    pop dx
     ret
 
 ; Monitor remap of one frame slot. AL = slot 0-3, CX = backing page index or
@@ -1564,6 +1538,17 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     add eax, 0x1000
     add edi, 4
     loop .syspt
+    ; ems_link shipped as `times EMS_MAX_PAGES dw 0xFFFF` when it was in the
+    ; file; the window is zero-filled instead, and 0 is a VALID page index while
+    ; 0xFFFF is the chain terminator. ef_alloc does write every link before
+    ; anything reads it, so this is belt and braces -- but a zeroed table claims
+    ; every page is chained to page 0, which is some other handle's memory, and
+    ; that is not a state to leave reachable by a future bug. Written by linear
+    ; address: paging is not on yet, and DS is flat either way.
+    lea edi, [ebp + SYS_DATA_OFF + SYS_EMS_LINK]
+    mov eax, 0xFFFFFFFF
+    mov ecx, EMS_MAX_PAGES / 2    ; two link words per stored dword
+    rep stosd
     ; Page the free upper window 0xC8000-0xEFFFF to extended RAM (the
     ; EMM386 trick). On real hardware these holes have no RAM; a UMB there must be
     ; extended RAM mapped in. (This emulator's flat array also backs phys 0xC8000 via
@@ -3129,6 +3114,17 @@ arena_release32:
     pop eax
     ret
 
+; Return the 16 KB EMS page at index EAX to the arena. Preserves EAX.
+ems_page_free32:
+    push eax
+    push ecx
+    shl eax, 4                    ; EMS page index -> granule index
+    mov ecx, EMS_PAGE_GRANULES
+    call arena_release32
+    pop ecx
+    pop eax
+    ret
+
 ; Take one 16 KB EMS page from the shared arena. out: AX = page index, CF clear;
 ; or CF set when none is free. EMS page p occupies granules [p*16, p*16+16).
 ;
@@ -3182,15 +3178,20 @@ ems_page_alloc32:
 ; The service itself. Sub-function in [arena_svc_op]; see the block beside
 ; arena_q_type for why everything crosses in memory rather than registers.
 arena_svc:
-    movzx eax, byte [fs:arena_svc_op]
+    push ebp                      ; vec13_entry's .intn path keeps &frame.eip
+    movzx eax, byte [fs:arena_svc_op]   ; here and .done_gp still needs it
     cmp eax, ASVC_MAX
     ja .bad
-    jmp dword [fs:.jt + eax*4]    ; offsets are driver-relative == CS-relative,
-.jt:                              ; the same table form vcpi_dispatch uses
-    dd .alloc, .release, .mark, .ems_alloc
+    call dword [fs:.jt + eax*4]   ; call, not jmp: the pop below must run.
+    pop ebp                       ; Offsets are driver-relative == CS-relative,
+    ret                           ; the same table form vcpi_dispatch uses
 .bad:
     mov byte [fs:arena_svc_fail], 1
+    pop ebp
     ret
+.jt:
+    dd .alloc, .release, .mark, .ems_alloc
+    dd .take, .give, .resolve, .next
 .alloc:
     movzx ebx, byte [fs:arena_svc_type]
     movzx ecx, word [fs:arena_svc_count]
@@ -3218,6 +3219,132 @@ arena_svc:
     movzx eax, word [fs:arena_svc_index]
     movzx ecx, word [fs:arena_svc_count]
     call arena_mark32
+    mov byte [fs:arena_svc_fail], 0
+    ret
+
+; ASVC_EMS_TAKE. in: arena_svc_index = ems_table slot offset,
+; arena_svc_count = pages wanted. Builds the handle's chain; on failure gives
+; every page back and reports fail. The caller has already range- and
+; free-checked (D3), so the failure path is a safety net, not the live path.
+.take:
+    mov ax, [fs:arena_svc_index]
+    mov [fs:ems_svc_slot], ax
+    mov ax, [fs:arena_svc_count]
+    mov [fs:ems_svc_left], ax
+    movzx esi, word [fs:ems_svc_slot]
+    mov word [fs:esi+4], 0xFFFF   ; empty chain
+    mov word [fs:ems_svc_tail], 0xFFFF
+.tk_next:
+    call ems_page_alloc32         ; -> AX = page index, or CF. Clobbers every
+    jc .tk_unwind                 ; register a loop would want; hence the
+    movzx edi, ax                 ; memory-held loop state
+    mov word [SYS_LIN_BASE + SYS_EMS_LINK + edi*2], 0xFFFF   ; new tail terminates the chain
+    movzx edx, word [fs:ems_svc_tail]
+    cmp dx, 0xFFFF
+    je .tk_head
+    mov [SYS_LIN_BASE + SYS_EMS_LINK + edx*2], ax ; link the old tail to it
+    jmp .tk_linked
+.tk_head:
+    movzx esi, word [fs:ems_svc_slot]
+    mov [fs:esi+4], ax
+.tk_linked:
+    mov [fs:ems_svc_tail], ax
+    dec word [fs:ems_svc_left]
+    jnz .tk_next
+    movzx esi, word [fs:ems_svc_slot]
+    mov word [fs:esi+16], 0       ; cold cache (0 = cold; see .resolve)
+    mov byte [fs:arena_svc_fail], 0
+    ret
+.tk_unwind:
+    movzx esi, word [fs:ems_svc_slot]
+    mov ax, [fs:esi+4]            ; give back every page we did take
+    mov [fs:ems_svc_cur], ax
+.tk_uw:
+    movzx edi, word [fs:ems_svc_cur]
+    cmp di, 0xFFFF
+    je .tk_uw_done
+    mov ax, [SYS_LIN_BASE + SYS_EMS_LINK + edi*2]
+    mov [fs:ems_svc_cur], ax
+    mov eax, edi
+    call ems_page_free32
+    jmp .tk_uw
+.tk_uw_done:
+    movzx esi, word [fs:ems_svc_slot]
+    mov word [fs:esi+4], 0xFFFF
+    mov byte [fs:arena_svc_fail], 1
+    ret
+
+; ASVC_EMS_GIVE. in: arena_svc_index = slot offset. Walks the chain and returns
+; every page to the arena. The chain is the only record of what the handle
+; holds -- backing runs are not contiguous, so there is no [first,first+npages)
+; range -- which is why the release has to happen here. Frame-slot unmapping
+; and saved_map scrubbing stay in ef_free: they touch ems_frame_map and
+; ems_table only, both still in the resident core.
+.give:
+    mov ax, [fs:arena_svc_index]
+    mov [fs:ems_svc_slot], ax
+    movzx esi, ax
+    mov ax, [fs:esi+4]
+    mov [fs:ems_svc_cur], ax
+.gv_page:
+    movzx edi, word [fs:ems_svc_cur]
+    cmp di, 0xFFFF
+    je .gv_done
+    mov ax, [SYS_LIN_BASE + SYS_EMS_LINK + edi*2]
+    mov [fs:ems_svc_cur], ax
+    mov eax, edi
+    call ems_page_free32
+    jmp .gv_page
+.gv_done:
+    movzx esi, word [fs:ems_svc_slot]
+    mov word [fs:esi+4], 0xFFFF
+    mov byte [fs:arena_svc_fail], 0
+    ret
+
+; ASVC_EMS_RESOLVE. in: arena_svc_index = slot offset, arena_svc_count =
+; logical page. out: arena_svc_index = backing EMS page index. Resumes from the
+; slot's (logical, backing) cache whenever the cache is at or before the wanted
+; page, so a forward sequential sweep of an L-page handle costs O(L) in total
+; rather than O(L^2).
+;
+; The cache at [slot+16]/[slot+18] stores cache_logical+1 (0 = cold) rather
+; than a bare index with an 0xFFFF sentinel (D4): a raw-zeroed ems_table slot
+; then already reads as cold, with no INIT-time sentinel fill needed.
+.resolve:
+    movzx esi, word [fs:arena_svc_index]
+    movzx ebx, word [fs:arena_svc_count]  ; wanted logical page
+    movzx ecx, word [fs:esi+4]            ; chain head
+    xor eax, eax                          ; logical index ECX stands at
+    movzx edx, word [fs:esi+16]
+    test edx, edx
+    jz .rs_walk                           ; cold cache
+    dec edx                               ; decode: stored value is logical+1
+    cmp edx, ebx
+    ja .rs_walk                           ; cache is past us: eax/ecx still head
+    mov eax, edx                          ; resume from the cache
+    movzx ecx, word [fs:esi+18]
+.rs_walk:
+    cmp eax, ebx
+    je .rs_done
+    movzx ecx, word [SYS_LIN_BASE + SYS_EMS_LINK + ecx*2]
+    inc eax
+    jmp .rs_walk
+.rs_done:
+    inc eax                               ; encode: logical+1, 0 stays "cold"
+    mov [fs:esi+16], ax
+    mov [fs:esi+18], cx
+    mov [fs:arena_svc_index], cx
+    mov byte [fs:arena_svc_fail], 0
+    ret
+
+; ASVC_EMS_NEXT. in/out: arena_svc_index = a page index -> the next page in its
+; chain. The one per-link round trip in the design, on EMS 45h release only,
+; bounded by the pages the handle holds and on a path that already does a
+; frame_remap per live slot.
+.next:
+    movzx eax, word [fs:arena_svc_index]
+    movzx eax, word [SYS_LIN_BASE + SYS_EMS_LINK + eax*2]
+    mov [fs:arena_svc_index], ax
     mov byte [fs:arena_svc_fail], 0
     ret
 
@@ -3747,4 +3874,20 @@ tables            equ $$ + TABLES_OFF
 ; diagnostic anywhere.
 %if IMAGE_END_OFF % 16
     %error "TOKAEMM IMAGE_END_OFF must be a whole number of paragraphs; INIT reports it shifted"
+%endif
+
+; pm_init lays the chain terminators down with a dword store, two link words at
+; a time, so an odd page count would leave the last link zeroed -- reading as
+; "chained to page 0" rather than "end of chain".
+%if EMS_MAX_PAGES % 2
+    %error "TOKAEMM ems_link terminator fill stores dwords; EMS_MAX_PAGES must be even"
+%endif
+
+; The system window is reserved by two independent expressions (INIT's high-path
+; add and IMAGE_END_OFF's fallback), zero-filled by a third and mapped by a
+; fourth, all built from SYS_BYTES. Only this catches a table added to the
+; layout without SYS_USED being grown to cover it, which would place it on top
+; of whatever follows the region.
+%if SYS_USED > SYS_BYTES
+    %error "TOKAEMM system window layout exceeds SYS_BYTES; grow SYS_USED"
 %endif

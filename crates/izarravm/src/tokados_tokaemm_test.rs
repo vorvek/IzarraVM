@@ -1279,13 +1279,15 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("591K"),
-        "the arena and VCPI bitmaps moved out of the resident core into the \
-         system window at SYS_LIN_BASE, which is what took conventional free \
-         from 582 KiB to 591 KiB. In the core they cost ~10 KiB AND grew with \
-         installed RAM; in extended memory they cost neither.\n{text}"
+        Some("598K"),
+        "all three RAM-scaled tables -- the arena bitmap, the VCPI ownership \
+         bitmap and the EMS chain table -- moved out of the resident core into \
+         the system window at SYS_LIN_BASE, which took conventional free from \
+         582 KiB to 598 KiB (past the 593 KiB the machine had before it grew to \
+         64 MB). In the core they cost ~18 KiB AND grew at ~288 bytes per \
+         megabyte of arena; in extended memory they cost neither.\n{text}"
     );
-    assert_extended_category(&screen, "23,552K", "23,149K");
+    assert_extended_category(&screen, "23,552K", "23,141K");
 
     let rows = memory_map_rows(&screen);
     assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
@@ -1355,7 +1357,7 @@ fn tokaemm_mem_noems_reports_combined_extended_free() {
         "no C:\\> prompt after MEM ran with NOEMS (stop={stop:?}).\n{}",
         screen.text
     );
-    assert_extended_category(&screen, "23,552K", "23,149K");
+    assert_extended_category(&screen, "23,552K", "23,141K");
 }
 
 #[test]
@@ -1472,11 +1474,12 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(31K)"),
-        "TokaEMM should retain only its ~31 KiB low core: code, state, the TSS \
-         and monitor stack, and the EMS chain table. The arena and VCPI \
-         bitmaps live in the system window now; ems_link is the last table \
-         here that still scales with installed RAM.\n{}",
+        tokaemm.contains("(23K)"),
+        "TokaEMM should retain only its ~23 KiB low core: code, state, the \
+         8,304-byte TSS and the monitor stack. Nothing left in the core scales \
+         with installed RAM -- all three tables that did are in the system \
+         window -- so this figure is now the same on a 64 MB machine and a \
+         256 MB one.\n{}",
         screen.text
     );
     let free = screen
@@ -1486,8 +1489,8 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(591K)"),
-        "MEM /CLASSIFY should report about 591 KiB conventional free.\n{}",
+        Some("(598K)"),
+        "MEM /CLASSIFY should report about 598 KiB conventional free.\n{}",
         screen.text
     );
 }
