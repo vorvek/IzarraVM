@@ -307,21 +307,56 @@ def main(check: bool = False) -> int:
     # name that subdirectory; only CONFIG.SYS/AUTOEXEC.BAT stay in the root. The
     # SHELL= dir argument (C:\DOS) is where FreeCOM builds COMSPEC from.
     config_sys = (b"FILES=40\r\nLASTDRIVE=D\r\n"
-                  b"DEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n"
+                  b"DEVICE=C:\\DOS\\TOKAEMM.SYS RAM /T\r\n"
                   b"DOS=HIGH,UMB\r\n"
                   b"DEVICEHIGH=C:\\DOS\\TOKACD.SYS\r\n"
                   b"SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
     # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH C:\DOS
     # lets the command-line tools (MOVE/SORT/MEM/...) and TOKAMOUS resolve from any
     # current directory. SET BLASTER advertises the emulated SB16 (base 0x220, IRQ7,
-    # DMA1, high DMA5, wavetable MPU at 0x300, type 6 SB16). LH
-    # loads the INT 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low load).
-    autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n"
+    # DMA1, high DMA5, wavetable MPU at 0x300, type 6 SB16). The FOR %%C loop
+    # self-calls this same AUTOEXEC.BAT once per driver (CDROM/MOUSE/SOUND),
+    # passing the label as %1 so "IF NOT %1==... GOTO %1" dispatches straight to
+    # the matching block and back via GOTO END, letting each driver's /T banner
+    # print in its own turn under the boot-tree styling instead of all at once.
+    # LH loads the INT 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low
+    # load). After the loop, the closed footer box (single-line CP437 border,
+    # 78 cols including the corners) tells the user text mode is active and how
+    # to reach the visual workbench; the whole boot stays within the 25-row
+    # screen budget (10 logo + 4 box + 5 tree lines + 2 ReSonique2 rows
+    # [heading + values] + 3 footer + 1 shell prompt = 25 -- the screen is
+    # exactly full; any component that grows a row must take one from another
+    # owner) so nothing scrolls the logo off row 0. (the kernel welcome box is
+    # deliberately 79 -- TOKA_BOX_W in kernel/kernel/init-mod.h -- both match
+    # the approved mockup; they are not meant to align)
+    footer_text = b"   Starting in text mode. Run TOKADESK to enable the visual workbench."
+    assert len(footer_text) <= 76, "footer_text must fit the 76-byte box interior"
+    footer_top = b"\xc6" + b"\xcd" * 76 + b"\xb8"
+    footer_middle = b"\xb3" + footer_text.ljust(76) + b"\xb3"
+    footer_bottom = b"\xd4" + b"\xcd" * 76 + b"\xbe"
+    for row in (footer_top, footer_middle, footer_bottom):
+        assert len(row) == 78, "each footer row must be exactly 78 bytes (corners + 76-wide interior)"
+    autoexec = (b"@ECHO OFF\r\n"
+                b"IF NOT \"%1\"==\"\" GOTO %1\r\n"
+                b"PROMPT $P$G\r\nPATH C:\\DOS\r\n"
                 b"SET BLASTER=A220 I7 D1 H5 P300 T6\r\n"
-                b"IZCDEX /I /D:TOKACD01 /L:D /Q\r\n"
-                b"LH TOKAMOUS\r\n")
+                b"FOR %%C IN (CDROM MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C\r\n"
+                b"ECHO " + footer_top + b"\r\n"
+                b"ECHO " + footer_middle + b"\r\n"
+                b"ECHO " + footer_bottom + b"\r\n"
+                b"GOTO END\r\n"
+                b":CDROM\r\n"
+                b"IZCDEX /I /D:TOKACD01 /L:D /T\r\n"
+                b"GOTO END\r\n"
+                b":MOUSE\r\n"
+                b"LH TOKAMOUS /T\r\n"
+                b"GOTO END\r\n"
+                b":SOUND\r\n"
+                b"SNDCTRL /B /T\r\n"
+                b"GOTO END\r\n"
+                b":END\r\n")
     hello_txt = b"Katea M0 OK\r\n"
-    # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
+    # The kernel signon points at "See LICENSE.TXT for more."; ship it on C:.
     license_txt = build_license_txt(repo)
 
     # --- FAT32 geometry for the partition -------------------------------------
@@ -367,7 +402,7 @@ def main(check: bool = False) -> int:
     # Only KERNEL.SYS, CONFIG.SYS and AUTOEXEC.BAT are truly forced to the root:
     # the boot sector loads KERNEL.SYS by root-directory name, and the kernel opens
     # CONFIG.SYS (then, via SHELL=, AUTOEXEC.BAT) from the boot-drive root. LICENSE.TXT
-    # stays at root too, because the kernel signon points at "See C:\LICENSE.TXT".
+    # stays at root too, because the kernel signon points at "See LICENSE.TXT".
     # Everything else -- COMMAND.COM and the command-line tools -- lives in C:\DOS so
     # a plain DIR of the root isn't buried under system files. KERNEL.SYS carries the
     # hidden+system+read-only attributes (0x27, the DOS convention for IO.SYS/

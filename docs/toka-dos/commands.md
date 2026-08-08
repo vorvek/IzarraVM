@@ -396,6 +396,8 @@ run a real sound card's configuration program.
 ```
 SNDCTRL                 full-screen configuration
 SNDCTRL /S              show the current assignment and exit
+SNDCTRL /B              two-row boot summary and exit (no CMOS writes)
+SNDCTRL /B /T           boot summary with a tree-styled prefix
 SNDCTRL /SBIRQ:n        Sound Blaster IRQ         2, 5, 7, 10
 SNDCTRL /SBDMAL:n       Sound Blaster 8-bit DMA   0, 1, 3
 SNDCTRL /SBDMAH:n       Sound Blaster 16-bit DMA  5, 6, 7
@@ -409,6 +411,12 @@ With no arguments it draws a configuration screen. Arrow keys or Tab move
 between values, Enter opens the list of values that resource supports, F10
 applies, Esc cancels. A `*` marks a value that does not apply to that device.
 Any switch on the command line is applied without drawing anything.
+
+`/B` prints a two-row boot summary — a heading, then a BLASTER-style values
+line for both devices — and exits without touching the mixer, CMOS, the
+environment, or `AUTOEXEC.BAT`. `/T` adds the tree-styled connector used by
+the Toka-DOS boot screen in front of that summary; it only means something
+paired with `/B`, so `SNDCTRL /T` alone just opens the configurator.
 
 Whichever way you set them, applying moves both devices **live** — neither
 needs a reboot — then saves the assignment in CMOS, updates `BLASTER` in the
@@ -430,11 +438,11 @@ program implementing the standard `INT 33h` mouse API (Microsoft Mouse
 compatible, plus the CuteMouse wheel extension).
 
 ```
-TOKAMOUS
+TOKAMOUS [/T]
 ```
 
-No arguments: it installs itself and returns to the prompt, or is loaded
-from `AUTOEXEC.BAT` with `LH TOKAMOUS` to load high into a
+It installs itself and returns to the prompt, or is loaded from
+`AUTOEXEC.BAT` with `LH TOKAMOUS` to load high into a
 [TOKAEMM](../tokaemm/manual.md) upper memory block when one is free. Once
 resident, it prints:
 
@@ -445,6 +453,15 @@ Toka-DOS mouse driver installed.
 and any mouse-aware DOS program talks to it through `INT 33h` from then on:
 cursor show/hide, position and button state, motion callbacks, and the
 wheel functions software checks for via CuteMouse's `AX=0x11` detection.
+
+`/T` (or `-T`) prefixes the signon line with the tree-styled connector used
+by the Toka-DOS boot screen instead:
+
+```
+├─> Toka-DOS mouse driver installed.
+```
+
+Off by default.
 
 ## Next
 

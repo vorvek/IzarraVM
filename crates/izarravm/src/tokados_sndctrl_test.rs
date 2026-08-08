@@ -169,3 +169,77 @@ fn sndctrl_status_reads_the_hardware_and_changes_nothing() {
     assert_eq!(machine.sound_blaster_routing(), Some((7, 1, 5)));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `/B /T`: exactly two rows, matched as whole lines (not substrings) since
+/// the kernel's own boot banner uses the same 0xC3/0xC4 bytes decoratively
+/// ("ÃÄ> Kernel compatibility: ...") -- a substring check for the tree prefix
+/// would pass even if SNDCTRL never emitted it. Row 1 is the tree-styled
+/// heading prefix (bytes 0xC3 0xC4 '>' ' ', which `screen_text` renders as
+/// U+00C3 U+00C4 '>' ' '); row 2 is the gutter byte 0xB3 (U+00B3) plus the
+/// 5-space indent, then the BLASTER-style device summary exactly as
+/// specified. Also pins the read-only property this design promises: the
+/// hardware routing the tool itself reports is unchanged after the call, the
+/// same way `/S` changes nothing.
+///
+/// Like every fixture in this file, `boot_with_sndctrl` serves SNDCTRL.COM out
+/// of the *committed* `tokados-hdd.img` (`mount_hdd_folder` -> Katea's system
+/// payload), not the freshly assembled `sndctrl.com` sitting next to the
+/// source -- this test needs the committed image's SNDCTRL to already
+/// support `/B`, permanently, since that is the only binary it boots.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndctrl_boot_summary_tree_prints_two_rows_and_changes_nothing() {
+    let (machine, dir) = boot_with_sndctrl("sndctrl_boot_tree", "/B /T");
+    let screen = machine.screen_text().as_text();
+    let heading = "\u{00C3}\u{00C4}> ReSonique2 Configuration [Run SNDCTRL to change]";
+    let summary = "\u{00B3}     SB16 220 I7 D1 H5   WSS 530 I11 D0   MIDI 300 I9";
+    assert!(
+        screen.lines().any(|line| line == heading),
+        "row 1 must be exactly the tree prefix (0xC3 0xC4 '>' ' ') followed by \
+         the heading, and nothing else\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|line| line == summary),
+        "row 2 must be exactly the gutter (0xB3), the 5-space indent, then the \
+         BLASTER-style summary, and nothing else\n{screen}"
+    );
+    assert_eq!(
+        machine.sound_blaster_routing(),
+        Some((7, 1, 5)),
+        "/B must not move the Sound Blaster, same guarantee as /S\n{screen}"
+    );
+    assert_eq!(
+        machine.wss_routing(),
+        Some((11, 0)),
+        "/B must not move the codec either\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Plain `/B` (no `/T`): the same two rows, but with no tree glyphs at all --
+/// the prefix and gutter are opt-in, not default. Matched as whole lines, for
+/// the same reason as the /T case: the kernel's own boot banner already
+/// contains 0xC3/0xC4 bytes elsewhere on screen, so only an exact-line match
+/// (no prefix at all on the heading line, no gutter before the indent) proves
+/// SNDCTRL itself withheld them.
+///
+/// Same committed-image note as the /T case above: this needs the committed
+/// image's SNDCTRL to already support `/B`, permanently.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndctrl_boot_summary_plain_has_no_tree_glyphs() {
+    let (machine, dir) = boot_with_sndctrl("sndctrl_boot_plain", "/B");
+    let screen = machine.screen_text().as_text();
+    let heading = "ReSonique2 Configuration [Run SNDCTRL to change]";
+    let summary = "     SB16 220 I7 D1 H5   WSS 530 I11 D0   MIDI 300 I9";
+    assert!(
+        screen.lines().any(|line| line == heading),
+        "row 1 must be exactly the heading with no tree prefix\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|line| line == summary),
+        "row 2 must be exactly the 5-space indent then the summary, with no \
+         leading gutter byte\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
