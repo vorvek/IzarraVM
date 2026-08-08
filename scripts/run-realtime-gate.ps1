@@ -49,11 +49,11 @@ $ErrorActionPreference = "Stop"
 # the pinned tree measures, and a pin moved without them silently stops
 # asserting anything.
 #
-# Floors: doom-486 and quake-586 carry over from the previous pin (their
-# budgets and personas are spec-stable and current runs clear them with
-# margin); doom-586's are the spec-change provisionals. ALL THREE are to be
-# re-derived from this pin's first accepted gate run and tightened in a
-# follow-up commit -- see the per-workload comments.
+# Floors: derived from this pin's accepted gate run
+# fdfc809c72be-20260808-152349-ca4cd8c6 (six pairs, quiet box, processor 8,
+# verdict passed) -- each workload's rt floor sits ~4% under the minimum of
+# its twelve samples, and every recorded sample clears the tightened floors.
+# See the per-workload comments in Get-WorkloadPolicy for the numbers.
 $acceptedBaselineTree = "5aabe720c492cbcf5f31c776c5c58d33d89cd6c8"
 $highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 $minimumDirectCoverage = 0.90
@@ -606,11 +606,12 @@ function Get-WorkloadPolicy([string]$Name) {
                 name = $Name
                 mode = "486"
                 cycle_budget = [uint64]8000000000
-                # Ratchets from the PREVIOUS (200 MHz-era) pin, kept as loose
-                # backstops across the 2026-08-08 re-pin: the 486 persona is
-                # spec-stable and currently measures rt ~3.3-3.5, well clear.
-                # Tighten from the first accepted run on pin fdf32ef2.
-                minimum_real_time_factor = 2.65
+                # Ratchets from pin fdf32ef2's accepted run
+                # fdfc809c72be-20260808-152349-ca4cd8c6 (six pairs, processor
+                # 8): rt 2.983-3.180 both roles, coverage 91.43% all twelve
+                # samples, realtics 2969 all twelve. Floor ~4% under the
+                # measured minimum, per the ratchet convention.
+                minimum_real_time_factor = 2.85
                 minimum_direct_native_coverage = 0.90
                 minimum_realtics = 2900
                 maximum_realtics = 3050
@@ -621,12 +622,12 @@ function Get-WorkloadPolicy([string]$Name) {
                 name = $Name
                 mode = "586"
                 cycle_budget = [uint64]6640000000
-                # PROVISIONAL bands for the 166 MHz / 64 MB spec change: the old
-                # 200 MHz baseline measured rt 0.911-0.961, realtics 826. Wall
-                # shrinks ~17% at the same guest span, so rt rises ~x1.2, and
-                # realtics scale by 200/166. Re-derive from the first accepted
-                # baseline on the new spec.
-                minimum_real_time_factor = 0.95
+                # Ratchets from pin fdf32ef2's accepted run
+                # fdfc809c72be-20260808-152349-ca4cd8c6: rt 1.136-1.213 both
+                # roles, coverage 93.15% all twelve samples, realtics 998 all
+                # twelve (the 970-1040 band stays wide because realtics is
+                # session-local). Floor ~4% under the measured minimum.
+                minimum_real_time_factor = 1.09
                 minimum_direct_native_coverage = 0.92
                 minimum_realtics = 970
                 maximum_realtics = 1040
@@ -637,11 +638,12 @@ function Get-WorkloadPolicy([string]$Name) {
                 name = $Name
                 mode = "586"
                 cycle_budget = [uint64]6200000000
-                # Baseline measures rt 1.470-1.567, coverage 96.26%. The rt
-                # floor stays 1.4 (same ~4% under the measured minimum as
-                # before); the paired checks against the new baseline are the
-                # tight layer, this absolute is the backstop.
-                minimum_real_time_factor = 1.4
+                # Ratchets from pin fdf32ef2's accepted run
+                # fdfc809c72be-20260808-152349-ca4cd8c6: rt 1.561-1.691 both
+                # roles, coverage 96.30% all twelve samples. Floor ~4% under
+                # the measured minimum; the paired checks against the baseline
+                # are the tight layer, this absolute is the backstop.
+                minimum_real_time_factor = 1.50
                 minimum_direct_native_coverage = 0.95
                 minimum_realtics = $null
                 maximum_realtics = $null
