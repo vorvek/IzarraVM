@@ -10,11 +10,11 @@ what you get at the C:\> prompt and how the disk is laid out.
 
 ## Boot banner
 
-The kernel signs on with:
+The kernel's boot banner box signs on with:
 
 ```
-Toka-DOS 3.0 (C) 1997 General Simulation Works - tongue firmly in cheek.
-See C:\LICENSE.TXT for more.
+Toka-DOS 3.0 - Kernel build 2043 - Compiled <date>
+(C) 1992-1997 Izarra SL - All Rights Reserved ** See LICENSE.TXT for more.
 ```
 
 `C:\LICENSE.TXT` explains what Toka-DOS is actually built from: the FreeDOS

@@ -69,14 +69,31 @@ fn resolve_symbol_reports_a_nonzero_extent_for_a_live_function() {
     );
 }
 
+/// The function the child resolves. `set_phase` was the original probe and
+/// release codegen destroyed it two ways at once: nothing in the test binary
+/// reads `ACTIVE_PHASE`, so its store optimized down to a bare `ret`, and the
+/// linker's identical-code folding then merged that `ret` with every other
+/// empty function — `SymFromAddrW` answered with a ThinLTO-promoted
+/// tracing_core symbol at displacement 0. The anchor mixes constants nothing
+/// else in the binary uses, so no build can make it byte-identical to another
+/// function, and `#[inline(never)]` pins a standalone body to resolve.
+#[inline(never)]
+fn extent_anchor(x: u32) -> u32 {
+    x.rotate_left(9).wrapping_mul(0x9E37_79B1) ^ 0x495A_4152
+}
+
 fn resolve_extent_in_this_process() {
-    use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitializeW};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SYMOPT_LOAD_LINES, SYMOPT_UNDNAME, SymCleanup, SymInitializeW, SymSetOptions,
+    };
     use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // The search path must be the exe's own directory, same as
     // `stop_and_report`: dbghelp's NULL default (CWD + _NT_SYMBOL_PATH) does
     // not contain the test binary's PDB, and this test fails from a NULL path.
     let process = unsafe { GetCurrentProcess() };
+    // The profiler's options, and the debug-info probe below needs the lines.
+    unsafe { SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME) };
     let mut path = [0u16; 1024];
     let len = unsafe { GetModuleFileNameW(std::ptr::null_mut(), path.as_mut_ptr(), 1024) };
     let exe_dir = exe_directory(&path[..len as usize]).expect("test exe has a directory");
@@ -85,11 +102,32 @@ fn resolve_extent_in_this_process() {
         0,
         "SymInitializeW failed"
     );
-    let rip = super::set_phase as *const () as usize as u64;
+    let rip = std::hint::black_box(extent_anchor as *const () as usize as u64);
+    // A `--release` test binary carries no CodeView for this crate (`debug` is
+    // unset in that profile): its PDB holds only linker publics, which have no
+    // sizes and omit LTO-internalized functions entirely, so the extent
+    // invariant has nothing to attach to. Detect that build per-ADDRESS —
+    // module-level flags like `IMAGEHLP_MODULEW64.LineNumbers` read true even
+    // then, because the CRT's /Z7 objects contribute debug info for their own
+    // ranges.
+    if super::resolve_line(process, rip).is_none() {
+        unsafe { SymCleanup(process) };
+        if cfg!(debug_assertions) {
+            panic!(
+                "a debug build must carry line info for its own code; without it \
+                 the extent guard below would be silently skipped in CI"
+            );
+        }
+        eprintln!(
+            "riprofile extent test: publics-only PDB (optimized build without debug \
+             info); function extents do not exist in this binary, skipping"
+        );
+        return;
+    }
     let resolved = super::resolve_symbol(process, rip);
     unsafe { SymCleanup(process) };
     let (name, displacement, size) = resolved.expect("the test binary's own PDB must resolve");
-    assert!(name.contains("set_phase"), "resolved {name:?}");
+    assert!(name.contains("extent_anchor"), "resolved {name:?}");
     assert!(
         size > 0,
         "the PDB carried no extent for a function symbol; the beyond-extent guard is disarmed"

@@ -148,6 +148,10 @@ optScanFct(opt_init)
  *      4) Perform all command line actions (spawn "/c" commands, alter
  *              size of environment etc.)
  *      5) If shell is interactive, invoke a ver() command.
+ *      (Modified by the Toka-DOS project, 2026: the startup ver() call
+ *      described above is suppressed -- the styled Toka-DOS boot tree owns
+ *      the screen, so the shell starts silently. VER remains fully
+ *      functional as an explicit command.)
  *
  * If a serious problem occurs, e.g. FreeCom has received an invalid
  * command line from the system (e.g. 128 bytes), FreeCom assumes that the
@@ -544,7 +548,12 @@ int initialize(void)
 
 		showinfo = 0;
 /*		short_version(); */
-		cmd_ver(NULL);
+		/* Modified by the Toka-DOS project, 2026: the styled Toka-DOS boot
+		   tree owns the screen; the shell starts silently (see the showinfo
+		   block below for the VER-stays-functional note). This is the /P
+		   (resident shell) startup path -- the one CONFIG.SYS's SHELL=...
+		   /P=C:\AUTOEXEC.BAT line actually takes -- so the version print
+		   is dropped here rather than only in the showinfo block below. */
 
 		if(skipAUTOEXEC) {		/* /D option */
 			showinfo = 0;
@@ -601,13 +610,15 @@ int initialize(void)
 
   if (showinfo)
   {
-/*    short_version(); */
-    cmd_ver(NULL);
-/* #ifndef DEBUG		No more commands
-    putchar('\n');
-    showcmds(0);
-    putchar('\n');
-#endif */
+    /* Modified by the Toka-DOS project, 2026: the styled Toka-DOS boot tree
+       owns the screen; the shell starts silently. cmd_ver stays fully
+       functional for an explicit VER. (The everyday boot path takes the
+       /P branch above instead -- see the comment there -- but a COMMAND.COM
+       invoked without /P, e.g. a nested interactive shell, reaches showinfo
+       here and must stay silent too.) The empty if and showinfo's other
+       assignments are kept deliberately, to hold this hunk's shape close to
+       upstream -- a merge resolver should NOT delete them. Upstream's
+       commented-out short_version() / showcmds() scaffolding went with it. */
   }
 
   return E_None;

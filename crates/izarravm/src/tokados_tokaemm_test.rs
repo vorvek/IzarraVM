@@ -270,16 +270,21 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
             // the vector table, which is independent of anything the driver
             // reports about itself.
             //
-            // The two bounds mirror the driver's own EQUs, derived from the
-            // shipped image's length rather than copied as literals, so they
-            // follow automatically when the core grows: the file ends exactly
-            // at resident_core_end now that the reservation is not emitted.
+            // Where the reservation STARTS is derived from the shipped image's
+            // length, so it tracks the core automatically: the file ends
+            // exactly at resident_core_end now that the tables are not emitted.
+            //
+            // TABLES_BYTES is the driver's own EQU and has no runtime trace, so
+            // it has to be mirrored. That mirror went stale: it was 0x7000
+            // (PD + 6 PT) until the 64 MB machine took it to 0x11000
+            // (PD + 16 PT) in 95169c4e, and this test kept 0x7000 for two days.
+            const TABLES_BYTES: u32 = 0x11000;
+            const TABLES_SLACK: u32 = 0xFF0;
             let vector = 0x67 * 4 + 2;
             let drv_seg = u32::from(machine.read_physical_u8(vector))
                 | (u32::from(machine.read_physical_u8(vector + 1)) << 8);
             let base = drv_seg << 4;
             let tables_off = (izarravm_firmware::tokaemm_sys().len() as u32).next_multiple_of(4096);
-            let image_end_off = tables_off + 0x7000 + 0xFF0;
             assert!(
                 cr3 >= base + tables_off,
                 "at {memory_mib} MiB CR3 ({cr3:#010x}) is below the reservation \
@@ -287,12 +292,44 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
                  the region reserved past the end of the file",
                 base + tables_off
             );
+
+            // The stale literal above was invisible because the bound it fed
+            // could not fail. It read
+            //     cr3 + TABLES_BYTES <= base + tables_off + TABLES_BYTES + SLACK
+            // in which TABLES_BYTES CANCELS. Whatever value it held, the test
+            // only ever asserted that CR3's page-rounding stayed under 0xFF0 --
+            // never that the tables fit the reservation, which is what its
+            // message claimed. Deriving the reservation end from the same
+            // formula the driver uses cannot check that the driver's formula is
+            // right. Keep the rounding check, but say what it is:
             assert!(
-                cr3 + 0x7000 <= base + image_end_off,
-                "at {memory_mib} MiB the seven tables at CR3 ({cr3:#010x}) run \
-                 past the reserved region ending {:#010x}, so DOS did not keep \
-                 all the memory the monitor is using",
-                base + image_end_off
+                cr3 - (base + tables_off) <= TABLES_SLACK,
+                "at {memory_mib} MiB CR3 ({cr3:#010x}) rounds up more than the \
+                 {TABLES_SLACK:#x} the reservation budgets over the \
+                 4096-aligned TABLES_OFF at {:#010x}",
+                base + tables_off
+            );
+
+            // For "DOS actually kept it", the bound has to come from DOS, not
+            // from the driver's arithmetic. The lowest independent witness
+            // available at this point is the running fixture itself: VCPILOW is
+            // a .COM, so CS is its PSP + 0x10, and DOS placed it wherever the
+            // reservation left off. Tables overlapping it means DOS handed out
+            // memory the monitor is paging through.
+            //
+            // Resolution is ~132 KB at 1 MiB (COMMAND.COM, its environment and
+            // the fixture sit between), so this catches a badly under-reported
+            // break, not a marginal one. A tight bound needs an MCB-chain walk
+            // and there is no MCB helper in the test suite yet; that is the
+            // follow-up, not a reason to keep a bound that cannot fail at all.
+            let fixture_lin = u32::from(machine.cpu().registers.cs().selector) << 4;
+            assert!(
+                cr3 + TABLES_BYTES <= fixture_lin,
+                "at {memory_mib} MiB the seventeen tables at CR3 ({cr3:#010x}) \
+                 run up to {:#010x}, into the memory DOS gave the running \
+                 fixture at {fixture_lin:#010x}: the reported break did not \
+                 cover them",
+                cr3 + TABLES_BYTES
             );
         } else {
             assert!(
@@ -946,7 +983,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
                     .screen_text()
                     .as_text()
                     .to_ascii_lowercase()
-                    .contains("tokaemm:")
+                    .contains("tokaemm xms/umb/ems memory manager; system running in v86")
         },
     );
     let text = machine.screen_text().as_text();
@@ -956,7 +993,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
         "no C:\\> prompt on the default boot.\n{text}"
     );
     assert!(
-        lower.contains("tokaemm:"),
+        lower.contains("tokaemm xms/umb/ems memory manager; system running in v86"),
         "the TOKAEMM signon banner is missing.\n{text}"
     );
     assert!(
@@ -1043,7 +1080,7 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
                 return false;
             }
             let lower = machine.screen_text().as_text().to_ascii_lowercase();
-            lower.contains("tokaemm: xms/umb/ems memory manager; system running in v86")
+            lower.contains("tokaemm xms/umb/ems memory manager; system running in v86")
                 && lower.contains("switched to 386-slow")
                 && lower.contains("switched to 586")
                 && lower.contains("cpu mode '286' was removed; use '386-slow'")
@@ -1066,7 +1103,7 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
     );
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("tokaemm: xms/umb/ems memory manager; system running in v86"),
+        lower.contains("tokaemm xms/umb/ems memory manager; system running in v86"),
         "TOKAEMM did not install while code 3 was active (stop={stop:?}).\n{text}"
     );
     assert!(
@@ -1242,10 +1279,11 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("593K"),
-        "the high page tables should leave about 593 KiB conventional memory free.\n{text}"
+        Some("582K"),
+        "the high page tables should leave about 582 KiB conventional memory free \
+         (the 64 MB arena bitmaps cost ~11 KiB of low core over the 24 MB era).\n{text}"
     );
-    assert_extended_category(&screen, "23,552K", "21,925K");
+    assert_extended_category(&screen, "23,552K", "23,165K");
 
     let rows = memory_map_rows(&screen);
     assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
@@ -1315,7 +1353,7 @@ fn tokaemm_mem_noems_reports_combined_extended_free() {
         "no C:\\> prompt after MEM ran with NOEMS (stop={stop:?}).\n{}",
         screen.text
     );
-    assert_extended_category(&screen, "23,552K", "21,925K");
+    assert_extended_category(&screen, "23,552K", "23,165K");
 }
 
 #[test]
@@ -1421,11 +1459,21 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
     let tokaemm = screen
         .text
         .lines()
-        .find(|line| line.trim_start().starts_with("TOKAEMM "))
+        .find(|line| {
+            // The signon banner also starts with "TOKAEMM " now that the /T
+            // restyle dropped the colon, so require a digit right after the
+            // name+whitespace run to land on the table row, not the banner.
+            line.trim_start()
+                .strip_prefix("TOKAEMM")
+                .map(|rest| rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                .unwrap_or(false)
+        })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(29K)"),
-        "TokaEMM should retain only its 29 KiB low core.\n{}",
+        tokaemm.contains("(40K)"),
+        "TokaEMM should retain only its ~40 KiB low core: the 24 MB-era 29 KiB \
+         of code and state plus the 64 MB machine's arena bitmaps and EMS \
+         chain table.\n{}",
         screen.text
     );
     let free = screen
@@ -1435,8 +1483,8 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(593K)"),
-        "MEM /CLASSIFY should report about 593 KiB conventional free.\n{}",
+        Some("(582K)"),
+        "MEM /CLASSIFY should report about 582 KiB conventional free.\n{}",
         screen.text
     );
 }

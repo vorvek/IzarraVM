@@ -27,7 +27,13 @@
 ;   SNDCTRL                     full-screen configuration
 ;   SNDCTRL /S                  print the current assignment and exit
 ;   SNDCTRL /SBIRQ:7 /MPU:330   set values from the command line and exit
+;   SNDCTRL /B                  two-row boot summary and exit (no CMOS writes)
+;   SNDCTRL /B /T               boot summary with a tree-styled prefix
 ;   SNDCTRL /?                  usage
+;
+; /T only styles the /B summary. Used alone, or paired with anything other
+; than /B, it is accepted and simply has nothing to style -- a no-op, not an
+; error, the same way /S with no value switches is a no-op on the hardware.
 ;
 ; Build: nasm -f bin sndctrl.asm -o sndctrl.com
     cpu 386
@@ -119,6 +125,8 @@ start:
     jne .usage
     cmp byte [want_status], 0
     jne .status
+    cmp byte [want_boot], 0
+    jne .boot
     cmp byte [want_apply], 0
     jne .cli_apply
     jmp interactive
@@ -156,6 +164,14 @@ start:
 
 .status:
     call report
+    mov ax, 0x4c00
+    int 0x21
+
+; /B is a read-only summary: it reuses read_hardware's already-probed state
+; (the same fields report() prints) and never touches the mixer, WSS config
+; register, CMOS, the environment, or AUTOEXEC.BAT.
+.boot:
+    call boot_report
     mov ax, 0x4c00
     int 0x21
 
@@ -279,7 +295,7 @@ read_hardware:
 ;
 ; The wait is bounded by the BIOS tick counter, not by an iteration count. The
 ; DSP needs ~100us of settle time to answer, and how many poll instructions fit
-; into 100us depends entirely on the CPU persona -- a count tuned on the 200 MHz
+; into 100us depends entirely on the CPU persona -- a count tuned on the 166 MHz
 ; part reports "not installed" on the 22 MHz one, and vice versa. Three ticks
 ; (~165ms) is far longer than any real settle and still instant to a person. The
 ; iteration cap underneath it is a backstop for a machine whose timer interrupt
@@ -386,6 +402,9 @@ parse_tail:
     mov byte [bad_kind], 1
     stc
     ret
+.bad:
+    stc
+    ret
 .switch:
     inc si
     dec cx
@@ -397,8 +416,14 @@ parse_tail:
     mov [cur_kind], al
     mov al, [bx + 3]
     mov [cur_field], al
+    ; Kinds 2-3 are the value switches and MUST stay contiguous here -- this
+    ; is the range test that routes them; every other kind is a flag and
+    ; falls through to the .flag chain below, which must give it an explicit
+    ; arm (see the guard note at sw_table).
     cmp byte [cur_kind], 2
     jb .flag
+    cmp byte [cur_kind], 3
+    ja .flag
     ; A value switch needs a ':' or '=' and then digits.
     jcxz .bad
     mov al, [si]
@@ -439,11 +464,20 @@ parse_tail:
     mov byte [want_usage], 1
     jmp .next
 .flag_status:
+    cmp byte [cur_kind], 1
+    jne .flag_boot
     mov byte [want_status], 1
     jmp .next
-.bad:
-    stc
-    ret
+.flag_boot:
+    cmp byte [cur_kind], 4
+    jne .flag_tree
+    mov byte [want_boot], 1
+    jmp .next
+.flag_tree:
+    cmp byte [cur_kind], 5      ; guard, not an else: an unrouted future kind
+    jne .bad                    ; must reject rather than silently become /T
+    mov byte [tree_mode], 1
+    jmp .next
 
 ; Copy the rest of the current token into `token` so the error can quote it.
 copy_bad_token:
@@ -2082,6 +2116,8 @@ flush_line:
     pop si
     ret
 
+; boot_report (below) renders these same fields in the two-row /B form; a new
+; field belongs in both.
 report:
     mov si, msg_head
     call print
@@ -2197,6 +2233,96 @@ report:
     ret
 
 ; =============================================================================
+; /B boot summary: exactly two rows, no more (hard 25-row screen budget).
+; Row 1 is the heading, printed straight from its own CRLF-terminated string.
+; Row 2 is built in `linebuf` the same way report() builds its rows, reusing
+; the same probed fields report() reads -- read_hardware has already run by
+; the time start: gets here, same as it has for /S. Nothing here writes to
+; the hardware, CMOS, the environment, or AUTOEXEC.BAT.
+; =============================================================================
+boot_report:
+    cmp byte [tree_mode], 0
+    je .no_tree_head
+    mov si, msg_boot_tree
+    call print
+.no_tree_head:
+    mov si, msg_boot_head
+    call print
+    mov di, linebuf
+    cmp byte [tree_mode], 0
+    je .no_gutter
+    mov si, msg_boot_gut
+    call copy_str
+.no_gutter:
+    mov si, msg_boot_ind
+    call copy_str
+    ; ---- SB16 ----
+    mov si, msg_boot_sb
+    call copy_str
+    cmp byte [sb_present], 0
+    je .sb_absent
+    mov si, t_220
+    call copy_str
+    mov si, msg_boot_irq
+    call copy_str
+    mov al, [FVAL(F_SBIRQ)]
+    call u8dec
+    mov si, msg_boot_dmal
+    call copy_str
+    mov al, [FVAL(F_SBDMA)]
+    call u8dec
+    mov si, msg_boot_dmah
+    call copy_str
+    mov al, [FVAL(F_SBD16)]
+    call u8dec
+    jmp .sb_done
+.sb_absent:
+    mov si, msg_boot_absent
+    call copy_str
+.sb_done:
+    mov si, msg_boot_gap
+    call copy_str
+    ; ---- WSS ----
+    mov si, msg_boot_wss
+    call copy_str
+    cmp byte [wss_present], 0
+    je .wss_absent
+    mov si, t_530
+    call copy_str
+    mov si, msg_boot_irq
+    call copy_str
+    mov al, [FVAL(F_WSIRQ)]
+    call u8dec
+    mov si, msg_boot_dmal
+    call copy_str
+    mov al, [FVAL(F_WSDMA)]
+    call u8dec
+    jmp .wss_done
+.wss_absent:
+    mov si, msg_boot_absent
+    call copy_str
+.wss_done:
+    mov si, msg_boot_gap
+    call copy_str
+    ; ---- MIDI ----
+    ; The MPU IRQ is fixed at 9, same as s_rep_mpu_tail in report() -- there is
+    ; no field for it, so it is a literal here too, not a u8dec of anything.
+    mov si, msg_boot_midi
+    call copy_str
+    mov si, s_mpu300
+    cmp byte [FVAL(F_MPU)], 0
+    je .mpu_port
+    mov si, s_mpu330
+.mpu_port:
+    call copy_str
+    mov si, msg_boot_midi_irq
+    call copy_str
+    mov si, s_crlf              ; linebuf-builder convention, same as report()
+    call copy_str
+    call flush_line
+    ret
+
+; =============================================================================
 ; Data.
 ; =============================================================================
 AX_NONE    equ 0
@@ -2235,7 +2361,11 @@ nm_wsirq:  db 'Windows Sound System IRQ', 0
 nm_wsdma:  db 'Windows Sound System DMA', 0
 nm_mpu:    db 'MPU-401 port', 0
 
-; Switch keyword, kind (0 usage, 1 status, 2 value, 3 MPU port), field.
+; Switch keyword, kind (0 usage, 1 status, 2 value, 3 MPU port, 4 boot
+; summary, 5 tree style), field (unused by flag kinds).
+; Routing rule enforced in parse_tail: kinds 2-3 are the value switches and
+; MUST stay contiguous (parse_tail range-tests them); every other kind is a
+; flag and MUST get an explicit, guarded arm in the .flag chain.
 sw_table:
     dw sw_question
     db 0, 0
@@ -2267,6 +2397,10 @@ sw_table:
     db 3, F_MPU
     dw sw_midi
     db 3, F_MPU
+    dw sw_b
+    db 4, 0
+    dw sw_t
+    db 5, 0
     dw 0
     db 0, 0
 
@@ -2285,6 +2419,8 @@ sw_wssirq:   db 'WSSIRQ', 0
 sw_wssdma:   db 'WSSDMA', 0
 sw_mpu:      db 'MPU', 0
 sw_midi:     db 'MIDI', 0
+sw_b:        db 'B', 0
+sw_t:        db 'T', 0
 
 ; row, col, attribute, text
 static_text:
@@ -2390,6 +2526,29 @@ msg_head:        db 'ReSonique 2 sound system', 13, 10, 0
 msg_opl:         db '  OPL3 FM synthesis     port 388', 13, 10, 0
 msg_sb_absent:   db '  Sound Blaster 16      not installed', 13, 10, 0
 msg_wss_absent:  db '  Windows Sound System  not installed', 13, 10, 0
+
+; ---- /B boot summary ---------------------------------------------------
+; Tree glyphs match TOKAEMM/TOKAMOUS/IZCDEX's /T bytes exactly (0xC3 0xC4
+; '>' ' ' for the heading, 0xB3 for the gutter) -- duplicated here per the
+; family's deliberate per-tool policy rather than shared.
+msg_boot_tree:     db 0xC3, 0xC4, '>', ' ', 0
+msg_boot_gut:      db 0xB3, 0
+msg_boot_head:     db 'ReSonique2 Configuration [Run SNDCTRL to change]', 13, 10, 0
+msg_boot_ind:      times 5 db ' '     ; 5-space indent, per the /T spec
+                   db 0
+msg_boot_sb:       db 'SB16 ', 0
+msg_boot_wss:      db 'WSS ', 0
+msg_boot_midi:     db 'MIDI ', 0
+msg_boot_absent:   db 'absent', 0
+msg_boot_gap:      times 3 db ' '     ; 3-space gap between device groups
+                   db 0
+; The space precedes the letter; the letter itself sits directly against its
+; digit (I7, not I 7) -- see boot_report, which appends the digits with u8dec.
+msg_boot_irq:      db ' I', 0
+msg_boot_dmal:     db ' D', 0
+msg_boot_dmah:     db ' H', 0
+msg_boot_midi_irq: db ' I9', 0       ; MPU IRQ is the fixed literal 9
+
 msg_saved:       db 'Applied to the hardware and saved in CMOS.', 13, 10, 0
 msg_env_ok:      db 'BLASTER updated in the current environment.', 13, 10, 0
 msg_env_full:    db 'BLASTER left alone: no room in the master environment.', 13, 10, 0
@@ -2408,6 +2567,8 @@ msg_usage:
     db 'SNDCTRL - ReSonique 2 Sound System Configuration', 13, 10, 13, 10
     db '  SNDCTRL                 full-screen configuration', 13, 10
     db '  SNDCTRL /S              show the current assignment', 13, 10
+    db '  SNDCTRL /B              two-row boot summary, then exit', 13, 10
+    db '  SNDCTRL /B /T           boot summary with a tree-styled prefix', 13, 10
     db '  SNDCTRL /SBIRQ:n        Sound Blaster IRQ    2, 5, 7, 10', 13, 10
     db '  SNDCTRL /SBDMAL:n       Sound Blaster DMA    0, 1, 3', 13, 10
     db '  SNDCTRL /SBDMAH:n       Sound Blaster 16-bit DMA  5, 6, 7', 13, 10
@@ -2415,13 +2576,16 @@ msg_usage:
     db '  SNDCTRL /WSSDMA:n       Windows Sound Sys DMA  0, 1, 3', 13, 10
     db '  SNDCTRL /MPU:nnn        MPU-401 port         300, 330', 13, 10, 13, 10
     db 'Any setting given on the command line is applied without the', 13, 10
-    db 'full-screen interface. The two devices may not share a line.', 13, 10, 0
+    db 'full-screen interface. The two devices may not share a line.', 13, 10
+    db '/T only styles /B; alone or with anything else it has no effect.', 13, 10, 0
 
 ; ---- state ------------------------------------------------------------------
 sb_present:  db 0
 wss_present: db 0
 want_usage:  db 0
 want_status: db 0
+want_boot:   db 0
+tree_mode:   db 0
 want_apply:  db 0
 applied:     db 0
 cur_kind:    db 0

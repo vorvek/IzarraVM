@@ -22,9 +22,11 @@
 ; real-mode IVT through the null DS (base 0 == flat) and its own data through FS.
 ;
 ; All four GSW modes expose at least the 386 ISA. The guest-facing XMS/EMS/UMB
-; entry points keep a 16-bit ABI and use KB units internally. The 24 MB map
-; keeps each KB count under 0x6000. They pass 32-bit arguments to INT 0xC0
-; monitor services through driver-resident scratch dwords read through FS.
+; entry points keep a 16-bit ABI and use KB units internally. The 64 MB map
+; keeps each KB count under 0x10000, so every count still fits an UNSIGNED
+; 16-bit register; bitmap bit indices exceed the signed 16-bit BT range and use
+; the dword BT forms. They pass 32-bit arguments to INT 0xC0 monitor services
+; through driver-resident scratch dwords read through FS.
 cpu 386
 org 0
 
@@ -112,13 +114,13 @@ UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment); the window
 ; explicitly, whether this anchor moves with it.
 ARENA_PHYS_BASE equ UMB_PHYS_BASE + UMB_BYTES
 
-; PD (1 page) + 6 PT (6 pages). Read at three sites that must agree: INIT's
-; high-path fit check, `pm_init`'s zero-fill, and the `IMAGE_END_OFF`
-; reservation the `.low_tables` break address is built from. They were three
-; separate literals; a change that grew one and not the others would either
-; leave the tail unzeroed or hand DOS back memory the monitor is still paging
-; through.
-TABLES_BYTES  equ 0x7000
+; PD (1 page) + 16 PT (16 pages) for the 64 MiB identity map. Read at three
+; sites that must agree: INIT's high-path fit check, `pm_init`'s zero-fill, and
+; the `IMAGE_END_OFF` reservation the `.low_tables` break address is built
+; from. They were three separate literals; a change that grew one and not the
+; others would either leave the tail unzeroed or hand DOS back memory the
+; monitor is still paging through.
+TABLES_BYTES  equ 0x11000
 umb_available: db 0               ; backing fits inside detected physical RAM
 ; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
 UMB_SLOTS equ 8
@@ -131,7 +133,7 @@ umb_table: times UMB_SLOTS*UMB_SLOT db 0
 ; whatever the arena holds. `EMS_MAX_PAGES` is the bitmap's own ceiling, not a
 ; reservation -- it sizes ems_link and nothing else.
 EMS_PAGE_GRANULES equ 16
-EMS_MAX_PAGES equ ARENA_GRANULES / EMS_PAGE_GRANULES   ; 1456
+EMS_MAX_PAGES equ ARENA_GRANULES / EMS_PAGE_GRANULES   ; 4032
 EMS_FRAME_SEG equ 0xE000          ; page frame segment (4 slots x 16 KB)
 EMS_FRAME_LIN equ 0x000E0000
 EMS_HANDLES   equ 32
@@ -148,6 +150,8 @@ EMS_HANDLES   equ 32
 ; touched the slot (D4).
 EMS_SLOT      equ 20
 ems_on:      db 1                 ; 1 unless the command line contains NOEMS
+tree_mode:   db 0                 ; 1 when the command line contains /T (tree-
+                                  ; styled signon banner prefix)
 ems_pages:   dw 0                 ; total 16 KB pages the pool spans
 ems_category_kb: dw 0             ; private F0 query, pages converted to KB
 ems_disp:    dw 0                 ; dispatch scratch (mirrors xms_disp)
@@ -190,9 +194,12 @@ ems_link: times EMS_MAX_PAGES dw 0xFFFF
 ;
 ; Indices are POOL-RELATIVE, so the bitmap is sized for the pool and not for the
 ; address space. BT/BTS/BTR take the full bit-string index, which the 386 treats
-; as SIGNED for a memory operand; ARENA_GRANULES stays well under 32767.
-ARENA_GRANULES  equ 23296         ; 22.75 MB ceiling, in 1 KB granules
-ARENA_BMP_BYTES equ ARENA_GRANULES / 8      ; 2912
+; as SIGNED for a memory operand; ARENA_GRANULES exceeds 32767 on the 64 MB
+; machine, so every bitmap probe uses the DWORD BT forms with a zero-extended
+; 32-bit index -- the word forms would walk backward from the bitmap for any
+; granule past 32 MB.
+ARENA_GRANULES  equ 64512         ; 63 MB ceiling, in 1 KB granules
+ARENA_BMP_BYTES equ ARENA_GRANULES / 8      ; 8064
 ARENA_PAGES     equ ARENA_GRANULES / 4      ; 4 KB pages over the same span
 
 ; 386MAX ALLOC_LIM (QMAX_VMM.ASM:116), stored as boundary-1 so the value serves
@@ -212,7 +219,7 @@ arena_q_type:    db 0             ; INT 0xC0 'TQ' argument: an ALLOC_* offset
 arena_q_largest: dw 0             ; ... and its two answers, in granules
 arena_q_total:   dw 0
 ; Query memoization (D1). arena_query32 costs ~5-6 instructions per granule
-; and ARENA_GRANULES is ~23,000, so an uncached walk is ~110,000-140,000
+; and ARENA_GRANULES is ~64,500, so an uncached walk is ~320,000-390,000
 ; monitor instructions.
 ;
 ; An earlier version of this comment justified the memo with a tick-loss
@@ -319,6 +326,10 @@ init:
     ; (FreeDOS init_device). Bare and RAM both leave EMS enabled, drawing pages
     ; from the shared arena on demand rather than a fixed-size pool; NOEMS wins
     ; regardless of token order because no other token sets it back.
+    ; Also recognizes a whole-token "/T", order-independent like NOEMS, which
+    ; only selects the tree-styled signon banner prefix and touches nothing
+    ; else. DEVICE= parameters here use '/' lead-in only, by policy -- the '-'
+    ; alternative is reserved for the .COM tools' own command lines.
     push ds
     lds si, [es:bx+18]
 .p_path:                          ; skip the path token
@@ -335,6 +346,21 @@ init:
     je .p_gap
     cmp ah, 2
     je .p_done
+    cmp al, '/'                   ; RAW byte, BEFORE the upcase below: '/' is
+                                  ; 0x2F and 'and 0xDF' would fold it to 0x0F
+    jne .p_not_slash
+    lodsb
+    call cls_al
+    cmp ah, 1
+    je .p_gap                     ; bare "/" then separator
+    cmp ah, 2
+    je .p_done
+    and al, 0xDF
+    cmp al, 'T'
+    jne .p_skiptok
+    mov byte [cs:tree_mode], 1
+    jmp .p_skiptok                ; tolerate trailing junk (/TX): skip rest of token
+.p_not_slash:
     and al, 0xDF                  ; token first char, upcased
     cmp al, 'N'
     jne .p_skiptok
@@ -393,6 +419,16 @@ init:
     pop ds
 
     ; Signon banner. INT 29h works during device INIT, when INT 21h AH=09h is unreliable.
+    cmp byte [tree_mode], 0
+    je .bplain
+    mov si, banner_tree
+.btl:
+    lodsb                         ; DS = CS here
+    test al, al
+    jz .bplain                    ; prefix done, fall into the plain banner
+    int 0x29
+    jmp .btl
+.bplain:
     mov si, banner
 .bl:
     lodsb                         ; DS = CS here
@@ -433,9 +469,9 @@ init:
     xor eax, eax
 .mem_got_ext:
     add eax, 0x00100000           ; convert extended bytes to physical top
-    cmp eax, 0x01800000           ; this monitor maps at most 24 MB
+    cmp eax, 0x04000000           ; this monitor maps at most 64 MB
     jbe .mem_top_ok
-    mov eax, 0x01800000
+    mov eax, 0x04000000
 .mem_top_ok:
     and eax, 0xFFFFF000
     mov edi, eax                  ; EDI = detected/capped physical top
@@ -456,7 +492,7 @@ init:
     mov word [cs:umb_win_end], UMB_SEG_BASE
     mov eax, edi                  ; empty arena when the UMB backing cannot fit
 .arena_base:
-    ; Keep the monitor's seven paging pages out of conventional memory when
+    ; Keep the monitor's seventeen paging pages out of conventional memory when
     ; extended RAM has room.  The .SYS retains a low fallback tail for the
     ; 1 MiB profile, but normal machines reserve these aligned pages before
     ; the allocatable XMS/VCPI arena instead.
@@ -527,12 +563,16 @@ init:
     jbe .arena_bounds_ok
     mov eax, ebx
 .arena_bounds_ok:
-    ; Clamp to the span the granule bitmap covers. ARENA_PAGES * 0x1000 ==
-    ; ARENA_GRANULES * 0x400, so this byte ceiling is still correct now that
-    ; arena_bmp is indexed in 1 KB granules rather than 4 KB pages.
-    cmp ebx, ARENA_PAGES * 0x1000
+    ; Clamp to the span the granule bitmap covers, measured from the POOL BASE:
+    ; indices are pool-relative, so the ceiling has to be too. The old absolute
+    ; ceiling (ARENA_PAGES * 0x1000 from physical zero) silently donated the
+    ; bitmap's first ~1.3 MB of index space to memory below the pool and lost
+    ; the same amount off the RAM top.
+    mov ecx, eax
+    add ecx, ARENA_GRANULES * 0x400
+    cmp ebx, ecx
     jbe .arena_ceiling_ok
-    mov ebx, ARENA_PAGES * 0x1000
+    mov ebx, ecx
 .arena_ceiling_ok:
     cmp eax, ebx                  ; a base above the ceiling yields an empty pool
     jbe .arena_span_ok
@@ -1201,7 +1241,7 @@ ems_page_alloc:
     push bx
     push cx
     push dx
-    push si
+    push esi                      ; the page probe zero-extends into ESI now
     mov cx, [cs:arena_granules]
     shr cx, 4                     ; whole 16 KB pages the arena covers
     jz .none
@@ -1212,13 +1252,13 @@ ems_page_alloc:
     jb .test
     xor ax, ax                    ; wrap to the arena base
 .test:
-    mov si, ax
-    shl si, 4                     ; first granule of this candidate page
-    mov bx, EMS_PAGE_GRANULES
-.probe:
-    bt word [cs:arena_bmp], si
+    movzx esi, ax
+    shl esi, 4                    ; first granule of this candidate page;
+    mov bx, EMS_PAGE_GRANULES     ; dword BT since granule indices pass the
+.probe:                           ; signed 16-bit range on the 64 MB machine
+    bt dword [cs:arena_bmp], esi
     jc .next
-    inc si
+    inc esi
     dec bx
     jnz .probe
     jmp .take
@@ -1227,7 +1267,7 @@ ems_page_alloc:
     dec dx
     jnz .scan
 .none:
-    pop si
+    pop esi
     pop dx
     pop cx
     pop bx
@@ -1246,7 +1286,7 @@ ems_page_alloc:
                                    ; BX/BP/SI/DI can), so no LEA shortcut here
                                    ; the way the 32-bit VCPI side has one.
     mov [cs:ems_cursor], si       ; next-fit: resume just past this page
-    pop si
+    pop esi
     pop dx
     pop cx
     pop bx
@@ -1488,20 +1528,21 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     xor eax, eax
     mov ecx, TABLES_BYTES / 4
     rep stosd
-    ; PD[0..5] -> the six PTs that follow the PD (each PT maps 4 MiB), so the
-    ; identity map covers 0..24 MiB and the XMS-move memcpy can reach every EMB.
+    ; PD[0..15] -> the sixteen PTs that follow the PD (each PT maps 4 MiB), so
+    ; the identity map covers 0..64 MiB and the XMS-move memcpy can reach every
+    ; EMB.
     lea eax, [ebp + 0x1000]       ; first PT linear = PD + 0x1000
     or eax, 7
     mov edi, ebp                  ; write PD entries
-    mov ecx, 6
+    mov ecx, 16
 .pde:
     mov [edi], eax
     add eax, 0x1000               ; next PT is one page further
     add edi, 4
     loop .pde
-    lea edi, [ebp + 0x1000]       ; 6144 entries (0..24 MiB), present/rw/user
+    lea edi, [ebp + 0x1000]       ; 16384 entries (0..64 MiB), present/rw/user
     mov eax, 7
-    mov ecx, 6144
+    mov ecx, 16384
 .pt:
     mov [edi], eax
     add eax, 0x1000
@@ -2494,6 +2535,21 @@ vcpi_dispatch:
 ; (2026-08-06). Do not move any of these structures up without re-deriving it.
 ; The server page tables may be reserved above 1 MB, but DE0C reads pd_lin
 ; from low server data before switching back to the server CR3.
+;
+; The same bound pins arena_bmp and vcpi_bmp, which is less obvious because they
+; are plain data rather than fault-delivery machinery. DE01 copies exactly 0x110
+; page-table entries (below), so a client running under its own CR3 has linear
+; 0..0x110000 mapped and nothing above it. DE03/DE04/DE05 arrive HERE, under
+; that CR3, and run the same arena_query32/vcpi_page_alloc/vcpi_page_free bodies
+; the V86 path does. A bitmap at ARENA_PHYS_BASE (0x138000) would take a #PF in
+; the client's world, and a data selector based there would not exist in the
+; client's GDT either -- only CS, CS+8 and CS+16 are furnished. Trapping to the
+; monitor does not rescue it: these callers are not V86 code and cannot trap at
+; all. Two proposals to move those two bitmaps into the high reservation, to buy
+; back what the 64 MB arena cost the resident core, were cut on this
+; (2026-08-08). Only ems_link is movable that way, because EMS is INT 67h
+; AH=40h-4Dh and never reaches this entry point. vcpisw.asm exercises the
+; DE04/DE05 protected-mode path for real, so this is not an untested corner.
 ; Software-defined PTE bits 9-11 are cleared in the copy (spec p.6; the
 ; 386MAX COPY_PTE convention). The descriptors: +0 the server code segment
 ; (base = base_lin, byte limit = resident_core_end-1, 32-bit CPL0 code -- entry
@@ -3334,7 +3390,8 @@ a20_apply:
     mov cr3, eax
     ret
 
-banner: db 'TOKAEMM: XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
+banner_tree: db 0xC3, 0xC4, '>', ' ', 0
+banner: db 'TOKAEMM XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
 
 ; Debug failure signal via the unit-tester exit port (AL = code).
 signal32:
@@ -3369,7 +3426,7 @@ resident_core_end:
 ; offset budget on EVERY configuration, to serve a path that only a 1 MiB
 ; machine takes. That is what left the image 16 bytes under its ceiling.
 ;
-; Rounded up to a page: PD (1 page) + 6 PT (6 pages) = 0x7000, plus up to 0xFF0
+; Rounded up to a page: PD (1 page) + 16 PT (16 pages) = 0x11000, plus up to 0xFF0
 ; of page-rounding slack. `pd_lin` is round_up_4k(base + tables), and the load
 ; base is only paragraph-aligned, so keeping TABLES_OFF itself 4096-aligned
 ; makes (base + tables) mod 4096 equal base mod 4096, which caps the round-up at
@@ -3385,7 +3442,7 @@ tables            equ $$ + TABLES_OFF
 
 ; Nothing zero-fills this region any more. DOS used to do it incidentally, by
 ; loading a file that was long enough to cover it; now the file ends at
-; `resident_core_end`. `pm_init`'s `rep stosd` over exactly 0x7000 bytes at
+; `resident_core_end`. `pm_init`'s `rep stosd` over exactly 0x11000 bytes at
 ; `pd_lin` is therefore the ONLY thing that clears the tables, which makes it a
 ; load-bearing invariant rather than belt and braces. Anything added here that
 ; expects to start zeroed must zero itself.
@@ -3414,7 +3471,7 @@ tables            equ $$ + TABLES_OFF
 %endif
 
 ; The fallback break is reported as a paragraph count, `IMAGE_END_OFF >> 4`, and
-; a shift truncates in silence. It is exact only because 0x7000 + 0xFF0 is a
+; a shift truncates in silence. It is exact only because 0x11000 + 0xFF0 is a
 ; multiple of 16. Widening the slack to 0xFFF, which is the very edit the
 ; comment on TABLES_OFF warns about, would under-reserve by 15 bytes with no
 ; diagnostic anywhere.

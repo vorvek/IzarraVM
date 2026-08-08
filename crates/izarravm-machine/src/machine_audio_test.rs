@@ -1335,7 +1335,7 @@ fn approximate_class_delivers_pit_irq0_during_long_compute_stretches() {
         rom_with_code(&code),
     )
     .unwrap();
-    machine.set_mode(GswMode::Gsw586); // Approximate class, 200 MHz
+    machine.set_mode(GswMode::Gsw586); // Approximate class, 166 MHz
     // IRQ0 handler at 0x0700: inc word [0x7000]; mov al,0x20; out 0x20,al; iret.
     let handler: [u8; 9] = [0xff, 0x06, 0x00, 0x70, 0xb0, 0x20, 0xe6, 0x20, 0xcf];
     for (i, &b) in handler.iter().enumerate() {
@@ -1346,8 +1346,8 @@ fn approximate_class_delivers_pit_irq0_during_long_compute_stretches() {
     machine.write_physical_u8(0x21, 0x07);
     machine.write_physical_u8(0x22, 0x00);
     machine.write_physical_u8(0x23, 0x00);
-    // ~20 periods of 4096 PIT ticks at 200 MHz (~686.6k clocks each).
-    machine.run_cycles(14_000_000).unwrap();
+    // ~20 periods of 4096 PIT ticks at 166 MHz (~569.9k clocks each).
+    machine.run_cycles(11_600_000).unwrap();
     let ticks = u16::from(machine.read_physical_u8(0x7000))
         | (u16::from(machine.read_physical_u8(0x7001)) << 8);
     assert!(

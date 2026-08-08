@@ -6,14 +6,15 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
-// Stock files from the release immediately before the guest CD-ROM stack. Keep
-// these exact: they are a one-version migration key, not configuration templates.
+// Stock files from the release immediately before the styled init screen (the
+// last version with a plain, unstyled CONFIG.SYS/AUTOEXEC.BAT). Keep these
+// exact: they are a one-version migration key, not configuration templates.
 pub(super) const PREVIOUS_STOCK_CONFIG_SYS: &[u8] = b"FILES=40\r\nLASTDRIVE=D\r\n\
-DEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\nDOS=HIGH,UMB\r\n\
+DEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\nDOS=HIGH,UMB\r\nDEVICEHIGH=C:\\DOS\\TOKACD.SYS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n";
 pub(super) const PREVIOUS_STOCK_AUTOEXEC_BAT: &[u8] =
     b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n\
-SET BLASTER=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
+SET BLASTER=A220 I7 D1 H5 P300 T6\r\nIZCDEX /I /D:TOKACD01 /L:D /Q\r\nLH TOKAMOUS\r\n";
 
 const STOCK_SB_IRQS: &[u8] = &[2, 5, 7, 10];
 const STOCK_SB_DMA8: &[usize] = &[0, 1, 3];

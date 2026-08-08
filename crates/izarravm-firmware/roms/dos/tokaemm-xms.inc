@@ -192,7 +192,7 @@ xf_query_free_any:
     retf
 
 ; 89h allocate ANY extended memory block (XMS 3.0): EDX=KB in -> DX=handle.
-; The arena is clamped to what arena_bmp indexes (ARENA_GRANULES, ~22.75 MB),
+; The arena is clamped to what arena_bmp indexes (ARENA_GRANULES, 63 MB),
 ; so any request whose KB count does not fit a 16-bit DX cannot be satisfiable;
 ; refuse it as "not enough memory" and otherwise hand straight to 09h, which is
 ; the same allocator. Returning through xf_alloc keeps ONE allocation path.
@@ -538,7 +538,7 @@ slot_of:
 arena_alloc:
     push bx
     push cx
-    push dx
+    push edx                      ; the probe zero-extends into EDX now
     push si
     push di
     jcxz .empty
@@ -554,12 +554,12 @@ arena_alloc:
     jc .none
     cmp ax, [cs:arena_granules]
     ja .none
-    mov dx, si                    ; probe [si, si+cx)
-    mov bx, cx
-.probe:
-    bt word [cs:arena_bmp], dx
+    movzx edx, si                 ; probe [si, si+cx); dword BT: granule
+    mov bx, cx                    ; indices pass 32767 on the 64 MB machine and
+.probe:                           ; the word form treats them as signed
+    bt dword [cs:arena_bmp], edx
     jc .busy
-    inc dx
+    inc edx
     dec bx
     jnz .probe
     mov ax, si
@@ -579,7 +579,7 @@ arena_alloc:
 .out:
     pop di                        ; POP leaves the flags alone, so CF survives
     pop si
-    pop dx
+    pop edx
     pop cx
     pop bx
     ret
@@ -588,35 +588,37 @@ arena_alloc:
 ; Bumps arena_gen (D1): every query cache is invalid the instant the bitmap
 ; changes, and this is one of the two 16-bit-side places it does.
 arena_mark:
-    push ax
+    push eax
     push cx
     jcxz .done
+    movzx eax, ax                 ; dword BT forms: see arena_alloc's probe
 .next:
-    bts word [cs:arena_bmp], ax
-    inc ax
+    bts dword [cs:arena_bmp], eax
+    inc eax
     dec cx
     jnz .next
     inc dword [cs:arena_gen]
 .done:
     pop cx
-    pop ax
+    pop eax
     ret
 
 ; Release CX granules from granule AX. Preserves every register. Bumps
 ; arena_gen (D1); see arena_mark.
 arena_release:
-    push ax
+    push eax
     push cx
     jcxz .done
+    movzx eax, ax                 ; dword BT forms: see arena_alloc's probe
 .next:
-    btr word [cs:arena_bmp], ax
-    inc ax
+    btr dword [cs:arena_bmp], eax
+    inc eax
     dec cx
     jnz .next
     inc dword [cs:arena_gen]
 .done:
     pop cx
-    pop ax
+    pop eax
     ret
 
 ; Free space for allocation type BL. out: AX = largest free run, DX = total

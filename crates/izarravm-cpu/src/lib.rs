@@ -3491,7 +3491,7 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 /// floor), so this dial only trims the compute share. Dhrystone (the PRIMARY
 /// oracle) is a fetch+data mix split roughly compute/bus; these values plus
 /// `bus_timing` seat all four modes' Dhrystones/sec on the owner's authoritative
-/// era targets (386 ~9200, 486 ~61000, 586 ~475000) to within ~0.3%.
+/// era targets (386 ~9200, 486 ~61000, 586 ~250000 at 166 MHz) to within ~0.3%.
 ///
 /// fp-mandel TRADE-OFF: fp-mandel is x87-compute-bound (~7280 instruction clocks
 /// vs ~6247 bus per pixel), so it rides this dial. Dhrystone pinned to its owner
@@ -3609,7 +3609,16 @@ pub const fn bus_timing(persona: CpuPersona) -> (u32, u32) {
     match persona {
         CpuPersona::I386 => (23, 31),
         CpuPersona::I486 => (1, 3),
-        CpuPersona::I586 => (7, 30),
+        // Recalibrated for the 166 MHz / 64 MB P100 SDRAM spec (2026-08-08):
+        // 7/30 was seated on the 200 MHz Dhrystone target; the P100 memory
+        // subsystem cheapens the whole bus portion so Quake demo1 lands on the
+        // ~41 fps anchor at the lower clock. Solved jointly with the mode 13h
+        // video wait-state (75 -> 147) against the two-game linear model
+        // fitted from three measured configs on 2026-08-08 (guest-time shares:
+        // doom = 0.17 compute + 0.33 nonvideo-bus + 0.50 VGA; quake = 0.535 +
+        // 0.400 + 0.064), landing doom-586 on ~1001 realtics (74.6 fps) and
+        // quake demo1 on ~41.2 fps.
+        CpuPersona::I586 => (16, 105),
     }
 }
 

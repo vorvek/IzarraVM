@@ -52,7 +52,7 @@ fn table_has_the_exact_four_profiles_in_rank_order() {
             canonical_name: "586",
             rank: 3,
             register_code: 2,
-            clock: ClockRate::from_hz(200_000_000),
+            clock: ClockRate::from_hz(166_000_000),
             persona: CpuPersona::I586,
             cache: CacheGeometry {
                 l1: L1Cache::Split {

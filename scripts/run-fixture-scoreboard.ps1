@@ -97,7 +97,7 @@ function Get-FixtureTable {
     @(
         [pscustomobject]@{
             name = "doom-486"; folder = "jemmex_doom_c"
-            arguments = @("--cpu", "486", "--memory-mib", "24", "--video", "vega")
+            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]8000000000
             # Guest-reported, so robust to host noise. LOWER realtics is faster.
             realticsMinimum = 2900; realticsMaximum = 3050; gametics = 2134
@@ -105,14 +105,14 @@ function Get-FixtureTable {
         }
         [pscustomobject]@{
             name = "doom-586"; folder = "jemmex_doom_c"
-            arguments = @("--cpu", "586", "--memory-mib", "24", "--video", "vega")
-            cycles = [uint64]8000000000
-            realticsMinimum = 820; realticsMaximum = 850; gametics = 2134
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            cycles = [uint64]6640000000
+            realticsMinimum = 970; realticsMaximum = 1040; gametics = 2134
             qconsole = $false; resultPpm = $false; injection = @()
         }
         [pscustomobject]@{
             name = "quake-586"; folder = "quake_c"
-            arguments = @("--cpu", "586", "--memory-mib", "24", "--video", "vega")
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]6200000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             # QCONSOLE.LOG is the invariant. perf.instructions is NOT one: the
@@ -122,9 +122,9 @@ function Get-FixtureTable {
         }
         [pscustomobject]@{
             name = "prince-486"; folder = "prince_c"
-            # 486 for cost, not compatibility. A 1989 game does not need 200 MHz,
+            # 486 for cost, not compatibility. A 1989 game does not need 166 MHz,
             # and at 66 MHz the same guest time costs a third of the cycles.
-            arguments = @("--cpu", "486", "--memory-mib", "24", "--video", "vega")
+            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]4000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true
@@ -136,21 +136,21 @@ function Get-FixtureTable {
         }
         [pscustomobject]@{
             name = "wolf3d-486"; folder = "wolf3d_c"
-            arguments = @("--cpu", "486", "--memory-mib", "24", "--video", "vega")
+            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]4000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; injection = @()
         }
         [pscustomobject]@{
             name = "wolf3d-586"; folder = "wolf3d_c"
-            arguments = @("--cpu", "586", "--memory-mib", "24", "--video", "vega")
-            cycles = [uint64]4000000000
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            cycles = [uint64]3320000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; injection = @()
         }
         [pscustomobject]@{
             name = "duke3d-486"; folder = "duke3d_c"
-            arguments = @("--cpu", "486", "--memory-mib", "24", "--video", "vega")
+            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]7920000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; injection = @()
@@ -160,8 +160,8 @@ function Get-FixtureTable {
             # The most expensive fixture in the set at roughly 12 minutes, and
             # currently the one furthest below real time, which is why it is the
             # workload the campaign's merge rule protects.
-            arguments = @("--cpu", "586", "--memory-mib", "24", "--video", "vega")
-            cycles = [uint64]24000000000
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            cycles = [uint64]19920000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; injection = @()
         }
@@ -169,23 +169,23 @@ function Get-FixtureTable {
             name = "nascar-586"; folder = "nascar1_c"
             # No --video: PROTOCOL.md's recorded invocation omits it and the
             # invariant hash was measured that way.
-            arguments = @("--cpu", "586", "--memory-mib", "32")
-            cycles = [uint64]6000000000
+            arguments = @("--cpu", "586", "--memory-mib", "64")
+            cycles = [uint64]4980000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; injection = @()
         }
         [pscustomobject]@{
             name = "gp2-586"; folder = "gp2_c"
-            arguments = @("--cpu", "586", "--memory-mib", "32")
-            cycles = [uint64]16000000000
+            arguments = @("--cpu", "586", "--memory-mib", "64")
+            cycles = [uint64]13280000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true
             # Three clicks: credits OK, Quickrace, Select Circuit OK. GP2 sets
             # its own INT 33h ratio and is 1 pixel per mickey on BOTH axes,
             # which is NOT the TOKAMOUS default.
-            injection = @("--inject-mouse", ("4000000000:home;4400000000:move:320,386;" +
-                "4800000000:click;5600000000:move:0,-115;6200000000:click;" +
-                "7200000000:move:-273,181;7800000000:click"))
+            injection = @("--inject-mouse", ("3320000000:home;3652000000:move:320,386;" +
+                "3984000000:click;4648000000:move:0,-115;5146000000:click;" +
+                "5976000000:move:-273,181;6474000000:click"))
         }
     )
 }

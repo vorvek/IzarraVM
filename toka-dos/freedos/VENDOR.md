@@ -28,9 +28,111 @@ Neither tag has git submodules. (Upstream master has since diverged: kernel 2045
 - Local patch: `shsucdx.nsm` marks the altered source and changes only visible
   product strings from SHSUCDX to IZCDEX. The SHSUCDX v3 installation signature,
   feature set, command-line interface, and DOS redirector behavior stay intact.
+- Boot-screen restyle (2026), each site commented "modified by the Toka-DOS
+  project, 2026" in `shsucdx.nsm`:
+  - Adds a `/T` command-line option (`Options` dispatch table, kept in the
+    table's required ascending-ASCII order between `/S` and `/U`; `OptT`
+    near `OptV`) that sets a new transient BSS flag, `TreeMode`, following
+    the existing `/Q`/`QuietFlag` pattern. `/T` prefixes the install line
+    with the same CP437 tree glyph (`0xC3 0xC4 '>' ' '`) the kernel boot
+    tree and TOKAEMM/TOKAMOUS's own `/T` already use.
+  - Drops the install-time copyright/sign-on banner print (`CopyrightMsg`,
+    "take advantage of the photo op" in `Begin`) -- the 25-row boot-screen
+    budget has no room for it. `CopyrightMsg` itself is untouched and still
+    prints for `/?` (`DisplayHelp`); the file header (top of `shsucdx.nsm`)
+    still credits Jason Hood and, for the original v1.4b, John H. McCoy;
+    and the project's `NOTICE` (SHSUCDX line) is assembled verbatim into
+    `C:\LICENSE.TXT` by `scripts/license_txt.py`, so attribution stays
+    user-visible through three independent paths, not only the banner that
+    was removed. `QuietFlag` (backing plain `/Q`) has no other reader now,
+    so plain `/Q` becomes visually equivalent to no `/Q` at all -- the
+    option is kept, not removed, for command-line compatibility; its
+    `HelpMsg` line is reworded to say so instead of the now-false "don't
+    display sign-on banner" (`/Q+` and `/QQ`'s lines are unchanged and
+    still accurate).
+  - Replaces the fresh-install display (old: `DrivesInstalled`, "IZCDEX
+    installed." on its own line, then `DisplayDrives` printing a blank
+    line, `Drive  Driver   Unit` header, and one fixed-width row per
+    drive) with a single restyled line, emitted by a new
+    `DisplayInstallLine` routine (next to `DisplayDrives`): optional
+    tree-glyph prefix, then `IZCDEX installed. Assigned [n] drive(s): `,
+    then a space-separated `[name letter:]` entry per assigned drive, then
+    CRLF. `DrivesInstalled` lost its only caller (the removed `Output
+    DrivesInstalled` call in `Begin`) and is now unreferenced transient
+    data; left in place rather than deleted, per this being vendored
+    source in an already-discarded-after-install region.
+    `DisplayInstallLine` reuses the file's own
+    `MsgOut`/`Output`/`dz`/`dln`/`dlz` print plumbing and the same
+    self-modified-template technique `DriveLine` and `DrivesAvail`
+    already use for their per-drive/per-count fields: a single ASCII
+    digit written in place (`mov`, not `DrivesAvail`'s `add` -- the digit
+    is written unconditionally once per run either way, but `mov` stays
+    idempotent if this shape is ever called more than once, which matters
+    once a later task copies it), and a `[name letter:]` template whose
+    8-byte driver-name field and drive letter are overwritten in place
+    per entry. `EntrySeen` (new install-transient BSS scratch flag) only
+    tracks whether a separating space is needed before the next entry;
+    it plays no part in the name/letter overwrite itself. Two drives fit
+    comfortably in 80 columns; 3+ simultaneously-assigned drives would
+    wrap and are accepted as-is (commented in `shsucdx.nsm`), since the
+    stock `LASTDRIVE=D` config caps a single `/D:` invocation to one
+    drive. Only the genuine fresh-install path changes: the
+    already-resident add-drives/remove-drives paths and the `/Q+`
+    compact per-drive-letter display still go through the original
+    `DisplayDrives`, unchanged.
+  - `HelpMsg` (`/?`) gains a synopsis `[/T]` and one description line for
+    the new option.
 
 ## Local patches applied to the vendored source
-- Rebrand (Toka-DOS 3.0): kernel `hdr/version.h` (KVS banner), `kernel/main.c` (Toka signon banner, "General Simulation Works", tongue-in-cheek; the verbose FreeDOS/Villani copyright + GPL block was removed from the boot banner and replaced by a "See C:\LICENSE.TXT for more." pointer. The full GPL/copyright is preserved verbatim in C:\LICENSE.TXT, assembled by `scripts/license_txt.py` from the project NOTICE + kernel `COPYING` and shipped on the Katea C: payload); FreeCOM `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng` (product strings; GPL/copyright preserved). Each edited file carries a "modified by the Toka-DOS project, 2026" note.
+- Rebrand (Toka-DOS 3.0): kernel `kernel/hdr/version.h` (KVS banner; also adds
+  the `TOKA_BUILD_LINE_*` welcome-box strings -- `KERNEL_VERSION_STRING`/
+  `os_release` themselves are untouched), `kernel/kernel/init-mod.h`
+  (boot-screen styling constants -- `TOKA_BOX_W`, `TOKA_TREE_PREFIX`, and
+  their derived `TOKA_BOX_INNER_W`/`TOKA_BOX_TEXT_END`/`TOKA_BOX_TEXT_W` --
+  shared between `main.c` and `initdisk.c` within kernel-init only; userland
+  `/T` tools will each carry their own copy of the prefix bytes -- kernel-init
+  is not meant to be a project-wide single source), `kernel/kernel/main.c`
+  (`signon()` rewritten: a rainbow TOKA logo via direct text-RAM writes, a
+  CP437 welcome box (merged title line with build number + compile date, plus
+  an Izarra SL copyright line naming LICENSE.TXT, shipped at C:\LICENSE.TXT),
+  and a tree-styled kernel-compatibility line, all inside the kernel's 25-row
+  boot budget; the verbose FreeDOS/Villani copyright + GPL block that used to
+  print on the boot banner was removed and replaced by the "See LICENSE.TXT
+  for more." pointer -- the full GPL/copyright is preserved verbatim in
+  C:\LICENSE.TXT, assembled by `scripts/license_txt.py`
+  from the project NOTICE + kernel `COPYING` and shipped on the Katea C:
+  payload; the compiler `#if` chain that picked the banner's compiler name is
+  narrowed to Watcom-only, the upstream BORLANDC/TURBOC/MSC/GNUC arms removed
+  -- Toka-DOS only ships a Watcom build, so this is a deliberate upstream
+  divergence, not dead-code drift), `kernel/kernel/initdisk.c` (the
+  drive-assignment line restyled to match the boot tree -- one
+  `TOKA_TREE_PREFIX`-led line per unit, the Pri/Ext partition tag and CHS
+  geometry dropped per the boot-screen spec; the unterminated `" - InitDisk"`
+  progress fragment `dsk_init()` used to print ahead of it was also dropped,
+  since the styled screen has no free row for it to dangle on); FreeCOM
+  `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng`
+  (product strings; GPL/copyright preserved); FreeCOM
+  `shell/init.c` -- startup banner suppressed (silent start for the
+  Toka-DOS boot tree); VER unchanged. Each edited file carries a
+  "modified by the Toka-DOS project, 2026" note.
+- Idle CPU behavior (predates the boot-screen campaign, missing from this
+  ledger until now): kernel `kernel/kernel/config.c` (the `SHELL=` default
+  changed from upstream's bare `command.com` to the full
+  `C:\DOS\COMMAND.COM` path with tail ` C:\DOS /P /E:256`, ~line 138/156, so
+  the F5 config-bypass load points at the same interpreter and directory as
+  the shipped CONFIG.SYS `SHELL=` line and finds itself in `C:\DOS` too --
+  the switches differ, though: the built-in default keeps upstream's
+  `/E:256`, while the shipped CONFIG.SYS asks for `/E:2048`, so an F5 boot
+  still gets a smaller 256-byte environment; the `IDLEHALT` default changed
+  from 0 to 1 at
+  ~line 844, "safe hooks" halt-on-CON-wait behavior, safe here because
+  IzarraVM ships its own CPU and does not have the power-draw-transient
+  hardware class upstream's off-by-default is guarding against; a new
+  `idle_hlt()` inline-asm pragma at ~line 1045 wraps HLT in PUSHF/STI/POPF;
+  the CON character-input wait loop at ~line 1061 calls it) and
+  `kernel/kernel/main.c` (`HaltCpuWhileIdle` initialized to 1 at ~line 295,
+  ahead of CONFIG.SYS parsing, matching the config.c default so the window
+  between kernel entry and CONFIG.SYS is not spent busy-waiting either).
 - Build fix: FreeCOM `shell/wlinker.bat` adds `op caseexact`. Open Watcom 2.0's wlink defaults to case-insensitive symbol resolution, which collides FreeCOM's libc toupper_/tolower_ with its own toUpper_/toLower_ (infinite recursion at the first console char-translation). Required for a working shell.
 - Build target: kernel built XCPU=86 XFAT=32 (8086 + FAT32 => DOS 7.10), no UPX. XCPU=386 is NOT usable (emits 386 opcodes, e.g. PUSH FS, the emulator lacks).
 - Toka-DOS changes the default `DIR` sort order. Upstream FreeCOM lists entries
@@ -77,17 +179,16 @@ Rebrand: move src/version.h + move.c product-name string; sort src/sort.c banner
   `/DEBUG` still work by themselves. MEM also identifies the HMA resident as
   Toka-DOS instead of the upstream FreeDOS product name.
 - Toka-DOS replaces the default summary with a four-line, 79-column map for
-  conventional, upper, EMS, and XMS memory. The kinds appear consecutively
-  with BIOS attributes `0x09` (light blue), `0x0B` (light cyan), `0x0D`
-  (light magenta), and `0x0A` (light green). CP437 `B2` marks used memory and
-  CP437 `B0` marks free memory within each colored range. MEM uses 640 KiB
-  conventional and 384 KiB upper categories. TOKAEMM supplies the 3 MiB EMS
-  and 20 MiB XMS category sizes through its private XMS query on the 24 MiB
-  machine. The upper region includes video memory and ROMs; only 96 KiB is
+  conventional, upper, and extended memory. The kinds appear consecutively
+  with BIOS attributes `0x09` (light blue), `0x0B` (light cyan), and `0x0A`
+  (light green). CP437 `B2` marks used memory and CP437 `B0` marks free
+  memory within each colored range. MEM uses 640 KiB conventional and 384 KiB
+  upper categories. TOKAEMM supplies the single shared 63 MiB extended
+  category through its private XMS query on the 64 MiB machine; XMS, VCPI,
+  and EMS all draw from that one pool, so there is no separate EMS row or
+  partition. The upper region includes video memory and ROMs; only 96 KiB is
   available for UMB allocation with the default EMS frame, or 160 KiB under
-  `NOEMS`. EMS has its own top-of-RAM partition. Standard XMS blocks use up to
-  2 MiB and VCPI owns the rest of the extended category. Under `NOEMS`, the
-  EMS category becomes zero and the extended category grows to 23 MiB.
+  `NOEMS`.
   TOKAEMM's versioned private query returns free VCPI memory so MEM can add it
   to standard XMS free space. The MEM executable and driver must be rebuilt
   and shipped together. Pairing an older MEM with the new driver is safe, but
@@ -193,12 +294,25 @@ involved.
 
 ### Layout note
 
-All eighteen files (kernel/shell/config plus the userland tool set) live flat
-in the C:\ root; `scripts/build-freedos-hdd-image.py` has no subdirectory
-support (the FAT32 builder only ever writes a root directory and per-file
-cluster chains, no nested directory entries), so a `C:\DOS` layout was not
-attempted for this batch. The root directory itself needed a fix to become a
-proper multi-cluster chain (previously hardcoded to exactly cluster 2, which
-held at most 16 entries at this image's 1-sector-per-cluster geometry) to fit
-past the audit item 10 (MEM) baseline of 12 files; `CONFIG.SYS`/`AUTOEXEC.BAT`
-already point `PATH` at `C:\`, so no PATH change was needed.
+`scripts/build-freedos-hdd-image.py` builds a `C:\DOS` subdirectory -- the
+`dos_files` list (:385) is sized into
+`dos_first`/`dos_entries`/`dos_clusters` (:458-461) and linked into the root
+via the hardcoded `dir_entry(name11("DOS"), dos_first, 0, ATTR_SUBDIR)`
+(:470) -- and the current image uses it. The root holds KERNEL.SYS,
+CONFIG.SYS, AUTOEXEC.BAT, LICENSE.TXT, and that DOS subdirectory entry
+itself (5 entries, one cluster). `C:\DOS` holds COMMAND.COM, every
+command-line tool, the two drivers (TOKAEMM.SYS, TOKACD.SYS), and
+HELLO.TXT -- everything else in the eighteen-plus-file set above, not just
+the command-line tools. `CONFIG.SYS`'s `SHELL=` and `AUTOEXEC.BAT`'s `PATH`
+both point at `C:\DOS` (see `kernel/kernel/config.c`'s built-in `SHELL=`
+default in the "Idle CPU behavior" entry above, which points at the same
+interpreter and directory -- its switches differ, see that entry).
+
+Historical: the root directory once needed a fix to become a proper
+multi-cluster chain (previously hardcoded to exactly cluster 2, which held
+at most 16 entries at this image's 1-sector-per-cluster geometry) to fit
+past the audit item 10 (MEM) baseline of 12 files. That fix predates the
+`C:\DOS` subdirectory work and is no longer load-bearing for the root itself:
+now that the command-line tools and drivers live in `C:\DOS`, the shipped
+root is back down to 5 entries (a single cluster) and `C:\DOS` -- with its
+20 files plus `.`/`..` -- is the multi-cluster chain instead.

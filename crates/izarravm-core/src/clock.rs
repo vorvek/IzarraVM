@@ -9,8 +9,9 @@ pub struct ClockRate {
 }
 
 /// Fixed machine-timeline frequency. Every supported GSW CPU clock is an
-/// integer number of these ticks.
-pub const MASTER_CLOCK_HZ: u64 = 6_600_000_000;
+/// integer number of these ticks: 166 MHz x 33, 66 MHz x 83, 22 MHz x 249,
+/// and 22/3 MHz x 747.
+pub const MASTER_CLOCK_HZ: u64 = 5_478_000_000;
 
 const fn saturating_u64(value: u128) -> u64 {
     if value > u64::MAX as u128 {

@@ -619,13 +619,16 @@ function Get-WorkloadPolicy([string]$Name) {
             return [pscustomobject][ordered]@{
                 name = $Name
                 mode = "586"
-                cycle_budget = [uint64]8000000000
-                # Baseline measures rt 0.911-0.961, coverage 93.22%, realtics
-                # 826 all six samples.
-                minimum_real_time_factor = 0.87
+                cycle_budget = [uint64]6640000000
+                # PROVISIONAL bands for the 166 MHz / 64 MB spec change: the old
+                # 200 MHz baseline measured rt 0.911-0.961, realtics 826. Wall
+                # shrinks ~17% at the same guest span, so rt rises ~x1.2, and
+                # realtics scale by 200/166. Re-derive from the first accepted
+                # baseline on the new spec.
+                minimum_real_time_factor = 0.95
                 minimum_direct_native_coverage = 0.92
-                minimum_realtics = 820
-                maximum_realtics = 850
+                minimum_realtics = 970
+                maximum_realtics = 1040
             }
         }
         "quake-586" {
@@ -2312,7 +2315,7 @@ function Invoke-Observation(
     Remove-Item -LiteralPath $jsonPath -Force -ErrorAction SilentlyContinue
     $processArguments = @(
         "--cpu", $Policy.mode,
-        "--memory-mib", "24",
+        "--memory-mib", "64",
         "--video", "vega",
         "--hdd-folder", $fixture,
         "--cycles", $Policy.cycle_budget.ToString(),

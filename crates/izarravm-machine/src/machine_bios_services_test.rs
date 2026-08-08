@@ -2790,7 +2790,7 @@ fn timeline_tracks_the_active_mode_without_reinterpreting_elapsed_time() {
     )
     .unwrap();
     assert_eq!(machine.active_mode(), GswMode::Gsw386);
-    assert_eq!(machine.timeline.ticks_per_cpu_clock(), 300);
+    assert_eq!(machine.timeline.ticks_per_cpu_clock(), 249);
     machine.advance_devices_clocks(1);
     let before = machine.master_ticks();
     machine.set_mode(GswMode::Gsw586);
@@ -2799,7 +2799,7 @@ fn timeline_tracks_the_active_mode_without_reinterpreting_elapsed_time() {
     assert_eq!(machine.master_ticks(), before);
     machine.set_mode(GswMode::Gsw386Slow);
     assert_eq!(machine.active_mode(), GswMode::Gsw386Slow);
-    assert_eq!(machine.timeline.ticks_per_cpu_clock(), 900);
+    assert_eq!(machine.timeline.ticks_per_cpu_clock(), 747);
     assert_eq!(machine.master_ticks(), before);
 }
 

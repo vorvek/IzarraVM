@@ -77,7 +77,7 @@ starts at the offset in `DISP_START` (0 by default). Memory above the visible
 surface is free for offscreen work: blit sources, cached fonts, and saved screen
 regions.
 
-The frame buffer and register block sit above the 24 MB of system memory, so
+The frame buffer and register block sit above the 64 MB of system memory, so
 they are reached from protected or flat mode. Real mode code uses mode 13h or
 the legacy VGA aperture.
 

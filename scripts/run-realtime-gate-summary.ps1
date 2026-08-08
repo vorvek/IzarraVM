@@ -890,7 +890,7 @@ function Get-BackendWorkloadSummary(
         mode = $Policy.mode
         configuration = [ordered]@{
             cpu_mode = $Policy.mode
-            memory_mib = 24
+            memory_mib = 64
             video = "vega"
             cycle_budget = $Policy.cycle_budget
         }
@@ -1176,7 +1176,7 @@ function Get-TrackMWorkloadSummary(
         mode = $Policy.mode
         configuration = [ordered]@{
             cpu_mode = $Policy.mode
-            memory_mib = 24
+            memory_mib = 64
             video = "vega"
             cycle_budget = $Policy.cycle_budget
             cycle_budget_policy = "safety ceiling; semantic completion and TestExit code 0 are required"
@@ -1682,7 +1682,7 @@ function Get-PollSkipWorkloadSummary(
         mode = $Policy.mode
         configuration = [ordered]@{
             cpu_mode = $Policy.mode
-            memory_mib = 24
+            memory_mib = 64
             video = "vega"
             cycle_budget = $Policy.cycle_budget
             required_timedemo = "2134 gametics and exactly 828 realtics"

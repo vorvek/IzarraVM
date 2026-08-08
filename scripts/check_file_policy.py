@@ -84,12 +84,111 @@ SOURCE_CODE_SUFFIXES = {
 }
 SOURCE_CODE_NAMES = {"makefile"}
 
-# Line ceilings. Large focused files are fine here; the limits exist to catch
-# runaway growth, not to force splitting a hot module. Keep code free of
-# duplication and do not shred logic into tiny indirection layers to fit:
-# this codebase optimizes for performance and locality, not layer count.
+# Line ceilings, counted on CODE lines only: comment-only lines are free, so a
+# well-documented module is never pushed over the edge by its documentation.
+# Large focused files are fine here; the limits exist to catch runaway growth,
+# not to force splitting a hot module. Keep code free of duplication and do not
+# shred logic into tiny indirection layers to fit: this codebase optimizes for
+# performance and locality, not layer count. Dense, long systems still deserve
+# their own files along with their tests.
 SOURCE_LINE_LIMIT = 5000
 TEST_LINE_LIMIT = 7000
+
+# Comment syntax per suffix for the code-line count: (line prefixes, block pairs).
+HASH_COMMENTS = ((("#",), ()),)
+C_COMMENTS = ((("//",), (("/*", "*/"),)),)
+ASM_COMMENTS = (((";",), ()),)
+COMMENT_SYNTAX = {
+    ".rs": C_COMMENTS[0],
+    ".js": C_COMMENTS[0],
+    ".jsx": C_COMMENTS[0],
+    ".ts": C_COMMENTS[0],
+    ".tsx": C_COMMENTS[0],
+    ".c": C_COMMENTS[0],
+    ".cc": C_COMMENTS[0],
+    ".cpp": C_COMMENTS[0],
+    ".cxx": C_COMMENTS[0],
+    ".h": C_COMMENTS[0],
+    ".hh": C_COMMENTS[0],
+    ".hpp": C_COMMENTS[0],
+    ".hxx": C_COMMENTS[0],
+    ".m": C_COMMENTS[0],
+    ".ld": ((), (("/*", "*/"),)),
+    ".rc": C_COMMENTS[0],
+    ".asm": ASM_COMMENTS[0],
+    ".inc": ASM_COMMENTS[0],
+    ".nas": ASM_COMMENTS[0],
+    ".s": ((";", "#"), (("/*", "*/"),)),
+    ".py": HASH_COMMENTS[0],
+    ".pl": HASH_COMMENTS[0],
+    ".pm": HASH_COMMENTS[0],
+    ".sh": HASH_COMMENTS[0],
+    ".mk": HASH_COMMENTS[0],
+    ".mak": HASH_COMMENTS[0],
+    ".ps1": (("#",), (("<#", "#>"),)),
+    ".bat": (("rem ", "rem\t", "::"), ()),
+    ".cmd": (("rem ", "rem\t", "::"), ()),
+    ".btm": (("rem ", "rem\t", "::"), ()),
+}
+
+
+def code_line_count(lines: list[str], path: str) -> int:
+    """Count lines that carry code: comment-only lines are excluded.
+
+    A line is a comment line when it is inside a block comment, or its stripped
+    text starts with a line-comment marker, or it starts a block comment and
+    nothing follows the closer on the closing line. Markers inside string
+    literals mid-line never start block state because only lines BEGINNING with
+    the opener enter it; the rare miss counts the line as code, which errs
+    toward the stricter side of the gate.
+    """
+    item = PurePosixPath(path)
+    syntax = COMMENT_SYNTAX.get(item.suffix.lower())
+    if syntax is None and item.name.lower() in SOURCE_CODE_NAMES:
+        syntax = HASH_COMMENTS[0]
+    if syntax is None:
+        return len(lines)
+    line_prefixes, block_pairs = syntax
+    count = 0
+    closer: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if closer is not None:
+            end = stripped.find(closer)
+            if end < 0:
+                continue
+            rest = stripped[end + len(closer) :].strip()
+            closer = None
+            if rest:
+                count += 1
+            continue
+        if line_prefixes and lowered.startswith(tuple(line_prefixes)):
+            continue
+        opened = False
+        for opener, block_closer in block_pairs:
+            if stripped.startswith(opener):
+                tail = stripped[len(opener) :]
+                end = tail.find(block_closer)
+                while end >= 0:
+                    rest = tail[end + len(block_closer) :].strip()
+                    if not rest.startswith(opener):
+                        break
+                    tail = rest[len(opener) :]
+                    end = tail.find(block_closer)
+                if end < 0:
+                    closer = block_closer
+                    opened = True
+                else:
+                    rest = tail[end + len(block_closer) :].strip()
+                    if rest:
+                        count += 1
+                    opened = True
+                break
+        if opened:
+            continue
+        count += 1
+    return count
 
 
 def tracked_files() -> list[str]:
@@ -255,8 +354,11 @@ def main() -> int:
             errors.append(f"{path}: missing exact GPL-3.0-only header")
         if path not in GENERATED_TEXT and is_source_code(path):
             limit = TEST_LINE_LIMIT if is_test_file(path) else SOURCE_LINE_LIMIT
-            if len(lines) > limit:
-                errors.append(f"{path}: {len(lines)} lines exceeds the {limit}-line limit")
+            code_lines = code_line_count(lines, path)
+            if code_lines > limit:
+                errors.append(
+                    f"{path}: {code_lines} code lines exceeds the {limit}-line limit"
+                )
         if PurePosixPath(path).suffix.lower() == ".rs" and not is_test_file(path):
             if test_attribute.search(text):
                 errors.append(f"{path}: inline test body belongs in a *_test.rs file")

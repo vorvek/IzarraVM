@@ -24,10 +24,10 @@ fn rational_budget_overflow_saturates() {
 #[test]
 fn master_clock_exactly_represents_every_gsw_rate() {
     for (rate, expected) in [
-        (ClockRate::from_hz(200_000_000), 33),
-        (ClockRate::from_hz(66_000_000), 100),
-        (ClockRate::from_hz(22_000_000), 300),
-        (ClockRate::new(22_000_000, 3), 900),
+        (ClockRate::from_hz(166_000_000), 33),
+        (ClockRate::from_hz(66_000_000), 83),
+        (ClockRate::from_hz(22_000_000), 249),
+        (ClockRate::new(22_000_000, 3), 747),
     ] {
         assert_eq!(rate.master_ticks_per_clock(), Some(expected));
         assert_eq!(rate.master_ticks_for_clocks_floor(1), expected);
@@ -39,7 +39,7 @@ fn master_clock_exactly_represents_every_gsw_rate() {
 
 #[test]
 fn master_clock_inverse_uses_the_earliest_causal_clock() {
-    let rate = ClockRate::from_hz(200_000_000);
+    let rate = ClockRate::from_hz(166_000_000);
 
     assert_eq!(rate.clocks_for_master_ticks_floor(32), 0);
     assert_eq!(rate.clocks_for_master_ticks_ceil(32), 1);
