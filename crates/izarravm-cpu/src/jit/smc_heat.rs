@@ -108,6 +108,27 @@ impl SmcHeatMap {
         (first..=last).any(|global_chunk| self.chunk_hot(global_chunk << 4, epoch))
     }
 
+    /// Whether any 16-byte chunk overlapping `[physical, physical + len)` carries a record from
+    /// ANY epoch (count > 0). Read-only and non-consuming, unlike `take_stale_stamp`: this is
+    /// the disp-lane admission probe, and consuming here would fight `lift_cold_smc_dormant`'s
+    /// recovery contract. A record means the chunk took at least one heat-charged kill (a
+    /// killed block or a narrow decode kill — `note_code_write_inner` bumps on nothing else),
+    /// i.e. the bytes have measured patch history; lane-absorbed patches deliberately stop
+    /// refreshing it, so "no record" stays the steady state of code that never needed lanes.
+    pub(crate) fn has_record_range(&self, physical: u32, len: u32) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let first = physical >> 4;
+        let last = physical.wrapping_add(len - 1) >> 4;
+        (first..=last).any(|global_chunk| {
+            let byte = global_chunk << 4;
+            self.pages
+                .get(&(byte >> 12))
+                .is_some_and(|chunks| chunks[((byte & 0x0fff) >> 4) as usize].1 > 0)
+        })
+    }
+
     /// One-shot recovery probe: true when the chunk at `physical` carries a recorded stamp
     /// (count > 0) from an OLDER epoch, meaning its heat has aged out. Consumes the stamp so a
     /// later non-heat Dormant at the same chunk is never spuriously lifted by ancient history.

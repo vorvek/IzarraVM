@@ -188,6 +188,15 @@ fn guest_store_word(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, value: u32
     .expect("fixture patch store");
 }
 
+/// Seed a heat RECORD (not hotness) for the four bytes at `lane`, the way one real patch of a
+/// decoded instruction leaves one: `note_code_write_inner` bumps the written chunk on every
+/// heat-charged kill. Admission (`disp_lane_for`) requires this measured patch history — a
+/// never-patched load compiles baked, which is the doom-gate cut.
+fn seed_patch_history(cpu: &mut CpuGsw, lane: u32) {
+    cpu.sync_smc_heat();
+    cpu.jit_direct.smc_heat.bump(lane, 4, 0);
+}
+
 /// Compile and install the lane block, and hand back everything a patch-then-run needs.
 fn lane_fixture(disp: u32) -> (CpuGsw, TestBus, jit::direct::BlockId) {
     // The knob is a process-global OnceLock with no test override; a shell that still exports
@@ -200,6 +209,7 @@ fn lane_fixture(disp: u32) -> (CpuGsw, TestBus, jit::direct::BlockId) {
     let mut bus = test_bus(image(disp));
     map_flat_pages(&mut cpu, &mut bus);
     decode_at(&mut cpu, &mut bus, &block_starts());
+    seed_patch_history(&mut cpu, LANE);
     let id = install(&mut cpu, ENTRY, 3);
     assert_eq!(
         cpu.perf_counters().smc_lane_registrations,
@@ -225,6 +235,7 @@ fn disp_lane_load_matches_the_interpreter_across_patches() {
     let mut native_bus = test_bus(image(patches[0]));
     map_flat_pages(&mut native, &mut native_bus);
     decode_at(&mut native, &mut native_bus, &block_starts());
+    seed_patch_history(&mut native, LANE);
     let id = install(&mut native, ENTRY, 3);
 
     let mut interpreter = flat_cpu();
@@ -342,8 +353,9 @@ fn disp_lane_writes_contribute_no_smc_heat() {
 /// This pins the shared choke term (`width == IMM_LANE_WIDTH`) FOR A DISP-FIELD LANE — it is
 /// deliberate duplicate coverage of logic the imm-lane suite already pins, not this slice's
 /// mutation record. The slice's own records are the emit seam (baking the displacement back in
-/// fails the two read-through tests) and the two admission fixtures (`a_disp8_form_takes_no_lane`
-/// for `disp_len == 4`, `a_sib_disp32_form_lanes_at_the_right_offset` for the `len - 4` start).
+/// fails the two read-through tests) and the admission fixtures (`a_disp8_form_takes_no_lane`
+/// for `disp_len == 4`, `a_sib_disp32_form_lanes_at_the_right_offset` for the `len - 4` start,
+/// `a_cold_chunk_load_takes_no_lane` for the heat gate).
 #[test]
 fn word_write_at_the_disp_lane_start_retires_the_block() {
     let (mut cpu, mut bus, id) = lane_fixture(DATA[0].0);
@@ -393,6 +405,9 @@ fn a_disp8_form_takes_no_lane() {
     let mut bus = test_bus(memory);
     map_flat_pages(&mut cpu, &mut bus);
     decode_at(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2, ENTRY + 6]);
+    // Heat seeded where the len-4 arithmetic WOULD put the lane (the opcode byte), so the
+    // refusal below is the disp_len term's doing, not the heat gate's.
+    seed_patch_history(&mut cpu, ENTRY + LOAD_OFFSET);
 
     let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("the block compiles");
     assert_eq!(compilation.span.instructions, 3, "fixture shape changed");
@@ -403,10 +418,14 @@ fn a_disp8_form_takes_no_lane() {
 /// The SIB disp32 shape (`8a 1c 85 dd dd dd dd`, `MOV BL, [EAX*4 + disp32]`, SEVEN bytes with
 /// the displacement at offset 3) — the one admitted encoding whose displacement is NOT two
 /// bytes into the instruction. It pins the `len - 4` lane-start arithmetic: the review's
-/// mutation run replaced it with the fixed `+2` the six-byte fixture cannot distinguish, and
+/// mutation run replaced it with a fixed `+2` the six-byte fixture cannot distinguish, and
 /// every other test stayed green while the emitted code read its address out of the ModRM and
 /// SIB bytes. EAX is zero on entry (`arm` clears the file), so the load resolves to the bare
 /// displacement and the patched-read assertion is the same one the mod-0 fixture makes.
+///
+/// Indexed forms are IN deliberately (iteration 2 cut them and duke3d's whole win vanished —
+/// Build patches these too); what keeps doom's never-patched `[base+disp32]` renderer loads
+/// untaxed is the heat gate, pinned by `a_cold_chunk_load_takes_no_lane` below.
 #[test]
 fn a_sib_disp32_form_lanes_at_the_right_offset() {
     let mut cpu = flat_cpu();
@@ -421,6 +440,9 @@ fn a_sib_disp32_form_lanes_at_the_right_offset() {
     let mut bus = test_bus(memory);
     map_flat_pages(&mut cpu, &mut bus);
     decode_at(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2, ENTRY + 9]);
+    // The lane sits at instruction start + 3, one past where the six-byte form puts it.
+    let sib_lane = ENTRY + LOAD_OFFSET + 3;
+    seed_patch_history(&mut cpu, sib_lane);
     let id = install(&mut cpu, ENTRY, 3);
     assert_eq!(
         cpu.direct_stall_snapshot().disp_lane_registrations,
@@ -428,8 +450,6 @@ fn a_sib_disp32_form_lanes_at_the_right_offset() {
         "the SIB form must take a lane"
     );
 
-    // The lane sits at instruction start + 3, one past where the six-byte form puts it.
-    let sib_lane = ENTRY + LOAD_OFFSET + 3;
     guest_store(&mut cpu, &mut bus, sib_lane, DATA[1].0);
     assert_eq!(cpu.perf_counters().smc_lane_accepts, 1);
 
@@ -446,6 +466,57 @@ fn a_sib_disp32_form_lanes_at_the_right_offset() {
         cpu.registers.ebx(),
         0x300 | u32::from(DATA[1].1),
         "the native load must read through the patched SIB displacement"
+    );
+}
+
+/// The heat gate, pinned from the refusing side: the SAME instruction that takes a lane in
+/// every fixture above compiles BAKED when its displacement bytes carry no heat record. This
+/// is the doom-gate cut made testable — iteration 1 laned every disp32 load unconditionally
+/// and the formal gate failed on doom's never-patched renderer loads (paired RTF 0.978/0.975).
+/// Deleting the `has_record_range` term in `disp_lane_for` makes this fail on the
+/// registration counter.
+#[test]
+fn a_cold_chunk_load_takes_no_lane() {
+    let mut cpu = flat_cpu();
+    let mut bus = test_bus(image(DATA[0].0));
+    map_flat_pages(&mut cpu, &mut bus);
+    decode_at(&mut cpu, &mut bus, &block_starts());
+    // No seed_patch_history: the fixture differs from lane_fixture in exactly that line.
+
+    // The probe is what tracks the key (install refuses an untracked one).
+    let key = jit::direct::key_for(&cpu, ENTRY, true).unwrap();
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("the block compiles");
+    assert_eq!(compilation.span.instructions, 3, "fixture shape changed");
+    assert_eq!(
+        compilation.disp_lane_count(),
+        0,
+        "a never-patched displacement must compile baked (the doom-gate cut)"
+    );
+
+    // And with no lane, the patch a lane would have absorbed retires the block instead — after
+    // which the RECOMPILE picks the lane up, because the kill is exactly what writes the heat
+    // record admission reads. That convergence is the mechanism's whole story in one fixture.
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("the baked block installs");
+    guest_store(&mut cpu, &mut bus, LANE, DATA[1].0);
+    assert_eq!(cpu.perf_counters().smc_lane_accepts, 0);
+    assert!(
+        cpu.jit_direct.block(id).is_none(),
+        "the first patch must retire the baked block"
+    );
+    decode_at(&mut cpu, &mut bus, &block_starts());
+    let recompiled =
+        jit::direct::compile(&mut cpu, ENTRY, true).expect("the block recompiles after the kill");
+    assert_eq!(
+        recompiled.disp_lane_count(),
+        1,
+        "the recompile after the first patch must take the lane"
     );
 }
 
@@ -466,6 +537,9 @@ fn a_prefixed_form_takes_no_lane() {
     let mut bus = test_bus(memory);
     map_flat_pages(&mut cpu, &mut bus);
     decode_at(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2, ENTRY + 9]);
+    // Heat seeded on the prefixed form's disp bytes (instruction start + 3), so the refusal
+    // is the prefix term's doing, not the heat gate's.
+    seed_patch_history(&mut cpu, ENTRY + LOAD_OFFSET + 3);
 
     let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("the block compiles");
     assert_eq!(compilation.span.instructions, 3, "fixture shape changed");

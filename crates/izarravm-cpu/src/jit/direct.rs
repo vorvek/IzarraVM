@@ -3939,17 +3939,23 @@ pub(crate) fn sixteen_bit_admission_level() -> u8 {
 }
 
 /// Whether a hot SMC chunk may spend one compile-through-heat "lane trial" per key per heat
-/// epoch (`IZARRAVM_SMC_LANE_TRIAL`, OFF unless set to a non-"0" value). Per KEY, not per
+/// epoch (`IZARRAVM_SMC_LANE_TRIAL`, ON for every value except exactly "0"). Per KEY, not per
 /// chunk, deliberately: N entry points inside one 16-byte chunk buy N trials per epoch, which
 /// stays bounded and lets each entry's own lane coverage decide its fate.
 ///
-/// DEFAULT OFF BY MEASUREMENT (2026-08-08, duke586-lanetrial-{0,1}.json): with only the imm
-/// lane family available, the trial fired 146,956 times and installed 61,216 lane blocks on
-/// duke3d-586 — and lost 5.5% of rt (0.2600 -> 0.2456), because Build's patch bursts mix
-/// lane-shaped 0x81 writes with disp-field 0x8A rewrites in the same chunks, so the trial's
-/// installs die to the writes its lanes cannot absorb and the compile+install+kill churn is
-/// pure cost. Re-measure after displacement lanes exist; until then this is an opt-in
-/// experiment, not a shipped path.
+/// DEFAULT ON SINCE THE DISP LANES LANDED, and the flip is the same measurement that once
+/// turned it off, repeated on the other side of its stated precondition. 2026-08-08
+/// (duke586-lanetrial-{0,1}.json), imm lanes only: 146,956 trials, 61,216 installs, rt -5.5%
+/// (0.2600 -> 0.2456) — Build's patch bursts mix lane-shaped 0x81 writes with disp-field 0x8A
+/// rewrites in the same chunks, so trial installs died to the writes the lanes could not
+/// absorb, and the doc said "re-measure after displacement lanes exist". 2026-08-09
+/// (duke586-displane3-{0,1,trial}.json), heat-gated disp lanes shipped: trial-off is INERT on
+/// duke3d-586 (rt 0.2443 vs 0.2445 off-arm, because the kill that writes a disp lane's heat
+/// record also heats the chunk toward this very gate, so the laned recompile mostly never
+/// installs), and trial-on is rt 0.2801, +14.6%, with 446,503 disp lanes registered and
+/// narrow kills down 0.9M. The lanes and the trial are ONE mechanism: the trial is how a laned
+/// block gets past the heat gate, the lanes are why its install survives. doom-486/586 take
+/// ZERO disp lanes (heat-gated admission) and measured neutral in the same sitting.
 ///
 /// WHY THE TRIAL EXISTS. G1's admission gates and the mutable-lane mechanism deadlock against
 /// each other on a fixture whose patch loop never pauses: the gate refuses to compile while the
@@ -3976,9 +3982,7 @@ pub(crate) fn lane_family_enabled() -> bool {
 
 pub(crate) fn lane_trial_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(
-        || matches!(std::env::var("IZARRAVM_SMC_LANE_TRIAL").as_deref(), Ok(v) if v != "0"),
-    )
+    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_SMC_LANE_TRIAL").as_deref(), Ok("0")))
 }
 
 /// Whether `disp_lane_for` admits the `0x8A` displacement-lane family (`IZARRAVM_DISP_LANES`,
@@ -4357,15 +4361,36 @@ fn imm_lane_for(
 }
 
 /// The displacement twin of `imm_lane_for`: `0x8A MOV r8, [..disp32..]`, every ModRM memory
-/// form, no prefixes. The admitted field is the instruction's disp32, which duke3d-586's SMC
-/// trace measured at 17M of its 19.3M disp-patch events (dev_docs/2026-08-09-disp-lanes-design.md);
-/// each one today either kills the covering block or keeps its chunk's G1 heat stamped.
+/// form, no prefixes — GATED ON MEASURED PATCH HISTORY. The admitted field is the
+/// instruction's disp32, which duke3d-586's SMC trace measured at 17M of its 19.3M disp-patch
+/// events (dev_docs/2026-08-09-disp-lanes-design.md); each one today either kills the covering
+/// block or keeps its chunk's G1 heat stamped.
 ///
-/// `disp_len == 4` plus the default-prefix test is what confines this to 32-bit addressing: a
-/// CS.D=0 segment cannot reach a four-byte displacement without a `0x67` prefix, so a lane and
+/// THE HEAT GATE IS THE SLICE'S LOAD-BEARING DECISION, and it was reached by refutation twice
+/// over. The lane form costs two host instructions per EXECUTION whether or not the field is
+/// ever patched. Iteration 1 admitted the whole family unconditionally: duke +8.2%, but the
+/// 2026-08-09 formal gate FAILED — doom-486 paired RTF 0.978, doom-586 0.975 — because doom's
+/// renderer executes `[base+disp32]` texture/colormap byte loads constantly and patches none
+/// of them. Iteration 2 tried the shape cut (bare `[disp32]` only): doom recovered but duke's
+/// win VANISHED (rt 0.2706 vs 0.2697, 3.4k lanes vs 233k) — Build patches the indexed forms
+/// too, so no static shape separates the populations. What separates them is BEHAVIOR:
+/// `SmcHeatMap::has_record_range` over the disp field's bytes is true only after the field
+/// took a heat-charged kill, so a never-patched load compiles baked and untaxed forever, and a
+/// patched one converges to the lane form one kill after its first patch (the kill bumps the
+/// record, the recompile sees it). Lane-absorbed patches deliberately do not refresh records,
+/// and a record consumed by `lift_cold_smc_dormant` recovery self-heals the same way: one more
+/// kill, one more recompile.
+///
+/// The probe reads the heat accelerator WITHOUT `sync_smc_heat` (this is a `&CpuGsw` path); a
+/// stale read across a cache reset can at worst bake one block that a later recompile lanes,
+/// or lane one block that did not need it — admission tuning, never correctness.
+///
+/// `disp_len == 4` plus the default-prefix test confines this to 32-bit addressing: a CS.D=0
+/// segment cannot reach a four-byte displacement without a `0x67` prefix, so a lane and
 /// `AddressWrap::Word` can never co-occur and the loaded field needs no sign-extension — the
-/// four guest bytes ARE the architectural displacement. With `imm_len == 0` those bytes are the
-/// instruction's last four, so the lane start is `physical + len - 4`.
+/// four guest bytes ARE the architectural displacement. With `imm_len == 0` those bytes are
+/// the instruction's last four, so the lane start is `physical + len - 4` (offset 2 on the
+/// mod-0 rm-5 form, 3 on the SIB forms, more under mod 2 — the SIB fixture pins this).
 ///
 /// Only `DirectKind::Load` may carry a lane, and that is a REGISTER-PRESSURE contract, not
 /// taste: the lane arm of `emit_effective_address` stages the displacement through EAX alone,
@@ -4399,6 +4424,13 @@ fn disp_lane_for(
         return None;
     }
     let lane = physical.checked_add(u32::from(insn.len).checked_sub(4)?)?;
+    if !cpu
+        .jit_direct
+        .smc_heat
+        .has_record_range(lane, IMM_LANE_WIDTH)
+    {
+        return None;
+    }
     // Page-local in physical for the same reason as `imm_lane_for`: the compile loop only
     // reaches this after `physical_page_local`, so one host pointer covers all four bytes.
     let host = cpu.direct_host_bytes(lane, IMM_LANE_WIDTH)?;

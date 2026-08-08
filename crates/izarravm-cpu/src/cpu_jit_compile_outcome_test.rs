@@ -1563,6 +1563,9 @@ fn smc_heat_pre_compile_gate_demotes_a_hot_entry_chunk() {
     let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
     cpu.set_jit_auto_admit(true);
+    // Pin the trial-off arm: the lane trial defaults ON since the disp lanes landed, and with
+    // it on this key would legitimately spend one compile through the hot gate.
+    cpu.jit_direct.direct.set_lane_trial_for_test(false);
     let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
     // Heat the entry 16-byte chunk past the churn threshold within epoch 0 (sync first so a
     // reset pending from setup is observed before the seed, not after).
@@ -1577,9 +1580,9 @@ fn smc_heat_pre_compile_gate_demotes_a_hot_entry_chunk() {
         cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
             .expect("gate");
     }
-    // The cheap entry-chunk gate refuses admission before a compile is even attempted. The
-    // lane trial (`IZARRAVM_SMC_LANE_TRIAL`) is DEFAULT OFF by measurement, so the pre-trial
-    // behavior is also the shipped behavior; the trial's own semantics are pinned by
+    // The cheap entry-chunk gate refuses admission before a compile is even attempted. This
+    // is the TRIAL-OFF arm (pinned above — the trial defaults ON since the disp lanes made
+    // its installs survive); the trial's own semantics are pinned by
     // `lane_trial_compiles_once_and_installs_through_a_hot_span` (cpu_jit_imm_lane_test.rs,
     // whose fixtures are the proven lane-compiling environment).
     assert_eq!(
@@ -1617,6 +1620,10 @@ fn smc_heat_pre_install_gate_demotes_a_hot_span_after_compiling() {
     let (mut cpu, mut bus) = fixture(&code);
     warm(&mut cpu, &mut bus, &addresses);
     cpu.set_jit_auto_admit(true);
+    // Trial-off arm, pinned for the same reason as the pre-compile-gate test above (the
+    // lane-free block here could not install through a trial anyway, but the arm should be
+    // explicit, not incidental).
+    cpu.jit_direct.direct.set_lane_trial_for_test(false);
     let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
     // Heat a chunk inside the span but NOT the entry chunk: the cheap pre-compile gate passes and
     // the full-span gate after compilation must catch it before install.
