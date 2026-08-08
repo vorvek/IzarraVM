@@ -1174,7 +1174,7 @@ impl Machine {
                         // instruction, and drift one instruction past the plain
                         // interpreter at the same scaled-clock boundary (found
                         // by `memory_poll_skip_matches_the_interpreter_at_batch_boundaries`
-                        // when the 586 bus ratio moved for the P100 spec). The
+                        // when the 586 bus ratio moved for the PC100 spec). The
                         // deliberate zero-budget alignment run is different: it
                         // must still execute to reach the poll head.
                         #[cfg(feature = "jit")]

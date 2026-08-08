@@ -2131,7 +2131,7 @@ fn native_mode13_page_batches_charge_video_timing_and_move_generation_once() {
 #[test]
 fn approximate_video_wait_states_keep_the_doom_calibration() {
     assert_eq!(video_wait_states_approx(CpuPersona::I486), 45);
-    // 586: jointly solved with `bus_timing` 16/105 for the 166 MHz / P100
+    // 586: jointly solved with `bus_timing` 16/105 for the 166 MHz / PC100
     // spec so doom-586 holds ~1001 realtics; see video_wait_states_approx.
     assert_eq!(video_wait_states_approx(CpuPersona::I586), 147);
 }

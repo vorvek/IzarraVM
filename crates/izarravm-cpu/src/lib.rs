@@ -3609,8 +3609,8 @@ pub const fn bus_timing(persona: CpuPersona) -> (u32, u32) {
     match persona {
         CpuPersona::I386 => (23, 31),
         CpuPersona::I486 => (1, 3),
-        // Recalibrated for the 166 MHz / 64 MB P100 SDRAM spec (2026-08-08):
-        // 7/30 was seated on the 200 MHz Dhrystone target; the P100 memory
+        // Recalibrated for the 166 MHz / 64 MB PC100 SDRAM spec (2026-08-08):
+        // 7/30 was seated on the 200 MHz Dhrystone target; the PC100 memory
         // subsystem cheapens the whole bus portion so Quake demo1 lands on the
         // ~41 fps anchor at the lower clock. Solved jointly with the mode 13h
         // video wait-state (75 -> 147) against the two-game linear model

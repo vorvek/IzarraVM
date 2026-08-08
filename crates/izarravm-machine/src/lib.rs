@@ -355,7 +355,7 @@ pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 /// - 486 ws=45: 2980 realtics, 25.1 fps (target about 3000 realtics)
 /// - 586 ws=75 at 200 MHz with `bus_timing` 7/30: 833 realtics, 89.7 fps
 ///   (target 820 to 850 realtics); re-seated 2026-08-08 for the 166 MHz /
-///   P100 spec as ws=147 with `bus_timing` 16/105, jointly solved so doom-586
+///   PC100 spec as ws=147 with `bus_timing` 16/105, jointly solved so doom-586
 ///   holds ~1001 realtics (74.6 fps) while quake reaches ~41.2 fps.
 ///
 /// Interpreter, direct-page, REP, and native VGA paths all use this table. The
