@@ -1687,9 +1687,9 @@ fn accurate_386_modes_never_enter_either_jit() {
     }
 }
 
-const READ_ENTRY: u32 = 0x101;
+pub(super) const READ_ENTRY: u32 = 0x101;
 
-fn arm_read_fixture(cpu: &mut CpuGsw) {
+pub(super) fn arm_read_fixture(cpu: &mut CpuGsw) {
     cpu.halted = false;
     cpu.registers.eip = READ_ENTRY - 1;
     cpu.registers.set_eax(0);
@@ -1707,7 +1707,7 @@ fn arm_read_fixture(cpu: &mut CpuGsw) {
     cpu.alu_add(0xffff_ffff, 1, 0, BusWidth::Dword);
 }
 
-fn prime_direct_memory_block(cpu: &mut CpuGsw, bus: &mut TestBus) {
+pub(super) fn prime_direct_memory_block(cpu: &mut CpuGsw, bus: &mut TestBus) {
     cpu.set_jit_auto_admit(true);
     arm_read_fixture(cpu);
     drive(cpu, bus);
@@ -1750,7 +1750,7 @@ fn assert_read_parity(
     );
 }
 
-fn successful_read_program() -> Vec<u8> {
+pub(super) fn successful_read_program() -> Vec<u8> {
     let mut memory = vec![0; 0x2000];
     memory[(READ_ENTRY - 1) as usize] = 0x90;
     let code = [
@@ -3238,7 +3238,7 @@ fn direct_block_equal_to_deadline_falls_back_before_zero_scaled_suffix() {
     assert_eq!(native.perf_counters().jit_direct_entries, direct_entries);
 }
 
-fn make_data_segments_flat(cpu: &mut CpuGsw) {
+pub(super) fn make_data_segments_flat(cpu: &mut CpuGsw) {
     for segment in [
         SegmentIndex::Ds,
         SegmentIndex::Ss,
