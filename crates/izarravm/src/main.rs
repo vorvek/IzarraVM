@@ -1595,6 +1595,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "segment_write_block_head_insns": snapshot.segment_write_block_head_insns,
         "smc_lane_trials": snapshot.lane_trials,
         "smc_lane_trial_installs": snapshot.lane_trial_installs,
+        "smc_disp_lane_registrations": snapshot.disp_lane_registrations,
     })
 }
 

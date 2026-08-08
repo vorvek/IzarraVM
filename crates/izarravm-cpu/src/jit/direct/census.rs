@@ -380,6 +380,10 @@ pub(crate) struct DirectStallTally {
     /// this struct's doc.
     pub lane_trials: u64,
     pub lane_trial_installs: u64,
+    /// Displacement lanes registered at install (the `0x8A` family), the disp share of the
+    /// aggregate `PerfCounters::smc_lane_registrations`. The split is what the A/B needs:
+    /// `smc_lane_accepts` moving with this counter flat would say the imm lanes did the work.
+    pub disp_lane_registrations: u64,
     /// Entries refused because a call-out-bearing block met the privilege state whose port reads
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
@@ -1021,6 +1025,7 @@ impl crate::jit::JitState {
             segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
+            disp_lane_registrations: self.stalls.disp_lane_registrations,
         }
     }
 

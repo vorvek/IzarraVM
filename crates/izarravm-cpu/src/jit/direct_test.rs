@@ -77,6 +77,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
         body_offset: 0,
         imm_lanes: [NO_IMM_LANE; MAX_BLOCK_IMM_LANES],
+        disp_lanes: 0,
         code: vec![0xc3],
     }
 }
@@ -2078,6 +2079,7 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
         index: Some(6),
         scale: 1,
         disp: 4,
+        disp_lane: None,
     };
 
     let mut unmasked = Encoder::new();

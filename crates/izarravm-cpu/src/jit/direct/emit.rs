@@ -36,6 +36,7 @@ fn stack_addr(disp: u32) -> DirectAddr {
         index: None,
         scale: 1,
         disp,
+        disp_lane: None,
     }
 }
 
@@ -52,6 +53,7 @@ fn frame_addr() -> DirectAddr {
         index: None,
         scale: 1,
         disp: 0,
+        disp_lane: None,
     }
 }
 
@@ -3218,7 +3220,23 @@ fn emit_double_shift_mem(
 }
 
 pub(super) fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: AddressWrap) {
-    e.mov_r32_imm32(Reg::RAX, addr.disp);
+    // The lane form differs from the baked form in exactly where the displacement comes from:
+    // the four bytes of the guest instruction's disp32 field, loaded on every execution, so a
+    // guest patch of that field takes effect on the next entry with no recompile. Like the
+    // baked arm, the lane arm writes RAX and nothing else — and the 32-bit load clears the
+    // upper half, leaving exactly the state `mov eax, imm32` leaves — so the two arms present
+    // one register contract to every caller. (The scale != 1 index path below clobbers RCX in
+    // BOTH arms; that is this function's pre-existing contract, not the lane's.) Everything
+    // downstream (base/index adds, the 64K wrap, the segment-limit compare, the fast-map
+    // lookup and its guards) already runs on the runtime value, which is what makes a patched
+    // displacement take the same side exits the baked form would.
+    match addr.disp_lane {
+        Some(lane) => {
+            e.mov_r64_imm64(Reg::RAX, lane.host as u64);
+            e.load_r32_disp32(Reg::RAX, Reg::RAX, 0);
+        }
+        None => e.mov_r32_imm32(Reg::RAX, addr.disp),
+    }
     if let Some(base) = addr.base {
         e.add_r32_r32(Reg::RAX, home(base));
     }

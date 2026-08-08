@@ -1358,6 +1358,9 @@ pub struct DirectStallSnapshot {
     /// span. See `DirectStallTally`.
     pub lane_trials: u64,
     pub lane_trial_installs: u64,
+    /// Displacement lanes registered at install — the disp share of
+    /// `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
+    pub disp_lane_registrations: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

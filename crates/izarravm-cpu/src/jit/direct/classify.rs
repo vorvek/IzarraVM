@@ -994,6 +994,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         index: None,
                         scale: 1,
                         disp: insn.imm,
+                        disp_lane: None,
                     },
                     raw_clocks: 4,
                 });
@@ -1008,6 +1009,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         index: None,
                         scale: 1,
                         disp: insn.imm,
+                        disp_lane: None,
                     },
                     raw_clocks: 4,
                 });
@@ -1022,6 +1024,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         index: None,
                         scale: 1,
                         disp: insn.imm,
+                        disp_lane: None,
                     },
                     raw_clocks: 4,
                 });
@@ -1036,6 +1039,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         index: None,
                         scale: 1,
                         disp: insn.imm,
+                        disp_lane: None,
                     },
                     raw_clocks: 4,
                 });
@@ -1473,5 +1477,9 @@ pub(super) fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
         index: addr.index,
         scale: addr.scale,
         disp: addr.disp as u32,
+        // `classify` has no `&CpuGsw` and no physical address, and a lane needs both. The
+        // compile loop attaches one through `disp_lane_for` for the single shape that
+        // qualifies, exactly as `imm_lane_for` does for `AluImm`.
+        disp_lane: None,
     })
 }

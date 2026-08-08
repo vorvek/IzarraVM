@@ -1274,6 +1274,12 @@ impl BlockCache {
         self.stalls.lane_trial_installs += 1;
     }
 
+    /// Displacement lanes registered by an install — the disp share of the aggregate
+    /// `smc_lane_registrations` the same install site feeds.
+    pub(crate) fn note_disp_lane_registrations(&mut self, lanes: u64) {
+        self.stalls.disp_lane_registrations += lanes;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_lane_trial_for_test(&mut self, on: bool) {
         self.lane_trial_override = Some(on);
@@ -2384,6 +2390,11 @@ pub(crate) struct Compilation {
     /// `NO_IMM_LANE` for an unused slot. `install` copies these into the cache's per-block lane
     /// array, which is what the SMC write choke matches a patch against.
     imm_lanes: [u32; MAX_BLOCK_IMM_LANES],
+    /// How many of `imm_lanes` are DISPLACEMENT lanes (`disp_lane_for`). The write choke never
+    /// needs the distinction — a lane is a lane there — but the install site does: the split
+    /// between `smc_lane_registrations` and `disp_lane_registrations` is what says which lane
+    /// kind an A/B's `smc_lane_accepts` movement belongs to.
+    disp_lanes: u8,
     pub code: Vec<u8>,
 }
 
@@ -2393,6 +2404,10 @@ impl Compilation {
             .iter()
             .filter(|lane| **lane != NO_IMM_LANE)
             .count()
+    }
+
+    pub(crate) fn disp_lane_count(&self) -> usize {
+        usize::from(self.disp_lanes)
     }
 }
 
@@ -3224,6 +3239,19 @@ pub(crate) struct DirectAddr {
     pub(crate) index: Option<u8>,
     pub(crate) scale: u8,
     pub(crate) disp: u32,
+    /// Present only for the shapes `disp_lane_for` admits (the `0x8A MOV r8, [..disp32..]`
+    /// family). When present the emitted effective address IGNORES `disp` and loads the four
+    /// displacement bytes out of guest RAM on every execution, so a guest patch of those bytes
+    /// needs no recompile. `disp` still carries the value decoded at compile time and is what
+    /// the non-lane form bakes.
+    ///
+    /// It rides on the ADDRESS rather than on `DirectKind::Load` because the displacement's one
+    /// consumer is `emit_effective_address` and every memory emitter reaches it through
+    /// `emit_segmented_linear_address` — including the one-lookup fast paths — so a single seam
+    /// serves them all, and a later Store/AluMemSource admission is a `disp_lane_for` widening
+    /// rather than new plumbing. The lane arm forms the address through EAX alone, so it is
+    /// safe whatever a caller has staged in the other scratch registers.
+    pub(crate) disp_lane: Option<ImmLane>,
 }
 
 impl DirectKind {
@@ -3953,6 +3981,14 @@ pub(crate) fn lane_trial_enabled() -> bool {
     )
 }
 
+/// Whether `disp_lane_for` admits the `0x8A` displacement-lane family (`IZARRAVM_DISP_LANES`,
+/// on for every value except exactly "0"). The off arm exists for one-binary A/B measurement,
+/// the same contract as `IZARRAVM_LANE_FAMILY`.
+pub(crate) fn disp_lanes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_DISP_LANES").as_deref(), Ok("0")))
+}
+
 /// Seed for `JitState::word_at_486`, read once per process from `IZARRAVM_JIT16_486`.
 ///
 /// **DEFAULT ON since the 486 measurement.** Set `IZARRAVM_JIT16_486=0` to refuse.
@@ -4320,6 +4356,70 @@ fn imm_lane_for(
     ))
 }
 
+/// The displacement twin of `imm_lane_for`: `0x8A MOV r8, [..disp32..]`, every ModRM memory
+/// form, no prefixes. The admitted field is the instruction's disp32, which duke3d-586's SMC
+/// trace measured at 17M of its 19.3M disp-patch events (dev_docs/2026-08-09-disp-lanes-design.md);
+/// each one today either kills the covering block or keeps its chunk's G1 heat stamped.
+///
+/// `disp_len == 4` plus the default-prefix test is what confines this to 32-bit addressing: a
+/// CS.D=0 segment cannot reach a four-byte displacement without a `0x67` prefix, so a lane and
+/// `AddressWrap::Word` can never co-occur and the loaded field needs no sign-extension — the
+/// four guest bytes ARE the architectural displacement. With `imm_len == 0` those bytes are the
+/// instruction's last four, so the lane start is `physical + len - 4`.
+///
+/// Only `DirectKind::Load` may carry a lane, and that is a REGISTER-PRESSURE contract, not
+/// taste: the lane arm of `emit_effective_address` stages the displacement through EAX alone,
+/// which is safe for every caller, but widening admission to a kind whose emitter resolves the
+/// address AFTER staging other live state would still deserve its own review — and its own
+/// census row, per the standing rule against unmeasured admissions.
+fn disp_lane_for(
+    cpu: &CpuGsw,
+    insn: &DecodedInsn,
+    kind: DirectKind,
+    physical: u32,
+    lanes_used: usize,
+) -> Option<(DirectKind, ImmLane)> {
+    if lanes_used >= MAX_BLOCK_IMM_LANES || !disp_lanes_enabled() {
+        return None;
+    }
+    let DirectKind::Load {
+        dst,
+        width,
+        addr,
+        raw_clocks,
+    } = kind
+    else {
+        return None;
+    };
+    if insn.opcode != 0x8a
+        || insn.prefixes != Prefixes::default()
+        || insn.disp_len != 4
+        || insn.imm_len != 0
+    {
+        return None;
+    }
+    let lane = physical.checked_add(u32::from(insn.len).checked_sub(4)?)?;
+    // Page-local in physical for the same reason as `imm_lane_for`: the compile loop only
+    // reaches this after `physical_page_local`, so one host pointer covers all four bytes.
+    let host = cpu.direct_host_bytes(lane, IMM_LANE_WIDTH)?;
+    let lane = ImmLane {
+        physical: lane,
+        host,
+    };
+    Some((
+        DirectKind::Load {
+            dst,
+            width,
+            addr: DirectAddr {
+                disp_lane: Some(lane),
+                ..addr
+            },
+            raw_clocks,
+        },
+        lane,
+    ))
+}
+
 fn compile_with_instruction_limit(
     cpu: &mut CpuGsw,
     entry_lin: u32,
@@ -4361,6 +4461,7 @@ fn compile_with_instruction_limit(
     let mut memory_alu_slots = 0u8;
     let mut imm_lanes = [NO_IMM_LANE; MAX_BLOCK_IMM_LANES];
     let mut imm_lane_count = 0usize;
+    let mut disp_lane_count = 0u8;
     let mut stop = CompileStop::Boundary;
 
     while slots.len() < instruction_limit.min(MAX_BLOCK_INSTRUCTIONS) {
@@ -4757,13 +4858,23 @@ fn compile_with_instruction_limit(
         // Every `break` above abandons the slot, and a lane recorded for an instruction that never
         // joined the block would name bytes outside the block's span -- an address the write choke
         // could never match, but also a lane the block does not actually read through.
+        // The two lane matchers are mutually exclusive by kind (`AluImm` vs `Load`), so at most
+        // one fires per slot and both draw on the one `MAX_BLOCK_IMM_LANES` budget.
         let kind = match imm_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
             Some((kind, lane)) => {
                 imm_lanes[imm_lane_count] = lane.physical;
                 imm_lane_count += 1;
                 kind
             }
-            None => kind,
+            None => match disp_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+                Some((kind, lane)) => {
+                    imm_lanes[imm_lane_count] = lane.physical;
+                    imm_lane_count += 1;
+                    disp_lane_count += 1;
+                    kind
+                }
+                None => kind,
+            },
         };
         fetch_lens[slots.len()] = insn.len;
         slots.push(DirectInsn {
@@ -5081,6 +5192,7 @@ fn compile_with_instruction_limit(
         link_cells,
         body_offset: emitted.body_offset,
         imm_lanes,
+        disp_lanes: disp_lane_count,
         code: emitted.code,
     })
 }
