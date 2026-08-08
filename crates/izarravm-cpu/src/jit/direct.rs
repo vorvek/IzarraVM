@@ -3635,6 +3635,9 @@ mod frame;
 pub(crate) use frame::*;
 mod table_slots;
 pub(crate) use table_slots::*;
+// The compile-walk -> emitter handoff structs, moved out for the source-line ceiling.
+mod emit_input;
+use emit_input::*;
 
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
@@ -4980,75 +4983,6 @@ fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
         (!read && !write)
             || segment_access_supported(cpu, cpu.registers.segment(segment), read, write)
     })
-}
-
-struct EmitInput<'a> {
-    slots: &'a [DirectInsn],
-    span: BlockSpan,
-    raw_clocks: u32,
-    weighted_fp_clocks: u32,
-    byte_reads: u8,
-    word_reads: u8,
-    dword_reads: u8,
-    byte_stores: u8,
-    word_stores: u8,
-    dword_stores: u8,
-    self_loop: bool,
-    x87_entry_top: Option<u8>,
-    memory: MemoryEmitContext,
-    link_cell_ptrs: [usize; 2],
-}
-
-struct EmittedCode {
-    code: Vec<u8>,
-    body_offset: usize,
-}
-
-#[derive(Clone, Copy)]
-struct MemoryEmitContext {
-    map: Option<NativeMapBases>,
-    code_watch_tables: Option<[usize; 2]>,
-    cpl3: bool,
-    /// Whether memory sites load table bases from `CpuGsw::native_table_slots`
-    /// (`[r15 + disp32]`, 7 bytes) instead of baking each as a 10-byte imm64.
-    /// From `JitState::r15_tables`. Both arms load the identical pointer — the
-    /// publish site in the compile walk records exactly the values this
-    /// context carries — so the arms differ in encoding only.
-    r15_tables: bool,
-    /// Whether store emitters test the fast-map PAGE_WATCHED bit and skip the code-watch guard
-    /// on unwatched pages (watched-page-bit design D3). From `JitState::watch_page_bit`. False
-    /// reproduces the pre-slice emission byte for byte at the seven Group A sites; the two
-    /// Group B sites keep their H6 kind-mask `and` on every arm (a behavioral no-op there,
-    /// kept unconditional so the arms cannot drift), so the off arm is semantics-identical but
-    /// two instructions per ALU/double-shift site larger than the pre-slice binary.
-    watch_page_bit: bool,
-    /// Whether store sites emit the one-lookup probe + shared-stub shape (design D3/D4/D5)
-    /// instead of the classify/resolve front. From `JitState::one_lookup_store`, AND-ed at the
-    /// construction site with "the stub pad actually built" (review F5: a failed pad build
-    /// falls back to the inline emission for that block) — and it requires `r15_tables`,
-    /// because the stubs read every table through the R15 slots.
-    one_lookup_store: bool,
-    /// Whether read sites emit the one-lookup probe (load design D3a/D3b/D5) instead of the
-    /// classify/permission/resolve front. From `JitState::one_lookup_load`, AND-ed at the
-    /// construction site with "the read pad actually built"; requires `r15_tables`. Fully
-    /// independent of `one_lookup_store`: disjoint sites, separate pads, so an A/B of either
-    /// slice leaves the other's emission untouched.
-    one_lookup_load: bool,
-    segments: SegmentLayout,
-    /// Whether a ModRM-derived effective address wraps at 64K.
-    ///
-    /// A BLOCK property, not an address one. `decode` computes
-    /// `address_size = cs.default_size_32 XOR address_size_override`, and `prefixes_supported_for`
-    /// refuses the override outright, so within an admitted block the address size is a pure
-    /// function of CS.D, which the mode key pins.
-    ///
-    /// It lives here rather than on `DirectAddr` because that struct rides inside `Load`,
-    /// `Store`, `AluMemSource` and other kinds shared across many emit sites, and this
-    /// property is a block-wide fact, not a per-address one.
-    ///
-    /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
-    /// and is keyed separately, so all nine `stack_addr` call sites pass a literal.
-    address_wrap: emit::AddressWrap,
 }
 
 #[cfg(test)]
