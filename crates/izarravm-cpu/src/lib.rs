@@ -3491,7 +3491,7 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 /// floor), so this dial only trims the compute share. Dhrystone (the PRIMARY
 /// oracle) is a fetch+data mix split roughly compute/bus; these values plus
 /// `bus_timing` seat all four modes' Dhrystones/sec on the owner's authoritative
-/// era targets (386 ~9200, 486 ~61000, 586 ~475000) to within ~0.3%.
+/// era targets (386 ~9200, 486 ~61000, 586 ~250000 at 166 MHz) to within ~0.3%.
 ///
 /// fp-mandel TRADE-OFF: fp-mandel is x87-compute-bound (~7280 instruction clocks
 /// vs ~6247 bus per pixel), so it rides this dial. Dhrystone pinned to its owner

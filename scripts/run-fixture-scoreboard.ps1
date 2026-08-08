@@ -113,7 +113,7 @@ function Get-FixtureTable {
         [pscustomobject]@{
             name = "quake-586"; folder = "quake_c"
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]5146000000
+            cycles = [uint64]6200000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             # QCONSOLE.LOG is the invariant. perf.instructions is NOT one: the
             # demo finishes before the budget and the run stops in an idle tail

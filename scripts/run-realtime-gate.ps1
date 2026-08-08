@@ -635,7 +635,7 @@ function Get-WorkloadPolicy([string]$Name) {
             return [pscustomobject][ordered]@{
                 name = $Name
                 mode = "586"
-                cycle_budget = [uint64]5146000000
+                cycle_budget = [uint64]6200000000
                 # Baseline measures rt 1.470-1.567, coverage 96.26%. The rt
                 # floor stays 1.4 (same ~4% under the measured minimum as
                 # before); the paired checks against the new baseline are the
