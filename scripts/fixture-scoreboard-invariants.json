@@ -1,18 +1,19 @@
 {
   "duke3d-486": {
-    "frame_sha256": "bd7757e629e09096c9543c73ce96d5c4d287125b132fc89b3b52558b122b2f05",
+    "frame_sha256": "46bed73ea92c61e92e767f6b081cf528170e327672c9a3fc87455111ba82900a",
     "frame_sha256_interpreter": "af6c23e0266ad9208811afde894ccbd50eef8f53fcafaf72737042597afbcf32",
     "frame_sha256_stable_window": "13815df7f86ede63ce03795fb3f6748a51dce8092151803dbe2ec5c7511a5f31",
-    "note": "Re-pinned 2026-08-07 (R15 table bases): the slice's smaller emission lifts blocks past the one-host-page install limit (coverage 0.6978 -> 0.7008), which shifts cycle-charging phase, and the cutoff frame landed back on the 2026-08-06-era hash 58fcb752... -- the THIRD move in two days, all the same benign class. It also re-separates frame_sha256 from frame_sha256_interpreter, which the previous note predicted a future JIT-mix change would do. History: af6c23e0... (watched-page bit, 2026-08-07), 58fcb752... (byte-granular watch, 2026-08-06). The end-of-budget frame is CUTOFF-PHASE sensitive on this fixture: the 7.92e9-cycle axe lands mid-render in an animating demo, so ANY JIT-mix change that alters cycle charging legitimately moves it; treat a moved hash here as expected until the acceptance test says otherwise, never as corruption. THE ACCEPTANCE TEST, which is what actually proves state-exactness: run 2.64e9 cycles (the stable loading screen, AFTER the heaviest 16-bit phase) on both arms and require BIT-IDENTICAL frames equal to frame_sha256_stable_window. Run for this re-pin: IZARRAVM_R15_TABLES=0 and =1 both produced 13815df7..., matching the value unchanged across all three re-pins -- the stable window has never moved, only the cutoff frame has. The pinned hash checks the SHIPPED default (JIT16=1, JIT16_486=1, watched-page bit and R15 tables default on)."
+    "note": "Re-pinned 2026-08-08 (wolf3d word-row admissions, 33d32083): the four new Word-allowlist rows change the 16-bit JIT mix on EVERY fixture, not just wolf3d (coverage 0.7008 -> 0.7105, insns/entry 7.0 -> 7.43), which shifts cycle-charging phase -- the FOURTH move in three days, all the same benign class. History: bd7757e6... (R15 table bases, 2026-08-07), af6c23e0... (watched-page bit, 2026-08-07), 58fcb752... (byte-granular watch, 2026-08-06). The end-of-budget frame is CUTOFF-PHASE sensitive on this fixture: the 7.92e9-cycle axe lands mid-render in an animating demo, so ANY JIT-mix change that alters cycle charging legitimately moves it; treat a moved hash here as expected until the acceptance test says otherwise, never as corruption. THE ACCEPTANCE TEST, which is what actually proves state-exactness: run 2.64e9 cycles (the stable loading screen, AFTER the heaviest 16-bit phase) on both arms and require BIT-IDENTICAL frames equal to frame_sha256_stable_window. Run for this re-pin: JIT16/JIT16_486 both-on and both-off each produced 13815df7..., unchanged across all four re-pins -- the stable window has never moved, only the cutoff frame has. frame_sha256_interpreter is untouched: the admissions only alter the JIT arm. The pinned hash checks the SHIPPED default (JIT16=1, JIT16_486=1, one-lookup store/load on)."
   },
   "duke3d-586": {
-    "frame_sha256": "7742e077eb631f9ce1e26e520d4b552cf1f67b0d053870db2497b47e91bd0d97"
+    "frame_sha256": "e396447b9eda1690589b9a431364b680da7c6c4ebb45dfa39e1adad7408bf2fc",
+    "note": "Re-pinned 2026-08-08 alongside duke3d-486 (wolf3d word-row admissions, 33d32083): same cutoff-phase class, same animating demo. See duke3d-486's note for the doctrine and the stable-window acceptance test, which passed on this date. Prior: 7742e077... (166 MHz / 64 MB baseline, 2026-08-08)."
   },
   "gp2-586": {
-    "frame_sha256": "ac11e66ab796551bcddc8c9108b9e804faa6ccd62dc105611bb64a6cbfe77fe0"
+    "frame_sha256": "a5c53e4706c02729786e7242c42e6a05c3761a937b990ca6f8c780892cfb4128"
   },
   "nascar-586": {
-    "frame_sha256": "70fc331483a66369d81bc1f1cbcdebb1f50e221afe60b9ce19d5cd7bd6a5d43b"
+    "frame_sha256": "13bd7f39ed2ecfd2be82e26350ec14a55e07e824fb31d444a8490a1c920529c7"
   },
   "prince-486": {
     "frame_sha256": "32b5eefa8e7013dc55062913c8cc3fff806079daddeb626216510359e7121eec"
