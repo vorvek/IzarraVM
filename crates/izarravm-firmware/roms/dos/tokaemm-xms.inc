@@ -535,90 +535,57 @@ slot_of:
 ; same shape here. A zero-granule request succeeds at granule 0 without marking
 ; anything, which is what a zero-KB XMS block has always received.
 ; Preserves BX/CX/DX/SI/DI.
+; --- the arena allocator, V86 side (thin INT 0xC0 'TA' wrappers) ------------
+; arena_bmp lives in the system window, past anything a 16-bit offset can name,
+; so the allocator itself runs in the monitor (arena_alloc32 and friends). These
+; keep the ABI their callers already use, and convert arena_svc_fail back to CF
+; once, here, where the callers expect it.
+;
+; INT 0xC0 preserves every guest GPR -- both entry paths pushad on the way in
+; and popad on the way out -- so only DX, which carries the cookie, needs
+; saving. The 'TQ' caller in arena_query relies on the same property.
+
+; Allocate CX granules for allocation type BX. out: AX = first granule, CF
+; clear; or CF set when no run of that size starts on that boundary.
+; Preserves BX/CX/DX/SI/DI.
 arena_alloc:
-    push bx
-    push cx
-    push edx                      ; the probe zero-extends into EDX now
-    push si
-    push di
-    jcxz .empty
-    mov di, [cs:alloc_lim + bx]   ; boundary - 1
-    xor si, si                    ; candidate granule
-.align:
-    add si, di                    ; round the candidate up to the boundary
-    mov ax, di
-    not ax
-    and si, ax
-    mov ax, si
-    add ax, cx                    ; does the run still fit inside the arena?
-    jc .none
-    cmp ax, [cs:arena_granules]
-    ja .none
-    movzx edx, si                 ; probe [si, si+cx); dword BT: granule
-    mov bx, cx                    ; indices pass 32767 on the 64 MB machine and
-.probe:                           ; the word form treats them as signed
-    bt dword [cs:arena_bmp], edx
-    jc .busy
-    inc edx
-    dec bx
-    jnz .probe
-    mov ax, si
-    call arena_mark
+    push dx
+    mov [cs:arena_svc_type], bl
+    mov [cs:arena_svc_count], cx
+    mov byte [cs:arena_svc_op], ASVC_ALLOC
+    mov dx, 0x4154                ; 'TA' monitor-call cookie
+    int 0xC0
+    mov ax, [cs:arena_svc_index]
+    cmp byte [cs:arena_svc_fail], 0
+    pop dx                        ; POP leaves the flags alone, so the compare
+    jne .none                     ; above still drives the branch
     clc
-    jmp .out
-.busy:
-    mov si, dx                    ; restart past the granule that blocked us
-    inc si
-    jmp .align
-.empty:
-    xor ax, ax
-    clc
-    jmp .out
+    ret
 .none:
     stc
-.out:
-    pop di                        ; POP leaves the flags alone, so CF survives
-    pop si
-    pop edx
-    pop cx
-    pop bx
     ret
 
 ; Mark CX granules from granule AX as allocated. Preserves every register.
-; Bumps arena_gen (D1): every query cache is invalid the instant the bitmap
-; changes, and this is one of the two 16-bit-side places it does.
+; arena_gen (D1) is bumped monitor-side, by arena_mark32.
 arena_mark:
-    push eax
-    push cx
-    jcxz .done
-    movzx eax, ax                 ; dword BT forms: see arena_alloc's probe
-.next:
-    bts dword [cs:arena_bmp], eax
-    inc eax
-    dec cx
-    jnz .next
-    inc dword [cs:arena_gen]
-.done:
-    pop cx
-    pop eax
+    push dx
+    mov [cs:arena_svc_index], ax
+    mov [cs:arena_svc_count], cx
+    mov byte [cs:arena_svc_op], ASVC_MARK
+    mov dx, 0x4154
+    int 0xC0
+    pop dx
     ret
 
-; Release CX granules from granule AX. Preserves every register. Bumps
-; arena_gen (D1); see arena_mark.
+; Release CX granules from granule AX. Preserves every register.
 arena_release:
-    push eax
-    push cx
-    jcxz .done
-    movzx eax, ax                 ; dword BT forms: see arena_alloc's probe
-.next:
-    btr dword [cs:arena_bmp], eax
-    inc eax
-    dec cx
-    jnz .next
-    inc dword [cs:arena_gen]
-.done:
-    pop cx
-    pop eax
+    push dx
+    mov [cs:arena_svc_index], ax
+    mov [cs:arena_svc_count], cx
+    mov byte [cs:arena_svc_op], ASVC_RELEASE
+    mov dx, 0x4154
+    int 0xC0
+    pop dx
     ret
 
 ; Free space for allocation type BL. out: AX = largest free run, DX = total

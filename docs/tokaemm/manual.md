@@ -54,12 +54,18 @@ the same reporting convention MS-DOS 6.22 uses with EMM386.
 
 ## Resident footprint
 
-TOKAEMM occupies 40K of conventional memory for its code, its state, its task
-structure, its monitor stack, and the allocation bitmaps that track the 64 MB
-shared arena. Its page directory and sixteen page tables require a further 68K,
-which on a machine with sufficient extended memory is reserved above the 1 MB
-line rather than below it. The standard 64 MiB configuration therefore leaves
-582K of conventional memory free.
+TOKAEMM occupies 31K of conventional memory for its code, its state, its task
+structure, and its monitor stack. The allocation bitmaps that track the 64 MB
+shared arena are not among them: they live in a system window above the 1 MB
+line, reachable only by the manager's own ring-0 monitor and mapped in no
+client's address space. Keeping them there matters for more than the 10K it
+returns, because their size is proportional to installed memory — in
+conventional memory they would grow with every machine size, and above about
+148 MB there would be no way to fit them at all.
+
+The page directory and page tables require a further 68K, also reserved above
+the 1 MB line on a machine with sufficient extended memory. The standard 64 MiB
+configuration therefore leaves 591K of conventional memory free.
 
 The 1 MiB profile has no extended pages to reserve, so TOKAEMM keeps a low
 page-table fallback there. Loading the whole manager into a UMB would not help
