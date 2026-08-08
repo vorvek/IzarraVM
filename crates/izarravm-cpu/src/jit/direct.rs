@@ -674,6 +674,25 @@ pub(crate) enum BlockProbe {
     Ready(BlockId),
 }
 
+/// Per-physical-page key index for the SMC invalidation choke. `keys` stays
+/// SORTED ascending by `key.physical` so `invalidate_physical_range` can
+/// binary-search the overlap window instead of walking every key on the page:
+/// nascar-586 held ~950 keys on its hot pages and a RIP-sample profile put
+/// 40% of its wall in that walk (2026-08-08 campaign, lever 1).
+///
+/// `max_span` is the longest guest span (bytes) any Compiled/Rejected state
+/// rooted on this page has carried since the vec was last emptied; a span key
+/// below `write_start - (max_span - 1)` cannot reach the write. Seen/Dormant
+/// keys are points. The bound only grows (a stale-high value is correct, just
+/// less tight) and resets with the vec. Spans never cross a 4 KiB page (the
+/// block builder refuses page-crossing spans), so a page's own window covers
+/// every span its keys can root.
+#[derive(Default)]
+struct PageKeys {
+    keys: Vec<BlockKey>,
+    max_span: u32,
+}
+
 /// Bounded direct-block cache. Hash lookup is authoritative; the direct-mapped table is only a
 /// collision-checked accelerator. Capacity pressure clears the entire cache.
 pub(crate) struct BlockCache {
@@ -681,7 +700,7 @@ pub(crate) struct BlockCache {
     /// attributed 3.1 percent of wall to hashing this map's three-`u32` key. Its sibling
     /// `physical_keys` below already used the crate's fast hasher for the same reason.
     entries: HashMap<BlockKey, BlockState, PodKeyBuildHasher>,
-    physical_keys: HashMap<u32, Vec<BlockKey>, U32BuildHasher>,
+    physical_keys: HashMap<u32, PageKeys, U32BuildHasher>,
     blocks: Vec<CompiledBlock>,
     /// Parallel to `blocks`, same `BlockId::index()`. Split out of `CompiledBlock` because it
     /// was 116 of that struct's 240 bytes while every hot-path read goes through a `&self`
@@ -1080,6 +1099,7 @@ impl BlockCache {
         }
         self.live_blocks += 1;
         self.entries.insert(span.key, BlockState::Compiled(id));
+        self.note_page_span(span.key, u32::from(span.guest_len));
         self.hot[span.key.hot_index()] = Some(HotEntry {
             key: span.key,
             id,
@@ -1103,6 +1123,7 @@ impl BlockCache {
                     .0,
             );
             self.entries.insert(span.key, BlockState::Rejected(span));
+            self.note_page_span(span.key, u32::from(span.guest_len));
         }
     }
 
@@ -1414,12 +1435,26 @@ impl BlockCache {
             let page_remaining =
                 (1u32 << BLOCK_PAGE_SHIFT) - (cursor & ((1u32 << BLOCK_PAGE_SHIFT) - 1));
             let step = remaining.min(page_remaining);
-            if let Some(mut keys) = self.physical_keys.remove(&page) {
-                let mut survivor_count = 0;
+            if let Some(mut page_keys) = self.physical_keys.remove(&page) {
+                // Only keys whose `physical` lies in
+                // `[write_start - (max_span - 1), write_end)` can overlap the
+                // write: a span rooted below the lower bound ends at or before
+                // `write_start` (see `PageKeys`), and Seen/Dormant point keys
+                // must sit inside the write itself. Binary-search that window
+                // instead of walking the whole page.
+                let window_low = physical.saturating_sub(page_keys.max_span.saturating_sub(1));
+                let window_high = physical.saturating_add(width);
+                let keys = &mut page_keys.keys;
+                let window_start =
+                    keys.partition_point(|tracked| tracked.physical < window_low);
+                let window_end = window_start
+                    + keys[window_start..]
+                        .partition_point(|tracked| tracked.physical < window_high);
+                let mut survivor_count = window_start;
                 result.keys_scanned = result
                     .keys_scanned
-                    .saturating_add(u32::try_from(keys.len()).unwrap_or(u32::MAX));
-                for index in 0..keys.len() {
+                    .saturating_add(u32::try_from(window_end - window_start).unwrap_or(u32::MAX));
+                for index in window_start..window_end {
                     let key = keys[index];
                     let Some(state) = self.entries.get(&key).copied() else {
                         continue;
@@ -1494,9 +1529,14 @@ impl BlockCache {
                     }
                     invalidated += 1;
                 }
-                keys.truncate(survivor_count);
+                // Survivors compacted into [window_start, survivor_count);
+                // close the kill hole so the untouched tail keeps the sorted
+                // order the window search depends on.
+                if survivor_count != window_end {
+                    keys.drain(survivor_count..window_end);
+                }
                 if !keys.is_empty() {
-                    self.physical_keys.insert(page, keys);
+                    self.physical_keys.insert(page, page_keys);
                 }
             }
             cursor = cursor.wrapping_add(step);
@@ -2128,10 +2168,27 @@ impl BlockCache {
     }
 
     fn track_physical_key(&mut self, key: BlockKey) {
-        self.physical_keys
+        let page = self
+            .physical_keys
             .entry(key.physical >> BLOCK_PAGE_SHIFT)
-            .or_default()
-            .push(key);
+            .or_default();
+        // Sorted insert (ties on `physical` may exist across mode/linear keys;
+        // their relative order is irrelevant). Insertion is compile/track-time,
+        // orders of magnitude rarer than the store-side window scan this order
+        // exists for.
+        let at = page
+            .keys
+            .partition_point(|tracked| tracked.physical <= key.physical);
+        page.keys.insert(at, key);
+    }
+
+    /// Record that `key`'s page roots a span of `guest_len` bytes, widening the
+    /// page's invalidation window bound. Called when a key becomes
+    /// Compiled/Rejected; `track_physical_key` has always run first.
+    fn note_page_span(&mut self, key: BlockKey, guest_len: u32) {
+        if let Some(page) = self.physical_keys.get_mut(&(key.physical >> BLOCK_PAGE_SHIFT)) {
+            page.max_span = page.max_span.max(guest_len);
+        }
     }
 
     fn make_link_visible(&mut self, id: BlockId) {
