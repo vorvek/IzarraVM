@@ -1363,6 +1363,52 @@ fn physical_invalidation_forgets_seen_and_rejected_entries_only_on_overlap() {
     assert!(matches!(cache.probe(adjacent), BlockProbe::Compile));
 }
 
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn physical_invalidation_window_skips_far_keys_and_reaches_span_tails() {
+    let mut cache = BlockCache::default();
+    let low = BlockKey::new(0x1000, 0x70_010, 7);
+    let high = BlockKey::new(0x2000, 0x70_800, 7);
+    install_trivial(&mut cache, low, 16);
+    install_trivial(&mut cache, high, 16);
+
+    // A write between the two blocks roots no span within the window bound:
+    // the sorted page index must examine zero keys and kill nothing.
+    let result = cache.invalidate_physical_range(0x70_400, 4, false);
+    assert_eq!(result.blocks, 0);
+    assert_eq!(result.keys_scanned, 0, "far keys must stay outside the window");
+    assert!(matches!(cache.probe(low), BlockProbe::Ready(_)));
+    assert!(matches!(cache.probe(high), BlockProbe::Ready(_)));
+
+    // A write on the LAST byte of a span whose key roots 15 bytes lower is only
+    // reachable through the max_span widening of the window's lower bound.
+    let result = cache.invalidate_physical_range(0x70_01f, 1, false);
+    assert_eq!(result.blocks, 1, "the span tail must still be reached");
+    assert!(matches!(cache.probe(low), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(high), BlockProbe::Ready(_)));
+}
+
+#[test]
+fn physical_invalidation_window_survives_a_middle_kill_in_sorted_order() {
+    let mut cache = BlockCache::default();
+    let first = BlockKey::new(0x1000, 0x80_010, 7);
+    let middle = BlockKey::new(0x2000, 0x80_040, 7);
+    let last = BlockKey::new(0x3000, 0x80_080, 7);
+    for tracked in [first, middle, last] {
+        assert!(matches!(cache.probe(tracked), BlockProbe::Interpret));
+    }
+
+    // Killing the middle Seen key must close the hole without disturbing the
+    // sorted order the later windows depend on.
+    assert_eq!(cache.retire_physical_range_for_test(0x80_040, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(0x80_080, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(0x80_010, 1), 1);
+    assert_eq!(cache.retire_physical_range_for_test(0x80_010, 0x100), 0);
+}
+
 #[test]
 fn physical_invalidation_checks_both_pages_of_a_cross_page_write() {
     let mut cache = BlockCache::default();

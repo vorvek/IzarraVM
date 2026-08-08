@@ -137,16 +137,25 @@ function Get-FixtureTable {
         [pscustomobject]@{
             name = "wolf3d-486"; folder = "wolf3d_c"
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]4000000000
+            cycles = [uint64]8000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true; injection = @()
+            qconsole = $false; resultPpm = $true
+            # One Enter at the signon's "Press a key" so the title/credits/demo
+            # rotation runs. Without it (and without the memory manager the
+            # fixture's CONFIG.SYS was missing until 2026-08-08) every earlier
+            # wolf3d number measured an out-of-memory CRASH LOOP, not the game.
+            injection = @("--inject-keys", "2000000000:")
         }
         [pscustomobject]@{
             name = "wolf3d-586"; folder = "wolf3d_c"
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]3320000000
+            # 12e9 (72 guest seconds) so the end frame lands INSIDE demo
+            # playback, past the ~35 guest seconds of startup plus rotation.
+            cycles = [uint64]12000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true; injection = @()
+            qconsole = $false; resultPpm = $true
+            # See wolf3d-486: the Enter is what gets the game past its signon.
+            injection = @("--inject-keys", "2000000000:")
         }
         [pscustomobject]@{
             name = "duke3d-486"; folder = "duke3d_c"
