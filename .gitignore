@@ -91,3 +91,6 @@ toka-dos/build-freedos-tokamous.com
 # MkDocs build output
 /site/
 /.worktrees/
+
+# VS Code Counter extension scratch output
+.VSCodeCounter/

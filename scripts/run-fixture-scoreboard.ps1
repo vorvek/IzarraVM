@@ -51,6 +51,18 @@ param(
     # every value except exactly "0".
     [ValidateSet("on", "off", "jit16", "word486")]
     [string]$Arm = "on",
+    # The one-lookup store emission arm (dev_docs/2026-08-07-one-lookup-store-design.md D8):
+    # "1" is the shipped default, "0" restores the classic classify/resolve store emission.
+    # Set explicitly on every run for the same inherit-hazard reason as the JIT16 pair —
+    # IZARRAVM_ONE_LOOKUP_STORE is on for every value except exactly "0", so a stray "0" left
+    # in the caller's environment would silently turn an "on" observation into an "off" one.
+    [ValidateSet("1", "0")]
+    [string]$OneLookupStore = "1",
+    # The one-lookup LOAD emission arm (dev_docs/2026-08-07-one-lookup-load-design.md D7):
+    # same contract and the same inherit hazard as the store knob above; independent of it so
+    # either slice A/Bs alone.
+    [ValidateSet("1", "0")]
+    [string]$OneLookupLoad = "1",
     [switch]$RecordInvariants,
     [switch]$Force,
     [switch]$ListFixtures
@@ -369,6 +381,8 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     $environment = @{
         "IZARRAVM_JIT16"                 = $armFlags.jit16
         "IZARRAVM_JIT16_486"             = $armFlags.word486
+        "IZARRAVM_ONE_LOOKUP_STORE"      = $OneLookupStore
+        "IZARRAVM_ONE_LOOKUP_LOAD"       = $OneLookupLoad
         "IZARRAVM_DIRECT_BARRIER_CENSUS" = "0"
         "IZARRAVM_CPU_PROFILE"           = ""
         "IZARRAVM_MACHINE_PROFILE"       = ""
@@ -411,6 +425,8 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     $result = [ordered]@{
         name             = $Fixture.name
         arm              = $Arm
+        one_lookup_store = $OneLookupStore
+        one_lookup_load  = $OneLookupLoad
         exit_code        = $exitCode
         host_wall_s      = [math]::Round($wallStart.Elapsed.TotalSeconds, 3)
         background_load  = $backgroundLoad
@@ -616,12 +632,14 @@ try {
 }
 
 $summary = [ordered]@{
-    schema      = "izarravm-fixture-scoreboard-v1"
-    label       = $Label
-    arm         = $Arm
-    recorded_at = (Get-Date).ToString("o")
-    executable  = $executablePath
-    rows        = $rows
+    schema           = "izarravm-fixture-scoreboard-v1"
+    label            = $Label
+    arm              = $Arm
+    one_lookup_store = $OneLookupStore
+    one_lookup_load  = $OneLookupLoad
+    recorded_at      = (Get-Date).ToString("o")
+    executable       = $executablePath
+    rows             = $rows
 }
 $jsonPath = Join-Path $ResultsDirectory "scoreboard.json"
 $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encoding utf8
@@ -629,7 +647,7 @@ $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encodin
 $markdown = @()
 $markdown += "# Fixture scoreboard$(if ($Label) { ": $Label" })"
 $markdown += ""
-$markdown += "Recorded $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), JIT arm ``$Arm``. rt is guest seconds per wall second; 1.0 is real time."
+$markdown += "Recorded $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), JIT arm ``$Arm``, one-lookup store ``$OneLookupStore``, one-lookup load ``$OneLookupLoad``. rt is guest seconds per wall second; 1.0 is real time."
 $markdown += ""
 $markdown += "| fixture | rt | wall s | coverage | entries | insns/entry | 16-bit insns/entry | invariant |"
 $markdown += "|---|---|---|---|---|---|---|---|"

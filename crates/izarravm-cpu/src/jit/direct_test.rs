@@ -2237,7 +2237,10 @@ fn table_slots_are_host_state_not_guest_state() {
     // lockstep comparisons must not diff host pointers), and a clone must not
     // inherit pointers into another CPU's tables.
     assert_eq!(slots, NativeTableSlots::default());
-    assert_eq!(slots.clone().slots, [0; 6]);
+    assert_eq!(
+        slots.clone().slots,
+        [0; 7 + STORE_STUB_COUNT + 1 + READ_STUB_COUNT]
+    );
 }
 
 #[test]

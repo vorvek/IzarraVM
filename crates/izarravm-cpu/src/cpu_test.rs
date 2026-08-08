@@ -1849,11 +1849,16 @@ fn pending_flags_offset() {
     // PerfCounters rather than at the CpuGsw tail because they have to appear in the probe JSON
     // beside the other SMC counters, which is where the invalidation cost is read.
     // The R15 table-bases slice adds `native_table_slots: NativeTableSlots` ([usize; 6],
-    // 48 bytes) so emitted code can load table bases R15-relative instead of baking imm64s,
-    // moving this pin from 4528 to 4576 -- measured, not derived. It must be a by-value CpuGsw
-    // field: behind a Box the emitted load would need a second, dependent indirection, which is
-    // half the point of the slice gone.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
+    // 48 bytes) so emitted code can load table bases R15-relative instead of baking imm64s --
+    // it must be a by-value CpuGsw field: behind a Box the emitted load would need a second,
+    // dependent indirection, which is half the point of the slice gone. Its first position
+    // (mid-struct, beside native_callout) moved this pin 4528 -> 4576, and the one-lookup
+    // slice's growth to [usize; 24] moved it again to 4720 -- where the quiet-window gate
+    // measured a uniform ~2-5% doom regression with byte-identical counters: every hot
+    // interpreter field after the array had shifted cache lines. The array now lives at the
+    // struct TAIL (fault_site's precedent) and this pin is back at its pre-R15 value --
+    // measured, not derived. Do not let this array migrate mid-struct again.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -2688,7 +2693,11 @@ fn a_bus_decode_change_still_drops_ram_and_vga_direct_pages() {
 
 #[derive(Default)]
 struct TestBus {
-    memory: Vec<u8>,
+    // Aligned like the production `Memory` backing, and for the same reason: `direct_page`
+    // below hands `memory.as_mut_ptr()` pages to the fast map, and an unaligned backing would
+    // silently poison every store-bias entry — the whole one-lookup fixture suite would pass
+    // while exercising only the slow path (the fixtures-that-cannot-fail trap, design D7).
+    memory: izarravm_bus::PageAlignedBytes,
     trace: BusTrace,
     pending_irq: Option<u8>,
     // Mirrors the machine's `io_touched`: set by any port access, so `requires_step_break`
@@ -2758,7 +2767,7 @@ struct TestBus {
 impl TestBus {
     fn with_memory(memory: Vec<u8>) -> Self {
         Self {
-            memory,
+            memory: memory.into(),
             trace: BusTrace::default(),
             pending_irq: None,
             io_touched: false,
@@ -3652,6 +3661,22 @@ mod jit_direct;
 ))]
 #[path = "cpu_jit_r15_tables_test.rs"]
 mod jit_r15_tables;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_store_bias_test.rs"]
+mod jit_store_bias;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_load_bias_test.rs"]
+mod jit_load_bias;
 
 #[cfg(all(
     feature = "jit",

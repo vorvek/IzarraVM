@@ -1687,9 +1687,9 @@ fn accurate_386_modes_never_enter_either_jit() {
     }
 }
 
-const READ_ENTRY: u32 = 0x101;
+pub(super) const READ_ENTRY: u32 = 0x101;
 
-fn arm_read_fixture(cpu: &mut CpuGsw) {
+pub(super) fn arm_read_fixture(cpu: &mut CpuGsw) {
     cpu.halted = false;
     cpu.registers.eip = READ_ENTRY - 1;
     cpu.registers.set_eax(0);
@@ -1707,7 +1707,7 @@ fn arm_read_fixture(cpu: &mut CpuGsw) {
     cpu.alu_add(0xffff_ffff, 1, 0, BusWidth::Dword);
 }
 
-fn prime_direct_memory_block(cpu: &mut CpuGsw, bus: &mut TestBus) {
+pub(super) fn prime_direct_memory_block(cpu: &mut CpuGsw, bus: &mut TestBus) {
     cpu.set_jit_auto_admit(true);
     arm_read_fixture(cpu);
     drive(cpu, bus);
@@ -1750,7 +1750,7 @@ fn assert_read_parity(
     );
 }
 
-fn successful_read_program() -> Vec<u8> {
+pub(super) fn successful_read_program() -> Vec<u8> {
     let mut memory = vec![0; 0x2000];
     memory[(READ_ENTRY - 1) as usize] = 0x90;
     let code = [
@@ -2273,9 +2273,19 @@ fn direct_ram_stores_cover_esp_sib_scales_displacements_and_disp_only() {
         &native_bus.memory[0x3400..0x3404],
         &0xa1b2_c3d4u32.to_le_bytes()
     );
+    // 5 on the one-lookup arm, 4 on the classic arm — and the difference IS the slice's size
+    // mechanism, not noise: the classic emission of this six-slot span exceeds the one-host-page
+    // install budget, so the compile walk splits the block and the fifth store retires
+    // interpreted (compile_attempts 2, 5 insns/entry). The one-lookup sites are small enough
+    // that all six slots fit (compile_attempts 1, 6 insns/entry), so the fifth store's lane
+    // increment moves into the native batch.
     assert_eq!(
         native.perf_counters().jit_native_store_hits - native_before,
-        4,
+        if native.jit_direct.one_lookup_store {
+            5
+        } else {
+            4
+        },
         "{:?}",
         native.perf_counters()
     );
@@ -3228,7 +3238,7 @@ fn direct_block_equal_to_deadline_falls_back_before_zero_scaled_suffix() {
     assert_eq!(native.perf_counters().jit_direct_entries, direct_entries);
 }
 
-fn make_data_segments_flat(cpu: &mut CpuGsw) {
+pub(super) fn make_data_segments_flat(cpu: &mut CpuGsw) {
     for segment in [
         SegmentIndex::Ds,
         SegmentIndex::Ss,
@@ -6941,6 +6951,10 @@ fn a_stale_clear_bit_skips_the_guard_and_the_off_arm_still_probes() {
     for (bit_on, expected_watch_exits) in [(true, 0u64), (false, 1u64)] {
         let mut cpu = fresh();
         cpu.jit_direct.watch_page_bit = bit_on;
+        // This battery pins the CLASSIC emission's two watched-bit arms; the one-lookup shape
+        // bypasses the bit entirely (its own T4 differential lives in
+        // `cpu_jit_store_bias_test.rs`), so hold it off for both arms here.
+        cpu.jit_direct.one_lookup_store = false;
         let mut bus = TestBus::with_memory(store_exit_program(target));
         bus.direct_pages_enabled = true;
         bus.direct_page_clocks = true;

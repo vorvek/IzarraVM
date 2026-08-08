@@ -86,12 +86,22 @@ fn a_block_watch_acquire_sweeps_bit_clear_entries() {
 }
 
 /// T3: the sweep matches by PHYSICAL page, so every linear alias with a clear bit goes (H2).
+/// The store-bias asserts are the one-lookup design's T2 alias cell riding the same edge:
+/// both aliases' fast entries must poison in the same sweep, because a store bias only dies
+/// with its entry (`clear_entry`) and a surviving fast alias would be the INV-P miscompile.
 #[test]
 fn an_edge_sweeps_every_alias_of_the_physical_page() {
     let (mut cpu, mut bus) = watched_fixture();
     populate_target(&mut cpu, &mut bus, PHYS);
     populate_target(&mut cpu, &mut bus, ALIAS);
     assert!(cpu.jit_fast_map.has_write_mapping(ALIAS, PHYS));
+    for linear in [PHYS, ALIAS] {
+        assert_ne!(
+            cpu.jit_fast_map.store_bias_for_test(linear),
+            jit::fast_map::NATIVE_STORE_BIAS_POISON,
+            "both aliases start with fast store biases"
+        );
+    }
 
     cpu.mark_decode_code_for_test(PHYS, 1);
     assert!(!cpu.jit_fast_map.has_write_mapping(PHYS, PHYS));
@@ -99,6 +109,13 @@ fn an_edge_sweeps_every_alias_of_the_physical_page() {
         !cpu.jit_fast_map.has_write_mapping(ALIAS, PHYS),
         "both aliases of the watched physical page must go"
     );
+    for linear in [PHYS, ALIAS] {
+        assert_eq!(
+            cpu.jit_fast_map.store_bias_for_test(linear),
+            jit::fast_map::NATIVE_STORE_BIAS_POISON,
+            "and both store biases poison in the same sweep"
+        );
+    }
     assert_eq!(cpu.code_watch_edge_counters().sweep_cleared_entries, 2);
 }
 

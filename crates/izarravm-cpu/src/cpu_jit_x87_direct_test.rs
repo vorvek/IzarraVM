@@ -6,7 +6,7 @@ use super::*;
 const ENTRY: u32 = 0x100;
 const DATA: usize = 0x200;
 
-fn x87_cpu(mode: GswMode) -> CpuGsw {
+pub(super) fn x87_cpu(mode: GswMode) -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.jit_direct.set_fast_map_enabled_for_test(true);
     cpu.set_mode(mode);
@@ -28,7 +28,7 @@ fn x87_cpu(mode: GswMode) -> CpuGsw {
     cpu
 }
 
-fn arm(cpu: &mut CpuGsw, control: u16) {
+pub(super) fn arm(cpu: &mut CpuGsw, control: u16) {
     cpu.registers.eip = ENTRY - 1;
     cpu.registers.gpr.fill(0);
     cpu.registers.eflags = 2;
@@ -43,7 +43,7 @@ fn arm(cpu: &mut CpuGsw, control: u16) {
     cpu.interrupt_shadow = false;
 }
 
-fn run_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
+pub(super) fn run_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
     let mut outcomes = Vec::new();
     for _ in 0..32 {
         let outcome = cpu.run_straight_line(bus, u64::MAX).unwrap();
@@ -55,7 +55,7 @@ fn run_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
     panic!("x87 test program did not halt");
 }
 
-fn direct_memory(mut memory: Vec<u8>) -> TestBus {
+pub(super) fn direct_memory(mut memory: Vec<u8>) -> TestBus {
     if memory.len() < 0x1000 {
         memory.resize(0x1000, 0);
     }
@@ -2289,7 +2289,7 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     assert_eq!(direct.registers, before_registers);
     assert_eq!(direct.fpu, before_fpu);
     assert_eq!(direct.fp_rem, before_fp_rem);
-    assert_eq!(direct_bus.memory, memory);
+    assert_eq!(&direct_bus.memory[..], &memory[..]);
 
     let mut interpreter = x87_cpu(GswMode::Gsw586);
     arm(&mut interpreter, 0x0f7f);

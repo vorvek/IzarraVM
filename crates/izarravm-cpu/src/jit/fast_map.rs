@@ -19,6 +19,37 @@ const BITSET_WORDS: usize = LINEAR_PAGE_COUNT / u64::BITS as usize;
 const UNAVAILABLE_BIAS: usize = usize::MAX;
 const UNAVAILABLE_PHYSICAL_PAGE: u32 = u32::MAX;
 
+/// The store-bias poison (one-lookup store design D1,
+/// `dev_docs/2026-08-07-one-lookup-store-design.md`). In-band with the two tag bits below:
+/// a poisoned entry has bit 0 set AND cannot collide with a tagged mode13 bias, because a
+/// bias whose low 12 bits are not free is poisoned before tagging.
+const STORE_BIAS_POISON: usize = usize::MAX;
+/// Store-bias tag bit 0: the page is the Mode 13h VGA aperture. The emitted fast path routes
+/// tagged entries to the shared mode13 stub, which clears both tag bits before storing.
+const STORE_BIAS_MODE13: usize = 1;
+/// Store-bias tag bit 1: the page has a committed write bias but fails ring 3's
+/// user+writable test. Fast for cpl0 sites ONLY (today's cpl0 emitted path stores through any
+/// committed write bias with no further check); cpl3 sites test both tag bits and route
+/// bit-1 entries to the slow stub.
+const STORE_BIAS_SUPERVISOR: usize = 2;
+const STORE_BIAS_TAG_MASK: usize = STORE_BIAS_MODE13 | STORE_BIAS_SUPERVISOR;
+
+/// The load-bias twin (one-lookup load design D1,
+/// `dev_docs/2026-08-07-one-lookup-load-design.md`). Same in-band encoding as the store table —
+/// the VALUES are shared so the emitted tag tests are byte-identical between the twins — but the
+/// MEANINGS differ where the read path differs: there is no watch term (no read path consults a
+/// watch table, so a watched page's loads stay fast), and bit 1 is ring 3's READ test alone.
+const LOAD_BIAS_POISON: usize = STORE_BIAS_POISON;
+/// Load-bias tag bit 0: the page is the Mode 13h VGA aperture. The emitted site's inline mode13
+/// arm clears both tag bits before forming the pointer and moves the dynamic mode13 READ lane.
+const LOAD_BIAS_MODE13: usize = STORE_BIAS_MODE13;
+/// Load-bias tag bit 1: the page has a committed read bias but PAGE_USER is clear — ring 3 may
+/// not read it. Fast for cpl0 sites ONLY (today's cpl0 emitted read path resolves through any
+/// committed read bias with no check, emit_read_permission_check emits nothing at cpl0); cpl3
+/// sites route bit-1 entries to the slow stub.
+const LOAD_BIAS_SUPERVISOR: usize = STORE_BIAS_SUPERVISOR;
+const LOAD_BIAS_TAG_MASK: usize = LOAD_BIAS_MODE13 | LOAD_BIAS_SUPERVISOR;
+
 const KIND_MASK: u8 = 0b0000_0011;
 const HAS_READ_BIAS: u8 = 0b0000_0100;
 const HAS_WRITE_BIAS: u8 = 0b0000_1000;
@@ -143,6 +174,20 @@ impl FastMapAccess {
 struct FastMapStorage {
     read_biases: Box<[usize]>,
     write_biases: Box<[usize]>,
+    /// The one-lookup store table: a pure DERIVATION of (`flags`, `write_biases`) computed by
+    /// `derive_store_bias` at the end of every populate and poisoned by `clear_entry` — never
+    /// authoritative. Riding those two chokes is the whole coherence story: the strict watch-edge
+    /// sweeps kill entries through `clear_entry`, and every refill re-derives from the final
+    /// flags byte, so "watched implies poisoned" and the permission encoding can never skew
+    /// against the byte they are computed from.
+    store_biases: Box<[usize]>,
+    /// The one-lookup LOAD table: the store table's poisoned twin, derived by `derive_load_bias`
+    /// from (`flags`, `read_biases`) at the same two chokes — the end of every populate and
+    /// `clear_entry` — and never authoritative. The one deliberate difference from the store
+    /// twin: no watch term, so a watched page's loads derive FAST (reads have no code-watch
+    /// dimension; the fast_map_test twin-difference pin holds the two derivations apart on
+    /// exactly this).
+    load_biases: Box<[usize]>,
     physical_pages: Box<[u32]>,
     mapping_epochs: Box<[u64]>,
     flags: Box<[u8]>,
@@ -151,11 +196,69 @@ struct FastMapStorage {
     listed_vga_pages: Box<[u64]>,
 }
 
+/// Derive the store-bias entry from a FINAL flags byte and the stored write bias (one-lookup
+/// store design D1). The single source of the poison predicate: the emitted fast path, the
+/// populate wiring and the test batteries all read this one function's decision.
+///
+/// Poison unless the entry has a committed write bias, a RAM or Mode13 kind, a CLEAR
+/// `PAGE_WATCHED` bit, and a bias whose low 12 bits are free (the tag-bit precondition —
+/// misaligned host backing degrades to the slow path, never to a wrong tag). Otherwise the
+/// bias itself, tagged: bit 0 for Mode13, bit 1 when ring 3's user+writable test fails.
+fn derive_store_bias(flags: u8, write_bias: usize) -> usize {
+    let kind_ok = matches!(decode_kind(flags), PageKind::Ram | PageKind::Mode13);
+    if flags & HAS_WRITE_BIAS == 0
+        || write_bias == UNAVAILABLE_BIAS
+        || !kind_ok
+        || flags & PAGE_WATCHED != 0
+        || write_bias & PAGE_MASK as usize != 0
+    {
+        return STORE_BIAS_POISON;
+    }
+    let mut bias = write_bias;
+    if decode_kind(flags) == PageKind::Mode13 {
+        bias |= STORE_BIAS_MODE13;
+    }
+    if flags & PAGE_WRITABLE == 0 || flags & PAGE_USER == 0 {
+        bias |= STORE_BIAS_SUPERVISOR;
+    }
+    bias
+}
+
+/// Derive the load-bias entry from a FINAL flags byte and the stored read bias (one-lookup load
+/// design D1) — `derive_store_bias` with the watch term DELETED and the permission term reduced
+/// to ring 3's read test. The single source of the load-poison predicate.
+///
+/// Poison unless the entry has a committed read bias, a RAM or Mode13 kind, and a bias whose low
+/// 12 bits are free (misaligned host backing degrades to the slow path, never to a wrong tag).
+/// Otherwise the bias itself, tagged: bit 0 for Mode13, bit 1 when PAGE_USER is clear. A watched
+/// page derives FAST — no read path consults a watch table, and INV-R deliberately omits the
+/// watch clause (see the design's D1).
+fn derive_load_bias(flags: u8, read_bias: usize) -> usize {
+    let kind_ok = matches!(decode_kind(flags), PageKind::Ram | PageKind::Mode13);
+    if flags & HAS_READ_BIAS == 0
+        || read_bias == UNAVAILABLE_BIAS
+        || !kind_ok
+        || read_bias & PAGE_MASK as usize != 0
+    {
+        return LOAD_BIAS_POISON;
+    }
+    let mut bias = read_bias;
+    if decode_kind(flags) == PageKind::Mode13 {
+        bias |= LOAD_BIAS_MODE13;
+    }
+    if flags & PAGE_USER == 0 {
+        bias |= LOAD_BIAS_SUPERVISOR;
+    }
+    bias
+}
+
 impl FastMapStorage {
     fn new() -> Self {
         Self {
             read_biases: vec![UNAVAILABLE_BIAS; LINEAR_PAGE_COUNT].into_boxed_slice(),
             write_biases: vec![UNAVAILABLE_BIAS; LINEAR_PAGE_COUNT].into_boxed_slice(),
+            store_biases: vec![STORE_BIAS_POISON; LINEAR_PAGE_COUNT].into_boxed_slice(),
+            load_biases: vec![LOAD_BIAS_POISON; LINEAR_PAGE_COUNT].into_boxed_slice(),
             physical_pages: vec![UNAVAILABLE_PHYSICAL_PAGE; LINEAR_PAGE_COUNT].into_boxed_slice(),
             mapping_epochs: vec![0; LINEAR_PAGE_COUNT].into_boxed_slice(),
             flags: vec![PageKind::Unavailable as u8; LINEAR_PAGE_COUNT].into_boxed_slice(),
@@ -184,6 +287,8 @@ impl FastMapStorage {
     fn clear_entry(&mut self, index: usize) {
         self.read_biases[index] = UNAVAILABLE_BIAS;
         self.write_biases[index] = UNAVAILABLE_BIAS;
+        self.store_biases[index] = STORE_BIAS_POISON;
+        self.load_biases[index] = LOAD_BIAS_POISON;
         self.physical_pages[index] = UNAVAILABLE_PHYSICAL_PAGE;
         self.mapping_epochs[index] = 0;
         self.flags[index] = PageKind::Unavailable as u8;
@@ -207,6 +312,8 @@ pub(crate) struct FastMap {
 pub(crate) struct NativeMapBases {
     read_biases: usize,
     write_biases: usize,
+    store_biases: usize,
+    load_biases: usize,
     physical_pages: usize,
     mapping_epochs: usize,
     flags: usize,
@@ -220,6 +327,14 @@ impl NativeMapBases {
 
     pub(crate) const fn write_biases(self) -> usize {
         self.write_biases
+    }
+
+    pub(crate) const fn store_biases(self) -> usize {
+        self.store_biases
+    }
+
+    pub(crate) const fn load_biases(self) -> usize {
+        self.load_biases
     }
 
     pub(crate) const fn physical_pages(self) -> usize {
@@ -251,6 +366,22 @@ pub(crate) const NATIVE_PAGE_WRITABLE: u8 = PAGE_WRITABLE;
 pub(crate) const NATIVE_PAGE_USER: u8 = PAGE_USER;
 #[allow(dead_code)]
 pub(crate) const NATIVE_PAGE_WATCHED: u8 = PAGE_WATCHED;
+#[allow(dead_code)]
+pub(crate) const NATIVE_STORE_BIAS_POISON: usize = STORE_BIAS_POISON;
+#[allow(dead_code)]
+pub(crate) const NATIVE_STORE_BIAS_MODE13: usize = STORE_BIAS_MODE13;
+#[allow(dead_code)]
+pub(crate) const NATIVE_STORE_BIAS_SUPERVISOR: usize = STORE_BIAS_SUPERVISOR;
+#[allow(dead_code)]
+pub(crate) const NATIVE_STORE_BIAS_TAG_MASK: usize = STORE_BIAS_TAG_MASK;
+#[allow(dead_code)]
+pub(crate) const NATIVE_LOAD_BIAS_POISON: usize = LOAD_BIAS_POISON;
+#[allow(dead_code)]
+pub(crate) const NATIVE_LOAD_BIAS_MODE13: usize = LOAD_BIAS_MODE13;
+#[allow(dead_code)]
+pub(crate) const NATIVE_LOAD_BIAS_SUPERVISOR: usize = LOAD_BIAS_SUPERVISOR;
+#[allow(dead_code)]
+pub(crate) const NATIVE_LOAD_BIAS_TAG_MASK: usize = LOAD_BIAS_TAG_MASK;
 
 impl FastMap {
     /// Resolve a populated linear mapping for the interpreter without revisiting the small TLB.
@@ -356,6 +487,8 @@ impl FastMap {
         self.storage.as_ref().map(|storage| NativeMapBases {
             read_biases: storage.read_biases.as_ptr() as usize,
             write_biases: storage.write_biases.as_ptr() as usize,
+            store_biases: storage.store_biases.as_ptr() as usize,
+            load_biases: storage.load_biases.as_ptr() as usize,
             physical_pages: storage.physical_pages.as_ptr() as usize,
             mapping_epochs: storage.mapping_epochs.as_ptr() as usize,
             flags: storage.flags.as_ptr() as usize,
@@ -508,6 +641,16 @@ impl FastMap {
         storage.physical_pages[index] = physical_page;
         storage.mapping_epochs[index] = page.mapping_epoch;
         storage.flags[index] = flags;
+        // The store-bias derivation runs at the END of EVERY populate — read fills included —
+        // from the FINAL flags byte. Deriving on write fills only would let a same-mapping read
+        // refill that changes the permission bits (flags rebuild from fresh `permissions` each
+        // fill) leave a fast entry a ring-3 store may no longer take (design hazard H2).
+        storage.store_biases[index] = derive_store_bias(flags, storage.write_biases[index]);
+        // The load twin derives at the same choke, from the same final byte, for the same H2
+        // reason: a same-mapping refill that drops PAGE_USER must flip the entry to the
+        // supervisor tag in THIS populate. (A non-same-mapping write fill reset `read_biases`
+        // above AND dropped HAS_READ_BIAS, so the derivation poisons twice over.)
+        storage.load_biases[index] = derive_load_bias(flags, storage.read_biases[index]);
         FastMapStorage::set_bit(&mut storage.live_pages, index);
         if !FastMapStorage::bit(&storage.listed_pages, index) {
             FastMapStorage::set_bit(&mut storage.listed_pages, index);
@@ -629,6 +772,57 @@ impl FastMap {
         self.storage
             .as_ref()
             .is_some_and(|storage| storage.flags[index] & PAGE_WATCHED != 0)
+    }
+
+    /// The raw store-bias entry for `linear` — the one-lookup store battery's inspector
+    /// (a dead entry reads the poison).
+    #[cfg(test)]
+    pub(crate) fn store_bias_for_test(&self, linear: u32) -> usize {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.storage
+            .as_ref()
+            .map_or(STORE_BIAS_POISON, |storage| storage.store_biases[index])
+    }
+
+    /// Test-only INV-P violation injector (design T4): make the entry LOOK unwatched to the
+    /// fast path while the flags bit and both watch tables say watched — a state the
+    /// derivation can never produce. The differential a fixture builds on this proves the
+    /// emitted fast path consults nothing but the store-bias table.
+    #[cfg(test)]
+    pub(crate) fn force_fast_store_bias_for_test(&mut self, linear: u32) {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        let storage = self
+            .storage
+            .as_mut()
+            .expect("entry populated before forcing");
+        let flags = storage.flags[index] & !PAGE_WATCHED;
+        storage.store_biases[index] = derive_store_bias(flags, storage.write_biases[index]);
+    }
+
+    /// The raw load-bias entry for `linear` — the one-lookup load battery's inspector (a dead
+    /// entry reads the poison).
+    #[cfg(test)]
+    pub(crate) fn load_bias_for_test(&self, linear: u32) -> usize {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.storage
+            .as_ref()
+            .map_or(LOAD_BIAS_POISON, |storage| storage.load_biases[index])
+    }
+
+    /// Test-only INV-R violation injector (load design L4): recompute the entry with PAGE_USER
+    /// forced INTO the derivation input while the real flags byte says supervisor — a state
+    /// production cannot produce. The differential a fixture builds on this proves the emitted
+    /// fast load path consults nothing but the load-bias table (the flags byte is the one thing
+    /// the classic arm reads on that state and the fast arm must not).
+    #[cfg(test)]
+    pub(crate) fn force_fast_load_bias_for_test(&mut self, linear: u32) {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        let storage = self
+            .storage
+            .as_mut()
+            .expect("entry populated before forcing");
+        let flags = storage.flags[index] | PAGE_USER;
+        storage.load_biases[index] = derive_load_bias(flags, storage.read_biases[index]);
     }
 
     #[cfg(test)]

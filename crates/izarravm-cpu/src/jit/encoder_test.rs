@@ -1201,6 +1201,62 @@ fn call_indirect_known_bytes() {
 }
 
 #[test]
+fn call_m64_disp32_known_bytes() {
+    // call qword [r15 + 200] -- REX.B=1 (r15) = 0x41; FF; mod=10,reg=/2,rm=r15&7=7 ->
+    // 10_010_111 = 0x97; disp32. No REX.W: FF /2 defaults to 64-bit in long mode.
+    let mut e = Encoder::new();
+    e.call_m64_disp32(Reg::R15, 200);
+    assert_eq!(e.finish(), vec![0x41, 0xFF, 0x97, 0xC8, 0x00, 0x00, 0x00]);
+}
+
+#[test]
+fn ret_near_known_bytes() {
+    let mut e = Encoder::new();
+    e.ret_near();
+    assert_eq!(e.finish(), vec![0xC3]);
+}
+
+#[test]
+fn and_r64_imm32_known_bytes() {
+    // and rdi, -4 -- REX.W = 0x48; 81; mod=11,reg=/4,rm=7 -> 0xE7; imm32 0xFFFFFFFC.
+    let mut e = Encoder::new();
+    e.and_r64_imm32(Reg::RDI, 0xFFFF_FFFC);
+    assert_eq!(e.finish(), vec![0x48, 0x81, 0xE7, 0xFC, 0xFF, 0xFF, 0xFF]);
+}
+
+#[test]
+fn pop_and_jmp_m64_disp32_known_bytes() {
+    // pop qword [rsp + 128] -- 8F /0; mod=10,rm=rsp needs SIB 0x24; disp32 128.
+    let mut e = Encoder::new();
+    e.pop_m64_disp32(Reg::RSP, 128);
+    assert_eq!(e.finish(), vec![0x8F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]);
+
+    // jmp qword [rsp + 128] -- FF /4; same addressing.
+    let mut e = Encoder::new();
+    e.jmp_m64_disp32(Reg::RSP, 128);
+    assert_eq!(e.finish(), vec![0xFF, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00]);
+}
+
+#[test]
+fn test_r8_low_imm8_known_bytes() {
+    // test dil, 3 -- empty REX 0x40 selects DIL (without it, rm=7 at byte width is BH);
+    // F6 /0 ib; modrm mod=11,reg=0,rm=7 -> 0xC7.
+    let mut e = Encoder::new();
+    e.test_r8_low_imm8(Reg::RDI, 3);
+    assert_eq!(e.finish(), vec![0x40, 0xF6, 0xC7, 0x03]);
+
+    // test r9b, 1 -- REX.B form; no ambiguity but the prefix is still required.
+    let mut e = Encoder::new();
+    e.test_r8_low_imm8(Reg::R9, 1);
+    assert_eq!(e.finish(), vec![0x41, 0xF6, 0xC1, 0x01]);
+
+    // test al, 1 -- no prefix at all for the legacy low lanes.
+    let mut e = Encoder::new();
+    e.test_r8_low_imm8(Reg::RAX, 1);
+    assert_eq!(e.finish(), vec![0xF6, 0xC0, 0x01]);
+}
+
+#[test]
 fn test_al_al_known_bytes() {
     let mut e = Encoder::new();
     e.test_al_al();

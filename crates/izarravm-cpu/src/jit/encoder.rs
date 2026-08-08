@@ -1844,6 +1844,82 @@ impl Encoder {
         self.modrm(0b11, 2, target.low3());
     }
 
+    /// `call qword [base + disp32]` (FF /2, mod=10, no REX.W — FF /2 is 64-bit by default in
+    /// long mode). The one-lookup store sites use this against R15 slots: 7 bytes, no scratch
+    /// register, unlike the 13-byte `mov r64, imm64` + `call r64` call-out pattern.
+    pub(crate) fn call_m64_disp32(&mut self, base: Reg, disp32: i32) {
+        self.optional_rex(false, false, false, base.ext());
+        self.bytes.push(0xFF);
+        self.modrm(0b10, 2, base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// `ret` (C3). Unit-tested but not emitted today: the shared store stubs were designed
+    /// around call/ret and BUILT on the pop/jmp-through-slot mechanism instead (which keeps
+    /// RSP at the frame level inside the stub), so this is kept for a future caller exactly
+    /// as `cmp_r64_imm32` is.
+    #[allow(dead_code)]
+    pub(crate) fn ret_near(&mut self) {
+        self.bytes.push(0xC3);
+    }
+
+    /// `and r64, imm32` (REX.W + 81 /4 id), the immediate SIGN-extended to 64 bits — so
+    /// `and rdi, -4` clears exactly the low two bits, which is how the mode13 stub strips the
+    /// store-bias tags without touching the pointer's high half.
+    pub(crate) fn and_r64_imm32(&mut self, dst: Reg, imm: u32) {
+        self.rex(true, false, false, dst.ext());
+        self.bytes.push(0x81);
+        self.modrm(0b11, 4, dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `pop qword [base + disp32]` (8F /0, mod=10). EVERY shared store stub uses this as its
+    /// prologue: it moves the CALL's return address into a frame slot AND restores RSP to the
+    /// frame level in one instruction, so every frame-offset helper emits at its normal
+    /// displacement inside the stub. The displacement is computed against the RESTORED RSP:
+    /// with an RSP base, POP computes the operand address after the increment (SDM vol.2,
+    /// POP, "address of the operand is computed after the increment").
+    pub(crate) fn pop_m64_disp32(&mut self, base: Reg, disp32: i32) {
+        self.optional_rex(false, false, false, base.ext());
+        self.bytes.push(0x8F);
+        self.modrm(0b10, 0, base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// `jmp qword [base + disp32]` (FF /4, mod=10) — the slow store stubs' epilogue, returning
+    /// through the frame slot their `pop` prologue parked the return address in.
+    pub(crate) fn jmp_m64_disp32(&mut self, base: Reg, disp32: i32) {
+        self.optional_rex(false, false, false, base.ext());
+        self.bytes.push(0xFF);
+        self.modrm(0b10, 4, base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// `test r8_low, imm8` (F6 /0 ib) against the LOW byte lane of any GPR, emitting the empty
+    /// REX (0x40) for RSP/RBP/RSI/RDI so the encoding selects SPL/BPL/SIL/DIL rather than
+    /// AH/CH/DH/BH. The rest of the encoder deliberately avoids these byte registers (guest
+    /// high-byte lanes must map to shifts, see `emit_read_store_value`) — this form exists for
+    /// HOST-side bit tests on scratch registers, the store-bias tag probe first.
+    pub(crate) fn test_r8_low_imm8(&mut self, r: Reg, imm: u8) {
+        if r.ext() {
+            self.bytes.push(0x41);
+        } else if matches!(r, Reg::RSP | Reg::RBP | Reg::RSI | Reg::RDI) {
+            self.bytes.push(0x40);
+        }
+        self.bytes.push(0xF6);
+        self.modrm(0b11, 0, r.low3());
+        self.bytes.push(imm);
+    }
+
     /// `test al, al` (84 C0) -- tests the low byte of RAX (the C-ABI return register for a `u8`).
     pub(crate) fn test_al_al(&mut self) {
         self.bytes.push(0x84);

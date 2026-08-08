@@ -1605,12 +1605,6 @@ pub struct CpuGsw {
     // position is load-bearing only through `offset_of!`, which computes it.
     #[cfg(feature = "jit")]
     pub(crate) native_callout: jit::direct::CallOutTable,
-    // Write-once table bases republished for emitted code to load R15-relative
-    // instead of baking 10-byte immediates (jit/direct's NativeTableSlots doc
-    // has the invariant; emit::table_slot_offset computes the position via
-    // offset_of!, so it is load-bearing only through that).
-    #[cfg(feature = "jit")]
-    pub(crate) native_table_slots: jit::direct::NativeTableSlots,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
     timing_rem: u64,
@@ -1783,6 +1777,17 @@ pub struct CpuGsw {
     /// written once per run at most, and putting it mid-struct moved
     /// `pending_flags` off its pinned offset and every hot field after it.
     fault_site: FaultSite,
+    // Write-once table bases republished for emitted code to load R15-relative
+    // instead of baking 10-byte immediates (jit/direct's NativeTableSlots doc
+    // has the invariant; emit::table_slot_offset computes the position via
+    // offset_of!, so it is load-bearing only through that). AT THE TAIL for
+    // fault_site's reason, learned the hard way: the one-lookup slice grew this
+    // array by 144 bytes mid-struct, every hot interpreter field after it moved,
+    // and the quiet-window gate read it as a uniform ~2-5% doom regression with
+    // byte-identical counters and an unchanged profile shape. Emitted code
+    // addresses it through offset_of!, so the tail position costs nothing.
+    #[cfg(feature = "jit")]
+    pub(crate) native_table_slots: jit::direct::NativeTableSlots,
 }
 
 impl Default for CpuGsw {
