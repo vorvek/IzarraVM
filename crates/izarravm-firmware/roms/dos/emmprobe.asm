@@ -21,7 +21,7 @@ cpu 386
 org 0x100
 %define OK 0xA5
 ; XMS free must be well clear of the two baselines below for a collapse to mean
-; anything. A floor, not a pin: the 24 MB profile leaves about 20 MB free here,
+; anything. A floor, not a pin: the 64 MB profile leaves about 62 MB free here,
 ; so this only rejects a machine too small to be testing anything.
 XMS_MIN_KB equ 2048
 

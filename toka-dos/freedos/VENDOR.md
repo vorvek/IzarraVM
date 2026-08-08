@@ -179,17 +179,16 @@ Rebrand: move src/version.h + move.c product-name string; sort src/sort.c banner
   `/DEBUG` still work by themselves. MEM also identifies the HMA resident as
   Toka-DOS instead of the upstream FreeDOS product name.
 - Toka-DOS replaces the default summary with a four-line, 79-column map for
-  conventional, upper, EMS, and XMS memory. The kinds appear consecutively
-  with BIOS attributes `0x09` (light blue), `0x0B` (light cyan), `0x0D`
-  (light magenta), and `0x0A` (light green). CP437 `B2` marks used memory and
-  CP437 `B0` marks free memory within each colored range. MEM uses 640 KiB
-  conventional and 384 KiB upper categories. TOKAEMM supplies the 3 MiB EMS
-  and 20 MiB XMS category sizes through its private XMS query on the 24 MiB
-  machine. The upper region includes video memory and ROMs; only 96 KiB is
+  conventional, upper, and extended memory. The kinds appear consecutively
+  with BIOS attributes `0x09` (light blue), `0x0B` (light cyan), and `0x0A`
+  (light green). CP437 `B2` marks used memory and CP437 `B0` marks free
+  memory within each colored range. MEM uses 640 KiB conventional and 384 KiB
+  upper categories. TOKAEMM supplies the single shared 63 MiB extended
+  category through its private XMS query on the 64 MiB machine; XMS, VCPI,
+  and EMS all draw from that one pool, so there is no separate EMS row or
+  partition. The upper region includes video memory and ROMs; only 96 KiB is
   available for UMB allocation with the default EMS frame, or 160 KiB under
-  `NOEMS`. EMS has its own top-of-RAM partition. Standard XMS blocks use up to
-  2 MiB and VCPI owns the rest of the extended category. Under `NOEMS`, the
-  EMS category becomes zero and the extended category grows to 23 MiB.
+  `NOEMS`.
   TOKAEMM's versioned private query returns free VCPI memory so MEM can add it
   to standard XMS free space. The MEM executable and driver must be rebuilt
   and shipped together. Pairing an older MEM with the new driver is safe, but

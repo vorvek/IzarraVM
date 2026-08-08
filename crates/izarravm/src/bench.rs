@@ -1222,7 +1222,7 @@ fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
 /// Block sizes swept by --headless-bandwidth, powers of two from 4 KB to 4 MB.
 /// A block that fits the live mode's cache stays resident across passes; one that
 /// exceeds it re-misses every pass. The largest block (4 MB) plus the 1 MB base
-/// tops out at 5 MB, well inside the 24 MB machine.
+/// tops out at 5 MB, well inside the 64 MB machine.
 const BANDWIDTH_BLOCKS: &[u32] = &[
     4 * 1024,
     8 * 1024,

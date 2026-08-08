@@ -295,7 +295,7 @@ read_hardware:
 ;
 ; The wait is bounded by the BIOS tick counter, not by an iteration count. The
 ; DSP needs ~100us of settle time to answer, and how many poll instructions fit
-; into 100us depends entirely on the CPU persona -- a count tuned on the 200 MHz
+; into 100us depends entirely on the CPU persona -- a count tuned on the 166 MHz
 ; part reports "not installed" on the 22 MHz one, and vice versa. Three ticks
 ; (~165ms) is far longer than any real settle and still instant to a person. The
 ; iteration cap underneath it is a backstop for a machine whose timer interrupt

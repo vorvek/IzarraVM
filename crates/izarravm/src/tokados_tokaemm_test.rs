@@ -1242,10 +1242,11 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("593K"),
-        "the high page tables should leave about 593 KiB conventional memory free.\n{text}"
+        Some("582K"),
+        "the high page tables should leave about 582 KiB conventional memory free \
+         (the 64 MB arena bitmaps cost ~11 KiB of low core over the 24 MB era).\n{text}"
     );
-    assert_extended_category(&screen, "23,552K", "21,925K");
+    assert_extended_category(&screen, "23,552K", "23,165K");
 
     let rows = memory_map_rows(&screen);
     assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
@@ -1315,7 +1316,7 @@ fn tokaemm_mem_noems_reports_combined_extended_free() {
         "no C:\\> prompt after MEM ran with NOEMS (stop={stop:?}).\n{}",
         screen.text
     );
-    assert_extended_category(&screen, "23,552K", "21,925K");
+    assert_extended_category(&screen, "23,552K", "23,165K");
 }
 
 #[test]
@@ -1432,8 +1433,10 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(29K)"),
-        "TokaEMM should retain only its 29 KiB low core.\n{}",
+        tokaemm.contains("(40K)"),
+        "TokaEMM should retain only its ~40 KiB low core: the 24 MB-era 29 KiB \
+         of code and state plus the 64 MB machine's arena bitmaps and EMS \
+         chain table.\n{}",
         screen.text
     );
     let free = screen
@@ -1443,8 +1446,8 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(593K)"),
-        "MEM /CLASSIFY should report about 593 KiB conventional free.\n{}",
+        Some("(582K)"),
+        "MEM /CLASSIFY should report about 582 KiB conventional free.\n{}",
         screen.text
     );
 }

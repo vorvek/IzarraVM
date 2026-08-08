@@ -43,8 +43,8 @@ single pool as they are requested, and memory returned by one interface becomes
 available to the others. There is no fixed EMS partition and no reserved XMS
 area.
 
-On a 24 MiB Izarra 3000, MEM reports 640K of conventional memory, a 384K upper
-region, and a 23,552K extended category, of which 21,925K is free after Toka-DOS
+On a 64 MiB Izarra 3000, MEM reports 640K of conventional memory, a 384K upper
+region, and a 64,512K extended category, of which 64,125K is free after Toka-DOS
 and its drivers have loaded.
 
 **Note:** Because expanded memory is taken from the same pool, MEM does not
@@ -54,11 +54,12 @@ the same reporting convention MS-DOS 6.22 uses with EMM386.
 
 ## Resident footprint
 
-TOKAEMM occupies 29K of conventional memory for its code, its state, its task
-structure, and its monitor stack. Its page directory and six page tables require
-a further 28K, which on a machine with sufficient extended memory is reserved
-above the 1 MB line rather than below it. The standard 24 MiB configuration
-therefore leaves 593K of conventional memory free.
+TOKAEMM occupies 40K of conventional memory for its code, its state, its task
+structure, its monitor stack, and the allocation bitmaps that track the 64 MB
+shared arena. Its page directory and sixteen page tables require a further 68K,
+which on a machine with sufficient extended memory is reserved above the 1 MB
+line rather than below it. The standard 64 MiB configuration therefore leaves
+582K of conventional memory free.
 
 The 1 MiB profile has no extended pages to reserve, so TOKAEMM keeps a low
 page-table fallback there. Loading the whole manager into a UMB would not help

@@ -139,24 +139,23 @@ MEM [/P] [/FULL] [/DEBUG] [/PAGE] [...]
 ```
 
 By default, `MEM` shows a four-line, 79-column memory map after its numeric
-summary. Conventional, upper, EMS, and XMS memory appear consecutively in
-light blue, light cyan, light magenta, and light green. Within each colored
-range, `▓` (CP437 `B2`) marks memory in use and `░` (CP437 `B0`) marks free
-memory.
+summary. Conventional, upper, and extended memory appear consecutively in
+light blue, light cyan, and light green. Within each colored range, `▓`
+(CP437 `B2`) marks memory in use and `░` (CP437 `B0`) marks free memory.
 
-On the standard 24 MiB Izarra 3000, the map gives conventional memory 8
-cells, upper memory 5, EMS 40, and extended memory 263. Each of the 316 cells
-represents about 77.8 KiB. The exact summary categories are 640 KiB
-conventional memory, the full 384 KiB upper region, 3 MiB EMS, and 20 MiB in
-the row labelled `Extended (XMS)`. The upper category covers the whole
-`A0000` to `FFFFF` address region, including video memory and ROMs. TOKAEMM
-can allocate 96 KiB there with its default EMS frame. Under `NOEMS`, the EMS
-category becomes zero, the extended category grows to 23 MiB, and the
-allocatable UMB space grows to 160 KiB.
+On the standard 64 MiB Izarra 3000, the map gives conventional memory 3
+cells, upper memory 2, and extended memory 311. Each of the 316 cells
+represents about 207 KiB. The exact summary categories are 640 KiB
+conventional memory, the full 384 KiB upper region, and 64,512 KiB in the row
+labelled `Extended (XMS)`. The upper category covers the whole `A0000` to
+`FFFFF` address region, including video memory and ROMs. TOKAEMM can allocate
+96 KiB there with its default EMS frame; under `NOEMS` the allocatable UMB
+space grows to 160 KiB.
 
-The 3 MiB EMS pool is a separate top-of-RAM partition. Standard XMS blocks
-use a dedicated pool of up to 2 MiB. VCPI owns the rest of the extended
-category. MEM adds the free space from both pools for the existing XMS row.
+There is no separate EMS row or partition: XMS blocks, VCPI pages, and EMS
+pages all draw from one shared extended pool, so the `Extended (XMS)` row is
+starred and a footnote explains that EMS is simulated from XMS as required,
+the same convention MS-DOS 6.22 uses with EMM386.
 
 Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE`, which pauses
 after each screenful. The per-program size and segment listing normally needs
