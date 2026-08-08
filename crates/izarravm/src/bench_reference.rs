@@ -103,9 +103,9 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     band(
         "dhrystone",
         GswMode::Gsw586,
-        249_000.0,
+        337_200.0,
         "iters/sec",
-        "Project reference: Pentium MMX at 166 MHz, about 249000 Dhrystones/sec",
+        "Project reference: Pentium MMX-166 on the P100 board, about 337000 Dhrystones/sec",
     ),
     band(
         "sieve",
@@ -131,9 +131,9 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     band(
         "sieve",
         GswMode::Gsw586,
-        1375.0,
+        1813.0,
         "iters/sec",
-        "Deterministic BYTE Sieve calibration for the Pentium MMX-166 profile",
+        "Deterministic BYTE Sieve calibration for the Pentium MMX-166 / P100 profile",
     ),
     band(
         "fp-mandel",
@@ -145,7 +145,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     band(
         "fp-mandel",
         GswMode::Gsw586,
-        115_300.0,
+        145_200.0,
         "iters/sec",
         "Deterministic x87 Mandelbrot calibration; Whetstone remains the period FP reference",
     ),
@@ -159,9 +159,9 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     band(
         "whetstone",
         GswMode::Gsw586,
-        28.6,
+        36.8,
         "MFLOPS",
-        "Project reference: Pentium MMX-166 at about 28.6 Whetstone MFLOPS",
+        "Project reference: Pentium MMX-166 / P100 at about 36.8 Whetstone MFLOPS; the P100 bus recalibration lifts the x87 memory traffic above the plain-166 28.6",
     ),
     band(
         "bandwidth-l2",
@@ -215,23 +215,23 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     band(
         "bandwidth-l1",
         GswMode::Gsw586,
-        1411.0,
+        2160.0,
         "MB/s",
-        "Deterministic split-L1 calibration for the Pentium MMX-166 profile",
+        "Deterministic split-L1 calibration for the Pentium MMX-166 / P100 profile",
     ),
     band(
         "bandwidth-l2",
         GswMode::Gsw586,
-        195.0,
+        299.5,
         "MB/s",
-        "Deterministic 512 KiB L2 calibration for the Pentium MMX-166 profile",
+        "Deterministic 512 KiB L2 calibration for the Pentium MMX-166 / P100 profile",
     ),
     band(
         "bandwidth-ram",
         GswMode::Gsw586,
-        158.5,
+        242.9,
         "MB/s",
-        "Deterministic RAM calibration for the Pentium MMX-166 profile",
+        "Deterministic P100 SDRAM calibration for the Pentium MMX-166 profile",
     ),
 ];
 

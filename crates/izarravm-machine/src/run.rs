@@ -1167,6 +1167,20 @@ impl Machine {
                             .last_mut()
                             .expect("opened at batch entry")
                             .push(bus.prior_runs_core_clocks);
+                        // A committed span can land `spent` EXACTLY on the cap.
+                        // The loop-top check has already run this pass, so
+                        // without this break the machine would enter
+                        // `run_budgeted(0)`, which always executes at least one
+                        // instruction, and drift one instruction past the plain
+                        // interpreter at the same scaled-clock boundary (found
+                        // by `memory_poll_skip_matches_the_interpreter_at_batch_boundaries`
+                        // when the 586 bus ratio moved for the P100 spec). The
+                        // deliberate zero-budget alignment run is different: it
+                        // must still execute to reach the poll head.
+                        #[cfg(feature = "jit")]
+                        if !align_poll_head && remaining == 0 {
+                            break;
+                        }
                         #[cfg(feature = "jit")]
                         let run_budget = if align_poll_head { 0 } else { remaining };
                         #[cfg(not(feature = "jit"))]

@@ -2535,6 +2535,21 @@ vcpi_dispatch:
 ; (2026-08-06). Do not move any of these structures up without re-deriving it.
 ; The server page tables may be reserved above 1 MB, but DE0C reads pd_lin
 ; from low server data before switching back to the server CR3.
+;
+; The same bound pins arena_bmp and vcpi_bmp, which is less obvious because they
+; are plain data rather than fault-delivery machinery. DE01 copies exactly 0x110
+; page-table entries (below), so a client running under its own CR3 has linear
+; 0..0x110000 mapped and nothing above it. DE03/DE04/DE05 arrive HERE, under
+; that CR3, and run the same arena_query32/vcpi_page_alloc/vcpi_page_free bodies
+; the V86 path does. A bitmap at ARENA_PHYS_BASE (0x138000) would take a #PF in
+; the client's world, and a data selector based there would not exist in the
+; client's GDT either -- only CS, CS+8 and CS+16 are furnished. Trapping to the
+; monitor does not rescue it: these callers are not V86 code and cannot trap at
+; all. Two proposals to move those two bitmaps into the high reservation, to buy
+; back what the 64 MB arena cost the resident core, were cut on this
+; (2026-08-08). Only ems_link is movable that way, because EMS is INT 67h
+; AH=40h-4Dh and never reaches this entry point. vcpisw.asm exercises the
+; DE04/DE05 protected-mode path for real, so this is not an untested corner.
 ; Software-defined PTE bits 9-11 are cleared in the copy (spec p.6; the
 ; 386MAX COPY_PTE convention). The descriptors: +0 the server code segment
 ; (base = base_lin, byte limit = resident_core_end-1, 32-bit CPL0 code -- entry

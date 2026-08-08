@@ -353,7 +353,10 @@ pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 /// current values are measured after that change and after `scale_bus`:
 ///
 /// - 486 ws=45: 2980 realtics, 25.1 fps (target about 3000 realtics)
-/// - 586 ws=75: 833 realtics, 89.7 fps (target 820 to 850 realtics)
+/// - 586 ws=75 at 200 MHz with `bus_timing` 7/30: 833 realtics, 89.7 fps
+///   (target 820 to 850 realtics); re-seated 2026-08-08 for the 166 MHz /
+///   P100 spec as ws=147 with `bus_timing` 16/105, jointly solved so doom-586
+///   holds ~1001 realtics (74.6 fps) while quake reaches ~41.2 fps.
 ///
 /// Interpreter, direct-page, REP, and native VGA paths all use this table. The
 /// Accurate 386 class keeps the frozen `WaitStateProfile.video` path. Recalibrate
@@ -364,8 +367,11 @@ const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
         CpuPersona::I386 => 1,
         // (2 + 45) * 1/3 clocks at 66 MHz is about 237 ns per access.
         CpuPersona::I486 => 45,
-        // (2 + 75) * 7/30 clocks at 166 MHz is about 108 ns per access.
-        CpuPersona::I586 => 75,
+        // (2 + 147) * 16/105 clocks at 166 MHz is about 137 ns per access. The
+        // count rises with the `bus_timing` cut so the VGA product lands where
+        // the doom-586 anchor (~1001 realtics / 74.6 fps) needs it; see the
+        // joint solve note on `bus_timing`.
+        CpuPersona::I586 => 147,
     }
 }
 
