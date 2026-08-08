@@ -145,7 +145,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     band(
         "fp-mandel",
         GswMode::Gsw586,
-        117_500.0,
+        115_300.0,
         "iters/sec",
         "Deterministic x87 Mandelbrot calibration; Whetstone remains the period FP reference",
     ),
