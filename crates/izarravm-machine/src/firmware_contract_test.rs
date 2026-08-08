@@ -580,7 +580,8 @@ fn per_vector_linear_stub_identity_posts_the_matching_service() {
 #[test]
 fn the_tokaemm_image_keeps_room_under_the_16_bit_driver_ceiling() {
     const CEILING: usize = 0x10000;
-    // Measured 2026-08-06: 29,488 bytes. The bar is deliberately well under the
+    // Measured 2026-08-07: 29,552 bytes (+64 for the /T device parameter and
+    // its tree-styled banner prefix). The bar is deliberately well under the
     // ceiling rather than just below it, so that a change which eats the
     // headroom is caught while there is still room to think about it.
     const MAX: usize = 40_000;

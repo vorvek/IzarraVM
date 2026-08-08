@@ -200,3 +200,6 @@ mod sndctrl;
 
 #[path = "tokados_gswmode_test.rs"]
 mod gswmode;
+
+#[path = "tokados_bootscreen_test.rs"]
+mod bootscreen;

@@ -34,21 +34,44 @@ fn extracts_the_embedded_image_payload() {
     // failed sort-buffer allocation quiet when nobody asked for the sort, and
     // scanOrder() tracking its own argument start instead of reading the byte
     // in front of it. See toka-dos/freedos/VENDOR.md.
+    //
+    // 70076 -> 71084 (styled init screen): KERNEL.SYS grew net +1008 bytes.
+    // signon() replaced the old single-line "\r%S ..." banner with the
+    // rainbow boot logo (drawn straight into B800:0 text RAM) plus the
+    // welcome box, added signon_box_edge()/signon_box_text() box-drawing
+    // helpers, and initdisk.c's drive-assignment line now goes out through
+    // TOKA_TREE_PREFIX (the CP437 elbow "\xC3\xC4> ") instead of a bare
+    // printf. Those additions are only partly offset by what they replaced:
+    // the old "\r%S" signon format string and dsk_init()'s unterminated
+    // " - InitDisk" progress fragment (initdisk.c, ~line 1369) are both gone,
+    // the latter because a stray unanchored fragment would dangle ahead of
+    // the fixed-row tree lines whenever no DOS partition is found.
+    //
+    // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
+    // FreeCOM's startup ver() banner is now suppressed at both call sites so
+    // the styled boot tree owns the screen instead of racing FreeCOM's own
+    // signon: the /P (resident shell) branch's unconditional `cmd_ver(NULL)`
+    // in initialize() -- the path CONFIG.SYS's shipped
+    // `SHELL=...COMMAND.COM ... /P=C:\AUTOEXEC.BAT` line actually takes --
+    // and the non-/P `showinfo` block's `cmd_ver(NULL)` a few lines below it,
+    // which a COMMAND.COM invoked without /P (e.g. a nested interactive
+    // shell) still reaches. VER remains fully functional as an explicit
+    // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(70076),
+        Some(71084),
         "KERNEL.SYS size"
     );
     assert_eq!(
         by_name.get("COMMAND.COM").map(|d| d.len()),
-        Some(87495),
+        Some(87447),
         "COMMAND.COM size"
     );
     assert!(by_name.contains_key("CONFIG.SYS"), "CONFIG.SYS present");
     assert!(by_name.contains_key("AUTOEXEC.BAT"), "AUTOEXEC.BAT present");
     assert!(by_name.contains_key("HELLO.TXT"), "HELLO.TXT present");
 
-    // The kernel signon points at "See C:\\LICENSE.TXT for more.", so the full
+    // The kernel signon points at "** See LICENSE.TXT for more.", so the full
     // FreeDOS / Toka-DOS licensing ships as a real file on the C: payload.
     let license = by_name.get("LICENSE.TXT").expect("LICENSE.TXT present");
     assert!(
@@ -81,16 +104,27 @@ fn extracts_the_embedded_image_payload() {
          binary (rebuild sndctrl.com, then regenerate roms/tokados-hdd.img \
          via scripts/build-freedos-hdd-image.py)"
     );
+    // The actual dispatch order is set by the FOR list, not by where each
+    // labeled block sits in the file (a self-calling AUTOEXEC.BAT jumps to
+    // whichever label %1 names) -- pin the list itself rather than comparing
+    // block positions, or reordering the list would stay green while the
+    // boot order silently flipped.
     let autoexec_text = String::from_utf8_lossy(autoexec);
-    let izcdex_pos = autoexec_text
-        .find("IZCDEX /I /D:TOKACD01 /L:D /Q")
-        .expect("default AUTOEXEC assigns the guest CD-ROM as D:");
-    let mouse_pos = autoexec_text
-        .find("LH TOKAMOUS")
-        .expect("default AUTOEXEC loads the mouse driver");
     assert!(
-        izcdex_pos < mouse_pos,
-        "default AUTOEXEC installs IZCDEX before the mouse driver"
+        autoexec_text.contains("FOR %%C IN (CDROM MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C"),
+        "default AUTOEXEC dispatches CDROM, then MOUSE, then SOUND, via the self-calling FOR loop"
+    );
+    assert!(
+        autoexec_text.contains("IZCDEX /I /D:TOKACD01 /L:D /T"),
+        "default AUTOEXEC's CDROM block assigns the guest CD-ROM as D:"
+    );
+    assert!(
+        autoexec_text.contains("LH TOKAMOUS /T"),
+        "default AUTOEXEC's MOUSE block loads the mouse driver high"
+    );
+    assert!(
+        autoexec_text.contains("SNDCTRL /B /T"),
+        "default AUTOEXEC's SOUND block prints the boot-time sound summary"
     );
 
     // TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
@@ -111,8 +145,8 @@ fn extracts_the_embedded_image_payload() {
     let config = by_name.get("CONFIG.SYS").expect("CONFIG.SYS present");
     let config_text = String::from_utf8_lossy(config);
     assert!(
-        config_text.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS RAM"),
-        "default CONFIG.SYS loads TOKAEMM from C:\\DOS"
+        config_text.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS RAM /T"),
+        "default CONFIG.SYS loads TOKAEMM from C:\\DOS with the tree-styled banner"
     );
     assert!(
         config_text.contains("DOS=HIGH,UMB"),
@@ -133,16 +167,48 @@ fn extracts_the_embedded_image_payload() {
         "default CONFIG.SYS caps LASTDRIVE at D (A: floppy, C: HDD, D: CD)"
     );
 
+    // IZCDEX.COM and TOKAMOUS.COM have no committed reference binaries to
+    // identity-pin (the build script may legitimately re-extract them), so
+    // pin the /T feature's own bytes instead: the CP437 tree prefix and the
+    // one-line install text. The needle for the install text is the whole
+    // "IZCDEX installed. Assigned [" string, not just "drive(s)" -- the old
+    // pre-/T IZCDEX binary already contained "drive(s)" (from its DrivesAvail
+    // string), so that alone would not catch a stale pre-styled copy. A
+    // stale pre-styled copy fails here instead of silently unstyling the
+    // boot tree.
+    let tree_prefix: &[u8] = &[0xC3, 0xC4, b'>', b' '];
+    let install_text: &[u8] = b"IZCDEX installed. Assigned [";
+    let izcdex = by_name.get("IZCDEX.COM").expect("IZCDEX.COM present");
+    assert!(
+        izcdex.windows(tree_prefix.len()).any(|w| w == tree_prefix)
+            && izcdex
+                .windows(install_text.len())
+                .any(|w| w == install_text),
+        "IZCDEX.COM on the payload lacks the /T tree prefix or the one-line \
+         install text -- stale pre-styled binary in the image?"
+    );
+    let tokamous = by_name.get("TOKAMOUS.COM").expect("TOKAMOUS.COM present");
+    assert!(
+        tokamous
+            .windows(tree_prefix.len())
+            .any(|w| w == tree_prefix),
+        "TOKAMOUS.COM on the payload lacks the /T tree prefix -- stale \
+         pre-styled binary in the image?"
+    );
+
     // FreeDOS KERNEL.SYS is a raw binary, not an MZ: it begins with a short
     // JMP (0xEB) past the embedded BPB — the load-bearing first byte the boot
     // sector relies on.
     let kernel = by_name.get("KERNEL.SYS").unwrap();
     assert_eq!(kernel[0], 0xEB, "KERNEL.SYS begins with a short JMP");
 
-    // The rebranded, trimmed signon banner is compiled into the kernel.
+    // The rebranded, trimmed signon banner is compiled into the kernel. The
+    // welcome box's copyright line (TOKA_BUILD_LINE_2 in version.h) supersedes
+    // the older single-line "General Simulation Works" byline the pre-styled
+    // kernel printed.
     let has = |needle: &str| kernel.windows(needle.len()).any(|w| w == needle.as_bytes());
     assert!(
-        has("General Simulation Works"),
+        has("Izarra SL"),
         "the rebranded signon company name is in the kernel"
     );
     assert!(

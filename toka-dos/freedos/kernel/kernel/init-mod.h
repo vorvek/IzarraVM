@@ -1,6 +1,25 @@
 /* Included by initialisation functions */
 #define IN_INIT_MOD
 
+/* Modified by the Toka-DOS project, 2026: shared boot-screen styling for the
+   signon box and styled init lines (main.c, initdisk.c). Kernel-init only --
+   userland /T tools will each carry their own copy of the prefix bytes.
+   79, not 80: printf goes out via INT 29h -> BIOS TTY, which auto-wraps at
+   column 80; leaving the last column free keeps the explicit "\n" from
+   landing on an already-wrapped row and doubling every box line.
+   The tree prefix renders as a CP437 left tee + horizontal: 0xC3 0xC4 '>'.
+   (the AUTOEXEC footer box is deliberately 78 -- both match the approved
+   mockup; they are not meant to align) */
+#define TOKA_BOX_W 79
+#define TOKA_BOX_INNER_W (TOKA_BOX_W - 2)   /* edge interior run */
+#define TOKA_BOX_TEXT_END (TOKA_BOX_W - 1)  /* EXCLUSIVE bound: text/pad run
+                                                cols 2..(TOKA_BOX_TEXT_END-1);
+                                                col TOKA_BOX_TEXT_END itself is
+                                                the right border */
+#define TOKA_BOX_TEXT_W (TOKA_BOX_TEXT_END - 2)  /* usable text columns (76);
+                                                     later boxes copy this bound */
+#define TOKA_TREE_PREFIX "\xC3\xC4> "
+
 #include "version.h"
 #include "date.h"
 #include "time.h"

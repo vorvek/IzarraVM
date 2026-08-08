@@ -13,7 +13,7 @@ EMM386.EXE on a 386-or-better personal computer.
 `CONFIG.SYS` loads TOKAEMM as a device driver, before `DOS=HIGH,UMB`:
 
 ```
-DEVICE=C:\DOS\TOKAEMM.SYS [RAM | NOEMS]
+DEVICE=C:\DOS\TOKAEMM.SYS [RAM | NOEMS] [/T]
 ```
 
 The Toka-DOS default ships as:
@@ -34,6 +34,7 @@ memory-size argument.
 | --- | --- |
 | *(none)*, or `RAM` | Provides XMS, UMBs, HMA, and EMS 4.0 with its page frame at segment `E000`. This is the shipped default. |
 | `NOEMS` | Keep XMS, UMBs, and HMA, but disable the EMS page frame and page pool. `INT 67h` still reports the manager as present with zero EMS pages. |
+| `/T` | Prefix the signon banner with the tree-styled connector used by the Toka-DOS boot screen. Off by default; combine freely with `RAM` or `NOEMS` in any order. |
 
 ### How extended memory is divided
 

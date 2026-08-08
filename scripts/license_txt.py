@@ -3,7 +3,7 @@
 
 """Assemble C:\\LICENSE.TXT for the Toka-DOS disk images.
 
-The boot banner points at "See C:\\LICENSE.TXT for more.", so the full FreeDOS /
+The boot banner points at "See LICENSE.TXT for more.", so the full FreeDOS /
 Toka-DOS licensing lives in that one file on the C: drive instead of scrolling
 past on every boot. It is built from the project's NOTICE (attributions) and the
 FreeDOS kernel COPYING (the full GNU GPL v2) — single source, no duplicated blob;

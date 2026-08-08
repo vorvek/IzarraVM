@@ -946,7 +946,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
                     .screen_text()
                     .as_text()
                     .to_ascii_lowercase()
-                    .contains("tokaemm:")
+                    .contains("tokaemm xms/umb/ems memory manager; system running in v86")
         },
     );
     let text = machine.screen_text().as_text();
@@ -956,7 +956,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
         "no C:\\> prompt on the default boot.\n{text}"
     );
     assert!(
-        lower.contains("tokaemm:"),
+        lower.contains("tokaemm xms/umb/ems memory manager; system running in v86"),
         "the TOKAEMM signon banner is missing.\n{text}"
     );
     assert!(
@@ -1043,7 +1043,7 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
                 return false;
             }
             let lower = machine.screen_text().as_text().to_ascii_lowercase();
-            lower.contains("tokaemm: xms/umb/ems memory manager; system running in v86")
+            lower.contains("tokaemm xms/umb/ems memory manager; system running in v86")
                 && lower.contains("switched to 386-slow")
                 && lower.contains("switched to 586")
                 && lower.contains("cpu mode '286' was removed; use '386-slow'")
@@ -1066,7 +1066,7 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
     );
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("tokaemm: xms/umb/ems memory manager; system running in v86"),
+        lower.contains("tokaemm xms/umb/ems memory manager; system running in v86"),
         "TOKAEMM did not install while code 3 was active (stop={stop:?}).\n{text}"
     );
     assert!(
@@ -1421,7 +1421,15 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
     let tokaemm = screen
         .text
         .lines()
-        .find(|line| line.trim_start().starts_with("TOKAEMM "))
+        .find(|line| {
+            // The signon banner also starts with "TOKAEMM " now that the /T
+            // restyle dropped the colon, so require a digit right after the
+            // name+whitespace run to land on the table row, not the banner.
+            line.trim_start()
+                .strip_prefix("TOKAEMM")
+                .map(|rest| rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                .unwrap_or(false)
+        })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
         tokaemm.contains("(29K)"),

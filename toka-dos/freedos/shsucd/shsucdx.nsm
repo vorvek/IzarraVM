@@ -197,6 +197,9 @@ Options dopt	'?', Opt?
 	dopt	'Q', OptQ
 	dopt	'R', OptR
 	dopt	'S', OptIgn             ; MSCDEX: sharing
+	; modified by the Toka-DOS project, 2026: /T selects the tree-styled
+	; one-line install display (see OptT and DisplayInstallLine below)
+	dopt	'T', OptT
 	dopt	'U', OptU
 	dopt	'V', OptV
 	dopt	'~', Opt~
@@ -2593,12 +2596,14 @@ Drive	equ	$ + cdxsda_len * 2
 ;
 ;  The help screen is overwritten with the drive entries.
 
+; modified by the Toka-DOS project, 2026: /T added to the synopsis and
+; option list below (DisplayInstallLine / OptT)
 HelpMsg
 dln
 dln "Provides access to CD-ROM drives."
 dln
 dln "IZCDEX  [/D:[?|*]DriverName[,[Drive][,[Unit][,[MaxDrives]]]] [/L:Drive]]"
-dln "        [/D:Drives] [/C] [/V] [/~[+|-]] [/R[+|-]] [/I] [/U] [/Q[+|Q]]"
+dln "        [/D:Drives] [/C] [/V] [/~[+|-]] [/R[+|-]] [/I] [/U] [/Q[+|Q]] [/T]"
 dln "        [/L:Number] [/D] [/E][/K][/S][/M]"
 dln
 dln "   DriverName  Name of the CD-ROM device driver."
@@ -2617,9 +2622,17 @@ dln "   /~          Toggle or turn on/off tilde generation (default is off)."
 dln "   /R          Toggle or turn on/off read-only attribute (default is on)."
 dln "   /I          Install even if another redirector is detected."
 dln "   /U          Unload."
-dln "   /Q          Quiet - don't display sign-on banner."
+; modified by the Toka-DOS project, 2026: plain /Q's own line reworded --
+; install no longer prints a sign-on banner at all (see the removed
+; CopyrightMsg call in Begin), so /Q has no visible effect by itself; it is
+; still accepted for command-line compatibility. /Q+ and /QQ below are
+; unchanged and still accurate: /Q+ still gates DisplayDrives's table down
+; to per-drive letters, and /QQ still fully silences via SilentFlag.
+dln "   /Q          Accepted for compatibility - install prints no sign-on"
+dln "               banner regardless."
 dln "   /Q+         Extra quiet - only display assigned/removed drives."
 dln "   /QQ         Really quiet - don't display anything."
+dln "   /T          Prefix the install line with the boot-tree glyph."
 dln "   /L:Number   Return assigned drive number:"
 dln "                  0 = number of drives (255 = not installed)"
 dln "                  1 = first drive (1 = A:, 255 = not assigned)"
@@ -2669,6 +2682,46 @@ DrivesRemoved		dlz "  Drives Removed"
 DriveHeader		dlz "Drive  Driver   Unit"
 DriveLine		dlz "  ?:   ????????  ??"
 DrivesAvail		dlz "0 drive(s) available."
+
+; modified by the Toka-DOS project, 2026: one-line restyled install display
+; (DisplayInstallLine below) for the 25-row boot-screen budget, replacing
+; DrivesInstalled + the DriveHeader/DriveLine table on a fresh install only
+; -- DrivesAssigned/DrivesRemoved/DriveHeader/DriveLine above are unchanged
+; and still used by DisplayDrives for /Q+ and the already-resident
+; add-drives/remove-drives paths. DrivesInstalled itself lost its only
+; caller in this change (the "Output DrivesInstalled" call in Begin) and is
+; now unreferenced transient data; left in place rather than deleted, since
+; this is vendored source and the label sits in the same discarded-after-
+; install region as the rest of this block.
+;
+; TreePrefixMsg is the same CP437 left-tee-plus-horizontal glyph the kernel
+; boot tree and TOKAEMM/TOKAMOUS /T use (0xC3 0xC4 '>' ' ').
+;
+; InstallCount is self-modified in place before printing, the same technique
+; DrivesAvail above already uses for its single leading digit -- valid for
+; 0-9 drives assigned in one invocation (MaxDrives is documented 1-9), same
+; range DrivesAvail already assumes.
+;
+; Each "[name letter:]" entry is about 14 characters and the fixed text
+; ("IZCDEX installed. Assigned [n] drive(s): ") is about 45, so two drives
+; fit comfortably inside an 80-column line; a 3rd+ simultaneously-assigned
+; drive would wrap. Not specially handled: the stock LASTDRIVE=D config
+; caps a single /D: invocation to one drive, so this is an exotic case.
+; InstallMsg1/InstallCount/InstallMsg2 are printed as one run starting at
+; InstallMsg1 (Output stops at InstallMsg2's trailing NUL) -- no directive
+; that could insert padding (align, struc, etc.) may land between these
+; three labels. InstallMsg2 is otherwise unreferenced; kept as a label
+; rather than folded into InstallMsg1 so the digit position stays named.
+TreePrefixMsg		dz  0C3h,0C4h,'>',' '
+SpaceMsg		dz  ' '
+InstallMsg1		db  "IZCDEX installed. Assigned ["
+InstallCount		db  "0"
+InstallMsg2		dz  "] drive(s): "
+EntryTemplate		db  '['
+EntryName		db  "????????"		; driver name, filled at runtime
+			db  ' '
+EntryLetter		db  '?'			; drive letter, filled at runtime
+			dz  ':',']'
 
 MemoryUsage		dln
 			dz  "Memory Usage"
@@ -2725,6 +2778,12 @@ LoadLow 	resb	1
 QuietFlag	resb	1
 XQuietFlag	resb	1
 VerboseFlag	resb	1
+; modified by the Toka-DOS project, 2026: TreeMode backs /T (boot-tree-styled
+; install line); EntrySeen is DisplayInstallLine's own scratch flag, not a
+; command-line option, kept here since it is install-transient like the rest
+; of this block
+TreeMode	resb	1
+EntrySeen	resb	1
 BSS_size	equ	$-$$
 
 section .text
@@ -2949,9 +3008,13 @@ Begin:
 	 sflg.	[QuietFlag]
 	fi
 
-	; take advantage of the photo op
-	ifnflg	[QuietFlag], \
-	 Output CopyrightMsg
+	; modified by the Toka-DOS project, 2026: the install-time copyright
+	; banner ("take advantage of the photo op") is dropped -- the 25-row
+	; boot-screen budget has no room for it. CopyrightMsg itself, and its
+	; print in DisplayHelp for /?, are unchanged; full attribution also
+	; ships in C:\LICENSE.TXT (see NOTICE). QuietFlag has no other reader
+	; now, so plain /Q is visually equivalent to no /Q at all -- the
+	; option is kept for command-line compatibility, not removed.
 
 	; assign drives
 	mov	di, Drive
@@ -3002,9 +3065,13 @@ Begin:
 	 add	ax, [IODatap]		; last byte to keep now in ax
 	 jc	NotEnoughMem
 	 call	AllocMem
-	 ifnflg [XQuietFlag], \
-	  Output DrivesInstalled
 	fi
+
+	; modified by the Toka-DOS project, 2026: the old "Output
+	; DrivesInstalled" call (the fresh-install "IZCDEX installed."
+	; header, printed ahead of the DriveHeader/DriveLine table below) is
+	; gone -- DisplayInstallLine folds that text into its own one-line
+	; message instead. See the branch below.
 
 	; Display drive assignments
 	mmovb	[FirstDriveNo], [Drive+DrvEnt.No]
@@ -3017,8 +3084,19 @@ Begin:
 	fi
 	ld	es, ds
 	mov	bx, Drive
-	mov	si, DrivesAssigned
-	call	DisplayDrives
+	; modified by the Toka-DOS project, 2026: a genuine fresh install
+	; (not IsInstalled) with the sign-on banner not fully quieted gets
+	; the restyled one-line display; already-resident add-drives and the
+	; /Q+ compact table keep DisplayDrives's stock behavior unchanged.
+	ifflg	[IsInstalled]
+	 mov	si, DrivesAssigned
+	 call	DisplayDrives
+	elif	[XQuietFlag]
+	 mov	si, DrivesAssigned
+	 call	DisplayDrives
+	else
+	 call	DisplayInstallLine
+	fi
 
 	call	SetRoot
 
@@ -3568,6 +3646,64 @@ DisplayDrives
 
 
 ;+
+; FUNCTION : DisplayInstallLine
+;
+;	Modified by the Toka-DOS project, 2026: one-line restyled install
+;	display for the 25-row boot-screen budget. Emits exactly one line:
+;	an optional /T tree prefix, "IZCDEX installed. Assigned [n]
+;	drive(s): ", then a space-separated "[name letter:]" entry per
+;	assigned drive, then CRLF. Only called for a genuine fresh install
+;	(see the branch around "Display drive assignments" in Begin); the
+;	already-resident add-drives/remove-drives paths and /Q+ still go
+;	through DisplayDrives above, unchanged.
+;
+; Parameters:
+;	CX := number of drives just assigned (may be 0)
+;	ES:BX -> Drive table (DrvEnt array)
+;
+; Returns:
+;
+; Destroys:
+;	AX, BX, CX, DX, SI, DI
+;
+;-
+DisplayInstallLine
+	retif	[SilentFlag]
+	ifflg	[TreeMode], \
+	 Output TreePrefixMsg
+	; modified by the Toka-DOS project, 2026: mov-form write, not the
+	; add-form DrivesAvail above uses -- DrivesAvail is only ever added to
+	; once per run, but this template's shape (a text run wrapped around
+	; a mutable digit) is exactly what Task 9 copies for its own display,
+	; and a mov is idempotent under a second call while an add is not.
+	mov	al, cl
+	add	al, '0'
+	mov	[InstallCount], al
+	Output	InstallMsg1
+	cflg	[EntrySeen]
+	if cxnz
+	 for	bx,,*,, DrvEnt_size
+	  ifflg	[EntrySeen], \
+	   Output SpaceMsg
+	  sflg.	[EntrySeen]
+	  mov	al, [es:bx+DrvEnt.No]
+	  add	al, 'A'
+	  mov	[EntryLetter], al
+	  save	ds,es,si
+	   lds	si, [es:bx+DrvEnt.DevHdrp]
+	   add	si, 10			; driver name in header
+	   ld	es, cs
+	   mov	di, EntryName
+	   times 4 movsw
+	  restore
+	  Output EntryTemplate
+	 next
+	fi
+	Output	CRLF
+	return
+
+
+;+
 ; FUNCTION : DisplayMemory
 ;
 ;	Display the memory usage.
@@ -3778,6 +3914,12 @@ OptC:	sflg.	[LoadLow]		; /C load in conventional memory
 	ret
 
 OptV:	sflg.	[VerboseFlag]		; /V verbose (memory usage/option help)
+	ret
+
+; modified by the Toka-DOS project, 2026: /T selects the boot-tree-styled
+; one-line install display (DisplayInstallLine below), matching TOKAEMM's
+; and TOKAMOUS's /T
+OptT:	sflg.	[TreeMode]		; /T tree-styled install line
 	ret
 
 OptQ:	sflg.	[QuietFlag]		; /Q[+|Q] quiet
