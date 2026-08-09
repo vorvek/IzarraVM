@@ -1695,6 +1695,60 @@ fn wss_stream_reaches_the_mixed_render_output_through_render_audio() {
     );
 }
 
+/// The FM leg of `Ct1745Mix` has to be exercised through `render_audio`, not just
+/// through `SbMixer::fm_gain`.
+///
+/// A mixer-level test proves the register DECODES; it says nothing about whether
+/// the decoded gain is ever applied to the OPL stream. Reverting
+/// `Ct1745Mix::mix_opl_voice`'s FM multiply (passing `opl.0` straight through)
+/// left the whole workspace green, because nothing drove real OPL output through
+/// the mix with a non-default `0x34`/`0x35`. This does: one keyed OPL tone,
+/// rendered twice through the real path, once at 0 dB and once at -24 dB.
+#[test]
+fn ct1745_fm_level_attenuates_the_opl_through_render_audio() {
+    /// Peak absolute left-channel amplitude of a keyed OPL tone rendered through
+    /// `render_audio` with `0x34`/`0x35` set to `level`.
+    fn opl_peak_at_fm_level(level: u8) -> i32 {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            // The FM/MIDI bus level is LEFT-aligned in D7-D3.
+            for reg in [0x34u8, 0x35] {
+                bus.write_io(0x224, BusWidth::Byte, u32::from(reg), false)
+                    .unwrap();
+                bus.write_io(0x225, BusWidth::Byte, u32::from(level << 3), false)
+                    .unwrap();
+            }
+            program_tone(bus, 0x388, 0x389);
+        });
+        // The DSP is idle and the speaker/WSS/CD silent, so the mix is the OPL
+        // tone with exactly the CT1745 gains on it. Master and output gain both
+        // power on at 0 dB, so what is left is the FM leg.
+        machine
+            .render_audio(4_096)
+            .iter()
+            .map(|&(l, _)| i32::from(l).abs())
+            .max()
+            .unwrap()
+    }
+
+    let full = opl_peak_at_fm_level(31); // 0 dB
+    let quiet = opl_peak_at_fm_level(19); // -24 dB
+    assert!(full > 1_000, "the OPL tone must be audible at 0 dB: {full}");
+    assert!(
+        full < i32::from(i16::MAX),
+        "the 0 dB reference must not clip, or the ratio is meaningless: {full}"
+    );
+    let ratio = quiet as f32 / full as f32;
+    let expected = 10f32.powf(-24.0 / 20.0);
+    assert!(
+        (ratio - expected).abs() < 0.01,
+        "level 19 is -24 dB on the FM bus: expected ratio {expected}, got {ratio} ({quiet}/{full})"
+    );
+    // And a hard-muted FM bus silences the OPL entirely -- proof the leg is the
+    // only thing standing between the synthesiser and the DAC here.
+    assert_eq!(opl_peak_at_fm_level(0), 0, "level 0 on 0x34/0x35 is a mute");
+}
+
 #[test]
 fn wss_is_summed_raw_bypassing_the_ct1745_master_gain() {
     // Design contract: the WSS stream is summed into render_audio WITHOUT the

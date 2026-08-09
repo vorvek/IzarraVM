@@ -738,3 +738,25 @@ fn dsp_identification_consumes_its_argument_byte() {
     );
     assert_eq!(dsp.read_port(0x22A), Some(DSP_VERSION_LO));
 }
+
+/// The peak-amplitude instrument is default-OFF and gated at its per-frame call
+/// site, per the repo's default-off-instruments discipline: it runs once per
+/// produced PCM frame and its only consumer is the `IZARRAVM_SB_DEBUG` report.
+/// Unset, it must not even accumulate.
+#[test]
+fn peak_amplitude_is_not_tracked_unless_the_sb_debug_report_is_armed() {
+    assert!(
+        std::env::var_os("IZARRAVM_SB_DEBUG").is_none(),
+        "this test measures the default-off path"
+    );
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x14, 0x03, 0x00]);
+    // Full-scale unsigned 8-bit samples: the loudest the DMA path can produce.
+    let mut bytes = [0xFFu8; 4].into_iter();
+    assert_eq!(dsp.tick_n_samples(4, || bytes.next(), || None), 4);
+    assert!(
+        dsp.drain_frame().is_some(),
+        "the frames really were produced"
+    );
+    assert_eq!(dsp.take_peak_abs(), 0, "the instrument is not armed");
+}

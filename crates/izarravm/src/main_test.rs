@@ -1275,3 +1275,68 @@ fn held_keys_emit_only_the_edge_they_name() {
     // fallthrough that would inject nothing.
     assert!(text_to_scancode_groups("{+nosuchkey}").is_err());
 }
+
+/// The headless audio capture is an OBSERVER, not a run mode: it has to compose
+/// with whatever else is pacing the run.
+///
+/// `IZARRAVM_AUDIO_WAV` used to win the run if/else outright, so a run that also
+/// asked for `--inject-keys`/`--inject-mouse` got a WAV of a title that had never
+/// received its input, with no warning. The fix routes every guest advance
+/// through `run_sliced`, which is what the injection loop's `advance` now calls.
+/// This drives `run_sliced` the way that loop does -- several advances of
+/// different, short lengths -- and checks the capture keeps accumulating across
+/// all of them and paces its window by the cycles each one actually ran.
+#[test]
+fn audio_capture_observes_every_advance_and_paces_by_cycles_run() {
+    let hardware = HardwareProfile {
+        cpu: GswMode::Gsw486,
+        memory_mib: 16,
+        video: VideoCard::Vega,
+        sound_blaster: izarravm_core::SoundBlasterConfig::default(),
+        wss: izarravm_core::WssConfig::default(),
+    };
+    let dir = munt_test_dir("audio-capture-compose");
+    let wav = dir.join("capture.wav");
+    let clock_hz = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1);
+
+    let build = || {
+        // `jmp $`: runs for exactly the cycle budget, every time.
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xEB, 0xFE])
+            .expect("build raw machine")
+    };
+
+    // Ten advances of one guest millisecond each -- shorter than the capture's
+    // own 10 ms slice, which is what an injection burst looks like.
+    let mut machine = build();
+    let mut capture = Some(AudioCapture::new(wav.clone(), &hardware));
+    let per_advance = clock_hz / 1_000;
+    let mut spent = 0u64;
+    for _ in 0..10 {
+        let (_, ran) = run_sliced(&mut machine, per_advance, &mut capture).unwrap();
+        spent += ran;
+    }
+    assert_eq!(spent, per_advance * 10);
+    let frames = capture.as_ref().unwrap().pcm.len();
+    // Ten guest milliseconds at the 44.1 kHz DAC rate. A capture that rendered a
+    // fixed 10 ms slice's worth per advance would land near ten times this.
+    let expected = 44_100 * 10 / 1_000;
+    assert!(
+        frames.abs_diff(expected) < expected / 4,
+        "expected ~{expected} frames for 10 guest ms, got {frames}"
+    );
+    capture.as_ref().unwrap().finish().unwrap();
+    let written = std::fs::read(&wav).unwrap();
+    assert_eq!(&written[..4], b"RIFF");
+    assert_eq!(written.len(), 44 + frames * 4);
+
+    // With no capture armed the same advance is ONE `run_until_halt_or_cycles`
+    // call and renders nothing, so an unobserved run keeps its exact device
+    // boundaries.
+    let mut bare = build();
+    let mut none = None;
+    let (_, ran) = run_sliced(&mut bare, per_advance * 10, &mut none).unwrap();
+    assert_eq!(ran, per_advance * 10);
+    assert!(none.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

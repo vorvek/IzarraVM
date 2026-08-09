@@ -155,6 +155,18 @@ impl AdpcmState {
     }
 }
 
+/// Whether the peak-amplitude instrument is armed (`IZARRAVM_SB_DEBUG`, the same
+/// variable that prints the per-second `[SB]` report the peak is reported in).
+///
+/// Read once behind a `OnceLock`, and checked at the per-frame call site rather
+/// than inside the accumulator: a default-off instrument must not cost the hot
+/// path anything but a load-and-branch on an already-resident bool. Same shape as
+/// the mixer's `[SBMIX]` trace gate.
+fn peak_tracking() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_DEBUG").is_some())
+}
+
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +222,9 @@ pub struct SbDsp {
     /// [`take_peak_abs`]. Answers "is the guest feeding this card real audio,
     /// or a buffer of silence?" -- the one question `ticked/s` cannot: a DMA
     /// channel pointed at a never-filled buffer ticks at full rate.
+    ///
+    /// Only maintained when `IZARRAVM_SB_DEBUG` is set (see [`peak_tracking`]);
+    /// it stays 0 otherwise, because its sole consumer is that report.
     peak_abs: i32,
 }
 
@@ -603,9 +618,14 @@ impl SbDsp {
         W: FnMut() -> Option<u16>,
     {
         if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
-            let amplitude =
-                i32::from(frame.0.saturating_abs()).max(i32::from(frame.1.saturating_abs()));
-            self.peak_abs = self.peak_abs.max(amplitude);
+            // Per-frame instrument: gated at the call site, not inside a helper.
+            // This runs once per produced PCM frame -- 44100 times a second per
+            // playing channel -- and its only consumer is the `[SB]` report.
+            if peak_tracking() {
+                let amplitude =
+                    i32::from(frame.0.saturating_abs()).max(i32::from(frame.1.saturating_abs()));
+                self.peak_abs = self.peak_abs.max(amplitude);
+            }
             if push_frame_capped(&mut self.rendered, frame) {
                 self.dropped_frames = self.dropped_frames.saturating_add(1);
             }
@@ -636,7 +656,8 @@ impl SbDsp {
     }
 
     /// Read and clear the peak absolute sample amplitude produced since the last
-    /// call. Diagnostic only.
+    /// call. Diagnostic only, and reads 0 unless `IZARRAVM_SB_DEBUG` is set --
+    /// the same gate that decides whether the `[SB]` line is printed at all.
     pub fn take_peak_abs(&mut self) -> i32 {
         std::mem::replace(&mut self.peak_abs, 0)
     }

@@ -693,14 +693,35 @@ fn mode_select_volume_scales_signed_cd_audio_channels() {
 
 #[test]
 fn cd_audio_is_silent_with_the_volume_muted() {
+    // The CD line powers on at 0 dB, not muted (DOSBox-X `CTMIXER_Reset` sets
+    // cda = 31; 86Box resets 0x36/0x37 to 0xF8). A guest has to ASK for the
+    // mute, and this proves both halves: the untouched default passes audio, and
+    // level 0 on 0x36/0x37 stops it.
+    let start_playing = |machine: &mut Machine| {
+        machine.mount_cd(audio_cd(20));
+        let mut cdb = [0u8; 12];
+        cdb[0] = 0x45;
+        cdb[5] = 1;
+        cdb[8] = 16;
+        timed_packet(machine, cdb);
+    };
+
+    let mut default_volume = test_machine();
+    start_playing(&mut default_volume);
+    let pcm = default_volume.render_audio(2000);
+    assert!(
+        pcm.iter().any(|&(l, r)| l != 0 || r != 0),
+        "the power-on CD level is 0 dB, so a playing disc is audible"
+    );
+
     let mut machine = test_machine();
-    machine.mount_cd(audio_cd(20));
-    // Leave CD volume at its muted default (0). Start playback.
-    let mut cdb = [0u8; 12];
-    cdb[0] = 0x45;
-    cdb[5] = 1;
-    cdb[8] = 16;
-    timed_packet(&mut machine, cdb);
+    with_bus(&mut machine, |bus| {
+        for index in [0x36u32, 0x37] {
+            bus.write_io(0x224, BusWidth::Byte, index, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00, false).unwrap();
+        }
+    });
+    start_playing(&mut machine);
     let pcm = machine.render_audio(2000);
     assert!(
         pcm.iter().all(|&(l, r)| l == 0 && r == 0),
