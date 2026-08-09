@@ -25,7 +25,8 @@ const MEMORY_LEN: usize = 0x20_000;
 // continuing the first. That is a real split, not a truncation, so it costs one instruction off
 // the fully-native count; `GeneratedCase::cold_memory_target` records which cases hit it so the
 // comparison below can expect the right number instead of a single constant.
-const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 31;
+// 31 until the 2026-08-09 group-2 slice added the `0xC0 /4` SHL r8 slot beside the rotate.
+const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 32;
 const GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY: u64 =
     GENERATED_BLOCK_NATIVE_INSTRUCTIONS - 1;
 
@@ -66,6 +67,18 @@ fn push_u32(code: &mut Vec<u8>, value: u32) {
 }
 
 fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    // The generated block carries two slots that are DEFAULT OFF in the shipped backend: the
+    // `0xC1 /0` half of the rotate slot and the `0xC0 /4` SHL r8 slot beside it
+    // (`jit::direct::rotate_rows_enabled` carries the A/B that turned them off). Forced on here,
+    // in the builder, because it is the block's CONTENT that needs the arm -- every test that
+    // builds one of these blocks needs it, and `GENERATED_BLOCK_NATIVE_INSTRUCTIONS` is counted
+    // with both slots admitted. Without this the walk would stop at the SHL and the pin would
+    // fail rather than the differential going quiet, but it would name the wrong cause.
+    jit::direct::set_rotate_rows_for_test(Some(true));
+    assert!(
+        jit::direct::rotate_rows_enabled(),
+        "the generated block needs the group-2 admission arm forced on"
+    );
     let seed = 0xd1ff_e2e0_4865_0001u64
         ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let mut rng = Rng::new(seed);
@@ -135,10 +148,26 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     // MUL r32 (0xF7 /4, mod 11). 0xe0 is mod 11 with reg 4. This one writes EAX and EDX whatever
     // the operand is, so it also shuffles the register state the later slots run against.
     bytes.extend_from_slice(&[0xf7, 0xe0 | rng.reg()]);
-    // ROR r32, imm8 (0xC1 /1, mod 11). 0xc8 is mod 11 with reg 1. The count spans all three
-    // compile-time shapes: 0 masks to a no-op, 1 is the materialising shape, and the rest take the
-    // in-place carry override. Drawn from the same stream as the operand so it varies per case.
-    bytes.extend_from_slice(&[0xc1, 0xc8 | rng.reg(), (rng.u32() % 33) as u8]);
+    // ROL and ROR r32, imm8 (0xC1 /0 and /1, mod 11). 0xc0 is mod 11 with reg 0, so the drawn
+    // sub-opcode shifts into the reg field. The count spans all three compile-time shapes: 0 masks
+    // to a no-op, 1 is the materialising shape, and the rest take the in-place carry override.
+    // Both are drawn from the same stream as the operand so they vary per case.
+    //
+    // ONE slot for both directions rather than two, deliberately: the two sub-opcodes share one
+    // classify arm, one `DirectKind::RotateReg` and one emitter, so the thing worth randomising is
+    // which direction lands beside which neighbouring state, not how many rotates a case holds.
+    // A second slot would also move `GENERATED_BLOCK_NATIVE_INSTRUCTIONS`, and this way it does
+    // not.
+    let rotate_op = (rng.u32() & 1) as u8;
+    bytes.extend_from_slice(&[
+        0xc1,
+        0xc0 | (rotate_op << 3) | rng.reg(),
+        (rng.u32() % 33) as u8,
+    ]);
+    // SHL r8, imm8 (0xC0 /4, mod 11). 0xe0 is mod 11 with reg 4, and the operand is a BYTE
+    // register index, so `rng.reg()` reaches AH/CH/DH/BH as well as AL..BL and the emitter's
+    // high-lane read/write-back path is exercised here as well as in its own battery.
+    bytes.extend_from_slice(&[0xc0, 0xe0 | rng.reg(), (rng.u32() % 33) as u8]);
     let shift = [4, 5, 7][(rng.u32() % 3) as usize];
     bytes.extend_from_slice(&[
         0xc1,

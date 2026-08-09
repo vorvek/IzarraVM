@@ -571,7 +571,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 count,
                 width,
             } => emit_shift(&mut e, op, dst, count, width),
-            DirectKind::RotateRightReg { dst, count } => emit_rotate_right_reg(&mut e, dst, count),
+            DirectKind::RotateReg { op, dst, count } => emit_rotate_reg(&mut e, op, dst, count),
             DirectKind::DoubleShiftReg {
                 left,
                 dst,
@@ -4489,17 +4489,82 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
 /// that as a test rather than an assumption, so a host that disagreed would fail the suite loudly
 /// instead of miscompiling quietly.
 fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidth) {
+    debug_assert!(
+        matches!(op, 4..=7),
+        "emit_shift is the SHIFT lane; rotates route to emit_rotate_reg"
+    );
     let count = raw_count & 0x1f;
     if count == 0 {
         return;
     }
     match width {
+        // The Byte lane returns rather than falling through, because it has a write-back to place
+        // AFTER the flag publish and the shared tail cannot express that ordering.
+        MemoryWidth::Byte => {
+            emit_shift_reg8(e, op, dst, count);
+            return;
+        }
         MemoryWidth::Word => e.shift_r16_imm8(op, home(dst), count),
         MemoryWidth::Dword => e.shift_r32_imm8(op, home(dst), count),
-        MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
-            unreachable!("group-2 immediate shifts reach the emitter only at Word or Dword")
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("group-2 immediate shifts reach the emitter only at Byte, Word or Dword")
         }
     }
+    emit_commit_shift_flags(e, count);
+}
+
+/// SHL r8, imm8 (0xC0 /4). The masked count is already known non-zero; `emit_shift` owns that
+/// case for every width so the no-op shape cannot diverge between the lanes.
+///
+/// Modelled on `emit_inc_dec_reg8` rather than on the body above, and for the same reason: `dst`
+/// is a BYTE-register index where 4..7 name AH/CH/DH/BH, so `home(dst)` would reach the guest EBP,
+/// ESI or EDI home and shift the wrong register by 32 bits. The read/modify/write-back through
+/// `emit_read_store_value` and `emit_write_gpr8` touches exactly the destination lane's eight
+/// bits, which is `write_gpr8`'s contract and the one the interpreter's
+/// `write_operand_sized(.., Byte, ..)` reaches.
+///
+/// Two orderings are each a silent divergence if broken, and they are `emit_inc_dec_reg8`'s
+/// verbatim:
+///   - `emit_commit_shift_flags` runs BEFORE `emit_write_gpr8`, because that helper's `shl`, `and`
+///     and `or` clobber the host flags the capture is reading;
+///   - `emit_write_gpr8` runs after, because it also shifts its value register IN PLACE, and a
+///     later reader of RDX would see the lane-positioned copy rather than the byte result.
+///
+/// The arithmetic is a genuine 8-bit `shl`, not a 32-bit shift of the zero-extended byte. That is
+/// what makes the flags the host's rather than something this function has to reconstruct:
+/// `shift_rotate` at `BusWidth::Byte` takes CF from bit 7, SF from bit 7 and ZF/PF from the 8-bit
+/// result, which an 8-bit host shift does by construction and a 32-bit one gets wrong in all
+/// three. `0x80 shl 1` is the shortest witness -- 8 bits gives 0x00 with CF set and ZF set, 32
+/// bits gives 0x100 with CF clear and ZF clear.
+///
+/// **Counts of 8 to 31 are lowered too, and that part is MEASURED rather than derived.** x86 masks
+/// the count to five bits at every operand size, so a byte shift by 8 or more shifts the operand
+/// entirely away, and the SDM leaves CF undefined once the count reaches the operand width. The
+/// reference this tree matches is its own interpreter, not the manual: a 48-case host probe over
+/// this lane's seeds and counts reproduced `shift_rotate`'s single-bit loop exactly -- result, CF,
+/// OF, SF, ZF and PF -- and `BYTE_SHIFT_COUNTS` pins 8 and 31 as cases so a host that disagreed
+/// would fail the suite loudly instead of miscompiling quietly. That is the same argument, and the
+/// same kind of evidence, that `emit_shift`'s Word lane makes for its counts of 16 to 31.
+fn emit_shift_reg8(e: &mut Encoder, op: u8, dst: u8, count: u8) {
+    debug_assert_eq!(op, 4, "only SHL r8 (0xC0 /4) has a byte lane");
+    debug_assert!(count != 0, "emit_shift owns the no-op count");
+    emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RDX);
+    e.shift_r8_imm8(op, Reg::RDX, count);
+    emit_commit_shift_flags(e, count);
+    emit_write_gpr8(e, dst, Reg::RDX);
+}
+
+/// Publish a group-2 SHIFT's flags: the four it always defines, plus OF at a masked count of 1.
+///
+/// Shared by all three width lanes because the interpreter shares them -- `set_shift_result_flags`
+/// is reached once from `shift_rotate`'s `matches!(op, 4..=7)` branch with an `of` of `None` above
+/// count 1, and its `None` arm re-reads the CURRENT OF, i.e. preserves it. Publishing the whole
+/// RBP shadow reproduces that: `emit_capture_flags` merges only the `defined` bits, so OF above
+/// count 1 and AF at every count keep their pre-shift values in the shadow and are republished
+/// unchanged.
+///
+/// This is the licence a ROTATE does not have, which is why `emit_rotate_reg` does not call it.
+fn emit_commit_shift_flags(e: &mut Encoder, count: u8) {
     let mut defined = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
     if count == 1 {
         defined |= crate::FLAG_OF;
@@ -4562,7 +4627,14 @@ fn emit_set_cf_only(e: &mut Encoder) {
     e.place(done);
 }
 
-fn emit_rotate_right_reg(e: &mut Encoder, dst: u8, raw_count: u8) {
+/// ROL and ROR r32, imm8 (0xC1 and 0xD1, sub-opcodes /0 and /1), register destination.
+///
+/// `op` is the guest ModRM `reg` field and goes STRAIGHT into `shift_r32_imm8`'s `/op` slot: host
+/// group 2 numbers ROL 0 and ROR 1 exactly as the guest does, so there is no translation to get
+/// wrong. Everything below this line is direction-independent, which is the whole reason the two
+/// sub-opcodes share one function -- the flag contract, not the rotate, is what the code is for.
+fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
+    debug_assert!(matches!(op, 0 | 1), "only ROL and ROR reach this emitter");
     // The five-bit mask is applied HERE, on the raw decoded immediate, the same way emit_shift
     // does it. classify stores the immediate unmasked, so selecting the shape below on the raw
     // byte would misread `ror eax, 32` as a fourth case instead of the no-op it is.
@@ -4572,10 +4644,16 @@ fn emit_rotate_right_reg(e: &mut Encoder, dst: u8, raw_count: u8) {
         // write-back stores the unchanged value into the register. A genuine no-op.
         return;
     }
-    // Host ROR agrees with the interpreter by construction. CF is the bit rotated into the MSB,
-    // which is what `shift_rotate`'s loop leaves in `cf`, and at count 1 OF is the XOR of the
-    // result's top two bits, which is what its OF arm computes for a right rotate.
-    e.shift_r32_imm8(1, home(dst), count);
+    // Both host rotates agree with the interpreter by construction, and BOTH halves of that claim
+    // have to be read off `shift_rotate` rather than off the manual, because the manual calls OF
+    // undefined above count 1 and this tree's oracle is the interpreter.
+    //
+    // CF is the bit rotated across the boundary -- out of the MSB for ROL, out of bit 0 for ROR --
+    // which is what the loop leaves in `cf` for either direction. At count 1 the interpreter's OF
+    // arm splits by op: `0 | 2 => top ^ cf` for a left rotate and `1 | 3 => top ^ (bit 30 of the
+    // result)` for a right one. Those are the SAME two definitions x86 gives ROL and ROR, so the
+    // host computes each one for us and the split never appears in this function.
+    e.shift_r32_imm8(op, home(dst), count);
     if count == 1 {
         // Two set_flag calls, and their ORDER is what makes this branch-free. set_flag(FLAG_CF)
         // writes the override into the descriptor; set_flag(FLAG_OF) then sees a mask that is not

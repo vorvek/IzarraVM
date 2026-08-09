@@ -2700,8 +2700,23 @@ pub(crate) enum DirectKind {
     NegReg {
         dst: u8,
     },
-    /// ROR r/m32, register form (0xC1 /1 and 0xD1 /1). `count` is the RAW decoded immediate; the
-    /// emitter applies the architectural five-bit mask, exactly as `Shift` does.
+    /// ROL and ROR r/m32, register form (0xC1 and 0xD1, sub-opcodes /0 and /1). `count` is the RAW
+    /// decoded immediate; the emitter applies the architectural five-bit mask, exactly as `Shift`
+    /// does.
+    ///
+    /// `op` is the guest ModRM `reg` field, 0 for ROL and 1 for ROR, and it is passed STRAIGHT
+    /// through to `shift_r32_imm8`'s own `/op` slot. Host group 2 numbers its sub-opcodes the same
+    /// way the guest does, so the field needs no translation table and a widening to a third
+    /// sub-opcode would need one -- /2 and /3 are RCL and RCR, which the classify arm refuses
+    /// because they take the incoming CF as a rotate INPUT.
+    ///
+    /// No `width` field, and refusing rather than adding one is a deliberate boundary: `classify`
+    /// returns None for both sub-opcodes at `OperandSize::Word`, because this kind's emitter is
+    /// `shift_r32_imm8` and a 66-prefixed rotate routed through it would rotate 32 bits where the
+    /// guest rotates 16 -- wrong result AND wrong CF, since the bit rotated across the boundary
+    /// comes from bit 31 instead of bit 15. Neither the duke3d-586 nor the 16-bit census measures
+    /// a Word row for either sub-opcode, so a second emitter lane would be an unmeasured
+    /// admission.
     ///
     /// Deliberately NOT folded into `Shift`. That variant's emitter falls through to an
     /// arithmetic shift right, so a rotate routed through it would be silently emitted as SAR.
@@ -2709,7 +2724,8 @@ pub(crate) enum DirectKind {
     /// leaves AF, and OF above count 1, architecturally UNDEFINED, which is the only reason
     /// `emit_shift` may publish a possibly stale RBP to eflags. A rotate PRESERVES SF, ZF, PF and
     /// AF, so it must not.
-    RotateRightReg {
+    RotateReg {
+        op: u8,
         dst: u8,
         count: u8,
     },
@@ -2766,16 +2782,29 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
         addr: DirectAddr,
     },
-    /// SHL/SHR/SAL/SAR r/m, imm8, REGISTER form (0xC1 /4../7 and 0xD1 /4../7). `count` is the RAW
-    /// decoded immediate; the emitter applies the architectural five-bit mask.
+    /// SHL/SHR/SAL/SAR r/m, imm8, REGISTER form (0xC1 /4../7 and 0xD1 /4../7), plus SHL r8, imm8
+    /// (0xC0 /4). `count` is the RAW decoded immediate; the emitter applies the architectural
+    /// five-bit mask.
     ///
-    /// `width` is the operand size and is Byte-free: only Word and Dword can reach here, because
-    /// the byte opcodes 0xC0 and 0xD0 have no classify arm at all. It exists for the reason
-    /// `LoadExtend::dst_width` does -- a shift is a REGISTER-DESTINATION write, so a Dword-only
-    /// lowering of a 66-prefixed form clobbers the destination's high 16 bits where the
+    /// `width` is the operand size and reaches the emitter at all three widths. It exists for the
+    /// reason `LoadExtend::dst_width` does -- a shift is a REGISTER-DESTINATION write, so a
+    /// Dword-only lowering of a 66-prefixed form clobbers the destination's high 16 bits where the
     /// interpreter's `write_operand_sized(.., Word, ..)` merges into the low 16. That is a
     /// miscompile, not a missed lowering, which is why the Word allowlist refused 0xC1 until this
     /// field existed.
+    ///
+    /// **At Byte the field is not `operand_width` and must never become it.** 0xC0 is a byte
+    /// opcode whose width is fixed by the OPCODE, not by the operand-size prefix: an unprefixed
+    /// 0xC0 in a 32-bit segment decodes with `OperandSize::Dword`, which the duke3d-586 census
+    /// reports verbatim on the `0xC0 /4 register dword` row. The classify arm therefore hard-codes
+    /// `MemoryWidth::Byte`, the way 0xC6's arm does, and passing `operand_width` there would
+    /// silently emit a 32-bit shift of the whole home register.
+    ///
+    /// **`dst` is a BYTE-register index at Byte width**, where 4..7 name AH/CH/DH/BH rather than
+    /// the homes of EBP/ESI/EDI. `emit_shift`'s Byte arm therefore goes through
+    /// `emit_read_store_value`/`emit_write_gpr8` instead of `home(dst)`, exactly as
+    /// `emit_inc_dec_reg8` does, and reading this field with `home()` at Byte would shift the
+    /// wrong register by 32 bits.
     ///
     /// **Every flag rule is the host's, at BOTH widths, and that is the whole argument for the
     /// Word lane rather than a masked Dword one.** `CpuGsw::shift_rotate` computes CF from the
@@ -2796,8 +2825,8 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
     },
     /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
-    /// admits ROR (/1) but routes it to `RotateRightReg`, because rotates do not define PF, ZF,
-    /// SF or AF and `emit_shift_cl` merges the shift mask.
+    /// admits ROL (/0) and ROR (/1) but routes them to `RotateReg`, because rotates do not define
+    /// PF, ZF, SF or AF and `emit_shift_cl` merges the shift mask.
     ///
     /// A separate variant rather than a `ShiftCount` field on `Shift`: `Shift` carries its count
     /// as a decoded immediate (`count: u8`), while this form's count comes from CL at emission
@@ -3997,6 +4026,103 @@ pub(crate) fn lane_trial_enabled() -> bool {
 pub(crate) fn disp_lanes_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_DISP_LANES").as_deref(), Ok("0")))
+}
+
+/// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and
+/// **`0xC0 /4` SHL r8**, both register forms.
+///
+/// **DEFAULT OFF, MEASURED NET-NEGATIVE.** `IZARRAVM_ROTATE_ROWS` must be SET, to anything other
+/// than exactly "0", to admit them. The pre-flip `IZARRAVM_SMC_LANE_TRIAL` contract: the mechanism,
+/// its tests and its mutation record all ship, switched off, because the thing that refuted it is
+/// a property of one fixture's SMC behaviour rather than of the lowering.
+///
+/// WHY IT EXISTS. The duke3d-586 re-census (`.bench/results/duke586-census-20260809.json`) ranks
+/// `0xC1 /0` first by BOTH currencies -- 260,659,304 runtime hits, the hottest interpreted
+/// instruction in the trace, and 111,123,374 static unbound exits, the largest refused-row seam --
+/// with `0xC0 /4` second at 32,839,852 and 31,743,121. On paper this is the top of the list.
+///
+/// WHY IT IS OFF. Interleaved A/B/B/A on duke3d-586, one binary, quiet box. Off arm rt 0.3298
+/// (legs 0.3283, 0.3313); on arm rt 0.3184 (legs 0.3111, 0.3257). **Delta -3.44%**, and native
+/// coverage DROPPED on the admitting arm, 0.7480 -> 0.7264. Admitting the hottest row made the
+/// backend cover LESS.
+///
+/// THE MECHANISM, which the counters name outright: `smc_lane_accepts` collapsed 55.57M -> 25.45M,
+/// narrow kills rose 45.25M -> 49.55M, `heat_hot` 357k -> 373k. Duke patches the COUNT BYTE of its
+/// group-2 shifts (the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows, ~1.9M events). Before
+/// the slice those ROLs were hard boundaries, so no compiled block ever spanned the patched byte
+/// and the patch cost nothing. After it, blocks span the byte -- and each 1-byte count patch now
+/// kills a block that ALSO carries live `0x81` imm lanes and `0x8A` displacement lanes, taking
+/// their accepts down with it. That is the lane-trial iteration-1 mixing failure reborn one level
+/// up: not lane-shaped writes mixed with unlaned ones inside a chunk, but a lane-shaped BLOCK
+/// extended across a patch shape no lane class covers. The lowering is correct at every count and
+/// every flag; the ADMISSION is net-negative on the only fixture that carries the runtime mass.
+///
+/// **RE-TEST TRIGGER: a one-byte mutable-imm lane class covering the `imm_len=1` patch shapes
+/// (`0xC1`, `0xC0`, `0x80`).** `IMM_LANE_WIDTH` is four and `imm_lane_for`'s accept rule is written
+/// against that width, so a 1-byte lane is its own width class rather than a widened match. Once
+/// duke's count-byte patches become `lane_accepts` instead of narrow kills, this A/B is measuring
+/// something different and must be run again.
+///
+/// THE DESIGN COST THE NEXT SLICE MUST BUDGET FOR, because it is not a lane-plumbing detail. A
+/// laned count is loaded at RUNTIME, and `emit_rotate_reg`'s whole correctness argument is a
+/// COMPILE-TIME split on the count: 0 emits nothing, 1 captures `CF|OF` and publishes the shadow,
+/// 2..31 captures CF alone and goes through `emit_set_cf_only`. A runtime count cannot pick a
+/// capture mask at emission, so the lane form is forced onto the CL-shaped emission whose flag
+/// update is runtime-conditional -- and the count-0 case is not "some flags" but "no flag moves
+/// and no descriptor is created or destroyed", which a conservative publish gets WRONG rather than
+/// approximately right. So the lane-form rotate needs either a genuinely conditional runtime flag
+/// path (the three-way branch `emit_shift_cl` already declined) or a guard that admits the lane
+/// only when the patched count byte's value range excludes 0 and 1. Price that before pricing the
+/// lane.
+///
+/// THE ALTERNATIVE WORTH PRICING FIRST, because it may not need the lane work at all: admit
+/// `0xC1 /0` **only at sites whose count byte has no heat record** -- the disp-lane heat gate
+/// INVERTED, admitting never-patched sites instead of hot ones. See `disp_lane_for` for the
+/// pattern and for how a heat record is probed at classify time. Duke's ~1.9M count-byte patch
+/// events are concentrated on a small number of sites; the 260M runtime hits are not necessarily
+/// on the same ones, and the unpatched share is exactly the part of the row that carries no
+/// block-kill risk. If that share is most of the mass, this is a much smaller slice than the lane.
+///
+/// **Read at the CLASSIFY admission point, not at emission**, so the off arm reproduces the
+/// pre-slice refusal exactly: `classify` returns None, the compile walk breaks, and the row lands
+/// back in the census as an ordinary `hard_boundary` unbound exit rather than as some new refusal
+/// kind that would not be comparable with the census this slice was ranked against. That is also
+/// what makes the shipped default a true pre-slice world and not merely a quiet one.
+///
+/// **The knob covers THIS SLICE ONLY.** `0xC1 /1` and `0xD1 /1` ROR at Dword were lowered by the
+/// 2026-07-26 slice and are deliberately outside it; so are `/4..=7`. Sweeping them in would make
+/// every future A/B price two slices as one.
+///
+/// Both arms ship in one executable, the `IZARRAVM_LANE_FAMILY` and `IZARRAVM_DISP_LANES` contract:
+/// this box has measured 6% wall variance between builds of identical source, which is larger than
+/// the effect, so a cross-build comparison would not be evidence.
+pub(crate) fn rotate_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ROTATE_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(
+        || matches!(std::env::var("IZARRAVM_ROTATE_ROWS").as_deref(), Ok(value) if value != "0"),
+    )
+}
+
+// Per-THREAD, because the shipped knob is a process-wide `OnceLock` and the fixtures have to run
+// both arms in one process. Thread-local rather than a global is what keeps the parallel test
+// harness honest: one test's arm selection cannot reach another's compile.
+//
+// Since the flip to default-OFF this is not a convenience: every positive fixture for these two
+// rows MUST force the on arm through it, or it would test the refusal and call it a lowering.
+#[cfg(test)]
+thread_local! {
+    static ROTATE_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the group-2 admission arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_ROTATE_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_rotate_rows_for_test(forced: Option<bool>) {
+    ROTATE_ROWS_OVERRIDE.with(|cell| cell.set(forced));
 }
 
 /// Seed for `JitState::word_at_486`, read once per process from `IZARRAVM_JIT16_486`.

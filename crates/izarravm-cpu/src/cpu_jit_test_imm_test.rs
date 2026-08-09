@@ -1449,7 +1449,12 @@ fn neg_register_form_matches_the_interpreter_in_486_mode() {
     );
 }
 
-fn arm_ror_reg(cpu: &mut CpuGsw, dst: u8, seed: u32, eflags: u32, pending: Option<(u32, u32)>) {
+/// Shared by the rotate and byte-shift batteries: the group-2 register forms all want the same
+/// distinguishable background, one seeded destination and one controlled flag state.
+///
+/// `dst` indexes the 32-bit home. The byte battery passes `dst & 3` so the byte lane it names
+/// really carries the seed, since AH..BH live in the high half of the SAME four homes.
+fn arm_group2_reg(cpu: &mut CpuGsw, dst: u8, seed: u32, eflags: u32, pending: Option<(u32, u32)>) {
     cpu.halted = false;
     cpu.interrupt_shadow = false;
     for index in 0..8usize {
@@ -1471,7 +1476,11 @@ fn arm_ror_reg(cpu: &mut CpuGsw, dst: u8, seed: u32, eflags: u32, pending: Optio
     cpu.core_clocks_so_far = 0;
 }
 
-fn prepare_ror_reg(
+/// `op` is the group-2 sub-opcode, 0 for ROL and 1 for ROR. Every battery below runs both, because
+/// the two share ONE classify arm, ONE `DirectKind` and ONE emitter, so a mutation anywhere in the
+/// shared body has to be caught at both directions or the pair is not really a pair.
+fn prepare_rotate_reg(
+    op: u8,
     mode: GswMode,
     dst: u8,
     count: u8,
@@ -1479,8 +1488,8 @@ fn prepare_ror_reg(
     eflags: u32,
     pending: Option<(u32, u32)>,
 ) -> Fixture {
-    // C1 /1 ib: mod 11, reg 1, rm dst. 0xc8 is mod 11 with reg 1.
-    let insn = vec![0xc1u8, 0xc8 | dst, count];
+    // C1 /op ib: mod 11, reg = op, rm = dst. 0xc0 is mod 11 with reg 0.
+    let insn = vec![0xc1u8, 0xc0 | (op << 3) | dst, count];
     let mut pristine = vec![0; 0x5000];
     pristine[(ENTRY - 1) as usize] = 0x90;
     let mut code = insn.clone();
@@ -1502,9 +1511,14 @@ fn prepare_ror_reg(
     ];
     decode_fixture(&mut native, &mut native_bus, &starts);
     decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    // The shipped default is OFF (`rotate_rows_enabled` carries the A/B that made it so), so the
+    // ROL half of this battery has to FORCE the on arm rather than read the ambient one. Without
+    // this the `op == 0` cases would fail inside `install_block`'s three-slot assertion and the
+    // `op == 1` half would keep passing, which reads as a ROL-specific emitter bug.
+    select_rotate_rows(true);
     let block = install_block(&mut native);
-    arm_ror_reg(&mut native, dst, seed, eflags, pending);
-    arm_ror_reg(&mut interpreter, dst, seed, eflags, pending);
+    arm_group2_reg(&mut native, dst, seed, eflags, pending);
+    arm_group2_reg(&mut interpreter, dst, seed, eflags, pending);
     native_bus.trace = BusTrace::default();
     interpreter_bus.trace = BusTrace::default();
     Fixture {
@@ -1516,6 +1530,10 @@ fn prepare_ror_reg(
     }
 }
 
+// The two lowered rotate sub-opcodes. Every battery below is crossed with this, so a mutation in
+// the shared emitter that only shows up in one direction still fails.
+const ROTATE_OPS: [u8; 2] = [0, 1];
+
 // Counts chosen to hit every compile-time shape and both sides of the five-bit mask:
 //   0  and 32  the no-op shape, 32 only via `& 0x1f`, so a missing mask is caught here
 //   1          the materialising shape, the only count that defines OF
@@ -1523,19 +1541,34 @@ fn prepare_ror_reg(
 //   16         the byte-swap idiom a rasterizer actually emits
 const ROR_COUNTS: [u8; 7] = [0, 1, 2, 7, 16, 31, 32];
 
-// Seeds chosen to discriminate rather than to cover. For a right rotate by n, CF is bit n-1 of the
-// input, and at count 1 OF is the XOR of the result's top two bits:
-//   0x0000_0001  ror 1 -> 0x8000_0000, top two bits 1 and 0, so OF=1 and CF=1
-//   0x0000_0002  ror 1 -> 0x0000_0001, top two bits 0 and 0, so OF=0 and CF=0
-//   0xc000_0000  ror 1 -> 0x6000_0000, top two bits 0 and 1, so OF=1 and CF=0
-//   0x8000_0001  ror 1 -> 0xc000_0000, top two bits 1 and 1, so OF=0 and CF=1
-// All four OF/CF combinations, so a lowering that tied OF to CF cannot pass.
-//   0x0000_8000  bit 15 set, so it flips CF at count 16 against the seed below
+// Seeds chosen to discriminate rather than to cover, and the set has to carry all four CF/OF
+// combinations at count 1 in BOTH directions, since one emitter serves both.
+//
+// ROR by n leaves CF = bit n-1 of the input, and at count 1 OF is the XOR of the result's top two
+// bits:
+//   0x0000_0001  ror 1 -> 0x8000_0000, top two bits 1 and 0, so CF=1 OF=1
+//   0x1234_5678  ror 1 -> 0x091a_2b3c, top two bits 0 and 0, so CF=0 OF=0
+//   0xc000_0000  ror 1 -> 0x6000_0000, top two bits 0 and 1, so CF=0 OF=1
+//   0x8000_0001  ror 1 -> 0xc000_0000, top two bits 1 and 1, so CF=1 OF=0
+//
+// ROL by n leaves CF = bit 32-n of the input, and at count 1 OF is the result's top bit XOR that
+// carry. The mirror does NOT fall out of the same four seeds by luck and 0x4000_0000 is here to
+// close it -- an earlier version of this table used 0x0000_0002 in its place, which gives ROL the
+// (CF=0, OF=0) corner a seed already covered and left (CF=0, OF=1) untested:
+//   0x0000_0001  rol 1 -> 0x0000_0002, CF=0 OF=0
+//   0x4000_0000  rol 1 -> 0x8000_0000, CF=0 OF=1
+//   0xc000_0000  rol 1 -> 0x8000_0001, CF=1 OF=0
+//   0x8000_0001  rol 1 -> 0x0000_0003, CF=1 OF=1
+//
+// The rest are not corner cases but discriminators:
+//   0x0000_8000  bit 15 set, so ROR by 16 sets CF where ROL by 16 clears it
 //   0xffff_ffff  every rotate is a fixed point; only the flags can differ
-//   0x1234_5678  an asymmetric value, so a rotate in the wrong DIRECTION is caught
+//   0x1234_5678  the direction witness: rol 8 gives 0x3456_7812 and ror 8 gives 0x7812_3456, so
+//                any battery over it catches a lowering that rotated the wrong way
+//   0x0000_0000  the all-zero fixed point, where CF must come out 0 at every count
 const ROR_SEEDS: [u32; 8] = [
     0x0000_0001,
-    0x0000_0002,
+    0x4000_0000,
     0xc000_0000,
     0x8000_0001,
     0x0000_8000,
@@ -1545,19 +1578,22 @@ const ROR_SEEDS: [u32; 8] = [
 ];
 
 #[test]
-fn ror_register_form_matches_the_interpreter_across_destinations_counts_and_corners() {
+fn rotate_register_form_matches_the_interpreter_across_destinations_counts_and_corners() {
     // eflags 0x202 has CF clear and 0x203 has it set, so the no-descriptor path is exercised in
     // both polarities: a lowering that never wrote CF passes one and fails the other.
-    for dst in 0..8u8 {
-        for count in ROR_COUNTS {
-            for seed in ROR_SEEDS {
-                for eflags in [0x202u32, 0x203] {
-                    let context =
-                        format!("dst={dst} count={count} seed={seed:#010x} eflags={eflags:#x}");
-                    finish_and_compare(
-                        prepare_ror_reg(GswMode::Gsw586, dst, count, seed, eflags, None),
-                        &context,
-                    );
+    for op in ROTATE_OPS {
+        for dst in 0..8u8 {
+            for count in ROR_COUNTS {
+                for seed in ROR_SEEDS {
+                    for eflags in [0x202u32, 0x203] {
+                        let context = format!(
+                            "op={op} dst={dst} count={count} seed={seed:#010x} eflags={eflags:#x}"
+                        );
+                        finish_and_compare(
+                            prepare_rotate_reg(op, GswMode::Gsw586, dst, count, seed, eflags, None),
+                            &context,
+                        );
+                    }
                 }
             }
         }
@@ -1565,7 +1601,7 @@ fn ror_register_form_matches_the_interpreter_across_destinations_counts_and_corn
 }
 
 #[test]
-fn ror_register_form_updates_a_live_descriptor_in_place_without_materialising() {
+fn rotate_register_form_updates_a_live_descriptor_in_place_without_materialising() {
     // THE case this slice turns on. At counts 2 through 31 the interpreter calls set_flag with a
     // mask of exactly FLAG_CF, which flips the descriptor's override bits IN PLACE and leaves
     // SF/ZF/PF/AF deferred. finish_and_compare asserts the raw pending_flags word, so a lowering
@@ -1577,15 +1613,51 @@ fn ror_register_form_updates_a_live_descriptor_in_place_without_materialising() 
         Some((0xffff_ffff, 1)),
         Some((0x0000_0000, 0)),
     ];
-    for pending in pendings {
-        for count in [2u8, 7, 16, 31] {
+    for op in ROTATE_OPS {
+        for pending in pendings {
+            for count in [2u8, 7, 16, 31] {
+                for seed in ROR_SEEDS {
+                    for eflags in [0x202u32, 0x203] {
+                        let context = format!(
+                            "op={op} count={count} seed={seed:#010x} pending={pending:?} eflags={eflags:#x}"
+                        );
+                        finish_and_compare(
+                            prepare_rotate_reg(
+                                op,
+                                GswMode::Gsw586,
+                                3,
+                                count,
+                                seed,
+                                eflags,
+                                pending,
+                            ),
+                            &context,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rotate_register_form_materialises_a_live_descriptor_at_count_one() {
+    // Count 1 is the other side of the compile-time split. Here the CF call sets the override and
+    // the following OF call materialises WITH that override applied, then writes OF live and
+    // clears the descriptor. Getting the order backwards publishes a CF taken from the stale
+    // eflags instead of from the rotate.
+    for op in ROTATE_OPS {
+        for pending in [
+            Some((0x7fff_ffffu32, 1u32)),
+            Some((0x0000_00ff, 1)),
+            Some((0xffff_ffff, 1)),
+        ] {
             for seed in ROR_SEEDS {
                 for eflags in [0x202u32, 0x203] {
-                    let context = format!(
-                        "count={count} seed={seed:#010x} pending={pending:?} eflags={eflags:#x}"
-                    );
+                    let context =
+                        format!("op={op} seed={seed:#010x} pending={pending:?} eflags={eflags:#x}");
                     finish_and_compare(
-                        prepare_ror_reg(GswMode::Gsw586, 3, count, seed, eflags, pending),
+                        prepare_rotate_reg(op, GswMode::Gsw586, 3, 1, seed, eflags, pending),
                         &context,
                     );
                 }
@@ -1595,22 +1667,32 @@ fn ror_register_form_updates_a_live_descriptor_in_place_without_materialising() 
 }
 
 #[test]
-fn ror_register_form_materialises_a_live_descriptor_at_count_one() {
-    // Count 1 is the other side of the compile-time split. Here the CF call sets the override and
-    // the following OF call materialises WITH that override applied, then writes OF live and
-    // clears the descriptor. Getting the order backwards publishes a CF taken from the stale
-    // eflags instead of from the rotate.
-    for pending in [
-        Some((0x7fff_ffffu32, 1u32)),
-        Some((0x0000_00ff, 1)),
-        Some((0xffff_ffff, 1)),
-    ] {
-        for seed in ROR_SEEDS {
-            for eflags in [0x202u32, 0x203] {
-                let context = format!("seed={seed:#010x} pending={pending:?} eflags={eflags:#x}");
-                finish_and_compare(
-                    prepare_ror_reg(GswMode::Gsw586, 3, 1, seed, eflags, pending),
-                    &context,
+fn rotate_register_form_count_zero_touches_nothing_at_all() {
+    // A zero count returns before the value write-back and before any flag. Both encodings of it
+    // are checked: a literal 0, and 32, which is only zero after the five-bit mask. Asserted
+    // against the pre-run state directly rather than only against the interpreter, so a lowering
+    // that perturbed the guest identically on both sides could not hide.
+    for op in ROTATE_OPS {
+        for count in [0u8, 32] {
+            for pending in [None, Some((0x7fff_ffffu32, 1u32))] {
+                let fixture =
+                    prepare_rotate_reg(op, GswMode::Gsw586, 3, count, 0x1234_5678, 0x203, pending);
+                let before_gpr = fixture.native.registers.gpr;
+                let before_eflags = fixture.native.registers.eflags;
+                let before_pending = fixture.native.pending_flags;
+                let context = format!("op={op} count={count} pending={pending:?}");
+                let after = finish_and_compare(fixture, &context);
+                assert_eq!(
+                    after.native.registers.gpr[3], before_gpr[3],
+                    "{context}: a zero count must not touch the destination"
+                );
+                assert_eq!(
+                    after.native.registers.eflags, before_eflags,
+                    "{context}: a zero count must not touch eflags"
+                );
+                assert_eq!(
+                    after.native.pending_flags, before_pending,
+                    "{context}: a zero count must not touch the pending descriptor"
                 );
             }
         }
@@ -1618,51 +1700,27 @@ fn ror_register_form_materialises_a_live_descriptor_at_count_one() {
 }
 
 #[test]
-fn ror_register_form_count_zero_touches_nothing_at_all() {
-    // A zero count returns before the value write-back and before any flag. Both encodings of it
-    // are checked: a literal 0, and 32, which is only zero after the five-bit mask. Asserted
-    // against the pre-run state directly rather than only against the interpreter, so a lowering
-    // that perturbed the guest identically on both sides could not hide.
-    for count in [0u8, 32] {
-        for pending in [None, Some((0x7fff_ffffu32, 1u32))] {
-            let fixture = prepare_ror_reg(GswMode::Gsw586, 3, count, 0x1234_5678, 0x203, pending);
-            let before_gpr = fixture.native.registers.gpr;
-            let before_eflags = fixture.native.registers.eflags;
-            let before_pending = fixture.native.pending_flags;
-            let context = format!("count={count} pending={pending:?}");
-            let after = finish_and_compare(fixture, &context);
-            assert_eq!(
-                after.native.registers.gpr[3], before_gpr[3],
-                "{context}: a zero count must not touch the destination"
-            );
-            assert_eq!(
-                after.native.registers.eflags, before_eflags,
-                "{context}: a zero count must not touch eflags"
-            );
-            assert_eq!(
-                after.native.pending_flags, before_pending,
-                "{context}: a zero count must not touch the pending descriptor"
+fn rotate_register_form_matches_the_interpreter_in_486_mode() {
+    for op in ROTATE_OPS {
+        for count in [1u8, 16] {
+            finish_and_compare(
+                prepare_rotate_reg(op, GswMode::Gsw486, 0, count, 0x0000_8001, 0x202, None),
+                &format!("486 op={op} count={count}"),
             );
         }
     }
 }
 
-#[test]
-fn ror_register_form_matches_the_interpreter_in_486_mode() {
-    for count in [1u8, 16] {
-        finish_and_compare(
-            prepare_ror_reg(GswMode::Gsw486, 0, count, 0x0000_8001, 0x202, None),
-            &format!("486 count={count}"),
-        );
-    }
-}
-
-/// ROR at counts above 1 leaves a LAZY descriptor and only flips its override, so the batteries
-/// above compare pending_flags and would still pass if the RBP host-flag shadow went stale:
-/// nothing in a block of plain moves reads it. An in-block Jcc does, through emit_load_host_flags.
-/// JB reads CF, which is the one flag a rotate defines at every count.
-fn prepare_ror_terminal_jcc(dst: u8, count: u8, seed: u32) -> Fixture {
-    let insn = vec![0xc1u8, 0xc8 | dst, count];
+/// A rotate at counts above 1 leaves a LAZY descriptor and only flips its override, so the
+/// batteries above compare pending_flags and would still pass if the RBP host-flag shadow went
+/// stale: nothing in a block of plain moves reads it. An in-block Jcc does, through
+/// emit_load_host_flags. JB reads CF, which is the one flag a rotate defines at every count.
+fn prepare_rotate_terminal_jcc(op: u8, dst: u8, count: u8, seed: u32) -> Fixture {
+    // Builds its own block instead of going through `prepare_rotate_reg`, so it needs its own
+    // arm selection: on the shipped default the `op == 0` cases would refuse and the `expect`
+    // below would fire.
+    select_rotate_rows(true);
+    let insn = vec![0xc1u8, 0xc0 | (op << 3) | dst, count];
     let mut pristine = vec![0; 0x5000];
     pristine[(ENTRY - 1) as usize] = 0x90;
     let mut code = insn.clone();
@@ -1687,7 +1745,7 @@ fn prepare_ror_terminal_jcc(dst: u8, count: u8, seed: u32) -> Fixture {
         jit::direct::BlockProbe::Interpret
     ));
     let compilation =
-        jit::direct::compile(&mut native, ENTRY, true).expect("ROR+Jcc block compiles");
+        jit::direct::compile(&mut native, ENTRY, true).expect("rotate+Jcc block compiles");
     assert_eq!(
         compilation.span.instructions, 2,
         "block must end at the Jcc terminal"
@@ -1695,11 +1753,11 @@ fn prepare_ror_terminal_jcc(dst: u8, count: u8, seed: u32) -> Fixture {
     let id = native
         .jit_direct
         .install(&compilation)
-        .expect("ROR+Jcc block installs");
+        .expect("rotate+Jcc block installs");
     let block = native.jit_direct.block(id).unwrap();
 
-    arm_ror_reg(&mut native, dst, seed, 0x202, None);
-    arm_ror_reg(&mut interpreter, dst, seed, 0x202, None);
+    arm_group2_reg(&mut native, dst, seed, 0x202, None);
+    arm_group2_reg(&mut interpreter, dst, seed, 0x202, None);
     native_bus.trace = BusTrace::default();
     interpreter_bus.trace = BusTrace::default();
     Fixture {
@@ -1712,22 +1770,31 @@ fn prepare_ror_terminal_jcc(dst: u8, count: u8, seed: u32) -> Fixture {
 }
 
 #[test]
-fn ror_terminal_jcc_reads_the_carry_the_rotate_just_defined() {
-    // For a right rotate by n, CF is bit n-1 of the input, so these pairs put a 0 and a 1 there at
-    // both a count-1 and a multi-count shape. Both branch directions at both shapes.
-    for (count, seed, taken) in [
-        (1u8, 0x0000_0001u32, true),
-        (1, 0x0000_0002, false),
-        (16, 0x0000_8000, true),
-        (16, 0x0000_0001, false),
+fn rotate_terminal_jcc_reads_the_carry_the_rotate_just_defined() {
+    // For a right rotate by n, CF is bit n-1 of the input; for a LEFT rotate by n it is bit 32-n,
+    // so the two directions need different seeds to put a 0 and a 1 there and the table carries
+    // both. Both branch directions at both compile-time shapes, at both sub-opcodes. Crossing this
+    // with `op` rather than only running ROR is what makes the direction visible in the branch:
+    // the count-16 ROL and count-16 ROR rows below use the SAME seeds with OPPOSITE expected
+    // outcomes, so a lowering that rotated the wrong way flips both.
+    for (op, count, seed, taken) in [
+        (1u8, 1u8, 0x0000_0001u32, true),
+        (1, 1, 0x0000_0002, false),
+        (1, 16, 0x0000_8000, true),
+        (1, 16, 0x0000_0001, false),
+        // ROL by n leaves CF = bit 32-n of the input, the mirror of ROR's bit n-1.
+        (0, 1, 0x8000_0000, true),
+        (0, 1, 0x0000_0001, false),
+        (0, 16, 0x0001_0000, true),
+        (0, 16, 0x0000_8000, false),
     ] {
-        let mut fixture = prepare_ror_terminal_jcc(3, count, seed);
+        let mut fixture = prepare_rotate_terminal_jcc(op, 3, count, seed);
         assert!(
             fixture
                 .native
                 .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
                 .unwrap(),
-            "count {count} seed {seed:#010x} must run natively"
+            "op {op} count {count} seed {seed:#010x} must run natively"
         );
         for _ in 0..2 {
             fixture
@@ -1741,23 +1808,25 @@ fn ror_terminal_jcc_reads_the_carry_the_rotate_just_defined() {
         assert_eq!(
             fixture.native.registers.eip,
             expected,
-            "count {count} seed {seed:#010x}: JB must be {} here",
+            "op {op} count {count} seed {seed:#010x}: JB must be {} here",
             if taken { "taken" } else { "not taken" }
         );
         assert_eq!(
             fixture.native.registers.eip, fixture.interpreter.registers.eip,
-            "count {count} seed {seed:#010x}: the Jcc must branch on the carry ROR defined"
+            "op {op} count {count} seed {seed:#010x}: the Jcc must branch on the carry the rotate defined"
         );
     }
 }
 
-/// ROR followed by an instruction that COMMITS the whole RBP shadow to eflags. A rotate at counts
-/// above 1 must leave SF, ZF, PF and AF alone in the shadow, which the batteries cannot see
+/// A rotate followed by an instruction that COMMITS the whole RBP shadow to eflags. A rotate at
+/// counts above 1 must leave SF, ZF, PF and AF alone in the shadow, which the batteries cannot see
 /// because nothing there reads it. IMUL captures only CF and OF and then stores the entire RBP
 /// word, so a capture mask widened past CF publishes the host rotate's leftovers as guest flags.
-fn prepare_ror_then_imul(count: u8, seed: u32, pending: Option<(u32, u32)>) -> Fixture {
-    // ror eax, count; imul ebx, ecx; mov esi,esi; hlt
-    let insn = vec![0xc1u8, 0xc8, count];
+fn prepare_rotate_then_imul(op: u8, count: u8, seed: u32, pending: Option<(u32, u32)>) -> Fixture {
+    // Own block, own arm selection; see `prepare_rotate_terminal_jcc`.
+    select_rotate_rows(true);
+    // rol/ror eax, count; imul ebx, ecx; mov esi,esi; hlt
+    let insn = vec![0xc1u8, 0xc0 | (op << 3), count];
     let mut pristine = vec![0; 0x5000];
     pristine[(ENTRY - 1) as usize] = 0x90;
     let mut code = insn.clone();
@@ -1782,16 +1851,16 @@ fn prepare_ror_then_imul(count: u8, seed: u32, pending: Option<(u32, u32)>) -> F
         jit::direct::BlockProbe::Interpret
     ));
     let compilation =
-        jit::direct::compile(&mut native, ENTRY, true).expect("ROR+IMUL block compiles");
+        jit::direct::compile(&mut native, ENTRY, true).expect("rotate+IMUL block compiles");
     assert_eq!(compilation.span.instructions, 3);
     let id = native
         .jit_direct
         .install(&compilation)
-        .expect("ROR+IMUL block installs");
+        .expect("rotate+IMUL block installs");
     let block = native.jit_direct.block(id).unwrap();
 
-    arm_ror_reg(&mut native, 0, seed, 0x202, pending);
-    arm_ror_reg(&mut interpreter, 0, seed, 0x202, pending);
+    arm_group2_reg(&mut native, 0, seed, 0x202, pending);
+    arm_group2_reg(&mut interpreter, 0, seed, 0x202, pending);
     native_bus.trace = BusTrace::default();
     interpreter_bus.trace = BusTrace::default();
     Fixture {
@@ -1804,37 +1873,284 @@ fn prepare_ror_then_imul(count: u8, seed: u32, pending: Option<(u32, u32)>) -> F
 }
 
 #[test]
-fn ror_leaves_the_untouched_shadow_flags_alone_for_a_later_committer() {
-    for count in [1u8, 2, 16, 31] {
-        for pending in [None, Some((0x7fff_ffffu32, 1u32)), Some((0x0000_00ff, 1))] {
-            for seed in [0x0000_0001u32, 0x0000_8000, 0xffff_ffff] {
-                let context = format!("count={count} seed={seed:#010x} pending={pending:?}");
-                finish_and_compare(prepare_ror_then_imul(count, seed, pending), &context);
+fn rotate_leaves_the_untouched_shadow_flags_alone_for_a_later_committer() {
+    for op in ROTATE_OPS {
+        for count in [1u8, 2, 16, 31] {
+            for pending in [None, Some((0x7fff_ffffu32, 1u32)), Some((0x0000_00ff, 1))] {
+                for seed in [0x0000_0001u32, 0x0000_8000, 0xffff_ffff] {
+                    let context =
+                        format!("op={op} count={count} seed={seed:#010x} pending={pending:?}");
+                    finish_and_compare(
+                        prepare_rotate_then_imul(op, count, seed, pending),
+                        &context,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// SHL r8, imm8 (0xC0 /4), register destination.
+///
+/// `dst` is a BYTE-register index: 0..3 name AL/CL/DL/BL and 4..7 name AH/CH/DH/BH, which live in
+/// the HIGH half of the same four homes. That aliasing is the whole reason this fixture exists
+/// separately from the rotate one -- `home(dst)` on a byte index of 5 reaches guest ESI.
+fn prepare_shl_reg8(
+    mode: GswMode,
+    dst: u8,
+    count: u8,
+    seed: u32,
+    eflags: u32,
+    pending: Option<(u32, u32)>,
+) -> Fixture {
+    // C0 /4 ib: mod 11, reg 4, rm dst. 0xe0 is mod 11 with reg 4.
+    let insn = vec![0xc0u8, 0xe0 | dst, count];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ENTRY - 1) as usize] = 0x90;
+    let mut code = insn.clone();
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu(mode);
+    let mut interpreter = flat_cpu(mode);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interpreter_bus = TestBus::with_memory(pristine);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [
+        ENTRY,
+        ENTRY + insn.len() as u32,
+        ENTRY + insn.len() as u32 + 2,
+    ];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    // Same reason as the rotate fixture: 0xC0 has no arm at all on the shipped default, so this
+    // whole battery would fail inside `install_block` without forcing the on arm here.
+    select_rotate_rows(true);
+    let block = install_block(&mut native);
+    // `dst & 3` is the HOME the byte lane lives in, so the seed reaches the operand whichever half
+    // of the index is used. Seeding `dst` itself would put the value in ESI for `dst == 5` and
+    // leave the actual CH lane holding the background pattern.
+    arm_group2_reg(&mut native, dst & 3, seed, eflags, pending);
+    arm_group2_reg(&mut interpreter, dst & 3, seed, eflags, pending);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    Fixture {
+        native,
+        interpreter,
+        native_bus,
+        interpreter_bus,
+        block,
+    }
+}
+
+// Counts across every compile-time shape and both sides of the five-bit mask, plus the two an
+// 8-bit operand has that a 32-bit one does not:
+//   0 and 32  the no-op shape, 32 only via `& 0x1f`
+//   1         the only count that defines OF
+//   2, 5      the ordinary shape
+//   8, 31     counts at or past the OPERAND width. x86 still masks to five bits for a byte
+//             operand, so the host does 8 or 31 single-bit steps on 8 bits exactly as
+//             `shift_rotate`'s loop does, and both leave 0 with CF clear. A lowering that shifted
+//             the zero-extended byte as a dword would leave 0x100 and 0x8000_0000 here instead.
+const BYTE_SHIFT_COUNTS: [u8; 7] = [0, 1, 2, 5, 8, 31, 32];
+
+// Home values, not byte values: the low byte feeds `dst` 0..3 and byte 1 feeds `dst` 4..7, so each
+// seed discriminates twice. The low lane carries all four CF/OF combinations at count 1, where
+// SHL's OF is the result's top bit XOR the carry out:
+//   0x01 shl 1 -> 0x02  CF=0 OF=0
+//   0x40 shl 1 -> 0x80  CF=0 OF=1
+//   0xc0 shl 1 -> 0x80  CF=1 OF=0
+//   0x80 shl 1 -> 0x00  CF=1 OF=1, and ZF set, which no other seed produces
+// 0x1234_5678 and 0xdead_beef are the asymmetric pair: their two lanes differ, so a lowering that
+// read the wrong lane, or read the whole home, diverges on them rather than coincidentally
+// agreeing.
+const BYTE_SHIFT_SEEDS: [u32; 8] = [
+    0x0000_0001,
+    0x0000_0040,
+    0x0000_00c0,
+    0x0000_0080,
+    0x0000_8000,
+    0xffff_ffff,
+    0x1234_5678,
+    0xdead_beef,
+];
+
+#[test]
+fn byte_shl_register_form_matches_the_interpreter_across_lanes_counts_and_corners() {
+    // Both eflags polarities, because SHL DEFINES CF at every non-zero count: a lowering that
+    // never wrote it passes at 0x203 for a seed whose carry-out is 1 and fails everywhere else.
+    for dst in 0..8u8 {
+        for count in BYTE_SHIFT_COUNTS {
+            for seed in BYTE_SHIFT_SEEDS {
+                for eflags in [0x202u32, 0x203] {
+                    let context =
+                        format!("dst={dst} count={count} seed={seed:#010x} eflags={eflags:#x}");
+                    finish_and_compare(
+                        prepare_shl_reg8(GswMode::Gsw586, dst, count, seed, eflags, None),
+                        &context,
+                    );
+                }
             }
         }
     }
 }
 
 #[test]
+fn byte_shl_register_form_commits_and_clears_a_live_descriptor() {
+    // A shift's flag contract is the opposite of a rotate's: `set_shift_result_flags` materialises
+    // the descriptor and writes CF, OF, AF and SZP live, so the emitted form publishes the whole
+    // RBP shadow and clears the pending word. finish_and_compare asserts the raw pending_flags,
+    // so a byte lane that skipped the publish, or published without clearing, diverges here.
+    for pending in [
+        Some((0x7fff_ffffu32, 1u32)),
+        Some((0x0000_00ff, 1)),
+        Some((0xffff_ffff, 1)),
+        Some((0x0000_0000, 0)),
+    ] {
+        for dst in [0u8, 3, 4, 7] {
+            for count in [1u8, 5, 8] {
+                for seed in BYTE_SHIFT_SEEDS {
+                    let context =
+                        format!("dst={dst} count={count} seed={seed:#010x} pending={pending:?}");
+                    finish_and_compare(
+                        prepare_shl_reg8(GswMode::Gsw586, dst, count, seed, 0x202, pending),
+                        &context,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_shl_register_form_count_zero_touches_nothing_at_all() {
+    // The no-op shape, asserted against the pre-run state directly and not only against the
+    // interpreter. `emit_shift` returns before the byte lane is reached, so a byte arm that
+    // emitted the read and write-back pair unconditionally would still leave the value alone and
+    // would only be caught by the flag and descriptor assertions below.
+    for count in [0u8, 32] {
+        for dst in [0u8, 5] {
+            for pending in [None, Some((0x7fff_ffffu32, 1u32))] {
+                let fixture =
+                    prepare_shl_reg8(GswMode::Gsw586, dst, count, 0x1234_5678, 0x203, pending);
+                let before_gpr = fixture.native.registers.gpr;
+                let before_eflags = fixture.native.registers.eflags;
+                let before_pending = fixture.native.pending_flags;
+                let context = format!("dst={dst} count={count} pending={pending:?}");
+                let after = finish_and_compare(fixture, &context);
+                assert_eq!(
+                    after.native.registers.gpr, before_gpr,
+                    "{context}: a zero count must not touch any register"
+                );
+                assert_eq!(
+                    after.native.registers.eflags, before_eflags,
+                    "{context}: a zero count must not touch eflags"
+                );
+                assert_eq!(
+                    after.native.pending_flags, before_pending,
+                    "{context}: a zero count must not touch the pending descriptor"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_shl_register_form_writes_only_its_own_lane() {
+    // The write-back assertion the differential cannot make on its own: a lowering that wrote the
+    // whole home, or the wrong half of it, would be caught by the interpreter comparison only if
+    // the interpreter and the emitter disagreed about which bits move. This pins the surviving
+    // bits directly. `dst` 4..7 is the case that matters -- `emit_write_gpr8` shifts the value
+    // into the high lane, and dropping that shift writes AL where AH was asked for.
+    for dst in 0..8u8 {
+        let fixture = prepare_shl_reg8(GswMode::Gsw586, dst, 1, 0xdead_beef, 0x202, None);
+        let home = usize::from(dst & 3);
+        let context = format!("dst={dst}");
+        let after = finish_and_compare(fixture, &context);
+        let value = after.native.registers.gpr[home];
+        let (lane_mask, expected) = if dst < 4 {
+            (0x0000_00ffu32, (0xefu32 << 1) & 0xff)
+        } else {
+            (0x0000_ff00u32, ((0xbeu32 << 1) & 0xff) << 8)
+        };
+        assert_eq!(
+            value & lane_mask,
+            expected,
+            "{context}: the addressed byte lane must hold the shifted result"
+        );
+        assert_eq!(
+            value & !lane_mask,
+            0xdead_beefu32 & !lane_mask,
+            "{context}: every other bit of the home must survive untouched"
+        );
+    }
+}
+
+#[test]
+fn byte_shl_register_form_matches_the_interpreter_in_486_mode() {
+    for dst in [0u8, 4] {
+        for count in [1u8, 5] {
+            finish_and_compare(
+                prepare_shl_reg8(GswMode::Gsw486, dst, count, 0x0000_8081, 0x202, None),
+                &format!("486 dst={dst} count={count}"),
+            );
+        }
+    }
+}
+
+#[test]
 fn group2_non_lowered_rotates_remain_interpreter_only() {
+    // FORCED ON, and this is the subtle one. Every row here is refused by a GUARD -- the `m.reg`
+    // tests, the register-only `let-else`, the Word check inside the rotate branch. On the shipped
+    // default arm the knob would refuse `0xC1 /0` and the whole of `0xC0` before any of those
+    // guards ran, so the rows would still pass while certifying nothing about the guards, and a
+    // widening of `m.reg != 4` to `4..=7` would survive. The knob is pinned by
+    // `the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions`; the guards are
+    // pinned here, and the two must not be allowed to stand in for each other.
+    select_rotate_rows(true);
     for code in [
-        vec![0xc1, 0xc3, 0x05], // /0 ROL r/m32, imm8: zero measured rejects, deliberately out
         vec![0xc1, 0xd3, 0x05], // /2 RCL: takes the incoming CF as a rotate input
         vec![0xc1, 0xdb, 0x05], // /3 RCR: same
-        vec![0xd1, 0xc3],       // /0 ROL by 1
         vec![0xd1, 0xd3],       // /2 RCL by 1
         vec![0xd1, 0xdb],       // /3 RCR by 1
-        vec![0xc0, 0xcb, 0x05], // the BYTE rotate group, not lowered at any sub-opcode
-        vec![0xd0, 0xcb],       // byte ROR by 1
-        vec![0xd2, 0xcb],       // byte ROR by CL
-        vec![0xd3, 0xcb],       // /1 ROR by CL: a runtime count, deliberately out of this slice
-        // ROR dword [disp32], the MEMORY form of the very sub-opcode this slice lowers. Without
-        // this case, replacing the register-only `let-else` with a defaulting match would rotate
-        // EAX instead and survive every register battery.
+        // The BYTE group's rotates. 0xC0 has a classify arm as of the 2026-08-09 slice, and it
+        // admits `/4` ALONE -- these four rows are what says the `m.reg != 4` guard is doing the
+        // work rather than the arm having been widened to the whole group by inspection.
+        vec![0xc0, 0xc3, 0x05], // /0 ROL r8, imm8
+        vec![0xc0, 0xcb, 0x05], // /1 ROR r8, imm8
+        vec![0xc0, 0xd3, 0x05], // /2 RCL r8, imm8
+        vec![0xc0, 0xdb, 0x05], // /3 RCR r8, imm8
+        // The byte SHIFTS the arm does not claim. /5 SHR, /6 the SAL alias of /4 and /7 SAR are
+        // each one character away from admitted and none has a measured census row; the arm's
+        // `m.reg != 4` refuses all three, and dropping this trio would let a widening to
+        // `4..=7` pass unnoticed.
+        vec![0xc0, 0xeb, 0x05], // /5 SHR r8, imm8
+        vec![0xc0, 0xf3, 0x05], // /6 SAL r8, imm8, the undocumented /4 alias
+        vec![0xc0, 0xfb, 0x05], // /7 SAR r8, imm8
+        // SHL r8 by an implicit 1 and by CL. Same byte width, same sub-opcode, different opcodes
+        // and no arm: the duke3d-586 re-census tops 0xD0 out at 49,021 runtime hits across every
+        // sub-opcode, three orders below the row 0xC0 /4 is admitted for.
+        vec![0xd0, 0xe3], // /4 SHL r8, 1
+        vec![0xd2, 0xe3], // /4 SHL r8, CL
+        vec![0xd0, 0xcb], // byte ROR by 1
+        vec![0xd2, 0xcb], // byte ROR by CL
+        vec![0xd3, 0xcb], // /1 ROR by CL: a runtime count, deliberately out of this slice
+        vec![0xd3, 0xc3], // /0 ROL by CL: same
+        // ROR dword [disp32], the MEMORY form of a sub-opcode this arm lowers. Without this case,
+        // replacing the register-only `let-else` with a defaulting match would rotate EAX instead
+        // and survive every register battery. ROL and byte SHL get the same treatment: all three
+        // memory forms are separate census rows this slice does not claim.
         vec![0xc1, 0x0d, 0x00, 0x50, 0x00, 0x00, 0x05],
-        // 66-prefixed ROR r/m16. The OperandSize::Word allowlist is the only thing stopping this
-        // from being lowered as a 32-bit rotate, which would smear the high half into the low one.
+        vec![0xc1, 0x05, 0x00, 0x50, 0x00, 0x00, 0x05],
+        vec![0xc0, 0x25, 0x00, 0x50, 0x00, 0x00, 0x05],
+        // 66-prefixed ROR and ROL r/m16. The OperandSize::Word guard inside the classify arm is
+        // the only thing stopping these from being lowered as 32-bit rotates, which would smear
+        // the high half into the low one.
         vec![0x66, 0xc1, 0xcb, 0x05],
+        vec![0x66, 0xc1, 0xc3, 0x05],
     ] {
         assert!(
             compile_leading_block(&code).is_none(),
@@ -1844,22 +2160,146 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
 }
 
 #[test]
-fn group2_dword_ror_register_form_is_lowered() {
-    // The positive half of the guard above, and the ONLY test that can detect the new classify arm
+fn group2_dword_rotate_register_form_is_lowered() {
+    // The positive half of the guard above, and the ONLY test that can detect the classify arm
     // being unreachable. Placing it below the existing `matches!(m.reg, 4..=7)` guard would make
     // it dead code, and every negative assertion above would still pass.
+    //
+    // ROL (/0) is the 2026-08-09 admission: 260,659,304 runtime hits and 111,123,374 static
+    // unbound exits on duke3d-586, the top row of the re-census by both currencies. It ships
+    // DEFAULT OFF (the A/B measured -3.44% and a coverage drop; see `rotate_rows_enabled`), so the
+    // arm is forced here. The ROR and 0xD1 /1 rows below are outside the knob and would pass
+    // either way -- forcing is what stops this test from silently becoming a ROR-only pin.
+    select_rotate_rows(true);
     for code in [
         vec![0xc1u8, 0xcb, 0x10], // ror ebx, 16
         vec![0xc1, 0xcb, 0x01],   // ror ebx, 1
         vec![0xc1, 0xcb, 0x00],   // ror ebx, 0, the no-op shape still has to ADMIT
         vec![0xd1, 0xcb],         // ror ebx, 1 via the 0xD1 encoding
+        vec![0xc1, 0xc3, 0x10],   // rol ebx, 16
+        vec![0xc1, 0xc3, 0x01],   // rol ebx, 1
+        vec![0xc1, 0xc3, 0x00],   // rol ebx, 0, the no-op shape
+        vec![0xd1, 0xc3],         // rol ebx, 1 via the 0xD1 encoding
     ] {
         assert_eq!(
             compile_leading_block(&code),
             Some(3),
-            "ROR {code:02x?} must admit and carry the whole three-slot block"
+            "rotate {code:02x?} must admit and carry the whole three-slot block"
         );
     }
+}
+
+#[test]
+fn group2_byte_shl_register_form_is_lowered() {
+    // 0xC0 /4, the re-census's second refused row: 32,839,852 runtime hits and 31,743,121 static
+    // unbound exits. Every byte-register index, because 4..7 name AH/CH/DH/BH and reach a
+    // different lane of `emit_read_store_value` and `emit_write_gpr8` than 0..3 do.
+    //
+    // Default OFF, so the arm is forced; without this every assertion below would fail rather than
+    // go vacuous, but the failure would name the wrong cause.
+    select_rotate_rows(true);
+    for dst in 0..8u8 {
+        for count in [0u8, 1, 5, 32] {
+            let code = vec![0xc0u8, 0xe0 | dst, count];
+            assert_eq!(
+                compile_leading_block(&code),
+                Some(3),
+                "SHL r8 {code:02x?} must admit and carry the whole three-slot block"
+            );
+        }
+    }
+}
+
+/// Select a group-2 admission arm for this thread and PROVE the selection took.
+///
+/// The shipped knob is a process-wide `OnceLock` with a `cfg(test)` thread-local override; a
+/// fixture that leaned on the ambient reading would compile the same arm twice and call it an A/B.
+/// The assertion is what says the override decided, in both directions.
+fn select_rotate_rows(enabled: bool) {
+    jit::direct::set_rotate_rows_for_test(Some(enabled));
+    assert_eq!(
+        jit::direct::rotate_rows_enabled(),
+        enabled,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_ROTATE_ROWS"
+    );
+}
+
+/// The SHIPPED DEFAULT world, and the boundary of what the knob covers.
+///
+/// After the 2026-08-09 A/B (-3.44% wall and native coverage 0.7480 -> 0.7264 on the admitting
+/// arm; see `rotate_rows_enabled` for the lane-accept-collapse mechanism) the two rows this slice
+/// added ship OFF. That makes the default arm the one every other consumer of this backend sees,
+/// so it is the arm that needs a test of its own rather than the exotic one.
+///
+/// Three claims, and the last two are each the sort of regression that produces a wrong NUMBER
+/// rather than a broken build, so nothing else in the suite would notice:
+///
+/// * the default really is off. Asserted with the override CLEARED, so it reads the shipped
+///   `OnceLock` path and fails if `IZARRAVM_ROTATE_ROWS` is exported in this environment;
+/// * on that default arm the two rows are refused exactly as they were before the slice, which is
+///   what makes an A/B run against it a measurement of THIS slice;
+/// * the rows that were already lowered STAY lowered on it. `0xC1 /1` and `0xD1 /1` ROR at Dword
+///   landed in the 2026-07-26 slice, and `0xC1 /4..=7` earlier still; both are deliberately
+///   outside the knob. If a later edit swept them behind it, every A/B from then on would price
+///   two slices as one.
+///
+/// The forced-on half at the end is what stops the whole test passing against a compiler that
+/// refused everything. Restores the ambient arm before returning: the harness gives each test its
+/// own thread and the override is thread-local, so that is hygiene rather than load-bearing, but a
+/// fixture that left a process-visible knob flipped is the shape of trap this file has been bitten
+/// by before.
+#[test]
+fn the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions() {
+    jit::direct::set_rotate_rows_for_test(None);
+    assert!(
+        !jit::direct::rotate_rows_enabled(),
+        "the shipped default is OFF after the 2026-08-09 A/B; IZARRAVM_ROTATE_ROWS is exported in \
+         this environment, unset it"
+    );
+
+    for code in [
+        vec![0xc1u8, 0xc3, 0x10], // rol ebx, 16
+        vec![0xc1, 0xc3, 0x01],   // rol ebx, 1
+        vec![0xd1, 0xc3],         // rol ebx, 1 via the 0xD1 encoding
+        vec![0xc0, 0xe3, 0x05],   // shl bl, 5
+        vec![0xc0, 0xe7, 0x05],   // shl bh, 5, the high-lane index
+    ] {
+        assert!(
+            compile_leading_block(&code).is_none(),
+            "default arm: {code:02x?} must refuse exactly as it did before the slice"
+        );
+    }
+
+    for code in [
+        vec![0xc1u8, 0xcb, 0x10], // ror ebx, 16: the 2026-07-26 slice, NOT behind this knob
+        vec![0xc1, 0xcb, 0x01],
+        vec![0xd1, 0xcb],
+        vec![0xc1, 0xe3, 0x05], // shl ebx, 5: older still, and a dword operand
+    ] {
+        assert_eq!(
+            compile_leading_block(&code),
+            Some(3),
+            "default arm: {code:02x?} predates this slice and must stay lowered"
+        );
+    }
+
+    // The same five rows on the FORCED-ON arm, in the same process and on the same thread.
+    select_rotate_rows(true);
+    for code in [
+        vec![0xc1u8, 0xc3, 0x10],
+        vec![0xc1, 0xc3, 0x01],
+        vec![0xd1, 0xc3],
+        vec![0xc0, 0xe3, 0x05],
+        vec![0xc0, 0xe7, 0x05],
+    ] {
+        assert_eq!(
+            compile_leading_block(&code),
+            Some(3),
+            "on arm: {code:02x?} must admit"
+        );
+    }
+
+    jit::direct::set_rotate_rows_for_test(None);
 }
 
 /// Compile an instruction as slot 0 of a three-slot block, with every slot's decode line

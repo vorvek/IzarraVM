@@ -807,6 +807,29 @@ fn shl_r32_imm8_known_bytes() {
 }
 
 #[test]
+fn shift_r8_imm8_known_bytes() {
+    // shl dl, 3 -- no REX, C0 /4 ib. ModRM 11_100_010 = 0xE2. The absence of a 0x66 and of a REX
+    // is the whole assertion: this is the ONE encoding whose operand is eight bits wide, and the
+    // flags the emitter captures after it are the host's answer for an 8-bit operand.
+    let mut e = Encoder::new();
+    e.shift_r8_imm8(4, Reg::RDX, 3);
+    assert_eq!(e.finish(), vec![0xC0, 0xE2, 0x03]);
+    // The count is passed through unmasked; the host applies the five-bit mask itself, so a caller
+    // that pre-masked to zero and a caller that did not must encode differently.
+    let mut e = Encoder::new();
+    e.shift_r8_imm8(4, Reg::RAX, 0x20);
+    assert_eq!(e.finish(), vec![0xC0, 0xE0, 0x20]);
+}
+
+#[test]
+#[should_panic(expected = "byte shift scratch registers must be AL through BL")]
+fn shift_r8_imm8_refuses_a_high_register() {
+    // Without a REX prefix, ModRM register 4 is AH, not SPL. The assert is what stops a caller
+    // reaching for RSP through this helper and silently encoding a shift of AH.
+    Encoder::new().shift_r8_imm8(4, Reg::RSP, 1);
+}
+
+#[test]
 fn add_r32_r32_known_bytes() {
     // add eax, ecx -- no REX, 01 /r. ModRM mod=11,reg=ecx(1),rm=eax(0) = 0xC8.
     let mut e = Encoder::new();

@@ -995,6 +995,31 @@ impl Encoder {
         self.bytes.push(count);
     }
 
+    /// An 8-bit group-2 immediate shift (`C0 /op ib`).
+    ///
+    /// Restricted to AL through BL for the reason `alu_r8_r8` is: without a REX prefix, ModRM
+    /// register numbers 4 through 7 name AH/CH/DH/BH, and the emitter's byte lane works in
+    /// scratch registers rather than encoding a guest byte lane directly. Asserting is what keeps
+    /// a future caller from reaching for RSP through this and silently encoding AH.
+    ///
+    /// The 8-bit width is the point, exactly as the 16-bit width is for `shift_r16_imm8`: the host
+    /// computes every flag against the 8-bit operand -- CF from bit 7 for a left shift and bit 0
+    /// for a right one, SF from bit 7, ZF and PF from the 8-bit result -- so it does the narrowing
+    /// the interpreter's `BusWidth::Byte` does instead of the emitter reconstructing it.
+    ///
+    /// The count byte is passed through verbatim; the host applies the architectural five-bit mask
+    /// itself, and the caller must not pre-mask differently.
+    pub(crate) fn shift_r8_imm8(&mut self, op: u8, dst: Reg, count: u8) {
+        assert!(op < 8, "shift group must fit three bits");
+        assert!(
+            dst.0 < 4,
+            "byte shift scratch registers must be AL through BL"
+        );
+        self.bytes.push(0xC0);
+        self.modrm(0b11, op, dst.low3());
+        self.bytes.push(count);
+    }
+
     /// A 16-bit group-2 immediate shift (`66 [REX] C1 /op ib`).
     ///
     /// The 16-bit width is the whole point, exactly as it is for `alu_r16_imm16`: an x86-64 16-bit

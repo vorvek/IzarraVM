@@ -1104,17 +1104,80 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     }),
                 };
             }
+            // SHL r8, imm8 (0xC0 /4), REGISTER form. Second in the duke3d-586 re-census's
+            // refused-row ranking behind the ROL above: 32,839,852 runtime hits and 31,743,121
+            // static unbound exits, the latter up from 5.7M for the same reason ROL's grew.
+            //
+            // ONE sub-opcode, and the narrowness is the point rather than laziness. The census
+            // measures `/4` alone; `/6` is its undocumented SAL alias and would be free to add,
+            // but no row asks for it and an alias admitted on inspection is exactly the unmeasured
+            // admission this file refuses elsewhere. `/5` SHR and `/7` SAR have no byte row at
+            // all, the four byte rotates have neither a row nor an emitter, and 0xD0 (the same
+            // group by an implicit 1) tops out at 49,021 runtime hits across every sub-opcode --
+            // three orders below the floor this slice is working to.
+            //
+            // The width is the OPCODE's, not the prefix's. An unprefixed 0xC0 in a 32-bit segment
+            // decodes with `OperandSize::Dword`, which is verbatim what the census row says
+            // (`operand_form: register`, `operand_size: dword`, `prefix_mask: 0`), so this arm
+            // hard-codes `MemoryWidth::Byte` the way 0xC6's does and must never read
+            // `operand_width`. The consequence at the other end is a MISSED lowering, not a
+            // hazard: 0xC0 is absent from the `OperandSize::Word` allowlist at the top of this
+            // file, so a 66-prefixed encoding and a 16-bit code segment both refuse before
+            // reaching here even though the guest semantics would be identical. Adding the entry
+            // is safe on its own terms but has no measured row behind it.
+            //
+            // The MEMORY form is refused by the `let-else` below, as every other register-only arm
+            // in this file refuses it, and it is a separate census row this slice does not claim.
+            0xc0 => {
+                let m = insn.modrm?;
+                // The A/B off arm (`IZARRAVM_ROTATE_ROWS=0`). Read HERE rather than in the
+                // emitter so the off arm is the pre-slice refusal byte for byte: this whole
+                // opcode had no arm before the slice, so returning None from the top of it puts
+                // the row back in the census as the same `hard_boundary` it was ranked as.
+                if !rotate_rows_enabled() {
+                    return None;
+                }
+                if m.reg != 4 {
+                    return None;
+                }
+                let DecodedOperand::Reg(dst) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::Shift {
+                    op: 4,
+                    dst,
+                    count: insn.imm as u8,
+                    width: MemoryWidth::Byte,
+                });
+            }
             0xc1 | 0xd1 => {
                 let m = insn.modrm?;
-                // reg 1 is ROR and MUST be admitted by this guard, not appended after it: reg 1
-                // fails `matches!(m.reg, 4..=7)`, so a rotate arm placed below the guard would be
-                // unreachable and the whole lowering would be dead code that no negative test
-                // could detect. ROL (/0), RCL (/2) and RCR (/3) stay out. The refreshed attribution
-                // measures zero rejects for all three, and RCL and RCR additionally take the
-                // incoming CF as a rotate INPUT (`shift_rotate` seeds `cf` from `flag(FLAG_CF)`
-                // before its loop), which would need the flags loaded into the host before the
-                // rotate rather than only captured after it.
-                if !matches!(m.reg, 1 | 4..=7) {
+                // reg 0 and reg 1 are the two lowered ROTATES and MUST be admitted by this guard,
+                // not appended after it: neither passes `matches!(m.reg, 4..=7)`, so a rotate arm
+                // placed below the guard would be unreachable and the whole lowering would be dead
+                // code that no negative test could detect.
+                //
+                // `/0` ROL joined `/1` ROR on 2026-08-09 and it is the largest row in the
+                // duke3d-586 re-census by BOTH currencies: 260,659,304 runtime hits, the hottest
+                // interpreted instruction in the trace, AND 111,123,374 static unbound exits, the
+                // largest refused-row seam, up from 10.3M once the disp-lane slice raised coverage
+                // and blocks started compiling up TO it and seaming every pass.
+                //
+                // RCL (/2) and RCR (/3) stay out and the reason is structural rather than a
+                // missing row: both take the incoming CF as a rotate INPUT (`shift_rotate` seeds
+                // `cf` from `flag(FLAG_CF)` before its loop), which needs the guest flags loaded
+                // into the host before the rotate rather than only captured after it -- the shape
+                // `emit_carry_alu_preloaded` has, and a slice of its own rather than a list entry.
+                if !matches!(m.reg, 0 | 1 | 4..=7) {
+                    return None;
+                }
+                // The A/B off arm (`IZARRAVM_ROTATE_ROWS=0`), and it covers `/0` ALONE. `/1` ROR
+                // was lowered before this slice and stays ungated: the off arm has to restore the
+                // pre-slice world, not a no-rotates world, or an A/B would price two slices as
+                // one. `/4..=7` are older still. Read here, above the shared `let-else` and the
+                // Word guard, so the off arm reproduces the pre-slice refusal exactly -- ROL had
+                // no arm at all then, so the row goes back to being an ordinary `hard_boundary`.
+                if m.reg == 0 && !rotate_rows_enabled() {
                     return None;
                 }
                 let DecodedOperand::Reg(dst) = insn.operand? else {
@@ -1123,19 +1186,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // The RAW immediate, unmasked, matching what the Shift arm has always stored. The
                 // architectural five-bit mask is applied in the emitter.
                 let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 };
-                if m.reg == 1 {
-                    // ROR at Word is REFUSED, and this guard is the only thing that stops it now
-                    // that 0xc1 is on the Word allowlist. `RotateRightReg` carries no width and its
-                    // emitter is `shift_r32_imm8(1, ..)` plus `emit_set_cf_only`, so a 66-prefixed
-                    // ROR routed through it would rotate 32 bits where the guest rotates 16 --
-                    // wrong result AND wrong CF, since the bit rotated into the MSB comes from bit
-                    // 31 instead of bit 15. Neither fixture measures a Word `0xC1 /1` row, so this
-                    // is a refusal with nothing to buy rather than a missed lowering worth the
-                    // second emitter lane.
+                if matches!(m.reg, 0 | 1) {
+                    // BOTH rotates are REFUSED at Word, and this guard is the only thing that
+                    // stops them now that 0xc1 is on the Word allowlist. `RotateReg` carries no
+                    // width and its emitter is `shift_r32_imm8(op, ..)` plus `emit_set_cf_only`,
+                    // so a 66-prefixed rotate routed through it would rotate 32 bits where the
+                    // guest rotates 16 -- wrong result AND wrong CF, since the bit rotated across
+                    // the boundary comes from bit 31 instead of bit 15. The duke3d-586 re-census
+                    // measures the ROL row at `operand_size: dword` with `prefix_mask: 0`, and no
+                    // fixture measures a Word row for either sub-opcode, so this is a refusal with
+                    // nothing to buy rather than a missed lowering worth the second emitter lane.
                     if insn.operand_size == OperandSize::Word {
                         return None;
                     }
-                    return Some(DirectKind::RotateRightReg { dst, count });
+                    return Some(DirectKind::RotateReg {
+                        op: m.reg,
+                        dst,
+                        count,
+                    });
                 }
                 return Some(DirectKind::Shift {
                     op: m.reg,
