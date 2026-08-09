@@ -874,13 +874,79 @@ impl Machine {
             .min()
     }
 
+    /// Whether a consumer that can make CPU-batch GRANULARITY guest-visible is
+    /// currently active. This is the admission test for the Accurate class's fine
+    /// (DAC-period) batch fallback; see `event_batch_cap`.
+    ///
+    /// Every term is a live bool or one Option test: no rational conversion, no
+    /// device query that walks a queue. It runs once per batch, on the same hot
+    /// path the cap itself sits on.
+    ///
+    /// The terms, and what each one protects:
+    /// - OPL timers running. AdLib detection starts timer 1 (one 80 us step),
+    ///   runs a PURE-COMPUTE delay loop, then reads the status byte once. Nothing
+    ///   in that loop ends a batch, and the Accurate class reads the LIVE status
+    ///   byte (the `predicted_opl_status` peek is Approximate-only), so if the
+    ///   whole loop fits inside one batch the read reports the pre-delay flags and
+    ///   the guest concludes there is no card. Same failure the Approximate class
+    ///   hit before the peek existed.
+    /// - Speaker data enable. While the membrane is driven, port 0x61 bit 5
+    ///   (channel-2 OUT) is read live on this class too, so batch length bounds
+    ///   how stale a speaker-timing poll can be.
+    /// - DSP output clock, WSS playback/autocal, Red Book CD playback. The
+    ///   DMA-fed producers; a fine batch keeps the DMA current-count a guest can
+    ///   poll for its play position moving one frame at a time.
+    ///
+    /// NOT a term, deliberately: the sample producers' own fidelity. The original
+    /// cap (2026-06-21) existed so "the per-clock fine-samplers ... never alias" --
+    /// at that time the speaker sampled channel-2 OUT once per advance. Five days
+    /// later the speaker was rebuilt to integrate PIT transitions at their exact
+    /// sub-sample instants, and the timeline gives every producer a persistent
+    /// rate phase, so the DSP/WSS/CD/speaker frame counts and sample values are
+    /// split-invariant. The anti-aliasing rationale did not survive; what is left
+    /// is the observation-point list above.
+    ///
+    /// ALSO not a term, and the reason this is a gate and not a wider one: the
+    /// Margo blit engine. Its BUSY poll is the sharpest batch-granularity
+    /// consumer in the machine, but a gate cannot serve it -- the arming MMIO
+    /// write happens INSIDE the batch whose cap was already chosen, so the gate
+    /// would always be read too early. It is handled as a real deadline in
+    /// `event_batch_cap` instead.
+    fn fine_batch_grain_required(&self) -> bool {
+        self.opl.timers_running()
+            || self.speaker.data_enabled()
+            || self.sb16.is_producing()
+            || (self.wss_enabled && (self.wss.is_playing() || self.wss.autocal_active()))
+            || self.ide.device().playback().playing
+    }
+
     /// CPU clocks until the next due device event.
     ///
     /// Interrupts are serviced at batch entry and devices advance at batch end,
     /// so known timer, audio, MIDI, storage, RTC, keyboard, serial, and printer edges
-    /// shorten the batch to the first causal CPU clock in every CPU mode. Fast
-    /// modes have a 1 ms fallback; the 386 modes keep a finer DAC-period fallback.
-    /// A known edge may be earlier than either fallback.
+    /// shorten the batch to the first causal CPU clock in every CPU mode. Every
+    /// mode has a 1 ms fallback; the 386 (Accurate) modes drop to a finer
+    /// DAC-period fallback while `fine_batch_grain_required` says a consumer can
+    /// see the difference. A known edge may be earlier than either fallback.
+    ///
+    /// Why the fine fallback is gated rather than unconditional: at 22 MHz a
+    /// DAC period is ~500 clocks, so an idle 386 guest paid a floor of ~44,000
+    /// batch iterations per guest second -- each one a fresh pull-scan of the
+    /// device deadline queries below -- to protect consumers that were not
+    /// running. Gating it leaves the protected cases exactly as fine as before
+    /// and gives the idle case the same 1 ms ceiling the Approximate class uses.
+    ///
+    /// KNOWN CAVEAT (accepted, measured, not silently absorbed): time-derived
+    /// port reads with no in-batch peek -- chiefly the PIT counter latch on
+    /// 0x40/0x42 -- return device state as of BATCH START. A read ends the batch,
+    /// so only instructions executed before it in the same batch are unaccounted;
+    /// with the fine fallback that was bounded at ~23 us on the 386 tier and with
+    /// the coarse one it is bounded at 1 ms, which is what the Approximate class
+    /// has always accepted. A calibration loop of the shape "latch, compute,
+    /// latch" therefore under-reports by up to one batch. The principled fix is a
+    /// counter peek in `Pit` (the `out_after` precedent, which port 0x61 already
+    /// uses on the lazy path), not a batch-length floor; until then this is the
+    /// one place where the Accurate class's grain widens when audio is idle.
     ///
     /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
     /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
@@ -894,12 +960,15 @@ impl Machine {
     /// into different batches does not move an event deadline.
     pub(super) fn event_batch_cap(&self, remaining: u64) -> u64 {
         let clock_hz = self.active_mode.clock_hz();
-        let mut cap = if self.active_mode.uses_approximate_timing() {
-            clock_hz / 1000
-        } else {
-            clock_hz / u64::from(DAC_HZ)
-        }
-        .max(1);
+        // Order matters for cost: the class test short-circuits, so the
+        // Approximate (486/586) modes never run the gate at all.
+        let mut cap =
+            if self.active_mode.uses_approximate_timing() || !self.fine_batch_grain_required() {
+                clock_hz / 1000
+            } else {
+                clock_hz / u64::from(DAC_HZ)
+            }
+            .max(1);
         // Next PIT OUT rising edge: channel 0 feeds IRQ0, channel 2 the
         // speaker/GATE timing games poll. (Channel 1: see above.)
         for channel in [0usize, 2] {
@@ -936,6 +1005,32 @@ impl Machine {
         }
         if let Some(ticks) = self.next_ata_deadline() {
             cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        }
+        // The Margo blit engine's modeled busy time. This is a real device
+        // deadline that was missing from this pull-scan, and its absence was
+        // load-bearing in a way nothing recorded: STATUS.BUSY lives in MMIO, and
+        // MMIO does not set `io_touched`, so the BIOS's `margo_wait` spin
+        // (`mov eax,[fs:MARGO_MMIO+8]` / `test al,1` / `jnz`, izbios-lfb.inc)
+        // cannot end its own batch. BUSY therefore stayed set for the WHOLE
+        // remaining batch however short the operation was, and the guest paid a
+        // full batch cap per wait -- the DAC-period fallback was the only thing
+        // keeping that bill down on the 386 tier, and raising the fallback to
+        // 1 ms alone stopped POST from clearing the RAM test inside its
+        // 20M-cycle budget. With the deadline here the wait costs exactly the
+        // busy time the engine modeled (a glyph expand is ~740 ns, ~16 clocks at
+        // 22 MHz), which is both cheaper and far closer to the hardware than
+        // either fallback ever was. The arming write ends its own batch (see
+        // `MachineBus::write_memory`), so this term is always seen from a batch
+        // that starts with the engine busy.
+        let blit_busy_ns = self.vega.blitter_busy_ns();
+        if blit_busy_ns > 0
+            && let Some(clocks) = self.timeline.cpu_clocks_until(
+                timeline::DeviceClock::MargoNs,
+                blit_busy_ns,
+                timeline::NANOSECOND_HZ,
+            )
+        {
+            cap = cap.min(clocks);
         }
         if self.vega.display_start_pending()
             && let Some(clocks) = self.timeline.cpu_clocks_until(

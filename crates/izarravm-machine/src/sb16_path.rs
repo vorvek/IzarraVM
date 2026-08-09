@@ -278,6 +278,15 @@ impl Sb16Path {
         }
     }
 
+    /// Whether the DSP output clock still has PCM to produce this batch, i.e.
+    /// DMA playback is armed or ADPCM decode residue is draining. Cheap enough
+    /// for the per-batch cap gate: one Option test and one bool.
+    pub(crate) fn is_producing(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.dsp.needs_output_tick())
+    }
+
     pub(crate) fn irq_deadline(&self) -> Option<Sb16IrqDeadline> {
         let active = self.active.as_ref()?;
         Some(Sb16IrqDeadline {

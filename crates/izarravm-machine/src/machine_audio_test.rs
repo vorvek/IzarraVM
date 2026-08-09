@@ -1215,11 +1215,10 @@ fn event_batch_cap_reaches_a_near_due_pit_edge_in_every_mode() {
     ] {
         let mut machine = test_machine();
         machine.set_mode(mode);
-        let ceiling = if mode.uses_approximate_timing() {
-            mode.clock_hz() / 1000
-        } else {
-            mode.clock_hz() / u64::from(DAC_HZ)
-        };
+        // Audio is idle here, so the coarse fallback applies in every class;
+        // the fine one is exercised by
+        // `fine_batch_fallback_is_gated_on_an_active_audio_consumer`.
+        let ceiling = mode.clock_hz() / 1000;
 
         // With channels 0 and 2 stopped, the mode-scaled fallback binds.
         assert_eq!(machine.event_batch_cap(u64::MAX), ceiling, "{mode:?}");
@@ -1247,6 +1246,253 @@ fn event_batch_cap_reaches_a_near_due_pit_edge_in_every_mode() {
             .unwrap();
         assert_eq!(expected, 1, "{mode:?}: edge is one master tick away");
         assert_eq!(machine.event_batch_cap(u64::MAX), expected, "{mode:?}");
+    }
+}
+
+/// Accurate-class (386) modes only: every other mode has no fine fallback.
+const ACCURATE_MODES: [GswMode; 2] = [GswMode::Gsw386, GswMode::Gsw386Slow];
+
+fn coarse_fallback(mode: GswMode) -> u64 {
+    mode.clock_hz() / 1000
+}
+
+fn fine_fallback(mode: GswMode) -> u64 {
+    mode.clock_hz() / u64::from(DAC_HZ)
+}
+
+/// Fire a Margo FILL through the MMIO aperture so STATUS.BUSY has modeled busy
+/// time to drain.
+fn margo_start_fill(machine: &mut Machine) {
+    write_mmio_reg(machine, 0x100, 0); // DST_BASE
+    write_mmio_reg(machine, 0x104, 640); // DST_PITCH
+    write_mmio_reg(machine, 0x110, 1); // DEPTH
+    write_mmio_reg(machine, 0x114, (2 << 16) | 3); // DST_XY
+    write_mmio_reg(machine, 0x11c, (4 << 16) | 5); // DIM
+    write_mmio_reg(machine, 0x120, 0xab); // FG_COLOR
+    write_mmio_reg(machine, 0x128, 0xf0); // ROP: PATCOPY
+    write_mmio_reg(machine, 0x150, 0x01); // COMMAND: FILL
+    assert!(
+        machine.vega.blitter_busy_ns() > 0,
+        "the FILL must leave BUSY set"
+    );
+}
+
+/// Start OPL timer 1 (one 80 us step), the AdLib detection probe's arming
+/// sequence. Both writes go through the real port pair, so this is the same
+/// state a guest reaches.
+fn opl_start_timer1(machine: &mut Machine) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x388, BusWidth::Byte, 0x02, false).unwrap(); // timer-1 preset
+        bus.write_io(0x389, BusWidth::Byte, 0xFF, false).unwrap(); // one step
+        bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap(); // timer control
+        bus.write_io(0x389, BusWidth::Byte, 0x01, false).unwrap(); // START timer 1
+    });
+}
+
+/// Stop both OPL timers and clear the overflow flags (the probe's cleanup).
+fn opl_stop_timers(machine: &mut Machine) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap();
+        bus.write_io(0x389, BusWidth::Byte, 0x80, false).unwrap(); // IRQ RESET, no start bits
+    });
+}
+
+fn write_port_0x61(machine: &mut Machine, value: u32) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x61, BusWidth::Byte, value, false).unwrap();
+    });
+}
+
+/// Arm 8-bit mono DSP DMA output at 11025 Hz for a 4096-frame block, so the
+/// block IRQ deadline (~370 ms) is far past either fallback and cannot be what
+/// binds the cap.
+fn dsp_arm_long_8bit_block(machine: &mut Machine) {
+    for index in 0..64u32 {
+        machine.write_physical_u8(0x1_0000 + index, 0x80);
+    }
+    with_bus(machine, |bus| {
+        bus.write_io(0x0b, BusWidth::Byte, 0x49, false).unwrap(); // DMA1 ch1: single, read
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0xff, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x0f, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0a, BusWidth::Byte, 0x01, false).unwrap();
+        for byte in [0x41u8, 0x2b, 0x11, 0xc0, 0x00, 0xff, 0x0f] {
+            bus.write_io(0x22c, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+}
+
+/// Arm WSS playback with a block long enough that its terminal-count deadline
+/// (4096 frames at 48 kHz, ~85 ms) cannot bind the cap either.
+fn wss_arm_long_block(machine: &mut Machine) {
+    for index in 0..64u32 {
+        machine.write_physical_u8(0x1_0000 + index, 0x80);
+    }
+    with_bus(machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x48, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0xff, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x0f, false).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap(); // clear MCE
+        wss_write_indirect(bus, 10, 0x02); // I10 IEN
+        wss_write_indirect(bus, 15, 0xff); // I15 lower count
+        wss_write_indirect(bus, 14, 0x0f); // I14 upper count (loads current)
+        wss_write_indirect(bus, 9, 0x01); // I9 PEN
+        wss_write_indirect(bus, 6, 0x00);
+        wss_write_indirect(bus, 7, 0x00);
+    });
+}
+
+#[test]
+fn fine_batch_fallback_is_gated_on_an_active_audio_consumer() {
+    // Both directions, per consumer, in the Accurate class: an idle machine gets
+    // the 1 ms fallback; arming a consumer that can observe batch granularity
+    // pulls the cap down to one DAC period. Every arming path below leaves its
+    // own event deadline far outside 1 ms, so the DAC period is the ONLY thing
+    // that can produce the fine value -- an ungated cap would fail the idle
+    // assertions, and a gate stuck off would fail the armed ones.
+    type ArmConsumer = fn(&mut Machine);
+    let consumers: [(&str, ArmConsumer); 4] = [
+        ("OPL timer 1 running", opl_start_timer1),
+        ("speaker data enable", |machine| {
+            write_port_0x61(machine, 0x02)
+        }),
+        ("DSP DMA playback", dsp_arm_long_8bit_block),
+        ("WSS playback", wss_arm_long_block),
+    ];
+
+    for mode in ACCURATE_MODES {
+        let coarse = coarse_fallback(mode);
+        let fine = fine_fallback(mode);
+        assert!(
+            fine < coarse,
+            "{mode:?}: the two fallbacks must be distinguishable"
+        );
+
+        for (name, arm) in consumers {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            assert_eq!(
+                machine.event_batch_cap(u64::MAX),
+                coarse,
+                "{mode:?}/{name}: idle audio must take the 1 ms fallback"
+            );
+            arm(&mut machine);
+            assert_eq!(
+                machine.event_batch_cap(u64::MAX),
+                fine,
+                "{mode:?}/{name}: an active consumer must take the DAC-period fallback"
+            );
+        }
+    }
+}
+
+#[test]
+fn fine_batch_fallback_is_released_when_the_consumer_goes_idle_again() {
+    // The gate is live state, not a sticky first-touch admission: silencing the
+    // consumer returns the cap to 1 ms within the same machine.
+    for mode in ACCURATE_MODES {
+        let coarse = coarse_fallback(mode);
+        let fine = fine_fallback(mode);
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+
+        opl_start_timer1(&mut machine);
+        assert_eq!(machine.event_batch_cap(u64::MAX), fine, "{mode:?}: armed");
+        opl_stop_timers(&mut machine);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            coarse,
+            "{mode:?}: the probe finished, the fine cap is released"
+        );
+
+        write_port_0x61(&mut machine, 0x02);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            fine,
+            "{mode:?}: speaker driven"
+        );
+        write_port_0x61(&mut machine, 0x00);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            coarse,
+            "{mode:?}: speaker silenced"
+        );
+    }
+}
+
+#[test]
+fn approximate_class_keeps_the_1ms_fallback_even_with_audio_active() {
+    // The class test short-circuits ahead of the gate, so 486/586 never reach
+    // the fine fallback however loud the machine is.
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        opl_start_timer1(&mut machine);
+        write_port_0x61(&mut machine, 0x02);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            coarse_fallback(mode),
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
+    // The blit engine's BUSY flag is MMIO, so the guest's spin-wait cannot end
+    // its own batch: only the cap can. Two halves, both required.
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+
+        // 1. The arming write ends its own batch, the way a port write does, so
+        //    the busy deadline is seen from a batch that starts with it pending.
+        machine.io_touched = false;
+        margo_start_fill(&mut machine);
+        assert!(
+            machine.io_touched,
+            "{mode:?}: the COMMAND write must end the batch"
+        );
+
+        // 2. The cap is the modeled busy time, not a fallback. A 5x4 PATCOPY is
+        //    100 ns setup + 20 pixels * 5 ns = 200 ns, well inside every
+        //    fallback, so only the deadline term can produce this value.
+        let busy_ns = machine.vega.blitter_busy_ns();
+        assert_eq!(busy_ns, 200, "{mode:?}");
+        let expected = machine
+            .timeline
+            .cpu_clocks_until(timeline::DeviceClock::MargoNs, busy_ns, 1_000_000_000)
+            .unwrap();
+        assert!(
+            expected < mode.clock_hz() / u64::from(DAC_HZ),
+            "{mode:?}: the blit edge must be shorter than either fallback"
+        );
+        assert_eq!(machine.event_batch_cap(u64::MAX), expected, "{mode:?}");
+
+        // 3. Draining exactly that much device time clears BUSY, so the guest's
+        //    spin exits in the next batch instead of burning a whole cap.
+        machine.advance_devices_clocks(expected);
+        assert_eq!(
+            machine.vega.blitter_busy_ns(),
+            0,
+            "{mode:?}: the batch ended at the completion edge"
+        );
     }
 }
 

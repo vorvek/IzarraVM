@@ -912,10 +912,11 @@ impl Machine {
             // + 14-device fan-out that dominated the old loop.
             //
             // End every batch at the next known PIT, DSP, or WSS deadline. A
-            // 1 ms fallback bounds the fast modes; a DAC-period fallback keeps
-            // the 386 paths fine-grained. Either may be shortened by an earlier
-            // event. Compute this once at batch entry because the run loop is
-            // layout-sensitive.
+            // 1 ms fallback bounds every mode; the 386 paths drop to a
+            // DAC-period fallback while a consumer that can observe the
+            // difference is active (see `fine_batch_grain_required`). Either may be
+            // shortened by an earlier event. Compute this once at batch entry
+            // because the run loop is layout-sensitive.
             let remaining_ticks = deadline_ticks - self.timeline.now_ticks();
             let remaining = self
                 .timeline

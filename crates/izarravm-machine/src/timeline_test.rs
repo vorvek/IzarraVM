@@ -374,6 +374,7 @@ fn pit_and_video_deadlines_choose_the_first_causal_cpu_clock() {
                 DeviceClock::Dsp
                 | DeviceClock::Wss
                 | DeviceClock::MargoFrame
+                | DeviceClock::MargoNs
                 | DeviceClock::Rtc => unreachable!(),
             };
             assert_eq!(before_events, 0, "{mode:?} {clock:?}");

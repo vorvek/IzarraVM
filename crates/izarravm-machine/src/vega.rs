@@ -330,6 +330,16 @@ impl Vega {
         self.margo.display_start_pending()
     }
 
+    /// Whether the Margo blitter still has modeled busy time to drain.
+    ///
+    /// This is the TIME-DRAINING half of STATUS.BUSY only. An armed but unfed
+    /// color-expand stream also reads BUSY, and it is deliberately excluded: it
+    /// waits on guest MONO_DATA writes, not on elapsed time, so it would never
+    /// clear on its own.
+    pub(crate) fn blitter_busy_ns(&self) -> u64 {
+        self.margo.busy_ns()
+    }
+
     pub(crate) fn port_disabled(&self, port: u16) -> bool {
         !self.vga.video_subsystem_enabled() && port != 0x3c3 && (0x3b0..=0x3df).contains(&port)
     }

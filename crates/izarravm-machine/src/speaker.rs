@@ -254,6 +254,12 @@ impl Speaker {
         self.ever_enabled
     }
 
+    /// Whether the data enable (port 0x61 bit 1) is currently high, i.e. the
+    /// membrane is being driven and this speaker is producing non-zero samples.
+    pub(crate) fn data_enabled(&self) -> bool {
+        self.data_enable
+    }
+
     /// The low two bits last written to 0x61 (GATE2 and data enable), for readback.
     pub(crate) fn control_bits(&self) -> u8 {
         self.control_bits
