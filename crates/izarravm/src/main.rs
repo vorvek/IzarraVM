@@ -1072,6 +1072,149 @@ fn mouse_action_packets(action: &MouseAction, buttons: &mut u8) -> Vec<MousePack
     }
 }
 
+/// Guest milliseconds of emulation per `render_audio` call in the headless audio
+/// capture. Short enough that the DSP's own render ring (8192 frames, 186 ms at
+/// 44.1 kHz) never overflows between drains, which is what makes the captured
+/// stream continuous rather than a series of survivors.
+const AUDIO_CAPTURE_SLICE_MS: u64 = 10;
+/// OPL3 native synthesis rate; `render_audio` counts its window in these.
+const AUDIO_CAPTURE_OPL_HZ: f64 = 49_716.0;
+/// Sample rate of the captured WAV, matching the machine's DAC rate.
+const AUDIO_CAPTURE_DAC_HZ: u32 = 44_100;
+
+/// Headless capture of the host audio mix: an OBSERVER of a run, not a run mode.
+///
+/// It owns two things only -- how finely the run has to be sliced so the DSP's
+/// render ring never overflows between drains, and the growing PCM buffer. Every
+/// path that advances the guest goes through [`run_sliced`], so the capture
+/// composes with whatever else that path is doing (key and mouse injection, in
+/// particular). An earlier cut made the capture its own branch of the run
+/// if/else, which silently discarded `--inject-keys`/`--inject-mouse`: the
+/// capture ran, the WAV was written, and the recorded audio was of a title that
+/// had never been given the input it was supposed to react to.
+struct AudioCapture {
+    path: PathBuf,
+    pcm: Vec<(i16, i16)>,
+    /// Guest cycles per `render_audio` call.
+    slice: u64,
+    /// OPL-native samples per guest cycle. The window is derived from the cycles
+    /// a slice actually ran rather than from a constant, because a composed run
+    /// does not advance in fixed steps: an injection path runs 2 ms per scancode
+    /// and its own dwell per mouse packet. Rendering a fixed slice's worth of
+    /// audio for a short advance would stretch the captured stream exactly over
+    /// the input the capture exists to hear the reaction to.
+    opl_samples_per_cycle: f64,
+    /// `IZARRAVM_AUDIO_WAV_WALL=1` paces the window from HOST wall time, which
+    /// is what the GUI actually does. The two differ by exactly the real-time
+    /// factor: an emulator running the guest at 0.3x still has to hand the sound
+    /// card 44100 frames every real second, and the guest-clocked DSP stream can
+    /// only supply 0.3 of them. Capturing both says whether a title is silent
+    /// because the mix is wrong or because the guest is too slow to feed it.
+    wall_paced: bool,
+    debt: f64,
+    last_wall: std::time::Instant,
+}
+
+impl AudioCapture {
+    fn new(path: PathBuf, hardware: &HardwareProfile) -> Self {
+        let clock = hardware.cpu.clock_rate();
+        Self {
+            path,
+            pcm: Vec::new(),
+            slice: clock
+                .clocks_for_fraction_floor(AUDIO_CAPTURE_SLICE_MS, 1000)
+                .max(1_000),
+            // The GUI derives its OPL sample count from WALL time; pacing it from
+            // GUEST time instead models a host that keeps up exactly, which is
+            // the condition to test first -- a mix that is silent even there is
+            // broken independently of how fast the emulator runs.
+            opl_samples_per_cycle: AUDIO_CAPTURE_OPL_HZ
+                / clock.clocks_for_fraction_floor(1, 1).max(1) as f64,
+            wall_paced: std::env::var_os("IZARRAVM_AUDIO_WAV_WALL").is_some(),
+            debt: 0.0,
+            last_wall: std::time::Instant::now(),
+        }
+    }
+
+    /// Drain the host mix for the `cycles` the guest just ran. Called after every
+    /// guest advance, whatever placed it.
+    fn after_slice(&mut self, machine: &mut Machine, cycles: u64) {
+        if self.wall_paced {
+            let now = std::time::Instant::now();
+            self.debt += now.duration_since(self.last_wall).as_secs_f64() * AUDIO_CAPTURE_OPL_HZ;
+            self.last_wall = now;
+        } else {
+            self.debt += cycles as f64 * self.opl_samples_per_cycle;
+        }
+        let want = self.debt.floor() as usize;
+        self.debt -= want as f64;
+        let native_samples = want.min(AUDIO_CAPTURE_OPL_HZ as usize / 2);
+        if native_samples > 0 {
+            self.pcm.extend(machine.render_audio(native_samples));
+        }
+    }
+
+    fn finish(&self) -> Result<(), Box<dyn Error>> {
+        write_wav(&self.path, &self.pcm, AUDIO_CAPTURE_DAC_HZ)?;
+        println!("audio capture: wrote {}", self.path.display());
+        Ok(())
+    }
+}
+
+/// Advance the guest by `cycles`, subdividing into capture slices and draining
+/// the mix after each when a capture is armed. With no capture this is the one
+/// `run_until_halt_or_cycles` call it has always been, so a run without
+/// `IZARRAVM_AUDIO_WAV` keeps its exact device-servicing boundaries.
+///
+/// Returns the stop reason and the cycles actually spent -- a terminal stop ends
+/// the run partway through the request, and the caller's own pacing has to know.
+fn run_sliced(
+    machine: &mut Machine,
+    cycles: u64,
+    capture: &mut Option<AudioCapture>,
+) -> Result<(StopReason, u64), Box<dyn Error>> {
+    let Some(capture) = capture.as_mut() else {
+        return Ok((machine.run_until_halt_or_cycles(cycles)?, cycles));
+    };
+    let mut spent = 0u64;
+    let mut stop = StopReason::CycleLimit { requested: cycles };
+    while spent < cycles {
+        let step = capture.slice.min(cycles - spent);
+        let reason = machine.run_until_halt_or_cycles(step)?;
+        spent += step;
+        capture.after_slice(machine, step);
+        if non_cycle_stop(&reason).is_some() {
+            stop = reason;
+            break;
+        }
+    }
+    Ok((stop, spent))
+}
+
+/// Write 16-bit stereo PCM as a canonical 44-byte-header RIFF/WAVE file.
+fn write_wav(path: &Path, pcm: &[(i16, i16)], rate: u32) -> Result<(), Box<dyn Error>> {
+    let data_len = (pcm.len() * 4) as u32;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // PCM chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // format: PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // channels
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 4).to_le_bytes()); // byte rate
+    out.extend_from_slice(&4u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for (l, r) in pcm {
+        out.extend_from_slice(&l.to_le_bytes());
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
 /// Mount a host folder as C: through the Katea facade (real FreeDOS system files
 /// plus the folder's top-level files, read-only), run the BIOS so INT 19h boots
 /// it, and print the same diagnostics as `run_boot_hdd`. The lazy-facade analogue
@@ -1137,12 +1280,32 @@ fn run_boot_hdd_folder(
         machine.arm_periodic_phase_marks(per_ms.saturating_mul(ms), budget);
         machine.record_host_phase_mark(izarravm_machine::phase_mark::BENCH_START);
     }
+    // Headless capture of the HOST audio mix (`IZARRAVM_AUDIO_WAV=<path>`).
+    // Everything else headless observes the guest SIDE of the sound card: the
+    // per-second `[SB]` trace proves the DSP is programmed and that DMA is
+    // handing it real PCM, but `render_audio` -- the OPL + DSP + WSS + CD +
+    // speaker sum with the CT1745 gains applied -- only ever runs in the GUI,
+    // so "the guest is producing audio" and "audio reaches the speakers" could
+    // not be distinguished without a person and a pair of ears. This pumps the
+    // same call the GUI's `pump_audio` does, paced by GUEST time (i.e. the
+    // ideal real-time host), and writes the result as a 44.1 kHz stereo WAV.
+    //
+    // Diagnostic only, and off unless the variable is set: it slices the run,
+    // which moves where device events are serviced, so a captured run is NOT
+    // comparable against a pinned fixture invariant.
+    //
+    // The capture is an OBSERVER, not a run mode: it composes with key and mouse
+    // injection rather than replacing it, so `--inject-mouse ... IZARRAVM_AUDIO_WAV=x.wav`
+    // records the audio of a title that actually received its input.
+    let mut capture = std::env::var_os("IZARRAVM_AUDIO_WAV")
+        .map(|path| AudioCapture::new(PathBuf::from(path), hardware));
     let start_wall = std::time::Instant::now();
-    // The no-injection path stays ONE `run_until_halt_or_cycles` call, byte for
-    // byte what it was: slicing the run moves where the machine services device
-    // events, so the shipped Doom and Quake fixtures must not take this branch.
+    // The no-injection, no-capture path stays ONE `run_until_halt_or_cycles`
+    // call, byte for byte what it was: slicing the run moves where the machine
+    // services device events, so the shipped Doom and Quake fixtures must not
+    // take a sliced branch.
     let stop_reason = if injections.is_empty() {
-        machine.run_until_halt_or_cycles(budget)?
+        run_sliced(&mut machine, budget, &mut capture)?.0
     } else {
         let guest_ms = |ms: u64| {
             hardware
@@ -1161,18 +1324,20 @@ fn run_boot_hdd_folder(
         let mut reason = None;
         let mut buttons = 0u8;
         // Run `slice` more cycles, reporting a terminal stop. Returns false once
-        // the run is over, so the caller stops feeding it input.
+        // the run is over, so the caller stops feeding it input. Goes through
+        // `run_sliced`, so an armed audio capture observes this path too.
         let advance = |machine: &mut Machine,
                        spent: &mut u64,
                        reason: &mut Option<StopReason>,
+                       capture: &mut Option<AudioCapture>,
                        slice: u64|
          -> Result<bool, Box<dyn Error>> {
             let slice = slice.min(budget.saturating_sub(*spent));
             if slice == 0 {
                 return Ok(false);
             }
-            let stop = machine.run_until_halt_or_cycles(slice)?;
-            *spent += slice;
+            let (stop, ran) = run_sliced(machine, slice, capture)?;
+            *spent += ran;
             if let Some(terminal) = non_cycle_stop(&stop) {
                 *reason = Some(terminal);
                 return Ok(false);
@@ -1181,7 +1346,7 @@ fn run_boot_hdd_folder(
         };
         for step in &injections {
             let gap = step.at_cycles.saturating_sub(spent);
-            if gap > 0 && !advance(&mut machine, &mut spent, &mut reason, gap)? {
+            if gap > 0 && !advance(&mut machine, &mut spent, &mut reason, &mut capture, gap)? {
                 break;
             }
             match &step.event {
@@ -1189,7 +1354,13 @@ fn run_boot_hdd_folder(
                     for group in text_to_scancode_groups(text)? {
                         for code in group {
                             machine.inject_key_scancodes(&[code]);
-                            if !advance(&mut machine, &mut spent, &mut reason, per_key)? {
+                            if !advance(
+                                &mut machine,
+                                &mut spent,
+                                &mut reason,
+                                &mut capture,
+                                per_key,
+                            )? {
                                 break;
                             }
                         }
@@ -1199,7 +1370,7 @@ fn run_boot_hdd_folder(
                     for packet in mouse_action_packets(action, &mut buttons) {
                         machine.inject_mouse_relative(packet.dx, packet.dy, packet.buttons);
                         let dwell = guest_ms(packet.dwell_ms);
-                        if !advance(&mut machine, &mut spent, &mut reason, dwell)? {
+                        if !advance(&mut machine, &mut spent, &mut reason, &mut capture, dwell)? {
                             break;
                         }
                     }
@@ -1211,9 +1382,12 @@ fn run_boot_hdd_folder(
         }
         match reason {
             Some(terminal) => terminal,
-            None => machine.run_until_halt_or_cycles(budget.saturating_sub(spent))?,
+            None => run_sliced(&mut machine, budget.saturating_sub(spent), &mut capture)?.0,
         }
     };
+    if let Some(capture) = &capture {
+        capture.finish()?;
+    }
     // The wall reading comes FIRST. `record_host_phase_mark` routes to the full mark, which
     // takes a `cpu_profile` snapshot when profiling is armed -- the untruncated hot-address sort
     // that is at its largest exactly here, at end of run -- and a run with both the sampler and

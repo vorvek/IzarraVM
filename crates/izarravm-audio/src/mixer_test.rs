@@ -39,22 +39,40 @@ fn index_latch_and_data_round_trip() {
 #[test]
 fn cd_volume_attenuates_via_both_register_paths() {
     let mut mixer = SbMixer::default();
-    // Default CD volume is muted.
-    assert_eq!(mixer.cd_gain(), (0.0, 0.0));
-    // The 5-bit CD registers set the gain directly.
-    write_reg(&mut mixer, 0x36, 31);
-    write_reg(&mut mixer, 0x37, 31);
+    // CD powers on at 0 dB, like master/voice/FM (DOSBox-X CTMIXER_Reset cda=31,
+    // 86Box resets 0x36/0x37 to 0xF8).
+    let (dl, dr) = mixer.cd_gain();
+    assert!((dl - 1.0).abs() < 1e-3 && (dr - 1.0).abs() < 1e-3);
+    assert_eq!(read_reg(&mut mixer, 0x36), 0xF8);
+    // The 5-bit CD registers set the gain directly. The level lives in D7-D3,
+    // so level 31 is the byte 0xF8, not 31.
+    write_reg(&mut mixer, 0x36, 0x00);
+    write_reg(&mut mixer, 0x37, 0x00);
+    assert_eq!(mixer.cd_gain(), (0.0, 0.0), "level 0 is a hard mute");
+    write_reg(&mut mixer, 0x36, 31 << 3);
+    write_reg(&mut mixer, 0x37, 31 << 3);
     let (l, r) = mixer.cd_gain();
     assert!(l > 0.9 && r > 0.9, "full CD volume is near unity: {l},{r}");
-    // The CT1345 compat alias maps into the same 5-bit registers. The 4-bit
-    // max nibble maps to 5-bit level 30 (level<<1), ~0.79 gain, well above
-    // the muted floor.
+    // The CT1345 compat alias maps into the same 5-bit registers, and its max
+    // nibble reaches level 31 -- 0 dB, not the -2 dB a `nibble << 1` would give.
     let mut compat = SbMixer::default();
+    // Nibble 0 is level 1, NOT the mute step: the compat registers physically
+    // cannot reach level 0, so the quietest they express is the -60 dB floor.
+    write_reg(&mut compat, 0x28, 0x00);
+    assert_eq!(compat.cd_levels(), (1, 1));
+    let (ql, _) = compat.cd_gain();
+    assert!(ql > 0.0 && ql < 0.002, "compat floor is -60 dB, got {ql}");
     write_reg(&mut compat, 0x28, 0xFF); // both nibbles max
     let (cl, cr) = compat.cd_gain();
-    assert!(cl > 0.5 && cr > 0.5, "compat CD volume is loud: {cl},{cr}");
+    assert!((cl - 1.0).abs() < 1e-3 && (cr - 1.0).abs() < 1e-3);
+    assert_eq!(read_reg(&mut compat, 0x36), 0xF8, "full compat is 0 dB");
     // A read of 0x28 round-trips the compat byte.
     assert_eq!(read_reg(&mut compat, 0x28), 0xFF);
+    // The SB1/2 alias at 0x08 drives BOTH channels from one nibble.
+    let mut sb1 = SbMixer::default();
+    write_reg(&mut sb1, 0x08, 0x07);
+    assert_eq!(sb1.cd_levels(), (15, 15), "nibble 7 -> level (7<<1)|1");
+    assert_eq!(read_reg(&mut sb1, 0x08), 0x07);
 }
 
 #[test]
@@ -73,9 +91,11 @@ fn direct_cd_levels_preserve_latch_irq_and_keep_alias_coherent() {
     mixer.write_port(MIXER_INDEX_PORT, 0x28);
     assert_eq!(mixer.read_port(MIXER_DATA_PORT), Some(0xF8));
 
-    write_reg(&mut mixer, 0x36, 11);
-    write_reg(&mut mixer, 0x37, 24);
+    write_reg(&mut mixer, 0x36, 11 << 3);
+    write_reg(&mut mixer, 0x37, 24 << 3);
     assert_eq!(read_reg(&mut mixer, 0x28), 0x5C);
+    // The native register reads back left-aligned, the way it was written.
+    assert_eq!(read_reg(&mut mixer, 0x36), 11 << 3);
 }
 
 #[test]
@@ -125,7 +145,11 @@ fn reset_register_restores_hardware_defaults() {
     assert_eq!(read_reg(&mut mixer, 0x80), 0x02, "IRQ5 default");
     assert_eq!(read_reg(&mut mixer, 0x81), 0x22, "DMA1|DMA5 default");
     assert_eq!(mixer.selected_irq(), 5);
-    assert_eq!(read_reg(&mut mixer, 0x30), 24, "master -14 dB default");
+    assert_eq!(
+        read_reg(&mut mixer, 0x30),
+        31 << 3,
+        "master powers on at 0 dB, as DOSBox-X and 86Box also do"
+    );
 }
 
 #[test]
@@ -153,35 +177,53 @@ fn ct1345_compat_master_alias_round_trips_through_0x30_0x31() {
     let mut mixer = SbMixer::default();
     // out 0x224,0x22; out 0x225,0xFF; then 0x30/0x31 reflect 0x1E/0x1E.
     write_reg(&mut mixer, 0x22, 0xFF);
-    assert_eq!(read_reg(&mut mixer, 0x30), 0x1E);
-    assert_eq!(read_reg(&mut mixer, 0x31), 0x1E);
-    // Read-back through the alias packs each side back to 4-bit (0x1E>>1 = 0xF).
+    // The max nibble reaches level 31 (0xF8), so full compat volume is 0 dB. A
+    // `nibble << 1` mapping would land on level 30 / 0xF0, quietly -2 dB down and
+    // disagreeing with the same level written natively.
+    assert_eq!(read_reg(&mut mixer, 0x30), 0xF8);
+    assert_eq!(read_reg(&mut mixer, 0x31), 0xF8);
+    assert!((mixer.master_gain().0 - 1.0).abs() < 1e-3);
+    // Read-back through the alias packs each side back to 4-bit (0x1F>>1 = 0xF).
     assert_eq!(read_reg(&mut mixer, 0x22), 0xFF);
-    // The 5-bit default (24) packs to 12|12 => 0xCC.
+    // The 0 dB default (level 31) packs to 15|15 => 0xFF.
     let mut fresh = SbMixer::default();
-    assert_eq!(read_reg(&mut fresh, 0x22), 0xCC, "default master alias");
+    assert_eq!(read_reg(&mut fresh, 0x22), 0xFF, "default master alias");
+    // The SB1/2 alias at 0x02 drives both channels from one nibble.
+    let mut sb1 = SbMixer::default();
+    write_reg(&mut sb1, 0x02, 0x00);
+    assert_eq!(read_reg(&mut sb1, 0x30), 0x08, "nibble 0 -> level 1");
+    assert_eq!(read_reg(&mut sb1, 0x31), 0x08);
+    assert_eq!(read_reg(&mut sb1, 0x02), 0x00);
 }
 
 #[test]
 fn ct1345_compat_voice_alias_round_trips_through_0x32_0x33() {
     let mut mixer = SbMixer::default();
     write_reg(&mut mixer, 0x04, 0x00);
-    assert_eq!(read_reg(&mut mixer, 0x32), 0x00);
-    assert_eq!(read_reg(&mut mixer, 0x33), 0x00);
-    assert_eq!(mixer.voice_gain(), (0.0, 0.0), "level 0 is a hard mute");
+    // The compat scale bottoms out at level 1 (-60 dB), not the mute step.
+    assert_eq!(read_reg(&mut mixer, 0x32), 0x08);
+    assert_eq!(read_reg(&mut mixer, 0x33), 0x08);
+    let (vl, _) = mixer.voice_gain();
+    assert!(vl > 0.0 && vl < 0.002);
     write_reg(&mut mixer, 0x04, 0xFF);
-    assert_eq!(read_reg(&mut mixer, 0x32), 0x1E);
+    assert_eq!(read_reg(&mut mixer, 0x32), 0xF8);
 }
 
 #[test]
 fn volume_gain_tables_match_the_guide_scales() {
     let mixer = SbMixer::default();
-    // Master/voice default level 24 => -14 dB => 10**(-14/20).
-    let expected = 10f32.powf(-14.0 / 20.0);
+    // Master/voice/FM power on at level 31 => 0 dB => unity.
     let (ml, mr) = mixer.master_gain();
     let (vl, vr) = mixer.voice_gain();
-    assert!((ml - expected).abs() < 1e-3 && (mr - expected).abs() < 1e-3);
-    assert!((vl - expected).abs() < 1e-3 && (vr - expected).abs() < 1e-3);
+    let (fl, fr) = mixer.fm_gain();
+    assert!((ml - 1.0).abs() < 1e-3 && (mr - 1.0).abs() < 1e-3);
+    assert!((vl - 1.0).abs() < 1e-3 && (vr - 1.0).abs() < 1e-3);
+    assert!((fl - 1.0).abs() < 1e-3 && (fr - 1.0).abs() < 1e-3);
+    // Level 24, the Guide's documented -14 dB step, written left-aligned.
+    let mut quiet = mixer.clone();
+    write_reg(&mut quiet, 0x30, 24 << 3);
+    let expected = 10f32.powf(-14.0 / 20.0);
+    assert!((quiet.master_gain().0 - expected).abs() < 1e-3);
     // Level 0 is a hard mute (both channels).
     let mut muted = mixer.clone();
     write_reg(&mut muted, 0x30, 0x00);
@@ -189,13 +231,17 @@ fn volume_gain_tables_match_the_guide_scales() {
     assert_eq!(muted.master_gain(), (0.0, 0.0));
     // Level 31 is unity (0 dB).
     let mut full = mixer.clone();
-    write_reg(&mut full, 0x30, 0x1F);
-    let (fl, _) = full.master_gain();
-    assert!((fl - 1.0).abs() < 1e-3, "level 31 => 0 dB => gain 1.0");
-    // Output gain default 0 => 0 dB => 1.0; level 3 => +18 dB.
+    write_reg(&mut full, 0x30, 0x1F << 3);
+    let (fullgain, _) = full.master_gain();
+    assert!(
+        (fullgain - 1.0).abs() < 1e-3,
+        "level 31 => 0 dB => gain 1.0"
+    );
+    // Output gain default 0 => 0 dB => 1.0; level 3 => +18 dB. The 2-bit field
+    // lives in D7-D6.
     assert_eq!(mixer.outgain_gain(), (1.0, 1.0));
     let mut boosted = mixer.clone();
-    write_reg(&mut boosted, 0x41, 0x03);
+    write_reg(&mut boosted, 0x41, 0x03 << 6);
     let (ol, _) = boosted.outgain_gain();
     assert!((ol - 10f32.powf(18.0 / 20.0)).abs() < 1e-3);
 }
@@ -234,8 +280,139 @@ fn inert_registers_round_trip_at_their_defaults() {
     let mut mixer = mixer;
     // Output switches and tone defaults are returned verbatim.
     assert_eq!(read_reg(&mut mixer, 0x3C), 0x1F);
-    assert_eq!(read_reg(&mut mixer, 0x44), 8);
     // A guest write round-trips through the stored-but-inert slot.
     write_reg(&mut mixer, 0x3C, 0x02);
     assert_eq!(read_reg(&mut mixer, 0x3C), 0x02);
+}
+
+/// Every power-on byte an inert register returns must be encoded in the field
+/// that register actually uses, the same way the live registers are decoded.
+/// Returning a bare level (8 for a 4-bit tone control, 0 for the speaker) hands
+/// the guest a byte the card cannot produce and contradicts the convention the
+/// rest of the file is written to. 86Box's reset block is the reference.
+#[test]
+fn inert_defaults_are_hardware_encoded_not_bare_levels() {
+    let mut mixer = SbMixer::default();
+    // Tone controls: 4-bit field in D7-D4, centre 8 => 0x80 (86Box 0x44-0x47).
+    for reg in [0x44u8, 0x45, 0x46, 0x47] {
+        assert_eq!(read_reg(&mut mixer, reg), 0x80, "{reg:#04x} centre is 0x80");
+    }
+    // PC Speaker volume (86Box 0x3B = 0x80, "steps of 64").
+    assert_eq!(read_reg(&mut mixer, 0x3B), 0x80);
+    // Mic: 86Box writes `(regs[0x0a] << 5) | 0x18` into 0x3A, so the default is
+    // 0x18 and the alias tracks it in both directions.
+    assert_eq!(read_reg(&mut mixer, 0x3A), 0x18);
+    assert_eq!(read_reg(&mut mixer, 0x0A), 0x00);
+    write_reg(&mut mixer, 0x0A, 0x05);
+    assert_eq!(read_reg(&mut mixer, 0x3A), (5 << 5) | 0x18);
+    assert_eq!(read_reg(&mut mixer, 0x0A), 0x05);
+}
+
+/// The FM/MIDI bus has three register paths -- 0x34/0x35 (SB16), 0x26 (SB Pro,
+/// packed nibbles) and 0x06 (SB1/2, one nibble for both channels) -- and they are
+/// one control. 86Box `sb_ct1745_mixer_write` cases 0x06 and 0x26 copy into
+/// 0x34/0x35. Leaving 0x26/0x06 in the inert store meant an SB Pro-era title
+/// setting its music volume got no attenuation at all, and the register file
+/// contradicted itself at power-on (0x26 read 0xCC while 0x34 read 0xF8).
+#[test]
+fn fm_compat_aliases_drive_the_same_level_as_0x34_0x35() {
+    // Power-on: every FM path agrees on 0 dB.
+    let mut mixer = SbMixer::default();
+    assert_eq!(read_reg(&mut mixer, 0x34), 0xF8);
+    assert_eq!(read_reg(&mut mixer, 0x26), 0xFF);
+    assert_eq!(read_reg(&mut mixer, 0x06), 0x0F);
+
+    // Alias -> native: the SB Pro packed byte attenuates the FM bus.
+    write_reg(&mut mixer, 0x26, 0x94); // L nibble 9 -> level 19, R nibble 4 -> 9
+    assert_eq!(read_reg(&mut mixer, 0x34), 19 << 3);
+    assert_eq!(read_reg(&mut mixer, 0x35), 9 << 3);
+    let (fl, fr) = mixer.fm_gain();
+    assert!(
+        (fl - 10f32.powf(-24.0 / 20.0)).abs() < 1e-3,
+        "level 19: {fl}"
+    );
+    assert!(
+        (fr - 10f32.powf(-44.0 / 20.0)).abs() < 1e-4,
+        "level 9: {fr}"
+    );
+
+    // Native -> alias: a write to 0x34/0x35 moves the alias read-back too, so a
+    // read-modify-write through either path sees one consistent control.
+    write_reg(&mut mixer, 0x34, 31 << 3);
+    write_reg(&mut mixer, 0x35, 21 << 3);
+    assert_eq!(read_reg(&mut mixer, 0x26), 0xFA); // 31>>1 = 0xF, 21>>1 = 0xA
+    assert_eq!(read_reg(&mut mixer, 0x06), 0x0F);
+
+    // The SB1/2 alias sets both channels from one nibble, and reads back the
+    // nibble the FM level currently sits on.
+    let mut sb1 = SbMixer::default();
+    write_reg(&mut sb1, 0x06, 0x06); // level (6<<1)|1 = 13
+    assert_eq!(read_reg(&mut sb1, 0x34), 13 << 3);
+    assert_eq!(read_reg(&mut sb1, 0x35), 13 << 3);
+    assert_eq!(read_reg(&mut sb1, 0x06), 0x06);
+    assert_eq!(read_reg(&mut sb1, 0x26), 0x66);
+    let (gl, gr) = sb1.fm_gain();
+    let expected = 10f32.powf(-36.0 / 20.0);
+    assert!((gl - expected).abs() < 1e-4 && (gr - expected).abs() < 1e-4);
+
+    // A mixer reset restores every FM path to 0 dB together.
+    write_reg(&mut sb1, 0x00, 0x00);
+    assert_eq!(read_reg(&mut sb1, 0x34), 0xF8);
+    assert_eq!(read_reg(&mut sb1, 0x26), 0xFF);
+    assert_eq!(read_reg(&mut sb1, 0x06), 0x0F);
+}
+
+/// The exact register traffic Duke Nukem 3D emits, and the balance it asks for.
+///
+/// Duke computes each mixer level as `volume * 31 / 255` and writes it
+/// LEFT-ALIGNED (`level << 3`): with `FXVolume = 228` and `MusicVolume = 224`
+/// from DUKE3D.CFG that is `0xD8` to the voice pair and `0xC8` to the FM pair.
+/// Reading those bytes as `& 0x1F` decoded the voice as level 24 instead of 27
+/// and, because `0x34`/`0x35` were an inert store, applied no FM attenuation at
+/// all -- 6 dB off the effects and 12 dB of music that should not have been
+/// there, which is why the game's music played and its digital effects did not.
+#[test]
+fn duke3d_mixer_writes_put_the_effects_above_the_music() {
+    let mut mixer = SbMixer::default();
+    write_reg(&mut mixer, 0x32, 0xD8); // FX volume 228 -> level 27
+    write_reg(&mut mixer, 0x33, 0xD8);
+    write_reg(&mut mixer, 0x34, 0xC8); // music volume -> level 25
+    write_reg(&mut mixer, 0x35, 0xC8);
+
+    let (voice, _) = mixer.voice_gain();
+    let (fm, _) = mixer.fm_gain();
+    assert!(
+        (voice - 10f32.powf(-8.0 / 20.0)).abs() < 1e-3,
+        "level 27 is -8 dB, not the -14 dB `& 0x1F` produced: {voice}"
+    );
+    assert!(
+        (fm - 10f32.powf(-12.0 / 20.0)).abs() < 1e-3,
+        "level 25 is -12 dB, not the 0 dB an inert 0x34 produced: {fm}"
+    );
+    assert!(
+        voice > fm,
+        "Duke asks for effects ABOVE music ({voice} vs {fm})"
+    );
+    // Duke never writes 0x30/0x31, so the balance it asks for is only preserved
+    // if the master leaves it alone.
+    assert_eq!(mixer.master_gain(), (1.0, 1.0), "untouched master is 0 dB");
+    // Round-trip: a read-modify-write setup utility must see what it wrote.
+    assert_eq!(read_reg(&mut mixer, 0x32), 0xD8);
+    assert_eq!(read_reg(&mut mixer, 0x34), 0xC8);
+}
+
+/// The failure mode the old decode had beyond the few-dB error: any level that
+/// is a multiple of four writes a byte whose low five bits are zero, so
+/// `value & 0x1F` read it as level 0 -- a hard mute. Level 24 is the Guide's own
+/// documented power-on value, i.e. a card told to restore its default went
+/// silent.
+#[test]
+fn levels_that_are_multiples_of_four_are_not_muted() {
+    for level in [4u8, 8, 12, 16, 20, 24, 28] {
+        let mut mixer = SbMixer::default();
+        write_reg(&mut mixer, 0x32, level << 3);
+        let (gain, _) = mixer.voice_gain();
+        assert!(gain > 0.0, "level {level} must not decode as a mute");
+        assert_eq!(read_reg(&mut mixer, 0x32), level << 3);
+    }
 }

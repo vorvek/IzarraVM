@@ -56,6 +56,8 @@ pub struct SbMixer {
     master_r: u8,  // 0x31, 5-bit
     voice_l: u8,   // 0x32, 5-bit
     voice_r: u8,   // 0x33, 5-bit
+    fm_l: u8,      // 0x34, 5-bit (the FM/MIDI synthesiser bus, i.e. the OPL3)
+    fm_r: u8,      // 0x35, 5-bit
     outgain_l: u8, // 0x41, 2-bit
     outgain_r: u8, // 0x42, 2-bit
     // Stored-but-inert registers at their datasheet defaults (round-trip only).
@@ -161,6 +163,19 @@ impl SbMixer {
         )
     }
 
+    /// (Left, Right) linear FM gain from registers `0x34`/`0x35`. This is the
+    /// synthesiser bus: on a CT1745 it attenuates the OPL3, and it is the only
+    /// control a title has to balance its music against its digital effects.
+    /// Duke Nukem 3D sets it from `MusicVolume` and its voice level from
+    /// `FXVolume`; leaving it inert put the music 12 dB above where the card
+    /// would have placed it and buried the sound effects underneath.
+    pub fn fm_gain(&self) -> (f32, f32) {
+        (
+            VOL5_STEPS[(self.fm_l & 0x1F) as usize],
+            VOL5_STEPS[(self.fm_r & 0x1F) as usize],
+        )
+    }
+
     /// (Left, Right) linear master gain from registers `0x30`/`0x31`, applied
     /// to the summed output alongside the output gain.
     pub fn master_gain(&self) -> (f32, f32) {
@@ -189,8 +204,8 @@ impl SbMixer {
 
     /// (Left, Right) linear CD-Audio gain from registers `0x36`/`0x37` (the 5-bit
     /// CD volume), applied to the Red Book stream the ATAPI drive streams into the
-    /// mix. The CT1345-compatible alias at `0x28` mirrors these registers, so a
-    /// guest that programs either path attenuates the same source.
+    /// mix. The compat aliases at `0x28` (CT1345) and `0x08` (SB1/2) mirror these
+    /// registers, so a guest that programs any path attenuates the same source.
     pub fn cd_gain(&self) -> (f32, f32) {
         (
             VOL5_STEPS[(self.inert[0x36] & 0x1F) as usize],
@@ -205,12 +220,35 @@ impl SbMixer {
 
     /// Set the raw CD-Audio levels without touching the guest's selected mixer
     /// register or interrupt status. This is the host-control seam for the GUI;
-    /// guest reads through either the SB16 registers or the CT1345 alias see the
-    /// same levels.
+    /// guest reads through either the SB16 registers or the CT1345/SB1 aliases
+    /// see the same levels, because those reads are derived from this store.
     pub fn set_cd_levels(&mut self, left: u8, right: u8) {
         self.inert[0x36] = left.min(31);
         self.inert[0x37] = right.min(31);
-        self.inert[0x28] = pack_compat(self.inert[0x36], self.inert[0x37]);
+    }
+
+    /// Log every CT1745 mixer register write (`IZARRAVM_SB_CMD_TRACE`, the same
+    /// gate the DSP command and 8237 mode traces use, so one run shows the whole
+    /// setup: routing, volumes and transfer). Mixer writes happen a handful of
+    /// times per title, so the env lookup behind a `OnceLock` costs nothing that
+    /// matters. Routing registers are decoded inline because "which line did the
+    /// card end up on" is the question this trace exists to answer.
+    fn trace_write(&self, index: u8, value: u8) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_CMD_TRACE").is_some()) {
+            return;
+        }
+        let note = match index {
+            0x00 => " (RESET MIXER -> factory IRQ5/DMA1|5)".to_owned(),
+            0x80 | 0x81 => format!(
+                " -> irq={} dma8={} dma16={}",
+                self.selected_irq(),
+                self.selected_dma_8(),
+                self.selected_dma_16()
+            ),
+            _ => String::new(),
+        };
+        eprintln!("[SBMIX] reg={index:#04x} value={value:#04x}{note}");
     }
 
     /// Decode the `0x224`/`0x225` port pair. Returns `true` if the port belongs
@@ -223,6 +261,7 @@ impl SbMixer {
             }
             MIXER_DATA_PORT => {
                 self.write_register(self.latched_index, value);
+                self.trace_write(self.latched_index, value);
                 true
             }
             _ => false,
@@ -241,16 +280,31 @@ impl SbMixer {
 
     fn read_register(&self, index: u8) -> u8 {
         match index {
-            0x00 => 0x00,                        // Reset Mixer reads 0x00.
-            0x04 => self.voice_compat_packed(),  // CT1345 voice alias of 0x32/0x33
+            0x00 => 0x00, // Reset Mixer reads 0x00.
+            // SB1/2 aliases: one 4-bit level for both channels. Read back the
+            // left channel's nibble, so a read-modify-write on the alias sees
+            // the level the alias last set (or that 0x30/0x34/0x36 set since).
+            0x02 => compat_nibble(self.master_l),
+            0x06 => compat_nibble(self.fm_l),
+            0x08 => compat_nibble(self.inert[0x36]),
+            0x0A => self.inert[0x3A] >> 5, // mic: derived from the 5-bit register
+            0x04 => self.voice_compat_packed(), // CT1345 voice alias of 0x32/0x33
             0x22 => self.master_compat_packed(), // CT1345 master alias of 0x30/0x31
+            0x26 => pack_compat(self.fm_l, self.fm_r), // SB Pro FM alias of 0x34/0x35
             0x28 => pack_compat(self.inert[0x36], self.inert[0x37]),
-            0x30 => self.master_l,
-            0x31 => self.master_r,
-            0x32 => self.voice_l,
-            0x33 => self.voice_r,
-            0x41 => self.outgain_l,
-            0x42 => self.outgain_r,
+            // The 5-bit level registers carry the level in D7-D3 (D2-D0
+            // reserved); the 2-bit gain registers carry it in D7-D6. See the
+            // note on `write_register`.
+            0x30 => self.master_l << 3,
+            0x31 => self.master_r << 3,
+            0x32 => self.voice_l << 3,
+            0x33 => self.voice_r << 3,
+            0x34 => self.fm_l << 3,
+            0x35 => self.fm_r << 3,
+            0x36 => self.inert[0x36] << 3,
+            0x37 => self.inert[0x37] << 3,
+            0x41 => self.outgain_l << 6,
+            0x42 => self.outgain_r << 6,
             0x80 => self.irq_setup,
             0x81 => self.dma_setup,
             0x82 => self.irq_status,
@@ -261,9 +315,11 @@ impl SbMixer {
     fn write_register(&mut self, index: u8, value: u8) {
         match index {
             0x00 => self.reset(),
-            // CT1345-compatible 4-bit/channel volume: high nibble = L, low = R,
-            // mapped to the 5-bit registers as level<<1 (Guide: these are
-            // "mapped to the new volume control registers").
+            // CT1345/SB Pro-compatible 4-bit-per-channel volume: high nibble = L,
+            // low = R, mapped into the 5-bit registers (Guide: these are "mapped
+            // to the new volume control registers"; 86Box `sb_ct1745_mixer_write`
+            // writes `(regs[n] & 0xf0) | 0x8` into the left 5-bit register and
+            // `((regs[n] & 0xf) << 4) | 0x8` into the right).
             0x04 => {
                 let (l, r) = unpack_compat(value);
                 self.voice_l = l;
@@ -274,21 +330,63 @@ impl SbMixer {
                 self.master_l = l;
                 self.master_r = r;
             }
+            // The FM/MIDI bus has the same alias pair as master and voice, and it
+            // is the one an SB Pro-era title actually uses -- the 0x34/0x35 SB16
+            // registers did not exist on the CT1345. Leaving 0x26 in the inert
+            // store meant such a title got NO music attenuation at all (stuck at
+            // the 0 dB power-on level), the same defect 0x34/0x35 had.
+            0x26 => {
+                let (l, r) = unpack_compat(value);
+                self.fm_l = l;
+                self.fm_r = r;
+            }
             // CT1345-compatible CD volume alias: like 0x04/0x22, it maps into the
-            // 5-bit CD registers (0x36/0x37) so cd_gain() sees either path. The
-            // compat byte is also kept so a read of 0x28 round-trips.
+            // 5-bit CD registers (0x36/0x37) so cd_gain() sees either path.
             0x28 => {
                 let (l, r) = unpack_compat(value);
                 self.set_cd_levels(l, r);
             }
-            0x30 => self.master_l = value & 0x1F,
-            0x31 => self.master_r = value & 0x1F,
-            0x32 => self.voice_l = value & 0x1F,
-            0x33 => self.voice_r = value & 0x1F,
-            0x36 => self.set_cd_levels(value, self.inert[0x37]),
-            0x37 => self.set_cd_levels(self.inert[0x36], value),
-            0x41 => self.outgain_l = value & 0x03,
-            0x42 => self.outgain_r = value & 0x03,
+            // SB1/2 aliases: a single 4-bit level driving BOTH channels (86Box
+            // cases 0x02/0x06/0x08 write the same `((regs[n] & 0xf) << 4) | 0x8`
+            // byte to the left and right 5-bit registers).
+            0x02 => {
+                let level = compat_level(value);
+                self.master_l = level;
+                self.master_r = level;
+            }
+            0x06 => {
+                let level = compat_level(value);
+                self.fm_l = level;
+                self.fm_r = level;
+            }
+            0x08 => {
+                let level = compat_level(value);
+                self.set_cd_levels(level, level);
+            }
+            // Mic: the SB Pro 3-bit register maps into the SB16 5-bit one with the
+            // 86Box shape `(regs[0x0a] << 5) | 0x18`. Both are inert for audio (no
+            // mic source is modeled), but they are one control, so 0x3A is the
+            // single store and a read of 0x0A is derived from it.
+            0x0A => self.inert[0x3A] = ((value & 0x07) << 5) | 0x18,
+            // 5-bit level registers: the level is LEFT-aligned in D7-D3 and
+            // D2-D0 are reserved (Guide, Figure 4-3; DOSBox-X `CTMIXER_Write`
+            // uses `val>>3`, 86Box `sb_ct1745_mixer_write` uses `regs[n]>>3`).
+            // Reading the low five bits instead is not an off-by-a-few-dB
+            // rounding error: every level that is a multiple of four writes a
+            // byte whose low five bits are zero, so `& 0x1F` HARD-MUTED the
+            // channel. Duke Nukem 3D writes `FXVolume * 31 / 255 << 3` -- 228
+            // becomes level 27, byte 0xD8, which the old decode read as 24.
+            0x30 => self.master_l = value >> 3,
+            0x31 => self.master_r = value >> 3,
+            0x32 => self.voice_l = value >> 3,
+            0x33 => self.voice_r = value >> 3,
+            0x34 => self.fm_l = value >> 3,
+            0x35 => self.fm_r = value >> 3,
+            0x36 => self.set_cd_levels(value >> 3, self.inert[0x37]),
+            0x37 => self.set_cd_levels(self.inert[0x36], value >> 3),
+            // 2-bit gain registers: level in D7-D6 (86Box `regs[0x41]>>6`).
+            0x41 => self.outgain_l = value >> 6,
+            0x42 => self.outgain_r = value >> 6,
             0x80 => self.irq_setup = value,
             0x81 => self.dma_setup = value,
             0x82 => { /* Interrupt Status is read-only; writes are ignored. */ }
@@ -304,18 +402,38 @@ impl SbMixer {
         pack_compat(self.master_l, self.master_r)
     }
 
-    /// Restore every register to its hardware default (the power-on state the
-    /// Guide specifies): IRQ5 / DMA1|DMA5, master and voice 24/24 (-14 dB),
-    /// output gain 0/0 (0 dB), and the documented inert defaults.
+    /// Restore every register to its hardware default: IRQ5 / DMA1|DMA5, output
+    /// gain 0/0 (0 dB), and the documented inert defaults.
+    ///
+    /// Master, voice, FM and CD power on at level 31 (0 dB), NOT the level 24
+    /// (-14 dB) the Guide documents. This is a deliberate, and not a novel,
+    /// deviation: DOSBox-X's `CTMIXER_Reset` sets `master/dac/fm/cda = 31` and
+    /// 86Box's reset block carries the comment "Changed defaults from -14dB to
+    /// 0dB". The reason is that a DOS title which never touches the mixer -- the
+    /// common case, since BLASTER tells it nothing about volume -- would
+    /// otherwise play 14 dB down, and a title that sets only its own voice level
+    /// stacks a second 14 dB on top of that. The card's analog output stage
+    /// (`amp_gain`) is the host's volume control; the mixer should start out of
+    /// the way.
+    ///
+    /// The CD level (`0x36`/`0x37`, in the inert store) follows the same rule and
+    /// for the same reason: DOSBox-X's `CTMIXER_Reset` sets `cda` to 31 and 86Box
+    /// resets `0x36`/`0x37` to `0xF8`. It used to power on hard-muted, which meant
+    /// a CD-audio title that never programmed the mixer -- the usual case, since
+    /// the drive plays Red Book through the card's CD-in with no guest involvement
+    /// -- got silence from a working drive. The GUI front panel and `set_cd_levels`
+    /// remain the host's control over this line.
     fn reset(&mut self) {
         self.latched_index = 0;
         self.irq_setup = 0x02; // IRQ5
         self.dma_setup = 0x22; // DMA1 | DMA5
         self.irq_status = 0;
-        self.master_l = 24;
-        self.master_r = 24;
-        self.voice_l = 24;
-        self.voice_r = 24;
+        self.master_l = 31;
+        self.master_r = 31;
+        self.voice_l = 31;
+        self.voice_r = 31;
+        self.fm_l = 31;
+        self.fm_r = 31;
         self.outgain_l = 0;
         self.outgain_r = 0;
         self.inert = default_inert();
@@ -333,6 +451,8 @@ impl Default for SbMixer {
             master_r: 0,
             voice_l: 0,
             voice_r: 0,
+            fm_l: 0,
+            fm_r: 0,
             outgain_l: 0,
             outgain_r: 0,
             inert: [0; 256],
@@ -342,18 +462,35 @@ impl Default for SbMixer {
     }
 }
 
-/// Split a CT1345-compatible packed volume byte into (L, R) 5-bit levels: high
-/// nibble = L, low nibble = R, each `<<1` into the 5-bit scale and capped to 31.
-fn unpack_compat(value: u8) -> (u8, u8) {
-    let l = (((value >> 4) & 0x0F) << 1).min(31);
-    let r = ((value & 0x0F) << 1).min(31);
-    (l, r)
+/// Widen a compat 4-bit level to the 5-bit scale.
+///
+/// The hardware mapping sets the low bit: 86Box writes the 5-bit register as
+/// `(nibble << 4) | 0x8`, i.e. level `(nibble << 1) | 1`. Dropping that `| 1`
+/// (a plain `nibble << 1`) is not a rounding detail at the top of the scale --
+/// it makes the loudest value a compat register can express level 30, which is
+/// -2 dB, so an SB Pro-era title asking for FULL volume is quietly attenuated
+/// and its read-back of the 5-bit register disagrees with what the same level
+/// written natively would show (0xF0 vs 0xF8).
+fn compat_level(nibble: u8) -> u8 {
+    ((nibble & 0x0F) << 1) | 1
 }
 
-/// Pack two 5-bit levels into a CT1345-compatible byte: each level `>>1` into
-/// the 4-bit scale, high nibble = L, low nibble = R.
+/// Narrow a 5-bit level back to the compat 4-bit scale (the inverse of
+/// [`compat_level`], which round-trips because `((n << 1) | 1) >> 1 == n`).
+fn compat_nibble(level: u8) -> u8 {
+    (level >> 1) & 0x0F
+}
+
+/// Split a CT1345-compatible packed volume byte into (L, R) 5-bit levels: high
+/// nibble = L, low nibble = R.
+fn unpack_compat(value: u8) -> (u8, u8) {
+    (compat_level(value >> 4), compat_level(value))
+}
+
+/// Pack two 5-bit levels into a CT1345-compatible byte: high nibble = L, low
+/// nibble = R.
 fn pack_compat(left: u8, right: u8) -> u8 {
-    (((left >> 1) & 0x0F) << 4) | ((right >> 1) & 0x0F)
+    (compat_nibble(left) << 4) | compat_nibble(right)
 }
 
 /// Encode an IRQ line number as the `0x80` Interrupt Setup byte.
@@ -384,33 +521,44 @@ fn encode_dma(dma8: usize, dma16: usize) -> u8 {
     low | high
 }
 
-/// The stored-but-inert register defaults (Guide, Figure 4-3 and the per-
-/// register notes). These have no audio effect this slice but are returned so a
-/// setup utility's read-modify-write round-trips preserve guest writes.
+/// The stored-but-inert register defaults. These have no audio effect this slice
+/// but are returned so a setup utility's read-modify-write round-trips preserve
+/// guest writes.
+///
+/// The bytes are HARDWARE-ENCODED: each is what a read of that register returns
+/// at power-on, with the level sitting in the field the register actually uses,
+/// not the bare level. A 4-bit tone control lives in D7-D4, so its 0 dB centre
+/// reads 0x80 and not 8; the 2-bit speaker volume reads 0x80; and the mic level
+/// carries 86Box's `(reg << 5) | 0x18` shape. Storing bare levels here made the
+/// inert file contradict the very convention the live registers above are
+/// decoded with, and a guest reading a tone control back saw 0x08, a value the
+/// card cannot produce. Reference: 86Box `sb_ct1745_mixer_write` reset block.
+///
+/// `0x36`/`0x37` (CD) are the exception in FORM, not in convention: they are
+/// live registers whose store happens to live here, so they hold the decoded
+/// LEVEL, and `read_register` left-aligns them on the way out exactly as it does
+/// for `0x30`-`0x35`.
 fn default_inert() -> [u8; 256] {
     let mut regs = [0u8; 256];
-    regs[0x0A] = 0x00; // Mic volume (3-bit), default 0
-    regs[0x26] = 0xCC; // MIDI volume (CT1345-compat 4x2), default 12|12
-    regs[0x28] = 0x00; // CD volume (CT1345-compat), default 0
+    // 0x02/0x06/0x08/0x0A/0x22/0x04/0x26/0x28 are aliases whose reads are derived
+    // from the register they map into, so they have no default of their own.
     regs[0x2E] = 0x00; // Line volume (CT1345-compat), default 0
-    regs[0x34] = 24; // MIDI volume (5-bit), default 24 => -14 dB
-    regs[0x35] = 24;
-    regs[0x36] = 0; // CD volume (5-bit), default 0
-    regs[0x37] = 0;
-    regs[0x38] = 0; // Line volume (5-bit), default 0
-    regs[0x39] = 0;
-    regs[0x3A] = 0; // Mic volume (5-bit), default 0
-    regs[0x3B] = 0; // PC Speaker volume (2-bit), default 0
+    regs[0x36] = 31; // CD volume (5-bit), 0 dB (level, not the D7-D3 byte)
+    regs[0x37] = 31;
+    regs[0x38] = 0x00; // Line volume (5-bit), default 0
+    regs[0x39] = 0x00;
+    regs[0x3A] = 0x18; // Mic volume, (0 << 5) | 0x18
+    regs[0x3B] = 0x80; // PC Speaker volume, 2-bit field in D7-D6 (86Box: "steps of 64")
     regs[0x3C] = 0x1F; // Output mixer switches, default all closed
     regs[0x3D] = 0x15; // Input mixer L switches default
     regs[0x3E] = 0x0B; // Input mixer R switches default
-    regs[0x3F] = 0; // Input gain L (2-bit), default 0 => 0 dB
-    regs[0x40] = 0; // Input gain R (2-bit), default 0 => 0 dB
-    regs[0x43] = 0; // Mic AGC, bit0=0 => AGC on (default)
-    regs[0x44] = 8; // Treble L (4-bit), default 8 => 0 dB
-    regs[0x45] = 8; // Treble R
-    regs[0x46] = 8; // Bass L
-    regs[0x47] = 8; // Bass R
+    regs[0x3F] = 0x00; // Input gain L, 2-bit field in D7-D6 => 0 dB
+    regs[0x40] = 0x00; // Input gain R
+    regs[0x43] = 0x00; // Mic AGC, bit0=0 => AGC on (default)
+    regs[0x44] = 0x80; // Treble L, 4-bit field in D7-D4, 8 => 0 dB
+    regs[0x45] = 0x80; // Treble R
+    regs[0x46] = 0x80; // Bass L
+    regs[0x47] = 0x80; // Bass R
     regs
 }
 

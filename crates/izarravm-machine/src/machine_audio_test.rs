@@ -575,9 +575,9 @@ fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0000
         bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask ch1
         bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap(); // level 31 << 3
         bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap();
         // DSP: 11025 Hz, block 16, single 8-bit DMA output.
         for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
@@ -638,9 +638,9 @@ fn sb_pro_8bit_stereo_deinterleaves_two_bytes_per_frame_at_the_halved_rate() {
         bus.write_io(0x225, BusWidth::Byte, 0x02, false).unwrap();
         // Voice volume to unity so the decoded L/R samples survive the mixer.
         bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap(); // level 31 << 3
         bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap();
         // DSP: set the interleaved byte rate via the 0x40 TIME CONSTANT
         // (tc 0xD3 -> 1_000_000/45 = 22_222 byte/s; SB Pro stereo halves it
         // to the per-channel frame rate), block 16, single 8-bit DMA output.
@@ -734,9 +734,9 @@ fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
         // Voice volume to unity (0 dB) so the exact -1/+1 samples survive the
         // CT1745 voice attenuation and the test stays about 16-bit decoding.
         bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap(); // level 31 << 3
         bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap();
         // DSP: 22050 Hz, 16-bit auto-init output, signed, stereo, count 15.
         for &b in &[0x41u8, 0x56, 0x22, 0xB6, 0x30, 0x0F, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
@@ -1693,6 +1693,60 @@ fn wss_stream_reaches_the_mixed_render_output_through_render_audio() {
         quiet.iter().all(|&(l, r)| l == 0 && r == 0),
         "with WSS disabled the same buffer mixes to silence"
     );
+}
+
+/// The FM leg of `Ct1745Mix` has to be exercised through `render_audio`, not just
+/// through `SbMixer::fm_gain`.
+///
+/// A mixer-level test proves the register DECODES; it says nothing about whether
+/// the decoded gain is ever applied to the OPL stream. Reverting
+/// `Ct1745Mix::mix_opl_voice`'s FM multiply (passing `opl.0` straight through)
+/// left the whole workspace green, because nothing drove real OPL output through
+/// the mix with a non-default `0x34`/`0x35`. This does: one keyed OPL tone,
+/// rendered twice through the real path, once at 0 dB and once at -24 dB.
+#[test]
+fn ct1745_fm_level_attenuates_the_opl_through_render_audio() {
+    /// Peak absolute left-channel amplitude of a keyed OPL tone rendered through
+    /// `render_audio` with `0x34`/`0x35` set to `level`.
+    fn opl_peak_at_fm_level(level: u8) -> i32 {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            // The FM/MIDI bus level is LEFT-aligned in D7-D3.
+            for reg in [0x34u8, 0x35] {
+                bus.write_io(0x224, BusWidth::Byte, u32::from(reg), false)
+                    .unwrap();
+                bus.write_io(0x225, BusWidth::Byte, u32::from(level << 3), false)
+                    .unwrap();
+            }
+            program_tone(bus, 0x388, 0x389);
+        });
+        // The DSP is idle and the speaker/WSS/CD silent, so the mix is the OPL
+        // tone with exactly the CT1745 gains on it. Master and output gain both
+        // power on at 0 dB, so what is left is the FM leg.
+        machine
+            .render_audio(4_096)
+            .iter()
+            .map(|&(l, _)| i32::from(l).abs())
+            .max()
+            .unwrap()
+    }
+
+    let full = opl_peak_at_fm_level(31); // 0 dB
+    let quiet = opl_peak_at_fm_level(19); // -24 dB
+    assert!(full > 1_000, "the OPL tone must be audible at 0 dB: {full}");
+    assert!(
+        full < i32::from(i16::MAX),
+        "the 0 dB reference must not clip, or the ratio is meaningless: {full}"
+    );
+    let ratio = quiet as f32 / full as f32;
+    let expected = 10f32.powf(-24.0 / 20.0);
+    assert!(
+        (ratio - expected).abs() < 0.01,
+        "level 19 is -24 dB on the FM bus: expected ratio {expected}, got {ratio} ({quiet}/{full})"
+    );
+    // And a hard-muted FM bus silences the OPL entirely -- proof the leg is the
+    // only thing standing between the synthesiser and the DAC here.
+    assert_eq!(opl_peak_at_fm_level(0), 0, "level 0 on 0x34/0x35 is a mute");
 }
 
 #[test]
