@@ -1807,7 +1807,8 @@ impl Default for CpuGsw {
         let jit_direct = Box::new(jit::JitState::new(jit::direct::BlockCache::new(
             decode_cache.line_count(),
         )));
-        Self {
+        #[allow(unused_mut)]
+        let mut cpu = Self {
             registers: Registers::default(),
             fpu: X87::default(),
             control: ControlRegisters::default(),
@@ -1871,7 +1872,15 @@ impl Default for CpuGsw {
             fast_map_probe: FastMapProbeCounters::default(),
             rmw_census_enabled: rmw_census_default(),
             fault_site: FaultSite::default(),
-        }
+        };
+        // The literal above is the only place a `CpuGsw` picks a mode without going through
+        // `set_mode`, so it is the other half of `native_keys_admitted`'s invalidation contract:
+        // seed the cache here and `set_mode` owns it for the rest of the CPU's life. Seeding it
+        // from the ONE predicate, rather than hardcoding what `Gsw586` happens to answer, is what
+        // keeps a future change to the initial mode from shipping a silently refusing JIT.
+        #[cfg(feature = "jit")]
+        cpu.refresh_native_key_admission();
+        cpu
     }
 }
 

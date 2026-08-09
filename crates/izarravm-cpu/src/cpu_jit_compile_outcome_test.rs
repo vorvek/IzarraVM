@@ -456,6 +456,41 @@ fn the_word_flag_never_admits_the_386_class() {
     );
 }
 
+/// Key admission follows a LIVE persona switch, in both directions.
+///
+/// `key_for_phys`'s host/persona screen is no longer evaluated on the spot; it reads
+/// `JitState::native_keys_admitted`, refreshed by `set_mode`. That cache is what this pins. Delete
+/// the `refresh_native_key_admission()` call in `CpuGsw::set_mode` and the second iteration below
+/// fails: the CPU keeps answering with the persona it was constructed at, so a 386 CPU still keys
+/// blocks the Direct backend must never compile for it. (The `debug_assert` inside `key_for_phys`
+/// trips first in a debug build; this test is the one that still fails when asserts are off.)
+///
+/// The oracle is the predicate itself rather than a literal `true`, so the test says the same
+/// thing on a host without AVX2 — where every arm is refused and the whole Direct suite is
+/// vacuous anyway — while still separating the personas on the hosts that run the campaign.
+#[test]
+fn key_admission_follows_a_live_persona_switch() {
+    let code = [0x40, 0x41, 0x42];
+    let (mut cpu, mut bus) = fixture_in_mode(&code, GswMode::Gsw586);
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw386Slow,
+        GswMode::Gsw586,
+    ] {
+        cpu.set_mode(mode);
+        // `set_mode` invalidates the decode caches, so the line has to be re-warmed before
+        // `key_for` can find its physical start.
+        warm(&mut cpu, &mut bus, &[ENTRY]);
+        assert_eq!(
+            jit::direct::key_for(&cpu, ENTRY, true).is_some(),
+            jit::direct::native_keys_admitted(mode),
+            "{mode:?}: key admission must track the persona the CPU is running RIGHT NOW"
+        );
+    }
+}
+
 /// The census suffix scan carries the SAME Word predicate as the compile walk.
 ///
 /// There are three copies of this policy: the compile walk, `key_for_phys`, and the forward scan

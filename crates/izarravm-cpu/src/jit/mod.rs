@@ -112,6 +112,32 @@ pub(crate) struct JitState {
     /// so a fixture cannot exercise both arms, and the level-0 early-out in `try_direct_continuation`
     /// would have lost its only cover the moment the default moved off 0.
     pub(crate) sixteen_bit_level: u8,
+    /// Cached mirror of `direct::native_keys_admitted(cpu.mode())` — the host-capability and
+    /// persona screen `key_for_phys` opens with. A hoisted CONSTANT, not a policy dial: nothing
+    /// sets it directly, and `CpuGsw::set_native_key_admission_for_test` does not exist.
+    ///
+    /// Why the cache cannot go stale, rather than a claim that it does not:
+    ///
+    ///   * The screen reads exactly two things. `jit::host_supported()` is
+    ///     `is_x86_feature_detected!("avx2")`, fixed for the life of the process — and the reason
+    ///     this hoist is worth anything, since it is an out-of-crate call the compiler cannot
+    ///     fold away, measured at 1.19% of gp2's wall executed once per continuation.
+    ///     `CpuGsw::mode` is the other, and `CpuGsw::set_mode` is its only writer THAT CAN
+    ///     REACH `key_for_phys` — two canonical-state test closures poke the crate-private
+    ///     field directly without ever keying a block, which the adversarial review proved
+    ///     harmless by forcing a stale cache there and watching nothing fire
+    ///     (the field is private to the crate root, and canonical restore goes through
+    ///     `set_mode` like everything else). Both writers refresh this field; there is no third
+    ///     way to reach the inputs.
+    ///   * CARRIED by clone, deliberately unlike `FastMapServeGate` (which resets to `false`).
+    ///     The asymmetry follows the invariant: `CpuGsw::clone` copies `mode`, so the cached
+    ///     answer is still the right one, and resetting to `false` would silently REFUSE every
+    ///     block key on a cloned CPU — an admission-policy change wearing an accelerator's
+    ///     clothes. `word_at_486`'s clone comment makes the same argument for the same reason.
+    ///   * `key_for_phys` `debug_assert`s the cache against a live recompute on every call, so a
+    ///     future writer that forgets the refresh fails the whole debug test suite at its first
+    ///     admitted key rather than quietly changing what compiles.
+    pub(crate) native_keys_admitted: bool,
     pub(crate) direct_barrier_census: Option<Box<direct::DirectBarrierCensus>>,
     pub(crate) smc_heat: direct::SmcHeatMap,
     /// The native code watch, HOISTED out of `BlockCache` (Track C C1c-pre, design decision
@@ -172,6 +198,11 @@ impl JitState {
             one_lookup_store: one_lookup_store_default(),
             one_lookup_load: one_lookup_load_default(),
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
+            // A `JitState` does not know the CPU's mode; `CpuGsw::default` refreshes this to the
+            // real answer for `GswMode::Gsw586` before it hands the CPU out, and `set_mode` owns
+            // it from then on. Seeding `false` here rather than guessing a mode keeps the one
+            // computation in one place.
+            native_keys_admitted: false,
             direct_barrier_census: direct::barrier_census_default(),
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
@@ -198,6 +229,9 @@ impl Clone for JitState {
             one_lookup_store: self.one_lookup_store,
             one_lookup_load: self.one_lookup_load,
             sixteen_bit_level: self.sixteen_bit_level,
+            // CARRIED, for the reason spelled out on the field: the clone copies `mode` too, so
+            // the cached answer stays correct, and a reset would refuse every key.
+            native_keys_admitted: self.native_keys_admitted,
             direct_barrier_census: None,
             smc_heat: self.smc_heat.clone(),
             // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone

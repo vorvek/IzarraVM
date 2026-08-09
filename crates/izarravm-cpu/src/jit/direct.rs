@@ -27,7 +27,7 @@ pub(crate) use callout::{
 
 use std::{collections::HashMap, sync::Arc};
 
-use izarravm_core::CpuPersona;
+use izarravm_core::{CpuPersona, GswMode};
 
 use census::{BarrierStop, SuffixSeed, record_structural_barrier};
 // The stall/census TAXONOMY lives in `census.rs` beside the builder that already consumed it
@@ -4179,6 +4179,20 @@ fn word_operands_admitted(cpu: &CpuGsw) -> bool {
     }
 }
 
+/// May the Direct backend key a block at all, on this host and this persona? The screen
+/// `key_for_phys` opened with, lifted to a function of `mode` alone so `CpuGsw` can cache it
+/// (`JitState::native_keys_admitted`) and so the cache and the thing it caches are ONE expression
+/// — the same discipline `fast_map_population_enabled` and its serve gate keep.
+///
+/// This does NOT subsume `word_operands_admitted`, and the two must not be merged. That predicate
+/// answers a per-BLOCK question (does this segment's operand size survive the compile walk?) and
+/// its coupling contract with the compile walk is documented on it; this one answers a per-CPU
+/// question that the walk never re-asks. `key_for_phys` still consults both, in that order, so
+/// the two walks keep answering identically.
+pub(crate) fn native_keys_admitted(mode: GswMode) -> bool {
+    super::host_supported() && matches!(mode.persona(), CpuPersona::I486 | CpuPersona::I586)
+}
+
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
     let physical = cpu.decode_cache.line_phys_start(lin, d)?;
     key_for_phys(cpu, lin, d, physical)
@@ -4188,7 +4202,16 @@ pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
 /// this iteration). Identical decision: the only thing `key_for` reads off the decode cache is
 /// that one field, and `line_phys_start` would return exactly this value for the same key.
 pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Option<BlockKey> {
-    if !super::host_supported() || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586) {
+    // Hoisted screen, read from the cache instead of recomputed. See
+    // `JitState::native_keys_admitted` for why the cached answer cannot be stale; the assert
+    // below is the enforcement, not the argument.
+    debug_assert_eq!(
+        cpu.jit_direct.native_keys_admitted,
+        native_keys_admitted(cpu.mode()),
+        "native_keys_admitted cache is stale relative to the host/persona screen; a mode mutator \
+         is missing a refresh_native_key_admission() call"
+    );
+    if !cpu.jit_direct.native_keys_admitted {
         return None;
     }
     // A 16-bit code segment is admitted wherever `word_operands_admitted` says Word operands are

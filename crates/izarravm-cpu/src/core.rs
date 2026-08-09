@@ -665,6 +665,21 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.refresh_fast_map_serve_gate();
+        // The persona half of `key_for_phys`'s host/persona screen just moved. This is the only
+        // writer of `mode` outside `Default`, so this one call is the whole invalidation
+        // contract for `JitState::native_keys_admitted`.
+        #[cfg(feature = "jit")]
+        self.refresh_native_key_admission();
+    }
+
+    /// Recompute the cached `native_keys_admitted` mirror of
+    /// `jit::direct::native_keys_admitted(self.mode)`. Call it from every site that can change
+    /// that predicate's inputs; since `host_supported()` is process-constant, that inventory is
+    /// exactly `Default` (initial seed) and `set_mode` (persona). `key_for_phys`'s
+    /// `debug_assert` catches a site that grows later and forgets.
+    #[cfg(feature = "jit")]
+    pub(crate) fn refresh_native_key_admission(&mut self) {
+        self.jit_direct.native_keys_admitted = crate::jit::direct::native_keys_admitted(self.mode);
     }
 
     /// Advance the architectural TSC for machine time not represented by

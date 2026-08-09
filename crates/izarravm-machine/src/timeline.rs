@@ -41,7 +41,26 @@ impl RatePhase {
     /// Advance an integer-Hz device clock by `master_ticks`, returning the whole
     /// device events now due. Splitting one advance into batches gives the same
     /// event total and final remainder.
+    ///
+    /// The narrow arm is a VALUE-PRESERVING rewrite of the wide one, not an
+    /// approximation, and the guard is what makes that true: `checked_mul` +
+    /// `checked_add` admit it only when the exact product-plus-remainder fits
+    /// `u64`, and inside that domain `u64` and `u128` division agree digit for
+    /// digit (the wide quotient is then also below `u64::MAX`, so `saturating_u64`
+    /// was a no-op too). It exists because the wide form calls `__udivti3` /
+    /// `__umodti3` — twelve device clocks per advance, measured at ~1.6% of gp2's
+    /// wall — while the narrow form divides by the CONSTANT `MASTER_CLOCK_HZ` and
+    /// the compiler strength-reduces it to a multiply-high with no divide at all.
+    /// The guard's domain is not tight: a device clock at `NANOSECOND_HZ`, the
+    /// fastest rate this module drives, stays narrow for any advance below
+    /// ~18.4 G master ticks (3.3 seconds of machine time in ONE batch).
     pub(crate) fn advance(&mut self, master_ticks: u64, rate_hz: u64) -> u64 {
+        if let Some(scaled) = master_ticks.checked_mul(rate_hz)
+            && let Some(total) = scaled.checked_add(self.remainder)
+        {
+            self.remainder = total % MASTER_CLOCK_HZ;
+            return total / MASTER_CLOCK_HZ;
+        }
         let total = self.remainder as u128 + master_ticks as u128 * rate_hz as u128;
         self.remainder = (total % MASTER_CLOCK_HZ as u128) as u64;
         saturating_u64(total / MASTER_CLOCK_HZ as u128)
@@ -55,6 +74,15 @@ impl RatePhase {
         }
         if rate_hz == 0 {
             return None;
+        }
+        // Same value-preserving narrowing as `advance`. The subtraction cannot
+        // underflow on this arm: `events >= 1` is established above and the
+        // remainder is below `MASTER_CLOCK_HZ` by this type's invariant, so
+        // `scaled >= MASTER_CLOCK_HZ > self.remainder`. `u64::div_ceil` of a
+        // value that already fits cannot exceed it, so the wide form's
+        // saturation had nothing to do here either.
+        if let Some(scaled) = events.checked_mul(MASTER_CLOCK_HZ) {
+            return Some((scaled - self.remainder).div_ceil(rate_hz));
         }
         let needed = events as u128 * MASTER_CLOCK_HZ as u128 - self.remainder as u128;
         Some(saturating_u64(needed.div_ceil(rate_hz as u128)))
@@ -266,7 +294,10 @@ impl Timeline {
     }
 
     pub(crate) fn master_ticks_for_cpu_clocks(self, cpu_clocks: u64) -> u64 {
-        saturating_u64(cpu_clocks as u128 * self.ticks_per_cpu_clock as u128)
+        // `saturating_mul` IS the wide form: `saturating_u64(a as u128 * b as u128)`
+        // clamps at `u64::MAX` for exactly the products that overflow `u64`, and
+        // returns the exact product otherwise.
+        cpu_clocks.saturating_mul(self.ticks_per_cpu_clock)
     }
 
     #[cfg(test)]
@@ -274,8 +305,14 @@ impl Timeline {
         master_ticks / self.ticks_per_cpu_clock
     }
 
+    /// The batch-cap path calls this several times per batch (`event_batch_cap`
+    /// consults every armed device deadline), and the wide form burned a
+    /// `__udivti3` per call for no reason: the NUMERATOR here is a plain `u64`,
+    /// never a product, so nothing was ever wide. `u64::div_ceil` cannot overflow
+    /// for unsigned operands — the quotient is at most `master_ticks` — which is
+    /// why the dropped `saturating_u64` clamped nothing.
     pub(crate) fn cpu_clocks_for_master_ticks_ceil(self, master_ticks: u64) -> u64 {
-        saturating_u64((master_ticks as u128).div_ceil(self.ticks_per_cpu_clock as u128))
+        master_ticks.div_ceil(self.ticks_per_cpu_clock)
     }
 
     pub(crate) fn advance_cpu_clocks(
@@ -293,9 +330,40 @@ impl Timeline {
     ) -> DeviceAdvance {
         let master_ticks = requested_ticks.min(u64::MAX - self.now_ticks);
         self.now_ticks += master_ticks;
-        let tsc_ticks = self.tsc_phase_ticks as u128 + master_ticks as u128;
-        let tsc_clocks = (tsc_ticks / self.ticks_per_cpu_clock as u128) as u64;
-        self.tsc_phase_ticks = (tsc_ticks % self.ticks_per_cpu_clock as u128) as u64;
+        let quantum = self.ticks_per_cpu_clock;
+        // Narrow TSC accounting, exact on its own domain and wide otherwise. The
+        // guard states the two facts the `u64` arithmetic below needs:
+        //
+        //   * `tsc_phase_ticks < quantum` is this type's phase invariant. Its
+        //     writers: `new`, `set_mode` and the test-only `excluding_tsc` store 0,
+        //     and this function stores a remainder of `quantum`. Nothing outside the module
+        //     can write it, and `canonical_projection` refuses a capture that
+        //     violates it (`CanonicalTimelineError::PhaseRemainder`). So
+        //     `master_ticks % quantum + tsc_phase_ticks < 2 * quantum`, and one
+        //     conditional carry finishes the division;
+        //   * `quantum <= MASTER_CLOCK_HZ` bounds that sum to under 2 *
+        //     `MASTER_CLOCK_HZ` (~1.1e10), decisively inside `u64`. Every shipped
+        //     quantum is 33, 83, 249 or 747 ticks, so this is slack of nine orders
+        //     of magnitude, not a near miss.
+        //
+        // Neither can fail today; the wide arm is the honest way to say so without
+        // making an unreachable state silently wrong.
+        let (tsc_clocks, phase) = if self.tsc_phase_ticks < quantum && quantum <= MASTER_CLOCK_HZ {
+            let clocks = master_ticks / quantum;
+            let phase = master_ticks % quantum + self.tsc_phase_ticks;
+            if phase >= quantum {
+                (clocks + 1, phase - quantum)
+            } else {
+                (clocks, phase)
+            }
+        } else {
+            let tsc_ticks = self.tsc_phase_ticks as u128 + master_ticks as u128;
+            (
+                (tsc_ticks / quantum as u128) as u64,
+                (tsc_ticks % quantum as u128) as u64,
+            )
+        };
+        self.tsc_phase_ticks = phase;
         self.tsc_clocks = self.tsc_clocks.wrapping_add(tsc_clocks);
         let pit_remainder_before = self.pit.remainder();
         DeviceAdvance {
@@ -322,8 +390,8 @@ impl Timeline {
         rates: DeviceRates,
     ) -> DeviceAdvance {
         let advance = self.advance_master_ticks(master_ticks, rates);
-        self.io_stall_ticks =
-            saturating_u64(self.io_stall_ticks as u128 + advance.master_ticks as u128);
+        // `saturating_add` is the same clamp the wide sum plus `saturating_u64` was.
+        self.io_stall_ticks = self.io_stall_ticks.saturating_add(advance.master_ticks);
         advance
     }
 
