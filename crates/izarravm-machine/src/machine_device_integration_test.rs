@@ -629,7 +629,8 @@ fn play_audio_mixes_cd_audio_into_render_audio() {
     machine.mount_cd(audio_cd(20));
     // Open the CD volume to full (5-bit registers 0x36/0x37) via the mixer.
     with_bus(&mut machine, |bus| {
-        for (index, value) in [(0x36u32, 31u32), (0x37, 31)] {
+        // The 5-bit level lives in D7-D3, so full volume is 31 << 3.
+        for (index, value) in [(0x36u32, 0xF8u32), (0x37, 0xF8)] {
             bus.write_io(0x224, BusWidth::Byte, index, false).unwrap();
             bus.write_io(0x225, BusWidth::Byte, value, false).unwrap();
         }
@@ -655,7 +656,8 @@ fn mode_select_volume_scales_signed_cd_audio_channels() {
     let mut machine = test_machine();
     machine.mount_cd(audio_cd(20));
     with_bus(&mut machine, |bus| {
-        for (index, value) in [(0x36u32, 31u32), (0x37, 31)] {
+        // The 5-bit level lives in D7-D3, so full volume is 31 << 3.
+        for (index, value) in [(0x36u32, 0xF8u32), (0x37, 0xF8)] {
             bus.write_io(0x224, BusWidth::Byte, index, false).unwrap();
             bus.write_io(0x225, BusWidth::Byte, value, false).unwrap();
         }
@@ -1205,9 +1207,10 @@ fn render_audio_mixes_the_dsp_dc_level_with_the_opl() {
     let mut machine = test_machine();
     // A constant 256-byte DMA buffer; 0x40 maps to sample_u8(0x40) = -16384.
     // The default CT1745 volume attenuates it by voice (0x32=24, ~-14 dB)
-    // and master (0x30=24, ~-14 dB): -16384 * 0.19953^2 ~= -652.
+    // and master, which both power on at level 31 (0 dB), so the DC level
+    // arrives unattenuated.
     const BYTE: u8 = 0x40;
-    let expected: i32 = (-16384.0f32 * 10f32.powf(-14.0 / 20.0) * 10f32.powf(-14.0 / 20.0)) as i32;
+    let expected: i32 = -16384;
     for i in 0..256u32 {
         machine.write_physical_u8(0x1_0000 + i, BYTE);
     }
@@ -1295,8 +1298,8 @@ fn sb_mixer_voice_and_master_volume_attenuate_output() {
     );
 
     // Master mute (0x30/0x31 = 0) silences the whole mix even at full voice.
-    set_reg(&mut machine, 0x32, 0x1F);
-    set_reg(&mut machine, 0x33, 0x1F);
+    set_reg(&mut machine, 0x32, 0x1F << 3);
+    set_reg(&mut machine, 0x33, 0x1F << 3);
     set_reg(&mut machine, 0x30, 0x00);
     set_reg(&mut machine, 0x31, 0x00);
     assert!(
@@ -1304,8 +1307,14 @@ fn sb_mixer_voice_and_master_volume_attenuate_output() {
         "master mute silences the summed output"
     );
 
-    // Defaults (master/voice 24 => -14 dB each) return the attenuated DC level.
-    for (idx, val) in [(0x30u8, 24u8), (0x31, 24), (0x32, 24), (0x33, 24)] {
+    // Level 24 (the Guide's -14 dB step) on both legs returns the attenuated DC
+    // level. Written left-aligned: the 5-bit field is D7-D3.
+    for (idx, val) in [
+        (0x30u8, 24u8 << 3),
+        (0x31, 24 << 3),
+        (0x32, 24 << 3),
+        (0x33, 24 << 3),
+    ] {
         set_reg(&mut machine, idx, val);
     }
     let restored = render(&mut machine);

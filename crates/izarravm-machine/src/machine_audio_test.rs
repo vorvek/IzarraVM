@@ -575,9 +575,9 @@ fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0000
         bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask ch1
         bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap(); // level 31 << 3
         bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap();
         // DSP: 11025 Hz, block 16, single 8-bit DMA output.
         for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
@@ -638,9 +638,9 @@ fn sb_pro_8bit_stereo_deinterleaves_two_bytes_per_frame_at_the_halved_rate() {
         bus.write_io(0x225, BusWidth::Byte, 0x02, false).unwrap();
         // Voice volume to unity so the decoded L/R samples survive the mixer.
         bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap(); // level 31 << 3
         bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap();
         // DSP: set the interleaved byte rate via the 0x40 TIME CONSTANT
         // (tc 0xD3 -> 1_000_000/45 = 22_222 byte/s; SB Pro stereo halves it
         // to the per-channel frame rate), block 16, single 8-bit DMA output.
@@ -734,9 +734,9 @@ fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
         // Voice volume to unity (0 dB) so the exact -1/+1 samples survive the
         // CT1745 voice attenuation and the test stays about 16-bit decoding.
         bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap(); // level 31 << 3
         bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
-        bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0xF8, false).unwrap();
         // DSP: 22050 Hz, 16-bit auto-init output, signed, stereo, count 15.
         for &b in &[0x41u8, 0x56, 0x22, 0xB6, 0x30, 0x0F, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)

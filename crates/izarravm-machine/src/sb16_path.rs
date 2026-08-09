@@ -36,10 +36,11 @@ impl SbTrace {
         std::env::var_os("IZARRAVM_SB_DEBUG").is_some()
     }
 
-    fn report(&mut self, dsp: &SbDsp, dma8: usize, dma16: usize) {
+    fn report(&mut self, dsp: &mut SbDsp, dma8: usize, dma16: usize) {
         let dropped = dsp.dropped_frames();
+        let peak = dsp.take_peak_abs();
         eprintln!(
-            "[SB] playing={} rate={} out_rate={} bits={} stereo={} auto_init={} dma={} block={} remaining={} ticked/s={} rendered/s={} truncated/s={} padded/s={} irqs/s={} ring_drops/s={} resampler_rebuilds/s={} pending={}",
+            "[SB] playing={} rate={} out_rate={} bits={} stereo={} auto_init={} dma={} block={} remaining={} ticked/s={} rendered/s={} truncated/s={} padded/s={} irqs/s={} ring_drops/s={} resampler_rebuilds/s={} pending={} peak={}",
             dsp.is_playing(),
             dsp.rate_hz(),
             dsp.output_frame_rate(),
@@ -57,6 +58,7 @@ impl SbTrace {
             dropped.saturating_sub(self.last_dropped),
             self.resampler_rebuilds,
             self.pending_depth,
+            peak,
         );
         self.last_dropped = dropped;
         self.micros = 0;
@@ -150,6 +152,9 @@ pub(crate) struct Sb16RenderWindow {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Ct1745Mix {
     active: bool,
+    /// FM (OPL3) bus attenuation, mixer registers `0x34`/`0x35`.
+    fm_l: f32,
+    fm_r: f32,
     voice_bus_l: f32,
     voice_bus_r: f32,
     cd_l: f32,
@@ -160,6 +165,8 @@ impl Ct1745Mix {
     const fn bypass() -> Self {
         Self {
             active: false,
+            fm_l: 1.0,
+            fm_r: 1.0,
             voice_bus_l: 1.0,
             voice_bus_r: 1.0,
             cd_l: 0.0,
@@ -167,13 +174,18 @@ impl Ct1745Mix {
         }
     }
 
+    /// Sum the two card-internal buses the CT1745 controls: the FM synthesiser
+    /// (registers `0x34`/`0x35`) and the DSP voice (`0x32`/`0x33`, already
+    /// applied at drain time in `render_voice`), then take the master and output
+    /// gain. Keeping FM on its own leg is what lets a title balance music
+    /// against effects -- the two share only the master.
     pub(crate) fn mix_opl_voice(self, opl: (i32, i32), voice: (i32, i32)) -> (i32, i32) {
         if !self.active {
             return opl;
         }
         (
-            ((opl.0 + voice.0) as f32 * self.voice_bus_l) as i32,
-            ((opl.1 + voice.1) as f32 * self.voice_bus_r) as i32,
+            ((opl.0 as f32 * self.fm_l + voice.0 as f32) * self.voice_bus_l) as i32,
+            ((opl.1 as f32 * self.fm_r + voice.1 as f32) * self.voice_bus_r) as i32,
         )
     }
 
@@ -325,7 +337,7 @@ impl Sb16Path {
             }
             trace.micros += micros;
             if trace.micros >= 1_000_000 {
-                trace.report(&active.dsp, dma8, dma16);
+                trace.report(&mut active.dsp, dma8, dma16);
             }
         }
         irq
@@ -412,11 +424,14 @@ impl Sb16Path {
         let Some(active) = self.active.as_ref() else {
             return Ct1745Mix::bypass();
         };
+        let (fm_l, fm_r) = active.mixer.fm_gain();
         let (master_l, master_r) = active.mixer.master_gain();
         let (outgain_l, outgain_r) = active.mixer.outgain_gain();
         let (cd_l, cd_r) = active.mixer.cd_gain();
         Ct1745Mix {
             active: true,
+            fm_l,
+            fm_r,
             voice_bus_l: master_l * outgain_l,
             voice_bus_r: master_r * outgain_r,
             cd_l,

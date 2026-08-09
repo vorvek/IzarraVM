@@ -56,6 +56,8 @@ pub struct SbMixer {
     master_r: u8,  // 0x31, 5-bit
     voice_l: u8,   // 0x32, 5-bit
     voice_r: u8,   // 0x33, 5-bit
+    fm_l: u8,      // 0x34, 5-bit (the FM/MIDI synthesiser bus, i.e. the OPL3)
+    fm_r: u8,      // 0x35, 5-bit
     outgain_l: u8, // 0x41, 2-bit
     outgain_r: u8, // 0x42, 2-bit
     // Stored-but-inert registers at their datasheet defaults (round-trip only).
@@ -161,6 +163,19 @@ impl SbMixer {
         )
     }
 
+    /// (Left, Right) linear FM gain from registers `0x34`/`0x35`. This is the
+    /// synthesiser bus: on a CT1745 it attenuates the OPL3, and it is the only
+    /// control a title has to balance its music against its digital effects.
+    /// Duke Nukem 3D sets it from `MusicVolume` and its voice level from
+    /// `FXVolume`; leaving it inert put the music 12 dB above where the card
+    /// would have placed it and buried the sound effects underneath.
+    pub fn fm_gain(&self) -> (f32, f32) {
+        (
+            VOL5_STEPS[(self.fm_l & 0x1F) as usize],
+            VOL5_STEPS[(self.fm_r & 0x1F) as usize],
+        )
+    }
+
     /// (Left, Right) linear master gain from registers `0x30`/`0x31`, applied
     /// to the summed output alongside the output gain.
     pub fn master_gain(&self) -> (f32, f32) {
@@ -213,6 +228,30 @@ impl SbMixer {
         self.inert[0x28] = pack_compat(self.inert[0x36], self.inert[0x37]);
     }
 
+    /// Log every CT1745 mixer register write (`IZARRAVM_SB_CMD_TRACE`, the same
+    /// gate the DSP command and 8237 mode traces use, so one run shows the whole
+    /// setup: routing, volumes and transfer). Mixer writes happen a handful of
+    /// times per title, so the env lookup behind a `OnceLock` costs nothing that
+    /// matters. Routing registers are decoded inline because "which line did the
+    /// card end up on" is the question this trace exists to answer.
+    fn trace_write(&self, index: u8, value: u8) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_CMD_TRACE").is_some()) {
+            return;
+        }
+        let note = match index {
+            0x00 => " (RESET MIXER -> factory IRQ5/DMA1|5)".to_owned(),
+            0x80 | 0x81 => format!(
+                " -> irq={} dma8={} dma16={}",
+                self.selected_irq(),
+                self.selected_dma_8(),
+                self.selected_dma_16()
+            ),
+            _ => String::new(),
+        };
+        eprintln!("[SBMIX] reg={index:#04x} value={value:#04x}{note}");
+    }
+
     /// Decode the `0x224`/`0x225` port pair. Returns `true` if the port belongs
     /// to the mixer.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
@@ -223,6 +262,7 @@ impl SbMixer {
             }
             MIXER_DATA_PORT => {
                 self.write_register(self.latched_index, value);
+                self.trace_write(self.latched_index, value);
                 true
             }
             _ => false,
@@ -245,12 +285,19 @@ impl SbMixer {
             0x04 => self.voice_compat_packed(),  // CT1345 voice alias of 0x32/0x33
             0x22 => self.master_compat_packed(), // CT1345 master alias of 0x30/0x31
             0x28 => pack_compat(self.inert[0x36], self.inert[0x37]),
-            0x30 => self.master_l,
-            0x31 => self.master_r,
-            0x32 => self.voice_l,
-            0x33 => self.voice_r,
-            0x41 => self.outgain_l,
-            0x42 => self.outgain_r,
+            // The 5-bit level registers carry the level in D7-D3 (D2-D0
+            // reserved); the 2-bit gain registers carry it in D7-D6. See the
+            // note on `write_register`.
+            0x30 => self.master_l << 3,
+            0x31 => self.master_r << 3,
+            0x32 => self.voice_l << 3,
+            0x33 => self.voice_r << 3,
+            0x34 => self.fm_l << 3,
+            0x35 => self.fm_r << 3,
+            0x36 => self.inert[0x36] << 3,
+            0x37 => self.inert[0x37] << 3,
+            0x41 => self.outgain_l << 6,
+            0x42 => self.outgain_r << 6,
             0x80 => self.irq_setup,
             0x81 => self.dma_setup,
             0x82 => self.irq_status,
@@ -281,14 +328,25 @@ impl SbMixer {
                 let (l, r) = unpack_compat(value);
                 self.set_cd_levels(l, r);
             }
-            0x30 => self.master_l = value & 0x1F,
-            0x31 => self.master_r = value & 0x1F,
-            0x32 => self.voice_l = value & 0x1F,
-            0x33 => self.voice_r = value & 0x1F,
-            0x36 => self.set_cd_levels(value, self.inert[0x37]),
-            0x37 => self.set_cd_levels(self.inert[0x36], value),
-            0x41 => self.outgain_l = value & 0x03,
-            0x42 => self.outgain_r = value & 0x03,
+            // 5-bit level registers: the level is LEFT-aligned in D7-D3 and
+            // D2-D0 are reserved (Guide, Figure 4-3; DOSBox-X `CTMIXER_Write`
+            // uses `val>>3`, 86Box `sb_ct1745_mixer_write` uses `regs[n]>>3`).
+            // Reading the low five bits instead is not an off-by-a-few-dB
+            // rounding error: every level that is a multiple of four writes a
+            // byte whose low five bits are zero, so `& 0x1F` HARD-MUTED the
+            // channel. Duke Nukem 3D writes `FXVolume * 31 / 255 << 3` -- 228
+            // becomes level 27, byte 0xD8, which the old decode read as 24.
+            0x30 => self.master_l = value >> 3,
+            0x31 => self.master_r = value >> 3,
+            0x32 => self.voice_l = value >> 3,
+            0x33 => self.voice_r = value >> 3,
+            0x34 => self.fm_l = value >> 3,
+            0x35 => self.fm_r = value >> 3,
+            0x36 => self.set_cd_levels(value >> 3, self.inert[0x37]),
+            0x37 => self.set_cd_levels(self.inert[0x36], value >> 3),
+            // 2-bit gain registers: level in D7-D6 (86Box `regs[0x41]>>6`).
+            0x41 => self.outgain_l = value >> 6,
+            0x42 => self.outgain_r = value >> 6,
             0x80 => self.irq_setup = value,
             0x81 => self.dma_setup = value,
             0x82 => { /* Interrupt Status is read-only; writes are ignored. */ }
@@ -304,18 +362,30 @@ impl SbMixer {
         pack_compat(self.master_l, self.master_r)
     }
 
-    /// Restore every register to its hardware default (the power-on state the
-    /// Guide specifies): IRQ5 / DMA1|DMA5, master and voice 24/24 (-14 dB),
-    /// output gain 0/0 (0 dB), and the documented inert defaults.
+    /// Restore every register to its hardware default: IRQ5 / DMA1|DMA5, output
+    /// gain 0/0 (0 dB), and the documented inert defaults.
+    ///
+    /// Master, voice and FM power on at level 31 (0 dB), NOT the level 24
+    /// (-14 dB) the Guide documents. This is a deliberate, and not a novel,
+    /// deviation: DOSBox-X's `CTMIXER_Reset` sets `master/dac/fm/cda = 31` and
+    /// 86Box's reset block carries the comment "Changed defaults from -14dB to
+    /// 0dB". The reason is that a DOS title which never touches the mixer -- the
+    /// common case, since BLASTER tells it nothing about volume -- would
+    /// otherwise play 14 dB down, and a title that sets only its own voice level
+    /// stacks a second 14 dB on top of that. The card's analog output stage
+    /// (`amp_gain`) is the host's volume control; the mixer should start out of
+    /// the way.
     fn reset(&mut self) {
         self.latched_index = 0;
         self.irq_setup = 0x02; // IRQ5
         self.dma_setup = 0x22; // DMA1 | DMA5
         self.irq_status = 0;
-        self.master_l = 24;
-        self.master_r = 24;
-        self.voice_l = 24;
-        self.voice_r = 24;
+        self.master_l = 31;
+        self.master_r = 31;
+        self.voice_l = 31;
+        self.voice_r = 31;
+        self.fm_l = 31;
+        self.fm_r = 31;
         self.outgain_l = 0;
         self.outgain_r = 0;
         self.inert = default_inert();
@@ -333,6 +403,8 @@ impl Default for SbMixer {
             master_r: 0,
             voice_l: 0,
             voice_r: 0,
+            fm_l: 0,
+            fm_r: 0,
             outgain_l: 0,
             outgain_r: 0,
             inert: [0; 256],
@@ -393,9 +465,7 @@ fn default_inert() -> [u8; 256] {
     regs[0x26] = 0xCC; // MIDI volume (CT1345-compat 4x2), default 12|12
     regs[0x28] = 0x00; // CD volume (CT1345-compat), default 0
     regs[0x2E] = 0x00; // Line volume (CT1345-compat), default 0
-    regs[0x34] = 24; // MIDI volume (5-bit), default 24 => -14 dB
-    regs[0x35] = 24;
-    regs[0x36] = 0; // CD volume (5-bit), default 0
+    regs[0x36] = 0; // CD volume (5-bit), default 0 (level, not the D7-D3 byte)
     regs[0x37] = 0;
     regs[0x38] = 0; // Line volume (5-bit), default 0
     regs[0x39] = 0;
