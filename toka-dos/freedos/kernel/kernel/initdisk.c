@@ -551,6 +551,9 @@ void DosDefinePartition(struct DriveParamS *driveParam,
   ddt nddt;
   ddt *pddt = &nddt;
 
+  UNREFERENCED_PARAMETER(extendedPartNo);
+  UNREFERENCED_PARAMETER(PrimaryNum);
+
   if (nUnits >= NDEV)
   {
     printf("more Partitions detected then possible, max = %d\n", NDEV);
