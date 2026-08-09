@@ -66,6 +66,17 @@ impl Default for Counter {
     }
 }
 
+/// Truncate a counting-element value to the 16 bits a counter read exposes.
+fn mask16(value: u64) -> u16 {
+    (value & 0xffff) as u16
+}
+
+/// Decrement inside the 32-bit counting-element domain `step_counting` uses, so a
+/// peek wraps exactly where a real sequence of `step` calls would.
+fn wrap32(value: u64, by: u64) -> u64 {
+    value.wrapping_sub(by) & 0xffff_ffff
+}
+
 impl Counter {
     fn effective_reload(&self) -> u32 {
         if self.reload == 0 {
@@ -390,11 +401,171 @@ impl Counter {
         }
     }
 
-    fn write_control(&mut self, value: u8) {
+    /// The counting element `clocks` input CLKs from now, as a counter READ would
+    /// see it (masked to 16 bits), without stepping. The counter-value analogue of
+    /// `out_after`, and the reason it exists: devices advance at batch END in every
+    /// CPU mode, so a mid-batch latch or read of 0x40/0x42 would otherwise report
+    /// the CE as of BATCH START. A guest that measures elapsed time by
+    /// latch-compute-latch (the classic PC calibration loop) would then under-read
+    /// the first sample by however far into its batch the latch landed -- up to the
+    /// whole batch grain. This peek removes that error outright, so the batch cap is
+    /// free to be as coarse as the fallback allows without moving a counter read.
+    ///
+    /// O(1) per mode: the same case analysis `counting_out_after` walks, answering
+    /// "what value" instead of "what level", never a loop over `clocks`. BCD
+    /// counters return None on the same grounds as `out_after` (no PC software
+    /// clocks the PIT in BCD); the caller falls back to the live field, i.e. exactly
+    /// today's batch-start behavior. GATE is assumed to hold its level for the whole
+    /// span for the same batch-boundary reason `out_after` states.
+    fn count_after(&self, clocks: u64) -> Option<u16> {
+        if self.bcd {
+            return None;
+        }
+        match self.state {
+            // No live count: the CE cannot move without a guest write or a GATE
+            // edge, neither of which is a CLK.
+            CounterState::Inactive | CounterState::WaitGate => Some(self.masked_count()),
+            CounterState::LoadDelay => {
+                if !self.gate || clocks == 0 {
+                    return Some(self.masked_count());
+                }
+                // One CLK loads the CE from the reload register (no edge); the rest
+                // counts down from there, mirroring `step`'s load-then-count order.
+                let reload = self.effective_reload();
+                Some(Self::counting_count_after(
+                    self.mode,
+                    reload,
+                    reload,
+                    self.out,
+                    clocks - 1,
+                ))
+            }
+            CounterState::Counting => {
+                if !self.gate {
+                    return Some(self.masked_count());
+                }
+                Some(Self::counting_count_after(
+                    self.mode,
+                    self.count,
+                    self.effective_reload(),
+                    self.out,
+                    clocks,
+                ))
+            }
+        }
+    }
+
+    fn masked_count(&self) -> u16 {
+        (self.count & 0xffff) as u16
+    }
+
+    /// The CE `clocks` CLKs after a Counting state holding `value` at level `out`,
+    /// per mode. Binary radix, GATE already high (the caller handles the other
+    /// states). Mirrors `step_counting`'s case split mode for mode, including its
+    /// out-of-spec branches, so the two stay obviously in sync; the differential
+    /// test in `pit_test` pins it to clone-and-step.
+    fn counting_count_after(mode: u8, value: u32, reload: u32, out: bool, clocks: u64) -> u16 {
+        let v = u64::from(value);
+        if clocks == 0 {
+            return mask16(v);
+        }
+        let r = u64::from(reload); // >= 1: effective_reload maps a raw 0 to 0x10000
+        match mode {
+            // Mode 0 never stops: OUT rises at terminal count and the CE keeps
+            // decrementing (and wrapping) forever, which is what a guest polling a
+            // mode-0 counter past terminal actually reads back.
+            0 => mask16(wrap32(v, clocks)),
+            // Mode 1's one-shot ends AT terminal count (state goes Inactive), so the
+            // CE parks at 0 there. The degenerate `v == 0` entry mirrors
+            // `step_counting`: the first CLK wraps instead of terminating.
+            1 => {
+                let to_zero = if v == 0 { 1u64 << 32 } else { v };
+                if !out && clocks >= to_zero {
+                    0
+                } else {
+                    mask16(wrap32(v, clocks))
+                }
+            }
+            2 => {
+                // Illegal reload <= 1 reloads on every CLK (see step_counting).
+                if r <= 1 {
+                    return mask16(r);
+                }
+                // From v >= 2 the CE walks down to 1 (v-1 CLKs, OUT drops there) and
+                // the next CLK reloads to r; from v <= 1 the very first CLK reloads.
+                // After that it is periodic with period r.
+                let (base, at) = if v >= 2 { (v, v) } else { (v, 1) };
+                if clocks < at {
+                    return mask16(base - clocks);
+                }
+                mask16(r - (clocks - at) % r)
+            }
+            3 => {
+                let to_toggle = Self::mode3_half(v, out);
+                if clocks < to_toggle {
+                    return mask16(Self::mode3_value_in_half(v, out, clocks));
+                }
+                // Illegal reload <= 1 reloads every CLK, so no half-period exists.
+                if r <= 1 {
+                    return mask16(r);
+                }
+                // At `to_toggle` the CE reloads to r and OUT toggles. The two halves
+                // sum to exactly r (mode3_odd_count_period_is_exact), so one modulo
+                // folds the remainder into a single period and one comparison picks
+                // the half.
+                let rem = (clocks - to_toggle) % r;
+                let first_level = !out;
+                let first_half = Self::mode3_half(r, first_level);
+                if rem < first_half {
+                    mask16(Self::mode3_value_in_half(r, first_level, rem))
+                } else {
+                    mask16(Self::mode3_value_in_half(r, out, rem - first_half))
+                }
+            }
+            // Modes 4/5: while OUT is high the CE counts down to 0 (the strobe
+            // clock); the CLK after that raises OUT and ends the one-shot, leaving
+            // the CE parked at its terminal value. A mid-strobe entry (OUT low) is
+            // exactly that last CLK, so the CE does not move at all.
+            4 | 5 => {
+                if !out {
+                    return mask16(v);
+                }
+                let to_zero = if v == 0 { 1u64 << 32 } else { v };
+                if clocks >= to_zero {
+                    0
+                } else {
+                    mask16(wrap32(v, clocks))
+                }
+            }
+            _ => mask16(v),
+        }
+    }
+
+    /// The CE `k` CLKs into a mode-3 half-period that began at `value` with OUT at
+    /// `out`, for `k` strictly inside the half (the caller folds the phase first).
+    /// The chip steps the CE by two, trimming an odd count on the FIRST CLK of the
+    /// half -- by one with OUT high, by three with OUT low -- which is the same
+    /// asymmetry `step_counting` and `mode3_half` encode.
+    fn mode3_value_in_half(value: u64, out: bool, k: u64) -> u64 {
+        if k == 0 {
+            return value;
+        }
+        if value & 1 == 1 {
+            if out {
+                value + 1 - 2 * k
+            } else {
+                value - 1 - 2 * k
+            }
+        } else {
+            value - 2 * k
+        }
+    }
+
+    fn write_control(&mut self, value: u8, clocks: u64) {
         let rw_field = (value >> 4) & 0x3;
         if rw_field == 0 {
             // Counter-latch command: freeze the current count for reading.
-            self.latch_count();
+            self.latch_count(clocks);
             return;
         }
         self.rw = match rw_field {
@@ -475,11 +646,17 @@ impl Counter {
         }
     }
 
-    fn read(&mut self) -> u8 {
+    /// `clocks` is the in-batch PIT-clock offset of this access; an unlatched read
+    /// reports the CE as of that instant rather than as of batch start (see
+    /// `count_after`).
+    fn read(&mut self, clocks: u64) -> u8 {
         if let Some(status) = self.status_latch.take() {
             return status;
         }
-        let value = self.latch.unwrap_or((self.count & 0xffff) as u16);
+        let live = self
+            .count_after(clocks)
+            .unwrap_or_else(|| self.masked_count());
+        let value = self.latch.unwrap_or(live);
         match self.rw {
             RwMode::Lsb => {
                 self.latch = None;
@@ -502,21 +679,30 @@ impl Counter {
         }
     }
 
-    fn latch_count(&mut self) {
+    /// Freeze the CE as of the in-batch instant `clocks`, not as of batch start:
+    /// the latch is a snapshot taken when the guest asked, and the batch-end advance
+    /// then steps the live CE past it exactly as the chip would.
+    fn latch_count(&mut self, clocks: u64) {
         if self.latch.is_none() {
-            self.latch = Some((self.count & 0xffff) as u16);
+            let live = self
+                .count_after(clocks)
+                .unwrap_or_else(|| self.masked_count());
+            self.latch = Some(live);
         }
     }
 
-    fn latch_status(&mut self) {
+    /// Same instant for the status byte's OUT bit, through the existing `out_after`
+    /// peek. The other fields are register state that no CLK can move.
+    fn latch_status(&mut self, clocks: u64) {
         if self.status_latch.is_none() {
+            let out = self.out_after(clocks).unwrap_or(self.out);
             let rw_bits = match self.rw {
                 RwMode::Lsb => 1,
                 RwMode::Msb => 2,
                 RwMode::LsbThenMsb => 3,
             };
             self.status_latch = Some(
-                (u8::from(self.out) << 7)
+                (u8::from(out) << 7)
                     | (u8::from(self.null_count) << 6)
                     | (rw_bits << 4)
                     | (self.mode << 1)
@@ -777,7 +963,7 @@ impl Default for Pit {
             counters: [Counter::default(), Counter::default(), Counter::default()],
         };
         // Counter 1, LSB/MSB, mode 2, binary: SC=01, RW=11, mode=010 -> 0x74.
-        pit.write_control_word(0x74);
+        pit.write_control_word(0x74, 0);
         pit.counters[1].write_count((REFRESH_DIVISOR & 0xff) as u8);
         pit.counters[1].write_count((REFRESH_DIVISOR >> 8) as u8);
         pit
@@ -789,16 +975,26 @@ impl Pit {
         CanonicalPit { pit: self }
     }
 
-    pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
+    /// Port write at the in-batch PIT-clock offset `clocks`. Only the latch
+    /// commands on 0x43 read device state, and they take the peek so a latch
+    /// records the instant the guest asked for (see `Counter::count_after`).
+    pub(crate) fn write_port_at(&mut self, port: u16, value: u8, clocks: u64) -> bool {
         match port {
             0x40..=0x42 => self.counters[(port - 0x40) as usize].write_count(value),
-            0x43 => self.write_control_word(value),
+            0x43 => self.write_control_word(value, clocks),
             _ => return false,
         }
         true
     }
 
-    fn write_control_word(&mut self, value: u8) {
+    /// Zero-offset convenience for tests that drive the chip directly with no
+    /// batch around it. Production goes through `write_port_at`.
+    #[cfg(test)]
+    pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
+        self.write_port_at(port, value, 0)
+    }
+
+    fn write_control_word(&mut self, value: u8, clocks: u64) {
         let sc = (value >> 6) & 0x3;
         if sc == 3 {
             // Read-back command: latch count and/or status for the selected counters.
@@ -813,23 +1009,31 @@ impl Pit {
             for (i, counter) in self.counters.iter_mut().enumerate() {
                 if value & (1 << (i + 1)) != 0 {
                     if latch_count {
-                        counter.latch_count();
+                        counter.latch_count(clocks);
                     }
                     if latch_status {
-                        counter.latch_status();
+                        counter.latch_status(clocks);
                     }
                 }
             }
         } else {
-            self.counters[sc as usize].write_control(value);
+            self.counters[sc as usize].write_control(value, clocks);
         }
     }
 
-    pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {
+    /// Counter read at the in-batch PIT-clock offset `clocks`: an unlatched read
+    /// reports the CE at that instant, a latched one returns the frozen snapshot.
+    pub(crate) fn read_port_at(&mut self, port: u16, clocks: u64) -> Option<u8> {
         match port {
-            0x40..=0x42 => Some(self.counters[(port - 0x40) as usize].read()),
+            0x40..=0x42 => Some(self.counters[(port - 0x40) as usize].read(clocks)),
             _ => None,
         }
+    }
+
+    /// Zero-offset convenience for tests (see `write_port`).
+    #[cfg(test)]
+    pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {
+        self.read_port_at(port, 0)
     }
 
     fn tick_with_observer<F>(

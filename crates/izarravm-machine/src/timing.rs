@@ -907,11 +907,14 @@ impl Machine {
     ///   DMA-fed producers; a fine batch keeps the DMA current-count a guest can
     ///   poll for its play position moving one frame at a time.
     /// - A recent PIT counter access (`pit_observer_fine_until`). Not audio at
-    ///   all: a counter read reports the counting element as of BATCH START,
-    ///   because nothing peeks it the way `Pit::out_after` peeks OUT. A guest
-    ///   measuring time by latching a counter is therefore as sharp a
-    ///   batch-granularity consumer as any producer above, and the window keeps
-    ///   the grain fine across the compute leg between two latches.
+    ///   all, and no longer load-bearing for counter VALUES: `Counter::count_after`
+    ///   now peeks the counting element at the in-batch instant of every 0x40-0x43
+    ///   access, so a latch-compute-latch measurement is exact at any batch grain.
+    ///   The window is kept as the one case the peek declines -- a BCD-programmed
+    ///   counter, where `count_after` returns None and the read falls back to the
+    ///   live (batch-start) field, exactly as the 0x61 arm falls back for a BCD
+    ///   `out_after`. Removing the term is a measurable batch-length change and
+    ///   belongs to its own slice, not to a fidelity fix.
     ///
     /// NOT a term, deliberately: the sample producers' own fidelity. The original
     /// cap (2026-06-21) existed so "the per-clock fine-samplers ... never alias" --
@@ -953,21 +956,22 @@ impl Machine {
     /// running. Gating it leaves the protected cases exactly as fine as before
     /// and gives the idle case the same 1 ms ceiling the Approximate class uses.
     ///
-    /// KNOWN CAVEAT (bounded here, not silently absorbed): time-derived port
-    /// reads with no in-batch peek -- chiefly the PIT counter latch on
-    /// 0x40/0x42 -- return device state as of BATCH START. Nothing peeks the
-    /// counting element the way `Pit::out_after` peeks OUT, so a "latch,
-    /// compute, latch" measurement misses whatever ran between batch start and
-    /// each latch. That is why the PIT-observer window is a gate term: the FIRST
-    /// counter touch (a control write, a reload write, or a read -- all
-    /// batch-ending) arms it, so from the second touch onward the error is back
-    /// to the ~23 us the fine fallback always gave. What remains is exactly the
-    /// first touch after a quiet stretch, which can sit up to one coarse batch
-    /// (1 ms) into its batch -- the bound the Approximate class has always
-    /// accepted on every touch. The principled fix that removes even that is a
-    /// counter-value peek in `Pit` (the `out_after` precedent, which port 0x61
-    /// already uses on the lazy path); it is not a batch-length floor, and the
-    /// floor is not a substitute for it.
+    /// CAVEAT CLOSED (was: time-derived port reads with no in-batch peek). The PIT
+    /// counter latch on 0x40/0x42 used to return the counting element as of BATCH
+    /// START, so the FIRST latch of a "latch, compute, latch" measurement -- the one
+    /// that lands in a batch nothing had shortened yet -- could sit up to a full
+    /// coarse batch (1 ms) early, and the PIT-observer window only covered the
+    /// touches after it. The principled fix named here has since been taken:
+    /// `Counter::count_after` peeks the counting element the way `Pit::out_after`
+    /// peeks OUT, and `MachineBus` takes it on every 0x40-0x43 access in BOTH timing
+    /// classes (it changes the value read, never whether the batch ends). A
+    /// mid-batch latch is now exactly what a real `advance_devices` of the same
+    /// clock total would produce, pinned by
+    /// `a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks`,
+    /// so the batch grain no longer bounds counter-read accuracy at all. What is
+    /// left is a BCD-programmed counter, where the peek declines (as `out_after`
+    /// does, and for the same reason: no PC software clocks the PIT in BCD) and the
+    /// observer window still holds the grain fine.
     ///
     /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
     /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
@@ -1329,10 +1333,10 @@ impl MachineBus<'_> {
     /// keeps its fine batch grain for a while (see
     /// `Machine::fine_batch_grain_required` and `pit_observer_fine_until`).
     ///
-    /// Armed by every access to 0x40-0x43, read or write: a guest measuring
-    /// elapsed time through the PIT programs a counter, latches it, computes,
-    /// and latches again, and only the FIRST of those touches can land in a
-    /// coarse batch. The window is generous (`PIT_OBSERVER_FINE_WINDOW_MS`)
+    /// Armed by every access to 0x40-0x43, read or write. Since
+    /// `Counter::count_after` peeks the counting element at the access instant, this
+    /// no longer protects the latched VALUE (which is exact at any grain); it covers
+    /// the BCD counters that peek declines for. The window is generous (`PIT_OBSERVER_FINE_WINDOW_MS`)
     /// because the whole point is to cover the "compute" leg between two
     /// latches; it is charged from batch start rather than the exact in-flight
     /// instruction because a few microseconds at this scale cannot matter and

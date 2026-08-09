@@ -853,6 +853,132 @@ fn analytic_out_after_matches_on_channel1_and_channel2_defaults() {
     }
 }
 
+/// Brute-force oracle for the analytic count_after: clone and step `clocks` times,
+/// returning the counting element as a read would expose it.
+fn simulated_count_after(counter: &Counter, clocks: u64) -> u16 {
+    let mut probe = counter.clone();
+    for _ in 0..clocks {
+        probe.step();
+    }
+    probe.masked_count()
+}
+
+#[test]
+fn analytic_count_after_matches_the_step_simulation_across_modes_and_phases() {
+    // Same coverage shape as the out_after differential above -- every mode, a
+    // spread of reloads (even, odd, minimum legal, illegal, full-range), every
+    // phase across two-plus periods, and distances from 0 through several periods
+    // -- but pinning the COUNTER VALUE a mid-batch read reports, which is what the
+    // 0x40/0x42 peek returns.
+    for mode in 0..=5u8 {
+        for reload in [2u16, 3, 4, 5, 6, 7, 18, 100, 101, 255, 1, 0] {
+            let mut pit = Pit::default();
+            pit.write_port(0x43, 0x30 | (mode << 1));
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, false); // arm the trigger edge below
+            }
+            pit.write_port(0x40, (reload & 0xff) as u8);
+            pit.write_port(0x40, (reload >> 8) as u8);
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, true); // rising edge starts the one-shot
+            }
+            let phases = if reload == 0 {
+                6
+            } else {
+                (2 * u64::from(reload) + 6).min(120)
+            };
+            let period = if reload == 0 {
+                65536
+            } else {
+                u64::from(reload)
+            };
+            let sweeps: Vec<u64> = [
+                0,
+                1,
+                2,
+                period.saturating_sub(1),
+                period,
+                period + 1,
+                2 * period,
+                2 * period + 1,
+                5 * period + 3,
+            ]
+            .into_iter()
+            .collect();
+            for phase in 0..phases {
+                for &clocks in &sweeps {
+                    assert_eq!(
+                        pit.counters[0].count_after(clocks),
+                        Some(simulated_count_after(&pit.counters[0], clocks)),
+                        "mode {mode} reload {reload} phase {phase} clocks {clocks}"
+                    );
+                }
+                pit.tick(1);
+            }
+        }
+    }
+}
+
+#[test]
+fn analytic_count_after_zero_clocks_is_the_current_counting_element() {
+    // clocks == 0 must be a pure readback in every state, so a peek at the very
+    // start of a batch is byte-identical to the pre-peek behavior.
+    let mut pit = Pit::default(); // fresh counter 0 is Inactive
+    assert_eq!(
+        pit.counters[0].count_after(0),
+        Some(pit.counters[0].masked_count())
+    );
+    pit.write_port(0x43, CW_MODE1); // arms WaitGate
+    assert_eq!(
+        pit.counters[0].count_after(0),
+        Some(pit.counters[0].masked_count())
+    );
+    program_ch0(&mut pit, CW_MODE2, 100); // LoadDelay
+    assert_eq!(
+        pit.counters[0].count_after(0),
+        Some(pit.counters[0].masked_count())
+    );
+    pit.tick(3); // Counting
+    assert_eq!(
+        pit.counters[0].count_after(0),
+        Some(pit.counters[0].masked_count())
+    );
+}
+
+#[test]
+fn analytic_count_after_declines_for_a_bcd_counter() {
+    // BCD declines exactly like out_after, so the caller keeps today's live-field
+    // behavior rather than a wrong decimal peek.
+    let mut pit = Pit::default();
+    pit.write_port(0x43, CW_MODE2 | 1); // ch0 mode 2, BCD
+    pit.write_port(0x40, 0x50);
+    pit.write_port(0x40, 0x00);
+    pit.tick(5);
+    assert_eq!(pit.counters[0].count_after(7), None);
+}
+
+#[test]
+fn analytic_count_after_holds_while_gate_is_low() {
+    // A low GATE pauses counting in every mode that honors it, so the peek must
+    // report the CE unchanged for any distance.
+    for mode in [0u8, 2, 3, 4] {
+        let mut pit = Pit::default();
+        pit.write_port(0x43, 0x30 | (mode << 1));
+        pit.write_port(0x40, 50);
+        pit.write_port(0x40, 0);
+        pit.tick(4);
+        pit.set_gate(0, false);
+        let held = pit.counters[0].masked_count();
+        for clocks in [0u64, 1, 7, 1000] {
+            assert_eq!(
+                pit.counters[0].count_after(clocks),
+                Some(held),
+                "mode {mode} clocks {clocks}"
+            );
+        }
+    }
+}
+
 #[test]
 fn counter_latch_freezes_the_read() {
     let mut pit = Pit::default();

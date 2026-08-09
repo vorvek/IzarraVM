@@ -1686,9 +1686,18 @@ impl CpuBus for MachineBus<'_> {
             self.opl_probe.record_sb(port, false, value);
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.pit.read_port(port) {
-            self.note_pit_observer();
-            return Ok(u32::from(value));
+        // A counter read is time-derived: devices only advance at batch END, so the
+        // CE must be peeked at THIS instant or the guest reads the value the counter
+        // had at batch start (`Counter::count_after`). The port test guards the
+        // conversion so no other port pays for it, and unlike the 0x61 / 3DA peeks
+        // this one is NOT gated on `lazy_port_reads` -- it changes only the VALUE
+        // read, never whether the batch ends, so both timing classes want it.
+        if matches!(port, 0x40..=0x42) {
+            let elapsed_pit_clocks = self.elapsed_pit_clocks();
+            if let Some(value) = self.pit.read_port_at(port, elapsed_pit_clocks) {
+                self.note_pit_observer();
+                return Ok(u32::from(value));
+            }
         }
         if let Some(value) = self.pic.read_port(port) {
             return Ok(u32::from(value));
@@ -2024,9 +2033,18 @@ impl CpuBus for MachineBus<'_> {
             }
             return Ok(());
         }
-        if self.pit.write_port(port, value as u8) {
-            self.note_pit_observer();
-            return Ok(());
+        // 0x43's latch commands freeze the CE, so they need the same in-batch peek
+        // the counter read above takes; a count write needs no device state at all,
+        // but shares the arm so the port test stays one range compare.
+        if matches!(port, 0x40..=0x43) {
+            let elapsed_pit_clocks = self.elapsed_pit_clocks();
+            if self
+                .pit
+                .write_port_at(port, value as u8, elapsed_pit_clocks)
+            {
+                self.note_pit_observer();
+                return Ok(());
+            }
         }
         if self.pic.write_port(port, value as u8) {
             return Ok(());

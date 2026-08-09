@@ -921,6 +921,94 @@ fn predicted_pit_out_after_n_clocks_matches_a_real_advance_devices_of_the_same_n
     }
 }
 
+/// Program channel 0 as a mode-2 rate generator with an 18.2 Hz-ish divisor, the
+/// shape a BIOS leaves behind and a calibration loop latches.
+fn program_channel0_mode2(machine: &mut Machine, reload: u16) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap(); // ch0, lo/hi, mode 2, binary
+        bus.write_io(0x40, BusWidth::Byte, u32::from(reload & 0xff), false)
+            .unwrap();
+        bus.write_io(0x40, BusWidth::Byte, u32::from(reload >> 8), false)
+            .unwrap();
+    });
+}
+
+/// Latch channel 0 and read both halves back at the current in-batch offset.
+fn latch_and_read_channel0(machine: &mut Machine, prior: u64, core: u64) -> (u16, u64) {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        let before = bus.trace.elapsed_clocks();
+        bus.write_io(0x43, BusWidth::Byte, 0x00, false).unwrap(); // counter-latch, ch0
+        // The latch peek is taken AFTER read_io/write_io records this access's own
+        // bus time, so the raw total the peek converted is everything recorded
+        // since the bus was built.
+        let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+        let lo = bus.read_io(0x40, BusWidth::Byte, core, false).unwrap() as u8;
+        let hi = bus.read_io(0x40, BusWidth::Byte, core, false).unwrap() as u8;
+        (u16::from_le_bytes([lo, hi]), raw_bus_clocks)
+    })
+}
+
+#[test]
+fn a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The counter-value counterpart of
+    // predicted_pit_out_after_n_clocks_matches_a_real_advance_devices_of_the_same_n,
+    // and the test that retires the "counter reads are batch-start stale" caveat:
+    // a latch taken partway into a batch must equal the value a real
+    // advance_devices of the same clock total, followed by a latch at zero offset,
+    // produces. Both timing classes, since this peek is not gated on
+    // lazy_port_reads: the Accurate 386 class is the one whose batch grain the
+    // deadline work coarsened, so it is the one that most needs the peek.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        for prior in [0u64, 61, 33_000] {
+            for core in [0u64, 100, 12_345, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(mode);
+                program_channel0_mode2(&mut predicted_machine, 0x4000);
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(mode);
+                program_channel0_mode2(&mut real_machine, 0x4000);
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+                let (predicted, raw_bus_clocks) =
+                    latch_and_read_channel0(&mut predicted_machine, prior, core);
+
+                let step = prior + core + real_machine.scale_bus(raw_bus_clocks);
+                real_machine.advance_devices(step);
+                let (real, _) = latch_and_read_channel0(&mut real_machine, 0, 0);
+
+                assert_eq!(
+                    predicted, real,
+                    "mode {mode:?} prior {prior} core {core}: a mid-batch latch must \
+                     equal a real advance_devices of the same total"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_batch_counter_latch_moves_with_the_in_batch_offset() {
+    // Non-vacuity for the test above: without the peek every latch in a batch
+    // returns the same batch-start value, so the two offsets below would be equal.
+    // 450_000 clocks is ~20 ms at the 386 tier -- far more than one coarse batch --
+    // and the mode-2 counter must have visibly walked in between.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    program_channel0_mode2(&mut machine, 0x4000);
+    machine.run_cycles(5_000).unwrap();
+    let (at_batch_start, _) = latch_and_read_channel0(&mut machine, 0, 0);
+    let (mid_batch, _) = latch_and_read_channel0(&mut machine, 0, 450_000);
+    assert_ne!(
+        at_batch_start, mid_batch,
+        "a latch 450k clocks into the batch must not report the batch-start count"
+    );
+}
+
 #[test]
 fn lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter() {
     // `out_after` conservatively declines for a

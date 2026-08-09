@@ -1040,11 +1040,11 @@ pub struct Machine {
     isa_io_batch_clocks: u64,
     // Master-timeline instant until which a PIT counter observer is assumed live,
     // set by any access to the counter data ports or the control port and read by
-    // `fine_batch_grain_required`. A counter read reports state as of BATCH START
-    // (nothing peeks the counting element the way `Pit::out_after` peeks OUT), so
-    // a guest measuring elapsed time by latching a counter is a batch-granularity
-    // consumer exactly like the audio ones, and the Accurate class keeps its fine
-    // batch while one is around. Host scheduling only: never guest-visible state,
+    // `fine_batch_grain_required`. Counter VALUES no longer depend on it:
+    // `Counter::count_after` peeks the counting element at the in-batch instant of
+    // the access, so a latch is exact at any batch grain. The window remains for the
+    // one case that peek declines -- a BCD-programmed counter, which falls back to
+    // the live (batch-start) field. Host scheduling only: never guest-visible state,
     // never canonical.
     pit_observer_fine_until: u64,
     // Maintained next-device-edge deadline for the batch cap (86Box-style push
