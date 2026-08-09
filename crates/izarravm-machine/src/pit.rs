@@ -426,12 +426,23 @@ impl Counter {
             // edge, neither of which is a CLK.
             CounterState::Inactive | CounterState::WaitGate => Some(self.masked_count()),
             CounterState::LoadDelay => {
-                if !self.gate || clocks == 0 {
+                if clocks == 0 {
                     return Some(self.masked_count());
                 }
                 // One CLK loads the CE from the reload register (no edge); the rest
                 // counts down from there, mirroring `step`'s load-then-count order.
                 let reload = self.effective_reload();
+                // The load is UNCONDITIONAL in `step`: only `step_counting` is
+                // GATE-gated, so a low GATE still loads on the first CLK and then
+                // pauses AT the reload value (`clocks_until_out_rise` states the
+                // same rule: "a low GATE still loads but then pauses"). The
+                // mirrored gate-low arm in `out_after` returns the stored level
+                // because OUT genuinely does not move on the load; the CE does,
+                // and returning the pre-load field here would report a stale count
+                // for a guest that drops GATE2 (0x61 bit 0) and then reads 0x42.
+                if !self.gate {
+                    return Some(mask16(u64::from(reload)));
+                }
                 Some(Self::counting_count_after(
                     self.mode,
                     reload,

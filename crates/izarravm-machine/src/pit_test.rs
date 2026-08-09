@@ -920,6 +920,42 @@ fn analytic_count_after_matches_the_step_simulation_across_modes_and_phases() {
 }
 
 #[test]
+fn analytic_count_after_matches_the_step_simulation_with_a_low_gate() {
+    // The sweep above always runs with GATE high (channel 0's gate is wired
+    // high), so it never enters LoadDelay-with-GATE-low -- the one state where
+    // `step` still LOADS the counting element (the load is unconditional; only
+    // `step_counting` is gated) while the counter cannot count. Guest-reachable
+    // on channel 2: clear 0x61 bit 0, program the counter, then latch/read 0x42.
+    // Both peeks are pinned here, `count_after` because it must report the
+    // RELOAD and `out_after` because it must report the stored level (OUT does
+    // not move on the load).
+    for mode in 0..=5u8 {
+        for reload in [2u16, 3, 18, 100, 101, 255, 1, 0] {
+            let mut pit = Pit::default();
+            pit.set_gate(0, false);
+            pit.write_port(0x43, 0x30 | (mode << 1));
+            pit.write_port(0x40, (reload & 0xff) as u8);
+            pit.write_port(0x40, (reload >> 8) as u8);
+            for phase in 0..6u64 {
+                for clocks in [0u64, 1, 2, 3, 17, 1000, 70000] {
+                    assert_eq!(
+                        pit.counters[0].count_after(clocks),
+                        Some(simulated_count_after(&pit.counters[0], clocks)),
+                        "count mode {mode} reload {reload} phase {phase} clocks {clocks}"
+                    );
+                    assert_eq!(
+                        pit.counters[0].out_after(clocks),
+                        Some(simulated_out_after(&pit.counters[0], clocks)),
+                        "out mode {mode} reload {reload} phase {phase} clocks {clocks}"
+                    );
+                }
+                pit.tick(1);
+            }
+        }
+    }
+}
+
+#[test]
 fn analytic_count_after_zero_clocks_is_the_current_counting_element() {
     // clocks == 0 must be a pure readback in every state, so a peek at the very
     // start of a batch is byte-identical to the pre-peek behavior.

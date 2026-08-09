@@ -1591,25 +1591,48 @@ impl CpuBus for MachineBus<'_> {
         // write_io, so GATE cannot move between this read and the batch end
         // either.
         if port == 0x61 {
-            if self.lazy_port_reads || self.lazy_ports_386 {
-                // Both channels share the SAME elapsed-PIT-clocks conversion
-                // (same rate, same batch-entry carry): computed once here rather
-                // than twice inside two separate predicted_pit_out calls, since
-                // a redundant conversion on this hot path.
-                let elapsed_pit_clocks = self.elapsed_pit_clocks();
-                let ch1 = self.pit.out_after(1, elapsed_pit_clocks);
-                let ch2 = self.pit.out_after(2, elapsed_pit_clocks);
-                if let (Some(ch1_out), Some(ch2_out)) = (ch1, ch2) {
-                    let value = (self.speaker.control_bits() & 0x03)
-                        | (u8::from(ch1_out) << 4)
-                        | (u8::from(ch2_out) << 5);
-                    return Ok(u32::from(value));
+            // The OUT peek is taken in BOTH timing classes, on exactly the same
+            // grounds as the unconditional 0x40-0x42 counter peek below: it
+            // changes only the VALUE, never whether the batch ends. The lazy
+            // switch decides the BATCH question alone (see the io_touched set
+            // after this block).
+            //
+            // Why the Accurate class needs the value too, and not just the
+            // Approximate one. Bit 5 is channel-2 OUT, and the classic
+            // no-sound PIT timing technique leaves GATE2 high with the data
+            // enable LOW (0x61 bit 0 set, bit 1 clear), then polls bit 5. The
+            // fine-batch-grain gate does NOT cover that case:
+            // `speaker.data_enabled()` is false, and `note_pit_observer` arms
+            // only on a 0x40-0x43 access, so a guest that programs channel 2
+            // once and afterwards polls only 0x61 falls out of the 5 ms
+            // observer window and back to the 1 ms coarse cap. Reading the LIVE
+            // (batch-start) level there could report OUT up to a whole coarse
+            // batch stale -- a mode-3 square-wave FALL is half a period from
+            // the nearest cached rise, so the deadline cache does not bound it
+            // either. With the peek the level is the one a real
+            // `advance_devices` of the same clock total would produce, which is
+            // the same contract the counter peek closed for 0x40-0x42.
+            //
+            // Both channels share the SAME elapsed-PIT-clocks conversion (same
+            // rate, same batch-entry carry): computed once here rather than
+            // twice inside two separate predicted_pit_out calls, since a
+            // redundant conversion on this hot path.
+            let elapsed_pit_clocks = self.elapsed_pit_clocks();
+            let ch1 = self.pit.out_after(1, elapsed_pit_clocks);
+            let ch2 = self.pit.out_after(2, elapsed_pit_clocks);
+            if let (Some(ch1_out), Some(ch2_out)) = (ch1, ch2) {
+                if !(self.lazy_port_reads || self.lazy_ports_386) && !skip_io_touched {
+                    *self.io_touched = true;
                 }
-                // BCD fallback: at least one of channel 1/2 is BCD-programmed, so
-                // `out_after` conservatively declined. Fall through to the exact
-                // non-lazy path below (io_touched set, today's live read) rather
-                // than a second implementation of the same bit composition.
+                let value = (self.speaker.control_bits() & 0x03)
+                    | (u8::from(ch1_out) << 4)
+                    | (u8::from(ch2_out) << 5);
+                return Ok(u32::from(value));
             }
+            // BCD fallback: at least one of channel 1/2 is BCD-programmed, so
+            // `out_after` conservatively declined. Take the exact non-lazy path
+            // (io_touched set, live read) in EITHER class rather than a second
+            // implementation of the same bit composition.
             if !skip_io_touched {
                 *self.io_touched = true;
             }

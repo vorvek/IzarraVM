@@ -900,9 +900,19 @@ impl Machine {
     ///   whole loop fits inside one batch the read reports the pre-delay flags and
     ///   the guest concludes there is no card. Same failure the Approximate class
     ///   hit before the peek existed.
-    /// - Speaker data enable. While the membrane is driven, port 0x61 bit 5
-    ///   (channel-2 OUT) is read live on this class too, so batch length bounds
-    ///   how stale a speaker-timing poll can be.
+    /// - Speaker data enable. While the membrane is driven, the DAC-period grain
+    ///   keeps the audio consumer's own view of channel 2 moving one frame at a
+    ///   time. It is NO LONGER load-bearing for what a 0x61 READ reports: the
+    ///   `Pit::out_after` peek on bits 4/5 is taken in both timing classes (see
+    ///   `MachineBus::read_io`), so batch length does not bound how stale a
+    ///   0x61 poll can be in EITHER class. That matters because this term never
+    ///   covered the case that needed it most -- the classic no-sound PIT
+    ///   timing technique (GATE2 high, data enable LOW: 0x61 bit 0 set, bit 1
+    ///   clear) polls bit 5 with `data_enabled()` false, and the observer
+    ///   window below arms only on 0x40-0x43, so a guest that programs channel
+    ///   2 once and then polls only 0x61 falls back to the coarse cap. The peek
+    ///   closes that outright rather than widening this gate to a term that
+    ///   would bind every batch the way PIT channel 1 would.
     /// - DSP output clock, WSS playback/autocal, Red Book CD playback. The
     ///   DMA-fed producers; a fine batch keeps the DMA current-count a guest can
     ///   poll for its play position moving one frame at a time.

@@ -1009,6 +1009,107 @@ fn a_mid_batch_counter_latch_moves_with_the_in_batch_offset() {
     );
 }
 
+/// Program channel 2 as a mode-3 square wave and leave port 0x61 in the classic
+/// "PIT timing, no sound" configuration: GATE2 HIGH (bit 0 set), data enable LOW
+/// (bit 1 clear). `speaker.data_enabled()` is false there, so
+/// `fine_batch_grain_required` does not hold the batch fine for it, and a guest
+/// that never touches 0x40-0x43 again also falls out of the PIT-observer window.
+fn program_silent_channel2(machine: &mut Machine, reload: u16) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap(); // ch2, lo/hi, mode 3
+        bus.write_io(0x42, BusWidth::Byte, u32::from(reload & 0xff), false)
+            .unwrap();
+        bus.write_io(0x42, BusWidth::Byte, u32::from(reload >> 8), false)
+            .unwrap();
+        bus.write_io(0x61, BusWidth::Byte, 0x01, false).unwrap(); // GATE2, no data enable
+    });
+    assert!(
+        !machine.speaker.data_enabled(),
+        "sanity: this configuration must NOT arm the speaker term of \
+         fine_batch_grain_required"
+    );
+}
+
+/// Read port 0x61 at a given in-batch offset, returning the byte and the raw bus
+/// clocks the access itself recorded (the same accounting `latch_and_read_channel0`
+/// uses, so a differential can advance the twin machine by the identical total).
+fn read_port_61_at(machine: &mut Machine, prior: u64, core: u64) -> (u8, u64) {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        let before = bus.trace.elapsed_clocks();
+        let value = bus.read_io(0x61, BusWidth::Byte, core, false).unwrap() as u8;
+        (value, bus.trace.elapsed_clocks() - before)
+    })
+}
+
+#[test]
+fn a_mid_batch_61_read_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The 0x61 counterpart of
+    // a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks.
+    // Both timing classes: the `out_after` peek on bits 4/5 is taken in each, so
+    // the Accurate class's channel-2 OUT is no longer a batch-start read even in
+    // the silent-timing configuration the fine-grain gate does not cover.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        for prior in [0u64, 61, 33_000] {
+            // 100_000 is included deliberately: it is an offset where CHANNEL 2's
+            // OUT has flipped relative to batch start (the other offsets move only
+            // channel 1's ~15 us refresh bit), so the sweep exercises both bits.
+            for core in [0u64, 100, 12_345, 100_000, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(mode);
+                program_silent_channel2(&mut predicted_machine, 0x2000);
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(mode);
+                program_silent_channel2(&mut real_machine, 0x2000);
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+                let (predicted, raw_bus_clocks) =
+                    read_port_61_at(&mut predicted_machine, prior, core);
+                let step = prior + core + real_machine.scale_bus(raw_bus_clocks);
+                real_machine.advance_devices(step);
+                let (real, _) = read_port_61_at(&mut real_machine, 0, 0);
+                eprintln!(
+                    "DBG {mode:?} prior {prior} core {core} predicted {predicted:#04x} real {real:#04x} step {step}"
+                );
+
+                assert_eq!(
+                    predicted, real,
+                    "mode {mode:?} prior {prior} core {core}: a mid-batch 0x61 read must \
+                     equal a real advance_devices of the same total"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_batch_61_read_moves_with_the_in_batch_offset_on_the_accurate_class() {
+    // Non-vacuity for the test above, on the class that previously read the LIVE
+    // level: without the peek every 0x61 read in a batch reports the same
+    // batch-start bit 5, so the sweep below would be constant. The offsets span
+    // ~20 ms at the 386 tier, far more than the 1 ms coarse cap the silent-timing
+    // configuration falls back to.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    program_silent_channel2(&mut machine, 0x2000);
+    machine.run_cycles(5_000).unwrap();
+    let mut levels = std::collections::BTreeSet::new();
+    for core in (0u64..=450_000).step_by(50_000) {
+        let (value, _) = read_port_61_at(&mut machine, 0, core);
+        levels.insert((value >> 5) & 1);
+    }
+    assert_eq!(
+        levels.len(),
+        2,
+        "bit 5 (channel-2 OUT) must take both levels across a sweep of in-batch \
+         offsets; a constant column means the peek is not being taken"
+    );
+}
+
 #[test]
 fn lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter() {
     // `out_after` conservatively declines for a
