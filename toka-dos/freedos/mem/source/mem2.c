@@ -77,6 +77,7 @@ int filter_by_module_name(MINFO *entry, void *data)
  */
 int filter_system(MINFO *entry, void *data)
 {
+    (void)data;
     return (entry->type == MT_SYSCODE ||
 	    entry->type == MT_SYSDATA ||
 	    entry->type == MT_KERNEL);
@@ -87,6 +88,7 @@ int filter_system(MINFO *entry, void *data)
  */
 int filter_upper(MINFO *entry, void *data)
 {
+    (void)data;
     return (entry->type != MT_NONE
 	    && (entry->type < MT_ENV
 		|| entry->type == MT_DEVICE));
@@ -705,6 +707,7 @@ static void print_minfo_full(MINFO *entry, unsigned int level)
 
 static void print_minfo_free(MINFO *entry, unsigned int level)
 {
+    (void)level;
     printf("  %04X", entry->seg);
     print_classify_value("%11s", (ulong)entry->size);
     printf("\n");

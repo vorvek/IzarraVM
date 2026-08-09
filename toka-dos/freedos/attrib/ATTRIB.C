@@ -267,7 +267,7 @@ LOCAL void PROC error (byte errcode, const char arg[], const char err[]) {
 #define HELP() \
    say ("ATTRIB v" VERSION " - Displays or changes file attributes.\n" \
 	"Copyright (c) 1998-2003, licensed under GPL2.\n\n" \
-	"Syntax: ATTRIB { options | [path\][file] | /@[list] }\n\n" \
+	"Syntax: ATTRIB { options | [path\\][file] | /@[list] }\n\n" \
 	"Options:\n\n" \
 	"  +H  Sets the Hidden attribute.     -H  Clears the Hidden attribute.\n" \
 	"  +S  Sets the System attribute.     -S  Clears the System attribute.\n" \
@@ -278,7 +278,7 @@ LOCAL void PROC error (byte errcode, const char arg[], const char err[]) {
 	"  /@  Process files, listed in the specified file [or in stdin].\n\n" \
 	"Examples:\n\n" \
 	"  attrib file -rhs\n" \
-	"  attrib +a -r dir1\ dir2\*.dat /s\n" \
+	"  attrib +a -r dir1\\ dir2\\*.dat /s\n" \
 	"  attrib -hs/sd /@list.txt *.*", "")
 
 LOCAL byte iscomma = 0;

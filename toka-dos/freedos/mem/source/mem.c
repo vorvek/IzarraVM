@@ -1572,6 +1572,7 @@ int show_minfo_as_free(MINFO *entry)
 
 int filter_free(MINFO *entry, void *data)
 {
+    (void)data;
     return (show_minfo_as_free(entry));
 }
 
