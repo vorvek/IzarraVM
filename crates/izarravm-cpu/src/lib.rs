@@ -1361,6 +1361,9 @@ pub struct DirectStallSnapshot {
     /// Displacement lanes registered at install — the disp share of
     /// `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
     pub disp_lane_registrations: u64,
+    /// Continuations the packed decode first touch screened and then could not materialise a line
+    /// for. Expected identically zero; see `DirectStallTally`.
+    pub decode_pack_late_view_miss: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2568,10 +2571,12 @@ struct RepExecution {
 /// both channels push the same way, which is why the ladder is monotone.
 ///
 /// At 56 bytes per line NOW (measured via `size_of::<DecodeLine>()`, not derived: DecodeLine is
-/// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32,
-/// jit_direct_hotness: u8` -- DecodedInsn itself measures 40 bytes, having grown 36 -> 40 when C1e
-/// added the recorded {disp_len, imm_len} pair) 65536 lines is ~3.5 MB, against ~1.75 MB at 32768
-/// and ~0.22 MB at 4096.
+/// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32` -- DecodedInsn
+/// itself measures 40 bytes, having grown 36 -> 40 when C1e added the recorded
+/// {disp_len, imm_len} pair) 65536 lines is ~3.5 MB, against ~1.75 MB at 32768
+/// and ~0.22 MB at 4096. `DecodePack` adds a second array of 16 bytes per slot (1 MB here); it is
+/// sized to be the resident one, so growing IT is the change that costs, not the slack in the
+/// line.
 /// HISTORY: before the dynarec-refactor Task 2 region-JIT deletion, DecodeLine carried two more
 /// fields (`jit_region: Option<NonZeroU32>` and `jit_hotness: u16`, 6 bytes together) and measured
 /// 60 bytes with zero slack. Deleting those two fields shrank the line 60 -> 56, a REAL footprint
@@ -2648,9 +2653,79 @@ struct DecodeLine {
     /// path's covers-the-written-byte check. `phys_start..phys_start + len` is contiguous because
     /// page-straddling instructions are never inserted into this cache.
     phys_start: u32,
-    /// Saturating direct-code admission count.
-    #[cfg(feature = "jit")]
+}
+
+/// The screen inputs one continuation reads BEFORE it commits to executing anything, held in a
+/// side array parallel to `DecodeCache::lines` and stamped with the same generation.
+///
+/// FOOTPRINT is the reason it exists, not field count. A `DecodeLine` is 56 bytes and 65536 of
+/// them are 3.5 MB, so the first touch of a line is an L3 miss: on duke3d-586 that single touch
+/// is 11.75 percent of wall (`dev_docs/2026-08-08-dispatch-tier-next.md`). These sixteen bytes
+/// carry every field the continuable / page-cross / fetch-limit screens and the whole native
+/// admission path read, so at 1 MB the array stays resident and a continuation that dispatches
+/// natively never faults in the 3.5 MB table at all.
+///
+/// CONSISTENCY is the whole risk: a pack that answers for a line it no longer describes is a
+/// miscompile, not a slowdown. `publish_line`, `kill_line_at` and `clear_lines` are the only
+/// writers of either array and each writes both; nothing else may assign into `lines` or `packs`.
+///
+/// JIT-ONLY, and that is a consequence rather than a convenience: the packed screens are worth
+/// taking only when a native dispatch can consume them without the line (see the hoist in
+/// `run_budgeted_inner`). An interpreter-only build always needs the instruction, so a pack there
+/// would be a second array read in front of the same line read, plus 1 MB of allocation for it.
+///
+/// WHAT THIS COSTS WHILE SWITCHED OFF, stated plainly because the reading arm is opt-in and
+/// measured inert (`decode_pack_enabled`): a jit build still pays the unconditional pack write on
+/// every `put` / `kill_line_at` / `clear_lines`, the 1 MB allocation per `DecodeCache`, and the
+/// 16 bytes of `Box` that this array's pointer adds mid-`CpuGsw` (the reason the `registers` and
+/// `pending_flags` layout pins moved). That is deliberate: the writers have to stay unconditional
+/// or the opt-in arm could not be switched on inside one binary, which is the only way this gets
+/// re-measured without build-to-build variance. If the re-test trigger on `decode_pack_enabled`
+/// fires and refutes the mechanism a second time, delete it — do not keep paying this.
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct DecodePack {
+    tag: u32,
+    /// Stamped and tested exactly like `DecodeLine::generation`, and STORED rather than read
+    /// through to the line: sharing the one counter is what keeps the wholesale flush O(1) for
+    /// both arrays instead of walking the pack array on every SMC generation bump.
+    generation: u32,
+    phys_start: u32,
+    /// Zero marks a slot that has never been filled. `put` refuses a zero-length insn, so a pack
+    /// whose stamp is live always carries the length of a real instruction; the hit test uses
+    /// that to stand in for the line's `insn: Option`.
+    len: u8,
+    flags: u8,
+    /// Saturating direct-code admission count. It lives here rather than on the line because
+    /// `direct_hot_at` runs on every admitted continuation, and a counter left behind on the line
+    /// would fault in the exact cache line this array exists to avoid touching.
     jit_direct_hotness: u8,
+    _pad: u8,
+}
+
+/// `DecodePack::flags` bit 0: the CS D bit the line was decoded under, part of the hit condition.
+#[cfg(feature = "jit")]
+const PACK_FLAG_D: u8 = 1 << 0;
+/// `DecodePack::flags` bit 1: `DecodedInsn::continuable`, the first screen the loop applies.
+#[cfg(feature = "jit")]
+const PACK_FLAG_CONTINUABLE: u8 = 1 << 1;
+
+/// What a first touch yields: the screen fields plus the two facts native admission needs. The
+/// interpreted path asks for the full `DecodeLineView` separately, because only it needs the
+/// instruction.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecodeScreenView {
+    pub(crate) len: u8,
+    pub(crate) continuable: bool,
+    /// Physical address of the instruction's first byte; the block key's provenance input, so it
+    /// rides the screen only where there is a block key to build.
+    #[cfg(feature = "jit")]
+    pub(crate) phys_start: u32,
+    /// The table index the line was found at, valid for both arrays. Proof the slot is live for
+    /// its key, so a consumer can address it without re-testing the tag.
+    #[cfg(feature = "jit")]
+    pub(crate) slot: u32,
 }
 
 /// One decode-line fetch, materialised once and threaded through a whole continuation iteration.
@@ -2674,6 +2749,22 @@ pub(crate) struct DecodeLineView {
     /// consumer holding one can address the line by slot without re-testing the tag.
     #[cfg(feature = "jit")]
     pub(crate) slot: u32,
+}
+
+impl DecodeLineView {
+    /// The screen fields of a full view. The unpacked arm of `IZARRAVM_DECODE_PACK` reaches the
+    /// same downstream code through this, so both arms run one dispatch path rather than two.
+    #[inline]
+    fn screen(&self) -> DecodeScreenView {
+        DecodeScreenView {
+            len: self.insn.len,
+            continuable: self.insn.continuable,
+            #[cfg(feature = "jit")]
+            phys_start: self.phys_start,
+            #[cfg(feature = "jit")]
+            slot: self.slot,
+        }
+    }
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
@@ -2711,6 +2802,64 @@ pub(crate) fn poll_neg_cache_policy(value: Option<&str>) -> bool {
     !matches!(value, Some("" | "0"))
 }
 
+/// Whether the continuation loop takes its first touch from the packed side array.
+/// **OPT-IN ONLY** (`IZARRAVM_DECODE_PACK` set to anything but "0"); the off arm reads the screens
+/// out of the full `DecodeLineView` exactly as the loop did before the array existed. Both arms
+/// ship in one executable so an A/B carries no build-to-build variance.
+///
+/// MEASURED AND REFUTED, which is why the default is off. The motivation was a real number: an
+/// `#[inline(never)]` attribution build put 11.75 percent of duke3d-586's wall on the `view` copy
+/// at the `get_view` call in `run_budgeted_inner`, i.e. the first touch of a 56-byte line in a
+/// 3.5 MB table (`dev_docs/2026-08-08-dispatch-tier-next.md`). Three rounds of A/B:
+///
+/// 1. Contaminated box, duke3d-586: +22.5 percent. Not believed, re-run.
+/// 2. Quiet box, single pairs (`.bench/results/duke586-pack2-*.json`): doom-486 -2.7 percent,
+///    duke3d-586 -2.3 percent.
+/// 3. Interleaved A/B/B/A on a quiet box, the round that counts
+///    (`.bench/results/doom486-abba-*.json`, `.bench/results/nascar-abba-*.json`): doom-486 mean
+///    off 3.7609 vs on 3.7925 (+0.84 percent), nascar-586 off 0.4575 vs on 0.4561 (-0.32
+///    percent). Both inside the spread — doom's two OFF arms alone differ by 3.6 percent.
+///
+/// INERT. The lesson is about the profile, not the code: an attribution share names where cycles
+/// are SPENT, not a cost that can be removed. The interpreted majority still fetches the full line
+/// by design, and on the native-dispatch path the pack's own first touch simply replaces the
+/// line's — the miss moved rather than died.
+///
+/// RE-TEST TRIGGER: measure this again if a slice makes native dispatch DOMINATE continuations
+/// (the core-tier interpreter work, or link-bypass so seams stop reaching the dispatcher). That is
+/// the profile the pack's bet needs and the one no fixture has today. If the re-test refutes it a
+/// second time, delete the mechanism rather than carrying it (see `DecodePack` for what it costs
+/// while switched off).
+///
+/// Read ONCE per straight-line run, never per continuation: the whole point of the slice was to
+/// take work out of that loop, and a `OnceLock` load there would put some back.
+#[cfg(feature = "jit")]
+pub(crate) fn decode_pack_enabled() -> bool {
+    #[cfg(all(test, feature = "jit"))]
+    if let Some(forced) = DECODE_PACK_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(
+        || matches!(std::env::var("IZARRAVM_DECODE_PACK").as_deref(), Ok(value) if value != "0"),
+    )
+}
+
+// Per-THREAD, because the shipped knob is a process-wide `OnceLock` and the differential
+// fixture has to run both arms in one process. Thread-local rather than a global is what keeps
+// the parallel test harness honest: one test's arm selection cannot reach another's run.
+#[cfg(all(test, feature = "jit"))]
+thread_local! {
+    static DECODE_PACK_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the first-touch arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_DECODE_PACK` reading.
+#[cfg(all(test, feature = "jit"))]
+pub(crate) fn set_decode_pack_for_test(forced: Option<bool>) {
+    DECODE_PACK_OVERRIDE.with(|cell| cell.set(forced));
+}
+
 /// Ambient default for the poll negative cache, read fresh at CPU construction.
 #[cfg(feature = "jit")]
 pub(crate) fn poll_neg_cache_default() -> bool {
@@ -2733,6 +2882,9 @@ pub(crate) fn poll_neg_cache_default() -> bool {
 /// `PrefetchWindow`) and reset rather than copied on clone.
 struct DecodeCache {
     lines: Box<[DecodeLine]>,
+    /// First-touch side array, one entry per `lines` slot at the same index. See `DecodePack`.
+    #[cfg(feature = "jit")]
+    packs: Box<[DecodePack]>,
     mask: u32,
     generation: u32,
     /// Bitmap (1 bit per physical byte, low `SMC_BYTE_COVERAGE` bytes) of bytes an instruction has
@@ -2868,6 +3020,8 @@ impl DecodeCache {
         );
         Self {
             lines: vec![DecodeLine::default(); lines].into_boxed_slice(),
+            #[cfg(feature = "jit")]
+            packs: vec![DecodePack::default(); lines].into_boxed_slice(),
             mask: (lines - 1) as u32,
             // Fresh lines default to generation 0; start live at 1 so they miss until first filled.
             generation: 1,
@@ -3059,6 +3213,108 @@ impl DecodeCache {
         }
     }
 
+    /// The packed first touch: the same hit condition `get_view` applies, answered out of the
+    /// 16-byte side entry so the 56-byte line is never faulted in. `len != 0` stands in for the
+    /// line's `insn: Option` (see `DecodePack::len`).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn get_packed(&self, lin: u32, d: bool) -> Option<DecodeScreenView> {
+        let slot = lin & self.mask;
+        let pack = &self.packs[slot as usize];
+        if pack.generation == self.generation
+            && pack.tag == lin
+            && (pack.flags & PACK_FLAG_D != 0) == d
+            && pack.len != 0
+        {
+            Some(DecodeScreenView {
+                len: pack.len,
+                continuable: pack.flags & PACK_FLAG_CONTINUABLE != 0,
+                phys_start: pack.phys_start,
+                #[cfg(feature = "jit")]
+                slot,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The ONE place a live line is published. Both arrays are written here, from the one
+    /// `DecodeLine` value, so a pack cannot describe a line it does not match; `lines` is assigned
+    /// nowhere else. The pack's hotness starts at 0 for the same reason `put` used to reset the
+    /// line's: a re-inserted key is a fresh admission candidate.
+    #[inline]
+    fn publish_line(&mut self, index: usize, line: DecodeLine) {
+        #[cfg(feature = "jit")]
+        {
+            let mut flags = 0u8;
+            if line.d {
+                flags |= PACK_FLAG_D;
+            }
+            if line.insn.is_some_and(|insn| insn.continuable) {
+                flags |= PACK_FLAG_CONTINUABLE;
+            }
+            self.packs[index] = DecodePack {
+                tag: line.tag,
+                generation: line.generation,
+                phys_start: line.phys_start,
+                len: line.insn.map_or(0, |insn| insn.len),
+                flags,
+                jit_direct_hotness: 0,
+                _pad: 0,
+            };
+        }
+        self.lines[index] = line;
+    }
+
+    /// The ONE in-place kill (the narrow SMC path). The live generation is never 0, so zeroing
+    /// both stamps retires the slot in both arrays while leaving the sticky code marks alone.
+    #[inline]
+    fn kill_line_at(&mut self, index: usize) {
+        self.lines[index].generation = 0;
+        #[cfg(feature = "jit")]
+        {
+            self.packs[index].generation = 0;
+        }
+    }
+
+    /// The ONE wholesale clear, for the generation wrap. Both arrays go back to their unfilled
+    /// state together; a pack surviving a `lines` reset would answer for a line that no longer
+    /// exists.
+    fn clear_lines(&mut self) {
+        self.lines.fill(DecodeLine::default());
+        #[cfg(feature = "jit")]
+        self.packs.fill(DecodePack::default());
+    }
+
+    /// Every live pack agrees with its line, and no pack is live where its line is not. The
+    /// invariant the whole side array rests on, checked exhaustively by the fixtures that mutate
+    /// the cache (fill, narrow kill, eviction, generation bump).
+    #[cfg(all(test, feature = "jit"))]
+    fn assert_packs_consistent(&self) {
+        for (index, line) in self.lines.iter().enumerate() {
+            let pack = &self.packs[index];
+            let line_live = line.generation == self.generation && line.insn.is_some();
+            let pack_live = pack.generation == self.generation && pack.len != 0;
+            assert_eq!(
+                line_live, pack_live,
+                "slot {index}: line live {line_live} but pack live {pack_live}"
+            );
+            if !line_live {
+                continue;
+            }
+            let insn = line.insn.expect("live line carries an insn");
+            assert_eq!(pack.tag, line.tag, "slot {index}: tag");
+            assert_eq!(pack.flags & PACK_FLAG_D != 0, line.d, "slot {index}: D bit");
+            assert_eq!(pack.phys_start, line.phys_start, "slot {index}: phys_start");
+            assert_eq!(pack.len, insn.len, "slot {index}: len");
+            assert_eq!(
+                pack.flags & PACK_FLAG_CONTINUABLE != 0,
+                insn.continuable,
+                "slot {index}: continuable"
+            );
+        }
+    }
+
     /// `get`, plus the two other facts the continuation loop wants about the same line. One index
     /// and one generation/tag/`d` check serve all three consumers; see `DecodeLineView`.
     #[inline]
@@ -3126,15 +3382,16 @@ impl DecodeCache {
         let displaced = previous.generation == self.generation
             && previous.insn.is_some()
             && (previous.tag != lin || previous.d != d);
-        self.lines[index] = DecodeLine {
-            tag: lin,
-            generation: self.generation,
-            insn: Some(insn),
-            d,
-            phys_start: phys,
-            #[cfg(feature = "jit")]
-            jit_direct_hotness: 0,
-        };
+        self.publish_line(
+            index,
+            DecodeLine {
+                tag: lin,
+                generation: self.generation,
+                insn: Some(insn),
+                d,
+                phys_start: phys,
+            },
+        );
 
         DecodeInsertOutcome {
             inserted: true,
@@ -3160,22 +3417,19 @@ impl DecodeCache {
         let written_lin = (info.lin_page << 12) | (physical & 0xfff);
         let mut killed = 0u32;
         for candidate in written_lin.saturating_sub(14)..=written_lin {
+            let index = (candidate & self.mask) as usize;
             let removed = {
-                let line = &mut self.lines[(candidate & self.mask) as usize];
+                let line = &self.lines[index];
                 if line.generation != self.generation || line.tag != candidate {
                     false
                 } else {
                     let len = line.insn.map_or(0, |i| u32::from(i.len));
-                    if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
-                        // The sticky native mark stays conservative until global invalidation.
-                        line.generation = 0;
-                        true
-                    } else {
-                        false
-                    }
+                    line.phys_start <= physical && physical < line.phys_start.wrapping_add(len)
                 }
             };
             if removed {
+                // The sticky native mark stays conservative until global invalidation.
+                self.kill_line_at(index);
                 killed += 1;
             }
         }
@@ -3273,19 +3527,20 @@ impl DecodeCache {
     /// Observe a continuation for direct-code admission. Once the second encounter makes the line
     /// hot, later encounters stay eligible for the direct cache's separate first-seen/compile probe.
     ///
-    /// Takes the SLOT rather than the key: the only caller reaches this holding a `DecodeLineView`
-    /// it took from this very cache in the same loop iteration, so the line is already proven live
+    /// Takes the SLOT rather than the key: the only caller reaches this holding a
+    /// `DecodeScreenView` it took from this very cache in the same loop iteration, so the slot is
+    /// already proven live
     /// for `(lin, d)` and the generation/tag/`d` retest this used to run was answering a question
     /// that could not come back false. Nothing between the view and this call can invalidate a
     /// line (the admission gate only reads the cache; see the caller's staleness note).
     #[cfg(feature = "jit")]
     #[inline]
     fn direct_hot_at(&mut self, slot: u32, threshold: u8) -> bool {
-        let line = &mut self.lines[slot as usize];
-        if line.jit_direct_hotness < threshold {
-            line.jit_direct_hotness += 1;
+        let pack = &mut self.packs[slot as usize];
+        if pack.jit_direct_hotness < threshold {
+            pack.jit_direct_hotness += 1;
         }
-        line.jit_direct_hotness == threshold
+        pack.jit_direct_hotness == threshold
     }
 
     /// Invalidate every cached line and drop every matching code watch. The generation advance and
@@ -3293,7 +3548,7 @@ impl DecodeCache {
     fn invalidate_and_clear_code_marks(&mut self) {
         if self.generation == u32::MAX {
             // Clear old generation-1 lines before 1 can become live again.
-            self.lines.fill(DecodeLine::default());
+            self.clear_lines();
             self.generation = 1;
         } else {
             self.generation += 1;

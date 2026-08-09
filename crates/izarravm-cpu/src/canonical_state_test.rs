@@ -869,8 +869,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // one-lookup slice measured that growth as a uniform doom regression (hot fields
     // shifted cache lines) and moved the array to the struct TAIL, restoring the pre-R15
     // pin -- measured, not derived. See cpu_test.rs's twin comment for the full story.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    // The decode-line first-touch slice's `Box<[DecodePack]>` inside `DecodeCache` moves the pin
+    // 4528 -> 4544 -- measured, not derived. The packed array mirrors decode lines, which are a
+    // transparent accelerator, so it is absent from both canonical payloads for the same reason
+    // the lines are.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4544);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4544);
 }

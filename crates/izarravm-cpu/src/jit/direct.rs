@@ -1280,6 +1280,12 @@ impl BlockCache {
         self.stalls.disp_lane_registrations += lanes;
     }
 
+    /// The packed first touch screened a slot that no longer had a line by the time the
+    /// interpreted arm asked for it. See the field.
+    pub(crate) fn note_decode_pack_late_view_miss(&mut self) {
+        self.stalls.decode_pack_late_view_miss += 1;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_lane_trial_for_test(&mut self, on: bool) {
         self.lane_trial_override = Some(on);

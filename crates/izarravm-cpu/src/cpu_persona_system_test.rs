@@ -944,6 +944,7 @@ fn decode_cache_generation_wrap_clears_lines_and_watches() {
     assert_eq!(cache.native_code_watch.coarse_page_count(), 0);
     assert_eq!(cache.native_code_watch_table(), table_base);
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 }
 
 #[cfg(all(
@@ -966,6 +967,7 @@ fn decode_cache_replacement_and_refill_retain_conservative_native_marks() {
     assert_eq!(refill.evicted_slot, None);
     assert_eq!(cache.native_code_watch.precise_pages(), 1);
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     let replacement = cache.put(0x102, insn, false, 0x108);
     assert!(replacement.inserted);
@@ -973,11 +975,13 @@ fn decode_cache_replacement_and_refill_retain_conservative_native_marks() {
     assert!(cache.native_code_watch.is_watched(0x100));
     assert_eq!(cache.native_code_watch.precise_pages(), 1);
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     assert!(cache.put(0x104, insn, false, 0x130).inserted);
     assert!(cache.native_code_watch.is_watched(0x100));
     assert!(cache.native_code_watch.is_watched(0x130));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 }
 
 #[cfg(all(
@@ -998,10 +1002,12 @@ fn decode_cache_narrow_kills_retain_sticky_native_chunks_until_global_clear() {
     assert_eq!(cache.narrow_invalidate(0x100), Some(1));
     assert!(cache.native_code_watch.is_watched(0x100));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     assert_eq!(cache.narrow_invalidate(0x108), Some(1));
     assert!(cache.native_code_watch.is_watched(0x100));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     cache.invalidate_and_clear_code_marks();
     assert!(!cache.native_code_watch.is_watched(0x100));
@@ -1024,11 +1030,13 @@ fn decode_cache_global_clear_drops_marks_but_narrow_kill_does_not() {
     cache.invalidate_and_clear_code_marks();
     assert!(!cache.native_code_watch.is_watched(0x100));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     assert!(cache.put(0x100, insn, false, 0x100).inserted);
     assert_eq!(cache.narrow_invalidate(0x100), Some(1));
     assert!(cache.native_code_watch.is_watched(0x100));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     cache.invalidate_and_clear_code_marks();
     assert!(!cache.native_code_watch.is_watched(0x100));
@@ -1053,6 +1061,7 @@ fn cloning_a_populated_decode_cache_starts_empty() {
     assert_eq!(clone.native_code_watch.coarse_page_count(), 0);
     assert!(!clone.native_code_watch.is_watched(0x100));
     clone.assert_native_watch_consistent();
+    clone.assert_packs_consistent();
 }
 
 #[cfg(all(
@@ -1074,6 +1083,7 @@ fn decode_cache_marks_every_chunk_of_an_overlong_page_local_instruction() {
     assert!(cache.native_code_watch.is_watched(0x120));
     assert!(!cache.native_code_watch.is_watched(0x130));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 }
 
 #[cfg(all(
@@ -1089,6 +1099,7 @@ fn decode_cache_refuses_straddling_fill_without_evicting_collision() {
     let mut cache = DecodeCache::new(4);
     assert!(cache.put(0x103, insn, false, 0x203).inserted);
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     insn.len = 3;
     assert!(!cache.put(0x0fff, insn, false, 0x0fff).inserted);
@@ -1096,23 +1107,27 @@ fn decode_cache_refuses_straddling_fill_without_evicting_collision() {
     assert!(cache.native_code_watch.is_watched(0x203));
     assert!(!cache.native_code_watch.is_watched(0x0fff));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     assert!(!cache.put(0x107, insn, false, 0x0fff).inserted);
     assert!(cache.get(0x103, false).is_some());
     assert!(!cache.native_code_watch.is_watched(0x0fff));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     assert!(!cache.put(u32::MAX, insn, false, 0x300).inserted);
     assert!(cache.get(0x103, false).is_some());
     assert!(!cache.put(0x107, insn, false, u32::MAX).inserted);
     assert!(cache.get(0x103, false).is_some());
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 
     insn.len = 1;
     assert!(cache.put(0x0fff, insn, false, 0x0fff).inserted);
     assert!(cache.get(0x0fff, false).is_some());
     assert!(cache.native_code_watch.is_watched(0x0fff));
     cache.assert_native_watch_consistent();
+    cache.assert_packs_consistent();
 }
 
 #[test]

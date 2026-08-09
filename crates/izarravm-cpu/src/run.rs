@@ -621,6 +621,29 @@ impl CpuGsw {
         // the cap test below for the derivation.
         let raw_at_entry = bus.in_batch_raw_bus_clocks();
         let cap_screen_scale = bus.in_batch_scaled_bus_clocks_screen_scale();
+        // First-touch policy, decided ONCE per run: the knob is process-constant (see
+        // `decode_pack_enabled`) and the loop below is the exact code the packed arm exists to
+        // make cheaper, so asking per continuation would put back some of what it removes.
+        //
+        // The dispatch gates are part of the CONDITION, not a tidy-up. The packed screens pay for
+        // themselves only when a native dispatch can consume them and leave the instruction
+        // unread; a run that cannot dispatch natively — the interpreter switch, a disabled
+        // backend, the accurate-timing persona class — interprets every continuation and would
+        // read the packed entry and THEN the line, strictly more than the unpacked arm does. Such
+        // a run takes the unpacked path.
+        //
+        // The two gates asked here are exactly the RUN-INVARIANT prefix of
+        // `dispatch_continuation`'s chain (the latch is per-continuation by construction, and
+        // `backend_enabled` is already folded into `admission_active`). The mode is batch-scoped
+        // for the same reason the cap screen's inputs above are: a mode change is staged in
+        // `pending_mode` and applied after the batch, so a run never straddles one.
+        //
+        // The WRITERS stay unconditional: the packed entries a non-dispatching run publishes have
+        // to be correct for the next run that does.
+        #[cfg(feature = "jit")]
+        let pack_first_touch = native_continuations_active
+            && self.mode().uses_approximate_timing()
+            && crate::decode_pack_enabled();
         let rep_budget = RepBudget { bus_at_entry, cap };
         self.perf.straight_line_runs += 1;
         // Seam counters, folded once per run (never per-instruction on the hot path).
@@ -638,37 +661,63 @@ impl CpuGsw {
                 let lin = self.linear_eip();
                 let cs = self.registers.cs();
                 seam_probes += 1;
-                // ONE decode-line fetch for the whole iteration. The probe, the admission hotness
+                // ONE decode-cache fetch for the whole iteration. The probe, the admission hotness
                 // bump, the block key's physical start and the warm-fetch charge all wanted the
-                // same line and each used to index the table and repeat its tag check; they now
-                // read this view.
+                // same slot and each used to index the table and repeat its tag check; they now
+                // read what this fetch returns.
                 //
-                // STALENESS: the view is a snapshot taken BEFORE dispatch, and the interpreter
+                // Which array that fetch reads is the `IZARRAVM_DECODE_PACK` A/B. The packed arm
+                // answers the three screens and the whole native admission path out of 16 bytes
+                // and only materialises the 56-byte line when this continuation is going to be
+                // INTERPRETED; the unpacked arm takes the full line up front as the loop always
+                // did. `held_view` is what carries the difference: `Some` on the unpacked arm
+                // means the line is already in hand.
+                //
+                // STALENESS: the fetch is a snapshot taken BEFORE dispatch, and the interpreter
                 // below deliberately executes what it read. This is the same argument the decode
                 // cache's insn copy rests on (`.bench/results/decodecache-20260731/RESULTS.md`):
                 // a borrow would be unsound because lines get refilled, a copy simply commits to
                 // the instruction the probe saw. Nothing on the path between here and the consumers
                 // can invalidate this line anyway — admission only READS the decode cache (its
                 // compile walk uses `get`, never `put`), and every arm that returns to the
-                // interpreter does so before any guest instruction executes.
-                let view = match self.decode_cache.get_view(lin, cs.default_size_32) {
-                    Some(view) => {
-                        if !view.insn.continuable {
+                // interpreter does so before any guest instruction executes. That property is what
+                // lets the packed arm defer the line fetch past dispatch; it is not assumed, it is
+                // counted (`decode_pack_late_view_miss`, expected identically zero).
+                #[cfg(feature = "jit")]
+                let (held_view, screened) = if pack_first_touch {
+                    (None, self.decode_cache.get_packed(lin, cs.default_size_32))
+                } else {
+                    let view = self.decode_cache.get_view(lin, cs.default_size_32);
+                    (view, view.map(|view| view.screen()))
+                };
+                // No backend, no native dispatch, so no arm to choose between: an interpreter-only
+                // build is the unpacked path by construction, and the packed array does not exist
+                // in it. `screen` then feeds nothing but the three break checks, which is what the
+                // allow below is about.
+                #[cfg(not(feature = "jit"))]
+                let (held_view, screened) = {
+                    let view = self.decode_cache.get_view(lin, cs.default_size_32);
+                    (view, view.map(|view| view.screen()))
+                };
+                #[cfg_attr(not(feature = "jit"), allow(unused_variables))]
+                let screen = match screened {
+                    Some(screen) => {
+                        if !screen.continuable {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_not_continuable += 1;
                             break;
                         }
-                        if (lin & 0xfff) + u32::from(view.insn.len) > 0x1000 {
+                        if (lin & 0xfff) + u32::from(screen.len) > 0x1000 {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_page_cross += 1;
                             break;
                         }
-                        if !Self::fetch_within_limit(self.registers.eip, view.insn.len, cs.limit) {
+                        if !Self::fetch_within_limit(self.registers.eip, screen.len, cs.limit) {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_not_continuable += 1;
                             break;
                         }
-                        view
+                        screen
                     }
                     None => {
                         self.perf.brk_decode_or_branch += 1;
@@ -684,7 +733,7 @@ impl CpuGsw {
                 let direct_outcome = match self.dispatch_continuation(
                     bus,
                     native_continuations_active,
-                    &view,
+                    screen,
                     lin,
                     cs.default_size_32,
                     ContinuationBudget {
@@ -705,6 +754,25 @@ impl CpuGsw {
                 match direct_outcome {
                     Some(outcome) => outcome,
                     None => {
+                        // The interpreted arm is the one that needs the instruction, so this is
+                        // where the packed arm pays for the line. A miss here would mean something
+                        // on the admission path invalidated the slot after the screens passed,
+                        // which the staleness note above says cannot happen; ending the run on the
+                        // same decode-miss boundary a first-touch miss takes is the sound answer
+                        // if it ever did, and the counter is how a run says it did not.
+                        let view = match held_view {
+                            Some(view) => view,
+                            None => match self.decode_cache.get_view(lin, cs.default_size_32) {
+                                Some(view) => view,
+                                None => {
+                                    #[cfg(feature = "jit")]
+                                    self.jit_direct.note_decode_pack_late_view_miss();
+                                    self.perf.brk_decode_or_branch += 1;
+                                    self.perf.brk_cont_decode_miss += 1;
+                                    break;
+                                }
+                            },
+                        };
                         // A continuation skips cycle_no_interrupt_check (which resets this
                         // field to 0 for a fresh first instruction), so set it explicitly:
                         // total is exactly the prior instructions' charge in this run, not
@@ -1051,7 +1119,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         native_continuations_active: bool,
-        view: &DecodeLineView,
+        screen: DecodeScreenView,
         lin: u32,
         d: bool,
         budget: ContinuationBudget,
@@ -1069,7 +1137,7 @@ impl CpuGsw {
         if !self.mode().uses_approximate_timing() {
             return Ok(ContinuationDispatch::Skipped);
         }
-        match self.try_direct_continuation(bus, view, lin, d, budget)? {
+        match self.try_direct_continuation(bus, screen, lin, d, budget)? {
             DirectContinuation::Run(outcome) => Ok(ContinuationDispatch::Native(outcome)),
             DirectContinuation::Prefix(outcome) => {
                 self.direct_runtime.skip_direct_once = true;
@@ -1083,7 +1151,7 @@ impl CpuGsw {
     fn try_direct_continuation<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        view: &DecodeLineView,
+        screen: DecodeScreenView,
         lin: u32,
         d: bool,
         budget: ContinuationBudget,
@@ -1098,8 +1166,8 @@ impl CpuGsw {
         // Placed BEFORE `direct_hot` so the bookkeeping goes too. That is observationally
         // equivalent, and the reason is worth stating because it is the entire correctness case:
         // `direct_hot` only ever increments a line whose `d` already matches, so a 16-bit boundary
-        // can only heat a line with `d == false`; and `DecodeCache::put` REPLACES the whole
-        // `DecodeLine` with `jit_direct_hotness: 0` rather than merging, so the moment that linear
+        // can only heat a line with `d == false`; and `DecodeCache::put` REPUBLISHES the whole
+        // slot with `jit_direct_hotness: 0` rather than merging, so the moment that linear
         // address is executed as 32-bit code the line is re-inserted and the counter is zeroed.
         // The heating removed here is therefore write-only state that is always destroyed before
         // any 32-bit consumer can read it. The one in-place invalidator that preserves the counter,
@@ -1122,11 +1190,11 @@ impl CpuGsw {
         }
         if !self
             .decode_cache
-            .direct_hot_at(view.slot, self.jit_direct.admission_heat())
+            .direct_hot_at(screen.slot, self.jit_direct.admission_heat())
         {
             return Ok(DirectContinuation::Interpret);
         }
-        let Some(key) = jit::direct::key_for_phys(self, lin, d, view.phys_start) else {
+        let Some(key) = jit::direct::key_for_phys(self, lin, d, screen.phys_start) else {
             return Ok(DirectContinuation::Interpret);
         };
         let probe = self.jit_direct.probe(key);
@@ -1332,7 +1400,7 @@ impl CpuGsw {
         };
         let _ = self.try_direct_continuation(
             bus,
-            &view,
+            view.screen(),
             lin,
             d,
             ContinuationBudget {
@@ -1365,7 +1433,7 @@ impl CpuGsw {
         self.dispatch_continuation(
             bus,
             native_continuations_active,
-            &view,
+            view.screen(),
             lin,
             d,
             ContinuationBudget {

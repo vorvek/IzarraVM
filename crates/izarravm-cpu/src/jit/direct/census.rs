@@ -384,6 +384,12 @@ pub(crate) struct DirectStallTally {
     /// aggregate `PerfCounters::smc_lane_registrations`. The split is what the A/B needs:
     /// `smc_lane_accepts` moving with this counter flat would say the imm lanes did the work.
     pub disp_lane_registrations: u64,
+    /// Interpreted continuations whose decode line had died between the packed first touch and
+    /// the deferred full-view fetch (`IZARRAVM_DECODE_PACK`). The staleness argument in
+    /// `run_budgeted_inner` says admission cannot invalidate the slot it screened, so this is the
+    /// counter that makes that a measurement instead of a claim: any nonzero value on a real run
+    /// falsifies it, and the packed arm loses continuations the unpacked arm would have run.
+    pub decode_pack_late_view_miss: u64,
     /// Entries refused because a call-out-bearing block met the privilege state whose port reads
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
@@ -1026,6 +1032,7 @@ impl crate::jit::JitState {
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
             disp_lane_registrations: self.stalls.disp_lane_registrations,
+            decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
         }
     }
 

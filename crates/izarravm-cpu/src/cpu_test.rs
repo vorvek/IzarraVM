@@ -57,9 +57,10 @@ fn cpu_registers_field_offset_is_stable() {
     // `CpuGsw` itself, moving this pin from 504 to 464 (measured via a failing-test readout, not
     // derived: rustc's field reordering does not guarantee the naive byte-count shift). The
     // emitter re-reads the offset, so updating this number is a documentation change, not a code
-    // fix.
+    // fix. The decode-line first-touch slice adds the packed side array's `Box` to `DecodeCache`,
+    // which sits ahead of `registers`, moving this pin from 464 to 480 -- measured, not derived.
     assert_eq!(
-        off, 464,
+        off, 480,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -1858,7 +1859,11 @@ fn pending_flags_offset() {
     // interpreter field after the array had shifted cache lines. The array now lives at the
     // struct TAIL (fault_site's precedent) and this pin is back at its pre-R15 value --
     // measured, not derived. Do not let this array migrate mid-struct again.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4528);
+    // The decode-line first-touch slice adds one `Box<[DecodePack]>` to `DecodeCache` (16 bytes
+    // of fat pointer, mid-struct because the cache is a by-value field), moving this pin 4528 ->
+    // 4544 -- measured, not derived. It is a pointer, not a payload: the array it addresses is a
+    // separate 1 MB allocation whose whole purpose is to be the resident one.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4544);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -3749,6 +3754,14 @@ mod jit_disp_lane;
 ))]
 #[path = "cpu_jit_callout_test.rs"]
 mod jit_callout;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_decode_pack_test.rs"]
+mod decode_pack;
 
 /// C1e: `DecodedInsn`'s recorded `{disp_len, imm_len}` pair (design section 1.2, review
 /// finding M3) did NOT fit the struct's padding: the size grew 36 -> 40 and is pinned

@@ -428,7 +428,7 @@ fn fast_map_byte_write_feeds_unit_sim_even_when_unwatched() {
 fn sixteen_bit_boundaries_skip_the_direct_admission_path() {
     fn hotness(cpu: &CpuGsw, lin: u32) -> u8 {
         let index = (lin & cpu.decode_cache.mask) as usize;
-        cpu.decode_cache.lines[index].jit_direct_hotness
+        cpu.decode_cache.packs[index].jit_direct_hotness
     }
 
     // A trivial 16-bit loop that halts, so the decode lines around 0x101 are warmed by a real
