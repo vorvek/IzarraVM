@@ -2824,6 +2824,42 @@ struct MachineBus<'a> {
     /// byte-identical behavior. A single bool test at the top
     /// of the one arm that branches on it, not a per-access classification.
     lazy_port_reads: bool,
+    /// The Accurate-class (386) extension of the lazy time-derived port reads:
+    /// 3DA/3BA/3C2 (VGA status), 0x61 (PIT channel 1/2 OUT), and 0x200-0x207
+    /// (the gameport RC one-shots) answer WITHOUT ending the CPU batch.
+    /// `IZARRAVM_LAZY_PORT_386`, DEFAULT OFF.
+    ///
+    /// It is false for the whole Approximate class BY CONSTRUCTION, not merely
+    /// by default: 486/586 already get the 3DA and 0x61 arms from
+    /// `lazy_port_reads`, and the gameport arm is new, so letting this bool go
+    /// true there would silently move a pinned 486/586 fixture. Every use site
+    /// is therefore `lazy_port_reads || lazy_ports_386` (the two shared arms) or
+    /// `lazy_ports_386` alone (the gameport).
+    ///
+    /// Deliberately NOT folded into `lazy_port_reads`, which also gates the
+    /// ring-0-monitor `io_touched` exemption, the OPL ISA-I/O charge, and
+    /// `predicted_opl_status`. Those three are Approximate-class policy and do
+    /// not move with this switch: the Accurate class's ISA-I/O charging rules
+    /// stay byte-identical either way, and an OPL status poll stays
+    /// batch-ending in both classes.
+    ///
+    /// THE DRIFT, stated exactly, because it is why the default is OFF.
+    /// A lazy read is exact against the contract "end the batch HERE, advance
+    /// devices, then read": `predicted_beam` and `Pit::out_after` are pinned to
+    /// agree with a real `advance_devices` of the same clock total. But the
+    /// batch-ending path the Accurate class uses today is the OTHER order -- it
+    /// reads the LIVE device state, which is the state as of BATCH START, and
+    /// only then ends the batch. So moving a port from batch-ending to lazy
+    /// moves its answer forward by the batch clocks already elapsed at the read
+    /// instant. That is strictly closer to hardware and strictly not
+    /// byte-identical in general, and on a retrace poll it can change how many
+    /// iterations the loop spins.
+    ///
+    /// 0x200-0x207 is the exception and the one port where the value provably
+    /// cannot move: it already comes from `guest_tick_now()` (the in-batch
+    /// instant) in BOTH classes today, so only the batch boundary moves, not
+    /// the function of time being sampled.
+    lazy_ports_386: bool,
     // Set true by any port I/O this batch. The run loop batches straight-line
     // instructions and services devices once per batch; a port access (a PIT
     // latch read, 0x3DA retrace poll, RTC read, a PIT/PIC/DSP/mode write) reads

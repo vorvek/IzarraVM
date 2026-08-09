@@ -22,6 +22,37 @@ fn ranges_overlap(start: u32, len: u32, observed_start: u32, observed_len: u32) 
     start < observed_end && observed_start < end
 }
 
+/// Whether the Accurate (386) class also answers the time-derived poll ports
+/// lazily, i.e. WITHOUT ending the CPU batch. `IZARRAVM_LAZY_PORT_386`.
+///
+/// DEFAULT OFF, and that is a fidelity decision, not caution: see
+/// `MachineBus::lazy_ports_386` for the exact drift this changes. Read once
+/// per process; the run loop reads the resolved bool, never the environment.
+fn lazy_port_reads_386_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("IZARRAVM_LAZY_PORT_386")
+            .map(|value| matches!(value.trim(), "1" | "on" | "true" | "yes"))
+            .unwrap_or(false)
+    });
+    *ENABLED
+}
+
+/// The whole composition rule for `MachineBus::lazy_ports_386`, split out from
+/// the environment read so it is testable without touching process state.
+///
+/// The `!uses_approximate_timing()` term is the load-bearing half: it is what
+/// makes the switch structurally unable to move 486/586, which already have the
+/// 3DA and 0x61 arms from `lazy_port_reads` and have never had the gameport arm.
+pub(super) const fn lazy_ports_386_composed(mode: GswMode, env_enabled: bool) -> bool {
+    !mode.uses_approximate_timing() && env_enabled
+}
+
+/// `lazy_ports_386_composed` against the process environment. One call per bus
+/// construction; the environment itself is read once per process.
+pub(super) fn lazy_ports_386_for(mode: GswMode) -> bool {
+    lazy_ports_386_composed(mode, lazy_port_reads_386_enabled())
+}
+
 impl Machine {
     pub(super) fn make_bus(&mut self) -> MachineBus<'_> {
         // Captured before the struct literal below since VEGA and trace are also
@@ -77,6 +108,7 @@ impl Machine {
             cache: &mut self.cache_model,
             flat_data_cost: self.active_mode.uses_approximate_timing(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
+            lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
@@ -1404,6 +1436,15 @@ impl CpuBus for MachineBus<'_> {
         if skip_io_touched {
             *self.exempt_io_touched = true;
         }
+        // Snapshot for the lazy gameport arm far below, which is the one lazy
+        // port that cannot be dispatched before the general `io_touched` set:
+        // its decode position is load-bearing (a configured WSS/SB base could in
+        // principle overlap 0x200-0x207, and today the earlier arm wins). Rather
+        // than hoist the arm and silently change that precedence, the arm CLEARS
+        // the flag again -- but only when this very read is what set it, which is
+        // what this snapshot establishes. A wider-than-byte access re-enters
+        // read_io per byte and so re-snapshots per byte.
+        let io_touched_before_read = *self.io_touched;
         // Bus-clock trace recording stays unconditional for every port, both timing
         // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
         // here, so a lazy read that skipped this would under-predict its own beam.
@@ -1507,7 +1548,7 @@ impl CpuBus for MachineBus<'_> {
         // write itself sets io_touched and ends the batch, so no further lazy read
         // can observe the stale prediction within the same batch.
         if matches!(port, 0x3DA | 0x3BA | 0x3C2) && self.vega.port_enabled(port) {
-            if self.lazy_port_reads {
+            if self.lazy_port_reads || self.lazy_ports_386 {
                 let beam = self.predicted_beam();
                 if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
                     return Ok(u32::from(value));
@@ -1550,7 +1591,7 @@ impl CpuBus for MachineBus<'_> {
         // write_io, so GATE cannot move between this read and the batch end
         // either.
         if port == 0x61 {
-            if self.lazy_port_reads {
+            if self.lazy_port_reads || self.lazy_ports_386 {
                 // Both channels share the SAME elapsed-PIT-clocks conversion
                 // (same rate, same batch-entry carry): computed once here rather
                 // than twice inside two separate predicted_pit_out calls, since
@@ -1725,6 +1766,20 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
         }
         if (0x0200..=0x0207).contains(&port) {
+            // The gameport is the strongest lazy candidate in the machine and the
+            // only one whose VALUE does not move when the batch stops ending
+            // here: `GamePort::read` takes `&self` and is a pure function of the
+            // two RC discharge deadlines and `guest_tick_now()`, the SAME
+            // in-batch instant both timing classes already sample it at. Nothing
+            // in `advance_devices` touches those deadlines -- their only writers
+            // are `charge` (the 0x201 WRITE, which sets io_touched in write_io
+            // and so ends the batch before any later read in the same batch) and
+            // `set_state` (host-side injection, which runs between run calls).
+            // So the batch boundary moves and the sampled function does not,
+            // which is exactly the "same value at the same instant" contract.
+            if self.lazy_ports_386 && !io_touched_before_read {
+                *self.io_touched = false;
+            }
             return Ok(u32::from(self.gameport.read(self.guest_tick_now())));
         }
         if let Some(value) = self.unittester.read_port(port) {
