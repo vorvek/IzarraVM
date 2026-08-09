@@ -1497,6 +1497,140 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
 }
 
 #[test]
+fn only_the_arming_write_ends_the_batch_while_a_long_blit_drains() {
+    // The batch break is an EDGE on the blitter's modeled busy time, not the
+    // BUSY level. A blit can outlast a batch -- this 640x480 PATCOPY models
+    // ~1.54 ms against a 1 ms coarse cap -- and a guest that overlaps CPU
+    // rendering with one must keep batching its framebuffer writes. A
+    // level-triggered break turns that overlap into one batch per written byte,
+    // on every tier including 586.
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, 0); // DST_XY
+        write_mmio_reg(&mut machine, 0x11c, (640 << 16) | 480); // DIM
+        write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x128, 0xf0); // ROP: PATCOPY
+
+        machine.io_touched = false;
+        write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL
+        assert!(
+            machine.io_touched,
+            "{mode:?}: the arming write must end its own batch"
+        );
+        let busy_ns = machine.vega.blitter_busy_ns();
+        assert!(
+            busy_ns > 1_000_000,
+            "{mode:?}: this blit must outlast a coarse batch, modeled {busy_ns} ns"
+        );
+
+        // Everything below runs WHILE the engine is busy.
+        machine.io_touched = false;
+        machine.write_physical_u8(MARGO_LFB_BASE + 0x1234, 0x5a);
+        assert!(
+            !machine.io_touched,
+            "{mode:?}: an LFB write during a blit must keep batching"
+        );
+        machine.write_physical_u8(0x000a_0000, 0x5a);
+        assert!(
+            !machine.io_touched,
+            "{mode:?}: a legacy-aperture write during a blit must keep batching"
+        );
+        // Even an MMIO write: only one that ADDS busy time is an arming write.
+        write_mmio_reg(&mut machine, 0x120, 0x17); // FG_COLOR, no command
+        assert!(
+            !machine.io_touched,
+            "{mode:?}: a non-arming MMIO write during a blit must keep batching"
+        );
+        assert_eq!(
+            machine.vega.blitter_busy_ns(),
+            busy_ns,
+            "{mode:?}: none of those writes may have touched the busy model"
+        );
+    }
+}
+
+#[test]
+fn a_pit_counter_observer_holds_the_fine_batch_grain_on_the_accurate_class() {
+    // A counter read reports the counting element as of BATCH START, so a guest
+    // timing itself against the PIT is a batch-granularity consumer exactly like
+    // the audio producers. Reading a counter port arms the window; letting the
+    // window expire in guest time releases it.
+    for mode in ACCURATE_MODES {
+        let coarse = coarse_fallback(mode);
+        let fine = fine_fallback(mode);
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            coarse,
+            "{mode:?}: nothing has touched the PIT yet"
+        );
+
+        with_bus(&mut machine, |bus| {
+            bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+        });
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            fine,
+            "{mode:?}: a counter read must pull the cap to the DAC period"
+        );
+
+        // The window is guest time, not a batch count: it survives an advance
+        // shorter than itself and dies at one longer.
+        machine.advance_devices_ticks(crate::timing::PIT_OBSERVER_FINE_WINDOW_TICKS / 2);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            fine,
+            "{mode:?}: still inside the observer window"
+        );
+        machine.advance_devices_ticks(crate::timing::PIT_OBSERVER_FINE_WINDOW_TICKS);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            coarse,
+            "{mode:?}: the observer window expired"
+        );
+
+        // A control-port write arms it too: that is the first touch of a
+        // program-latch-compute-latch calibration.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x00, false).unwrap();
+        });
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            fine,
+            "{mode:?}: a latch command must arm the window"
+        );
+    }
+}
+
+#[test]
+fn approximate_class_ignores_the_pit_observer_window() {
+    // Same short-circuit as the audio terms: 486/586 never reach the fine
+    // fallback, so a PIT-timing guest cannot change their batch length.
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+        });
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            coarse_fallback(mode),
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn event_batch_cap_reaches_a_near_due_stereo_dsp_edge_in_every_mode() {
     for mode in [
         GswMode::Gsw586,

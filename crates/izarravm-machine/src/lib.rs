@@ -54,7 +54,7 @@ mod video;
 mod video_params;
 
 use timeline::{DeviceAdvance, DeviceRates, RatePhase, Timeline};
-use vega::Vega;
+use vega::{Vega, VideoWrite};
 
 use sb16_path::{Ct1745Mix, Sb16Path, Sb16RenderWindow};
 
@@ -1032,6 +1032,15 @@ pub struct Machine {
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
     isa_io_batch_clocks: u64,
+    // Master-timeline instant until which a PIT counter observer is assumed live,
+    // set by any access to the counter data ports or the control port and read by
+    // `fine_batch_grain_required`. A counter read reports state as of BATCH START
+    // (nothing peeks the counting element the way `Pit::out_after` peeks OUT), so
+    // a guest measuring elapsed time by latching a counter is a batch-granularity
+    // consumer exactly like the audio ones, and the Accurate class keeps its fine
+    // batch while one is around. Host scheduling only: never guest-visible state,
+    // never canonical.
+    pit_observer_fine_until: u64,
     // Diagnostic-only OPL counters plus an optional access trace; see `OplProbe`.
     // Never read by an emulation decision and never part of canonical state, so
     // unlike `isa_io_batch_clocks` above it does not gate a canonical capture.
@@ -1402,6 +1411,7 @@ impl Machine {
             last_int_vector: None,
             io_touched: false,
             isa_io_batch_clocks: 0,
+            pit_observer_fine_until: 0,
             opl_probe: OplProbe::from_env(),
             device_wrote_memory: false,
             pending_device_memory_write_range: None,
@@ -2790,6 +2800,9 @@ struct MachineBus<'a> {
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::isa_io_batch_clocks`.
     isa_io_clocks: &'a mut u64,
+    // Points at `Machine::pit_observer_fine_until`. Armed by any PIT counter or
+    // control port access; see that field.
+    pit_observer_fine_until: &'a mut u64,
     // Diagnostic-only OPL counters and trace. Points at `Machine::opl_probe`.
     // Never read by any emulation decision; see `OplProbe`.
     opl_probe: &'a mut OplProbe,

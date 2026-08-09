@@ -79,6 +79,7 @@ impl Machine {
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             io_touched: &mut self.io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
+            pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
             device_wrote_memory: &mut self.device_wrote_memory,
             pending_device_memory_write_range: &mut self.pending_device_memory_write_range,
@@ -1677,6 +1678,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pit.read_port(port) {
+            self.note_pit_observer();
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pic.read_port(port) {
@@ -2010,7 +2012,11 @@ impl CpuBus for MachineBus<'_> {
             }
             return Ok(());
         }
-        if self.pit.write_port(port, value as u8) || self.pic.write_port(port, value as u8) {
+        if self.pit.write_port(port, value as u8) {
+            self.note_pit_observer();
+            return Ok(());
+        }
+        if self.pic.write_port(port, value as u8) {
             return Ok(());
         }
         let a20_before = self.keyboard.a20_enabled();
@@ -2644,8 +2650,8 @@ impl MachineBus<'_> {
             }
             ByteRoute::Rom | ByteRoute::OpenBus => {}
             ByteRoute::DeviceOrFallbackRam => {
-                if self.vega.write_memory_u8(address, value) {
-                    // A write that ARMED the Margo blit engine ends the batch,
+                match self.vega.write_memory_u8(address, value) {
+                    // The write that ARMED the Margo blit engine ends the batch,
                     // the way a port write does. Memory writes deliberately do
                     // not set io_touched (framebuffer blits must keep batching),
                     // but this one case has to: STATUS.BUSY is MMIO, so the
@@ -2655,17 +2661,23 @@ impl MachineBus<'_> {
                     // the operation was, and the spin bills the guest a whole
                     // batch cap per blit. Ending here lets `event_batch_cap`'s
                     // MargoNs term size the next batch to the real busy time.
-                    // Only true immediately after an arming write: `busy_ns` is
-                    // set by COMMAND (and by the final MONO_DATA word of a
-                    // color-expand stream) and drains at the next advance.
-                    if self.vega.blitter_busy_ns() > 0 {
+                    //
+                    // EDGE, not level: `VideoWrite::ArmedBlit` is reported only
+                    // by a write that added busy time (see `VideoWrite`). A blit
+                    // can outlast a batch, and writes overlapped with a running
+                    // one must NOT end their batch -- that would turn a long blit
+                    // into thousands of single-instruction batches.
+                    VideoWrite::ArmedBlit => {
                         *self.io_touched = true;
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                if (address as usize) < self.memory.len() {
-                    self.memory.write_u8(address as usize, value)?;
-                    recorder.record_ram_write(address, 1);
+                    VideoWrite::Accepted => return Ok(()),
+                    VideoWrite::Unclaimed => {
+                        if (address as usize) < self.memory.len() {
+                            self.memory.write_u8(address as usize, value)?;
+                            recorder.record_ram_write(address, 1);
+                        }
+                    }
                 }
             }
         }

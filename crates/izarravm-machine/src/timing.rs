@@ -72,6 +72,16 @@ pub const MIX_HEADROOM: f32 = 0.5;
 pub const PIT_INPUT_HZ: u32 = 1_193_182;
 pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 
+/// How long a PIT counter access keeps the Accurate class on its fine batch
+/// grain. See `MachineBus::note_pit_observer`.
+///
+/// 5 ms is chosen to cover the "compute" leg of a latch-compute-latch
+/// calibration -- BIOS and game delay-loop calibrations time windows well under
+/// a millisecond -- without pinning a machine to the fine grain because
+/// something read a counter once. It is guest time, not host time, so it does
+/// not vary with the CPU mode.
+pub(crate) const PIT_OBSERVER_FINE_WINDOW_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 200;
+
 impl Machine {
     pub(super) fn stall_for_micros(&mut self, micros: u64) {
         let master_ticks = (u128::from(micros) * u128::from(izarravm_core::MASTER_CLOCK_HZ)
@@ -896,6 +906,12 @@ impl Machine {
     /// - DSP output clock, WSS playback/autocal, Red Book CD playback. The
     ///   DMA-fed producers; a fine batch keeps the DMA current-count a guest can
     ///   poll for its play position moving one frame at a time.
+    /// - A recent PIT counter access (`pit_observer_fine_until`). Not audio at
+    ///   all: a counter read reports the counting element as of BATCH START,
+    ///   because nothing peeks it the way `Pit::out_after` peeks OUT. A guest
+    ///   measuring time by latching a counter is therefore as sharp a
+    ///   batch-granularity consumer as any producer above, and the window keeps
+    ///   the grain fine across the compute leg between two latches.
     ///
     /// NOT a term, deliberately: the sample producers' own fidelity. The original
     /// cap (2026-06-21) existed so "the per-clock fine-samplers ... never alias" --
@@ -918,6 +934,7 @@ impl Machine {
             || self.sb16.is_producing()
             || (self.wss_enabled && (self.wss.is_playing() || self.wss.autocal_active()))
             || self.ide.device().playback().playing
+            || self.timeline.now_ticks() < self.pit_observer_fine_until
     }
 
     /// CPU clocks until the next due device event.
@@ -936,17 +953,21 @@ impl Machine {
     /// running. Gating it leaves the protected cases exactly as fine as before
     /// and gives the idle case the same 1 ms ceiling the Approximate class uses.
     ///
-    /// KNOWN CAVEAT (accepted, measured, not silently absorbed): time-derived
-    /// port reads with no in-batch peek -- chiefly the PIT counter latch on
-    /// 0x40/0x42 -- return device state as of BATCH START. A read ends the batch,
-    /// so only instructions executed before it in the same batch are unaccounted;
-    /// with the fine fallback that was bounded at ~23 us on the 386 tier and with
-    /// the coarse one it is bounded at 1 ms, which is what the Approximate class
-    /// has always accepted. A calibration loop of the shape "latch, compute,
-    /// latch" therefore under-reports by up to one batch. The principled fix is a
-    /// counter peek in `Pit` (the `out_after` precedent, which port 0x61 already
-    /// uses on the lazy path), not a batch-length floor; until then this is the
-    /// one place where the Accurate class's grain widens when audio is idle.
+    /// KNOWN CAVEAT (bounded here, not silently absorbed): time-derived port
+    /// reads with no in-batch peek -- chiefly the PIT counter latch on
+    /// 0x40/0x42 -- return device state as of BATCH START. Nothing peeks the
+    /// counting element the way `Pit::out_after` peeks OUT, so a "latch,
+    /// compute, latch" measurement misses whatever ran between batch start and
+    /// each latch. That is why the PIT-observer window is a gate term: the FIRST
+    /// counter touch (a control write, a reload write, or a read -- all
+    /// batch-ending) arms it, so from the second touch onward the error is back
+    /// to the ~23 us the fine fallback always gave. What remains is exactly the
+    /// first touch after a quiet stretch, which can sit up to one coarse batch
+    /// (1 ms) into its batch -- the bound the Approximate class has always
+    /// accepted on every touch. The principled fix that removes even that is a
+    /// counter-value peek in `Pit` (the `out_after` precedent, which port 0x61
+    /// already uses on the lazy path); it is not a batch-length floor, and the
+    /// floor is not a substitute for it.
     ///
     /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
     /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
@@ -1155,6 +1176,24 @@ impl MachineBus<'_> {
     /// `pit_clocks` value the real call will start folding T's clocks into: no
     /// time travel, this predicts exactly what a real `advance_devices` at T
     /// followed by a read would produce.
+    /// Record that the guest just touched a PIT counter, so the Accurate class
+    /// keeps its fine batch grain for a while (see
+    /// `Machine::fine_batch_grain_required` and `pit_observer_fine_until`).
+    ///
+    /// Armed by every access to 0x40-0x43, read or write: a guest measuring
+    /// elapsed time through the PIT programs a counter, latches it, computes,
+    /// and latches again, and only the FIRST of those touches can land in a
+    /// coarse batch. The window is generous (`PIT_OBSERVER_FINE_WINDOW_MS`)
+    /// because the whole point is to cover the "compute" leg between two
+    /// latches; it is charged from batch start rather than the exact in-flight
+    /// instruction because a few microseconds at this scale cannot matter and
+    /// `master_ticks_at_batch_start` is already loaded here.
+    pub(super) fn note_pit_observer(&mut self) {
+        *self.pit_observer_fine_until = self
+            .master_ticks_at_batch_start
+            .saturating_add(PIT_OBSERVER_FINE_WINDOW_TICKS);
+    }
+
     pub(super) fn elapsed_pit_clocks(&self) -> u64 {
         self.timeline_at_batch_start
             .preview_cpu_clocks(self.in_batch_clocks(), self.vega.dot_clock_hz())
