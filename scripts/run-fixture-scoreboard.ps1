@@ -35,7 +35,10 @@ param(
     [string]$Label = "",
     [string]$ResultsDirectory = "",
     [int]$ProcessorIndex = -1,
-    [int]$HostTimeoutSeconds = 1800,
+    # Per fixture, not for the sweep. duke3d-586 alone is about half an hour of
+    # wall since it has to play a DUKEMARK demo to completion, so the old 1800
+    # would kill the run it is meant to protect.
+    [int]$HostTimeoutSeconds = 3600,
     # Which JIT arm to drive. Both flags are read from the environment, so ONE
     # binary runs both arms and a comparison carries no build-to-build or
     # build-path-length variance at all.
@@ -89,6 +92,66 @@ $invariantPath = Join-Path $PSScriptRoot "fixture-scoreboard-invariants.json"
 $maximumBackgroundLoadPercent = 30.0
 
 # ---------------------------------------------------------------------------
+# DUKEMARK pins. DUKEMARK.EXE is a modified Duke Nukem 3D Atomic build that
+# plays a canned demo, samples FPS about four times a second, then exits to DOS
+# and prints a report.
+#
+# The whole run is GUEST-DRIVEN, which is the point of this shape:
+#
+#     @echo off
+#     cd \DUKE3D
+#     DUKEMARK.EXE /bqBENCH2 > C:\DUKEMARK.TXT
+#     C:\EXITVM.COM
+#
+# DOS redirection captures the report into a file on the mounted host folder,
+# and EXITVM.COM (the house 15-byte Lotura unit-tester exit poke, the same one
+# the Doom and bench16 fixtures carry) ends the VM. So the cycle budget is a
+# GUARD, not the thing that ends the run: the demo finishes when it finishes.
+#
+# The invariants, in descending order of how much they are worth:
+#
+#   exitCode  the run stopped as `test_exit` with EXITVM's code. The game
+#             returned to DOS on its own and the batch reached its last line.
+#             Completely insensitive to timing, and it is what replaced the
+#             cutoff-phase framebuffer hash.
+#   resultFile the redirected report exists and parses. It also guards the one
+#             real risk in this design: DUKEMARK's report goes through DOS
+#             stdout today (verified -- the text page is blank on a redirected
+#             run and the file holds the whole report), and if that ever became
+#             direct-video output the file would be empty rather than wrong.
+#   info      the Info String, a config fingerprint of
+#             Demo,Width,Height,Mode,Hud,Detail,Sound,Music read straight out of
+#             DUKE3D.CFG. Also timing-insensitive. `1,1` at the tail is sound and
+#             music both ENABLED, so an audio regression that silences the game
+#             cannot quietly present itself as a speedup. The first field does
+#             NOT identify the demo -- it reads 2 for BENCH1, BENCH2 and BENCH3
+#             alike (measured) -- so the sample count is the only field that does.
+#   samples   the extrapolation count, DUKEMARK's own stall detector, held to a
+#             TOLERANCE rather than an exact value. Its docs call the count
+#             constant per demo across machines, and it is not: BENCH2 reads 580
+#             at the 486 persona and rather more at the 586, reproducibly. It is
+#             therefore a function of emulated timing, and pinning it exactly
+#             would rebuild the re-pin treadmill this fixture was rewritten to
+#             escape. The band absorbs ordinary timing-model drift and is far
+#             tighter than the "stalls very hard" case it exists to catch: a
+#             multi-second stall inside a ~145 s demo moves it several percent.
+#
+# FPS min/max/avg are MEASUREMENTS. They are guest-observed frame rates and move
+# with host load, so they are reported and never asserted.
+$dukemarkSampleTolerance = 0.02
+function New-DukemarkPins([int]$Samples) {
+    @{
+        demo             = "BENCH2"
+        info             = "2,320,200,2,0,1,1,1"
+        resultFile       = "DUKEMARK.TXT"
+        # EXITVM.COM poking 0x51 at the unit-tester exit register, not zero.
+        exitCode         = 0x51
+        samples          = $Samples
+        samplesTolerance = $dukemarkSampleTolerance
+    }
+}
+
+# ---------------------------------------------------------------------------
 # The fixture table. Arguments are copied from .bench/PROTOCOL.md; see the note
 # in the .DESCRIPTION above about why they are copied rather than normalised.
 # ---------------------------------------------------------------------------
@@ -101,14 +164,14 @@ function Get-FixtureTable {
             cycles = [uint64]8000000000
             # Guest-reported, so robust to host noise. LOWER realtics is faster.
             realticsMinimum = 2900; realticsMaximum = 3050; gametics = 2134
-            qconsole = $false; resultPpm = $false; injection = @()
+            qconsole = $false; resultPpm = $false; injection = @(); dukemark = $null
         }
         [pscustomobject]@{
             name = "doom-586"; folder = "jemmex_doom_c"
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]6640000000
             realticsMinimum = 970; realticsMaximum = 1040; gametics = 2134
-            qconsole = $false; resultPpm = $false; injection = @()
+            qconsole = $false; resultPpm = $false; injection = @(); dukemark = $null
         }
         [pscustomobject]@{
             name = "quake-586"; folder = "quake_c"
@@ -118,7 +181,7 @@ function Get-FixtureTable {
             # QCONSOLE.LOG is the invariant. perf.instructions is NOT one: the
             # demo finishes before the budget and the run stops in an idle tail
             # whose length moves with the timing model.
-            qconsole = $true; resultPpm = $false; injection = @()
+            qconsole = $true; resultPpm = $false; injection = @(); dukemark = $null
         }
         [pscustomobject]@{
             name = "prince-486"; folder = "prince_c"
@@ -127,7 +190,7 @@ function Get-FixtureTable {
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]4000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true
+            qconsole = $false; resultPpm = $true; dukemark = $null
             # Six Shifts to reach level 1, then right HELD so he runs instead of
             # standing. A bare {right} is a tap and leaves him standing.
             injection = @("--inject-keys", ("400000000:{shift};600000000:{shift};" +
@@ -139,7 +202,7 @@ function Get-FixtureTable {
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]8000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true
+            qconsole = $false; resultPpm = $true; dukemark = $null
             # One Enter at the signon's "Press a key" so the title/credits/demo
             # rotation runs. Without it (and without the memory manager the
             # fixture's CONFIG.SYS was missing until 2026-08-08) every earlier
@@ -153,26 +216,36 @@ function Get-FixtureTable {
             # playback, past the ~35 guest seconds of startup plus rotation.
             cycles = [uint64]12000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true
+            qconsole = $false; resultPpm = $true; dukemark = $null
             # See wolf3d-486: the Enter is what gets the game past its signon.
             injection = @("--inject-keys", "2000000000:")
         }
         [pscustomobject]@{
             name = "duke3d-486"; folder = "duke3d_c"
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]7920000000
+            # A GUARD, not the length of the run: the guest exits itself through
+            # EXITVM once the demo is done, which lands at about 19.4e9 (294
+            # guest seconds). 26.4e9 is 400 guest seconds, so a run that hits
+            # the budget has genuinely failed to finish and says so.
+            cycles = [uint64]26400000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true; injection = @()
+            qconsole = $false; resultPpm = $false; injection = @()
+            dukemark = (New-DukemarkPins 580)
         }
         [pscustomobject]@{
             name = "duke3d-586"; folder = "duke3d_c"
-            # The most expensive fixture in the set at roughly 12 minutes, and
-            # currently the one furthest below real time, which is why it is the
-            # workload the campaign's merge rule protects.
+            # The most expensive fixture in the set, and the one furthest below
+            # real time, which is why it is the workload the campaign's merge
+            # rule protects.
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]19920000000
+            # Same guard role as the 486 row. 79.68e9 is 480 guest seconds at
+            # 166 MHz, comfortably past where EXITVM actually fires.
+            cycles = [uint64]79680000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true; injection = @()
+            qconsole = $false; resultPpm = $false; injection = @()
+            # Not the 486 row's number. Same demo, same config, same fixture --
+            # the count follows emulated timing, so it is pinned per persona.
+            dukemark = (New-DukemarkPins 962)
         }
         [pscustomobject]@{
             name = "nascar-586"; folder = "nascar1_c"
@@ -181,14 +254,14 @@ function Get-FixtureTable {
             arguments = @("--cpu", "586", "--memory-mib", "64")
             cycles = [uint64]4980000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true; injection = @()
+            qconsole = $false; resultPpm = $true; injection = @(); dukemark = $null
         }
         [pscustomobject]@{
             name = "gp2-586"; folder = "gp2_c"
             arguments = @("--cpu", "586", "--memory-mib", "64")
             cycles = [uint64]13280000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
-            qconsole = $false; resultPpm = $true
+            qconsole = $false; resultPpm = $true; dukemark = $null
             # Three clicks: credits OK, Quickrace, Select Circuit OK. GP2 sets
             # its own INT 33h ratio and is 1 pixel per mickey on BOTH axes,
             # which is NOT the TOKAMOUS default.
@@ -311,6 +384,63 @@ function Get-FileSha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+<#
+Read DUKEMARK's result out of the file the guest redirected it into.
+
+The fixture's AUTOEXEC runs `DUKEMARK.EXE /bqBENCH2 > C:\DUKEMARK.TXT` and then
+`C:\EXITVM.COM`, so the whole run is guest-driven: the demo plays, DOS captures
+the report through ordinary stdout redirection, and the guest ends the VM itself
+through the Lotura unit-tester exit port. Katea holds guest writes until
+`flush_hdd_folder()`, which the run's normal end-of-run path performs whatever
+the stop reason was, so the file is on the host by the time this reads it.
+
+VERIFIED, because it was the design's one real risk: DUKEMARK's final report DOES
+go through DOS stdout and lands in the file intact. Redirection would have caught
+nothing if the Build engine had painted that screen directly, and the check is
+cheap to repeat -- the text page is BLANK on a redirected run, so a regression to
+direct-video output shows up as an empty file rather than as silently wrong
+numbers.
+
+The tail of the file it is looking at is:
+
+     DukeMark by DXZeff
+
+     Info         : 2,320,200,2,0,1,1,1
+     FPS Minimum  : 1
+     FPS Maximum  : 50
+     FPS Average  : 27
+     Extrapolated : 580 Samples
+
+Returns `found = $false` when the file is missing entirely, which is a different
+failure (the redirection or the flush broke) from a present file with no Info
+line (the game never reached its own exit path).
+#>
+function Read-DukemarkResult([string]$ResultPath) {
+    $scraped = @{
+        found = $false; info = $null; samples = $null
+        fps_min = $null; fps_max = $null; fps_avg = $null
+        report = $null
+    }
+    if (-not (Test-Path -LiteralPath $ResultPath)) { return $scraped }
+    $lines = @(Get-Content -LiteralPath $ResultPath)
+    $scraped.found = $true
+    # Only the tail is worth keeping as evidence: everything before it is the
+    # engine's start-up chatter, which is not what this fixture measures.
+    $scraped.report = (@($lines | Where-Object { $_.Trim().Length -gt 0 }) |
+        Select-Object -Last 6) -join "`n"
+    foreach ($line in $lines) {
+        $trimmed = $line.TrimEnd()
+        if ($trimmed -match '^\s*Info\s*:\s*(\S+)\s*$') { $scraped.info = $Matches[1] }
+        elseif ($trimmed -match '^\s*FPS Minimum\s*:\s*(\d+)\s*$') { $scraped.fps_min = [int]$Matches[1] }
+        elseif ($trimmed -match '^\s*FPS Maximum\s*:\s*(\d+)\s*$') { $scraped.fps_max = [int]$Matches[1] }
+        elseif ($trimmed -match '^\s*FPS Average\s*:\s*(\d+)\s*$') { $scraped.fps_avg = [int]$Matches[1] }
+        elseif ($trimmed -match '^\s*Extrapolated\s*:\s*(\d+)\s+Samples\s*$') {
+            $scraped.samples = [int]$Matches[1]
+        }
+    }
+    return $scraped
+}
+
 # ---------------------------------------------------------------------------
 # Invariants. Held in a sidecar JSON so a legitimate move is a reviewable diff
 # rather than an edit buried in a script.
@@ -370,82 +500,6 @@ function Write-Invariants($Table) {
 }
 
 # ---------------------------------------------------------------------------
-# Duke3D cutoff-phase acceptance. The two duke3d rows' end-of-budget frames
-# are CUTOFF-PHASE sensitive (the fixed-cycle axe lands mid-render in an
-# animating demo), so any JIT-mix change that shifts cycle charging
-# legitimately moves them -- six benign moves in three days, each one failing
-# a sweep and costing a manual re-pin. This automates the documented
-# acceptance test (duke3d-486's `note` in the invariants json is the
-# authority): run 2.64e9 cycles at 486 -- the stable loading screen, AFTER
-# the heaviest 16-bit phase -- and compare against
-# `frame_sha256_stable_window`, which has never moved across any re-pin. A
-# match proves guest state is exact and the cutoff move is the benign class,
-# so the sweep re-pins the hash itself and stamps the entry's note; a
-# mismatch is REAL state divergence and the row fails exactly as before.
-# Deliberately NOT generalized: only fixtures with this doctrine written in
-# their note get the automatic path, and the stable pin itself is never
-# auto-rewritten by anything.
-# ---------------------------------------------------------------------------
-
-$script:dukeStableWindowVerdict = $null
-function Get-DukeStableWindowVerdict([string]$ExecutablePath, [string]$ScratchRoot,
-    [string]$ExpectedStableHash) {
-    if ($null -ne $script:dukeStableWindowVerdict) { return $script:dukeStableWindowVerdict }
-
-    $stamp = [Guid]::NewGuid().ToString("N").Substring(0, 8)
-    $workingCopy = Join-Path $ScratchRoot "duke3d-acceptance-$stamp"
-    $ppmPath = Join-Path $ScratchRoot "duke3d-acceptance-$stamp.ppm"
-    Copy-Fixture (Join-Path $repositoryRoot ".bench" "duke3d_c") $workingCopy
-
-    $armFlags = switch ($Arm) {
-        "on"      { @{ jit16 = "1"; word486 = "1" } }
-        "off"     { @{ jit16 = "0"; word486 = "0" } }
-        "jit16"   { @{ jit16 = "1"; word486 = "0" } }
-        "word486" { @{ jit16 = "0"; word486 = "1" } }
-    }
-    $start = @{
-        FilePath               = $ExecutablePath
-        ArgumentList           = @("--cpu", "486", "--memory-mib", "64", "--video", "vega",
-            "--hdd-folder", $workingCopy, "--cycles", "2640000000", "--result-ppm", $ppmPath)
-        NoNewWindow            = $true
-        PassThru               = $true
-        RedirectStandardOutput = (Join-Path $ScratchRoot "duke3d-acceptance-$stamp.out")
-        RedirectStandardError  = (Join-Path $ScratchRoot "duke3d-acceptance-$stamp.err")
-        Environment            = @{
-            "IZARRAVM_JIT16"                 = $armFlags.jit16
-            "IZARRAVM_JIT16_486"             = $armFlags.word486
-            "IZARRAVM_ONE_LOOKUP_STORE"      = $OneLookupStore
-            "IZARRAVM_ONE_LOOKUP_LOAD"       = $OneLookupLoad
-            "IZARRAVM_DIRECT_BARRIER_CENSUS" = "0"
-            "IZARRAVM_CPU_PROFILE"           = ""
-            "IZARRAVM_MACHINE_PROFILE"       = ""
-            "IZARRAVM_RIP_PROFILE"           = ""
-            "IZARRAVM_PHASE_INTERVAL_MS"     = ""
-        }
-    }
-    Write-Host " running the duke3d stable-window acceptance ..." -NoNewline
-    $process = Start-Process @start
-    if ($ProcessorIndex -ge 0) {
-        try { $process.ProcessorAffinity = [IntPtr]([int64]1 -shl $ProcessorIndex) } catch { }
-    }
-    if (-not $process.WaitForExit(300000)) {
-        try { $process.Kill($true) } catch { }
-        throw "the duke3d stable-window acceptance run exceeded 300 seconds"
-    }
-    $hash = Get-FileSha256 $ppmPath
-    Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
-
-    $script:dukeStableWindowVerdict = @{
-        pass     = ($null -ne $hash -and $hash -eq $ExpectedStableHash)
-        hash     = $hash
-        expected = $ExpectedStableHash
-    }
-    Write-Host $(if ($script:dukeStableWindowVerdict.pass) { " stable window HELD" }
-        else { " stable window MOVED" })
-    return $script:dukeStableWindowVerdict
-}
-
-# ---------------------------------------------------------------------------
 # One observation
 # ---------------------------------------------------------------------------
 
@@ -468,6 +522,16 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     $staleQuakeLog = Join-Path $workingCopy "QUAKE\ID1\QCONSOLE.LOG"
     if (Test-Path -LiteralPath $staleQuakeLog) {
         Remove-Item -LiteralPath $staleQuakeLog -Force
+    }
+
+    # Same hazard for DUKEMARK's redirected report: if a copy ever ends up in the
+    # source fixture, a run that produced nothing would be graded on it.
+    $dukemarkResultPath = $null
+    if ($null -ne $Fixture.dukemark) {
+        $dukemarkResultPath = Join-Path $workingCopy $Fixture.dukemark.resultFile
+        if (Test-Path -LiteralPath $dukemarkResultPath) {
+            Remove-Item -LiteralPath $dukemarkResultPath -Force
+        }
     }
 
     $arguments = @()
@@ -501,12 +565,13 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         "IZARRAVM_PHASE_INTERVAL_MS"     = ""
     }
 
+    $stdoutPath = Join-Path $ScratchRoot "$($Fixture.name)-$stamp.out"
     $start = @{
         FilePath               = $ExecutablePath
         ArgumentList           = $arguments
         NoNewWindow            = $true
         PassThru               = $true
-        RedirectStandardOutput = (Join-Path $ScratchRoot "$($Fixture.name)-$stamp.out")
+        RedirectStandardOutput = $stdoutPath
         RedirectStandardError  = (Join-Path $ScratchRoot "$($Fixture.name)-$stamp.err")
         Environment            = $environment
     }
@@ -636,6 +701,76 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         }
     }
 
+    # DUKEMARK. Four deterministic assertions and three reported measurements;
+    # see New-DukemarkPins for why the split falls exactly there. There is no
+    # framebuffer hash on this fixture at all any more: the old end-of-budget
+    # frame was cutoff-phase sensitive and moved six times in three days for
+    # entirely benign reasons, which is the whole reason this replaced it.
+    if ($null -ne $Fixture.dukemark) {
+        $pins = $Fixture.dukemark
+        $result.dukemark_demo = $pins.demo
+
+        # 1. The guest ended the VM itself. A cycle_limit stop means the budget
+        #    ran out first, i.e. the run never got to C:\EXITVM.COM -- the budget
+        #    on this fixture is a guard, not the thing that ends the run.
+        $stopKind = $profile.stop.kind
+        $result.stop_kind = $stopKind
+        if ($stopKind -ne "test_exit") {
+            $failures += ("the guest did not exit through EXITVM: stop was '$stopKind', " +
+                "expected 'test_exit' (budget too small, or the game never returned to DOS)")
+        } else {
+            $stopCode = [int]$profile.stop.code
+            $result.stop_code = $stopCode
+            if ($stopCode -ne $pins.exitCode) {
+                $failures += ("EXITVM reported exit code $stopCode, expected $($pins.exitCode)")
+            }
+        }
+
+        # 2-4. The redirected report.
+        $scraped = Read-DukemarkResult $dukemarkResultPath
+        if (-not $scraped.found) {
+            $failures += ("no $($pins.resultFile) was written: the redirection or the " +
+                "host-folder flush failed")
+        } else {
+            $result.dukemark_info = $scraped.info
+            $result.dukemark_samples = $scraped.samples
+            # Measurements, never asserted.
+            $result.fps_min = $scraped.fps_min
+            $result.fps_max = $scraped.fps_max
+            $result.fps_avg = $scraped.fps_avg
+
+            if ($null -eq $scraped.info) {
+                $failures += ("$($pins.resultFile) carries no Info String -- either the demo " +
+                    "never reached its exit, or DUKEMARK stopped printing its report through " +
+                    "DOS stdout and redirection no longer captures it")
+            } elseif ($scraped.info -ne $pins.info) {
+                $failures += ("DUKEMARK Info String is '$($scraped.info)', expected " +
+                    "'$($pins.info)' -- the fixture's configuration moved " +
+                    "(Demo,Width,Height,Mode,Hud,Detail,Sound,Music)")
+            }
+            if ($null -eq $scraped.samples) {
+                $failures += "$($pins.resultFile) carries no extrapolation count"
+            } else {
+                $allowed = [math]::Max(1, [math]::Round($pins.samples * $pins.samplesTolerance))
+                $drift = [math]::Abs($scraped.samples - $pins.samples)
+                $result.dukemark_samples_drift = $drift
+                if ($drift -gt $allowed) {
+                    $failures += ("DUKEMARK extrapolated $($scraped.samples) samples against a " +
+                        "pin of $($pins.samples) +/- $allowed -- the demo stalled or did not " +
+                        "play to completion")
+                }
+            }
+            $result.notes += ("DUKEMARK {0}: fps min {1} / avg {2} / max {3} (MEASUREMENTS), " +
+                "{4} samples, info {5}") -f $pins.demo, $scraped.fps_min, $scraped.fps_avg,
+                $scraped.fps_max, $scraped.samples, $scraped.info
+            if (-not [string]::IsNullOrWhiteSpace($KeepProfilesIn) -and $null -ne $scraped.report) {
+                Set-Content -Encoding utf8 `
+                    -LiteralPath (Join-Path $KeepProfilesIn "$($Fixture.name).dukemark.txt") `
+                    -Value $scraped.report
+            }
+        }
+    }
+
     $result.invariant = if ($failures.Count -eq 0) { "pass" } else { "FAIL" }
     $result.notes += $failures
 
@@ -690,7 +825,6 @@ $scratchRoot = Join-Path ([IO.Path]::GetTempPath()) ("izarravm-scoreboard-" +
 New-Item -ItemType Directory -Force -Path $scratchRoot | Out-Null
 
 $invariants = Read-Invariants
-$script:invariantsDirty = $false
 $rows = @()
 $profileArchive = Join-Path $ResultsDirectory "profiles"
 New-Item -ItemType Directory -Force -Path $profileArchive | Out-Null
@@ -726,37 +860,8 @@ try {
                 $row.notes += "no recorded frame hash to compare against"
                 if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
             } elseif ($expected -ne $row.frame_sha256) {
-                # The duke3d rows get the automatic cutoff-phase acceptance path
-                # (see Get-DukeStableWindowVerdict). Everything else keeps the
-                # plain loud failure.
-                $stablePin = if ($invariants.Contains("duke3d-486")) {
-                    $invariants["duke3d-486"].frame_sha256_stable_window
-                } else { $null }
-                if ($fixture.name -like "duke3d-*" -and -not [string]::IsNullOrEmpty($stablePin)) {
-                    $verdict = Get-DukeStableWindowVerdict $executablePath $scratchRoot $stablePin
-                    if ($verdict.pass) {
-                        $invariants[$fixture.name].frame_sha256 = $row.frame_sha256
-                        $stampLine = ("[auto-repin {0}] cutoff frame {1}... -> {2}...; stable " +
-                            "window {3}... verified bit-identical by the sweep's acceptance " +
-                            "run. ") -f (Get-Date -Format "yyyy-MM-dd"),
-                            $expected.Substring(0, 8), $row.frame_sha256.Substring(0, 8),
-                            $stablePin.Substring(0, 8)
-                        $invariants[$fixture.name].note =
-                            $stampLine + $invariants[$fixture.name].note
-                        $script:invariantsDirty = $true
-                        $row.invariant = "repinned"
-                        $row.notes += ("cutoff frame moved (benign class): re-pinned after the " +
-                            "stable-window acceptance held; commit the invariants json + manifest")
-                    } else {
-                        $row.invariant = "FAIL"
-                        $row.notes += ("REAL STATE DIVERGENCE: cutoff frame moved AND the " +
-                            "stable-window acceptance moved (expected $($verdict.expected), " +
-                            "got $($verdict.hash)); nothing was re-pinned")
-                    }
-                } else {
-                    $row.invariant = "FAIL"
-                    $row.notes += "frame hash moved: expected $expected, got $($row.frame_sha256)"
-                }
+                $row.invariant = "FAIL"
+                $row.notes += "frame hash moved: expected $expected, got $($row.frame_sha256)"
             }
         }
 
@@ -767,7 +872,7 @@ try {
             $(if ($row.contaminated) { "  (CONTAMINATED)" } else { "" }))
     }
 
-    if ($RecordInvariants -or $script:invariantsDirty) { Write-Invariants $invariants }
+    if ($RecordInvariants) { Write-Invariants $invariants }
 } finally {
     Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

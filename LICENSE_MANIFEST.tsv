@@ -96,7 +96,7 @@ docs/izarra-3000-chassis.jpg	project-artwork	IzarraVM project	GPL-3.0-only	2c1ee
 docs/izarra3000-logo.png	project-artwork	IzarraVM project	GPL-3.0-only	2533847bd1b9db59b06e6af6f70c83e94ebadec04195a5df9eff74507f78fb91
 docs/izarravm-screenshot.png	project-screenshot	IzarraVM project	GPL-3.0-only	cc5204840f4185cd4bfa50ef7a5650c9d7d51031ce8abdcb9502c21d16e10357
 docs/resonique2/sndctrl.png	project-screenshot	IzarraVM project	GPL-3.0-only	7a03094a1086619d5a4b51385fe1c7632189df8809aee06dcd37508c461bc824
-scripts/fixture-scoreboard-invariants.json	benchmark-fixture-manifest	IzarraVM project	GPL-3.0-only	ea499a301898ae81cf070044c31f002203d46fa7b23cf491ea75bcf02e215525
+scripts/fixture-scoreboard-invariants.json	benchmark-fixture-manifest	IzarraVM project	GPL-3.0-only	11d3722ed71a590a7910a19034a90f0199f2410b81a5117c687ff4dbef44b7c7
 scripts/realtime-gate-inputs.json	benchmark-fixture-manifest	IzarraVM project	GPL-3.0-only	394d48133a154f86900f1f1f83cb7c5f35b3b19023e992449a8d6e7eba1413d4
 third_party/fluidr3mono/FluidR3Mono_GM.sf3	vendored-soundfont	FluidR3Mono from MuseScore	MIT	cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2
 third_party/fluidr3mono/FluidR3Mono_License.md	third-party-license-text	FluidR3Mono by Frank Wen and Michael Cowgill	MIT	09926f9451f751408abd65162c99343f840234d2a708584808fd46427633063f
