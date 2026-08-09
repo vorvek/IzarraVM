@@ -310,6 +310,8 @@ impl Machine {
         self.floppy = Some(floppy);
         self.refresh_bios_drive_counts();
         self.fdc.set_media_geometry(Some(geometry));
+        // Media change resets the FDC's event schedule, a cached cap term.
+        self.invalidate_device_edge_cache();
         Ok(())
     }
 
@@ -346,6 +348,7 @@ impl Machine {
         let bytes = self.floppy.take().map(|f| f.bytes().to_vec());
         self.refresh_bios_drive_counts();
         self.fdc.set_media_geometry(None);
+        self.invalidate_device_edge_cache();
         bytes
     }
 
@@ -389,6 +392,8 @@ impl Machine {
         self.eltorito_boot = parse_el_torito(&image);
         let bootable = u8::from(self.eltorito_boot.is_some());
         self.ide.device_mut().insert(image);
+        // ATAPI completion/IRQ timers are cached cap terms.
+        self.invalidate_device_edge_cache();
         self.write_physical_u8(
             (u32::from(EBDA_SEGMENT) << 4) + EBDA_CD_BOOTABLE_OFF,
             bootable,
@@ -398,6 +403,7 @@ impl Machine {
     /// Eject the CD, leaving the ATAPI drive empty.
     pub fn eject_cd(&mut self) {
         self.ide.device_mut().eject();
+        self.invalidate_device_edge_cache();
         self.eltorito_boot = None;
         self.eltorito_emulation = None;
         self.write_physical_u8((u32::from(EBDA_SEGMENT) << 4) + EBDA_CD_BOOTABLE_OFF, 0);
@@ -411,6 +417,7 @@ impl Machine {
     pub fn mount_hdd(&mut self, bytes: Vec<u8>) {
         self.bmide.reset_primary();
         self.ata = Some(ata::AtaDisk::new(bytes));
+        self.invalidate_device_edge_cache();
         let _ = self.publish_fixed_disk_parameter_table();
         self.refresh_bios_drive_counts();
     }
@@ -515,6 +522,7 @@ impl Machine {
             .map(|d| d.bytes().to_vec());
         let _ = self.clear_fixed_disk_parameter_table();
         self.refresh_bios_drive_counts();
+        self.invalidate_device_edge_cache();
         bytes
     }
 
@@ -596,11 +604,13 @@ impl Machine {
     /// a front-panel mutation and does not execute an ATAPI packet command.
     pub fn cd_front_panel_play(&mut self) {
         self.ide.device_mut().front_panel_play();
+        self.invalidate_device_edge_cache();
     }
 
     /// Stop CD audio without executing an ATAPI packet command.
     pub fn cd_front_panel_stop(&mut self) {
         self.ide.device_mut().front_panel_stop();
+        self.invalidate_device_edge_cache();
     }
 
     /// Set both guest-visible CT1745 CD levels to one linked raw value.

@@ -1026,6 +1026,12 @@ pub struct Machine {
     // it to know when to stop and service devices (see run_until_tick). A field
     // rather than a loop local so make_bus's one-off host accesses share it.
     io_touched: bool,
+    // Set by MachineBus on a port access that was EXEMPTED from `io_touched` (the
+    // TOKAEMM ring-0-monitor carve-out in read_io/write_io). Such an access still
+    // pokes real devices, so it can move a device schedule without ending the
+    // batch -- which is exactly the case the device-edge deadline cache must not
+    // miss. Reset per batch alongside `io_touched`.
+    exempt_io_touched: bool,
     // Fixed ISA-bus time (in CPU clocks) accrued this batch by the OPL status poll,
     // added to the batch's device advance in the fast modes so a fast CPU
     // poll cannot outrun the 80 us OPL timer. See the batch-end use in
@@ -1041,6 +1047,15 @@ pub struct Machine {
     // batch while one is around. Host scheduling only: never guest-visible state,
     // never canonical.
     pit_observer_fine_until: u64,
+    // Maintained next-device-edge deadline for the batch cap (86Box-style push
+    // model, see `Machine::event_batch_cap_cached`). Host scheduling only: it can
+    // only ever shorten a batch, it is never guest-visible, and it is never part
+    // of canonical state -- a restored machine simply re-scans.
+    device_edge_cache: timing::DeviceEdgeCache,
+    // Batch entries and pull-scans since power-on, for the deadline cache's own
+    // hit-rate readout. Two increments on the batch path, never an emulation input.
+    device_edge_batches: u64,
+    device_edge_scans: u64,
     // Diagnostic-only OPL counters plus an optional access trace; see `OplProbe`.
     // Never read by an emulation decision and never part of canonical state, so
     // unlike `isa_io_batch_clocks` above it does not gate a canonical capture.
@@ -1410,8 +1425,12 @@ impl Machine {
             pending_bios32: None,
             last_int_vector: None,
             io_touched: false,
+            exempt_io_touched: false,
             isa_io_batch_clocks: 0,
             pit_observer_fine_until: 0,
+            device_edge_cache: timing::DeviceEdgeCache::Stale,
+            device_edge_batches: 0,
+            device_edge_scans: 0,
             opl_probe: OplProbe::from_env(),
             device_wrote_memory: false,
             pending_device_memory_write_range: None,
@@ -1575,6 +1594,8 @@ impl Machine {
     ) {
         self.rtc
             .seed(year, month, day, weekday, hour, minute, second);
+        // Reseeding moves the update-ended / alarm instant, a cached cap term.
+        self.invalidate_device_edge_cache();
     }
 
     /// The full 64-byte CMOS image (clock registers plus NVRAM) for persisting
@@ -1705,6 +1726,9 @@ impl Machine {
     /// checksummed so the host can persist a safe replacement.
     pub fn load_cmos(&mut self, bytes: &[u8; 64]) -> bool {
         let valid = self.rtc.load_nvram(bytes);
+        // Register B/A come back with the image, so the periodic-IRQ rate and the
+        // update/alarm enables can both change under us.
+        self.invalidate_device_edge_cache();
         // Installed RAM is a property of THIS machine, not of the saved image: a
         // real BIOS rewrites the memory-size bytes at POST every boot. Re-apply
         // them so a cmos.bin carried over from a different --memory-mib (or
@@ -1737,6 +1761,7 @@ impl Machine {
     /// Set one CMOS NVRAM byte by index and refresh the stored checksum, the way
     /// a host-side configuration change would. Out-of-range indices are ignored.
     pub fn set_cmos_byte(&mut self, index: usize, value: u8) {
+        self.invalidate_device_edge_cache();
         self.rtc.set_nvram(index, value);
         self.rtc.refresh_checksum();
     }
@@ -2033,6 +2058,9 @@ impl Machine {
 
     pub fn inject_key_scancodes(&mut self, codes: &[u8]) {
         self.keyboard.push_scancodes(codes);
+        // Arms the 8042's output-buffer delivery timer, a `next_timed_io_deadline`
+        // term. See `Machine::event_batch_cap_cached`.
+        self.invalidate_device_edge_cache();
     }
 
     /// Feed a host mouse delta and button mask to the PS/2 aux device. `dx`/`dy`
@@ -2041,11 +2069,13 @@ impl Machine {
     /// reporting is enabled, this requests IRQ12 so a guest ISR runs.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) {
         let _ = self.keyboard.inject_mouse(dx, dy, buttons);
+        self.invalidate_device_edge_cache();
     }
 
     /// Inject a scroll-wheel detent as a PS/2 packet (IntelliMouse 4-byte mode).
     pub fn inject_mouse_wheel(&mut self, dz: i32) {
         let _ = self.keyboard.inject_mouse_wheel(dz);
+        self.invalidate_device_edge_cache();
     }
 
     /// Map the GUI's absolute captured pointer onto relative aux-device motion.
@@ -2298,6 +2328,10 @@ impl Machine {
         // a new mode with no carried remainder, exactly like the CPU does for its
         // instruction-clock scaler.
         self.bus_rem = 0;
+        // The cache holds master ticks, which survive a mode change, but the cap
+        // conversion and the fallback grain are both per-mode; drop it so nothing
+        // depends on that distinction.
+        self.invalidate_device_edge_cache();
         self.advance_direct_mapping_epoch();
     }
 
@@ -2796,6 +2830,8 @@ struct MachineBus<'a> {
     // or changes time-dependent device state, so it ends the batch to keep that
     // state exact. Memory/MMIO (framebuffer blits, the hot path) does not set it.
     io_touched: &'a mut bool,
+    // Points at `Machine::exempt_io_touched`; see the field there.
+    exempt_io_touched: &'a mut bool,
     // Accrues fixed ISA-bus time (CPU clocks) for the OPL status poll in the
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::isa_io_batch_clocks`.

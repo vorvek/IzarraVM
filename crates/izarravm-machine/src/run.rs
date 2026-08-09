@@ -859,6 +859,13 @@ impl Machine {
         if std::mem::take(&mut self.device_wrote_memory) {
             self.cpu.note_device_memory_write();
         }
+        // The device-edge deadline cache is only maintained INSIDE this loop. Every
+        // host-side mutator that can move a device schedule -- key/mouse/joystick
+        // injection, media mount and eject, RTC/CMOS seeding, audio rendering,
+        // canonical-state restore, a mode change from the GUI -- runs between run
+        // calls on the machine thread, so dropping it once here covers all of them
+        // at the cost of one pull-scan per run call (~1 ms of guest time).
+        self.invalidate_device_edge_cache();
         while self.timeline.now_ticks() < deadline_ticks {
             // Periodic sampling, gated on a sentinel that is `u64::MAX` when disarmed so this
             // costs one compare against an already-live value. See `fire_periodic_phase_mark`.
@@ -884,6 +891,7 @@ impl Machine {
                 self.pending_soft_int = None;
             }
             self.io_touched = false;
+            self.exempt_io_touched = false;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
             // Capture live timing state before the fields move into MachineBus.
@@ -922,7 +930,7 @@ impl Machine {
                 .timeline
                 .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
                 .max(1);
-            let cap = self.event_batch_cap(remaining);
+            let cap = self.event_batch_cap_cached(remaining);
             #[cfg(feature = "jit")]
             let poll_skip_enabled = self.poll_skip_enabled;
             let cpu_batch_start = self.host_profile.start();
@@ -973,6 +981,7 @@ impl Machine {
                     unittester,
                     pci,
                     io_touched,
+                    exempt_io_touched,
                     isa_io_batch_clocks,
                     pit_observer_fine_until,
                     opl_probe,
@@ -1033,6 +1042,7 @@ impl Machine {
                     flat_data_cost: active_mode.uses_approximate_timing(),
                     lazy_port_reads: active_mode.uses_approximate_timing(),
                     io_touched,
+                    exempt_io_touched,
                     isa_io_clocks: isa_io_batch_clocks,
                     pit_observer_fine_until,
                     opl_probe,
@@ -1377,6 +1387,25 @@ impl Machine {
                         }
                         self.host_profile
                             .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
+                    }
+                    // Keep the cached device edge across this batch only if the batch
+                    // was provably quiet. Anything else could have rearmed a device:
+                    // a guest port access (io_touched, which the Margo blit-arming
+                    // MMIO write sets too), a bus-side DMA write into guest RAM, any
+                    // serviced HLE / mode-switch / Toka / BIOS32 / unittester step, or
+                    // the HLT fast-forward's device advance. Over-invalidating here
+                    // costs one pull-scan; under-invalidating would hand the next
+                    // batch a deadline LATER than the truth, so the test is
+                    // deliberately one-sided. The batch-entry check in
+                    // `event_batch_cap_cached` handles the remaining case, a cached
+                    // edge that simply came due.
+                    if self.io_touched
+                        || self.exempt_io_touched
+                        || self.device_wrote_memory
+                        || serviced
+                        || outcome.halted
+                    {
+                        self.invalidate_device_edge_cache();
                     }
                     // The A20 gate toggled during this step (port 0x92, the 8042, INT 15h, or XMS):
                     // tell the CPU so it drops any prefetch/decoded bytes that A20 now remaps near

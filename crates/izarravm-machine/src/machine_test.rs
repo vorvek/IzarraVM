@@ -405,6 +405,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         flat_data_cost: machine.active_mode.uses_approximate_timing(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
         io_touched: &mut machine.io_touched,
+        exempt_io_touched: &mut machine.exempt_io_touched,
         isa_io_clocks: &mut machine.isa_io_batch_clocks,
         pit_observer_fine_until: &mut machine.pit_observer_fine_until,
         opl_probe: &mut machine.opl_probe,
@@ -598,6 +599,9 @@ mod bus_timing;
 #[cfg(test)]
 #[path = "machine_core_test.rs"]
 mod core;
+#[cfg(test)]
+#[path = "machine_deadline_cache_test.rs"]
+mod deadline_cache;
 #[cfg(test)]
 #[path = "machine_device_integration_test.rs"]
 mod device_integration;

@@ -78,6 +78,7 @@ impl Machine {
             flat_data_cost: self.active_mode.uses_approximate_timing(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             io_touched: &mut self.io_touched,
+            exempt_io_touched: &mut self.exempt_io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
@@ -1395,6 +1396,14 @@ impl CpuBus for MachineBus<'_> {
         // Accurate 386 class keeps byte-identical batch semantics, matching
         // every other lazy-read gate in this function.
         let skip_io_touched = cpu_is_ring0_pm && self.lazy_port_reads;
+        // The exemption above keeps the batch running across a device access, so
+        // the device-edge deadline cache cannot rely on `io_touched` alone to know
+        // that a schedule may have moved. Record the access separately; the run
+        // loop drops the cache on either flag. Off the exempt path this costs
+        // nothing, and on it, one store.
+        if skip_io_touched {
+            *self.exempt_io_touched = true;
+        }
         // Bus-clock trace recording stays unconditional for every port, both timing
         // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
         // here, so a lazy read that skipped this would under-predict its own beam.
@@ -1766,6 +1775,9 @@ impl CpuBus for MachineBus<'_> {
             && !(PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_DATA_END).contains(&port);
         if !skip_io_touched {
             *self.io_touched = true;
+        } else {
+            // See read_io: an exempted write still programs a device.
+            *self.exempt_io_touched = true;
         }
         self.trace.record(
             BusAccessKind::IoWrite,
