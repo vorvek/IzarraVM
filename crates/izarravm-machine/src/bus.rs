@@ -1567,7 +1567,33 @@ impl CpuBus for MachineBus<'_> {
                 if !skip_io_touched {
                     *self.io_touched = true;
                 }
-                if let Some(value) = self.vega.read_port(port) {
+                // The BEAM peek is taken in BOTH timing classes, on exactly the
+                // same grounds as the 0x61 OUT peek and the 0x40-0x42 counter
+                // peek below: it changes only the VALUE, never whether the batch
+                // ends. `io_touched` is already set above, so this arm keeps the
+                // batch-ending behavior the Accurate class has always had; only
+                // the bits reported change.
+                //
+                // Why the Accurate class needs it. Without the peek this arm
+                // read the LIVE beam, which is the beam as of BATCH START, and
+                // only then ended the batch -- so a retrace poll reported a
+                // position up to a whole batch stale. That was bounded at a
+                // DAC period while the fine fallback was unconditional, but
+                // `fine_batch_grain_required` now gates it (and no term in that
+                // gate covers a display poll: 3DA/3BA arm nothing), so an
+                // otherwise-idle 386 guest polling retrace sits on the 1 ms
+                // coarse cap and reads a beam up to 1 ms old. The deadline cache
+                // does not bound it either: `vega_edge_ticks` carries the Margo
+                // blit and DISPLAY_START terms, not a retrace edge.
+                //
+                // `read_status_port_lazy` is the same function the lazy arm
+                // above calls and performs the identical guest-visible side
+                // effects a `read_port` of these three ports would
+                // (`status1_side_effects` / `catch_up`); it declines exactly
+                // where `read_port` declines -- the inactive status1 alias --
+                // so the fallthrough below is unchanged.
+                let beam = self.predicted_beam();
+                if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
                     return Ok(u32::from(value));
                 }
             }

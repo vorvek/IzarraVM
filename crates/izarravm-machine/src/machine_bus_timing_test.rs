@@ -1072,10 +1072,6 @@ fn a_mid_batch_61_read_matches_a_real_advance_devices_of_the_same_clocks() {
                 let step = prior + core + real_machine.scale_bus(raw_bus_clocks);
                 real_machine.advance_devices(step);
                 let (real, _) = read_port_61_at(&mut real_machine, 0, 0);
-                eprintln!(
-                    "DBG {mode:?} prior {prior} core {core} predicted {predicted:#04x} real {real:#04x} step {step}"
-                );
-
                 assert_eq!(
                     predicted, real,
                     "mode {mode:?} prior {prior} core {core}: a mid-batch 0x61 read must \
@@ -1108,6 +1104,142 @@ fn a_mid_batch_61_read_moves_with_the_in_batch_offset_on_the_accurate_class() {
         "bit 5 (channel-2 OUT) must take both levels across a sweep of in-batch \
          offsets; a constant column means the peek is not being taken"
     );
+}
+
+/// Read a VGA status port at a given in-batch offset, returning the byte and the
+/// raw bus clocks the access itself recorded (same accounting as
+/// `read_port_61_at`, so a differential can advance the twin by the identical
+/// total).
+fn read_status_port_at(machine: &mut Machine, port: u16, prior: u64, core: u64) -> (u8, u64) {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        let before = bus.trace.elapsed_clocks();
+        let value = bus.read_io(port, BusWidth::Byte, core, false).unwrap() as u8;
+        (value, bus.trace.elapsed_clocks() - before)
+    })
+}
+
+#[test]
+fn a_mid_batch_3da_read_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The VGA-beam counterpart of
+    // a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks
+    // and a_mid_batch_61_read_matches_a_real_advance_devices_of_the_same_clocks,
+    // and the test that retires the "3DA reports the batch-start beam" caveat.
+    //
+    // The 386 (Accurate) tier is the case that needed it: `lazy_ports_386` is
+    // DEFAULT OFF, so this arm sets io_touched and ends the batch exactly as it
+    // always has, and before the beam peek it read the LIVE beam -- the beam as
+    // of BATCH START. Nothing bounds that staleness once
+    // `fine_batch_grain_required` gates the fine fallback off (no term in that
+    // gate is armed by a display poll, and `vega_edge_ticks` carries the Margo
+    // blit and DISPLAY_START terms, not a retrace edge), so the read could be a
+    // full 1 ms coarse batch old. Gsw486 is swept alongside to pin that the
+    // Approximate class, which reaches the value by the lazy arm instead, agrees
+    // with the same oracle.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        for prior in [0u64, 61, 33_000] {
+            for core in [0u64, 100, 12_345, 100_000, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(mode);
+                assert!(predicted_machine.set_vga_mode(0x13));
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(mode);
+                assert!(real_machine.set_vga_mode(0x13));
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+                let (predicted, predicted_raw) =
+                    read_status_port_at(&mut predicted_machine, 0x3da, prior, core);
+                // The step is exactly the in-batch offset, with NO term for the
+                // access's own bus time. Unlike the PIT ports, a VGA status read
+                // is charged video wait states, and that charge is recorded
+                // before the peek on BOTH machines -- so it is already inside
+                // each read's own `in_batch_clocks` and cancels. Adding it to the
+                // step would advance the oracle by it twice, which bit 0
+                // (display enable, one toggle per ~700 clocks at this tier) is
+                // sharp enough to catch. The equality below is asserted, not
+                // assumed.
+                real_machine.advance_devices(prior + core);
+                let (real, real_raw) = read_status_port_at(&mut real_machine, 0x3da, 0, 0);
+                assert_eq!(
+                    predicted_raw, real_raw,
+                    "mode {mode:?}: the two reads must charge the same bus time for \
+                     the own-charge term to cancel"
+                );
+
+                assert_eq!(
+                    predicted, real,
+                    "mode {mode:?} prior {prior} core {core}: a mid-batch 3DA read must \
+                     equal a real advance_devices of the same total"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_batch_3da_read_moves_with_the_in_batch_offset_on_the_accurate_class() {
+    // Non-vacuity for the test above, on the class that previously read the LIVE
+    // beam: without the peek every 3DA read in a batch reports the same
+    // batch-start bits, so both columns below would be constant. Bit 3 is
+    // vertical retrace and bit 0 is display-enable-inverted; the offsets span
+    // more than a whole 70 Hz frame at the 386 tier, so each must take both
+    // levels.
+    //
+    // The STEP matters and is why this is not a 10k-clock sweep: vertical
+    // retrace is only a couple of scanlines (~64 us, ~1400 clocks at this
+    // tier), so a coarse sweep can stride over the retrace window entirely and
+    // report a constant bit 3 whether or not the peek is being taken -- a
+    // fixture that cannot fail. 250 clocks is well inside both the retrace
+    // window and one ~700-clock scanline.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    assert!(machine.set_vga_mode(0x13));
+    machine.run_cycles(5_000).unwrap();
+    let mut vretrace = std::collections::BTreeSet::new();
+    let mut display_enable = std::collections::BTreeSet::new();
+    for core in (0u64..=450_000).step_by(250) {
+        let (value, _) = read_status_port_at(&mut machine, 0x3da, 0, core);
+        vretrace.insert((value >> 3) & 1);
+        display_enable.insert(value & 1);
+    }
+    assert_eq!(
+        vretrace.len(),
+        2,
+        "bit 3 (vertical retrace) must take both levels across a sweep of in-batch \
+         offsets; a constant column means the beam peek is not being taken"
+    );
+    assert_eq!(
+        display_enable.len(),
+        2,
+        "bit 0 (display enable) must take both levels across a sweep of in-batch offsets"
+    );
+}
+
+#[test]
+fn the_accurate_3da_arm_still_ends_the_batch() {
+    // The beam peek changes the VALUE only. `lazy_ports_386` is default OFF, so
+    // the Accurate class must still set io_touched on a 3DA read exactly as it
+    // did before the peek -- otherwise this would silently become the lazy
+    // behavior the `IZARRAVM_LAZY_PORT_386` switch exists to keep opt-in, and
+    // every 386 fixture's batch shape would move.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    assert!(machine.set_vga_mode(0x13));
+    machine.run_cycles(5_000).unwrap();
+    let touched = with_bus(&mut machine, |bus| {
+        assert!(
+            !bus.lazy_ports_386,
+            "sanity: this test covers the DEFAULT (non-lazy) Accurate arm"
+        );
+        *bus.io_touched = false;
+        bus.read_io(0x3da, BusWidth::Byte, 0, false).unwrap();
+        *bus.io_touched
+    });
+    assert!(touched, "a 386-tier 3DA read must still end the batch");
 }
 
 #[test]
