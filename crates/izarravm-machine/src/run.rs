@@ -861,9 +861,9 @@ impl Machine {
         }
         // The device-edge deadline cache is only maintained INSIDE this loop. Every
         // host-side mutator that can move a device schedule -- key/mouse/joystick
-        // injection, media mount and eject, RTC/CMOS seeding, audio rendering,
-        // canonical-state restore, a mode change from the GUI -- runs between run
-        // calls on the machine thread, so dropping it once here covers all of them
+        // injection, media mount and eject, RTC/CMOS seeding, audio rendering, a
+        // mode change from the GUI -- runs between run calls on the machine
+        // thread, so dropping it once here covers all of them
         // at the cost of one pull-scan per run call (~1 ms of guest time).
         self.invalidate_device_edge_cache();
         while self.timeline.now_ticks() < deadline_ticks {

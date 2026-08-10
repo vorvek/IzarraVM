@@ -2816,11 +2816,14 @@ fn the_386_lazy_port_switch_can_never_arm_the_approximate_class() {
             }
         }
     }
-    assert!(
-        !crate::bus::lazy_ports_386_for(GswMode::Gsw386)
-            || crate::bus::lazy_ports_386_for(GswMode::Gsw386),
-        "lazy_ports_386_for must be a pure function of the mode and the environment"
-    );
+    // The loop above is the whole test. `lazy_ports_386_for` -- the env-composed
+    // wrapper the bus actually calls -- is deliberately NOT asserted on here:
+    // its only added term is `lazy_port_reads_386_enabled()`, and with the
+    // switch off by default every assertion about it passes for the wrong reason
+    // (a mutation deleting the mode test still returns false), while forcing the
+    // switch on means writing the process environment under a threaded test
+    // runner. Pinning `lazy_ports_386_composed` over both environment states,
+    // which is what the loop does, covers the mode half without that race.
 }
 
 /// A 386 bus with the lazy poll ports armed as if `IZARRAVM_LAZY_PORT_386` were

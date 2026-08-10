@@ -467,7 +467,7 @@ impl Counter {
     }
 
     fn masked_count(&self) -> u16 {
-        (self.count & 0xffff) as u16
+        mask16(u64::from(self.count))
     }
 
     /// The CE `clocks` CLKs after a Counting state holding `value` at level `out`,

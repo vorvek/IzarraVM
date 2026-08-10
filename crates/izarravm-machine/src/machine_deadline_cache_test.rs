@@ -68,6 +68,19 @@ fn print_one_lpt_byte(machine: &mut Machine, byte: u8) {
     out(machine, LPT1_CONTROL, 0x10);
 }
 
+/// A one-data-track, one-audio-track disc: enough for `mount_cd` / `eject_cd`
+/// and for the CD front-panel transport, which declines on a data-only disc.
+fn audio_disc() -> crate::cdimage::CdImage {
+    use crate::cdimage::{DATA_SECTOR, RAW_SECTOR};
+    let cue = "TRACK 01 MODE1/2048\nINDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\nINDEX 01 00:00:01\n";
+    let mut bin = vec![0u8; DATA_SECTOR + 100 * RAW_SECTOR];
+    for byte in bin[DATA_SECTOR..].iter_mut() {
+        *byte = 0x20;
+    }
+    crate::cdimage::CdImage::from_cue(cue, bin).unwrap()
+}
+
 /// SEEK to `cylinder`, which arms an FDC step deadline and an IRQ6 after it.
 fn issue_seek(machine: &mut Machine, cylinder: u8) {
     with_bus(machine, |bus| {
@@ -195,28 +208,74 @@ fn host_side_injection_and_media_changes_drop_the_cache_at_their_own_site() {
     // guest time, so a device edge further out than that (the 8042's own delivery
     // timer is exactly 1 ms, an SB16 block ~370 ms) never shows up in the cap at
     // all, and a cap comparison would pass with the invalidation deleted.
-    type HostMutator = (&'static str, fn(&mut Machine));
-    let mutators: [HostMutator; 7] = [
-        ("inject_key_scancodes", |machine| {
+    //
+    // `setup` runs BEFORE the fixture arms and caches an edge, so a mutator that
+    // needs media present (the CD front-panel transport) can mount it without
+    // the mount's own invalidation being what the assertion sees.
+    type HostMutator = (&'static str, fn(&mut Machine), fn(&mut Machine));
+    fn no_setup(_: &mut Machine) {}
+    let mutators: [HostMutator; 14] = [
+        ("inject_key_scancodes", no_setup, |machine| {
             machine.inject_key_scancodes(&[0x1e])
         }),
-        ("inject_mouse", |machine| machine.inject_mouse(4, -4, 0)),
-        ("inject_mouse_wheel", |machine| {
+        ("inject_mouse", no_setup, |machine| {
+            machine.inject_mouse(4, -4, 0)
+        }),
+        ("inject_mouse_wheel", no_setup, |machine| {
             machine.inject_mouse_wheel(1)
         }),
-        ("set_mode", |machine| machine.set_mode(GswMode::Gsw386)),
-        ("seed_rtc", |machine| {
+        ("set_mode", no_setup, |machine| {
+            machine.set_mode(GswMode::Gsw386)
+        }),
+        ("seed_rtc", no_setup, |machine| {
             machine.seed_rtc(2026, 8, 9, 1, 3, 4, 5)
         }),
-        ("set_cmos_byte", |machine| machine.set_cmos_byte(0x0a, 0x26)),
-        ("eject_floppy", |machine| {
+        ("set_cmos_byte", no_setup, |machine| {
+            machine.set_cmos_byte(0x0a, 0x26)
+        }),
+        ("mount_floppy", no_setup, |machine| {
+            machine.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+        }),
+        ("eject_floppy", no_setup, |machine| {
             machine.eject_floppy();
         }),
+        ("mount_hdd", no_setup, |machine| {
+            machine.mount_hdd(vec![0u8; 64 * 512]);
+        }),
+        ("mount_cd", no_setup, |machine| {
+            machine.mount_cd(audio_disc());
+        }),
+        (
+            "eject_cd",
+            |machine| machine.mount_cd(audio_disc()),
+            |machine| machine.eject_cd(),
+        ),
+        (
+            "eject_hdd",
+            |machine| machine.mount_hdd(vec![0u8; 64 * 512]),
+            |machine| {
+                machine.eject_hdd();
+            },
+        ),
+        (
+            "cd_front_panel_play",
+            |machine| machine.mount_cd(audio_disc()),
+            |machine| machine.cd_front_panel_play(),
+        ),
+        (
+            "cd_front_panel_stop",
+            |machine| {
+                machine.mount_cd(audio_disc());
+                machine.cd_front_panel_play();
+            },
+            |machine| machine.cd_front_panel_stop(),
+        ),
     ];
 
-    for (name, mutate) in mutators {
+    for (name, setup, mutate) in mutators {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
+        setup(&mut machine);
         program_pit_channel0(&mut machine, 60_000);
         issue_seek(&mut machine, 12);
         machine.invalidate_device_edge_cache();

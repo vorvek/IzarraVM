@@ -2819,12 +2819,21 @@ struct MachineBus<'a> {
     flat_data_cost: bool,
     /// True for the approximate-timing 486/586 modes, computed identically to
     /// `flat_data_cost` (same `active_mode.uses_approximate_timing()` check, same
-    /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`
-    /// When true, a status-port read does not set `io_touched`
-    /// and computes its returned bits from `predicted_beam()` instead of the
-    /// live device beam; when false (Accurate 386 class) the port keeps
-    /// byte-identical behavior. A single bool test at the top
-    /// of the one arm that branches on it, not a per-access classification.
+    /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`:
+    /// when true (or when `lazy_ports_386` is), a status-port read does not set
+    /// `io_touched`, so a poll loop chains instead of ending its batch.
+    ///
+    /// What it does NOT decide any more is the VALUE. Since the beam peek landed
+    /// (42721631) BOTH arms compute their bits from `predicted_beam()`; the
+    /// Accurate arm merely sets `io_touched` first and ends the batch as it
+    /// always has. So this bool no longer buys byte-identical Accurate-class
+    /// behavior -- it buys the batch-ending behavior alone.
+    ///
+    /// Nor is it the sole test at that dispatch: every shared use site reads
+    /// `lazy_port_reads || lazy_ports_386` (see `lazy_ports_386` below), so
+    /// "one arm branches on it" describes the shape of the dispatch -- a static
+    /// per-port landing plus a bool test, never a per-access classification --
+    /// not a single reader.
     lazy_port_reads: bool,
     /// The Accurate-class (386) extension of the lazy time-derived port reads:
     /// 3DA/3BA/3C2 (VGA status), 0x61 (PIT channel 1/2 OUT), and 0x200-0x207

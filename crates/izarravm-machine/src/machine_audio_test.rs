@@ -1353,6 +1353,26 @@ fn wss_arm_long_block(machine: &mut Machine) {
     });
 }
 
+/// Mount a disc with one audio track and start it from the front panel, the
+/// Red Book term in `fine_batch_grain_required`
+/// (`self.ide.device().playback().playing`). No ATAPI packet command is
+/// involved, so nothing here arms a storage deadline that could bind the cap.
+fn cd_start_red_book_audio(machine: &mut Machine) {
+    use crate::cdimage::{CdImage, DATA_SECTOR, RAW_SECTOR};
+    let cue = "TRACK 01 MODE1/2048\nINDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\nINDEX 01 00:00:01\n";
+    let mut bin = vec![0u8; DATA_SECTOR + 100 * RAW_SECTOR];
+    for byte in bin[DATA_SECTOR..].iter_mut() {
+        *byte = 0x20;
+    }
+    machine.mount_cd(CdImage::from_cue(cue, bin).unwrap());
+    machine.cd_front_panel_play();
+    assert!(
+        machine.cd_audio_state().playing,
+        "the front-panel play must leave the transport playing"
+    );
+}
+
 #[test]
 fn fine_batch_fallback_is_gated_on_an_active_audio_consumer() {
     // Both directions, per consumer, in the Accurate class: an idle machine gets
@@ -1362,13 +1382,14 @@ fn fine_batch_fallback_is_gated_on_an_active_audio_consumer() {
     // that can produce the fine value -- an ungated cap would fail the idle
     // assertions, and a gate stuck off would fail the armed ones.
     type ArmConsumer = fn(&mut Machine);
-    let consumers: [(&str, ArmConsumer); 4] = [
+    let consumers: [(&str, ArmConsumer); 5] = [
         ("OPL timer 1 running", opl_start_timer1),
         ("speaker data enable", |machine| {
             write_port_0x61(machine, 0x02)
         }),
         ("DSP DMA playback", dsp_arm_long_8bit_block),
         ("WSS playback", wss_arm_long_block),
+        ("Red Book CD audio playing", cd_start_red_book_audio),
     ];
 
     for mode in ACCURATE_MODES {

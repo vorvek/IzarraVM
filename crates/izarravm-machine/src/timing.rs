@@ -1079,12 +1079,31 @@ impl Machine {
     /// UNCONDITIONAL ACROSS TIMING CLASSES, AND WHAT THAT COSTS. The blit wait is
     /// two halves -- this deadline term, and the `VideoWrite::ArmedBlit`
     /// `io_touched` set in `MachineBus::write_memory_byte_recorded` -- and both
-    /// apply in the Approximate class as well. That is deliberate:
-    /// `docs/vega/vega-technical-reference.md` section 9 specifies that "software
-    /// cannot observe the engine as idle until the modeled time has passed" and
-    /// calls the Margo cost model "exact by construction ... a stronger guarantee
-    /// than the CPU compatibility modes". The tier is a CPU-speed policy, never a
-    /// device-behavior one, and no `GswMode` reaches margo.rs.
+    /// apply in the Approximate class as well. That is deliberate, but the break
+    /// buys LESS than it looks like it buys, so be precise about which half of
+    /// `docs/vega/vega-technical-reference.md` section 9 needs it.
+    ///
+    /// Section 9 has two clauses. The IDLE-EARLY clause -- software cannot
+    /// observe the engine as idle until the modeled time has passed -- holds
+    /// WITHOUT the break: STATUS.BUSY is a live read of `Margo::busy_ns`
+    /// (margo.rs, `REG_STATUS`), and `busy_ns` is only ever decremented by
+    /// `advance_busy` with real elapsed device time, so a poll inside a
+    /// still-running batch reads the engine as busy, never as idle. What the
+    /// break buys is the EXACTNESS clause -- the cost model is "exact by
+    /// construction ... a stronger guarantee than the CPU compatibility modes".
+    /// Without it BUSY reads busy for TOO LONG: the poll cannot end its own
+    /// batch, so the engine stays busy to the end of a batch that was capped
+    /// before the arming write, up to a stale cap however short the operation
+    /// was. The tier is a CPU-speed policy, never a device-behavior one, and no
+    /// `GswMode` reaches margo.rs, so exactness is not something the Approximate
+    /// class gets to opt out of.
+    ///
+    /// RECOVERABLE, and this is the shape: a lazy `Margo::busy_ns_after(elapsed)`
+    /// peek would let the STATUS read answer with the busy time as of the READ
+    /// rather than as of batch start, exactly the way `Counter::count_after` and
+    /// `Pit::out_after` peek the PIT without ending the batch. That is a future
+    /// slice; until it lands the ~5% wall below on Margo-heavy fixtures is the
+    /// price of the exactness clause.
     ///
     /// The price is real and was measured, so it is recorded here rather than
     /// left for the next person to rediscover. Ending a batch on the arming write
@@ -1105,7 +1124,7 @@ impl Machine {
     /// variable rather than a coincidence. A probe gating BOTH halves to the
     /// Accurate class recovers the entry counts EXACTLY (prince back to
     /// 1,233,464,425) and the wall with them -- so this is the whole cost, and it
-    /// is bought deliberately for the section-9 contract.
+    /// is bought deliberately for section 9's exactness clause.
     fn vega_edge_ticks(&self) -> Option<u64> {
         let blit_busy_ns = self.vega.blitter_busy_ns();
         let blit = if blit_busy_ns > 0 {
@@ -1219,11 +1238,11 @@ impl Machine {
     /// `now + ticks_until` does not move. The master-tick terms (ATA, RTC
     /// periodic, FDC, serial, LPT, keyboard, MPU) are stored deadlines already.
     ///
-    /// INVALIDATION IS CONSERVATIVE by construction: returning an edge EARLIER
-    /// than a fresh scan only shortens a batch (always safe -- a shorter batch is
-    /// strictly more observable), while returning a LATER one would let a device
-    /// edge land mid-batch, so every path that can move a device schedule drops
-    /// the cache. Those paths are:
+    /// INVALIDATION IS CONSERVATIVE by construction. The one-sided SAFETY
+    /// argument is that an edge EARLIER than a fresh scan only shortens a batch
+    /// (a shorter batch is strictly more observable), while a LATER one would
+    /// let a device edge land mid-batch -- so every path that can move a device
+    /// schedule drops the cache. Those paths are:
     ///   * batch entry, when the cached edge is already due -- the device fired
     ///     inside its own advance and rearmed or went idle;
     ///   * batch end, whenever the batch was not provably quiet: any guest port
@@ -1232,13 +1251,28 @@ impl Machine {
     ///     Toka / BIOS32 / unittester step, or a HLT fast-forward;
     ///   * `run_until_tick` entry, which covers EVERY host-side mutator in one
     ///     place -- keyboard/mouse/joystick injection, media mount and eject,
-    ///     CMOS and RTC seeding, audio rendering, canonical-state restore -- since
-    ///     those can only run between run calls on the machine thread. The
-    ///     individually risky ones also invalidate at their own site, so the
-    ///     property does not silently depend on that scheduling fact.
+    ///     CMOS and RTC seeding, audio rendering -- since those can only run
+    ///     between run calls on the machine thread. The individually risky ones
+    ///     also invalidate at their own site, so the property does not silently
+    ///     depend on that scheduling fact.
     ///
-    /// The `debug_assert` compares every cached answer against the fresh scan, so
-    /// the whole test suite is a continuous audit of the invalidation list.
+    /// Canonical state is NOT on that list, and does not need to be: the
+    /// canonical API is capture-only (`Machine::canonical_state_capture` takes
+    /// `&self`), and a "restore" builds a FRESH `Machine`, whose cache starts
+    /// `Stale` like any other field. There is no in-place restore that could
+    /// move a device schedule behind a live cache.
+    ///
+    /// SAFETY IS ONE-SIDED, THE CONTRACT IS NOT. Over-invalidating never yields
+    /// an early cached edge: dropping the cache routes the next batch through
+    /// `Stale`, which reruns the fresh scan and returns exactly what the scan
+    /// returns. The only way a live cached edge can differ from a fresh scan is
+    /// therefore a MISSING invalidation, i.e. the unsafe direction. That is why
+    /// the `debug_assert_eq!` below demands exact equality rather than `<=`:
+    /// inequality in the "safe" direction cannot arise from correct code, so an
+    /// exact check costs no false positives and catches drift the one-sided
+    /// check would let through. Every cached answer is compared against a fresh
+    /// scan, so the whole test suite is a continuous audit of the invalidation
+    /// list.
     pub(super) fn event_batch_cap_cached(&mut self, remaining: u64) -> u64 {
         // Hit-rate instrumentation, GATED AT THE CALL SITE on the same flag that
         // decides whether anything will ever read it (`--machine-phase-timing`,
