@@ -234,6 +234,14 @@ impl Ad1848 {
         usize::from(self.config.dma)
     }
 
+    /// One indexed register as the guest last left it, without moving the
+    /// codec's own index latch. The host-side counterpart to a guest `IN` on
+    /// R1, for a test that wants to check what a setup tool programmed without
+    /// becoming a second writer. Indices past the file read back as 0.
+    pub fn peek_register(&self, index: usize) -> u8 {
+        self.regs.get(index).copied().unwrap_or(0)
+    }
+
     // ---- Direct register (port) interface ---------------------------------
 
     /// Read one of the 8 device ports by `offset`:

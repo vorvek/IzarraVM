@@ -17,17 +17,18 @@ Toka-DOS 3.0 - Kernel build 2043 - Compiled <date>
 (C) 1992-1997 Izarra SL - All Rights Reserved ** See LICENSE.TXT for more.
 ```
 
-`C:\LICENSE.TXT` explains what Toka-DOS is actually built from: the FreeDOS
+`C:\LICENSE.TXT` explains what Toka-DOS is built from: the FreeDOS
 kernel and FreeCOM shell, plus MOVE, SORT, MEM, and other tools from the
 FreeDOS project, all free software under the GNU GPL. General Simulation
-Works's own additions (`GSWMODE`, `SNDCTRL`, `TOKAMOUS`, `TOKAEMM.SYS`) are layered on
+Works's own additions (`GSWMODE`, `SNDCTRL`, `SNDMIXER`, `TOKAMOUS`,
+`TOKAEMM.SYS`) are layered on
 top of that stock FreeDOS base; the shell and kernel underneath are
 otherwise unmodified.
 
 ## What's on the disk
 
-The C: drive root stays sparse: only the files DOS needs there, plus a `DOS`
-directory that holds the command interpreter and every tool.
+The C: drive root holds only the files DOS requires there, plus a `DOS`
+directory containing the command interpreter and every tool.
 
 ```
 C:\
@@ -37,15 +38,15 @@ C:\
 `KERNEL.SYS` lives in the root too, because the boot sector loads it by name, but it
 is hidden, so a plain `DIR` of C:\ shows only the `DOS` folder, `AUTOEXEC.BAT`,
 `CONFIG.SYS`, and `LICENSE.TXT` — in that order, since `DIR` sorts by name and
-groups directories first. Everything you actually run lives in `C:\DOS`:
+groups directories first. Every program you run is in `C:\DOS`:
 
 ```
 C:\DOS\
     COMMAND.COM     GSWMODE.COM     MEM.EXE         FIND.EXE
     TOKAMOUS.COM    SNDCTRL.COM     ATTRIB.EXE      LABEL.EXE
-    TOKAEMM.SYS     MOVE.EXE        CHOICE.EXE      DELTREE.COM
-                    SORT.EXE        MORE.EXE        XCOPY.EXE
-                                                    HELLO.TXT
+    TOKAEMM.SYS     SNDMIXER.COM    CHOICE.EXE      DELTREE.COM
+                    MOVE.EXE        MORE.EXE        XCOPY.EXE
+                    SORT.EXE                        HELLO.TXT
 ```
 
 `AUTOEXEC.BAT` puts `C:\DOS` on the `PATH`, so every tool runs from any
@@ -54,20 +55,20 @@ one does.
 
 ## The system ROM
 
-Toka-DOS does not really live on the hard disk. It ships inside the Izarra
-3000's system ROM and is mounted onto C: at power-on, so the operating system
-comes up the same on every boot no matter what the last program did to the
-disk. General Simulation Works built the ROM to be reflashed for updates, but
-none ever shipped, so Toka-DOS ended up immutable: the hidden `KERNEL.SYS`, the
-shell, and everything under `C:\DOS` are mounted read-only and cannot be
-deleted or overwritten from DOS. Most DOS machines of the era ran the whole
-system off a writable disk; the Izarra 3000 kept it in ROM instead.
+Toka-DOS is not stored on the hard disk. It is held in the Izarra 3000's system
+ROM and mounted onto C: at power-on, so the operating system comes up the same
+on every boot regardless of what the last program did to the disk. General
+Simulation Works built the ROM to be reflashed for updates, but no update ever
+shipped, so Toka-DOS is immutable. The hidden `KERNEL.SYS`, the shell, and
+everything under `C:\DOS` are mounted read-only and cannot be deleted or
+overwritten from DOS. Most DOS machines of the era ran the whole system from a
+writable disk. The Izarra 3000 holds it in ROM instead.
 
 `CONFIG.SYS` and `AUTOEXEC.BAT` are the two exceptions. The machine writes
 editable copies of them to C: the first time it boots and then leaves them
-alone, so your startup configuration is yours to change while the system files
-underneath it never drift. [Repair Toka-DOS](#repair-toka-dos) resets just
-those two files to the ROM defaults if you want the stock startup back.
+alone, so the startup configuration can be edited while the system files
+underneath it remain unchanged. [Repair Toka-DOS](#repair-toka-dos) resets those
+two files to the ROM defaults, for returning to the stock startup.
 
 ## Drive letters
 
@@ -89,8 +90,8 @@ Toka-DOS's shell is FreeCOM, FreeDOS's COMMAND.COM. Booting drops you at:
 C:\>
 ```
 
-set by `PROMPT $P$G` in `AUTOEXEC.BAT`. Everything you'd expect from a
-FreeCOM shell works normally:
+set by `PROMPT $P$G` in `AUTOEXEC.BAT`. The standard FreeCOM shell facilities
+are available:
 
 - **DIR**, **COPY**, **DEL**, **REN**, and the rest of the built-in command
   set.
@@ -118,8 +119,8 @@ LH TOKAMOUS
 `SET BLASTER` advertises the ReSonique 2's Sound Blaster-compatible digital
 audio to any program that looks for the environment variable (base 0x220,
 IRQ 7, 8-bit DMA 1, 16-bit DMA 5). Toka-DOS regenerates the line from the
-machine's configuration, so it always matches the card's actual resources —
-unless you have hand-edited `AUTOEXEC.BAT`, which it leaves alone. See the
+machine's configuration, so it matches the card's current resources. A
+hand-edited `AUTOEXEC.BAT` is left alone. See the
 [ReSonique 2 manual](../resonique2/manual.md) for what those numbers mean.
 `LH TOKAMOUS` loads the mouse driver high, into an upper memory block if
 [TOKAEMM](../tokaemm/manual.md) has one free, falling back to a normal load
@@ -146,3 +147,5 @@ overwritten.
   DOS.
 - [SNDCTRL](commands.md#sndctrl): move the sound card's IRQ and DMA
   assignment without leaving DOS.
+- [SNDMIXER](commands.md#sndmixer): set the card's volume levels, and keep
+  them across reboots.

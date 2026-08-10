@@ -1705,6 +1705,25 @@ impl Machine {
         self.sb16.routing()
     }
 
+    /// One CT1745 mixer register as the guest would read it back, or `None`
+    /// when the card is not built. Live state with no side effect: unlike a
+    /// guest read it does not disturb the latched index, so a host can look at
+    /// what a setup tool programmed without becoming a second writer. This is
+    /// the mixer's counterpart to [`Machine::cmos_bytes`], and it is what lets
+    /// a test check that SNDMIXER.COM moved a level rather than only that it
+    /// printed one.
+    pub fn sb_mixer_register(&self, index: u8) -> Option<u8> {
+        self.sb16.peek_mixer_register(index)
+    }
+
+    /// One AD1848 indexed register, or `None` when the codec is not built.
+    /// Same contract as [`Machine::sb_mixer_register`]: the codec's own index
+    /// latch is left alone.
+    pub fn wss_register(&self, index: u8) -> Option<u8> {
+        self.wss_enabled
+            .then(|| self.wss.peek_register(usize::from(index)))
+    }
+
     /// The IRQ line and DMA channel the AD1848 codec currently answers on, or
     /// `None` when it is not built. Live, for the same reason as
     /// [`Machine::sound_blaster_routing`].
@@ -2539,9 +2558,16 @@ impl Machine {
     /// duration at its own rate. Each stream is resampled to 44100 and summed.
     ///
     /// The ReSonique 2 analog output-stage gain (`self.card_amp`, the host-tunable
-    /// "amp gain") is applied to the card's own sources (OPL, SB DSP, the WSS
-    /// codec, and CD-audio through the card's CD-in) but NOT to the PC speaker,
-    /// which is motherboard hardware that does not pass through the card's amp.
+    /// "amp gain") is applied to the card's own sources: OPL, SB DSP, the WSS
+    /// codec, CD-audio through the card's CD-in, and -- ONLY when a card is
+    /// fitted -- the PC speaker through the card's PC-SPK input. The beeper is
+    /// motherboard hardware, but on a machine with a sound card its output is
+    /// wired INTO the card, which is what mixer register `0x3B` attenuates; it
+    /// used to be added after the amp and after the summing node's headroom
+    /// reserve, which left it hot by that reserve (6 dB) on top of the 7 dB the
+    /// card's own power-on PC-SPK level takes off. On a machine built WITHOUT a
+    /// card there is no such wire, so the beeper bypasses both and reaches the
+    /// output at its own level.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
         let render_start = self.host_profile.start();
         let card_amp = self.card_amp;
@@ -2648,20 +2674,28 @@ impl Machine {
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
                 let (wl, wr) = hold_frame(&mut wss_hold, wss_out.get(i).copied());
                 // Host PC speaker volume: a straight attenuation on the beeper,
-                // independent of the card amp (0.0 mutes it). Unity leaves the mix
-                // bit-identical to before.
+                // taken before the card's PC-SPK input (0.0 mutes it). This is
+                // the host's control; register 0x3B below is the guest's.
                 let s = (f32::from(spk[i]) * speaker_volume) as i32;
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
                 let (sb_l, sb_r) = ct1745.mix_opl_voice((ol, or), (dl, dr));
                 let (cl, cr) = ct1745.mix_cd((cl, cr));
-                // OPL + SB16 DSP take the CT1745 master/outgain; the WSS codec and
+                // Where the beeper joins depends on whether there is a card to
+                // join it to. With one fitted it is a card leg (PC-SPK level,
+                // then the master, then the node); with none it goes straight
+                // to the output, taking neither the node's reserve nor the
+                // card's amp -- there is no card in the path to take them.
+                let (spk_l, spk_r, spk_direct) = match ct1745.mix_speaker(s) {
+                    Some((left, right)) => (left, right, 0),
+                    None => (0, 0, s),
+                };
+                // OPL + SB16 DSP take the CT1745 master/outgain; the PC speaker
+                // takes the PC-SPK level and the same master; the WSS codec and
                 // CD are summed in raw (their own attenuation already applied). All
                 // of these are ReSonique 2 card sources, so the analog output-stage
-                // gain (`card_amp`) scales their sum. The PC speaker (`s`) is
-                // motherboard hardware, not on the card, so it is added AFTER the
-                // amp at its own level.
+                // gain (`card_amp`) scales their sum.
                 // Sum the card sources, reserve the summing node's headroom, then
-                // scale by the analog amp and add the speaker.
+                // scale by the analog amp.
                 //
                 // `MIX_HEADROOM` is one scalar applied AFTER every card leg has
                 // been summed, so it cannot disturb the relative FM/voice/CD
@@ -2669,10 +2703,10 @@ impl Machine {
                 // a hardware register. It exists because those legs all power on
                 // at unity and therefore sum past full scale on their own; see the
                 // constant for the full argument.
-                let card_l = (sb_l + wl + cl) as f32 * MIX_HEADROOM * card_amp;
-                let card_r = (sb_r + wr + cr) as f32 * MIX_HEADROOM * card_amp;
-                let l = clamp_i16(card_l as i32 + s);
-                let r = clamp_i16(card_r as i32 + s);
+                let card_l = (sb_l + wl + cl + spk_l) as f32 * MIX_HEADROOM * card_amp;
+                let card_r = (sb_r + wr + cr + spk_r) as f32 * MIX_HEADROOM * card_amp;
+                let l = clamp_i16(card_l as i32 + spk_direct);
+                let r = clamp_i16(card_r as i32 + spk_direct);
                 (l, r)
             })
             .collect();
@@ -2757,6 +2791,19 @@ impl Machine {
     /// Take the next complete message written to the MIDI MPU at 0x330/0x331.
     pub fn take_midi_message(&mut self) -> Option<TimedMidiMessage> {
         self.midi_mpu.take_message()
+    }
+
+    /// (Left, Right) linear gain for the MIDI legs, from the ReSonique 2
+    /// wavetable volume registers `0x50`/`0x51`.
+    ///
+    /// Native MIDI synthesis is mixed by the frontend AFTER
+    /// [`render_audio`](Self::render_audio) returns -- the synth runs on the
+    /// host, not on the guest's clock -- so this leg cannot be folded into the
+    /// summing node above. The caller applies it to the MIDI engines before
+    /// they add themselves to the mix. It is a plain scalar read out of a guest
+    /// device register, so the value is a pure function of canonical state.
+    pub fn midi_gain(&self) -> (f32, f32) {
+        self.sb16.wavetable_gain()
     }
 }
 

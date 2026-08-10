@@ -89,6 +89,8 @@ pub const UNHALT_COM: &[u8] = include_bytes!("../roms/dos/unhalt.com");
 pub const UNHALT_COM_SOURCE: &str = include_str!("../roms/dos/unhalt.asm");
 pub const SNDCTRL_COM: &[u8] = include_bytes!("../roms/dos/sndctrl.com");
 pub const SNDCTRL_COM_SOURCE: &str = include_str!("../roms/dos/sndctrl.asm");
+pub const SNDMIXER_COM: &[u8] = include_bytes!("../roms/dos/sndmixer.com");
+pub const SNDMIXER_COM_SOURCE: &str = include_str!("../roms/dos/sndmixer.asm");
 pub const GSWMODE_COM_SOURCE: &str = include_str!("../roms/dos/gswmode.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
@@ -423,6 +425,18 @@ pub fn unhalt_com() -> &'static [u8] {
 /// in `C:\DOS` (see build-freedos-hdd-image.py).
 pub fn sndctrl_com() -> &'static [u8] {
     SNDCTRL_COM
+}
+
+/// SNDMIXER.COM, the card's volume mixer: six vertical faders over the CT1745
+/// mixer (master, FM, wave, CD, wavetable MIDI and the PC speaker), a config
+/// file so the levels survive a power cycle, and a `/CFG path /S` boot line
+/// that restores them without printing anything.
+///
+/// SNDCTRL.COM decides where the card lives; this decides how loud it is. The
+/// two are one setup screen split in half, and share a palette and key map.
+/// Ships on the Toka-DOS image in `C:\DOS` (see build-freedos-hdd-image.py).
+pub fn sndmixer_com() -> &'static [u8] {
+    SNDMIXER_COM
 }
 
 /// The direct UMB mechanism fixture: drives XMS 10h/11h/12h without

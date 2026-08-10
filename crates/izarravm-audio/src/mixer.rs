@@ -9,8 +9,11 @@
 //!
 //! The mixer models IRQ/DMA routing (`0x80`/`0x81`), the read-only Interrupt
 //! Status register (`0x82`), and the volume registers that attenuate host
-//! audio. Other source, tone, and AGC registers retain guest writes but have
-//! no audio effect because their signal sources are not modeled.
+//! audio: master (`0x30`/`0x31`), voice (`0x32`/`0x33`), FM (`0x34`/`0x35`),
+//! CD (`0x36`/`0x37`), PC speaker (`0x3B`), output gain (`0x41`/`0x42`) and the
+//! ReSonique 2 wavetable extension (`0x50`/`0x51`). Other source, tone, and AGC
+//! registers retain guest writes but have no audio effect because their signal
+//! sources are not modeled (there is no line or microphone input).
 
 use std::sync::LazyLock;
 
@@ -41,6 +44,28 @@ static OUTGAIN_STEPS: LazyLock<[f32; 4]> = LazyLock::new(|| {
     steps
 });
 
+/// Linear gain per level of the 2-bit PC-speaker volume register (`0x3B`).
+///
+/// The CT1745 gives this leg two bits, not five: the motherboard beeper feeds
+/// the card's PC-SPK input and the card offers four coarse positions for it.
+/// 86Box's `sb_att_7dbstep_2bits` table is `{164, 6537, 14637, 32767}` out of
+/// 32768, i.e. -46.0, -14.0, -7.0 and 0 dB; the spacing is ~7 dB, which is why
+/// the table carries that name. The emulator-side attenuation is taken from
+/// those dB figures rather than from a 2-bit shift, so the leg is finer than
+/// its control -- but the CONTROL stays as coarse as the hardware's, because a
+/// guest that reads `0x3B` back must see the same four positions a real card
+/// offers. SNDMIXER.COM's PC-SPEAKER fader therefore has four stops, not ten.
+///
+/// Level 0 is forced to a hard mute rather than 86Box's -46 dB floor, the same
+/// deviation (and for the same reason) as [`VOL5_STEPS`] level 0.
+static SPK2_STEPS: LazyLock<[f32; 4]> = LazyLock::new(|| {
+    let mut steps = [0f32; 4];
+    for (level, db) in [(1usize, -14.0f32), (2, -7.0), (3, 0.0)] {
+        steps[level] = 10f32.powf(db / 20.0);
+    }
+    steps
+});
+
 /// The CT1745 mixer. The index register (`0x224`) latches which register the
 /// next data access (`0x225`) hits; the register file holds the routing and
 /// volume state plus the inert store for round-trip-only registers.
@@ -60,6 +85,8 @@ pub struct SbMixer {
     fm_r: u8,      // 0x35, 5-bit
     outgain_l: u8, // 0x41, 2-bit
     outgain_r: u8, // 0x42, 2-bit
+    wt_l: u8,      // 0x50, ReSonique 2 extension: the wavetable MIDI leg
+    wt_r: u8,      // 0x51, ditto; both hold the register BYTE, not the level
     // Stored-but-inert registers at their datasheet defaults (round-trip only).
     inert: [u8; 256],
 }
@@ -213,6 +240,57 @@ impl SbMixer {
         )
     }
 
+    /// Linear PC-speaker gain from register `0x3B` (2-bit, D7-D6).
+    ///
+    /// The beeper is motherboard hardware, but its output is wired to the
+    /// card's PC-SPK mixer input, so it is a card leg like any other: this
+    /// attenuation, then the master, then the summing node. Mono, because the
+    /// input is.
+    pub fn speaker_gain(&self) -> f32 {
+        SPK2_STEPS[(self.inert[0x3B] >> 6) as usize]
+    }
+
+    /// Raw 2-bit PC-speaker level from register `0x3B` (D7-D6).
+    pub fn speaker_level(&self) -> u8 {
+        self.inert[0x3B] >> 6
+    }
+
+    /// (Left, Right) linear wavetable-MIDI gain from registers `0x50`/`0x51`.
+    ///
+    /// This pair is a ReSonique 2 extension, not a CT1745 register: a real
+    /// CT1745 leaves `0x50`/`0x51` undecoded, and its `0x34`/`0x35` "MIDI" pair
+    /// is the FM synthesiser bus (which is why [`fm_gain`](Self::fm_gain) owns
+    /// the OPL3). The Izarra 3000's card also carries a wavetable MPU whose
+    /// synthesis is mixed on-card, the way an AWE32 mixes its EMU8000, and that
+    /// leg had no level control at all. It gets one here, on the card's own
+    /// register file, at the card's own 5-bit level scale (D7-D3), so a guest
+    /// programs it with the sequence it already uses for every other leg.
+    ///
+    /// Two rules make this pair different from `0x30`-`0x37`, and both exist
+    /// because this leg has NO second owner. Every other source can be found
+    /// again from somewhere else -- the GUI's card-amp slider, its PC-speaker
+    /// slider, a game's own setup screen -- but nothing else in the machine
+    /// touches the wavetable. Silence here is unexplainable and unrecoverable
+    /// from inside the guest, so silence has to be asked for:
+    ///
+    /// * **D0 is MUTE.** Set it and the leg is silent whatever the level says.
+    ///   `0x50`/`0x51` are ours, so their reserved low bits are ours to define;
+    ///   D2-D1 stay reserved and read back clear.
+    /// * **Level 0 with D0 clear is NOT a mute.** It floors at
+    ///   `WAVETABLE_FLOOR_LEVEL`, the quietest step SNDMIXER.COM's fader can
+    ///   reach (-36 dB). A guest that clears a block of mixer registers writes
+    ///   `0x00` here as collateral; without the floor that one stray byte
+    ///   silences the machine's MIDI for the rest of the session, with nothing
+    ///   on screen to say so. With it, the same stray byte is a channel that
+    ///   went very quiet -- a symptom you can hear and undo.
+    ///
+    /// The cost is that "level 0" and "muted" are no longer the same thing on
+    /// this pair alone. SNDMIXER.COM writes D0 for its step 0, so the fader's
+    /// mute is a real mute; see `sndmixer.asm`.
+    pub fn wavetable_gain(&self) -> (f32, f32) {
+        (decode_wavetable(self.wt_l), decode_wavetable(self.wt_r))
+    }
+
     /// Raw (Left, Right) CD-Audio levels from registers `0x36`/`0x37`.
     pub fn cd_levels(&self) -> (u8, u8) {
         (self.inert[0x36] & 0x1F, self.inert[0x37] & 0x1F)
@@ -278,6 +356,15 @@ impl SbMixer {
         }
     }
 
+    /// Read a register WITHOUT touching the latched index, for a host that
+    /// wants to see what the guest programmed. The guest's own path is
+    /// [`read_port`](Self::read_port); this is the same decode with no side
+    /// effect, so a test can look at the register file between guest writes
+    /// without becoming one of them.
+    pub fn peek_register(&self, index: u8) -> u8 {
+        self.read_register(index)
+    }
+
     fn read_register(&self, index: u8) -> u8 {
         match index {
             0x00 => 0x00, // Reset Mixer reads 0x00.
@@ -305,6 +392,8 @@ impl SbMixer {
             0x37 => self.inert[0x37] << 3,
             0x41 => self.outgain_l << 6,
             0x42 => self.outgain_r << 6,
+            0x50 => self.wt_l,
+            0x51 => self.wt_r,
             0x80 => self.irq_setup,
             0x81 => self.dma_setup,
             0x82 => self.irq_status,
@@ -387,6 +476,13 @@ impl SbMixer {
             // 2-bit gain registers: level in D7-D6 (86Box `regs[0x41]>>6`).
             0x41 => self.outgain_l = value >> 6,
             0x42 => self.outgain_r = value >> 6,
+            // The ReSonique 2 wavetable leg (see `wavetable_gain`). The whole
+            // byte is kept, not the level, because D0 carries the mute; the
+            // reserved bits are dropped on the way in so a read-back never
+            // reports a bit the card does not implement, the same normalising
+            // 0x30-0x37 do by storing only their level.
+            0x50 => self.wt_l = value & WT_IMPLEMENTED,
+            0x51 => self.wt_r = value & WT_IMPLEMENTED,
             0x80 => self.irq_setup = value,
             0x81 => self.dma_setup = value,
             0x82 => { /* Interrupt Status is read-only; writes are ignored. */ }
@@ -423,6 +519,11 @@ impl SbMixer {
     /// the drive plays Red Book through the card's CD-in with no guest involvement
     /// -- got silence from a working drive. The GUI front panel and `set_cd_levels`
     /// remain the host's control over this line.
+    ///
+    /// The wavetable extension (`0x50`/`0x51`) powers on at level 31 for the
+    /// same reason as the rest: it is a new control over a leg that until now
+    /// had none, so its power-on position has to be the level that leaves the
+    /// leg exactly where it already was.
     fn reset(&mut self) {
         self.latched_index = 0;
         self.irq_setup = 0x02; // IRQ5
@@ -436,6 +537,8 @@ impl SbMixer {
         self.fm_r = 31;
         self.outgain_l = 0;
         self.outgain_r = 0;
+        self.wt_l = 31 << 3;
+        self.wt_r = 31 << 3;
         self.inert = default_inert();
     }
 }
@@ -455,11 +558,39 @@ impl Default for SbMixer {
             fm_r: 0,
             outgain_l: 0,
             outgain_r: 0,
+            wt_l: 0,
+            wt_r: 0,
             inert: [0; 256],
         };
         mixer.reset();
         mixer
     }
+}
+
+/// The bits `0x50`/`0x51` implement: the 5-bit level in D7-D3 and the mute in
+/// D0. D2-D1 are reserved and read back clear.
+const WT_IMPLEMENTED: u8 = 0xF9;
+
+/// D0 of `0x50`/`0x51`: mute this channel of the wavetable leg outright.
+const WT_MUTE: u8 = 0x01;
+
+/// The level a wavetable register of 0 is floored to: 13, which is -36 dB and
+/// the quietest stop SNDMIXER.COM's fader offers. See
+/// [`SbMixer::wavetable_gain`] for why a zero here is treated as "very quiet"
+/// rather than "off".
+const WAVETABLE_FLOOR_LEVEL: usize = 13;
+
+/// Decode one wavetable register byte into a linear gain.
+fn decode_wavetable(register: u8) -> f32 {
+    if register & WT_MUTE != 0 {
+        return 0.0;
+    }
+    let level = usize::from(register >> 3);
+    VOL5_STEPS[if level == 0 {
+        WAVETABLE_FLOOR_LEVEL
+    } else {
+        level
+    }]
 }
 
 /// Widen a compat 4-bit level to the 5-bit scale.
@@ -548,7 +679,12 @@ fn default_inert() -> [u8; 256] {
     regs[0x38] = 0x00; // Line volume (5-bit), default 0
     regs[0x39] = 0x00;
     regs[0x3A] = 0x18; // Mic volume, (0 << 5) | 0x18
-    regs[0x3B] = 0x80; // PC Speaker volume, 2-bit field in D7-D6 (86Box: "steps of 64")
+    // PC Speaker volume, 2-bit field in D7-D6 (86Box: "steps of 64"). LIVE, not
+    // inert: `speaker_gain` decodes it. The store stays here because the whole
+    // byte round-trips -- D5-D0 are don't-care on the card and are neither
+    // masked on the way in nor cleared on the way out, matching 86Box, so a
+    // guest's read-modify-write sees its own byte back.
+    regs[0x3B] = 0x80;
     regs[0x3C] = 0x1F; // Output mixer switches, default all closed
     regs[0x3D] = 0x15; // Input mixer L switches default
     regs[0x3E] = 0x0B; // Input mixer R switches default

@@ -2153,6 +2153,13 @@ fn pump_audio(
     }
     let guest_tick = machine.master_ticks();
     let mut pcm = machine.render_audio(samples);
+    // The card's wavetable volume (CT1745 extension 0x50/0x51) is the guest's
+    // control over the MIDI legs. It has to be applied here rather than inside
+    // render_audio because native synthesis is staged on the host clock and
+    // joins the mix only after the machine's own summing node has run.
+    let midi_gain = machine.midi_gain();
+    wavetable.set_gain(midi_gain);
+    midi_receiver.set_gain(midi_gain);
     wavetable.render(&mut pcm, guest_tick);
     midi_receiver.render(&mut pcm, guest_tick);
     for (l, r) in &mut pcm {

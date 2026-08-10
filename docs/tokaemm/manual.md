@@ -60,11 +60,12 @@ allocation bitmap, the VCPI ownership bitmap, and the EMS page chain — are not
 among them. They live in a system window above the 1 MB line, reachable only by
 the manager's own ring-0 monitor and mapped in no client's address space.
 
-Keeping them there matters for more than the 18K it returns. Their size is
-proportional to installed memory, about 288 bytes per megabyte between them, so
-in conventional memory they grew with every machine size; past roughly 148 MB
-they could not be fitted at all. Held outside it, the resident figure above is
-the same on a 64 MB machine and a 512 MB one.
+Holding them above the 1 MB line returns 18K of conventional memory and also
+removes a size limit. Their combined size is proportional to installed memory,
+about 288 bytes per megabyte, so in conventional memory they grew with every
+machine size, and past roughly 148 MB they could not be fitted at all. Held
+above the line, the resident figure above is the same on a 64 MB machine and a
+512 MB one.
 
 The page directory and page tables require a further 68K, also reserved above
 the 1 MB line on a machine with sufficient extended memory. The standard 64 MiB
@@ -96,8 +97,7 @@ and drivers rely on:
   data between conventional and extended memory, or between two extended
   blocks.
 - **UMB functions**: request, release, and reallocate upper memory blocks
-  (10h-12h), which is what `DOS=UMB` and `LOADHIGH`/`DEVICEHIGH` actually
-  call.
+  (10h-12h), which `DOS=UMB` and `LOADHIGH`/`DEVICEHIGH` call.
 
 ## Upper memory blocks (DOS=UMB)
 
@@ -162,7 +162,7 @@ depend on TOKAEMM already being loaded as a device driver, which is why
 
 ## A20
 
-The A20 gate (the line that decides whether memory addressing wraps at
+The A20 gate (the line that controls whether memory addressing wraps at
 1 MB, the way the original 8086 did, or continues into extended memory)
 is under TOKAEMM's control the normal way: through `INT 21h`/`XMS`
 local and global enable/disable calls, and through the classic keyboard

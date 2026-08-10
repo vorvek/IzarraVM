@@ -67,6 +67,49 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// 6.02 dB is that choice. It leaves the DIGITAL VOICE leg within 0.4 dB of the
 /// absolute level it had before the decode fix, so a title's effects land where
 /// they used to while the FM bus comes down to meet them.
+///
+/// ## The fourth leg
+///
+/// The node sums four sources, not three: FM + voice (as one CT1745 bus), the
+/// WSS codec, CD-in, and -- since the PC-SPK register (`0x3B`) was wired up --
+/// the PC speaker. The speaker is the one that does NOT power on at unity: the
+/// card's own PC-SPK level starts at position 2 of 4, which is -7 dB, so the
+/// beeper contributes about a fifth of a full-scale leg before the reserve is
+/// applied at all. It also does not always join: a machine built with no sound
+/// card has no PC-SPK input, so its beeper reaches the output outside this node
+/// entirely (see `render_audio`). The "every leg powers on at unity and they
+/// SUM" argument above is about the three card legs a title actually drives at
+/// once; the beeper never adds a fourth full-scale unity source to them.
+///
+/// ## Where the beeper lands, against 86Box
+///
+/// 86Box is the reference for the speaker's staging as much as for the rest.
+/// The comparable number is the beeper against a full-scale DIGITAL VOICE leg
+/// through each emulator's own chain, at both cards' defaults -- an absolute
+/// level means nothing across two different output stages, and voice is what
+/// the 6.02 dB above is already anchored to.
+///
+/// - 86Box: a mode-3 beeper swings 0..0x1400 (`snd_speaker.c`), so 5120
+///   peak-to-peak, then `buffer * speaker * (1/3) * master`. A full-scale voice
+///   leg is 65534 peak-to-peak through `dsp * voice / 3.0 * master`. The `/3`
+///   and the master are common to both and cancel, leaving
+///   `5120 * 0.4467 / 65534` = **-29.13 dB**.
+/// - here: the beeper swings +/-`SPEAKER_AMPLITUDE` (8000, so 16000
+///   peak-to-peak), then `0x3B * master`, and voice is 65534 peak-to-peak. This
+///   scalar and the master are likewise common and cancel, leaving
+///   `16000 * 0.4467 / 65534` = **-19.25 dB**.
+///
+/// So the beeper rests 9.88 dB hotter than 86Box's, and the whole of that gap
+/// is `SPEAKER_AMPLITUDE`: 20*log10(16000/5120) is 9.90 dB. The per-leg `/3`
+/// versus this post-sum 0.5 does NOT contribute, because each applies to the
+/// beeper and to the reference alike.
+///
+/// Wiring `0x3B` closed 13.02 dB (6.02 of reserve the beeper was skipping, plus
+/// the 7.0 the card's own default PC-SPK level takes off) and this is where it
+/// was left. The remaining 9.88 dB is the beeper's own model, not the mixer's:
+/// closing it means moving `SPEAKER_AMPLITUDE`, which changes every PC-speaker
+/// title and belongs to its own measurement, not to a change that gave the
+/// mixer a register it was missing.
 pub const MIX_HEADROOM: f32 = 0.5;
 
 pub const PIT_INPUT_HZ: u32 = 1_193_182;

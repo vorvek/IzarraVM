@@ -304,3 +304,66 @@ fn p300_soundfont_changes_do_not_reset_p330_messages() {
     receiver.reconfigure(&changed);
     assert_eq!(receiver.pending.len(), 1);
 }
+
+/// The MIDI leg's volume control, which is the card's wavetable register pair
+/// (`0x50`/`0x51`) arriving here as a linear gain.
+///
+/// This leg is the one source in the machine that joins the mix outside
+/// `render_audio` -- native synthesis runs on the host clock and is added by
+/// the frontend afterwards -- so the card's summing node cannot attenuate it
+/// and the scalar has to be applied at the point it adds itself. Unity is an
+/// exact identity, so an engine nobody has set a gain on is byte-for-byte what
+/// it was before the control existed.
+#[test]
+fn the_wavetable_gain_attenuates_what_the_engine_adds_to_the_mix() {
+    let staged = [(1000i16, -2000i16), (30000, 30000), (-32768, 12), (0, 0)];
+
+    let render_with = |gain: Option<(f32, f32)>| {
+        let mut midi = MidiEngine::open_wavetable(&config(MidiBackend::Off));
+        if let Some(gain) = gain {
+            midi.set_gain(gain);
+        }
+        for frame in staged {
+            midi.staged.push_back(frame);
+        }
+        let mut mix = [(0i16, 0i16); 4];
+        midi.render(&mut mix, tick_for_frame(4));
+        mix
+    };
+
+    assert_eq!(
+        render_with(None),
+        staged,
+        "an engine with no gain set adds exactly what it synthesised"
+    );
+    assert_eq!(
+        render_with(Some((1.0, 1.0))),
+        staged,
+        "unity is an exact identity, not a rounding of one"
+    );
+    assert_eq!(
+        render_with(Some((0.0, 0.0))),
+        [(0, 0); 4],
+        "a muted wavetable register silences the leg"
+    );
+
+    // -20 dB, which is level 21 on the card's 5-bit ladder: each channel scaled
+    // on its own, so the pair is a real stereo control and not one scalar.
+    let quiet = render_with(Some((0.1, 0.5)));
+    for (index, (left, right)) in quiet.iter().enumerate() {
+        let (want_l, want_r) = (
+            (f32::from(staged[index].0) * 0.1).round() as i16,
+            (f32::from(staged[index].1) * 0.5).round() as i16,
+        );
+        assert_eq!((*left, *right), (want_l, want_r), "frame {index}");
+    }
+
+    // The leg still SUMS into what is already in the buffer; the gain scales
+    // the contribution, not the mix it lands in.
+    let mut midi = MidiEngine::open_wavetable(&config(MidiBackend::Off));
+    midi.set_gain((0.5, 0.5));
+    midi.staged.push_back((1000, 1000));
+    let mut mix = [(4000i16, -4000i16)];
+    midi.render(&mut mix, tick_for_frame(1));
+    assert_eq!(mix, [(4500, -3500)]);
+}

@@ -6,8 +6,8 @@
 The Izarra 3000 is a fixed machine. This manual describes it as built: what
 you see when you power it on, what the boot menu and setup panel offer, and
 what each control does. None of the hardware here is user-selectable in the
-way a real PC's BIOS setup lets you swap parts. IzarraVM reproduces one
-machine, and this manual reproduces its manual.
+way a real PC's BIOS setup allows parts to be exchanged. IzarraVM reproduces
+one machine, and this manual documents that machine.
 
 ## Tech specs
 
@@ -53,9 +53,9 @@ DEL ► Configuration menu
 TAB ► Select boot device
 ```
 
-Either key can be pressed at any point during POST, not just at the very
-end; the first one pressed wins. Press neither, and the machine boots
-normally once diagnostics finish.
+Either key can be pressed at any point during POST, not only at the end of
+the sequence. The first key pressed takes effect. If neither is pressed, the
+machine boots normally once diagnostics finish.
 
 ## The Tab boot menu
 
@@ -91,7 +91,7 @@ and restores the primary already stored in CMOS.
 | 386-slow | The same 386DX ISA at 7.33 MHz | 3 |
 
 Accepting the menu writes the chosen speed to the Lotura chipset's mode port
-immediately (the CPU actually changes speed class right there) and saves
+immediately (the CPU changes speed class at that point) and saves
 both the primary boot device and the CPU speed to CMOS as the new defaults for
 future cold boots. There is no separate reboot: the machine falls straight
 through to booting the chosen device at the chosen speed.

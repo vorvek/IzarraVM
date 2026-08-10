@@ -5,8 +5,7 @@
 
 ReSonique 2 is the Izarra 3000's audio hardware: a combo card built around a
 Sound Blaster 16 compatible digital audio path and an OPL3 FM synthesizer.
-This manual covers what a DOS program actually finds when it probes the
-card.
+This manual describes what a DOS program finds when it probes the card.
 
 ## What's on the card
 
@@ -18,10 +17,10 @@ card.
 | Wavetable daughterboard header | MPU-401 | `0x300` | 9 | n/a |
 | Rear MIDI/game port | MPU-401 | `0x330` | 9 | n/a |
 
-Those are the **power-on defaults**, and the ones Toka-DOS advertises in
-`BLASTER`. The base ports are fixed; the IRQ and DMA columns are not — see
+Those are the power-on defaults, and the ones Toka-DOS advertises in
+`BLASTER`. The base ports are fixed. The IRQ and DMA columns are not; see
 [Changing the card's resources](#changing-the-cards-resources) for the tool that
-moves them.
+changes them.
 
 The digital and FM sections use their standard, fixed Sound Blaster and
 AdLib addresses. ReSonique 2 assigns separate fixed ports to its internal
@@ -31,12 +30,12 @@ explicitly. The rear 15-pin connector also carries the usual joystick signals.
 ### Why the Sound Blaster sits on IRQ 7
 
 IRQ 5 is the Sound Blaster 16 factory setting, so it is the value you might
-expect here. ReSonique 2 ships on **IRQ 7** instead, because DOS software falls
+expect here. ReSonique 2 ships on IRQ 7 instead, because DOS software falls
 into two groups and only 7 satisfies both:
 
-- Programs that **read `BLASTER`** work on any line, since the variable always
+- Programs that read `BLASTER` work on any line, since the variable always
   describes the running configuration.
-- Programs that **hardwire an IRQ** almost always hardwire 7, because 7 was the
+- Programs that hardwire an IRQ almost always hardwire 7, because 7 was the
   factory setting on the Sound Blaster 1.x and 2.0 that their drivers were
   written against. Such a program on IRQ 5 never receives its interrupt: with
   most drivers that means playback starts and then stops after the first DMA
@@ -44,10 +43,10 @@ into two groups and only 7 satisfies both:
 
 Hardwiring 5 is rare, because 5 only became a default with SB16-class cards, by
 which time reading `BLASTER` was standard practice. If you do hit a title that
-insists on 5, run `SNDCTRL` before it — that is what the tool is for.
+insists on 5, run `SNDCTRL` before starting it.
 
 Because the AD1848 codec cannot share a line with the Sound Blaster, it takes
-**IRQ 11** rather than the WSS standard IRQ 7. Real combo cards jumper the two
+IRQ 11 rather than the WSS standard IRQ 7. Real combo cards jumper the two
 apart in exactly this way.
 
 ## The BLASTER variable
@@ -64,15 +63,15 @@ That's base address `0x220`, IRQ 7, 8-bit DMA channel 1, 16-bit DMA channel
 match the defaults above.
 
 Toka-DOS regenerates this line from the machine's configuration, so it follows
-whatever you set. It leaves a hand-edited `AUTOEXEC.BAT` alone, though — if you
-have customised yours, `SNDCTRL` still rewrites the `SET BLASTER` line in place
-and leaves the rest of your file untouched.
+whatever you set. A hand-edited `AUTOEXEC.BAT` is left alone. In a customised
+file, `SNDCTRL` rewrites the `SET BLASTER` line in place and leaves the rest of
+the file unchanged.
 
 ## Changing the card's resources
 
-Run **`SNDCTRL`** from the DOS prompt. It is the card's own setup utility, the
-same thing you would have run on a real sound card of the period, and it is
-installed in `C:\DOS` on every Toka-DOS disk:
+The `SNDCTRL` utility is used to set your ReSonique 2 Sound Card's hardware
+parameters. It is the card's own setup utility, and it is installed in `C:\DOS`
+on every Toka-DOS disk. Run it from the DOS prompt:
 
 ```
 C:\> SNDCTRL
@@ -84,21 +83,20 @@ Move between the values with the arrow keys or Tab, press Enter on one to
 choose from the list the hardware supports, then **F10** to apply. Esc leaves
 everything as it was. Values that do not apply to a device show as `*`.
 
-The lists only offer values that work. You will not be shown a line or channel
-the other device already holds, so there is no way to put the Sound Blaster and
-the codec on top of each other — the same rule the emulator enforces at startup,
-applied while you choose instead of after.
+The lists offer only values that are available. A line or channel the other
+device already holds is not shown, so the Sound Blaster and the codec cannot be
+assigned to the same resource. The emulator enforces the same rule at startup.
 
 Applying does four things:
 
-- **Moves the hardware immediately.** Both devices are re-pointed live, with no
+- The hardware moves immediately. Both devices are re-pointed live, with no
   reboot: the mixer's Interrupt and DMA Setup registers for the Sound Blaster,
   the config register for the codec.
-- **Saves the choice in CMOS**, so it survives a power cycle and comes back on
+- The choice is saved in CMOS, so it survives a power cycle and comes back on
   the next boot.
-- **Updates `BLASTER` in the current environment**, so a game started from that
-  same prompt sees the new routing straight away.
-- **Rewrites the `SET BLASTER` line in `C:\AUTOEXEC.BAT`**, so the next boot
+- `BLASTER` is updated in the current environment, so a game started from that
+  same prompt uses the new routing.
+- The `SET BLASTER` line in `C:\AUTOEXEC.BAT` is rewritten, so the next boot
   agrees.
 
 Existing variables are updated, never created. If you deliberately removed the
@@ -107,7 +105,7 @@ Existing variables are updated, never created. If you deliberately removed the
 ### From the command line
 
 Every setting can be given as a switch, in which case `SNDCTRL` applies it and
-exits without drawing anything — useful from a batch file:
+exits without drawing anything, which is useful from a batch file:
 
 ```
 SNDCTRL /SBIRQ:5              Sound Blaster IRQ        2, 5, 7, 10
@@ -122,30 +120,29 @@ SNDCTRL /?                    usage
 
 Switches combine: `SNDCTRL /SBIRQ:5 /MPU:330`. A value the hardware cannot
 select is refused with the list of ones it can, and a combination that would put
-both devices on one line or channel is refused outright — nothing is written.
+both devices on one line or channel is refused outright, and nothing is written.
 
 `SNDCTRL /S` reads the mixer and the codec back rather than reporting what was
-last saved, so it tells you what the card is really doing even if something else
-moved it.
+last saved, so it reports the card's current assignment even if another program
+changed it.
 
 ### Why there is nothing to set in the machine config file
 
-There used to be. `[audio.sound_blaster] irq` and its neighbours were removed,
-because a config file cannot win an argument with NVRAM: the machine boots from
-CMOS, so once `SNDCTRL` had saved anything, editing those keys did nothing at
-all. A setting that silently does nothing is worse than one that is not there.
+There used to be. `[audio.sound_blaster] irq` and its neighbours were removed.
+The machine boots from CMOS, so once `SNDCTRL` had saved an assignment, editing
+those keys had no effect on the running machine.
 
 Old config files still load. The retired keys are ignored, with a note in the
 log naming them.
 
-What stays in the file is what CMOS has no opinion about: whether each device is
-fitted at all (`enabled`), and the codec's I/O base (`base`), which is fixed
-board wiring rather than a resource anything can select.
+The file retains the settings CMOS does not hold: whether each device is fitted
+at all (`enabled`), and the codec's I/O base (`base`), which is fixed board
+wiring rather than a selectable resource.
 
-`--sb-irq`, `--sb-dma` and `--sb-high-dma` still work on the command line, and
-they are what a machine with no saved CMOS starts from — which is every headless
-run, since those never load one. On a machine that *has* been configured, the
-saved assignment wins, and the emulator says so:
+`--sb-irq`, `--sb-dma` and `--sb-high-dma` still work on the command line. They
+set the power-on values for a machine with no saved CMOS, which includes every
+headless run, since headless runs do not load one. On a machine that has been
+configured, the saved assignment takes precedence, and the emulator reports it:
 
 ```
 WARN the saved CMOS overrode these flags; it is what the machine boots from.
@@ -156,17 +153,52 @@ flags again  flags=--sb-irq 5
 
 `--cpu` behaves the same way, for the same reason.
 
+## Setting the volume
+
+Use the `SNDMIXER` utility to set the card's volume levels. It presents six
+vertical faders over the card's own mixer: MASTER, FMSYNTH, WAVE, CD-ROM, MIDI
+and the PC speaker. Each level is applied as the fader moves, saved to a file,
+and restored on the next boot from `AUTOEXEC.BAT`.
+
+```
+C:\> SNDMIXER
+```
+
+There is no line-in or microphone fader. The machine models playback only, so
+those inputs have no source for a control to adjust.
+
+Every leg of the card powers on at 0 dB, and the mix reserves its headroom after
+the mixer, so nothing clips at the default settings and the faders cover the
+whole range below them. Each step is 4 dB, which spreads the ten positions
+evenly rather than crowding them into the top of a 62 dB scale. The full
+switch list is in [SNDMIXER](../toka-dos/commands.md#sndmixer).
+
+Two of the six are not plain Sound Blaster registers:
+
+- **PC speaker** is the card's PC-SPK input (mixer register `0x3B`). That input
+  is two bits wide on the real chip, so the fader has four positions, not ten.
+  The beeper is mixed through the card, so MASTER affects it as well.
+- **MIDI** is the wavetable synthesiser. A real SB16 has no register for one;
+  its "MIDI" volume is the FM bus, which is this card's FMSYNTH fader. The
+  ReSonique 2 therefore adds a pair of its own at `0x50`/`0x51`, on the same
+  register file and the same 5-bit scale as everything else. That pair alone
+  carries a mute bit in D0, and a level of zero on it is the quietest audible
+  step rather than silence. The wavetable is the only source with no second
+  control elsewhere in the machine, so a program that cleared the mixer's
+  registers would otherwise silence it with no indication of the cause. Mute
+  the wavetable with the mute bit.
+
 ## Digital audio (Sound Blaster 16 compatible)
 
 The CT1745-compatible mixer and DSP answer at `0x220`-`0x22F`, with the
 power-on IRQ and DMA defaults from the table above. Both are movable, from
 inside DOS with [`SNDCTRL`](#changing-the-cards-resources), in case a program
 insists on jumpering the card somewhere else. Toka-DOS's `BLASTER` line always
-matches whatever the running configuration actually is.
+matches the running configuration.
 
 The mixer's Interrupt and DMA Setup registers (`0x80`/`0x81`) are writable by
-the guest, so a program that configures the card that way moves it too — the
-same path `SNDCTRL` uses.
+the guest, so a program that configures the card that way moves it as well,
+by the same path `SNDCTRL` uses.
 
 ## FM synthesis (OPL3)
 
@@ -183,8 +215,8 @@ digital audio path rather than a separate device. The 4-bit, 2.6-bit, and
 2-bit playback commands (`0x74`-`0x77`, `0x16`/`0x17`, and their auto-init
 variants) expand the compressed DMA stream to 8-bit samples through the
 DSP's adaptive predictor, with one interrupt at each programmed block boundary,
-as in raw PCM playback. Nothing extra to detect or configure: a
-program that issues the ADPCM DSP commands just works.
+as in raw PCM playback. No additional detection or configuration is required for
+a program that issues the ADPCM DSP commands.
 
 ## MIDI and wavetable
 

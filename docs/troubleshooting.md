@@ -5,20 +5,20 @@
 
 ## The machine is slow / a game feels sluggish
 
-Most games run at full speed, in the top GSW-586 mode included. Two things are
-worth separating before assuming a bug. The Izarra 3000 is a 166 MHz
-Pentium-class machine, so anything that wanted more than that in period still
-wants more than that here: demanding 3D at high resolutions and frame rates, or
-late titles that recommended a Pentium II or higher, are outside what this could
-ever have done. If instead a game feels wrong on hardware that should have coped,
-it is usually timing rather than throughput, since software written for a slower
-machine can misbehave on a faster one. Try:
+Most games run at full speed, including in the top GSW-586 mode. Two causes
+should be separated before assuming a defect. The Izarra 3000 is a 166 MHz
+Pentium-class machine, so software that required more than that in period still
+requires more than that here. Demanding 3D at high resolutions and frame rates,
+and late titles that recommended a Pentium II or higher, are outside the
+machine's capability. If a game instead runs poorly on hardware sufficient for
+it, the cause is usually timing rather than throughput, since software written
+for a slower machine can misbehave on a faster one. Try the following:
 
-- **A slower CPU mode.** Counterintuitively, `GSWMODE 486` or even
-  `GSWMODE 386` from the DOS prompt (see the [command
+- **A slower CPU mode.** `GSWMODE 486` or `GSWMODE 386` from the DOS prompt
+  (see the [command
   reference](toka-dos/commands.md#gswmode)) can produce steadier timing than
   `586` for software that was tuned against a real 486-class machine and
-  gets confused by an unexpectedly fast one. You can also set the boot-time
+  misbehaves on a faster one. You can also set the boot-time
   default from the [Tab boot menu](izarra-3000/user-manual.md#the-tab-boot-menu)
   or the [Del setup panel](izbios/configuration-panel.md#cpu-mode).
 - Check whether the game is CPU-bound versus waiting on the emulated
@@ -41,16 +41,18 @@ reference](toka-dos/commands.md#unhalt)) to put the BIOS back to spinning, and
 
 ## A game doesn't detect my sound card
 
-Check what the game is actually probing for against the [ReSonique 2
+Check what the game is probing for against the [ReSonique 2
 manual](resonique2/manual.md):
 
 - **Digital audio / Sound Blaster**: should auto-detect via the `BLASTER`
   environment variable Toka-DOS sets in `AUTOEXEC.BAT`. If a game insists on
   manual configuration, use base `220`, IRQ `7`, 8-bit DMA `1`, 16-bit DMA
-  `5`. Run `SNDCTRL /S` at the prompt to confirm what the card is actually
-  set to.
+  `5`. Run `SNDCTRL /S` at the prompt to confirm the card's current setting.
 - **FM music**: use the AdLib or OPL2/OPL3 option at port `388` if the game
   offers a choice. This is fully modeled.
+- **Too loud, too quiet, or the music drowning the effects**: run `SNDMIXER`.
+  It provides a fader per source (music, digital audio, CD, MIDI, PC speaker),
+  and the levels are saved between sessions.
 - **General MIDI / wavetable**: select MPU-401 output at port `300`. Toka-DOS
   advertises it as `P300` in `BLASTER`. This represents a daughterboard fitted
   to the ReSonique 2's internal pin headers, which IzarraVM emulates through
@@ -62,12 +64,12 @@ manual](resonique2/manual.md):
 
 ### The game finds the card but plays a short click, then silence
 
-That is the signature of a game that **hardwires an IRQ** rather than reading
+This is the behaviour of a game that hardwires an IRQ rather than reading
 `BLASTER`. Its interrupt handler is on a line the card is not using, so nothing
 re-arms the DSP after the first DMA block finishes.
 
 The card ships on IRQ 7 because that is what such games nearly always assume,
-but a few want IRQ 5. Move it and try again:
+but a few require IRQ 5. Change the assignment and try again:
 
 ```
 SNDCTRL /SBIRQ:5
@@ -119,7 +121,7 @@ lawful right to do so. See [VEGA technical reference, section
 10](vega/vega-technical-reference.md#10-distira-3d) for the emulated hardware
 contract.
 
-## Where do my files actually live?
+## Where are my files stored?
 
 By default, everything IzarraVM writes (the C: drive contents, `cmos.bin`,
 and `izarravm.conf`) lives under `~/.izarravm`, not next to the executable
@@ -181,9 +183,9 @@ IZARRAVM_INT_TRACE=67,21 ./target/release/izarravm --hdd-folder <path> --cpu gsw
 
 Every traced `INT n` prints its arguments -- the register file at the moment
 of the call -- as soon as it fires, then a `  -> ` line with the handler's
-answer once execution returns to the instruction after it. Reading both
-halves is the point: the arguments alone can only show that a driver was
-called, not whether it answered correctly. This is how the TOKAEMM
+answer once execution returns to the instruction after it. Read both halves:
+the arguments alone show only that a driver was called, not whether it
+answered correctly. This is how the TOKAEMM
 shared-pool defect was found. The arguments into `INT 67h` looked fine; the
 handler's answer carried `AH=88h`, where a reference EMM manager returns
 success.

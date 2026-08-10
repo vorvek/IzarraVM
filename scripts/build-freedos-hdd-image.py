@@ -296,6 +296,8 @@ def main(check: bool = False) -> int:
         repo, "crates", "izarravm-firmware", "roms", "dos", "unhalt.com"), "rb").read()
     sndctrl = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "sndctrl.com"), "rb").read()
+    sndmixer = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "sndmixer.com"), "rb").read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). TOKAEMM
     # loads as the memory manager, drawing EMS pages on demand from the same
@@ -353,6 +355,7 @@ def main(check: bool = False) -> int:
                 b"GOTO END\r\n"
                 b":SOUND\r\n"
                 b"SNDCTRL /B /T\r\n"
+                b"SNDMIXER /CFG C:\\VOLCONF.CFG /S\r\n"
                 b"GOTO END\r\n"
                 b":END\r\n")
     hello_txt = b"Katea M0 OK\r\n"
@@ -426,6 +429,7 @@ def main(check: bool = False) -> int:
         ("GSWMODE.COM", gswmode, ATTR_ARCHIVE),
         ("UNHALT.COM", unhalt, ATTR_ARCHIVE),
         ("SNDCTRL.COM", sndctrl, ATTR_ARCHIVE),
+        ("SNDMIXER.COM", sndmixer, ATTR_ARCHIVE),
         ("MOVE.EXE", move, ATTR_ARCHIVE),
         ("SORT.EXE", sort, ATTR_ARCHIVE),
         ("MEM.EXE", mem, ATTR_ARCHIVE),
