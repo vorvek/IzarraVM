@@ -142,18 +142,35 @@ $maximumBackgroundLoadPercent = 30.0
 #             run-to-run noise, and a count that varies WITHIN a build is a
 #             determinism bug rather than drift.
 #
+#             THE BAND IS SIZED AGAINST A MEASUREMENT (2026-08-10). Under the
+#             largest lever this harness has, `-Arm off` -- both JIT halves off,
+#             duke3d-486 coverage 0.7235 -> 0.5932, wall 141.1 s -> 155.2 s --
+#             the count moved from 919 to 920, one count against an allowance
+#             of 18. It survives because arm off moves GUEST time by three parts
+#             in ten thousand (163.150 -> 163.103 s): charging is per
+#             instruction and does not care which backend retired it. So +/-2%
+#             covers JIT-mix work with a factor of 18 in hand and deliberately
+#             does NOT cover timing-model work -- the same day's storage-charge
+#             slices moved this count 580 -> 919 -- which is the class of change
+#             that SHOULD reach a reviewer as a pin move. See .bench/PROTOCOL.md.
+#
+#             The count and its band live in the SIDECAR JSON beside the frame
+#             hashes, not here, and go through the same -RecordInvariants /
+#             -Force machinery: a pin that moves is a reviewable one-line diff
+#             with the manifest sha moved in the same breath, which is exactly
+#             the argument the sidecar comment below makes for the hashes. The
+#             constants below are only what a FIRST record starts from.
+#
 # FPS min/max/avg are MEASUREMENTS. They are guest-observed frame rates and move
 # with host load, so they are reported and never asserted.
 $dukemarkSampleTolerance = 0.02
-function New-DukemarkPins([int]$Samples) {
+function New-DukemarkPins {
     @{
-        demo             = "BENCH2"
-        info             = "2,320,200,2,0,1,1,1"
-        resultFile       = "DUKEMARK.TXT"
+        demo       = "BENCH2"
+        info       = "2,320,200,2,0,1,1,1"
+        resultFile = "DUKEMARK.TXT"
         # EXITVM.COM poking 0x51 at the unit-tester exit register, not zero.
-        exitCode         = 0x51
-        samples          = $Samples
-        samplesTolerance = $dukemarkSampleTolerance
+        exitCode   = 0x51
     }
 }
 
@@ -221,7 +238,8 @@ function Get-FixtureTable {
             # rotation runs. Without it (and without the memory manager the
             # fixture's CONFIG.SYS was missing until 2026-08-08) every earlier
             # wolf3d number measured an out-of-memory CRASH LOOP, not the game.
-            injection = @("--inject-keys", "2000000000:")
+            injection = @("--inject-keys", "2000000000:
+")
         }
         [pscustomobject]@{
             name = "wolf3d-586"; folder = "wolf3d_c"
@@ -232,19 +250,22 @@ function Get-FixtureTable {
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; dukemark = $null
             # See wolf3d-486: the Enter is what gets the game past its signon.
-            injection = @("--inject-keys", "2000000000:")
+            injection = @("--inject-keys", "2000000000:
+")
         }
         [pscustomobject]@{
             name = "duke3d-486"; folder = "duke3d_c"
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             # A GUARD, not the length of the run: the guest exits itself through
-            # EXITVM once the demo is done, which lands at about 19.4e9 (294
-            # guest seconds). 26.4e9 is 400 guest seconds, so a run that hits
-            # the budget has genuinely failed to finish and says so.
+            # EXITVM once the demo is done, which lands at about 10.8e9 (163
+            # guest seconds) since the HDD-geometry slice of 2026-08-10 took the
+            # FAT-chain walking out of the load phase, and landed at 19.4e9 (294
+            # guest seconds) before it. 26.4e9 is 400 guest seconds, so a run
+            # that hits the budget has genuinely failed to finish and says so.
             cycles = [uint64]26400000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $false; injection = @()
-            dukemark = (New-DukemarkPins 919)
+            dukemark = (New-DukemarkPins)
         }
         [pscustomobject]@{
             name = "duke3d-586"; folder = "duke3d_c"
@@ -253,13 +274,15 @@ function Get-FixtureTable {
             # rule protects.
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
             # Same guard role as the 486 row. 79.68e9 is 480 guest seconds at
-            # 166 MHz, comfortably past where EXITVM actually fires.
+            # 166 MHz, comfortably past where EXITVM actually fires (about
+            # 23.2e9, 140 guest seconds).
             cycles = [uint64]79680000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $false; injection = @()
-            # Not the 486 row's number. Same demo, same config, same fixture --
-            # the count follows emulated timing, so it is pinned per persona.
-            dukemark = (New-DukemarkPins 1026)
+            # The sample pin is per persona (the count follows emulated timing,
+            # so the 586 row does not read the 486 row's number); both live in
+            # the sidecar json.
+            dukemark = (New-DukemarkPins)
         }
         [pscustomobject]@{
             name = "nascar-586"; folder = "nascar1_c"
@@ -646,14 +669,34 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         notes            = @()
     }
 
+    # A run that wrote no profile, or wrote one that will not parse, is a run
+    # that told us NOTHING -- an emulator that crashed on start looks exactly
+    # like this. It used to report a third word, `no-profile`, which the exit
+    # check at the bottom did not count, so a sweep whose fixtures all crashed
+    # exited 0 and read as a clean sweep. It is a FAIL; the note is what says
+    # which kind of fail it is.
     if (-not (Test-Path -LiteralPath $profilePath)) {
-        $result.invariant = "no-profile"
-        $result.notes += "the run produced no profile JSON; exit code $exitCode"
+        $result.invariant = "FAIL"
+        $result.notes += ("no profile JSON was written (the emulator crashed, or never " +
+            "started); exit code $exitCode")
         Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
         return $result
     }
 
-    $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+    $profile = $null
+    try {
+        $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+    } catch {
+        $profile = $null
+    }
+    if ($null -eq $profile -or $null -eq $profile.PSObject.Properties["perf"]) {
+        $result.invariant = "FAIL"
+        $result.notes += ("the profile JSON did not parse or carries no perf block " +
+            "(truncated by a crash mid-write?); exit code $exitCode")
+        Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
+        return $result
+    }
+
     $perf = $profile.perf
     $entries = [double]$perf.jit_direct_entries
     $entries16 = [double]$perf.jit_direct_entries_sixteen_bit
@@ -781,17 +824,12 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
                     "'$($pins.info)' -- the fixture's configuration moved " +
                     "(Demo,Width,Height,Mode,Hud,Detail,Sound,Music)")
             }
+            # The count itself is graded in the driver against the sidecar pin,
+            # the same way the frame hashes are. Its ABSENCE is graded here,
+            # because a report with no count at all is a broken report rather
+            # than a moved pin.
             if ($null -eq $scraped.samples) {
                 $failures += "$($pins.resultFile) carries no extrapolation count"
-            } else {
-                $allowed = [math]::Max(1, [math]::Round($pins.samples * $pins.samplesTolerance))
-                $drift = [math]::Abs($scraped.samples - $pins.samples)
-                $result.dukemark_samples_drift = $drift
-                if ($drift -gt $allowed) {
-                    $failures += ("DUKEMARK extrapolated $($scraped.samples) samples against a " +
-                        "pin of $($pins.samples) +/- $allowed -- the demo stalled or did not " +
-                        "play to completion")
-                }
             }
             $result.notes += ("DUKEMARK {0}: fps min {1} / avg {2} / max {3} (MEASUREMENTS), " +
                 "{4} samples, info {5}") -f $pins.demo, $scraped.fps_min, $scraped.fps_avg,
@@ -898,6 +936,58 @@ try {
             }
         }
 
+        # The DUKEMARK extrapolation count, held to a band. Same sidecar, same
+        # -RecordInvariants / -Force machinery and the same three outcomes as the
+        # frame hash above: a moved pin is a reviewable one-line diff with the
+        # manifest sha moved beside it, never a hand edit inside this script.
+        # Unlike the hash it is a BAND, so what the sidecar carries is the centre
+        # and the tolerance, and only a value outside the band fails.
+        if ($row.Contains("dukemark_samples") -and $null -ne $row.dukemark_samples) {
+            $recorded = if ($invariants.Contains($fixture.name)) {
+                $invariants[$fixture.name]
+            } else { $null }
+            $pinned = if ($null -ne $recorded -and $recorded.Contains("dukemark_samples")) {
+                [int]$recorded.dukemark_samples
+            } else { $null }
+            $tolerance = if ($null -ne $recorded -and
+                $recorded.Contains("dukemark_samples_tolerance")) {
+                [double]$recorded.dukemark_samples_tolerance
+            } else { $dukemarkSampleTolerance }
+
+            if ($RecordInvariants) {
+                $allowed = if ($null -ne $pinned) {
+                    [math]::Max(1, [math]::Round($pinned * $tolerance))
+                } else { 0 }
+                if ($null -ne $pinned -and
+                    [math]::Abs($row.dukemark_samples - $pinned) -gt $allowed -and -not $Force) {
+                    throw ("$($fixture.name) already has a recorded DUKEMARK sample pin of " +
+                        "$pinned +/- $allowed and this run read $($row.dukemark_samples). " +
+                        "Re-recording would erase the evidence of a real change. Pass -Force " +
+                        "only if you have established that the move is legitimate.")
+                }
+                if (-not $invariants.Contains($fixture.name)) {
+                    $invariants[$fixture.name] = @{}
+                }
+                $invariants[$fixture.name].dukemark_samples = $row.dukemark_samples
+                $invariants[$fixture.name].dukemark_samples_tolerance = $tolerance
+                $row.notes += "DUKEMARK sample pin recorded ($($row.dukemark_samples) +/- $tolerance)"
+            } elseif ($null -eq $pinned) {
+                $row.notes += "no recorded DUKEMARK sample pin to compare against"
+                if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
+            } else {
+                $allowed = [math]::Max(1, [math]::Round($pinned * $tolerance))
+                $drift = [math]::Abs($row.dukemark_samples - $pinned)
+                $row.dukemark_samples_pin = $pinned
+                $row.dukemark_samples_drift = $drift
+                if ($drift -gt $allowed) {
+                    $row.invariant = "FAIL"
+                    $row.notes += ("DUKEMARK extrapolated $($row.dukemark_samples) samples " +
+                        "against a pin of $pinned +/- $allowed -- the demo stalled or did not " +
+                        "play to completion")
+                }
+            }
+        }
+
         $rows += [pscustomobject]$row
         Write-Host ("  {0}  rt {1}  load {2}%{3}" -f $row.invariant,
             $(if ($row.Contains("real_time_factor")) { $row.real_time_factor } else { "n/a" }),
@@ -957,10 +1047,15 @@ Write-Host ($markdown -join "`n")
 Write-Host ""
 Write-Host "wrote $jsonPath"
 
-$failed = @($rows | Where-Object { $_.invariant -eq "FAIL" })
+# Anything that is not a checked pass or a deliberate `unpinned` is a failure.
+# An allow-list rather than a `-eq "FAIL"` test on purpose: the old form counted
+# only the one word, so a fixture that never got as far as being graded (a
+# crashed emulator reported `no-profile`, an early return left `unchecked`)
+# exited 0 and a sweep of nothing but crashes read as a clean sweep.
+$failed = @($rows | Where-Object { $_.invariant -notin @("pass", "unpinned") })
 if ($failed.Count -gt 0) {
     Write-Host ""
     Write-Error ("{0} fixture(s) failed their invariant: {1}" -f
-        $failed.Count, ($failed.name -join ", "))
+        $failed.Count, (($failed | ForEach-Object { "$($_.name) [$($_.invariant)]" }) -join ", "))
     exit 1
 }

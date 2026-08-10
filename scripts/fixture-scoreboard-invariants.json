@@ -1,4 +1,12 @@
 {
+  "duke3d-486": {
+    "dukemark_samples": 919,
+    "dukemark_samples_tolerance": 0.02
+  },
+  "duke3d-586": {
+    "dukemark_samples": 1026,
+    "dukemark_samples_tolerance": 0.02
+  },
   "gp2-586": {
     "frame_sha256": "1a289f8db4fb242cf0877a3ff9fbfe790f1efa46e230701ed4ed655deb272ace"
   },
