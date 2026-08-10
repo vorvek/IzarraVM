@@ -3,8 +3,8 @@
 
 ; SNDMIXER.COM - ReSonique 2 Volume Mixer.
 ;
-; Six vertical faders over the card's mixer: MASTER, FMSYNTH, WAVE, CD-ROM,
-; MIDI and PC-SPEAKER. Sibling to SNDCTRL.COM, which assigns the card's
+; Seven vertical faders over the card's mixer: MASTER, FMSYNTH, WAVE, CD-ROM,
+; MIDI, PC-SPEAKER and AMP. Sibling to SNDCTRL.COM, which assigns the card's
 ; resources; this one sets its levels. Same box, same palette, same key map.
 ;
 ; There is deliberately no line or microphone fader: the machine models no
@@ -86,6 +86,34 @@
 ; four hardware positions actually sit. A value from the command line snaps up
 ; to the nearest stop at or above it (any non-zero request stays audible).
 ;
+; AMP is two bits as well, on the OUTPUT GAIN pair at 0x41/0x42, and it is the
+; one fader that goes UP. The other six attenuate: their top stop is the level
+; the card powers on at and everything below it is quieter. This one is the
+; card's output amplifier, whose 2-bit field in D7-D6 is
+;
+;     step  code  gain
+;        0     0    0 dB   <- the card's power-on setting
+;        3     1   +6 dB
+;        7     2  +12 dB
+;       10     3  +18 dB
+;
+; so its BOTTOM stop is unity and its travel is gain the card did not have
+; before. Step 0 on this fader is therefore not a mute -- there is nothing to
+; mute, only an amplifier turned off -- which is why it is the step the record
+; opens on and the step a fresh card reads back as.
+;
+; It shares the speaker's four UI positions because it has the same number of
+; hardware positions, and for the same reason: ten stops over four loudnesses
+; is the failure the fader law exists to avoid. A value from the command line
+; snaps up the same way.
+;
+; WARNING, and it is the user's to take, exactly as it is on the hardware: the
+; mix reserves 6 dB after the mixer, which is enough to absorb one full-scale
+; leg. +6 dB spends that reserve. +12 and +18 dB are past it, and a hot source
+; -- a full-scale digital voice leg, or several legs at once -- will clip. The
+; card offers those positions, so this fader offers them; it does not refuse
+; them and it does not quietly limit them.
+;
 ; MIDI has no CT1745 register at all: on a real SB16 the pair at 0x34/0x35
 ; called "MIDI" is the FM synthesiser bus, which is this card's FMSYNTH fader.
 ; The wavetable MPU's synthesis is mixed on-card the way an AWE32 mixes its
@@ -131,9 +159,14 @@ A_FIELD   equ 0x0F       ; white on black: an editable value, drawn as an input
 A_SEL     equ 0x4F       ; white on red: the selected input
 A_SHADOW  equ 0x80       ; dark grey block under and beside the box
 
+; The box holds seven 5-column tracks with a column of air between them, so it
+; is as wide as an 80-column screen and its two-column shadow leave room for:
+; BOX_COL + BOX_W + 2 = 80 exactly, and the shadow's own row runs BOX_COL + 2
+; for BOX_W columns, which ends on 79. Six faders fitted in 72 columns at a
+; pitch of 11; seven need a pitch of 10 and four more columns of box.
 BOX_ROW   equ 1
-BOX_COL   equ 4
-BOX_W     equ 72
+BOX_COL   equ 2
+BOX_W     equ 76
 BOX_H     equ 22
 
 TRACK_TOP equ 5          ; the track's top border row
@@ -148,6 +181,12 @@ BTN_ROW   equ 21         ; the button row, along the bottom of the box
 ; the way the sibling tool draws an editable value. They are the last two stops
 ; on the same Tab ring the faders sit on, so nothing new has to be learned to
 ; reach them.
+;
+; The pair is centred in the box's interior (BOX_COL + 1 .. BOX_COL + BOX_W - 2,
+; i.e. 3..76): two 12-column cells with 4 columns between them span 26..53, whose
+; midpoint is 39.5 and so is the interior's. The columns did not have to move
+; when the box widened by four and shifted left by two, because those two
+; changes cancel here.
 BTN_W     equ 12
 BTN_A_COL equ 26
 BTN_C_COL equ 42
@@ -171,6 +210,7 @@ K_CT5 equ 0               ; a CT1745 5-bit pair
 K_WAV equ 1               ; the CT1745 voice pair AND the AD1848 attenuators
 K_SPK equ 2               ; the CT1745 2-bit PC-speaker register
 K_MID equ 3               ; the ReSonique 2 wavetable pair, which has a mute bit
+K_AMP equ 4               ; the CT1745 2-bit output-gain PAIR, 0x41/0x42
 
 ; D0 of 0x50/0x51. The wavetable leg is the only source in the machine with no
 ; other control anywhere, so a level of 0 there is floored to the quietest
@@ -189,9 +229,10 @@ C_WAVE    equ 2
 C_CD      equ 3
 C_MIDI    equ 4
 C_SPK     equ 5
-C_COUNT   equ 6
+C_AMP     equ 6
+C_COUNT   equ 7
 
-; The Tab ring is the six faders followed by the two buttons. A selection at or
+; The Tab ring is the seven faders followed by the two buttons. A selection at or
 ; above C_COUNT is a button and has no channel record behind it, which is the
 ; one thing every reader of `cur_sel` has to check before indexing the table.
 B_ACCEPT  equ C_COUNT
@@ -428,8 +469,8 @@ read_levels:
 read_channel:
     call channel_enabled
     jnc .absent
-    cmp byte [si + CH_KIND], K_SPK
-    je .speaker
+    call quad_fader
+    jc .quad
     cmp byte [si + CH_KIND], K_MID
     je .wavetable
     mov al, [si + CH_REG]
@@ -454,15 +495,34 @@ read_channel:
 .muted:
     xor al, al
     ret
-.speaker:
+; Both 2-bit faders read the same way: the position is D7-D6 of the register
+; the record names, and the step it displays as is the one that position IS.
+; For the speaker that register is 0x3B and the positions are attenuations; for
+; AMP it is 0x41, the left half of the output-gain pair, and they are gains.
+.quad:
     mov al, [si + CH_REG]
     call mixer_read
     shr al, 6                   ; two bits, D7-D6
     movzx bx, al
-    mov al, [spk_step + bx]
+    mov al, [q4_step + bx]
     ret
 .absent:
     xor al, al
+    ret
+
+; SI -> channel record. CF=1 when its fader has the FOUR stops of a 2-bit
+; register rather than the eleven of a 5-bit ladder. Preserves SI; the only
+; other thing it touches is the flags, so every caller may branch on it
+; directly. Clobbers nothing else.
+quad_fader:
+    cmp byte [si + CH_KIND], K_SPK
+    je .yes
+    cmp byte [si + CH_KIND], K_AMP
+    je .yes
+    clc
+    ret
+.yes:
+    stc
     ret
 
 ; AL = 5-bit level -> AL = the nearest fader step.
@@ -516,6 +576,8 @@ apply_channel:
     movzx di, byte [si + CH_STEP]
     cmp byte [si + CH_KIND], K_SPK
     je .speaker
+    cmp byte [si + CH_KIND], K_AMP
+    je .amp
     ; The 5-bit pair: one byte, both channels. The mixer is mono per channel
     ; here on purpose -- a balance control is a separate idea from a level, and
     ; this tool does not offer one, so the two registers always agree.
@@ -550,9 +612,25 @@ apply_channel:
 .done:
     ret
 .speaker:
-    mov al, [spk_level + di]
+    mov al, [q4_level + di]
     shl al, 6
     mov ah, [si + CH_REG]
+    call mixer_write
+    ret
+; Output gain is a PAIR, unlike the speaker's single register: 0x41 is the left
+; half and 0x42 the right, and the card amplifies each side by its own field.
+; Writing one and not the other is a balance change nobody asked for, so both
+; go every time, from the same byte, exactly as the 5-bit pairs above do.
+.amp:
+    mov al, [q4_level + di]
+    shl al, 6
+    mov bh, al
+    mov ah, [si + CH_REG]
+    mov al, bh
+    call mixer_write
+    mov ah, [si + CH_REG]
+    inc ah
+    mov al, bh
     call mixer_write
     ret
 
@@ -593,19 +671,22 @@ index_enabled:
     stc
     ret
 
-; Clamp AL into 0..10 and, for the PC speaker, snap it to the nearest stop at
-; or ABOVE it. Snapping up is what keeps `/P 1` audible: a request for a little
-; is a request for some, and the nearest stop downwards from 1 is silence.
+; Clamp AL into 0..10 and, for the two 2-bit faders, snap it to the nearest stop
+; at or ABOVE it. Snapping up is what keeps `/P 1` audible: a request for a
+; little is a request for some, and the nearest stop downwards from 1 is
+; silence. `/A 1` snaps by the same rule and for the matching reason -- a
+; request for a little gain is a request for some, and the stop below it is no
+; gain at all.
 ; SI -> channel record. Clobbers BX.
 normalize_step:
     cmp al, 10
     jbe .in_range
     mov al, 10
 .in_range:
-    cmp byte [si + CH_KIND], K_SPK
-    jne .done
+    call quad_fader
+    jnc .done
     movzx bx, al
-    mov al, [spk_snap + bx]
+    mov al, [q4_snap + bx]
 .done:
     ret
 
@@ -1329,45 +1410,45 @@ interactive:
     call draw_info
     jmp .loop
 ; Up and Down move one POSITION, which for five of the faders is one step and
-; for the PC speaker is one of its four hardware stops. Stepping the speaker by
-; one and then snapping would not move at all -- from a stop, the nearest stop
-; at or above step+1 is the stop you started on -- so the speaker counts in
-; register levels and converts back.
+; for the PC speaker and AMP is one of their four hardware stops. Stepping one
+; of those by one and then snapping would not move at all -- from a stop, the
+; nearest stop at or above step+1 is the stop you started on -- so they count in
+; register positions and convert back.
 .louder:
     call selected_channel       ; a button has no level to move
     jnc .loop
-    cmp byte [si + CH_KIND], K_SPK
-    je .spk_up
+    call quad_fader
+    jc .quad_up
     mov al, [si + CH_STEP]
     cmp al, 10
     jae .loop
     inc al
     jmp .set_al
-.spk_up:
+.quad_up:
     movzx bx, byte [si + CH_STEP]
-    mov bl, [spk_level + bx]
+    mov bl, [q4_level + bx]
     cmp bl, 3
     jae .loop
     inc bl
-    mov al, [spk_step + bx]
+    mov al, [q4_step + bx]
     jmp .set_al
 .quieter:
     call selected_channel
     jnc .loop
-    cmp byte [si + CH_KIND], K_SPK
-    je .spk_down
+    call quad_fader
+    jc .quad_down
     mov al, [si + CH_STEP]
     test al, al
     jz .loop
     dec al
     jmp .set_al
-.spk_down:
+.quad_down:
     movzx bx, byte [si + CH_STEP]
-    mov bl, [spk_level + bx]
+    mov bl, [q4_level + bx]
     test bl, bl
     jz .loop
     dec bl
-    mov al, [spk_step + bx]
+    mov al, [q4_step + bx]
     jmp .set_al
 .full:
     mov al, 10
@@ -1380,10 +1461,10 @@ interactive:
     pop ax                      ; POP does not disturb the carry
     jnc .loop
 .set_al:
-    ; The speaker snaps to its four stops, so stepping "up" from a stop that is
-    ; already the highest below the next one has to keep moving rather than
-    ; land back where it started; normalize_step rounds up, which is exactly
-    ; that.
+    ; The speaker and AMP snap to their four stops, so stepping "up" from a stop
+    ; that is already the highest below the next one has to keep moving rather
+    ; than land back where it started; normalize_step rounds up, which is
+    ; exactly that.
     call normalize_step
     mov [si + CH_STEP], al
     call apply_channel
@@ -1855,8 +1936,11 @@ draw_info:
     mov si, [si + CH_DESC]
     call puts
     pop si
+    ; Far enough right to clear the longest description (AMP's, which ends on
+    ; column 56) with air to spare, and near enough that a six-character dB
+    ; string still finishes inside the box.
     mov al, INFO_ROW
-    mov ah, BOX_COL + 52
+    mov ah, BOX_COL + 60
     call screen_at
     mov ah, A_TITLE
     push si
@@ -1886,16 +1970,25 @@ draw_info:
 db_text:
     push di
     movzx di, byte [si + CH_STEP]
-    cmp byte [si + CH_KIND], K_SPK
-    je .speaker
+    call quad_fader
+    jc .quad
     shl di, 1
     mov si, [db_ct5 + di]
     pop di
     ret
-.speaker:
-    movzx di, byte [spk_level + di]
+; The two 2-bit faders index their own four-entry ladder by POSITION rather than
+; by step, and the two ladders read in opposite directions: the speaker's are
+; attenuations down from 0 dB, AMP's are gains up from it.
+.quad:
+    movzx di, byte [q4_level + di]
     shl di, 1
+    cmp byte [si + CH_KIND], K_AMP
+    je .amp
     mov si, [db_spk + di]
+    pop di
+    ret
+.amp:
+    mov si, [db_amp + di]
     pop di
     ret
 
@@ -2127,29 +2220,46 @@ step_level: db 0, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31
 ; the way down to it.
 wss_atten:  db WSS_DAC_MUTE, 24, 21, 19, 16, 13, 11, 8, 5, 3, 0
 
-; The 2-bit PC-speaker register has four positions, so a step maps onto one of
+; The two 2-bit registers have four positions each, so a step maps onto one of
 ; them and the fader shows the step that position IS (0, 3, 7, 10) rather than
-; the one the user asked for. spk_snap rounds a request up to the nearest stop
+; the one the user asked for. q4_snap rounds a request up to the nearest stop
 ; at or above it, so a request for any audible level gets an audible one, and
 ; the four canonical steps are fixed points of it.
-spk_level:  db 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3
-spk_snap:   db 0, 3, 3, 3, 7, 7, 7, 7, 10, 10, 10
-spk_step:   db 0, 3, 7, 10
+;
+; One ladder serves both faders because both registers are two bits wide and
+; both put their field in D7-D6. What the four positions MEAN differs -- the
+; speaker's are attenuations, AMP's are gains -- and that difference lives in
+; the two dB tables below, not here.
+q4_level:   db 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3
+q4_snap:    db 0, 3, 3, 3, 7, 7, 7, 7, 10, 10, 10
+q4_step:    db 0, 3, 7, 10
 
 ; kind, reg, col, namecol, step, saved, dev, spare / name, key, desc, pad
+;
+; Track columns are 7, 17, ... at a pitch of 10: five columns of track and one
+; of air. The name column is the track's, offset so the label centres on it --
+; one to the left for a six or seven character name, level for a four, one to
+; the right for AMP's three.
+;
+; AMP is the one record that does not open on step 10. Its step 0 is the card's
+; power-on 0 dB rather than a mute, so a machine whose card is absent (which is
+; the only case where these defaults are ever seen) shows it turned off, which
+; is what an absent card's output gain is.
 channels:
-    db K_CT5, 0x30,  8,  7, 10, 10, DEV_SB, 0
+    db K_CT5, 0x30,  7,  6, 10, 10, DEV_SB, 0
     dw nm_master, key_master, ds_master, 0
-    db K_CT5, 0x34, 19, 18, 10, 10, DEV_SB, 0
+    db K_CT5, 0x34, 17, 16, 10, 10, DEV_SB, 0
     dw nm_fm, key_fm, ds_fm, 0
-    db K_WAV, 0x32, 30, 30, 10, 10, DEV_ANY, 0
+    db K_WAV, 0x32, 27, 27, 10, 10, DEV_ANY, 0
     dw nm_wave, key_wave, ds_wave, 0
-    db K_CT5, 0x36, 41, 40, 10, 10, DEV_SB, 0
+    db K_CT5, 0x36, 37, 36, 10, 10, DEV_SB, 0
     dw nm_cd, key_cd, ds_cd, 0
-    db K_MID, 0x50, 52, 52, 10, 10, DEV_SB, 0
+    db K_MID, 0x50, 47, 47, 10, 10, DEV_SB, 0
     dw nm_midi, key_midi, ds_midi, 0
-    db K_SPK, 0x3B, 63, 62, 10, 10, DEV_SB, 0
+    db K_SPK, 0x3B, 57, 56, 10, 10, DEV_SB, 0
     dw nm_spk, key_spk, ds_spk, 0
+    db K_AMP, 0x41, 67, 68,  0,  0, DEV_SB, 0
+    dw nm_amp, key_amp, ds_amp, 0
 
 nm_master: db 'MASTER', 0
 nm_fm:     db 'FMSYNTH', 0
@@ -2157,6 +2267,7 @@ nm_wave:   db 'WAVE', 0
 nm_cd:     db 'CD-ROM', 0
 nm_midi:   db 'MIDI', 0
 nm_spk:    db 'SPEAKER', 0
+nm_amp:    db 'AMP', 0
 
 key_master: db 'MASTER', 0
 key_fm:     db 'FMSYNTH', 0
@@ -2164,6 +2275,7 @@ key_wave:   db 'WAVE', 0
 key_cd:     db 'CD', 0
 key_midi:   db 'MIDI', 0
 key_spk:    db 'SPEAKER', 0
+key_amp:    db 'AMP', 0
 
 ds_master: db 'MASTER    all ReSonique 2 output', 0
 ds_fm:     db 'FMSYNTH   OPL3 FM synthesis (music bus)', 0
@@ -2171,16 +2283,22 @@ ds_wave:   db 'WAVE      digital audio: SB16 DSP and WSS codec', 0
 ds_cd:     db 'CD-ROM    Red Book audio from the CD drive', 0
 ds_midi:   db 'MIDI      wavetable synthesis from the MPU-401', 0
 ds_spk:    db 'SPEAKER   PC speaker, via the card PC-SPK input', 0
+ds_amp:    db 'AMP       card output gain; above 0 dB a hot mix clips', 0
 
 ds_accept: db 'ACCEPT    leave with these levels in effect', 0
 ds_cancel: db 'CANCEL    leave and put the previous levels back', 0
 
-; The dB each step costs, as text, for the two ladders on the card.
+; The dB each step costs, as text, for the three ladders on the card. The first
+; two are indexed by STEP and by POSITION respectively and both run downwards
+; from 0 dB; db_amp is indexed by position and runs UPWARDS from it, which is
+; the whole of what makes AMP a different control from the six above it.
 db_ct5:
     dw s_mute, s_m36, s_m32, s_m28, s_m24, s_m20
     dw s_m16, s_m12, s_m8, s_m4, s_m0
 db_spk:
     dw s_mute, s_m14, s_m7, s_m0
+db_amp:
+    dw s_m0, s_p6, s_p12, s_p18
 
 s_mute: db 'mute', 0
 s_m36:  db '-36 dB', 0
@@ -2195,6 +2313,9 @@ s_m8:   db '-8 dB', 0
 s_m7:   db '-7 dB', 0
 s_m4:   db '-4 dB', 0
 s_m0:   db '0 dB', 0
+s_p6:   db '+6 dB', 0
+s_p12:  db '+12 dB', 0
+s_p18:  db '+18 dB', 0
 
 ; Switch keyword, kind (0 usage, 1 list, 2 silent, 3 channel level, 4 config
 ; path), argument (the channel index for kind 3).
@@ -2240,6 +2361,10 @@ sw_table:
     db 3, C_SPK
     dw sw_spk
     db 3, C_SPK
+    dw sw_a
+    db 3, C_AMP
+    dw sw_amp
+    db 3, C_AMP
     dw sw_cfg
     db 4, 0
     dw 0
@@ -2264,13 +2389,17 @@ sw_i:        db 'I', 0
 sw_midi:     db 'MIDI', 0
 sw_p:        db 'P', 0
 sw_spk:      db 'SPEAKER', 0
+sw_a:        db 'A', 0
+sw_amp:      db 'AMP', 0
 sw_cfg:      db 'CFG', 0
 
-; row, col, attribute, text
+; row, col, attribute, text. Both strings are centred in the box's interior
+; (columns 3..76): the title is 24 wide and the key line 62, so they start at
+; 3 + (74 - 24) / 2 = 28 and 3 + (74 - 62) / 2 = 9.
 static_text:
-    db  3, 27, A_TITLE
+    db  3, 28, A_TITLE
     dw t_title
-    db KEYS_ROW,  6, A_BOX
+    db KEYS_ROW,  9, A_BOX
     dw t_keys
     db 0xFF
 
@@ -2287,7 +2416,10 @@ cfg_head:
     db '; ReSonique 2 volume levels, written by SNDMIXER.COM.', 13, 10
     db '; One channel per line. 0 mutes, 10 is full volume.', 13, 10
     db '; Spaces around the = are permitted.', 13, 10
-    db '; SPEAKER has four positions and reads back as 0, 3, 7 or 10.', 13, 10, 0
+    db '; SPEAKER has four positions and reads back as 0, 3, 7 or 10.', 13, 10
+    db '; AMP is the card output gain and has the same four positions,', 13, 10
+    db '; but it AMPLIFIES: 0 is 0 dB, 3 is +6, 7 is +12, 10 is +18 dB.', 13, 10
+    db '; Above 0 dB a hot source can clip. 0 is the power-on setting.', 13, 10, 0
 
 msg_head:        db 'ReSonique 2 volume levels', 13, 10, 0
 msg_no_card:     db '  No ReSonique 2 card detected.', 13, 10, 0
@@ -2313,16 +2445,22 @@ msg_usage:
     db '  SNDMIXER /C n           CD-ROM      Red Book audio', 13, 10
     db '  SNDMIXER /I n           MIDI        wavetable synthesis', 13, 10
     db '  SNDMIXER /P n           PC speaker  four positions: 0 3 7 10', 13, 10
+    db '  SNDMIXER /A n           AMP         output gain, same four', 13, 10
     db '  SNDMIXER /S             suppress all output', 13, 10
     db '  SNDMIXER /?             usage', 13, 10, 13, 10
-    db 'Each step is 4 dB. Step 10 is the power-on level.', 13, 10
-    db '/CFG alone restores the levels in the file. /CFG with any', 13, 10
-    db 'channel switch writes the new levels to the file.', 13, 10
-    db 'In the full-screen mixer, levels take effect immediately.', 13, 10
-    db 'Tab reaches the Accept and Cancel buttons; Enter or Space', 13, 10
-    db 'presses the one that is selected. Accept leaves the levels', 13, 10
-    db 'in effect. Cancel and Esc restore the previous levels.', 13, 10
-    db 'F10 saves.', 13, 10, 0
+    ; Twenty-two lines. The screen holds 24 of them once the command that asked
+    ; for them and the prompt that follows are counted -- measured, not guessed;
+    ; see the fixture that pins it. The seventh switch line and AMP's
+    ; explanation were paid for out of the prose below rather than added to it,
+    ; because the version that added them came to 25 and scrolled its own title
+    ; away.
+    db 'Each step is 4 dB; step 10 is the power-on level. AMP is the', 13, 10
+    db 'exception -- it is the card output gain, and its stops 0 3 7', 13, 10
+    db '10 are 0, +6, +12 and +18 dB. Above 0 dB a hot source clips.', 13, 10
+    db '/CFG alone restores the levels in the file; with a channel', 13, 10
+    db 'switch it saves them there instead. Levels take effect as set.', 13, 10
+    db 'Tab reaches Accept and Cancel; Enter or Space presses the', 13, 10
+    db 'selected one. Esc and Cancel restore them. F10 saves.', 13, 10, 0
 
 ; ---- state ------------------------------------------------------------------
 sb_present:  db 0

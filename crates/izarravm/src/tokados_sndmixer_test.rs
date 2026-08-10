@@ -137,6 +137,10 @@ fn sndmixer_lists_the_levels_the_card_powers_on_with() {
         // Two bits, and the card powers on at position 2 of 4. The listing
         // reports the step that position IS, not a step it rounded from.
         "SPEAKER      7   -7 dB",
+        // Two bits as well, and the card powers on at position 0 -- which on
+        // this fader is 0 dB and not a mute, because it is the card's output
+        // amplifier and 0 dB is an amplifier passing its input through.
+        "AMP          0   0 dB",
     ] {
         assert!(
             screen
@@ -393,8 +397,8 @@ fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
         "the full-screen mixer never opened\n{opened}"
     );
     assert!(
-        opened.contains("MASTER") && opened.contains("SPEAKER"),
-        "all six faders must be on screen\n{opened}"
+        opened.contains("MASTER") && opened.contains("SPEAKER") && opened.contains("AMP"),
+        "all seven faders must be on screen\n{opened}"
     );
 
     // Right moves the selection off MASTER and onto FMSYNTH; Down twice takes
@@ -539,14 +543,14 @@ fn sndmixer_accept_button_leaves_the_levels_applied() {
         "the moves must have reached the hardware, or Accept has nothing to keep"
     );
 
-    // Six Tabs walk the selection off SPEAKER (the sixth fader) and onto the
-    // Accept button; the buttons are the last two stops on the same ring.
+    // Seven Tabs walk the selection off AMP (the seventh and last fader) and
+    // onto the Accept button; the buttons are the last two stops on the ring.
     let opened = machine.screen_text().as_text();
     assert!(
         opened.contains("Accept") && opened.contains("Cancel"),
         "both buttons are on screen from the moment the mixer opens\n{opened}"
     );
-    for _ in 0..6 {
+    for _ in 0..7 {
         press(&mut machine, &[0x0F, 0x8F]);
     }
     let focused = machine.screen_text().as_text();
@@ -591,8 +595,8 @@ fn sndmixer_cancel_button_restores_the_levels_the_mixer_opened_on() {
         "the moves must have reached the hardware, or Cancel has nothing to undo"
     );
 
-    // Seven Tabs: six faders, then Accept, then Cancel.
-    for _ in 0..7 {
+    // Eight Tabs: seven faders, then Accept, then Cancel.
+    for _ in 0..8 {
         press(&mut machine, &[0x0F, 0x8F]);
     }
     let focused = machine.screen_text().as_text();
@@ -624,16 +628,30 @@ fn sndmixer_cancel_button_restores_the_levels_the_mixer_opened_on() {
 /// the data area, not a channel. The whole screen and the whole mixer register
 /// file are compared, not a chosen few of each, because the address that stray
 /// write lands on depends on which routine painted last: with the check removed
-/// it wrote the card's OUTPUT GAIN pair, `0x41`/`0x42` -- registers this tool
-/// does not own and a short list of the ones it does would never have looked at.
+/// it reads the bytes just past the channel table as a record, and the register
+/// index it finds there is `0x41`.
+///
+/// That is why the oracle is "NOTHING moved" and not "`0x41`/`0x42` are still
+/// zero", which is what it used to be. Those two registers are the card's
+/// output gain, and since the AMP fader they are a pair this tool owns and
+/// writes on purpose -- so their staying at zero is no longer evidence of
+/// anything, and a fixture that asserted it would pass on a build where the
+/// stray write had simply moved one record further along. The companion
+/// fixture below is the other half: the same keys, with a FADER selected, must
+/// move those very registers.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndmixer_level_keys_do_nothing_while_a_button_is_selected() {
     let (mut machine, dir) = open_the_mixer("sndmixer_btn_keys", "SNDMIXER /M 4\r\nSNDMIXER\r\n");
-    for _ in 0..6 {
+    // Seven Tabs: past all seven faders and onto Accept.
+    for _ in 0..7 {
         press(&mut machine, &[0x0F, 0x8F]);
     }
     let before_screen = machine.screen_text().as_text();
+    assert!(
+        before_screen.contains("ACCEPT    leave with these levels in effect"),
+        "the fixture must start with a BUTTON selected, or it proves nothing\n{before_screen}"
+    );
     let before: Vec<Option<u8>> = (0u8..=0xFF)
         .map(|index| machine.sb_mixer_register(index))
         .collect();
@@ -657,6 +675,63 @@ fn sndmixer_level_keys_do_nothing_while_a_button_is_selected() {
     assert!(
         after_screen.contains("ACCEPT    leave with these levels in effect"),
         "the selection is still on the button it started on\n{after_screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The other half of the guard above: the same keys, on the last FADER, DO
+/// move the registers the stray write used to land on.
+///
+/// Without this, "no register moved" could be satisfied by a tool that had
+/// stopped writing anything at all, and the guard would be measuring a dead
+/// path. The keys and the register pair are deliberately the same ones; only
+/// the selection differs, which is the single variable the guard is about.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_level_keys_on_the_amp_fader_move_the_output_gain_pair() {
+    let (mut machine, dir) = open_the_mixer("sndmixer_amp_keys", "SNDMIXER /M 4\r\nSNDMIXER\r\n");
+    // Six Tabs: MASTER through SPEAKER, landing on AMP, one short of Accept.
+    for _ in 0..6 {
+        press(&mut machine, &[0x0F, 0x8F]);
+    }
+    let focused = machine.screen_text().as_text();
+    assert!(
+        focused.contains("AMP       card output gain"),
+        "six Tabs must land on the AMP fader, not on a button\n{focused}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x41),
+        Some(0),
+        "the card powers on at 0 dB of output gain\n{focused}"
+    );
+
+    // Home is the same key the guard fixture pressed on the button.
+    press(&mut machine, &[0x47, 0xC7]);
+    let screen = machine.screen_text().as_text();
+    assert_eq!(
+        machine.sb_mixer_register(0x41),
+        Some(3 << 6),
+        "Home on AMP must take the left half of the pair to +18 dB\n{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x42),
+        Some(3 << 6),
+        "and the right half with it: one fader writes both, or it is a balance\n{screen}"
+    );
+
+    // Down walks one hardware POSITION, not one step: +18 dB to +12 dB.
+    press(&mut machine, &[0x50, 0xD0]);
+    let screen = machine.screen_text().as_text();
+    for index in [0x41u8, 0x42] {
+        assert_eq!(
+            machine.sb_mixer_register(index),
+            Some(2 << 6),
+            "Down moves AMP one position, and moves both halves ({index:#04x})\n{screen}"
+        );
+    }
+    assert!(
+        screen.contains("+12 dB"),
+        "the info line reads the gain out of the ladder that runs UPWARDS\n{screen}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -825,6 +900,125 @@ fn sndmixer_speaker_step_three_survives_the_cli_save_and_restore_round_trip() {
     let second = fs::read_to_string(dir.join("VOL2.CFG")).expect("read the second config");
     assert!(
         second.contains("SPEAKER=3"),
+        "the round trip must not drift the step:\n{second}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `/?` still fits on the screen it is printed to.
+///
+/// DOS does not page this text and the tool does not either, so a usage screen
+/// one line too long scrolls its own first line away -- which is exactly what
+/// adding the seventh switch and AMP's explanation did before the prose below
+/// them was cut to pay for it. Both ends are asserted: the title, which is what
+/// scrolls off first, and the last line, which is what proves the text was
+/// printed whole rather than truncated somewhere in the middle.
+///
+/// The screen holds 24 lines of it, measured by adding filler lines here until
+/// this fails: 24 passes and 25 does not. The text is 22, so there are two
+/// spare. That margin is why this fixture is worth having rather than obvious
+/// -- the overflowing version was 25 and looked fine in the source.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_usage_text_fits_an_eighty_by_twentyfive_screen() {
+    let (machine, dir) = boot_with_sndmixer("sndmixer_usage", "SNDMIXER /?\r\n");
+    let screen = machine.screen_text().as_text();
+    assert!(
+        screen.contains("SNDMIXER - ReSonique 2 Volume Mixer"),
+        "the title must not have scrolled off the top\n{screen}"
+    );
+    assert!(
+        screen.contains("selected one. Esc and Cancel restore them. F10 saves."),
+        "and the last line must be on it too\n{screen}"
+    );
+    assert!(
+        screen.contains("SNDMIXER /A n"),
+        "with the switch this slice added among them\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `/A` on the command line, over all four of the gain register's positions.
+///
+/// Both halves of the pair are checked at every stop, because a write that
+/// reached only `0x41` would be a balance change that no fader offers, and the
+/// listing's dB figure is checked with them, because the position and the
+/// number printed beside it come from two different tables and can disagree.
+///
+/// `/A 1` is the snap-up rule on this fader: 1 is not one of the four stops, so
+/// it lands on the next one up (step 3, position 1, +6 dB) rather than on the
+/// nearer stop below, which is no gain at all.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_amp_switch_drives_both_output_gain_registers() {
+    for (request, position, step, db) in [
+        (0u8, 0u8, 0u8, "0 dB"),
+        (1, 1, 3, "+6 dB"),
+        (3, 1, 3, "+6 dB"),
+        (7, 2, 7, "+12 dB"),
+        (10, 3, 10, "+18 dB"),
+    ] {
+        let (machine, dir) = boot_with_sndmixer(
+            &format!("sndmixer_amp_cli{request}"),
+            &format!("SNDMIXER /A {request}\r\n"),
+        );
+        let screen = machine.screen_text().as_text();
+        for index in [0x41u8, 0x42] {
+            assert_eq!(
+                machine.sb_mixer_register(index),
+                Some(position << 6),
+                "/A {request} must put position {position} in D7-D6 of {index:#04x}\n{screen}"
+            );
+        }
+        // The listing pads the name to 12 columns, right-aligns the step in
+        // two, then leaves three before the dB figure.
+        let row = format!("AMP{:9}{step:>2}   {db}", "");
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.trim_end() == format!("  {row}")),
+            "/A {request} must list as {row:?}\n{screen}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// AMP through the config file and back, the shape `F10` and the AUTOEXEC line
+/// make between them.
+///
+/// The middle command drives the gain to its top position, so the restore has
+/// to move it back down and cannot pass on a run where the restore did nothing.
+/// The second save names MASTER rather than AMP, so its `AMP` line is written
+/// from reading `0x41` back off the card rather than from anything requested on
+/// that command line -- which is what makes it a round trip and not an echo.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_amp_survives_the_cli_save_and_restore_round_trip() {
+    let (machine, dir) = boot_with_sndmixer(
+        "sndmixer_amp_roundtrip",
+        "SNDMIXER /A 7 /CFG C:\\VOL.CFG /S\r\n\
+         SNDMIXER /A 10 /S\r\n\
+         SNDMIXER /CFG C:\\VOL.CFG /S\r\n\
+         SNDMIXER /M 8 /CFG C:\\VOL2.CFG /S\r\n\
+         ECHO MIXER-DONE\r\n",
+    );
+    let screen = machine.screen_text().as_text();
+    assert!(screen.contains("MIXER-DONE"), "{screen}");
+    let first = fs::read_to_string(dir.join("VOL.CFG")).expect("read the saved config");
+    assert!(
+        first.contains("AMP=7"),
+        "/A 7 has to save as step 7:\n{first}"
+    );
+    for index in [0x41u8, 0x42] {
+        assert_eq!(
+            machine.sb_mixer_register(index),
+            Some(2 << 6),
+            "step 7 restores to hardware position 2 on {index:#04x}\n{screen}"
+        );
+    }
+    let second = fs::read_to_string(dir.join("VOL2.CFG")).expect("read the second config");
+    assert!(
+        second.contains("AMP=7"),
         "the round trip must not drift the step:\n{second}"
     );
     let _ = fs::remove_dir_all(&dir);
