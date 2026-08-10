@@ -1075,6 +1075,37 @@ impl Machine {
     /// engine modeled (a glyph expand is ~740 ns, ~16 clocks at 22 MHz). The
     /// arming write ends its own batch, so this term is always seen from a batch
     /// that starts with the engine busy.
+    ///
+    /// UNCONDITIONAL ACROSS TIMING CLASSES, AND WHAT THAT COSTS. The blit wait is
+    /// two halves -- this deadline term, and the `VideoWrite::ArmedBlit`
+    /// `io_touched` set in `MachineBus::write_memory_byte_recorded` -- and both
+    /// apply in the Approximate class as well. That is deliberate:
+    /// `docs/vega/vega-technical-reference.md` section 9 specifies that "software
+    /// cannot observe the engine as idle until the modeled time has passed" and
+    /// calls the Margo cost model "exact by construction ... a stronger guarantee
+    /// than the CPU compatibility modes". The tier is a CPU-speed policy, never a
+    /// device-behavior one, and no `GswMode` reaches margo.rs.
+    ///
+    /// The price is real and was measured, so it is recorded here rather than
+    /// left for the next person to rediscover. Ending a batch on the arming write
+    /// raises BATCH ENTRIES on Margo-heavy Approximate-class workloads by ~5.9%,
+    /// and wall follows it:
+    ///
+    ///   | fixture    | entries          | wall s          |
+    ///   |------------|------------------|-----------------|
+    ///   | prince-486 | 1.233G -> 1.306G | 65.96 -> 69.05  (+4.7%) |
+    ///   | nascar-586 | 190.2M -> 201.4M | 63.03 -> 66.15  (+4.9%) |
+    ///   | duke3d-486 | 442.1M -> 439.7M | 132.87 -> 132.76 (neutral) |
+    ///   | duke3d-586 | 1.517G -> 1.522G | 450.15 -> 452.45 (+0.5%) |
+    ///
+    /// Guest seconds are IDENTICAL across arms on prince and nascar (60.61 and
+    /// 30.00), so those are wall-for-wall comparisons, not a real-time-factor
+    /// artifact. gp2-586's entries move only 0.08% and its wall difference is
+    /// inside host noise, which is the control that makes entries the causal
+    /// variable rather than a coincidence. A probe gating BOTH halves to the
+    /// Accurate class recovers the entry counts EXACTLY (prince back to
+    /// 1,233,464,425) and the wall with them -- so this is the whole cost, and it
+    /// is bought deliberately for the section-9 contract.
     fn vega_edge_ticks(&self) -> Option<u64> {
         let blit_busy_ns = self.vega.blitter_busy_ns();
         let blit = if blit_busy_ns > 0 {
