@@ -134,13 +134,23 @@ A_SHADOW  equ 0x80       ; dark grey block under and beside the box
 BOX_ROW   equ 1
 BOX_COL   equ 4
 BOX_W     equ 72
-BOX_H     equ 21
+BOX_H     equ 22
 
 TRACK_TOP equ 5          ; the track's top border row
 TRACK_BOT equ 16         ; its bottom border row; the ten cells are 6..15
 VALUE_ROW equ 17
 NAME_ROW  equ 18
 INFO_ROW  equ 19
+KEYS_ROW  equ 20
+BTN_ROW   equ 21         ; the button row, along the bottom of the box
+
+; The two buttons, drawn as inputs of a fixed width with their labels centred,
+; the way the sibling tool draws an editable value. They are the last two stops
+; on the same Tab ring the faders sit on, so nothing new has to be learned to
+; reach them.
+BTN_W     equ 12
+BTN_A_COL equ 26
+BTN_C_COL equ 42
 
 ; ---- channel records (16 bytes each) ----------------------------------------
 CH_KIND    equ 0
@@ -180,6 +190,13 @@ C_CD      equ 3
 C_MIDI    equ 4
 C_SPK     equ 5
 C_COUNT   equ 6
+
+; The Tab ring is the six faders followed by the two buttons. A selection at or
+; above C_COUNT is a button and has no channel record behind it, which is the
+; one thing every reader of `cur_sel` has to check before indexing the table.
+B_ACCEPT  equ C_COUNT
+B_CANCEL  equ C_COUNT + 1
+SEL_COUNT equ C_COUNT + 2
 
 TOKEN_MAX equ 16
 PATH_MAX  equ 80
@@ -559,14 +576,21 @@ channel_enabled:
     clc
     ret
 
-; BL = channel index. CF=1 when it is editable. Preserves SI.
+; BL = a stop on the Tab ring. CF=1 when it can hold the selection. Preserves
+; SI. The two buttons always can: they are the way out of the screen, and a
+; machine with no card at all still has to be able to leave it.
 index_enabled:
+    cmp bl, C_COUNT
+    jae .button
     push si
     movzx si, bl
     shl si, 4
     add si, channels
     call channel_enabled
     pop si
+    ret
+.button:
+    stc
     ret
 
 ; Clamp AL into 0..10 and, for the PC speaker, snap it to the nearest stop at
@@ -1237,8 +1261,15 @@ cfg_save:
 ;
 ; Levels are applied to the hardware as the fader moves, not on F10: a mixer
 ; you cannot hear while you set it is not a mixer. F10 therefore SAVES (and
-; leaves), and Esc puts back the levels the run opened on -- which is a real
-; undo precisely because the writes already happened.
+; leaves), Accept leaves with the levels standing, and Cancel puts back the
+; levels the run opened on -- which is a real undo precisely because the writes
+; already happened.
+;
+; The two buttons are the last two stops on the Tab ring the faders already sit
+; on, and Enter or Space presses the one that has the selection, which is the
+; sibling tool's model for an input exactly. They are an affordance, not a new
+; way to leave: Esc still cancels and F10 still saves, and the buttons only put
+; the two exits on screen for a user who does not know that yet.
 ; =============================================================================
 interactive:
     call read_levels
@@ -1253,6 +1284,10 @@ interactive:
     je .cancel
     cmp ah, 0x44                ; F10
     je .save
+    cmp al, 13                  ; Enter
+    je .press
+    cmp al, ' '
+    je .press
     cmp al, 9                   ; Tab
     je .forward
     cmp ah, 0x0F                ; Shift+Tab
@@ -1275,6 +1310,14 @@ interactive:
     ja .loop
     sub al, '0'
     jmp .set
+; Enter and Space press the selected button and do nothing at all on a fader:
+; a fader has no "activate", and the levels are already live.
+.press:
+    cmp byte [cur_sel], B_ACCEPT
+    je .accept
+    cmp byte [cur_sel], B_CANCEL
+    je .cancel
+    jmp .loop
 .backward:
     call prev_channel
     call draw_faders
@@ -1291,7 +1334,8 @@ interactive:
 ; at or above step+1 is the stop you started on -- so the speaker counts in
 ; register levels and converts back.
 .louder:
-    call selected
+    call selected_channel       ; a button has no level to move
+    jnc .loop
     cmp byte [si + CH_KIND], K_SPK
     je .spk_up
     mov al, [si + CH_STEP]
@@ -1308,7 +1352,8 @@ interactive:
     mov al, [spk_step + bx]
     jmp .set_al
 .quieter:
-    call selected
+    call selected_channel
+    jnc .loop
     cmp byte [si + CH_KIND], K_SPK
     je .spk_down
     mov al, [si + CH_STEP]
@@ -1331,8 +1376,9 @@ interactive:
     xor al, al
 .set:
     push ax
-    call selected
-    pop ax
+    call selected_channel
+    pop ax                      ; POP does not disturb the carry
+    jnc .loop
 .set_al:
     ; The speaker snaps to its four stops, so stepping "up" from a stop that is
     ; already the highest below the next one has to keep moving rather than
@@ -1358,6 +1404,16 @@ interactive:
     call report
     mov ax, 0x4c00
     int 0x21
+; Accept leaves with the levels the run set, and says so. It is NOT a save: the
+; levels are already on the hardware, and writing them to the config file is
+; F10's job, which is why the message says what happened to the mixer rather
+; than naming a file nothing was written to.
+.accept:
+    call video_done
+    mov si, msg_accepted
+    call print
+    mov ax, 0x4c00
+    int 0x21
 .cancel:
     call restore_saved
     call apply_all
@@ -1367,11 +1423,25 @@ interactive:
     mov ax, 0x4c00
     int 0x21
 
-; SI -> the selected channel's record.
+; SI -> the selected channel's record. Only valid when the selection is a fader.
 selected:
     movzx si, byte [cur_sel]
     shl si, 4
     add si, channels
+    ret
+
+; CF=1 and SI -> the selected channel's record when a fader has the selection;
+; CF=0, and SI untouched, when a button has it. Every key that moves a level
+; goes through this, because a button has no record and indexing the table with
+; its selection number would read whatever follows the table as a channel.
+selected_channel:
+    cmp byte [cur_sel], C_COUNT
+    jae .button
+    call selected
+    stc
+    ret
+.button:
+    clc
     ret
 
 restore_saved:
@@ -1389,17 +1459,19 @@ restore_saved:
 .done:
     ret
 
+; Open on the first stop the ring will accept, which is MASTER on a machine with
+; a card and the Accept button on one without.
 first_channel:
-    mov byte [cur_sel], C_COUNT - 1
+    mov byte [cur_sel], SEL_COUNT - 1
     call next_channel
     ret
 
 next_channel:
     mov bl, [cur_sel]
-    mov cx, C_COUNT
+    mov cx, SEL_COUNT
 .loop:
     inc bl
-    cmp bl, C_COUNT
+    cmp bl, SEL_COUNT
     jb .check
     xor bl, bl
 .check:
@@ -1413,11 +1485,11 @@ next_channel:
 
 prev_channel:
     mov bl, [cur_sel]
-    mov cx, C_COUNT
+    mov cx, SEL_COUNT
 .loop:
     test bl, bl
     jnz .step
-    mov bl, C_COUNT
+    mov bl, SEL_COUNT
 .step:
     dec bl
     call index_enabled
@@ -1590,6 +1662,48 @@ draw_faders:
     inc bl
     jmp .loop
 .done:
+    call draw_buttons
+    ret
+
+; The two buttons, in the colours the sibling tool gives an input: the one
+; holding the selection is drawn selected, the other plain, and no fader is
+; highlighted while either of them is, so there is never a question about where
+; a keystroke will land.
+draw_buttons:
+    mov bl, B_ACCEPT
+    mov ah, BTN_A_COL
+    mov si, t_accept
+    call draw_button
+    mov bl, B_CANCEL
+    mov ah, BTN_C_COL
+    mov si, t_cancel
+    call draw_button
+    ret
+
+; BL = the button's stop on the ring, AH = its column, SI -> its ASCIIZ label.
+draw_button:
+    mov [tmp_col], ah
+    mov al, BTN_ROW
+    call screen_at
+    mov ah, A_FIELD
+    cmp bl, [cur_sel]
+    jne .attr
+    mov ah, A_SEL
+.attr:
+    mov [tmp_attr], ah
+    mov al, ' '
+    mov cx, BTN_W
+    rep stosw
+    call str_len                ; CX = the label's length, SI unchanged
+    mov bx, BTN_W
+    sub bx, cx
+    shr bx, 1                   ; centred in the cell, as a value is
+    mov al, BTN_ROW
+    mov ah, [tmp_col]
+    add ah, bl
+    call screen_at
+    mov ah, [tmp_attr]
+    call puts
     ret
 
 ; BL = channel index.
@@ -1721,7 +1835,8 @@ draw_fader:
 
 ; The one-line description of the selected channel, plus what its current step
 ; costs in dB. Redrawn on every change, so the number on screen is always the
-; number the hardware is holding.
+; number the hardware is holding. A selected button describes itself in the same
+; line and carries no dB figure, because it has no level.
 draw_info:
     mov al, INFO_ROW
     mov ah, BOX_COL + 2
@@ -1729,6 +1844,8 @@ draw_info:
     mov ax, (A_BOX << 8) | ' '
     mov cx, BOX_W - 4
     rep stosw
+    cmp byte [cur_sel], C_COUNT
+    jae .button
     call selected
     mov al, INFO_ROW
     mov ah, BOX_COL + 2
@@ -1746,6 +1863,18 @@ draw_info:
     call db_text                ; SI -> the dB string for this step
     call puts
     pop si
+    ret
+.button:
+    mov si, ds_accept
+    cmp byte [cur_sel], B_ACCEPT
+    je .put
+    mov si, ds_cancel
+.put:
+    mov al, INFO_ROW
+    mov ah, BOX_COL + 2
+    call screen_at
+    mov ah, A_BOX
+    call puts
     ret
 
 ; SI -> channel record. Returns SI -> the ASCIIZ dB label for its current step.
@@ -1792,6 +1921,20 @@ u8dec:
     add al, '0'
     mov [di], al
     inc di
+    ret
+
+; SI -> ASCIIZ. CX = its length, SI unchanged.
+str_len:
+    push si
+    xor cx, cx
+.loop:
+    cmp byte [si], 0
+    je .done
+    inc si
+    inc cx
+    jmp .loop
+.done:
+    pop si
     ret
 
 ; Copy the ASCIIZ at SI to [DI] without its terminator. CX = bytes copied.
@@ -2029,6 +2172,9 @@ ds_cd:     db 'CD-ROM    Red Book audio from the CD drive', 0
 ds_midi:   db 'MIDI      wavetable synthesis from the MPU-401', 0
 ds_spk:    db 'SPEAKER   PC speaker, via the card PC-SPK input', 0
 
+ds_accept: db 'ACCEPT    leave with these levels in effect', 0
+ds_cancel: db 'CANCEL    leave and put the previous levels back', 0
+
 ; The dB each step costs, as text, for the two ladders on the card.
 db_ct5:
     dw s_mute, s_m36, s_m32, s_m28, s_m24, s_m20
@@ -2124,12 +2270,14 @@ sw_cfg:      db 'CFG', 0
 static_text:
     db  3, 27, A_TITLE
     dw t_title
-    db 20,  6, A_BOX
+    db KEYS_ROW,  6, A_BOX
     dw t_keys
     db 0xFF
 
-t_title: db 'ReSonique 2 Volume Mixer', 0
-t_keys:  db 'Left/Right  channel    Up/Down  level    Home/End  full/mute', 0
+t_title:  db 'ReSonique 2 Volume Mixer', 0
+t_keys:   db 'Tab/Arrows  move    Up/Down  level    F10  save    Esc  cancel', 0
+t_accept: db 'Accept', 0
+t_cancel: db 'Cancel', 0
 
 s_indent:      db '  ', 0
 s_gap:         db '   ', 0
@@ -2148,6 +2296,7 @@ msg_saved:       db 'Saved in ', 0
 msg_save_failed: db 'Could not write ', 0
 msg_restored:    db 'Volume levels restored from ', 0
 msg_no_file:     db 'No saved volume levels in ', 0
+msg_accepted:    db 'Settings applied.', 13, 10, 0
 msg_cancelled:   db 'Cancelled. Previous levels restored.', 13, 10, 0
 msg_bad_switch:  db 'Unrecognised option: ', 0
 msg_bad_value:   db 'Level must be 0 to 10: ', 0
@@ -2169,8 +2318,11 @@ msg_usage:
     db 'Each step is 4 dB. Step 10 is the power-on level.', 13, 10
     db '/CFG alone restores the levels in the file. /CFG with any', 13, 10
     db 'channel switch writes the new levels to the file.', 13, 10
-    db 'In the full-screen mixer, F10 saves and Esc restores the', 13, 10
-    db 'previous levels. Levels take effect immediately.', 13, 10, 0
+    db 'In the full-screen mixer, levels take effect immediately.', 13, 10
+    db 'Tab reaches the Accept and Cancel buttons; Enter or Space', 13, 10
+    db 'presses the one that is selected. Accept leaves the levels', 13, 10
+    db 'in effect. Cancel and Esc restore the previous levels.', 13, 10
+    db 'F10 saves.', 13, 10, 0
 
 ; ---- state ------------------------------------------------------------------
 sb_present:  db 0
@@ -2188,6 +2340,7 @@ bad_kind:    db 0
 cur_sel:     db 0
 tmp_attr:    db 0
 tmp_chan:    db 0
+tmp_col:     db 0
 cfg_channel: db 0
 pending:     times C_COUNT db 0
 pending_set: times C_COUNT db 0
