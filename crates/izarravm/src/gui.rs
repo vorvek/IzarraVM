@@ -37,19 +37,27 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 /// The ReSonique 2 output amp gain as a linear multiplier, from the config's
-/// tenths encoding (30 -> 3.0). Models the card's analog output stage (line
-/// driver / power amp) that the digital mixer model does not represent: a game
-/// like Doom that never programs the CT1745 volume runs on the power-on default
-/// (master and voice both -14 dB), so its digitized voice path lands at -28 dB
-/// and is inaudible played straight out of a host DAC with no analog gain. The
-/// user tunes it from the config menu; it is folded into the shared master gain.
-fn amp_multiplier(amp_gain: u32) -> f32 {
-    amp_gain as f32 / 10.0
+/// tenths encoding (10 -> 1.0). Models the card's analog output stage (line
+/// driver / power amp) that the digital mixer model does not represent. It
+/// defaults to unity: the CT1745 now powers on at 0 dB on every leg, so a game
+/// that never programs the mixer -- Doom, Duke Nukem 3D -- already arrives at
+/// full level, and the machine's summing node reserves the headroom below full
+/// scale (`MIX_HEADROOM`). See `prefs::DEFAULT_OUTPUT_GAIN` for why this used to
+/// be 12.0x and why leaving it there clipped everything. The user tunes it from
+/// the config menu; it is folded into the shared master gain.
+///
+/// `pub(crate)` because the headless audio capture stages its gains through the
+/// same two functions rather than a copy of the arithmetic. The capture is the
+/// instrument a mix bug is diagnosed with, and it spent this entire investigation
+/// rendering at unity while the GUI rendered at 12.0x -- 21.6 dB blind to the
+/// very staging it was pointed at.
+pub(crate) fn amp_multiplier(output_gain: u32) -> f32 {
+    output_gain as f32 / 10.0
 }
 
 /// The PC speaker volume as a linear gain, from the config's percent (100 -> 1.0,
 /// 0 -> muted). Applied host-side to the speaker only, independent of the card amp.
-fn speaker_multiplier(pc_speaker_volume: u32) -> f32 {
+pub(crate) fn speaker_multiplier(pc_speaker_volume: u32) -> f32 {
     pc_speaker_volume as f32 / 100.0
 }
 
@@ -585,15 +593,16 @@ pub struct GuiApp {
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
     // the emulation thread reads through `gain`.
     volume: f32,
-    // ReSonique 2 output amp gain, in tenths (120 = 12.0x). Edited in the config
-    // modal, persisted in prefs. The multiplier form rides `amp` to the emu thread.
-    amp_gain: u32,
+    // ReSonique 2 output amp gain, in tenths (10 = 1.0x, unity). Edited in the
+    // config modal, persisted in prefs as `output_gain`. The multiplier form
+    // rides `amp` to the emu thread.
+    output_gain: u32,
     // PC speaker volume as a percent (100 = full, 0 = muted). Edited in the config
     // modal, persisted in prefs. The gain form rides `speaker_vol` to the emu thread.
     pc_speaker_volume: u32,
     // The shared master gain (curved volume slider), read each audio pump.
     gain: SharedGain,
-    // The shared ReSonique 2 amp multiplier (amp_gain / 10), read each audio pump
+    // The shared ReSonique 2 amp multiplier (output_gain / 10), read each audio pump
     // and applied to the card's sources only (not the PC speaker). Separate atomic
     // from `gain` so the two stay lock-free and independently updatable.
     amp: SharedGain,
@@ -637,8 +646,8 @@ struct ConfigDialog {
     joystick_binding: Option<JoystickBinding>,
     joystick_wizard: Option<JoystickWizard>,
     crt_style: CrtStyle,
-    // ReSonique 2 amp gain in tenths (120 = 12.0x); see GuiApp::amp_gain.
-    amp_gain: u32,
+    // ReSonique 2 amp gain in tenths (10 = 1.0x, unity); see GuiApp::output_gain.
+    output_gain: u32,
     // PC speaker volume percent (100 = full, 0 = muted); see GuiApp::pc_speaker_volume.
     pc_speaker_volume: u32,
     midi_backend: MidiBackend,
@@ -885,10 +894,10 @@ impl GuiApp {
             }
         };
         let volume = prefs.master_volume.clamp(0.0, 1.0);
-        let amp_gain = prefs.amp_gain;
+        let output_gain = prefs.output_gain;
         let pc_speaker_volume = prefs.pc_speaker_volume;
         let gain = SharedGain::new(volume_gain(volume));
-        let amp = SharedGain::new(amp_multiplier(amp_gain));
+        let amp = SharedGain::new(amp_multiplier(output_gain));
         let speaker_vol = SharedGain::new(speaker_multiplier(pc_speaker_volume));
         let initial_media = prepare_initial_media(cd_image, &prefs);
         let spec = SessionSpec {
@@ -957,7 +966,7 @@ impl GuiApp {
             show_about: false,
             show_license: false,
             volume,
-            amp_gain,
+            output_gain,
             pc_speaker_volume,
             gain,
             amp,

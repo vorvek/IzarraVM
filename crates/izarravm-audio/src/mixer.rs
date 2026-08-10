@@ -413,7 +413,7 @@ impl SbMixer {
     /// common case, since BLASTER tells it nothing about volume -- would
     /// otherwise play 14 dB down, and a title that sets only its own voice level
     /// stacks a second 14 dB on top of that. The card's analog output stage
-    /// (`amp_gain`) is the host's volume control; the mixer should start out of
+    /// (`output_gain`) is the host's volume control; the mixer should start out of
     /// the way.
     ///
     /// The CD level (`0x36`/`0x37`, in the inert store) follows the same rule and

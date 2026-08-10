@@ -643,6 +643,23 @@ fn the_guis_own_preferences_file_is_recognised_and_named() {
         message.contains("examples/machine.toml"),
         "and say what to pass instead: {message}"
     );
+
+    // The gain knob was renamed `amp_gain` -> `output_gain`. BOTH spellings have
+    // to be recognised here: the new one because that is what is written now,
+    // and the old one because a file that still carries it is still a prefs file
+    // and deserves this message rather than an unknown-field error.
+    for (name, key) in [
+        ("legacy", "amp_gain = 120"),
+        ("current", "output_gain = 25"),
+    ] {
+        let path = directory.path().join(format!("{name}.conf"));
+        fs::write(&path, format!("{key}\n")).unwrap();
+        let message = AppConfig::from_toml_path(&path).unwrap_err().to_string();
+        assert!(
+            message.contains("GUI"),
+            "{key} alone must identify a prefs file: {message}"
+        );
+    }
 }
 
 /// The detector keys off fields a machine config cannot have, so a real one --

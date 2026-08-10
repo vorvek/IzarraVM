@@ -17,6 +17,58 @@ pub const DAC_HZ: u32 = 44_100;
 /// ordinary jitter, so reaching it means the guest is genuinely outrunning the
 /// host drain, which is worth reporting rather than absorbing silently.
 pub const DAC_PENDING_FRAME_CAP: usize = 4410;
+
+/// Digital headroom reserved below full scale on the ReSonique 2's summing
+/// node, as a linear gain: 0.5 is -6.02 dB, exactly one bit.
+///
+/// The CT1745 powers on with master, voice, FM and CD all at level 31 (0 dB),
+/// matching DOSBox-X's `CTMIXER_Reset` and 86Box. Every one of those legs is
+/// therefore unity, and they SUM: a title playing digital effects over FM music
+/// -- Duke Nukem 3D, the common case -- drives the summing node past full scale
+/// with both legs at their defaults and nothing misprogrammed. Saturating that
+/// at `clamp_i16` is not just loud, it is destructive in a way a level control
+/// cannot undo: symmetric clipping squashes a panned image toward the centre
+/// (both channels rail at the same value) and turns every waveform into a
+/// square. That is exactly the "no stereo separation" plus "peaked and muffled"
+/// pair reported against the volume-decode fix.
+///
+/// Reserving the headroom here, once, after the legs are summed, is the only
+/// placement that leaves the hardware register semantics untouched -- guest
+/// reads, writes and read-modify-write round-trips of `0x30`-`0x37`/`0x41`/`0x42`
+/// are unchanged -- and preserves the RELATIVE balance the decode fix
+/// established (FM against voice against CD) exactly, since a single scalar
+/// divides out of every ratio.
+///
+/// Making the mix quieter is the point: SNDMIXER.COM owns amplification (see
+/// `dev_docs/sndmixer-spec.md`), and its faders have nothing to raise if the
+/// defaults already sit on the clamp.
+///
+/// The shape is not novel: 86Box reserves headroom for the same reason. Its
+/// placement is different, and worth being exact about, because the difference
+/// is the whole argument for one post-sum scalar.
+///
+/// 86Box attenuates PER LEG, ahead of the sum, and by DIFFERENT amounts
+/// (`src/sound/snd_sb.c`, read as study only under `dev_docs/reference/86box`;
+/// the concept is cited, no code taken):
+///
+/// - digital voice, `sb_get_buffer_sb16_awe32`: `dsp * voice_l / 3.0` (-9.54 dB)
+/// - CD-in, `sb16_awe32_filter_cd_audio`: `buffer * cd / 3.0 * master` (-9.54 dB)
+/// - PC speaker, `sb16_awe32_filter_pc_speaker`: `/ 3.0` likewise
+/// - external MIDI in through the FM registers, `sb16_awe32_filter_midi`: `/ 3.0`
+/// - but the INTERNAL OPL leg, `sb_get_music_buffer_sb16_awe32:501-503`:
+///   `opl_buf * fm_l * 0.7171630859375`, which is -2.89 dB and no `/ 3.0` at all
+///
+/// So there is no single 86Box number to match: its FM sits 6.65 dB ABOVE its
+/// voice by construction, and copying that would undo exactly what the CT1745
+/// volume-decode fix corrected here (FM running over voice). One scalar after
+/// the sum keeps the FM/voice/CD ratios the decode fix established and leaves
+/// only the absolute level to choose.
+///
+/// 6.02 dB is that choice. It leaves the DIGITAL VOICE leg within 0.4 dB of the
+/// absolute level it had before the decode fix, so a title's effects land where
+/// they used to while the FM bus comes down to meet them.
+pub const MIX_HEADROOM: f32 = 0.5;
+
 pub const PIT_INPUT_HZ: u32 = 1_193_182;
 pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 

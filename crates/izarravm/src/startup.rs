@@ -244,6 +244,12 @@ impl ResolvedStartup {
         &self.config.dos.c_drive
     }
 
+    /// The GUI preferences this run resolved, for the headless paths that have
+    /// to stage audio the way the GUI stages it.
+    pub(super) fn prefs(&self) -> &prefs::GuiPrefs {
+        &self.prefs
+    }
+
     pub(super) fn load_global_glide_ovl(&self) -> Option<Vec<u8>> {
         load_state_glide_ovl(&self.state_dir)
     }

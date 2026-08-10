@@ -28,7 +28,7 @@ fn joystick_binding() -> JoystickBinding {
 fn round_trips_through_toml() {
     let prefs = GuiPrefs {
         master_volume: 0.65,
-        amp_gain: 55,
+        output_gain: 55,
         pc_speaker_volume: 40,
         crt_style: CrtStyle::YeOlde,
         input_release: KeyBinding::new(true, true, false, "F4"),
@@ -61,7 +61,7 @@ fn missing_keys_fall_back_to_defaults() {
     let parsed: GuiPrefs = toml::from_str("").expect("deserialize empty");
     assert_eq!(parsed, GuiPrefs::default());
     assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
-    assert_eq!(parsed.amp_gain, DEFAULT_AMP_GAIN);
+    assert_eq!(parsed.output_gain, DEFAULT_OUTPUT_GAIN);
     assert_eq!(parsed.pc_speaker_volume, DEFAULT_PC_SPEAKER_VOLUME);
     assert_eq!(
         parsed.crt_style,
@@ -130,6 +130,65 @@ fn retired_glide_render_threads_key_is_ignored_and_not_written() {
             .unwrap()
             .contains("glide_render_threads")
     );
+}
+
+/// A persisted `amp_gain` must be DROPPED, not clamped and carried over.
+///
+/// Every file written before this branch holds a value chosen against a chain
+/// with a 12.0x compensator in it, and the default that shipped in those files
+/// -- 120 -- was itself calibrated to a CT1745 that powered on 28 dB down. The
+/// loader only ever clamped to the maximum, so all of those files kept running
+/// the output stage at +21.6 dB into the clamp: the exact clipping this branch
+/// removes, still happening to anyone who had ever opened the config menu (which
+/// is what writes the file out). Renaming the key is what makes the fix reach
+/// them.
+#[test]
+fn a_persisted_legacy_amp_gain_is_ignored_and_the_new_key_round_trips() {
+    let path = Path::new("izarravm.conf");
+    let load = |text: &str| {
+        let text = text.to_string();
+        GuiPrefs::load_with(path, move |_| Ok(text.clone()))
+    };
+
+    // The shipped legacy default, and a hand-raised one. 120 is inside
+    // OUTPUT_GAIN_MAX, so the old clamp let it through untouched.
+    for legacy in ["amp_gain = 120\n", "amp_gain = 300\n"] {
+        let prefs = load(legacy);
+        assert_eq!(
+            prefs.output_gain, DEFAULT_OUTPUT_GAIN,
+            "{legacy:?} must load at the fresh default, not its own value"
+        );
+        assert_eq!(
+            prefs,
+            GuiPrefs::default(),
+            "the retired key must not disturb anything else either"
+        );
+    }
+
+    // The retired key is not written back, so the file heals on the next save.
+    assert!(
+        !toml::to_string(&GuiPrefs::default())
+            .unwrap()
+            .contains("amp_gain")
+    );
+
+    // And the new key is live: it loads, clamps, and survives a save/load cycle.
+    assert_eq!(load("output_gain = 25\n").output_gain, 25);
+    assert_eq!(
+        load(&format!("output_gain = {}\n", OUTPUT_GAIN_MAX + 1)).output_gain,
+        OUTPUT_GAIN_MAX,
+    );
+    let saved = GuiPrefs {
+        output_gain: 25,
+        ..GuiPrefs::default()
+    };
+    let text = toml::to_string_pretty(&saved).unwrap();
+    assert!(text.contains("output_gain = 25"), "{text}");
+    assert_eq!(load(&text), saved);
+
+    // A file carrying BOTH -- one the user hand-edited, or one written by a
+    // build straddling the rename -- takes the new key and ignores the old.
+    assert_eq!(load("amp_gain = 120\noutput_gain = 25\n").output_gain, 25);
 }
 
 #[test]

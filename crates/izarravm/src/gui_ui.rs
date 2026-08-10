@@ -274,7 +274,7 @@ impl GuiApp {
             joystick_binding: self.joystick_binding.clone(),
             joystick_wizard: None,
             crt_style: self.crt_style,
-            amp_gain: self.amp_gain,
+            output_gain: self.output_gain,
             pc_speaker_volume: self.pc_speaker_volume,
             midi_backend: midi_config.backend,
             external_midi_port: midi_config.external_port,
@@ -441,8 +441,11 @@ impl GuiApp {
                         ui.horizontal(|ui| {
                             ui.label("ReSonique 2 amp gain");
                             ui.add(
-                                egui::Slider::new(&mut dialog.amp_gain, 0..=prefs::AMP_GAIN_MAX)
-                                    .custom_formatter(|n, _| format!("{:.1}x", n / 10.0)),
+                                egui::Slider::new(
+                                    &mut dialog.output_gain,
+                                    0..=prefs::OUTPUT_GAIN_MAX,
+                                )
+                                .custom_formatter(|n, _| format!("{:.1}x", n / 10.0)),
                             )
                             .on_hover_text(
                                 "Output gain for the sound card's analog stage. Raise if a \
@@ -626,10 +629,10 @@ impl GuiApp {
         // Amp gain: update the live value + prefs and push the new multiplier to
         // the shared amp atomic so the emulation thread's audio pump picks it up
         // without a restart.
-        if dialog.amp_gain != self.amp_gain {
-            self.amp_gain = dialog.amp_gain;
-            self.prefs.amp_gain = dialog.amp_gain;
-            self.amp.set(amp_multiplier(self.amp_gain));
+        if dialog.output_gain != self.output_gain {
+            self.output_gain = dialog.output_gain;
+            self.prefs.output_gain = dialog.output_gain;
+            self.amp.set(amp_multiplier(self.output_gain));
         }
         // PC speaker volume: same live-update path as the amp gain.
         if dialog.pc_speaker_volume != self.pc_speaker_volume {
