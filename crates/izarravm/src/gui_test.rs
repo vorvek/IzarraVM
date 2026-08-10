@@ -289,15 +289,61 @@ fn accepting_the_panel_retries_a_midi_engine_that_is_not_ready() {
         );
     }
 
-    // With nothing running there is no engine to reconfigure, whatever the last
-    // status said. The panel shows a failed state for an unpowered machine by
-    // construction, and sending into that is a request that cannot be served.
+    // With nothing running there is no engine to RETRY: a status can only be
+    // stale, and an engine can only be re-opened, when a worker is holding one.
+    // An unpowered machine reports `MidiStatus::default()` (Ready) for both
+    // legs anyway, so this pair cannot arise from a real snapshot -- it is
+    // written out to pin that the retry half is gated on `powered` and not on
+    // the statuses happening to be Ready.
     assert!(!midi_request_needed(
-        &changed,
+        &live,
         &live,
         false,
         [MidiStatus::InitializationFailed; 2]
     ));
+}
+
+/// A configuration changed while the machine is OFF must still be sent.
+///
+/// There is no engine to reconfigure, which is why the RETRY half of this
+/// decision is gated on `powered` -- but the session is not idle. With no
+/// worker it applies the change to its own spec and snapshot and emits the
+/// `Applied` event, and that event is the only thing that writes `prefs.midi`.
+/// So refusing to send while powered off lost the setting three times over: the
+/// next power-on booted the old configuration, `izarravm.conf` never learned
+/// the new one, and the panel -- which reseeds from the snapshot -- showed the
+/// old values back with no error. Accept looked like it had worked.
+///
+/// The two links after this one are pinned next door:
+/// `session::tests::power_cycle_starts_empty_but_shutdown_closes_the_session`
+/// for what the session does with an unpowered request, and
+/// `applied_state_is_the_only_media_and_midi_preference_input` above for the
+/// event reaching the prefs file.
+#[test]
+fn a_midi_change_made_while_the_machine_is_off_is_still_sent() {
+    let live = MidiConfig::default();
+    let changed = MidiConfig {
+        backend: MidiBackend::External,
+        external_port: Some(MidiPortId {
+            name: "chosen while off".into(),
+            ordinal: 0,
+        }),
+        ..MidiConfig::default()
+    };
+    // The statuses an unpowered snapshot really carries: `SessionSnapshot`
+    // fills both MIDI legs with `MidiStatus::default()`, which is Ready. The
+    // gate cannot lean on them looking broken.
+    let unpowered = [MidiStatus::default(); 2];
+    assert_eq!(unpowered, [MidiStatus::Ready; 2]);
+
+    assert!(
+        midi_request_needed(&changed, &live, false, unpowered),
+        "a change made with the machine off has to reach the session"
+    );
+    assert!(
+        !midi_request_needed(&live, &live, false, unpowered),
+        "and an unchanged one still does not"
+    );
 }
 
 /// The MT-32 ROM boxes take a FOLDER as readily as a file.

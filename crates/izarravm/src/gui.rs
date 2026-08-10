@@ -698,15 +698,22 @@ fn midi_request_needed(
     powered: bool,
     statuses: [MidiStatus; 2],
 ) -> bool {
-    if !powered {
-        // Nothing is running to reconfigure; the settings are picked up when
-        // the machine next starts.
-        return false;
-    }
+    // A CHANGED configuration is always sent, running or not. There is no
+    // engine to reconfigure while the machine is off, but the session still has
+    // to be told: with no worker it applies the change to the spec and the
+    // snapshot itself and emits the Applied event that carries it into
+    // izarravm.conf, so the next power-on boots what the user chose. Swallowing
+    // it here lost the setting in total silence -- the panel reseeds from the
+    // snapshot, so Accept looked like it had worked.
+    //
+    // The RETRY half is what needs the machine running: a status can only be
+    // stale, and an engine can only be re-opened, when there is a worker
+    // holding one.
     staged != live
-        || statuses
-            .into_iter()
-            .any(|status| status != MidiStatus::Ready)
+        || (powered
+            && statuses
+                .into_iter()
+                .any(|status| status != MidiStatus::Ready))
 }
 
 fn midi_status_text(status: MidiStatus) -> &'static str {

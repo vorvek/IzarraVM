@@ -328,8 +328,18 @@ impl AudioPlayer {
                 // Installing drops the old stream, if any, once the new one is
                 // already running.
                 self.stream = Some(stream);
-                eprintln!("izarravm audio: output stream opened");
-                true
+                // Built is not the same as PLAYING: a device can fail during
+                // the very open that made it, and `StreamRecovery` deliberately
+                // keeps that report. Say which happened, and answer the caller
+                // with whether there is now sound rather than with whether a
+                // constructor returned.
+                let playing = self.is_playing();
+                if playing {
+                    eprintln!("izarravm audio: output stream opened");
+                } else {
+                    eprintln!("izarravm audio: output stream failed as it opened; will retry");
+                }
+                playing
             }
             None => false,
         }
