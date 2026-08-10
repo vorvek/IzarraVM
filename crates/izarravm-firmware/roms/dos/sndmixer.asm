@@ -159,11 +159,12 @@ A_FIELD   equ 0x0F       ; white on black: an editable value, drawn as an input
 A_SEL     equ 0x4F       ; white on red: the selected input
 A_SHADOW  equ 0x80       ; dark grey block under and beside the box
 
-; The box holds seven 5-column tracks with a column of air between them, so it
-; is as wide as an 80-column screen and its two-column shadow leave room for:
-; BOX_COL + BOX_W + 2 = 80 exactly, and the shadow's own row runs BOX_COL + 2
-; for BOX_W columns, which ends on 79. Six faders fitted in 72 columns at a
-; pitch of 11; seven need a pitch of 10 and four more columns of box.
+; The box holds seven tracks at a pitch of 10 -- five columns of track and five
+; of air, the air being where the names are drawn -- so it is as wide as an
+; 80-column screen and its two-column shadow leave room for: BOX_COL + BOX_W + 2
+; = 80 exactly, and the shadow's own row runs BOX_COL + 2 for BOX_W columns,
+; which ends on 79. Six faders fitted in 72 columns at a pitch of 11; seven need
+; the tighter pitch and four more columns of box.
 BOX_ROW   equ 1
 BOX_COL   equ 2
 BOX_W     equ 76
@@ -1936,9 +1937,9 @@ draw_info:
     mov si, [si + CH_DESC]
     call puts
     pop si
-    ; Far enough right to clear the longest description (AMP's, which ends on
-    ; column 56) with air to spare, and near enough that a six-character dB
-    ; string still finishes inside the box.
+    ; Far enough right to clear the longest description (AMP's, which starts on
+    ; column 4 and runs 54 characters, so it ends on 57) with air to spare, and
+    ; near enough that a six-character dB string still finishes inside the box.
     mov al, INFO_ROW
     mov ah, BOX_COL + 60
     call screen_at
@@ -2236,10 +2237,12 @@ q4_step:    db 0, 3, 7, 10
 
 ; kind, reg, col, namecol, step, saved, dev, spare / name, key, desc, pad
 ;
-; Track columns are 7, 17, ... at a pitch of 10: five columns of track and one
-; of air. The name column is the track's, offset so the label centres on it --
-; one to the left for a six or seven character name, level for a four, one to
-; the right for AMP's three.
+; Track columns are 7, 17, ... at a pitch of 10: five columns of track and five
+; of air. The air is what the names are drawn into -- a seven-character label on
+; a five-column track overhangs it by one at each end -- so it is not slack to
+; be reclaimed. The name column is the track's, offset so the label centres on
+; it: one to the left for a six or seven character name, level for a four, one
+; to the right for AMP's three.
 ;
 ; AMP is the one record that does not open on step 10. Its step 0 is the card's
 ; power-on 0 dB rather than a mute, so a machine whose card is absent (which is

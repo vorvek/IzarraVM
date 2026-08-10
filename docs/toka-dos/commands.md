@@ -448,9 +448,10 @@ SNDMIXER /S             suppress all output
 SNDMIXER /?             usage
 ```
 
-Tab and the arrow keys select a fader, Up and Down move it, Home and End set it
-to full and to mute, and the digit keys set a level directly. Each level is
-applied to the hardware as it is set.
+Tab and the arrow keys select a fader, Up and Down move it, Home and End send it
+to the top and the bottom of its travel, and the digit keys set a level directly.
+The bottom is a mute on the six faders that attenuate, and 0 dB — no gain — on
+`AMP`, which amplifies. Each level is applied to the hardware as it is set.
 
 Two buttons sit along the bottom of the box, after the seven faders on the same
 Tab ring. **Accept** leaves the mixer with the levels that were set still in

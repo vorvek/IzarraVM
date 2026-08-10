@@ -196,8 +196,14 @@ Two of the seven are not plain Sound Blaster registers:
 ### Output gain (AMP)
 
 The seventh fader is not a volume control. It is the card's output amplifier,
-the stage after the mixer's summing node, and it is the only control on the
-card that adds level rather than taking it away.
+and it is the only control on the card that adds level rather than taking it
+away.
+
+It sits on the card's internal bus, beside the master: it raises the FM
+synthesis, the digital audio the Sound Blaster DSP plays, and the PC-speaker
+input. CD audio and the Windows Sound System codec do not pass through it —
+those two legs reach the summing node carrying only their own attenuation — so
+the AMP fader does not lift a Red Book track or a WSS recording.
 
 | Register | Bits | Field | Positions |
 | --- | --- | --- | --- |
@@ -219,12 +225,13 @@ through, and everything above it is gain the card was not applying before. The
 two registers are written together — `SNDMIXER` moves both from one fader,
 because a difference between them is a balance change and not a level.
 
-**The gain can clip.** The mix reserves 6 dB of headroom after the mixer, which
-is exactly enough to absorb one leg driven to full scale. Position 1 spends that
-reserve. Positions 2 and 3 are past it, and a hot source — a full-scale digital
-audio leg, or several legs playing at once — will distort. The card offers the
-positions and the fader offers them; neither one refuses the setting or quietly
-limits it. Use them to lift a quiet recording, not to make a loud one louder.
+**The gain can clip.** The mix reserves 6 dB of headroom where the card's legs
+are summed, which is exactly enough to absorb one of them driven to full scale.
+The amplifier is applied to its three legs before that sum, so position 1 spends
+the reserve. Positions 2 and 3 are past it, and a hot source — a full-scale DSP
+voice, or the FM and the voice playing together — will distort. The card offers
+the positions and the fader offers them; neither one refuses the setting or
+quietly limits it. Use them to lift a quiet game, not to make a loud one louder.
 
 ## Digital audio (Sound Blaster 16 compatible)
 
