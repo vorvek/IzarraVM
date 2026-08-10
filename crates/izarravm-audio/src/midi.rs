@@ -100,11 +100,12 @@ impl MidiEngine {
     }
 
     /// How many guest messages this engine handed to the synth and the synth
-    /// refused as malformed.
+    /// did not take -- malformed, or offered while its input queue was full.
     ///
     /// A refusal is NOT a failure of the engine: the MPU-401 hands us whatever
-    /// the guest wrote, and a DOS driver is free to write a byte no synthesiser
-    /// accepts. Counted so a stuck note has a number behind it.
+    /// the guest wrote, a DOS driver is free to write a byte no synthesiser
+    /// accepts, and a synth that is momentarily full is still a working synth.
+    /// Counted so a stuck note has a number behind it.
     pub const fn rejected_messages(&self) -> u64 {
         self.rejected
     }
@@ -196,7 +197,8 @@ impl MidiEngine {
             let message = self.pending.pop_front().expect("front message exists");
             match send_native(&mut self.adapter, &message.bytes) {
                 NativeSend::Delivered => {}
-                // The guest wrote a byte this synth will not take. Drop THAT
+                // The synth did not take this message -- a byte it will not
+                // accept, or a queue that is full right now. Drop THAT
                 // MESSAGE and keep playing. Failing the engine here is what
                 // made a single stray `0xF7`/`0xF4`/`0xF9` -- all of which the
                 // MPU-401 parser forwards verbatim as one-byte messages -- kill
@@ -207,7 +209,7 @@ impl MidiEngine {
                     if self.rejected == 1 {
                         warn!(
                             bytes = ?message.bytes,
-                            "the synth refused a guest MIDI message; dropping it and continuing"
+                            "the synth did not take a guest MIDI message; dropping it and continuing"
                         );
                     }
                 }
@@ -433,8 +435,27 @@ fn send_native(adapter: &mut MidiAdapter, bytes: &[u8]) -> NativeSend {
     };
     match result {
         Ok(()) => NativeSend::Delivered,
-        Err(SynthError::InvalidMidiMessage) => NativeSend::Rejected,
-        Err(error) => {
+        Err(error) => triage_send_error(&error),
+    }
+}
+
+/// Decide whether a failed send costs the MESSAGE or the ENGINE.
+///
+/// Split out because this is the whole of the decision and it is not reachable
+/// through `send_native` without a live synthesiser: `MuntSynth::send` can only
+/// be made to return a full queue by filling one, and only a real ROM set opens
+/// one at all.
+///
+/// `mt32emu_play_msg` and `mt32emu_play_sysex` return exactly two failures --
+/// `MT32EMU_RC_QUEUE_FULL` when the synth is open and momentarily full, and
+/// `MT32EMU_RC_NOT_OPENED` when there is no synth behind the context. Only the
+/// second is terminal. Treating both as terminal (which the bare `NativeCall`
+/// mapping did) turns one busy audio window into a P330 that is dead for the
+/// session, exactly the way one stray `0xF7` used to.
+fn triage_send_error(error: &SynthError) -> NativeSend {
+    match error {
+        SynthError::InvalidMidiMessage | SynthError::SynthQueueFull => NativeSend::Rejected,
+        error => {
             warn!(%error, "native MIDI synthesis failed on a guest message");
             NativeSend::Failed
         }

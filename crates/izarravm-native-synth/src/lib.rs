@@ -56,6 +56,13 @@ pub enum Error {
         code: i32,
     },
     InvalidMidiMessage,
+    /// The synthesiser's own input queue was full and it declined this message.
+    /// The synth is HEALTHY: back-pressure is a property of the moment, not of
+    /// the engine, so the message is dropped and the next one is offered.
+    SynthQueueFull,
+    /// The synthesiser is not open, so nothing can be played through it. Unlike
+    /// [`Self::SynthQueueFull`] this is terminal for the adapter holding it.
+    SynthNotOpened,
     OutputMustBeStereo,
     TooManyFrames,
     MissingRom(PathBuf),
@@ -86,6 +93,10 @@ impl fmt::Display for Error {
                 write!(formatter, "native call {operation} failed with code {code}")
             }
             Self::InvalidMidiMessage => formatter.write_str("invalid complete MIDI message"),
+            Self::SynthQueueFull => {
+                formatter.write_str("the synthesiser's MIDI input queue is full")
+            }
+            Self::SynthNotOpened => formatter.write_str("the synthesiser is not open"),
             Self::OutputMustBeStereo => {
                 formatter.write_str("output buffer must contain complete stereo frames")
             }

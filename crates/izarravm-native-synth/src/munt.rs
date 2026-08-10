@@ -44,6 +44,14 @@ unsafe extern "C" {
 const ADDED_CONTROL_ROM: c_int = 1;
 const ADDED_PCM_ROM: c_int = 2;
 const MISSING_ROMS: c_int = -4;
+/// `MT32EMU_RC_NOT_OPENED`: the context has no open synth. `mt32emu_play_msg`
+/// and `mt32emu_play_sysex` return this or `QUEUE_FULL` and nothing else, so the
+/// two have to be told apart HERE -- the caller decides whether a failed send
+/// costs the message or the engine, and only one of these two costs the engine.
+const NOT_OPENED: c_int = -5;
+/// `MT32EMU_RC_QUEUE_FULL`: the synth is open and healthy, its event queue is
+/// simply full this instant (the default report handler declines to wait).
+const QUEUE_FULL: c_int = -6;
 
 /// How many files a directory scan will offer to the library. A ROM set is a
 /// handful of files; the cap only stops a user who points the picker at their
@@ -366,9 +374,14 @@ fn rom_path(path: &Path) -> Result<CString, Error> {
 }
 
 fn munt_result(operation: &'static str, code: c_int) -> Result<(), Error> {
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(Error::NativeCall { operation, code })
+    match code {
+        0 => Ok(()),
+        QUEUE_FULL => Err(Error::SynthQueueFull),
+        NOT_OPENED => Err(Error::SynthNotOpened),
+        code => Err(Error::NativeCall { operation, code }),
     }
 }
+
+#[cfg(test)]
+#[path = "munt_test.rs"]
+mod tests;

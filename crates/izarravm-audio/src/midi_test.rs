@@ -455,3 +455,37 @@ fn reconfiguring_reopens_an_engine_that_failed_even_with_identical_settings() {
         "a working engine keeps its queued messages"
     );
 }
+
+/// A synth whose queue is momentarily full is not a broken synth.
+///
+/// `mt32emu_play_msg` has exactly two failure answers -- the queue is full, or
+/// there is no open synth behind the context -- and until now both arrived here
+/// as an opaque `NativeCall`, which `send_native` treats as terminal. A P330
+/// that got ahead of its own event queue for one audio window would therefore
+/// latch itself Silent and stay there, the same permanent death a stray `0xF7`
+/// used to cause. Only `NOT_OPENED` is worth the engine.
+#[test]
+fn a_full_synth_queue_costs_the_message_and_a_closed_synth_costs_the_engine() {
+    assert!(matches!(
+        triage_send_error(&SynthError::SynthQueueFull),
+        NativeSend::Rejected
+    ));
+    assert!(matches!(
+        triage_send_error(&SynthError::InvalidMidiMessage),
+        NativeSend::Rejected
+    ));
+    assert!(matches!(
+        triage_send_error(&SynthError::SynthNotOpened),
+        NativeSend::Failed
+    ));
+    // Anything the synthesiser reports that is not one of those two is still
+    // treated as a failure: an unknown answer from a native library is not a
+    // thing to keep playing through.
+    assert!(matches!(
+        triage_send_error(&SynthError::NativeCall {
+            operation: "Munt MIDI",
+            code: -100,
+        }),
+        NativeSend::Failed
+    ));
+}
