@@ -263,3 +263,67 @@ fn the_headroom_placement_leaves_the_fm_voice_cd_balance_untouched() {
         "attenuating FM must not move the voice leg"
     );
 }
+
+/// What the reserve is worth, in legs -- the policy stated instead of implied.
+///
+/// `MIX_HEADROOM` is 0.5, exactly one bit, and every CT1745 leg powers on at
+/// 0 dB. So the reserve is worth exactly ONE full-scale source, and the
+/// behaviour at the summing node falls out of that:
+///
+/// - one leg at full scale lands at half scale, 6 dB of room left over
+/// - TWO legs at full scale -- digital voice over FM music, which is Duke Nukem
+///   3D's exact case and the report this branch came from -- land on the rail
+///   EXACTLY: nothing to spare, and nothing clipped
+/// - THREE legs at full scale clip, by design
+///
+/// The third row is a taste call, so it is pinned here rather than left to be
+/// rediscovered. Covering it needs 9.5 dB rather than 6, and that extra 3.5 dB
+/// would be paid by every title in the library to protect a case that needs
+/// voice, FM and CD-audio all pegged at digital full scale in the same frame.
+/// Music and effects together is the common case; music, effects and a Red Book
+/// track all at maximum is not, and when it happens the guest has a mixer to
+/// turn something down with. What must NOT happen is the two-leg case clipping,
+/// which is the row above and the one with the bug report behind it.
+#[test]
+fn the_headroom_reserve_is_worth_exactly_one_full_scale_leg() {
+    const FS: i32 = i16::MAX as i32;
+
+    let mut path = enabled_path();
+    path.set_linked_cd_level(31);
+    let mix = path.mix_snapshot();
+
+    // The summing node from `render_audio`: legs sum raw, then one scalar.
+    let staged = |sum: i32| (sum as f32 * crate::MIX_HEADROOM) as i32;
+
+    let voice_only = mix.mix_opl_voice((0, 0), (FS, FS)).0;
+    assert_eq!(voice_only, FS, "one leg is unity at its power-on default");
+    assert_eq!(staged(voice_only), 16_383, "half scale: 6 dB still spare");
+    assert_eq!(crate::clamp_i16(staged(voice_only)), 16_383);
+
+    let voice_over_fm = mix.mix_opl_voice((FS, FS), (FS, FS)).0;
+    assert_eq!(voice_over_fm, 2 * FS, "the legs sum; neither is trimmed");
+    assert_eq!(
+        crate::clamp_i16(staged(voice_over_fm)),
+        i16::MAX,
+        "effects over music at full scale must land ON the rail, not past it"
+    );
+    assert_eq!(
+        staged(voice_over_fm),
+        FS,
+        "and it must be an exact landing, not a clamp hiding an overshoot -- \
+         this is what fails if MIX_HEADROOM is loosened"
+    );
+
+    let plus_cd = voice_over_fm + mix.mix_cd((FS, FS)).0;
+    assert_eq!(plus_cd, 3 * FS, "the CD leg is unity at level 31 as well");
+    assert_eq!(
+        staged(plus_cd),
+        49_150,
+        "three full-scale legs overshoot by 3.5 dB -- accepted, see above"
+    );
+    assert_eq!(
+        crate::clamp_i16(staged(plus_cd)),
+        i16::MAX,
+        "and the overshoot is what clipping is for"
+    );
+}

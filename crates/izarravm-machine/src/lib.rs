@@ -2420,6 +2420,21 @@ impl Machine {
         self.card_amp = amp.max(0.0);
     }
 
+    /// The output-stage gain [`render_audio`](Self::render_audio) will apply.
+    /// Exposed so a host that renders audio can be checked to have STAGED it:
+    /// this is host loudness that leaves no trace in the samples of a silent
+    /// machine, and the headless capture ran an entire investigation at the
+    /// default 1.0 while the GUI ran at 12.0.
+    pub fn card_amp(&self) -> f32 {
+        self.card_amp
+    }
+
+    /// The PC speaker attenuation [`render_audio`](Self::render_audio) will
+    /// apply. The speaker's counterpart to [`card_amp`](Self::card_amp).
+    pub fn speaker_volume(&self) -> f32 {
+        self.speaker_volume
+    }
+
     /// Set the PC speaker output volume (host-side). Applied in
     /// [`render_audio`](Self::render_audio) to the speaker only. Clamped to
     /// 0.0..=1.0; 0.0 mutes the beeps, 1.0 is full.

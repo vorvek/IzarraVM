@@ -43,15 +43,30 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// `dev_docs/sndmixer-spec.md`), and its faders have nothing to raise if the
 /// defaults already sit on the clamp.
 ///
-/// The shape is not novel. 86Box reserves headroom the same way and for the
-/// same reason -- its SB16 path divides every leg (voice, FM, CD, PC speaker)
-/// by a fixed 3.0 before applying the master, alongside the reset comment that
-/// moved its defaults from -14 dB to 0 dB. That is 9.54 dB against the 6.02 dB
-/// here; the difference is deliberate. Half leaves the DIGITAL VOICE leg within
-/// 0.4 dB of the absolute level it had before the volume-decode fix, so a title's
-/// effects land where they used to while the FM bus comes down to meet them,
-/// which is the balance correction the fix was for. Reference read as study
-/// only, under `dev_docs/reference/86box`; the concept is cited, no code taken.
+/// The shape is not novel: 86Box reserves headroom for the same reason. Its
+/// placement is different, and worth being exact about, because the difference
+/// is the whole argument for one post-sum scalar.
+///
+/// 86Box attenuates PER LEG, ahead of the sum, and by DIFFERENT amounts
+/// (`src/sound/snd_sb.c`, read as study only under `dev_docs/reference/86box`;
+/// the concept is cited, no code taken):
+///
+/// - digital voice, `sb_get_buffer_sb16_awe32`: `dsp * voice_l / 3.0` (-9.54 dB)
+/// - CD-in, `sb16_awe32_filter_cd_audio`: `buffer * cd / 3.0 * master` (-9.54 dB)
+/// - PC speaker, `sb16_awe32_filter_pc_speaker`: `/ 3.0` likewise
+/// - external MIDI in through the FM registers, `sb16_awe32_filter_midi`: `/ 3.0`
+/// - but the INTERNAL OPL leg, `sb_get_music_buffer_sb16_awe32:501-503`:
+///   `opl_buf * fm_l * 0.7171630859375`, which is -2.89 dB and no `/ 3.0` at all
+///
+/// So there is no single 86Box number to match: its FM sits 6.65 dB ABOVE its
+/// voice by construction, and copying that would undo exactly what the CT1745
+/// volume-decode fix corrected here (FM running over voice). One scalar after
+/// the sum keeps the FM/voice/CD ratios the decode fix established and leaves
+/// only the absolute level to choose.
+///
+/// 6.02 dB is that choice. It leaves the DIGITAL VOICE leg within 0.4 dB of the
+/// absolute level it had before the decode fix, so a title's effects land where
+/// they used to while the FM bus comes down to meet them.
 pub const MIX_HEADROOM: f32 = 0.5;
 
 pub const PIT_INPUT_HZ: u32 = 1_193_182;

@@ -2071,7 +2071,7 @@ fn host_mix_peaks(machine: &mut Machine) -> (i32, i32) {
 /// "peaked and muffled" half of the same bug report.
 ///
 /// The second half of this test is the mutation proof: at the output-stage gain
-/// the product shipped (12.0x, `DEFAULT_AMP_GAIN` 120), the very same 20 dB pan
+/// the product shipped (12.0x, the retired `amp_gain = 120`), the very same 20 dB pan
 /// collapses to a dead centre.
 #[test]
 fn the_default_output_stage_preserves_a_panned_stereo_source() {

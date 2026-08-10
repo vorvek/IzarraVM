@@ -336,6 +336,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             cli.expect_test_exit,
             cli.inject_keys.as_deref(),
             cli.inject_mouse.as_deref(),
+            // The headless capture renders through the machine's own audio path,
+            // so it has to be staged like the GUI stages it or the WAV is not
+            // what the user hears. Same prefs file, same two setters.
+            HostAudioGains::from_prefs(startup.prefs()),
         );
     }
 
@@ -1082,6 +1086,44 @@ const AUDIO_CAPTURE_OPL_HZ: f64 = 49_716.0;
 /// Sample rate of the captured WAV, matching the machine's DAC rate.
 const AUDIO_CAPTURE_DAC_HZ: u32 = 44_100;
 
+/// The host gain staging the GUI's `pump_audio` applies to the MACHINE before
+/// every `render_audio`, resolved from the same `izarravm.conf` the GUI reads.
+///
+/// These are the two knobs that live outside the machine's own model -- the
+/// ReSonique 2 analog output stage and the PC speaker attenuation -- and both
+/// default to something other than what a bare `Machine` starts at. The headless
+/// capture set neither, so it rendered every WAV at 1.0x while the GUI rendered
+/// at the then-default 12.0x: the instrument was 21.6 dB quieter than the
+/// thing it was pointed at, which is precisely the clipping this branch fixes,
+/// and it could not have shown it.
+///
+/// The master-volume slider is deliberately NOT here. It is applied by
+/// `pump_audio` AFTER `render_audio`, on the way to the host sound device, and
+/// on the MIDI engines' output too; it is a playback level, not part of what the
+/// machine renders. A WAV is played back at the listener's own volume. This
+/// struct is exactly the state that makes `render_audio` return the same samples
+/// in both places.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HostAudioGains {
+    card_amp: f32,
+    speaker_volume: f32,
+}
+
+impl HostAudioGains {
+    fn from_prefs(prefs: &prefs::GuiPrefs) -> Self {
+        Self {
+            card_amp: gui::amp_multiplier(prefs.output_gain),
+            speaker_volume: gui::speaker_multiplier(prefs.pc_speaker_volume),
+        }
+    }
+
+    /// Stage the machine the way `pump_audio` does, immediately before a render.
+    fn apply(&self, machine: &mut Machine) {
+        machine.set_card_amp(self.card_amp);
+        machine.set_speaker_volume(self.speaker_volume);
+    }
+}
+
 /// Headless capture of the host audio mix: an OBSERVER of a run, not a run mode.
 ///
 /// It owns two things only -- how finely the run has to be sliced so the DSP's
@@ -1113,14 +1155,18 @@ struct AudioCapture {
     wall_paced: bool,
     debt: f64,
     last_wall: std::time::Instant,
+    /// The GUI's own gain staging, applied before every render so the capture
+    /// and the GUI produce the same samples from the same guest.
+    gains: HostAudioGains,
 }
 
 impl AudioCapture {
-    fn new(path: PathBuf, hardware: &HardwareProfile) -> Self {
+    fn new(path: PathBuf, hardware: &HardwareProfile, gains: HostAudioGains) -> Self {
         let clock = hardware.cpu.clock_rate();
         Self {
             path,
             pcm: Vec::new(),
+            gains,
             slice: clock
                 .clocks_for_fraction_floor(AUDIO_CAPTURE_SLICE_MS, 1000)
                 .max(1_000),
@@ -1150,6 +1196,10 @@ impl AudioCapture {
         self.debt -= want as f64;
         let native_samples = want.min(AUDIO_CAPTURE_OPL_HZ as usize / 2);
         if native_samples > 0 {
+            // Staged per render, exactly where `pump_audio` stages it, so the
+            // capture cannot drift from the GUI if either side later learns to
+            // change a gain mid-run.
+            self.gains.apply(machine);
             self.pcm.extend(machine.render_audio(native_samples));
         }
     }
@@ -1231,6 +1281,7 @@ fn run_boot_hdd_folder(
     expect_test_exit: bool,
     inject_keys: Option<&str>,
     inject_mouse: Option<&str>,
+    audio_gains: HostAudioGains,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(path) = profile_json {
         validate_profile_json_parent(path)?;
@@ -1298,7 +1349,7 @@ fn run_boot_hdd_folder(
     // injection rather than replacing it, so `--inject-mouse ... IZARRAVM_AUDIO_WAV=x.wav`
     // records the audio of a title that actually received its input.
     let mut capture = std::env::var_os("IZARRAVM_AUDIO_WAV")
-        .map(|path| AudioCapture::new(PathBuf::from(path), hardware));
+        .map(|path| AudioCapture::new(PathBuf::from(path), hardware, audio_gains));
     let start_wall = std::time::Instant::now();
     // The no-injection, no-capture path stays ONE `run_until_halt_or_cycles`
     // call, byte for byte what it was: slicing the run moves where the machine

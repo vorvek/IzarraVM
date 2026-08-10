@@ -548,7 +548,12 @@ pub const RETIRED_CMOS_KEYS: &[&[&str]] = &[
 /// real machine config can never carry one.
 const GUI_PREFS_MARKER_KEYS: &[&str] = &[
     "master_volume",
+    // `amp_gain` is the retired spelling of `output_gain`. It stays here on
+    // purpose: the prefs loader ignores it, but a file that still carries it is
+    // still unmistakably a prefs file, and pointing --config at one should say
+    // so rather than fail on an unknown field.
     "amp_gain",
+    "output_gain",
     "pc_speaker_volume",
     "crt_style",
     "input_release",
