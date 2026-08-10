@@ -367,3 +367,91 @@ fn the_wavetable_gain_attenuates_what_the_engine_adds_to_the_mix() {
     midi.render(&mut mix, tick_for_frame(1));
     assert_eq!(mix, [(4500, -3500)]);
 }
+
+/// A byte the synth will not take must cost that MESSAGE, not the synthesiser.
+///
+/// The MPU-401 parser forwards `0xF4`, `0xF5`, `0xF7`, `0xF9` and `0xFD` to us
+/// as one-byte messages, verbatim, because that is what the guest wrote to the
+/// port -- a lone `0xF7` is what a driver emits when it abandons a SysEx, and
+/// undefined real-time bytes come from any program that pokes the port. None of
+/// them is a message a synthesiser accepts, so `validate` refuses them.
+///
+/// It used to be that ONE such byte called `fail_native`, which drops the
+/// adapter to Silent and latches the status at InitializationFailed for good:
+/// the P300 went silent mid-game, the panel said "The MIDI output could not be
+/// initialized.", and nothing short of restarting the machine brought it back.
+/// The engine now drops the message and keeps playing.
+#[test]
+fn a_message_the_synth_refuses_does_not_silence_the_engine() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    let mut midi = MidiEngine::open_wavetable(&config(MidiBackend::Off));
+    assert!(matches!(midi.adapter, MidiAdapter::Fluid(_)));
+
+    // A note on, then every byte the MPU can hand us that no synth will take,
+    // then a second note on -- all inside one staging window.
+    midi.send(&message(0, &[0x90, 60, 110]));
+    for (index, refused) in [0xF4_u8, 0xF5, 0xF7, 0xF9, 0xFD].into_iter().enumerate() {
+        midi.send(&message(index as u64 + 1, &[refused]));
+    }
+    midi.send(&message(16, &[0x90, 67, 110]));
+
+    let mut output = vec![(0, 0); 4_096];
+    midi.render(&mut output, tick_for_frame(4_096));
+
+    assert_eq!(midi.status(), MidiStatus::Ready, "the engine is still open");
+    assert!(
+        matches!(midi.adapter, MidiAdapter::Fluid(_)),
+        "the adapter must not have been dropped to Silent"
+    );
+    assert_eq!(
+        midi.rejected_messages(),
+        5,
+        "each refused byte is counted, and only the refused ones"
+    );
+    assert!(
+        output.iter().any(|frame| *frame != (0, 0)),
+        "the notes on either side of the refused bytes still sound"
+    );
+}
+
+/// An engine that failed must be re-openable, and Accept is what re-opens it.
+///
+/// `fail_native` is a latch by design -- a broken synth cannot be played
+/// through -- but the only thing that used to clear it was a settings change
+/// the engine's own role cares about, and the wavetable's role cares about
+/// exactly one setting: the SoundFont path. So a P300 that died stayed dead and
+/// the config panel kept showing its error no matter what was changed there,
+/// including switching the P330 receiver off. The stale red message the owner
+/// reported and the dead wavetable were one bug.
+#[test]
+fn reconfiguring_reopens_an_engine_that_failed_even_with_identical_settings() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    let settings = config(MidiBackend::Off);
+    let mut midi = MidiEngine::open_wavetable(&settings);
+    midi.fail_native();
+    assert_eq!(midi.status(), MidiStatus::InitializationFailed);
+    assert!(matches!(midi.adapter, MidiAdapter::Silent));
+
+    // The SAME settings. Nothing about the config has changed; the engine's
+    // state has.
+    midi.reconfigure(&settings);
+    assert_eq!(midi.status(), MidiStatus::Ready);
+    assert!(matches!(midi.adapter, MidiAdapter::Fluid(_)));
+    assert_eq!(midi.rejected_messages(), 0, "the count restarts with it");
+
+    // A healthy engine with unchanged settings is still left alone: reconfigure
+    // must not tear down and rebuild a working synth on every Accept, which
+    // would cut whatever it was playing.
+    let mut healthy = MidiEngine::open_wavetable(&settings);
+    healthy.queue(message(30, &[0x90, 60, 100]));
+    healthy.reconfigure(&settings);
+    assert_eq!(
+        healthy.pending.len(),
+        1,
+        "a working engine keeps its queued messages"
+    );
+}

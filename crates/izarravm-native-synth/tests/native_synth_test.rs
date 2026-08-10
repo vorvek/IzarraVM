@@ -5,7 +5,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use izarravm_native_synth::{Error, FluidSynth, MuntSynth, NATIVE_SYNTH_AVAILABLE, SAMPLE_RATE_HZ};
+use izarravm_native_synth::{
+    Error, FluidSynth, MuntSynth, NATIVE_SYNTH_AVAILABLE, RomKind, SAMPLE_RATE_HZ,
+};
 
 fn embedded_soundfont() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -52,6 +54,16 @@ fn wrappers_reject_incomplete_midi_and_partial_frames() {
     );
 }
 
+/// The ROM loader must say WHICH requirement failed, and take a set however it
+/// is laid out.
+///
+/// Every distribution of these ROMs names its files differently --
+/// `MT32_CONTROL.ROM`, `CM32L_CONTROL.ROM`, `MT32_1.0.7_control.rom`,
+/// `ctrl_mt32_1_07.rom`, and half-image pairs that have to be merged before
+/// they can be identified at all -- so the loader identifies by CONTENT and
+/// accepts a folder as readily as a file. What it must never do is answer a
+/// user with a complete, valid set and a message that says only "The MIDI
+/// output could not be initialized."
 #[test]
 fn munt_reports_missing_and_unrecognized_roms() {
     if !NATIVE_SYNTH_AVAILABLE {
@@ -64,11 +76,54 @@ fn munt_reports_missing_and_unrecognized_roms() {
         Error::MissingRom(missing.clone())
     );
 
+    // One file, and it is not a ROM this library knows: name it.
     let invalid = directory.path().join("invalid.rom");
     fs::write(&invalid, b"not a Roland ROM").unwrap();
     assert_eq!(
         MuntSynth::new(&invalid, &invalid).unwrap_err(),
-        Error::InvalidRom(invalid)
+        Error::InvalidRom(invalid.clone())
+    );
+
+    // A FOLDER is a legal hint, and a folder of files that are not ROMs is
+    // reported as "no control ROM among these", listing what was tried. The
+    // list is the whole point: it is what tells a user whose set is in another
+    // directory, or whose download is short a file, which it was.
+    let folder = tempfile::tempdir().unwrap();
+    let names = ["MT32_CONTROL.ROM", "MT32_PCM.ROM", "notes.txt"];
+    for name in names {
+        fs::write(folder.path().join(name), b"still not a Roland ROM").unwrap();
+    }
+    let error = MuntSynth::new(folder.path(), folder.path()).unwrap_err();
+    let Error::RomNotFound { kind, searched } = &error else {
+        panic!("a folder of non-ROMs must report a missing control image, got {error:?}");
+    };
+    assert_eq!(*kind, RomKind::Control);
+    assert_eq!(
+        searched.len(),
+        names.len(),
+        "every file in the folder was offered to the library: {searched:?}"
+    );
+    let message = error.to_string();
+    for name in names {
+        assert!(
+            message.contains(name),
+            "the message must name the files it tried; {name} missing from {message:?}"
+        );
+    }
+
+    // Two file hints in DIFFERENT folders both get their folder scanned, so a
+    // set whose halves sit beside the file the user picked is still found. Here
+    // nothing is a real ROM, but the search has to have covered both sides.
+    let second = tempfile::tempdir().unwrap();
+    fs::write(second.path().join("PCM_A.ROM"), b"nope").unwrap();
+    let error = MuntSynth::new(folder.path().join("MT32_CONTROL.ROM"), second.path()).unwrap_err();
+    let Error::RomNotFound { searched, .. } = &error else {
+        panic!("expected a missing-image report, got {error:?}");
+    };
+    assert!(
+        searched.iter().any(|path| path.ends_with("PCM_A.ROM"))
+            && searched.iter().any(|path| path.ends_with("notes.txt")),
+        "both hints' folders must be searched before giving up: {searched:?}"
     );
 }
 

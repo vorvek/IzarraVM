@@ -2471,9 +2471,11 @@ fn host_mix_peaks(machine: &mut Machine) -> (i32, i32) {
 /// apart they started, which is a centred image made of square waves: the
 /// "peaked and muffled" half of the same bug report.
 ///
-/// The second half of this test is the mutation proof: at the output-stage gain
-/// the product shipped (12.0x, the retired `amp_gain = 120`), the very same 20 dB pan
-/// collapses to a dead centre.
+/// The second half of this test is the mutation proof: run the card's own
+/// output stage at its maximum (+18 dB) and the very same 20 dB pan collapses
+/// towards the centre. That is the shape of the bug the shipped 12.0x host gain
+/// caused (the retired `amp_gain = 120`), reached through the only route left
+/// now that the host knob is gone: the guest's `0x41`/`0x42` registers.
 #[test]
 fn the_default_output_stage_preserves_a_panned_stereo_source() {
     // A 20 dB pan: hard left with the right channel 10x down.
@@ -2493,25 +2495,37 @@ fn the_default_output_stage_preserves_a_panned_stereo_source() {
          (peak_l={peak_l} peak_r={peak_r})"
     );
 
-    // Mutation: restore the shipped 12.0x analog gain. That gain was calibrated
-    // when the CT1745 powered on at master -14 dB AND voice -14 dB, so it was
-    // compensating 28 dB of attenuation that the volume-decode fix removed.
+    // Mutation: put the card's output stage where the shipped 12.0x host gain
+    // used to sit. That gain was calibrated when the CT1745 powered on at
+    // master -14 dB AND voice -14 dB, so it compensated 28 dB of attenuation
+    // that the volume-decode fix removed; the host knob is gone now, but the
+    // guest can ask for the same abuse through the output-gain registers
+    // (0x41/0x42, +18 dB), and the mix has to be judged the same way.
     let mut clipped = test_machine();
-    clipped.set_card_amp(12.0);
+    set_mixer_register(&mut clipped, 0x41, 3 << 6);
+    set_mixer_register(&mut clipped, 0x42, 3 << 6);
     play_16bit_stereo_pair(&mut clipped, LEFT, RIGHT);
     let (clip_l, clip_r) = host_mix_peaks(&mut clipped);
     assert_eq!(
         clip_l,
         i32::from(i16::MAX),
-        "mutation proof: at 12.0x the loud channel rails at the clamp"
+        "mutation proof: at +18 dB the loud channel rails at the clamp"
     );
+    // The healthy image is at least twice as wide as the clipped one. Stated as
+    // a RATIO against the same source rather than as an absolute, because how
+    // far a clipped pan collapses depends on how much gain there is to clip
+    // with, and the guest's own stage tops out at +18 dB where the host knob
+    // went to 12.0x. The direction and the cause are the same.
+    let healthy = f64::from(peak_l) / f64::from(peak_r.max(1));
+    let squashed = f64::from(clip_l) / f64::from(clip_r.max(1));
     assert!(
-        clip_r * 4 >= clip_l,
-        "mutation proof: at 12.0x the SAME 20 dB pan arrives as {clip_l}:{clip_r}, \
-         inside the 4:1 the assertion above demands -- clipping alone squashes a \
-         10:1 pan to nearly dead centre, which is the reported 'centered but \
-         quieter' symptom. If this stops failing the pan check, the assertion \
-         above has stopped proving anything."
+        squashed * 2.0 < healthy,
+        "mutation proof: the SAME 20 dB pan arrives as {peak_l}:{peak_r} \
+         ({healthy:.1}:1) through the default stage and {clip_l}:{clip_r} \
+         ({squashed:.1}:1) through a railed one -- clipping alone squashes the \
+         image toward centre, which is the reported 'centered but quieter' \
+         symptom. If this stops holding, the pan assertion above has stopped \
+         proving anything."
     );
 }
 
@@ -2645,70 +2659,28 @@ fn pc_speaker_mixer_level_attenuates_the_beeper_through_render_audio() {
     );
 }
 
-/// The speaker leg sits INSIDE the card's summing node, not after it.
+/// Where the beeper joins, both ways round.
 ///
-/// Placement is the half of this change that the ratio test above cannot see:
-/// the PC-SPK register would decode identically whether its output joined the
-/// mix before or after the node. What pins the position is the node's own
-/// scalars, and `card_amp` is the one a test can move -- the beeper used to be
-/// added after it and was therefore completely unaffected by the card's output
-/// stage, which is the mutation this asserts against. `MIX_HEADROOM` travels
-/// with it: the two are one multiply on one sum.
-#[test]
-fn the_speaker_leg_is_inside_the_cards_output_stage() {
-    let peak_at_amp = |amp: f32| {
-        let mut machine = test_machine();
-        set_mixer_register(&mut machine, 0x3B, 3 << 6); // PC-SPK at 0 dB
-        machine.set_card_amp(amp);
-        beeper_on(&mut machine);
-        speaker_peak(&mut machine)
-    };
-
-    let unity = peak_at_amp(1.0);
-    assert!(unity > 1_000, "the beeper must be audible at unity");
-    assert_eq!(
-        peak_at_amp(0.0),
-        0,
-        "a card amp of zero silences everything the card carries, beeper included"
-    );
-    for (amp, factor) in [(0.5f32, 0.5f32), (2.0, 2.0)] {
-        let want = unity as f32 * factor;
-        let got = peak_at_amp(amp) as f32;
-        assert!(
-            (got - want).abs() < want * 0.06,
-            "card amp {amp} must scale the beeper: {unity} -> {got}, wanted about {want}"
-        );
-    }
-}
-
-/// The other direction, and the reason the routing is conditional: on a machine
-/// built with NO sound card there is no PC-SPK input to pass the beeper
-/// through, so it must take neither the card's summing-node headroom nor the
-/// card's output stage. Folding it in unconditionally would pull 6 dB off a
-/// beeper that meets no mixer at all, and -- worse -- would let the GUI's
-/// card-amp slider mute the one sound source such a machine still has.
+/// On a machine built with NO sound card there is no PC-SPK input to pass the
+/// beeper through, so it must take neither the card's summing-node headroom nor
+/// anything else the card does. On a machine WITH one it is a card leg and
+/// takes the node's reserve like every other leg.
+///
+/// That reserve is what pins the PLACEMENT, which is the half of this routing
+/// the level tests above cannot see: the PC-SPK register would decode
+/// identically whether its output joined the mix before or after the node, and
+/// `MIX_HEADROOM` is the node's remaining scalar. A beeper added AFTER the node
+/// -- which is what it used to be -- reaches the output at the cardless level
+/// on both machines, and the comparison below fails by exactly 6 dB.
 #[test]
 fn a_machine_with_no_card_keeps_its_beeper_outside_the_card_stage() {
-    let peak_at_amp = |amp: f32| {
-        let mut machine = cardless_machine();
-        machine.set_card_amp(amp);
-        beeper_on(&mut machine);
-        speaker_peak(&mut machine)
-    };
-
-    let unity = peak_at_amp(1.0);
+    let mut cardless = cardless_machine();
+    beeper_on(&mut cardless);
+    let unity = speaker_peak(&mut cardless);
     assert!(unity > 1_000, "the beeper must be audible with no card");
-    for amp in [0.0f32, 0.5, 2.0] {
-        assert_eq!(
-            peak_at_amp(amp),
-            unity,
-            "the card amp cannot reach a beeper that passes through no card"
-        );
-    }
 
-    // And it keeps its full swing: no summing-node reserve either. Compared
-    // against the SAME beeper on a carded machine with the PC-SPK level at
-    // 0 dB, which differs from this one by exactly the node's reserve.
+    // Compared against the SAME beeper on a carded machine with the PC-SPK
+    // level at 0 dB, which differs from this one by exactly the node's reserve.
     let mut carded = test_machine();
     set_mixer_register(&mut carded, 0x3B, 3 << 6);
     beeper_on(&mut carded);

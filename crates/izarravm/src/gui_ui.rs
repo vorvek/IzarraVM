@@ -224,12 +224,21 @@ impl GuiApp {
                 ui.add_space(6.0);
                 // Volume row: the classic ascending-bars icon and a slider that
                 // stretches to fill the remaining width.
+                //
+                // This is the HOST's level -- the powered speakers the machine's
+                // line-out feeds -- applied to the finished mix on its way to the
+                // sound device. The levels inside the machine are the guest's,
+                // on the card's own mixer, and SNDMIXER.COM sets them.
                 ui.horizontal(|ui| {
                     volume_icon(ui);
                     ui.add_space(4.0);
                     ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(40.0);
-                    let slider =
-                        ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
+                    let slider = ui
+                        .add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
+                        .on_hover_text(
+                            "Speaker volume. This is the host's playback level; the machine's \
+                             own mixer levels are set in DOS with SNDMIXER.",
+                        );
                     if slider.changed() {
                         self.gain.set(volume_gain(self.volume));
                         self.prefs.master_volume = self.volume;
@@ -274,8 +283,6 @@ impl GuiApp {
             joystick_binding: self.joystick_binding.clone(),
             joystick_wizard: None,
             crt_style: self.crt_style,
-            output_gain: self.output_gain,
-            pc_speaker_volume: self.pc_speaker_volume,
             midi_backend: midi_config.backend,
             external_midi_port: midi_config.external_port,
             soundfont: midi_config.soundfont,
@@ -438,39 +445,19 @@ impl GuiApp {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("AUDIO").color(LABEL).size(11.0));
                     beige_group(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("ReSonique 2 amp gain");
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut dialog.output_gain,
-                                    0..=prefs::OUTPUT_GAIN_MAX,
-                                )
-                                .custom_formatter(|n, _| format!("{:.1}x", n / 10.0)),
-                            )
-                            .on_hover_text(
-                                "Output gain for the sound card's analog stage. Raise if a \
-                                 game's sound is too quiet, lower if it clips.",
-                            );
-                        });
+                        // Levels INSIDE the machine's audio chain -- the card's
+                        // output stage, the PC speaker's leg, every source
+                        // balance -- belong to the guest and are set with
+                        // SNDMIXER.COM, on the card's own registers, the way
+                        // they were on the hardware this models. What the host
+                        // owns is the far end of the line-out: the speakers,
+                        // which is the volume fader on the machine panel, and
+                        // which synthesiser answers the two MIDI ports.
+                        ui.small(
+                            "Levels inside the machine are set in DOS with SNDMIXER. \
+                             The panel's volume knob is the speakers.",
+                        );
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label("PC speaker volume");
-                            ui.add(
-                                egui::Slider::new(&mut dialog.pc_speaker_volume, 0..=100)
-                                    .custom_formatter(|n, _| {
-                                        if n <= 0.0 {
-                                            "Muted".to_string()
-                                        } else {
-                                            format!("{n:.0}%")
-                                        }
-                                    }),
-                            )
-                            .on_hover_text(
-                                "Volume of the motherboard PC speaker (the beeps), separate \
-                                 from the sound card. Set to 0 to mute it.",
-                            );
-                        });
-                        ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("P300 wavetable output");
                             ui.label("FluidSynth");
@@ -539,7 +526,7 @@ impl GuiApp {
                                 &mut dialog.mt32_control_rom,
                                 "ROM image",
                                 &["rom", "bin"],
-                                "Required",
+                                "ROM file or the set's folder",
                             );
                             midi_path_picker(
                                 ui,
@@ -547,7 +534,7 @@ impl GuiApp {
                                 &mut dialog.mt32_pcm_rom,
                                 "ROM image",
                                 &["rom", "bin"],
-                                "Required",
+                                "ROM file or the set's folder",
                             );
                         }
                         let status_color = if midi_status == MidiStatus::Ready {
@@ -626,21 +613,6 @@ impl GuiApp {
             &dialog.joystick_binding,
             &mut self.last_joystick_sent,
         );
-        // Amp gain: update the live value + prefs and push the new multiplier to
-        // the shared amp atomic so the emulation thread's audio pump picks it up
-        // without a restart.
-        if dialog.output_gain != self.output_gain {
-            self.output_gain = dialog.output_gain;
-            self.prefs.output_gain = dialog.output_gain;
-            self.amp.set(amp_multiplier(self.output_gain));
-        }
-        // PC speaker volume: same live-update path as the amp gain.
-        if dialog.pc_speaker_volume != self.pc_speaker_volume {
-            self.pc_speaker_volume = dialog.pc_speaker_volume;
-            self.prefs.pc_speaker_volume = dialog.pc_speaker_volume;
-            self.speaker_vol
-                .set(speaker_multiplier(self.pc_speaker_volume));
-        }
         let midi_config = MidiConfig {
             backend: dialog.midi_backend,
             external_port: dialog.external_midi_port.clone(),
@@ -648,7 +620,15 @@ impl GuiApp {
             mt32_control_rom: optional_path(&dialog.mt32_control_rom),
             mt32_pcm_rom: optional_path(&dialog.mt32_pcm_rom),
         };
-        if midi_config != self.session_snapshot.midi_config {
+        if midi_request_needed(
+            &midi_config,
+            &self.session_snapshot.midi_config,
+            self.session_snapshot.powered,
+            [
+                self.session_snapshot.wavetable_status,
+                self.session_snapshot.midi_status,
+            ],
+        ) {
             let _ = self.request_session(SessionRequest::MidiConfig(midi_config));
         }
         self.save_prefs();
@@ -777,6 +757,10 @@ impl GuiApp {
     /// winit event loop now, not here, so the guest reads raw physical keys.
     pub(super) fn ui(&mut self, ctx: &egui::Context) {
         self.poll_session();
+        // Cheap unless the stream has actually failed: one relaxed atomic load.
+        if let Some(audio) = &mut self.audio {
+            audio.poll_recover();
+        }
         // The window title (capture-lock hint) is set directly on the winit window
         // from the event loop now; viewport commands are not applied without eframe.
         // Host render rate: count this frame, roll the rate up once a second.

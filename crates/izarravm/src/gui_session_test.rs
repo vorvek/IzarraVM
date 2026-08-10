@@ -46,8 +46,6 @@ fn test_spec(scratch: &TestScratch) -> SessionSpec {
         sink: None,
         rtc_setup: crate::cmos::RtcSetup::from_c_root(scratch.path()),
         gain: SharedGain::new(1.0),
-        amp: SharedGain::new(1.0),
-        speaker_vol: SharedGain::new(1.0),
         finalization_probe: None,
     }
 }
@@ -1008,5 +1006,138 @@ fn live_mode_switch_debits_credit_in_master_ticks() {
     assert!(
         credit > -(100 * 900),
         "credit debt is only final-instruction overshoot, not mixed clock units"
+    );
+}
+
+/// The audio pump carries the GUEST's wavetable level to the MIDI engines.
+///
+/// This link had no test and reviewers flagged it repeatedly, for a structural
+/// reason: the level lives in CT1745 registers `0x50`/`0x51`, the only way to
+/// move them is a guest `OUT`, and both registers power on at unity -- so a
+/// test driving a real `Machine` reads (1.0, 1.0) whether the pump wires them
+/// up or not, and passes on a deleted line. The `AudioMachine` seam exists to
+/// make the wiring observable: this fake reports a level no register default
+/// could produce, and both engines have to be carrying it afterwards.
+#[test]
+fn the_audio_pump_hands_the_guests_wavetable_level_to_both_midi_engines() {
+    /// Reports one distinctive gain and one distinctive frame.
+    struct FakeMachine {
+        gain: (f32, f32),
+        frame: (i16, i16),
+        rendered: usize,
+    }
+
+    impl AudioMachine for FakeMachine {
+        fn master_ticks(&self) -> u64 {
+            0
+        }
+
+        fn midi_gain(&self) -> (f32, f32) {
+            self.gain
+        }
+
+        fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+            self.rendered += native_samples;
+            vec![self.frame; native_samples]
+        }
+    }
+
+    let mut machine = FakeMachine {
+        // Asymmetric on purpose: a pump that passed one channel to both, or
+        // swapped them, would survive a symmetric level.
+        gain: (0.25, 0.75),
+        frame: (1_000, -2_000),
+        rendered: 0,
+    };
+    let config = MidiConfig::default();
+    let mut wavetable = MidiEngine::open_wavetable(&config);
+    let mut receiver = MidiEngine::open_receiver(&config);
+    assert_eq!(
+        (wavetable.gain(), receiver.gain()),
+        ((1.0, 1.0), (1.0, 1.0)),
+        "engines start at unity, so the assertions below cannot pass by default"
+    );
+
+    let sink = AudioSink::detached();
+    let mut debt = 0.0;
+    // 10 ms of wall time, at unity host gain.
+    pump_audio(
+        &mut machine,
+        &mut wavetable,
+        &mut receiver,
+        &sink,
+        0.01,
+        &mut debt,
+        1.0,
+    );
+
+    assert!(machine.rendered > 0, "the pump must have rendered a window");
+    assert_eq!(
+        wavetable.gain(),
+        (0.25, 0.75),
+        "the P300 wavetable leg takes the card's 0x50/0x51 level"
+    );
+    assert_eq!(
+        receiver.gain(),
+        (0.25, 0.75),
+        "so does the P330 receiver: both are the card's MIDI legs"
+    );
+
+    let queued = sink.take_queued_frames();
+    assert_eq!(
+        queued.len(),
+        machine.rendered,
+        "every frame the machine rendered reaches the sink"
+    );
+    assert!(
+        queued.iter().all(|frame| *frame == (1_000, -2_000)),
+        "at unity host gain the machine's own mix is queued untouched"
+    );
+}
+
+/// The host volume knob is applied to the finished mix, and to nothing else.
+///
+/// It stands for the powered speakers the machine's line-out feeds, which is
+/// why it is the LAST thing in the chain and why the headless capture
+/// deliberately does not record it. A gain that leaked into the machine instead
+/// would change what `render_audio` returns, and the WAV with it.
+#[test]
+fn the_host_volume_knob_scales_the_finished_mix_only() {
+    struct FlatMachine;
+
+    impl AudioMachine for FlatMachine {
+        fn master_ticks(&self) -> u64 {
+            0
+        }
+
+        fn midi_gain(&self) -> (f32, f32) {
+            (1.0, 1.0)
+        }
+
+        fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+            vec![(8_000, -8_000); native_samples]
+        }
+    }
+
+    let config = MidiConfig::default();
+    let mut wavetable = MidiEngine::open_wavetable(&config);
+    let mut receiver = MidiEngine::open_receiver(&config);
+    let sink = AudioSink::detached();
+    let mut debt = 0.0;
+    pump_audio(
+        &mut FlatMachine,
+        &mut wavetable,
+        &mut receiver,
+        &sink,
+        0.01,
+        &mut debt,
+        0.5,
+    );
+
+    let queued = sink.take_queued_frames();
+    assert!(!queued.is_empty());
+    assert!(
+        queued.iter().all(|frame| *frame == (4_000, -4_000)),
+        "the knob halves the mix on its way out, symmetrically"
     );
 }

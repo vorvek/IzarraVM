@@ -979,3 +979,47 @@ fn the_guis_preferences_file_is_refused_as_a_machine_config() {
         "the error must name the file and the key that gave it away: {message}"
     );
 }
+
+/// A ROM set dropped in as a FOLDER is discovered too.
+///
+/// The loose-pair rule only recognises a set whose two files carry the
+/// canonical names, and most distributions do not: versioned names, Munt's own
+/// `ctrl_mt32_1_07.rom` shape, and half-image pairs that cannot be named as two
+/// files at all. Handing the folder to the loader lets it identify the images by
+/// content instead, which is the whole point of it accepting a folder.
+#[test]
+fn a_rom_set_folder_in_the_state_directory_is_discovered() {
+    let root = startup_test_dir("munt-folder-discovery");
+    let state_dir = root.join("state");
+    let roms = state_dir.join("MT32");
+    std::fs::create_dir_all(&roms).unwrap();
+    // Names the loose-pair rule would not match, in a folder name it does.
+    std::fs::write(roms.join("ctrl_mt32_1_07.rom"), b"control").unwrap();
+    std::fs::write(roms.join("pcm_mt32.rom"), b"pcm").unwrap();
+
+    let mut config = MidiConfig::default();
+    discover_munt_roms(&mut config, &state_dir);
+    assert_eq!(config.mt32_control_rom.as_deref(), Some(roms.as_path()));
+    assert_eq!(config.mt32_pcm_rom.as_deref(), Some(roms.as_path()));
+
+    // A loose canonical pair still wins: it is the more specific answer, and
+    // pointing at two files is what the user gets to see in the panel.
+    let control = state_dir.join("MT32_CONTROL.ROM");
+    let pcm = state_dir.join("MT32_PCM.ROM");
+    std::fs::write(&control, b"control").unwrap();
+    std::fs::write(&pcm, b"pcm").unwrap();
+    let mut config = MidiConfig::default();
+    discover_munt_roms(&mut config, &state_dir);
+    assert_eq!(config.mt32_control_rom.as_deref(), Some(control.as_path()));
+    assert_eq!(config.mt32_pcm_rom.as_deref(), Some(pcm.as_path()));
+
+    // A folder that is not a ROM-set folder is left alone.
+    let bare = root.join("bare");
+    std::fs::create_dir_all(bare.join("screenshots")).unwrap();
+    let mut config = MidiConfig::default();
+    discover_munt_roms(&mut config, &bare);
+    assert_eq!(config.mt32_control_rom, None);
+    assert_eq!(config.mt32_pcm_rom, None);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

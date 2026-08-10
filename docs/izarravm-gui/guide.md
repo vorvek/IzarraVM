@@ -84,7 +84,12 @@ A TOML file holding GUI preferences that are meant to survive between runs:
 - The P330 receiver, exact host destination, P300 SoundFont, and MT-32 ROM paths
 
 Every field has a default, so an old or partial `izarravm.conf` still loads
-cleanly after an upgrade.
+cleanly after an upgrade. Master volume is the only audio level kept here: it is
+the host's playback level. `amp_gain`, `output_gain` and `pc_speaker_volume`
+named levels inside the machine's own mixer and are retired -- a file that still
+carries them loads, logs one line naming them, and drops them on the next save.
+Those levels are set from DOS with `SNDMIXER`, on the card's own registers,
+where the guest can read them back.
 
 ## The config modal
 
@@ -114,10 +119,16 @@ machine config disables injection regardless of a saved GUI binding.
 | **Subtle** | A light shadow-mask CRT effect. This is the default. |
 | **Ye Olde Screene** | A heavier CRT effect for the full period look. |
 
-**Audio**: set the card amp and PC speaker volume. P300 represents a wavetable
-daughterboard fitted to the ReSonique 2's internal pin headers. IzarraVM
-emulates that board through FluidSynth with the embedded FluidR3Mono bank. You
-can select a custom SF2 or SF3 bank without changing the P330 MIDI route.
+**Audio**: choose which synthesiser answers each MIDI port. Levels are not set
+here. The card's output stage, the PC speaker's level and the balance between
+sources are ReSonique 2 mixer registers, and `SNDMIXER` sets them from DOS; the
+volume knob on the machine panel is the host's playback level, the powered
+speakers the machine's line-out feeds.
+
+P300 represents a wavetable daughterboard fitted to the ReSonique 2's internal
+pin headers. IzarraVM emulates that board through FluidSynth with the embedded
+FluidR3Mono bank. You can select a custom SF2 or SF3 bank without changing the
+P330 MIDI route.
 
 P330 represents the Izarra 3000's rear MPU-401/gameport. Its receiver selector
 contains these choices:
@@ -128,10 +139,20 @@ contains these choices:
 | **Munt (MT-32)** | An emulator convenience using user-selected MT-32 control and PCM ROMs. IzarraVM does not include Roland ROMs. |
 | **Host device name and ordinal** | The exact operating-system MIDI destination. These entries represent the MIDI IN side of an external receiver. If the destination disappears, IzarraVM does not choose another one. |
 
+The two MT-32 ROM boxes each accept either a ROM file or the folder the ROM set
+lives in, and the images are identified by content rather than by filename: a
+set named `MT32_CONTROL.ROM` / `MT32_PCM.ROM`, one named for its version, and
+one split into half-images all load. Which box you put which file in does not
+matter. When a set cannot be loaded the status line says what was missing -- a
+control image, a PCM image, or a control and PCM pair from different machines --
+and the log names every file that was tried.
+
 P300 and P330 are independent. A P330 receiver change sends all-notes-off to
 the old receiver without interrupting FluidSynth. Each section has its own
 status line, so a missing host destination or missing ROMs cannot hide a failed
-custom SoundFont. Neither failure hides the corresponding guest MPU.
+custom SoundFont. Neither failure hides the corresponding guest MPU. Accept
+retries a failed synthesiser even when nothing was changed, so a problem fixed
+outside the emulator can be picked up without restarting the machine.
 
 Startup settings are resolved one field at a time. An explicit command-line
 option takes precedence, followed by an explicitly present `--config` TOML key,

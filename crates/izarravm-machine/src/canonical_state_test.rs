@@ -1773,13 +1773,11 @@ fn speaker_capture_is_read_only_and_excludes_host_audio_history() {
         tick: 5,
         level: true,
     });
-    history.set_speaker_volume(0.25);
     history.speaker.write_control(0x00);
     baseline.speaker.write_control(0x00);
 
     assert!(history.speaker.ever_enabled());
     assert!(!history.speaker_transitions.is_empty());
-    assert_ne!(history.speaker_volume, baseline.speaker_volume);
     assert_eq!(speaker_payload(&history), speaker_payload(&baseline));
 }
 

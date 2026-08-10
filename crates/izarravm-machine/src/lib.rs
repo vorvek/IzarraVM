@@ -1139,15 +1139,6 @@ pub struct Machine {
     fdc: fdc::Fdc,
     opl: OplChip,
     resampler: Resampler,
-    /// ReSonique 2 analog output-stage gain (host-tunable "amp gain"), applied in
-    /// render_audio to the card's sources but not the PC speaker. 1.0 = unity (the
-    /// default; the GUI sets it from the config). Host-side loudness only, not
-    /// guest-visible, so it never affects timing or the guest audio model.
-    card_amp: f32,
-    /// PC speaker output volume (host-tunable), a linear attenuation applied in
-    /// render_audio to the speaker only. 1.0 = full (default), 0.0 = muted. Like
-    /// card_amp it is host-side loudness only, never guest-visible.
-    speaker_volume: f32,
     sb16: Sb16Path,
     last_audio_ticks: u64,
     wavetable_mpu: Mpu401,
@@ -1469,8 +1460,6 @@ impl Machine {
             fdc: fdc::Fdc::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
-            card_amp: 1.0,
-            speaker_volume: 1.0,
             sb16,
             last_audio_ticks: 0,
             wavetable_mpu: Mpu401::default(),
@@ -2523,55 +2512,31 @@ impl Machine {
         }
     }
 
-    /// Set the ReSonique 2 analog output-stage gain (the host "amp gain"). Applied
-    /// in [`render_audio`](Self::render_audio) to the card's sources only. Clamped
-    /// non-negative; 1.0 is unity.
-    pub fn set_card_amp(&mut self, amp: f32) {
-        self.card_amp = amp.max(0.0);
-    }
-
-    /// The output-stage gain [`render_audio`](Self::render_audio) will apply.
-    /// Exposed so a host that renders audio can be checked to have STAGED it:
-    /// this is host loudness that leaves no trace in the samples of a silent
-    /// machine, and the headless capture ran an entire investigation at the
-    /// default 1.0 while the GUI ran at 12.0.
-    pub fn card_amp(&self) -> f32 {
-        self.card_amp
-    }
-
-    /// The PC speaker attenuation [`render_audio`](Self::render_audio) will
-    /// apply. The speaker's counterpart to [`card_amp`](Self::card_amp).
-    pub fn speaker_volume(&self) -> f32 {
-        self.speaker_volume
-    }
-
-    /// Set the PC speaker output volume (host-side). Applied in
-    /// [`render_audio`](Self::render_audio) to the speaker only. Clamped to
-    /// 0.0..=1.0; 0.0 mutes the beeps, 1.0 is full.
-    pub fn set_speaker_volume(&mut self, volume: f32) {
-        self.speaker_volume = volume.clamp(0.0, 1.0);
-    }
-
     /// Render `native_samples` of mixed OPL3 + SB16 DSP audio at the 44100 Hz DAC
     /// rate (stereo, saturated to 16-bit). `native_samples` is counted in OPL
     /// native (49716 Hz) time; the DSP is advanced by the matching wall-clock
     /// duration at its own rate. Each stream is resampled to 44100 and summed.
     ///
-    /// The ReSonique 2 analog output-stage gain (`self.card_amp`, the host-tunable
-    /// "amp gain") is applied to the card's own sources: OPL, SB DSP, the WSS
-    /// codec, CD-audio through the card's CD-in, and -- ONLY when a card is
-    /// fitted -- the PC speaker through the card's PC-SPK input. The beeper is
-    /// motherboard hardware, but on a machine with a sound card its output is
-    /// wired INTO the card, which is what mixer register `0x3B` attenuates; it
-    /// used to be added after the amp and after the summing node's headroom
-    /// reserve, which left it hot by that reserve (6 dB) on top of the 7 dB the
-    /// card's own power-on PC-SPK level takes off. On a machine built WITHOUT a
-    /// card there is no such wire, so the beeper bypasses both and reaches the
-    /// output at its own level.
+    /// Every level in this chain is GUEST state on the CT1745 register file --
+    /// the source levels, the master, the output gain, the PC-SPK leg -- so what
+    /// this returns is what the machine's line-out carries. There is no
+    /// host-side multiplier left in here. There were two (an "amp gain" and a
+    /// "PC speaker volume" the settings panel owned), and they were a second,
+    /// invisible copy of controls the card already has: a user turned a knob in
+    /// the GUI and the guest's own mixer could neither see it nor read it back.
+    /// The host's one level is the volume knob, applied to this mix on its way
+    /// to the sound device, which is where a real machine's listener has one.
+    ///
+    /// The PC speaker is a card leg when a card is fitted: the beeper is
+    /// motherboard hardware, but its output is wired INTO the card's PC-SPK
+    /// input, which is what mixer register `0x3B` attenuates, so it takes that
+    /// level, then the master, then the summing node's headroom reserve. It
+    /// used to be added after both, which left it hot by that reserve (6 dB) on
+    /// top of the 7 dB the card's own power-on PC-SPK level takes off. On a
+    /// machine built WITHOUT a card there is no such wire, so the beeper
+    /// bypasses both and reaches the output at its own level.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
         let render_start = self.host_profile.start();
-        let card_amp = self.card_amp;
-        let speaker_volume = self.speaker_volume;
         let opl_native: Vec<(i32, i32)> = (0..native_samples)
             .map(|_| self.opl.render_sample())
             .collect();
@@ -2673,10 +2638,7 @@ impl Machine {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
                 let (wl, wr) = hold_frame(&mut wss_hold, wss_out.get(i).copied());
-                // Host PC speaker volume: a straight attenuation on the beeper,
-                // taken before the card's PC-SPK input (0.0 mutes it). This is
-                // the host's control; register 0x3B below is the guest's.
-                let s = (f32::from(spk[i]) * speaker_volume) as i32;
+                let s = i32::from(spk[i]);
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
                 let (sb_l, sb_r) = ct1745.mix_opl_voice((ol, or), (dl, dr));
                 let (cl, cr) = ct1745.mix_cd((cl, cr));
@@ -2691,11 +2653,8 @@ impl Machine {
                 };
                 // OPL + SB16 DSP take the CT1745 master/outgain; the PC speaker
                 // takes the PC-SPK level and the same master; the WSS codec and
-                // CD are summed in raw (their own attenuation already applied). All
-                // of these are ReSonique 2 card sources, so the analog output-stage
-                // gain (`card_amp`) scales their sum.
-                // Sum the card sources, reserve the summing node's headroom, then
-                // scale by the analog amp.
+                // CD are summed in raw (their own attenuation already applied).
+                // Sum the card sources, then reserve the summing node's headroom.
                 //
                 // `MIX_HEADROOM` is one scalar applied AFTER every card leg has
                 // been summed, so it cannot disturb the relative FM/voice/CD
@@ -2703,8 +2662,8 @@ impl Machine {
                 // a hardware register. It exists because those legs all power on
                 // at unity and therefore sum past full scale on their own; see the
                 // constant for the full argument.
-                let card_l = (sb_l + wl + cl + spk_l) as f32 * MIX_HEADROOM * card_amp;
-                let card_r = (sb_r + wr + cr + spk_r) as f32 * MIX_HEADROOM * card_amp;
+                let card_l = (sb_l + wl + cl + spk_l) as f32 * MIX_HEADROOM;
+                let card_r = (sb_r + wr + cr + spk_r) as f32 * MIX_HEADROOM;
                 let l = clamp_i16(card_l as i32 + spk_direct);
                 let r = clamp_i16(card_r as i32 + spk_direct);
                 (l, r)

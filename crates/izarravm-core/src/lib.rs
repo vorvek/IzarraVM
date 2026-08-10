@@ -548,10 +548,11 @@ pub const RETIRED_CMOS_KEYS: &[&[&str]] = &[
 /// real machine config can never carry one.
 const GUI_PREFS_MARKER_KEYS: &[&str] = &[
     "master_volume",
-    // `amp_gain` is the retired spelling of `output_gain`. It stays here on
-    // purpose: the prefs loader ignores it, but a file that still carries it is
-    // still unmistakably a prefs file, and pointing --config at one should say
-    // so rather than fail on an unknown field.
+    // All three are RETIRED audio levels the prefs loader now ignores, and they
+    // stay here on purpose: a file old enough to carry one is still
+    // unmistakably a prefs file, and pointing --config at it should say so
+    // rather than fail on an unknown field naming one key and explaining
+    // nothing. See `prefs::RETIRED_KEYS` for why they went.
     "amp_gain",
     "output_gain",
     "pc_speaker_volume",
@@ -966,7 +967,21 @@ pub enum MidiStatus {
     Ready,
     MissingPort,
     MissingSoundFont,
+    /// No ROM paths are selected at all.
     MissingRoms,
+    /// A selected path does not exist on disk.
+    RomPathMissing,
+    /// Files were offered to the synthesiser and none of them was a control
+    /// image. Distinct from [`Self::RomPcmMissing`] because the two are fixed by
+    /// finding different files, and "could not be initialized" told the user
+    /// neither.
+    RomControlMissing,
+    /// Same, for the PCM image.
+    RomPcmMissing,
+    /// Both images were found but the synthesiser would not open on them --
+    /// on real ROM sets this is a control and a PCM image from different
+    /// machines (an MT-32 control ROM with a CM-32L PCM ROM, say).
+    RomsNotPairable,
     InitializationFailed,
 }
 

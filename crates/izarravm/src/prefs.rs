@@ -22,52 +22,29 @@ const PREFS_FILE: &str = "izarravm.conf";
 /// material while still being plainly audible.
 const DEFAULT_VOLUME: f32 = 0.8;
 
-/// Default ReSonique 2 output amp gain, in tenths of a linear multiplier
-/// (10 = 1.0x, unity). Models the card's analog output stage; the default is
-/// neutral, so the mix reaches the host at the level the machine staged it.
+/// GUI preference keys that are no longer read or written.
 ///
-/// This was 12.0x, and that was correct for the card it was measured on: the
-/// CT1745 then powered on at master -14 dB AND voice -14 dB, so a title that
-/// never programmed the mixer -- the common case -- played its digital voice
-/// 28 dB down and needed roughly that much back to be audible at all. The
-/// volume-decode fix moved those defaults to 0 dB (matching DOSBox-X and
-/// 86Box) and so removed the 28 dB this gain existed to cancel, leaving a
-/// bare +21.6 dB on a mix that was already at unity. Everything clipped:
-/// symmetric saturation squashes a panned image to the centre and squares off
-/// every waveform, which is precisely the "no stereo separation" and "peaked
-/// and muffled" pair reported after that fix.
+/// All three named a level INSIDE the machine's audio chain, and the machine's
+/// chain belongs to the guest: the ReSonique 2's output stage and the PC
+/// speaker's leg are CT1745 registers, set from DOS with SNDMIXER.COM and read
+/// back by any program that asks. A second copy of those controls in the host
+/// GUI could not be seen by the guest, was not saved with the machine, and had
+/// to be kept in step with a mixer that had every right to disagree with it.
+/// The host's own level -- the volume knob, standing for the powered speakers
+/// the line-out feeds -- is `master_volume`, and it stays.
 ///
-/// Headroom below full scale is now reserved once on the machine's summing
-/// node (`MIX_HEADROOM`), and raising the level is SNDMIXER.COM's job. The
-/// slider still runs to `OUTPUT_GAIN_MAX` for genuinely quiet material.
-pub const DEFAULT_OUTPUT_GAIN: u32 = 10;
-
-/// Upper bound for the output gain (tenths); 500 = 50x. Generous headroom above
-/// the default so a very quiet game can still be brought up, guarding only
-/// against an absurd hand-edited value.
-pub const OUTPUT_GAIN_MAX: u32 = 500;
-
-/// The key `output_gain` replaced, and which is now ignored on load.
+/// They are IGNORED, not rejected, and never written back: an existing
+/// `izarravm.conf` keeps loading and quietly loses them on the next save. One
+/// warning names whichever were present, the same courtesy `strip_retired_keys`
+/// extends to the config keys CMOS took over. `amp_gain` was already retired
+/// once (it was `output_gain`'s old spelling); it is listed here so a file old
+/// enough to carry it gets the same one line about it.
 ///
-/// Renaming it is a version break, and a deliberate one. `amp_gain` did not
-/// change its RANGE, it changed its MEANING: every persisted value was chosen
-/// against a chain that put a fixed 12.0x compensator downstream of it, and
-/// that compensator no longer exists. The 120 that shipped as the default was
-/// itself calibrated to a CT1745 that powered on 28 dB down. Clamping such a
-/// file to `OUTPUT_GAIN_MAX` -- all `load_with` used to do -- keeps it running
-/// at +21.6 dB into the clamp, which is the bug this branch fixes, still
-/// happening to everyone who ever opened the config menu.
-///
-/// No rescale is attempted. There is no factor that is right for both the
-/// default value and a value the user picked by ear, and this is prerelease
-/// (see the no-shipped-version posture): a clean break to the fresh default is
-/// honest, whereas a heuristic would silently invent a level nobody chose.
-const LEGACY_OUTPUT_GAIN_KEY: &str = "amp_gain";
-
-/// Default PC speaker volume, as a percent (100 = full). The speaker is separate
-/// from the ReSonique 2 card; this is a straight attenuation so it can be turned
-/// down or muted (0) independently of the card's amp gain.
-pub const DEFAULT_PC_SPEAKER_VOLUME: u32 = 100;
+/// No value is carried over into anything. There is no rescale that is right
+/// for both a default nobody chose and a level a user picked by ear, and this
+/// is prerelease: the honest move is to let the machine's own mixer be the
+/// answer from here.
+const RETIRED_KEYS: &[&str] = &["amp_gain", "output_gain", "pc_speaker_volume"];
 
 /// A host hotkey: modifier flags plus a key name. `key` is the winit `KeyCode`
 /// debug name (e.g. "F2", "KeyA"), which the GUI compares against the live key
@@ -148,29 +125,11 @@ impl CrtStyle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuiPrefs {
-    /// Master output volume, 0.0..1.0. Applied host-side as a perceptual gain.
+    /// Master output volume, 0.0..1.0. The HOST's level: the powered speakers
+    /// the machine's line-out feeds, applied to the finished mix on its way to
+    /// the sound device. Every level inside the machine is the guest's, on the
+    /// card's own registers (see `RETIRED_KEYS`).
     pub master_volume: f32,
-    /// ReSonique 2 output amp gain, in tenths of a linear multiplier
-    /// (10 = 1.0x unity, the default; see `DEFAULT_OUTPUT_GAIN`). Models the
-    /// card's analog output stage, which the digital CT1745 model does not
-    /// represent, and is the one host-side control over the card's absolute
-    /// level.
-    ///
-    /// It sits at the END of the machine's chain, after the CT1745 legs are
-    /// summed and after `MIX_HEADROOM` has reserved 6 dB below full scale, so
-    /// raising it spends that reserve and then clips. Unity is the level the
-    /// machine staged; the room to go up is for genuinely quiet material, not
-    /// for correcting the mix, which is SNDMIXER.COM's job.
-    ///
-    /// Persisted as `output_gain`. It was `amp_gain` while the chain carried a
-    /// 12.0x compensator; see `LEGACY_OUTPUT_GAIN_KEY` for why old values are
-    /// dropped rather than carried over. Converted to a multiplier by
-    /// `amp_multiplier`.
-    pub output_gain: u32,
-    /// PC speaker volume, as a percent (100 = full, 0 = muted). A linear
-    /// attenuation applied host-side to the speaker only, independent of the card
-    /// amp, so the beeps can be turned down or off.
-    pub pc_speaker_volume: u32,
     /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
     pub crt_style: CrtStyle,
     /// Hotkey that releases captured input. Default Ctrl+F2.
@@ -199,8 +158,6 @@ impl Default for GuiPrefs {
     fn default() -> Self {
         Self {
             master_volume: DEFAULT_VOLUME,
-            output_gain: DEFAULT_OUTPUT_GAIN,
-            pc_speaker_volume: DEFAULT_PC_SPEAKER_VOLUME,
             crt_style: CrtStyle::Subtle,
             input_release: KeyBinding::new(true, false, false, "F2"),
             fullscreen: KeyBinding::new(true, false, false, "F11"),
@@ -247,22 +204,19 @@ impl GuiPrefs {
                 return Self::default();
             }
         };
-        if value
-            .as_table()
-            .is_some_and(|table| table.contains_key(LEGACY_OUTPUT_GAIN_KEY))
-        {
+        let retired = retired_keys_present(&value);
+        if !retired.is_empty() {
             warn!(
                 path = %path.display(),
-                "ignoring the retired `{LEGACY_OUTPUT_GAIN_KEY}` in izarravm.conf: the output \
-                 stage is unity now, so its old value is miscalibrated; the key is `output_gain` \
-                 and it starts fresh at {DEFAULT_OUTPUT_GAIN}"
+                keys = %retired.join(", "),
+                "ignoring retired keys in izarravm.conf; the machine's own mixer owns those \
+                 levels now -- set them in DOS with SNDMIXER, and use the panel's volume knob \
+                 for the host speakers"
             );
         }
         match value.try_into::<Self>() {
             Ok(mut prefs) => {
                 prefs.master_volume = prefs.master_volume.clamp(0.0, 1.0);
-                prefs.output_gain = prefs.output_gain.min(OUTPUT_GAIN_MAX);
-                prefs.pc_speaker_volume = prefs.pc_speaker_volume.min(100);
                 prefs
             }
             Err(err) => {
@@ -286,6 +240,22 @@ impl GuiPrefs {
             warn!(%err, path = %path.display(), "could not write izarravm.conf");
         }
     }
+}
+
+/// Which [`RETIRED_KEYS`] a parsed prefs document still carries.
+///
+/// The struct deserializer drops unknown fields silently -- that is what lets an
+/// older file keep loading -- so the document has to be inspected before it is
+/// deserialized or a retired key leaves no trace at all.
+fn retired_keys_present(value: &toml::Value) -> Vec<&'static str> {
+    let Some(table) = value.as_table() else {
+        return Vec::new();
+    };
+    RETIRED_KEYS
+        .iter()
+        .filter(|key| table.contains_key(**key))
+        .copied()
+        .collect()
 }
 
 #[cfg(test)]

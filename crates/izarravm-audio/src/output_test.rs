@@ -241,3 +241,26 @@ fn sink_exposes_no_snapshot_when_diagnostics_are_disabled() {
 
     assert_eq!(sink.debug_snapshot(), None);
 }
+
+/// A detached sink is a real queue that simply has no callback behind it.
+///
+/// It exists so the emulation thread's audio path can be driven and INSPECTED
+/// in a test -- what the pump queues is otherwise only observable by listening,
+/// which is how a gain that was never applied went unnoticed.
+#[test]
+fn a_detached_sink_queues_audio_and_hands_it_back_without_the_prefill_padding() {
+    let sink = AudioSink::detached();
+    assert!(
+        sink.take_queued_frames().is_empty(),
+        "a fresh queue holds only the prefill padding, which is not audio"
+    );
+
+    let frames = [(1_i16, -1_i16), (2, -2), (3, -3)];
+    sink.queue(&frames);
+    assert_eq!(sink.take_queued_frames(), frames);
+    assert!(
+        sink.take_queued_frames().is_empty(),
+        "taking the frames drains them"
+    );
+    assert!(sink.debug_snapshot().is_none());
+}

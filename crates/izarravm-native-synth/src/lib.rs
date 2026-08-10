@@ -25,6 +25,28 @@ pub use unavailable::{FluidSynth, MuntSynth};
 pub const SAMPLE_RATE_HZ: u32 = 44_100;
 pub const NATIVE_SYNTH_AVAILABLE: bool = !cfg!(izarravm_native_synth_unavailable);
 
+/// Which of the two ROM images a Roland synthesiser needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RomKind {
+    Control,
+    Pcm,
+}
+
+impl RomKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Pcm => "PCM",
+        }
+    }
+}
+
+impl fmt::Display for RomKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     InvalidPath(PathBuf),
@@ -38,9 +60,12 @@ pub enum Error {
     TooManyFrames,
     MissingRom(PathBuf),
     InvalidRom(PathBuf),
-    WrongRomType {
-        path: PathBuf,
-        expected: &'static str,
+    /// Files were found and offered to the library, but none of them was a
+    /// usable image of this kind. `searched` is every file that was tried, so
+    /// the message can say what was looked at rather than only what was wanted.
+    RomNotFound {
+        kind: RomKind,
+        searched: Vec<PathBuf>,
     },
     MissingRoms,
     Unavailable,
@@ -69,8 +94,17 @@ impl fmt::Display for Error {
             Self::InvalidRom(path) => {
                 write!(formatter, "ROM file is not recognized: {}", path.display())
             }
-            Self::WrongRomType { path, expected } => {
-                write!(formatter, "expected a {expected} ROM at {}", path.display())
+            Self::RomNotFound { kind, searched } => {
+                write!(
+                    formatter,
+                    "no {kind} ROM image was recognised among the {} file(s) tried: {}",
+                    searched.len(),
+                    searched
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
             Self::MissingRoms => {
                 formatter.write_str("a matching control and PCM ROM pair is required")

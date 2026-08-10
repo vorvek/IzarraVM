@@ -1308,11 +1308,7 @@ fn audio_capture_observes_every_advance_and_paces_by_cycles_run() {
     // Ten advances of one guest millisecond each -- shorter than the capture's
     // own 10 ms slice, which is what an injection burst looks like.
     let mut machine = build();
-    let mut capture = Some(AudioCapture::new(
-        wav.clone(),
-        &hardware,
-        HostAudioGains::from_prefs(&prefs::GuiPrefs::default()),
-    ));
+    let mut capture = Some(AudioCapture::new(wav.clone(), &hardware));
     let per_advance = clock_hz / 1_000;
     let mut spent = 0u64;
     for _ in 0..10 {
@@ -1401,103 +1397,6 @@ fn the_audio_wav_capture_writes_distinct_left_and_right_channels() {
         frames, pcm,
         "the capture must round-trip each channel untouched -- no downmix, no \
          channel dropped, no reordering"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The headless capture must render through the SAME gain staging the GUI uses.
-///
-/// `render_audio` applies two host-side gains that live outside the machine's
-/// own model -- the ReSonique 2 analog output stage (`card_amp`) and the PC
-/// speaker attenuation -- and a bare `Machine` starts both at their neutral
-/// value. The GUI's `pump_audio` sets them from `izarravm.conf` before every
-/// render; the capture set neither, so every WAV it ever wrote was rendered at
-/// 1.0x while the GUI rendered at the then-default 12.0x. That is 21.6 dB, and
-/// it made the instrument systematically unable to show the clipping it was
-/// pointed at: a mix that railed in the GUI came back clean in the file.
-///
-/// Drive `run_sliced` with a capture armed and a non-default prefs file, and
-/// check the machine really carries that staging into its render.
-#[test]
-fn the_audio_capture_stages_the_same_gains_the_gui_does() {
-    let hardware = HardwareProfile {
-        cpu: GswMode::Gsw486,
-        memory_mib: 16,
-        video: VideoCard::Vega,
-        sound_blaster: izarravm_core::SoundBlasterConfig::default(),
-        wss: izarravm_core::WssConfig::default(),
-    };
-    let dir = munt_test_dir("audio-capture-gain-parity");
-    let clock_hz = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1);
-    // Ten guest milliseconds: long enough that `after_slice` asks for a non-zero
-    // window. A render that never happens stages nothing, and every assertion
-    // below would be vacuous.
-    let advance = clock_hz / 100;
-
-    // Values a user could have dialled in, both away from the machine's neutral
-    // start so neither assertion can pass on the untouched default.
-    let prefs = prefs::GuiPrefs {
-        output_gain: 25,
-        pc_speaker_volume: 40,
-        ..prefs::GuiPrefs::default()
-    };
-
-    let build = || {
-        // `jmp $`: runs for exactly the cycle budget, every time.
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xEB, 0xFE])
-            .expect("build raw machine")
-    };
-    let mut machine = build();
-    assert_eq!(
-        (machine.card_amp(), machine.speaker_volume()),
-        (1.0, 1.0),
-        "a bare Machine starts neutral -- which is what the capture used to \
-         leave it at, whatever the user had configured"
-    );
-
-    let mut capture = Some(AudioCapture::new(
-        dir.join("capture.wav"),
-        &hardware,
-        HostAudioGains::from_prefs(&prefs),
-    ));
-    run_sliced(&mut machine, advance, &mut capture).unwrap();
-    assert!(
-        !capture.as_ref().unwrap().pcm.is_empty(),
-        "the capture must actually have rendered, or this proves nothing"
-    );
-
-    assert_eq!(
-        machine.card_amp(),
-        2.5,
-        "output_gain 25 is 2.5x through the analog output stage"
-    );
-    assert_eq!(
-        machine.speaker_volume(),
-        0.4,
-        "pc_speaker_volume 40 is a 0.4 attenuation on the beeper"
-    );
-    // Not a restatement of the two numbers above: this pins that the capture
-    // reads the prefs through the GUI's OWN conversion rather than a copy of the
-    // arithmetic, so the two cannot drift apart later.
-    assert_eq!(machine.card_amp(), gui::amp_multiplier(prefs.output_gain));
-    assert_eq!(
-        machine.speaker_volume(),
-        gui::speaker_multiplier(prefs.pc_speaker_volume)
-    );
-
-    // The default conf is not a special case that skips the staging: it stages
-    // unity explicitly, which is now what the GUI stages from the same file.
-    let mut plain = build();
-    let mut plain_capture = Some(AudioCapture::new(
-        dir.join("default.wav"),
-        &hardware,
-        HostAudioGains::from_prefs(&prefs::GuiPrefs::default()),
-    ));
-    run_sliced(&mut plain, advance, &mut plain_capture).unwrap();
-    assert_eq!(
-        plain.card_amp(),
-        gui::amp_multiplier(prefs::DEFAULT_OUTPUT_GAIN)
     );
 
     let _ = std::fs::remove_dir_all(&dir);
