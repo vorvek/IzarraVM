@@ -476,17 +476,28 @@ fn sndmixer_escape_restores_the_levels_the_mixer_opened_on() {
 /// A level the fader scale does not have is refused, and refused BEFORE
 /// anything is written: a batch where one switch is wrong must not leave the
 /// card half-configured.
+///
+/// 65536 and 65546 are the interesting ones. The tail parser accumulates into
+/// a 16-bit register, so before it saturated they wrapped to 0 and to 10 -- a
+/// typo that MUTED the master and exited 0, and a typo that quietly set it to
+/// full. Both are in range after the wrap and neither could be caught by the
+/// bounds check that follows.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndmixer_refuses_an_out_of_range_level_without_writing_anything() {
     let (machine, dir) = boot_with_sndmixer(
         "sndmixer_range",
-        "SNDMIXER /F 6 /M 11\r\nECHO MIXER-DONE\r\n",
+        "SNDMIXER /F 6 /M 11\r\n\
+         SNDMIXER /M 65536\r\n\
+         SNDMIXER /M 65546\r\n\
+         SNDMIXER /M 999999999\r\n\
+         ECHO MIXER-DONE\r\n",
     );
     let screen = machine.screen_text().as_text();
-    assert!(
-        screen.contains("A level must be 0 to 10, on MASTER"),
-        "the refusal names the channel it refused\n{screen}"
+    assert_eq!(
+        screen.matches("A level must be 0 to 10, on MASTER").count(),
+        4,
+        "all four out-of-range MASTER values are refused by name\n{screen}"
     );
     assert!(
         screen.contains("MIXER-DONE"),
@@ -495,13 +506,112 @@ fn sndmixer_refuses_an_out_of_range_level_without_writing_anything() {
     assert_eq!(
         machine.sb_mixer_register(0x30),
         Some(step_byte(10)),
-        "MASTER must be untouched\n{screen}"
+        "MASTER must be untouched: 65536 wrapped to 0 and muted it\n{screen}"
     );
     assert_eq!(
         machine.sb_mixer_register(0x34),
         Some(step_byte(10)),
         "the switch that parsed FIRST must not have been applied either: the \
          line is refused whole\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `/S` silences the run wherever it sits on the line.
+///
+/// Read in order, it only silenced what came after it, so the AUTOEXEC-shaped
+/// `SNDMIXER /CFG ... /S` was fine but `SNDMIXER /M 99 /S` printed its refusal
+/// onto a boot screen that has no row to spare. The mutation proof is the
+/// second half: the same line without `/S` does print, so this is a property of
+/// the flag and not of a run that had nothing to say.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_silent_flag_works_from_any_position_on_the_line() {
+    let (machine, dir) = boot_with_sndmixer(
+        "sndmixer_silent_pos",
+        "SNDMIXER /M 99 /S\r\n\
+         SNDMIXER /L /S\r\n\
+         ECHO MIXER-DONE\r\n",
+    );
+    let screen = machine.screen_text().as_text();
+    assert!(screen.contains("MIXER-DONE"), "the batch ran\n{screen}");
+    for chatter in ["A level must be", "ReSonique 2 volume levels"] {
+        assert!(
+            !screen.contains(chatter),
+            "/S after the switch it silences must still silence it, found \
+             {chatter:?}\n{screen}"
+        );
+    }
+
+    let (loud, loud_dir) = boot_with_sndmixer("sndmixer_silent_pos_loud", "SNDMIXER /M 99\r\n");
+    let loud_screen = loud.screen_text().as_text();
+    assert!(
+        loud_screen.contains("A level must be 0 to 10, on MASTER"),
+        "without /S the same line does print\n{loud_screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&loud_dir);
+}
+
+/// The MIDI fader's step 0 writes the wavetable pair's mute BIT, and the card
+/// reads a bare level of 0 there as the quietest audible step instead.
+///
+/// Both halves matter to the tool: it has to be able to mute the leg, and it
+/// has to display what the register is really doing when something else wrote
+/// a zero into it. A fader that wrote level 0 for its mute would be
+/// indistinguishable from that stray write and would come back reading 1.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_midi_mute_uses_the_wavetable_mute_bit() {
+    let (machine, dir) = boot_with_sndmixer("sndmixer_midi_mute", "SNDMIXER /I 0\r\n");
+    let screen = machine.screen_text().as_text();
+    assert_eq!(
+        machine.sb_mixer_register(0x50),
+        Some(0x01),
+        "step 0 on MIDI writes D0, not a level of zero\n{screen}"
+    );
+    assert_eq!(machine.sb_mixer_register(0x51), Some(0x01), "{screen}");
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.trim_end() == "  MIDI         0   mute"),
+        "and it reads back as a mute\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A config file a person edited by hand: spaces and tabs around the `=`, a
+/// comment, and a channel the file does not name. The file is documented as
+/// TYPE-able and TOKAEDIT-able, so it has to survive being typed.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_reads_a_config_that_was_edited_by_hand() {
+    let saved = "; my levels\r\nMASTER = 6\r\n\tFMSYNTH\t=\t2\r\n  CD=0\r\nJUNK = 4\r\n";
+    let (machine, dir) = boot_with_sndmixer_files(
+        "sndmixer_handedit",
+        "SNDMIXER /CFG C:\\VOL.CFG /S\r\n",
+        &[("VOL.CFG", saved)],
+    );
+    let screen = machine.screen_text().as_text();
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(6)),
+        "{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x34),
+        Some(step_byte(2)),
+        "{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x36),
+        Some(step_byte(0)),
+        "{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x32),
+        Some(step_byte(10)),
+        "a channel the file does not name keeps the card's level\n{screen}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

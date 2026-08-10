@@ -85,8 +85,8 @@ pub struct SbMixer {
     fm_r: u8,      // 0x35, 5-bit
     outgain_l: u8, // 0x41, 2-bit
     outgain_r: u8, // 0x42, 2-bit
-    wt_l: u8,      // 0x50, 5-bit (ReSonique 2 extension: the wavetable MIDI leg)
-    wt_r: u8,      // 0x51, 5-bit
+    wt_l: u8,      // 0x50, ReSonique 2 extension: the wavetable MIDI leg
+    wt_r: u8,      // 0x51, ditto; both hold the register BYTE, not the level
     // Stored-but-inert registers at their datasheet defaults (round-trip only).
     inert: [u8; 256],
 }
@@ -263,13 +263,32 @@ impl SbMixer {
     /// the OPL3). The Izarra 3000's card also carries a wavetable MPU whose
     /// synthesis is mixed on-card, the way an AWE32 mixes its EMU8000, and that
     /// leg had no level control at all. It gets one here, on the card's own
-    /// register file, at the card's own 5-bit level scale, so a guest programs
-    /// it with exactly the sequence it already uses for every other leg.
+    /// register file, at the card's own 5-bit level scale (D7-D3), so a guest
+    /// programs it with the sequence it already uses for every other leg.
+    ///
+    /// Two rules make this pair different from `0x30`-`0x37`, and both exist
+    /// because this leg has NO second owner. Every other source can be found
+    /// again from somewhere else -- the GUI's card-amp slider, its PC-speaker
+    /// slider, a game's own setup screen -- but nothing else in the machine
+    /// touches the wavetable. Silence here is unexplainable and unrecoverable
+    /// from inside the guest, so silence has to be asked for:
+    ///
+    /// * **D0 is MUTE.** Set it and the leg is silent whatever the level says.
+    ///   `0x50`/`0x51` are ours, so their reserved low bits are ours to define;
+    ///   D2-D1 stay reserved and read back clear.
+    /// * **Level 0 with D0 clear is NOT a mute.** It floors at
+    ///   `WAVETABLE_FLOOR_LEVEL`, the quietest step SNDMIXER.COM's fader can
+    ///   reach (-36 dB). A guest that clears a block of mixer registers writes
+    ///   `0x00` here as collateral; without the floor that one stray byte
+    ///   silences the machine's MIDI for the rest of the session, with nothing
+    ///   on screen to say so. With it, the same stray byte is a channel that
+    ///   went very quiet -- a symptom you can hear and undo.
+    ///
+    /// The cost is that "level 0" and "muted" are no longer the same thing on
+    /// this pair alone. SNDMIXER.COM writes D0 for its step 0, so the fader's
+    /// mute is a real mute; see `sndmixer.asm`.
     pub fn wavetable_gain(&self) -> (f32, f32) {
-        (
-            VOL5_STEPS[(self.wt_l & 0x1F) as usize],
-            VOL5_STEPS[(self.wt_r & 0x1F) as usize],
-        )
+        (decode_wavetable(self.wt_l), decode_wavetable(self.wt_r))
     }
 
     /// Raw (Left, Right) CD-Audio levels from registers `0x36`/`0x37`.
@@ -373,8 +392,8 @@ impl SbMixer {
             0x37 => self.inert[0x37] << 3,
             0x41 => self.outgain_l << 6,
             0x42 => self.outgain_r << 6,
-            0x50 => self.wt_l << 3,
-            0x51 => self.wt_r << 3,
+            0x50 => self.wt_l,
+            0x51 => self.wt_r,
             0x80 => self.irq_setup,
             0x81 => self.dma_setup,
             0x82 => self.irq_status,
@@ -457,10 +476,13 @@ impl SbMixer {
             // 2-bit gain registers: level in D7-D6 (86Box `regs[0x41]>>6`).
             0x41 => self.outgain_l = value >> 6,
             0x42 => self.outgain_r = value >> 6,
-            // The ReSonique 2 wavetable leg (see `wavetable_gain`). Same 5-bit
-            // D7-D3 encoding as 0x30-0x37, so the same `>> 3` decode.
-            0x50 => self.wt_l = value >> 3,
-            0x51 => self.wt_r = value >> 3,
+            // The ReSonique 2 wavetable leg (see `wavetable_gain`). The whole
+            // byte is kept, not the level, because D0 carries the mute; the
+            // reserved bits are dropped on the way in so a read-back never
+            // reports a bit the card does not implement, the same normalising
+            // 0x30-0x37 do by storing only their level.
+            0x50 => self.wt_l = value & WT_IMPLEMENTED,
+            0x51 => self.wt_r = value & WT_IMPLEMENTED,
             0x80 => self.irq_setup = value,
             0x81 => self.dma_setup = value,
             0x82 => { /* Interrupt Status is read-only; writes are ignored. */ }
@@ -515,8 +537,8 @@ impl SbMixer {
         self.fm_r = 31;
         self.outgain_l = 0;
         self.outgain_r = 0;
-        self.wt_l = 31;
-        self.wt_r = 31;
+        self.wt_l = 31 << 3;
+        self.wt_r = 31 << 3;
         self.inert = default_inert();
     }
 }
@@ -543,6 +565,32 @@ impl Default for SbMixer {
         mixer.reset();
         mixer
     }
+}
+
+/// The bits `0x50`/`0x51` implement: the 5-bit level in D7-D3 and the mute in
+/// D0. D2-D1 are reserved and read back clear.
+const WT_IMPLEMENTED: u8 = 0xF9;
+
+/// D0 of `0x50`/`0x51`: mute this channel of the wavetable leg outright.
+const WT_MUTE: u8 = 0x01;
+
+/// The level a wavetable register of 0 is floored to: 13, which is -36 dB and
+/// the quietest stop SNDMIXER.COM's fader offers. See
+/// [`SbMixer::wavetable_gain`] for why a zero here is treated as "very quiet"
+/// rather than "off".
+const WAVETABLE_FLOOR_LEVEL: usize = 13;
+
+/// Decode one wavetable register byte into a linear gain.
+fn decode_wavetable(register: u8) -> f32 {
+    if register & WT_MUTE != 0 {
+        return 0.0;
+    }
+    let level = usize::from(register >> 3);
+    VOL5_STEPS[if level == 0 {
+        WAVETABLE_FLOOR_LEVEL
+    } else {
+        level
+    }]
 }
 
 /// Widen a compat 4-bit level to the 5-bit scale.

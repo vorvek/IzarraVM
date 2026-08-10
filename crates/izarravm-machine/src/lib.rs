@@ -2559,12 +2559,15 @@ impl Machine {
     ///
     /// The ReSonique 2 analog output-stage gain (`self.card_amp`, the host-tunable
     /// "amp gain") is applied to the card's own sources: OPL, SB DSP, the WSS
-    /// codec, CD-audio through the card's CD-in, and the PC speaker through the
-    /// card's PC-SPK input. The beeper is motherboard hardware, but its output
-    /// is wired INTO the card, which is what mixer register `0x3B` attenuates;
-    /// it used to be added after the amp and after the summing node's headroom
+    /// codec, CD-audio through the card's CD-in, and -- ONLY when a card is
+    /// fitted -- the PC speaker through the card's PC-SPK input. The beeper is
+    /// motherboard hardware, but on a machine with a sound card its output is
+    /// wired INTO the card, which is what mixer register `0x3B` attenuates; it
+    /// used to be added after the amp and after the summing node's headroom
     /// reserve, which left it hot by that reserve (6 dB) on top of the 7 dB the
-    /// card's own power-on PC-SPK level takes off.
+    /// card's own power-on PC-SPK level takes off. On a machine built WITHOUT a
+    /// card there is no such wire, so the beeper bypasses both and reaches the
+    /// output at its own level.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
         let render_start = self.host_profile.start();
         let card_amp = self.card_amp;
@@ -2677,7 +2680,15 @@ impl Machine {
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
                 let (sb_l, sb_r) = ct1745.mix_opl_voice((ol, or), (dl, dr));
                 let (cl, cr) = ct1745.mix_cd((cl, cr));
-                let (sl, sr) = ct1745.mix_speaker(s);
+                // Where the beeper joins depends on whether there is a card to
+                // join it to. With one fitted it is a card leg (PC-SPK level,
+                // then the master, then the node); with none it goes straight
+                // to the output, taking neither the node's reserve nor the
+                // card's amp -- there is no card in the path to take them.
+                let (spk_l, spk_r, spk_direct) = match ct1745.mix_speaker(s) {
+                    Some((left, right)) => (left, right, 0),
+                    None => (0, 0, s),
+                };
                 // OPL + SB16 DSP take the CT1745 master/outgain; the PC speaker
                 // takes the PC-SPK level and the same master; the WSS codec and
                 // CD are summed in raw (their own attenuation already applied). All
@@ -2692,10 +2703,10 @@ impl Machine {
                 // a hardware register. It exists because those legs all power on
                 // at unity and therefore sum past full scale on their own; see the
                 // constant for the full argument.
-                let card_l = (sb_l + wl + cl + sl) as f32 * MIX_HEADROOM * card_amp;
-                let card_r = (sb_r + wr + cr + sr) as f32 * MIX_HEADROOM * card_amp;
-                let l = clamp_i16(card_l as i32);
-                let r = clamp_i16(card_r as i32);
+                let card_l = (sb_l + wl + cl + spk_l) as f32 * MIX_HEADROOM * card_amp;
+                let card_r = (sb_r + wr + cr + spk_r) as f32 * MIX_HEADROOM * card_amp;
+                let l = clamp_i16(card_l as i32 + spk_direct);
+                let r = clamp_i16(card_r as i32 + spk_direct);
                 (l, r)
             })
             .collect();

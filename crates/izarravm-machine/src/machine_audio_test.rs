@@ -2538,6 +2538,22 @@ fn a_full_scale_voice_at_power_on_defaults_keeps_its_headroom() {
     );
 }
 
+/// A machine built with no sound card at all, for the legs whose routing
+/// depends on whether there is a card in the path.
+fn cardless_machine() -> Machine {
+    Machine::new(
+        MachineProfile {
+            sound_blaster: izarravm_core::SoundBlasterConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..MachineProfile::gsw_386(16, VideoCard::Vega)
+        },
+        I386DX25_TEST_ROM,
+    )
+    .expect("build a machine with no sound card")
+}
+
 /// Write one CT1745 mixer register through the guest's own port pair.
 fn set_mixer_register(machine: &mut Machine, index: u8, value: u8) {
     with_bus(machine, |bus| {
@@ -2665,6 +2681,45 @@ fn the_speaker_leg_is_inside_the_cards_output_stage() {
     }
 }
 
+/// The other direction, and the reason the routing is conditional: on a machine
+/// built with NO sound card there is no PC-SPK input to pass the beeper
+/// through, so it must take neither the card's summing-node headroom nor the
+/// card's output stage. Folding it in unconditionally would pull 6 dB off a
+/// beeper that meets no mixer at all, and -- worse -- would let the GUI's
+/// card-amp slider mute the one sound source such a machine still has.
+#[test]
+fn a_machine_with_no_card_keeps_its_beeper_outside_the_card_stage() {
+    let peak_at_amp = |amp: f32| {
+        let mut machine = cardless_machine();
+        machine.set_card_amp(amp);
+        beeper_on(&mut machine);
+        speaker_peak(&mut machine)
+    };
+
+    let unity = peak_at_amp(1.0);
+    assert!(unity > 1_000, "the beeper must be audible with no card");
+    for amp in [0.0f32, 0.5, 2.0] {
+        assert_eq!(
+            peak_at_amp(amp),
+            unity,
+            "the card amp cannot reach a beeper that passes through no card"
+        );
+    }
+
+    // And it keeps its full swing: no summing-node reserve either. Compared
+    // against the SAME beeper on a carded machine with the PC-SPK level at
+    // 0 dB, which differs from this one by exactly the node's reserve.
+    let mut carded = test_machine();
+    set_mixer_register(&mut carded, 0x3B, 3 << 6);
+    beeper_on(&mut carded);
+    let through_card = speaker_peak(&mut carded) as f32;
+    let want = unity as f32 * crate::MIX_HEADROOM;
+    assert!(
+        (through_card - want).abs() < want * 0.06,
+        "the card path costs the node's reserve and the cardless path does not:          {unity} -> {through_card}, wanted about {want}"
+    );
+}
+
 /// The guest side of the MIDI volume hook: the card's wavetable register pair
 /// is what `Machine::midi_gain` reports, so the frontend has one place to read
 /// it from and the value is a function of canonical device state rather than of
@@ -2684,19 +2739,19 @@ fn the_wavetable_registers_drive_the_midi_gain_and_not_the_fm_bus() {
     );
 
     set_mixer_register(&mut machine, 0x50, 21 << 3); // -20 dB
-    set_mixer_register(&mut machine, 0x51, 0x00); // mute
+    set_mixer_register(&mut machine, 0x51, 0x01); // D0: the deliberate mute
     let (left, right) = machine.midi_gain();
     assert!(
         (left - 10f32.powf(-20.0 / 20.0)).abs() < 1e-4,
         "0x50 level 21 is -20 dB, got {left}"
     );
-    assert_eq!(right, 0.0, "0x51 level 0 is a hard mute");
+    assert_eq!(right, 0.0, "0x51 D0 is the mute bit");
 
     // The FM bus is untouched by all of that, and the read-back is the level
     // the guest wrote (D7-D3), not a bare number.
     assert_eq!(machine.sb_mixer_register(0x34), Some(31 << 3));
     assert_eq!(machine.sb_mixer_register(0x50), Some(21 << 3));
-    assert_eq!(machine.sb_mixer_register(0x51), Some(0x00));
+    assert_eq!(machine.sb_mixer_register(0x51), Some(0x01));
 
     // And the converse: the FM registers do not reach the MIDI leg.
     set_mixer_register(&mut machine, 0x34, 0x00);
@@ -2709,17 +2764,42 @@ fn the_wavetable_registers_drive_the_midi_gain_and_not_the_fm_bus() {
 
     // A machine with no card carries no wavetable register, so the leg passes
     // at unity rather than being silenced by a control that is not there.
-    let bare = Machine::new(
-        MachineProfile {
-            sound_blaster: izarravm_core::SoundBlasterConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            ..MachineProfile::gsw_386(16, VideoCard::Vega)
-        },
-        I386DX25_TEST_ROM,
-    )
-    .expect("build a machine with no sound card");
+    let bare = cardless_machine();
     assert_eq!(bare.midi_gain(), (1.0, 1.0));
     assert_eq!(bare.sb_mixer_register(0x50), None);
+}
+
+/// A guest that clears a block of mixer registers writes `0x00` to the
+/// wavetable pair as collateral. That must not silence the machine's MIDI:
+/// the leg has no other control anywhere, so the silence would be both
+/// unexplainable and unrecoverable from inside the guest, and
+/// `gui_session::pump_audio` hands this one gain to BOTH engines, so it would
+/// take the external MIDI receiver down with the wavetable.
+///
+/// The mutation this guards is the obvious implementation -- decoding the pair
+/// with the same `VOL5_STEPS[level]` every other register uses, where level 0
+/// is 0.0.
+#[test]
+fn a_stray_zero_to_the_wavetable_registers_attenuates_rather_than_muting() {
+    let mut machine = test_machine();
+    // The block clear: 0x30 upward, which is what the stray write looks like.
+    for index in 0x30u8..=0x51 {
+        set_mixer_register(&mut machine, index, 0x00);
+    }
+    let (left, right) = machine.midi_gain();
+    let floor = 10f32.powf(-36.0 / 20.0);
+    assert!(
+        (left - floor).abs() < 1e-5 && (right - floor).abs() < 1e-5,
+        "a cleared wavetable pair is -36 dB, not silence: {left}, {right}"
+    );
+    // Every other leg in that same sweep IS muted, which is what makes the
+    // wavetable's exception an exception rather than a decode that never mutes.
+    assert_eq!(machine.sb_mixer_register(0x32), Some(0x00));
+    assert_eq!(machine.sb_mixer_register(0x3B), Some(0x00));
+
+    // And the deliberate mute still reaches silence, so the floor costs no
+    // capability: SNDMIXER.COM's step 0 writes D0.
+    set_mixer_register(&mut machine, 0x50, 0x01);
+    set_mixer_register(&mut machine, 0x51, 0x01);
+    assert_eq!(machine.midi_gain(), (0.0, 0.0));
 }

@@ -93,6 +93,15 @@
 ; 0x50/0x51, on the card's own register file and at the card's own 5-bit level
 ; scale. That is a ReSonique 2 extension, not a CT1745 register.
 ;
+; That pair alone has a mute BIT, D0, and this fader is the reason. The
+; wavetable is the one source in the machine with no second control anywhere --
+; no GUI slider, no other register, no game setup screen reaches it -- so the
+; card refuses to read a level of 0 there as silence and floors it at the
+; quietest audible step instead; a guest clearing a block of mixer registers
+; would otherwise silence the machine's MIDI for the session with nothing on
+; screen to say so. Step 0 on this fader therefore writes D0, which IS silence,
+; and the fader keeps a real mute without the register having to guess.
+;
 ; Build: nasm -f bin sndmixer.asm -o sndmixer.com
     cpu 386
     org 0x100
@@ -151,6 +160,15 @@ CH_SIZE    equ 16
 K_CT5 equ 0               ; a CT1745 5-bit pair
 K_WAV equ 1               ; the CT1745 voice pair AND the AD1848 attenuators
 K_SPK equ 2               ; the CT1745 2-bit PC-speaker register
+K_MID equ 3               ; the ReSonique 2 wavetable pair, which has a mute bit
+
+; D0 of 0x50/0x51. The wavetable leg is the only source in the machine with no
+; other control anywhere, so a level of 0 there is floored to the quietest
+; audible step rather than taken as silence -- a guest clearing a block of mixer
+; registers would otherwise silence the machine's MIDI for the session with
+; nothing to show for it. This bit is how silence is asked for on purpose, and
+; it is what step 0 on the MIDI fader writes.
+WT_MUTE equ 0x01
 
 DEV_SB  equ 0             ; needs the card
 DEV_ANY equ 1             ; the card or the codec will do
@@ -173,6 +191,10 @@ CFG_MAX   equ 1024
 start:
     cld
     call probe_hardware
+    ; /S is read out of the whole tail BEFORE anything can print, so it silences
+    ; the run wherever the user put it. Reading it in order instead made
+    ; `SNDMIXER /M 99 /S` report the error it was told not to report.
+    call prescan_silent
     call parse_tail
     jc .usage_error
     cmp byte [want_usage], 0
@@ -391,10 +413,30 @@ read_channel:
     jnc .absent
     cmp byte [si + CH_KIND], K_SPK
     je .speaker
+    cmp byte [si + CH_KIND], K_MID
+    je .wavetable
     mov al, [si + CH_REG]
     call mixer_read
     shr al, 3                   ; the level lives in D7-D3
     jmp level_to_step
+; The wavetable pair reads back its mute bit as well as its level, and a level
+; of 0 there is NOT silence: the register floors it at the quietest step, so
+; that is the step to show.
+.wavetable:
+    mov al, [si + CH_REG]
+    call mixer_read
+    test al, WT_MUTE
+    jnz .muted
+    shr al, 3
+    test al, al
+    jz .floored
+    jmp level_to_step
+.floored:
+    mov al, 1
+    ret
+.muted:
+    xor al, al
+    ret
 .speaker:
     mov al, [si + CH_REG]
     call mixer_read
@@ -462,6 +504,12 @@ apply_channel:
     ; this tool does not offer one, so the two registers always agree.
     mov al, [step_level + di]
     shl al, 3
+    cmp byte [si + CH_KIND], K_MID
+    jne .level_ready
+    test al, al                 ; step 0 on the wavetable is the mute BIT, not
+    jnz .level_ready            ; level 0, which that register floors
+    mov al, WT_MUTE
+.level_ready:
     mov bh, al
     mov ah, [si + CH_REG]
     mov al, bh
@@ -535,6 +583,53 @@ normalize_step:
     movzx bx, al
     mov al, [spk_snap + bx]
 .done:
+    ret
+
+; Walk the tail looking only for /S, before a single byte has been printed.
+;
+; The main parse cannot do this job: it acts on switches as it meets them, so a
+; flag that silences output only silences what comes after it. This pass reads
+; the same tokens with the same reader and sets nothing else.
+prescan_silent:
+    mov cl, [0x80]
+    xor ch, ch
+    mov si, 0x81
+.next:
+    call skip_blanks
+    jcxz .done
+    mov al, [si]
+    cmp al, 13
+    je .done
+    cmp al, '/'
+    je .switch
+    cmp al, '-'
+    je .switch
+    inc si                      ; not a switch: step over it and keep looking
+    dec cx
+    jmp .next
+.switch:
+    inc si
+    dec cx
+    call read_keyword
+    jc .done
+    mov di, sw_s
+    call token_is
+    jc .found
+    mov di, sw_silent
+    call token_is
+    jc .found
+    jmp .next
+.found:
+    mov byte [want_silent], 1
+.done:
+    ret
+
+; Is `token` the ASCIIZ at DI? CF=1 when it is. Preserves SI.
+token_is:
+    push si
+    mov si, token
+    call str_eq
+    pop si
     ret
 
 ; =============================================================================
@@ -806,6 +901,12 @@ str_eq:
     ret
 
 ; Parse decimal digits at SI/CX into AX. CF=1 when there were none.
+;
+; A number too big for AX SATURATES at 0xFFFF rather than wrapping. Every
+; caller bounds the result against a fader step, so a wrapped value is not a
+; harmless wrong number: `/M 65536` wrapped to 0 and silently MUTED the master
+; with a clean exit, and `/M 65546` came back as 10. The ceiling is a value no
+; caller accepts, so an overlong number is refused for being overlong.
 read_number:
     push bx
     xor ax, ax
@@ -820,14 +921,32 @@ read_number:
     sub dl, '0'
     push dx
     mov dx, 10
-    mul dx
-    pop dx
+    mul dx                      ; DX:AX; a non-zero DX is the overflow
+    test dx, dx
+    pop dx                      ; POP does not disturb the flags
+    jnz .saturate
     xor dh, dh
     add ax, dx
+    jc .saturate                ; and so is a carry out of the add
     inc bx
     inc si
     dec cx
     jmp .loop
+.saturate:
+    mov ax, 0xFFFF
+    inc bx                      ; digits were seen, so this is not "no number"
+.eat:
+    ; Consume the rest of the digits so the caller resumes at the same place a
+    ; number that fitted would have left it.
+    jcxz .done
+    mov dl, [si]
+    cmp dl, '0'
+    jb .done
+    cmp dl, '9'
+    ja .done
+    inc si
+    dec cx
+    jmp .eat
 .done:
     test bx, bx
     pop bx
@@ -950,6 +1069,10 @@ cfg_parse:
     mov al, [si]
     cmp al, '='
     je .named
+    cmp al, ' '                 ; `MASTER = 8` is a line a person types
+    je .name_end
+    cmp al, 9
+    je .name_end
     cmp al, 13
     je .skip_line
     cmp al, 10
@@ -967,9 +1090,41 @@ cfg_parse:
     inc bx
     inc si
     jmp .name
+; The name ended on a blank, so the '=' is still ahead of it -- unless the line
+; is something else entirely, in which case it is skipped like any other line
+; the parser does not recognise.
+.name_end:
+    mov byte [di], 0
+.name_blanks:
+    cmp si, [cfg_end]
+    jae .skip_line
+    mov al, [si]
+    cmp al, ' '
+    je .name_blank
+    cmp al, 9
+    je .name_blank
+    cmp al, '='
+    jne .skip_line
+    jmp .separator
+.name_blank:
+    inc si
+    jmp .name_blanks
 .named:
     mov byte [di], 0
+.separator:
     inc si                      ; past '='
+.value_blanks:
+    cmp si, [cfg_end]
+    jae .skip_line
+    mov al, [si]
+    cmp al, ' '
+    je .value_blank
+    cmp al, 9
+    jne .value_start
+.value_blank:
+    inc si
+    jmp .value_blanks
+.value_start:
     call find_channel_key       ; BL = index, CF=1 on a match
     jnc .skip_line
     mov [cfg_channel], bl
@@ -1190,13 +1345,14 @@ interactive:
     call draw_info
     jmp .loop
 .save:
-    cmp byte [have_cfg], 0
-    jne .save_path
+    ; Always the default path. The full-screen mixer is only ever reached with
+    ; no /CFG on the line -- /CFG alone restores and exits, /CFG with a channel
+    ; switch saves and exits -- so a branch here on `have_cfg` was code that
+    ; could not run. Writing a different file is the command line's job.
     mov si, s_default_cfg
     mov di, cfg_path
     call copy_str
     mov byte [di], 0
-.save_path:
     call cfg_save
     call video_done
     call report
@@ -1821,9 +1977,11 @@ CFG_ERROR   equ 2
 step_level: db 0, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31
 
 ; AD1848 output attenuation for the same steps: the codec moves in 1.5 dB, so
-; each stop takes the count nearest the same dB figure (0, 3, 5, 8, 11, 13, 16,
-; 19, 21, 24 <- -4.5, -7.5, -12, -16.5, -19.5, -24, -28.5, -31.5, -36 dB), and
-; step 0 sets the register's own mute bit rather than counting down to it.
+; each stop takes the count nearest the same dB figure. Reading the table below
+; from step 10 down to step 1, counts 0, 3, 5, 8, 11, 13, 16, 19, 21, 24 are
+; -0, -4.5, -7.5, -12, -16.5, -19.5, -24, -28.5, -31.5, -36 dB -- ten counts and
+; ten figures. Step 0 sets the register's own mute bit rather than counting all
+; the way down to it.
 wss_atten:  db WSS_DAC_MUTE, 24, 21, 19, 16, 13, 11, 8, 5, 3, 0
 
 ; The 2-bit PC-speaker register has four positions, so a step maps onto one of
@@ -1845,7 +2003,7 @@ channels:
     dw nm_wave, key_wave, ds_wave, 0
     db K_CT5, 0x36, 41, 40, 10, 10, DEV_SB, 0
     dw nm_cd, key_cd, ds_cd, 0
-    db K_CT5, 0x50, 52, 52, 10, 10, DEV_SB, 0
+    db K_MID, 0x50, 52, 52, 10, 10, DEV_SB, 0
     dw nm_midi, key_midi, ds_midi, 0
     db K_SPK, 0x3B, 63, 62, 10, 10, DEV_SB, 0
     dw nm_spk, key_spk, ds_spk, 0
@@ -1979,8 +2137,9 @@ s_default_cfg: db 'C:\VOLCONF.CFG', 0
 
 cfg_head:
     db '; ReSonique 2 volume levels, written by SNDMIXER.COM.', 13, 10
-    db '; One channel per line: 0 mutes, 10 is full. SPEAKER has four', 13, 10
-    db '; positions on the card, so it reads back as 0, 3, 7 or 10.', 13, 10, 0
+    db '; One channel per line: 0 mutes, 10 is full. Spaces around the', 13, 10
+    db '; = are fine. SPEAKER has four positions on the card, so it', 13, 10
+    db '; reads back as 0, 3, 7 or 10.', 13, 10, 0
 
 msg_head:        db 'ReSonique 2 volume levels', 13, 10, 0
 msg_no_card:     db '  No ReSonique 2 card detected.', 13, 10, 0

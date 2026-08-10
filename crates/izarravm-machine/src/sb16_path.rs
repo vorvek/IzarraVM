@@ -204,17 +204,18 @@ impl Ct1745Mix {
     /// `sb16_awe32_filter_pc_speaker` does (`buffer * speaker * master`). The
     /// beeper is a mono source, so one sample fans out to the stereo master.
     ///
-    /// A card that is not installed has no PC-SPK input to route the beeper
-    /// through, so the leg passes at unity rather than vanishing: the
-    /// motherboard speaker still works on a machine with no sound card.
-    pub(crate) fn mix_speaker(self, spk: i32) -> (i32, i32) {
-        if !self.active {
-            return (spk, spk);
-        }
-        (
+    /// `None` when no card is fitted. That is not "silent" -- it is "not on
+    /// the card": the motherboard beeper on a machine with no sound card is
+    /// wired to the speaker and nothing else, so it must take neither the
+    /// card's summing-node headroom nor the card's output-stage gain. The
+    /// caller adds it to the output directly instead. Folding it into the card
+    /// node unconditionally would pull 6 dB off a beeper that passes through no
+    /// mixer at all, and let the GUI's card-amp slider mute it at zero.
+    pub(crate) fn mix_speaker(self, spk: i32) -> Option<(i32, i32)> {
+        self.active.then_some((
             (spk as f32 * self.speaker * self.voice_bus_l) as i32,
             (spk as f32 * self.speaker * self.voice_bus_r) as i32,
-        )
+        ))
     }
 }
 

@@ -493,11 +493,59 @@ fn wavetable_extension_registers_decode_as_five_bit_levels() {
     );
     assert!((r - 1.0).abs() < 1e-3);
 
-    write_reg(&mut mixer, 0x51, 0x00);
-    assert_eq!(mixer.wavetable_gain().1, 0.0, "level 0 is a hard mute");
-
     // A mixer reset restores it with everything else.
     write_reg(&mut mixer, 0x00, 0x00);
     assert_eq!(read_reg(&mut mixer, 0x50), 0xF8);
     assert_eq!(read_reg(&mut mixer, 0x51), 0xF8);
+}
+
+/// The two rules that make this pair unlike `0x30`-`0x37`: D0 mutes, and a
+/// level of 0 does NOT.
+///
+/// The wavetable is the one leg in the machine with no second owner -- no GUI
+/// slider, no other register, no game setup screen reaches it -- so a stray
+/// `0x00` from a guest clearing a block of mixer registers would silence its
+/// MIDI for the whole session with nothing to show for it. Flooring that at
+/// the fader's own quietest stop turns an unexplainable silence into an
+/// audible symptom, and D0 keeps a real mute available to anything that means
+/// it.
+#[test]
+fn a_wavetable_level_of_zero_floors_and_only_d0_mutes() {
+    let mut mixer = SbMixer::default();
+
+    // The stray write. -36 dB, not silence, and the same on both channels.
+    write_reg(&mut mixer, 0x50, 0x00);
+    write_reg(&mut mixer, 0x51, 0x00);
+    let (left, right) = mixer.wavetable_gain();
+    let floor = 10f32.powf(-36.0 / 20.0);
+    for gain in [left, right] {
+        assert!(
+            (gain - floor).abs() < 1e-5,
+            "a zero level floors at -36 dB, got {gain}"
+        );
+        assert!(gain > 0.0, "and is emphatically not a mute");
+    }
+    // The register still reads back the byte that was written: the floor is a
+    // decode rule, not a rewrite of what the guest asked for.
+    assert_eq!(read_reg(&mut mixer, 0x50), 0x00);
+
+    // The deliberate mute, which is what SNDMIXER.COM's step 0 writes. Note it
+    // is REACHED with level 0 in D7-D3 and D0 set, so the discriminator really
+    // is the bit and not the level.
+    write_reg(&mut mixer, 0x50, 0x01);
+    assert_eq!(mixer.wavetable_gain().0, 0.0, "D0 mutes");
+    assert_eq!(read_reg(&mut mixer, 0x50), 0x01);
+    // D0 wins over any level, so a mute does not depend on zeroing the level.
+    write_reg(&mut mixer, 0x51, (31 << 3) | 0x01);
+    assert_eq!(mixer.wavetable_gain().1, 0.0, "D0 mutes at full level too");
+
+    // D2-D1 are reserved: stored nowhere, read back clear, no effect.
+    write_reg(&mut mixer, 0x50, (21 << 3) | 0x06);
+    assert_eq!(read_reg(&mut mixer, 0x50), 21 << 3);
+    assert!((mixer.wavetable_gain().0 - 10f32.powf(-20.0 / 20.0)).abs() < 1e-4);
+
+    // Every other 5-bit register keeps the plain rule: level 0 IS a mute
+    // there, because those legs can all be found again from somewhere else.
+    write_reg(&mut mixer, 0x32, 0x00);
+    assert_eq!(mixer.voice_gain().0, 0.0);
 }

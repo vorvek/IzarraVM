@@ -185,7 +185,11 @@ Two of the six are not plain Sound Blaster registers:
 - **MIDI** is the wavetable synthesiser. A real SB16 has no register for one —
   its "MIDI" volume is the FM bus, which is this card's FMSYNTH fader — so the
   ReSonique 2 adds a pair of its own at `0x50`/`0x51`, on the same register file
-  and the same 5-bit scale as everything else.
+  and the same 5-bit scale as everything else. That pair alone carries a mute
+  bit in D0, and a *level* of zero on it is not silence but the quietest
+  audible step: the wavetable is the only source with no second control
+  anywhere, so silence there has to be asked for rather than arrived at by a
+  program clearing registers it does not care about.
 
 ## Digital audio (Sound Blaster 16 compatible)
 

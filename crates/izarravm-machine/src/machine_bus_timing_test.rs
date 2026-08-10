@@ -2632,13 +2632,13 @@ fn pc_speaker_renders_a_square_wave() {
     );
 }
 
-#[test]
-fn pc_speaker_ultrasonic_square_wave_averages_quietly() {
+/// Peak of the beeper at a PIT2 divisor, through the whole mix.
+fn speaker_peak_at_divisor(low: u32, high: u32) -> i32 {
     let mut machine = test_machine();
     with_bus(&mut machine, |bus| {
         bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap(); // ch2, lo/hi, mode 3
-        bus.write_io(0x42, BusWidth::Byte, 0x02, false).unwrap(); // divisor low
-        bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap(); // divisor high
+        bus.write_io(0x42, BusWidth::Byte, low, false).unwrap();
+        bus.write_io(0x42, BusWidth::Byte, high, false).unwrap();
         bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap(); // GATE2 + data enable
     });
     let clock_hz = machine.active_mode.clock_rate().floor_hz();
@@ -2646,15 +2646,32 @@ fn pc_speaker_ultrasonic_square_wave_averages_quietly() {
     for _ in 0..2_000 {
         machine.advance_devices_clocks(chunk); // ~20 ms total
     }
-    let pcm = machine.render_audio(OPL_NATIVE_HZ as usize / 50);
-    let peak = pcm
+    machine
+        .render_audio(OPL_NATIVE_HZ as usize / 50)
         .iter()
         .map(|&(l, r)| i32::from(l).abs().max(i32::from(r).abs()))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// An ultrasonic PIT2 square wave has to average down rather than alias at the
+/// leg's full swing.
+///
+/// The bound is taken FROM the leg rather than written as a constant, because
+/// the leg's ceiling moves whenever its staging does -- it just moved 13 dB
+/// when the beeper started passing through the card's PC-SPK level and the
+/// summing node's reserve, at which point a fixed `peak < 1200` had stopped
+/// being a two-thirds bound on anything and become a bound the aliasing case
+/// would also have passed. An audible tone measured through the same path is
+/// what the ceiling actually is.
+#[test]
+fn pc_speaker_ultrasonic_square_wave_averages_quietly() {
+    let audible = speaker_peak_at_divisor(0x97, 0x04); // ~1 kHz, a full swing
+    let ultrasonic = speaker_peak_at_divisor(0x02, 0x00); // ~600 kHz
+    assert!(audible > 0, "the audible reference tone must be audible");
     assert!(
-        peak < 1_200,
-        "an ultrasonic PIT2 square wave should average down instead of aliasing at full scale, peak {peak}"
+        ultrasonic * 3 < audible * 2,
+        "an ultrasonic PIT2 square wave should average down instead of aliasing          at the leg's full scale: {ultrasonic} against a {audible} swing"
     );
 }
 

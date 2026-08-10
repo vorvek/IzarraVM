@@ -465,6 +465,13 @@ The PC-speaker fader has four positions rather than ten, because the card gives
 that input two bits and not five. A value between them rounds up to the next
 one, so asking for a little never gets you silence.
 
+The MIDI fader's 0 writes a mute bit rather than a level of zero. The card
+refuses to read a *level* of zero on the wavetable as silence — it takes it as
+the quietest audible step instead — because nothing else in the machine can
+reach that leg, so a program that cleared the mixer's registers would silence
+your MIDI for the rest of the session with nothing on screen to say why. The
+fader still mutes; it just says so explicitly.
+
 `WAVE` moves both digital-audio paths at once — the Sound Blaster DSP and the
 Windows Sound System codec — since no program uses both and to a listener they
 are the same thing.
@@ -479,8 +486,17 @@ SNDMIXER /CFG C:\VOLCONF.CFG /S
 `/CFG` on its own reads the file and writes the card. `/CFG` together with any
 channel switch does the opposite: it applies the switches and then writes them
 into the file. `/S` prints nothing at all, which is what keeps the boot screen
-clean. F10 in the full-screen mixer saves to whatever `/CFG` named, or to
-`C:\VOLCONF.CFG` when it named nothing — the same file the boot line reads.
+clean, and it works wherever you put it on the line.
+
+F10 in the full-screen mixer always saves to `C:\VOLCONF.CFG`, the file the
+boot line reads. `/CFG` is the boot-restore form and does not open the mixer,
+so to keep levels in some other file use the command-line form:
+`SNDMIXER /M 8 /F 6 /CFG C:\GAMES\QUIET.CFG`.
+
+The file is plain text and meant to be edited: `TYPE` it, or open it in
+TOKAEDIT. Lines are `CHANNEL=step`, spaces around the `=` are fine, `;` and `#`
+start a comment, and anything the parser does not recognise is skipped rather
+than refused.
 
 The default sits in the root of `C:` rather than in `C:\DOS`, because `C:` is
 not always the Toka-DOS image: point IzarraVM at a folder of games and that
