@@ -38,6 +38,26 @@ pub(crate) const MARGO_EXT_DISPY_HI: u8 = 0x05;
 /// Write bit 0 to latch (DISPX, DISPY) into the display start.
 pub(crate) const MARGO_EXT_DISPCTL: u8 = 0x06;
 
+/// What a video-aperture byte write did, reported to `MachineBus::write_memory`.
+///
+/// `ArmedBlit` comes ONLY from the write that INCREASED the Margo blitter's
+/// modeled busy time -- never from a write that merely happened while the engine
+/// was already busy. That distinction is load-bearing: a blit can outlast a
+/// batch (a 640x480 FILL models ~1.54 ms of busy time against a 1 ms cap), and a
+/// guest overlapping CPU rendering with a long blit must keep batching its
+/// framebuffer writes. Every aperture other than Margo's MMIO window returns
+/// `Accepted` without even loading the busy counter, so the planar / chain-4 /
+/// LFB / text write paths pay nothing for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VideoWrite {
+    /// No aperture claimed the address; the caller falls back to RAM.
+    Unclaimed,
+    /// An aperture took the byte.
+    Accepted,
+    /// An aperture took the byte and it started a Margo blit.
+    ArmedBlit,
+}
+
 #[derive(Debug)]
 pub(crate) struct Vega {
     vga: Box<Vga>,
@@ -328,6 +348,16 @@ impl Vega {
 
     pub(crate) fn display_start_pending(&self) -> bool {
         self.margo.display_start_pending()
+    }
+
+    /// Whether the Margo blitter still has modeled busy time to drain.
+    ///
+    /// This is the TIME-DRAINING half of STATUS.BUSY only. An armed but unfed
+    /// color-expand stream also reads BUSY, and it is deliberately excluded: it
+    /// waits on guest MONO_DATA writes, not on elapsed time, so it would never
+    /// clear on its own.
+    pub(crate) fn blitter_busy_ns(&self) -> u64 {
+        self.margo.busy_ns()
     }
 
     pub(crate) fn port_disabled(&self, port: u16) -> bool {
@@ -777,23 +807,23 @@ impl Vega {
         false
     }
 
-    pub(crate) fn write_memory_u8(&mut self, address: u32, value: u8) -> bool {
+    pub(crate) fn write_memory_u8(&mut self, address: u32, value: u8) -> VideoWrite {
         if self.margo_banked_window_at(address) {
             if let Some(offset) = self.margo_banked_window_offset(address) {
                 self.margo.write_vram_u8(offset, value);
             }
-            return true;
+            return VideoWrite::Accepted;
         }
         if let Some(offset) = self.legacy_gfx_offset(address, 1) {
             match self.vga.active_mode() {
                 VideoMode::Mode13h => self.vga.cpu_write_chain4(offset, value),
                 _ => self.vga.cpu_write(offset, value),
             }
-            return true;
+            return VideoWrite::Accepted;
         }
         if let Some(offset) = self.hercules_offset(address, 1) {
             self.vga.hgc_write(offset, value);
-            return true;
+            return VideoWrite::Accepted;
         }
         if let Some(offset) = self.text_offset(address, 1) {
             let offset = if self.vga.is_cga_personality() {
@@ -806,7 +836,7 @@ impl Vega {
             } else {
                 let _ = self.vga.write_u8(offset, value);
             }
-            return true;
+            return VideoWrite::Accepted;
         }
         if self.vga.video_memory_enabled()
             && let Some(offset) = planar_offset(address, 1)
@@ -814,33 +844,43 @@ impl Vega {
             match self.vga.active_mode() {
                 VideoMode::Planar | VideoMode::ModeX => {
                     self.vga.cpu_write(offset, value);
-                    return true;
+                    return VideoWrite::Accepted;
                 }
                 VideoMode::Mode13h => {
                     self.vga.cpu_write_chain4(offset, value);
-                    return true;
+                    return VideoWrite::Accepted;
                 }
                 VideoMode::Text | VideoMode::Cga | VideoMode::Hercules => {}
             }
         }
         if let Some(offset) = margo_lfb_offset(address, 1) {
             self.margo.write_vram_u8(offset, value);
-            return true;
+            return VideoWrite::Accepted;
         }
         if let Some(offset) = margo_mmio_offset(address, 1) {
+            // The ONLY arming path in this function: COMMAND (and the final
+            // MONO_DATA word of a color-expand stream) is what charges the
+            // blitter modeled busy time. Detect the EDGE -- busy time that this
+            // write added -- rather than the level, so a write landing while an
+            // earlier long blit is still draining is an ordinary accepted write.
+            let busy_before = self.margo.busy_ns();
             self.margo.write_mmio_u8(offset, value);
-            return true;
+            return if self.margo.busy_ns() > busy_before {
+                VideoWrite::ArmedBlit
+            } else {
+                VideoWrite::Accepted
+            };
         }
         if self.distira_lfb_offset(address, 1).is_some()
             || self.distira_texture_offset(address, 1).is_some()
         {
-            return true;
+            return VideoWrite::Accepted;
         }
         if let Some(offset) = self.distira_mmio_offset(address, 1) {
             self.distira.write_mmio_u8(offset, value);
-            return true;
+            return VideoWrite::Accepted;
         }
-        false
+        VideoWrite::Unclaimed
     }
 
     /// Conservative SUPERSET of `owns_memory`: false here proves no aperture can claim the

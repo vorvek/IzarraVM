@@ -921,6 +921,327 @@ fn predicted_pit_out_after_n_clocks_matches_a_real_advance_devices_of_the_same_n
     }
 }
 
+/// Program channel 0 as a mode-2 rate generator with an 18.2 Hz-ish divisor, the
+/// shape a BIOS leaves behind and a calibration loop latches.
+fn program_channel0_mode2(machine: &mut Machine, reload: u16) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap(); // ch0, lo/hi, mode 2, binary
+        bus.write_io(0x40, BusWidth::Byte, u32::from(reload & 0xff), false)
+            .unwrap();
+        bus.write_io(0x40, BusWidth::Byte, u32::from(reload >> 8), false)
+            .unwrap();
+    });
+}
+
+/// Latch channel 0 and read both halves back at the current in-batch offset.
+fn latch_and_read_channel0(machine: &mut Machine, prior: u64, core: u64) -> (u16, u64) {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        let before = bus.trace.elapsed_clocks();
+        bus.write_io(0x43, BusWidth::Byte, 0x00, false).unwrap(); // counter-latch, ch0
+        // The latch peek is taken AFTER read_io/write_io records this access's own
+        // bus time, so the raw total the peek converted is everything recorded
+        // since the bus was built.
+        let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+        let lo = bus.read_io(0x40, BusWidth::Byte, core, false).unwrap() as u8;
+        let hi = bus.read_io(0x40, BusWidth::Byte, core, false).unwrap() as u8;
+        (u16::from_le_bytes([lo, hi]), raw_bus_clocks)
+    })
+}
+
+#[test]
+fn a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The counter-value counterpart of
+    // predicted_pit_out_after_n_clocks_matches_a_real_advance_devices_of_the_same_n,
+    // and the test that retires the "counter reads are batch-start stale" caveat:
+    // a latch taken partway into a batch must equal the value a real
+    // advance_devices of the same clock total, followed by a latch at zero offset,
+    // produces. Both timing classes, since this peek is not gated on
+    // lazy_port_reads: the Accurate 386 class is the one whose batch grain the
+    // deadline work coarsened, so it is the one that most needs the peek.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        for prior in [0u64, 61, 33_000] {
+            for core in [0u64, 100, 12_345, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(mode);
+                program_channel0_mode2(&mut predicted_machine, 0x4000);
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(mode);
+                program_channel0_mode2(&mut real_machine, 0x4000);
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+                let (predicted, raw_bus_clocks) =
+                    latch_and_read_channel0(&mut predicted_machine, prior, core);
+
+                let step = prior + core + real_machine.scale_bus(raw_bus_clocks);
+                real_machine.advance_devices(step);
+                let (real, _) = latch_and_read_channel0(&mut real_machine, 0, 0);
+
+                assert_eq!(
+                    predicted, real,
+                    "mode {mode:?} prior {prior} core {core}: a mid-batch latch must \
+                     equal a real advance_devices of the same total"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_batch_counter_latch_moves_with_the_in_batch_offset() {
+    // Non-vacuity for the test above: without the peek every latch in a batch
+    // returns the same batch-start value, so the two offsets below would be equal.
+    // 450_000 clocks is ~20 ms at the 386 tier -- far more than one coarse batch --
+    // and the mode-2 counter must have visibly walked in between.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    program_channel0_mode2(&mut machine, 0x4000);
+    machine.run_cycles(5_000).unwrap();
+    let (at_batch_start, _) = latch_and_read_channel0(&mut machine, 0, 0);
+    let (mid_batch, _) = latch_and_read_channel0(&mut machine, 0, 450_000);
+    assert_ne!(
+        at_batch_start, mid_batch,
+        "a latch 450k clocks into the batch must not report the batch-start count"
+    );
+}
+
+/// Program channel 2 as a mode-3 square wave and leave port 0x61 in the classic
+/// "PIT timing, no sound" configuration: GATE2 HIGH (bit 0 set), data enable LOW
+/// (bit 1 clear). `speaker.data_enabled()` is false there, so
+/// `fine_batch_grain_required` does not hold the batch fine for it, and a guest
+/// that never touches 0x40-0x43 again also falls out of the PIT-observer window.
+fn program_silent_channel2(machine: &mut Machine, reload: u16) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap(); // ch2, lo/hi, mode 3
+        bus.write_io(0x42, BusWidth::Byte, u32::from(reload & 0xff), false)
+            .unwrap();
+        bus.write_io(0x42, BusWidth::Byte, u32::from(reload >> 8), false)
+            .unwrap();
+        bus.write_io(0x61, BusWidth::Byte, 0x01, false).unwrap(); // GATE2, no data enable
+    });
+    assert!(
+        !machine.speaker.data_enabled(),
+        "sanity: this configuration must NOT arm the speaker term of \
+         fine_batch_grain_required"
+    );
+}
+
+/// Read port 0x61 at a given in-batch offset, returning the byte and the raw bus
+/// clocks the access itself recorded (the same accounting `latch_and_read_channel0`
+/// uses, so a differential can advance the twin machine by the identical total).
+fn read_port_61_at(machine: &mut Machine, prior: u64, core: u64) -> (u8, u64) {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        let before = bus.trace.elapsed_clocks();
+        let value = bus.read_io(0x61, BusWidth::Byte, core, false).unwrap() as u8;
+        (value, bus.trace.elapsed_clocks() - before)
+    })
+}
+
+#[test]
+fn a_mid_batch_61_read_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The 0x61 counterpart of
+    // a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks.
+    // Both timing classes: the `out_after` peek on bits 4/5 is taken in each, so
+    // the Accurate class's channel-2 OUT is no longer a batch-start read even in
+    // the silent-timing configuration the fine-grain gate does not cover.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        for prior in [0u64, 61, 33_000] {
+            // 100_000 is included deliberately: it is an offset where CHANNEL 2's
+            // OUT has flipped relative to batch start (the other offsets move only
+            // channel 1's ~15 us refresh bit), so the sweep exercises both bits.
+            for core in [0u64, 100, 12_345, 100_000, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(mode);
+                program_silent_channel2(&mut predicted_machine, 0x2000);
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(mode);
+                program_silent_channel2(&mut real_machine, 0x2000);
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+                let (predicted, raw_bus_clocks) =
+                    read_port_61_at(&mut predicted_machine, prior, core);
+                let step = prior + core + real_machine.scale_bus(raw_bus_clocks);
+                real_machine.advance_devices(step);
+                let (real, _) = read_port_61_at(&mut real_machine, 0, 0);
+                assert_eq!(
+                    predicted, real,
+                    "mode {mode:?} prior {prior} core {core}: a mid-batch 0x61 read must \
+                     equal a real advance_devices of the same total"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_batch_61_read_moves_with_the_in_batch_offset_on_the_accurate_class() {
+    // Non-vacuity for the test above, on the class that previously read the LIVE
+    // level: without the peek every 0x61 read in a batch reports the same
+    // batch-start bit 5, so the sweep below would be constant. The offsets span
+    // ~20 ms at the 386 tier, far more than the 1 ms coarse cap the silent-timing
+    // configuration falls back to.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    program_silent_channel2(&mut machine, 0x2000);
+    machine.run_cycles(5_000).unwrap();
+    let mut levels = std::collections::BTreeSet::new();
+    for core in (0u64..=450_000).step_by(50_000) {
+        let (value, _) = read_port_61_at(&mut machine, 0, core);
+        levels.insert((value >> 5) & 1);
+    }
+    assert_eq!(
+        levels.len(),
+        2,
+        "bit 5 (channel-2 OUT) must take both levels across a sweep of in-batch \
+         offsets; a constant column means the peek is not being taken"
+    );
+}
+
+/// Read a VGA status port at a given in-batch offset, returning the byte and the
+/// raw bus clocks the access itself recorded (same accounting as
+/// `read_port_61_at`, so a differential can advance the twin by the identical
+/// total).
+fn read_status_port_at(machine: &mut Machine, port: u16, prior: u64, core: u64) -> (u8, u64) {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        let before = bus.trace.elapsed_clocks();
+        let value = bus.read_io(port, BusWidth::Byte, core, false).unwrap() as u8;
+        (value, bus.trace.elapsed_clocks() - before)
+    })
+}
+
+#[test]
+fn a_mid_batch_3da_read_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The VGA-beam counterpart of
+    // a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks
+    // and a_mid_batch_61_read_matches_a_real_advance_devices_of_the_same_clocks,
+    // and the test that retires the "3DA reports the batch-start beam" caveat.
+    //
+    // The 386 (Accurate) tier is the case that needed it: `lazy_ports_386` is
+    // DEFAULT OFF, so this arm sets io_touched and ends the batch exactly as it
+    // always has, and before the beam peek it read the LIVE beam -- the beam as
+    // of BATCH START. Nothing bounds that staleness once
+    // `fine_batch_grain_required` gates the fine fallback off (no term in that
+    // gate is armed by a display poll, and `vega_edge_ticks` carries the Margo
+    // blit and DISPLAY_START terms, not a retrace edge), so the read could be a
+    // full 1 ms coarse batch old. Gsw486 is swept alongside to pin that the
+    // Approximate class, which reaches the value by the lazy arm instead, agrees
+    // with the same oracle.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        for prior in [0u64, 61, 33_000] {
+            for core in [0u64, 100, 12_345, 100_000, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(mode);
+                assert!(predicted_machine.set_vga_mode(0x13));
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(mode);
+                assert!(real_machine.set_vga_mode(0x13));
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+                let (predicted, predicted_raw) =
+                    read_status_port_at(&mut predicted_machine, 0x3da, prior, core);
+                // The step is exactly the in-batch offset, with NO term for the
+                // access's own bus time. Unlike the PIT ports, a VGA status read
+                // is charged video wait states, and that charge is recorded
+                // before the peek on BOTH machines -- so it is already inside
+                // each read's own `in_batch_clocks` and cancels. Adding it to the
+                // step would advance the oracle by it twice, which bit 0
+                // (display enable, one toggle per ~700 clocks at this tier) is
+                // sharp enough to catch. The equality below is asserted, not
+                // assumed.
+                real_machine.advance_devices(prior + core);
+                let (real, real_raw) = read_status_port_at(&mut real_machine, 0x3da, 0, 0);
+                assert_eq!(
+                    predicted_raw, real_raw,
+                    "mode {mode:?}: the two reads must charge the same bus time for \
+                     the own-charge term to cancel"
+                );
+
+                assert_eq!(
+                    predicted, real,
+                    "mode {mode:?} prior {prior} core {core}: a mid-batch 3DA read must \
+                     equal a real advance_devices of the same total"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_batch_3da_read_moves_with_the_in_batch_offset_on_the_accurate_class() {
+    // Non-vacuity for the test above, on the class that previously read the LIVE
+    // beam: without the peek every 3DA read in a batch reports the same
+    // batch-start bits, so both columns below would be constant. Bit 3 is
+    // vertical retrace and bit 0 is display-enable-inverted; the offsets span
+    // more than a whole 70 Hz frame at the 386 tier, so each must take both
+    // levels.
+    //
+    // The STEP matters and is why this is not a 10k-clock sweep: vertical
+    // retrace is only a couple of scanlines (~64 us, ~1400 clocks at this
+    // tier), so a coarse sweep can stride over the retrace window entirely and
+    // report a constant bit 3 whether or not the peek is being taken -- a
+    // fixture that cannot fail. 250 clocks is well inside both the retrace
+    // window and one ~700-clock scanline.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    assert!(machine.set_vga_mode(0x13));
+    machine.run_cycles(5_000).unwrap();
+    let mut vretrace = std::collections::BTreeSet::new();
+    let mut display_enable = std::collections::BTreeSet::new();
+    for core in (0u64..=450_000).step_by(250) {
+        let (value, _) = read_status_port_at(&mut machine, 0x3da, 0, core);
+        vretrace.insert((value >> 3) & 1);
+        display_enable.insert(value & 1);
+    }
+    assert_eq!(
+        vretrace.len(),
+        2,
+        "bit 3 (vertical retrace) must take both levels across a sweep of in-batch \
+         offsets; a constant column means the beam peek is not being taken"
+    );
+    assert_eq!(
+        display_enable.len(),
+        2,
+        "bit 0 (display enable) must take both levels across a sweep of in-batch offsets"
+    );
+}
+
+#[test]
+fn the_accurate_3da_arm_still_ends_the_batch() {
+    // The beam peek changes the VALUE only. `lazy_ports_386` is default OFF, so
+    // the Accurate class must still set io_touched on a 3DA read exactly as it
+    // did before the peek -- otherwise this would silently become the lazy
+    // behavior the `IZARRAVM_LAZY_PORT_386` switch exists to keep opt-in, and
+    // every 386 fixture's batch shape would move.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    assert!(machine.set_vga_mode(0x13));
+    machine.run_cycles(5_000).unwrap();
+    let touched = with_bus(&mut machine, |bus| {
+        assert!(
+            !bus.lazy_ports_386,
+            "sanity: this test covers the DEFAULT (non-lazy) Accurate arm"
+        );
+        *bus.io_touched = false;
+        bus.read_io(0x3da, BusWidth::Byte, 0, false).unwrap();
+        *bus.io_touched
+    });
+    assert!(touched, "a 386-tier 3DA read must still end the batch");
+}
+
 #[test]
 fn lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter() {
     // `out_after` conservatively declines for a
@@ -2459,4 +2780,188 @@ fn opl_status_read_stays_live_in_the_accurate_class() {
     });
     let live = u32::from(machine.opl.status());
     assert_eq!(value, live, "the Accurate class must read the live byte");
+}
+
+// ---------------------------------------------------------------------------
+// The Accurate-class (386) lazy poll ports: IZARRAVM_LAZY_PORT_386.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_386_lazy_port_switch_can_never_arm_the_approximate_class() {
+    // The structural half of the design, and the reason the switch is a
+    // separate bool from `lazy_port_reads`: 486/586 already take the 3DA and
+    // 0x61 arms and have NEVER taken the gameport arm, so a switch that could
+    // reach them would silently move a pinned 486/586 fixture. Pinned over the
+    // whole mode set in both environment states rather than trusting the
+    // default, because the default is the only thing an env-based test could
+    // observe without racing the process environment.
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for env_enabled in [false, true] {
+            let armed = crate::bus::lazy_ports_386_composed(mode, env_enabled);
+            assert_eq!(
+                armed,
+                env_enabled && !mode.uses_approximate_timing(),
+                "mode {mode:?} env {env_enabled}"
+            );
+            if mode.uses_approximate_timing() {
+                assert!(
+                    !armed,
+                    "{mode:?} is Approximate; the switch must not reach it"
+                );
+            }
+        }
+    }
+    // The loop above is the whole test. `lazy_ports_386_for` -- the env-composed
+    // wrapper the bus actually calls -- is deliberately NOT asserted on here:
+    // its only added term is `lazy_port_reads_386_enabled()`, and with the
+    // switch off by default every assertion about it passes for the wrong reason
+    // (a mutation deleting the mode test still returns false), while forcing the
+    // switch on means writing the process environment under a threaded test
+    // runner. Pinning `lazy_ports_386_composed` over both environment states,
+    // which is what the loop does, covers the mode half without that race.
+}
+
+/// A 386 bus with the lazy poll ports armed as if `IZARRAVM_LAZY_PORT_386` were
+/// set, without touching the process environment.
+fn with_lazy_386_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
+    with_bus(machine, |bus| {
+        assert!(
+            !bus.lazy_port_reads,
+            "this helper is for the Accurate class only"
+        );
+        bus.lazy_ports_386 = true;
+        f(bus)
+    })
+}
+
+fn accurate_machine_with_joystick() -> Machine {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    machine.set_joystick_state(Some(JoystickState {
+        x: 0x80,
+        y: 0x40,
+        buttons: 0,
+    }));
+    machine.run_cycles(5_000).unwrap();
+    machine
+}
+
+#[test]
+fn the_386_lazy_switch_stops_the_poll_ports_ending_the_batch() {
+    // What the whole slice buys: on the Accurate class a poll loop used to end
+    // its batch on EVERY read, which is why a PoP-386 run spent 1.16M batch
+    // entries to answer 934k 3DA polls. Each arm is checked for both states of
+    // the switch in the same test, so neither direction can rot into vacuity.
+    for port in [0x3DA_u16, 0x61, 0x201] {
+        for lazy in [false, true] {
+            let mut machine = accurate_machine_with_joystick();
+            let touched = with_bus(&mut machine, |bus| {
+                bus.lazy_ports_386 = lazy;
+                *bus.io_touched = false;
+                bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+                *bus.io_touched
+            });
+            assert_eq!(
+                touched, !lazy,
+                "port {port:#06X} with the 386 switch {lazy}: batch-ending must \
+                 follow the switch exactly"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_386_lazy_switch_leaves_the_opl_charging_rules_alone() {
+    // The hard constraint of the slice. An OPL status poll is deliberately
+    // batch-ending in BOTH classes (it is how the timer advances between
+    // polls), and the Approximate class's ISA-I/O charge is Approximate-class
+    // policy. Neither may move with this switch, so both are pinned here with
+    // the switch ON.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    let (touched, isa_clocks) = with_lazy_386_bus(&mut machine, |bus| {
+        *bus.io_touched = false;
+        *bus.isa_io_clocks = 0;
+        bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
+        (*bus.io_touched, *bus.isa_io_clocks)
+    });
+    assert!(touched, "an OPL status poll stays batch-ending on 386");
+    assert_eq!(
+        isa_clocks, 0,
+        "the Approximate-class ISA-I/O charge must not appear on the 386 class"
+    );
+}
+
+#[test]
+fn a_lazy_gameport_read_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The exactness proof for the one port whose VALUE provably cannot move:
+    // `GamePort::read` is a pure function of the two RC discharge deadlines and
+    // `guest_tick_now()`, and nothing in advance_devices touches the deadlines.
+    // Differential form, same as predicted_beam/predicted_pit_out: read the
+    // predicted machine mid-batch at total T, advance the other machine for
+    // real by the same T and read it at zero offset, require equality.
+    for core_clocks_so_far in [0u64, 1_000, 40_000, 150_000, 400_000] {
+        let mut predicted_machine = accurate_machine_with_joystick();
+        let mut real_machine = accurate_machine_with_joystick();
+        assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+        // The RC one-shots are armed by the 0x201 WRITE, in the batch before
+        // the reads -- exactly as a guest arms them, and the reason the read
+        // never observes a mid-batch mutation of its own inputs.
+        for machine in [&mut predicted_machine, &mut real_machine] {
+            with_bus(machine, |bus| {
+                bus.write_io(0x201, BusWidth::Byte, 0, false).unwrap();
+            });
+        }
+
+        let (predicted, raw_bus_clocks) = with_lazy_386_bus(&mut predicted_machine, |bus| {
+            let before = bus.trace.elapsed_clocks();
+            let value = bus
+                .read_io(0x201, BusWidth::Byte, core_clocks_so_far, false)
+                .unwrap();
+            (value, bus.trace.elapsed_clocks() - before)
+        });
+
+        let step = core_clocks_so_far + real_machine.scale_bus(raw_bus_clocks);
+        real_machine.advance_devices(step);
+        let real = with_bus(&mut real_machine, |bus| {
+            bus.read_io(0x201, BusWidth::Byte, 0, false).unwrap()
+        });
+
+        assert_eq!(
+            predicted, real,
+            "core {core_clocks_so_far}: a lazy gameport read must equal a real \
+             advance_devices of the same clock total followed by a read"
+        );
+    }
+}
+
+#[test]
+fn a_lazy_gameport_read_moves_with_the_in_batch_offset() {
+    // Non-vacuity for the test above: the RC one-shots must actually discharge
+    // across the swept range, or the differential test would pass on a
+    // constant. 0x80 on X is ~1.4 ms, far more than one 386 batch, so the bit
+    // is still SET early in the batch and CLEAR once the batch is long enough.
+    let mut machine = accurate_machine_with_joystick();
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x201, BusWidth::Byte, 0, false).unwrap();
+    });
+    let (early, late) = with_lazy_386_bus(&mut machine, |bus| {
+        let early = bus.read_io(0x201, BusWidth::Byte, 0, false).unwrap();
+        let late = bus
+            .read_io(0x201, BusWidth::Byte, 4_000_000, false)
+            .unwrap();
+        (early, late)
+    });
+    assert_eq!(
+        early & 0x03,
+        0x03,
+        "both one-shots are still charged at t=0"
+    );
+    assert_eq!(late & 0x03, 0x00, "both have discharged 4M clocks later");
 }

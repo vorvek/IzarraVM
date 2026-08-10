@@ -6,7 +6,7 @@ use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, GswMode, MASTER_C
 use crate::timing::PIT_INPUT_HZ;
 
 const MICROSECOND_HZ: u64 = 1_000_000;
-const NANOSECOND_HZ: u64 = 1_000_000_000;
+pub(crate) const NANOSECOND_HZ: u64 = 1_000_000_000;
 pub(crate) const MARGO_FRAME_HZ: u64 = 60;
 const DISTIRA_LINE_HZ: u64 = 525 * 60;
 
@@ -119,6 +119,9 @@ pub(crate) enum DeviceClock {
     Dsp,
     Wss,
     MargoFrame,
+    /// Margo's nanosecond engine clock: the phase the blitter's modeled busy
+    /// time drains against.
+    MargoNs,
     Rtc,
     Vga,
 }
@@ -437,6 +440,7 @@ impl Timeline {
             DeviceClock::Dsp => self.dsp,
             DeviceClock::Wss => self.wss,
             DeviceClock::MargoFrame => self.margo_frame,
+            DeviceClock::MargoNs => self.margo,
             DeviceClock::Rtc => self.rtc,
             DeviceClock::Vga => self.vga,
         };

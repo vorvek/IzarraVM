@@ -404,8 +404,11 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         cache: &mut machine.cache_model,
         flat_data_cost: machine.active_mode.uses_approximate_timing(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
+        lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),
         io_touched: &mut machine.io_touched,
+        exempt_io_touched: &mut machine.exempt_io_touched,
         isa_io_clocks: &mut machine.isa_io_batch_clocks,
+        pit_observer_fine_until: &mut machine.pit_observer_fine_until,
         opl_probe: &mut machine.opl_probe,
         device_wrote_memory: &mut machine.device_wrote_memory,
         pending_device_memory_write_range: &mut machine.pending_device_memory_write_range,
@@ -597,6 +600,9 @@ mod bus_timing;
 #[cfg(test)]
 #[path = "machine_core_test.rs"]
 mod core;
+#[cfg(test)]
+#[path = "machine_deadline_cache_test.rs"]
+mod deadline_cache;
 #[cfg(test)]
 #[path = "machine_device_integration_test.rs"]
 mod device_integration;

@@ -1515,6 +1515,14 @@ fn run_boot_hdd_folder(
     let machine_profile_snapshot = machine.host_profile_snapshot();
     if machine_profile_snapshot.machine_phase_timing_enabled {
         bench::print_machine_profile(&machine_profile_snapshot, wall);
+        // Hit rate of the batch cap's device-edge deadline cache. The CpuBatch
+        // count above is the batch total; this says how many of those entries had
+        // to run the ~15-query device pull-scan instead of one compare.
+        let (batches, scans) = machine.device_edge_cache_counts();
+        let served = 100.0 * (batches.saturating_sub(scans)) as f64 / batches.max(1) as f64;
+        println!(
+            "device-edge cache: {scans} scans over {batches} batch entries ({served:.2}% served from cache)"
+        );
     }
     // Run-shape diagnostics (insns/run + break reasons). Unconditional: the counters are
     // always maintained, so unlike the sampled profile above this print costs nothing.

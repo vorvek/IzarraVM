@@ -22,6 +22,37 @@ fn ranges_overlap(start: u32, len: u32, observed_start: u32, observed_len: u32) 
     start < observed_end && observed_start < end
 }
 
+/// Whether the Accurate (386) class also answers the time-derived poll ports
+/// lazily, i.e. WITHOUT ending the CPU batch. `IZARRAVM_LAZY_PORT_386`.
+///
+/// DEFAULT OFF, and that is a fidelity decision, not caution: see
+/// `MachineBus::lazy_ports_386` for the exact drift this changes. Read once
+/// per process; the run loop reads the resolved bool, never the environment.
+fn lazy_port_reads_386_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("IZARRAVM_LAZY_PORT_386")
+            .map(|value| matches!(value.trim(), "1" | "on" | "true" | "yes"))
+            .unwrap_or(false)
+    });
+    *ENABLED
+}
+
+/// The whole composition rule for `MachineBus::lazy_ports_386`, split out from
+/// the environment read so it is testable without touching process state.
+///
+/// The `!uses_approximate_timing()` term is the load-bearing half: it is what
+/// makes the switch structurally unable to move 486/586, which already have the
+/// 3DA and 0x61 arms from `lazy_port_reads` and have never had the gameport arm.
+pub(super) const fn lazy_ports_386_composed(mode: GswMode, env_enabled: bool) -> bool {
+    !mode.uses_approximate_timing() && env_enabled
+}
+
+/// `lazy_ports_386_composed` against the process environment. One call per bus
+/// construction; the environment itself is read once per process.
+pub(super) fn lazy_ports_386_for(mode: GswMode) -> bool {
+    lazy_ports_386_composed(mode, lazy_port_reads_386_enabled())
+}
+
 impl Machine {
     pub(super) fn make_bus(&mut self) -> MachineBus<'_> {
         // Captured before the struct literal below since VEGA and trace are also
@@ -77,8 +108,11 @@ impl Machine {
             cache: &mut self.cache_model,
             flat_data_cost: self.active_mode.uses_approximate_timing(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
+            lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
+            exempt_io_touched: &mut self.exempt_io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
+            pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
             device_wrote_memory: &mut self.device_wrote_memory,
             pending_device_memory_write_range: &mut self.pending_device_memory_write_range,
@@ -1394,6 +1428,23 @@ impl CpuBus for MachineBus<'_> {
         // Accurate 386 class keeps byte-identical batch semantics, matching
         // every other lazy-read gate in this function.
         let skip_io_touched = cpu_is_ring0_pm && self.lazy_port_reads;
+        // The exemption above keeps the batch running across a device access, so
+        // the device-edge deadline cache cannot rely on `io_touched` alone to know
+        // that a schedule may have moved. Record the access separately; the run
+        // loop drops the cache on either flag. Off the exempt path this costs
+        // nothing, and on it, one store.
+        if skip_io_touched {
+            *self.exempt_io_touched = true;
+        }
+        // Snapshot for the lazy gameport arm far below, which is the one lazy
+        // port that cannot be dispatched before the general `io_touched` set:
+        // its decode position is load-bearing (a configured WSS/SB base could in
+        // principle overlap 0x200-0x207, and today the earlier arm wins). Rather
+        // than hoist the arm and silently change that precedence, the arm CLEARS
+        // the flag again -- but only when this very read is what set it, which is
+        // what this snapshot establishes. A wider-than-byte access re-enters
+        // read_io per byte and so re-snapshots per byte.
+        let io_touched_before_read = *self.io_touched;
         // Bus-clock trace recording stays unconditional for every port, both timing
         // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
         // here, so a lazy read that skipped this would under-predict its own beam.
@@ -1497,7 +1548,7 @@ impl CpuBus for MachineBus<'_> {
         // write itself sets io_touched and ends the batch, so no further lazy read
         // can observe the stale prediction within the same batch.
         if matches!(port, 0x3DA | 0x3BA | 0x3C2) && self.vega.port_enabled(port) {
-            if self.lazy_port_reads {
+            if self.lazy_port_reads || self.lazy_ports_386 {
                 let beam = self.predicted_beam();
                 if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
                     return Ok(u32::from(value));
@@ -1516,7 +1567,33 @@ impl CpuBus for MachineBus<'_> {
                 if !skip_io_touched {
                     *self.io_touched = true;
                 }
-                if let Some(value) = self.vega.read_port(port) {
+                // The BEAM peek is taken in BOTH timing classes, on exactly the
+                // same grounds as the 0x61 OUT peek and the 0x40-0x42 counter
+                // peek below: it changes only the VALUE, never whether the batch
+                // ends. `io_touched` is already set above, so this arm keeps the
+                // batch-ending behavior the Accurate class has always had; only
+                // the bits reported change.
+                //
+                // Why the Accurate class needs it. Without the peek this arm
+                // read the LIVE beam, which is the beam as of BATCH START, and
+                // only then ended the batch -- so a retrace poll reported a
+                // position up to a whole batch stale. That was bounded at a
+                // DAC period while the fine fallback was unconditional, but
+                // `fine_batch_grain_required` now gates it (and no term in that
+                // gate covers a display poll: 3DA/3BA arm nothing), so an
+                // otherwise-idle 386 guest polling retrace sits on the 1 ms
+                // coarse cap and reads a beam up to 1 ms old. The deadline cache
+                // does not bound it either: `vega_edge_ticks` carries the Margo
+                // blit and DISPLAY_START terms, not a retrace edge.
+                //
+                // `read_status_port_lazy` is the same function the lazy arm
+                // above calls and performs the identical guest-visible side
+                // effects a `read_port` of these three ports would
+                // (`status1_side_effects` / `catch_up`); it declines exactly
+                // where `read_port` declines -- the inactive status1 alias --
+                // so the fallthrough below is unchanged.
+                let beam = self.predicted_beam();
+                if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
                     return Ok(u32::from(value));
                 }
             }
@@ -1540,25 +1617,48 @@ impl CpuBus for MachineBus<'_> {
         // write_io, so GATE cannot move between this read and the batch end
         // either.
         if port == 0x61 {
-            if self.lazy_port_reads {
-                // Both channels share the SAME elapsed-PIT-clocks conversion
-                // (same rate, same batch-entry carry): computed once here rather
-                // than twice inside two separate predicted_pit_out calls, since
-                // a redundant conversion on this hot path.
-                let elapsed_pit_clocks = self.elapsed_pit_clocks();
-                let ch1 = self.pit.out_after(1, elapsed_pit_clocks);
-                let ch2 = self.pit.out_after(2, elapsed_pit_clocks);
-                if let (Some(ch1_out), Some(ch2_out)) = (ch1, ch2) {
-                    let value = (self.speaker.control_bits() & 0x03)
-                        | (u8::from(ch1_out) << 4)
-                        | (u8::from(ch2_out) << 5);
-                    return Ok(u32::from(value));
+            // The OUT peek is taken in BOTH timing classes, on exactly the same
+            // grounds as the unconditional 0x40-0x42 counter peek below: it
+            // changes only the VALUE, never whether the batch ends. The lazy
+            // switch decides the BATCH question alone (see the io_touched set
+            // after this block).
+            //
+            // Why the Accurate class needs the value too, and not just the
+            // Approximate one. Bit 5 is channel-2 OUT, and the classic
+            // no-sound PIT timing technique leaves GATE2 high with the data
+            // enable LOW (0x61 bit 0 set, bit 1 clear), then polls bit 5. The
+            // fine-batch-grain gate does NOT cover that case:
+            // `speaker.data_enabled()` is false, and `note_pit_observer` arms
+            // only on a 0x40-0x43 access, so a guest that programs channel 2
+            // once and afterwards polls only 0x61 falls out of the 5 ms
+            // observer window and back to the 1 ms coarse cap. Reading the LIVE
+            // (batch-start) level there could report OUT up to a whole coarse
+            // batch stale -- a mode-3 square-wave FALL is half a period from
+            // the nearest cached rise, so the deadline cache does not bound it
+            // either. With the peek the level is the one a real
+            // `advance_devices` of the same clock total would produce, which is
+            // the same contract the counter peek closed for 0x40-0x42.
+            //
+            // Both channels share the SAME elapsed-PIT-clocks conversion (same
+            // rate, same batch-entry carry): computed once here rather than
+            // twice inside two separate predicted_pit_out calls, since a
+            // redundant conversion on this hot path.
+            let elapsed_pit_clocks = self.elapsed_pit_clocks();
+            let ch1 = self.pit.out_after(1, elapsed_pit_clocks);
+            let ch2 = self.pit.out_after(2, elapsed_pit_clocks);
+            if let (Some(ch1_out), Some(ch2_out)) = (ch1, ch2) {
+                if !(self.lazy_port_reads || self.lazy_ports_386) && !skip_io_touched {
+                    *self.io_touched = true;
                 }
-                // BCD fallback: at least one of channel 1/2 is BCD-programmed, so
-                // `out_after` conservatively declined. Fall through to the exact
-                // non-lazy path below (io_touched set, today's live read) rather
-                // than a second implementation of the same bit composition.
+                let value = (self.speaker.control_bits() & 0x03)
+                    | (u8::from(ch1_out) << 4)
+                    | (u8::from(ch2_out) << 5);
+                return Ok(u32::from(value));
             }
+            // BCD fallback: at least one of channel 1/2 is BCD-programmed, so
+            // `out_after` conservatively declined. Take the exact non-lazy path
+            // (io_touched set, live read) in EITHER class rather than a second
+            // implementation of the same bit composition.
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -1676,8 +1776,18 @@ impl CpuBus for MachineBus<'_> {
             self.opl_probe.record_sb(port, false, value);
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.pit.read_port(port) {
-            return Ok(u32::from(value));
+        // A counter read is time-derived: devices only advance at batch END, so the
+        // CE must be peeked at THIS instant or the guest reads the value the counter
+        // had at batch start (`Counter::count_after`). The port test guards the
+        // conversion so no other port pays for it, and unlike the 0x61 / 3DA peeks
+        // this one is NOT gated on `lazy_port_reads` -- it changes only the VALUE
+        // read, never whether the batch ends, so both timing classes want it.
+        if matches!(port, 0x40..=0x42) {
+            let elapsed_pit_clocks = self.elapsed_pit_clocks();
+            if let Some(value) = self.pit.read_port_at(port, elapsed_pit_clocks) {
+                self.note_pit_observer();
+                return Ok(u32::from(value));
+            }
         }
         if let Some(value) = self.pic.read_port(port) {
             return Ok(u32::from(value));
@@ -1705,6 +1815,20 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
         }
         if (0x0200..=0x0207).contains(&port) {
+            // The gameport is the strongest lazy candidate in the machine and the
+            // only one whose VALUE does not move when the batch stops ending
+            // here: `GamePort::read` takes `&self` and is a pure function of the
+            // two RC discharge deadlines and `guest_tick_now()`, the SAME
+            // in-batch instant both timing classes already sample it at. Nothing
+            // in `advance_devices` touches those deadlines -- their only writers
+            // are `charge` (the 0x201 WRITE, which sets io_touched in write_io
+            // and so ends the batch before any later read in the same batch) and
+            // `set_state` (host-side injection, which runs between run calls).
+            // So the batch boundary moves and the sampled function does not,
+            // which is exactly the "same value at the same instant" contract.
+            if self.lazy_ports_386 && !io_touched_before_read {
+                *self.io_touched = false;
+            }
             return Ok(u32::from(self.gameport.read(self.guest_tick_now())));
         }
         if let Some(value) = self.unittester.read_port(port) {
@@ -1764,6 +1888,9 @@ impl CpuBus for MachineBus<'_> {
             && !(PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_DATA_END).contains(&port);
         if !skip_io_touched {
             *self.io_touched = true;
+        } else {
+            // See read_io: an exempted write still programs a device.
+            *self.exempt_io_touched = true;
         }
         self.trace.record(
             BusAccessKind::IoWrite,
@@ -2010,7 +2137,20 @@ impl CpuBus for MachineBus<'_> {
             }
             return Ok(());
         }
-        if self.pit.write_port(port, value as u8) || self.pic.write_port(port, value as u8) {
+        // 0x43's latch commands freeze the CE, so they need the same in-batch peek
+        // the counter read above takes; a count write needs no device state at all,
+        // but shares the arm so the port test stays one range compare.
+        if matches!(port, 0x40..=0x43) {
+            let elapsed_pit_clocks = self.elapsed_pit_clocks();
+            if self
+                .pit
+                .write_port_at(port, value as u8, elapsed_pit_clocks)
+            {
+                self.note_pit_observer();
+                return Ok(());
+            }
+        }
+        if self.pic.write_port(port, value as u8) {
             return Ok(());
         }
         let a20_before = self.keyboard.a20_enabled();
@@ -2644,12 +2784,34 @@ impl MachineBus<'_> {
             }
             ByteRoute::Rom | ByteRoute::OpenBus => {}
             ByteRoute::DeviceOrFallbackRam => {
-                if self.vega.write_memory_u8(address, value) {
-                    return Ok(());
-                }
-                if (address as usize) < self.memory.len() {
-                    self.memory.write_u8(address as usize, value)?;
-                    recorder.record_ram_write(address, 1);
+                match self.vega.write_memory_u8(address, value) {
+                    // The write that ARMED the Margo blit engine ends the batch,
+                    // the way a port write does. Memory writes deliberately do
+                    // not set io_touched (framebuffer blits must keep batching),
+                    // but this one case has to: STATUS.BUSY is MMIO, so the
+                    // guest's `margo_wait` spin cannot break its own batch, and
+                    // BUSY only clears when devices advance. Without this the
+                    // engine looks busy for the rest of the batch however short
+                    // the operation was, and the spin bills the guest a whole
+                    // batch cap per blit. Ending here lets `event_batch_cap`'s
+                    // MargoNs term size the next batch to the real busy time.
+                    //
+                    // EDGE, not level: `VideoWrite::ArmedBlit` is reported only
+                    // by a write that added busy time (see `VideoWrite`). A blit
+                    // can outlast a batch, and writes overlapped with a running
+                    // one must NOT end their batch -- that would turn a long blit
+                    // into thousands of single-instruction batches.
+                    VideoWrite::ArmedBlit => {
+                        *self.io_touched = true;
+                        return Ok(());
+                    }
+                    VideoWrite::Accepted => return Ok(()),
+                    VideoWrite::Unclaimed => {
+                        if (address as usize) < self.memory.len() {
+                            self.memory.write_u8(address as usize, value)?;
+                            recorder.record_ram_write(address, 1);
+                        }
+                    }
                 }
             }
         }

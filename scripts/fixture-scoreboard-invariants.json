@@ -8,13 +8,13 @@
     "dukemark_samples_tolerance": 0.02
   },
   "gp2-586": {
-    "frame_sha256": "1a289f8db4fb242cf0877a3ff9fbfe790f1efa46e230701ed4ed655deb272ace"
+    "frame_sha256": "245e365c6e416e89c7b95819c6664ae111ac760d11c57682841b3bd6adc014a4"
   },
   "nascar-586": {
-    "frame_sha256": "e65cd6162e21d319a59a755affd7bd26c0699805a632ec69bfed5310b0cda5a1"
+    "frame_sha256": "435d403b10a7ac0360cdc2d7996aacde88b389ed70d90901d8c31da579acd547"
   },
   "prince-486": {
-    "frame_sha256": "60d1f794042510c4c38ab989ddb7db445a82ef2f09a77eb597b0031f6d91c1a4"
+    "frame_sha256": "6cc0d3549968b72031469eb7894f7465fe727919d5a7926d499188526ed4479c"
   },
   "wolf3d-486": {
     "frame_sha256": "6101c4f39ee50cdee2fa3bc12c8ca3c678d82c9c22fee3275f5d22379dfbee04"

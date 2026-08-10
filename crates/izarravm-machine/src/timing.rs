@@ -72,6 +72,16 @@ pub const MIX_HEADROOM: f32 = 0.5;
 pub const PIT_INPUT_HZ: u32 = 1_193_182;
 pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 
+/// How long a PIT counter access keeps the Accurate class on its fine batch
+/// grain. See `MachineBus::note_pit_observer`.
+///
+/// 5 ms is chosen to cover the "compute" leg of a latch-compute-latch
+/// calibration -- BIOS and game delay-loop calibrations time windows well under
+/// a millisecond -- without pinning a machine to the fine grain because
+/// something read a counter once. It is guest time, not host time, so it does
+/// not vary with the CPU mode.
+pub(crate) const PIT_OBSERVER_FINE_WINDOW_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 200;
+
 impl Machine {
     pub(super) fn stall_for_micros(&mut self, micros: u64) {
         let master_ticks = (u128::from(micros) * u128::from(izarravm_core::MASTER_CLOCK_HZ)
@@ -874,13 +884,120 @@ impl Machine {
             .min()
     }
 
+    /// Whether a consumer that can make CPU-batch GRANULARITY guest-visible is
+    /// currently active. This is the admission test for the Accurate class's fine
+    /// (DAC-period) batch fallback; see `event_batch_cap`.
+    ///
+    /// Every term is a live bool or one Option test: no rational conversion, no
+    /// device query that walks a queue. It runs once per batch, on the same hot
+    /// path the cap itself sits on.
+    ///
+    /// The terms, and what each one protects:
+    /// - OPL timers running. AdLib detection starts timer 1 (one 80 us step),
+    ///   runs a PURE-COMPUTE delay loop, then reads the status byte once. Nothing
+    ///   in that loop ends a batch, and the Accurate class reads the LIVE status
+    ///   byte (the `predicted_opl_status` peek is Approximate-only), so if the
+    ///   whole loop fits inside one batch the read reports the pre-delay flags and
+    ///   the guest concludes there is no card. Same failure the Approximate class
+    ///   hit before the peek existed.
+    /// - Speaker data enable. While the membrane is driven, the DAC-period grain
+    ///   keeps the audio consumer's own view of channel 2 moving one frame at a
+    ///   time. It is NO LONGER load-bearing for what a 0x61 READ reports: the
+    ///   `Pit::out_after` peek on bits 4/5 is taken in both timing classes (see
+    ///   `MachineBus::read_io`), so batch length does not bound how stale a
+    ///   0x61 poll can be in EITHER class. That matters because this term never
+    ///   covered the case that needed it most -- the classic no-sound PIT
+    ///   timing technique (GATE2 high, data enable LOW: 0x61 bit 0 set, bit 1
+    ///   clear) polls bit 5 with `data_enabled()` false, and the observer
+    ///   window below arms only on 0x40-0x43, so a guest that programs channel
+    ///   2 once and then polls only 0x61 falls back to the coarse cap. The peek
+    ///   closes that outright rather than widening this gate to a term that
+    ///   would bind every batch the way PIT channel 1 would.
+    /// - DSP output clock, WSS playback/autocal, Red Book CD playback. The
+    ///   DMA-fed producers; a fine batch keeps the DMA current-count a guest can
+    ///   poll for its play position moving one frame at a time.
+    /// - A recent PIT counter access (`pit_observer_fine_until`). Not audio at
+    ///   all, and no longer load-bearing for counter VALUES: `Counter::count_after`
+    ///   now peeks the counting element at the in-batch instant of every 0x40-0x43
+    ///   access, so a latch-compute-latch measurement is exact at any batch grain.
+    ///   The window is kept as the one case the peek declines -- a BCD-programmed
+    ///   counter, where `count_after` returns None and the read falls back to the
+    ///   live (batch-start) field, exactly as the 0x61 arm falls back for a BCD
+    ///   `out_after`. Removing the term is a measurable batch-length change and
+    ///   belongs to its own slice, not to a fidelity fix.
+    ///
+    ///   COVERAGE AUDITED, because the original 5 ms figure was chosen to span a
+    ///   latch-compute-latch pair and does NOT span a once-per-frame (>5 ms)
+    ///   latch cadence -- so if the window were still load-bearing for values,
+    ///   that pattern would fall through it. Every 0x40-0x43 path in BOTH classes
+    ///   now peeks at the in-batch instant, so it is not:
+    ///     * read 0x40-0x42 -> `Pit::read_port_at` -> `Counter::read(clocks)`,
+    ///       which returns the status latch, else the count latch, else
+    ///       `count_after(clocks)`;
+    ///     * write 0x43 read-back/latch -> `latch_count(clocks)` and
+    ///       `latch_status(clocks)`, the latter peeking OUT via `out_after` and
+    ///       NULL COUNT via `null_count_after`;
+    ///     * write 0x40-0x42 (a count write needs no device state at all).
+    ///
+    ///   Neither arm is gated on `lazy_port_reads`. The BCD decline is the whole
+    ///   remaining surface.
+    ///
+    /// NOT a term, deliberately: the sample producers' own fidelity. The original
+    /// cap (2026-06-21) existed so "the per-clock fine-samplers ... never alias" --
+    /// at that time the speaker sampled channel-2 OUT once per advance. Five days
+    /// later the speaker was rebuilt to integrate PIT transitions at their exact
+    /// sub-sample instants, and the timeline gives every producer a persistent
+    /// rate phase, so the DSP/WSS/CD/speaker frame counts and sample values are
+    /// split-invariant. The anti-aliasing rationale did not survive; what is left
+    /// is the observation-point list above.
+    ///
+    /// ALSO not a term, and the reason this is a gate and not a wider one: the
+    /// Margo blit engine. Its BUSY poll is the sharpest batch-granularity
+    /// consumer in the machine, but a gate cannot serve it -- the arming MMIO
+    /// write happens INSIDE the batch whose cap was already chosen, so the gate
+    /// would always be read too early. It is handled as a real deadline in
+    /// `event_batch_cap` instead.
+    fn fine_batch_grain_required(&self) -> bool {
+        self.opl.timers_running()
+            || self.speaker.data_enabled()
+            || self.sb16.is_producing()
+            || (self.wss_enabled && (self.wss.is_playing() || self.wss.autocal_active()))
+            || self.ide.device().playback().playing
+            || self.timeline.now_ticks() < self.pit_observer_fine_until
+    }
+
     /// CPU clocks until the next due device event.
     ///
     /// Interrupts are serviced at batch entry and devices advance at batch end,
     /// so known timer, audio, MIDI, storage, RTC, keyboard, serial, and printer edges
-    /// shorten the batch to the first causal CPU clock in every CPU mode. Fast
-    /// modes have a 1 ms fallback; the 386 modes keep a finer DAC-period fallback.
-    /// A known edge may be earlier than either fallback.
+    /// shorten the batch to the first causal CPU clock in every CPU mode. Every
+    /// mode has a 1 ms fallback; the 386 (Accurate) modes drop to a finer
+    /// DAC-period fallback while `fine_batch_grain_required` says a consumer can
+    /// see the difference. A known edge may be earlier than either fallback.
+    ///
+    /// Why the fine fallback is gated rather than unconditional: at 22 MHz a
+    /// DAC period is ~500 clocks, so an idle 386 guest paid a floor of ~44,000
+    /// batch iterations per guest second -- each one a fresh pull-scan of the
+    /// device deadline queries below -- to protect consumers that were not
+    /// running. Gating it leaves the protected cases exactly as fine as before
+    /// and gives the idle case the same 1 ms ceiling the Approximate class uses.
+    ///
+    /// CAVEAT CLOSED (was: time-derived port reads with no in-batch peek). The PIT
+    /// counter latch on 0x40/0x42 used to return the counting element as of BATCH
+    /// START, so the FIRST latch of a "latch, compute, latch" measurement -- the one
+    /// that lands in a batch nothing had shortened yet -- could sit up to a full
+    /// coarse batch (1 ms) early, and the PIT-observer window only covered the
+    /// touches after it. The principled fix named here has since been taken:
+    /// `Counter::count_after` peeks the counting element the way `Pit::out_after`
+    /// peeks OUT, and `MachineBus` takes it on every 0x40-0x43 access in BOTH timing
+    /// classes (it changes the value read, never whether the batch ends). A
+    /// mid-batch latch is now exactly what a real `advance_devices` of the same
+    /// clock total would produce, pinned by
+    /// `a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks`,
+    /// so the batch grain no longer bounds counter-read accuracy at all. What is
+    /// left is a BCD-programmed counter, where the peek declines (as `out_after`
+    /// does, and for the same reason: no PC software clocks the PIT in BCD) and the
+    /// observer window still holds the grain fine.
     ///
     /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
     /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
@@ -893,67 +1010,330 @@ impl Machine {
     /// Timeline phase is included in every conversion, so splitting execution
     /// into different batches does not move an event deadline.
     pub(super) fn event_batch_cap(&self, remaining: u64) -> u64 {
+        let edge_ticks = self
+            .vega_edge_ticks()
+            .into_iter()
+            .chain(self.next_cacheable_edge_ticks())
+            .min();
+        self.compose_batch_cap(edge_ticks, remaining)
+    }
+
+    /// The device-free half of the cap: the mode-class fallback grain.
+    ///
+    /// Split out of `event_batch_cap` so the cached path can keep paying it per
+    /// batch. It is two integer divisions and, on the Accurate class, the
+    /// `fine_batch_grain_required` gate -- all live-field tests, nothing that
+    /// walks a device queue -- so there is nothing here worth caching, and the
+    /// gate is LEVEL state that a cache would have to invalidate on every
+    /// consumer edge anyway.
+    fn batch_grain_fallback(&self) -> u64 {
         let clock_hz = self.active_mode.clock_hz();
-        let mut cap = if self.active_mode.uses_approximate_timing() {
+        // Order matters for cost: the class test short-circuits, so the
+        // Approximate (486/586) modes never run the gate at all.
+        if self.active_mode.uses_approximate_timing() || !self.fine_batch_grain_required() {
             clock_hz / 1000
         } else {
             clock_hz / u64::from(DAC_HZ)
         }
-        .max(1);
-        // Next PIT OUT rising edge: channel 0 feeds IRQ0, channel 2 the
-        // speaker/GATE timing games poll. (Channel 1: see above.)
-        for channel in [0usize, 2] {
-            if let Some(ticks) = self.pit.clocks_until_out_rise(channel)
-                && let Some(clocks) = self.timeline.cpu_clocks_until(
-                    timeline::DeviceClock::Pit,
-                    ticks,
-                    u64::from(PIT_INPUT_HZ),
-                )
-            {
-                cap = cap.min(clocks);
-            }
-        }
-        // Next audio block IRQ edge. Both counters are expressed in output
-        // frames, including stereo DMA-unit accounting inside the DSP.
-        if let Some(deadline) = self.sb16.irq_deadline()
-            && let Some(clocks) = self.timeline.cpu_clocks_until(
-                timeline::DeviceClock::Dsp,
-                deadline.frames(),
-                deadline.rate_hz(),
-            )
-        {
-            cap = cap.min(clocks);
-        }
-        if self.wss_enabled
-            && let Some(frames) = self.wss.frames_until_next_irq()
-            && let Some(clocks) = self.timeline.cpu_clocks_until(
-                timeline::DeviceClock::Wss,
-                frames,
-                u64::from(self.wss.output_frame_rate()),
-            )
-        {
-            cap = cap.min(clocks);
-        }
-        if let Some(ticks) = self.next_ata_deadline() {
-            cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
-        }
-        if self.vega.display_start_pending()
-            && let Some(clocks) = self.timeline.cpu_clocks_until(
-                timeline::DeviceClock::MargoFrame,
-                1,
-                timeline::MARGO_FRAME_HZ,
-            )
-        {
-            cap = cap.min(clocks);
-        }
-        if let Some(ticks) = self.next_rtc_irq_deadline() {
-            cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
-        }
-        if let Some(ticks) = self.next_timed_io_deadline() {
+        .max(1)
+    }
+
+    /// Fold a master-tick edge delta and the fallback grain into the CPU-clock
+    /// cap. One conversion for the whole scan rather than one per term: `ceil`
+    /// is monotone and `.max(1)` commutes with `min`, so
+    /// `min_i(ceil(t_i).max(1)) == ceil(min_i t_i).max(1)` exactly. This is a
+    /// value-preserving rewrite of the old per-term `cap.min(...)` chain, not an
+    /// approximation.
+    fn compose_batch_cap(&self, edge_ticks: Option<u64>, remaining: u64) -> u64 {
+        let mut cap = self.batch_grain_fallback();
+        if let Some(ticks) = edge_ticks {
             cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
         }
         cap.max(1).min(remaining)
     }
+
+    /// The two Margo terms, deliberately kept OUT of the deadline cache.
+    ///
+    /// Both are armed by a memory write, and Margo MMIO writes do not all set
+    /// `io_touched`: only the blit-arming edge does (see
+    /// `MachineBus::write_memory_byte_recorded`), while a DISPLAY_START register
+    /// write returns `VideoWrite::Accepted` like any framebuffer store. There is
+    /// therefore no cheap seam that could invalidate a cached Margo deadline, and
+    /// caching one would violate the "never later than a fresh scan" contract.
+    /// They cost a bool test and a `u64` field read when idle, which is what the
+    /// cache was buying elsewhere anyway.
+    ///
+    /// The blit term is a real device deadline whose absence was load-bearing in
+    /// a way nothing recorded: STATUS.BUSY lives in MMIO, so the BIOS's
+    /// `margo_wait` spin (`mov eax,[fs:MARGO_MMIO+8]` / `test al,1` / `jnz`,
+    /// izbios-lfb.inc) cannot break its own batch. BUSY therefore stayed set for
+    /// the WHOLE remaining batch however short the operation was, and the guest
+    /// paid a full batch cap per wait -- the DAC-period fallback was the only
+    /// thing keeping that bill down on the 386 tier, and raising the fallback to
+    /// 1 ms alone stopped POST from clearing the RAM test inside its 20M-cycle
+    /// budget. With the deadline here the wait costs exactly the busy time the
+    /// engine modeled (a glyph expand is ~740 ns, ~16 clocks at 22 MHz). The
+    /// arming write ends its own batch, so this term is always seen from a batch
+    /// that starts with the engine busy.
+    ///
+    /// UNCONDITIONAL ACROSS TIMING CLASSES, AND WHAT THAT COSTS. The blit wait is
+    /// two halves -- this deadline term, and the `VideoWrite::ArmedBlit`
+    /// `io_touched` set in `MachineBus::write_memory_byte_recorded` -- and both
+    /// apply in the Approximate class as well. That is deliberate, but the break
+    /// buys LESS than it looks like it buys, so be precise about which half of
+    /// `docs/vega/vega-technical-reference.md` section 9 needs it.
+    ///
+    /// Section 9 has two clauses. The IDLE-EARLY clause -- software cannot
+    /// observe the engine as idle until the modeled time has passed -- holds
+    /// WITHOUT the break: STATUS.BUSY is a live read of `Margo::busy_ns`
+    /// (margo.rs, `REG_STATUS`), and `busy_ns` is only ever decremented by
+    /// `advance_busy` with real elapsed device time, so a poll inside a
+    /// still-running batch reads the engine as busy, never as idle. What the
+    /// break buys is the EXACTNESS clause -- the cost model is "exact by
+    /// construction ... a stronger guarantee than the CPU compatibility modes".
+    /// Without it BUSY reads busy for TOO LONG: the poll cannot end its own
+    /// batch, so the engine stays busy to the end of a batch that was capped
+    /// before the arming write, up to a stale cap however short the operation
+    /// was. The tier is a CPU-speed policy, never a device-behavior one, and no
+    /// `GswMode` reaches margo.rs, so exactness is not something the Approximate
+    /// class gets to opt out of.
+    ///
+    /// RECOVERABLE, and this is the shape: a lazy `Margo::busy_ns_after(elapsed)`
+    /// peek would let the STATUS read answer with the busy time as of the READ
+    /// rather than as of batch start, exactly the way `Counter::count_after` and
+    /// `Pit::out_after` peek the PIT without ending the batch. That is a future
+    /// slice; until it lands the ~5% wall below on Margo-heavy fixtures is the
+    /// price of the exactness clause.
+    ///
+    /// The price is real and was measured, so it is recorded here rather than
+    /// left for the next person to rediscover. Ending a batch on the arming write
+    /// raises BATCH ENTRIES on Margo-heavy Approximate-class workloads by ~5.9%,
+    /// and wall follows it:
+    ///
+    ///   | fixture    | entries          | wall s          |
+    ///   |------------|------------------|-----------------|
+    ///   | prince-486 | 1.233G -> 1.306G | 65.96 -> 69.05  (+4.7%) |
+    ///   | nascar-586 | 190.2M -> 201.4M | 63.03 -> 66.15  (+4.9%) |
+    ///   | duke3d-486 | 442.1M -> 439.7M | 132.87 -> 132.76 (neutral) |
+    ///   | duke3d-586 | 1.517G -> 1.522G | 450.15 -> 452.45 (+0.5%) |
+    ///
+    /// Guest seconds are IDENTICAL across arms on prince and nascar (60.61 and
+    /// 30.00), so those are wall-for-wall comparisons, not a real-time-factor
+    /// artifact. gp2-586's entries move only 0.08% and its wall difference is
+    /// inside host noise, which is the control that makes entries the causal
+    /// variable rather than a coincidence. A probe gating BOTH halves to the
+    /// Accurate class recovers the entry counts EXACTLY (prince back to
+    /// 1,233,464,425) and the wall with them -- so this is the whole cost, and it
+    /// is bought deliberately for section 9's exactness clause.
+    fn vega_edge_ticks(&self) -> Option<u64> {
+        let blit_busy_ns = self.vega.blitter_busy_ns();
+        let blit = if blit_busy_ns > 0 {
+            self.timeline.master_ticks_until(
+                timeline::DeviceClock::MargoNs,
+                blit_busy_ns,
+                timeline::NANOSECOND_HZ,
+            )
+        } else {
+            None
+        };
+        let display_start = if self.vega.display_start_pending() {
+            self.timeline.master_ticks_until(
+                timeline::DeviceClock::MargoFrame,
+                1,
+                timeline::MARGO_FRAME_HZ,
+            )
+        } else {
+            None
+        };
+        blit.into_iter().chain(display_start).min()
+    }
+
+    /// Master ticks until the earliest armed PIT / audio / storage / RTC /
+    /// timed-I/O edge. This is the ~15-query pull-scan the deadline cache exists
+    /// to hoist off the per-batch path; every term here is an ABSOLUTE instant in
+    /// disguise (see `event_batch_cap_cached`), which is what makes caching it
+    /// sound.
+    fn next_cacheable_edge_ticks(&self) -> Option<u64> {
+        // Next PIT OUT rising edge: channel 0 feeds IRQ0, channel 2 the
+        // speaker/GATE timing games poll. (Channel 1: see above.)
+        let pit = [0usize, 2].into_iter().filter_map(|channel| {
+            self.pit.clocks_until_out_rise(channel).and_then(|ticks| {
+                self.timeline.master_ticks_until(
+                    timeline::DeviceClock::Pit,
+                    ticks,
+                    u64::from(PIT_INPUT_HZ),
+                )
+            })
+        });
+        // Next audio block IRQ edge. Both counters are expressed in output
+        // frames, including stereo DMA-unit accounting inside the DSP.
+        let dsp = self.sb16.irq_deadline().and_then(|deadline| {
+            self.timeline.master_ticks_until(
+                timeline::DeviceClock::Dsp,
+                deadline.frames(),
+                deadline.rate_hz(),
+            )
+        });
+        let wss = if self.wss_enabled {
+            self.wss.frames_until_next_irq().and_then(|frames| {
+                self.timeline.master_ticks_until(
+                    timeline::DeviceClock::Wss,
+                    frames,
+                    u64::from(self.wss.output_frame_rate()),
+                )
+            })
+        } else {
+            None
+        };
+        pit.chain(dsp)
+            .chain(wss)
+            .chain(self.next_ata_deadline())
+            .chain(self.next_rtc_irq_deadline())
+            .chain(self.next_timed_io_deadline())
+            .min()
+    }
+
+    /// Drop the cached device edge. Correct at any time; the only cost of an
+    /// unnecessary call is the pull-scan the next batch entry then runs.
+    pub(crate) fn invalidate_device_edge_cache(&mut self) {
+        self.device_edge_cache = DeviceEdgeCache::Stale;
+    }
+
+    /// Test seam: the cache's raw state. A cap comparison cannot see every
+    /// invalidation -- the mode-class fallback is 1 ms of guest time, so a device
+    /// edge further out than that is invisible in the cap however wrong the cache
+    /// is -- so the invalidation-site tests assert on this directly.
+    #[cfg(test)]
+    pub(super) fn device_edge_cache_state(&self) -> DeviceEdgeCache {
+        self.device_edge_cache
+    }
+
+    /// How many batch entries ran, and how many of those had to re-scan. Host
+    /// instrumentation for the deadline cache; never an emulation input.
+    ///
+    /// Both counters are maintained ONLY while machine phase timing is enabled
+    /// (see `event_batch_cap_cached`), so they read `(0, 0)` on a normal run.
+    /// The only consumer prints behind the same flag.
+    pub fn device_edge_cache_counts(&self) -> (u64, u64) {
+        (self.device_edge_batches, self.device_edge_scans)
+    }
+
+    /// `event_batch_cap` with the device pull-scan served from a maintained
+    /// next-deadline cache. This is the run loop's entry point;
+    /// `event_batch_cap` stays the fresh-scan reference and the oracle below.
+    ///
+    /// PUSH, not pull. Concept borrowed from 86Box's `src/timer.c`, which keeps a
+    /// sorted timer list behind one global `timer_target` and compares against it
+    /// once per instruction instead of asking every device how far away its next
+    /// event is (86Box is GPL-2 and study-only for this tree: the idea is
+    /// attributed here, no code was copied). The adaptation to this codebase is
+    /// deliberately coarser than a sorted list -- one cached MINIMUM rather than a
+    /// full ordering -- because the batch loop only ever needs the earliest edge,
+    /// and a single `Option<u64>` needs no per-device arm/disarm plumbing.
+    ///
+    /// The cache holds an ABSOLUTE master tick, which is sound because every term
+    /// in `next_cacheable_edge_ticks` is an absolute instant expressed as a delta:
+    /// a `RatePhase` term is `ceil((events * MASTER_HZ - remainder) / rate)`, and
+    /// advancing `d` ticks lowers that numerator by exactly `d * rate`, so
+    /// `now + ticks_until` does not move. The master-tick terms (ATA, RTC
+    /// periodic, FDC, serial, LPT, keyboard, MPU) are stored deadlines already.
+    ///
+    /// INVALIDATION IS CONSERVATIVE by construction. The one-sided SAFETY
+    /// argument is that an edge EARLIER than a fresh scan only shortens a batch
+    /// (a shorter batch is strictly more observable), while a LATER one would
+    /// let a device edge land mid-batch -- so every path that can move a device
+    /// schedule drops the cache. Those paths are:
+    ///   * batch entry, when the cached edge is already due -- the device fired
+    ///     inside its own advance and rearmed or went idle;
+    ///   * batch end, whenever the batch was not provably quiet: any guest port
+    ///     access (`io_touched`, which the Margo blit-arming MMIO write also
+    ///     sets), a bus-side DMA write to guest RAM, any serviced HLE / mode /
+    ///     Toka / BIOS32 / unittester step, or a HLT fast-forward;
+    ///   * `run_until_tick` entry, which covers EVERY host-side mutator in one
+    ///     place -- keyboard/mouse/joystick injection, media mount and eject,
+    ///     CMOS and RTC seeding, audio rendering -- since those can only run
+    ///     between run calls on the machine thread. The individually risky ones
+    ///     also invalidate at their own site, so the property does not silently
+    ///     depend on that scheduling fact.
+    ///
+    /// Canonical state is NOT on that list, and does not need to be: the
+    /// canonical API is capture-only (`Machine::canonical_state_capture` takes
+    /// `&self`), and a "restore" builds a FRESH `Machine`, whose cache starts
+    /// `Stale` like any other field. There is no in-place restore that could
+    /// move a device schedule behind a live cache.
+    ///
+    /// SAFETY IS ONE-SIDED, THE CONTRACT IS NOT. Over-invalidating never yields
+    /// an early cached edge: dropping the cache routes the next batch through
+    /// `Stale`, which reruns the fresh scan and returns exactly what the scan
+    /// returns. The only way a live cached edge can differ from a fresh scan is
+    /// therefore a MISSING invalidation, i.e. the unsafe direction. That is why
+    /// the `debug_assert_eq!` below demands exact equality rather than `<=`:
+    /// inequality in the "safe" direction cannot arise from correct code, so an
+    /// exact check costs no false positives and catches drift the one-sided
+    /// check would let through. Every cached answer is compared against a fresh
+    /// scan, so the whole test suite is a continuous audit of the invalidation
+    /// list.
+    pub(super) fn event_batch_cap_cached(&mut self, remaining: u64) -> u64 {
+        // Hit-rate instrumentation, GATED AT THE CALL SITE on the same flag that
+        // decides whether anything will ever read it (`--machine-phase-timing`,
+        // the only consumer -- see the print in `run_boot_hdd_folder`). An
+        // ungated pair of `u64` increments on the batch-entry path is exactly the
+        // default-off instrument tax this repo has been bitten by before: the
+        // whole point of the cache is that the common batch entry is one compare
+        // and one subtraction, and two unconditional read-modify-writes of
+        // machine state next to it is a real fraction of that. `host_profile` is
+        // already the loop's own profiling gate (`host_profile.start()` is
+        // called a few lines down in `run_until_tick`), so this reuses a bool
+        // that is hot in cache rather than adding another.
+        let instrumented = self.host_profile.enabled;
+        if instrumented {
+            self.device_edge_batches = self.device_edge_batches.wrapping_add(1);
+        }
+        let now = self.timeline.now_ticks();
+        if let DeviceEdgeCache::Due(at) = self.device_edge_cache
+            && at <= now
+        {
+            self.device_edge_cache = DeviceEdgeCache::Stale;
+        }
+        if self.device_edge_cache == DeviceEdgeCache::Stale {
+            if instrumented {
+                self.device_edge_scans = self.device_edge_scans.wrapping_add(1);
+            }
+            self.device_edge_cache = match self.next_cacheable_edge_ticks() {
+                Some(ticks) => DeviceEdgeCache::Due(now.saturating_add(ticks)),
+                None => DeviceEdgeCache::Idle,
+            };
+        }
+        // The common case from here is one compare (above) and one subtraction.
+        let cached = match self.device_edge_cache {
+            DeviceEdgeCache::Due(at) => Some(at - now),
+            DeviceEdgeCache::Idle | DeviceEdgeCache::Stale => None,
+        };
+        let edge_ticks = self.vega_edge_ticks().into_iter().chain(cached).min();
+        let cap = self.compose_batch_cap(edge_ticks, remaining);
+        debug_assert_eq!(
+            cap,
+            self.event_batch_cap(remaining),
+            "device-edge cache disagreed with a fresh pull-scan (cache {:?}, now {now})",
+            self.device_edge_cache,
+        );
+        cap
+    }
+}
+
+/// The maintained next-device-edge deadline behind `event_batch_cap_cached`.
+///
+/// `Idle` and `Due` are both VALID cached answers; only `Stale` forces a scan.
+/// Caching "nothing is armed" is what makes an idle guest cheap, and it carries
+/// the same invalidation obligation as a cached instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceEdgeCache {
+    /// Nothing is cached; the next batch entry runs the full pull-scan.
+    Stale,
+    /// The scan found no armed device edge at all.
+    Idle,
+    /// Absolute master tick of the earliest armed device edge.
+    Due(u64),
 }
 
 impl MachineBus<'_> {
@@ -1064,6 +1444,25 @@ impl MachineBus<'_> {
         self.timeline_at_batch_start
             .preview_cpu_clocks(self.in_batch_clocks(), self.vega.dot_clock_hz())
             .0
+    }
+
+    /// Record that the guest just touched a PIT counter, so the Accurate class
+    /// keeps its fine batch grain for a while (see
+    /// `Machine::fine_batch_grain_required` and `pit_observer_fine_until`).
+    ///
+    /// Armed by every access to 0x40-0x43, read or write. Since
+    /// `Counter::count_after` peeks the counting element at the access instant,
+    /// this no longer protects the latched VALUE (which is exact at any grain);
+    /// it covers the BCD counters that peek declines for. The window
+    /// (`PIT_OBSERVER_FINE_WINDOW_TICKS`, 5 ms of guest time) is generous
+    /// because the whole point is to cover the "compute" leg between two
+    /// latches; it is charged from batch start rather than the exact in-flight
+    /// instruction because a few microseconds at this scale cannot matter and
+    /// `master_ticks_at_batch_start` is already loaded here.
+    pub(super) fn note_pit_observer(&mut self) {
+        *self.pit_observer_fine_until = self
+            .master_ticks_at_batch_start
+            .saturating_add(PIT_OBSERVER_FINE_WINDOW_TICKS);
     }
 
     /// Peek `channel`'s live PIT OUT level mid-batch without stepping

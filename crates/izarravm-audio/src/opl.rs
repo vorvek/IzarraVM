@@ -1004,6 +1004,18 @@ impl OplChip {
         self.timer2.advance(micros, preset2);
     }
 
+    /// Whether either hardware timer is currently counting.
+    ///
+    /// A running timer is the one OPL state that makes CPU-batch GRANULARITY
+    /// guest-visible: the flag it will set is read through the status byte, and
+    /// in a timing class that keeps the live byte (Accurate/386) a status read
+    /// taken at the end of a long batch reports the pre-batch flags. The machine
+    /// uses this to keep its fine batch cap while a timer probe is in flight and
+    /// to drop back to the coarse one when the chip is idle.
+    pub fn timers_running(&self) -> bool {
+        self.timer1.running || self.timer2.running
+    }
+
     /// OPL status byte: bit7 IRQ, bit6 timer-1 flag, bit5 timer-2 flag.
     /// A timer's overflow flag is always reported; the mask bits in register
     /// 0x04 (bit6 = timer 1, bit5 = timer 2) only gate the IRQ line.
