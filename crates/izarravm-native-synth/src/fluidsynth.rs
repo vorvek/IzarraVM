@@ -139,14 +139,32 @@ impl FluidSynth {
         Ok(result)
     }
 
+    /// Play one complete MIDI message.
+    ///
+    /// A non-zero return is a DECLINE, never a broken synth, and the difference
+    /// is the whole reason this does not go through [`native_result`]. Every
+    /// call reachable from here is a per-message entry point, and FluidSynth
+    /// answers `FLUID_FAILED` from them for ordinary things:
+    /// `fluid_synth_noteoff` fails whenever no voice is sounding for that
+    /// channel and key, which is what an all-notes-off does on all fifteen
+    /// channels that were silent, what a note released after its own voice
+    /// decayed does, and what any driver that sends a note-off twice does;
+    /// `fluid_synth_sysex` answers the same way for a message it does not
+    /// implement, such as a truncated or bad-checksum GS `DT1`.
+    ///
+    /// Mapping those onto a generic native-call failure made the CALLER treat
+    /// them as a dead synthesiser -- and the caller latches. A single redundant
+    /// note-off silenced the P300 for the rest of the session.
     pub fn send(&mut self, message: &[u8]) -> Result<(), Error> {
-        let code = match midi::validate(message)? {
-            MidiMessage::Short { bytes, .. } => self.send_short(bytes),
+        let (code, operation) = match midi::validate(message)? {
+            MidiMessage::Short { bytes, .. } => {
+                (self.send_short(bytes), "FluidSynth channel voice")
+            }
             MidiMessage::SysEx(bytes) => {
                 let body = &bytes[1..bytes.len() - 1];
                 let length = c_int::try_from(body.len()).map_err(|_| Error::InvalidMidiMessage)?;
                 // SAFETY: The synth is live and `body` is readable for `length` bytes.
-                unsafe {
+                let code = unsafe {
                     fluid_synth_sysex(
                         self.synth.as_ptr(),
                         body.as_ptr().cast(),
@@ -156,10 +174,15 @@ impl FluidSynth {
                         ptr::null_mut(),
                         0,
                     )
-                }
+                };
+                (code, "fluid_synth_sysex")
             }
         };
-        native_result("FluidSynth MIDI", code)
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(Error::SynthDeclinedMessage { operation })
+        }
     }
 
     pub fn render_interleaved_i16(&mut self, output: &mut [i16]) -> Result<(), Error> {

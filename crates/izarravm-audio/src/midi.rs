@@ -3,7 +3,7 @@
 
 use crate::{TimedMidiMessage, embedded_soundfont_path};
 use izarravm_core::{MASTER_CLOCK_HZ, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
-use izarravm_native_synth::{FluidSynth, MuntSynth, SAMPLE_RATE_HZ};
+use izarravm_native_synth::{Error as SynthError, FluidSynth, MuntSynth, RomKind, SAMPLE_RATE_HZ};
 use midir::{MidiOutput, MidiOutputConnection};
 use std::collections::VecDeque;
 use tracing::warn;
@@ -53,6 +53,9 @@ pub struct MidiEngine {
     /// from the card's wavetable volume registers (`0x50`/`0x51`). Unity until
     /// the caller sets it, so an engine driven without a machine is unchanged.
     gain: (f32, f32),
+    /// Guest messages the synth would not accept, dropped rather than fatal.
+    /// See [`MidiEngine::rejected_messages`].
+    rejected: u64,
 }
 
 impl MidiEngine {
@@ -75,6 +78,7 @@ impl MidiEngine {
             role,
             config: config.clone(),
             gain: (1.0, 1.0),
+            rejected: 0,
         };
         engine.configure(config);
         engine
@@ -82,6 +86,28 @@ impl MidiEngine {
 
     pub const fn status(&self) -> MidiStatus {
         self.status
+    }
+
+    /// The (Left, Right) gain [`render`](Self::render) will apply as this engine
+    /// adds itself to the mix.
+    ///
+    /// Exposed because this is STAGING: it leaves no trace in the samples of a
+    /// silent engine, so a frontend that forgets to push the card's wavetable
+    /// level here fails invisibly, and only once something is playing. Reading
+    /// it back is what lets `pump_audio` be tested at all.
+    pub const fn gain(&self) -> (f32, f32) {
+        self.gain
+    }
+
+    /// How many guest messages this engine handed to the synth and the synth
+    /// did not take -- malformed, or offered while its input queue was full.
+    ///
+    /// A refusal is NOT a failure of the engine: the MPU-401 hands us whatever
+    /// the guest wrote, a DOS driver is free to write a byte no synthesiser
+    /// accepts, and a synth that is momentarily full is still a working synth.
+    /// Counted so a stuck note has a number behind it.
+    pub const fn rejected_messages(&self) -> u64 {
+        self.rejected
     }
 
     /// List output ports by stable name and same-name ordinal.
@@ -169,9 +195,28 @@ impl MidiEngine {
             }
             cursor = offset;
             let message = self.pending.pop_front().expect("front message exists");
-            if !send_native(&mut self.adapter, &message.bytes) {
-                self.fail_native();
-                return;
+            match send_native(&mut self.adapter, &message.bytes) {
+                NativeSend::Delivered => {}
+                // The synth did not take this message -- a byte it will not
+                // accept, or a queue that is full right now. Drop THAT
+                // MESSAGE and keep playing. Failing the engine here is what
+                // made a single stray `0xF7`/`0xF4`/`0xF9` -- all of which the
+                // MPU-401 parser forwards verbatim as one-byte messages -- kill
+                // the P300 for the rest of the session, silently and with no way
+                // back short of a restart.
+                NativeSend::Rejected => {
+                    self.rejected = self.rejected.saturating_add(1);
+                    if self.rejected == 1 {
+                        warn!(
+                            bytes = ?message.bytes,
+                            "the synth did not take a guest MIDI message; dropping it and continuing"
+                        );
+                    }
+                }
+                NativeSend::Failed => {
+                    self.fail_native();
+                    return;
+                }
             }
         }
         if !matches!(self.adapter, MidiAdapter::Silent)
@@ -187,12 +232,23 @@ impl MidiEngine {
         self.guest_frame_cursor = end;
     }
 
+    /// Apply new settings, and re-open an engine that is not currently working.
+    ///
+    /// The second half is not a nicety. `fail_native` is a LATCH: it drops the
+    /// adapter to `Silent` and leaves the status at `InitializationFailed`, and
+    /// the only thing that used to clear it was a settings change this engine's
+    /// role cares about -- for the wavetable, a different SoundFont, and nothing
+    /// else. So a P300 that died mid-session stayed dead, and the config panel
+    /// kept showing "The MIDI output could not be initialized." no matter what
+    /// the user did to it, including switching the P330 receiver off. Anything
+    /// short of Ready is retried here, so re-accepting the panel is a retry.
     pub fn reconfigure(&mut self, config: &MidiConfig) {
-        if !self.role.settings_changed(&self.config, config) {
+        if !self.role.settings_changed(&self.config, config) && self.status == MidiStatus::Ready {
             return;
         }
         self.close();
         self.config = config.clone();
+        self.rejected = 0;
         self.configure(config);
     }
 
@@ -253,10 +309,33 @@ impl MidiEngine {
         self.status = MidiStatus::InitializationFailed;
     }
 
-    fn record_external_send_result<E>(&mut self, result: Result<(), E>) -> Result<(), E> {
-        if result.is_err() {
-            self.adapter = MidiAdapter::Silent;
-            self.status = MidiStatus::MissingPort;
+    /// Judge one external-port send failure: the MESSAGE or the PORT.
+    ///
+    /// `midir::SendError` has exactly two variants and they mean different
+    /// things. `InvalidData` is about the bytes -- midir's own backends raise it
+    /// for an empty message and for a non-SysEx message longer than three bytes,
+    /// before the OS is touched at all -- so the port is untouched and healthy.
+    /// `Other` is the platform call failing, which for a MIDI OUT handle means
+    /// the destination is gone; that one is worth the adapter, and latching to
+    /// `MissingPort` is right because the port has to be re-selected (or
+    /// re-accepted) to come back.
+    ///
+    /// This is the same shape as the synthesiser triage next door, and for the
+    /// same reason: a guest is free to write bytes no destination will take, and
+    /// one of them must not cost the receiver for the rest of the session.
+    fn record_external_send_result(
+        &mut self,
+        result: Result<(), midir::SendError>,
+    ) -> Result<(), midir::SendError> {
+        match &result {
+            Ok(()) => {}
+            Err(midir::SendError::InvalidData(_)) => {
+                self.rejected = self.rejected.saturating_add(1);
+            }
+            Err(midir::SendError::Other(_)) => {
+                self.adapter = MidiAdapter::Silent;
+                self.status = MidiStatus::MissingPort;
+            }
         }
         result
     }
@@ -307,15 +386,41 @@ fn open_munt(config: &MidiConfig) -> (MidiAdapter, MidiStatus) {
     let (Some(control), Some(pcm)) = (&config.mt32_control_rom, &config.mt32_pcm_rom) else {
         return (MidiAdapter::Silent, MidiStatus::MissingRoms);
     };
-    if !control.is_file() || !pcm.is_file() {
-        return (MidiAdapter::Silent, MidiStatus::MissingRoms);
-    }
     match MuntSynth::new(control, pcm) {
         Ok(synth) => (MidiAdapter::Munt(synth), MidiStatus::Ready),
         Err(error) => {
-            warn!(%error, "could not initialize Munt with the selected ROMs");
-            (MidiAdapter::Silent, MidiStatus::InitializationFailed)
+            // The message names the file and the requirement; the status is
+            // what the panel can colour. Both exist because "The MIDI output
+            // could not be initialized." told a user with a real, complete ROM
+            // set nothing whatsoever about why theirs was refused.
+            warn!(
+                %error,
+                control = %control.display(),
+                pcm = %pcm.display(),
+                "could not initialize Munt with the selected ROMs"
+            );
+            (MidiAdapter::Silent, munt_rom_status(&error))
         }
+    }
+}
+
+/// Map a ROM loader failure onto the status the config panel renders.
+fn munt_rom_status(error: &SynthError) -> MidiStatus {
+    match error {
+        SynthError::MissingRom(_) => MidiStatus::RomPathMissing,
+        SynthError::RomNotFound {
+            kind: RomKind::Control,
+            ..
+        } => MidiStatus::RomControlMissing,
+        SynthError::RomNotFound {
+            kind: RomKind::Pcm, ..
+        } => MidiStatus::RomPcmMissing,
+        // One file, unidentified: the user pointed at something that is not a
+        // ROM this library knows. Which of the two it was meant to be is not
+        // knowable, so report the control image, the one that is looked for first.
+        SynthError::InvalidRom(_) => MidiStatus::RomControlMissing,
+        SynthError::MissingRoms => MidiStatus::RomsNotPairable,
+        _ => MidiStatus::InitializationFailed,
     }
 }
 
@@ -333,17 +438,60 @@ fn render_adapter(adapter: &mut MidiAdapter, output: &mut [i16]) -> bool {
     }
 }
 
-fn send_native(adapter: &mut MidiAdapter, bytes: &[u8]) -> bool {
+/// What one message did to the synth, which is not the same question as whether
+/// the message was good.
+enum NativeSend {
+    Delivered,
+    /// The message itself was not acceptable. The synth is untouched and healthy.
+    Rejected,
+    /// The synth failed. Nothing more can be played through it.
+    Failed,
+}
+
+fn send_native(adapter: &mut MidiAdapter, bytes: &[u8]) -> NativeSend {
     let result = match adapter {
         MidiAdapter::Fluid(synth) => synth.send(bytes),
         MidiAdapter::Munt(synth) => synth.send(bytes),
-        MidiAdapter::Off | MidiAdapter::External(_) | MidiAdapter::Silent => return true,
+        MidiAdapter::Off | MidiAdapter::External(_) | MidiAdapter::Silent => {
+            return NativeSend::Delivered;
+        }
     };
-    if let Err(error) = result {
-        warn!(%error, "native MIDI synthesis rejected a guest message");
-        false
-    } else {
-        true
+    match result {
+        Ok(()) => NativeSend::Delivered,
+        Err(error) => triage_send_error(&error),
+    }
+}
+
+/// Decide whether a failed send costs the MESSAGE or the ENGINE.
+///
+/// Split out because this is the whole of the decision and it is not reachable
+/// through `send_native` without a live synthesiser: `MuntSynth::send` can only
+/// be made to return a full queue by filling one, and only a real ROM set opens
+/// one at all.
+///
+/// `mt32emu_play_msg` and `mt32emu_play_sysex` return exactly two failures --
+/// `MT32EMU_RC_QUEUE_FULL` when the synth is open and momentarily full, and
+/// `MT32EMU_RC_NOT_OPENED` when there is no synth behind the context. Only the
+/// second is terminal. Treating both as terminal (which the bare `NativeCall`
+/// mapping did) turns one busy audio window into a P330 that is dead for the
+/// session, exactly the way one stray `0xF7` used to.
+///
+/// FluidSynth's declines are the same class and by far the commonest of the
+/// three: its note-off answers `FLUID_FAILED` whenever no voice is sounding for
+/// that channel and key, so an all-notes-off, a note released after its voice
+/// decayed, and a driver that sends a note-off twice all arrive here. That is
+/// ordinary MIDI traffic, not a broken synthesiser, and it is the likeliest
+/// thing to have killed a P300 on an alt-tab: switching focus is exactly when a
+/// game sends all-notes-off across sixteen channels, fifteen of which are quiet.
+fn triage_send_error(error: &SynthError) -> NativeSend {
+    match error {
+        SynthError::InvalidMidiMessage
+        | SynthError::SynthQueueFull
+        | SynthError::SynthDeclinedMessage { .. } => NativeSend::Rejected,
+        error => {
+            warn!(%error, "native MIDI synthesis failed on a guest message");
+            NativeSend::Failed
+        }
     }
 }
 

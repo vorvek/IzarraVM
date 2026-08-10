@@ -51,9 +51,9 @@ pub(super) struct SessionSpec {
     pub(super) test_pattern: bool,
     pub(super) sink: Option<AudioSink>,
     pub(super) rtc_setup: crate::cmos::RtcSetup,
+    /// The host playback level (the volume knob). Applied to the finished mix
+    /// on its way to the sound device, never inside the machine's chain.
     pub(super) gain: SharedGain,
-    pub(super) amp: SharedGain,
-    pub(super) speaker_vol: SharedGain,
     #[cfg(test)]
     pub(super) finalization_probe: Option<Arc<AtomicU64>>,
 }
@@ -1408,8 +1408,6 @@ fn run_worker(
                 dt_secs,
                 &mut audio_debt,
                 generation.spec.gain.get(),
-                generation.spec.amp.get(),
-                generation.spec.speaker_vol.get(),
             );
         }
         let audio_finished = generation.runtime_profile.as_ref().map(|_| Instant::now());
@@ -2126,20 +2124,56 @@ fn tick_machine_ticks(machine: &mut Machine, master_ticks: u64) -> Option<StopRe
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the audio pump needs from the machine, and nothing else.
+///
+/// The pump's job is a wiring job -- take the guest's own wavetable level to
+/// the MIDI engines, mix them into the machine's frame, apply the host playback
+/// level, queue it -- and wiring is exactly what a `Machine` cannot be asked
+/// about in a unit test: reaching `0x50`/`0x51` from outside means booting DOS
+/// and running SNDMIXER. Reviewers flagged `set_gain` here as untested three
+/// times for that reason. Behind this seam a fake reports a known gain and a
+/// known frame, so the whole pump is checked in microseconds.
+pub(super) trait AudioMachine {
+    /// Guest time, for placing native synthesis on the guest's clock.
+    fn master_ticks(&self) -> u64;
+    /// (Left, Right) linear gain for the MIDI legs, from the card's wavetable
+    /// volume registers.
+    fn midi_gain(&self) -> (f32, f32);
+    /// One wall-clock window of the machine's own mix.
+    fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)>;
+}
+
+impl AudioMachine for Machine {
+    fn master_ticks(&self) -> u64 {
+        Machine::master_ticks(self)
+    }
+
+    fn midi_gain(&self) -> (f32, f32) {
+        Machine::midi_gain(self)
+    }
+
+    fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+        Machine::render_audio(self, native_samples)
+    }
+}
+
+/// Render one wall-clock window and queue it for the sound device.
+///
+/// `gain` is the HOST playback level -- the volume knob, which stands for the
+/// powered speakers the machine's line-out feeds. It is applied last, to the
+/// finished mix, and it is the only level the host owns: everything inside the
+/// chain (the card's output stage, the PC speaker's leg, the balance between
+/// sources) is guest state on the CT1745 register file and is set from DOS with
+/// SNDMIXER.COM.
 fn pump_audio(
-    machine: &mut Machine,
+    machine: &mut impl AudioMachine,
     wavetable: &mut MidiEngine,
     midi_receiver: &mut MidiEngine,
     sink: &AudioSink,
     wall_dt: f64,
     debt: &mut f64,
     gain: f32,
-    amp: f32,
-    speaker_vol: f32,
 ) {
-    machine.set_card_amp(amp);
-    machine.set_speaker_volume(speaker_vol);
     *debt += wall_dt * OPL_NATIVE_HZ;
     let mut samples = debt.floor() as usize;
     *debt -= samples as f64;

@@ -136,6 +136,18 @@ fn merge_saved_midi(config: &mut MidiConfig, saved: &MidiConfig, presence: MidiC
     }
 }
 
+/// Folders under the state directory a ROM set is conventionally dropped into.
+/// Matched case-insensitively.
+const MUNT_ROM_FOLDERS: &[&str] = &["mt32", "cm32l", "roms", "mt32-roms"];
+
+/// Find an MT-32 ROM set the user has dropped into their state directory, when
+/// they have not named one themselves.
+///
+/// Two layouts, and neither depends on the files being NAMED anything: the
+/// canonical pair sitting loose in the state directory, or a folder that looks
+/// like it holds a ROM set. A folder hint is handed to the loader whole, which
+/// is what lets it identify the images by content and merge split halves --
+/// the pair of names below is only how a loose set is recognised as one.
 fn discover_munt_roms(config: &mut MidiConfig, state_dir: &Path) {
     if config.mt32_control_rom.is_some() || config.mt32_pcm_rom.is_some() {
         return;
@@ -143,11 +155,11 @@ fn discover_munt_roms(config: &mut MidiConfig, state_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(state_dir) else {
         return;
     };
-    let files: Vec<PathBuf> = entries
+    let (files, folders): (Vec<PathBuf>, Vec<PathBuf>) = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect();
+        .filter(|path| path.is_file() || path.is_dir())
+        .partition(|path| path.is_file());
     let named = |name: &str| {
         files.iter().find(|path| {
             path.file_name()
@@ -163,6 +175,24 @@ fn discover_munt_roms(config: &mut MidiConfig, state_dir: &Path) {
             config.mt32_pcm_rom = Some(pcm.clone());
             return;
         }
+    }
+    // A ROM-set folder, both hints pointing at it: the loader takes it from
+    // there, whatever the files inside are called.
+    let mut candidates: Vec<&PathBuf> = folders
+        .iter()
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                MUNT_ROM_FOLDERS
+                    .iter()
+                    .any(|known| name.eq_ignore_ascii_case(known))
+            })
+        })
+        .collect();
+    candidates.sort();
+    if let Some(folder) = candidates.first() {
+        config.mt32_control_rom = Some((*folder).clone());
+        config.mt32_pcm_rom = Some((*folder).clone());
     }
 }
 
@@ -242,12 +272,6 @@ impl ResolvedStartup {
     /// user actually runs rather than a stand-in for it.
     pub(super) fn c_drive(&self) -> &Path {
         &self.config.dos.c_drive
-    }
-
-    /// The GUI preferences this run resolved, for the headless paths that have
-    /// to stage audio the way the GUI stages it.
-    pub(super) fn prefs(&self) -> &prefs::GuiPrefs {
-        &self.prefs
     }
 
     pub(super) fn load_global_glide_ovl(&self) -> Option<Vec<u8>> {

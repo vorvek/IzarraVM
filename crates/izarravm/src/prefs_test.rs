@@ -28,8 +28,6 @@ fn joystick_binding() -> JoystickBinding {
 fn round_trips_through_toml() {
     let prefs = GuiPrefs {
         master_volume: 0.65,
-        output_gain: 55,
-        pc_speaker_volume: 40,
         crt_style: CrtStyle::YeOlde,
         input_release: KeyBinding::new(true, true, false, "F4"),
         fullscreen: KeyBinding::new(false, false, true, "Enter"),
@@ -61,8 +59,6 @@ fn missing_keys_fall_back_to_defaults() {
     let parsed: GuiPrefs = toml::from_str("").expect("deserialize empty");
     assert_eq!(parsed, GuiPrefs::default());
     assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
-    assert_eq!(parsed.output_gain, DEFAULT_OUTPUT_GAIN);
-    assert_eq!(parsed.pc_speaker_volume, DEFAULT_PC_SPEAKER_VOLUME);
     assert_eq!(
         parsed.crt_style,
         CrtStyle::Subtle,
@@ -132,63 +128,95 @@ fn retired_glide_render_threads_key_is_ignored_and_not_written() {
     );
 }
 
-/// A persisted `amp_gain` must be DROPPED, not clamped and carried over.
+/// The three retired audio keys are DROPPED, not clamped and carried over.
 ///
-/// Every file written before this branch holds a value chosen against a chain
-/// with a 12.0x compensator in it, and the default that shipped in those files
-/// -- 120 -- was itself calibrated to a CT1745 that powered on 28 dB down. The
-/// loader only ever clamped to the maximum, so all of those files kept running
-/// the output stage at +21.6 dB into the clamp: the exact clipping this branch
-/// removes, still happening to anyone who had ever opened the config menu (which
-/// is what writes the file out). Renaming the key is what makes the fix reach
-/// them.
+/// Each named a level inside the machine's own audio chain, and that chain is
+/// the guest's: the ReSonique 2's output stage and the PC speaker's leg are
+/// CT1745 registers that SNDMIXER.COM sets and any program can read back. A
+/// host-side second copy could not be seen by the guest and had to be kept in
+/// step with a mixer entitled to disagree with it.
+///
+/// Dropping beats carrying over. `amp_gain` was retired once already, and its
+/// persisted values were calibrated against a chain with a 12.0x compensator in
+/// it -- the loader only ever CLAMPED, so every file written before that fix
+/// kept running the output stage at +21.6 dB into the clamp. `output_gain`
+/// replaced it and shipped for one branch. There is no factor that is right for
+/// both a default nobody chose and a level a user picked by ear, so the file
+/// simply loses them and the machine's own mixer answers from here.
 #[test]
-fn a_persisted_legacy_amp_gain_is_ignored_and_the_new_key_round_trips() {
+fn the_retired_audio_keys_are_ignored_and_never_written_back() {
     let path = Path::new("izarravm.conf");
     let load = |text: &str| {
         let text = text.to_string();
         GuiPrefs::load_with(path, move |_| Ok(text.clone()))
     };
 
-    // The shipped legacy default, and a hand-raised one. 120 is inside
-    // OUTPUT_GAIN_MAX, so the old clamp let it through untouched.
-    for legacy in ["amp_gain = 120\n", "amp_gain = 300\n"] {
-        let prefs = load(legacy);
+    // Each retired key on its own, at values the old loaders accepted: the
+    // shipped legacy default, a hand-raised one, the newer key, and the
+    // speaker percent.
+    for retired in [
+        "amp_gain = 120
+",
+        "amp_gain = 300
+",
+        "output_gain = 25
+",
+        "output_gain = 500
+",
+        "pc_speaker_volume = 40
+",
+    ] {
         assert_eq!(
-            prefs.output_gain, DEFAULT_OUTPUT_GAIN,
-            "{legacy:?} must load at the fresh default, not its own value"
-        );
-        assert_eq!(
-            prefs,
+            load(retired),
             GuiPrefs::default(),
-            "the retired key must not disturb anything else either"
+            "{retired:?} must load as if it were not there at all"
         );
     }
 
-    // The retired key is not written back, so the file heals on the next save.
-    assert!(
-        !toml::to_string(&GuiPrefs::default())
-            .unwrap()
-            .contains("amp_gain")
+    // All three at once, alongside a key that IS live: the live one survives
+    // and the retired ones leave no trace. Without the master_volume half this
+    // would also pass if the loader threw the whole file away.
+    let mixed = load(
+        "amp_gain = 120
+output_gain = 25
+pc_speaker_volume = 40
+master_volume = 0.25
+",
     );
-
-    // And the new key is live: it loads, clamps, and survives a save/load cycle.
-    assert_eq!(load("output_gain = 25\n").output_gain, 25);
     assert_eq!(
-        load(&format!("output_gain = {}\n", OUTPUT_GAIN_MAX + 1)).output_gain,
-        OUTPUT_GAIN_MAX,
+        mixed,
+        GuiPrefs {
+            master_volume: 0.25,
+            ..GuiPrefs::default()
+        }
     );
-    let saved = GuiPrefs {
-        output_gain: 25,
-        ..GuiPrefs::default()
-    };
-    let text = toml::to_string_pretty(&saved).unwrap();
-    assert!(text.contains("output_gain = 25"), "{text}");
-    assert_eq!(load(&text), saved);
 
-    // A file carrying BOTH -- one the user hand-edited, or one written by a
-    // build straddling the rename -- takes the new key and ignores the old.
-    assert_eq!(load("amp_gain = 120\noutput_gain = 25\n").output_gain, 25);
+    // Never written back, so the file heals on the next save.
+    let text = toml::to_string_pretty(&GuiPrefs::default()).unwrap();
+    for retired in ["amp_gain", "output_gain", "pc_speaker_volume"] {
+        assert!(!text.contains(retired), "{retired} in {text}");
+    }
+}
+
+/// `--config` pointed at a prefs file must still be RECOGNISED as one.
+///
+/// The retired keys stay in the marker list for exactly this: a file old enough
+/// to carry `output_gain` and nothing else newer is still unmistakably the
+/// GUI's own conf, and pointing the machine config flag at it should say so
+/// rather than fail on an unknown field naming one key and explaining nothing.
+#[test]
+fn retired_keys_still_identify_a_prefs_file_to_the_config_flag() {
+    for key in [
+        "amp_gain = 120",
+        "output_gain = 25",
+        "pc_speaker_volume = 40",
+    ] {
+        let value = toml::from_str::<toml::Value>(key).unwrap();
+        assert!(
+            izarravm_core::gui_prefs_marker(&value).is_some(),
+            "{key} must still mark the file as GUI prefs"
+        );
+    }
 }
 
 #[test]

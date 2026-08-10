@@ -11,7 +11,7 @@ mod ui;
 pub use runtime::run;
 
 use crate::host_input::HostInputPolicy;
-use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
+use crate::prefs::{CrtStyle, GuiPrefs, KeyBinding};
 use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioPlayer, MidiEngine};
 use izarravm_core::{GswMode, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
@@ -35,31 +35,6 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
-
-/// The ReSonique 2 output amp gain as a linear multiplier, from the config's
-/// tenths encoding (10 -> 1.0). Models the card's analog output stage (line
-/// driver / power amp) that the digital mixer model does not represent. It
-/// defaults to unity: the CT1745 now powers on at 0 dB on every leg, so a game
-/// that never programs the mixer -- Doom, Duke Nukem 3D -- already arrives at
-/// full level, and the machine's summing node reserves the headroom below full
-/// scale (`MIX_HEADROOM`). See `prefs::DEFAULT_OUTPUT_GAIN` for why this used to
-/// be 12.0x and why leaving it there clipped everything. The user tunes it from
-/// the config menu; it is folded into the shared master gain.
-///
-/// `pub(crate)` because the headless audio capture stages its gains through the
-/// same two functions rather than a copy of the arithmetic. The capture is the
-/// instrument a mix bug is diagnosed with, and it spent this entire investigation
-/// rendering at unity while the GUI rendered at 12.0x -- 21.6 dB blind to the
-/// very staging it was pointed at.
-pub(crate) fn amp_multiplier(output_gain: u32) -> f32 {
-    output_gain as f32 / 10.0
-}
-
-/// The PC speaker volume as a linear gain, from the config's percent (100 -> 1.0,
-/// 0 -> muted). Applied host-side to the speaker only, independent of the card amp.
-pub(crate) fn speaker_multiplier(pc_speaker_volume: u32) -> f32 {
-    pc_speaker_volume as f32 / 100.0
-}
 
 /// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
 /// perceptual curve; swap it for a proper dB map if it ever matters.
@@ -564,8 +539,10 @@ pub struct GuiApp {
     // are forwarded to the guest. A full notch sends exactly one +/-1 wheel command.
     wheel_accum: f32,
     // The cpal stream is !Send, so it stays here on the UI thread; the
-    // emulation thread gets a Send sink cloned from it.
-    _audio: Option<AudioPlayer>,
+    // emulation thread gets a Send sink cloned from it. Polled each frame so a
+    // stream killed by a device change is rebuilt on the same queue rather than
+    // leaving the machine playing to nothing for the rest of the session.
+    audio: AudioPlayer,
     // Guest frame counter of the texture currently uploaded, so we rebuild it
     // only when a new frame is presented rather than on every update().
     frame_seq: u64,
@@ -593,22 +570,11 @@ pub struct GuiApp {
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
     // the emulation thread reads through `gain`.
     volume: f32,
-    // ReSonique 2 output amp gain, in tenths (10 = 1.0x, unity). Edited in the
-    // config modal, persisted in prefs as `output_gain`. The multiplier form
-    // rides `amp` to the emu thread.
-    output_gain: u32,
-    // PC speaker volume as a percent (100 = full, 0 = muted). Edited in the config
-    // modal, persisted in prefs. The gain form rides `speaker_vol` to the emu thread.
-    pc_speaker_volume: u32,
-    // The shared master gain (curved volume slider), read each audio pump.
+    // The shared master gain (curved volume slider), read each audio pump. This
+    // is the HOST's level: the powered speakers the machine's line-out feeds,
+    // applied after everything the machine renders. Every level inside the
+    // chain belongs to the guest and is set with SNDMIXER.COM.
     gain: SharedGain,
-    // The shared ReSonique 2 amp multiplier (output_gain / 10), read each audio pump
-    // and applied to the card's sources only (not the PC speaker). Separate atomic
-    // from `gain` so the two stay lock-free and independently updatable.
-    amp: SharedGain,
-    // The shared PC speaker gain (pc_speaker_volume / 100), read each audio pump
-    // and applied to the speaker only.
-    speaker_vol: SharedGain,
     // CRT presentation style (off / subtle / Ye Olde). Persisted; read by
     // monitor_ui each frame and mapped to the shader's style uniform.
     crt_style: CrtStyle,
@@ -646,10 +612,6 @@ struct ConfigDialog {
     joystick_binding: Option<JoystickBinding>,
     joystick_wizard: Option<JoystickWizard>,
     crt_style: CrtStyle,
-    // ReSonique 2 amp gain in tenths (10 = 1.0x, unity); see GuiApp::output_gain.
-    output_gain: u32,
-    // PC speaker volume percent (100 = full, 0 = muted); see GuiApp::pc_speaker_volume.
-    pc_speaker_volume: u32,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
     soundfont: Option<PathBuf>,
@@ -701,14 +663,57 @@ fn midi_backend_label(backend: MidiBackend) -> &'static str {
     }
 }
 
+/// Whether the two ROM boxes name something the loader can work with.
+///
+/// `exists`, not `is_file`: either box may name the FOLDER a ROM set lives in,
+/// which is how a set of split half-images (and any set whose files are named
+/// something other than `MT32_*.ROM`) is loaded. Requiring a file here is what
+/// left the Munt entry greyed out for a user whose ROMs were perfectly good.
 fn munt_roms_available(control: &str, pcm: &str) -> bool {
-    [control, pcm]
-        .into_iter()
-        .all(|path| Path::new(path.trim()).is_file())
+    [control, pcm].into_iter().all(|path| {
+        let path = path.trim();
+        !path.is_empty() && Path::new(path).exists()
+    })
 }
 
 fn midi_port_label(port: &MidiPortId) -> String {
     format!("{} #{}", port.name, u32::from(port.ordinal) + 1)
+}
+
+/// Whether pressing Accept should hand the session a MIDI configuration.
+///
+/// A changed configuration obviously has to be sent. So does an UNCHANGED one
+/// when an engine is not Ready, and that half is the fix for a panel that could
+/// show an error forever: the engines only re-open on a settings change their
+/// own role cares about, and the wavetable's role cares about exactly one
+/// setting, so an engine that failed mid-session had no path back and no way to
+/// clear its message. With this, Accept is a retry.
+///
+/// `MissingSoundFont` counts as not-Ready on purpose: it means the user's own
+/// SoundFont failed and the embedded bank is standing in, so Accept should try
+/// theirs again rather than leave the fallback until the next restart.
+fn midi_request_needed(
+    staged: &MidiConfig,
+    live: &MidiConfig,
+    powered: bool,
+    statuses: [MidiStatus; 2],
+) -> bool {
+    // A CHANGED configuration is always sent, running or not. There is no
+    // engine to reconfigure while the machine is off, but the session still has
+    // to be told: with no worker it applies the change to the spec and the
+    // snapshot itself and emits the Applied event that carries it into
+    // izarravm.conf, so the next power-on boots what the user chose. Swallowing
+    // it here lost the setting in total silence -- the panel reseeds from the
+    // snapshot, so Accept looked like it had worked.
+    //
+    // The RETRY half is what needs the machine running: a status can only be
+    // stale, and an engine can only be re-opened, when there is a worker
+    // holding one.
+    staged != live
+        || (powered
+            && statuses
+                .into_iter()
+                .any(|status| status != MidiStatus::Ready))
 }
 
 fn midi_status_text(status: MidiStatus) -> &'static str {
@@ -717,6 +722,16 @@ fn midi_status_text(status: MidiStatus) -> &'static str {
         MidiStatus::MissingPort => "The selected host MIDI destination is not available.",
         MidiStatus::MissingSoundFont => "The custom SoundFont failed. The embedded bank is active.",
         MidiStatus::MissingRoms => "Select both MT-32 ROMs. P330 output is silent.",
+        MidiStatus::RomPathMissing => "A selected MT-32 ROM path does not exist.",
+        MidiStatus::RomControlMissing => {
+            "No MT-32 control ROM was recognised. Point either box at the ROM set's folder."
+        }
+        MidiStatus::RomPcmMissing => {
+            "The control ROM loaded but no PCM ROM was recognised. Add the PCM image to the set."
+        }
+        MidiStatus::RomsNotPairable => {
+            "The control and PCM ROMs are from different machines. Use one matched set."
+        }
         MidiStatus::InitializationFailed => "The MIDI output could not be initialized.",
     }
 }
@@ -731,7 +746,7 @@ fn midi_path_picker(
 ) {
     ui.label(label);
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 72.0).max(120.0);
+        let width = (ui.available_width() - 140.0).max(120.0);
         ui.add_sized(
             [width, 22.0],
             egui::TextEdit::singleline(text).hint_text(hint),
@@ -740,6 +755,14 @@ fn midi_path_picker(
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(filter, extensions)
                 .pick_file()
+        {
+            *text = path.to_string_lossy().into_owned();
+        }
+        // A ROM set is a folder as often as it is two files a user can name,
+        // and the loader takes either. Without this button the only way to load
+        // a set whose files are split halves is to type the folder in by hand.
+        if ui.button("Folder").clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
         {
             *text = path.to_string_lossy().into_owned();
         }
@@ -886,19 +909,15 @@ impl GuiApp {
             mut prefs,
             prefs_path,
         } = launch;
-        let audio = match AudioPlayer::new() {
-            Ok(player) => Some(player),
-            Err(err) => {
-                warn!(%err, "audio output unavailable; running silently");
-                None
-            }
-        };
+        // Always built, even with no sound device on the host: the queue is
+        // what the emulation thread writes to, and it has to exist before a
+        // stream does for a device plugged in later to be picked up at all.
+        let audio = AudioPlayer::new();
+        if !audio.is_playing() {
+            warn!("no audio output device; the machine will play to one if it appears");
+        }
         let volume = prefs.master_volume.clamp(0.0, 1.0);
-        let output_gain = prefs.output_gain;
-        let pc_speaker_volume = prefs.pc_speaker_volume;
         let gain = SharedGain::new(volume_gain(volume));
-        let amp = SharedGain::new(amp_multiplier(output_gain));
-        let speaker_vol = SharedGain::new(speaker_multiplier(pc_speaker_volume));
         let initial_media = prepare_initial_media(cd_image, &prefs);
         let spec = SessionSpec {
             profile,
@@ -907,11 +926,9 @@ impl GuiApp {
             midi_config,
             glide_ovl,
             test_pattern,
-            sink: audio.as_ref().map(AudioPlayer::sink),
+            sink: Some(audio.sink()),
             rtc_setup,
             gain: gain.clone(),
-            amp: amp.clone(),
-            speaker_vol: speaker_vol.clone(),
             #[cfg(test)]
             finalization_probe: None,
         };
@@ -951,7 +968,7 @@ impl GuiApp {
             mouse_rel_y: 0.0,
             mouse_dirty: false,
             wheel_accum: 0.0,
-            _audio: audio,
+            audio,
             frame_seq: u64::MAX,
             metrics_mark: None,
             frames_since: 0,
@@ -966,11 +983,7 @@ impl GuiApp {
             show_about: false,
             show_license: false,
             volume,
-            output_gain,
-            pc_speaker_volume,
             gain,
-            amp,
-            speaker_vol,
             crt_style,
             input_release,
             fullscreen_key,

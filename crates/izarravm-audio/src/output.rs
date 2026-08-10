@@ -11,8 +11,9 @@ use cpal::{FromSample, SizedSample};
 use crossbeam_queue::ArrayQueue;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 type StereoFrame = (i16, i16);
 
@@ -24,6 +25,9 @@ const HIGH_FRAMES: usize = SOURCE_HZ as usize * 60 / 1_000;
 const CAPACITY_FRAMES: usize = SOURCE_HZ as usize * 100 / 1_000;
 const RAMP_FRAMES: u16 = 64;
 const CALLBACK_LATE_TOLERANCE_NS: u128 = 1_000_000;
+/// How long to wait between attempts to reopen a failed output stream. A device
+/// that has just gone is not coming back this frame.
+const STREAM_RETRY_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AudioDebugSnapshot {
@@ -146,6 +150,32 @@ pub struct AudioSink {
 }
 
 impl AudioSink {
+    /// A sink with no output stream behind it, for tests and for any caller
+    /// that wants to drive the audio path without a sound device.
+    ///
+    /// The queue behaves exactly as a live one does -- same capacity, same
+    /// high-water recovery -- it is simply never drained by a callback. That is
+    /// the point: it makes what the emulation thread QUEUES observable, which is
+    /// otherwise only visible by listening.
+    pub fn detached() -> Self {
+        Self {
+            ring: new_ring(),
+            debug: None,
+        }
+    }
+
+    /// Take every audio frame currently queued, discarding the padding a fresh
+    /// queue is primed with. Pairs with [`detached`](Self::detached).
+    pub fn take_queued_frames(&self) -> Vec<StereoFrame> {
+        let mut frames = Vec::new();
+        while let Some(queued) = self.ring.pop() {
+            if let QueuedFrame::Audio(frame) = queued {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
     /// Return the optional diagnostic counters without exposing the mutable
     /// atomics shared with the audio callback.
     pub fn debug_snapshot(&self) -> Option<AudioDebugSnapshot> {
@@ -205,61 +235,223 @@ impl AudioSink {
 /// The cpal stream is not sendable, so callers keep this value on its creation
 /// thread and pass an AudioSink to the emulation thread.
 pub struct AudioPlayer {
-    _stream: cpal::Stream,
+    /// `None` while there is no working output stream: either the host had no
+    /// default device when the player was built, or the running stream failed
+    /// and has not been rebuilt yet. The SINK exists either way, which is what
+    /// makes both states recoverable -- the emulation thread keeps writing to a
+    /// queue that a later stream can be attached to.
+    stream: Option<cpal::Stream>,
     sink: AudioSink,
+    audio_debug: bool,
+    recovery: StreamRecovery,
+}
+
+impl Default for AudioPlayer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AudioPlayer {
-    /// Open the default output device at its preferred format.
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or("no default audio output device")?;
-        let supported = device.default_output_config()?;
-        let sample_format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
+    /// Build the player and try to open the default output device.
+    ///
+    /// Infallible on purpose. A machine with no sound device at startup used to
+    /// get `Err` here and `audio: None` in the GUI for the rest of the session,
+    /// so plugging in a headset after launch did nothing -- the same permanent
+    /// silence a device change caused mid-run, arrived at from the other side.
+    /// The queue is created regardless and [`poll_recover`](Self::poll_recover)
+    /// covers both, because from its point of view "the device went" and "the
+    /// device was never there" are the same state.
+    pub fn new() -> Self {
         let ring = new_ring();
         let audio_debug = std::env::var_os("IZARRAVM_AUDIO_DEBUG").is_some();
         let runtime_profile = std::env::var("IZARRAVM_RUNTIME_PROFILE").as_deref() == Ok("1");
         let debug =
             (audio_debug || runtime_profile).then(|| Arc::new(AudioDebugCounters::new(ring.len())));
+        let recovery = StreamRecovery::default();
+        let stream = match open_stream(
+            Arc::clone(&ring),
+            debug.clone(),
+            audio_debug,
+            recovery.flag(),
+        ) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                eprintln!("izarravm audio: no output stream at startup: {error}");
+                recovery.arm();
+                None
+            }
+        };
 
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => build_stream::<f32>(
-                &device,
-                &config,
-                Arc::clone(&ring),
-                debug.clone(),
-                audio_debug,
-            ),
-            cpal::SampleFormat::I16 => build_stream::<i16>(
-                &device,
-                &config,
-                Arc::clone(&ring),
-                debug.clone(),
-                audio_debug,
-            ),
-            cpal::SampleFormat::U16 => build_stream::<u16>(
-                &device,
-                &config,
-                Arc::clone(&ring),
-                debug.clone(),
-                audio_debug,
-            ),
-            other => return Err(format!("unsupported audio sample format: {other:?}").into()),
-        }?;
-        stream.play()?;
-
-        Ok(Self {
-            _stream: stream,
+        Self {
+            stream,
             sink: AudioSink { ring, debug },
-        })
+            audio_debug,
+            recovery,
+        }
     }
 
     /// Return a handle that can feed this stream from another thread.
     pub fn sink(&self) -> AudioSink {
         self.sink.clone()
     }
+
+    /// True while audio is actually reaching a device.
+    pub fn is_playing(&self) -> bool {
+        self.stream.is_some() && !self.recovery.is_armed()
+    }
+
+    /// Open an output stream if there is not a working one. Call this from the
+    /// thread that owns the player, once in a while (the GUI does it each
+    /// frame); returns true when a stream was successfully installed.
+    ///
+    /// A cpal stream that reports an error is finished: it stops calling back
+    /// and never resumes, so the machine plays to nothing for the rest of the
+    /// session. That is what a device change does -- unplugging a headset,
+    /// Windows moving the default endpoint, a driver reset -- and it used to be
+    /// handled by printing one line to stderr. The default device is re-queried
+    /// on every attempt, so the new stream follows the endpoint the host has
+    /// moved to rather than reopening the one that vanished.
+    ///
+    /// The QUEUE survives: the new stream is built on the same ring the
+    /// emulation thread is already writing to, so nothing has to be told that
+    /// this happened and no audio staged in the meantime is lost.
+    pub fn poll_recover(&mut self) -> bool {
+        let ring = Arc::clone(&self.sink.ring);
+        let debug = self.sink.debug.clone();
+        let audio_debug = self.audio_debug;
+        let opened = self.recovery.poll(Instant::now(), |failed| {
+            open_stream(ring, debug, audio_debug, failed)
+        });
+        match opened {
+            Some(stream) => {
+                // Installing drops the old stream, if any, once the new one is
+                // already running.
+                self.stream = Some(stream);
+                // Built is not the same as PLAYING: a device can fail during
+                // the very open that made it, and `StreamRecovery` deliberately
+                // keeps that report. Say which happened, and answer the caller
+                // with whether there is now sound rather than with whether a
+                // constructor returned.
+                let playing = self.is_playing();
+                if playing {
+                    eprintln!("izarravm audio: output stream opened");
+                } else {
+                    eprintln!("izarravm audio: output stream failed as it opened; will retry");
+                }
+                playing
+            }
+            None => false,
+        }
+    }
+}
+
+/// The "is there a working stream, and may I try to make one" state machine.
+///
+/// Separate from [`AudioPlayer`] because its two rules are the difference
+/// between recovering and never making a sound again, and neither can be tested
+/// through a real device: opening one needs hardware, and the case that matters
+/// is a stream that fails DURING the open.
+struct StreamRecovery {
+    /// Raised by the cpal error callback, from whatever thread cpal runs it on,
+    /// and by [`arm`](Self::arm) when there was no device to open at all. A
+    /// stream that has errored never calls back again, so this is the only
+    /// evidence there is that the machine has gone silent.
+    failed: Arc<AtomicBool>,
+    /// When the next attempt may be made. A device that is gone stays gone for
+    /// a while, and retrying every frame would spend the UI thread enumerating
+    /// audio endpoints at the host's refresh rate.
+    retry_after: Option<Instant>,
+}
+
+impl Default for StreamRecovery {
+    fn default() -> Self {
+        Self {
+            failed: Arc::new(AtomicBool::new(false)),
+            retry_after: None,
+        }
+    }
+}
+
+impl StreamRecovery {
+    fn flag(&self) -> &Arc<AtomicBool> {
+        &self.failed
+    }
+
+    /// Declare that there is no working stream, so the next poll tries.
+    fn arm(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// Attempt one open if one is due. `open` is handed the flag so the stream
+    /// it builds reports its own later failures through it.
+    ///
+    /// Two rules, both of which exist because getting them wrong is silent:
+    ///
+    /// * The flag is cleared BEFORE the attempt and restored if the attempt
+    ///   fails. `open` starts the stream, so the stream can fail inside the
+    ///   call; clearing afterwards would wipe that report and leave a player
+    ///   that believes it is healthy and is not -- a permanent-silence hole in
+    ///   the shape of the very bug this path exists to close.
+    /// * `retry_after` is set before the attempt and never cleared on success,
+    ///   so it bounds BOTH outcomes. A device that opens and then errors
+    ///   immediately would otherwise be rebuilt on every GUI frame: a full
+    ///   endpoint enumeration and a WASAPI stream build at 60 Hz, forever.
+    fn poll<S>(
+        &mut self,
+        now: Instant,
+        open: impl FnOnce(&Arc<AtomicBool>) -> Result<S, Box<dyn std::error::Error>>,
+    ) -> Option<S> {
+        if !self.is_armed() {
+            return None;
+        }
+        if self.retry_after.is_some_and(|at| now < at) {
+            return None;
+        }
+        self.retry_after = Some(now + STREAM_RETRY_INTERVAL);
+        self.failed.store(false, Ordering::Release);
+        match open(&self.failed) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                eprintln!("izarravm audio: could not open an output stream: {error}");
+                self.arm();
+                None
+            }
+        }
+    }
+}
+
+/// Open a stream on the CURRENT default output device, feeding `ring`.
+fn open_stream(
+    ring: Arc<ArrayQueue<QueuedFrame>>,
+    debug: Option<Arc<AudioDebugCounters>>,
+    audio_debug: bool,
+    failed: &Arc<AtomicBool>,
+) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or("no default audio output device")?;
+    let supported = device.default_output_config()?;
+    let sample_format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            build_stream::<f32>(&device, &config, ring, debug, audio_debug, failed)
+        }
+        cpal::SampleFormat::I16 => {
+            build_stream::<i16>(&device, &config, ring, debug, audio_debug, failed)
+        }
+        cpal::SampleFormat::U16 => {
+            build_stream::<u16>(&device, &config, ring, debug, audio_debug, failed)
+        }
+        other => return Err(format!("unsupported audio sample format: {other:?}").into()),
+    }?;
+    stream.play()?;
+    Ok(stream)
 }
 
 struct CallbackSource {
@@ -358,6 +550,7 @@ fn build_stream<T>(
     ring: Arc<ArrayQueue<QueuedFrame>>,
     debug: Option<Arc<AudioDebugCounters>>,
     emit_debug_log: bool,
+    failed: &Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample + FromSample<f32>,
@@ -445,7 +638,17 @@ where
                 }
             }
         },
-        |error| eprintln!("izarravm audio: output stream error: {error}"),
+        {
+            // A cpal stream never recovers on its own: after an error it stops
+            // calling back for good. Raising the flag is what lets the owning
+            // thread notice and rebuild -- printing alone left the machine
+            // playing to a dead device with nothing on screen to say so.
+            let failed = Arc::clone(failed);
+            move |error| {
+                eprintln!("izarravm audio: output stream error: {error}");
+                failed.store(true, Ordering::Release);
+            }
+        },
         None,
     )
 }
