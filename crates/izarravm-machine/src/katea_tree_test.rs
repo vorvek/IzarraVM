@@ -380,8 +380,10 @@ fn reconcile_makes_a_subdir_and_a_file_inside_it() {
 fn reconcile_holds_an_incomplete_chain_and_skips_system_files() {
     let (mut vol, root) = fresh_vol("rec_hold");
     let free = vol.next_free;
-    // Stamp a directory entry claiming size 600 (2 clusters) but only chain one
-    // cluster (single-cluster EOC chain), so clusters*cb < size -> hold.
+    // Stamp a directory entry claiming a size that needs two clusters but only
+    // chain one (single-cluster EOC chain), so clusters*cb < size -> hold. The
+    // claim has to exceed ONE cluster at the derived 4 KiB cluster size, or the
+    // single chained cluster would cover it and the file would be complete.
     let byte = free as usize * 4;
     let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
     let mut sec = vol.read_sector(lba);
@@ -403,7 +405,7 @@ fn reconcile_holds_an_incomplete_chain_and_skips_system_files() {
         free,
         0,
         0,
-        600, // claims 600 bytes but only 1 cluster (512) is chained
+        6_000, // claims 6,000 bytes but only 1 cluster (4,096) is chained
     );
     let slot = (0..16).map(|i| i * 32).find(|&o| dsec[o] == 0).unwrap();
     dsec[slot..slot + 32].copy_from_slice(&entry);
@@ -479,7 +481,9 @@ fn walks_a_host_folder_into_a_tree_metadata_only_skipping_non_files() {
 fn allocation_chains_dirs_and_files_and_sizes_the_disk() {
     let root = scratch("alloc");
     std::fs::create_dir_all(root.join("SUB")).unwrap();
-    std::fs::write(root.join("SUB/A.TXT"), vec![0u8; 600]).unwrap(); // 2 clusters at 512B/clu
+    // Two clusters at the derived 4 KiB cluster size (see
+    // `no_folder_size_derives_five_hundred_twelve_byte_clusters`).
+    std::fs::write(root.join("SUB/A.TXT"), vec![0u8; 4_696]).unwrap();
     let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 100])];
     let mut tree = build_tree(&root, &sys);
     let geo = allocate(&mut tree).expect("small folder fits a FAT32 volume");
@@ -491,7 +495,8 @@ fn allocation_chains_dirs_and_files_and_sizes_the_disk() {
     let sub = &tree.root.subdirs[0].dir;
     assert!(sub.first_cluster >= 3);
     assert_eq!(sub.parent_first_cluster, 2);
-    // A.TXT spans 2 clusters.
+    // A.TXT spans 2 clusters: 4,696 bytes over 4,096-byte clusters.
+    assert_eq!(u32::from(geo.spc) * SECTOR as u32, 4_096);
     assert_eq!(sub.files[0].cluster_count, 2);
     // Geometry: a valid FAT32 (>= 65525 clusters), spc derived, fatsz via the
     // kernel formula (not fatgen103).
@@ -513,7 +518,7 @@ fn allocation_chains_dirs_and_files_and_sizes_the_disk() {
 #[test]
 fn fat_sector_reflects_the_allocated_chains() {
     let root = scratch("fat");
-    std::fs::write(root.join("A.TXT"), vec![0u8; 600]).unwrap(); // 2 clusters
+    std::fs::write(root.join("A.TXT"), vec![0u8; 4_696]).unwrap(); // 2 clusters at 4 KiB
     let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 100])]; // 1 cluster
     let mut tree = build_tree(&root, &sys);
     let geo = allocate(&mut tree).expect("small folder fits a FAT32 volume");
@@ -578,34 +583,44 @@ fn directory_sector_emits_dot_dotdot_files_and_subdir_entries() {
 #[test]
 fn directory_spanning_multiple_clusters_serves_later_sectors() {
     let root = scratch("multiclu");
-    for i in 0..20 {
-        std::fs::write(root.join(format!("F{i:02}.TXT")), b"x").unwrap();
+    // 16 directory entries per 512-byte sector, 8 sectors per 4 KiB cluster, so
+    // one cluster holds 128 entries: it takes more than 128 files to span two.
+    for i in 0..200 {
+        std::fs::write(root.join(format!("F{i:03}.TXT")), b"x").unwrap();
     }
     let mut tree = build_tree(&root, &[]);
     allocate(&mut tree).expect("small folder fits a FAT32 volume");
-    // 20 file entries (16 per 512B sector at spc=1) need more than one cluster.
     assert!(
         tree.root.cluster_count >= 2,
-        "20 entries need > 1 cluster at spc=1"
+        "200 entries need > 1 cluster at 128 entries per cluster"
     );
     // Second sector (entries 16..32 in directory order) holds the 17th+ entries.
     let s1 = dir_sector(&tree.root, true, 1);
-    // The walk sorts F00.TXT..F19.TXT and there are no subdirs/system files,
-    // so the 17th directory entry (0-based index 16) is F16.TXT.
+    // The walk sorts F000.TXT..F199.TXT and there are no subdirs/system files,
+    // so the 17th directory entry (0-based index 16) is F016.TXT.
     assert_eq!(
         &s1[0..11],
-        b"F16     TXT",
+        b"F016    TXT",
         "sector 1, entry 0 is the 17th file"
     );
     assert_eq!(s1[11], crate::katea_volume::ATTR_ARCHIVE, "a file entry");
-    // The 20th (last) file lands at index 19 -> sector 1, entry 3.
+    // Sector 8 is the FIRST SECTOR OF THE SECOND CLUSTER (8 sectors per 4 KiB
+    // cluster), which is what this test is named for: entry 128 is F128.TXT.
+    let s8 = dir_sector(&tree.root, true, 8);
     assert_eq!(
-        &s1[3 * 32..3 * 32 + 11],
-        b"F19     TXT",
-        "entry 19 is F19.TXT"
+        &s8[0..11],
+        b"F128    TXT",
+        "sector 8 opens the second cluster with the 129th file"
     );
-    // Entries past the 20th are zero-padded.
-    assert_eq!(s1[4 * 32], 0x00, "no entry past the last file");
+    // The 200th (last) file lands at index 199 -> sector 12, entry 7.
+    let s12 = dir_sector(&tree.root, true, 12);
+    assert_eq!(
+        &s12[7 * 32..7 * 32 + 11],
+        b"F199    TXT",
+        "entry 199 is F199.TXT"
+    );
+    // Entries past the 200th are zero-padded.
+    assert_eq!(s12[8 * 32], 0x00, "no entry past the last file");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -696,16 +711,55 @@ fn geometry_bounds_a_huge_folder_and_reproduces_m0_for_a_small_one() {
     );
     assert_eq!(sectors_per_cluster(geo1g.part_sectors), geo1g.spc);
 
-    // A tiny demand floors at MIN_DATA_CLUSTERS and reproduces the exact,
-    // boot-tested geometry: spc=1, fatsz=741, count_of_clusters=94742.
+    // A tiny demand floors at MIN_PART_SECTORS, which puts it on the 4 KiB
+    // cluster band. The exact numbers are pinned because the whole point of the
+    // floor is that the derived geometry is not a function of how small the
+    // folder happens to be.
     let small = fat32_geometry_for(|_cb| 10).expect("a tiny demand fits a FAT32 volume");
-    assert_eq!(
-        small.spc, 1,
-        "small folder stays on the 1-sector cluster band"
+    assert_eq!(small.spc, 8, "a small folder still gets 4 KiB clusters");
+    assert_eq!(small.fatsz, 521, "kernel-formula FAT size at spc=8");
+    assert_eq!(small.count_of_clusters, 66_561, "data-cluster count");
+    assert!(
+        small.part_sectors >= MIN_PART_SECTORS,
+        "the partition floor is what forces the band: {} sectors",
+        small.part_sectors
     );
-    assert_eq!(small.fatsz, 741, "kernel-formula FAT size");
-    assert_eq!(small.count_of_clusters, 94_742, "data-cluster count");
     assert_eq!(sectors_per_cluster(small.part_sectors), small.spc);
+}
+
+/// The degenerate geometry this floor exists to prevent, stated as a property
+/// rather than as one pinned number: NO folder, at any size, may derive
+/// 512-byte clusters. At spc=1 a 44 MB game archive is an ~86,600-entry FAT
+/// chain that DOS re-walks on every seek, and 86.2% of every sector a measured
+/// DUKEMARK run read was a FAT sector.
+///
+/// NON-VACUOUS: restoring the old `MIN_DATA_CLUSTERS = 94_742` cluster floor
+/// makes the first four demands derive spc=1 and fails on the very first one.
+/// The large demands are here so the test cannot pass by the floor alone --
+/// they clear the floor by their own size and must still never read back spc=1.
+#[test]
+fn no_folder_size_derives_five_hundred_twelve_byte_clusters() {
+    for demand_bytes in [
+        0u64,
+        1 << 10,
+        48 << 20,   // the duke3d_c fixture: the folder that exposed this
+        200 << 20,  // still under the old 260 MB spc=1 band ceiling
+        640 << 20,  // the owner's real c_drive
+        4u64 << 30, // a large folder that clears the floor on its own
+    ] {
+        let geo = fat32_geometry_for(|cb| (demand_bytes / u64::from(cb)).max(1))
+            .expect("every one of these fits a FAT32 volume");
+        assert!(
+            geo.spc >= 8,
+            "{demand_bytes} bytes derived spc={}, a 512-byte-cluster volume",
+            geo.spc
+        );
+        assert_eq!(
+            sectors_per_cluster(geo.part_sectors),
+            geo.spc,
+            "the BPB stays self-consistent at {demand_bytes} bytes"
+        );
+    }
 }
 
 #[test]
@@ -1954,4 +2008,48 @@ fn image_root_file(name: &str) -> Vec<u8> {
         }
     }
     panic!("committed image has no root file named {name}");
+}
+
+/// The FAT / directory / free-space region census is a DEFAULT-OFF instrument
+/// and must prove both legs: silent when unarmed, counting when armed. This
+/// repo has paid for a default-on instrument taxing the path it only meant to
+/// observe, and each of these increments is a read-modify-write of the whole
+/// counter block on the per-sector read path.
+///
+/// NON-VACUOUS: deleting either `if self.region_census` guard makes the unarmed
+/// volume count and fails the first block; hard-wiring the field to `false`
+/// fails the second.
+#[test]
+fn the_region_census_is_silent_until_armed_and_counts_after() {
+    fn touch_every_region(vol: &KateaTreeVolume) {
+        // One FAT sector, the root directory's first sector, and a free cluster
+        // well past anything allocated -- the three arms that count.
+        vol.read_sector(vol.geo.part_start + u32::from(RESERVED_SECTORS));
+        vol.read_sector(vol.cluster_to_lba(2));
+        vol.read_sector(vol.geo.part_start + vol.geo.first_data_sector + 40_000);
+    }
+
+    let (mut vol, root) = fresh_vol("region_census");
+    touch_every_region(&vol);
+    let quiet = vol.storage_counters();
+    assert_eq!(
+        (quiet.fat_sector_reads, quiet.dir_or_free_sector_reads),
+        (0, 0),
+        "an unarmed volume must not count, even after reading every counted region"
+    );
+    assert!(
+        quiet.sector_reads >= 3,
+        "the reads really happened ({} sectors served)",
+        quiet.sector_reads
+    );
+
+    vol.arm_region_census();
+    touch_every_region(&vol);
+    let armed = vol.storage_counters();
+    assert_eq!(armed.fat_sector_reads, 1, "the FAT read counted");
+    assert_eq!(
+        armed.dir_or_free_sector_reads, 2,
+        "the directory read and the free-space read counted"
+    );
+    std::fs::remove_dir_all(&root).ok();
 }

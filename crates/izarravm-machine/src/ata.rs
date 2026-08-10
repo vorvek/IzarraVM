@@ -45,7 +45,18 @@ pub const SECTOR: usize = 512;
 /// the only image-dependent value.
 const HEADS: u32 = 16;
 const SECTORS_PER_TRACK: u32 = 63;
-const COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000; // 100 us
+/// Fixed per-command overhead before the first byte moves.
+///
+/// ZERO by design. The Izarra 3000's storage profile is "16.7 MB/s of data on
+/// command": the machine's disk is host-backed and has no platter, no head and no
+/// rotational position, so there is nothing for a seek-and-settle charge to
+/// model. It was 100 us, and that number dominated: 98.7% of the guest's
+/// fixed-disk reads in a Duke Nukem 3D load are SINGLE-SECTOR, where 100 us of
+/// latency against 30.6 us of transfer made the effective rate 3.9 MB/s -- a
+/// four-fold understatement of the spec the rest of the model implements. Kept as
+/// a named constant, not deleted, because it is where a future drive model with
+/// real geometry would put its seek time.
+const COMMAND_LATENCY_TICKS: u64 = 0;
 const PIO_BYTES_PER_SECOND: u64 = 16_700_000;
 
 fn pio_sector_ticks() -> u64 {
@@ -56,10 +67,25 @@ fn pio_sector_ticks() -> u64 {
 /// media transfer. The BIOS fixed-disk path uses the same disk and deadline as
 /// the ATA task-file path, without charging for guest data-port instructions.
 pub(crate) fn pio_transfer_ticks(sectors: u32) -> u64 {
+    pio_transfer_ticks_cached(sectors, 0)
+}
+
+/// The same charge, less the sectors that came out of the host-side sector cache.
+///
+/// A cache hit charges NOTHING. The medium was never touched: no command was
+/// issued, no bytes crossed the cable, and the bytes were already in host memory.
+/// That is the same accounting SMARTDRV's INT 13h hook produced on real hardware,
+/// where a hit returned without the drive ever seeing the request, and it is the
+/// only charge that keeps the model's story straight -- charging a fraction of a
+/// transfer for a transfer that did not happen would be a number with nothing
+/// behind it. `hits` is clamped to `sectors` so a miscounted delta can only ever
+/// under-credit.
+pub(crate) fn pio_transfer_ticks_cached(sectors: u32, hits: u32) -> u64 {
     if sectors == 0 {
         return 0;
     }
-    COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(u64::from(sectors)))
+    let charged = u64::from(sectors.saturating_sub(hits.min(sectors)));
+    COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(charged))
 }
 
 /// ATA status register bits.
@@ -208,6 +234,18 @@ pub struct AtaDisk {
     dma_mode: DmaMode,
     /// Bytes moved by the last data command, for the GUI access LED.
     last_access_bytes: usize,
+    /// Host-side sector cache under every addressing form. `RefCell` because a
+    /// lookup mutates LRU order on a `&self` read path. Host-side state, and
+    /// deliberately outside canonical capture — see `sector_cache`.
+    cache: std::cell::RefCell<crate::sector_cache::SectorCache>,
+}
+
+/// Whether new disks get a live sector cache. Read once per disk from
+/// `IZARRAVM_HDD_CACHE`; the default is ON because a host-backed disk really is
+/// instant and the cache is what makes the charged model say so on a re-read.
+/// `=0` is the A/B control leg.
+fn sector_cache_enabled() -> bool {
+    std::env::var("IZARRAVM_HDD_CACHE").as_deref() != Ok("0")
 }
 
 impl AtaDisk {
@@ -262,6 +300,9 @@ impl AtaDisk {
             dma_request: None,
             dma_mode: DmaMode::Ultra(2),
             last_access_bytes: 0,
+            cache: std::cell::RefCell::new(crate::sector_cache::SectorCache::new(
+                sector_cache_enabled(),
+            )),
         }
     }
 
@@ -316,6 +357,14 @@ impl AtaDisk {
         }
     }
 
+    /// The synthesized FAT32 geometry, or None for an image-backed disk.
+    pub fn katea_geometry_report(&self) -> Option<crate::katea_tree::KateaGeometryReport> {
+        match &self.backing {
+            Backing::Image(_) => None,
+            Backing::HostFolder(volume) => Some(volume.geometry_report()),
+        }
+    }
+
     /// Run the host-folder reconcile pass. A no-op for an image-backed disk.
     /// The machine calls this at eject/flush so anything held in the overlay is a
     /// final-pass materialized to the host folder.
@@ -329,17 +378,70 @@ impl AtaDisk {
     /// synthesizes sectors on demand, so this returns an owned array rather than a
     /// borrow into a backing buffer.
     pub fn read_lba(&self, lba: u32) -> Option<[u8; SECTOR]> {
+        // The host-side sector cache sits HERE, under every addressing form, so
+        // CHS, LBA28 and EDD share one residency set and one hit/miss counter.
+        // A hit skips the backing entirely; the caller reads the counter delta to
+        // learn what to charge (see `pio_transfer_ticks_cached`).
+        //
+        // CHARGE ASYMMETRY, deliberate: only the BIOS fixed-disk service reads
+        // that delta. The ATA task-file and BMIDE DMA paths take cache hits for
+        // their DATA -- there is one residency set and it sits under all of them,
+        // which is what keeps the bytes a guest sees independent of how it asked
+        // -- but they still price their transfers with the UNCACHED formula,
+        // because they schedule their own deadlines at command time, before any
+        // sector has been looked up. That matches the thing being modelled:
+        // SMARTDRV hooked INT 13h and nothing below it, so a driver talking to
+        // the controller directly saw the drive's real cost. Widening the credit
+        // to those paths means moving their deadline scheduling after the
+        // transfer, which is a different change with its own timing risk.
+        if let Some(hit) = self.cache.borrow_mut().get(lba) {
+            return Some(hit);
+        }
+        let served = self.read_lba_uncached(lba)?;
+        // A DEGRADED read is served but never remembered. Its bytes are the zero
+        // fallback for a host-side failure, not content, and caching them would
+        // turn a transient failure permanent: every later read of this LBA would
+        // hit the cache and get zeros even after the host file came back. The
+        // backing's own retry design assumes the next read reaches it again (a
+        // failed read drops the cached host handle so the next sector re-opens).
+        if !served.degraded {
+            self.cache.borrow_mut().put(lba, &served.bytes);
+        }
+        Some(served.bytes)
+    }
+
+    /// Sector-cache hits and misses since mount. The fixed-disk service reads the
+    /// hit counter before and after a transfer to price it; nothing else in the
+    /// machine depends on these.
+    pub fn sector_cache_hits(&self) -> u64 {
+        self.cache.borrow().hits()
+    }
+
+    pub fn sector_cache_misses(&self) -> u64 {
+        self.cache.borrow().misses()
+    }
+
+    /// Read straight from the backing, bypassing the cache. Split out so the
+    /// cache has exactly one filler and the backing exactly one reader.
+    ///
+    /// Carries the backing's degraded flag through unchanged: an image read is
+    /// either in range or it is not, so it never degrades; the Katea volume
+    /// reports a failed host read that came back as zeros.
+    fn read_lba_uncached(&self, lba: u32) -> Option<crate::katea_tree::SectorRead> {
         match &self.backing {
             Backing::Image(image) => {
                 let off = lba as usize * SECTOR;
                 image.get(off..off + SECTOR).map(|s| {
                     let mut out = [0u8; SECTOR];
                     out.copy_from_slice(s);
-                    out
+                    crate::katea_tree::SectorRead {
+                        bytes: out,
+                        degraded: false,
+                    }
                 })
             }
             Backing::HostFolder(volume) => {
-                (lba < volume.total_sectors()).then(|| volume.read_sector(lba))
+                (lba < volume.total_sectors()).then(|| volume.read_sector_checked(lba))
             }
         }
     }
@@ -368,6 +470,14 @@ impl AtaDisk {
                 volume.write_sector(lba, &sector);
             }
         }
+        // Write-through, which is also the invalidation: the guest's bytes are
+        // the new truth for this sector, so storing them leaves nothing stale to
+        // serve. Both backings return exactly these bytes on the next read --
+        // the image writes them in place and the Katea overlay reads back out of
+        // the same overlay the write just landed in.
+        let mut stored = [0u8; SECTOR];
+        stored.copy_from_slice(&data[..SECTOR]);
+        self.cache.borrow_mut().put(lba, &stored);
         self.dirty = true;
         true
     }

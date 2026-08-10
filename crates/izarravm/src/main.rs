@@ -1313,6 +1313,12 @@ fn run_boot_hdd_folder(
     } else if machine_profile {
         machine.enable_machine_profiling();
     }
+    // BIOS fixed-disk census: IZARRAVM_INT13_PROFILE=1 counts INT 13h calls, the
+    // sectors each one moved, and the wall the service burned. Off by default,
+    // and the machine gates every increment at its call site.
+    if std::env::var("IZARRAVM_INT13_PROFILE").as_deref() == Ok("1") {
+        machine.enable_int13_profile();
+    }
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     #[cfg(windows)]
     let rip_sampler =
@@ -1643,6 +1649,30 @@ fn write_hdd_profile_json(
             machine.cpu().direct_barrier_census_snapshot()
         ),
         "phase_marks": phase_mark_series_json(machine.phase_marks()),
+        "int13_profile": int13_profile_json(machine.int13_profile()),
+        "katea_geometry": machine.katea_geometry_report().map(|g| json!({
+            "sectors_per_cluster": g.sectors_per_cluster,
+            "fat_sectors": g.fat_sectors,
+            "partition_sectors": g.partition_sectors,
+            "total_sectors": g.total_sectors,
+            "count_of_clusters": g.count_of_clusters,
+        })),
+        "hdd_sector_cache": machine.hdd_sector_cache_counters().map(|(hits, misses)| json!({
+            "hits": hits,
+            "misses": misses,
+        })),
+        "io_stall_ticks": machine.io_stall_ticks(),
+        "halted_ticks": machine.halted_ticks(),
+        "katea": machine.katea_storage_counters().map(|k| json!({
+            "sector_reads": k.sector_reads,
+            "host_file_reads": k.host_file_reads,
+            "host_bytes": k.host_bytes,
+            "host_wall_ns": k.host_wall_ns,
+            "host_file_opens": k.host_file_opens,
+            "run_scan_steps": k.run_scan_steps,
+            "fat_sector_reads": k.fat_sector_reads,
+            "dir_or_free_sector_reads": k.dir_or_free_sector_reads,
+        })),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
@@ -1753,6 +1783,33 @@ fn direct_barrier_census_json(
     })
 }
 
+/// The whole-run BIOS fixed-disk census. All zero unless `IZARRAVM_INT13_PROFILE=1`.
+///
+/// `read_count_hist` buckets are `1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-127, 128+`
+/// sectors. The first bucket carried the load-time question this census was built
+/// to answer, and it has been answered: with the old 100 us `COMMAND_LATENCY_TICKS`
+/// a 512-byte call paid three times more latency than transfer, so the effective
+/// rate was a property of the call SIZE rather than of the modelled 16.7 MB/s,
+/// and 98.7% of a Duke Nukem 3D load was single-sector. That latency is now ZERO,
+/// so the histogram no longer predicts a rate — read it as the call-size shape of
+/// the workload, and read `stall_ticks` against `read_sectors - cache_hits` for
+/// the charge.
+fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
+    json!({
+        "read_calls": p.read_calls,
+        "read_sectors": p.read_sectors,
+        "write_calls": p.write_calls,
+        "write_sectors": p.write_sectors,
+        "verify_calls": p.verify_calls,
+        "verify_sectors": p.verify_sectors,
+        "control_calls": p.control_calls,
+        "read_count_hist": p.read_count_hist.to_vec(),
+        "cache_hits": p.cache_hits,
+        "stall_ticks": p.stall_ticks,
+        "host_wall_ns": p.host_wall_ns,
+    })
+}
+
 /// The periodic phase-mark series, as offsets from the first mark.
 ///
 /// `Instant` is not serialisable, so wall is emitted as a nanosecond offset from `marks[0]`,
@@ -1786,6 +1843,52 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "halted_ticks": mark.halted_ticks,
                 "katea_host_wall_ns": mark.katea.as_ref().map(|k| k.host_wall_ns),
                 "katea_sector_reads": mark.katea.as_ref().map(|k| k.sector_reads),
+                "katea_host_bytes": mark.katea.as_ref().map(|k| k.host_bytes),
+                "katea_host_file_reads": mark.katea.as_ref().map(|k| k.host_file_reads),
+                "katea_host_file_opens": mark.katea.as_ref().map(|k| k.host_file_opens),
+                "katea_run_scan_steps": mark.katea.as_ref().map(|k| k.run_scan_steps),
+                // The FAT / directory region split. Zero unless
+                // IZARRAVM_KATEA_REGION_CENSUS=1 armed the volume at mount.
+                "katea_fat_sector_reads": mark.katea.as_ref().map(|k| k.fat_sector_reads),
+                "katea_dir_or_free_sector_reads": mark.katea.as_ref().map(|k| k.dir_or_free_sector_reads),
+                // The fixed-disk census. All zero unless IZARRAVM_INT13_PROFILE=1.
+                "int13_read_calls": mark.int13.read_calls,
+                "int13_read_sectors": mark.int13.read_sectors,
+                "int13_write_calls": mark.int13.write_calls,
+                "int13_write_sectors": mark.int13.write_sectors,
+                "int13_verify_calls": mark.int13.verify_calls,
+                "int13_control_calls": mark.int13.control_calls,
+                "int13_cache_hits": mark.int13.cache_hits,
+                "int13_stall_ticks": mark.int13.stall_ticks,
+                "int13_host_wall_ns": mark.int13.host_wall_ns,
+                // The JIT / SMC / decode series QUESTION 1 correlates against the
+                // dip window. Absolute, like everything else here.
+                // Bytes written into device (VGA aperture) memory. In Duke's
+                // 320x200 screen-buffered mode one presented frame is a 64,000-byte
+                // blit to 0xA0000, so this is a real per-interval FRAME COUNTER --
+                // the thing a min-FPS hitch has to be found in. `smc_lane_accepts`
+                // is NOT a substitute: it counts lane admissions, which stop once a
+                // lane is established, and it varies 80x across a steady demo.
+                "device_write_bytes": mark.perf.device_write_bytes,
+                "device_write_ranges": mark.perf.device_write_ranges,
+                "decode_probes": mark.perf.decode_probes,
+                "decode_misses": mark.perf.decode_misses,
+                "decode_inval_smc": mark.perf.decode_inval_smc,
+                "decode_inval_cs_load": mark.perf.decode_inval_cs_load,
+                "code_invalidations": mark.perf.code_invalidations,
+                "smc_narrow_kills": mark.perf.smc_narrow_kills,
+                "smc_lane_accepts": mark.perf.smc_lane_accepts,
+                "smc_heat_demotions": mark.perf.smc_heat_demotions,
+                "jit_direct_compile_attempts": mark.perf.jit_direct_compile_attempts,
+                "jit_direct_blocks_installed": mark.perf.jit_direct_blocks_installed,
+                "jit_direct_compile_ns": mark.perf.jit_direct_compile_ns,
+                "jit_direct_cache_resets": mark.perf.jit_direct_cache_resets,
+                "jit_direct_arena_compactions": mark.perf.jit_direct_arena_compactions,
+                "wipes_direct_map": mark.fast_map_audit.wipes_direct_map,
+                "wipes_direct_data_map": mark.fast_map_audit.wipes_direct_data_map,
+                "wipes_tlb_flush": mark.fast_map_audit.wipes_tlb_flush,
+                "wipes_admission": mark.fast_map_audit.wipes_admission,
+                "wipe_pages_cleared": mark.fast_map_audit.wipe_pages_cleared,
             })
         })
         .collect();

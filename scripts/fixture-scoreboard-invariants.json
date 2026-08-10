@@ -1,17 +1,17 @@
 {
   "gp2-586": {
-    "frame_sha256": "a5c53e4706c02729786e7242c42e6a05c3761a937b990ca6f8c780892cfb4128"
+    "frame_sha256": "1a289f8db4fb242cf0877a3ff9fbfe790f1efa46e230701ed4ed655deb272ace"
   },
   "nascar-586": {
-    "frame_sha256": "13bd7f39ed2ecfd2be82e26350ec14a55e07e824fb31d444a8490a1c920529c7"
+    "frame_sha256": "e65cd6162e21d319a59a755affd7bd26c0699805a632ec69bfed5310b0cda5a1"
   },
   "prince-486": {
-    "frame_sha256": "32b5eefa8e7013dc55062913c8cc3fff806079daddeb626216510359e7121eec"
+    "frame_sha256": "60d1f794042510c4c38ab989ddb7db445a82ef2f09a77eb597b0031f6d91c1a4"
   },
   "wolf3d-486": {
     "frame_sha256": "6101c4f39ee50cdee2fa3bc12c8ca3c678d82c9c22fee3275f5d22379dfbee04"
   },
   "wolf3d-586": {
-    "frame_sha256": "3c3d89467f1c8232ee4a28b771673e1063d2fdeaa1bb9deb787cb6a35393d811"
+    "frame_sha256": "e33418bbd34c13ad9c99e23c3d1cddb68df08beecec8676378557a4cc102f963"
   }
 }

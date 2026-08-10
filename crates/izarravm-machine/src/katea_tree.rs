@@ -30,14 +30,31 @@ use std::path::{Path, PathBuf};
 /// also roughly the depth DOS's 64-char path limit allows.
 const MAX_DEPTH: usize = 32;
 
-/// Floor on the data-cluster count so the synthesized partition is always a
-/// valid, boot-tested FAT32. This is exactly the flat static disk's data-cluster
-/// count: `(PART_SECTORS - used) / spc` for the proven-bootable 96256-sector
-/// partition (`used = 32 + 2*741`). Flooring here means a small host folder
-/// reproduces the known-good geometry (`part_sectors = 96256`, `fatsz = 741`)
-/// instead of landing just under `sectors_per_cluster`'s FAT32 floor (66601
-/// sectors), where it would panic. A larger folder grows past this floor.
-const MIN_DATA_CLUSTERS: u32 = 94_742;
+/// Floor on the synthesized partition, in sectors: 532,481, which is exactly one
+/// sector past where fatgen103's `DskTableFAT32` leaves 512-byte clusters behind
+/// for 4 KiB ones. Every derived volume is at least this big, so every derived
+/// volume gets `spc >= 8`.
+///
+/// This replaced a data-cluster floor of 94,742, which reproduced the flat static
+/// image's proven-bootable 96,256-sector geometry — and, with it, that geometry's
+/// `spc = 1`. 512-byte clusters are the degenerate case: a 44 MB file becomes an
+/// ~86,600-entry FAT chain, DOS re-walks that chain on every seek, and 86.2% of
+/// all sectors a measured Duke Nukem 3D benchmark read were FAT sectors. No 1997
+/// tool would have produced it either — FORMAT.COM sized clusters off this same
+/// table, and 512-byte clusters were reserved for volumes under 260 MB, which
+/// FAT32 was not used on. Flooring the PARTITION rather than the cluster count is
+/// what keeps the derivation self-consistent: `fat32_geometry_for` still requires
+/// `sectors_per_cluster(part_sectors) == spc`, and a partition at or above this
+/// floor satisfies it at `spc = 8` without any special case.
+///
+/// The bootability the old floor was protecting is not a property of that one
+/// geometry: it comes from `fat_size_sectors` using the FreeDOS kernel's own
+/// `CalculateFATData` formula, which holds at any `spc`. It is re-established by
+/// test at the new size (`geometry_bounds_a_huge_folder_and_reproduces_m0_for_a_small_one`
+/// pins the derived numbers, `no_folder_size_derives_five_hundred_twelve_byte_clusters`
+/// states the property) and by every hdd-folder fixture in the scoreboard, all
+/// of which boot through this geometry.
+const MIN_PART_SECTORS: u32 = 532_481;
 
 #[derive(Debug)]
 pub(crate) struct TreeFile {
@@ -236,6 +253,59 @@ fn fold_literal_83(name: &str) -> [u8; 11] {
     out
 }
 
+/// One sector as served, plus whether serving it DEGRADED.
+///
+/// `degraded` is true when `bytes` is the all-zero fallback this module
+/// substitutes for a host-side failure — a spilled guest write whose payload
+/// could not be read back, a host file that vanished, or one that was truncated
+/// underneath a live handle — rather than the sector's real content.
+///
+/// It exists because of what sits ABOVE this module: `AtaDisk` keeps a host-side
+/// LRU sector cache and fills it from whatever the backing returns. Without this
+/// flag a transient failure would be made PERMANENT — the zeros would be cached
+/// and served on every later read of that LBA even after the host file came
+/// back, defeating the retry design this module already has (a failed read drops
+/// the cached handle so the next sector re-opens, and `reconcile` brackets read
+/// errors rather than acting on them). The disk skips the cache fill when this
+/// is set.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SectorRead {
+    pub(crate) bytes: [u8; SECTOR],
+    pub(crate) degraded: bool,
+}
+
+impl SectorRead {
+    /// A sector served from real content.
+    fn ok(bytes: [u8; SECTOR]) -> Self {
+        Self {
+            bytes,
+            degraded: false,
+        }
+    }
+
+    /// The zero fallback for a failed read.
+    fn degraded() -> Self {
+        Self {
+            bytes: [0u8; SECTOR],
+            degraded: true,
+        }
+    }
+}
+
+/// The synthesized volume's FAT32 geometry, for the profile report.
+///
+/// `spc` is the load-time number: it is DERIVED from the folder's size, so a
+/// fixture folder and the committed image can disagree, and at `spc = 1` a
+/// 44 MB file's cluster chain is ~90,000 FAT entries that DOS re-walks per seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KateaGeometryReport {
+    pub sectors_per_cluster: u8,
+    pub fat_sectors: u32,
+    pub partition_sectors: u32,
+    pub total_sectors: u32,
+    pub count_of_clusters: u32,
+}
+
 /// The synthesized disk's geometry, derived from the tree's cluster needs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Geometry {
@@ -332,12 +402,15 @@ fn fat32_geometry_for(demand_at: impl Fn(u32) -> u64) -> Result<Geometry, std::i
         // The demand for THIS cluster size: the only honest figure to size from.
         let used_data = demand_at(u32::from(spc) * SECTOR as u32);
         // Need a valid FAT32; pad with headroom (25%) so DIR shows free space and
-        // writes have room, and floor at the boot-tested cluster count so the small-
-        // folder partition reproduces the known-good geometry (see
-        // MIN_DATA_CLUSTERS) rather than landing just under the FAT32 floor. All in
-        // u64 so the +25% can't overflow before the checks below.
+        // writes have room, and floor the whole partition at MIN_PART_SECTORS so
+        // no derived volume lands on the degenerate 512-byte-cluster band. The
+        // floor is expressed in clusters here because that is what this loop
+        // sizes with; at spc=1 it forces a partition the table reads back as
+        // spc=8, and the self-consistency check below climbs there in one step.
+        // All in u64 so the +25% can't overflow before the checks below.
         let needed = used_data.max(1);
-        let count_of_clusters = (needed + needed / 4).max(u64::from(MIN_DATA_CLUSTERS));
+        let floor_clusters = u64::from(MIN_PART_SECTORS).div_ceil(u64::from(spc));
+        let count_of_clusters = (needed + needed / 4).max(floor_clusters);
         // Too many clusters / too many data sectors for THIS band: if a bigger
         // cluster size exists, climb to it (it shrinks the cluster count); only at
         // the top band (MAX_SPC) does this mean the folder is genuinely too large.
@@ -698,6 +771,19 @@ pub(crate) struct KateaTreeVolume {
     /// a stale handle matters because `File::open` shares delete and rename, so a
     /// replaced file would otherwise keep reading its pre-write contents.
     host_read_cache: std::cell::RefCell<Option<(PathBuf, File)>>,
+    /// Arms the FAT / directory / free-space region census. Read once at mount
+    /// from `IZARRAVM_KATEA_REGION_CENSUS=1`, and OFF by default: those two
+    /// counters were investigation residue, and each increment is a
+    /// read-modify-write of the whole `KateaStorageCounters` block on the
+    /// per-sector read path. House discipline is that a default-off instrument
+    /// is gated at its call site, not inside the helper it calls.
+    region_census: bool,
+}
+
+/// Whether a new volume counts FAT/directory/free-space sectors. See
+/// [`KateaTreeVolume::region_census`].
+fn region_census_enabled() -> bool {
+    std::env::var("IZARRAVM_KATEA_REGION_CENSUS").as_deref() == Ok("1")
 }
 
 /// What the Katea host-folder read path did, for the boot profiler's disk phases.
@@ -721,6 +807,21 @@ pub struct KateaStorageCounters {
     /// binary-searches the sorted `runs`, so this is now `log2(runs)` per sector
     /// rather than the tree-size-dependent linear walk it was built to expose.
     pub run_scan_steps: u64,
+    /// Sectors served out of the synthesized FAT region. ZERO unless
+    /// `IZARRAVM_KATEA_REGION_CENSUS=1` armed the volume: this is a diagnostic,
+    /// gated at its call site so an ordinary run never pays for it.
+    ///
+    /// The FAT is generated in memory, so these cost no host I/O at all -- but
+    /// each one is still a whole guest INT 13h call, and a high count against
+    /// `host_file_reads` is the signature of DOS re-walking a cluster chain
+    /// rather than of the guest asking for data. That signature is what the
+    /// 512-byte-cluster geometry bug looked like from here.
+    pub fat_sector_reads: u64,
+    /// Sectors served out of the data region that were NOT file bytes: directory
+    /// clusters and free space. Separating these from the FAT count is what tells
+    /// a chain walk apart from a directory rescan. Same gate, same default: zero
+    /// unless `IZARRAVM_KATEA_REGION_CENSUS=1`.
+    pub dir_or_free_sector_reads: u64,
     /// Host `File::open` calls. Distinct from `host_file_reads` (which counts
     /// SECTORS served from a host file) because the one-entry handle cache makes
     /// them differ: their ratio is what says the cache is working. Before the
@@ -978,7 +1079,28 @@ impl KateaTreeVolume {
             atomic_write_bytes: 0,
             counters: std::cell::Cell::new(KateaStorageCounters::default()),
             host_read_cache: std::cell::RefCell::new(None),
+            region_census: region_census_enabled(),
         })
+    }
+
+    /// The synthesized geometry, for the profile report. Derived at mount from
+    /// the host folder's size; nothing about it changes during a run.
+    pub(crate) fn geometry_report(&self) -> KateaGeometryReport {
+        KateaGeometryReport {
+            sectors_per_cluster: self.geo.spc,
+            fat_sectors: self.geo.fatsz,
+            partition_sectors: self.geo.part_sectors,
+            total_sectors: self.geo.total_sectors,
+            count_of_clusters: self.geo.count_of_clusters,
+        }
+    }
+
+    /// Arm the region census without going through the environment, so a test
+    /// can drive both legs of the gate in one process. Production arms it once
+    /// at mount from `IZARRAVM_KATEA_REGION_CENSUS`.
+    #[cfg(test)]
+    pub(crate) fn arm_region_census(&mut self) {
+        self.region_census = true;
     }
 
     /// What the read path has done since mount. See [`KateaStorageCounters`].
@@ -1610,12 +1732,20 @@ impl KateaTreeVolume {
     /// Read one whole-disk sector by absolute LBA. Resolves entirely from
     /// in-memory metadata except for `HostFile` data and spilled guest writes,
     /// read on demand. Out-of-range or unmapped sectors read back as zeros.
+    ///
+    /// Drops the degraded flag; use [`read_sector_checked`](Self::read_sector_checked)
+    /// when the caller intends to REMEMBER the bytes.
     pub(crate) fn read_sector(&self, lba: u32) -> [u8; SECTOR] {
+        self.read_sector_checked(lba).bytes
+    }
+
+    /// The same read, saying whether it degraded. See [`SectorRead`].
+    pub(crate) fn read_sector_checked(&self, lba: u32) -> SectorRead {
         let mut counters = self.counters.get();
         counters.sector_reads += 1;
         self.counters.set(counters);
         match self.store.get(lba) {
-            Ok(Some(s)) => return s,
+            Ok(Some(s)) => return SectorRead::ok(s),
             Ok(None) => {}
             Err(e) => {
                 // The sector exists but its payload could not be read back. Never
@@ -1625,31 +1755,38 @@ impl KateaTreeVolume {
                 // store's error count makes `reconcile` hold this chain rather
                 // than act on what we are about to return.
                 eprintln!("katea: guest-written sector {lba} could not be read back: {e}");
-                return [0u8; SECTOR];
+                return SectorRead::degraded();
             }
         }
         if lba == 0 {
-            return self.mbr;
+            return SectorRead::ok(self.mbr);
         }
         if lba < self.geo.part_start {
-            return [0u8; SECTOR];
+            return SectorRead::ok([0u8; SECTOR]);
         }
         let rel = lba - self.geo.part_start; // partition-relative sector
 
         // Reserved area: VBR (0), FSInfo (1), backup boot (6), backup FSInfo (7).
         if rel == 0 || rel == u32::from(BACKUP_BOOT_SECTOR) {
-            return self.vbr;
+            return SectorRead::ok(self.vbr);
         }
         if rel == u32::from(FSINFO_SECTOR) || rel == u32::from(BACKUP_FSINFO_SECTOR) {
-            return fat32_fsinfo_sector(self.free_count, self.next_free);
+            return SectorRead::ok(fat32_fsinfo_sector(self.free_count, self.next_free));
         }
 
         // FAT region: NUM_FATS identical copies, each `fatsz` long.
         let reserved = u32::from(RESERVED_SECTORS);
         let fat_end = reserved + u32::from(NUM_FATS) * self.geo.fatsz;
         if (reserved..fat_end).contains(&rel) {
+            // Region census: default-off instrument, gated at the call site so an
+            // ordinary run never pays the read-modify-write of the counter block.
+            if self.region_census {
+                let mut counters = self.counters.get();
+                counters.fat_sector_reads += 1;
+                self.counters.set(counters);
+            }
             let within = (rel - reserved) % self.geo.fatsz;
-            return self.fat.fat_sector(within, &self.geo);
+            return SectorRead::ok(self.fat.fat_sector(within, &self.geo));
         }
 
         // Data region: cluster 2 begins at `first_data_sector`.
@@ -1661,13 +1798,13 @@ impl KateaTreeVolume {
             return self.data_sector(cluster, sector_in_cluster);
         }
 
-        [0u8; SECTOR]
+        SectorRead::ok([0u8; SECTOR])
     }
 
     /// Resolve one data-region sector by finding the run owning `cluster`, then
     /// serving directory entries or lazy file bytes. A cluster in no run is free
     /// space (zeros).
-    fn data_sector(&self, cluster: u32, sector_in_cluster: u32) -> [u8; SECTOR] {
+    fn data_sector(&self, cluster: u32, sector_in_cluster: u32) -> SectorRead {
         // `runs` is sorted by `first_cluster` (the constructor sorts it after
         // `flatten`) and its ranges are disjoint and non-empty: `assign_dir` hands
         // out clusters from one monotonically increasing counter, and
@@ -1695,12 +1832,24 @@ impl KateaTreeVolume {
         counters.run_scan_steps = counters.run_scan_steps.saturating_add(steps);
         self.counters.set(counters);
         let Some(run) = found else {
-            return [0u8; SECTOR]; // free space
+            // Region census: default-off, gated at the call site (see the FAT arm).
+            if self.region_census {
+                let mut counters = self.counters.get();
+                counters.dir_or_free_sector_reads += 1;
+                self.counters.set(counters);
+            }
+            return SectorRead::ok([0u8; SECTOR]); // free space
         };
         let cluster_off = cluster - run.0; // cluster index within the run
         let spc = u32::from(self.geo.spc);
         match &run.2 {
             Role::Dir(id) => {
+                // Region census: default-off, gated at the call site (see the FAT arm).
+                if self.region_census {
+                    let mut counters = self.counters.get();
+                    counters.dir_or_free_sector_reads += 1;
+                    self.counters.set(counters);
+                }
                 let d = &self.dirs[*id];
                 let sector_in_dir = cluster_off * spc + sector_in_cluster;
                 let mut out = [0u8; SECTOR];
@@ -1710,7 +1859,7 @@ impl KateaTreeVolume {
                         out[i * 32..i * 32 + 32].copy_from_slice(e);
                     }
                 }
-                out
+                SectorRead::ok(out)
             }
             Role::File(id) => {
                 let f = &self.files[*id];
@@ -1786,11 +1935,12 @@ fn read_source_span(
     size: u32,
     counters: &std::cell::Cell<KateaStorageCounters>,
     cache: &std::cell::RefCell<Option<(PathBuf, File)>>,
-) -> [u8; SECTOR] {
+) -> SectorRead {
     let mut out = [0u8; SECTOR];
+    let mut degraded = false;
     let valid = u64::from(size).saturating_sub(byte_off).min(SECTOR as u64) as usize;
     if valid == 0 {
-        return out;
+        return SectorRead::ok(out);
     }
     match source {
         FileSource::InMemory(v) => {
@@ -1833,6 +1983,7 @@ fn read_source_span(
                     {
                         eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
                         out = [0u8; SECTOR];
+                        degraded = true;
                         // A failed read can leave the handle at an unknown offset,
                         // and the file may have been truncated underneath us. Drop
                         // it so the next sector re-opens rather than compounding.
@@ -1841,7 +1992,10 @@ fn read_source_span(
                 }
                 // The open failed and already logged; read back as zeros, exactly
                 // as the pre-cache path did for a vanished host file.
-                None => out = [0u8; SECTOR],
+                None => {
+                    out = [0u8; SECTOR];
+                    degraded = true;
+                }
             }
             drop(slot);
             let mut tally = counters.get();
@@ -1854,7 +2008,10 @@ fn read_source_span(
             counters.set(tally);
         }
     }
-    out
+    SectorRead {
+        bytes: out,
+        degraded,
+    }
 }
 
 #[cfg(test)]

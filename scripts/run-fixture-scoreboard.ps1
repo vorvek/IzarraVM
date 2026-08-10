@@ -128,13 +128,19 @@ $maximumBackgroundLoadPercent = 30.0
 #             alike (measured) -- so the sample count is the only field that does.
 #   samples   the extrapolation count, DUKEMARK's own stall detector, held to a
 #             TOLERANCE rather than an exact value. Its docs call the count
-#             constant per demo across machines, and it is not: BENCH2 reads 580
-#             at the 486 persona and rather more at the 586, reproducibly. It is
+#             constant per demo across machines, and it is not: BENCH2 reads 919
+#             at the 486 persona and 1026 at the 586, reproducibly. It is
 #             therefore a function of emulated timing, and pinning it exactly
 #             would rebuild the re-pin treadmill this fixture was rewritten to
 #             escape. The band absorbs ordinary timing-model drift and is far
 #             tighter than the "stalls very hard" case it exists to catch: a
-#             multi-second stall inside a ~145 s demo moves it several percent.
+#             multi-second stall inside a ~131 s demo moves it several percent.
+#             Within one build the count is EXACT: two 486 runs twenty minutes
+#             apart, on a host busy enough that their WALL times differed by 38%,
+#             agreed to the digit on 919 samples and on every guest-side counter
+#             in the profile. The band absorbs model drift between builds, not
+#             run-to-run noise, and a count that varies WITHIN a build is a
+#             determinism bug rather than drift.
 #
 # FPS min/max/avg are MEASUREMENTS. They are guest-observed frame rates and move
 # with host load, so they are reported and never asserted.
@@ -163,14 +169,22 @@ function Get-FixtureTable {
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]8000000000
             # Guest-reported, so robust to host noise. LOWER realtics is faster.
-            realticsMinimum = 2900; realticsMaximum = 3050; gametics = 2134
+            # Shifted down 86 tics on 2026-08-10 with the storage-charge changes,
+            # keeping the band's width and its margins around the measurement.
+            # Doom READS FROM DISK DURING THE TIMEDEMO -- charged I/O stall over
+            # this budget fell from 0.996 to 0.171 guest seconds -- so the demo
+            # completes in fewer tics while gametics stays 2134, which is what
+            # says the demo itself is unchanged.
+            realticsMinimum = 2814; realticsMaximum = 2964; gametics = 2134
             qconsole = $false; resultPpm = $false; injection = @(); dukemark = $null
         }
         [pscustomobject]@{
             name = "doom-586"; folder = "jemmex_doom_c"
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]6640000000
-            realticsMinimum = 970; realticsMaximum = 1040; gametics = 2134
+            # Shifted down 19 tics on 2026-08-10 for the same reason as the 486
+            # row, band width and margins preserved.
+            realticsMinimum = 951; realticsMaximum = 1021; gametics = 2134
             qconsole = $false; resultPpm = $false; injection = @(); dukemark = $null
         }
         [pscustomobject]@{
@@ -230,7 +244,7 @@ function Get-FixtureTable {
             cycles = [uint64]26400000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $false; injection = @()
-            dukemark = (New-DukemarkPins 580)
+            dukemark = (New-DukemarkPins 919)
         }
         [pscustomobject]@{
             name = "duke3d-586"; folder = "duke3d_c"
@@ -245,7 +259,7 @@ function Get-FixtureTable {
             qconsole = $false; resultPpm = $false; injection = @()
             # Not the 486 row's number. Same demo, same config, same fixture --
             # the count follows emulated timing, so it is pinned per persona.
-            dukemark = (New-DukemarkPins 962)
+            dukemark = (New-DukemarkPins 1026)
         }
         [pscustomobject]@{
             name = "nascar-586"; folder = "nascar1_c"
@@ -406,10 +420,10 @@ The tail of the file it is looking at is:
      DukeMark by DXZeff
 
      Info         : 2,320,200,2,0,1,1,1
-     FPS Minimum  : 1
+     FPS Minimum  : 11
      FPS Maximum  : 50
-     FPS Average  : 27
-     Extrapolated : 580 Samples
+     FPS Average  : 31
+     Extrapolated : 919 Samples
 
 Returns `found = $false` when the file is missing entirely, which is a different
 failure (the redirection or the flush broke) from a present file with no Info
@@ -463,14 +477,33 @@ function Read-Invariants {
     return $normalised
 }
 
+# Write text with LF endings and no BOM, which is what .gitattributes normalises
+# these two files to on the way into a commit.
+#
+# CORRECTION to the claim made when this helper landed: it said the CRLF bug WAS
+# the cause of the three red mains the comment below counts. It was not. Those
+# three commits carried the PREVIOUS commit's (LF) sha in the manifest row --
+# the manifest was simply not updated at all, which is the omission the
+# auto-sync below now closes. The CRLF defect is real and is fixed here, but it
+# was LATENT: `Set-Content -Encoding utf8` writes CRLF on Windows, so the sha
+# this script recorded would have been the sha of a CRLF file that git then
+# stored as LF, and no amount of keeping the two writes in step would have
+# helped, because the mismatch happened AFTER both of them. Two distinct
+# defects; only one of them had fired.
+function Write-TextLf([string]$Path, [string]$Text) {
+    $normalised = $Text -replace "`r`n", "`n"
+    if (-not $normalised.EndsWith("`n")) { $normalised += "`n" }
+    [IO.File]::WriteAllText($Path, $normalised, (New-Object Text.UTF8Encoding $false))
+}
+
 function Write-Invariants($Table) {
-    $Table.GetEnumerator() |
+    $json = $Table.GetEnumerator() |
         Sort-Object Key |
         ForEach-Object -Begin { $ordered = [ordered]@{} } `
             -Process { $ordered[$_.Key] = $_.Value } `
             -End { $ordered } |
-        ConvertTo-Json -Depth 6 |
-        Set-Content -LiteralPath $invariantPath -Encoding utf8
+        ConvertTo-Json -Depth 6
+    Write-TextLf $invariantPath $json
 
     # The invariants json is LICENSE_MANIFEST-covered, and a re-record without the
     # matching manifest sha has turned main red THREE times now (the file-policy
@@ -493,7 +526,7 @@ function Write-Invariants($Table) {
             }
         }
         if ($updated) {
-            Set-Content -LiteralPath $manifestPath -Value $rows -Encoding utf8
+            Write-TextLf $manifestPath ($rows -join "`n")
             Write-Host "updated LICENSE_MANIFEST.tsv sha for the invariants json"
         }
     }
