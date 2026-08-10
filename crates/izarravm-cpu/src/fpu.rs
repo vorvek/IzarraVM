@@ -81,8 +81,15 @@ impl Default for X87 {
 }
 
 impl X87 {
-    /// Writes version 1 of the canonical x87 payload without changing FPU state.
-    /// Registers use physical storage order so TOP remains solely in the status word.
+    /// Writes the canonical x87 payload without changing FPU state. Registers use physical
+    /// storage order so TOP remains solely in the status word.
+    ///
+    /// The payload shape is COMMIT-PINNED, not versioned: `fpu_test.rs` is the only caller, it
+    /// picks the section version it writes, and nothing persists a capture or reads one back, so
+    /// there is no older payload for a version number to discriminate. Dropping MMX shrank it
+    /// 134 -> 70 bytes (the `[u64; 8]` MM file went with the extension) and needed no bump for
+    /// exactly that reason. If a production writer or an on-disk savestate ever consumes this,
+    /// the shape stops being free to change and this comment must become a real version.
     pub fn write_canonical_payload(
         &self,
         out: &mut CanonicalFieldWriter<'_>,

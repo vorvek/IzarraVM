@@ -874,7 +874,28 @@ fn misc_seed(cpu: &mut CpuGsw) {
     cpu.registers.set_edi(0x0000_0018);
     cpu.registers.set_ebp(0x0000_0010);
     cpu.registers.eflags = 0x13; // CF=1, AF=1 (bit 4) on top of the always-1 bit 1
+    // Seed a non-trivial x87 tag word. No surviving Misc opcode touches the FPU, so the tag is
+    // an INVARIANT across the whole battery rather than a per-case end-state -- but it is only
+    // worth pinning if the seeded value is distinctive. Left at the FINIT default the tag would
+    // be 0xffff, and a stray `finit()` inside a Misc executor would reproduce it exactly and go
+    // unnoticed. Three pushes covering all three non-empty tag encodings (0b01 zero, 0b10
+    // special, 0b00 valid) give a value no reset or clear can forge.
+    cpu.fpu.finit();
+    cpu.fpu.push(0.0); // tag 0b01, physical 7
+    cpu.fpu.push(f64::INFINITY); // tag 0b10, physical 6
+    cpu.fpu.push(1.25); // tag 0b00, physical 5
 }
+
+/// The x87 tag word `misc_seed` leaves behind, asserted unchanged after every Misc case. See the
+/// seed for why this is one shared constant instead of a per-case `MiscGolden` column: the Misc
+/// block is BCD/IMUL/TEST/XLAT/SALC/HLT/CPUID/RDTSC/CMPXCHG8B, none of which reads or writes x87
+/// state, so a per-case column would be the same literal 28 times. Pinning it once still catches
+/// the regression that matters -- a Misc executor that disturbs the FPU -- and additionally
+/// catches a broken tag computation in the seed path itself.
+/// Derivation: FINIT leaves 0xffff (all eight empty) and TOP 0; the three pushes land on physical
+/// 7, 6 and 5 and rewrite those tag fields to 0b01, 0b10 and 0b00, clearing bits 15-10 to
+/// 0b011000 and leaving physical 4-0 empty.
+const MISC_SEED_X87_TAG: u16 = 0x63ff;
 
 /// Seed memory for the Misc battery: plant the XLAT lookup table byte at [BX+AL]=[0x39] and an
 /// m64 for CMPXCHG8B at [0x40].
@@ -1036,7 +1057,7 @@ fn misc_split_matches_golden_across_ops() {
     // The Misc one-off opcodes are converted to the decode/execute split, so their fused arms
     // are deleted and they can no longer be diffed against a fused executor in-tree. Run each
     // case through the split (`exec_one_split`) and assert the architectural end-state — GPRs,
-    // eflags, and the memory writes — against goldens captured from the
+    // eflags, the x87 tag word and the memory writes — against goldens captured from the
     // pre-split fused path (parent f1d65e0f) via `regen_misc_goldens`. eip + fetch prove decode
     // consumed and charged every byte (opcode + ModRM + displacement + immediate) exactly once.
     for g in misc_golden_cases() {
@@ -1052,6 +1073,11 @@ fn misc_split_matches_golden_across_ops() {
         assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
         assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
         assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+        assert_eq!(
+            split.fpu.tag, MISC_SEED_X87_TAG,
+            "x87 tag word disturbed by {}",
+            g.name
+        );
         let deltas: Vec<(usize, u8)> = sbus
             .memory
             .iter()

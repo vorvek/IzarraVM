@@ -3905,8 +3905,12 @@ const fn persona_supports(persona: CpuPersona, required: IsaGeneration) -> bool 
     }
 }
 
-/// Generation requirement for each implemented two-byte opcode family. Operand-sensitive
-/// additions such as INVLPG and CR4 are checked by their executors after the ModRM is decoded.
+/// Generation requirement for each two-byte opcode family the decode gate has an opinion about.
+/// Most arms name an IMPLEMENTED family and give the earliest persona that has it; the `Never`
+/// arms name families this core deliberately does not implement (SMM, the AMD/P6 additions, and
+/// the MMX integer-SIMD block), which are invalid on every persona. Anything unlisted falls to
+/// `I386` and, if no group claims it, #UDs at the fallback instead. Operand-sensitive additions
+/// such as INVLPG and CR4 are checked by their executors after the ModRM is decoded.
 const fn two_byte_isa_generation(opcode: u8) -> IsaGeneration {
     match opcode {
         // AMD fast system calls and the P6 conditional-move family are outside the GSW-586.
