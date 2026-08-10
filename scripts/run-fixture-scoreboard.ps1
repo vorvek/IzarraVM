@@ -480,11 +480,16 @@ function Read-Invariants {
 # Write text with LF endings and no BOM, which is what .gitattributes normalises
 # these two files to on the way into a commit.
 #
-# THIS IS THE BUG BEHIND THE THREE RED MAINS the comment below counts.
-# `Set-Content -Encoding utf8` writes CRLF on Windows, so the sha this script
-# recorded was the sha of a CRLF file that git then stored as LF -- the manifest
-# row could not match the committed blob no matter how carefully the two writes
-# were kept in step, because the mismatch happened AFTER both of them.
+# CORRECTION to the claim made when this helper landed: it said the CRLF bug WAS
+# the cause of the three red mains the comment below counts. It was not. Those
+# three commits carried the PREVIOUS commit's (LF) sha in the manifest row --
+# the manifest was simply not updated at all, which is the omission the
+# auto-sync below now closes. The CRLF defect is real and is fixed here, but it
+# was LATENT: `Set-Content -Encoding utf8` writes CRLF on Windows, so the sha
+# this script recorded would have been the sha of a CRLF file that git then
+# stored as LF, and no amount of keeping the two writes in step would have
+# helped, because the mismatch happened AFTER both of them. Two distinct
+# defects; only one of them had fired.
 function Write-TextLf([string]$Path, [string]$Text) {
     $normalised = $Text -replace "`r`n", "`n"
     if (-not $normalised.EndsWith("`n")) { $normalised += "`n" }

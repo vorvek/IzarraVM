@@ -382,14 +382,32 @@ impl AtaDisk {
         // CHS, LBA28 and EDD share one residency set and one hit/miss counter.
         // A hit skips the backing entirely; the caller reads the counter delta to
         // learn what to charge (see `pio_transfer_ticks_cached`).
+        //
+        // CHARGE ASYMMETRY, deliberate: only the BIOS fixed-disk service reads
+        // that delta. The ATA task-file and BMIDE DMA paths take cache hits for
+        // their DATA -- there is one residency set and it sits under all of them,
+        // which is what keeps the bytes a guest sees independent of how it asked
+        // -- but they still price their transfers with the UNCACHED formula,
+        // because they schedule their own deadlines at command time, before any
+        // sector has been looked up. That matches the thing being modelled:
+        // SMARTDRV hooked INT 13h and nothing below it, so a driver talking to
+        // the controller directly saw the drive's real cost. Widening the credit
+        // to those paths means moving their deadline scheduling after the
+        // transfer, which is a different change with its own timing risk.
         if let Some(hit) = self.cache.borrow_mut().get(lba) {
             return Some(hit);
         }
-        let served = self.read_lba_uncached(lba);
-        if let Some(bytes) = &served {
-            self.cache.borrow_mut().put(lba, bytes);
+        let served = self.read_lba_uncached(lba)?;
+        // A DEGRADED read is served but never remembered. Its bytes are the zero
+        // fallback for a host-side failure, not content, and caching them would
+        // turn a transient failure permanent: every later read of this LBA would
+        // hit the cache and get zeros even after the host file came back. The
+        // backing's own retry design assumes the next read reaches it again (a
+        // failed read drops the cached host handle so the next sector re-opens).
+        if !served.degraded {
+            self.cache.borrow_mut().put(lba, &served.bytes);
         }
-        served
+        Some(served.bytes)
     }
 
     /// Sector-cache hits and misses since mount. The fixed-disk service reads the
@@ -405,18 +423,25 @@ impl AtaDisk {
 
     /// Read straight from the backing, bypassing the cache. Split out so the
     /// cache has exactly one filler and the backing exactly one reader.
-    fn read_lba_uncached(&self, lba: u32) -> Option<[u8; SECTOR]> {
+    ///
+    /// Carries the backing's degraded flag through unchanged: an image read is
+    /// either in range or it is not, so it never degrades; the Katea volume
+    /// reports a failed host read that came back as zeros.
+    fn read_lba_uncached(&self, lba: u32) -> Option<crate::katea_tree::SectorRead> {
         match &self.backing {
             Backing::Image(image) => {
                 let off = lba as usize * SECTOR;
                 image.get(off..off + SECTOR).map(|s| {
                     let mut out = [0u8; SECTOR];
                     out.copy_from_slice(s);
-                    out
+                    crate::katea_tree::SectorRead {
+                        bytes: out,
+                        degraded: false,
+                    }
                 })
             }
             Backing::HostFolder(volume) => {
-                (lba < volume.total_sectors()).then(|| volume.read_sector(lba))
+                (lba < volume.total_sectors()).then(|| volume.read_sector_checked(lba))
             }
         }
     }

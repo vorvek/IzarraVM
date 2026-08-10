@@ -2009,3 +2009,47 @@ fn image_root_file(name: &str) -> Vec<u8> {
     }
     panic!("committed image has no root file named {name}");
 }
+
+/// The FAT / directory / free-space region census is a DEFAULT-OFF instrument
+/// and must prove both legs: silent when unarmed, counting when armed. This
+/// repo has paid for a default-on instrument taxing the path it only meant to
+/// observe, and each of these increments is a read-modify-write of the whole
+/// counter block on the per-sector read path.
+///
+/// NON-VACUOUS: deleting either `if self.region_census` guard makes the unarmed
+/// volume count and fails the first block; hard-wiring the field to `false`
+/// fails the second.
+#[test]
+fn the_region_census_is_silent_until_armed_and_counts_after() {
+    fn touch_every_region(vol: &KateaTreeVolume) {
+        // One FAT sector, the root directory's first sector, and a free cluster
+        // well past anything allocated -- the three arms that count.
+        vol.read_sector(vol.geo.part_start + u32::from(RESERVED_SECTORS));
+        vol.read_sector(vol.cluster_to_lba(2));
+        vol.read_sector(vol.geo.part_start + vol.geo.first_data_sector + 40_000);
+    }
+
+    let (mut vol, root) = fresh_vol("region_census");
+    touch_every_region(&vol);
+    let quiet = vol.storage_counters();
+    assert_eq!(
+        (quiet.fat_sector_reads, quiet.dir_or_free_sector_reads),
+        (0, 0),
+        "an unarmed volume must not count, even after reading every counted region"
+    );
+    assert!(
+        quiet.sector_reads >= 3,
+        "the reads really happened ({} sectors served)",
+        quiet.sector_reads
+    );
+
+    vol.arm_region_census();
+    touch_every_region(&vol);
+    let armed = vol.storage_counters();
+    assert_eq!(armed.fat_sector_reads, 1, "the FAT read counted");
+    assert_eq!(
+        armed.dir_or_free_sector_reads, 2,
+        "the directory read and the free-space read counted"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

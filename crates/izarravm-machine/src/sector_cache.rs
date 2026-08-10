@@ -27,10 +27,22 @@
 //! No wall clock, no host memory pressure, no allocator address feeds into it.
 //! Same guest history, same hit/miss sequence, same charges.
 //!
-//! The cache is deliberately NOT part of canonical state, for the same reason
-//! the deadline cache is not: it is a pure accelerator over a value the backing
-//! can always recompute. A capture taken with a warm cache and one taken cold
-//! describe the same machine.
+//! ## Canonical state, stated once
+//!
+//! The cache is deliberately NOT part of canonical state. It is HOST SCHEDULING
+//! STATE: every byte in it is recomputable from the backing, so no captured or
+//! restored machine can read a different value because of it. CONTENT is
+//! cache-independent.
+//!
+//! CHARGE is not, and the earlier claim that a warm capture and a cold one
+//! "describe the same machine" overstated it. A restored machine restarts COLD,
+//! so its first read of an LBA the original had resident pays the medium cost
+//! the original did not, and the replayed guest-visible timeline may therefore
+//! differ from the uninterrupted run's (see `stall_for_hdd_sectors_cached`).
+//! That is acceptable today only because there is NO restore path: nothing in
+//! the machine reloads a capture and continues from it. Whoever builds one owns
+//! this decision — either capture the residency set with the rest of the state,
+//! or accept a timing discontinuity at the restore point and say so there.
 //!
 //! Limit: bounded at [`CAPACITY_SECTORS`] with no way to raise it at runtime.
 //! Lift by taking the bound from the machine config if a workload ever needs a

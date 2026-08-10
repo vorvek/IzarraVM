@@ -1545,6 +1545,7 @@ fn int13_census_is_silent_until_armed_and_counts_after() {
 
     let mut armed = machine_with_hdd(64);
     armed.enable_int13_profile();
+    let stall_before = armed.io_stall_ticks();
     read_one_sector(&mut armed, 1);
     read_one_sector(&mut armed, 8);
     // AH=08 get-parameters: a control call, not a data call.
@@ -1567,6 +1568,12 @@ fn int13_census_is_silent_until_armed_and_counts_after() {
     // it makes this assertion fail if the census ever prices a transfer with the
     // uncached formula while the machine charges the cached one.
     assert_eq!(p.cache_hits, 1, "the repeated first sector was a cache hit");
+    assert_eq!(
+        p.stall_ticks,
+        armed.io_stall_ticks() - stall_before,
+        "the census figure must equal what the MACHINE actually charged the guest, \
+         not merely what the same helper recomputes"
+    );
     assert_eq!(
         p.stall_ticks,
         ata::pio_transfer_ticks_cached(1, 0) + ata::pio_transfer_ticks_cached(8, 1),
@@ -1652,6 +1659,10 @@ fn int13_write_at(machine: &mut Machine, lba: u32, count: u8) {
 /// NON-VACUOUS: restoring `COMMAND_LATENCY_TICKS` to `MASTER_CLOCK_HZ / 10_000`
 /// drops the single-sector rate to 3.9 MB/s and fails the second assertion;
 /// it also fails the first, at 14.9 MB/s for a 64-sector read.
+///
+/// Measured off the MACHINE's `io_stall_ticks`, never off the census: the census
+/// recomputes its own figure with the same helper the charge uses, so a census
+/// assertion cannot tell the two apart.
 #[test]
 fn the_charged_fixed_disk_rate_is_sixteen_point_seven_megabytes_per_second() {
     fn charged_rate(sectors: u64, ticks: u64) -> f64 {
@@ -1660,23 +1671,35 @@ fn the_charged_fixed_disk_rate_is_sixteen_point_seven_megabytes_per_second() {
 
     let mut bulk = machine_with_hdd(4096);
     bulk.enable_int13_profile();
+    let before = bulk.io_stall_ticks();
     int13_read_at(&mut bulk, 0, 64);
-    let bulk_rate = charged_rate(64, bulk.int13_profile().stall_ticks);
+    let bulk_ticks = bulk.io_stall_ticks() - before;
+    let bulk_rate = charged_rate(64, bulk_ticks);
     assert!(
         (bulk_rate - 16_700_000.0).abs() < 16_700.0,
         "a 64-sector read must charge 16.7 MB/s, got {bulk_rate:.0} B/s"
+    );
+    assert_eq!(
+        bulk.int13_profile().stall_ticks,
+        bulk_ticks,
+        "the census must report what the machine actually charged"
     );
 
     // 64 DISTINCT single-sector reads: no repeat, so the cache never answers one
     // and every sector is charged. Only the per-call overhead can differ.
     let mut singles = machine_with_hdd(4096);
     singles.enable_int13_profile();
+    let before = singles.io_stall_ticks();
     for lba in 100..164 {
         int13_read_at(&mut singles, lba, 1);
     }
-    let profile = singles.int13_profile();
-    assert_eq!(profile.cache_hits, 0, "distinct LBAs cannot hit the cache");
-    let single_rate = charged_rate(64, profile.stall_ticks);
+    let single_ticks = singles.io_stall_ticks() - before;
+    assert_eq!(
+        singles.int13_profile().cache_hits,
+        0,
+        "distinct LBAs cannot hit the cache"
+    );
+    let single_rate = charged_rate(64, single_ticks);
     assert!(
         (single_rate - 16_700_000.0).abs() < 16_700.0,
         "64 single-sector reads must charge the same 16.7 MB/s, got {single_rate:.0} B/s"
@@ -1687,29 +1710,56 @@ fn the_charged_fixed_disk_rate_is_sixteen_point_seven_megabytes_per_second() {
 /// read is charged NOTHING and returns the same bytes, and a write makes the
 /// next read return the WRITTEN bytes rather than a stale cached copy.
 ///
+/// MEASURED OFF THE MACHINE, NOT THE CENSUS. `int13_profile().stall_ticks` is
+/// recomputed by `note_int13_data` through the very same
+/// `pio_transfer_ticks_cached` call that `stall_for_hdd_sectors_cached` uses, so
+/// asserting it proves only that the helper agrees with itself: the earlier shape
+/// of this test passed with the machine charging the UNCACHED form. What the
+/// guest can observe is `io_stall_ticks` and the master timeline, so those are
+/// what is asserted here.
+///
 /// NON-VACUOUS in both directions. Removing the `cache.borrow_mut().put` from
 /// `write_lba` leaves the pre-write bytes resident and fails the write-back
 /// assertion — that is the invalidation half, and without it the cache would be
 /// a correctness bug rather than an accelerator. Charging
-/// `pio_transfer_ticks(done)` instead of the cached form makes the repeat read
-/// cost the same as the first and fails the free-repeat assertion.
+/// `pio_transfer_ticks(done)` instead of the cached form in
+/// `stall_for_hdd_sectors_cached` makes the repeat read cost the same as the
+/// first and fails the free-repeat assertions on both the stall counter and the
+/// timeline.
 #[test]
 fn a_repeat_read_costs_nothing_and_a_write_is_never_served_stale() {
     let mut machine = machine_with_hdd(4096);
     machine.enable_int13_profile();
 
+    let stall_before = machine.io_stall_ticks();
+    let clock_before = machine.master_ticks();
     let first = int13_read_at(&mut machine, 7, 1);
-    let after_first = machine.int13_profile().stall_ticks;
-    assert!(after_first > 0, "the first read reached the medium");
+    let first_stall = machine.io_stall_ticks() - stall_before;
+    let first_elapsed = machine.master_ticks() - clock_before;
+    assert!(first_stall > 0, "the first read reached the medium");
 
+    let stall_before = machine.io_stall_ticks();
+    let clock_before = machine.master_ticks();
     let repeat = int13_read_at(&mut machine, 7, 1);
     assert_eq!(repeat, first, "a hit serves the same bytes");
     assert_eq!(
-        machine.int13_profile().stall_ticks,
-        after_first,
-        "a repeat read charges nothing: the medium was never touched"
+        machine.io_stall_ticks() - stall_before,
+        0,
+        "a repeat read charges the guest NOTHING: the medium was never touched \
+         (the first read charged {first_stall})"
+    );
+    assert_eq!(
+        machine.master_ticks() - clock_before,
+        0,
+        "and the guest-visible timeline does not advance either \
+         (the first read advanced it {first_elapsed})"
     );
     assert_eq!(machine.int13_profile().cache_hits, 1);
+    assert_eq!(
+        machine.int13_profile().stall_ticks,
+        first_stall,
+        "the census must agree with the machine's own charge"
+    );
 
     // Write sector 7 the way the guest would -- INT 13h AH=03 -- then read it
     // back through the same service.
@@ -1740,14 +1790,15 @@ fn the_same_read_sequence_charges_the_same_ticks_every_time() {
         .map(|i| ((i * 13) % 97, if i % 5 == 0 { 4 } else { 1 }))
         .collect();
 
+    // The MACHINE's charge, not the census's recomputation of it.
     let charge = |()| {
         let mut machine = machine_with_hdd(4096);
         machine.enable_int13_profile();
         let mut per_call = Vec::with_capacity(sequence.len());
-        let mut last = 0u64;
+        let mut last = machine.io_stall_ticks();
         for &(lba, count) in &sequence {
             int13_read_at(&mut machine, lba, count);
-            let now = machine.int13_profile().stall_ticks;
+            let now = machine.io_stall_ticks();
             per_call.push(now - last);
             last = now;
         }
@@ -1765,4 +1816,209 @@ fn the_same_read_sequence_charges_the_same_ticks_every_time() {
         first.1 > 0 && first.0.contains(&0),
         "the sequence must actually produce free calls, or this proves nothing"
     );
+}
+
+// ---- the sector cache on a KATEA HOST-FOLDER backing ------------------
+//
+// Everything above exercises `Backing::Image`, which cannot fail a read: an
+// image is a `Vec` and a sector is either in range or it is not. The synthesized
+// Katea volume is the backing that reads real host files mid-run, so it is the
+// only one where the cache can be asked to remember something that was never
+// true. These tests use it.
+
+/// Mount `dir` as C: on a fresh machine, Katea-synthesized.
+fn machine_with_hdd_folder(dir: &std::path::Path) -> Machine {
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.mount_hdd_folder(dir).unwrap();
+    machine
+}
+
+/// A scratch host folder, emptied first so a previous run cannot seed it.
+fn katea_scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("izarra_hdd_cache_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Walk the synthesized VBR and root directory to find `name`'s first data LBA
+/// and its size. Reads go through `read_lba`, which is the same path the guest
+/// uses, so the volume is warm afterwards exactly as a real boot would leave it.
+fn katea_file_lba(disk: &ata::AtaDisk, name: &[u8; 11]) -> (u32, u32) {
+    let part_start = crate::katea_volume::PART_START;
+    let vbr = disk.read_lba(part_start).unwrap();
+    let spc = u32::from(vbr[0x0D]);
+    let reserved = u32::from(u16::from_le_bytes([vbr[0x0E], vbr[0x0F]]));
+    let fats = u32::from(vbr[0x10]);
+    let fat_sectors = u32::from_le_bytes([vbr[0x24], vbr[0x25], vbr[0x26], vbr[0x27]]);
+    let root_cluster = u32::from_le_bytes([vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F]]);
+    let data_start = part_start + reserved + fats * fat_sectors;
+    let root_lba = data_start + (root_cluster - 2) * spc;
+    for sector in 0..spc {
+        let root = disk.read_lba(root_lba + sector).unwrap();
+        for slot in (0..512).step_by(32) {
+            if &root[slot..slot + 11] != name {
+                continue;
+            }
+            let first_cluster = (u32::from(u16::from_le_bytes([root[slot + 20], root[slot + 21]]))
+                << 16)
+                | u32::from(u16::from_le_bytes([root[slot + 26], root[slot + 27]]));
+            let size = u32::from_le_bytes([
+                root[slot + 28],
+                root[slot + 29],
+                root[slot + 30],
+                root[slot + 31],
+            ]);
+            return (data_start + (first_cluster - 2) * spc, size);
+        }
+    }
+    panic!(
+        "{} not in the synthesized root directory",
+        String::from_utf8_lossy(name)
+    );
+}
+
+/// Distinct, sector-identifying bytes so a served sector says which one it is
+/// and a zero fallback is unmistakable.
+fn patterned(sectors: usize) -> Vec<u8> {
+    (0..sectors * 512).map(|i| (i / 512) as u8 | 0x40).collect()
+}
+
+/// Hit, miss and charge on the KATEA backing, through the guest's own INT 13h
+/// service. The image-backed tests above cannot cover this: the two backings
+/// reach the cache through different code (`read_lba_uncached`), and only this
+/// one synthesizes its sectors and reads host files.
+///
+/// NON-VACUOUS: charging `pio_transfer_ticks(done)` instead of the cached form
+/// in `stall_for_hdd_sectors_cached` makes the repeat read cost the same as the
+/// first and fails the free-repeat assertion; disabling the cache
+/// (`SectorCache::new(false)`) fails the hit-counter assertion.
+#[test]
+fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
+    let dir = katea_scratch("hitmiss");
+    std::fs::write(dir.join("GAME.DAT"), patterned(8)).unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    let (lba, size) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+    assert_eq!(size, 8 * 512, "the whole file is visible to the guest");
+
+    let (hits_before, misses_before) = machine.hdd_sector_cache_counters().unwrap();
+    let stall_before = machine.io_stall_ticks();
+    let first = int13_read_at(&mut machine, lba, 4);
+    let first_stall = machine.io_stall_ticks() - stall_before;
+    let (hits_after, misses_after) = machine.hdd_sector_cache_counters().unwrap();
+    assert_eq!(
+        first,
+        vec![0x40, 0x41, 0x42, 0x43],
+        "host bytes, per sector"
+    );
+    assert_eq!(hits_after, hits_before, "a cold read cannot hit");
+    assert_eq!(misses_after - misses_before, 4, "four sectors missed");
+    assert!(first_stall > 0, "and were charged the medium");
+
+    let stall_before = machine.io_stall_ticks();
+    let repeat = int13_read_at(&mut machine, lba, 4);
+    assert_eq!(repeat, first, "a hit serves the same bytes");
+    assert_eq!(
+        machine.io_stall_ticks() - stall_before,
+        0,
+        "the repeat is free (the first read charged {first_stall})"
+    );
+    assert_eq!(
+        machine.hdd_sector_cache_counters().unwrap().0 - hits_after,
+        4,
+        "all four sectors came out of the cache"
+    );
+
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A TRANSIENT HOST READ FAILURE MUST NEVER BE CACHED.
+///
+/// The reviewer's reproduction, made permanent. The Katea read path answers an
+/// unreadable host file with ZEROS so a vanished or shrunk file cannot panic the
+/// guest, and it drops its cached host handle so the next sector re-opens -- a
+/// deliberate retry design. The host-side sector cache sits above all of that
+/// and remembers whatever the backing returned, so without a degraded signal
+/// those zeros become the sector's permanent content: every later read hits the
+/// cache and gets zeros, for the life of the mount, even after the host file has
+/// been restored byte for byte.
+///
+/// Sector A proves the cache is live in this same run; sector B is the one the
+/// failure hits.
+///
+/// NON-VACUOUS: deleting the `if !served.degraded` guard in `AtaDisk::read_lba`
+/// (i.e. always filling the cache, which is what the code did before this test
+/// existed) fails the restored-bytes assertion -- the restored sector still
+/// reads back as zeros. Removing the `degraded = true` assignment from
+/// `read_source_span`'s read-error arm fails it identically.
+#[test]
+fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
+    let dir = katea_scratch("degraded");
+    let path = dir.join("GAME.DAT");
+    let original = patterned(8);
+    std::fs::write(&path, &original).unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+    let (sector_a, sector_b) = (lba, lba + 1);
+
+    // A: a healthy read, then proof the cache really is answering in this run.
+    assert_eq!(int13_read_at(&mut machine, sector_a, 1), vec![0x40]);
+    let hits_before = machine.hdd_sector_cache_counters().unwrap().0;
+    assert_eq!(int13_read_at(&mut machine, sector_a, 1), vec![0x40]);
+    assert_eq!(
+        machine.hdd_sector_cache_counters().unwrap().0 - hits_before,
+        1,
+        "the cache is live, so the B assertions below are about caching"
+    );
+
+    // Truncate the host file underneath the running machine. B is now past EOF.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    let misses_before = machine.hdd_sector_cache_counters().unwrap().1;
+    assert_eq!(
+        int13_read_at(&mut machine, sector_b, 1),
+        vec![0x00],
+        "a failed host read is SERVED as zeros rather than faulting the guest"
+    );
+    assert_eq!(
+        machine.hdd_sector_cache_counters().unwrap().1 - misses_before,
+        1,
+        "and it went to the backing, as a miss"
+    );
+
+    // Restore the host file byte for byte. The guest did nothing; only the host
+    // recovered.
+    std::fs::write(&path, &original).unwrap();
+    let (hits_before, misses_before) = machine.hdd_sector_cache_counters().unwrap();
+    assert_eq!(
+        int13_read_at(&mut machine, sector_b, 1),
+        vec![0x41],
+        "the recovered sector must read back its REAL bytes: the zeros were a \
+         failure, not content, and caching them would have pinned them here for \
+         the life of the mount"
+    );
+    let (hits_now, misses_now) = machine.hdd_sector_cache_counters().unwrap();
+    assert_eq!(
+        (hits_now - hits_before, misses_now - misses_before),
+        (0, 1),
+        "the retry reached the backing, which is only possible if the failed \
+         read was never stored"
+    );
+
+    // And the good bytes ARE cached, so the skip is scoped to the failure.
+    let hits_before = machine.hdd_sector_cache_counters().unwrap().0;
+    assert_eq!(int13_read_at(&mut machine, sector_b, 1), vec![0x41]);
+    assert_eq!(
+        machine.hdd_sector_cache_counters().unwrap().0 - hits_before,
+        1,
+        "the successful re-read filled the cache normally"
+    );
+
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
 }

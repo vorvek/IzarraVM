@@ -1732,27 +1732,17 @@ fn direct_barrier_census_json(
     })
 }
 
-/// The periodic phase-mark series, as offsets from the first mark.
-///
-/// `Instant` is not serialisable, so wall is emitted as a nanosecond offset from `marks[0]`,
-/// the same shape the boot profiler's `build_rows` uses via `duration_since`.
-///
-/// Emits absolute counters, not deltas. Differencing consecutive entries is the consumer's job
-/// and keeps this honest: a delta series hides whether a counter went backwards, and several of
-/// these (`katea`, the perf counters) are cumulative by contract.
-///
-/// READ THE STALL COLUMNS BEFORE COMPARING INTERVALS. `stall_for_master_ticks` grants guest time
-/// for zero emulation work while the host burns real wall inside Katea, so a loading interval
-/// looks fast in raw wall-over-guest for an accounting reason rather than an emulation-rate one.
-/// Net out `katea_host_wall_ns` and `io_stall_ticks` first. The rt in this series is NOT the rt
-/// the realtime gate ratchets on.
 /// The whole-run BIOS fixed-disk census. All zero unless `IZARRAVM_INT13_PROFILE=1`.
 ///
 /// `read_count_hist` buckets are `1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-127, 128+`
-/// sectors. The first bucket carries the load-time question: at 512 bytes per
-/// call the fixed `COMMAND_LATENCY_TICKS` dominates the per-sector transfer time
-/// by a factor of three, so the effective rate is a property of the call SIZE and
-/// not of the modelled 16.7 MB/s.
+/// sectors. The first bucket carried the load-time question this census was built
+/// to answer, and it has been answered: with the old 100 us `COMMAND_LATENCY_TICKS`
+/// a 512-byte call paid three times more latency than transfer, so the effective
+/// rate was a property of the call SIZE rather than of the modelled 16.7 MB/s,
+/// and 98.7% of a Duke Nukem 3D load was single-sector. That latency is now ZERO,
+/// so the histogram no longer predicts a rate — read it as the call-size shape of
+/// the workload, and read `stall_ticks` against `read_sectors - cache_hits` for
+/// the charge.
 fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
     json!({
         "read_calls": p.read_calls,
@@ -1769,6 +1759,20 @@ fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
     })
 }
 
+/// The periodic phase-mark series, as offsets from the first mark.
+///
+/// `Instant` is not serialisable, so wall is emitted as a nanosecond offset from `marks[0]`,
+/// the same shape the boot profiler's `build_rows` uses via `duration_since`.
+///
+/// Emits absolute counters, not deltas. Differencing consecutive entries is the consumer's job
+/// and keeps this honest: a delta series hides whether a counter went backwards, and several of
+/// these (`katea`, the perf counters) are cumulative by contract.
+///
+/// READ THE STALL COLUMNS BEFORE COMPARING INTERVALS. `stall_for_master_ticks` grants guest time
+/// for zero emulation work while the host burns real wall inside Katea, so a loading interval
+/// looks fast in raw wall-over-guest for an accounting reason rather than an emulation-rate one.
+/// Net out `katea_host_wall_ns` and `io_stall_ticks` first. The rt in this series is NOT the rt
+/// the realtime gate ratchets on.
 fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::Value {
     let Some(first) = marks.first() else {
         return serde_json::Value::Array(Vec::new());
@@ -1792,6 +1796,8 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "katea_host_file_reads": mark.katea.as_ref().map(|k| k.host_file_reads),
                 "katea_host_file_opens": mark.katea.as_ref().map(|k| k.host_file_opens),
                 "katea_run_scan_steps": mark.katea.as_ref().map(|k| k.run_scan_steps),
+                // The FAT / directory region split. Zero unless
+                // IZARRAVM_KATEA_REGION_CENSUS=1 armed the volume at mount.
                 "katea_fat_sector_reads": mark.katea.as_ref().map(|k| k.fat_sector_reads),
                 "katea_dir_or_free_sector_reads": mark.katea.as_ref().map(|k| k.dir_or_free_sector_reads),
                 // The fixed-disk census. All zero unless IZARRAVM_INT13_PROFILE=1.

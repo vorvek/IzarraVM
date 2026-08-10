@@ -12,9 +12,12 @@ const ELTORITO_CD_DRIVE: u8 = 0xE0;
 /// to observe, so `int13_hdd` tests one bool before it touches an `Instant`.
 ///
 /// It exists because the existing counters answer "how many sectors" but not
-/// "in how many CALLS", and the per-call `COMMAND_LATENCY_TICKS` is charged per
-/// call. Without the size distribution there is no way to tell a 100 us latency
-/// tax from a per-sector cost: both scale with bytes when the call size is fixed.
+/// "in how many CALLS", and at the time `COMMAND_LATENCY_TICKS` was charged once
+/// per call. Without the size distribution there was no way to tell a 100 us
+/// latency tax from a per-sector cost: both scale with bytes when the call size
+/// is fixed. That latency is now zero, and this census is what measured it into
+/// the ground; the size distribution stays because it also describes the
+/// workload the sector cache serves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Int13Profile {
     /// AH=02/0A/42 read calls that reached a data path, and the sectors they moved.
@@ -1678,7 +1681,10 @@ impl Machine {
     /// served without touching the backing. This is the only place the cache
     /// changes guest-observable behaviour: content is identical either way, only
     /// the charge differs, and the charge is a pure function of the guest's own
-    /// prior reads and writes (see `sector_cache`).
+    /// prior reads and writes -- WITHIN one run. Across a capture-and-restore it
+    /// would not be, because a restored machine restarts with an empty cache;
+    /// `sector_cache`'s module docs state that consequence in full and it is
+    /// unowned until a restore path exists.
     fn stall_for_hdd_sectors_cached(&mut self, sectors: u32, hits: u32) {
         self.stall_for_master_ticks(ata::pio_transfer_ticks_cached(sectors, hits));
     }
