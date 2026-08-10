@@ -716,7 +716,7 @@ impl CpuGsw {
     }
 
     /// Read eight bytes as a little-endian u64. The one primitive behind FLD m64,
-    /// FILD m64, the FLD m80 mantissa, FNSAVE/FRSTOR, and the MMX 64-bit transfers.
+    /// FILD m64, the FLD m80 mantissa, and FNSAVE/FRSTOR.
     pub(super) fn read_qword<B: CpuBus>(
         &mut self,
         bus: &mut B,

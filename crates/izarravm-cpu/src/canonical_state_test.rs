@@ -873,8 +873,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // 4528 -> 4544 -- measured, not derived. The packed array mirrors decode lines, which are a
     // transparent accelerator, so it is absent from both canonical payloads for the same reason
     // the lines are.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4544);
+    // Dropping MMX removes `X87`'s `[u64; 8]` MM register file, moving the pin 4544 -> 4480. The
+    // MM file WAS in the x87 canonical payload, so this is the one entry in this list that also
+    // shrinks a payload (134 -> 70 bytes); see cpu_test.rs's twin comment for the layout half.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4480);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4544);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4480);
 }

@@ -72,9 +72,9 @@ impl CpuGsw {
             DecodeGroup::Fpu => self.execute_fpu_decoded(insn, bus),
             // The heterogeneous one-off block (BCD adjust, AAM/AAD, SALC/XLAT, TEST imm, three-
             // operand IMUL, INS/OUTS, HLT, and the no-operand 0F system/serializing/CPU-id ops,
-            // CMPXCHG8B, and MMX) runs through its split executor, consuming the pre-decoded
+            // and CMPXCHG8B) runs through its split executor, consuming the pre-decoded
             // ModRM/operand/immediate and reusing the existing BCD/`imul_truncated`/`run_string`/
-            // CPUID/RDTSC/halt/MMX leaf logic verbatim.
+            // CPUID/RDTSC/halt leaf logic verbatim.
             DecodeGroup::Misc => self.execute_misc_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second

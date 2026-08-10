@@ -7,7 +7,7 @@ use izarravm_core::{
     CanonicalStateWriter,
 };
 
-const X87_PAYLOAD_LEN: usize = 134;
+const X87_PAYLOAD_LEN: usize = 70;
 
 fn x87_payload(fpu: &X87) -> Vec<u8> {
     let mut state = CanonicalStateWriter::new().unwrap();
@@ -39,16 +39,6 @@ fn sentinel_x87() -> X87 {
         control: 0x1234,
         status: 0xa941,
         tag: 0x5678,
-        mm: [
-            0x0102_0304_0506_0708,
-            0x1112_1314_1516_1718,
-            0x2122_2324_2526_2728,
-            0x3132_3334_3536_3738,
-            0x4142_4344_4546_4748,
-            0x5152_5354_5556_5758,
-            0x6162_6364_6566_6768,
-            0x7172_7374_7576_7778,
-        ],
     }
 }
 
@@ -86,9 +76,6 @@ fn canonical_payload_has_exact_golden_bytes() {
     for value in fpu.st {
         expected.extend_from_slice(&value.to_bits().to_le_bytes());
     }
-    for value in fpu.mm {
-        expected.extend_from_slice(&value.to_le_bytes());
-    }
     assert_eq!(expected.len(), X87_PAYLOAD_LEN);
     assert_eq!(x87_payload(&fpu), expected);
 }
@@ -103,12 +90,6 @@ fn canonical_payload_assigns_each_field_one_span() {
         let start = 6 + index * 8;
         assert_only_span_changes(&fpu, start..start + 8, |changed| {
             changed.st[index] = f64::from_bits(changed.st[index].to_bits() ^ 1);
-        });
-    }
-    for index in 0..8 {
-        let start = 70 + index * 8;
-        assert_only_span_changes(&fpu, start..start + 8, |changed| {
-            changed.mm[index] ^= 1;
         });
     }
 }
@@ -128,11 +109,12 @@ fn canonical_payload_keeps_physical_order_across_top_wrap() {
 }
 
 #[test]
-fn canonical_payload_keeps_mmx_bits_when_emms_changes_tags() {
-    let mut fpu = sentinel_x87();
+fn canonical_payload_isolates_the_tag_word_from_the_register_file() {
+    let fpu = sentinel_x87();
     let before = x87_payload(&fpu);
-    fpu.emms();
-    let after = x87_payload(&fpu);
+    let mut changed = fpu.clone();
+    changed.tag = 0xffff;
+    let after = x87_payload(&changed);
 
     assert_ne!(&before[4..6], &after[4..6]);
     assert_eq!(&before[..4], &after[..4]);

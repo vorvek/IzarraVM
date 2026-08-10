@@ -1010,10 +1010,9 @@ impl CpuGsw {
         operand_size: OperandSize,
     ) -> ExecResult<CycleOutcome> {
         match opcode {
-            // The MMX block (`is_mmx_two_byte`) is converted to the decode/execute split (task A14):
-            // `route_group` classifies it as `DecodeGroup::Misc` and `execute_mmx_decoded` runs it
-            // (the ModRM + the 0F 71/72/73 imm8 are parsed in `decode`). Not handled here.
-            // The shared decode gate limits every MMX opcode to the P55C persona.
+            // The MMX integer-SIMD encodings are not handled anywhere: the GSW-586 carries no SIMD
+            // extension, so `two_byte_isa_generation` marks them `IsaGeneration::Never` and the
+            // shared decode gate #UDs them on every persona before execute is reached.
             // 0F 00 (group 6: SLDT/STR/LLDT/LTR/VERR/VERW), 0F 01 (group 7: SGDT/SIDT/LGDT/LIDT/
             // SMSW/LMSW/INVLPG), 0F 02 (LAR), 0F 03 (LSL), and 0F 06 (CLTS) are converted to the
             // decode/execute split (task A12): `route_group` classifies them as
@@ -1261,7 +1260,7 @@ impl CpuGsw {
     /// The heterogeneous one-off block (task A14) through the decode/execute split. Each arm mirrors
     /// the former fused handler verbatim — same flag effects, same memory access, same clocks — but
     /// consumes the ModRM/operand/immediate `decode` pre-parsed (so the executor never re-fetches an
-    /// instruction byte). The MMX block and CMPXCHG8B resolve their pre-decoded ModRM here; the
+    /// instruction byte). CMPXCHG8B resolves its pre-decoded ModRM here; the
     /// no-operand 0F system/serializing/CPU-id ops (INVD/WBINVD/WRMSR/RDTSC/RDMSR/
     /// CPUID/BSWAP) read no instruction bytes, so they reuse the existing `execute_two_byte` leaf
     /// logic verbatim (it re-reads nothing for them). Dispatch is off the FULL u16 `insn.opcode`
@@ -1502,12 +1501,6 @@ impl CpuGsw {
                     self.set_flag(FLAG_ZF, false);
                 }
                 Ok(clocks(10))
-            }
-            // The MMX block (EMMS, the shift-by-imm forms, MOVD/MOVQ, and the Pxxx forms) runs
-            // through its split executor, consuming the pre-decoded ModRM/operand and the pre-fetched
-            // imm8 (for the 0F 71/72/73 shifts).
-            op if op & 0xff00 == 0x0f00 && is_mmx_two_byte(op as u8) => {
-                self.execute_mmx_decoded(insn, bus)
             }
             // The remaining 0F system/serializing/CPU-id/stack ops re-read no further instruction
             // bytes in `execute_two_byte`, so reuse that leaf logic verbatim: INVD/WBINVD (08/09),

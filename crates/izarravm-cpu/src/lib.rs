@@ -27,8 +27,6 @@ mod jit;
 #[cfg(feature = "jit")]
 pub use jit::unit_sim::SimReport;
 mod memory;
-mod mmx;
-mod mmx_exec;
 mod paging;
 mod run;
 mod smc_trace;
@@ -247,20 +245,25 @@ const CR0_NW: u32 = 0x2000_0000; // bit 29
 #[allow(dead_code)]
 const CR0_CD: u32 = 0x4000_0000; // bit 30
 
-// Pentium MMX P55C CPUID identity. Leaf 0 returns the maximum basic leaf in EAX and the
-// 12-byte Intel vendor string split across EBX, EDX, ECX in the architectural order.
+// GSW-586 CPUID identity. Leaf 0 returns the maximum basic leaf in EAX and the 12-byte
+// vendor string split across EBX, EDX, ECX in the architectural order (EBX first, then
+// EDX, then ECX -- the order Intel's own "GenuineIntel" is laid out in). The GSW-586 is
+// Izarra's own part, so it reports Izarra's own vendor id rather than a licensed one:
+// "IzarBenetako", Euskara for a genuine star.
 const CPUID_MAX_BASIC_LEAF: u32 = 1;
-const CPUID_VENDOR_EBX: u32 = u32::from_le_bytes(*b"Genu");
-const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"ineI");
-const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"ntel");
+const CPUID_VENDOR_EBX: u32 = u32::from_le_bytes(*b"Izar");
+const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"Bene");
+const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"tako");
 
 // Leaf 1 EAX packs type (bits 13-12), family (bits 11-8), model (bits 7-4) and stepping
-// (bits 3-0). Family 5, model 4 is the Pentium MMX P55C identity. Stepping 3 is one of
-// the production P55C revisions.
+// (bits 3-0). Family 5 places the part in the Pentium-class generation, which is what
+// era software dispatches on; the model/stepping pair is Izarra's own namespace under
+// Izarra's own vendor id (the same freedom Cyrix and AMD took under theirs), so the
+// first shipped GSW-586 is model 1, stepping 1.
 const CPUID_TYPE: u32 = 0; // original OEM part
 const CPUID_FAMILY: u32 = 5;
-const CPUID_MODEL: u32 = 4;
-const CPUID_STEPPING: u32 = 3;
+const CPUID_MODEL: u32 = 1;
+const CPUID_STEPPING: u32 = 1;
 const CPUID_VERSION_EAX: u32 =
     (CPUID_TYPE << 12) | (CPUID_FAMILY << 8) | (CPUID_MODEL << 4) | CPUID_STEPPING;
 
@@ -269,12 +272,8 @@ const CPUID_FEATURE_FPU: u32 = 1 << 0;
 const CPUID_FEATURE_TSC: u32 = 1 << 4;
 const CPUID_FEATURE_MSR: u32 = 1 << 5;
 const CPUID_FEATURE_CX8: u32 = 1 << 8; // CMPXCHG8B
-const CPUID_FEATURE_MMX: u32 = 1 << 23;
-const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_FPU
-    | CPUID_FEATURE_TSC
-    | CPUID_FEATURE_MSR
-    | CPUID_FEATURE_CX8
-    | CPUID_FEATURE_MMX;
+const CPUID_FEATURES_EDX: u32 =
+    CPUID_FEATURE_FPU | CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_CX8;
 
 // CR4 bits with a modeled effect. TSD (bit 2) makes RDTSC privileged: when set, RDTSC
 // outside CPL 0 raises #GP(0). The other CR4 bits are storage only.
@@ -2214,15 +2213,11 @@ enum DecodeGroup {
     ///     (0F 08/09), WRMSR (0F 30), RDTSC (0F 31), RDMSR (0F 32),
     ///     CPUID (0F A2), BSWAP r32 (0F C8-CF).
     ///   - CMPXCHG8B m64 (0F C7 /1) — a ModRM r/m form (`decode` parses the ModRM + descriptor).
-    ///   - the MMX integer-SIMD block (the `is_mmx_two_byte` opcodes): EMMS (0F 77, no ModRM); the
-    ///     shift-by-imm forms (0F 71/72/73, a ModRM whose `rm` is the register plus a trailing imm8);
-    ///     MOVD/MOVQ and every Pxxx mm,mm/m64 — all ModRM r/m forms (`decode` parses the ModRM +
-    ///     descriptor; the imm8 is fetched only for 0F 71/72/73).
     ///
     /// `decode` parses each form's ModRM + addressing descriptor (instruction bytes only, so it stays
     /// cacheable) and its immediate exactly as the fused handler did, so the byte budget — and thus the
     /// fetch clocks — is byte-identical. The executor reuses the existing BCD/`imul_truncated`/
-    /// `run_string`/`execute_mmx_decoded`/CPUID/RDTSC/halt leaf logic verbatim; the only
+    /// `run_string`/CPUID/RDTSC/halt leaf logic verbatim; the only
     /// change is WHERE the ModRM/immediate is fetched (once, in `decode`). The 0F forms are folded
     /// into `insn.opcode` as 0x0F00 | second and dispatched off the full u16. The genuinely
     /// unimplemented neighbours (single-byte 0xF1; 0F AA RSM; the other unmapped 0F bytes) are NOT
@@ -3910,18 +3905,50 @@ const fn persona_supports(persona: CpuPersona, required: IsaGeneration) -> bool 
     }
 }
 
-/// Generation requirement for each implemented two-byte opcode family. Operand-sensitive
-/// additions such as INVLPG and CR4 are checked by their executors after the ModRM is decoded.
+/// Generation requirement for each two-byte opcode family the decode gate has an opinion about.
+/// Most arms name an IMPLEMENTED family and give the earliest persona that has it; the `Never`
+/// arms name families this core deliberately does not implement (SMM, the AMD/P6 additions, and
+/// the MMX integer-SIMD block), which are invalid on every persona. Anything unlisted falls to
+/// `I386` and, if no group claims it, #UDs at the fallback instead. Operand-sensitive additions
+/// such as INVLPG and CR4 are checked by their executors after the ModRM is decoded.
 const fn two_byte_isa_generation(opcode: u8) -> IsaGeneration {
     match opcode {
-        // AMD fast system calls and the P6 conditional-move family are outside P55C.
+        // AMD fast system calls and the P6 conditional-move family are outside the GSW-586.
         // RSM stays invalid because this core never enters SMM.
         0x05 | 0x07 | 0x40..=0x4f | 0xaa => IsaGeneration::Never,
+        // The MMX integer-SIMD block. The GSW-586 is a semi-custom 1997 part, not an Intel
+        // flagship, and carries no SIMD extension at all: these encodings name no instruction
+        // on ANY persona, so they are invalid everywhere rather than gated to the 586. That is
+        // what the silicon would do -- an absent extension raises #UD -- and it is what correct
+        // era software expects, because it tests CPUID leaf 1 EDX bit 23 (which this core does
+        // not set) before it ever executes one of these bytes.
+        0x60..=0x6b
+        | 0x6e
+        | 0x6f
+        | 0x71..=0x77
+        | 0x7e
+        | 0x7f
+        | 0xd1..=0xd3
+        | 0xd5
+        | 0xd8
+        | 0xd9
+        | 0xdb..=0xdd
+        | 0xdf
+        | 0xe1
+        | 0xe2
+        | 0xe5
+        | 0xe8
+        | 0xe9
+        | 0xeb..=0xed
+        | 0xef
+        | 0xf1..=0xf3
+        | 0xf5
+        | 0xf8..=0xfa
+        | 0xfc..=0xfe => IsaGeneration::Never,
         // 486 additions.
         0x08 | 0x09 | 0xb0 | 0xb1 | 0xc0 | 0xc1 | 0xc8..=0xcf => IsaGeneration::I486,
-        // Pentium and Pentium MMX additions.
+        // Pentium additions.
         0x30..=0x32 | 0xa2 | 0xc7 => IsaGeneration::P55c,
-        op if is_mmx_two_byte(op) => IsaGeneration::P55c,
         _ => IsaGeneration::I386,
     }
 }
@@ -3990,41 +4017,6 @@ fn fpu_round_rc(control: u16, value: f64) -> f64 {
         2 => value.ceil(),
         _ => value.trunc(),
     }
-}
-
-/// The base MMX second-byte opcodes (after 0F). Excludes the SSE/SSE2 additions
-/// that share the integer-SIMD ranges (PADDQ 0F D4, PAVGB 0F E0, etc.).
-const fn is_mmx_two_byte(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        0x60..=0x6b
-            | 0x6e
-            | 0x6f
-            | 0x71..=0x77
-            | 0x7e
-            | 0x7f
-            | 0xd1..=0xd3
-            | 0xd5
-            | 0xd8
-            | 0xd9
-            | 0xdb
-            | 0xdc
-            | 0xdd
-            | 0xdf
-            | 0xe1
-            | 0xe2
-            | 0xe5
-            | 0xe8
-            | 0xe9
-            | 0xeb
-            | 0xec
-            | 0xed
-            | 0xef
-            | 0xf1..=0xf3
-            | 0xf5
-            | 0xf8..=0xfa
-            | 0xfc..=0xfe
-    )
 }
 
 #[cfg(test)]

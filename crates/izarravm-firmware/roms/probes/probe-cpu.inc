@@ -4,11 +4,11 @@
 ; GSW CPU probe (the CPU icon).
 ; Toggle EFLAGS.AC first. If it is fixed, this is either 386 clock mode. If AC
 ; changes, toggle EFLAGS.ID. A fixed ID marks the 486. Only the 586 executes
-; CPUID, where leaf 0 must report GenuineIntel for the modeled P55C.
+; CPUID, where leaf 0 must report IzarBenetako, the GSW-586's vendor id.
 ;
 ; The original EFLAGS value and the registers not used for the result are
 ; restored before returning. NASM character constants pack the first character
-; into the low byte, so 'Genu' matches the little-endian CPUID vendor word.
+; into the low byte, so 'Izar' matches the little-endian CPUID vendor word.
 
 POST_STEP "component.cpu_gsw", probe_cpu
 
@@ -45,11 +45,11 @@ probe_cpu:
     popfd                         ; CPUID must see the caller's flags
     xor eax, eax
     cpuid                         ; leaf 0: max leaf in EAX, vendor in EBX:EDX:ECX
-    cmp ebx, 'Genu'               ; vendor[0..4]
+    cmp ebx, 'Izar'               ; vendor[0..4]
     jne .fail
-    cmp edx, 'ineI'               ; vendor[4..8]
+    cmp edx, 'Bene'               ; vendor[4..8]
     jne .fail
-    cmp ecx, 'ntel'               ; vendor[8..12]
+    cmp ecx, 'tako'               ; vendor[8..12]
     jne .fail
 .pass:
     push esi
