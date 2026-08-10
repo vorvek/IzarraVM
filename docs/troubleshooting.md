@@ -60,7 +60,10 @@ manual](resonique2/manual.md):
 - **External MIDI / MT-32**: select MPU-401 output at port `330`. This is the
   Izarra 3000's rear MPU-401/gameport. In Settings, choose Munt as an emulator
   convenience or select the exact host destination connected to the receiver's
-  MIDI IN side. See the [ReSonique 2 manual](resonique2/manual.md#midi-and-wavetable).
+  MIDI IN side. See the [ReSonique 2 manual](resonique2/manual.md#midi-and-wavetable),
+  and the recipes for [using your own MIDI
+  player](recipes/host-midi-player.md) and [MT-32
+  ROMs](recipes/mt32-roms.md).
 
 ### The game finds the card but plays a short click, then silence
 

@@ -18,6 +18,12 @@ nav:
   - IZBIOS Configuration Panel: izbios/configuration-panel.md
   - ReSonique 2 sound card: resonique2/manual.md
   - IzarraVM GUI guide: izarravm-gui/guide.md
+  - Recipes:
+      - Overview: recipes/index.md
+      - Using your own MIDI player: recipes/host-midi-player.md
+      - The Roland Sound Canvas VSTi: recipes/sound-canvas-vsti.md
+      - Nuked-SC55 for Sound Canvas playback: recipes/nuked-sc55.md
+      - MT-32 ROMs with the P330 receiver: recipes/mt32-roms.md
   - Troubleshooting & FAQ: troubleshooting.md
   - VGA core: vga-core/README.md
   - VEGA (Margo / Distira):
