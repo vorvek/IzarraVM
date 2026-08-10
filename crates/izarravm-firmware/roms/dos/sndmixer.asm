@@ -17,7 +17,7 @@
 ;   SNDMIXER /CFG file           load levels from a file and apply them
 ;   SNDMIXER /M 8 /F 6           set channels from the command line and exit
 ;   SNDMIXER /M 8 /CFG file      set channels, apply, and save them to the file
-;   SNDMIXER /S                  silent: no output at all (for AUTOEXEC)
+;   SNDMIXER /S                  suppress all output (for AUTOEXEC)
 ;   SNDMIXER /?                  usage
 ;
 ; /CFG alone RESTORES (read the file, write the hardware). /CFG together with
@@ -2022,12 +2022,12 @@ key_cd:     db 'CD', 0
 key_midi:   db 'MIDI', 0
 key_spk:    db 'SPEAKER', 0
 
-ds_master: db 'MASTER    everything the card plays', 0
-ds_fm:     db 'FMSYNTH   OPL3 FM synthesis, the music bus', 0
+ds_master: db 'MASTER    all ReSonique 2 output', 0
+ds_fm:     db 'FMSYNTH   OPL3 FM synthesis (music bus)', 0
 ds_wave:   db 'WAVE      digital audio: SB16 DSP and WSS codec', 0
 ds_cd:     db 'CD-ROM    Red Book audio from the CD drive', 0
 ds_midi:   db 'MIDI      wavetable synthesis from the MPU-401', 0
-ds_spk:    db 'SPEAKER   the PC speaker, through the card', 0
+ds_spk:    db 'SPEAKER   PC speaker, via the card PC-SPK input', 0
 
 ; The dB each step costs, as text, for the two ladders on the card.
 db_ct5:
@@ -2137,9 +2137,9 @@ s_default_cfg: db 'C:\VOLCONF.CFG', 0
 
 cfg_head:
     db '; ReSonique 2 volume levels, written by SNDMIXER.COM.', 13, 10
-    db '; One channel per line: 0 mutes, 10 is full. Spaces around the', 13, 10
-    db '; = are fine. SPEAKER has four positions on the card, so it', 13, 10
-    db '; reads back as 0, 3, 7 or 10.', 13, 10, 0
+    db '; One channel per line. 0 mutes, 10 is full volume.', 13, 10
+    db '; Spaces around the = are permitted.', 13, 10
+    db '; SPEAKER has four positions and reads back as 0, 3, 7 or 10.', 13, 10, 0
 
 msg_head:        db 'ReSonique 2 volume levels', 13, 10, 0
 msg_no_card:     db '  No ReSonique 2 card detected.', 13, 10, 0
@@ -2148,9 +2148,9 @@ msg_saved:       db 'Saved in ', 0
 msg_save_failed: db 'Could not write ', 0
 msg_restored:    db 'Volume levels restored from ', 0
 msg_no_file:     db 'No saved volume levels in ', 0
-msg_cancelled:   db 'Cancelled; the levels this run opened on are back.', 13, 10, 0
+msg_cancelled:   db 'Cancelled. Previous levels restored.', 13, 10, 0
 msg_bad_switch:  db 'Unrecognised option: ', 0
-msg_bad_value:   db 'A level must be 0 to 10, on ', 0
+msg_bad_value:   db 'Level must be 0 to 10: ', 0
 msg_dot:         db '.', 13, 10, 0
 msg_crlf:        db 13, 10, 0
 msg_usage:
@@ -2164,12 +2164,13 @@ msg_usage:
     db '  SNDMIXER /C n           CD-ROM      Red Book audio', 13, 10
     db '  SNDMIXER /I n           MIDI        wavetable synthesis', 13, 10
     db '  SNDMIXER /P n           PC speaker  four positions: 0 3 7 10', 13, 10
-    db '  SNDMIXER /S             say nothing at all', 13, 10, 13, 10
-    db 'Each step is 4 dB, so all ten are worth having; step 10 is the', 13, 10
-    db 'level the card powers on at. /CFG on its own restores a saved', 13, 10
-    db 'file; /CFG with any channel switch saves the result into it.', 13, 10
-    db 'In the full-screen mixer F10 saves and Esc puts back what was', 13, 10
-    db 'there. Levels move the hardware as you set them.', 13, 10, 0
+    db '  SNDMIXER /S             suppress all output', 13, 10
+    db '  SNDMIXER /?             usage', 13, 10, 13, 10
+    db 'Each step is 4 dB. Step 10 is the power-on level.', 13, 10
+    db '/CFG alone restores the levels in the file. /CFG with any', 13, 10
+    db 'channel switch writes the new levels to the file.', 13, 10
+    db 'In the full-screen mixer, F10 saves and Esc restores the', 13, 10
+    db 'previous levels. Levels take effect immediately.', 13, 10, 0
 
 ; ---- state ------------------------------------------------------------------
 sb_present:  db 0

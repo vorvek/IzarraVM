@@ -435,15 +435,15 @@ mixer. The full-screen display presents six vertical faders, one per source.
 
 ```
 SNDMIXER                full-screen mixer
-SNDMIXER /L             list the current levels and exit
+SNDMIXER /L             list the current levels
 SNDMIXER /CFG file      restore the levels saved in a file
 SNDMIXER /M n           MASTER      0 (mute) to 10 (full)
 SNDMIXER /F n           FMSYNTH     OPL3 music
 SNDMIXER /W n           WAVE        SB16 DSP and WSS codec
 SNDMIXER /C n           CD-ROM      Red Book audio
 SNDMIXER /I n           MIDI        wavetable synthesis
-SNDMIXER /P n           PC speaker  four positions: 0, 3, 7, 10
-SNDMIXER /S             say nothing at all
+SNDMIXER /P n           PC speaker  four positions: 0 3 7 10
+SNDMIXER /S             suppress all output
 SNDMIXER /?             usage
 ```
 
@@ -488,10 +488,10 @@ boot line reads. `/CFG` is the boot-restore form and does not open the mixer,
 so to keep levels in some other file use the command-line form:
 `SNDMIXER /M 8 /F 6 /CFG C:\GAMES\QUIET.CFG`.
 
-The file is plain text and meant to be edited: `TYPE` it, or open it in
-TOKAEDIT. Lines are `CHANNEL=step`, spaces around the `=` are fine, `;` and `#`
-start a comment, and anything the parser does not recognise is skipped rather
-than refused.
+The file is plain text and may be edited with `TYPE` or TOKAEDIT. Lines are
+`CHANNEL=step`. Spaces around the `=` are permitted, `;` and `#` start a
+comment, and a line the parser does not recognise is skipped rather than
+refused.
 
 The default file is in the root of `C:` rather than in `C:\DOS`, because `C:` is
 not always the Toka-DOS image. When IzarraVM is pointed at a folder of games,

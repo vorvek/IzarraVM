@@ -495,7 +495,7 @@ fn sndmixer_refuses_an_out_of_range_level_without_writing_anything() {
     );
     let screen = machine.screen_text().as_text();
     assert_eq!(
-        screen.matches("A level must be 0 to 10, on MASTER").count(),
+        screen.matches("Level must be 0 to 10: MASTER").count(),
         4,
         "all four out-of-range MASTER values are refused by name\n{screen}"
     );
@@ -535,7 +535,7 @@ fn sndmixer_silent_flag_works_from_any_position_on_the_line() {
     );
     let screen = machine.screen_text().as_text();
     assert!(screen.contains("MIXER-DONE"), "the batch ran\n{screen}");
-    for chatter in ["A level must be", "ReSonique 2 volume levels"] {
+    for chatter in ["Level must be", "ReSonique 2 volume levels"] {
         assert!(
             !screen.contains(chatter),
             "/S after the switch it silences must still silence it, found \
@@ -546,7 +546,7 @@ fn sndmixer_silent_flag_works_from_any_position_on_the_line() {
     let (loud, loud_dir) = boot_with_sndmixer("sndmixer_silent_pos_loud", "SNDMIXER /M 99\r\n");
     let loud_screen = loud.screen_text().as_text();
     assert!(
-        loud_screen.contains("A level must be 0 to 10, on MASTER"),
+        loud_screen.contains("Level must be 0 to 10: MASTER"),
         "without /S the same line does print\n{loud_screen}"
     );
     let _ = fs::remove_dir_all(&dir);
