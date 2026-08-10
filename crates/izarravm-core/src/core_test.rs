@@ -644,13 +644,15 @@ fn the_guis_own_preferences_file_is_recognised_and_named() {
         "and say what to pass instead: {message}"
     );
 
-    // The gain knob was renamed `amp_gain` -> `output_gain`. BOTH spellings have
-    // to be recognised here: the new one because that is what is written now,
-    // and the old one because a file that still carries it is still a prefs file
-    // and deserves this message rather than an unknown-field error.
+    // All three audio-level keys are RETIRED -- the machine's own mixer owns
+    // those levels now -- and every one of them still has to be recognised
+    // here. A file old enough to carry any of them is still unmistakably the
+    // GUI's prefs file, and pointing --config at it deserves this message
+    // rather than an unknown-field error naming one key and explaining nothing.
     for (name, key) in [
-        ("legacy", "amp_gain = 120"),
-        ("current", "output_gain = 25"),
+        ("legacy-amp", "amp_gain = 120"),
+        ("retired-output", "output_gain = 25"),
+        ("retired-speaker", "pc_speaker_volume = 40"),
     ] {
         let path = directory.path().join(format!("{name}.conf"));
         fs::write(&path, format!("{key}\n")).unwrap();

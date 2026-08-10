@@ -44,6 +44,10 @@ unsafe extern "C" {
 const ADDED_CONTROL_ROM: c_int = 1;
 const ADDED_PCM_ROM: c_int = 2;
 const MISSING_ROMS: c_int = -4;
+/// `MT32EMU_RC_FAILED`: `mt32emu_open_synth` got both images and `Synth::open`
+/// still refused them, which for a real ROM set means they are from different
+/// machines.
+const OPEN_FAILED: c_int = -100;
 /// `MT32EMU_RC_NOT_OPENED`: the context has no open synth. `mt32emu_play_msg`
 /// and `mt32emu_play_sysex` return this or `QUEUE_FULL` and nothing else, so the
 /// two have to be told apart HERE -- the caller decides whether a failed send
@@ -173,6 +177,16 @@ impl MuntSynth {
             match code {
                 ADDED_CONTROL_ROM => set.control = Some(first),
                 ADDED_PCM_ROM => set.pcm = Some(first),
+                // `ROMS_NOT_PAIRABLE` lands here and is deliberately NOT used
+                // to conclude "your two halves are from different dumps". It
+                // cannot mean that: `addROMFiles` answers it whenever
+                // `makeROMImage` returns NULL, which is every pair of files
+                // that are not halves of one image -- including two files that
+                // are not ROMs at all. A folder of junk produces it on every
+                // pair, so trusting it told a user with no ROMs whatsoever that
+                // their ROM set was mismatched. The unpairable verdict comes
+                // from `open` instead, where both images have already been
+                // identified by SHA-1 and the synth still refuses them.
                 _ => {}
             }
         }
@@ -235,6 +249,13 @@ impl MuntSynth {
         match unsafe { mt32emu_open_synth(self.context.as_ptr()) } {
             0 => Ok(()),
             MISSING_ROMS => Err(Error::MissingRoms),
+            // `Synth::open` refused a pair this loader had already identified as
+            // one control and one PCM image. On a real ROM set that is the two
+            // coming from different machines -- an MT-32 control ROM with a
+            // CM-32L PCM ROM -- which is exactly the case `MissingRoms` says out
+            // loud ("a matching control and PCM ROM pair is required") and the
+            // generic native-call message did not.
+            OPEN_FAILED => Err(Error::MissingRoms),
             code => Err(Error::NativeCall {
                 operation: "mt32emu_open_synth",
                 code,

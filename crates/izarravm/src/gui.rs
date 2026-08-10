@@ -542,7 +542,7 @@ pub struct GuiApp {
     // emulation thread gets a Send sink cloned from it. Polled each frame so a
     // stream killed by a device change is rebuilt on the same queue rather than
     // leaving the machine playing to nothing for the rest of the session.
-    audio: Option<AudioPlayer>,
+    audio: AudioPlayer,
     // Guest frame counter of the texture currently uploaded, so we rebuild it
     // only when a new frame is presented rather than on every update().
     frame_seq: u64,
@@ -902,13 +902,13 @@ impl GuiApp {
             mut prefs,
             prefs_path,
         } = launch;
-        let audio = match AudioPlayer::new() {
-            Ok(player) => Some(player),
-            Err(err) => {
-                warn!(%err, "audio output unavailable; running silently");
-                None
-            }
-        };
+        // Always built, even with no sound device on the host: the queue is
+        // what the emulation thread writes to, and it has to exist before a
+        // stream does for a device plugged in later to be picked up at all.
+        let audio = AudioPlayer::new();
+        if !audio.is_playing() {
+            warn!("no audio output device; the machine will play to one if it appears");
+        }
         let volume = prefs.master_volume.clamp(0.0, 1.0);
         let gain = SharedGain::new(volume_gain(volume));
         let initial_media = prepare_initial_media(cd_image, &prefs);
@@ -919,7 +919,7 @@ impl GuiApp {
             midi_config,
             glide_ovl,
             test_pattern,
-            sink: audio.as_ref().map(AudioPlayer::sink),
+            sink: Some(audio.sink()),
             rtc_setup,
             gain: gain.clone(),
             #[cfg(test)]

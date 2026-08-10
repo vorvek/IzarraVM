@@ -139,6 +139,13 @@ contains these choices:
 | **Munt (MT-32)** | An emulator convenience using user-selected MT-32 control and PCM ROMs. IzarraVM does not include Roland ROMs. |
 | **Host device name and ordinal** | The exact operating-system MIDI destination. These entries represent the MIDI IN side of an external receiver. If the destination disappears, IzarraVM does not choose another one. |
 
+The host sound device is followed rather than latched. If the default output
+device changes, disappears, or was not there when IzarraVM started, the machine
+keeps playing into its own output queue and the stream is reopened on the
+current default device as soon as one is available, without interrupting the
+guest. This is unlike the P330 external destination above, which is a named
+choice and is not silently replaced.
+
 The two MT-32 ROM boxes each accept either a ROM file or the folder the ROM set
 lives in, and the images are identified by content rather than by filename: a
 set named `MT32_CONTROL.ROM` / `MT32_PCM.ROM`, one named for its version, and

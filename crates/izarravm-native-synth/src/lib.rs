@@ -63,6 +63,20 @@ pub enum Error {
     /// The synthesiser is not open, so nothing can be played through it. Unlike
     /// [`Self::SynthQueueFull`] this is terminal for the adapter holding it.
     SynthNotOpened,
+    /// The synthesiser declined this message. The synth is HEALTHY -- a decline
+    /// is an answer about the MESSAGE, and every entry point that can return one
+    /// is a per-message call.
+    ///
+    /// This is not an unusual event and it is not a sign of anything wrong.
+    /// FluidSynth's note-off returns `FLUID_FAILED` whenever no voice is
+    /// sounding for that channel and key (`fluid_synth_noteoff_monopoly` starts
+    /// at `FLUID_FAILED` and only reaches `FLUID_OK` on a match), so an
+    /// all-notes-off, a note released after its voice decayed, and a driver that
+    /// sends a note-off twice ALL land here. Its SysEx entry point answers the
+    /// same way for a message it does not implement.
+    SynthDeclinedMessage {
+        operation: &'static str,
+    },
     OutputMustBeStereo,
     TooManyFrames,
     MissingRom(PathBuf),
@@ -97,6 +111,9 @@ impl fmt::Display for Error {
                 formatter.write_str("the synthesiser's MIDI input queue is full")
             }
             Self::SynthNotOpened => formatter.write_str("the synthesiser is not open"),
+            Self::SynthDeclinedMessage { operation } => {
+                write!(formatter, "the synthesiser declined a message: {operation}")
+            }
             Self::OutputMustBeStereo => {
                 formatter.write_str("output buffer must contain complete stereo frames")
             }

@@ -508,9 +508,9 @@ impl SbMixer {
     /// 0dB". The reason is that a DOS title which never touches the mixer -- the
     /// common case, since BLASTER tells it nothing about volume -- would
     /// otherwise play 14 dB down, and a title that sets only its own voice level
-    /// stacks a second 14 dB on top of that. The card's analog output stage
-    /// (`output_gain`) is the host's volume control; the mixer should start out of
-    /// the way.
+    /// stacks a second 14 dB on top of that. The mixer should start out of the
+    /// way; a title that wants less turns it down itself, and a user who wants
+    /// less has SNDMIXER.COM and the host's own volume knob.
     ///
     /// The CD level (`0x36`/`0x37`, in the inert store) follows the same rule and
     /// for the same reason: DOSBox-X's `CTMIXER_Reset` sets `cda` to 31 and 86Box

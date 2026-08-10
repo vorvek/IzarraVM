@@ -342,6 +342,11 @@ fn the_mt32_rom_boxes_accept_a_folder_a_file_or_neither() {
 /// initialized." and nothing else -- no file name, no requirement, no hint that
 /// a folder would have worked. A status that cannot say what went wrong is a
 /// status that sends the user back to guessing.
+///
+/// The statuses themselves are proved REACHABLE next door, in
+/// `midi::tests::open_munt_reports_which_rom_requirement_failed`, which drives
+/// the real loader. This is the other half: that each one then reads as its own
+/// sentence rather than sharing a string with another.
 #[test]
 fn every_rom_failure_says_something_different() {
     let rom_statuses = [

@@ -4,6 +4,7 @@
 use super::*;
 use izarravm_native_synth::NATIVE_SYNTH_AVAILABLE;
 use std::fs;
+use std::path::PathBuf;
 
 fn config(backend: MidiBackend) -> MidiConfig {
     MidiConfig {
@@ -261,12 +262,32 @@ fn external_close_covers_every_channel() {
 #[test]
 fn failed_external_send_enters_missing_port_state_without_hardware() {
     let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
-    assert_eq!(midi.record_external_send_result(Ok::<(), &str>(())), Ok(()));
+    assert!(midi.record_external_send_result(Ok(())).is_ok());
     assert_eq!(midi.status(), MidiStatus::Ready);
 
+    // A message the BYTES of which midir refused, before the OS was touched:
+    // its backends raise this for an empty message and for a non-SysEx message
+    // over three bytes long. The guest is free to write either, and neither is
+    // evidence about the port. Costing the receiver for one of them is the same
+    // mistake the synthesiser triage exists to avoid -- and the same symptom:
+    // a P330 that goes quiet mid-game and stays quiet.
+    assert!(
+        midi.record_external_send_result(Err(midir::SendError::InvalidData("too long")))
+            .is_err()
+    );
     assert_eq!(
-        midi.record_external_send_result(Err("disconnected")),
-        Err("disconnected")
+        midi.status(),
+        MidiStatus::Ready,
+        "a message midir would not carry does not cost the port"
+    );
+    assert_eq!(midi.rejected_messages(), 1, "it is counted, like the rest");
+
+    // The platform call failing on a MIDI OUT handle means the destination is
+    // gone. That IS worth the adapter, and it latches on purpose: the port has
+    // to be re-selected or re-accepted to come back.
+    assert!(
+        midi.record_external_send_result(Err(midir::SendError::Other("disconnected")))
+            .is_err()
     );
     assert!(matches!(midi.adapter, MidiAdapter::Silent));
     assert_eq!(midi.status(), MidiStatus::MissingPort);
@@ -416,6 +437,63 @@ fn a_message_the_synth_refuses_does_not_silence_the_engine() {
     );
 }
 
+/// A note-off with nothing sounding under it must not kill the synthesiser.
+///
+/// This is the ORDINARY case, not an exotic one, and it is the likeliest thing
+/// to have taken the P300 down on an alt-tab: `fluid_synth_noteoff` returns
+/// `FLUID_FAILED` whenever no voice is sounding for that channel and key
+/// (`fluid_synth_noteoff_monopoly` starts at `FLUID_FAILED` and only reaches
+/// `FLUID_OK` on a match). A game switching focus sends all-notes-off across
+/// sixteen channels; fifteen of them are quiet. A note released after its own
+/// voice has decayed does it too, and so does any driver that sends a note-off
+/// twice.
+///
+/// FluidSynth's per-message returns used to become `Error::NativeCall`, which
+/// the engine treats as a dead synth and latches on. So the synthesiser died of
+/// a note nobody was playing.
+#[test]
+fn an_unmatched_note_off_does_not_silence_the_engine() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    let mut midi = MidiEngine::open_wavetable(&config(MidiBackend::Off));
+
+    // A note-off on a channel that has never played a note: nothing to match.
+    midi.send(&message(0, &[0x80, 60, 0x40]));
+    // A note played and released properly, then released AGAIN -- the duplicate
+    // has no voice left to find.
+    midi.send(&message(1, &[0x90, 67, 110]));
+    midi.send(&message(2, &[0x80, 67, 0x40]));
+    midi.send(&message(3, &[0x80, 67, 0x40]));
+    // All-notes-off across every channel, the way a game does on focus change.
+    for (index, channel) in (0..16_u8).enumerate() {
+        midi.send(&message(4 + index as u64, &[0xB0 | channel, 123, 0]));
+    }
+
+    let mut output = vec![(0, 0); 4_096];
+    midi.render(&mut output, tick_for_frame(4_096));
+
+    assert_eq!(
+        midi.status(),
+        MidiStatus::Ready,
+        "an unmatched note-off is ordinary MIDI traffic, not a broken synth"
+    );
+    assert!(
+        matches!(midi.adapter, MidiAdapter::Fluid(_)),
+        "the adapter must not have been dropped to Silent"
+    );
+
+    // And the engine still plays afterwards: a latched adapter would render
+    // silence from here on, which is precisely the reported symptom.
+    midi.send(&message(4_200, &[0x90, 72, 110]));
+    let mut after = vec![(0, 0); 4_096];
+    midi.render(&mut after, tick_for_frame(8_192));
+    assert!(
+        after.iter().any(|frame| *frame != (0, 0)),
+        "the synthesiser still sounds after the note-offs"
+    );
+}
+
 /// An engine that failed must be re-openable, and Accept is what re-opens it.
 ///
 /// `fail_native` is a latch by design -- a broken synth cannot be played
@@ -488,4 +566,71 @@ fn a_full_synth_queue_costs_the_message_and_a_closed_synth_costs_the_engine() {
         }),
         NativeSend::Failed
     ));
+}
+
+/// The Munt path must report WHICH ROM requirement failed, through the real loader.
+///
+/// Not a table of strings: each of these statuses is produced here by handing
+/// `open_munt` an actual configuration and letting the library answer. A status
+/// nothing can reach is a status that will quietly stop being produced, and the
+/// owner's report was precisely that every one of these arrived as the same
+/// generic sentence.
+///
+/// Two of the five need a real Roland ROM set to reach -- a PCM image cannot be
+/// "the missing one" until a control image has loaded, and a mismatched pair
+/// needs two genuine images from different machines. Those are asserted at the
+/// mapping instead, and the loader sites that raise them are named in the
+/// comments below so the pair can be found again.
+#[test]
+fn open_munt_reports_which_rom_requirement_failed() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let munt = |control: Option<PathBuf>, pcm: Option<PathBuf>| {
+        let mut settings = config(MidiBackend::Munt);
+        settings.mt32_control_rom = control;
+        settings.mt32_pcm_rom = pcm;
+        open_munt(&settings).1
+    };
+
+    // Nothing selected at all.
+    assert_eq!(munt(None, None), MidiStatus::MissingRoms);
+
+    // A path that is not there. Distinct from "nothing selected": the user has
+    // chosen something and it has moved or been deleted.
+    let absent = temp.path().join("gone.rom");
+    assert_eq!(
+        munt(Some(absent.clone()), Some(absent)),
+        MidiStatus::RomPathMissing
+    );
+
+    // A folder that exists and holds no ROM this library knows. The control
+    // image is the one looked for first, so it is the one reported missing.
+    let junk = temp.path().join("set");
+    std::fs::create_dir_all(&junk).unwrap();
+    for name in ["MT32_CONTROL.ROM", "MT32_PCM.ROM"] {
+        fs::write(junk.join(name), b"not a Roland ROM").unwrap();
+    }
+    assert_eq!(
+        munt(Some(junk.clone()), Some(junk)),
+        MidiStatus::RomControlMissing
+    );
+
+    // The two that need real ROMs. `RomNotFound { kind: Pcm }` comes from
+    // `RomSet::require(Pcm, ..)` once a control image has loaded, and
+    // `MissingRoms` from `MuntSynth::open` when `mt32emu_open_synth` answers
+    // MISSING_ROMS or FAILED -- the latter being a control and a PCM image from
+    // different machines.
+    assert_eq!(
+        munt_rom_status(&SynthError::RomNotFound {
+            kind: RomKind::Pcm,
+            searched: vec![PathBuf::from("control.rom")],
+        }),
+        MidiStatus::RomPcmMissing
+    );
+    assert_eq!(
+        munt_rom_status(&SynthError::MissingRoms),
+        MidiStatus::RomsNotPairable
+    );
 }

@@ -757,10 +757,8 @@ impl GuiApp {
     /// winit event loop now, not here, so the guest reads raw physical keys.
     pub(super) fn ui(&mut self, ctx: &egui::Context) {
         self.poll_session();
-        // Cheap unless the stream has actually failed: one relaxed atomic load.
-        if let Some(audio) = &mut self.audio {
-            audio.poll_recover();
-        }
+        // Cheap unless there is no working stream: one atomic load.
+        self.audio.poll_recover();
         // The window title (capture-lock hint) is set directly on the winit window
         // from the event loop now; viewport commands are not applied without eframe.
         // Host render rate: count this frame, roll the rate up once a second.

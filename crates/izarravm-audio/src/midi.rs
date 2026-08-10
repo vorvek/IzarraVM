@@ -309,10 +309,33 @@ impl MidiEngine {
         self.status = MidiStatus::InitializationFailed;
     }
 
-    fn record_external_send_result<E>(&mut self, result: Result<(), E>) -> Result<(), E> {
-        if result.is_err() {
-            self.adapter = MidiAdapter::Silent;
-            self.status = MidiStatus::MissingPort;
+    /// Judge one external-port send failure: the MESSAGE or the PORT.
+    ///
+    /// `midir::SendError` has exactly two variants and they mean different
+    /// things. `InvalidData` is about the bytes -- midir's own backends raise it
+    /// for an empty message and for a non-SysEx message longer than three bytes,
+    /// before the OS is touched at all -- so the port is untouched and healthy.
+    /// `Other` is the platform call failing, which for a MIDI OUT handle means
+    /// the destination is gone; that one is worth the adapter, and latching to
+    /// `MissingPort` is right because the port has to be re-selected (or
+    /// re-accepted) to come back.
+    ///
+    /// This is the same shape as the synthesiser triage next door, and for the
+    /// same reason: a guest is free to write bytes no destination will take, and
+    /// one of them must not cost the receiver for the rest of the session.
+    fn record_external_send_result(
+        &mut self,
+        result: Result<(), midir::SendError>,
+    ) -> Result<(), midir::SendError> {
+        match &result {
+            Ok(()) => {}
+            Err(midir::SendError::InvalidData(_)) => {
+                self.rejected = self.rejected.saturating_add(1);
+            }
+            Err(midir::SendError::Other(_)) => {
+                self.adapter = MidiAdapter::Silent;
+                self.status = MidiStatus::MissingPort;
+            }
         }
         result
     }
@@ -452,9 +475,19 @@ fn send_native(adapter: &mut MidiAdapter, bytes: &[u8]) -> NativeSend {
 /// second is terminal. Treating both as terminal (which the bare `NativeCall`
 /// mapping did) turns one busy audio window into a P330 that is dead for the
 /// session, exactly the way one stray `0xF7` used to.
+///
+/// FluidSynth's declines are the same class and by far the commonest of the
+/// three: its note-off answers `FLUID_FAILED` whenever no voice is sounding for
+/// that channel and key, so an all-notes-off, a note released after its voice
+/// decayed, and a driver that sends a note-off twice all arrive here. That is
+/// ordinary MIDI traffic, not a broken synthesiser, and it is the likeliest
+/// thing to have killed a P300 on an alt-tab: switching focus is exactly when a
+/// game sends all-notes-off across sixteen channels, fifteen of which are quiet.
 fn triage_send_error(error: &SynthError) -> NativeSend {
     match error {
-        SynthError::InvalidMidiMessage | SynthError::SynthQueueFull => NativeSend::Rejected,
+        SynthError::InvalidMidiMessage
+        | SynthError::SynthQueueFull
+        | SynthError::SynthDeclinedMessage { .. } => NativeSend::Rejected,
         error => {
             warn!(%error, "native MIDI synthesis failed on a guest message");
             NativeSend::Failed
