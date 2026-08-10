@@ -41,8 +41,8 @@ Six fields in order: Hour, Minute, Second, Day, Month, Year. Left/Right
 moves between fields; Up/Down (or Enter) bumps the highlighted field up or
 down by one, wrapping at each field's limits. The clock is edited as a
 binary 24-hour value, matching the machine's real-time clock format.
-Editing any field marks the time as changed, so Save and Exit knows to write
-it to the RTC; if you never touch this screen, the clock is left alone.
+Editing any field marks the time as changed, so Save and Exit writes it to
+the RTC. If this screen is not used, the clock is left unchanged.
 
 ## KEYBOARD
 
@@ -58,7 +58,7 @@ Cycles the boot-time CPU speed directly on the main menu, in the order
 `386` → `486` → `586` → `386-slow`, wrapping back to `386`. This sets the speed
 class the machine will boot at next time, saved to CMOS on Save. It's the
 same four classes and the same underlying value as the [Tab boot
-menu](../izarra-3000/user-manual.md#the-tab-boot-menu), just reachable from
+menu](../izarra-3000/user-manual.md#the-tab-boot-menu), reachable from
 inside setup instead. It does not change the machine's speed live; for
 that, either use the Tab boot menu at the next boot, or run `GSWMODE` from
 inside Toka-DOS (see the [command reference](../toka-dos/commands.md#gswmode)).
@@ -76,8 +76,8 @@ LOTURA      PIT TIMER    SB DSP     MARGO VGA
 ```
 
 PASS is shown in sage green, FAIL in red. This is a diagnostic screen only.
-There is nothing here to configure, just a live re-check without a full
-reboot.
+There is nothing to configure on it; it performs a live re-check without a
+full reboot.
 
 ## REPAIR TOKA-DOS
 

@@ -9,7 +9,7 @@ Toka-DOS commands come in two kinds. The **built-in commands** (`DIR`, `COPY`,
 and so on), each a real file, most carried over from FreeDOS with a Toka-DOS
 rebrand and a few written by General Simulation Works. This page lists the
 built-ins first, then documents each external command with the switches it
-actually implements. Where Toka-DOS diverges from a command's usual behavior,
+implements. Where Toka-DOS diverges from a command's usual behavior,
 it says so.
 
 ## Built-in commands
@@ -294,7 +294,7 @@ SORT [/R] [/+num] [/A] [/?] [file]
 
 ## GSWMODE
 
-General Simulation Works's own tool: switches the GSW-586's CPU speed class
+General Simulation Works's own tool. It switches the GSW-586's CPU speed class
 from inside DOS, without rebooting.
 
 ```
@@ -309,22 +309,20 @@ confirms:
 GSWMODE: switched to <mode>, saved.
 ```
 
-The speed then **survives a reboot**, exactly as though you had set it in the
+The speed then survives a reboot, as though it had been set in the
 [Del setup panel](../izbios/configuration-panel.md). Add `/T` to change the
-speed for this session only and leave the saved one alone:
+speed for this session only and leave the saved one unchanged:
 
 ```
 GSWMODE 386-slow /T
 GSWMODE: switched to 386-slow for this session only.
 ```
 
-That is the right switch for running one program slower without committing to
-it. Everything else about the machine's setup is remembered, so the speed is
-too unless you say otherwise.
+Use `/T` to run one program at a different speed without changing the saved
+setting. Without it, the speed is saved, as the machine's other settings are.
 
 With no argument or an unrecognized one, GSWMODE prints usage and both speeds,
-and changes nothing. The two differ after a `/T`, which is the only time the
-distinction matters and exactly when you would want to see it:
+and changes nothing. The two values differ only after a `/T`:
 
 ```
 Usage: GSWMODE 386-slow|386|486|586 [/T]
@@ -346,8 +344,8 @@ machine will start at next time.
 
 ## UNHALT
 
-General Simulation Works's own tool: makes the BIOS keyboard wait spin instead
-of halting the CPU.
+General Simulation Works's own tool. It makes the BIOS keyboard wait spin
+instead of halting the CPU.
 
 ```
 UNHALT      spin while waiting for a key
@@ -361,12 +359,12 @@ the keyboard buffer. Pressing a key raises IRQ1 and wakes it immediately, so
 nothing responds any slower, but the emulator stops interpreting a busy loop
 that does nothing.
 
-BIOSes of the era did this both ways, so neither behaviour is unfaithful. A
-program can only tell the difference in two situations:
+BIOSes of the era implemented both behaviours, so neither is unfaithful. A
+program can detect the difference in two situations:
 
-- It masks the timer and keyboard interrupts and *then* waits for a key. A spin
-  loops forever; a halt has nothing left to wake it. Both are hung, since no key
-  can ever arrive, but they hang differently.
+- It masks the timer and keyboard interrupts and then waits for a key. No key
+  can arrive, so the program hangs either way, but a spin loops on the keyboard
+  buffer while a halt has no interrupt left to wake it.
 - It expects time to pass smoothly across the wait rather than in steps of about
   1/18 second.
 
@@ -382,15 +380,14 @@ MYGAME
 every reset starts out halting; put `UNHALT` in `AUTOEXEC.BAT` if a program
 needs it every time.
 
-This covers the **BIOS** keyboard wait only. Toka-DOS separately halts while DOS
+This covers the BIOS keyboard wait only. Toka-DOS separately halts while DOS
 itself is waiting for input; to turn that off, put `IDLEHALT=0` in `CONFIG.SYS`
 and reboot.
 
 ## SNDCTRL
 
-The [ReSonique 2](../resonique2/manual.md) sound card's own setup utility:
-moves the card's IRQ and DMA assignment from inside DOS, the way you would have
-run a real sound card's configuration program.
+The [ReSonique 2](../resonique2/manual.md) sound card's own setup utility. It
+changes the card's IRQ and DMA assignment from inside DOS.
 
 ```
 SNDCTRL                 full-screen configuration
@@ -411,30 +408,30 @@ between values, Enter opens the list of values that resource supports, F10
 applies, Esc cancels. A `*` marks a value that does not apply to that device.
 Any switch on the command line is applied without drawing anything.
 
-`/B` prints a two-row boot summary — a heading, then a BLASTER-style values
-line for both devices — and exits without touching the mixer, CMOS, the
+`/B` prints a two-row boot summary, a heading followed by a BLASTER-style values
+line for both devices, and exits without writing the mixer, CMOS, the
 environment, or `AUTOEXEC.BAT`. `/T` adds the tree-styled connector used by
-the Toka-DOS boot screen in front of that summary; it only means something
-paired with `/B`, so `SNDCTRL /T` alone just opens the configurator.
+the Toka-DOS boot screen in front of that summary. It has an effect only when
+paired with `/B`; `SNDCTRL /T` on its own opens the configuration screen.
 
-Whichever way you set them, applying moves both devices **live** — neither
-needs a reboot — then saves the assignment in CMOS, updates `BLASTER` in the
-current environment, and rewrites the `SET BLASTER` line in `C:\AUTOEXEC.BAT`.
+Applying a change moves both devices live, without a reboot, then saves the
+assignment in CMOS, updates `BLASTER` in the current environment, and rewrites
+the `SET BLASTER` line in `C:\AUTOEXEC.BAT`. This is the same in the
+full-screen display and on the command line.
 
 The Sound Blaster and the Windows Sound System codec cannot share an IRQ line
-or a DMA channel. The full-screen lists simply omit whatever the other device
-holds; the command line refuses the combination and writes nothing.
+or a DMA channel. The full-screen lists omit whatever the other device holds.
+The command line refuses such a combination and writes nothing.
 
-Most people need this for one reason: a game that hardwires an IRQ instead of
+The usual reason to run this utility is a game that hardwires an IRQ instead of
 reading `BLASTER`. The card ships on IRQ 7 because that is what such games
-almost always assume, but a few want IRQ 5. See
+almost always assume, but a few require IRQ 5. See
 [Why the Sound Blaster sits on IRQ 7](../resonique2/manual.md#why-the-sound-blaster-sits-on-irq-7).
 
 ## SNDMIXER
 
-The [ReSonique 2](../resonique2/manual.md) card's volume mixer: six vertical
-faders, one per source. `SNDCTRL` decides where the card lives; this decides how
-loud it is.
+Sets the volume levels on the [ReSonique 2](../resonique2/manual.md) card's
+mixer. The full-screen display presents six vertical faders, one per source.
 
 ```
 SNDMIXER                full-screen mixer
@@ -450,31 +447,29 @@ SNDMIXER /S             say nothing at all
 SNDMIXER /?             usage
 ```
 
-Left and Right pick a fader, Up and Down move it, Home and End go to full and
-to mute, the digit keys jump straight to a level. A level takes effect **as you
-set it**, so you can hear what you are doing; F10 saves and leaves, Esc puts
-back the levels the mixer opened on.
+Left and Right select a fader, Up and Down move it, Home and End set it to full
+and to mute, and the digit keys set a level directly. Each level is applied to
+the hardware as it is set. **F10** saves and exits. **Esc** restores the levels
+that were in effect when the mixer was opened.
 
-Each step is 4 dB. That is deliberate: the card's own volume registers are
-2 dB per step over a 62 dB range, so spreading ten fader positions evenly over
-the *numbers* would put seven of them inside the top 12 dB, where they all sound
-the same. Ten even 4 dB steps gives ten positions you can tell apart, with 10
-being the level the card powers on at and 0 a real mute.
+Each step is 4 dB. The card's own volume registers are 2 dB per step over a
+62 dB range, so ten fader positions spread evenly over the register values would
+place seven of them within the top 12 dB. Ten even 4 dB steps instead give ten
+distinguishable positions, with 10 the level the card powers on at and 0 a mute.
 
 The PC-speaker fader has four positions rather than ten, because the card gives
-that input two bits and not five. A value between them rounds up to the next
-one, so asking for a little never gets you silence.
+that input two bits and not five. A value between two positions rounds up to the
+next one, so a low setting does not become silence.
 
-The MIDI fader's 0 writes a mute bit rather than a level of zero. The card
-refuses to read a *level* of zero on the wavetable as silence — it takes it as
-the quietest audible step instead — because nothing else in the machine can
-reach that leg, so a program that cleared the mixer's registers would silence
-your MIDI for the rest of the session with nothing on screen to say why. The
-fader still mutes; it just says so explicitly.
+A MIDI level of 0 writes the wavetable mute bit rather than a level of zero. The
+card treats a level of zero on the wavetable as the quietest audible step, not
+as silence, because no other control in the machine reaches that leg. A program
+that cleared the mixer's registers would otherwise silence MIDI for the rest of
+the session with no indication on screen of the cause.
 
-`WAVE` moves both digital-audio paths at once — the Sound Blaster DSP and the
-Windows Sound System codec — since no program uses both and to a listener they
-are the same thing.
+`WAVE` sets both digital-audio paths together, the Sound Blaster DSP and the
+Windows Sound System codec. No program uses both at once, and they carry the
+same class of audio.
 
 Levels are saved to a file with `/CFG`, and the default `AUTOEXEC.BAT` restores
 them on the next boot:
@@ -484,9 +479,9 @@ SNDMIXER /CFG C:\VOLCONF.CFG /S
 ```
 
 `/CFG` on its own reads the file and writes the card. `/CFG` together with any
-channel switch does the opposite: it applies the switches and then writes them
-into the file. `/S` prints nothing at all, which is what keeps the boot screen
-clean, and it works wherever you put it on the line.
+channel switch applies the switches and then writes them into the file. `/S`
+suppresses all output, which keeps the boot screen clear, and it may appear
+anywhere on the command line.
 
 F10 in the full-screen mixer always saves to `C:\VOLCONF.CFG`, the file the
 boot line reads. `/CFG` is the boot-restore form and does not open the mixer,
@@ -498,10 +493,10 @@ TOKAEDIT. Lines are `CHANNEL=step`, spaces around the `=` are fine, `;` and `#`
 start a comment, and anything the parser does not recognise is skipped rather
 than refused.
 
-The default sits in the root of `C:` rather than in `C:\DOS`, because `C:` is
-not always the Toka-DOS image: point IzarraVM at a folder of games and that
-folder becomes `C:`, with no `DOS` directory in it. A save into a directory
-that is not there fails; the root of a mounted drive is always there.
+The default file is in the root of `C:` rather than in `C:\DOS`, because `C:` is
+not always the Toka-DOS image. When IzarraVM is pointed at a folder of games,
+that folder becomes `C:` and contains no `DOS` directory. A save into a
+directory that does not exist fails. The root of a mounted drive always exists.
 
 ## TOKAMOUS
 

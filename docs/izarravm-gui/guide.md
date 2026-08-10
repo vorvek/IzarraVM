@@ -3,9 +3,9 @@
 
 # IzarraVM GUI Guide
 
-IzarraVM's desktop application wraps the emulated Izarra 3000 in a control
+IzarraVM's desktop application presents the emulated Izarra 3000 in a control
 panel: a display, a beige panel of controls below it, and a config modal for
-the things you don't need to reach every session. This page covers the host
+the settings not needed every session. This page covers the host
 application, not the emulated machine. See the [Izarra 3000 user
 manual](../izarra-3000/user-manual.md) for what happens inside the guest.
 
@@ -41,9 +41,10 @@ launch.
 
 The C: drive path itself is set at startup, not from inside the GUI: via
 `--c-drive`, `--dosroot`, or the `dos.c_drive` key in a `--config` TOML file
-such as `examples/machine.toml`. The GUI's "Open C: folder" control just
-opens your host file manager on whatever path is already configured (handy
-for dropping files onto the guest's hard disk, not a way to switch drives).
+such as `examples/machine.toml`. The GUI's "Open C: folder" control opens
+the host file manager on the path already configured. It is intended for
+copying files onto the guest's hard disk, and does not change which folder C:
+uses.
 
 ## The two config files
 
@@ -61,13 +62,14 @@ Passing the GUI's own `izarravm.conf` to `--config` is refused with a message
 saying so, rather than a parse error about a key you did not know was
 significant.
 
-Note that a *third* thing holds machine settings, and it beats both files:
-`cmos.bin`, the machine's NVRAM, which is what it actually boots from. The CPU
-speed and the sound card's resources live there and are set from inside the
-guest; see [GSWMODE](../toka-dos/commands.md#gswmode) and
+A third location also holds machine settings, and it takes precedence over both
+files: `cmos.bin`, the machine's NVRAM, which is what the machine boots from.
+The CPU speed and the sound card's resources are stored there and are set from
+inside the guest; see [GSWMODE](../toka-dos/commands.md#gswmode) and
 [SNDCTRL](../toka-dos/commands.md#sndctrl). A `--cpu` or `--sb-irq` flag sets
-the power-on value for a machine that has never been configured; after that the
-saved value wins, and the emulator logs a warning naming the flags it ignored.
+the power-on value for a machine that has never been configured. After that the
+saved value takes precedence, and the emulator logs a warning naming the flags
+it ignored.
 
 ## izarravm.conf
 
@@ -132,8 +134,8 @@ status line, so a missing host destination or missing ROMs cannot hide a failed
 custom SoundFont. Neither failure hides the corresponding guest MPU.
 
 Startup settings are resolved one field at a time. An explicit command-line
-option wins, followed by an explicitly present `--config` TOML key, the saved
-GUI preference, and finally the built-in default.
+option takes precedence, followed by an explicitly present `--config` TOML key,
+the saved GUI preference, and finally the built-in default.
 
 Accept applies your changes and closes the modal; Cancel discards them.
 

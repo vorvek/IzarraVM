@@ -23,9 +23,9 @@
 ; /CFG alone RESTORES (read the file, write the hardware). /CFG together with
 ; any channel switch SAVES (write the hardware, then write the file). That one
 ; rule is what lets the boot line and the "remember this" line be the same
-; switch. The full-screen F10 saves to the /CFG path, or to C:\VOLCONF.CFG when
-; none was given, so an interactive change survives the next boot without the
-; user having to name a file. The default sits in the ROOT, not in C:\DOS: a
+; switch. The full-screen F10 always saves to C:\VOLCONF.CFG, the file the boot
+; line reads, so an interactive change survives the next boot without the user
+; having to name a file. The default sits in the ROOT, not in C:\DOS: a
 ; host-folder-mounted C: is the GUI's default and need not contain a DOS
 ; directory at all, and a save into a directory that is not there fails. The
 ; root of a mounted drive always exists.

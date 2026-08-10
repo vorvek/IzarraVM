@@ -38,9 +38,9 @@ The computer line began with the 286-based Izarra 1000 in 1990, followed by the
 further beyond office work, especially as better graphics, sound, and CD-ROMs
 made multimedia and home use more practical.
 
-The Izarra 3000 was the big swing: a custom 586-class workstation with its own
-BIOS, Toka-DOS 3.0, VEGA graphics, and ReSonique 2 sound. Unfortunately, it was
-ready for a market that had already moved on. Buyers expected Windows 95, which
+The Izarra 3000 was the most ambitious of the line: a custom 586-class
+workstation with its own BIOS, Toka-DOS 3.0, VEGA graphics, and ReSonique 2
+sound. It was ready for a market that had already moved on. Buyers expected Windows 95, which
 the machine could not run, and MS-DOS compatibility was no longer enough to
 justify the cost of Izarra's custom approach. The 3000 never reached stores.
 What survived were photos, manuals, BIOS dumps, unfinished developer notes, and
@@ -72,10 +72,10 @@ fairly broad, and the work continues.
 
 If a game you want to play does not run, or runs poorly where it should not,
 please [open an issue](https://github.com/vorvek/IzarraVM/issues). The Izarra
-3000 is a 166 MHz Pentium-class machine, so anything that wanted more than that
-in period still wants more than that here. Demanding 3D at high resolutions and
-frame rates, or late titles that recommended a Pentium II or higher, are outside
-what this hardware could ever have done rather than defects in emulation.
+3000 is a 166 MHz Pentium-class machine, so software that required more than
+that in period still requires more than that here. Demanding 3D at high
+resolutions and frame rates, and late titles that recommended a Pentium II or
+higher, are outside the hardware's capability rather than defects in emulation.
 
 ## Quick Start
 
