@@ -233,9 +233,14 @@ impl GuiApp {
                 // The travel runs past unity to MAX_VOLUME, the way a powered
                 // speaker's knob does: a title that maxes its own mixer can still
                 // arrive 14 dB down (see `volume_gain`). The value box reads in
-                // percent so the neutral point is named, and the 1% step makes
-                // 100% land exactly -- the CD slider next to it is an integer
-                // percent slider, so this is the same granularity.
+                // percent so the neutral point is named, and the 0.01 step means
+                // every position the knob can hold is a whole percent -- keyboard
+                // arrows and typed values land on one, and 100% is reachable
+                // exactly rather than approached.
+                //
+                // The box is editable, so it needs a parser in the units it
+                // prints as much as it needs the formatter; `volume_percent_to_
+                // fraction` says what egui's default gets wrong.
                 ui.horizontal(|ui| {
                     volume_icon(ui);
                     ui.add_space(4.0);
@@ -244,7 +249,8 @@ impl GuiApp {
                         .add(
                             egui::Slider::new(&mut self.volume, 0.0..=MAX_VOLUME)
                                 .step_by(0.01)
-                                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+                                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                                .custom_parser(volume_percent_to_fraction),
                         )
                         .on_hover_text(
                             "Speaker volume. This is the host's playback level; 100% is unity and \

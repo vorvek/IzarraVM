@@ -1417,8 +1417,11 @@ fn the_audio_wav_capture_writes_distinct_left_and_right_channels() {
 /// loud enough that any factor other than 1.0 would move the peak.
 #[test]
 fn the_audio_wav_capture_records_the_machine_unscaled_by_the_host_volume_knob() {
+    // The profile the capture is told about and the profile the machine is
+    // actually built with have to be the same CPU, or the capture paces its
+    // window off a clock the guest is not running at.
     let hardware = HardwareProfile {
-        cpu: GswMode::Gsw486,
+        cpu: GswMode::Gsw386,
         memory_mib: 16,
         video: VideoCard::Vega,
         sound_blaster: izarravm_core::SoundBlasterConfig::default(),

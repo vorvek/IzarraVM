@@ -139,6 +139,46 @@ fn volume_gain_amplifies_above_unity_up_to_the_ceiling() {
     assert_eq!(volume_gain(50.0), MAX_VOLUME);
 }
 
+/// The slider's value box is editable, and it has to read back in the units it
+/// prints.
+///
+/// egui's stock parser is a plain float parse. Against a box that displays
+/// "80%" it fails twice: it rejects the string the box seeded itself with, so
+/// Enter on unedited text does nothing, and it takes a typed `100` at face
+/// value. That second one used to be harmless -- 100 clamped to the old ceiling
+/// of 1.0, which is what the user meant anyway -- and stopped being harmless the
+/// moment the ceiling moved to 5.0, because now typing the neutral setting jumps
+/// the knob to five times it. Pin the divide, the suffix, and the rejection.
+#[test]
+fn the_volume_box_parses_the_percent_it_prints() {
+    // The case the wider range broke: 100 means unity, not the number 100.
+    assert_eq!(volume_percent_to_fraction("100"), Some(1.0));
+    assert_ne!(
+        volume_percent_to_fraction("100"),
+        Some(100.0),
+        "a face-value parse would clamp this to the top of the travel"
+    );
+    // The string the box seeds itself with must survive a round trip.
+    assert_eq!(volume_percent_to_fraction("80%"), Some(0.8));
+    // The whole travel, including above unity.
+    assert_eq!(volume_percent_to_fraction("0"), Some(0.0));
+    assert_eq!(volume_percent_to_fraction("500"), Some(5.0));
+    assert_eq!(
+        volume_percent_to_fraction("500%"),
+        Some(f64::from(MAX_VOLUME))
+    );
+    // Whitespace either side of the number or the suffix.
+    assert_eq!(volume_percent_to_fraction("  250 % "), Some(2.5));
+    // Not a number: rejected, so egui keeps the value the box already held.
+    for garbage in ["", "%", "loud", "1.2.3", "--5"] {
+        assert_eq!(
+            volume_percent_to_fraction(garbage),
+            None,
+            "{garbage:?} must leave the knob where it was"
+        );
+    }
+}
+
 #[test]
 fn cd_volume_mapping_links_live_stereo_levels() {
     assert_eq!(cd_level_percent(0, 0), 0);

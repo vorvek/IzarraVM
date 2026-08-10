@@ -53,6 +53,28 @@ fn volume_gain(volume: f32) -> f32 {
     if volume < 1.0 { volume.powi(3) } else { volume }
 }
 
+/// Read a volume back out of the slider's value box, in the units it prints.
+///
+/// The box is editable and it displays "80%" over a stored 0.8. egui's stock
+/// parser is a plain float parse, which gets both halves of that wrong. It
+/// rejects the "%" the box seeds itself with, so pressing Enter on text the user
+/// never edited silently does nothing. And it reads a typed `100` as the number
+/// one hundred: on a knob that used to stop at 1.0 that clamped harmlessly to
+/// unity, but the travel now goes to five, so typing the neutral setting would
+/// land at five times it.
+///
+/// Parsing in the printed units fixes both: strip one optional trailing "%",
+/// read the number, divide. Anything that is not a number is rejected, which is
+/// what tells egui to leave the value alone.
+fn volume_percent_to_fraction(text: &str) -> Option<f64> {
+    text.trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|percent| percent / 100.0)
+}
+
 /// Ceiling on how often accumulated mouse motion is flushed into the guest,
 /// independent of (and generally faster than) the video refresh rate that
 /// paces rendering. A real PS/2 mouse samples at well under this; it just
