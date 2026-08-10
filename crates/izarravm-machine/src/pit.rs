@@ -702,11 +702,39 @@ impl Counter {
         }
     }
 
+    /// The status byte's NULL COUNT bit at the same in-batch instant `out_after`
+    /// peeks OUT at. Bit 6 is the guest's "has the count I just wrote reached the
+    /// counting element yet" answer, and it is the one bit of the status byte
+    /// besides OUT that a CLK can move -- so reading the live field made a
+    /// mid-batch status read report the BATCH-START value, which is the same
+    /// staleness `count_after` and `out_after` closed for the other two ports.
+    ///
+    /// Exact, not conservative, and it needs no BCD escape: this is a
+    /// state-machine fact, not an arithmetic one.
+    /// - `LoadDelay` with at least one CLK to spend: `step` loads the counting
+    ///   element from the reload register and clears `null_count` on that first
+    ///   CLK, and it does so UNCONDITIONALLY -- only `step_counting` is
+    ///   GATE-gated -- so a low GATE does not hold the bit set. This is the same
+    ///   load-on-the-first-CLK rule `count_after`'s `LoadDelay` arm mirrors.
+    /// - `WaitGate` (modes 1 and 5, armed and waiting for a GATE rising edge):
+    ///   `step` returns without loading, so the bit HOLDS however many CLKs
+    ///   pass. Only a GATE edge clears it, and GATE is assumed to hold its level
+    ///   across the batch for the same boundary reason `out_after` states.
+    /// - `Inactive` and `Counting`: no CLK touches `null_count` in either.
+    fn null_count_after(&self, clocks: u64) -> bool {
+        match self.state {
+            CounterState::LoadDelay if clocks >= 1 => false,
+            _ => self.null_count,
+        }
+    }
+
     /// Same instant for the status byte's OUT bit, through the existing `out_after`
-    /// peek. The other fields are register state that no CLK can move.
+    /// peek, and for its NULL COUNT bit through `null_count_after`. The other
+    /// fields (RW mode, mode, BCD) are register state that no CLK can move.
     fn latch_status(&mut self, clocks: u64) {
         if self.status_latch.is_none() {
             let out = self.out_after(clocks).unwrap_or(self.out);
+            let null_count = self.null_count_after(clocks);
             let rw_bits = match self.rw {
                 RwMode::Lsb => 1,
                 RwMode::Msb => 2,
@@ -714,7 +742,7 @@ impl Counter {
             };
             self.status_latch = Some(
                 (u8::from(out) << 7)
-                    | (u8::from(self.null_count) << 6)
+                    | (u8::from(null_count) << 6)
                     | (rw_bits << 4)
                     | (self.mode << 1)
                     | u8::from(self.bcd),

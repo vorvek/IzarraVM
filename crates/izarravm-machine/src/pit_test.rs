@@ -1015,6 +1015,115 @@ fn analytic_count_after_holds_while_gate_is_low() {
     }
 }
 
+/// Brute-force oracle for the mid-batch status byte: clone, step `clocks` times,
+/// then latch at zero offset. The same shape as `simulated_count_after`.
+fn simulated_status_after(counter: &Counter, clocks: u64) -> u8 {
+    let mut probe = counter.clone();
+    for _ in 0..clocks {
+        probe.step();
+    }
+    probe.latch_status(0);
+    probe.status_latch.unwrap()
+}
+
+/// The analytic answer: latch at an in-batch offset of `clocks`.
+fn analytic_status_after(counter: &Counter, clocks: u64) -> u8 {
+    let mut probe = counter.clone();
+    probe.latch_status(clocks);
+    probe.status_latch.unwrap()
+}
+
+#[test]
+fn mid_batch_status_byte_matches_the_step_simulation_across_load_delay_phases() {
+    // The status-byte counterpart of the count_after and out_after
+    // differentials, and the test that retires the "status reports the
+    // batch-start null count" residual. The WHOLE byte is compared, so it pins
+    // bit 7 (OUT, already peeked) and bit 6 (NULL COUNT, the residual) together
+    // and would also catch a peek leaking into the three register-state fields
+    // that no CLK may move.
+    //
+    // The sweep deliberately STARTS in LoadDelay -- the state entered by the
+    // count write and left on the very first CLK -- because that is the only
+    // phase where bit 6 moves at all. `clocks == 0` must still report the bit
+    // SET (nothing has clocked yet) and `clocks >= 1` must report it CLEAR;
+    // both edges are inside the sweep.
+    for mode in 0..=5u8 {
+        for reload in [2u16, 3, 18, 100, 255, 1, 0] {
+            for gate in [true, false] {
+                let mut pit = Pit::default();
+                pit.write_port(0x43, 0x30 | (mode << 1));
+                pit.set_gate(0, gate);
+                pit.write_port(0x40, (reload & 0xff) as u8);
+                pit.write_port(0x40, (reload >> 8) as u8);
+                // Phase 0 is LoadDelay (or WaitGate for the gate-low modes 1/5);
+                // later phases walk into Counting so the test also pins that the
+                // peek leaves an already-loaded counter's bit 6 alone.
+                for phase in 0..8u64 {
+                    for clocks in [0u64, 1, 2, 3, 17, 260, 5_000] {
+                        assert_eq!(
+                            analytic_status_after(&pit.counters[0], clocks),
+                            simulated_status_after(&pit.counters[0], clocks),
+                            "mode {mode} reload {reload} gate {gate} phase {phase} clocks {clocks}"
+                        );
+                    }
+                    pit.tick(1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_null_count_bit_is_set_at_zero_offset_and_clear_one_clock_later() {
+    // Non-vacuity for the sweep above: without the peek, bit 6 is the live
+    // field and BOTH reads below return it set, so the differential could pass
+    // on a counter that never leaves LoadDelay within the sweep. This pins the
+    // single transition the peek exists to model, in the state a guest reaches
+    // by writing a count and immediately issuing a read-back.
+    let mut pit = Pit::default();
+    pit.write_port(0x43, CW_MODE2);
+    pit.write_port(0x40, 100);
+    pit.write_port(0x40, 0);
+    assert_eq!(
+        pit.counters[0].state,
+        CounterState::LoadDelay,
+        "sanity: a completed count write must leave the counter in LoadDelay"
+    );
+    assert_eq!(
+        analytic_status_after(&pit.counters[0], 0) & 0x40,
+        0x40,
+        "at zero in-batch offset nothing has clocked, so NULL COUNT must be set"
+    );
+    assert_eq!(
+        analytic_status_after(&pit.counters[0], 1) & 0x40,
+        0,
+        "one CLK loads the counting element, so NULL COUNT must read clear"
+    );
+}
+
+#[test]
+fn the_null_count_bit_holds_through_wait_gate_however_many_clocks_pass() {
+    // Modes 1 and 5 park in WaitGate until a GATE rising edge, and `step` never
+    // loads there -- so unlike LoadDelay the bit must NOT clear with distance.
+    // A peek that keyed on "a count was written" rather than on the state
+    // machine would clear it here and this is the case that catches that.
+    for mode in [CW_MODE1, CW_MODE5] {
+        let mut pit = Pit::default();
+        pit.write_port(0x43, mode);
+        pit.set_gate(0, false);
+        pit.write_port(0x40, 100);
+        pit.write_port(0x40, 0);
+        assert_eq!(pit.counters[0].state, CounterState::WaitGate);
+        for clocks in [0u64, 1, 2, 5_000] {
+            assert_eq!(
+                analytic_status_after(&pit.counters[0], clocks) & 0x40,
+                0x40,
+                "mode {mode:#04x} clocks {clocks}: WaitGate must hold NULL COUNT set"
+            );
+        }
+    }
+}
+
 #[test]
 fn counter_latch_freezes_the_read() {
     let mut pit = Pit::default();
