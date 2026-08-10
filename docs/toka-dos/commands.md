@@ -430,6 +430,59 @@ reading `BLASTER`. The card ships on IRQ 7 because that is what such games
 almost always assume, but a few want IRQ 5. See
 [Why the Sound Blaster sits on IRQ 7](../resonique2/manual.md#why-the-sound-blaster-sits-on-irq-7).
 
+## SNDMIXER
+
+The [ReSonique 2](../resonique2/manual.md) card's volume mixer: six vertical
+faders, one per source. `SNDCTRL` decides where the card lives; this decides how
+loud it is.
+
+```
+SNDMIXER                full-screen mixer
+SNDMIXER /L             list the current levels and exit
+SNDMIXER /CFG file      restore the levels saved in a file
+SNDMIXER /M n           MASTER      0 (mute) to 10 (full)
+SNDMIXER /F n           FMSYNTH     OPL3 music
+SNDMIXER /W n           WAVE        SB16 DSP and WSS codec
+SNDMIXER /C n           CD-ROM      Red Book audio
+SNDMIXER /I n           MIDI        wavetable synthesis
+SNDMIXER /P n           PC speaker  four positions: 0, 3, 7, 10
+SNDMIXER /S             say nothing at all
+SNDMIXER /?             usage
+```
+
+Left and Right pick a fader, Up and Down move it, Home and End go to full and
+to mute, the digit keys jump straight to a level. A level takes effect **as you
+set it**, so you can hear what you are doing; F10 saves and leaves, Esc puts
+back the levels the mixer opened on.
+
+Each step is 4 dB. That is deliberate: the card's own volume registers are
+2 dB per step over a 62 dB range, so spreading ten fader positions evenly over
+the *numbers* would put seven of them inside the top 12 dB, where they all sound
+the same. Ten even 4 dB steps gives ten positions you can tell apart, with 10
+being the level the card powers on at and 0 a real mute.
+
+The PC-speaker fader has four positions rather than ten, because the card gives
+that input two bits and not five. A value between them rounds up to the next
+one, so asking for a little never gets you silence.
+
+`WAVE` moves both digital-audio paths at once — the Sound Blaster DSP and the
+Windows Sound System codec — since no program uses both and to a listener they
+are the same thing.
+
+Levels are saved to a file with `/CFG`, and the default `AUTOEXEC.BAT` restores
+them on the next boot:
+
+```
+SNDMIXER /CFG C:\DOS\VOLCONF.CFG /S
+```
+
+`/CFG` on its own reads the file and writes the card. `/CFG` together with any
+channel switch does the opposite: it applies the switches and then writes them
+into the file. `/S` prints nothing at all, which is what keeps the boot screen
+clean. F10 in the full-screen mixer saves to whatever `/CFG` named, or to
+`C:\DOS\VOLCONF.CFG` when it named nothing — the same file the boot line
+reads.
+
 ## TOKAMOUS
 
 General Simulation Works's PS/2 mouse driver: a terminate-and-stay-resident

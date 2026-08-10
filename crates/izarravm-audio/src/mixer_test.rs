@@ -416,3 +416,88 @@ fn levels_that_are_multiples_of_four_are_not_muted() {
         assert_eq!(read_reg(&mut mixer, 0x32), level << 3);
     }
 }
+
+/// The PC-speaker leg (`0x3B`) is two bits wide on the CT1745, not five: the
+/// control the guest sees has four positions and only D7-D6 select one. The
+/// three audible ones are 86Box's `sb_att_7dbstep_2bits` figures (-14, -7 and
+/// 0 dB); position 0 is the house hard mute rather than that table's -46 dB
+/// floor, matching what level 0 does on every 5-bit register here.
+///
+/// Before this the register was inert: every byte read back and NOTHING moved,
+/// which is why the beeper sat at full scale next to attenuated card audio.
+#[test]
+fn pc_speaker_register_decodes_two_bits_and_attenuates() {
+    let mut mixer = SbMixer::default();
+    // Power-on is position 2 (0x80), which is -7 dB and NOT unity: a card that
+    // has never been programmed already pads its PC-SPK input.
+    assert_eq!(mixer.speaker_level(), 2);
+    let power_on = mixer.speaker_gain();
+    assert!(
+        (power_on - 10f32.powf(-7.0 / 20.0)).abs() < 1e-4,
+        "power-on PC-SPK is -7 dB, got {power_on}"
+    );
+
+    let mut seen = Vec::new();
+    for position in 0u8..4 {
+        write_reg(&mut mixer, 0x3B, position << 6);
+        assert_eq!(mixer.speaker_level(), position);
+        seen.push(mixer.speaker_gain());
+    }
+    assert_eq!(seen[0], 0.0, "position 0 is a hard mute");
+    for (position, db) in [(1usize, -14.0f32), (2, -7.0), (3, 0.0)] {
+        let want = 10f32.powf(db / 20.0);
+        assert!(
+            (seen[position] - want).abs() < 1e-4,
+            "position {position} is {db} dB: want {want}, got {}",
+            seen[position]
+        );
+    }
+    // Strictly monotonic: four positions, four distinct gains. A decode that
+    // dropped a bit (`>> 7`) or masked the wrong field would collapse two of
+    // them onto each other and this is what would catch it.
+    for pair in seen.windows(2) {
+        assert!(pair[1] > pair[0], "positions must be ordered: {seen:?}");
+    }
+
+    // D5-D0 are don't-care on the card: they neither change the decode nor get
+    // masked out of the read-back (86Box stores the raw byte). A guest doing a
+    // read-modify-write therefore sees exactly its own byte.
+    write_reg(&mut mixer, 0x3B, 0x7F);
+    assert_eq!(read_reg(&mut mixer, 0x3B), 0x7F);
+    assert_eq!(mixer.speaker_level(), 1, "0x7F selects position 1");
+    assert!((mixer.speaker_gain() - 10f32.powf(-14.0 / 20.0)).abs() < 1e-4);
+}
+
+/// The ReSonique 2 wavetable leg (`0x50`/`0x51`) is this card's own extension:
+/// a real CT1745 has no register for a wavetable, because a real CT1745 has no
+/// wavetable. It carries the card's ordinary 5-bit D7-D3 level so a guest
+/// programs it with the sequence it already uses for master/voice/FM/CD, and it
+/// powers on at 0 dB so adding the control does not move the leg.
+#[test]
+fn wavetable_extension_registers_decode_as_five_bit_levels() {
+    let mut mixer = SbMixer::default();
+    assert_eq!(read_reg(&mut mixer, 0x50), 0xF8);
+    assert_eq!(read_reg(&mut mixer, 0x51), 0xF8);
+    let (l, r) = mixer.wavetable_gain();
+    assert!((l - 1.0).abs() < 1e-3 && (r - 1.0).abs() < 1e-3);
+
+    // The two channels are independent, and the level lives in D7-D3: writing
+    // the bare level 21 instead of `21 << 3` would land on level 2.
+    write_reg(&mut mixer, 0x50, 21 << 3);
+    assert_eq!(read_reg(&mut mixer, 0x50), 21 << 3);
+    assert_eq!(read_reg(&mut mixer, 0x51), 0xF8, "0x50 does not touch 0x51");
+    let (l, r) = mixer.wavetable_gain();
+    assert!(
+        (l - 10f32.powf(-20.0 / 20.0)).abs() < 1e-4,
+        "level 21 is -20 dB, got {l}"
+    );
+    assert!((r - 1.0).abs() < 1e-3);
+
+    write_reg(&mut mixer, 0x51, 0x00);
+    assert_eq!(mixer.wavetable_gain().1, 0.0, "level 0 is a hard mute");
+
+    // A mixer reset restores it with everything else.
+    write_reg(&mut mixer, 0x00, 0x00);
+    assert_eq!(read_reg(&mut mixer, 0x50), 0xF8);
+    assert_eq!(read_reg(&mut mixer, 0x51), 0xF8);
+}

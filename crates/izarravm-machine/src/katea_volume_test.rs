@@ -104,6 +104,14 @@ fn extracts_the_embedded_image_payload() {
          binary (rebuild sndctrl.com, then regenerate roms/tokados-hdd.img \
          via scripts/build-freedos-hdd-image.py)"
     );
+    // SNDMIXER.COM, on the same terms and for the same reason: a stale copy
+    // would be a mixer whose fader law disagrees with the registers the host
+    // decodes.
+    assert_eq!(
+        by_name.get("SNDMIXER.COM").map(|d| d.as_slice()),
+        Some(izarravm_firmware::sndmixer_com()),
+        "SNDMIXER.COM on the payload must be byte-identical to the committed          binary (rebuild sndmixer.com, then regenerate roms/tokados-hdd.img          via scripts/build-freedos-hdd-image.py)"
+    );
     // The actual dispatch order is set by the FOR list, not by where each
     // labeled block sits in the file (a self-calling AUTOEXEC.BAT jumps to
     // whichever label %1 names) -- pin the list itself rather than comparing
@@ -125,6 +133,24 @@ fn extracts_the_embedded_image_payload() {
     assert!(
         autoexec_text.contains("SNDCTRL /B /T"),
         "default AUTOEXEC's SOUND block prints the boot-time sound summary"
+    );
+    // The volume restore runs after the summary and prints NOTHING: the boot
+    // screen's 25 rows are fully spoken for (see the row budget in
+    // scripts/build-freedos-hdd-image.py), so this line has to be silent or it
+    // takes a row from another owner.
+    assert!(
+        autoexec_text.contains(r"SNDMIXER /CFG C:\DOS\VOLCONF.CFG /S"),
+        "default AUTOEXEC's SOUND block restores the saved volume levels silently"
+    );
+    let summary_at = autoexec_text
+        .find("SNDCTRL /B /T")
+        .expect("the SOUND block prints its summary");
+    let restore_at = autoexec_text
+        .find("SNDMIXER /CFG")
+        .expect("the SOUND block restores the volumes");
+    assert!(
+        restore_at > summary_at,
+        "the volume restore follows the configuration summary"
     );
 
     // TOKAEMM.SYS ships on the payload and the default CONFIG.SYS

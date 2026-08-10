@@ -49,6 +49,10 @@ pub struct MidiEngine {
     scratch: Vec<i16>,
     role: MidiRole,
     config: MidiConfig,
+    /// (Left, Right) linear gain applied as this engine adds itself to the mix,
+    /// from the card's wavetable volume registers (`0x50`/`0x51`). Unity until
+    /// the caller sets it, so an engine driven without a machine is unchanged.
+    gain: (f32, f32),
 }
 
 impl MidiEngine {
@@ -70,6 +74,7 @@ impl MidiEngine {
             scratch: Vec::new(),
             role,
             config: config.clone(),
+            gain: (1.0, 1.0),
         };
         engine.configure(config);
         engine
@@ -125,13 +130,22 @@ impl MidiEngine {
             self.guest_frame_cursor = target;
         }
 
+        let (gain_l, gain_r) = self.gain;
         for frame in output {
             let Some(samples) = self.staged.pop_front() else {
                 break;
             };
-            frame.0 = frame.0.saturating_add(samples.0);
-            frame.1 = frame.1.saturating_add(samples.1);
+            frame.0 = frame.0.saturating_add(scale(samples.0, gain_l));
+            frame.1 = frame.1.saturating_add(scale(samples.1, gain_r));
         }
+    }
+
+    /// Set the (Left, Right) linear gain this engine applies as it adds itself
+    /// to the mix. The frontend takes it from `Machine::midi_gain`, so the
+    /// guest's own mixer register drives it; nothing is stored on the host that
+    /// the guest cannot read back.
+    pub fn set_gain(&mut self, gain: (f32, f32)) {
+        self.gain = gain;
     }
 
     fn stage_until(&mut self, target: u64) {
@@ -352,6 +366,16 @@ fn silence(adapter: &mut MidiAdapter) {
         }
         MidiAdapter::Off | MidiAdapter::Silent => {}
     }
+}
+
+/// Attenuate one sample by a linear gain. Unity is an exact identity (the
+/// multiply and the round both leave the value alone), so an engine whose gain
+/// has not been set renders bit-for-bit what it rendered before there was one.
+fn scale(sample: i16, gain: f32) -> i16 {
+    if gain == 1.0 {
+        return sample;
+    }
+    (f32::from(sample) * gain).round().clamp(-32768.0, 32767.0) as i16
 }
 
 fn sample_frame_for_tick(guest_tick: u64) -> u64 {

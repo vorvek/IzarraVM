@@ -156,6 +156,37 @@ flags again  flags=--sb-irq 5
 
 `--cpu` behaves the same way, for the same reason.
 
+## Setting the volume
+
+`SNDCTRL` decides where the card lives. **`SNDMIXER`** decides how loud it is:
+six vertical faders over the card's own mixer — MASTER, FMSYNTH, WAVE, CD-ROM,
+MIDI and the PC speaker — set live as you move them, saved to a file, and
+restored on the next boot from `AUTOEXEC.BAT`.
+
+```
+C:\> SNDMIXER
+```
+
+There is no line-in or microphone fader, because there is nothing to record:
+the machine models playback only, and a control over a source that does not
+exist would be a control that does nothing.
+
+Every leg of the card powers on at 0 dB and the mix reserves its headroom after
+the mixer, so nothing clips at the defaults and the faders own the whole range
+below them. Each step is 4 dB — ten positions you can actually tell apart,
+rather than ten positions crowded into the top of a 62 dB scale. The full
+switch list is in [SNDMIXER](../toka-dos/commands.md#sndmixer).
+
+Two of the six are not plain Sound Blaster registers:
+
+- **PC speaker** is the card's PC-SPK input (mixer register `0x3B`). That input
+  is two bits wide on the real chip, so the fader has four positions, not ten.
+  The beeper is mixed **through the card**, which is why MASTER moves it too.
+- **MIDI** is the wavetable synthesiser. A real SB16 has no register for one —
+  its "MIDI" volume is the FM bus, which is this card's FMSYNTH fader — so the
+  ReSonique 2 adds a pair of its own at `0x50`/`0x51`, on the same register file
+  and the same 5-bit scale as everything else.
+
 ## Digital audio (Sound Blaster 16 compatible)
 
 The CT1745-compatible mixer and DSP answer at `0x220`-`0x22F`, with the

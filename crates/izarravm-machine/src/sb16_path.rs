@@ -159,6 +159,8 @@ pub(crate) struct Ct1745Mix {
     voice_bus_r: f32,
     cd_l: f32,
     cd_r: f32,
+    /// PC-speaker input attenuation, mixer register `0x3B` (mono, 2-bit).
+    speaker: f32,
 }
 
 impl Ct1745Mix {
@@ -171,6 +173,7 @@ impl Ct1745Mix {
             voice_bus_r: 1.0,
             cd_l: 0.0,
             cd_r: 0.0,
+            speaker: 1.0,
         }
     }
 
@@ -193,6 +196,24 @@ impl Ct1745Mix {
         (
             (cd.0 as f32 * self.cd_l) as i32,
             (cd.1 as f32 * self.cd_r) as i32,
+        )
+    }
+
+    /// Take the PC-speaker leg through the card: the 2-bit PC-SPK level
+    /// (`0x3B`) and then the master, exactly as 86Box's
+    /// `sb16_awe32_filter_pc_speaker` does (`buffer * speaker * master`). The
+    /// beeper is a mono source, so one sample fans out to the stereo master.
+    ///
+    /// A card that is not installed has no PC-SPK input to route the beeper
+    /// through, so the leg passes at unity rather than vanishing: the
+    /// motherboard speaker still works on a machine with no sound card.
+    pub(crate) fn mix_speaker(self, spk: i32) -> (i32, i32) {
+        if !self.active {
+            return (spk, spk);
+        }
+        (
+            (spk as f32 * self.speaker * self.voice_bus_l) as i32,
+            (spk as f32 * self.speaker * self.voice_bus_r) as i32,
         )
     }
 }
@@ -445,7 +466,23 @@ impl Sb16Path {
             voice_bus_r: master_r * outgain_r,
             cd_l,
             cd_r,
+            speaker: active.mixer.speaker_gain(),
         }
+    }
+
+    /// (Left, Right) linear gain for the wavetable MIDI leg, mixer registers
+    /// `0x50`/`0x51`. A card that is not installed carries no wavetable leg,
+    /// but the synth still exists as a host device, so it passes at unity.
+    pub(crate) fn wavetable_gain(&self) -> (f32, f32) {
+        self.active
+            .as_ref()
+            .map_or((1.0, 1.0), |active| active.mixer.wavetable_gain())
+    }
+
+    pub(crate) fn peek_mixer_register(&self, index: u8) -> Option<u8> {
+        self.active
+            .as_ref()
+            .map(|active| active.mixer.peek_register(index))
     }
 
     pub(crate) fn cd_levels(&self) -> (u8, u8) {

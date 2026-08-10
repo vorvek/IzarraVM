@@ -20,7 +20,8 @@ Toka-DOS 3.0 - Kernel build 2043 - Compiled <date>
 `C:\LICENSE.TXT` explains what Toka-DOS is actually built from: the FreeDOS
 kernel and FreeCOM shell, plus MOVE, SORT, MEM, and other tools from the
 FreeDOS project, all free software under the GNU GPL. General Simulation
-Works's own additions (`GSWMODE`, `SNDCTRL`, `TOKAMOUS`, `TOKAEMM.SYS`) are layered on
+Works's own additions (`GSWMODE`, `SNDCTRL`, `SNDMIXER`, `TOKAMOUS`,
+`TOKAEMM.SYS`) are layered on
 top of that stock FreeDOS base; the shell and kernel underneath are
 otherwise unmodified.
 
@@ -43,9 +44,9 @@ groups directories first. Everything you actually run lives in `C:\DOS`:
 C:\DOS\
     COMMAND.COM     GSWMODE.COM     MEM.EXE         FIND.EXE
     TOKAMOUS.COM    SNDCTRL.COM     ATTRIB.EXE      LABEL.EXE
-    TOKAEMM.SYS     MOVE.EXE        CHOICE.EXE      DELTREE.COM
-                    SORT.EXE        MORE.EXE        XCOPY.EXE
-                                                    HELLO.TXT
+    TOKAEMM.SYS     SNDMIXER.COM    CHOICE.EXE      DELTREE.COM
+                    MOVE.EXE        MORE.EXE        XCOPY.EXE
+                    SORT.EXE                        HELLO.TXT
 ```
 
 `AUTOEXEC.BAT` puts `C:\DOS` on the `PATH`, so every tool runs from any
@@ -146,3 +147,5 @@ overwritten.
   DOS.
 - [SNDCTRL](commands.md#sndctrl): move the sound card's IRQ and DMA
   assignment without leaving DOS.
+- [SNDMIXER](commands.md#sndmixer): set the card's volume levels, and keep
+  them across reboots.

@@ -51,6 +51,9 @@ manual](resonique2/manual.md):
   set to.
 - **FM music**: use the AdLib or OPL2/OPL3 option at port `388` if the game
   offers a choice. This is fully modeled.
+- **Too loud, too quiet, or the music drowning the effects**: run `SNDMIXER`.
+  It has a fader per source (music, digital audio, CD, MIDI, PC speaker) and
+  remembers where you left them.
 - **General MIDI / wavetable**: select MPU-401 output at port `300`. Toka-DOS
   advertises it as `P300` in `BLASTER`. This represents a daughterboard fitted
   to the ReSonique 2's internal pin headers, which IzarraVM emulates through

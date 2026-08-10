@@ -1,0 +1,507 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! SNDMIXER.COM end to end: the real guest binary, on a booted machine, moving
+//! the real mixer registers.
+//!
+//! The fader law and the register decode both have host-side unit tests
+//! (`mixer_test.rs`, `machine_audio_test.rs`). What only a boot can prove is
+//! the part in between: that the tool finds the card, that the level it writes
+//! is the level the register ends up holding, that `/CFG` at boot actually
+//! reaches the hardware rather than only reading a file, that `/S` really is
+//! silent, and that a key pressed on the full-screen fader moves a register.
+//!
+//! Unlike the SNDCTRL fixtures next door, these boot the tool from the SCRATCH
+//! FOLDER rather than out of the committed image, by copying
+//! `izarravm_firmware::sndmixer_com()` in beside `AUTOEXEC.BAT`. That is the
+//! same bytes the image is built from (`katea_volume_test` pins the two equal),
+//! and it means a change to `sndmixer.asm` is tested by the very next `cargo
+//! test` instead of only after an image rebuild.
+
+use super::*;
+
+/// Levels, as this tool's fader law defines them: `-4 dB` per step, so step
+/// `s >= 1` is level `11 + 2s` and the register byte is that level shifted into
+/// D7-D3. Step 0 is the register's hard mute.
+fn step_byte(step: u8) -> u8 {
+    if step == 0 { 0 } else { (11 + 2 * step) << 3 }
+}
+
+/// Put SNDMIXER.COM and an AUTOEXEC in a scratch folder and boot it. Returns
+/// the machine and the folder, which the caller inspects and then removes.
+fn boot_with_sndmixer(label: &str, commands: &str) -> (Machine, PathBuf) {
+    boot_with_sndmixer_files(label, commands, &[])
+}
+
+/// The same, with extra files staged in the folder first (a saved config, for
+/// the restore path).
+fn boot_with_sndmixer_files(
+    label: &str,
+    commands: &str,
+    files: &[(&str, &str)],
+) -> (Machine, PathBuf) {
+    let scratch = TokaScratch::new(label);
+    let dir = scratch.path().to_path_buf();
+    // Leak the guard: the caller reads files back after the machine stops.
+    std::mem::forget(scratch);
+    fs::write(dir.join("SNDMIXER.COM"), izarravm_firmware::sndmixer_com())
+        .expect("stage SNDMIXER.COM");
+    for (name, body) in files {
+        fs::write(dir.join(name), body.as_bytes()).expect("stage fixture file");
+    }
+    fs::write(
+        dir.join("AUTOEXEC.BAT"),
+        format!("@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n{commands}"),
+    )
+    .expect("write AUTOEXEC");
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .expect("build machine");
+    machine.mount_hdd_folder(&dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 900_000_000, current_root_prompt);
+    if let StopReason::CpuError(message) = &stop {
+        panic!(
+            "CPU fault running SNDMIXER: {message}\n{}",
+            machine.screen_text().as_text()
+        );
+    }
+    machine.flush_hdd_folder();
+    (machine, dir)
+}
+
+/// Every CT1745 level register the tool owns, at its power-on value, and the
+/// PC-speaker register at the position the card powers on in. This is the
+/// baseline every other fixture here is a departure from, so if the card's
+/// power-on state ever moves, this is what says so first.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_lists_the_levels_the_card_powers_on_with() {
+    let (machine, dir) = boot_with_sndmixer("sndmixer_list", "SNDMIXER /L\r\n");
+    let screen = machine.screen_text().as_text();
+    for row in [
+        "MASTER      10   0 dB",
+        "FMSYNTH     10   0 dB",
+        "WAVE        10   0 dB",
+        "CD-ROM      10   0 dB",
+        "MIDI        10   0 dB",
+        // Two bits, and the card powers on at position 2 of 4. The listing
+        // reports the step that position IS, not a step it rounded from.
+        "SPEAKER      7   -7 dB",
+    ] {
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.trim_end() == format!("  {row}")),
+            "the listing must carry the row {row:?}\n{screen}"
+        );
+    }
+    // Nothing was asked for, so nothing was applied: /L is a read.
+    assert!(
+        !screen.contains("Applied to the mixer"),
+        "/L must not write the hardware\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The whole point of the tool: a level named on the command line reaches the
+/// register. Read back through the mixer's own register file, not through the
+/// tool's report -- a tool that printed the right number and wrote nothing
+/// would pass a screen-scrape and fail this.
+///
+/// `/P 2` is the PC speaker's snap-up rule in the same run: two bits give four
+/// stops and 2 is not one of them, so the request lands on the next stop up
+/// (step 3, register position 1) rather than on the nearer stop below, which
+/// is silence.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_command_line_levels_reach_the_mixer_registers() {
+    let (machine, dir) =
+        boot_with_sndmixer("sndmixer_cli", "SNDMIXER /M 5 /F 7 /W 8 /C 0 /I 3 /P 2\r\n");
+    let screen = machine.screen_text().as_text();
+    for (index, step, what) in [
+        (0x30u8, 5u8, "master left"),
+        (0x31, 5, "master right"),
+        (0x34, 7, "FM left"),
+        (0x35, 7, "FM right"),
+        (0x32, 8, "voice left"),
+        (0x33, 8, "voice right"),
+        (0x36, 0, "CD left"),
+        (0x37, 0, "CD right"),
+        (0x50, 3, "wavetable left"),
+        (0x51, 3, "wavetable right"),
+    ] {
+        assert_eq!(
+            machine.sb_mixer_register(index),
+            Some(step_byte(step)),
+            "{what} ({index:#04x}) must hold step {step}\n{screen}"
+        );
+    }
+    // The speaker's own register: position 1 in D7-D6, from a request of 2.
+    assert_eq!(
+        machine.sb_mixer_register(0x3B),
+        Some(1 << 6),
+        "/P 2 must snap UP to the next hardware stop, not down into silence\n{screen}"
+    );
+    // WAVE drives the codec too, at the count nearest the same dB figure
+    // (step 8 is -8 dB; the codec moves in 1.5 dB, so 5 counts).
+    assert_eq!(machine.wss_register(6), Some(5), "AD1848 I6\n{screen}");
+    assert_eq!(machine.wss_register(7), Some(5), "AD1848 I7\n{screen}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The boot line the image's AUTOEXEC carries: restore from a file, silently.
+///
+/// Both halves are load-bearing and both are checked here, because they fail
+/// independently -- a tool that restored correctly but printed a line would
+/// break the boot screen's row budget, and a tool that printed nothing but
+/// restored nothing would look identical from the screen alone.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_cfg_restore_writes_the_registers_at_boot_and_says_nothing() {
+    let saved = "; saved levels\r\nMASTER=6\r\nFMSYNTH=2\r\nCD=0\r\nSPEAKER=10\r\n";
+    let (machine, dir) = boot_with_sndmixer_files(
+        "sndmixer_restore",
+        "SNDMIXER /CFG C:\\VOL.CFG /S\r\nECHO MIXER-DONE\r\n",
+        &[("VOL.CFG", saved)],
+    );
+    let screen = machine.screen_text().as_text();
+
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(6)),
+        "{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x34),
+        Some(step_byte(2)),
+        "{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x36),
+        Some(step_byte(0)),
+        "{screen}"
+    );
+    assert_eq!(machine.sb_mixer_register(0x3B), Some(3 << 6), "{screen}");
+    // A channel the file does not name keeps what the card was holding, rather
+    // than being reset to the tool's own idea of a default.
+    assert_eq!(
+        machine.sb_mixer_register(0x32),
+        Some(step_byte(10)),
+        "WAVE was not in the file and must not have moved\n{screen}"
+    );
+
+    // Silence: the run reached the ECHO after it, so the tool ran; and it put
+    // nothing of its own on the screen.
+    assert!(
+        screen.contains("MIXER-DONE"),
+        "the batch must have got past SNDMIXER\n{screen}"
+    );
+    for chatter in [
+        "ReSonique 2 volume levels",
+        "Volume levels restored",
+        "Applied to the mixer",
+    ] {
+        assert!(
+            !screen.contains(chatter),
+            "/S must print nothing, found {chatter:?}\n{screen}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The mutation proof for the silence assertion above: the SAME restore
+/// without `/S` does print, so "found no output" is a property of the flag and
+/// not of a fixture that never ran the tool.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_cfg_restore_without_the_silent_flag_reports_itself() {
+    let saved = "MASTER=6\r\n";
+    let (machine, dir) = boot_with_sndmixer_files(
+        "sndmixer_restore_loud",
+        "SNDMIXER /CFG C:\\VOL.CFG\r\n",
+        &[("VOL.CFG", saved)],
+    );
+    let screen = machine.screen_text().as_text();
+    assert!(
+        screen.contains("Volume levels restored from C:\\VOL.CFG"),
+        "without /S the restore names the file it read\n{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(6)),
+        "{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A missing config file is the state every machine is in before the first
+/// save, and the AUTOEXEC line runs anyway: it must leave the card alone and
+/// exit 0 rather than fail the boot or reset the levels.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_cfg_restore_of_a_missing_file_leaves_the_card_alone() {
+    let (machine, dir) = boot_with_sndmixer(
+        "sndmixer_no_cfg",
+        "SNDMIXER /M 4\r\nSNDMIXER /CFG C:\\NOSUCH.CFG /S\r\nECHO MIXER-DONE\r\n",
+    );
+    let screen = machine.screen_text().as_text();
+    assert!(screen.contains("MIXER-DONE"), "{screen}");
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(4)),
+        "a missing file must not disturb the level already set\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Save then restore, through the file, across two invocations: what F10 and
+/// the AUTOEXEC line do between them. The second run starts from the card's
+/// power-on levels and has to end on the saved ones.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_saves_a_config_the_next_run_can_restore() {
+    let (machine, dir) = boot_with_sndmixer(
+        "sndmixer_roundtrip",
+        "SNDMIXER /M 3 /F 9 /CFG C:\\VOL.CFG\r\n\
+         SNDMIXER /M 10 /F 10\r\n\
+         SNDMIXER /CFG C:\\VOL.CFG /S\r\n",
+    );
+    let screen = machine.screen_text().as_text();
+    let written = fs::read_to_string(dir.join("VOL.CFG")).expect("read the saved config");
+    assert!(
+        written.contains("MASTER=3") && written.contains("FMSYNTH=9"),
+        "the saved file must carry the levels that were set:\n{written}"
+    );
+    assert!(
+        written.starts_with(';'),
+        "the file leads with the comment that explains it:\n{written}"
+    );
+    // The middle command put both back to 10; the restore has to move them
+    // again, so this cannot pass on a run where the restore did nothing.
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(3)),
+        "{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x34),
+        Some(step_byte(9)),
+        "{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The full-screen fader, driven by keys: select FMSYNTH, take it down two
+/// steps, save with F10. Proves the interactive path writes the same register
+/// the command line does, and that F10 persists to the `/CFG` file.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
+    let scratch = TokaScratch::new("sndmixer_keys");
+    let dir = scratch.path().to_path_buf();
+    std::mem::forget(scratch);
+    fs::write(dir.join("SNDMIXER.COM"), izarravm_firmware::sndmixer_com())
+        .expect("stage SNDMIXER.COM");
+    // F10 with no `/CFG` saves to `C:\DOS\VOLCONF.CFG`, the path the image's
+    // AUTOEXEC restores from. On the committed image that directory is a real
+    // one; under the host-folder facade `C:\DOS` is synthesized from the
+    // overlay, so the host side of it has to exist for Katea to materialize a
+    // guest write into it.
+    fs::create_dir_all(dir.join("DOS")).expect("stage the host side of C:\\DOS");
+    fs::write(
+        dir.join("AUTOEXEC.BAT"),
+        "@ECHO OFF\r\nPROMPT $P$G\r\nSNDMIXER\r\n",
+    )
+    .expect("write AUTOEXEC");
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .expect("build machine");
+    machine.mount_hdd_folder(&dir).expect("mount host folder");
+
+    // No switches at all is the full-screen interface. Wait for the interface
+    // itself rather than for a cycle count: a fixture that injected keys into
+    // a boot screen would "pass" by leaving every register untouched.
+    let (stop, _) = run_until_toka_condition(&mut machine, 900_000_000, |machine| {
+        machine
+            .screen_text()
+            .as_text()
+            .contains("ReSonique 2 Volume Mixer")
+    });
+    if let StopReason::CpuError(message) = &stop {
+        panic!(
+            "CPU fault opening the mixer: {message}\n{}",
+            machine.screen_text().as_text()
+        );
+    }
+    let opened = machine.screen_text().as_text();
+    assert!(
+        opened.contains("ReSonique 2 Volume Mixer"),
+        "the full-screen mixer never opened\n{opened}"
+    );
+    assert!(
+        opened.contains("MASTER") && opened.contains("SPEAKER"),
+        "all six faders must be on screen\n{opened}"
+    );
+
+    // Right moves the selection off MASTER and onto FMSYNTH; Down twice takes
+    // it from 10 to 8. One scancode per run slice -- a batched injection is
+    // delivered faster than the guest's INT 16h loop consumes it.
+    // 0x4D Right, 0x50 Down, 0x44 F10, each make then break.
+    for code in [0x4Du8, 0xCD, 0x50, 0xD0, 0x50, 0xD0] {
+        machine.inject_key_scancodes(&[code]);
+        machine
+            .run_until_halt_or_cycles(5_000_000)
+            .expect("fader keystroke");
+    }
+    // Live application: the register has already moved, before F10.
+    assert_eq!(
+        machine.sb_mixer_register(0x34),
+        Some(step_byte(8)),
+        "two Downs on FMSYNTH must reach register 0x34 as they are pressed\n{}",
+        machine.screen_text().as_text()
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(10)),
+        "MASTER was moved off, not moved down\n{}",
+        machine.screen_text().as_text()
+    );
+
+    for code in [0x44u8, 0xC4] {
+        machine.inject_key_scancodes(&[code]);
+        machine
+            .run_until_halt_or_cycles(5_000_000)
+            .expect("F10 keystroke");
+    }
+    run_until_toka_condition(&mut machine, 200_000_000, current_root_prompt);
+    machine.flush_hdd_folder();
+
+    let screen = machine.screen_text().as_text();
+    assert!(
+        screen.contains("Saved in C:\\DOS\\VOLCONF.CFG"),
+        "with no /CFG, F10 saves to the path the image's AUTOEXEC restores from\n{screen}"
+    );
+    let written =
+        fs::read_to_string(dir.join("DOS").join("VOLCONF.CFG")).expect("read the saved config");
+    assert!(
+        written.contains("FMSYNTH=8"),
+        "the saved file must carry the level the fader was left on:\n{written}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Esc is a real undo, not a no-op.
+///
+/// Because levels are applied as the fader moves -- a mixer you cannot hear
+/// while you set it is not a mixer -- "cancel" has to put the hardware back
+/// rather than merely decline to write it. The run below moves a fader, leaves
+/// with Esc, and the register has to read what it read before the mixer opened.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_escape_restores_the_levels_the_mixer_opened_on() {
+    let scratch = TokaScratch::new("sndmixer_escape");
+    let dir = scratch.path().to_path_buf();
+    std::mem::forget(scratch);
+    fs::write(dir.join("SNDMIXER.COM"), izarravm_firmware::sndmixer_com())
+        .expect("stage SNDMIXER.COM");
+    fs::write(
+        dir.join("AUTOEXEC.BAT"),
+        "@ECHO OFF\r\nPROMPT $P$G\r\nSNDMIXER /M 4\r\nSNDMIXER\r\n",
+    )
+    .expect("write AUTOEXEC");
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .expect("build machine");
+    machine.mount_hdd_folder(&dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 900_000_000, |machine| {
+        machine
+            .screen_text()
+            .as_text()
+            .contains("ReSonique 2 Volume Mixer")
+    });
+    if let StopReason::CpuError(message) = &stop {
+        panic!(
+            "CPU fault opening the mixer: {message}\n{}",
+            machine.screen_text().as_text()
+        );
+    }
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(4)),
+        "the mixer opens on the level the previous command set"
+    );
+
+    // Two Downs on MASTER (the fader the screen opens on), then Esc.
+    for code in [0x50u8, 0xD0, 0x50, 0xD0] {
+        machine.inject_key_scancodes(&[code]);
+        machine
+            .run_until_halt_or_cycles(5_000_000)
+            .expect("fader keystroke");
+    }
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(2)),
+        "the moves must have reached the hardware, or Esc has nothing to undo"
+    );
+
+    for code in [0x01u8, 0x81] {
+        machine.inject_key_scancodes(&[code]);
+        machine
+            .run_until_halt_or_cycles(5_000_000)
+            .expect("escape keystroke");
+    }
+    run_until_toka_condition(&mut machine, 200_000_000, current_root_prompt);
+    let screen = machine.screen_text().as_text();
+    assert!(
+        screen.contains("Cancelled"),
+        "Esc reports that it put the levels back\n{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(4)),
+        "Esc must restore the level the mixer opened on\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A level the fader scale does not have is refused, and refused BEFORE
+/// anything is written: a batch where one switch is wrong must not leave the
+/// card half-configured.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_refuses_an_out_of_range_level_without_writing_anything() {
+    let (machine, dir) = boot_with_sndmixer(
+        "sndmixer_range",
+        "SNDMIXER /F 6 /M 11\r\nECHO MIXER-DONE\r\n",
+    );
+    let screen = machine.screen_text().as_text();
+    assert!(
+        screen.contains("A level must be 0 to 10, on MASTER"),
+        "the refusal names the channel it refused\n{screen}"
+    );
+    assert!(
+        screen.contains("MIXER-DONE"),
+        "the batch continued\n{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(10)),
+        "MASTER must be untouched\n{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x34),
+        Some(step_byte(10)),
+        "the switch that parsed FIRST must not have been applied either: the \
+         line is refused whole\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
