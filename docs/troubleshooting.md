@@ -6,8 +6,8 @@
 ## The machine is slow / a game feels sluggish
 
 Most games run at full speed, in the top GSW-586 mode included. Two things are
-worth separating before assuming a bug. The Izarra 3000 is a Pentium 200 MMX
-class machine, so anything that wanted more than that in period still wants more
+worth separating before assuming a bug. The Izarra 3000 is a 166 MHz
+Pentium-class machine, so anything that wanted more than that in period still wants more
 than that here: demanding 3D at high resolutions and frame rates, or late titles
 that recommended a Pentium II or higher, are outside what this hardware could
 ever have done. If instead a game feels wrong on hardware that should have coped,

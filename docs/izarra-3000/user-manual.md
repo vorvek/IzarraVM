@@ -13,7 +13,7 @@ machine, and this manual reproduces its manual.
 
 | Area | Izarra 3000 hardware |
 | --- | --- |
-| CPU | GSW-586, a Pentium MMX-class part at 166 MHz on a 66 MHz bus. Toka-DOS can throttle it to a 486DX2 at 66 MHz, a 386DX at 22 MHz, or the same 386 ISA at 7.33 MHz without rebooting. |
+| CPU | GSW-586 at 166 MHz on a 66 MHz bus, a Pentium-class part with an x87 unit and no SIMD extension. Toka-DOS can throttle it to a 486DX2 at 66 MHz, a 386DX at 22 MHz, or the same 386 ISA at 7.33 MHz without rebooting. |
 | Memory | 64 MB PC100 SDRAM, with Toka-DOS mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D with a 4 MB frame store; Distira 3D with a 2 MB framebuffer and 2 MB per TMU; VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio (PCM and Creative ADPCM), OPL3 FM, pin headers for a wavetable daughterboard, and a rear MPU-401/gameport. |
@@ -85,7 +85,7 @@ and restores the primary already stored in CMOS.
 
 | Row | CPU class | Port/CMOS code |
 | --- | --- | --- |
-| 586 | Pentium MMX-class at 166 MHz | 2 |
+| 586 | GSW-586 at 166 MHz | 2 |
 | 486 | 486DX2 at 66 MHz | 1 |
 | 386 | 386DX at 22 MHz | 0 |
 | 386-slow | The same 386DX ISA at 7.33 MHz | 3 |

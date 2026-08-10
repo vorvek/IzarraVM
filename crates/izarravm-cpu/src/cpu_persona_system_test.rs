@@ -21,28 +21,32 @@ fn run_cpuid(leaf: u32) -> CpuGsw {
 fn cpuid_leaf0_reports_vendor_string_and_max_leaf() {
     let cpu = run_cpuid(0);
     assert_eq!(cpu.registers.eax(), 1);
-    assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
-    assert_eq!(cpu.registers.edx().to_le_bytes(), *b"ineI");
-    assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"ntel");
+    assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
+    assert_eq!(cpu.registers.edx().to_le_bytes(), *b"Bene");
+    assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"tako");
+    // The 12 bytes are assembled EBX, then EDX, then ECX — the architectural order, the same one
+    // that spells "GenuineIntel" on an Intel part. Pinning the assembled string as well as the
+    // three registers is what makes a transposed pair (EDX/ECX swapped) fail.
     let mut vendor = [0u8; 12];
     vendor[0..4].copy_from_slice(&cpu.registers.ebx().to_le_bytes());
     vendor[4..8].copy_from_slice(&cpu.registers.edx().to_le_bytes());
     vendor[8..12].copy_from_slice(&cpu.registers.ecx().to_le_bytes());
-    assert_eq!(&vendor, b"GenuineIntel");
+    assert_eq!(&vendor, b"IzarBenetako");
 }
 
 #[test]
-fn cpuid_leaf1_reports_the_modeled_p55c_contract() {
+fn cpuid_leaf1_reports_the_modeled_gsw586_contract() {
     let cpu = run_cpuid(1);
-    assert_eq!(cpu.registers.eax(), 0x0000_0543);
+    // Type 0, family 5, model 1, stepping 1.
+    assert_eq!(cpu.registers.eax(), 0x0000_0511);
     assert_eq!(
         cpu.registers.edx(),
-        CPUID_FEATURE_FPU
-            | CPUID_FEATURE_TSC
-            | CPUID_FEATURE_MSR
-            | CPUID_FEATURE_CX8
-            | CPUID_FEATURE_MMX
+        CPUID_FEATURE_FPU | CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_CX8
     );
+    // Bit 23 is MMX. The GSW-586 has no SIMD extension, and correct software reads this bit
+    // before it executes an MMX encoding — so a clear bit here is what keeps the #UD those
+    // encodings now raise from ever being reached by a well-behaved program.
+    assert_eq!(cpu.registers.edx() & (1 << 23), 0, "MMX bit must be clear");
     assert_eq!(cpu.registers.ebx(), 0);
     assert_eq!(cpu.registers.ecx(), 0);
 }
@@ -78,7 +82,7 @@ fn cpuid_is_not_privileged_at_cpl3() {
 
     assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
     assert_eq!(cpu.registers.eax(), 1);
-    assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
+    assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
 }
 
 #[test]
@@ -1522,7 +1526,6 @@ fn generation_matrix_accepts_only_the_target_isa() {
         &[0x0f, 0x32],                   // RDMSR, ECX selects MCAR
         &[0x0f, 0xa2],                   // CPUID
         &[0x0f, 0xc7, 0x0e, 0x40, 0x00], // CMPXCHG8B [0x40]
-        &[0x0f, 0x6f, 0xc0],             // MOVQ MM0,MM0
         &[0x0f, 0x20, 0xe0],             // MOV EAX,CR4
     ];
     for code in p55c_ops {
@@ -1536,18 +1539,70 @@ fn generation_matrix_accepts_only_the_target_isa() {
     }
 }
 
+/// The MMX integer-SIMD second bytes (after 0F). The GSW-586 carries no SIMD extension, so this
+/// is the list of encodings that must name no instruction on ANY persona. Kept here, in the test,
+/// rather than in the core: production no longer needs a concept of "MMX", only a set of bytes
+/// `two_byte_isa_generation` marks `Never`. If an edit puts one of them back into service, the
+/// test below fails on that byte.
+const MMX_SECOND_BYTES: &[u8] = &[
+    0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6e, 0x6f, 0x71, 0x72,
+    0x73, 0x74, 0x75, 0x76, 0x77, 0x7e, 0x7f, 0xd1, 0xd2, 0xd3, 0xd5, 0xd8, 0xd9, 0xdb, 0xdc, 0xdd,
+    0xdf, 0xe1, 0xe2, 0xe5, 0xe8, 0xe9, 0xeb, 0xec, 0xed, 0xef, 0xf1, 0xf2, 0xf3, 0xf5, 0xf8, 0xf9,
+    0xfa, 0xfc, 0xfd, 0xfe,
+];
+
 #[test]
-fn every_mmx_opcode_is_gated_to_the_586_persona() {
-    for second in 0u8..=u8::MAX {
-        if !is_mmx_two_byte(second) {
-            continue;
-        }
-        let code = [0x0f, second, 0xc0, 0x00];
-        for mode in [GswMode::Gsw386Slow, GswMode::Gsw386, GswMode::Gsw486] {
-            assert!(matches!(
-                run_at_mode(&code, mode).unwrap_err(),
-                InternalFault::Exception { vector: 6, .. }
-            ));
+fn every_mmx_opcode_is_invalid_on_every_persona() {
+    // MMX was removed from the GSW-586's contract: these bytes are not gated to the 586, they name
+    // nothing at all. Assert #UD on all FOUR personas, the 586 included.
+    //
+    // "Everything #UDs" is the assertion here, so the vacuity hazard has flipped relative to the
+    // gate-era test this replaces: a harness that faulted on ANY input — a broken `run_at_mode`, a
+    // mis-seeded CPU, an operand that faults before the opcode is even classified — would satisfy
+    // it while proving nothing. Two guards close that off. First, the control below runs a
+    // still-implemented 0F opcode through the SAME harness at each persona and requires it NOT to
+    // fault, so the harness is demonstrably capable of returning Ok. Second, every arm pins vector
+    // 6 specifically, so a #GP or #NM standing in for the #UD fails.
+    assert_eq!(MMX_SECOND_BYTES.len(), 52, "the byte list itself is intact");
+
+    // Behaviour alone cannot tell the two #UD sources apart: an MMX byte left unclassified would
+    // fall to `IsaGeneration::I386`, route to `TwoByteFallback`, and #UD there instead — the same
+    // vector and the same frame, which is exactly the invariant
+    // `a_never_gated_two_byte_opcode_delivers_the_same_ud_from_the_decode_gate` pins. So assert the
+    // CLASSIFICATION as well. `Never` is the deliberate statement "this encoding names nothing on
+    // this chip", checked before the ModRM or immediate is even parsed; the fallback is the
+    // accident of nobody having implemented an opcode. Removing MMX is the former.
+    for &second in MMX_SECOND_BYTES {
+        assert_eq!(
+            two_byte_isa_generation(second),
+            IsaGeneration::Never,
+            "0F {second:02x} must be gated Never, not left to the fallback"
+        );
+    }
+
+    const ALL_PERSONAS: [GswMode; 4] = [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ];
+
+    for mode in ALL_PERSONAS {
+        // Control: MOVZX EAX,AL (0F B6 C0) is a plain 386 two-byte opcode with the same shape as
+        // the MMX probes (0F, second byte, ModRM C0). It must EXECUTE on every persona. If this
+        // ever starts faulting, the #UD assertions below have stopped meaning anything.
+        assert!(
+            run_at_mode(&[0x0f, 0xb6, 0xc0], mode).is_ok(),
+            "{mode}: the control opcode must execute, or the #UD arms below are vacuous"
+        );
+
+        for &second in MMX_SECOND_BYTES {
+            let code = [0x0f, second, 0xc0, 0x00];
+            let fault = run_at_mode(&code, mode).unwrap_err();
+            assert!(
+                matches!(fault, InternalFault::Exception { vector: 6, .. }),
+                "0F {second:02x} on {mode} must be #UD, got {fault:?}"
+            );
         }
     }
 }
@@ -1783,7 +1838,7 @@ fn implemented_two_byte(second: u8) -> bool {
         | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
         | 0xc7 | 0xc8..=0xcf
     );
-    routed || is_mmx_two_byte(second)
+    routed
 }
 
 #[test]
@@ -2008,25 +2063,36 @@ fn a_never_gated_two_byte_opcode_delivers_the_same_ud_from_the_decode_gate() {
 }
 
 #[test]
-fn an_mmx_opcode_uds_on_the_486_persona_and_executes_on_the_586() {
-    // EMMS (`0F 77`). On the 486 persona the shared decode gate (`IsaGeneration::P55c`) must
-    // deliver the same guest-visible #UD as an unmapped byte — this is how era software probes
-    // for MMX without CPUID.
-    let (cpu, bus) = ud_trap_cycle(&[0x0f, 0x77, 0x90], GswMode::Gsw486);
-    assert_ud_frame(&cpu, &bus, UD_CODE_ORIGIN as u16);
+fn an_mmx_opcode_delivers_a_real_ud_frame_on_every_persona_including_the_586() {
+    // EMMS (`0F 77`) is the byte era software executes to probe for MMX when it skips CPUID. On a
+    // GSW-586 it must deliver exactly the #UD an unmapped 0F byte does — same vector, same IVT[6]
+    // retarget, same three-word real-mode frame, same rewind to the instruction START — on the
+    // 586 as much as on the 386. `every_mmx_opcode_is_invalid_on_every_persona` above proves the
+    // vector for the whole block; this proves the DELIVERY is a genuine fault rather than a
+    // swallowed error, which a plain `unwrap_err()` on the vector cannot distinguish.
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let (cpu, bus) = ud_trap_cycle(&[0x0f, 0x77, 0x90], mode);
+        assert_ud_frame(&cpu, &bus, UD_CODE_ORIGIN as u16);
+    }
 
-    // Control on the same bytes: the 586 persona is the P55C contract, so EMMS EXECUTES. Without
-    // this arm, a gate that #UD'd MMX everywhere would pass the assertion above.
-    let (cpu, _bus) = ud_trap_cycle(&[0x0f, 0x77, 0x90], GswMode::Gsw586);
+    // Control on the same harness: CPUID (`0F A2`) is in the 586's contract, so on the 586 it
+    // EXECUTES and never reaches IVT[6]. Without this arm a `ud_trap_cycle` that trapped
+    // unconditionally — or an `assert_ud_frame` that checked nothing — would pass the loop above.
+    let (cpu, _bus) = ud_trap_cycle(&[0x0f, 0xa2, 0x90], GswMode::Gsw586);
     assert_eq!(
         cpu.registers.cs().selector,
         0,
-        "EMMS must execute, not trap"
+        "CPUID must execute on the 586, not trap"
     );
     assert_eq!(
         cpu.registers.eip,
         UD_CODE_ORIGIN + 2,
-        "EIP advanced past EMMS"
+        "EIP advanced past CPUID"
     );
 }
 
@@ -2088,8 +2154,8 @@ fn id_flag_toggle_detection_sequence_finds_cpuid() {
     let toggled = cpu.flag(FLAG_ID);
     assert_eq!(toggled, !before, "ID flag must be toggleable");
 
-    // Detection concluded CPUID is present; execute it and confirm the Intel vendor.
+    // Detection concluded CPUID is present; execute it and confirm the GSW-586 vendor.
     cpu.cycle(&mut bus).unwrap(); // cpuid
     assert_eq!(cpu.registers.eax(), 1);
-    assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
+    assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
 }

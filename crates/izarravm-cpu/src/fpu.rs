@@ -32,9 +32,6 @@ pub struct X87 {
     pub status: u16,
     /// Two bits per physical register: 00 valid, 01 zero, 10 special, 11 empty.
     pub tag: u16,
-    /// MMX registers MM0-7. Real silicon aliases these onto the x87 mantissas; we
-    /// keep them separate and model the visible tag effect (see mmx.rs).
-    mm: [u64; 8],
 }
 
 /// Byte offsets used by the native x64 backend to access the existing x87 state.
@@ -60,7 +57,6 @@ impl PartialEq for X87 {
         self.control == other.control
             && self.status == other.status
             && self.tag == other.tag
-            && self.mm == other.mm
             && self
                 .st
                 .iter()
@@ -78,7 +74,6 @@ impl Default for X87 {
             control: 0,
             status: 0,
             tag: 0,
-            mm: [0; 8],
         };
         fpu.finit();
         fpu
@@ -97,9 +92,6 @@ impl X87 {
         out.write_u16(self.tag)?;
         for value in self.st {
             out.write_f64(value)?;
-        }
-        for value in self.mm {
-            out.write_u64(value)?;
         }
         Ok(())
     }
@@ -213,23 +205,6 @@ impl X87 {
         let b = self.get(i);
         self.set(0, b);
         self.set(i, a);
-    }
-
-    /// Read MMX register MMi.
-    pub fn mm(&self, i: u8) -> u64 {
-        self.mm[(i & 7) as usize]
-    }
-
-    /// Write MMX register MMi. Touching an MMX register marks every x87 tag valid,
-    /// matching the silicon (the registers share storage).
-    pub fn set_mm(&mut self, i: u8, value: u64) {
-        self.mm[(i & 7) as usize] = value;
-        self.tag = 0x0000;
-    }
-
-    /// EMMS: empty the MMX state by marking the x87 tag word all-empty.
-    pub fn emms(&mut self) {
-        self.tag = 0xffff;
     }
 
     /// Set one of the six exception flags (IE 0x01, DE 0x02, ZE 0x04, OE 0x08,

@@ -1863,7 +1863,12 @@ fn pending_flags_offset() {
     // of fat pointer, mid-struct because the cache is a by-value field), moving this pin 4528 ->
     // 4544 -- measured, not derived. It is a pointer, not a payload: the array it addresses is a
     // separate 1 MB allocation whose whole purpose is to be the resident one.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4544);
+    // Dropping MMX removes the `[u64; 8]` MM register file from `X87`, 64 bytes of state that sat
+    // ahead of the hot interpreter fields, moving this pin 4544 -> 4480. Unlike the growth events
+    // above this is a SHRINK of dead architectural state, so it pulls the fields after it toward
+    // the front of the struct rather than pushing them apart -- but it is still a cache-line
+    // reshuffle of the hot region, so it is measured by the fixture sweep, not assumed inert.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4480);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

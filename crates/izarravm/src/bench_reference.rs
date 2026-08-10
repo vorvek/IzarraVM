@@ -105,7 +105,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         GswMode::Gsw586,
         337_200.0,
         "iters/sec",
-        "Project reference: Pentium MMX-166 on the PC100 board, about 337000 Dhrystones/sec",
+        "Project reference: GSW-586 at 166 MHz on the PC100 board, about 337000 Dhrystones/sec",
     ),
     band(
         "sieve",
@@ -133,7 +133,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         GswMode::Gsw586,
         1813.0,
         "iters/sec",
-        "Deterministic BYTE Sieve calibration for the Pentium MMX-166 / PC100 profile",
+        "Deterministic BYTE Sieve calibration for the GSW-586 166 MHz / PC100 profile",
     ),
     band(
         "fp-mandel",
@@ -161,7 +161,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         GswMode::Gsw586,
         36.8,
         "MFLOPS",
-        "Project reference: Pentium MMX-166 / PC100 at about 36.8 Whetstone MFLOPS; the PC100 bus recalibration lifts the x87 memory traffic above the plain-166 28.6",
+        "Project reference: GSW-586 166 MHz / PC100 at about 36.8 Whetstone MFLOPS; the PC100 bus recalibration lifts the x87 memory traffic above the plain-166 28.6",
     ),
     band(
         "bandwidth-l2",
@@ -217,21 +217,21 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         GswMode::Gsw586,
         2160.0,
         "MB/s",
-        "Deterministic split-L1 calibration for the Pentium MMX-166 / PC100 profile",
+        "Deterministic split-L1 calibration for the GSW-586 166 MHz / PC100 profile",
     ),
     band(
         "bandwidth-l2",
         GswMode::Gsw586,
         299.5,
         "MB/s",
-        "Deterministic 512 KiB L2 calibration for the Pentium MMX-166 / PC100 profile",
+        "Deterministic 512 KiB L2 calibration for the GSW-586 166 MHz / PC100 profile",
     ),
     band(
         "bandwidth-ram",
         GswMode::Gsw586,
         242.9,
         "MB/s",
-        "Deterministic PC100 SDRAM calibration for the Pentium MMX-166 profile",
+        "Deterministic PC100 SDRAM calibration for the GSW-586 166 MHz profile",
     ),
 ];
 

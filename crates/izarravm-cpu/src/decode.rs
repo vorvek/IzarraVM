@@ -141,8 +141,8 @@ impl CpuGsw {
                 // ops INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
                 // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
                 // (A0/A1/A8/A9, 386+, mirroring the one-byte ES/SS/DS segment push/pop arms in
-                // `execute_stack_decoded`); and the whole MMX block (`is_mmx_two_byte`). 0F AA
-                // (RSM) is unimplemented and stays TwoByteFallback.
+                // `execute_stack_decoded`). 0F AA (RSM) is unimplemented and stays
+                // TwoByteFallback.
                 0x08
                 | 0x09
                 | 0x30
@@ -155,7 +155,6 @@ impl CpuGsw {
                 | 0xa9
                 | 0xc7
                 | 0xc8..=0xcf => DecodeGroup::Misc,
-                second if is_mmx_two_byte(second as u8) => DecodeGroup::Misc,
                 _ => DecodeGroup::TwoByteFallback,
             };
         }
@@ -870,29 +869,9 @@ impl CpuGsw {
                         insn.modrm = Some(modrm);
                         insn.operand = Some(operand);
                     }
-                    // The MMX shift-by-immediate forms (0F 71/72/73). The fused path read ONLY the
-                    // ModRM byte and then the imm8 count — it never decoded an addressing mode (these
-                    // are register-form, `modrm.rm` is the target). Mirror that exactly so the byte
-                    // budget matches even the malformed mode != 3 encoding: ModRM, then imm8, with no
-                    // addressing-descriptor parse.
-                    0x0f71..=0x0f73 => {
-                        let modrm = self.fetch_modrm(bus)?;
-                        insn.modrm = Some(modrm);
-                        insn.imm = u32::from(self.fetch_u8(bus)?);
-                    }
-                    // The rest of the MMX block, except EMMS (0F 77), which has no ModRM and falls to
-                    // the no-operand arm below. Every other MMX opcode is a ModRM r/m form: parse the
-                    // ModRM + addressing descriptor. (MOVD/MOVQ and the Pxxx forms carry no immediate.)
-                    op if op != 0x0f77 && op & 0xff00 == 0x0f00 && is_mmx_two_byte(op as u8) => {
-                        let modrm = self.fetch_modrm(bus)?;
-                        let operand =
-                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
-                        insn.modrm = Some(modrm);
-                        insn.operand = Some(operand);
-                    }
                     // Every other one-off carries no encoded operand after the opcode byte(s):
                     // the BCD adjusts (0x27/0x2f/0x37/0x3f), SALC/XLAT (0xd6/0xd7), INS/OUTS
-                    // (0x6c-0x6f), HLT (0xf4), EMMS (0F 77), and the no-operand 0F system/serializing/
+                    // (0x6c-0x6f), HLT (0xf4), and the no-operand 0F system/serializing/
                     // CPU-id ops (08/09/30/31/32/a2/c8-cf). XLAT reads memory at execute from
                     // live registers; the rest take implicit/register/no operands.
                     _ => {}

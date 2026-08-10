@@ -844,8 +844,7 @@ fn regen_fpu_goldens() {
 
 /// One golden end-state for a Misc case (task A14). Captures the architectural register file
 /// (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip, the (offset,value) memory writes, the instruction-
-/// fetch cycle count, and the MMX register file + x87 tag word (so the MMX/EMMS members are
-/// covered too). Port reads via TestBus always return 0, so the IN/OUT-derived register/memory
+/// fetch cycle count. Port reads via TestBus always return 0, so the IN/OUT-derived register/memory
 /// values reflect the read-zero behaviour; the port traffic itself is asserted separately by the
 /// dedicated INS/OUTS tests.
 struct MiscGolden {
@@ -856,11 +855,9 @@ struct MiscGolden {
     eip: u32,
     deltas: &'static [(usize, u8)],
     fetch: usize,
-    mmx: [u64; 8],
-    fpu_tag: u16,
 }
 
-/// Seed for the Misc golden battery: a fixed register file giving BCD/IMUL/TEST/XLAT/MMX stable
+/// Seed for the Misc golden battery: a fixed register file giving BCD/IMUL/TEST/XLAT stable
 /// inputs. AL=0x29, AH=0x05 (so DAA/AAA/AAM/AAD/TEST exercise the adjust/flag paths); CF/AF preset
 /// so DAA/DAS see an incoming carry; BX=0x10 (XLAT base); CX/DX/SI/DI/BP fixed. EDX:EAX and ECX:EBX
 /// are also given known 32-bit halves for CMPXCHG8B (set after this via the high words below).
@@ -877,27 +874,25 @@ fn misc_seed(cpu: &mut CpuGsw) {
     cpu.registers.set_edi(0x0000_0018);
     cpu.registers.set_ebp(0x0000_0010);
     cpu.registers.eflags = 0x13; // CF=1, AF=1 (bit 4) on top of the always-1 bit 1
-    // Seed the MMX register file so MOVQ/Pxxx/EMMS have non-trivial inputs.
-    cpu.fpu.set_mm(0, 0x0102_0304_0506_0708);
-    cpu.fpu.set_mm(1, 0x1010_1010_1010_1010);
 }
 
-/// Seed memory for the Misc battery: plant the XLAT lookup table byte at [BX+AL]=[0x39], an
-/// m64 for CMPXCHG8B at [0x40], and a packed-byte source for the MMX memory form at [0x100].
+/// Seed memory for the Misc battery: plant the XLAT lookup table byte at [BX+AL]=[0x39] and an
+/// m64 for CMPXCHG8B at [0x40].
 fn misc_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[..code.len()].copy_from_slice(code);
     mem[0x39] = 0xab; // XLAT: [DS:BX+AL] with BX=0x10, AL=0x29 -> 0x39
     mem[0x40..0x48].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes()); // CMPXCHG8B m64
-    mem[0x100..0x108].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // MMX m64 source
 }
 
 /// The heterogeneous one-off differential battery (task A14). Captured from the PRIOR fused
 /// reference (`execute_instruction_legacy`) via `regen_misc_goldens` at parent commit f1d65e0f
 /// WHILE the fused arms (single-byte 0x27/0x2f/0x37/0x3f/0x69/0x6b/0x6c-0x6f/0xa8/0xa9/0xd4/0xd5/
-/// 0xd6/0xd7/0xf4 and the 0F CMPXCHG8B/MMX/CPUID/RDTSC/...) still existed. Never edit by hand —
+/// 0xd6/0xd7/0xf4 and the 0F CMPXCHG8B/CPUID/RDTSC/...) still existed. Never edit by hand —
 /// re-run the regen from the pre-split commit. Covers: DAA/DAS/AAA/AAS (BCD flag effects),
 /// AAM/AAD (incl. the imm8 base), TEST AL/AX,imm (flags only), IMUL r,r/m,imm8/imm16 (OF/CF set),
-/// SALC, XLAT (memory read), HLT, CPUID, RDTSC, MOVD/MOVQ/PADDB/EMMS (MMX), and CMPXCHG8B.
+/// SALC, XLAT (memory read), HLT, CPUID, RDTSC, and CMPXCHG8B. (The MMX cases the battery once
+/// carried went with the MMX block: the GSW-586 has no SIMD extension, so those encodings are
+/// invalid and their #UD is asserted in `cpu_persona_system_test.rs` instead.)
 fn misc_golden_cases() -> &'static [MiscGolden] {
     // Captured verbatim from the fused reference at parent f1d65e0f via `regen_misc_goldens`
     // (run in a throwaway worktree). Never edit by hand.
@@ -916,17 +911,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x1,
         deltas: &[],
         fetch: 2,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "das (2f)",
@@ -936,17 +920,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x1,
         deltas: &[],
         fetch: 2,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "aaa (37)",
@@ -956,17 +929,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x1,
         deltas: &[],
         fetch: 2,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "aas (3f)",
@@ -976,17 +938,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x1,
         deltas: &[],
         fetch: 2,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "aam (d4 0a)",
@@ -996,17 +947,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x2,
         deltas: &[],
         fetch: 3,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "aad (d5 0a)",
@@ -1016,17 +956,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x2,
         deltas: &[],
         fetch: 3,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "test al,imm8 (a8 0f)",
@@ -1036,17 +965,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x2,
         deltas: &[],
         fetch: 3,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "test ax,imm16 (a9 ff 00)",
@@ -1056,17 +974,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x3,
         deltas: &[],
         fetch: 4,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "imul ax,bx,imm8 (6b c3 02)",
@@ -1076,17 +983,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x3,
         deltas: &[],
         fetch: 4,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "imul ax,bx,imm16 (69 c3 00 40)",
@@ -1096,17 +992,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x4,
         deltas: &[],
         fetch: 5,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "salc (d6)",
@@ -1116,17 +1001,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x1,
         deltas: &[],
         fetch: 2,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "xlat (d7)",
@@ -1136,17 +1010,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x1,
         deltas: &[],
         fetch: 2,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
     MiscGolden {
         name: "rdtsc (0f 31)",
@@ -1156,97 +1019,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x2,
         deltas: &[],
         fetch: 3,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
-    },
-    MiscGolden {
-        name: "movd mm0,eax (0f 6e c0)",
-        code: &[15, 110, 192],
-        gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
-        eflags: 0x13,
-        eip: 0x3,
-        deltas: &[],
-        fetch: 4,
-        mmx: [
-            0x0000000000000529,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
-    },
-    MiscGolden {
-        name: "movq mm1,mm0 (0f 6f c8)",
-        code: &[15, 111, 200],
-        gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
-        eflags: 0x13,
-        eip: 0x3,
-        deltas: &[],
-        fetch: 4,
-        mmx: [
-            0x0102030405060708,
-            0x0102030405060708,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
-    },
-    MiscGolden {
-        name: "paddb mm0,[0x100] (0f fc 06 00 01)",
-        code: &[15, 252, 6, 0, 1],
-        gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
-        eflags: 0x13,
-        eip: 0x5,
-        deltas: &[],
-        fetch: 6,
-        mmx: [
-            0x0909090909090909,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
-    },
-    MiscGolden {
-        name: "emms (0f 77)",
-        code: &[15, 119],
-        gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
-        eflags: 0x13,
-        eip: 0x2,
-        deltas: &[],
-        fetch: 3,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0xffff,
     },
     MiscGolden {
         name: "cmpxchg8b [0x40] (0f c7 0e 40 00)",
@@ -1256,17 +1028,6 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eip: 0x5,
         deltas: &[],
         fetch: 6,
-        mmx: [
-            0x0102030405060708,
-            0x1010101010101010,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        fpu_tag: 0x0,
     },
 ];
 
@@ -1275,7 +1036,7 @@ fn misc_split_matches_golden_across_ops() {
     // The Misc one-off opcodes are converted to the decode/execute split, so their fused arms
     // are deleted and they can no longer be diffed against a fused executor in-tree. Run each
     // case through the split (`exec_one_split`) and assert the architectural end-state — GPRs,
-    // eflags, the MMX file + x87 tag, and the memory writes — against goldens captured from the
+    // eflags, and the memory writes — against goldens captured from the
     // pre-split fused path (parent f1d65e0f) via `regen_misc_goldens`. eip + fetch prove decode
     // consumed and charged every byte (opcode + ModRM + displacement + immediate) exactly once.
     for g in misc_golden_cases() {
@@ -1291,9 +1052,6 @@ fn misc_split_matches_golden_across_ops() {
         assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
         assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
         assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
-        let mmx: [u64; 8] = std::array::from_fn(|i| split.fpu.mm(i as u8));
-        assert_eq!(mmx, g.mmx, "mmx register mismatch for {}", g.name);
-        assert_eq!(split.fpu.tag, g.fpu_tag, "fpu tag mismatch for {}", g.name);
         let deltas: Vec<(usize, u8)> = sbus
             .memory
             .iter()
@@ -1365,9 +1123,8 @@ fn regen_misc_goldens() {
             .map(|(i, b)| (i, *b))
             .collect();
         let fetch = seam_fetch_count(&fbus);
-        let mmx: [u64; 8] = std::array::from_fn(|i| fused.fpu.mm(i as u8));
         println!(
-            "    MiscGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {}, mmx: [{} ], fpu_tag: {:#x} }},",
+            "    MiscGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
             g.name,
             g.code,
             fused.registers.gpr,
@@ -1375,10 +1132,6 @@ fn regen_misc_goldens() {
             fused.registers.eip,
             deltas,
             fetch,
-            mmx.iter()
-                .map(|b| format!(" {b:#018x},"))
-                .collect::<String>(),
-            fused.fpu.tag,
         );
     }
 }

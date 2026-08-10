@@ -534,59 +534,6 @@ fn fucompp_sets_equal_condition() {
     assert_eq!(cpu.fpu.top(), 0, "both operands popped");
 }
 
-// ---- MMX execute path; lane math is unit-tested in mmx.rs ----
-
-#[test]
-fn movd_then_movq_copies_registers() {
-    // MOVD mm0, eax (0F 6E C0); MOVQ mm1, mm0 (0F 6F C8).
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x6e, 0xc0, 0x0f, 0x6f, 0xc8], 0x20);
-    cpu.registers.set_eax(0x0a0b_0c0d);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.fpu.mm(0), 0x0a0b_0c0d);
-    assert_eq!(cpu.fpu.mm(1), 0x0a0b_0c0d);
-}
-
-#[test]
-fn paddb_adds_packed_bytes_from_memory() {
-    // MOVQ mm0, [0x100]; PADDB mm0, [0x108].
-    let code = [0x0f, 0x6f, 0x06, 0x00, 0x01, 0x0f, 0xfc, 0x06, 0x08, 0x01];
-    let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
-    memory[0x100..0x108].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    memory[0x108..0x110].copy_from_slice(&[10, 10, 10, 10, 10, 10, 10, 10]);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(
-        cpu.fpu.mm(0).to_le_bytes(),
-        [11, 12, 13, 14, 15, 16, 17, 18]
-    );
-}
-
-#[test]
-fn emms_marks_the_x87_stack_empty() {
-    // MOVD mm0, eax marks the tags valid; EMMS (0F 77) empties them.
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x6e, 0xc0, 0x0f, 0x77], 0x20);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.fpu.tag, 0x0000, "MMX write marks tags valid");
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.fpu.tag, 0xffff, "EMMS empties the tag word");
-}
-
-#[test]
-fn psllw_immediate_shifts_each_word() {
-    // MOVD mm0, eax (0x0001_0002); PSLLW mm0, 4 (0F 71 /6 imm8).
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x6e, 0xc0, 0x0f, 0x71, 0xf0, 0x04], 0x20);
-    cpu.registers.set_eax(0x0001_0002);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    cpu.cycle(&mut bus).unwrap();
-    // low dword loaded; word lanes 0x0002 and 0x0001 each shift left by 4.
-    assert_eq!(cpu.fpu.mm(0) & 0xffff_ffff, 0x0010_0020);
-}
-
 // ---- Protected-mode system instructions ----
 
 #[test]
