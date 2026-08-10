@@ -31,6 +31,12 @@ pub struct Int13Profile {
     /// Read calls bucketed by sector count: 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64,
     /// 65-127, 128+. The first bucket is the whole question for hypothesis (a).
     pub read_count_hist: [u64; 9],
+    /// Read sectors that came out of the host-side sector cache and were
+    /// therefore charged nothing. `read_sectors - cache_hits` is what the model
+    /// actually billed at 16.7 MB/s, so the two together are the whole of the
+    /// charge: without this field a fallen `stall_ticks` cannot be told apart
+    /// from a fallen read count.
+    pub cache_hits: u64,
     /// Master ticks the fixed-disk path charged the guest through
     /// `stall_for_master_ticks`. The guest-charge side of the throughput sum.
     pub stall_ticks: u64,
@@ -1667,13 +1673,31 @@ impl Machine {
     /// Advance the shared machine clock for sectors moved directly by an INT
     /// 13h fixed-disk service. Port-driven ATA commands schedule this deadline
     /// themselves, so only the BIOS path calls this helper.
-    fn stall_for_hdd_sectors(&mut self, sectors: u32) {
-        self.stall_for_master_ticks(ata::pio_transfer_ticks(sectors));
+    ///
+    /// The advance is less the `hits` sectors the host-side sector cache
+    /// served without touching the backing. This is the only place the cache
+    /// changes guest-observable behaviour: content is identical either way, only
+    /// the charge differs, and the charge is a pure function of the guest's own
+    /// prior reads and writes (see `sector_cache`).
+    fn stall_for_hdd_sectors_cached(&mut self, sectors: u32, hits: u32) {
+        self.stall_for_master_ticks(ata::pio_transfer_ticks_cached(sectors, hits));
+    }
+
+    /// Sector-cache hits since mount, or 0 with no disk. A transfer reads this
+    /// before and after its loop; the delta is what that transfer got for free.
+    fn sector_cache_hits(&self) -> u64 {
+        self.ata.as_ref().map_or(0, |d| d.sector_cache_hits())
+    }
+
+    /// Hits accumulated since `before`, saturating into the `u32` a sector count
+    /// is expressed in.
+    fn sector_cache_hits_since(&self, before: u64) -> u32 {
+        u32::try_from(self.sector_cache_hits().saturating_sub(before)).unwrap_or(u32::MAX)
     }
 
     /// Record one fixed-disk data call in the census. Gated at the call site, so
     /// this is never reached on an ordinary run.
-    pub(super) fn note_int13_data(&mut self, kind: Int13DataKind, sectors: u32) {
+    pub(super) fn note_int13_data(&mut self, kind: Int13DataKind, sectors: u32, hits: u32) {
         let p = &mut self.int13_profile;
         match kind {
             Int13DataKind::Read => {
@@ -1690,9 +1714,10 @@ impl Machine {
                 p.verify_sectors += u64::from(sectors);
             }
         }
+        p.cache_hits = p.cache_hits.saturating_add(u64::from(hits.min(sectors)));
         p.stall_ticks = p
             .stall_ticks
-            .saturating_add(ata::pio_transfer_ticks(sectors));
+            .saturating_add(ata::pio_transfer_ticks_cached(sectors, hits));
     }
 
     /// The fixed-disk census so far. All zero unless `IZARRAVM_INT13_PROFILE=1`.
@@ -1723,6 +1748,8 @@ impl Machine {
         };
         self.c_accesses += 1;
         let mut done: u8 = 0;
+        // Sector-cache hits this transfer collects, for the charge below.
+        let hits_before = self.sector_cache_hits();
         for i in 0..count {
             let lba = start_lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * 512);
@@ -1758,15 +1785,16 @@ impl Machine {
                 self.booter_inert = true;
             }
         }
+        let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
             let kind = if ah == 0x02 {
                 Int13DataKind::Read
             } else {
                 Int13DataKind::Write
             };
-            self.note_int13_data(kind, u32::from(done));
+            self.note_int13_data(kind, u32::from(done), cache_hits);
         }
-        self.stall_for_hdd_sectors(u32::from(done));
+        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -1804,6 +1832,8 @@ impl Machine {
 
         self.c_accesses += 1;
         let mut done: u8 = 0;
+        // Sector-cache hits this transfer collects, for the charge below.
+        let hits_before = self.sector_cache_hits();
         for i in 0..count {
             let lba = start_lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * LONG_SECTOR_BYTES);
@@ -1830,15 +1860,16 @@ impl Machine {
             done += 1;
         }
 
+        let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
             let kind = if ah == 0x0A {
                 Int13DataKind::Read
             } else {
                 Int13DataKind::Write
             };
-            self.note_int13_data(kind, u32::from(done));
+            self.note_int13_data(kind, u32::from(done), cache_hits);
         }
-        self.stall_for_hdd_sectors(u32::from(done));
+        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -1867,6 +1898,8 @@ impl Machine {
         };
         self.c_accesses += 1;
         let mut done: u8 = 0;
+        // Sector-cache hits this transfer collects, for the charge below.
+        let hits_before = self.sector_cache_hits();
         for i in 0..count {
             let readable = self
                 .ata
@@ -1878,10 +1911,11 @@ impl Machine {
             }
             done += 1;
         }
+        let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
-            self.note_int13_data(Int13DataKind::Verify, u32::from(done));
+            self.note_int13_data(Int13DataKind::Verify, u32::from(done), cache_hits);
         }
-        self.stall_for_hdd_sectors(u32::from(done));
+        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -1996,6 +2030,8 @@ impl Machine {
         }
         self.c_accesses += 1;
         let mut done: u16 = 0;
+        // Sector-cache hits this transfer collects, for the charge below.
+        let hits_before = self.sector_cache_hits();
         for i in 0..count {
             let l = u32::try_from(lba + u64::from(i)).expect("validated EDD LBA fits ATA");
             let addr = buffer.wrapping_add(u32::from(i) * 512);
@@ -2027,15 +2063,16 @@ impl Machine {
             }
             done += 1;
         }
+        let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
             let kind = match ah {
                 0x42 => Int13DataKind::Read,
                 0x43 => Int13DataKind::Write,
                 _ => Int13DataKind::Verify,
             };
-            self.note_int13_data(kind, u32::from(done));
+            self.note_int13_data(kind, u32::from(done), cache_hits);
         }
-        self.stall_for_hdd_sectors(u32::from(done));
+        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
         if done == count {

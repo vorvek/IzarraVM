@@ -114,6 +114,7 @@ mod pit;
 mod raw_program;
 mod rtc;
 mod run;
+mod sector_cache;
 mod speaker;
 mod storage;
 mod uart;
@@ -1825,6 +1826,16 @@ impl Machine {
     /// mounted host folder.
     pub fn katea_geometry_report(&self) -> Option<katea_tree::KateaGeometryReport> {
         self.ata.as_ref().and_then(|d| d.katea_geometry_report())
+    }
+
+    /// Host-side sector-cache hits and misses on the fixed disk since mount, or
+    /// None with no disk. Always counted (two `u64` adds on a path that already
+    /// synthesizes a sector), because without them a fallen `io_stall_ticks`
+    /// cannot be attributed to the cache rather than to fewer reads.
+    pub fn hdd_sector_cache_counters(&self) -> Option<(u64, u64)> {
+        self.ata
+            .as_ref()
+            .map(|d| (d.sector_cache_hits(), d.sector_cache_misses()))
     }
 
     /// Arm the BIOS fixed-disk census. Off by default; the host CLI arms it from

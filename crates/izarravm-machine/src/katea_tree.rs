@@ -30,14 +30,30 @@ use std::path::{Path, PathBuf};
 /// also roughly the depth DOS's 64-char path limit allows.
 const MAX_DEPTH: usize = 32;
 
-/// Floor on the data-cluster count so the synthesized partition is always a
-/// valid, boot-tested FAT32. This is exactly the flat static disk's data-cluster
-/// count: `(PART_SECTORS - used) / spc` for the proven-bootable 96256-sector
-/// partition (`used = 32 + 2*741`). Flooring here means a small host folder
-/// reproduces the known-good geometry (`part_sectors = 96256`, `fatsz = 741`)
-/// instead of landing just under `sectors_per_cluster`'s FAT32 floor (66601
-/// sectors), where it would panic. A larger folder grows past this floor.
-const MIN_DATA_CLUSTERS: u32 = 94_742;
+/// Floor on the synthesized partition, in sectors: 532,481, which is exactly one
+/// sector past where fatgen103's `DskTableFAT32` leaves 512-byte clusters behind
+/// for 4 KiB ones. Every derived volume is at least this big, so every derived
+/// volume gets `spc >= 8`.
+///
+/// This replaced a data-cluster floor of 94,742, which reproduced the flat static
+/// image's proven-bootable 96,256-sector geometry — and, with it, that geometry's
+/// `spc = 1`. 512-byte clusters are the degenerate case: a 44 MB file becomes an
+/// ~86,600-entry FAT chain, DOS re-walks that chain on every seek, and 86.2% of
+/// all sectors a measured Duke Nukem 3D benchmark read were FAT sectors. No 1997
+/// tool would have produced it either — FORMAT.COM sized clusters off this same
+/// table, and 512-byte clusters were reserved for volumes under 260 MB, which
+/// FAT32 was not used on. Flooring the PARTITION rather than the cluster count is
+/// what keeps the derivation self-consistent: `fat32_geometry_for` still requires
+/// `sectors_per_cluster(part_sectors) == spc`, and a partition at or above this
+/// floor satisfies it at `spc = 8` without any special case.
+///
+/// The bootability the old floor was protecting is not a property of that one
+/// geometry: it comes from `fat_size_sectors` using the FreeDOS kernel's own
+/// `CalculateFATData` formula, which holds at any `spc`. It is re-established by
+/// test at the new size (`small_folder_derives_a_four_kib_cluster_volume`) and by
+/// every hdd-folder fixture in the scoreboard, all of which boot through this
+/// geometry.
+const MIN_PART_SECTORS: u32 = 532_481;
 
 #[derive(Debug)]
 pub(crate) struct TreeFile {
@@ -346,12 +362,15 @@ fn fat32_geometry_for(demand_at: impl Fn(u32) -> u64) -> Result<Geometry, std::i
         // The demand for THIS cluster size: the only honest figure to size from.
         let used_data = demand_at(u32::from(spc) * SECTOR as u32);
         // Need a valid FAT32; pad with headroom (25%) so DIR shows free space and
-        // writes have room, and floor at the boot-tested cluster count so the small-
-        // folder partition reproduces the known-good geometry (see
-        // MIN_DATA_CLUSTERS) rather than landing just under the FAT32 floor. All in
-        // u64 so the +25% can't overflow before the checks below.
+        // writes have room, and floor the whole partition at MIN_PART_SECTORS so
+        // no derived volume lands on the degenerate 512-byte-cluster band. The
+        // floor is expressed in clusters here because that is what this loop
+        // sizes with; at spc=1 it forces a partition the table reads back as
+        // spc=8, and the self-consistency check below climbs there in one step.
+        // All in u64 so the +25% can't overflow before the checks below.
         let needed = used_data.max(1);
-        let count_of_clusters = (needed + needed / 4).max(u64::from(MIN_DATA_CLUSTERS));
+        let floor_clusters = u64::from(MIN_PART_SECTORS).div_ceil(u64::from(spc));
+        let count_of_clusters = (needed + needed / 4).max(floor_clusters);
         // Too many clusters / too many data sectors for THIS band: if a bigger
         // cluster size exists, climb to it (it shrinks the cluster count); only at
         // the top band (MAX_SPC) does this mean the folder is genuinely too large.

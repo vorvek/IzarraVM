@@ -1606,6 +1606,10 @@ fn write_hdd_profile_json(
             "total_sectors": g.total_sectors,
             "count_of_clusters": g.count_of_clusters,
         })),
+        "hdd_sector_cache": machine.hdd_sector_cache_counters().map(|(hits, misses)| json!({
+            "hits": hits,
+            "misses": misses,
+        })),
         "io_stall_ticks": machine.io_stall_ticks(),
         "halted_ticks": machine.halted_ticks(),
         "katea": machine.katea_storage_counters().map(|k| json!({
@@ -1759,6 +1763,7 @@ fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
         "verify_sectors": p.verify_sectors,
         "control_calls": p.control_calls,
         "read_count_hist": p.read_count_hist.to_vec(),
+        "cache_hits": p.cache_hits,
         "stall_ticks": p.stall_ticks,
         "host_wall_ns": p.host_wall_ns,
     })
@@ -1796,6 +1801,7 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "int13_write_sectors": mark.int13.write_sectors,
                 "int13_verify_calls": mark.int13.verify_calls,
                 "int13_control_calls": mark.int13.control_calls,
+                "int13_cache_hits": mark.int13.cache_hits,
                 "int13_stall_ticks": mark.int13.stall_ticks,
                 "int13_host_wall_ns": mark.int13.host_wall_ns,
                 // The JIT / SMC / decode series QUESTION 1 correlates against the
