@@ -926,6 +926,22 @@ impl Machine {
     ///   `out_after`. Removing the term is a measurable batch-length change and
     ///   belongs to its own slice, not to a fidelity fix.
     ///
+    ///   COVERAGE AUDITED, because the original 5 ms figure was chosen to span a
+    ///   latch-compute-latch pair and does NOT span a once-per-frame (>5 ms)
+    ///   latch cadence -- so if the window were still load-bearing for values,
+    ///   that pattern would fall through it. Every 0x40-0x43 path in BOTH classes
+    ///   now peeks at the in-batch instant, so it is not:
+    ///     * read 0x40-0x42 -> `Pit::read_port_at` -> `Counter::read(clocks)`,
+    ///       which returns the status latch, else the count latch, else
+    ///       `count_after(clocks)`;
+    ///     * write 0x43 read-back/latch -> `latch_count(clocks)` and
+    ///       `latch_status(clocks)`, the latter peeking OUT via `out_after` and
+    ///       NULL COUNT via `null_count_after`;
+    ///     * write 0x40-0x42 (a count write needs no device state at all).
+    ///
+    ///   Neither arm is gated on `lazy_port_reads`. The BCD decline is the whole
+    ///   remaining surface.
+    ///
     /// NOT a term, deliberately: the sample producers' own fidelity. The original
     /// cap (2026-06-21) existed so "the per-clock fine-samplers ... never alias" --
     /// at that time the speaker sampled channel-2 OUT once per advance. Five days
@@ -1144,6 +1160,10 @@ impl Machine {
 
     /// How many batch entries ran, and how many of those had to re-scan. Host
     /// instrumentation for the deadline cache; never an emulation input.
+    ///
+    /// Both counters are maintained ONLY while machine phase timing is enabled
+    /// (see `event_batch_cap_cached`), so they read `(0, 0)` on a normal run.
+    /// The only consumer prints behind the same flag.
     pub fn device_edge_cache_counts(&self) -> (u64, u64) {
         (self.device_edge_batches, self.device_edge_scans)
     }
@@ -1189,7 +1209,21 @@ impl Machine {
     /// The `debug_assert` compares every cached answer against the fresh scan, so
     /// the whole test suite is a continuous audit of the invalidation list.
     pub(super) fn event_batch_cap_cached(&mut self, remaining: u64) -> u64 {
-        self.device_edge_batches = self.device_edge_batches.wrapping_add(1);
+        // Hit-rate instrumentation, GATED AT THE CALL SITE on the same flag that
+        // decides whether anything will ever read it (`--machine-phase-timing`,
+        // the only consumer -- see the print in `run_boot_hdd_folder`). An
+        // ungated pair of `u64` increments on the batch-entry path is exactly the
+        // default-off instrument tax this repo has been bitten by before: the
+        // whole point of the cache is that the common batch entry is one compare
+        // and one subtraction, and two unconditional read-modify-writes of
+        // machine state next to it is a real fraction of that. `host_profile` is
+        // already the loop's own profiling gate (`host_profile.start()` is
+        // called a few lines down in `run_until_tick`), so this reuses a bool
+        // that is hot in cache rather than adding another.
+        let instrumented = self.host_profile.enabled;
+        if instrumented {
+            self.device_edge_batches = self.device_edge_batches.wrapping_add(1);
+        }
         let now = self.timeline.now_ticks();
         if let DeviceEdgeCache::Due(at) = self.device_edge_cache
             && at <= now
@@ -1197,7 +1231,9 @@ impl Machine {
             self.device_edge_cache = DeviceEdgeCache::Stale;
         }
         if self.device_edge_cache == DeviceEdgeCache::Stale {
-            self.device_edge_scans = self.device_edge_scans.wrapping_add(1);
+            if instrumented {
+                self.device_edge_scans = self.device_edge_scans.wrapping_add(1);
+            }
             self.device_edge_cache = match self.next_cacheable_edge_ticks() {
                 Some(ticks) => DeviceEdgeCache::Due(now.saturating_add(ticks)),
                 None => DeviceEdgeCache::Idle,
@@ -1339,14 +1375,21 @@ impl MachineBus<'_> {
     /// `pit_clocks` value the real call will start folding T's clocks into: no
     /// time travel, this predicts exactly what a real `advance_devices` at T
     /// followed by a read would produce.
+    pub(super) fn elapsed_pit_clocks(&self) -> u64 {
+        self.timeline_at_batch_start
+            .preview_cpu_clocks(self.in_batch_clocks(), self.vega.dot_clock_hz())
+            .0
+    }
+
     /// Record that the guest just touched a PIT counter, so the Accurate class
     /// keeps its fine batch grain for a while (see
     /// `Machine::fine_batch_grain_required` and `pit_observer_fine_until`).
     ///
     /// Armed by every access to 0x40-0x43, read or write. Since
-    /// `Counter::count_after` peeks the counting element at the access instant, this
-    /// no longer protects the latched VALUE (which is exact at any grain); it covers
-    /// the BCD counters that peek declines for. The window is generous (`PIT_OBSERVER_FINE_WINDOW_MS`)
+    /// `Counter::count_after` peeks the counting element at the access instant,
+    /// this no longer protects the latched VALUE (which is exact at any grain);
+    /// it covers the BCD counters that peek declines for. The window
+    /// (`PIT_OBSERVER_FINE_WINDOW_TICKS`, 5 ms of guest time) is generous
     /// because the whole point is to cover the "compute" leg between two
     /// latches; it is charged from batch start rather than the exact in-flight
     /// instruction because a few microseconds at this scale cannot matter and
@@ -1355,12 +1398,6 @@ impl MachineBus<'_> {
         *self.pit_observer_fine_until = self
             .master_ticks_at_batch_start
             .saturating_add(PIT_OBSERVER_FINE_WINDOW_TICKS);
-    }
-
-    pub(super) fn elapsed_pit_clocks(&self) -> u64 {
-        self.timeline_at_batch_start
-            .preview_cpu_clocks(self.in_batch_clocks(), self.vega.dot_clock_hz())
-            .0
     }
 
     /// Peek `channel`'s live PIT OUT level mid-batch without stepping

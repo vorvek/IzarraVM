@@ -1053,7 +1053,9 @@ pub struct Machine {
     // of canonical state -- a restored machine simply re-scans.
     device_edge_cache: timing::DeviceEdgeCache,
     // Batch entries and pull-scans since power-on, for the deadline cache's own
-    // hit-rate readout. Two increments on the batch path, never an emulation input.
+    // hit-rate readout. Never an emulation input, and maintained only while
+    // `host_profile.enabled` is set, so the batch path pays nothing for them on a
+    // normal run. See `Machine::event_batch_cap_cached`.
     device_edge_batches: u64,
     device_edge_scans: u64,
     // Diagnostic-only OPL counters plus an optional access trace; see `OplProbe`.

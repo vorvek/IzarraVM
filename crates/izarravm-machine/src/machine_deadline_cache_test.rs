@@ -284,6 +284,12 @@ fn the_run_loop_serves_most_batch_entries_from_the_cache() {
     )
     .unwrap();
     machine.set_mode(GswMode::Gsw586);
+    // The hit-rate counters are gated at the call site on the machine-phase
+    // profiling flag, so that a normal run pays nothing for an instrument only
+    // `--machine-phase-timing` ever reads. A test that asserts on the instrument
+    // has to turn it on; without this the counters stay (0, 0) and the
+    // assertions below fail, which is the gate's own non-vacuity proof.
+    machine.enable_machine_profiling();
     program_pit_channel0(&mut machine, 60_000); // ~50 ms, the slowest useful period
 
     machine
