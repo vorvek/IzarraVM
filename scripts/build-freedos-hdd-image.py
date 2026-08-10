@@ -355,7 +355,7 @@ def main(check: bool = False) -> int:
                 b"GOTO END\r\n"
                 b":SOUND\r\n"
                 b"SNDCTRL /B /T\r\n"
-                b"SNDMIXER /CFG C:\\DOS\\VOLCONF.CFG /S\r\n"
+                b"SNDMIXER /CFG C:\\VOLCONF.CFG /S\r\n"
                 b"GOTO END\r\n"
                 b":END\r\n")
     hello_txt = b"Katea M0 OK\r\n"

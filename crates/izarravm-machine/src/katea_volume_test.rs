@@ -139,7 +139,7 @@ fn extracts_the_embedded_image_payload() {
     // scripts/build-freedos-hdd-image.py), so this line has to be silent or it
     // takes a row from another owner.
     assert!(
-        autoexec_text.contains(r"SNDMIXER /CFG C:\DOS\VOLCONF.CFG /S"),
+        autoexec_text.contains(r"SNDMIXER /CFG C:\VOLCONF.CFG /S"),
         "default AUTOEXEC's SOUND block restores the saved volume levels silently"
     );
     let summary_at = autoexec_text

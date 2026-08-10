@@ -473,15 +473,19 @@ Levels are saved to a file with `/CFG`, and the default `AUTOEXEC.BAT` restores
 them on the next boot:
 
 ```
-SNDMIXER /CFG C:\DOS\VOLCONF.CFG /S
+SNDMIXER /CFG C:\VOLCONF.CFG /S
 ```
 
 `/CFG` on its own reads the file and writes the card. `/CFG` together with any
 channel switch does the opposite: it applies the switches and then writes them
 into the file. `/S` prints nothing at all, which is what keeps the boot screen
 clean. F10 in the full-screen mixer saves to whatever `/CFG` named, or to
-`C:\DOS\VOLCONF.CFG` when it named nothing — the same file the boot line
-reads.
+`C:\VOLCONF.CFG` when it named nothing — the same file the boot line reads.
+
+The default sits in the root of `C:` rather than in `C:\DOS`, because `C:` is
+not always the Toka-DOS image: point IzarraVM at a folder of games and that
+folder becomes `C:`, with no `DOS` directory in it. A save into a directory
+that is not there fails; the root of a mounted drive is always there.
 
 ## TOKAMOUS
 

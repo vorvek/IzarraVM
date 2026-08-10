@@ -305,12 +305,13 @@ fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
     std::mem::forget(scratch);
     fs::write(dir.join("SNDMIXER.COM"), izarravm_firmware::sndmixer_com())
         .expect("stage SNDMIXER.COM");
-    // F10 with no `/CFG` saves to `C:\DOS\VOLCONF.CFG`, the path the image's
-    // AUTOEXEC restores from. On the committed image that directory is a real
-    // one; under the host-folder facade `C:\DOS` is synthesized from the
-    // overlay, so the host side of it has to exist for Katea to materialize a
-    // guest write into it.
-    fs::create_dir_all(dir.join("DOS")).expect("stage the host side of C:\\DOS");
+    // F10 with no `/CFG` saves to `C:\VOLCONF.CFG`, the path the image's
+    // AUTOEXEC restores from. Deliberately NOT staging a host-side `DOS`
+    // directory here: the default has to land somewhere that exists on a bare
+    // host-folder mount, which is the GUI's default drive and need carry
+    // nothing but the game the user dropped in it. The root always exists;
+    // `C:\DOS` does not, and a create into a directory that is not there is
+    // the failure this path is written to avoid.
     fs::write(
         dir.join("AUTOEXEC.BAT"),
         "@ECHO OFF\r\nPROMPT $P$G\r\nSNDMIXER\r\n",
@@ -384,11 +385,10 @@ fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
 
     let screen = machine.screen_text().as_text();
     assert!(
-        screen.contains("Saved in C:\\DOS\\VOLCONF.CFG"),
+        screen.contains("Saved in C:\\VOLCONF.CFG"),
         "with no /CFG, F10 saves to the path the image's AUTOEXEC restores from\n{screen}"
     );
-    let written =
-        fs::read_to_string(dir.join("DOS").join("VOLCONF.CFG")).expect("read the saved config");
+    let written = fs::read_to_string(dir.join("VOLCONF.CFG")).expect("read the saved config");
     assert!(
         written.contains("FMSYNTH=8"),
         "the saved file must carry the level the fader was left on:\n{written}"
