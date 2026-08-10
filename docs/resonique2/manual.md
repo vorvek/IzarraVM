@@ -164,6 +164,11 @@ and restored on the next boot from `AUTOEXEC.BAT`.
 C:\> SNDMIXER
 ```
 
+Tab and the arrow keys move between the faders and, after them, the **Accept**
+and **Cancel** buttons along the bottom of the box; Enter or Space presses the
+one that is selected. Accept leaves with the levels in effect, Cancel puts back
+the levels the mixer opened on, and F10 saves them for the next boot.
+
 There is no line-in or microphone fader. The machine models playback only, so
 those inputs have no source for a control to adjust.
 

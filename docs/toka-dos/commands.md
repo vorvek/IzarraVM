@@ -447,10 +447,17 @@ SNDMIXER /S             suppress all output
 SNDMIXER /?             usage
 ```
 
-Left and Right select a fader, Up and Down move it, Home and End set it to full
-and to mute, and the digit keys set a level directly. Each level is applied to
-the hardware as it is set. **F10** saves and exits. **Esc** restores the levels
-that were in effect when the mixer was opened.
+Tab and the arrow keys select a fader, Up and Down move it, Home and End set it
+to full and to mute, and the digit keys set a level directly. Each level is
+applied to the hardware as it is set.
+
+Two buttons sit along the bottom of the box, after the six faders on the same
+Tab ring. **Accept** leaves the mixer with the levels that were set still in
+effect and prints `Settings applied.` **Cancel** restores the levels that were
+in effect when the mixer was opened, which is what **Esc** has always done.
+**Enter** or **Space** presses whichever button holds the selection, and does
+nothing while a fader holds it. **F10** saves the levels to `C:\VOLCONF.CFG`
+and exits; it is the only key that writes a file.
 
 Each step is 4 dB. The card's own volume registers are 2 dB per step over a
 62 dB range, so ten fader positions spread evenly over the register values would

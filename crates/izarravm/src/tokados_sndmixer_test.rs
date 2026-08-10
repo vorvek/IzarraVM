@@ -72,6 +72,53 @@ fn boot_with_sndmixer_files(
     (machine, dir)
 }
 
+/// Boot into the full-screen mixer and stop on it. The condition is the mixer's
+/// own title rather than a cycle count: a fixture that injected keys into a boot
+/// screen would "pass" by leaving every register untouched.
+fn open_the_mixer(label: &str, commands: &str) -> (Machine, PathBuf) {
+    let scratch = TokaScratch::new(label);
+    let dir = scratch.path().to_path_buf();
+    std::mem::forget(scratch);
+    fs::write(dir.join("SNDMIXER.COM"), izarravm_firmware::sndmixer_com())
+        .expect("stage SNDMIXER.COM");
+    fs::write(
+        dir.join("AUTOEXEC.BAT"),
+        format!("@ECHO OFF\r\nPROMPT $P$G\r\n{commands}"),
+    )
+    .expect("write AUTOEXEC");
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .expect("build machine");
+    machine.mount_hdd_folder(&dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 900_000_000, |machine| {
+        machine
+            .screen_text()
+            .as_text()
+            .contains("ReSonique 2 Volume Mixer")
+    });
+    if let StopReason::CpuError(message) = &stop {
+        panic!(
+            "CPU fault opening the mixer: {message}\n{}",
+            machine.screen_text().as_text()
+        );
+    }
+    (machine, dir)
+}
+
+/// Deliver scancodes one at a time. A batched injection is handed over faster
+/// than the guest's `INT 16h` loop consumes it, so each code gets its own slice.
+fn press(machine: &mut Machine, codes: &[u8]) {
+    for code in codes {
+        machine.inject_key_scancodes(&[*code]);
+        machine
+            .run_until_halt_or_cycles(5_000_000)
+            .expect("keystroke");
+    }
+}
+
 /// Every CT1745 level register the tool owns, at its power-on value, and the
 /// PC-speaker register at the position the card powers on in. This is the
 /// baseline every other fixture here is a departure from, so if the card's
@@ -469,6 +516,316 @@ fn sndmixer_escape_restores_the_levels_the_mixer_opened_on() {
         machine.sb_mixer_register(0x30),
         Some(step_byte(4)),
         "Esc must restore the level the mixer opened on\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The button row: Tab reaches it, Enter presses Accept, and Accept leaves with
+/// the levels standing and says so.
+///
+/// The fixture moves a fader FIRST and then accepts, so "the levels are still
+/// applied" is a claim about a level this run set rather than about one that was
+/// never touched: a tool whose Accept quietly ran the Esc path would pass a
+/// screen-scrape for the message and fail the register.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_accept_button_leaves_the_levels_applied() {
+    let (mut machine, dir) = open_the_mixer("sndmixer_accept", "SNDMIXER /M 4\r\nSNDMIXER\r\n");
+    // Two Downs on MASTER (the fader the screen opens on): 4 to 2.
+    press(&mut machine, &[0x50, 0xD0, 0x50, 0xD0]);
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(2)),
+        "the moves must have reached the hardware, or Accept has nothing to keep"
+    );
+
+    // Six Tabs walk the selection off SPEAKER (the sixth fader) and onto the
+    // Accept button; the buttons are the last two stops on the same ring.
+    let opened = machine.screen_text().as_text();
+    assert!(
+        opened.contains("Accept") && opened.contains("Cancel"),
+        "both buttons are on screen from the moment the mixer opens\n{opened}"
+    );
+    for _ in 0..6 {
+        press(&mut machine, &[0x0F, 0x8F]);
+    }
+    let focused = machine.screen_text().as_text();
+    assert!(
+        focused.contains("ACCEPT    leave with these levels in effect"),
+        "the selected button describes itself where a fader's description goes\n{focused}"
+    );
+
+    press(&mut machine, &[0x1C, 0x9C]); // Enter
+    run_until_toka_condition(&mut machine, 200_000_000, current_root_prompt);
+    let screen = machine.screen_text().as_text();
+    assert!(
+        screen.contains("Settings applied."),
+        "Accept closes with its own message\n{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(2)),
+        "Accept keeps the levels the run set\n{screen}"
+    );
+    assert!(
+        !screen.contains("Cancelled"),
+        "Accept is not the cancel path\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The Cancel button is the Esc path with a face on it: the same restore, the
+/// same message, reached with Tab and a keypress instead.
+///
+/// Pressed with SPACE, not Enter. Both keys press a button -- that is the
+/// sibling tool's model for an input, and the `/?` text and the manuals say so
+/// -- and a fixture that only ever pressed Enter would let the Space arm rot.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_cancel_button_restores_the_levels_the_mixer_opened_on() {
+    let (mut machine, dir) = open_the_mixer("sndmixer_cancel", "SNDMIXER /M 4\r\nSNDMIXER\r\n");
+    press(&mut machine, &[0x50, 0xD0, 0x50, 0xD0]);
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(2)),
+        "the moves must have reached the hardware, or Cancel has nothing to undo"
+    );
+
+    // Seven Tabs: six faders, then Accept, then Cancel.
+    for _ in 0..7 {
+        press(&mut machine, &[0x0F, 0x8F]);
+    }
+    let focused = machine.screen_text().as_text();
+    assert!(
+        focused.contains("CANCEL    leave and put the previous levels back"),
+        "Cancel says what it will do before it is pressed\n{focused}"
+    );
+
+    press(&mut machine, &[0x39, 0xB9]); // Space
+    run_until_toka_condition(&mut machine, 200_000_000, current_root_prompt);
+    let screen = machine.screen_text().as_text();
+    assert!(
+        screen.contains("Cancelled. Previous levels restored."),
+        "the button reports the same thing Esc does\n{screen}"
+    );
+    assert_eq!(
+        machine.sb_mixer_register(0x30),
+        Some(step_byte(4)),
+        "Cancel restores the level the mixer opened on\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A key that moves a level does nothing while a button holds the selection.
+///
+/// This is the failure the button ring makes possible: the two extra stops have
+/// no channel record behind them, so a level key that skipped the check would
+/// write through whatever SI was last left pointing at -- which is a string in
+/// the data area, not a channel. The whole screen and the whole mixer register
+/// file are compared, not a chosen few of each, because the address that stray
+/// write lands on depends on which routine painted last: with the check removed
+/// it wrote the card's OUTPUT GAIN pair, `0x41`/`0x42` -- registers this tool
+/// does not own and a short list of the ones it does would never have looked at.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_level_keys_do_nothing_while_a_button_is_selected() {
+    let (mut machine, dir) = open_the_mixer("sndmixer_btn_keys", "SNDMIXER /M 4\r\nSNDMIXER\r\n");
+    for _ in 0..6 {
+        press(&mut machine, &[0x0F, 0x8F]);
+    }
+    let before_screen = machine.screen_text().as_text();
+    let before: Vec<Option<u8>> = (0u8..=0xFF)
+        .map(|index| machine.sb_mixer_register(index))
+        .collect();
+
+    // Up, Down, Home, End, and the digit 9: every key that sets a level.
+    for code in [0x48u8, 0x50, 0x47, 0x4F, 0x0A] {
+        press(&mut machine, &[code, code | 0x80]);
+    }
+    let after_screen = machine.screen_text().as_text();
+    let after: Vec<Option<u8>> = (0u8..=0xFF)
+        .map(|index| machine.sb_mixer_register(index))
+        .collect();
+    assert_eq!(
+        before, after,
+        "a level key pressed on a button must move no mixer register\n{after_screen}"
+    );
+    assert_eq!(
+        before_screen, after_screen,
+        "and must leave the screen exactly as it found it"
+    );
+    assert!(
+        after_screen.contains("ACCEPT    leave with these levels in effect"),
+        "the selection is still on the button it started on\n{after_screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The PC speaker set to step 3 in the full-screen mixer has to SAVE as step 3.
+///
+/// The owner's report: the fader was moved to 3, F10 written, and the file came
+/// back saying 7. Both halves are asserted, and they fail independently -- a
+/// tool that wrote the right register and the wrong number, or the wrong
+/// register and the right number, are different bugs.
+///
+/// The run opens the fader on 10 (the command before it puts the register at
+/// position 3) rather than on the card's power-on 7, because 7 is the number the
+/// bug produces: a fixture that opened on 7 could not tell "saved what it was
+/// set to" from "saved what it opened on".
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_speaker_set_to_three_saves_as_three() {
+    let scratch = TokaScratch::new("sndmixer_spk3");
+    let dir = scratch.path().to_path_buf();
+    std::mem::forget(scratch);
+    fs::write(dir.join("SNDMIXER.COM"), izarravm_firmware::sndmixer_com())
+        .expect("stage SNDMIXER.COM");
+    fs::write(
+        dir.join("AUTOEXEC.BAT"),
+        "@ECHO OFF\r\nPROMPT $P$G\r\nSNDMIXER /P 10\r\nSNDMIXER\r\n",
+    )
+    .expect("write AUTOEXEC");
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .expect("build machine");
+    machine.mount_hdd_folder(&dir).expect("mount host folder");
+    let (stop, _) = run_until_toka_condition(&mut machine, 900_000_000, |machine| {
+        machine
+            .screen_text()
+            .as_text()
+            .contains("ReSonique 2 Volume Mixer")
+    });
+    if let StopReason::CpuError(message) = &stop {
+        panic!(
+            "CPU fault opening the mixer: {message}\n{}",
+            machine.screen_text().as_text()
+        );
+    }
+    assert_eq!(
+        machine.sb_mixer_register(0x3B),
+        Some(3 << 6),
+        "the mixer opens on the position the previous command set"
+    );
+
+    // Five Rights walk the selection from MASTER to SPEAKER, then the digit 3
+    // asks for step 3 directly. 0x4D Right, 0x04 the '3' key; make then break.
+    let mut codes = vec![];
+    for _ in 0..5 {
+        codes.push(0x4Du8);
+        codes.push(0xCD);
+    }
+    codes.push(0x04);
+    codes.push(0x84);
+    for code in codes {
+        machine.inject_key_scancodes(&[code]);
+        machine
+            .run_until_halt_or_cycles(5_000_000)
+            .expect("fader keystroke");
+    }
+    let screen = machine.screen_text().as_text();
+    assert_eq!(
+        machine.sb_mixer_register(0x3B),
+        Some(1 << 6),
+        "step 3 is the speaker's hardware position 1 (-14 dB)\n{screen}"
+    );
+
+    for code in [0x44u8, 0xC4] {
+        machine.inject_key_scancodes(&[code]);
+        machine
+            .run_until_halt_or_cycles(5_000_000)
+            .expect("F10 keystroke");
+    }
+    run_until_toka_condition(&mut machine, 200_000_000, current_root_prompt);
+    machine.flush_hdd_folder();
+
+    let written = fs::read_to_string(dir.join("VOLCONF.CFG")).expect("read the saved config");
+    assert!(
+        written.contains("SPEAKER=3"),
+        "the fader was left on step 3 and the file has to say so:\n{written}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The speaker's 2-bit READ-BACK, which is the only place the position-to-step
+/// table is consulted: position 1 is step 3.
+///
+/// This is the leg the two fixtures above cannot reach. Both of them name the
+/// step they want, so the number that reaches the file comes from the request
+/// and the decode table is never read; transposing that table leaves them green.
+/// Here the second command names a DIFFERENT channel, so the SPEAKER line it
+/// writes can only have come from reading `0x3B` back -- which is exactly the
+/// shape that would turn a speaker set to 3 into a file that says 7.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_speaker_read_back_off_the_register_is_the_step_that_was_set() {
+    let (machine, dir) = boot_with_sndmixer(
+        "sndmixer_spk_readback",
+        "SNDMIXER /P 3 /S\r\n\
+         SNDMIXER /M 8 /CFG C:\\VOL.CFG /S\r\n\
+         SNDMIXER /L\r\n",
+    );
+    let screen = machine.screen_text().as_text();
+    assert_eq!(
+        machine.sb_mixer_register(0x3B),
+        Some(1 << 6),
+        "the register still holds position 1, so the read-back has 1 to decode\n{screen}"
+    );
+    let written = fs::read_to_string(dir.join("VOL.CFG")).expect("read the saved config");
+    assert!(
+        written.contains("SPEAKER=3"),
+        "the SPEAKER line was composed from the register, and position 1 is \
+         step 3:\n{written}"
+    );
+    // The same decode on the way to the screen, with the dB figure the position
+    // really costs beside it.
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.trim_end() == "  SPEAKER      3   -14 dB"),
+        "and the listing reads it back the same way\n{screen}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same shape on the command line: `/P 3` then a save, and the round trip
+/// back through the file. A step the file carries has to survive being restored
+/// to the register and read back off it -- position 1 reads as step 3, so a
+/// second save of an untouched machine writes the same number the first did.
+#[test]
+#[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+fn sndmixer_speaker_step_three_survives_the_cli_save_and_restore_round_trip() {
+    let (machine, dir) = boot_with_sndmixer(
+        "sndmixer_spk3_cli",
+        "SNDMIXER /P 3 /CFG C:\\VOL.CFG /S\r\n\
+         SNDMIXER /P 10 /S\r\n\
+         SNDMIXER /CFG C:\\VOL.CFG /S\r\n\
+         SNDMIXER /M 8 /CFG C:\\VOL2.CFG /S\r\n\
+         ECHO MIXER-DONE\r\n",
+    );
+    let screen = machine.screen_text().as_text();
+    assert!(screen.contains("MIXER-DONE"), "{screen}");
+    let first = fs::read_to_string(dir.join("VOL.CFG")).expect("read the saved config");
+    assert!(
+        first.contains("SPEAKER=3"),
+        "/P 3 has to save as step 3:\n{first}"
+    );
+    // The middle command put the register at position 3, so the restore has to
+    // move it back down: this cannot pass on a run where the restore did nothing.
+    assert_eq!(
+        machine.sb_mixer_register(0x3B),
+        Some(1 << 6),
+        "step 3 restores to hardware position 1\n{screen}"
+    );
+    // And a save composed after that restore says the same thing again. The
+    // command that writes it names MASTER, not the speaker, so its SPEAKER line
+    // comes from reading `0x3B` back rather than from a request.
+    let second = fs::read_to_string(dir.join("VOL2.CFG")).expect("read the second config");
+    assert!(
+        second.contains("SPEAKER=3"),
+        "the round trip must not drift the step:\n{second}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
