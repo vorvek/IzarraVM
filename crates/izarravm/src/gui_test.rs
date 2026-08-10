@@ -96,17 +96,47 @@ fn munt_selection_requires_two_existing_rom_files() {
 }
 
 #[test]
-fn volume_gain_is_cubic_and_clamped() {
-    // Endpoints are exact: silence at 0, unity at full.
+fn volume_gain_is_cubic_below_unity_and_clamped() {
+    // Endpoints are exact: silence at 0, unity at the 100% detent.
     assert_eq!(volume_gain(0.0), 0.0);
     assert_eq!(volume_gain(1.0), 1.0);
-    // Halfway on the slider is 0.5^3 = 0.125 of linear gain.
+    // Halfway to the detent is 0.5^3 = 0.125 of linear gain.
     assert!((volume_gain(0.5) - 0.125).abs() < 1e-6);
     // 0.8 (the default) cubes to 0.512.
     assert!((volume_gain(0.8) - 0.512).abs() < 1e-6);
-    // Out-of-range input is clamped before cubing.
+    // Negative input is clamped away.
     assert_eq!(volume_gain(-1.0), 0.0);
-    assert_eq!(volume_gain(2.0), 1.0);
+}
+
+/// The knob amplifies past unity, and the numbers it puts on the mix are the
+/// numbers the panel prints.
+///
+/// The taper below the detent is perceptual and the travel above it is not: a
+/// cubic carried past 1.0 would reach 125x at the top of the slider, which is
+/// not a speaker knob, it is a fuse. Above unity the reading is literal, so 300%
+/// is three times and the label means what it says. Pin both the literal
+/// readings and the ceiling.
+#[test]
+fn volume_gain_amplifies_above_unity_up_to_the_ceiling() {
+    assert!(
+        volume_gain(2.0) > 1.0,
+        "the knob must have travel past line level at all"
+    );
+    // Literal above the detent: the percent on the panel IS the multiplier.
+    assert!((volume_gain(2.0) - 2.0).abs() < 1e-6);
+    assert!((volume_gain(3.0) - 3.0).abs() < 1e-6);
+    assert!((volume_gain(MAX_VOLUME) - 5.0).abs() < 1e-6);
+    // 5x is +14 dB, the worst well-behaved case the ceiling was chosen to
+    // recover. A curve that stopped short would leave that case quiet.
+    let db = 20.0 * volume_gain(MAX_VOLUME).log10();
+    assert!(
+        (db - 14.0).abs() < 0.1,
+        "top of travel is {db} dB, want +14"
+    );
+    // Continuous across the detent: no jump in level as the knob passes 100%.
+    assert!((volume_gain(0.999) - 1.0).abs() < 0.01);
+    // And clamped at the ceiling, so a hand-edited conf cannot ask for more.
+    assert_eq!(volume_gain(50.0), MAX_VOLUME);
 }
 
 #[test]

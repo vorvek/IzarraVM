@@ -198,6 +198,55 @@ master_volume = 0.25
     }
 }
 
+/// The knob's persisted range reaches past unity, and widening it retires
+/// nothing.
+///
+/// This is the whole compatibility story for `master_volume` going above 1.0:
+/// the accepted interval only grew, so every value an older build could have
+/// written is still inside it and still means the level it always meant. That is
+/// why there is no new retired key and no rescale -- unlike `amp_gain` above,
+/// which changed what its numbers MEANT and had to be dropped. Assert the
+/// legacy values load untouched, that an above-unity value survives the round
+/// trip, and that the ceiling still catches a hand-edited file.
+#[test]
+fn master_volume_persists_above_unity_and_keeps_legacy_values_untouched() {
+    let path = Path::new("izarravm.conf");
+    let load = |text: &str| {
+        let text = text.to_string();
+        GuiPrefs::load_with(path, move |_| Ok(text.clone()))
+    };
+
+    // Legacy: every value an older build could write, loaded with no change.
+    for legacy in [0.0f32, 0.25, 0.65, 0.8, 1.0] {
+        let loaded = load(&format!("master_volume = {legacy}\n"));
+        assert_eq!(
+            loaded.master_volume, legacy,
+            "a saved {legacy} must still mean {legacy}"
+        );
+    }
+
+    // Above unity: accepted, and not flattened back to 1.0 the way the old
+    // clamp did.
+    for boosted in [1.5f32, 2.0, 3.75, MAX_VOLUME] {
+        let loaded = load(&format!("master_volume = {boosted}\n"));
+        assert_eq!(loaded.master_volume, boosted);
+    }
+
+    // Round trip through the file the GUI actually writes.
+    let prefs = GuiPrefs {
+        master_volume: 3.75,
+        ..GuiPrefs::default()
+    };
+    let text = toml::to_string_pretty(&prefs).expect("serialize");
+    let parsed = load(&text);
+    assert_eq!(parsed, prefs, "the boosted level survives a save and load");
+
+    // Still bounded on both ends: a hand-edited file cannot ask for more than
+    // the knob can, or for a negative level.
+    assert_eq!(load("master_volume = 50.0\n").master_volume, MAX_VOLUME);
+    assert_eq!(load("master_volume = -2.0\n").master_volume, 0.0);
+}
+
 /// `--config` pointed at a prefs file must still be RECOGNISED as one.
 ///
 /// The retired keys stay in the marker list for exactly this: a file old enough

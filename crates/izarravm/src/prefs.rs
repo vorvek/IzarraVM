@@ -18,9 +18,22 @@ use tracing::warn;
 /// File name for the GUI prefs, written next to the C: root.
 const PREFS_FILE: &str = "izarravm.conf";
 
-/// Default master volume (0..1). 0.8 sits comfortably below clipping for most
+/// Default master volume. 0.8 sits comfortably below clipping for most
 /// material while still being plainly audible.
 const DEFAULT_VOLUME: f32 = 0.8;
+
+/// Highest accepted `master_volume`: five times line level, +14 dB.
+///
+/// The knob is the host's powered speakers, and a speaker knob has travel past
+/// line level. The figure is the worst well-behaved case measured back: a title
+/// whose own mixer is maxed still writes a CT1745 output level of 27 (-8 dB) and
+/// the mix reserves a further -6 dB of headroom, so its peaks arrive 14 dB below
+/// full scale. Five times puts them back at it.
+///
+/// Widening the accepted range retires nothing. The 0..1 values older builds
+/// wrote are inside it and keep their meaning, so an existing `izarravm.conf`
+/// loads to the same level it always did.
+pub const MAX_VOLUME: f32 = 5.0;
 
 /// GUI preference keys that are no longer read or written.
 ///
@@ -125,10 +138,11 @@ impl CrtStyle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuiPrefs {
-    /// Master output volume, 0.0..1.0. The HOST's level: the powered speakers
-    /// the machine's line-out feeds, applied to the finished mix on its way to
-    /// the sound device. Every level inside the machine is the guest's, on the
-    /// card's own registers (see `RETIRED_KEYS`).
+    /// Master output volume, 0.0..[`MAX_VOLUME`]. The HOST's level: the powered
+    /// speakers the machine's line-out feeds, applied to the finished mix on its
+    /// way to the sound device. 1.0 is unity and anything above it amplifies.
+    /// Every level inside the machine is the guest's, on the card's own
+    /// registers (see `RETIRED_KEYS`).
     pub master_volume: f32,
     /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
     pub crt_style: CrtStyle,
@@ -216,7 +230,7 @@ impl GuiPrefs {
         }
         match value.try_into::<Self>() {
             Ok(mut prefs) => {
-                prefs.master_volume = prefs.master_volume.clamp(0.0, 1.0);
+                prefs.master_volume = prefs.master_volume.clamp(0.0, MAX_VOLUME);
                 prefs
             }
             Err(err) => {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::prefs::MAX_VOLUME;
 use izarravm_core::{MidiPortId, VideoCard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -1139,5 +1140,100 @@ fn the_host_volume_knob_scales_the_finished_mix_only() {
     assert!(
         queued.iter().all(|frame| *frame == (4_000, -4_000)),
         "the knob halves the mix on its way out, symmetrically"
+    );
+}
+
+/// Past unity the knob can ask for more than the sink can carry, and what it
+/// gets then is the rail, not a wrapped sample.
+///
+/// The multiply is the last thing in the host chain and it is the one place a
+/// gain above 1.0 can leave full scale. A narrowing integer multiply would wrap:
+/// 20000 * 5 is 100000, which truncated to 16 bits is -31072 -- a loud passage's
+/// positive peaks would come back out inverted and near the negative rail, which
+/// is a far uglier noise than the clipping it is pretending not to be. Drive it
+/// well past the rail in both directions and require saturation.
+#[test]
+fn the_host_volume_knob_saturates_instead_of_wrapping_above_unity() {
+    // Chosen so a 16-bit wrap lands somewhere unmistakable rather than near the
+    // rail by luck: 20_000 * 5 = 100_000, and 100_000 as i16 is -31_072.
+    let mut pcm = vec![(20_000i16, -20_000i16), (1_000, -1_000), (0, 0)];
+    apply_speaker_gain(&mut pcm, 5.0);
+
+    assert_eq!(
+        pcm[0],
+        (i16::MAX, i16::MIN),
+        "a sample driven past full scale is pinned at the rail, not wrapped"
+    );
+    assert_eq!(
+        pcm[1],
+        (5_000, -5_000),
+        "a sample with room to grow is simply amplified"
+    );
+    assert_eq!(pcm[2], (0, 0), "silence stays silence at any gain");
+
+    // The whole travel of the knob is safe, not just the value above.
+    for frame in [(i16::MAX, i16::MIN), (i16::MIN, i16::MAX)] {
+        let mut rails = vec![frame];
+        apply_speaker_gain(&mut rails, MAX_VOLUME);
+        let (l, r) = rails[0];
+        assert!(
+            (l == i16::MAX || l == i16::MIN) && (r == i16::MAX || r == i16::MIN),
+            "full-scale input at the top of the knob stays at a rail, got {l},{r}"
+        );
+        assert_eq!(
+            l.signum(),
+            frame.0.signum(),
+            "and on the same side of zero it went in on"
+        );
+        assert_eq!(r.signum(), frame.1.signum());
+    }
+}
+
+/// The gain the pump applies covers the MIDI legs, because it runs after them.
+///
+/// The engines add themselves INTO the machine's buffer, so a knob applied
+/// before that call would play the synths at a level nobody set. There is no way
+/// to make a `MidiEngine` produce a sample in a test -- an adapter needs a real
+/// synth behind it -- so this pins the seam the other way round: everything the
+/// pump queues has been through `apply_speaker_gain`, whoever put it there.
+#[test]
+fn the_pump_applies_the_knob_after_the_midi_legs_have_been_added() {
+    struct FlatMachine;
+
+    impl AudioMachine for FlatMachine {
+        fn master_ticks(&self) -> u64 {
+            0
+        }
+
+        fn midi_gain(&self) -> (f32, f32) {
+            (1.0, 1.0)
+        }
+
+        fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+            vec![(20_000, -20_000); native_samples]
+        }
+    }
+
+    let config = MidiConfig::default();
+    let mut wavetable = MidiEngine::open_wavetable(&config);
+    let mut receiver = MidiEngine::open_receiver(&config);
+    let sink = AudioSink::detached();
+    let mut debt = 0.0;
+    pump_audio(
+        &mut FlatMachine,
+        &mut wavetable,
+        &mut receiver,
+        &sink,
+        0.01,
+        &mut debt,
+        MAX_VOLUME,
+    );
+
+    let queued = sink.take_queued_frames();
+    assert!(!queued.is_empty());
+    assert!(
+        queued.iter().all(|frame| *frame == (i16::MAX, i16::MIN)),
+        "the buffer the engines rendered into is what the knob then scales, \
+         saturating"
     );
 }
