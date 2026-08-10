@@ -23,10 +23,24 @@ const PREFS_FILE: &str = "izarravm.conf";
 const DEFAULT_VOLUME: f32 = 0.8;
 
 /// Default ReSonique 2 output amp gain, in tenths of a linear multiplier
-/// (120 = 12.0x). Models the card's analog output stage, which the digital mixer
-/// model does not represent, so a game that rides the -14 dB CT1745 volume
-/// default is comfortably audible; peaks clamp.
-pub const DEFAULT_AMP_GAIN: u32 = 120;
+/// (10 = 1.0x, unity). Models the card's analog output stage; the default is
+/// neutral, so the mix reaches the host at the level the machine staged it.
+///
+/// This was 12.0x, and that was correct for the card it was measured on: the
+/// CT1745 then powered on at master -14 dB AND voice -14 dB, so a title that
+/// never programmed the mixer -- the common case -- played its digital voice
+/// 28 dB down and needed roughly that much back to be audible at all. The
+/// volume-decode fix moved those defaults to 0 dB (matching DOSBox-X and
+/// 86Box) and so removed the 28 dB this gain existed to cancel, leaving a
+/// bare +21.6 dB on a mix that was already at unity. Everything clipped:
+/// symmetric saturation squashes a panned image to the centre and squares off
+/// every waveform, which is precisely the "no stereo separation" and "peaked
+/// and muffled" pair reported after that fix.
+///
+/// Headroom below full scale is now reserved once on the machine's summing
+/// node (`MIX_HEADROOM`), and raising the level is SNDMIXER.COM's job. The
+/// slider still runs to `AMP_GAIN_MAX` for genuinely quiet material.
+pub const DEFAULT_AMP_GAIN: u32 = 10;
 
 /// Upper bound for the amp gain (tenths); 500 = 50x. Generous headroom above the
 /// default so a very quiet game can still be brought up, guarding only against an

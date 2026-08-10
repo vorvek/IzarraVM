@@ -1340,3 +1340,64 @@ fn audio_capture_observes_every_advance_and_paces_by_cycles_run() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `IZARRAVM_AUDIO_WAV` capture must write real stereo.
+///
+/// This instrument is what a stereo bug gets diagnosed WITH, so a capture that
+/// summed or dropped a channel would manufacture the very symptom it is used to
+/// investigate. Assert the declared channel count AND that two distinct input
+/// channels come back distinct -- a header claiming stereo over duplicated
+/// samples would pass the first check alone.
+#[test]
+fn the_audio_wav_capture_writes_distinct_left_and_right_channels() {
+    let dir = std::env::temp_dir().join(format!(
+        "izarravm_wav_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("capture.wav");
+
+    // Hard-panned left, then hard-panned right, then a distinct pair.
+    let pcm = [(20_000i16, 0i16), (0, -20_000), (1234, -5678)];
+    write_wav(&path, &pcm, 44_100).expect("write the capture");
+    let bytes = std::fs::read(&path).expect("read the capture back");
+
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WAVE");
+    assert_eq!(
+        u16::from_le_bytes([bytes[22], bytes[23]]),
+        2,
+        "the capture must declare two channels"
+    );
+    assert_eq!(
+        u16::from_le_bytes([bytes[32], bytes[33]]),
+        4,
+        "block align must be 4 bytes: two 16-bit channels per frame"
+    );
+    assert_eq!(
+        u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
+        (pcm.len() * 4) as u32,
+        "the data chunk must hold both channels of every frame"
+    );
+
+    let frames: Vec<(i16, i16)> = bytes[44..]
+        .chunks_exact(4)
+        .map(|f| {
+            (
+                i16::from_le_bytes([f[0], f[1]]),
+                i16::from_le_bytes([f[2], f[3]]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        frames, pcm,
+        "the capture must round-trip each channel untouched -- no downmix, no \
+         channel dropped, no reordering"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -684,9 +684,12 @@ fn mode_select_volume_scales_signed_cd_audio_channels() {
     let pcm = machine.render_audio(2000);
 
     assert!(!pcm.is_empty());
+    // The CD leg is at full volume, so these are the Red Book samples after the
+    // drive's own per-channel scaling and the summing node's MIX_HEADROOM
+    // (-6 dB), which every card source takes alike.
     assert!(
         pcm.iter()
-            .all(|&(left, right)| (left, right) == (8000, -4015)),
+            .all(|&(left, right)| (left, right) == (4000, -2007)),
         "drive volumes must scale positive and negative Red Book samples per channel"
     );
 }
@@ -1227,11 +1230,11 @@ fn render_audio_passes_through_when_the_dsp_is_idle() {
 fn render_audio_mixes_the_dsp_dc_level_with_the_opl() {
     let mut machine = test_machine();
     // A constant 256-byte DMA buffer; 0x40 maps to sample_u8(0x40) = -16384.
-    // The default CT1745 volume attenuates it by voice (0x32=24, ~-14 dB)
-    // and master, which both power on at level 31 (0 dB), so the DC level
-    // arrives unattenuated.
+    // Voice (0x32/0x33) and master (0x30/0x31) both power on at level 31
+    // (0 dB), so the CT1745 passes the DC level unattenuated and the only
+    // scaling left is the summing node's MIX_HEADROOM (-6 dB).
     const BYTE: u8 = 0x40;
-    let expected: i32 = -16384;
+    let expected: i32 = -8192;
     for i in 0..256u32 {
         machine.write_physical_u8(0x1_0000 + i, BYTE);
     }
@@ -1345,7 +1348,9 @@ fn sb_mixer_voice_and_master_volume_attenuate_output() {
         .map(|f| f.0)
         .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
     let center = (i32::from(min_l) + i32::from(max_l)) / 2;
-    let expected = (-16384.0f32 * 10f32.powf(-14.0 / 20.0) * 10f32.powf(-14.0 / 20.0)) as i32;
+    // Voice -14 dB, master -14 dB, then the summing node's MIX_HEADROOM.
+    let expected =
+        (-16384.0f32 * 10f32.powf(-14.0 / 20.0) * 10f32.powf(-14.0 / 20.0) * MIX_HEADROOM) as i32;
     assert!(
         (center - expected).abs() < 200,
         "restored DC center {center}, expected ~{expected}"

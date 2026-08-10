@@ -37,12 +37,14 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 /// The ReSonique 2 output amp gain as a linear multiplier, from the config's
-/// tenths encoding (30 -> 3.0). Models the card's analog output stage (line
-/// driver / power amp) that the digital mixer model does not represent: a game
-/// like Doom that never programs the CT1745 volume runs on the power-on default
-/// (master and voice both -14 dB), so its digitized voice path lands at -28 dB
-/// and is inaudible played straight out of a host DAC with no analog gain. The
-/// user tunes it from the config menu; it is folded into the shared master gain.
+/// tenths encoding (10 -> 1.0). Models the card's analog output stage (line
+/// driver / power amp) that the digital mixer model does not represent. It
+/// defaults to unity: the CT1745 now powers on at 0 dB on every leg, so a game
+/// that never programs the mixer -- Doom, Duke Nukem 3D -- already arrives at
+/// full level, and the machine's summing node reserves the headroom below full
+/// scale (`MIX_HEADROOM`). See `prefs::DEFAULT_AMP_GAIN` for why this used to be
+/// 12.0x and why leaving it there clipped everything. The user tunes it from the
+/// config menu; it is folded into the shared master gain.
 fn amp_multiplier(amp_gain: u32) -> f32 {
     amp_gain as f32 / 10.0
 }

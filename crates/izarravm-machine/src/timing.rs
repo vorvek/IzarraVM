@@ -17,6 +17,43 @@ pub const DAC_HZ: u32 = 44_100;
 /// ordinary jitter, so reaching it means the guest is genuinely outrunning the
 /// host drain, which is worth reporting rather than absorbing silently.
 pub const DAC_PENDING_FRAME_CAP: usize = 4410;
+
+/// Digital headroom reserved below full scale on the ReSonique 2's summing
+/// node, as a linear gain: 0.5 is -6.02 dB, exactly one bit.
+///
+/// The CT1745 powers on with master, voice, FM and CD all at level 31 (0 dB),
+/// matching DOSBox-X's `CTMIXER_Reset` and 86Box. Every one of those legs is
+/// therefore unity, and they SUM: a title playing digital effects over FM music
+/// -- Duke Nukem 3D, the common case -- drives the summing node past full scale
+/// with both legs at their defaults and nothing misprogrammed. Saturating that
+/// at `clamp_i16` is not just loud, it is destructive in a way a level control
+/// cannot undo: symmetric clipping squashes a panned image toward the centre
+/// (both channels rail at the same value) and turns every waveform into a
+/// square. That is exactly the "no stereo separation" plus "peaked and muffled"
+/// pair reported against the volume-decode fix.
+///
+/// Reserving the headroom here, once, after the legs are summed, is the only
+/// placement that leaves the hardware register semantics untouched -- guest
+/// reads, writes and read-modify-write round-trips of `0x30`-`0x37`/`0x41`/`0x42`
+/// are unchanged -- and preserves the RELATIVE balance the decode fix
+/// established (FM against voice against CD) exactly, since a single scalar
+/// divides out of every ratio.
+///
+/// Making the mix quieter is the point: SNDMIXER.COM owns amplification (see
+/// `dev_docs/sndmixer-spec.md`), and its faders have nothing to raise if the
+/// defaults already sit on the clamp.
+///
+/// The shape is not novel. 86Box reserves headroom the same way and for the
+/// same reason -- its SB16 path divides every leg (voice, FM, CD, PC speaker)
+/// by a fixed 3.0 before applying the master, alongside the reset comment that
+/// moved its defaults from -14 dB to 0 dB. That is 9.54 dB against the 6.02 dB
+/// here; the difference is deliberate. Half leaves the DIGITAL VOICE leg within
+/// 0.4 dB of the absolute level it had before the volume-decode fix, so a title's
+/// effects land where they used to while the FM bus comes down to meet them,
+/// which is the balance correction the fix was for. Reference read as study
+/// only, under `dev_docs/reference/86box`; the concept is cited, no code taken.
+pub const MIX_HEADROOM: f32 = 0.5;
+
 pub const PIT_INPUT_HZ: u32 = 1_193_182;
 pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 

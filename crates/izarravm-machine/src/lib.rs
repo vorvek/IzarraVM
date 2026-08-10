@@ -74,7 +74,7 @@ pub struct CdAudioState {
 pub(crate) use ram_lookup::RamPageLookup;
 #[cfg(test)]
 pub(crate) use timing::PIT_INPUT_HZ;
-pub(crate) use timing::{DAC_HZ, DAC_PENDING_FRAME_CAP, OPL_NATIVE_HZ};
+pub(crate) use timing::{DAC_HZ, DAC_PENDING_FRAME_CAP, MIX_HEADROOM, OPL_NATIVE_HZ};
 
 pub(crate) use cache_config::{
     CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_TIER_DISABLED_MASK, CacheLevelConfig, TierCost,
@@ -2554,13 +2554,17 @@ impl Machine {
                 // gain (`card_amp`) scales their sum. The PC speaker (`s`) is
                 // motherboard hardware, not on the card, so it is added AFTER the
                 // amp at its own level.
-                // Sum the card sources exactly as before (SB16 part truncated, then
-                // the raw WSS + CD adds), scale that by the analog amp, then add the
-                // speaker. At card_amp == 1.0 this is bit-identical to the pre-amp
-                // mix (`... as i32 + wl + s + cl`), since a whole f32 casts back
-                // unchanged and integer addition commutes.
-                let card_l = (sb_l + wl + cl) as f32 * card_amp;
-                let card_r = (sb_r + wr + cr) as f32 * card_amp;
+                // Sum the card sources, reserve the summing node's headroom, then
+                // scale by the analog amp and add the speaker.
+                //
+                // `MIX_HEADROOM` is one scalar applied AFTER every card leg has
+                // been summed, so it cannot disturb the relative FM/voice/CD
+                // balance the CT1745 decode fix established, and it never touches
+                // a hardware register. It exists because those legs all power on
+                // at unity and therefore sum past full scale on their own; see the
+                // constant for the full argument.
+                let card_l = (sb_l + wl + cl) as f32 * MIX_HEADROOM * card_amp;
+                let card_r = (sb_r + wr + cr) as f32 * MIX_HEADROOM * card_amp;
                 let l = clamp_i16(card_l as i32 + s);
                 let r = clamp_i16(card_r as i32 + s);
                 (l, r)

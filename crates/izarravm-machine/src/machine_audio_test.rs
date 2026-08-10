@@ -2012,3 +2012,127 @@ fn opl_trace_is_off_by_default_and_respects_its_cap() {
         "counting must continue after the trace fills"
     );
 }
+
+/// Program the SB16 for 22050 Hz 16-bit signed stereo auto-init output on DMA5
+/// -- what Duke Nukem 3D and its SETUP utility play through -- looping over an
+/// 8-frame buffer of the given (left, right) sample pair. The CT1745 is left at
+/// its power-on defaults: the point of these tests is what the DEFAULTS do.
+fn play_16bit_stereo_pair(machine: &mut Machine, left: i16, right: i16) {
+    let l = left.to_le_bytes();
+    let r = right.to_le_bytes();
+    let frame = [l[0], l[1], r[0], r[1]];
+    for i in 0..8u32 {
+        for (j, &b) in frame.iter().enumerate() {
+            machine.write_physical_u8(0x2_0000 + i * 4 + j as u32, b);
+        }
+    }
+    with_bus(machine, |bus| {
+        // Slave ch5 (local ch1): word addr 0, page 0x02, count 15, auto-init read.
+        bus.write_io(0xD6, BusWidth::Byte, 0x59, false).unwrap();
+        bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xC6, BusWidth::Byte, 0x0F, false).unwrap();
+        bus.write_io(0xC6, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x8B, BusWidth::Byte, 0x02, false).unwrap();
+        bus.write_io(0xD4, BusWidth::Byte, 0x01, false).unwrap();
+        // DSP: 22050 Hz, 16-bit auto-init output, signed stereo, count 15.
+        for &b in &[0x41u8, 0x56, 0x22, 0xB6, 0x30, 0x0F, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    });
+}
+
+/// Run the guest long enough to fill the DSP ring, then take the loudest
+/// per-channel magnitude the host mix produces over a few render windows. The
+/// first window is skipped so the voice resampler's startup ramp does not set
+/// the reading.
+fn host_mix_peaks(machine: &mut Machine) -> (i32, i32) {
+    machine.advance_devices_clocks(2_000_000);
+    machine.render_audio(512);
+    let (mut peak_l, mut peak_r) = (0, 0);
+    for _ in 0..4 {
+        machine.advance_devices_clocks(500_000);
+        for (l, r) in machine.render_audio(512) {
+            peak_l = peak_l.max(i32::from(l).abs());
+            peak_r = peak_r.max(i32::from(r).abs());
+        }
+    }
+    (peak_l, peak_r)
+}
+
+/// A panned stereo source must still be panned when it reaches the host.
+///
+/// Duke Nukem 3D's SETUP left/right speaker test was reported as CENTERED but
+/// quieter on both sides. Nothing in the voice path sums or averages the
+/// channels -- the collapse is symmetric hard clipping. With enough gain ahead
+/// of the final `clamp_i16`, BOTH channels rail at full scale no matter how far
+/// apart they started, which is a centred image made of square waves: the
+/// "peaked and muffled" half of the same bug report.
+///
+/// The second half of this test is the mutation proof: at the output-stage gain
+/// the product shipped (12.0x, `DEFAULT_AMP_GAIN` 120), the very same 20 dB pan
+/// collapses to a dead centre.
+#[test]
+fn the_default_output_stage_preserves_a_panned_stereo_source() {
+    // A 20 dB pan: hard left with the right channel 10x down.
+    const LEFT: i16 = 20_000;
+    const RIGHT: i16 = 2_000;
+
+    let mut machine = test_machine();
+    play_16bit_stereo_pair(&mut machine, LEFT, RIGHT);
+    let (peak_l, peak_r) = host_mix_peaks(&mut machine);
+    assert!(
+        peak_l > 1_000,
+        "the panned source must reach the host mix at all (peak_l={peak_l})"
+    );
+    assert!(
+        peak_r * 4 < peak_l,
+        "a 20 dB pan must survive the default output stage as at least 4:1 \
+         (peak_l={peak_l} peak_r={peak_r})"
+    );
+
+    // Mutation: restore the shipped 12.0x analog gain. That gain was calibrated
+    // when the CT1745 powered on at master -14 dB AND voice -14 dB, so it was
+    // compensating 28 dB of attenuation that the volume-decode fix removed.
+    let mut clipped = test_machine();
+    clipped.set_card_amp(12.0);
+    play_16bit_stereo_pair(&mut clipped, LEFT, RIGHT);
+    let (clip_l, clip_r) = host_mix_peaks(&mut clipped);
+    assert_eq!(
+        clip_l,
+        i32::from(i16::MAX),
+        "mutation proof: at 12.0x the loud channel rails at the clamp"
+    );
+    assert!(
+        clip_r * 4 >= clip_l,
+        "mutation proof: at 12.0x the SAME 20 dB pan arrives as {clip_l}:{clip_r}, \
+         inside the 4:1 the assertion above demands -- clipping alone squashes a \
+         10:1 pan to nearly dead centre, which is the reported 'centered but \
+         quieter' symptom. If this stops failing the pan check, the assertion \
+         above has stopped proving anything."
+    );
+}
+
+/// One full-scale source at power-on defaults must not reach the clamp.
+///
+/// A real SB16 does not clip its own full-scale DAC at its reset mixer
+/// settings, and SNDMIXER.COM -- which owns amplification per the owner
+/// directive -- needs somewhere to go UP to. Three dB is the floor.
+#[test]
+fn a_full_scale_voice_at_power_on_defaults_keeps_its_headroom() {
+    let mut machine = test_machine();
+    play_16bit_stereo_pair(&mut machine, i16::MAX, i16::MAX);
+    let (peak_l, peak_r) = host_mix_peaks(&mut machine);
+    let peak = peak_l.max(peak_r);
+    assert!(
+        peak > 1_000,
+        "the full-scale source must reach the host mix at all (peak={peak})"
+    );
+    // 3 dB below full scale: 32767 * 10^(-3/20) = 23207.
+    assert!(
+        peak <= 23_207,
+        "a single full-scale source at power-on defaults must leave at least \
+         3 dB of headroom (peak={peak}, budget=23207)"
+    );
+}
