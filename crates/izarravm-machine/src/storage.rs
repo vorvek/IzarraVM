@@ -6,6 +6,64 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
+/// What the BIOS fixed-disk (INT 13h, DL>=0x80) service did, for the load-time
+/// profile. OFF unless `IZARRAVM_INT13_PROFILE=1`, and gated AT THE CALL SITE:
+/// this project has measured default-on instruments taxing paths they only meant
+/// to observe, so `int13_hdd` tests one bool before it touches an `Instant`.
+///
+/// It exists because the existing counters answer "how many sectors" but not
+/// "in how many CALLS", and the per-call `COMMAND_LATENCY_TICKS` is charged per
+/// call. Without the size distribution there is no way to tell a 100 us latency
+/// tax from a per-sector cost: both scale with bytes when the call size is fixed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Int13Profile {
+    /// AH=02/0A/42 read calls that reached a data path, and the sectors they moved.
+    pub read_calls: u64,
+    pub read_sectors: u64,
+    /// AH=03/0B/43 write calls.
+    pub write_calls: u64,
+    pub write_sectors: u64,
+    /// AH=04/44 verify calls (no data copied, still charged the latency).
+    pub verify_calls: u64,
+    pub verify_sectors: u64,
+    /// Every other fixed-disk subfunction (parameters, reset, EDD checks).
+    pub control_calls: u64,
+    /// Read calls bucketed by sector count: 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64,
+    /// 65-127, 128+. The first bucket is the whole question for hypothesis (a).
+    pub read_count_hist: [u64; 9],
+    /// Master ticks the fixed-disk path charged the guest through
+    /// `stall_for_master_ticks`. The guest-charge side of the throughput sum.
+    pub stall_ticks: u64,
+    /// Host wall nanoseconds spent inside `int13_hdd`, all subfunctions. Covers
+    /// the Katea host reads, the guest-block writes, and the device stepping the
+    /// stall performs, so `host_wall_ns - katea.host_wall_ns` isolates the
+    /// stall-advance and copy halves (hypotheses c vs d).
+    pub host_wall_ns: u64,
+}
+
+/// Bucket index for a sector count, matching `Int13Profile::read_count_hist`.
+fn int13_size_bucket(sectors: u32) -> usize {
+    match sectors {
+        0..=1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        65..=127 => 7,
+        _ => 8,
+    }
+}
+
+/// Which fixed-disk data path a `note_int13_data` call is reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Int13DataKind {
+    Read,
+    Write,
+    Verify,
+}
+
 // Stock files from the release immediately before the styled init screen (the
 // last version with a plain, unstyled CONFIG.SYS/AUTOEXEC.BAT). Keep these
 // exact: they are a one-version migration key, not configuration templates.
@@ -1499,6 +1557,25 @@ impl Machine {
             self.int13_hdd_error(0x01);
             return;
         }
+        // Census arm. One bool test on a path that already services a software
+        // interrupt; the `Instant` pair is behind it, never in front.
+        if self.int13_profile_enabled {
+            let started = std::time::Instant::now();
+            self.int13_hdd_dispatch(ah);
+            let elapsed = started.elapsed().as_nanos() as u64;
+            let p = &mut self.int13_profile;
+            p.host_wall_ns = p.host_wall_ns.saturating_add(elapsed);
+            if !matches!(ah, 0x02 | 0x03 | 0x04 | 0x0A | 0x0B | 0x42 | 0x43 | 0x44) {
+                p.control_calls += 1;
+            }
+            return;
+        }
+        self.int13_hdd_dispatch(ah);
+    }
+
+    /// The fixed-disk subfunction table, split out so the census can time the
+    /// whole service without duplicating the table.
+    fn int13_hdd_dispatch(&mut self, ah: u8) {
         match ah {
             // AH=00 reset disk system: a no-op success on this model (no real
             // recalibrate cost is charged for the hard disk).
@@ -1594,6 +1671,35 @@ impl Machine {
         self.stall_for_master_ticks(ata::pio_transfer_ticks(sectors));
     }
 
+    /// Record one fixed-disk data call in the census. Gated at the call site, so
+    /// this is never reached on an ordinary run.
+    pub(super) fn note_int13_data(&mut self, kind: Int13DataKind, sectors: u32) {
+        let p = &mut self.int13_profile;
+        match kind {
+            Int13DataKind::Read => {
+                p.read_calls += 1;
+                p.read_sectors += u64::from(sectors);
+                p.read_count_hist[int13_size_bucket(sectors)] += 1;
+            }
+            Int13DataKind::Write => {
+                p.write_calls += 1;
+                p.write_sectors += u64::from(sectors);
+            }
+            Int13DataKind::Verify => {
+                p.verify_calls += 1;
+                p.verify_sectors += u64::from(sectors);
+            }
+        }
+        p.stall_ticks = p
+            .stall_ticks
+            .saturating_add(ata::pio_transfer_ticks(sectors));
+    }
+
+    /// The fixed-disk census so far. All zero unless `IZARRAVM_INT13_PROFILE=1`.
+    pub fn int13_profile(&self) -> Int13Profile {
+        self.int13_profile
+    }
+
     /// AH=02/03 CHS read/write against the mounted hard disk. ES:BX is the buffer;
     /// AL is the sector count. AL returns the count actually moved.
     fn int13_hdd_transfer(&mut self, ah: u8) {
@@ -1651,6 +1757,14 @@ impl Machine {
             if signed {
                 self.booter_inert = true;
             }
+        }
+        if self.int13_profile_enabled {
+            let kind = if ah == 0x02 {
+                Int13DataKind::Read
+            } else {
+                Int13DataKind::Write
+            };
+            self.note_int13_data(kind, u32::from(done));
         }
         self.stall_for_hdd_sectors(u32::from(done));
         self.set_eax_al(done);
@@ -1716,6 +1830,14 @@ impl Machine {
             done += 1;
         }
 
+        if self.int13_profile_enabled {
+            let kind = if ah == 0x0A {
+                Int13DataKind::Read
+            } else {
+                Int13DataKind::Write
+            };
+            self.note_int13_data(kind, u32::from(done));
+        }
         self.stall_for_hdd_sectors(u32::from(done));
         self.set_eax_al(done);
         if done == count {
@@ -1755,6 +1877,9 @@ impl Machine {
                 break;
             }
             done += 1;
+        }
+        if self.int13_profile_enabled {
+            self.note_int13_data(Int13DataKind::Verify, u32::from(done));
         }
         self.stall_for_hdd_sectors(u32::from(done));
         self.set_eax_al(done);
@@ -1901,6 +2026,14 @@ impl Machine {
                 _ => unreachable!("EDD transfer dispatch validates AH"),
             }
             done += 1;
+        }
+        if self.int13_profile_enabled {
+            let kind = match ah {
+                0x42 => Int13DataKind::Read,
+                0x43 => Int13DataKind::Write,
+                _ => Int13DataKind::Verify,
+            };
+            self.note_int13_data(kind, u32::from(done));
         }
         self.stall_for_hdd_sectors(u32::from(done));
         // EDD writes the count actually moved back into the DAP block-count field.

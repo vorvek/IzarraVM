@@ -236,6 +236,20 @@ fn fold_literal_83(name: &str) -> [u8; 11] {
     out
 }
 
+/// The synthesized volume's FAT32 geometry, for the profile report.
+///
+/// `spc` is the load-time number: it is DERIVED from the folder's size, so a
+/// fixture folder and the committed image can disagree, and at `spc = 1` a
+/// 44 MB file's cluster chain is ~90,000 FAT entries that DOS re-walks per seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KateaGeometryReport {
+    pub sectors_per_cluster: u8,
+    pub fat_sectors: u32,
+    pub partition_sectors: u32,
+    pub total_sectors: u32,
+    pub count_of_clusters: u32,
+}
+
 /// The synthesized disk's geometry, derived from the tree's cluster needs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Geometry {
@@ -721,6 +735,16 @@ pub struct KateaStorageCounters {
     /// binary-searches the sorted `runs`, so this is now `log2(runs)` per sector
     /// rather than the tree-size-dependent linear walk it was built to expose.
     pub run_scan_steps: u64,
+    /// Sectors served out of the synthesized FAT region. The FAT is generated in
+    /// memory, so these cost no host I/O at all -- but each one is still a full
+    /// guest INT 13h call charged `COMMAND_LATENCY_TICKS`, and a high count
+    /// against `host_file_reads` is the signature of DOS re-walking a cluster
+    /// chain rather than of the guest asking for data.
+    pub fat_sector_reads: u64,
+    /// Sectors served out of the data region that were NOT file bytes: directory
+    /// clusters and free space. Separating these from the FAT count is what tells
+    /// a chain walk apart from a directory rescan.
+    pub dir_or_free_sector_reads: u64,
     /// Host `File::open` calls. Distinct from `host_file_reads` (which counts
     /// SECTORS served from a host file) because the one-entry handle cache makes
     /// them differ: their ratio is what says the cache is working. Before the
@@ -982,6 +1006,18 @@ impl KateaTreeVolume {
     }
 
     /// What the read path has done since mount. See [`KateaStorageCounters`].
+    /// The synthesized geometry, for the profile report. Derived at mount from
+    /// the host folder's size; nothing about it changes during a run.
+    pub(crate) fn geometry_report(&self) -> KateaGeometryReport {
+        KateaGeometryReport {
+            sectors_per_cluster: self.geo.spc,
+            fat_sectors: self.geo.fatsz,
+            partition_sectors: self.geo.part_sectors,
+            total_sectors: self.geo.total_sectors,
+            count_of_clusters: self.geo.count_of_clusters,
+        }
+    }
+
     pub(crate) fn storage_counters(&self) -> KateaStorageCounters {
         self.counters.get()
     }
@@ -1648,6 +1684,9 @@ impl KateaTreeVolume {
         let reserved = u32::from(RESERVED_SECTORS);
         let fat_end = reserved + u32::from(NUM_FATS) * self.geo.fatsz;
         if (reserved..fat_end).contains(&rel) {
+            let mut counters = self.counters.get();
+            counters.fat_sector_reads += 1;
+            self.counters.set(counters);
             let within = (rel - reserved) % self.geo.fatsz;
             return self.fat.fat_sector(within, &self.geo);
         }
@@ -1695,12 +1734,18 @@ impl KateaTreeVolume {
         counters.run_scan_steps = counters.run_scan_steps.saturating_add(steps);
         self.counters.set(counters);
         let Some(run) = found else {
+            let mut counters = self.counters.get();
+            counters.dir_or_free_sector_reads += 1;
+            self.counters.set(counters);
             return [0u8; SECTOR]; // free space
         };
         let cluster_off = cluster - run.0; // cluster index within the run
         let spc = u32::from(self.geo.spc);
         match &run.2 {
             Role::Dir(id) => {
+                let mut counters = self.counters.get();
+                counters.dir_or_free_sector_reads += 1;
+                self.counters.set(counters);
                 let d = &self.dirs[*id];
                 let sector_in_dir = cluster_off * spc + sector_in_cluster;
                 let mut out = [0u8; SECTOR];

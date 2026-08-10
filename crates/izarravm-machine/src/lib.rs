@@ -155,7 +155,9 @@ use firmware_contract::{Bios32Call, install_boot_memory, patch_rom};
 pub use gameport::JoystickState;
 
 pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
+pub use katea_tree::KateaGeometryReport;
 pub use katea_tree::KateaStorageCounters;
+pub use storage::Int13Profile;
 pub use vga_wipe_census::{VgaWipeCensusSnapshot, VgaWipeKeyRow};
 
 pub use cdimage::CdImage;
@@ -596,6 +598,14 @@ pub struct PhaseMark {
     /// these out (with `katea.host_wall_ns`) is what makes two intervals comparable.
     pub io_stall_ticks: u64,
     pub halted_ticks: u64,
+    /// The BIOS fixed-disk census at this boundary. All-zero unless
+    /// `IZARRAVM_INT13_PROFILE` armed it. `Copy` and fixed-size, so unlike
+    /// `cpu_profile` it costs the same at mark 1 and mark 1000 and cannot bias a
+    /// late interval against an early one.
+    pub int13: storage::Int13Profile,
+    /// FastMap / direct-map whole-map wipe counters at this boundary. `Copy` and
+    /// always-on in the CPU, so sampling it per mark costs a struct move.
+    pub fast_map_audit: izarravm_cpu::FastMapAuditCounters,
     /// The sampled CPU census at this boundary, when `IZARRAVM_CPU_PROFILE`
     /// armed it; `None` otherwise, so an unprofiled run pays nothing and reports
     /// no empty tables. Differencing consecutive marks gives the per-phase
@@ -1164,6 +1174,11 @@ pub struct Machine {
     // counter never misses an event the way a poll-and-clear bool would.
     floppy_accesses: u64,
     c_accesses: u64,
+    // BIOS fixed-disk census, and the bool that arms it. Both live here rather
+    // than in `ata` because the census counts INT 13h CALLS, which the drive
+    // never sees: it is handed sectors.
+    int13_profile: storage::Int13Profile,
+    int13_profile_enabled: bool,
     // ATAPI CD-ROM on the secondary IDE channel (0x170-0x177/0x376, IRQ15). It
     // owns the mounted disc image, the ATA register file, and the CD-audio
     // playback state the mixer streams.
@@ -1455,6 +1470,8 @@ impl Machine {
             floppy: None,
             floppy_accesses: 0,
             c_accesses: 0,
+            int13_profile: storage::Int13Profile::default(),
+            int13_profile_enabled: false,
             ide: ide::IdeChannel::new(),
             eltorito_boot: None,
             eltorito_emulation: None,
@@ -1804,6 +1821,19 @@ impl Machine {
         self.post_phase_marked = false;
     }
 
+    /// The synthesized Katea FAT32 geometry for C:, or None when C: is not a
+    /// mounted host folder.
+    pub fn katea_geometry_report(&self) -> Option<katea_tree::KateaGeometryReport> {
+        self.ata.as_ref().and_then(|d| d.katea_geometry_report())
+    }
+
+    /// Arm the BIOS fixed-disk census. Off by default; the host CLI arms it from
+    /// `IZARRAVM_INT13_PROFILE`, and every increment is behind this bool at its
+    /// own call site rather than inside the helper it calls.
+    pub fn enable_int13_profile(&mut self) {
+        self.int13_profile_enabled = true;
+    }
+
     /// The boundaries recorded so far, in the order they fired.
     pub fn phase_marks(&self) -> &[PhaseMark] {
         &self.phase_marks
@@ -1831,6 +1861,8 @@ impl Machine {
             katea: self.katea_storage_counters(),
             io_stall_ticks: self.timeline.io_stall_ticks(),
             halted_ticks: self.halted_ticks,
+            int13: self.int13_profile,
+            fast_map_audit: self.cpu.fast_map_audit_counters(),
             cpu_profile: self
                 .cpu
                 .profiling_enabled()
@@ -1908,6 +1940,8 @@ impl Machine {
             katea: self.katea_storage_counters(),
             io_stall_ticks: self.timeline.io_stall_ticks(),
             halted_ticks: self.halted_ticks,
+            int13: self.int13_profile,
+            fast_map_audit: self.cpu.fast_map_audit_counters(),
             cpu_profile: None,
         });
     }

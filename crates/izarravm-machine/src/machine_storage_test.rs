@@ -1507,3 +1507,67 @@ fn floppy_booted_machine_stands_dos_down_at_interrupt_ack() {
         "INT 21h stands down once a floppy has booted"
     );
 }
+
+/// The BIOS fixed-disk census must be SILENT until armed and must count once it
+/// is. Both halves are asserted here because the census is an instrument and the
+/// house rule is that a default-off instrument proves it stays off, not just that
+/// it works: a census that quietly counted on every run would be exactly the kind
+/// of hot-path tax this repo has already paid for once.
+#[test]
+fn int13_census_is_silent_until_armed_and_counts_after() {
+    fn read_one_sector(machine: &mut Machine, count: u8) {
+        machine
+            .cpu
+            .registers
+            .set_eax((0x02 << 8) | u32::from(count));
+        machine.cpu.registers.set_ecx(0x0001);
+        machine.cpu.registers.set_edx(0x0080);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2000));
+        machine.cpu.registers.set_ebx(0);
+        machine.handle_int13();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            0,
+            "the read has to SUCCEED, or the census would be counting a failure path"
+        );
+    }
+
+    let mut quiet = machine_with_hdd(64);
+    read_one_sector(&mut quiet, 1);
+    assert_eq!(
+        quiet.int13_profile(),
+        crate::storage::Int13Profile::default(),
+        "unarmed census must stay all-zero after a real successful transfer"
+    );
+
+    let mut armed = machine_with_hdd(64);
+    armed.enable_int13_profile();
+    read_one_sector(&mut armed, 1);
+    read_one_sector(&mut armed, 8);
+    // AH=08 get-parameters: a control call, not a data call.
+    armed.cpu.registers.set_eax(0x08 << 8);
+    armed.cpu.registers.set_edx(0x0080);
+    armed.handle_int13();
+
+    let p = armed.int13_profile();
+    assert_eq!(p.read_calls, 2, "two data reads counted");
+    assert_eq!(p.read_sectors, 9, "1 + 8 sectors counted");
+    assert_eq!(p.control_calls, 1, "AH=08 counted as a control call");
+    assert_eq!(p.write_calls, 0);
+    // Buckets are 1, 2, 3-4, 5-8, ...; the 1-sector read and the 8-sector read
+    // land in the first and fourth.
+    assert_eq!(p.read_count_hist[0], 1, "one single-sector read");
+    assert_eq!(p.read_count_hist[3], 1, "one 5-8 sector read");
+    assert_eq!(
+        p.stall_ticks,
+        ata::pio_transfer_ticks(1) + ata::pio_transfer_ticks(8),
+        "charged ticks must equal what the ATA model actually charged"
+    );
+    assert!(
+        p.host_wall_ns > 0,
+        "the service was timed, so some host wall was recorded"
+    );
+}

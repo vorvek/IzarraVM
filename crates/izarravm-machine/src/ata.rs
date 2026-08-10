@@ -316,6 +316,14 @@ impl AtaDisk {
         }
     }
 
+    /// The synthesized FAT32 geometry, or None for an image-backed disk.
+    pub fn katea_geometry_report(&self) -> Option<crate::katea_tree::KateaGeometryReport> {
+        match &self.backing {
+            Backing::Image(_) => None,
+            Backing::HostFolder(volume) => Some(volume.geometry_report()),
+        }
+    }
+
     /// Run the host-folder reconcile pass. A no-op for an image-backed disk.
     /// The machine calls this at eject/flush so anything held in the overlay is a
     /// final-pass materialized to the host folder.
