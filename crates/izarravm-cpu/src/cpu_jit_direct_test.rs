@@ -1172,20 +1172,23 @@ fn direct_push_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() {
     }
 }
 
-/// `MOV DS, r16` in real mode writes the WHOLE descriptor, not just the base.
+/// `MOV DS, r16` in real mode recomputes selector, base, access and B -- and leaves the cached
+/// LIMIT exactly where it was.
 ///
 /// The starting DS is UNREAL: base 0, limit 0xFFFF_FFFF, which is what a game gets after a
-/// protected-mode excursion sets a 4 GB limit and drops back. `load_segment_real` stamps
-/// `limit = 0xFFFF` and `access = 0x93` unconditionally, so a lowering that wrote only the
-/// selector and the base would leave the 4 GB limit live. That is not a local error:
-/// `emit_segmented_linear_address` omits its limit compare entirely when the limit is
-/// `u32::MAX`, so the divergence would go on to suppress limit faults in later blocks.
+/// protected-mode excursion sets a 4 GB limit and drops back. That seed is load-bearing in both
+/// directions now. A lowering that wrote only the selector and the base would leave a stale
+/// ACCESS byte live; a lowering that stamped the limit back to 0xFFFF -- which is what this
+/// emitter and `load_segment_real` both used to do -- would destroy unreal mode and turn every
+/// later >64 KB access into a #GP (the SpeedSys 4.78 hang). Neither error is local:
+/// `emit_segmented_linear_address` bakes the entry limit and omits its compare entirely when the
+/// limit is `u32::MAX`, so a divergence propagates into later blocks.
 ///
-/// With a plain real-mode starting DS this test passes whether or not the limit and access
-/// stores exist, which is the whole reason the seed is unreal.
+/// With a plain real-mode starting DS this test passes whether or not the access store exists and
+/// whether or not a limit store exists, which is the whole reason the seed is unreal.
 ///
-/// The full-state comparison against the interpreter is what covers all five fields; nothing here
-/// re-states `SegmentRegister::real`, so the test cannot drift with it.
+/// The full-state comparison against the interpreter is what covers all five fields; the explicit
+/// descriptor assertion below re-states only the ONE field the seed makes interesting.
 #[test]
 fn direct_load_segment_real_writes_the_whole_descriptor() {
     let mut memory = vec![0; 0x1000];
@@ -1272,8 +1275,12 @@ fn direct_load_segment_real_writes_the_whole_descriptor() {
         assert_eq!(native, interp, "selector {selector:#06x} CPU state");
         assert_eq!(
             native.registers.segment(SegmentIndex::Ds),
-            SegmentRegister::real(selector),
-            "selector {selector:#06x}: the descriptor must be exactly the real-mode one"
+            SegmentRegister {
+                limit: u32::MAX,
+                ..SegmentRegister::real(selector)
+            },
+            "selector {selector:#06x}: every field but the limit is the real-mode one, \
+             and the unreal limit survives"
         );
         assert_eq!(
             native.perf_counters().jit_direct_insns - before,
