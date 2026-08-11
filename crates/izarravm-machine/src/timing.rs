@@ -1100,14 +1100,13 @@ impl Machine {
 
     /// The two Margo terms, deliberately kept OUT of the deadline cache.
     ///
-    /// Both are armed by a memory write, and Margo MMIO writes do not all set
-    /// `io_touched`: only the blit-arming edge does (see
-    /// `MachineBus::write_memory_byte_recorded`), while a DISPLAY_START register
-    /// write returns `VideoWrite::Accepted` like any framebuffer store. There is
-    /// therefore no cheap seam that could invalidate a cached Margo deadline, and
-    /// caching one would violate the "never later than a fresh scan" contract.
-    /// They cost a bool test and a `u64` field read when idle, which is what the
-    /// cache was buying elsewhere anyway.
+    /// Both are armed by a memory write, and NO Margo MMIO write sets
+    /// `io_touched` -- a DISPLAY_START or COMMAND store returns
+    /// `VideoWrite::Accepted`/`ArmedBlit` and batches on like any framebuffer
+    /// store. There is therefore no cheap seam that could invalidate a cached
+    /// Margo deadline, and caching one would violate the "never later than a
+    /// fresh scan" contract. They cost a bool test and a `u64` field read when
+    /// idle, which is what the cache was buying elsewhere anyway.
     ///
     /// The blit term is a real device deadline whose absence was load-bearing in
     /// a way nothing recorded: STATUS.BUSY lives in MMIO, so the BIOS's
@@ -1118,43 +1117,37 @@ impl Machine {
     /// thing keeping that bill down on the 386 tier, and raising the fallback to
     /// 1 ms alone stopped POST from clearing the RAM test inside its 20M-cycle
     /// budget. With the deadline here the wait costs exactly the busy time the
-    /// engine modeled (a glyph expand is ~740 ns, ~16 clocks at 22 MHz). The
-    /// arming write ends its own batch, so this term is always seen from a batch
-    /// that starts with the engine busy.
+    /// engine modeled (a glyph expand is ~740 ns, ~16 clocks at 22 MHz). A blit
+    /// can now be armed mid-batch and first seen by the FOLLOWING batch entry, at
+    /// which point `blitter_busy_ns` already reports the credited remainder --
+    /// `Margo::advance_busy` spends the arm-time credit before draining, so the
+    /// raw `busy_ns` this term reads is the truth at a batch boundary.
     ///
-    /// UNCONDITIONAL ACROSS TIMING CLASSES, AND WHAT THAT COSTS. The blit wait is
-    /// two halves -- this deadline term, and the `VideoWrite::ArmedBlit`
-    /// `io_touched` set in `MachineBus::write_memory_byte_recorded` -- and both
-    /// apply in the Approximate class as well. That is deliberate, but the break
-    /// buys LESS than it looks like it buys, so be precise about which half of
-    /// `docs/vega/vega-technical-reference.md` section 9 needs it.
+    /// UNCONDITIONAL ACROSS TIMING CLASSES. This term applies in the Approximate
+    /// class as well. The tier is a CPU-speed policy, never a device-behavior
+    /// one, and no `GswMode` reaches margo.rs, so
+    /// `docs/vega/vega-technical-reference.md` section 9 is not something the
+    /// Approximate class gets to opt out of.
     ///
-    /// Section 9 has two clauses. The IDLE-EARLY clause -- software cannot
-    /// observe the engine as idle until the modeled time has passed -- holds
-    /// WITHOUT the break: STATUS.BUSY is a live read of `Margo::busy_ns`
-    /// (margo.rs, `REG_STATUS`), and `busy_ns` is only ever decremented by
-    /// `advance_busy` with real elapsed device time, so a poll inside a
-    /// still-running batch reads the engine as busy, never as idle. What the
-    /// break buys is the EXACTNESS clause -- the cost model is "exact by
-    /// construction ... a stronger guarantee than the CPU compatibility modes".
-    /// Without it BUSY reads busy for TOO LONG: the poll cannot end its own
-    /// batch, so the engine stays busy to the end of a batch that was capped
-    /// before the arming write, up to a stale cap however short the operation
-    /// was. The tier is a CPU-speed policy, never a device-behavior one, and no
-    /// `GswMode` reaches margo.rs, so exactness is not something the Approximate
-    /// class gets to opt out of.
+    /// Section 9 has two clauses, and BOTH are held by this term plus the lazy
+    /// STATUS peek. The IDLE-EARLY clause -- software cannot observe the engine
+    /// as idle until the modeled time has passed -- holds because
+    /// `Margo::busy_ns_after` measures from the arm instant, not from batch
+    /// start, and the batch-end drain credits that same offset back. The
+    /// EXACTNESS clause -- the cost model is "exact by construction ... a
+    /// stronger guarantee than the CPU compatibility modes" -- holds because the
+    /// poll answers with the busy time as of the READ rather than as of batch
+    /// start, the way `Counter::count_after` and `Pit::out_after` peek the PIT.
     ///
-    /// RECOVERABLE, and this is the shape: a lazy `Margo::busy_ns_after(elapsed)`
-    /// peek would let the STATUS read answer with the busy time as of the READ
-    /// rather than as of batch start, exactly the way `Counter::count_after` and
-    /// `Pit::out_after` peek the PIT without ending the batch. That is a future
-    /// slice; until it lands the ~5% wall below on Margo-heavy fixtures is the
-    /// price of the exactness clause.
-    ///
-    /// The price is real and was measured, so it is recorded here rather than
-    /// left for the next person to rediscover. Ending a batch on the arming write
-    /// raises BATCH ENTRIES on Margo-heavy Approximate-class workloads by ~5.9%,
-    /// and wall follows it:
+    /// HOW IT WAS BOUGHT BEFORE, and what that cost. Until the peek landed, the
+    /// exactness clause was bought by a SECOND half: `VideoWrite::ArmedBlit` set
+    /// `io_touched` in `MachineBus::write_memory_byte_recorded`, ending the batch
+    /// on the arming write, because a `margo_wait` MMIO spin cannot break its own
+    /// batch and BUSY only moved when devices advanced. It worked, and it was
+    /// expensive. The measurement is kept because it is the acceptance target for
+    /// removing the break: ending a batch on the arming write raised BATCH
+    /// ENTRIES on Margo-heavy Approximate-class workloads by ~5.9%, and wall
+    /// followed it:
     ///
     ///   | fixture    | entries          | wall s          |
     ///   |------------|------------------|-----------------|
@@ -1167,10 +1160,10 @@ impl Machine {
     /// 30.00), so those are wall-for-wall comparisons, not a real-time-factor
     /// artifact. gp2-586's entries move only 0.08% and its wall difference is
     /// inside host noise, which is the control that makes entries the causal
-    /// variable rather than a coincidence. A probe gating BOTH halves to the
-    /// Accurate class recovers the entry counts EXACTLY (prince back to
-    /// 1,233,464,425) and the wall with them -- so this is the whole cost, and it
-    /// is bought deliberately for section 9's exactness clause.
+    /// variable rather than a coincidence. A probe gating the break to the
+    /// Accurate class recovered the entry counts EXACTLY (prince back to
+    /// 1,233,464,425) and the wall with them -- so that was the whole cost, and
+    /// removing the break has to land back on those same numbers.
     fn vega_edge_ticks(&self) -> Option<u64> {
         let blit_busy_ns = self.vega.blitter_busy_ns();
         let blit = if blit_busy_ns > 0 {
@@ -1292,15 +1285,25 @@ impl Machine {
     ///   * batch entry, when the cached edge is already due -- the device fired
     ///     inside its own advance and rearmed or went idle;
     ///   * batch end, whenever the batch was not provably quiet: any guest port
-    ///     access (`io_touched`, which the Margo blit-arming MMIO write also
-    ///     sets), a bus-side DMA write to guest RAM, any serviced HLE / mode /
-    ///     Toka / BIOS32 / unittester step, or a HLT fast-forward;
+    ///     access (`io_touched`), a bus-side DMA write to guest RAM, any
+    ///     serviced HLE / mode / Toka / BIOS32 / unittester step, or a HLT
+    ///     fast-forward;
     ///   * `run_until_tick` entry, which covers EVERY host-side mutator in one
     ///     place -- keyboard/mouse/joystick injection, media mount and eject,
     ///     CMOS and RTC seeding, audio rendering -- since those can only run
     ///     between run calls on the machine thread. The individually risky ones
     ///     also invalidate at their own site, so the property does not silently
     ///     depend on that scheduling fact.
+    ///
+    /// A MARGO BLIT ARM IS NOT ON THAT LIST, and does not need to be. It used to
+    /// be, via `io_touched`, only as a side effect of the batch break that has
+    /// since been replaced by the lazy STATUS peek. Arming a blit does move a
+    /// device schedule -- but the Margo terms are the ones `vega_edge_ticks`
+    /// keeps OUT of the cache (see its doc, and the exclusion pinned by
+    /// `machine_deadline_cache_test.rs`'s `arm_every_cached_device`), so there is
+    /// no cached Margo deadline for it to make stale. That soundness rests on the
+    /// exclusion: anything that later moves a Margo term INTO
+    /// `next_cacheable_edge_ticks` has to put the arm back on this list.
     ///
     /// Canonical state is NOT on that list, and does not need to be: the
     /// canonical API is capture-only (`Machine::canonical_state_capture` takes
@@ -1490,6 +1493,30 @@ impl MachineBus<'_> {
         self.timeline_at_batch_start
             .preview_cpu_clocks(self.in_batch_clocks(), self.vega.dot_clock_hz())
             .0
+    }
+
+    /// Elapsed Margo nanoseconds at the current point in the batch, without
+    /// draining `busy_ns`.
+    ///
+    /// The exact analogue of `elapsed_pit_clocks`, and it converts the SAME
+    /// in-batch clock total `T` through the SAME `RatePhase` the real batch-end
+    /// `advance_master_ticks` will use for `margo_nanoseconds` -- carry included,
+    /// which is why `Timeline::preview_margo_nanoseconds` clones the accumulator
+    /// rather than recomputing ns from a rate. A divergence here would show as
+    /// STATUS.BUSY clearing a nanosecond early or late against a real
+    /// `advance_devices` of the same clocks.
+    ///
+    /// `isa_io_clocks` is deliberately NOT folded in: that accrual is charged
+    /// only on OPL polls, so `predicted_opl_status` includes it and the beam and
+    /// PIT peeks exclude it. A Margo MMIO read is a memory access, not a port
+    /// access, and accrues no I/O stall of its own.
+    ///
+    /// Two callers, both in `MachineBus`: the STATUS read (`read_phys`) and the
+    /// arm-time drain credit (`write_memory_byte_recorded`). They must agree,
+    /// since the credit is the origin the read measures from.
+    pub(super) fn elapsed_margo_ns(&self) -> u64 {
+        self.timeline_at_batch_start
+            .preview_margo_nanoseconds(self.in_batch_clocks())
     }
 
     /// Record that the guest just touched a PIT counter, so the Accurate class

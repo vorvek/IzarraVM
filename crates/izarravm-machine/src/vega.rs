@@ -40,21 +40,29 @@ pub(crate) const MARGO_EXT_DISPCTL: u8 = 0x06;
 
 /// What a video-aperture byte write did, reported to `MachineBus::write_memory`.
 ///
-/// `ArmedBlit` comes ONLY from the write that INCREASED the Margo blitter's
-/// modeled busy time -- never from a write that merely happened while the engine
-/// was already busy. That distinction is load-bearing: a blit can outlast a
-/// batch (a 640x480 FILL models ~1.54 ms of busy time against a 1 ms cap), and a
-/// guest overlapping CPU rendering with a long blit must keep batching its
-/// framebuffer writes. Every aperture other than Margo's MMIO window returns
-/// `Accepted` without even loading the busy counter, so the planar / chain-4 /
-/// LFB / text write paths pay nothing for this.
+/// `ArmedBlit` comes ONLY from a write that MOVED the Margo blitter's modeled
+/// busy time -- never from a write that merely happened while the engine was
+/// already busy. That distinction is load-bearing: a blit can outlast a batch (a
+/// 640x480 FILL models ~1.54 ms of busy time against a 1 ms cap), and a guest
+/// overlapping CPU rendering with a long blit must not re-stamp the origin on
+/// every framebuffer store. Every aperture other than Margo's MMIO window
+/// returns `Accepted` without even loading the busy counter, so the planar /
+/// chain-4 / LFB / text write paths pay nothing for this.
+///
+/// WHAT THE CALLER OWES IT: the busy time is measured from the instant of this
+/// write, but the machine drains Margo once per batch, with the whole batch's
+/// nanoseconds. So the bus answers `ArmedBlit` by crediting the in-batch offset
+/// (`Margo::credit_busy_ns`); see `MachineBus::write_memory_byte_recorded`. The
+/// EDGE is tested in both directions -- a RESET that lowers busy time while an
+/// earlier blit drains is also a new origin -- which is why this says "moved"
+/// and not "increased".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VideoWrite {
     /// No aperture claimed the address; the caller falls back to RAM.
     Unclaimed,
     /// An aperture took the byte.
     Accepted,
-    /// An aperture took the byte and it started a Margo blit.
+    /// An aperture took the byte and it moved the Margo blitter's busy time.
     ArmedBlit,
 }
 
@@ -358,6 +366,15 @@ impl Vega {
     /// clear on its own.
     pub(crate) fn blitter_busy_ns(&self) -> u64 {
         self.margo.busy_ns()
+    }
+
+    /// Tell Margo the write that just moved its busy time landed `elapsed_ns`
+    /// into the current batch. Only `MachineBus::write_memory_byte_recorded`
+    /// calls this, and only on `VideoWrite::ArmedBlit`; `pump_pusher` must NOT,
+    /// since it runs at batch end after the drain, i.e. at offset 0 of the next
+    /// batch.
+    pub(crate) fn credit_blit_arm(&mut self, elapsed_ns: u64) {
+        self.margo.credit_busy_ns(elapsed_ns);
     }
 
     pub(crate) fn port_disabled(&self, port: u16) -> bool {
@@ -697,7 +714,16 @@ impl Vega {
         false
     }
 
-    pub(crate) fn read_memory(&mut self, address: u32, out: &mut [u8]) -> bool {
+    /// `margo_elapsed_ns` is the in-batch offset the read is taken at, and is
+    /// consumed by the Margo MMIO arm alone (STATUS.BUSY). The caller only has
+    /// to compute it when `margo_mmio_at` says the address is in that window;
+    /// every other aperture passes 0 and pays nothing.
+    pub(crate) fn read_memory(
+        &mut self,
+        address: u32,
+        out: &mut [u8],
+        margo_elapsed_ns: u64,
+    ) -> bool {
         let width = out.len();
         if width == 0 {
             return false;
@@ -777,7 +803,7 @@ impl Vega {
         }
         if let Some(offset) = margo_mmio_offset(address, width) {
             for (index, byte) in out.iter_mut().enumerate() {
-                *byte = self.margo.read_mmio_u8(offset + index);
+                *byte = self.margo.read_mmio_u8_at(offset + index, margo_elapsed_ns);
             }
             return true;
         }
@@ -860,12 +886,13 @@ impl Vega {
         if let Some(offset) = margo_mmio_offset(address, 1) {
             // The ONLY arming path in this function: COMMAND (and the final
             // MONO_DATA word of a color-expand stream) is what charges the
-            // blitter modeled busy time. Detect the EDGE -- busy time that this
-            // write added -- rather than the level, so a write landing while an
-            // earlier long blit is still draining is an ordinary accepted write.
+            // blitter modeled busy time; CONTROL.RESET is what drops it. Detect
+            // the EDGE -- busy time this write MOVED -- rather than the level,
+            // so a write landing while an earlier long blit is still draining is
+            // an ordinary accepted write and does not re-stamp the origin.
             let busy_before = self.margo.busy_ns();
             self.margo.write_mmio_u8(offset, value);
-            return if self.margo.busy_ns() > busy_before {
+            return if self.margo.busy_ns() != busy_before {
                 VideoWrite::ArmedBlit
             } else {
                 VideoWrite::Accepted
@@ -1139,6 +1166,14 @@ fn margo_lfb_offset(address: u32, width: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Whether `address` falls in the Margo MMIO register window. A constant-range
+/// test the bus uses to decide whether a read has to compute the in-batch Margo
+/// nanosecond offset at all, so the LFB / planar / text / chain-4 read paths do
+/// not pay for a peek only STATUS consumes.
+pub(crate) fn margo_mmio_at(address: u32) -> bool {
+    (MARGO_MMIO_BASE..MARGO_MMIO_BASE + MARGO_MMIO_SIZE as u32).contains(&address)
 }
 
 fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {

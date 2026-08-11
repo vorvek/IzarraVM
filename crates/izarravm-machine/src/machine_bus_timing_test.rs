@@ -2982,3 +2982,268 @@ fn a_lazy_gameport_read_moves_with_the_in_batch_offset() {
     );
     assert_eq!(late & 0x03, 0x00, "both have discharged 4M clocks later");
 }
+
+// ---------------------------------------------------------------------------
+// Margo STATUS.BUSY: the lazy peek, and the arm-time drain credit it is
+// measured from. The counterparts of the PIT-latch and 3DA suites above; see
+// `Machine::vega_edge_ticks` for why the arming write no longer ends its batch.
+// ---------------------------------------------------------------------------
+
+/// Program a Margo FILL whose modeled busy time spans a coarse batch, WITHOUT
+/// issuing the COMMAND that arms it. 640x480 at 5 ns/pixel is 1,536,100 ns --
+/// ~33,794 clocks at the 386 tier, so an in-batch offset sweep can straddle the
+/// instant BUSY drops.
+fn program_large_margo_fill(machine: &mut Machine) {
+    write_mmio_reg(machine, 0x100, 0); // DST_BASE
+    write_mmio_reg(machine, 0x104, 640); // DST_PITCH
+    write_mmio_reg(machine, 0x110, 1); // DEPTH
+    write_mmio_reg(machine, 0x114, 0); // DST_XY: (0,0)
+    write_mmio_reg(machine, 0x11c, (480 << 16) | 640); // DIM: 640x480
+    write_mmio_reg(machine, 0x120, 0xab); // FG_COLOR
+    write_mmio_reg(machine, 0x128, 0xf0); // ROP: PATCOPY
+    write_mmio_reg(machine, 0x130, 0); // FLAGS: none
+}
+
+/// The same, sized like a glyph blit: 20 pixels is 100 + 20*5 = 200 ns, about
+/// 4.4 clocks at the 386 tier.
+fn program_small_margo_fill(machine: &mut Machine) {
+    write_mmio_reg(machine, 0x100, 0); // DST_BASE
+    write_mmio_reg(machine, 0x104, 640); // DST_PITCH
+    write_mmio_reg(machine, 0x110, 1); // DEPTH
+    write_mmio_reg(machine, 0x114, (2 << 16) | 3); // DST_XY: (3,2)
+    write_mmio_reg(machine, 0x11c, (4 << 16) | 5); // DIM: 5x4
+    write_mmio_reg(machine, 0x120, 0xab); // FG_COLOR
+    write_mmio_reg(machine, 0x128, 0xf0); // ROP: PATCOPY
+    write_mmio_reg(machine, 0x130, 0); // FLAGS: none
+}
+
+/// Read Margo STATUS through the MMIO aperture at a given in-batch offset,
+/// returning the byte and the raw bus clocks the access itself recorded (the
+/// same accounting `read_status_port_at` uses, so a differential can advance the
+/// twin machine by the identical total).
+fn read_margo_status_at(machine: &mut Machine, prior: u64, core: u64) -> (u8, u64) {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        let before = bus.trace.elapsed_clocks();
+        let value = bus
+            .read_memory(
+                MARGO_MMIO_BASE + 0x008,
+                BusWidth::Byte,
+                BusAccessKind::DataRead,
+            )
+            .unwrap() as u8;
+        (value, bus.trace.elapsed_clocks() - before)
+    })
+}
+
+/// Issue the four COMMAND bytes at a given in-batch offset, the way a guest that
+/// has been computing for most of a batch does. Returns the elapsed Margo
+/// nanoseconds at that instant -- the credit the arm just stamped.
+fn arm_margo_fill_at(machine: &mut Machine, prior: u64, command: u32) -> u64 {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = 0;
+        for (i, byte) in command.to_le_bytes().into_iter().enumerate() {
+            bus.write_memory(
+                MARGO_MMIO_BASE + 0x150 + i as u32,
+                BusWidth::Byte,
+                u32::from(byte),
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+        }
+        assert!(
+            !*bus.io_touched,
+            "the Margo arming write must NOT end its own batch any more: that \
+             break is what the analytic peek replaced"
+        );
+        bus.elapsed_margo_ns()
+    })
+}
+
+#[test]
+fn a_mid_batch_margo_status_read_matches_a_real_advance_devices_of_the_same_clocks() {
+    // The Margo counterpart of
+    // a_mid_batch_3da_read_matches_a_real_advance_devices_of_the_same_clocks,
+    // and the test that retires the "STATUS.BUSY reports the batch-start engine"
+    // caveat. It is the load-bearing one for this slice: the guest's blit wait
+    // is an MMIO spin, which cannot end its own batch, so before the peek the
+    // ONLY thing making that spin see BUSY drop on time was ending the batch on
+    // the arming write. Removing that break is only sound if a mid-batch STATUS
+    // read equals what a real advance_devices of the same clock total, followed
+    // by a read at zero offset, produces.
+    //
+    // Both timing classes: the tier is a CPU-speed policy, and no GswMode
+    // reaches margo.rs, so section 9 applies to both.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        for prior in [0u64, 61, 33_000] {
+            for core in [0u64, 100, 12_345, 40_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(mode);
+                predicted_machine.run_cycles(5_000).unwrap();
+                program_large_margo_fill(&mut predicted_machine);
+                write_mmio_reg(&mut predicted_machine, 0x150, 0x01); // COMMAND: FILL
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(mode);
+                real_machine.run_cycles(5_000).unwrap();
+                program_large_margo_fill(&mut real_machine);
+                write_mmio_reg(&mut real_machine, 0x150, 0x01);
+                assert_eq!(predicted_machine.timeline, real_machine.timeline);
+                assert_eq!(
+                    predicted_machine.vega.blitter_busy_ns(),
+                    real_machine.vega.blitter_busy_ns()
+                );
+
+                let (predicted, predicted_raw) =
+                    read_margo_status_at(&mut predicted_machine, prior, core);
+                // The step carries NO term for the access's own bus time: a
+                // Margo MMIO read is charged video wait states, and that charge
+                // is recorded before the peek on BOTH machines, so it is already
+                // inside each read's own in_batch_clocks and cancels. The
+                // equality below is asserted, not assumed.
+                real_machine.advance_devices(prior + core);
+                let (real, real_raw) = read_margo_status_at(&mut real_machine, 0, 0);
+                assert_eq!(
+                    predicted_raw, real_raw,
+                    "mode {mode:?}: the two reads must charge the same bus time for \
+                     the own-charge term to cancel"
+                );
+                assert_eq!(
+                    predicted & 1,
+                    real & 1,
+                    "mode {mode:?} prior {prior} core {core}: a mid-batch STATUS read \
+                     must equal a real advance_devices of the same total"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_batch_margo_status_read_moves_with_the_in_batch_offset() {
+    // Non-vacuity for the test above: without the peek every STATUS read in a
+    // batch reports the same batch-start BUSY, so the column below would be
+    // constant. The 640x480 fill models 1,536,100 ns, ~33,794 clocks at this
+    // tier, so a 0..60,000 sweep straddles the instant the engine goes idle.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    machine.run_cycles(5_000).unwrap();
+    program_large_margo_fill(&mut machine);
+    write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL
+
+    let mut levels = std::collections::BTreeSet::new();
+    for core in (0u64..=60_000).step_by(1_000) {
+        let (value, _) = read_margo_status_at(&mut machine, 0, core);
+        levels.insert(value & 1);
+    }
+    assert_eq!(
+        levels.len(),
+        2,
+        "STATUS.BUSY must take both levels across a sweep of in-batch offsets; a \
+         constant column means the peek is not being taken"
+    );
+    // ... and in the right direction, at the modeled instant rather than merely
+    // somewhere in the sweep.
+    assert_eq!(read_margo_status_at(&mut machine, 0, 33_000).0 & 1, 1);
+    assert_eq!(read_margo_status_at(&mut machine, 0, 34_500).0 & 1, 0);
+}
+
+#[test]
+fn a_blit_armed_mid_batch_is_not_idle_early_at_the_next_batch_entry() {
+    // The property a peek-only patch would have shipped broken, and the reason
+    // `Margo::busy_credit_ns` exists. Margo drains ONCE, at batch end, with the
+    // WHOLE batch's nanoseconds. While the arming write ended its own batch a
+    // blit always started at in-batch offset ~0 and that was exactly right.
+    // Without the break, a blit armed 20,000 clocks (~909 us) into a batch would
+    // be billed all 909 us against its 200 ns of work and read IDLE at the next
+    // batch entry -- an idle-early violation of section 9's first clause,
+    // observable through the deadline term as well, since `vega_edge_ticks`
+    // reads the drained `busy_ns` at batch entry.
+    const ARM_OFFSET: u64 = 20_000;
+    const BATCH_END: u64 = ARM_OFFSET + 4; // ~181 ns past the arm: less than 200
+
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    machine.run_cycles(5_000).unwrap();
+    program_small_margo_fill(&mut machine);
+    let credit_ns = arm_margo_fill_at(&mut machine, ARM_OFFSET, 0x01);
+    assert_eq!(machine.vega.blitter_busy_ns(), 200); // 20 px: 100 + 20*5
+    assert!(
+        credit_ns > 800_000,
+        "sanity: the arm must land deep into the batch, got {credit_ns} ns"
+    );
+
+    machine.advance_devices(BATCH_END);
+    let remaining = machine.vega.blitter_busy_ns();
+    assert!(
+        remaining > 0 && remaining <= 200,
+        "a blit armed mid-batch must still be busy at the next batch entry, with \
+         only the time SINCE the arm drained; got {remaining} ns"
+    );
+    // What the guest's spin sees at the next batch entry, and what the deadline
+    // term will size the next batch from.
+    assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+
+    // Control, so the assertion above is about the credit and not about the
+    // operation simply outliving the advance: the IDENTICAL blit armed at offset
+    // 0 of the batch really is drained to idle by the same advance.
+    let mut control = test_machine();
+    control.set_mode(GswMode::Gsw386);
+    control.run_cycles(5_000).unwrap();
+    program_small_margo_fill(&mut control);
+    write_mmio_reg(&mut control, 0x150, 0x01);
+    assert_eq!(control.vega.blitter_busy_ns(), 200);
+    control.advance_devices(BATCH_END);
+    assert_eq!(
+        control.vega.blitter_busy_ns(),
+        0,
+        "control: a blit armed at offset 0 is drained by the whole batch"
+    );
+    assert_eq!(read_mmio_reg(&mut control, 0x008) & 1, 0);
+}
+
+#[test]
+fn an_overlapping_write_does_not_restamp_the_blit_origin() {
+    // The other half of the EDGE argument, which used to be pinned through
+    // `io_touched` in `no_margo_write_ends_the_batch_while_a_long_blit_drains`.
+    // `VideoWrite::ArmedBlit` now stamps the instant the busy time is measured
+    // FROM, so a level-triggered test would re-stamp that origin on every
+    // framebuffer store a guest overlaps with a running blit -- and the
+    // operation would never finish. The 200 ns fill armed at offset 0 must be
+    // drained to idle by a batch that also contains writes at offset 10,000.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    machine.run_cycles(5_000).unwrap();
+    program_small_margo_fill(&mut machine);
+    write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL, at offset ~0
+    assert_eq!(machine.vega.blitter_busy_ns(), 200);
+
+    with_bus(&mut machine, |bus| {
+        bus.prior_runs_core_clocks = 10_000;
+        bus.core_clocks_so_far = 0;
+        // An LFB store and a non-arming MMIO store, both while the engine runs.
+        bus.write_memory(
+            MARGO_LFB_BASE + 0x1234,
+            BusWidth::Byte,
+            0x5a,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+        bus.write_memory(
+            MARGO_MMIO_BASE + 0x120, // FG_COLOR
+            BusWidth::Byte,
+            0x17,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+    });
+
+    machine.advance_devices(10_010);
+    assert_eq!(
+        machine.vega.blitter_busy_ns(),
+        0,
+        "an overlapping write must not move the instant the blit is timed from"
+    );
+}

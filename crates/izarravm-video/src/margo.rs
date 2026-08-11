@@ -499,6 +499,22 @@ pub struct Margo {
     blit: [u32; BLIT_REGS],
     command: u32,
     busy_ns: u64,
+    /// Nanoseconds of the CURRENT batch that had already elapsed when the last
+    /// write moved `busy_ns` -- the ORIGIN the busy time is measured from.
+    ///
+    /// It exists because the machine drains busy time once, at batch end, with
+    /// the whole batch's nanoseconds. A blit armed partway into a batch was not
+    /// running for the part before the arm, so that part must not be drained
+    /// from it; `advance_busy` spends this credit first. Without it, dropping
+    /// the arming write's batch break would over-drain by the in-batch offset
+    /// and let software observe the engine idle before its modeled time had
+    /// passed (`docs/vega/vega-technical-reference.md` section 9, first clause).
+    ///
+    /// BATCH-SCOPED SCRATCH, not device state: the host sets it only from a
+    /// mid-batch offset and `advance_busy` consumes it at batch end, so it is
+    /// zero at every batch boundary. Canonical capture is taken at a boundary
+    /// and may exclude it, the way `io_touched` is excluded.
+    busy_credit_ns: u64,
     expand: Option<ExpandState>,
     mono_data: u32,
     cursor: [u32; CURSOR_REGS],
@@ -517,6 +533,7 @@ impl Default for Margo {
             blit: [0; BLIT_REGS],
             command: 0,
             busy_ns: 0,
+            busy_credit_ns: 0,
             expand: None,
             mono_data: 0,
             cursor: [0; CURSOR_REGS],
@@ -861,11 +878,11 @@ impl Margo {
         }
     }
 
-    fn register_u32(&self, reg: usize) -> u32 {
+    fn register_u32(&self, reg: usize, elapsed_ns: u64) -> u32 {
         match reg {
             REG_ID => MARGO_ID_VALUE,
             REG_CAPS => MARGO_CAPS_VALUE,
-            REG_STATUS => u32::from(self.busy_ns > 0 || self.expand.is_some()), // bit 0: BUSY
+            REG_STATUS => u32::from(self.status_busy_after(elapsed_ns)), // bit 0: BUSY
             REG_CONTROL => self.control,
             REG_DISP_MODE => u32::from(self.display.mode),
             REG_DISP_WIDTH => self.display.width,
@@ -890,9 +907,22 @@ impl Margo {
     }
 
     pub fn read_mmio_u8(&self, offset: usize) -> u8 {
+        self.read_mmio_u8_at(offset, 0)
+    }
+
+    /// Read a register as of `elapsed_ns` nanoseconds into the current batch.
+    ///
+    /// Only STATUS is time-dependent, and it is the reason this form exists: the
+    /// machine advances Margo once, at batch end, so a `read_mmio_u8` taken
+    /// partway through a batch would report the BUSY the engine had when the
+    /// batch STARTED. The guest's blit wait is an MMIO spin, which cannot end
+    /// its own batch, so that staleness is exactly what it would read. This is
+    /// the same lazy peek `Counter::count_after` and `OplChip::status_after`
+    /// give the PIT and the OPL; `elapsed_ns == 0` reduces to the live state.
+    pub fn read_mmio_u8_at(&self, offset: usize, elapsed_ns: u64) -> u8 {
         let reg = offset & !0x3;
         let byte = offset & 0x3;
-        (self.register_u32(reg) >> (8 * byte)) as u8
+        (self.register_u32(reg, elapsed_ns) >> (8 * byte)) as u8
     }
 
     pub fn write_mmio_u8(&mut self, offset: usize, value: u8) {
@@ -920,6 +950,7 @@ impl Margo {
                 // RESET aborts the operation. It already completed, so this only
                 // drops BUSY and any in-flight color-expand stream. Self-clearing.
                 self.busy_ns = 0;
+                self.busy_credit_ns = 0;
                 self.expand = None;
                 self.control &= !0x1;
             }
@@ -973,6 +1004,40 @@ impl Margo {
     /// completes), so the pusher keeps feeding its MONO_DATA words.
     pub fn busy_ns(&self) -> u64 {
         self.busy_ns
+    }
+
+    /// The modeled busy time remaining `elapsed_ns` nanoseconds from now, without
+    /// draining anything. `busy_ns_after(0)` IS `busy_ns()`.
+    ///
+    /// The credit is subtracted from the elapsed time, not added to the busy
+    /// time: a blit armed at in-batch offset `a` has only been running for
+    /// `elapsed - a`, and the arm-time drain credit (`credit_busy_ns`) is
+    /// exactly `a`.
+    pub fn busy_ns_after(&self, elapsed_ns: u64) -> u64 {
+        self.busy_ns
+            .saturating_sub(elapsed_ns.saturating_sub(self.busy_credit_ns))
+    }
+
+    /// STATUS.BUSY as of `elapsed_ns` into the batch: the time-draining term
+    /// peeked, OR the armed-but-unfed color-expand term, which is not
+    /// time-derived at all (it waits on guest MONO_DATA writes) and so passes
+    /// through untransformed. `Vega::blitter_busy_ns` deliberately excludes that
+    /// second term from the DEADLINE for the same reason -- it would never come
+    /// due -- so the two must not be unified.
+    pub fn status_busy_after(&self, elapsed_ns: u64) -> bool {
+        self.busy_ns_after(elapsed_ns) > 0 || self.expand.is_some()
+    }
+
+    /// Record that the write which just moved `busy_ns` landed `elapsed_ns`
+    /// nanoseconds into the current batch, so the batch-end drain does not bill
+    /// the new operation for time that passed before it started.
+    ///
+    /// ASSIGN, never accumulate: every busy setter in this file is an `=`, so
+    /// the LATEST write is the new origin, whether it raised busy time (a
+    /// COMMAND, or the final MONO_DATA word of a color-expand stream) or lowered
+    /// it (a RESET while an earlier blit was still draining).
+    pub fn credit_busy_ns(&mut self, elapsed_ns: u64) {
+        self.busy_credit_ns = elapsed_ns;
     }
 
     fn build_clip(&self) -> Clip {
@@ -1174,10 +1239,18 @@ impl Margo {
         }
     }
 
-    /// Drain `ns` nanoseconds of modeled busy time. The machine calls this each
-    /// CPU cycle, converting machine clocks to nanoseconds.
+    /// Drain `ns` nanoseconds of modeled busy time. The machine calls this at
+    /// batch end, converting machine clocks to nanoseconds.
+    ///
+    /// Any arm-time credit is spent FIRST: those nanoseconds elapsed before the
+    /// current operation was armed, so they are not time it was running. The
+    /// `min` matters -- `advance_master_time` can deliver one batch here in
+    /// several FDC-bounded steps, and the credit has to survive being consumed
+    /// across them rather than being written off whole on the first call.
     pub fn advance_busy(&mut self, ns: u64) {
-        self.busy_ns = self.busy_ns.saturating_sub(ns);
+        let credit = self.busy_credit_ns.min(ns);
+        self.busy_credit_ns -= credit;
+        self.busy_ns = self.busy_ns.saturating_sub(ns - credit);
     }
 }
 

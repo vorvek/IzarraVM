@@ -1391,10 +1391,12 @@ impl Machine {
                     }
                     // Keep the cached device edge across this batch only if the batch
                     // was provably quiet. Anything else could have rearmed a device:
-                    // a guest port access (io_touched, which the Margo blit-arming
-                    // MMIO write sets too), a bus-side DMA write into guest RAM, any
-                    // serviced HLE / mode-switch / Toka / BIOS32 / unittester step, or
-                    // the HLT fast-forward's device advance. Over-invalidating here
+                    // a guest port access (io_touched -- NOT a Margo blit arm, which
+                    // is a memory write and arms only the uncached `vega_edge_ticks`
+                    // terms; see `Machine::device_edge_cache`), a bus-side DMA write
+                    // into guest RAM, any serviced HLE / mode-switch / Toka / BIOS32
+                    // / unittester step, or the HLT fast-forward's device advance.
+                    // Over-invalidating here
                     // costs one pull-scan; under-invalidating would hand the next
                     // batch a deadline LATER than the truth, so the test is
                     // deliberately one-sided. The batch-entry check in

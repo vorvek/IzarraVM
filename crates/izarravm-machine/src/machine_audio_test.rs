@@ -1472,7 +1472,7 @@ fn approximate_class_keeps_the_1ms_fallback_even_with_audio_active() {
 #[test]
 fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
     // The blit engine's BUSY flag is MMIO, so the guest's spin-wait cannot end
-    // its own batch: only the cap can. Two halves, both required.
+    // its own batch: only the cap can.
     for mode in [
         GswMode::Gsw586,
         GswMode::Gsw486,
@@ -1482,13 +1482,16 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
         let mut machine = test_machine();
         machine.set_mode(mode);
 
-        // 1. The arming write ends its own batch, the way a port write does, so
-        //    the busy deadline is seen from a batch that starts with it pending.
+        // 1. The arming write does NOT end its own batch. It used to, and that
+        //    break cost ~5% wall on Margo-heavy fixtures (see
+        //    `Machine::vega_edge_ticks`); a mid-batch STATUS read now answers
+        //    analytically instead, so the deadline term below is the only half
+        //    left. Pinned here because this test is what the break was for.
         machine.io_touched = false;
         margo_start_fill(&mut machine);
         assert!(
-            machine.io_touched,
-            "{mode:?}: the COMMAND write must end the batch"
+            !machine.io_touched,
+            "{mode:?}: the COMMAND write must NOT end the batch"
         );
 
         // 2. The cap is the modeled busy time, not a fallback. A 5x4 PATCOPY is
@@ -1518,13 +1521,15 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
 }
 
 #[test]
-fn only_the_arming_write_ends_the_batch_while_a_long_blit_drains() {
-    // The batch break is an EDGE on the blitter's modeled busy time, not the
-    // BUSY level. A blit can outlast a batch -- this 640x480 PATCOPY models
-    // ~1.54 ms against a 1 ms coarse cap -- and a guest that overlaps CPU
-    // rendering with one must keep batching its framebuffer writes. A
-    // level-triggered break turns that overlap into one batch per written byte,
-    // on every tier including 586.
+fn no_margo_write_ends_the_batch_while_a_long_blit_drains() {
+    // No video-aperture write ends a batch, the arming one included. A blit can
+    // outlast a batch -- this 640x480 PATCOPY models ~1.54 ms against a 1 ms
+    // coarse cap -- and a guest that overlaps CPU rendering with one must keep
+    // batching its framebuffer writes. This used to be an argument about the
+    // arming break being EDGE- and not level-triggered; the break is gone, but
+    // the edge survives it (`VideoWrite::ArmedBlit` now stamps the arm-time
+    // drain credit), so the property it protects is pinned the same way: none of
+    // these writes may end a batch or disturb the busy model.
     for mode in [
         GswMode::Gsw586,
         GswMode::Gsw486,
@@ -1544,8 +1549,8 @@ fn only_the_arming_write_ends_the_batch_while_a_long_blit_drains() {
         machine.io_touched = false;
         write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL
         assert!(
-            machine.io_touched,
-            "{mode:?}: the arming write must end its own batch"
+            !machine.io_touched,
+            "{mode:?}: the arming write must not end its own batch"
         );
         let busy_ns = machine.vega.blitter_busy_ns();
         assert!(
@@ -1565,7 +1570,7 @@ fn only_the_arming_write_ends_the_batch_while_a_long_blit_drains() {
             !machine.io_touched,
             "{mode:?}: a legacy-aperture write during a blit must keep batching"
         );
-        // Even an MMIO write: only one that ADDS busy time is an arming write.
+        // Even an MMIO write: only one that MOVES busy time is an arming write.
         write_mmio_reg(&mut machine, 0x120, 0x17); // FG_COLOR, no command
         assert!(
             !machine.io_touched,

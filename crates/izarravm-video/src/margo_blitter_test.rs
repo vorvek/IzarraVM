@@ -2242,3 +2242,129 @@ fn pat_base_register_round_trips() {
     margo.write_mmio_u8(REG_PAT_BASE + 3, 0x44);
     assert_eq!(read_reg_u32(&margo, REG_PAT_BASE), 0x4433_2211);
 }
+
+// ---------------------------------------------------------------------------
+// The analytic BUSY peek (`busy_ns_after` / `status_busy_after`) and the
+// arm-time drain credit it is measured from.
+// ---------------------------------------------------------------------------
+
+/// Read a register as of `elapsed_ns` into the current batch.
+fn read_reg_u32_at(margo: &Margo, offset: usize, elapsed_ns: u64) -> u32 {
+    (0..4)
+        .map(|i| u32::from(margo.read_mmio_u8_at(offset + i, elapsed_ns)) << (8 * i))
+        .fold(0, |a, b| a | b)
+}
+
+/// Arm the 4-pixel FILL (busy_ns = 100 + 4*5 = 120) as the bus does: the write
+/// that moves busy time first, then the credit for the in-batch offset it
+/// landed at.
+fn arm_fill_at(credit_ns: u64) -> Margo {
+    let mut margo = Margo::default();
+    setup_fill(&mut margo);
+    write_reg(&mut margo, REG_COMMAND, 0x01);
+    margo.credit_busy_ns(credit_ns);
+    margo
+}
+
+#[test]
+fn analytic_busy_ns_after_matches_a_step_simulation() {
+    // The peek is only worth having if it agrees with the drain it replaces, so
+    // check it against the drain itself: for every elapsed n, one
+    // `busy_ns_after(n)` must equal n single-nanosecond `advance_busy` steps on
+    // a twin. Mirrors the PIT's analytic count_after step simulation.
+    //
+    // Sweeping the credit is what makes this cover risk 4 of the design: the
+    // twin spends the credit ONE nanosecond at a time, which is the batch that
+    // `advance_master_time` splits into several FDC-bounded calls.
+    for credit in [0u64, 1, 37, 200] {
+        let armed = arm_fill_at(credit);
+        let mut stepped = armed.clone();
+        for elapsed in 0..=(credit + 200) {
+            assert_eq!(
+                armed.busy_ns_after(elapsed),
+                stepped.busy_ns(),
+                "credit {credit}: busy_ns_after({elapsed}) must equal {elapsed} \
+                 single-ns advance_busy steps"
+            );
+            assert_eq!(
+                armed.status_busy_after(elapsed),
+                read_reg_u32_at(&stepped, REG_STATUS, 0) & 1 == 1,
+                "credit {credit}: STATUS.BUSY at elapsed {elapsed} must agree too"
+            );
+            stepped.advance_busy(1);
+        }
+    }
+}
+
+#[test]
+fn analytic_busy_ns_after_zero_elapsed_is_the_live_field() {
+    // A zero-elapsed peek is what every non-batched caller takes (the pusher,
+    // the deadline term, `read_mmio_u8`), so it must reduce EXACTLY to the live
+    // field -- including while a credit is outstanding, which subtracts from
+    // the elapsed time and so cannot make a zero-elapsed read report longer.
+    let idle = Margo::default();
+    assert_eq!(idle.busy_ns_after(0), idle.busy_ns());
+    assert!(!idle.status_busy_after(0));
+
+    let mut margo = arm_fill_at(0);
+    assert_eq!(margo.busy_ns(), 120);
+    assert_eq!(margo.busy_ns_after(0), margo.busy_ns());
+    assert!(margo.status_busy_after(0));
+    assert_eq!(read_reg_u32_at(&margo, REG_STATUS, 0) & 1, 1);
+    assert_eq!(
+        read_reg_u32(&margo, REG_STATUS),
+        read_reg_u32_at(&margo, REG_STATUS, 0)
+    );
+
+    margo.credit_busy_ns(5_000);
+    assert_eq!(margo.busy_ns_after(0), margo.busy_ns());
+    assert_eq!(
+        read_reg_u32(&margo, REG_STATUS),
+        read_reg_u32_at(&margo, REG_STATUS, 0)
+    );
+}
+
+#[test]
+fn an_armed_but_unfed_color_expand_reads_busy_at_any_elapsed() {
+    // STATUS.BUSY has a second term that is not time-derived at all: an armed
+    // COLOR_EXPAND_DATA stream waits on guest MONO_DATA writes, not on elapsed
+    // time. The peek must pass it through untransformed, or a guest that arms a
+    // stream and polls before feeding it would see the engine go idle after
+    // enough elapsed nanoseconds and never send the data.
+    let mut margo = Margo::default();
+    write_reg(&mut margo, REG_DST_BASE, 0);
+    write_reg(&mut margo, REG_DST_PITCH, 640);
+    write_reg(&mut margo, REG_DEPTH, 1);
+    write_reg(&mut margo, REG_DST_XY, 0);
+    write_reg(&mut margo, REG_DIM, (8 << 16) | 8); // 8x8 glyph
+    write_reg(&mut margo, REG_COMMAND, 0x03); // COLOR_EXPAND_DATA: arm only
+
+    // Armed, and charged NO busy time: the operation has not run yet.
+    assert_eq!(margo.busy_ns(), 0);
+    for elapsed in [0u64, 1, 1_000, u64::MAX] {
+        assert_eq!(margo.busy_ns_after(elapsed), 0);
+        assert!(
+            margo.status_busy_after(elapsed),
+            "an armed but unfed color expand must read BUSY at elapsed {elapsed}"
+        );
+        assert_eq!(read_reg_u32_at(&margo, REG_STATUS, elapsed) & 1, 1);
+    }
+}
+
+#[test]
+fn a_reset_clears_the_arm_time_credit_with_the_busy_time() {
+    // CONTROL.RESET drops the operation, so the credit that named its start
+    // instant has to go with it -- a leftover credit would shield the NEXT
+    // batch-end drain from nanoseconds no operation is entitled to.
+    let mut margo = arm_fill_at(5_000);
+    write_reg(&mut margo, REG_CONTROL, 0x1);
+    assert_eq!(margo.busy_ns(), 0);
+    assert!(!margo.status_busy_after(0));
+
+    // Re-arm and drain the full batch: with a stale 5000 ns credit the fill
+    // would survive this.
+    setup_fill(&mut margo);
+    write_reg(&mut margo, REG_COMMAND, 0x01);
+    margo.advance_busy(120);
+    assert!(!margo.status_busy_after(0));
+}

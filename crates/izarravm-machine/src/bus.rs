@@ -2673,7 +2673,15 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        if self.vega.read_memory(address, out) {
+        // STATUS.BUSY is answered as of THIS instant, not as of batch start (see
+        // `Margo::read_mmio_u8_at`). The offset is only computed for the Margo
+        // MMIO window; every other aperture below passes 0.
+        let margo_elapsed_ns = if vega::margo_mmio_at(address) {
+            self.elapsed_margo_ns()
+        } else {
+            0
+        };
+        if self.vega.read_memory(address, out, margo_elapsed_ns) {
             return Ok(());
         }
 
@@ -2785,24 +2793,33 @@ impl MachineBus<'_> {
             ByteRoute::Rom | ByteRoute::OpenBus => {}
             ByteRoute::DeviceOrFallbackRam => {
                 match self.vega.write_memory_u8(address, value) {
-                    // The write that ARMED the Margo blit engine ends the batch,
-                    // the way a port write does. Memory writes deliberately do
-                    // not set io_touched (framebuffer blits must keep batching),
-                    // but this one case has to: STATUS.BUSY is MMIO, so the
-                    // guest's `margo_wait` spin cannot break its own batch, and
-                    // BUSY only clears when devices advance. Without this the
-                    // engine looks busy for the rest of the batch however short
-                    // the operation was, and the spin bills the guest a whole
-                    // batch cap per blit. Ending here lets `event_batch_cap`'s
-                    // MargoNs term size the next batch to the real busy time.
+                    // The write that MOVED the Margo blit engine's busy time
+                    // stamps its own in-batch instant as the origin that time is
+                    // measured from. Margo drains once, at batch end, with the
+                    // WHOLE batch's nanoseconds -- so without this credit an
+                    // operation armed partway in would be billed for the part of
+                    // the batch that ran before it started, and STATUS.BUSY would
+                    // report idle before the modeled time had passed
+                    // (`docs/vega/vega-technical-reference.md` section 9).
+                    //
+                    // This deliberately does NOT set `io_touched`. It used to:
+                    // STATUS.BUSY is MMIO, so the guest's `margo_wait` spin
+                    // cannot break its own batch, and ending the batch here was
+                    // the only way the spin could see BUSY drop at the right
+                    // instant. `Margo::status_busy_after` answers that read
+                    // analytically now, the way `Counter::count_after` does for
+                    // the PIT, so the break is no longer what buys section 9's
+                    // exactness -- it was only buying it at the price of ~5% wall
+                    // on Margo-heavy fixtures (the table on `vega_edge_ticks`).
                     //
                     // EDGE, not level: `VideoWrite::ArmedBlit` is reported only
-                    // by a write that added busy time (see `VideoWrite`). A blit
+                    // by a write that moved busy time (see `VideoWrite`). A blit
                     // can outlast a batch, and writes overlapped with a running
-                    // one must NOT end their batch -- that would turn a long blit
-                    // into thousands of single-instruction batches.
+                    // one must NOT re-stamp the origin -- that would keep
+                    // resetting the operation's start and stretch it forever.
                     VideoWrite::ArmedBlit => {
-                        *self.io_touched = true;
+                        let elapsed_ns = self.elapsed_margo_ns();
+                        self.vega.credit_blit_arm(elapsed_ns);
                         return Ok(());
                     }
                     VideoWrite::Accepted => return Ok(()),
