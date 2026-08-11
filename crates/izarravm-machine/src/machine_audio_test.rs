@@ -1506,8 +1506,10 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge_for_the_push
         machine.set_mode(mode);
 
         // 1. The arming write does NOT end its own batch. It used to, and that
-        //    break plus the unconditional deadline jointly cost ~5% wall on
-        //    Margo-heavy fixtures (see `Machine::vega_edge_ticks`).
+        //    break is what made the NEXT batch start with the engine busy,
+        //    which is the only way the deadline below ever armed (the
+        //    dependency is documented on `Machine::vega_edge_ticks`). Removing
+        //    it was measured wall-neutral on current main.
         machine.io_touched = false;
         margo_start_fill(&mut machine);
         assert!(

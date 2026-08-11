@@ -2809,8 +2809,13 @@ impl MachineBus<'_> {
                     // instant. `Margo::status_busy_after` answers that read
                     // analytically now, the way `Counter::count_after` does for
                     // the PIT, so the break is no longer what buys section 9's
-                    // exactness -- it was only buying it at the price of ~5% wall
-                    // on Margo-heavy fixtures (the table on `vega_edge_ticks`).
+                    // exactness. It is dropped on those grounds alone: removing
+                    // it was MEASURED wall-neutral on current main (+0.10% on
+                    // prince-486, +0.64% on nascar-586, both inside noise), and
+                    // the ~5% it once cost is not reproducible -- see the stale-
+                    // cost note on `Machine::vega_edge_ticks`. Dropping it also
+                    // stops this term arming that deadline at all, which is the
+                    // dependency documented there.
                     //
                     // EDGE, not level: `VideoWrite::ArmedBlit` is reported only
                     // by a write that moved busy time (see `VideoWrite`). A blit

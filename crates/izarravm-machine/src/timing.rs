@@ -1143,26 +1143,27 @@ impl Machine {
     /// `Margo::advance_busy` spends the credit first, which is what keeps the
     /// raw `busy_ns` this term reads true at a batch boundary.
     ///
-    /// WHAT THIS COSTS, AND THE TRUTH TABLE THAT PRICES IT. The mechanism has
-    /// two halves -- (1) this busy deadline term, (2) the `VideoWrite::ArmedBlit`
-    /// `io_touched` break, since removed -- and they are NON-ADDITIVE. Every
-    /// quadrant has now been measured:
+    /// THE BREAK FED THIS TERM: "half 2 feeds half 1", NOT two independent
+    /// halves. This is the settled model, and it replaces an "either alone is
+    /// inert, the pair moves things" reading that two rounds of measurement
+    /// disproved. The dependency is structural and visible right below: the blit
+    /// term arms only when `blitter_busy_ns() > 0` AT BATCH ENTRY. The
+    /// `VideoWrite::ArmedBlit` `io_touched` break is what put it there -- it
+    /// ended the batch on the arming write, so the NEXT batch started with the
+    /// engine busy. With the break gone a 200-740 ns blit is armed and drained
+    /// inside one ~1 ms batch, no batch ever starts busy, and this term stops
+    /// arming on its own. Removing the break therefore already produced the
+    /// both-halves-off machine; removing this term afterwards is a no-op
+    /// wherever the pusher is idle.
     ///
-    ///   | (1) deadline | (2) break | three fixture hashes | prince entries |
-    ///   |--------------|-----------|----------------------|----------------|
-    ///   | on           | on        | post-slice           | 1,306,336,687  |
-    ///   | off          | on        | post-slice           | --             |
-    ///   | on           | off       | post-slice           | 1,306,334,801  |
-    ///   | off          | off       | PRE-slice            | 1,233,464,425  |
+    /// MEASURED, not argued: the two binaries -- break removed, and break plus
+    /// this term removed -- produce BYTE-IDENTICAL deterministic counters on
+    /// prince-486. All 128 perf fields agree; the only two that differ are
+    /// `jit_direct_compile_ns` and `jit_direct_arena_compaction_ns`, which are
+    /// host-nanosecond measurements rather than counters.
     ///
-    /// EITHER HALF ALONE IS INERT; only the pair moves anything. `13ade802` said
-    /// "half 2 alone is sufficient to move them" -- that was an INFERENCE from
-    /// the (off, on) probe, never a measurement of (on, off), and the (on, off)
-    /// row above refutes it: removing the break alone moved prince entries by
-    /// 1,886 in 1.306 BILLION and left all three hashes byte-identical. Do not
-    /// re-litigate this by re-deriving it from one quadrant.
-    ///
-    /// The price of the pair, measured when it was bought:
+    /// THE OLD COST TABLE IS STALE -- DO NOT QUOTE IT AS A LIVE LEVER. It was
+    /// measured on the 2026-08-10 stack and read:
     ///
     ///   | fixture    | entries          | wall s          |
     ///   |------------|------------------|-----------------|
@@ -1171,11 +1172,21 @@ impl Machine {
     ///   | duke3d-486 | 442.1M -> 439.7M | 132.87 -> 132.76 (neutral) |
     ///   | duke3d-586 | 1.517G -> 1.522G | 450.15 -> 452.45 (+0.5%) |
     ///
-    /// Guest seconds are IDENTICAL across arms on prince and nascar (60.61 and
-    /// 30.00), so those are wall-for-wall comparisons, not a real-time-factor
-    /// artifact. gp2-586's entries move only 0.08% and its wall difference is
-    /// inside host noise, which is the control that makes entries the causal
-    /// variable rather than a coincidence.
+    /// It is NOT reproducible on current main. Measured 2026-08-11 against
+    /// `f9847498`, A/B/B/A interleaved, ~2% host load: removing the whole
+    /// mechanism moves prince-486 by 1,886 entries in 1,306,336,687 (0.00014%)
+    /// and +0.10% min-wall, and nascar-586 by 0.56% of entries and +0.64%
+    /// min-wall. Both inside the noise floor. The three fixture hashes
+    /// (prince-486, nascar-586, gp2-586) do NOT revert to their pre-slice
+    /// values; they stay byte-identical to the current pins, which is why this
+    /// branch re-pins nothing.
+    ///
+    /// So ~5% of wall was absorbed by something else between 2026-08-10 and
+    /// now, or the probe that produced it gated more than its commit message
+    /// says. Candidate absorbers, none of them yet isolated: the HDD
+    /// geometry + sector-cache slice, the DAC-gate / DeviceEdgeCache work, and
+    /// the JIT arena default (32 -> 128 MiB). Anyone re-opening this should
+    /// re-measure from scratch rather than trusting the table above.
     ///
     /// HISTORY, so the 386 tier's stake is not lost: this deadline was added
     /// because the BIOS `margo_wait` spin (`mov eax,[fs:MARGO_MMIO+8]` /
