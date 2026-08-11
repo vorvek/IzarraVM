@@ -3638,8 +3638,12 @@ mod fpu_flags;
 mod legacy_system;
 #[path = "cpu_persona_system_test.rs"]
 mod persona_system;
-/// The slow-read page histogram (N2's diagnostic). Nested here for the `TestBus` fixture, whose
-/// default no-direct-pages shape is exactly what makes every data read a `data_slow_reads`.
+/// The slow-read page histogram (N2's diagnostic). Nested here for the `TestBus` fixture and, in
+/// particular, for its `non_direct_read_pages` seam: `direct_memory_bytes` does NOT consult
+/// `direct_pages_enabled`, so every aligned in-range `DataRead` comes back `direct: true` and
+/// TestBus has no readable-but-not-direct region of its own. That seam is what produces a
+/// `data_slow_reads` at all, and `direct_reads_are_counted_by_neither_the_histogram_nor_data_slow_reads`
+/// is the case that pins the other side of it.
 #[path = "cpu_slow_read_histo_test.rs"]
 mod slow_read_histo;
 #[path = "cpu_stack_branch_test.rs"]

@@ -1134,15 +1134,19 @@ fn slow_read_histo_default() -> bool {
 /// them, and nothing in the profile carried it.
 ///
 /// A `HashMap` on a path that already went to the bus is the right cost: the instrument is OFF by
-/// default and its call sites test THIS SLOT before doing anything, so a default run pays one
-/// null test per slow read and no call. Non-architectural: excluded from CPU equality and cloned
-/// off, exactly like `unit_sim` and `smc_trace`.
+/// default and the null test on THIS SLOT is the last conjunct at both call sites, so a default
+/// run pays it only on a read that already missed the direct path -- 1,371,552,807 of the
+/// 2,769,793,893 reads reaching those sites on wolf3d-586 -- and never a call. See
+/// `CpuGsw::slow_read_histo_armed`, whose doc comment owns that ordering rule: it MUST be the last
+/// conjunct, and a call site that hoists it in front of `read.direct` puts this load back on every
+/// direct read. Non-architectural: excluded from CPU equality and cloned off, exactly like
+/// `unit_sim` and `smc_trace`.
 ///
-/// The `Box` is what `clippy::box_collection` calls a redundant allocation, and it is deliberate
-/// for the same reason `unit_sim` and `smc_trace` box theirs: this slot lives on `CpuGsw`, whose
-/// field layout the hot paths depend on (see `FastMapProbeCounters` and `rmw_census_enabled`), and
-/// an inline `Option<HashMap>` would put 48 bytes of a default-OFF diagnostic in that struct where
-/// a nullable pointer needs eight. The armed case pays one extra allocation, once.
+/// The `Box` is deliberate for the same reason `unit_sim` and `smc_trace` box theirs: this slot
+/// lives on `CpuGsw`, whose field layout the hot paths depend on (see `FastMapProbeCounters` and
+/// `rmw_census_enabled`), and an inline `Option<SlowReadTally>` would put the whole tally -- a
+/// `HashMap` plus two `u64`s, about 64 bytes -- of a default-OFF diagnostic in that struct where a
+/// nullable pointer needs eight. The armed case pays one extra allocation, once.
 #[derive(Default)]
 pub(crate) struct SlowReadHisto(pub(crate) Option<Box<SlowReadTally>>);
 
