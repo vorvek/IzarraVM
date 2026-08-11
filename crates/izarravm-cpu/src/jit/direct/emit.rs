@@ -262,12 +262,17 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // dirty-segment rule ends the block at the first later slot that touches a segment
             // a `LoadSegReal` has written, so the baked limit can never go stale behind this.
             //
-            // The same lowering is admitted under V86, where the limit must be 0xFFFF. It is:
-            // both V86 entries canonicalize every segment -- the IRET-into-V86 tail calls
-            // `load_segment_real` for all six, and a task switch into a V86 task loads EFLAGS.VM
-            // before its segment-restore loop, so that loop takes `load_segment_checked`'s V86
-            // branch -- as does every in-V86 load thereafter. So "leave the limit" and "write
-            // 0xFFFF" coincide there, and omitting the store is correct in both modes.
+            // The same lowering is admitted under V86, where the limit must be 0xFFFF. It is,
+            // and that is now true by construction rather than by luck: BOTH V86 entries
+            // canonicalize all six segments -- the IRET-into-V86 tail calls `load_segment_real`
+            // directly, and a task switch into a V86 task commits EFLAGS.VM before its
+            // segment-restore loop, so every selector that loop handles goes through
+            // `load_segment_checked`'s V86 branch, INCLUDING a null one (that branch's
+            // null-selector short-circuit is explicitly gated off in V86; see `task_switch`).
+            // Every in-V86 load thereafter takes the same branch. So "leave the limit" and
+            // "write 0xFFFF" coincide there, and omitting the store is correct in both modes.
+            // `task_switch_into_v86_builds_a_null_data_selector_as_a_real_mode_segment` is the
+            // test that keeps the one hole in that argument closed.
             //
             // The access store IS still required: it is what a real-mode load recomputes.
             // `default_size_32` rides along in the same 16-bit store because it is re-stamped

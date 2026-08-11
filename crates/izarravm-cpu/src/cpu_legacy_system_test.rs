@@ -2165,3 +2165,106 @@ fn a_real_mode_only_guest_never_sees_a_limit_other_than_0xffff() {
         assert!(!descriptor.default_size_32, "{segment:?} B bit");
     }
 }
+
+/// A hardware task switch INTO a V86 task with a null DS selector.
+///
+/// Selector 0 in a V86 task's DS is not the protected-mode null descriptor -- it is an
+/// ordinary 8086 segment at base 0, and the task-switch restore loop must build it the way
+/// every other V86 segment load does: base 0, limit 0xFFFF, the real-mode access byte. The
+/// loop's null-selector short-circuit used to install `Default::default()` (limit 0, access
+/// 0) for it, which is only right in protected mode.
+///
+/// This became reachable-and-visible with the unreal-mode fix. Before it, the JIT's
+/// `LoadSegReal` lowering re-stamped 0xFFFF over the bad descriptor on the next
+/// `MOV DS, r16` and silently repaired the state; now neither role writes the limit, so a
+/// natively-executed segment load in such a task would have diverged from the interpreter.
+#[test]
+fn task_switch_into_v86_builds_a_null_data_selector_as_a_real_mode_segment() {
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+        &[0xea, 0x00, 0x00, 0x18, 0x00],
+        &[RING0_CODE, ring0_data, new_tss, old_tss],
+    );
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x380 + 32, 0x200); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0002_0002); // EFLAGS: VM set
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x0a00); // ES
+    put16(&mut memory, 0x380 + 76, 0x0a00); // CS
+    put16(&mut memory, 0x380 + 80, 0x0900); // SS
+    put16(&mut memory, 0x380 + 84, 0x0000); // DS -- null, and perfectly ordinary in V86
+    put16(&mut memory, 0x380 + 88, 0x0000); // FS
+    put16(&mut memory, 0x380 + 92, 0x0000); // GS
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.cycle(&mut bus).unwrap();
+
+    assert!(cpu.is_v86_mode(), "the incoming task's EFLAGS carried VM");
+    assert_eq!(cpu.current_privilege_level(), 3, "a V86 task runs at CPL 3");
+    for segment in [SegmentIndex::Ds, SegmentIndex::Fs, SegmentIndex::Gs] {
+        assert_eq!(
+            cpu.registers.segment(segment),
+            SegmentRegister::real(0),
+            "{segment:?} must be an 8086 segment, not a null descriptor"
+        );
+    }
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Es),
+        SegmentRegister::real(0x0a00),
+        "the non-null V86 segments take the same rule"
+    );
+}
+
+#[test]
+fn task_switch_into_protected_mode_still_builds_a_null_data_selector_as_unusable() {
+    // The companion to the case above, and the reason the repair must be VM-gated: outside
+    // V86 a null selector really is the null descriptor -- loadable without fault, base 0,
+    // limit 0, and #GP on the first access through it (386 PRM 6.3.3).
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+        &[0xea, 0x00, 0x00, 0x18, 0x00],
+        &[RING0_CODE, ring0_data, new_tss, old_tss],
+    );
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x380 + 32, 0x200); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS: VM clear
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x10); // ES
+    put16(&mut memory, 0x380 + 76, 0x08); // CS
+    put16(&mut memory, 0x380 + 80, 0x10); // SS
+    put16(&mut memory, 0x380 + 84, 0x0000); // DS -- the null descriptor
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.cycle(&mut bus).unwrap();
+
+    assert!(!cpu.is_v86_mode());
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds),
+        SegmentRegister::default(),
+        "a protected-mode null selector stays the unusable null descriptor"
+    );
+}

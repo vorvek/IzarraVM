@@ -1091,7 +1091,19 @@ impl CpuGsw {
                 self.read_system_linear(bus, base + 72 + k as u32 * 4, BusWidth::Word)? as u16;
             // A null data segment (ES/DS/FS/GS) is legal and just unusable; CS and SS
             // must be loadable.
-            if selector & !0x7 == 0 && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss) {
+            //
+            // "Unusable" is a PROTECTED-MODE statement. The incoming EFLAGS -- VM included --
+            // was committed above, before this loop, so `is_v86_mode` here already answers for
+            // the task being switched TO: if it is a V86 task, selector 0 is not the null
+            // descriptor at all but an ordinary 8086 segment at base 0, and it must be built
+            // like every other V86 segment (limit 0xFFFF, real-mode access). Leaving it at
+            // `Default::default()` gave such a task a limit-0 DS that faults on its first
+            // access -- and, since `load_segment_real_mode` no longer re-stamps the limit,
+            // the JIT's `LoadSegReal` lowering would no longer paper over it either.
+            if selector & !0x7 == 0
+                && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss)
+                && !self.is_v86_mode()
+            {
                 self.registers.set_segment(
                     *segment,
                     SegmentRegister {
