@@ -1491,6 +1491,7 @@ fn run_boot_hdd_folder(
     );
     maybe_report_unit_sim(&mut machine);
     maybe_report_smc_trace(&mut machine);
+    maybe_report_slow_read_histo(&machine);
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
     // that the run loop returned, or its last partial buffer's worth of lines -- most
     // often exactly the tail we care about -- is silently lost at process exit. This
@@ -2060,6 +2061,69 @@ fn io_hist_lines(hist: &[(u16, u64)]) -> Vec<String> {
 
 #[cfg(not(feature = "jit"))]
 fn maybe_report_unit_sim(_machine: &mut Machine) {}
+
+/// Print the non-direct data-read page histogram at the end of a headless run
+/// (`IZARRAVM_SLOW_READ_HISTO=1`). A no-op when the instrument was never armed.
+fn maybe_report_slow_read_histo(machine: &Machine) {
+    let Some(pages) = machine.slow_read_histo() else {
+        return;
+    };
+    for line in slow_read_histo_lines(&pages, machine.cpu().perf_counters().data_slow_reads) {
+        println!("{line}");
+    }
+}
+
+/// The 4 KiB linear pages a real-mode DOS guest's non-direct reads can land in, in the order the
+/// report prints them. These are the four candidate answers to N2's question, and each implies a
+/// DIFFERENT slice: the aperture needs a video-side fast path, UMB/EMS RAM needs
+/// `ram_lookup_page_is_direct` granularity, and anything above 1 MiB is neither.
+const SLOW_READ_REGIONS: [(&str, u32, u32); 6] = [
+    ("conventional_00000_9FFFF", 0x00, 0x9f),
+    ("vga_aperture_A0000_AFFFF", 0xa0, 0xaf),
+    ("text_B0000_BFFFF", 0xb0, 0xbf),
+    ("umb_ems_C0000_EFFFF", 0xc0, 0xef),
+    ("bios_F0000_FFFFF", 0xf0, 0xff),
+    ("above_1MiB", 0x100, u32::MAX),
+];
+
+/// Format the histogram: one `slow_read_region` line per region, then the top 24
+/// `slow_read_page` lines, then one `slow_read_total` line carrying the histogram's own sum
+/// against `data_slow_reads`.
+///
+/// The total line is not decoration. One `data_slow_reads` contributor -- the REP CMPS destination
+/// read in `strings.rs` -- is deliberately not bucketed because it holds a PHYSICAL address, so
+/// the two numbers agreeing is what licenses reading the region split as the whole story.
+fn slow_read_histo_lines(pages: &[(u32, u64)], data_slow_reads: u64) -> Vec<String> {
+    let mut lines = Vec::new();
+    let bucketed: u64 = pages.iter().map(|&(_, count)| count).sum();
+    for &(name, first, last) in &SLOW_READ_REGIONS {
+        let count: u64 = pages
+            .iter()
+            .filter(|&&(page, _)| page >= first && page <= last)
+            .map(|&(_, count)| count)
+            .sum();
+        let percent = if bucketed == 0 {
+            0.0
+        } else {
+            count as f64 * 100.0 / bucketed as f64
+        };
+        lines.push(format!(
+            "slow_read_region {name} count={count} pct={percent:.2}"
+        ));
+    }
+    for &(page, count) in pages.iter().take(24) {
+        lines.push(format!(
+            "slow_read_page page={:#07x} linear={:#010x} count={count}",
+            page,
+            page << 12
+        ));
+    }
+    lines.push(format!(
+        "slow_read_total bucketed={bucketed} data_slow_reads={data_slow_reads} distinct_pages={}",
+        pages.len()
+    ));
+    lines
+}
 
 /// Nearest-rank percentile of an ascending-sorted slice. `p` is a whole percent (50, 90). Empty
 /// input yields 0.

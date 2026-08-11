@@ -1114,6 +1114,69 @@ fn rmw_census_default() -> bool {
     })
 }
 
+/// Gate for the slow-read page histogram (`IZARRAVM_SLOW_READ_HISTO=1`). Cached like
+/// `rmw_census_default`, and read ONCE at CPU construction rather than per access -- the per-access
+/// gate is the `Option`'s null test on the slot below, which is the same one relaxed load.
+fn slow_read_histo_default() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("IZARRAVM_SLOW_READ_HISTO").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+/// Where the interpreter's NON-DIRECT data reads land, bucketed by 4 KiB linear page.
+///
+/// The diagnostic behind `dev_docs/wolf3d-586-measurement-results.md` N2: that fixture's demo phase
+/// takes 957.8 M `data_slow_reads` against 17.3 M direct ones, one for one with
+/// `jit_direct_exit_cross_page_or_alignment`, and the two candidate causes -- the mode-Y VGA
+/// aperture, which `ram_lookup_page_is_direct` refuses by design, and UMB/EMS RAM the same range
+/// test refuses by accident -- need completely different slices. Only the page split separates
+/// them, and nothing in the profile carried it.
+///
+/// A `HashMap` on a path that already went to the bus is the right cost: the instrument is OFF by
+/// default and its call sites test THIS SLOT before doing anything, so a default run pays one
+/// null test per slow read and no call. Non-architectural: excluded from CPU equality and cloned
+/// off, exactly like `unit_sim` and `smc_trace`.
+///
+/// The `Box` is what `clippy::box_collection` calls a redundant allocation, and it is deliberate
+/// for the same reason `unit_sim` and `smc_trace` box theirs: this slot lives on `CpuGsw`, whose
+/// field layout the hot paths depend on (see `FastMapProbeCounters` and `rmw_census_enabled`), and
+/// an inline `Option<HashMap>` would put 48 bytes of a default-OFF diagnostic in that struct where
+/// a nullable pointer needs eight. The armed case pays one extra allocation, once.
+#[derive(Default)]
+#[allow(clippy::box_collection)]
+pub(crate) struct SlowReadHisto(pub(crate) Option<Box<std::collections::HashMap<u32, u64>>>);
+
+impl SlowReadHisto {
+    /// Armed from the environment, once per process.
+    fn from_env() -> Self {
+        Self(slow_read_histo_default().then(Box::default))
+    }
+}
+
+impl PartialEq for SlowReadHisto {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SlowReadHisto {}
+
+impl Clone for SlowReadHisto {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl std::fmt::Debug for SlowReadHisto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlowReadHisto")
+            .field("enabled", &self.0.is_some())
+            .field("pages", &self.0.as_ref().map_or(0, |histo| histo.len()))
+            .finish()
+    }
+}
+
 /// Audit instrument for the deferred FastMap-interleaving item (N5). Two independent questions
 /// share one struct because both are diagnostic and both must stay off the pinned hot-field
 /// layout: they live at the `CpuGsw` tail for exactly the reason `FastMapProbeCounters`
@@ -1729,6 +1792,10 @@ pub struct CpuGsw {
     /// Non-architectural, excluded from CPU equality and cloned off, exactly like `unit_sim`.
     /// See `smc_trace`.
     smc_trace: smc_trace::SmcTraceSlot,
+    /// Optional non-direct-read page histogram (diagnostic, off by default;
+    /// `IZARRAVM_SLOW_READ_HISTO=1`). At the `CpuGsw` tail with the other diagnostic slots, for the
+    /// layout reason `FastMapProbeCounters` documents. See `SlowReadHisto`.
+    slow_read_histo: SlowReadHisto,
     /// Current privilege level. Per the 386 PRM, CPL is a *cached* quantity carried in
     /// (the hidden part of) CS, updated only at defined transition points -- it is not a
     /// live formula over the current CS selector. Updated at: real mode / PE clear (0);
@@ -1879,6 +1946,7 @@ impl Default for CpuGsw {
             #[cfg(feature = "jit")]
             unit_sim: UnitSimSlot::default(),
             smc_trace: smc_trace::SmcTraceSlot::default(),
+            slow_read_histo: SlowReadHisto::from_env(),
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
             #[cfg(all(

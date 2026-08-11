@@ -530,6 +530,44 @@ impl CpuGsw {
         }
     }
 
+    /// True when the slow-read page histogram is armed. The whole per-access gate: one null test
+    /// on a tail field, and the ONLY thing a default run pays for the instrument. Kept as a call
+    /// -site predicate rather than a test inside `note_slow_read_page`, because a gate inside the
+    /// callee still pays for the call on hundreds of millions of accesses -- the recorded lesson
+    /// behind `barrier_census_active` and `census_enabled`.
+    #[inline]
+    pub(super) fn slow_read_histo_armed(&self) -> bool {
+        self.slow_read_histo.0.is_some()
+    }
+
+    /// Bucket one non-direct data read's LINEAR page. Never called on a default run; see
+    /// `slow_read_histo_armed`. `#[cold]` so the arming test's not-taken side stays straight-line.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_slow_read_page(&mut self, linear: u32) {
+        if let Some(histo) = self.slow_read_histo.0.as_mut() {
+            *histo.entry(linear >> 12).or_insert(0) += 1;
+        }
+    }
+
+    /// Arm or disarm the slow-read page histogram without the environment variable, so a test can
+    /// drive the instrument in-process (`slow_read_histo_default` is a `OnceLock` and therefore
+    /// not per-test settable). Arming clears whatever was collected.
+    pub fn set_slow_read_histo_enabled(&mut self, enabled: bool) {
+        self.slow_read_histo = SlowReadHisto(enabled.then(Box::default));
+    }
+
+    /// The armed histogram as `(page, count)` pairs, count descending then page ascending.
+    /// `None` when the instrument was never armed, so a caller cannot print an empty table and
+    /// read it as "no slow reads".
+    pub fn slow_read_histo(&self) -> Option<Vec<(u32, u64)>> {
+        let histo = self.slow_read_histo.0.as_ref()?;
+        let mut pages: Vec<(u32, u64)> =
+            histo.iter().map(|(&page, &count)| (page, count)).collect();
+        pages.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Some(pages)
+    }
+
     #[inline]
     pub(super) fn record_data_read(&mut self, kind: BusAccessKind, direct: bool) {
         if kind == BusAccessKind::DataRead {
@@ -983,6 +1021,9 @@ impl CpuGsw {
         }
         let read = bus.read_memory_direct(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, read.direct);
+        if self.slow_read_histo_armed() && !read.direct && kind == BusAccessKind::DataRead {
+            self.note_slow_read_page(linear);
+        }
         Ok(read.value as u8)
     }
 
@@ -1290,6 +1331,9 @@ impl CpuGsw {
         }
         let read = bus.read_memory_direct(physical, width, kind)?;
         self.record_data_read(kind, read.direct);
+        if self.slow_read_histo_armed() && !read.direct && kind == BusAccessKind::DataRead {
+            self.note_slow_read_page(linear);
+        }
         Ok(read.value)
     }
 

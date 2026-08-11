@@ -592,6 +592,13 @@ impl CpuGsw {
                 } else {
                     let read = bus.read_memory_direct(dst, width, BusAccessKind::DataRead)?;
                     self.record_data_read(BusAccessKind::DataRead, read.direct);
+                    // DELIBERATELY not fed to the slow-read page histogram
+                    // (`IZARRAVM_SLOW_READ_HISTO`): every other contributor to `data_slow_reads`
+                    // buckets a LINEAR page, and `dst` here is already translated. Mixing the two
+                    // address spaces in one table would be worse than the omission, which the
+                    // report makes visible by printing the histogram total against
+                    // `data_slow_reads` -- a REP CMPS-heavy workload shows up as a shortfall
+                    // rather than as a silently mislabelled bucket.
                     read.value
                 };
                 self.alu_sub(a, b, 0, width);

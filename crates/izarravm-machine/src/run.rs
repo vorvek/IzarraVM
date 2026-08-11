@@ -528,6 +528,12 @@ impl Machine {
         self.cpu.unit_sim_io_hist()
     }
 
+    /// The non-direct data-read page histogram (behind `IZARRAVM_SLOW_READ_HISTO=1`), sorted by
+    /// count descending. `None` without it. See `CpuGsw::slow_read_histo`.
+    pub fn slow_read_histo(&self) -> Option<Vec<(u32, u64)>> {
+        self.cpu.slow_read_histo()
+    }
+
     fn consume_pending_device_memory_write_range(&mut self) {
         if let Some((physical, width)) = self.pending_device_memory_write_range.take() {
             self.cpu.note_device_memory_write_range(physical, width);

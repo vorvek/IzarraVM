@@ -2751,6 +2751,13 @@ struct TestBus {
     direct_pages_enabled: bool,
     direct_pages_writable: bool,
     direct_write_denied_page: Option<u32>,
+    // Every 4 KiB page listed here is refused by `direct_memory_bytes` for `DataRead` while `read_memory`
+    // still serves it -- so the read succeeds but comes back `direct: false` and lands in
+    // `data_slow_reads`. This is exactly the production shape `ram_lookup_page_is_direct` produces
+    // for `0x000A_0000..0x0010_0000` (VGA aperture, ROM shadow, and any UMB the memory manager put
+    // there), which is the situation the slow-read page histogram exists to take apart. Without it
+    // TestBus has no readable-but-not-direct region at all: every in-range `DataRead` is direct.
+    non_direct_read_pages: Vec<u32>,
     // G4: deny direct pages under InstructionPrefetch only, modeling a non-RAM code page.
     deny_instruction_prefetch_direct_page: bool,
     uniform_native_fetches: bool,
@@ -2797,6 +2804,7 @@ impl TestBus {
             direct_pages_enabled: false,
             direct_pages_writable: true,
             direct_write_denied_page: None,
+            non_direct_read_pages: Vec::new(),
             deny_instruction_prefetch_direct_page: false,
             uniform_native_fetches: false,
             direct_page_clocks: false,
@@ -2997,6 +3005,10 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> usize {
+        if kind == BusAccessKind::DataRead && self.non_direct_read_pages.contains(&(address >> 12))
+        {
+            return 0;
+        }
         if !matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
             || bytes == 0
             || !bytes.is_multiple_of(width.bytes() as usize)
@@ -3626,6 +3638,10 @@ mod fpu_flags;
 mod legacy_system;
 #[path = "cpu_persona_system_test.rs"]
 mod persona_system;
+/// The slow-read page histogram (N2's diagnostic). Nested here for the `TestBus` fixture, whose
+/// default no-direct-pages shape is exactly what makes every data read a `data_slow_reads`.
+#[path = "cpu_slow_read_histo_test.rs"]
+mod slow_read_histo;
 #[path = "cpu_stack_branch_test.rs"]
 mod stack_branch;
 #[path = "cpu_straight_line_test.rs"]

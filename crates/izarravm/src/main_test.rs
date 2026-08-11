@@ -1008,6 +1008,50 @@ fn io_hist_lines_format_top_ports_descending() {
     assert_eq!(io_hist_lines(&many).len(), 16);
 }
 
+#[test]
+fn slow_read_histo_lines_split_the_low_megabyte_into_the_regions_n2_asks_about() {
+    // One page in each of the five sub-megabyte regions plus one above 1 MiB, so every boundary in
+    // `SLOW_READ_REGIONS` is exercised from BOTH sides by its neighbours: 0x9f/0xa0, 0xaf/0xb0,
+    // 0xbf/0xc0, 0xef/0xf0 and 0xff/0x100. An off-by-one in any of them moves a whole region's
+    // count, which is exactly the mistake that would have sent N2's next slice to the wrong place.
+    let pages: Vec<(u32, u64)> = vec![
+        (0xa8, 500), // mode-Y aperture
+        (0xd4, 300), // UMB / EMS page frame
+        (0x9f, 100), // last conventional page
+        (0xb8, 40),  // text
+        (0xf0, 10),  // BIOS
+        (0x100, 1),  // first page above 1 MiB
+    ];
+    let lines = slow_read_histo_lines(&pages, 960);
+    assert_eq!(
+        lines[..6],
+        [
+            "slow_read_region conventional_00000_9FFFF count=100 pct=10.52",
+            "slow_read_region vga_aperture_A0000_AFFFF count=500 pct=52.58",
+            "slow_read_region text_B0000_BFFFF count=40 pct=4.21",
+            "slow_read_region umb_ems_C0000_EFFFF count=300 pct=31.55",
+            "slow_read_region bios_F0000_FFFFF count=10 pct=1.05",
+            "slow_read_region above_1MiB count=1 pct=0.11",
+        ]
+    );
+    assert_eq!(
+        lines[6],
+        "slow_read_page page=0x000a8 linear=0x000a8000 count=500"
+    );
+    // The total line carries the histogram's own sum against `data_slow_reads`. They agree here;
+    // a REP CMPS-heavy workload (whose destination read holds a physical address and is
+    // deliberately not bucketed) shows up as a shortfall rather than as a mislabelled bucket.
+    assert_eq!(
+        lines.last().unwrap(),
+        "slow_read_total bucketed=951 data_slow_reads=960 distinct_pages=6"
+    );
+
+    // A 40-page run prints the top 24 pages and no more; the six region lines and the total are
+    // not part of that cap.
+    let many: Vec<(u32, u64)> = (0..40u32).map(|i| (i, 100 - u64::from(i))).collect();
+    assert_eq!(slow_read_histo_lines(&many, 0).len(), 6 + 24 + 1);
+}
+
 #[cfg(feature = "jit")]
 #[test]
 fn unit_sim_report_lines_handle_empty_run() {
