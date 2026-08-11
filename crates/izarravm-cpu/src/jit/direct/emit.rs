@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::jit::encoder::Ymm;
 
 // The RMW and push-through-memory emitters live in `emit/mem.rs`: `emit.rs` reached the
 // 5,000-line file-policy ceiling. Both cfg variants of every moved item went together, so the
@@ -147,26 +148,28 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         e.store_r64_disp32(Reg::RSP, STACK_SAVED_RSI, Reg::RSI);
         emit_save_x87_host_xmms(&mut e);
     }
+    // Clear the accumulator window in whole 32-byte stores rather than one 8-byte store per
+    // slot: four stores instead of thirteen, per block ENTRY. `STACK_ZERO_FILL_LEN` carries the
+    // slot inventory and the const-asserts that keep it honest.
+    //
+    // ORDER IS LOAD-BEARING: `STACK_EXIT` and `STACK_QUOTA` live inside the window, so they are
+    // written after the fill, not before.
+    //
+    // AVX, like the x87 host-XMM save below. That is not a new host requirement: no block is
+    // ever admitted at all unless `jit::host_supported()` (AVX2) holds — `native_keys_admitted`
+    // screens every key on it — so every host that can reach this emitter can execute it.
+    e.vxorpd(Xmm::XMM0, Xmm::XMM0, Xmm::XMM0);
+    let mut zero_fill = 0i32;
+    while zero_fill < STACK_ZERO_FILL_LEN {
+        e.vmovupd_disp32_ymm(Reg::RSP, zero_fill, Ymm::YMM0);
+        zero_fill += 32;
+    }
     e.mov_r64_r64(Reg::R15, CPU_ARG);
     e.mov_r32_r32(Reg::RBP, FLAGS_ARG);
     e.mov_r64_r64(Reg::RAX, EXIT_ARG);
     e.store_r64_disp8(Reg::RSP, STACK_EXIT, Reg::RAX);
     e.mov_r32_r32(Reg::RAX, QUOTA_ARG);
     e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
-    e.xor_r64_self(Reg::RAX);
-    e.store_r64_disp8(Reg::RSP, STACK_ITERATIONS, Reg::RAX);
-    for (stack_offset, _) in dynamic_counter_fields() {
-        e.store_r64_disp8(Reg::RSP, stack_offset, Reg::RAX);
-    }
-    for stack_offset in [
-        STACK_INSTRUCTIONS,
-        STACK_RAW_CLOCKS,
-        STACK_BYTE_READS,
-        STACK_DWORD_READS,
-        STACK_WEIGHTED_FP_CLOCKS,
-    ] {
-        e.store_r64_disp8(Reg::RSP, stack_offset, Reg::RAX);
-    }
     for (index, home) in GUEST_HOMES.into_iter().enumerate() {
         e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
     }
