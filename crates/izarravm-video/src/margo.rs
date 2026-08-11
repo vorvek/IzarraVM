@@ -511,10 +511,27 @@ pub struct Margo {
     /// passed (`docs/vega/vega-technical-reference.md` section 9, first clause).
     ///
     /// BATCH-SCOPED SCRATCH, not device state: the host sets it only from a
-    /// mid-batch offset and `advance_busy` consumes it at batch end, so it is
-    /// zero at every batch boundary. Canonical capture is taken at a boundary
-    /// and may exclude it, the way `io_touched` is excluded.
+    /// mid-batch offset and `advance_busy` consumes it as the batch's device
+    /// time is delivered. It is zero once a batch's time has been delivered in
+    /// FULL -- but NOT necessarily at every intermediate point, because
+    /// `Machine::advance_master_time` can deliver one batch in several
+    /// FDC-bounded steps and a blit armed late in the batch can outlast the
+    /// first of them. Canonical capture runs between run calls, after full
+    /// delivery, so excluding it stays sound the way `io_touched` is excluded.
     busy_credit_ns: u64,
+    /// Bumped by every write to `busy_ns` that is an ARM (a COMMAND, the final
+    /// MONO_DATA word, or a RESET) and never by the drain.
+    ///
+    /// It exists because the bus cannot infer an arm from the busy VALUE. Every
+    /// setter below is an assign and nothing drains mid-batch, so two operations
+    /// of identical modeled duration armed in the same batch leave `busy_ns`
+    /// unchanged across the second one -- and a value comparison would report it
+    /// as an ordinary write, leaving the drain credit naming the FIRST arm's
+    /// instant. The second operation would then read idle for its whole length.
+    /// That is not a corner case: izbios' `lfb_text` draws every glyph with a
+    /// fixed `MG_DIM` of 0x00080008, so consecutive glyph blits model exactly
+    /// the same busy time.
+    busy_stamp: u64,
     expand: Option<ExpandState>,
     mono_data: u32,
     cursor: [u32; CURSOR_REGS],
@@ -534,6 +551,7 @@ impl Default for Margo {
             command: 0,
             busy_ns: 0,
             busy_credit_ns: 0,
+            busy_stamp: 0,
             expand: None,
             mono_data: 0,
             cursor: [0; CURSOR_REGS],
@@ -949,7 +967,7 @@ impl Margo {
             if self.control & 0x1 != 0 {
                 // RESET aborts the operation. It already completed, so this only
                 // drops BUSY and any in-flight color-expand stream. Self-clearing.
-                self.busy_ns = 0;
+                self.arm_busy_ns(0);
                 self.busy_credit_ns = 0;
                 self.expand = None;
                 self.control &= !0x1;
@@ -998,6 +1016,25 @@ impl Margo {
         self.overlay[(offset - OVL_BASE) / 4]
     }
 
+    /// Charge `ns` of modeled busy time as a NEW operation, bumping the arm
+    /// stamp with it.
+    ///
+    /// Every arming path goes through here rather than assigning `busy_ns`
+    /// directly, so the stamp cannot fall out of step with the field: a new
+    /// operation whose duration happens to equal the running one's is still a
+    /// new arm, and `Vega::write_memory_u8` can only see that through the stamp.
+    /// The drain (`advance_busy`) deliberately does NOT come through here.
+    fn arm_busy_ns(&mut self, ns: u64) {
+        self.busy_ns = ns;
+        self.busy_stamp = self.busy_stamp.wrapping_add(1);
+    }
+
+    /// The arm stamp: changes exactly when an operation is armed (or reset).
+    /// The bus compares this across an MMIO write to detect the arming edge.
+    pub fn busy_stamp(&self) -> u64 {
+        self.busy_stamp
+    }
+
     /// The remaining modeled busy time in nanoseconds. The pusher gates on this so
     /// it stalls at each COMMAND until that operation completes; an armed but unfed
     /// color-expand stream reads 0 here (busy_ns is only set when an operation
@@ -1011,7 +1048,7 @@ impl Margo {
     ///
     /// The credit is subtracted from the elapsed time, not added to the busy
     /// time: a blit armed at in-batch offset `a` has only been running for
-    /// `elapsed - a`, and the arm-time drain credit (`credit_busy_ns`) is
+    /// `elapsed - a`, and the arm-time drain credit (`busy_credit_ns`) is
     /// exactly `a`.
     pub fn busy_ns_after(&self, elapsed_ns: u64) -> u64 {
         self.busy_ns
@@ -1084,7 +1121,7 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = fill(&mut self.vram, &params);
-        self.busy_ns = BLIT_SETUP_NS + pixels * FILL_NS_PER_PIXEL;
+        self.arm_busy_ns(BLIT_SETUP_NS + pixels * FILL_NS_PER_PIXEL);
     }
 
     fn run_copy(&mut self) {
@@ -1110,7 +1147,7 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = copy(&mut self.vram, &params);
-        self.busy_ns = BLIT_SETUP_NS + pixels * COPY_NS_PER_PIXEL;
+        self.arm_busy_ns(BLIT_SETUP_NS + pixels * COPY_NS_PER_PIXEL);
     }
 
     fn run_expand_mem(&mut self) {
@@ -1138,7 +1175,7 @@ impl Margo {
             src_y: src_xy >> 16,
         };
         let pixels = color_expand_mem(&mut self.vram, &params);
-        self.busy_ns = BLIT_SETUP_NS + pixels * EXPAND_NS_PER_PIXEL;
+        self.arm_busy_ns(BLIT_SETUP_NS + pixels * EXPAND_NS_PER_PIXEL);
     }
 
     fn run_line(&mut self) {
@@ -1157,7 +1194,7 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = line(&mut self.vram, &params);
-        self.busy_ns = BLIT_SETUP_NS + pixels * LINE_NS_PER_PIXEL;
+        self.arm_busy_ns(BLIT_SETUP_NS + pixels * LINE_NS_PER_PIXEL);
     }
 
     fn run_pattern(&mut self) {
@@ -1178,7 +1215,7 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = pattern(&mut self.vram, &params);
-        self.busy_ns = BLIT_SETUP_NS + pixels * PATTERN_NS_PER_PIXEL;
+        self.arm_busy_ns(BLIT_SETUP_NS + pixels * PATTERN_NS_PER_PIXEL);
     }
 
     fn arm_expand_data(&mut self) {
@@ -1232,7 +1269,7 @@ impl Margo {
         state.words_received += 1;
         state.written += written;
         if u64::from(state.words_received) >= state.total_words {
-            self.busy_ns = BLIT_SETUP_NS + state.written * EXPAND_NS_PER_PIXEL;
+            self.arm_busy_ns(BLIT_SETUP_NS + state.written * EXPAND_NS_PER_PIXEL);
             self.expand = None;
         } else {
             self.expand = Some(state);

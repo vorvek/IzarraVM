@@ -2258,6 +2258,14 @@ fn read_reg_u32_at(margo: &Margo, offset: usize, elapsed_ns: u64) -> u32 {
 /// Arm the 4-pixel FILL (busy_ns = 100 + 4*5 = 120) as the bus does: the write
 /// that moves busy time first, then the credit for the in-batch offset it
 /// landed at.
+///
+/// CAVEAT: this stamps the credit BY HAND and therefore does not exercise the
+/// bus's arming-edge detection at all. That gap is what let the same-duration
+/// re-arm defect through review -- a second identical operation left `busy_ns`
+/// unchanged, so the edge was missed and the credit was never re-stamped. The
+/// edge itself is covered at machine level by
+/// `a_second_identical_blit_in_one_batch_restamps_the_origin`; keep it that way,
+/// and do not "improve" this helper into looking like the real path.
 fn arm_fill_at(credit_ns: u64) -> Margo {
     let mut margo = Margo::default();
     setup_fill(&mut margo);

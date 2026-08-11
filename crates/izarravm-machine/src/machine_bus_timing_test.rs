@@ -3305,3 +3305,83 @@ fn a_batch_is_not_cut_at_blit_completion_but_the_read_is_still_exact_across_it()
     // batch boundary: nothing drained it early to make the sweep above pass.
     assert_eq!(machine.vega.blitter_busy_ns(), 200);
 }
+
+/// A 200x200 FILL: 40,000 pixels at 5 ns each plus 100 ns setup = 200,100 ns of
+/// modeled busy time, ~4,402 clocks at the 386 tier. Big enough that a whole
+/// operation-length error is unmissable, unlike the 200 ns glyph-sized fill.
+fn program_square_margo_fill(machine: &mut Machine) {
+    write_mmio_reg(machine, 0x100, 0); // DST_BASE
+    write_mmio_reg(machine, 0x104, 640); // DST_PITCH
+    write_mmio_reg(machine, 0x110, 1); // DEPTH
+    write_mmio_reg(machine, 0x114, 0); // DST_XY: (0,0)
+    write_mmio_reg(machine, 0x11c, (200 << 16) | 200); // DIM: 200x200
+    write_mmio_reg(machine, 0x120, 0xab); // FG_COLOR
+    write_mmio_reg(machine, 0x128, 0xf0); // ROP: PATCOPY
+    write_mmio_reg(machine, 0x130, 0); // FLAGS: none
+}
+
+#[test]
+fn a_second_identical_blit_in_one_batch_restamps_the_origin() {
+    // THE SAME-DURATION RE-ARM. Two operations of IDENTICAL modeled duration,
+    // armed in the same batch, are the case a busy_ns VALUE comparison cannot
+    // see: every setter in margo.rs is an assign and nothing drains mid-batch,
+    // so `busy_ns` before and after the second COMMAND are EQUAL, the write
+    // reports `Accepted` instead of `ArmedBlit`, and the credit still names the
+    // FIRST arm's offset. The second operation then reads idle for its entire
+    // length -- a section 9 idle-early violation that scales with operation
+    // size, not a rounding error.
+    //
+    // This is not a contrived shape: izbios' lfb_text draws every glyph with a
+    // fixed MG_DIM of 0x00080008, so consecutive glyph blits all model exactly
+    // the same busy time. The 200x200 fill below just makes the window wide
+    // enough to assert on comfortably.
+    const ARM2_OFFSET: u64 = 10_000;
+
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    machine.run_cycles(5_000).unwrap();
+    program_square_margo_fill(&mut machine);
+
+    // Both arms go through the REAL bus write path, which is the seam that
+    // decides whether the origin is re-stamped. A test that called
+    // `credit_busy_ns` by hand would pass while the bus edge stayed broken.
+    arm_margo_fill_at(&mut machine, 0, 0x01);
+    let busy_ns = machine.vega.blitter_busy_ns();
+    assert_eq!(busy_ns, 200_100, "200x200 at 5 ns/px + 100 ns setup");
+    arm_margo_fill_at(&mut machine, ARM2_OFFSET, 0x01);
+    assert_eq!(
+        machine.vega.blitter_busy_ns(),
+        busy_ns,
+        "the second FILL is identical, so busy_ns is unchanged -- which is \
+         exactly why a value comparison cannot detect it"
+    );
+
+    // The second operation must run its full modeled length FROM ITS OWN ARM.
+    let duration = machine
+        .timeline
+        .cpu_clocks_until(timeline::DeviceClock::MargoNs, busy_ns, 1_000_000_000)
+        .unwrap();
+    assert!(
+        duration > 4_000,
+        "sanity: a wide window, got {duration} clocks"
+    );
+
+    for probe in [0u64, 1, duration / 2, duration - 64] {
+        let (status, _) = read_margo_status_at(&mut machine, 0, ARM2_OFFSET + probe);
+        assert_eq!(
+            status & 1,
+            1,
+            "BUSY must still be set {probe} clocks after the SECOND arm; \
+             reading idle here bills the second operation against the first \
+             one's start instant"
+        );
+    }
+    // ... and it does finish: the credit moves the origin, it does not disable
+    // the drain.
+    let (late, _) = read_margo_status_at(&mut machine, 0, ARM2_OFFSET + duration + 64);
+    assert_eq!(
+        late & 1,
+        0,
+        "BUSY must clear once the second operation is done"
+    );
+}

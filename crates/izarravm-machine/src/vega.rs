@@ -905,12 +905,23 @@ impl Vega {
             // The ONLY arming path in this function: COMMAND (and the final
             // MONO_DATA word of a color-expand stream) is what charges the
             // blitter modeled busy time; CONTROL.RESET is what drops it. Detect
-            // the EDGE -- busy time this write MOVED -- rather than the level,
-            // so a write landing while an earlier long blit is still draining is
-            // an ordinary accepted write and does not re-stamp the origin.
-            let busy_before = self.margo.busy_ns();
+            // the EDGE -- an operation was armed by THIS write -- rather than
+            // the level, so a write landing while an earlier blit is still
+            // draining is an ordinary accepted write and does not re-stamp the
+            // origin.
+            //
+            // The edge is the arm STAMP, not the busy VALUE. A value comparison
+            // is blind to the case that matters most: every setter in margo.rs
+            // is an assign and nothing drains mid-batch, so a second operation
+            // of identical modeled duration -- every glyph in izbios' `lfb_text`,
+            // which fixes MG_DIM at 0x00080008 -- leaves `busy_ns` unchanged and
+            // would be read as an ordinary write. The drain credit would then
+            // still name the FIRST arm's instant and the second operation would
+            // report idle for its entire length, breaking section 9 by a whole
+            // operation rather than a rounding error.
+            let stamp_before = self.margo.busy_stamp();
             self.margo.write_mmio_u8(offset, value);
-            return if self.margo.busy_ns() != busy_before {
+            return if self.margo.busy_stamp() != stamp_before {
                 VideoWrite::ArmedBlit
             } else {
                 VideoWrite::Accepted
