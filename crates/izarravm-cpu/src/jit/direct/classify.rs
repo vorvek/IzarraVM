@@ -661,6 +661,48 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // allowlist above for the reason that list documents, so a 66-prefixed encoding falls
             // to `None` and stays a barrier. The invariance is stated, not relied on.
             //
+            // THE WORD-SIZE ADMISSION HAS BEEN TRIED AND IS PROVABLY INERT. Do not re-derive it
+            // from the census. `dev_docs/wolf3d-586-measurement-results.md` ranks this row at
+            // 370,316,594 of 381,560,241 block-stopping hits (97.05%) on wolf3d-586 and recommends
+            // exactly one line: `0xec` added to the list above. Built and run (2026-08-11,
+            // A/B/B/A at ProcessorIndex 8, 12e9 clocks) it serves ZERO port reads natively, and
+            // the reason is the one fact a barrier census cannot see -- THE GUEST IS IN V86 MODE.
+            // wolf3d-586's CONFIG.SYS loads TOKAEMM, so every 16-bit block runs under the V86
+            // monitor, and V86 is the FIRST thing `port_read_al_dx` refuses (module docs, abnormal
+            // producer 1: the TSS I/O-bitmap probe page-walks, which is unsupportable from inside
+            // a live block). With the admission in, the full run measures
+            // `side_exit_callout_abnormal` 136,772,308 against `jit_direct_callout_executed`
+            // 136,772,308 -- ONE HUNDRED PERCENT of the call-outs that ran returned abnormal --
+            // plus 233,559,698 whole-block entries refused up front by `run_direct_block`'s
+            // `callout_port_slots` privilege gate. So the admission buys a spill, a call, a reload
+            // and a side exit where a free barrier used to be, and refuses 9.3% of this fixture's
+            // block entries outright, in exchange for nothing at all.
+            //
+            // (The four wall legs were 289.706 / 294.872 / 304.269 / 312.868 s in A/B/B/A order --
+            // a monotonic 8% HOST DRIFT that swamps the effect, so the drift-corrected wall delta
+            // of −0.57% is noise and is NOT the evidence here. The evidence is that not one port
+            // read was served: `perf.instructions` was byte-identical at 15,218,471,683 on all
+            // four legs and the framebuffer invariant passed on all four, so the two arms differ
+            // only in host cost, and the abnormal ratio says the admission has no upside to trade
+            // that cost against.)
+            //
+            // The Dword form is NOT affected and is healthy: on the 32-bit protected-mode fixtures
+            // the same helper reads `side_exit_callout_abnormal` at 1,080 of 9,868,635 (doom-486),
+            // 1,085 of 26,612,249 (doom-586) and 135,164 of 1,836,356,449 (gp2-586). The problem
+            // is V86, not the mechanism.
+            //
+            // What would make the Word admission worth having, in order of size:
+            //   1. A V86-CAPABLE PORT CALL-OUT: pre-check that the TSS I/O-permission bit for the
+            //      port is resident and readable through the FastMap serve path with no page walk,
+            //      the same shape `call_out_stack_frame_resident` already uses for the memory
+            //      class, and drop the blanket V86 refusal. That is the slice that unlocks 97% of
+            //      this census; it is a real slice, not a list entry.
+            //   2. Failing that, a compile-time refusal of a PORT call-out slot while
+            //      `is_v86_mode()` (sound because V86 is bit 2 of `jit_mode_key`, so a block
+            //      cannot be reused across the boundary) would make the admission provably
+            //      NEUTRAL rather than negative -- but neutral on every fixture in tree, which is
+            //      the dead-code-no-counter-can-gate case this list exists to refuse.
+            //
             // The Approximate-class gate is INHERITED, not re-stated. `block_continuable`
             // (decode.rs) admits the IN forms only on I486/I586, so on the Accurate 386 class
             // `insn.continuable` is false and the compile walk stops at this instruction BEFORE
