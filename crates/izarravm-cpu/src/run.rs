@@ -1185,6 +1185,11 @@ impl CpuGsw {
         if !self.mode().uses_approximate_timing() {
             return Ok(DirectContinuation::Interpret);
         }
+        // Emission-shape synchronisation, BEFORE the probe so a compile below emits what this
+        // bus needs. `JitState::native_fetch_trace` carries the whole argument; the cost here
+        // is one bus bool and a compare per continuation, against four instructions and two
+        // dependent loads per completed path AND per chain hop inside every emitted block.
+        self.sync_native_fetch_trace(bus);
         if !self.jit_direct.auto_admit() {
             return Ok(DirectContinuation::Interpret);
         }
@@ -1790,6 +1795,35 @@ impl CpuGsw {
         self.jit_direct.note_dynamic_miss_target(kind, linear);
     }
 
+    /// Point `JitState::native_fetch_trace` at the live bus. See that field for why the two
+    /// are not allowed to drift apart.
+    ///
+    /// The two directions are NOT symmetric, and the asymmetry is the whole design:
+    ///
+    ///   * `true -> false` (a uniform-fetch bus arrives, blocks carry the append) is SAFE for
+    ///     resident code. Such a bus hands out `trace_ptr == 0`, the emitted preamble finds it
+    ///     and jumps over its own body — which is exactly the pre-slice behaviour. So the
+    ///     field moves, later compiles get the smaller shape, and the cache is LEFT ALONE.
+    ///   * `false -> true` (a trace-observing bus arrives, blocks have no append) would drop
+    ///     fetch observations silently. The cache is cleared, and every block recompiles with
+    ///     the preamble.
+    ///
+    /// Neither arm is reachable more than once on `MachineBus`: the answer there is
+    /// `active_mode.uses_approximate_timing()`, which cannot change without
+    /// `Machine::set_mode` -> `CpuGsw::set_mode` -> `invalidate_code_caches` clearing this
+    /// cache anyway. The clear here is what makes the invariant hold for ANY bus.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn sync_native_fetch_trace<B: CpuBus>(&mut self, bus: &B) {
+        let wanted = !bus.native_fetches_are_uniform();
+        if self.jit_direct.native_fetch_trace != wanted {
+            self.jit_direct.native_fetch_trace = wanted;
+            if wanted {
+                self.jit_direct.clear();
+            }
+        }
+    }
+
     #[cfg(feature = "jit")]
     fn run_direct_block<B: CpuBus>(
         &mut self,
@@ -1823,6 +1857,17 @@ impl CpuGsw {
         }
         if !bus.native_aggregate_accounting_allowed() {
             self.perf.jit_direct_reject_aggregate_accounting += 1;
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        // Emission-shape backstop, guarding the ONE unsafe combination: a trace-elided block
+        // about to be entered by a bus that wants fetch observations. `try_direct_continuation`
+        // already synchronised this ahead of the probe, so the production path never sees it;
+        // it is here for the test seams that call `run_direct_block` directly
+        // (`try_run_direct_block_for_test`) and so bypass that synchronisation. The converse
+        // combination — a block that CARRIES the append under a uniform-fetch bus — is not a
+        // hazard and is not checked: `trace_ptr` is 0, so the preamble jumps over itself.
+        if !self.jit_direct.native_fetch_trace && !bus.native_fetches_are_uniform() {
+            self.sync_native_fetch_trace(bus);
             return Ok(DirectBlockOutcome::NotRun);
         }
         let span = block.span();

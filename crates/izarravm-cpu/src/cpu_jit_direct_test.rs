@@ -2166,7 +2166,7 @@ fn cpl3_fast_map_permission_side_exit_is_counted() {
     );
 }
 
-const STORE_ENTRY: u32 = 0x1101;
+pub(super) const STORE_ENTRY: u32 = 0x1101;
 
 pub(super) fn arm_store_fixture(cpu: &mut CpuGsw) {
     cpu.halted = false;

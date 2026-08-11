@@ -147,6 +147,76 @@ const _: () = {
     );
 };
 
+/// The prologue's zero-fill window: frame bytes `0..STACK_ZERO_FILL_LEN`, cleared as whole
+/// 32-byte vector stores instead of one 8-byte store per accumulator.
+///
+/// Thirteen slots need zeroing — `STACK_ITERATIONS`, the seven `dynamic_counter_fields` lanes
+/// and the five static accumulators — and they are scattered across 8..128 with
+/// `STACK_EXIT` (56) and `STACK_READ_KIND` (80) interleaved between them. Clearing the whole
+/// window and writing `STACK_EXIT` and `STACK_QUOTA` afterwards is four stores instead of
+/// thirteen, per block ENTRY (a chained transfer jumps to `body_offset` and skips the prologue
+/// entirely, so this is per entry and not per hop). `STACK_READ_KIND` is pure scratch, so
+/// clearing it costs nothing but the bytes it shares with the vector store.
+///
+/// It stops at 128 because the ALU scratch cluster starts there and is deliberately NOT
+/// zeroed; the asserts below pin both halves of that boundary, so moving a slot across it
+/// fails the build rather than silently losing its initialisation.
+///
+/// One side effect worth naming rather than leaving to be rediscovered: `STACK_READ_KIND`
+/// (and its alias `STACK_WATCH_PAGE`) now starts every entry at a DETERMINISTIC zero, where
+/// before it held whatever the previous entry left in the slot. That is strictly safer but it
+/// changes a failure mode — a future read-before-write of that slot now reads page 0 and
+/// resolves something wrong, instead of reading garbage and failing loudly. Nothing reads it
+/// before writing it today; every parker writes it inside the same slot's emission.
+pub(super) const STACK_ZERO_FILL_LEN: i32 = 128;
+const _: () = {
+    assert!(STACK_ZERO_FILL_LEN as u32 <= NATIVE_STACK_LEN);
+    assert!(STACK_ZERO_FILL_LEN % 32 == 0);
+    // Every slot the prologue must start at zero lives inside the window...
+    assert!(STACK_ITERATIONS >= 0 && (STACK_ITERATIONS as i32) < STACK_ZERO_FILL_LEN);
+    assert!(STACK_INSTRUCTIONS >= 0 && (STACK_INSTRUCTIONS as i32) < STACK_ZERO_FILL_LEN);
+    assert!(STACK_RAW_CLOCKS >= 0 && (STACK_RAW_CLOCKS as i32) < STACK_ZERO_FILL_LEN);
+    assert!(STACK_BYTE_READS >= 0 && (STACK_BYTE_READS as i32) < STACK_ZERO_FILL_LEN);
+    assert!(STACK_DWORD_READS >= 0 && (STACK_DWORD_READS as i32) < STACK_ZERO_FILL_LEN);
+    assert!(
+        STACK_WEIGHTED_FP_CLOCKS >= 0 && (STACK_WEIGHTED_FP_CLOCKS as i32) < STACK_ZERO_FILL_LEN
+    );
+    assert!(STACK_RAM_BYTE_WRITES >= 0 && (STACK_RAM_BYTE_WRITES as i32) < STACK_ZERO_FILL_LEN);
+    assert!(STACK_RAM_DWORD_WRITES >= 0 && (STACK_RAM_DWORD_WRITES as i32) < STACK_ZERO_FILL_LEN);
+    assert!(
+        STACK_MODE13_BYTE_WRITES >= 0 && (STACK_MODE13_BYTE_WRITES as i32) < STACK_ZERO_FILL_LEN
+    );
+    assert!(
+        STACK_MODE13_DWORD_WRITES >= 0 && (STACK_MODE13_DWORD_WRITES as i32) < STACK_ZERO_FILL_LEN
+    );
+    assert!(
+        STACK_MODE13_DIRTY_PAGES >= 0 && (STACK_MODE13_DIRTY_PAGES as i32) < STACK_ZERO_FILL_LEN
+    );
+    assert!(STACK_MODE13_BYTE_READS >= 0 && (STACK_MODE13_BYTE_READS as i32) < STACK_ZERO_FILL_LEN);
+    assert!(
+        STACK_MODE13_DWORD_READS >= 0 && (STACK_MODE13_DWORD_READS as i32) < STACK_ZERO_FILL_LEN
+    );
+    // ...and the two slots the prologue writes AFTER the fill are inside it too, which is why
+    // the write order matters.
+    assert!(STACK_QUOTA >= 0 && (STACK_QUOTA as i32) < STACK_ZERO_FILL_LEN);
+    assert!(STACK_EXIT >= 0 && (STACK_EXIT as i32) < STACK_ZERO_FILL_LEN);
+    // The ALU scratch cluster is outside, and stays outside.
+    assert!(STACK_ALU_ADDRESS_KIND >= STACK_ZERO_FILL_LEN);
+    assert!(STACK_ALU_OLD_RESULT >= STACK_ZERO_FILL_LEN);
+    assert!(STACK_ALU_FLAGS >= STACK_ZERO_FILL_LEN);
+    assert!(STACK_SHIFT_COUNT >= STACK_ZERO_FILL_LEN);
+};
+// The Windows-only areas above the base frame. The prologue writes BOTH of these BEFORE the
+// fill runs (the x87 entry path saves RSI and XMM6-11 immediately after `sub rsp`), so a
+// `BASE_STACK_LEN` that ever shrank under the fill window would have the fill quietly eat a
+// saved host register on its way past — handing garbage RSI or XMM state back to the Rust
+// caller with nothing else complaining.
+#[cfg(target_os = "windows")]
+const _: () = {
+    assert!(STACK_SAVED_RSI >= STACK_ZERO_FILL_LEN);
+    assert!(STACK_X87_XMM_BASE >= STACK_ZERO_FILL_LEN);
+};
+
 /// The seven dynamic counter lanes, each pairing the emitter stack slot that accumulates it with
 /// the `NativeExit` field it is copied into on the way out.
 ///
@@ -160,6 +230,20 @@ const _: () = {
 /// exit — unmeasurable against this campaign's layout noise — on the hottest shared exit path,
 /// where a wrongly-cleared lane is a guest-visible bus-accounting error rather than a diagnostic
 /// one.
+///
+/// **A per-block mask is not merely unprofitable, it is UNSOUND, and that is why this stays
+/// unconditional** (recorded 2026-08-11, after the rt-2.0 JIT audit proposed recovering it).
+/// A chained native transfer jumps to a successor's `body_offset`, skipping its prologue, and
+/// the block that finally leaves native code runs ITS OWN `emit_return` against the frame the
+/// whole chain accumulated into. So neither end of a chain knows the lane set:
+///
+///   * masking the PROLOGUE by the entry block's kinds leaves a successor accumulating into a
+///     slot nobody zeroed, and
+///   * masking `emit_return` by the exiting block's kinds drops a predecessor's counts.
+///
+/// Links form at runtime between any two blocks sharing a mode key, so no compile-time union
+/// bounds either set. Both failures are guest-visible bus accounting. The prologue cost was
+/// recovered instead by making the zeroing WIDER, not narrower — see `STACK_ZERO_FILL_LEN`.
 pub(super) fn dynamic_counter_fields() -> [(i8, usize); 7] {
     [
         (

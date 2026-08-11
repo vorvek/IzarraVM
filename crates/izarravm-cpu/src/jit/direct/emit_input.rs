@@ -23,6 +23,22 @@ pub(super) struct EmitInput<'a> {
     pub(super) x87_entry_top: Option<u8>,
     pub(super) memory: MemoryEmitContext,
     pub(super) link_cell_ptrs: [usize; 2],
+    /// Whether completed paths, self-loop returns and side-exit returns emit the
+    /// `NativeBlockTrace` append preamble (`emit_fetch_trace`).
+    ///
+    /// The instrument only has a consumer when the bus wants per-block fetch observation:
+    /// `run_direct_block` hands the block a `NativeExit` whose `trace_ptr` is 0 whenever
+    /// `CpuBus::native_fetches_are_uniform()`, and the emitted preamble then loads the exit
+    /// pointer, loads `trace_ptr`, compares it against 0 and jumps over its own body — four
+    /// instructions and two dependent loads, per completed path AND per chain hop, to discover
+    /// a compile-time constant. This flag moves the gate from the emitted callee to the
+    /// emission site.
+    ///
+    /// From `JitState::native_fetch_trace`, which `try_direct_continuation` synchronises with
+    /// the live bus BEFORE any probe or compile, and which `run_direct_block` re-checks as a
+    /// backstop before entering native code. A change clears the block cache, so a resident
+    /// block's emission shape always matches the bus that will enter it.
+    pub(super) fetch_trace: bool,
 }
 
 pub(super) struct EmittedCode {

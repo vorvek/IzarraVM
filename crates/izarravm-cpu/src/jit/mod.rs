@@ -106,6 +106,31 @@ pub(crate) struct JitState {
     /// clone for the lockstep reason. Requires `r15_tables`; independent of `one_lookup_store`
     /// so either slice A/Bs alone.
     pub(crate) one_lookup_load: bool,
+    /// Whether the blocks in this cache were emitted WITH the `NativeBlockTrace` append
+    /// preamble — i.e. the answer to `!bus.native_fetches_are_uniform()` that every resident
+    /// block was compiled against.
+    ///
+    /// Not a policy dial: a MIRROR of a bus property, kept here because `direct::compile`
+    /// has no bus in scope (`EmitInput::fetch_trace` carries it the rest of the way). Two
+    /// sites keep it honest, and neither is optional:
+    ///
+    ///   * `try_direct_continuation` synchronises it against the live bus BEFORE the probe,
+    ///     so a compile always emits the shape the bus that asked for it needs.
+    ///   * `run_direct_block` re-checks it against the live bus before entering native code,
+    ///     which covers the test seams that drive `run_direct_block` directly.
+    ///
+    /// A disagreement at either site rewrites the field and CLEARS the block cache: an
+    /// elided-trace block entered with a live `trace_ptr` would silently under-report fetch
+    /// observations, so the shape and the bus can never be allowed to drift apart.
+    ///
+    /// Seeded TRUE — the emitting arm, which is the pre-slice behaviour and what the
+    /// `CpuBus` trait default (`native_fetches_are_uniform() == false`) asks for. On the
+    /// production `MachineBus` the Direct backend only runs at all under an Approximate
+    /// persona (`try_direct_continuation`'s `uses_approximate_timing` gate), and that is
+    /// exactly when `flat_data_cost` — and therefore `native_fetches_are_uniform` — is true,
+    /// so the field flips to false on the first continuation and never moves again.
+    /// CARRIED by clone, for `watch_page_bit`'s lockstep-comparison reason.
+    pub(crate) native_fetch_trace: bool,
     /// Admission level for 16-bit code segments, seeded from `IZARRAVM_JIT16`.
     ///
     /// A field for the same reason `word_at_486` is one: the `OnceLock` behind it is process-wide,
@@ -197,6 +222,7 @@ impl JitState {
             watch_page_bit: true,
             one_lookup_store: one_lookup_store_default(),
             one_lookup_load: one_lookup_load_default(),
+            native_fetch_trace: true,
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
             // A `JitState` does not know the CPU's mode; `CpuGsw::default` refreshes this to the
             // real answer for `GswMode::Gsw586` before it hands the CPU out, and `set_mode` owns
@@ -228,6 +254,7 @@ impl Clone for JitState {
             watch_page_bit: self.watch_page_bit,
             one_lookup_store: self.one_lookup_store,
             one_lookup_load: self.one_lookup_load,
+            native_fetch_trace: self.native_fetch_trace,
             sixteen_bit_level: self.sixteen_bit_level,
             // CARRIED, for the reason spelled out on the field: the clone copies `mode` too, so
             // the cached answer stays correct, and a reset would refuse every key.
