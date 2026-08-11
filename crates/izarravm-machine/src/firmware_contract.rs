@@ -118,6 +118,37 @@ pub(crate) mod address {
     pub(crate) const fn bios_int_stub_off(vector: u8) -> u16 {
         0x0200 + (vector as u16) * 2
     }
+
+    /// The single linear window that contains EVERY address `MachineBus::note_code_fetch_linear`
+    /// reacts to: the two BIOS32 entry points at the bottom and the legacy IRET / per-vector stub
+    /// window at the top. Derived from those four constants, never spelled out, so moving any one
+    /// of them moves the window with it (and trips the assertions below if it moves outside).
+    ///
+    /// Every interpreted and warm-JIT instruction fetch tests one `wrapping_sub` against this
+    /// window; only a fetch inside it can change firmware state, so everything else skips the
+    /// body outright.
+    pub(crate) const FIRMWARE_FETCH_WINDOW_START: u32 = BIOS32_DIRECTORY_LINEAR;
+    pub(crate) const FIRMWARE_FETCH_WINDOW_LEN: u32 =
+        BIOS_LEGACY_IRET_LINEAR + BIOS_STUB_WINDOW_LEN - FIRMWARE_FETCH_WINDOW_START;
+
+    const fn inside_firmware_fetch_window(linear: u32) -> bool {
+        linear.wrapping_sub(FIRMWARE_FETCH_WINDOW_START) < FIRMWARE_FETCH_WINDOW_LEN
+    }
+
+    const _: () = {
+        assert!(inside_firmware_fetch_window(BIOS32_DIRECTORY_LINEAR));
+        assert!(inside_firmware_fetch_window(BIOS32_PCI_LINEAR));
+        assert!(inside_firmware_fetch_window(BIOS_LEGACY_IRET_LINEAR));
+        assert!(inside_firmware_fetch_window(
+            BIOS_LEGACY_IRET_LINEAR + BIOS_STUB_WINDOW_LEN - 1
+        ));
+        // The stub table must stay inside the legacy window the top half tests against, which is
+        // what lets one window cover all four addresses.
+        assert!(
+            BIOS_INT_STUB_TABLE_LINEAR + BIOS_INT_STUB_TABLE_LEN
+                <= BIOS_LEGACY_IRET_LINEAR + BIOS_STUB_WINDOW_LEN
+        );
+    };
 }
 
 use address::*;

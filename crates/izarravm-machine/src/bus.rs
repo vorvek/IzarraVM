@@ -1301,6 +1301,14 @@ impl CpuBus for MachineBus<'_> {
 
     #[inline]
     fn note_code_fetch_linear(&mut self, linear: u32) {
+        // ONE range compare for the whole body. Every interpreted instruction and every warm JIT
+        // fetch calls this, and outside `FIRMWARE_FETCH_WINDOW` (the two BIOS32 entry points
+        // through the end of the per-vector stub table) neither half can do anything: the BIOS32
+        // arm's `_ => None` writes `None` back over an already-`None` slot, and the stub arm's own
+        // window is contained in this one. So the guard is a pure hoist, not a behaviour change.
+        if linear.wrapping_sub(FIRMWARE_FETCH_WINDOW_START) >= FIRMWARE_FETCH_WINDOW_LEN {
+            return;
+        }
         if self.pending_bios32.is_none() {
             *self.pending_bios32 = match linear {
                 BIOS32_DIRECTORY_LINEAR => Some(Bios32Call::Directory),
@@ -1308,9 +1316,7 @@ impl CpuBus for MachineBus<'_> {
                 _ => None,
             };
         }
-        // One range compare (0xFF000..0xFF400: the legacy FF00:0000 target
-        // through the end of the per-vector stub table) keeps this out of the
-        // way of every ordinary fetch.
+        // The legacy FF00:0000 target through the end of the per-vector stub table.
         if linear.wrapping_sub(BIOS_LEGACY_IRET_LINEAR) < BIOS_STUB_WINDOW_LEN {
             self.note_stub_fetch(linear);
         }

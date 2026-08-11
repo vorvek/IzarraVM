@@ -696,3 +696,50 @@ fn margo_caps_match_the_end_to_end_coverage_matrix() {
     let mut machine = test_machine();
     assert_eq!(read_mmio_reg(&mut machine, 0x0004), covered);
 }
+
+/// A1: `note_code_fetch_linear` is guarded by ONE range test against
+/// `FIRMWARE_FETCH_WINDOW`. This proves the guard both ADMITS every address the
+/// body reacts to and REJECTS everything else, so the hoist cannot have changed
+/// behaviour: the BIOS32 arm arms exactly at its two entry points, the two
+/// addresses immediately outside the window arm nothing, and an ordinary
+/// conventional-RAM code address (what every interpreted fetch actually passes)
+/// arms nothing either.
+///
+/// The window itself is checked against the four contract addresses at compile
+/// time (`firmware_contract::address`); this is the runtime half.
+#[test]
+fn firmware_fetch_window_admits_exactly_the_bios32_entry_points() {
+    let armed = |linear: u32| {
+        let mut machine = test_machine();
+        machine.pending_bios32 = None;
+        with_bus(&mut machine, |bus| bus.note_code_fetch_linear(linear));
+        machine.pending_bios32
+    };
+
+    assert_eq!(armed(BIOS32_DIRECTORY_LINEAR), Some(Bios32Call::Directory));
+    assert_eq!(armed(BIOS32_PCI_LINEAR), Some(Bios32Call::Pci));
+
+    // Inside the window but not an entry point.
+    assert_eq!(armed(BIOS32_PCI_LINEAR + 1), None);
+    assert_eq!(armed(BIOS_LEGACY_IRET_LINEAR), None);
+    // The two addresses that bracket the window, and an ordinary code fetch.
+    assert_eq!(armed(FIRMWARE_FETCH_WINDOW_START - 1), None);
+    assert_eq!(
+        armed(FIRMWARE_FETCH_WINDOW_START + FIRMWARE_FETCH_WINDOW_LEN),
+        None
+    );
+    assert_eq!(armed(0x0002_1234), None);
+
+    // An already-armed call is never overwritten, inside the window or out.
+    for linear in [
+        BIOS32_DIRECTORY_LINEAR,
+        BIOS32_PCI_LINEAR,
+        FIRMWARE_FETCH_WINDOW_START - 1,
+        0x0002_1234,
+    ] {
+        let mut machine = test_machine();
+        machine.pending_bios32 = Some(Bios32Call::Directory);
+        with_bus(&mut machine, |bus| bus.note_code_fetch_linear(linear));
+        assert_eq!(machine.pending_bios32, Some(Bios32Call::Directory));
+    }
+}
