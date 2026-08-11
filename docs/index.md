@@ -18,8 +18,6 @@ installation instructions. These pages are the machine's manuals.
 
 - **[Izarra 3000 user manual](izarra-3000/user-manual.md)**, the machine
   itself: powering on, the POST screen, the boot menu, and the setup panel.
-- **[Company story](izarra-3000/company-story.md)**: where the Izarra 3000
-  and Toka-DOS came from.
 - **[Using Toka-DOS](toka-dos/using-toka-dos.md)**: the bundled operating
   system, its shell, and its disk layout.
 - **[DOS command reference](toka-dos/commands.md)**: every shipped

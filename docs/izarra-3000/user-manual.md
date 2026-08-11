@@ -22,8 +22,7 @@ one machine, and this manual documents that machine.
 | Firmware | 2 MB ROM with the Izarra BIOS, Toka-DOS (FreeDOS-based), and bundled tools. |
 | I/O | PS/2 keyboard and mouse, serial, parallel, VGA, rear MPU-401/gameport, line out, line in. |
 
-See the [company story](company-story.md) for where the machine came from, and
-the [DOS command reference](../toka-dos/commands.md) for the software side.
+See the [DOS command reference](../toka-dos/commands.md) for the software side.
 
 ## Powering on: the POST screen
 

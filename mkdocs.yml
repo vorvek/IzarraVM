@@ -8,9 +8,7 @@ theme:
   name: readthedocs
 nav:
   - Home: index.md
-  - Izarra 3000:
-      - User manual: izarra-3000/user-manual.md
-      - Company story: izarra-3000/company-story.md
+  - Izarra 3000 user manual: izarra-3000/user-manual.md
   - Toka-DOS:
       - Using Toka-DOS: toka-dos/using-toka-dos.md
       - Command reference: toka-dos/commands.md
