@@ -2196,15 +2196,35 @@ fn pump_audio(
     midi_receiver.set_gain(midi_gain);
     wavetable.render(&mut pcm, guest_tick);
     midi_receiver.render(&mut pcm, guest_tick);
-    for (l, r) in &mut pcm {
-        *l = (*l as f32 * gain)
-            .round()
-            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-        *r = (*r as f32 * gain)
-            .round()
-            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-    }
+    // Last, and after both MIDI legs have added themselves, so the knob covers
+    // everything the host is about to play.
+    apply_speaker_gain(&mut pcm, gain);
     sink.queue(&pcm);
+}
+
+/// Apply the host playback level to a finished frame buffer, in place.
+///
+/// The knob goes above unity, so this multiply can leave full scale, and what
+/// happens then is the whole point of the function: it SATURATES. A sample that
+/// wants to be louder than the sink can carry is pinned at the rail, which is
+/// what a driven amplifier does. Letting the value wrap instead -- which is what
+/// a plain narrowing multiply in integer arithmetic gives -- would turn a loud
+/// passage's peaks inside out and read as violent distortion rather than as the
+/// clipping it is.
+///
+/// The machine's own summing node already clamps its mix; this is the host-side
+/// multiply that happens after it, on the machine's PCM and the MIDI engines'
+/// additions alike.
+fn apply_speaker_gain(pcm: &mut [(i16, i16)], gain: f32) {
+    let scale = |sample: i16| -> i16 {
+        (sample as f32 * gain)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    };
+    for (l, r) in pcm {
+        *l = scale(*l);
+        *r = scale(*r);
+    }
 }
 
 fn pump_midi(machine: &mut Machine, wavetable: &mut MidiEngine, midi_receiver: &mut MidiEngine) {

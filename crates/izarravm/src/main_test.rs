@@ -1401,3 +1401,86 @@ fn the_audio_wav_capture_writes_distinct_left_and_right_channels() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `IZARRAVM_AUDIO_WAV` capture records the MACHINE's output, not the host's
+/// speakers, so the GUI's volume knob must never reach it.
+///
+/// The knob is a host playback level applied after `render_audio`, and it now
+/// goes to 5x. If it ever leaked into the capture, a WAV would stop being
+/// evidence about the machine: two recordings of the same title would differ by
+/// whatever the panel happened to be set to, and one taken with the knob up
+/// would show clipping the machine never produced. The capture takes its samples
+/// straight from `render_audio` and this is the assertion that says so -- the
+/// captured peak is the machine's own peak, unscaled.
+///
+/// Non-vacuous by construction: the guest drives the PC speaker, so the mix is
+/// loud enough that any factor other than 1.0 would move the peak.
+#[test]
+fn the_audio_wav_capture_records_the_machine_unscaled_by_the_host_volume_knob() {
+    // The profile the capture is told about and the profile the machine is
+    // actually built with have to be the same CPU, or the capture paces its
+    // window off a clock the guest is not running at.
+    let hardware = HardwareProfile {
+        cpu: GswMode::Gsw386,
+        memory_mib: 16,
+        video: VideoCard::Vega,
+        sound_blaster: izarravm_core::SoundBlasterConfig::default(),
+        wss: izarravm_core::WssConfig::default(),
+    };
+    let dir = munt_test_dir("audio-capture-no-host-gain");
+    let clock_hz = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1);
+    let ten_ms = clock_hz / 100;
+
+    // PIT channel 2 as a ~1 kHz square wave, then port 0x61 bits 0 (gate) and
+    // 1 (data enable): the beeper, driven from the guest the way a DOS program
+    // drives it. Then spin.
+    const BEEP: &[u8] = &[
+        0xB0, 0xB6, // mov al, 0xB6   -- channel 2, mode 3, lobyte/hibyte
+        0xE6, 0x43, // out 0x43, al
+        0xB0, 0xA9, // mov al, 0xA9   -- divisor 0x04A9 = 1193
+        0xE6, 0x42, // out 0x42, al
+        0xB0, 0x04, // mov al, 0x04
+        0xE6, 0x42, // out 0x42, al
+        0xB0, 0x03, // mov al, 0x03   -- gate + data enable
+        0xE6, 0x61, // out 0x61, al
+        0xEB, 0xFE, // jmp $
+    ];
+    let build = || {
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), BEEP)
+            .expect("build raw machine")
+    };
+    let peak = |pcm: &[(i16, i16)]| -> i32 {
+        pcm.iter()
+            .map(|(l, r)| (*l as i32).abs().max((*r as i32).abs()))
+            .max()
+            .unwrap_or(0)
+    };
+
+    // Through the capture, the way a headless run records.
+    let mut machine = build();
+    let mut capture = Some(AudioCapture::new(dir.join("beep.wav"), &hardware));
+    for _ in 0..5 {
+        run_sliced(&mut machine, ten_ms, &mut capture).unwrap();
+    }
+    let captured = peak(&capture.as_ref().unwrap().pcm);
+
+    // Straight off the machine, no capture in the path at all.
+    let mut reference = build();
+    let mut direct: Vec<(i16, i16)> = Vec::new();
+    for _ in 0..5 {
+        reference.run_until_halt_or_cycles(ten_ms).unwrap();
+        direct.extend(reference.render_audio(497));
+    }
+    let unscaled = peak(&direct);
+
+    assert!(
+        unscaled > 0,
+        "the beeper must actually reach render_audio, or this test proves nothing"
+    );
+    assert_eq!(
+        captured, unscaled,
+        "the capture is the machine's own mix at unity -- no host playback level"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

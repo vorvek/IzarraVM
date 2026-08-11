@@ -85,7 +85,8 @@ A TOML file holding GUI preferences that are meant to survive between runs:
 
 Every field has a default, so an old or partial `izarravm.conf` still loads
 cleanly after an upgrade. Master volume is the only audio level kept here: it is
-the host's playback level. `amp_gain`, `output_gain` and `pc_speaker_volume`
+the host's playback level, 0.0 to 5.0 with 1.0 as unity (see "The volume knob"
+below). `amp_gain`, `output_gain` and `pc_speaker_volume`
 named levels inside the machine's own mixer and are retired -- a file that still
 carries them loads, logs one line naming them, and drops them on the next save.
 Those levels are set from DOS with `SNDMIXER`, on the card's own registers,
@@ -184,11 +185,42 @@ A CD image and a CD folder are mutually exclusive. Mounting one clears the
 other. There is no equivalent host-folder option for the floppy drive; A:
 only takes image files.
 
+## The volume knob
+
+The slider on the control panel is the host's playback level: the powered
+speakers the machine's line-out feeds. It is applied to the finished mix on its
+way to the sound device, it covers the machine's own output and both MIDI
+synthesisers together, and it is the only audio level the emulator itself owns.
+Every level inside the machine -- the card's output stage, the PC speaker's leg,
+the balance between sources -- is a ReSonique 2 mixer register that `SNDMIXER`
+sets from DOS. The headless `IZARRAVM_AUDIO_WAV` capture records the machine's
+output and is deliberately taken ahead of this knob, so a recording does not
+change when you move the slider.
+
+The travel runs from 0% to 500%, and the value box reads in percent. 100% is
+unity: the mix reaches the sound device exactly as the machine produced it, and
+the slider steps in whole percent so 100% can be set exactly. Below 100% the
+knob follows a perceptual taper. At and above 100% the reading is the
+multiplication factor -- 200% is twice line level, 500% is five times, +14 dB.
+
+The ceiling is chosen from the quietest well-behaved case. A title whose own
+setup program is at maximum still writes an output level of 27 to the card's
+CT1745 mixer, which is 8 dB of attenuation, and the mix reserves a further 6 dB
+of headroom below full scale. Its peaks therefore arrive 14 dB down, and 500%
+puts them back at the rail.
+
+Gain above 100% can drive samples past what the sound device can carry. Those
+samples are held at full scale rather than allowed to wrap, so an overdriven
+passage clips the way a driven amplifier clips. The knob is stored in
+`izarravm.conf` as `master_volume`, where 1.0 is unity; a file written by an
+earlier version, which could only save 0.0 to 1.0, loads to the level it always
+meant.
+
 ## Other GUI features
 
 - A collapsible beige control panel below the display, with activity LEDs
   for the floppy and the C: drive.
-- A master volume slider.
+- A master volume slider (above).
 - A COM1 serial log window: a floating, resizable panel showing what the
   guest has written to the emulated serial port, useful for anything that
   logs there instead of the screen.

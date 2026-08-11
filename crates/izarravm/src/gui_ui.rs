@@ -229,15 +229,33 @@ impl GuiApp {
                 // line-out feeds -- applied to the finished mix on its way to the
                 // sound device. The levels inside the machine are the guest's,
                 // on the card's own mixer, and SNDMIXER.COM sets them.
+                //
+                // The travel runs past unity to MAX_VOLUME, the way a powered
+                // speaker's knob does: a title that maxes its own mixer can still
+                // arrive 14 dB down (see `volume_gain`). The value box reads in
+                // percent so the neutral point is named, and the 0.01 step means
+                // every position the knob can hold is a whole percent -- keyboard
+                // arrows and typed values land on one, and 100% is reachable
+                // exactly rather than approached.
+                //
+                // The box is editable, so it needs a parser in the units it
+                // prints as much as it needs the formatter; `volume_percent_to_
+                // fraction` says what egui's default gets wrong.
                 ui.horizontal(|ui| {
                     volume_icon(ui);
                     ui.add_space(4.0);
-                    ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(40.0);
+                    ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(40.0);
                     let slider = ui
-                        .add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
+                        .add(
+                            egui::Slider::new(&mut self.volume, 0.0..=MAX_VOLUME)
+                                .step_by(0.01)
+                                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                                .custom_parser(volume_percent_to_fraction),
+                        )
                         .on_hover_text(
-                            "Speaker volume. This is the host's playback level; the machine's \
-                             own mixer levels are set in DOS with SNDMIXER.",
+                            "Speaker volume. This is the host's playback level; 100% is unity and \
+                             above it amplifies. The machine's own mixer levels are set in DOS \
+                             with SNDMIXER.",
                         );
                     if slider.changed() {
                         self.gain.set(volume_gain(self.volume));

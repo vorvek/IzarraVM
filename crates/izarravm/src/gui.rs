@@ -11,7 +11,7 @@ mod ui;
 pub use runtime::run;
 
 use crate::host_input::HostInputPolicy;
-use crate::prefs::{CrtStyle, GuiPrefs, KeyBinding};
+use crate::prefs::{CrtStyle, GuiPrefs, KeyBinding, MAX_VOLUME};
 use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioPlayer, MidiEngine};
 use izarravm_core::{GswMode, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
@@ -36,10 +36,43 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-/// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
-/// perceptual curve; swap it for a proper dB map if it ever matters.
+/// Map the master-volume slider to a linear audio gain.
+///
+/// The knob stands for the powered speakers the machine's line-out feeds, and
+/// such a knob has travel past line level. Below the 100% detent the curve is
+/// the cubic perceptual taper it has always been, so a `master_volume` saved by
+/// an older build still means exactly what it meant. At and above the detent the
+/// knob reads directly: 100% is unity, 300% is three times, 500% is five.
+///
+/// Five times is [`MAX_VOLUME`], which is +14 dB, and the arithmetic behind that
+/// ceiling is in `docs/izarravm-gui/guide.md`: a title that maxes its own mixer
+/// still leaves the card at CT1745 level 27 (-8 dB) under the mix's deliberate
+/// -6 dB headroom reserve, so the worst well-behaved case arrives 14 dB down.
 fn volume_gain(volume: f32) -> f32 {
-    volume.clamp(0.0, 1.0).powi(3)
+    let volume = volume.clamp(0.0, MAX_VOLUME);
+    if volume < 1.0 { volume.powi(3) } else { volume }
+}
+
+/// Read a volume back out of the slider's value box, in the units it prints.
+///
+/// The box is editable and it displays "80%" over a stored 0.8. egui's stock
+/// parser is a plain float parse, which gets both halves of that wrong. It
+/// rejects the "%" the box seeds itself with, so pressing Enter on text the user
+/// never edited silently does nothing. And it reads a typed `100` as the number
+/// one hundred: on a knob that used to stop at 1.0 that clamped harmlessly to
+/// unity, but the travel now goes to five, so typing the neutral setting would
+/// land at five times it.
+///
+/// Parsing in the printed units fixes both: strip one optional trailing "%",
+/// read the number, divide. Anything that is not a number is rejected, which is
+/// what tells egui to leave the value alone.
+fn volume_percent_to_fraction(text: &str) -> Option<f64> {
+    text.trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|percent| percent / 100.0)
 }
 
 /// Ceiling on how often accumulated mouse motion is flushed into the guest,
@@ -567,8 +600,9 @@ pub struct GuiApp {
     // Whether the floating License (GPL-3.0-only) window is open. The About window's
     // "View license" button and the window's own close control flip this.
     show_license: bool,
-    // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
-    // the emulation thread reads through `gain`.
+    // Master volume slider position, 0.0..MAX_VOLUME, where 1.0 is unity.
+    // Mapped by `volume_gain` into a host-side gain that the emulation thread
+    // reads through `gain`.
     volume: f32,
     // The shared master gain (curved volume slider), read each audio pump. This
     // is the HOST's level: the powered speakers the machine's line-out feeds,
@@ -916,7 +950,7 @@ impl GuiApp {
         if !audio.is_playing() {
             warn!("no audio output device; the machine will play to one if it appears");
         }
-        let volume = prefs.master_volume.clamp(0.0, 1.0);
+        let volume = prefs.master_volume.clamp(0.0, MAX_VOLUME);
         let gain = SharedGain::new(volume_gain(volume));
         let initial_media = prepare_initial_media(cd_image, &prefs);
         let spec = SessionSpec {
