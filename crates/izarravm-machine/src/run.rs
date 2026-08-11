@@ -1038,6 +1038,10 @@ impl Machine {
                     toka_service_status: *toka_service_status,
                     unittester,
                     wait_states: profile.wait_states,
+                    icache_fetch_clocks: u64::from(izarravm_bus::BusCycle::clocks_for(
+                        BusWidth::Byte,
+                        cache_model.code_fetch_wait_states(),
+                    )),
                     cache: cache_model,
                     flat_data_cost: active_mode.uses_approximate_timing(),
                     lazy_port_reads: active_mode.uses_approximate_timing(),

@@ -3385,3 +3385,47 @@ fn a_second_identical_blit_in_one_batch_restamps_the_origin() {
         "BUSY must clear once the second operation is done"
     );
 }
+
+/// A3: `MachineBus::icache_fetch_clocks` is the per-persona I-cache fetch cost, snapshotted at
+/// bus construction so the conventional-RAM arm of `charge_physical_instruction_fetch_run` is
+/// one add instead of a chase through the cache model. Two things have to hold for every
+/// persona, and this checks both against the LIVE model rather than a table: the charge equals
+/// `clocks_for(Byte, code_fetch_wait_states())`, and it is the same on the tracing arm (which
+/// still reads the wait-state, so a stale snapshot would make the two arms disagree).
+///
+/// Personas are looped because the value is the only thing that distinguishes them here: a
+/// snapshot taken from the wrong model, or not refreshed on a mode change, shows up as one
+/// persona charging another's constant. (`Machine::set_mode` rewrites `cache_model`, and a bus
+/// cannot outlive it -- `make_bus` borrows the machine mutably -- which is what makes the
+/// snapshot sound; the `debug_assert` in the fast arm is the standing check.)
+#[test]
+fn cached_icache_fetch_cost_matches_the_live_model_in_every_persona() {
+    use izarravm_bus::BusCycle;
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        let expected = u64::from(BusCycle::clocks_for(
+            BusWidth::Byte,
+            machine.cache_model.code_fetch_wait_states(),
+        ));
+
+        for tracing in [TracingMode::Off, TracingMode::Counts, TracingMode::Full] {
+            machine.trace.set_tracing_mode(tracing);
+            with_bus(&mut machine, |bus| {
+                let before = bus.trace.elapsed_clocks();
+                bus.charge_physical_instruction_fetch_run(0x0002_0000, 4)
+                    .unwrap();
+                assert_eq!(
+                    bus.trace.elapsed_clocks() - before,
+                    expected,
+                    "{mode:?}/{tracing:?}: one collapsed I-cache access at the persona's constant"
+                );
+            });
+        }
+    }
+}

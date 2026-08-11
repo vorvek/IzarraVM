@@ -2818,6 +2818,15 @@ struct MachineBus<'a> {
     // warms it via data_access_wait_states, and the resolved tier's calibrated cost
     // is the charged wait-state.
     cache: &'a mut CacheModel,
+    /// The clocks ONE cacheable-RAM instruction fetch costs: `clocks_for(Byte,
+    /// cache.code_fetch_wait_states())`, resolved once per batch instead of per
+    /// instruction. Code is assumed I-cache-resident, so this is a per-persona
+    /// constant with no tag check (`CacheModel::code_fetch_wait_states`) and it
+    /// is rewritten only by `CacheModel::set_mode`, which cannot run while a
+    /// `MachineBus` is borrowed. Same construction-time snapshot discipline as
+    /// `flat_data_cost`; `charge_physical_instruction_fetch_run`'s conventional-RAM
+    /// arm carries the matching `debug_assert` against the live model.
+    icache_fetch_clocks: u64,
     /// True in the Approximate timing class (486/586): data accesses charge a flat
     /// cost and skip the per-access cache-tier tag arrays. False in the Accurate
     /// 386 class and forced false by the bandwidth diagnostic so its tier

@@ -358,6 +358,10 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
     let beam_at_batch_start = machine.vega.beam_dots();
     let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
     let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.cpu.level());
+    let icache_fetch_clocks = u64::from(izarravm_bus::BusCycle::clocks_for(
+        BusWidth::Byte,
+        machine.cache_model.code_fetch_wait_states(),
+    ));
     let mut bus = MachineBus {
         memory: &mut machine.memory,
         ram_lookup: &mut machine.ram_lookup,
@@ -402,6 +406,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         unittester: &mut machine.unittester,
         wait_states: machine.profile.wait_states,
         cache: &mut machine.cache_model,
+        icache_fetch_clocks,
         flat_data_cost: machine.active_mode.uses_approximate_timing(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
         lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),

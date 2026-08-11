@@ -62,6 +62,13 @@ impl Machine {
         // Read from the CPU, the same authoritative mode owner that scale_bus
         // uses. Machine's active_mode copy is kept for bus register readback.
         let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
+        // The per-persona I-cache fetch cost, snapshotted for the batch alongside the bus scale
+        // (see `MachineBus::icache_fetch_clocks`). Captured here because `cache_model` is also
+        // mutably borrowed by the literal below.
+        let icache_fetch_clocks = u64::from(izarravm_bus::BusCycle::clocks_for(
+            BusWidth::Byte,
+            self.cache_model.code_fetch_wait_states(),
+        ));
         MachineBus {
             memory: &mut self.memory,
             ram_lookup: &mut self.ram_lookup,
@@ -106,6 +113,7 @@ impl Machine {
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
+            icache_fetch_clocks,
             flat_data_cost: self.active_mode.uses_approximate_timing(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
@@ -1362,11 +1370,27 @@ impl CpuBus for MachineBus<'_> {
         if let Some(end) = physical_start.checked_add(count - 1)
             && end < 0x000A_0000
         {
-            self.trace.record_instruction_fetch_run(
-                physical_start,
-                1,
-                self.cache.code_fetch_wait_states(),
+            debug_assert_eq!(
+                self.icache_fetch_clocks,
+                u64::from(izarravm_bus::BusCycle::clocks_for(
+                    BusWidth::Byte,
+                    self.cache.code_fetch_wait_states()
+                )),
+                "icache_fetch_clocks is stale relative to the live cache model; a mode change \
+                 landed without rebuilding the bus"
             );
+            // The whole charge is one add of a per-batch constant. The wait-state itself is only
+            // needed to DESCRIBE the cycle, so it is read (chasing `cache`) exclusively on the
+            // tracing arm, which the default build never takes.
+            if self.trace.tracing_mode() == TracingMode::Off {
+                self.trace.add_elapsed_clocks(self.icache_fetch_clocks);
+            } else {
+                self.trace.record_instruction_fetch_run(
+                    physical_start,
+                    1,
+                    self.cache.code_fetch_wait_states(),
+                );
+            }
             return Ok(());
         }
         let first = self.apply_a20(physical_start);
