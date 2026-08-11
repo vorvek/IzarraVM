@@ -53,7 +53,7 @@ reproduces the Izarra 3000 exactly as it was built.
 
 | Area | Izarra 3000 hardware |
 | --- | --- |
-| CPU | GSW-586 at 166 MHz on a 66 MHz bus, a Pentium-class part with an x87 unit and no SIMD extension. The BIOS or the bundled GSWMODE tool can throttle it to a 486DX2-like at 66 MHz, a 386DX-like at 22 MHz, or the same 386 ISA at 7.33 MHz without rebooting. |
+| CPU | GSW-586 at 166 MHz (32KB L1 cache and a massive 512KB L2 cache) on a 66 MHz bus, a capable Pentium-class part with an x87 unit but no SIMD extension. The BIOS or the bundled GSWMODE tool can throttle it to a 486DX2-like at 66 MHz, a 386DX-like at 22 MHz, or the same 386 ISA at 7.33 MHz without rebooting. |
 | Memory | 64 MB PC100 SDRAM. |
 | Graphics | VEGA chipset: Margo 2D with a 4 MB frame store; Distira 3D with a 2 MB framebuffer and 2 MB per TMU; VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio (PCM and Creative ADPCM), OPL3 FM, pin headers for a wavetable daughterboard, and a rear MPU-401/gameport. |
