@@ -3981,3 +3981,71 @@ fn record_write_page_early_out_tracks_the_same_pages_as_a_full_scan() {
     );
     assert_eq!(cpu.written_pages[0], Some(0x30));
 }
+
+/// A7: `range_hits_code` answers a non-crossing 1/2/4-byte range with one masked word test
+/// instead of a per-byte loop. `code_write_watched` asks it on every guest store, so the fast
+/// arm has to agree with the per-byte definition EVERYWHERE, and the two places it could
+/// silently disagree are the 64-byte word boundary (a straddling range needs both words) and
+/// the `SMC_BYTE_COVERAGE` edge (past it the answer comes from the page bitmap, not the byte
+/// bitmap).
+///
+/// So this walks both boundaries with every width, marking one byte at a time, and compares
+/// against the per-byte oracle spelled out here rather than against the function's own
+/// fallback.
+#[test]
+fn range_hits_code_masked_test_matches_the_per_byte_definition_at_both_edges() {
+    // Marked bytes are placed to sit on every interesting offset: the last byte of a word, the
+    // first byte of the next word, the last byte inside the byte-granular window, and the first
+    // byte past it (which is only representable in the page bitmap).
+    let marks = [
+        64 * 4 - 1,
+        64 * 4,
+        64 * 4 + 1,
+        SMC_BYTE_COVERAGE - 1,
+        SMC_BYTE_COVERAGE,
+        SMC_BYTE_COVERAGE + 1,
+    ];
+
+    for mark in marks {
+        let mut cache = DecodeCache::new(2);
+        cache.mark_code_range(mark, 1);
+
+        // Every start within 8 bytes below each edge, every width the callers use plus the wide
+        // forms that must take the fallback.
+        for base in [64u32 * 4, SMC_BYTE_COVERAGE] {
+            for start in base - 8..base + 8 {
+                for width in [1u32, 2, 3, 4, 5, 8] {
+                    // Oracle: the per-byte definition, independent of the function under test.
+                    let expected = (0..width).any(|i| {
+                        let addr = start.wrapping_add(i);
+                        if addr < SMC_BYTE_COVERAGE {
+                            cache.code_bytes[(addr >> 6) as usize] & (1u64 << (addr & 63)) != 0
+                        } else {
+                            let page = addr >> 12;
+                            cache.code_pages[(page >> 6) as usize] & (1u64 << (page & 63)) != 0
+                        }
+                    });
+                    assert_eq!(
+                        cache.range_hits_code(start, width),
+                        expected,
+                        "mark={mark:#x} start={start:#x} width={width}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The fast arm must actually be reachable and must actually answer true: a 4-byte range that
+    // fits in one word, inside the coverage window, over a marked byte.
+    let mut cache = DecodeCache::new(2);
+    cache.mark_code_range(0x1_0002, 1);
+    assert!(cache.range_hits_code(0x1_0000, 4), "aligned dword sees it");
+    assert!(
+        !cache.range_hits_code(0x1_0004, 4),
+        "the next dword does not"
+    );
+    // Exactly filling a word from bit 60, and exactly ending at the coverage edge: both are the
+    // widest ranges the fast arm may take.
+    assert!(!cache.range_hits_code(0x1_003c, 4));
+    assert!(!cache.range_hits_code(SMC_BYTE_COVERAGE - 4, 4));
+}
