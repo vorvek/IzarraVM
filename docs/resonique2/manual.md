@@ -279,7 +279,8 @@ recording, external clock sync, metronome input, or MPU reference filters.
 
 IzarraVM supplies the fitted daughterboard and external receiver separately.
 See the [GUI guide](../izarravm-gui/guide.md#the-config-modal) for those
-host-side settings and status messages.
+host-side settings and status messages, and the [recipes](../recipes/index.md)
+for the procedures that use them.
 
 ## Next
 

@@ -29,6 +29,20 @@ installation instructions. These pages are the machine's manuals.
 - **[Troubleshooting & FAQ](troubleshooting.md)**: common problems and what
   to try.
 
+## Recipes
+
+Task-oriented procedures, as opposed to the reference manuals below.
+
+- **[Recipes index](recipes/index.md)**: all of them.
+- **[Using your own MIDI player](recipes/host-midi-player.md)**: send the
+  guest's MPU-401 music to a player on the host.
+- **[The Roland Sound Canvas VSTi](recipes/sound-canvas-vsti.md)**: that route,
+  ending at SC-55/88-class playback.
+- **[Nuked-SC55 for Sound Canvas playback](recipes/nuked-sc55.md)**: the same
+  instrument, emulated from its own ROMs.
+- **[MT-32 ROMs with the P330 receiver](recipes/mt32-roms.md)**: what the ROM
+  loader accepts, and what each failure means.
+
 ## Hardware manuals
 
 - **[IZBIOS Configuration Panel guide](izbios/configuration-panel.md)**: a

@@ -168,6 +168,10 @@ the saved GUI preference, and finally the built-in default.
 
 Accept applies your changes and closes the modal; Cancel discards them.
 
+For step-by-step procedures built on these settings -- routing P330 to a player
+on the host, or loading an MT-32 ROM set -- see the
+[recipes](../recipes/index.md).
+
 ## Mounting removable media
 
 **Floppy (A:)**: accepts `.img`, `.ima`, and `.flp` disk images through a
