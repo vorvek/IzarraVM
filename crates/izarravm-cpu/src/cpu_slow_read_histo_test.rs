@@ -92,6 +92,40 @@ fn slow_reads_bucket_by_linear_page_and_sort_by_count() {
         Some(vec![(0x2, 9), (0x4, 7), (0x1, 2)])
     );
     assert_eq!(cpu.perf.data_slow_reads, 18);
+    // Every read above is a byte read, which is aligned by definition.
+    assert_eq!(cpu.slow_read_alignment(), Some((0, 18)));
+}
+
+#[test]
+fn the_alignment_split_separates_should_split_from_a_non_direct_region() {
+    // The distinction N2 turns on. Both of these reads land in `data_slow_reads` and both would
+    // raise `jit_direct_exit_cross_page_or_alignment`, but one is refused because its ADDRESS is
+    // odd for its width and the other because its PAGE is not direct RAM -- and they want opposite
+    // slices. Page 6 is direct here, so only `should_split`'s shape can refuse the word read.
+    let (mut cpu, mut bus) = cpu_and_bus(&[0x1]);
+    cpu.set_slow_read_histo_enabled(true);
+
+    // Odd address, word width, on a page the bus is happy to serve directly.
+    cpu.read_memory_sized(
+        &mut bus,
+        SegmentIndex::Ds,
+        0x6001,
+        OperandSize::Word,
+        BusAccessKind::DataRead,
+    )
+    .unwrap();
+    // Even address, word width, on the page the bus refuses.
+    cpu.read_memory_sized(
+        &mut bus,
+        SegmentIndex::Ds,
+        0x1002,
+        OperandSize::Word,
+        BusAccessKind::DataRead,
+    )
+    .unwrap();
+
+    assert_eq!(cpu.slow_read_alignment(), Some((1, 2)));
+    assert_eq!(cpu.slow_read_histo(), Some(vec![(0x1, 1), (0x6, 1)]));
 }
 
 #[test]

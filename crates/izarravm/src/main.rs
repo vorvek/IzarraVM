@@ -2068,7 +2068,13 @@ fn maybe_report_slow_read_histo(machine: &Machine) {
     let Some(pages) = machine.slow_read_histo() else {
         return;
     };
-    for line in slow_read_histo_lines(&pages, machine.cpu().perf_counters().data_slow_reads) {
+    let (misaligned, seen) = machine.slow_read_alignment().unwrap_or((0, 0));
+    for line in slow_read_histo_lines(
+        &pages,
+        machine.cpu().perf_counters().data_slow_reads,
+        misaligned,
+        seen,
+    ) {
         println!("{line}");
     }
 }
@@ -2093,7 +2099,12 @@ const SLOW_READ_REGIONS: [(&str, u32, u32); 6] = [
 /// The total line is not decoration. One `data_slow_reads` contributor -- the REP CMPS destination
 /// read in `strings.rs` -- is deliberately not bucketed because it holds a PHYSICAL address, so
 /// the two numbers agreeing is what licenses reading the region split as the whole story.
-fn slow_read_histo_lines(pages: &[(u32, u64)], data_slow_reads: u64) -> Vec<String> {
+fn slow_read_histo_lines(
+    pages: &[(u32, u64)],
+    data_slow_reads: u64,
+    misaligned: u64,
+    seen: u64,
+) -> Vec<String> {
     let mut lines = Vec::new();
     let bucketed: u64 = pages.iter().map(|&(_, count)| count).sum();
     for &(name, first, last) in &SLOW_READ_REGIONS {
@@ -2118,6 +2129,14 @@ fn slow_read_histo_lines(pages: &[(u32, u64)], data_slow_reads: u64) -> Vec<Stri
             page << 12
         ));
     }
+    let misaligned_pct = if seen == 0 {
+        0.0
+    } else {
+        misaligned as f64 * 100.0 / seen as f64
+    };
+    lines.push(format!(
+        "slow_read_align misaligned={misaligned} of={seen} pct={misaligned_pct:.2}"
+    ));
     lines.push(format!(
         "slow_read_total bucketed={bucketed} data_slow_reads={data_slow_reads} distinct_pages={}",
         pages.len()

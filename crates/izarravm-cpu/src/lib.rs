@@ -1144,8 +1144,28 @@ fn slow_read_histo_default() -> bool {
 /// an inline `Option<HashMap>` would put 48 bytes of a default-OFF diagnostic in that struct where
 /// a nullable pointer needs eight. The armed case pays one extra allocation, once.
 #[derive(Default)]
-#[allow(clippy::box_collection)]
-pub(crate) struct SlowReadHisto(pub(crate) Option<Box<std::collections::HashMap<u32, u64>>>);
+pub(crate) struct SlowReadHisto(pub(crate) Option<Box<SlowReadTally>>);
+
+/// What an armed [`SlowReadHisto`] accumulates.
+///
+/// The alignment split is not decoration, and it is the field that turned N2 around. The JIT-side
+/// counter this instrument shadows is `jit_direct_exit_cross_page_or_alignment` -- ONE counter for
+/// two unrelated causes -- and on the machine bus `direct_page_ram_bytes` refuses an access for
+/// either `should_split` (a word at an odd address, a dword off a multiple of four) or a page
+/// crossing, before `ram_lookup_page_is_direct` is even consulted. A page table alone therefore
+/// cannot distinguish "this REGION is not direct RAM" from "this ACCESS is not naturally aligned",
+/// and those want opposite slices.
+#[derive(Default)]
+pub(crate) struct SlowReadTally {
+    /// Non-direct data reads by 4 KiB linear page.
+    pub(crate) pages: std::collections::HashMap<u32, u64>,
+    /// Of those, the ones whose linear address was not naturally aligned for their width. A byte
+    /// read is aligned by definition and never counted here.
+    pub(crate) misaligned: u64,
+    /// Every non-direct data read seen, so `misaligned` has its own denominator and does not have
+    /// to be summed out of `pages`.
+    pub(crate) total: u64,
+}
 
 impl SlowReadHisto {
     /// Armed from the environment, once per process.
@@ -1172,7 +1192,10 @@ impl std::fmt::Debug for SlowReadHisto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlowReadHisto")
             .field("enabled", &self.0.is_some())
-            .field("pages", &self.0.as_ref().map_or(0, |histo| histo.len()))
+            .field(
+                "pages",
+                &self.0.as_ref().map_or(0, |tally| tally.pages.len()),
+            )
             .finish()
     }
 }

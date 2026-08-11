@@ -534,6 +534,11 @@ impl Machine {
         self.cpu.slow_read_histo()
     }
 
+    /// `(misaligned, total)` over the same reads. See `CpuGsw::slow_read_alignment`.
+    pub fn slow_read_alignment(&self) -> Option<(u64, u64)> {
+        self.cpu.slow_read_alignment()
+    }
+
     fn consume_pending_device_memory_write_range(&mut self) {
         if let Some((physical, width)) = self.pending_device_memory_write_range.take() {
             self.cpu.note_device_memory_write_range(physical, width);

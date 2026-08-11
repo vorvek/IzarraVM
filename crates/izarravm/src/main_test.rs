@@ -1022,7 +1022,7 @@ fn slow_read_histo_lines_split_the_low_megabyte_into_the_regions_n2_asks_about()
         (0xf0, 10),  // BIOS
         (0x100, 1),  // first page above 1 MiB
     ];
-    let lines = slow_read_histo_lines(&pages, 960);
+    let lines = slow_read_histo_lines(&pages, 960, 900, 951);
     assert_eq!(
         lines[..6],
         [
@@ -1041,6 +1041,14 @@ fn slow_read_histo_lines_split_the_low_megabyte_into_the_regions_n2_asks_about()
     // The total line carries the histogram's own sum against `data_slow_reads`. They agree here;
     // a REP CMPS-heavy workload (whose destination read holds a physical address and is
     // deliberately not bucketed) shows up as a shortfall rather than as a mislabelled bucket.
+    // The alignment split is what separates `should_split` (a word at an odd address) from
+    // `ram_lookup_page_is_direct` (a region that is not direct RAM). Both refuse the same access
+    // and both land in `jit_direct_exit_cross_page_or_alignment`, which is one counter for two
+    // unrelated causes -- so the region table without this line cannot answer N2 at all.
+    assert_eq!(
+        lines[lines.len() - 2],
+        "slow_read_align misaligned=900 of=951 pct=94.64"
+    );
     assert_eq!(
         lines.last().unwrap(),
         "slow_read_total bucketed=951 data_slow_reads=960 distinct_pages=6"
@@ -1049,7 +1057,7 @@ fn slow_read_histo_lines_split_the_low_megabyte_into_the_regions_n2_asks_about()
     // A 40-page run prints the top 24 pages and no more; the six region lines and the total are
     // not part of that cap.
     let many: Vec<(u32, u64)> = (0..40u32).map(|i| (i, 100 - u64::from(i))).collect();
-    assert_eq!(slow_read_histo_lines(&many, 0).len(), 6 + 24 + 1);
+    assert_eq!(slow_read_histo_lines(&many, 0, 0, 0).len(), 6 + 24 + 2);
 }
 
 #[cfg(feature = "jit")]

@@ -540,13 +540,19 @@ impl CpuGsw {
         self.slow_read_histo.0.is_some()
     }
 
-    /// Bucket one non-direct data read's LINEAR page. Never called on a default run; see
-    /// `slow_read_histo_armed`. `#[cold]` so the arming test's not-taken side stays straight-line.
+    /// Bucket one non-direct data read by LINEAR page, and record whether it was naturally aligned
+    /// for `width`. Never called on a default run; see `slow_read_histo_armed`. `#[cold]` so the
+    /// arming test's not-taken side stays straight-line.
     #[cold]
     #[inline(never)]
-    pub(super) fn note_slow_read_page(&mut self, linear: u32) {
-        if let Some(histo) = self.slow_read_histo.0.as_mut() {
-            *histo.entry(linear >> 12).or_insert(0) += 1;
+    pub(super) fn note_slow_read_page(&mut self, linear: u32, width: BusWidth) {
+        if let Some(tally) = self.slow_read_histo.0.as_mut() {
+            *tally.pages.entry(linear >> 12).or_insert(0) += 1;
+            tally.total += 1;
+            // The same predicate `MachineBus::should_split` applies, restated on the CPU side
+            // rather than asked of the bus: a word off an odd address or a dword off a multiple of
+            // four is refused a direct page BEFORE the region test runs.
+            tally.misaligned += u64::from(linear & (width.bytes() - 1) != 0);
         }
     }
 
@@ -561,11 +567,21 @@ impl CpuGsw {
     /// `None` when the instrument was never armed, so a caller cannot print an empty table and
     /// read it as "no slow reads".
     pub fn slow_read_histo(&self) -> Option<Vec<(u32, u64)>> {
-        let histo = self.slow_read_histo.0.as_ref()?;
-        let mut pages: Vec<(u32, u64)> =
-            histo.iter().map(|(&page, &count)| (page, count)).collect();
+        let tally = self.slow_read_histo.0.as_ref()?;
+        let mut pages: Vec<(u32, u64)> = tally
+            .pages
+            .iter()
+            .map(|(&page, &count)| (page, count))
+            .collect();
         pages.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         Some(pages)
+    }
+
+    /// `(misaligned, total)` over the armed histogram's non-direct reads. `None` when the
+    /// instrument was never armed.
+    pub fn slow_read_alignment(&self) -> Option<(u64, u64)> {
+        let tally = self.slow_read_histo.0.as_ref()?;
+        Some((tally.misaligned, tally.total))
     }
 
     #[inline]
@@ -1022,7 +1038,7 @@ impl CpuGsw {
         let read = bus.read_memory_direct(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, read.direct);
         if self.slow_read_histo_armed() && !read.direct && kind == BusAccessKind::DataRead {
-            self.note_slow_read_page(linear);
+            self.note_slow_read_page(linear, BusWidth::Byte);
         }
         Ok(read.value as u8)
     }
@@ -1332,7 +1348,7 @@ impl CpuGsw {
         let read = bus.read_memory_direct(physical, width, kind)?;
         self.record_data_read(kind, read.direct);
         if self.slow_read_histo_armed() && !read.direct && kind == BusAccessKind::DataRead {
-            self.note_slow_read_page(linear);
+            self.note_slow_read_page(linear, width);
         }
         Ok(read.value)
     }
