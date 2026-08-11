@@ -1856,8 +1856,15 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 // difference between "the guest changed shape" and "we stopped being able to
                 // stay in a straight line". `brk_cont_decode_miss` rising with a falling
                 // instructions/entry implicates decode footprint; `brk_cont_not_continuable`
-                // rising implicates the SMC/dispatch path instead. They partition
-                // `straight_line_runs` except for the rare fatal-error run.
+                // rising implicates the SMC/dispatch path instead.
+                //
+                // These are TWO LEVELS, not one flat histogram. The partition of
+                // `straight_line_runs` (bar the rare fatal-error run) is
+                // {brk_decode_or_branch, brk_step, brk_interrupt, brk_cap, brk_halt}; the three
+                // `brk_cont_*` counters are the BREAKDOWN of `brk_decode_or_branch` alone, which
+                // is bumped on the same line pair as each of them (run.rs:706, 711, 716, 723,
+                // 770), so brk_decode_or_branch == cont_decode_miss + cont_not_continuable +
+                // cont_page_cross. Summing all eight double-counts every continuation break.
                 "straight_line_runs": mark.perf.straight_line_runs,
                 "brk_decode_or_branch": mark.perf.brk_decode_or_branch,
                 "brk_cont_decode_miss": mark.perf.brk_cont_decode_miss,
@@ -1884,8 +1891,10 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                     .perf
                     .jit_direct_unresolved_dynamic_miss_or_unbound,
                 "jit_direct_unresolved_dynamic_hidden": mark.perf.jit_direct_unresolved_dynamic_hidden,
-                // The data-side direct page cache. Its miss ratio is the working-set proxy
-                // that does not go through the decode table.
+                // The direct page cache. Its miss ratio is the working-set proxy that does not go
+                // through the decode table. NOT data-only: the instruction-prefetch refill bumps
+                // the same two counters (decode.rs:1158/:1168) on a fetch-page miss, so this ratio
+                // mixes code and data footprint and cannot be read as a pure data-side number.
                 "direct_page_hits": mark.perf.direct_page_hits,
                 "direct_page_misses": mark.perf.direct_page_misses,
                 "wipes_direct_map": mark.fast_map_audit.wipes_direct_map,
