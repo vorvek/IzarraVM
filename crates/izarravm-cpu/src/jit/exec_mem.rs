@@ -13,14 +13,36 @@ pub(crate) struct ExecutableBuffer {
 }
 
 /// Default virtual memory reserved for direct blocks. Each block owns one host page so completed
-/// blocks can be sealed Read+Execute while unused slots remain Read+Write.
+/// blocks can be sealed Read+Execute while unused slots remain Read+Write. 32,768 slots at 4 KiB.
 ///
-/// At 4 KiB pages this is 8,192 slots. Duke3D-486 fills them and then compacts 1,205 times in one
-/// BENCH2 demo, 6.7% of demo wall, because `arena_compaction_can_reclaim` admits a whole-arena
-/// rebuild for a single dead slot and mean occupancy at that moment is 95.9%
-/// (`dev_docs/duke3d-open-area-profile-results.md` §4). Compaction cost scales with LIVE bytes
-/// copied, not with arena size, so capacity is the cheap dial: see `executable_arena_len`.
-const DEFAULT_ARENA_MIB: usize = 32;
+/// RAISED 32 -> 128 MiB, MEASURED, not chosen. At 32 MiB (8,192 slots) duke3d-486 filled the arena
+/// and then compacted 1,205 times in one BENCH2 demo, because `arena_compaction_can_reclaim`
+/// admits a whole-arena rebuild for a single dead slot and mean occupancy at that moment was
+/// 95.9%: each rebuild copied 14.7 MB of live code to reclaim ~4% of the slots, and the next ~335
+/// installs refilled it. Compaction cost scales with LIVE bytes copied, not with arena size, so
+/// capacity is the cheap dial. Two independent A/B/B/A rounds against `IZARRAVM_JIT_ARENA_MIB`,
+/// one binary, `dev_docs/duke3d-open-area-profile-results.md` §9:
+///
+/// | | compactions | `arena_compaction_ns` | installs | min wall |
+/// |---|---|---|---|---|
+/// | duke3d-486 32 MiB | 1,205 | 4.10 s | 588,852 | 138.103 s |
+/// | duke3d-486 128 MiB | 19 | 0.17 s | 419,997 | 133.651 s (-3.22%) |
+/// | duke3d-586 32 -> 128 MiB | 3,021 -> 83 | 10.34 -> 0.98 s | 1.98 M -> 1.48 M | -4.16% |
+///
+/// The arms did not overlap across the eight duke3d-486 legs and every deterministic counter was
+/// byte-identical within each arm. doom-586 takes 2 compactions in a whole run, predicted no
+/// change and measured none (whole counter set byte-identical, frame hash unchanged).
+///
+/// What it COSTS, because a default is a posture: 128 MiB of commit charge instead of 32, and two
+/// arenas (256 MiB) live for the duration of a rebuild. Commit, not working set -- untouched slots
+/// have no physical backing -- but a long duke run does eventually touch most of it. Allocation
+/// failure still degrades rather than breaks: `ExecutableArena::new` returning `None` disables the
+/// backend, and `compact_arena` returning false falls back to `reset_storage`.
+///
+/// 64 MiB was measured too and is NOT past the knee (317 compactions, 2.31 s, 135.276 s min wall);
+/// the ladder is monotonic through 128. The remaining lever is sub-page packing: 54% of every slot
+/// is still padding at a 1,870-byte mean block, which no size change recovers.
+const DEFAULT_ARENA_MIB: usize = 128;
 const MIN_ARENA_MIB: usize = 8;
 /// Upper clamp on `IZARRAVM_JIT_ARENA_MIB`, set by two hard structural ceilings rather than taste:
 ///
