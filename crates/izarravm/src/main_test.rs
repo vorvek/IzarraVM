@@ -1484,3 +1484,80 @@ fn the_audio_wav_capture_records_the_machine_unscaled_by_the_host_volume_knob() 
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every counter the open-area profiling protocol correlates against must actually reach the
+/// series JSON. `PhaseMark.perf` carries the whole `PerfCounters` struct, so the failure mode
+/// this guards is silent: a column that is simply absent reads, downstream, as a counter that
+/// did not move. Each value below is distinct so a copy-paste between two keys fails here.
+#[test]
+fn phase_mark_series_carries_the_break_and_smc_scan_columns() {
+    let perf = izarravm_cpu::PerfCounters {
+        straight_line_runs: 900,
+        brk_decode_or_branch: 1,
+        brk_cont_decode_miss: 2,
+        brk_cont_not_continuable: 3,
+        brk_cont_page_cross: 4,
+        brk_step: 5,
+        brk_interrupt: 6,
+        brk_cap: 7,
+        brk_halt: 8,
+        smc_scan_calls: 9,
+        smc_scan_keys: 10,
+        smc_heat_chunks_hot: 11,
+        jit_direct_side_exits: 12,
+        jit_direct_unresolved_exits: 13,
+        jit_direct_unresolved_static_unbound: 14,
+        jit_direct_unresolved_static_hidden: 15,
+        jit_direct_unresolved_dynamic_miss_or_unbound: 16,
+        jit_direct_unresolved_dynamic_hidden: 17,
+        direct_page_hits: 18,
+        direct_page_misses: 19,
+        ..Default::default()
+    };
+
+    let mark = izarravm_machine::PhaseMark {
+        id: izarravm_machine::phase_mark::PERIODIC,
+        wall: std::time::Instant::now(),
+        master_ticks: 0,
+        elapsed_clocks: 0,
+        perf,
+        machine_phases: Default::default(),
+        katea: None,
+        io_stall_ticks: 0,
+        halted_ticks: 0,
+        int13: Default::default(),
+        fast_map_audit: Default::default(),
+        cpu_profile: None,
+    };
+
+    let rows = phase_mark_series_json(std::slice::from_ref(&mark));
+    let row = &rows[0];
+    for (key, expected) in [
+        ("straight_line_runs", 900),
+        ("brk_decode_or_branch", 1),
+        ("brk_cont_decode_miss", 2),
+        ("brk_cont_not_continuable", 3),
+        ("brk_cont_page_cross", 4),
+        ("brk_step", 5),
+        ("brk_interrupt", 6),
+        ("brk_cap", 7),
+        ("brk_halt", 8),
+        ("smc_scan_calls", 9),
+        ("smc_scan_keys", 10),
+        ("smc_heat_chunks_hot", 11),
+        ("jit_direct_side_exits", 12),
+        ("jit_direct_unresolved_exits", 13),
+        ("jit_direct_unresolved_static_unbound", 14),
+        ("jit_direct_unresolved_static_hidden", 15),
+        ("jit_direct_unresolved_dynamic_miss_or_unbound", 16),
+        ("jit_direct_unresolved_dynamic_hidden", 17),
+        ("direct_page_hits", 18),
+        ("direct_page_misses", 19),
+    ] {
+        assert_eq!(
+            row.get(key).and_then(|v| v.as_u64()),
+            Some(expected),
+            "{key} must be serialised into the phase-mark series"
+        );
+    }
+}

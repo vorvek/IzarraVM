@@ -1849,6 +1849,42 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "jit_direct_compile_ns": mark.perf.jit_direct_compile_ns,
                 "jit_direct_cache_resets": mark.perf.jit_direct_cache_resets,
                 "jit_direct_arena_compactions": mark.perf.jit_direct_arena_compactions,
+                // Batch-break histogram. These say what LIMITS batch length, which is the
+                // difference between "the guest changed shape" and "we stopped being able to
+                // stay in a straight line". `brk_cont_decode_miss` rising with a falling
+                // instructions/entry implicates decode footprint; `brk_cont_not_continuable`
+                // rising implicates the SMC/dispatch path instead. They partition
+                // `straight_line_runs` except for the rare fatal-error run.
+                "straight_line_runs": mark.perf.straight_line_runs,
+                "brk_decode_or_branch": mark.perf.brk_decode_or_branch,
+                "brk_cont_decode_miss": mark.perf.brk_cont_decode_miss,
+                "brk_cont_not_continuable": mark.perf.brk_cont_not_continuable,
+                "brk_cont_page_cross": mark.perf.brk_cont_page_cross,
+                "brk_step": mark.perf.brk_step,
+                "brk_interrupt": mark.perf.brk_interrupt,
+                "brk_cap": mark.perf.brk_cap,
+                "brk_halt": mark.perf.brk_halt,
+                // `smc_scan_keys / smc_scan_calls` is the MEAN OVERLAP-SCAN LENGTH of
+                // `invalidate_physical_range`. Without it a rise in SMC cost cannot be split
+                // into "more events" (calls) and "each event dearer" (keys per call), and the
+                // two select completely different fixes.
+                "smc_scan_calls": mark.perf.smc_scan_calls,
+                "smc_scan_keys": mark.perf.smc_scan_keys,
+                "smc_heat_chunks_hot": mark.perf.smc_heat_chunks_hot,
+                // Native-side exit and cold-chain accounting. A coverage dip that shows up here
+                // as unresolved static-unbound growth is block formation, not admission.
+                "jit_direct_side_exits": mark.perf.jit_direct_side_exits,
+                "jit_direct_unresolved_exits": mark.perf.jit_direct_unresolved_exits,
+                "jit_direct_unresolved_static_unbound": mark.perf.jit_direct_unresolved_static_unbound,
+                "jit_direct_unresolved_static_hidden": mark.perf.jit_direct_unresolved_static_hidden,
+                "jit_direct_unresolved_dynamic_miss_or_unbound": mark
+                    .perf
+                    .jit_direct_unresolved_dynamic_miss_or_unbound,
+                "jit_direct_unresolved_dynamic_hidden": mark.perf.jit_direct_unresolved_dynamic_hidden,
+                // The data-side direct page cache. Its miss ratio is the working-set proxy
+                // that does not go through the decode table.
+                "direct_page_hits": mark.perf.direct_page_hits,
+                "direct_page_misses": mark.perf.direct_page_misses,
                 "wipes_direct_map": mark.fast_map_audit.wipes_direct_map,
                 "wipes_direct_data_map": mark.fast_map_audit.wipes_direct_data_map,
                 "wipes_tlb_flush": mark.fast_map_audit.wipes_tlb_flush,
