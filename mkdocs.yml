@@ -12,6 +12,7 @@ nav:
   - Toka-DOS:
       - Using Toka-DOS: toka-dos/using-toka-dos.md
       - Command reference: toka-dos/commands.md
+      - Licensing: toka-dos/licensing.md
   - TOKAEMM memory manager: tokaemm/manual.md
   - IZBIOS Configuration Panel: izbios/configuration-panel.md
   - ReSonique 2 sound card: resonique2/manual.md

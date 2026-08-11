@@ -561,3 +561,5 @@ Off by default.
   boots by default.
 - [The TOKAEMM manual](../tokaemm/manual.md): the memory manager these
   commands and the shell run on top of.
+- [Toka-DOS licensing](licensing.md): which of these commands came from
+  FreeDOS, and under what terms.

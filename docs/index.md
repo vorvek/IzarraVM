@@ -22,6 +22,8 @@ installation instructions. These pages are the machine's manuals.
   system, its shell, and its disk layout.
 - **[DOS command reference](toka-dos/commands.md)**: every shipped
   command, with its switches.
+- **[Toka-DOS licensing](toka-dos/licensing.md)**: what the system is built
+  from, and under what terms.
 - **[IzarraVM GUI guide](izarravm-gui/guide.md)**, the host application:
   config, mounting media, and where your files live.
 - **[Troubleshooting & FAQ](troubleshooting.md)**: common problems and what
