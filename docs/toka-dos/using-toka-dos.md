@@ -74,7 +74,7 @@ to point C: at a folder and mount removable media.
 
 ## The shell
 
-Toka-DOS's shell is FreeCOM, FreeDOS's COMMAND.COM. Booting ends at:
+Toka-DOS's shell is FreeCOM, FreeDOS's COMMAND.COM. Booting leaves you at:
 
 ```
 C:\>
@@ -108,8 +108,8 @@ SHELL=C:\DOS\COMMAND.COM C:\DOS /E:2048 /P=C:\AUTOEXEC.BAT
 ```
 
 `TOKAEMM.SYS` is the memory manager. `RAM` gives both EMS and upper memory
-blocks; `/T` is the tree-styled boot line the driver prints instead of its
-full banner. `DOS=HIGH,UMB` moves the kernel into the HMA and links the upper
+blocks; `/T` prefixes the driver's signon line with the tree connector used by
+the boot screen. `DOS=HIGH,UMB` moves the kernel into the HMA and links the upper
 memory blocks into the DOS chain, which is what makes `DEVICEHIGH` and `LH`
 work. `TOKACD.SYS` is the ATAPI CD-ROM device driver; the redirector that
 assigns it a drive letter runs later, from `AUTOEXEC.BAT`. The `SHELL=` line
@@ -155,25 +155,27 @@ the matching label, the block there loads one driver, and `GOTO END` returns.
 The point of the arrangement is ordering on screen: each driver prints its own
 line, in its own turn, under the boot screen's tree styling, rather than all of
 them printing together after the loop. The three `ECHO` lines that follow draw
-the closed box at the foot of the boot screen.
+the closed box at the foot of the boot screen. The workbench named in that box
+is not part of this release; in text mode the line is informational only.
 
 The individual lines:
 
 | Line | What it does |
 | --- | --- |
 | `SET BLASTER=A220 I7 D1 H5 P300 T6` | Advertises the [ReSonique 2](../resonique2/manual.md)'s Sound Blaster-compatible digital audio to programs that read the variable: base 0x220, IRQ 7, 8-bit DMA 1, 16-bit DMA 5, MPU-401 at 0x300, card type 6. |
-| `IZCDEX /I /D:TOKACD01 /L:D /T` | The CD-ROM redirector. `/D:` names the device driver `TOKACD.SYS` installed from `CONFIG.SYS`, `/L:D` assigns it drive D:. |
+| `IZCDEX /I /D:TOKACD01 /L:D /T` | The CD-ROM redirector. `/D:` names the device the driver publishes, `TOKACD01` (the driver's own name in memory, not its file name), and `/L:D` gives it drive D:. `/I` installs even if another redirector is already resident. |
 | `LH TOKAMOUS /T` | Loads the INT 33h mouse driver into an upper memory block if [TOKAEMM](../tokaemm/manual.md) has one free, and into conventional memory otherwise. |
 | `SNDCTRL /B /T` | Prints the sound card's current IRQ and DMA assignment. It writes nothing. |
 | `SNDMIXER /CFG C:\VOLCONF.CFG /S` | Restores the mixer levels last saved with F10 in the full-screen mixer. `/S` suppresses its output. If the file does not exist, the card keeps its power-on levels. |
 
-`/T` on the driver lines selects the short, tree-styled boot line in place of
-the driver's full sign-on banner.
+`/T` prefixes the driver's signon line with the tree connector used by the
+boot screen. It does not shorten the line; on `SNDCTRL` it is `/B` that
+selects the two-row summary, and `/T` only styles it.
 
 Toka-DOS regenerates the `SET BLASTER` line from the machine's current
 configuration, so it always matches the card's resources; `SNDCTRL` rewrites
 the same line when it moves them. Once you edit `AUTOEXEC.BAT` yourself, the
-file becomes yours and is left alone.
+machine treats it as user-owned and stops rewriting it.
 
 ## Repair Toka-DOS
 
@@ -182,8 +184,9 @@ the [IZBIOS setup panel](../izbios/configuration-panel.md) has a **Repair
 Toka-DOS** row that reinstalls the system files from the copy built into ROM.
 
 Repair does two things. It writes `CONFIG.SYS` and `AUTOEXEC.BAT` back to the
-stock contents shown above, renaming the existing files to `CONFIG.OLD` and
-`AUTOEXEC.OLD` first, so an edited startup is recoverable. It then re-mounts
+stock contents shown above, with the `SET BLASTER` line regenerated from the
+machine's current configuration, renaming the existing files to `CONFIG.OLD`
+and `AUTOEXEC.OLD` first, so an edited startup is recoverable. It then re-mounts
 the drive, which restores the kernel, the shell, and the contents of `C:\DOS`
 from ROM.
 
