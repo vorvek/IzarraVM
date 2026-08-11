@@ -5361,6 +5361,7 @@ fn compile_with_instruction_limit(
             },
         },
         link_cell_ptrs: link_cells.each_ref().map(|cell| cell.address()),
+        fetch_trace: cpu.jit_direct.native_fetch_trace,
     });
     CompileOutcome::Compiled(Compilation {
         span,

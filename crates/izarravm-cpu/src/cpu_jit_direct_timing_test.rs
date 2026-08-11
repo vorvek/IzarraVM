@@ -2081,6 +2081,16 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
         bus.direct_page_clocks = true;
         bus.uniform_native_fetches = uniform_fetches;
     }
+    // Declare the emission arm beside the bus that implies it. `install_fixture_block` calls
+    // `direct::compile` straight through, so it never reaches the `try_direct_continuation`
+    // synchronisation that production uses, and without this line the field would sit at its
+    // `true` seed for every case — leaving this whole interpreter-versus-native matrix testing
+    // only the WITH-preamble shape, on both arms of the `uniform_fetches` loop (review
+    // finding). With it, the `uniform_fetches == true` half of the matrix now checks the
+    // trace-elided emission lane by lane against the interpreter, which is the coverage the
+    // elision needs and the only place it can come from.
+    direct.jit_direct.native_fetch_trace = !uniform_fetches;
+    interpreter.jit_direct.native_fetch_trace = !uniform_fetches;
     decode_fixture(&mut direct, &mut direct_bus, &starts);
     decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
     for (cpu, bus) in [

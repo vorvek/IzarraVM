@@ -127,6 +127,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         x87_entry_top,
         memory,
         link_cell_ptrs,
+        fetch_trace,
     } = input;
     let full_accounting = StaticAccounting {
         instructions: span.instructions,
@@ -996,6 +997,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1203,6 +1205,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1264,6 +1267,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1284,6 +1288,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1344,6 +1349,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1404,6 +1410,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1471,6 +1478,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1549,6 +1557,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     shared_return,
                     full_accounting,
                     x87_entry_top.is_some(),
+                    fetch_trace,
                 );
                 terminal = true;
                 break;
@@ -1580,6 +1589,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         shared_return,
                         full_accounting,
                         x87_entry_top.is_some(),
+                        fetch_trace,
                     );
                 }
                 e.place(taken);
@@ -1602,6 +1612,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         shared_return,
                         full_accounting,
                         x87_entry_top.is_some(),
+                        fetch_trace,
                     );
                 }
                 terminal = true;
@@ -1625,6 +1636,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             shared_return,
             full_accounting,
             x87_entry_top.is_some(),
+            fetch_trace,
         );
     }
     if let Some(self_loop_return) = self_loop_return {
@@ -1636,6 +1648,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             StaticAccounting::default(),
             true,
             full_accounting,
+            fetch_trace,
         );
         e.jmp(shared_return);
     }
@@ -1665,8 +1678,13 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         e.add_r64_imm32(Reg::RAX, reason_offset);
         e.store_r8_disp8(Reg::RAX, 0, Reg::RDX);
         emit_add_static_accounting(&mut e, exit);
-        e.mov_r64_imm64(Reg::RAX, u64::from(exit.instructions));
-        e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RAX);
+        // The side-exit prefix count is parked ONLY for the shared `side_return` fetch-trace
+        // append below (`TracePrefix::Stack(STACK_READ_KIND)`); nothing else reads the slot
+        // after a side exit. With the trace elided the park has no consumer, so it goes too.
+        if fetch_trace {
+            e.mov_r64_imm64(Reg::RAX, u64::from(exit.instructions));
+            e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RAX);
+        }
         emit_advance_eip(&mut e, eip_delta);
         e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
         e.store_imm32_disp32(
@@ -1681,13 +1699,15 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         if self_loop {
             emit_add_repeated_accounting(&mut e, full_accounting);
         }
-        emit_fetch_trace(
-            &mut e,
-            span,
-            self_loop,
-            TracePrefix::Stack(STACK_READ_KIND),
-            false,
-        );
+        if fetch_trace {
+            emit_fetch_trace(
+                &mut e,
+                span,
+                self_loop,
+                TracePrefix::Stack(STACK_READ_KIND),
+                false,
+            );
+        }
         e.jmp(shared_return);
     }
     e.place(shared_return);
@@ -1739,6 +1759,7 @@ fn emit_accounting(
     prefix: StaticAccounting,
     completed: bool,
     full: StaticAccounting,
+    fetch_trace: bool,
 ) {
     if self_loop {
         emit_add_repeated_accounting(e, full);
@@ -1746,13 +1767,15 @@ fn emit_accounting(
         emit_add_static_accounting(e, full);
     }
     emit_add_static_accounting(e, prefix);
-    emit_fetch_trace(
-        e,
-        span,
-        self_loop,
-        TracePrefix::Immediate(u32::from(prefix.instructions)),
-        completed,
-    );
+    if fetch_trace {
+        emit_fetch_trace(
+            e,
+            span,
+            self_loop,
+            TracePrefix::Immediate(u32::from(prefix.instructions)),
+            completed,
+        );
+    }
 }
 
 fn accounting_fields(accounting: StaticAccounting) -> [(i8, u32); 5] {
@@ -1903,6 +1926,7 @@ fn emit_completed_path(
     shared_return: Label,
     accounting: StaticAccounting,
     x87_source: bool,
+    fetch_trace: bool,
 ) {
     emit_accounting(
         e,
@@ -1911,6 +1935,7 @@ fn emit_completed_path(
         StaticAccounting::default(),
         true,
         accounting,
+        fetch_trace,
     );
     emit_advance_eip(e, eip_delta);
     if let Some(link_cell) = link_cell {
@@ -2014,6 +2039,7 @@ fn emit_completed_path(
 /// `mov` and buys the same property: `x87_avx2_emit::emit_spill` clobbers RAX and RSI and leaves
 /// RCX/RDX alone. RDX is free to reuse at that point because the two unresolved epilogues reach
 /// it only from branches taken BEFORE the move, and the EIP it held is in `CpuGsw.eip` anyway.
+#[allow(clippy::too_many_arguments)]
 fn emit_completed_dynamic_path(
     e: &mut Encoder,
     span: BlockSpan,
@@ -2022,6 +2048,7 @@ fn emit_completed_dynamic_path(
     shared_return: Label,
     accounting: StaticAccounting,
     x87_source: bool,
+    fetch_trace: bool,
 ) {
     e.store_r32_disp32(Reg::R15, eip_offset(), target);
     emit_accounting(
@@ -2031,6 +2058,7 @@ fn emit_completed_dynamic_path(
         StaticAccounting::default(),
         true,
         accounting,
+        fetch_trace,
     );
     e.load_r32_disp32(Reg::RDX, Reg::R15, eip_offset());
     let dynamic_hidden_or_unbound = e.label();
