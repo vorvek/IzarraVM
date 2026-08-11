@@ -149,7 +149,7 @@ fn default_metadata_is_bounded_above_the_executable_arena() {
     let cache = BlockCache::default();
     assert_eq!(cache.entry_cap, DEFAULT_ENTRY_CAP);
     let arena_slots =
-        super::super::exec_mem::EXECUTABLE_ARENA_LEN / super::super::exec_mem::host_page_len();
+        super::super::exec_mem::executable_arena_len() / super::super::exec_mem::host_page_len();
     assert!(cache.entry_cap > arena_slots);
 }
 
@@ -1057,6 +1057,10 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     old_entry();
     assert_eq!(cache.retire_physical_range_for_test(dead.physical, 1), 1);
     let link_epochs = cache.block_link_epochs.clone();
+    assert_eq!(
+        cache.stats.arena_compaction_ns, 0,
+        "nothing may charge compaction wall before a compaction runs"
+    );
 
     assert!(cache.compact_arena());
 
@@ -1081,6 +1085,12 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     assert_eq!(stats.arena_compaction_live_blocks, 2);
     assert_eq!(stats.arena_compaction_bytes, 16);
     assert_eq!(stats.arena_compaction_failures, 0);
+    // The timer must actually be wired to the body, not merely declared. A rebuild allocates a
+    // whole fresh arena and VirtualProtects it, so it cannot land inside one clock tick.
+    assert!(
+        stats.arena_compaction_ns > 0,
+        "arena_compaction_ns stayed 0 across a real compaction"
+    );
     assert_eq!(stats.cache_resets, 0);
 }
 

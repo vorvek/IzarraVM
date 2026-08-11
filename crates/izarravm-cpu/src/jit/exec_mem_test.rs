@@ -24,10 +24,10 @@ fn executes_a_trivial_emitted_function() {
 #[test]
 fn arena_seals_one_page_per_block() {
     let mut arena = ExecutableArena::new().expect("allocation must succeed on a supported host");
-    assert_eq!(EXECUTABLE_ARENA_LEN % arena.slot_len(), 0);
+    assert_eq!(executable_arena_len() % arena.slot_len(), 0);
     assert_eq!(
         arena.slot_capacity(),
-        EXECUTABLE_ARENA_LEN / arena.slot_len()
+        executable_arena_len() / arena.slot_len()
     );
 
     let code = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
@@ -39,6 +39,47 @@ fn arena_seals_one_page_per_block() {
     let oversized = vec![0xC3; arena.slot_len() + 1];
     assert!(arena.install(&oversized).is_none());
     assert_eq!(arena.used_slots(), 1);
+}
+
+/// `IZARRAVM_JIT_ARENA_MIB` is parsed once into a process-global `OnceLock`, so the clamp is
+/// tested through its pure half. Every rejected shape must fall back to the default rather than
+/// to some other size: an arena silently sized at 0 or at 4 GiB is a crash, not a slow run.
+#[test]
+fn arena_size_knob_clamps_and_rejects_junk() {
+    const MIB: usize = 1024 * 1024;
+    assert_eq!(arena_len_from_env(None), DEFAULT_ARENA_MIB * MIB);
+    assert_eq!(arena_len_from_env(Some("")), DEFAULT_ARENA_MIB * MIB);
+    assert_eq!(arena_len_from_env(Some("junk")), DEFAULT_ARENA_MIB * MIB);
+    assert_eq!(arena_len_from_env(Some("-4")), DEFAULT_ARENA_MIB * MIB);
+    assert_eq!(arena_len_from_env(Some("128")), 128 * MIB);
+    assert_eq!(arena_len_from_env(Some(" 128 ")), 128 * MIB);
+    // Not a power of two, and accepted: nothing here indexes by shifting.
+    assert_eq!(arena_len_from_env(Some("100")), 100 * MIB);
+    // Clamps, both ends. Zero would make `with_len` return None and disable the backend.
+    assert_eq!(arena_len_from_env(Some("0")), MIN_ARENA_MIB * MIB);
+    assert_eq!(arena_len_from_env(Some("1")), MIN_ARENA_MIB * MIB);
+    assert_eq!(
+        arena_len_from_env(Some("4096")),
+        MAX_ARENA_MIB * MIB,
+        "an over-large request must clamp, not allocate"
+    );
+}
+
+/// The two structural ceilings `MAX_ARENA_MIB` exists to respect. `BlockId`'s index is a u16 and
+/// a live block owns one slot, so the slot capacity at the smallest possible host page must stay
+/// below `u16::MAX`; `DEFAULT_ENTRY_CAP` must stay strictly above it. Both are checked against the
+/// clamp OUTPUT, so raising `MAX_ARENA_MIB` without doing the design work fails here.
+#[test]
+fn max_arena_size_stays_inside_the_block_index_and_entry_cap_ceilings() {
+    let slots_at_smallest_page = arena_len_from_env(Some("999999")) / 4096;
+    assert!(
+        slots_at_smallest_page < usize::from(u16::MAX),
+        "{slots_at_smallest_page} slots overflows BlockId's u16 metadata index"
+    );
+    assert!(
+        slots_at_smallest_page < super::super::direct::DEFAULT_ENTRY_CAP,
+        "{slots_at_smallest_page} slots would fill the metadata map before the arena"
+    );
 }
 
 #[cfg(any(

@@ -1084,6 +1084,7 @@ pub(super) fn perf_counters_json(
         "jit_direct_arena_compaction_live_blocks": perf.jit_direct_arena_compaction_live_blocks,
         "jit_direct_arena_compaction_bytes": perf.jit_direct_arena_compaction_bytes,
         "jit_direct_arena_compaction_failures": perf.jit_direct_arena_compaction_failures,
+        "jit_direct_arena_compaction_ns": perf.jit_direct_arena_compaction_ns,
         "jit_direct_links_created": perf.jit_direct_links_created,
         "jit_direct_links_cleared": perf.jit_direct_links_cleared,
         "jit_direct_decode_dependencies_scanned": perf.jit_direct_decode_dependencies_scanned,
@@ -1116,7 +1117,7 @@ pub(super) fn print_perf_counter_row(
          unresolved[static-unbound/static-hidden/dynamic-miss/dynamic-hidden]={}/{}/{}/{}  \
          compile[attempt/installed/ns]={}/{}/{} lookup[hot/hash/miss]={}/{}/{} links[new/clear/reset]={}/{}/{}  \
          portal[scan/hide]={}/{}  \
-         arena[compact/live/bytes/fail]={}/{}/{}/{}  \
+         arena[compact/live/bytes/fail/ns]={}/{}/{}/{}/{}  \
          gate[obs/shadow/agg/mode/top/cs/cpl/data/align/fetch/short/budget]={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}  \
          jit_mem[load/store/tlb]={}/{}/{}",
         name,
@@ -1181,6 +1182,7 @@ pub(super) fn print_perf_counter_row(
         perf.jit_direct_arena_compaction_live_blocks,
         perf.jit_direct_arena_compaction_bytes,
         perf.jit_direct_arena_compaction_failures,
+        perf.jit_direct_arena_compaction_ns,
         perf.jit_direct_reject_observer,
         perf.jit_direct_reject_interrupt_shadow,
         perf.jit_direct_reject_aggregate_accounting,

@@ -154,7 +154,7 @@ pub(crate) const IMM_LANE_WIDTH: u32 = 4;
 /// Empty slot in a block's lane array. Physical address 0 is a real address (the real-mode IVT),
 /// so the sentinel has to be an address no six-byte instruction's immediate can start at.
 const NO_IMM_LANE: u32 = u32::MAX;
-const DEFAULT_ENTRY_CAP: usize = 131_072;
+pub(crate) const DEFAULT_ENTRY_CAP: usize = 131_072;
 const DEFAULT_DECODE_SLOT_COUNT: usize = 4_096;
 const BLOCK_PAGE_SHIFT: u32 = 12;
 #[cfg(not(test))]
@@ -1830,6 +1830,11 @@ impl BlockCache {
     /// Copy only active native blocks into a new arena. No address is published and no old link
     /// cell is changed until every byte range has been validated and the new prefix is executable.
     fn compact_arena(&mut self) -> bool {
+        // One `Instant` pair per COMPACTION, not per block or per install: duke3d-486's worst
+        // measured run takes 1,205 of these in 158 s, so the clock read is unmeasurable against
+        // the ~7.4 ms body it times. Started before the early bails so a refused compaction is
+        // charged nothing (it does no work); the accumulate sits at the success tail.
+        let started = std::time::Instant::now();
         let Some(old_arena) = self.arena.as_ref() else {
             return false;
         };
@@ -1936,6 +1941,10 @@ impl BlockCache {
 
         self.arena = Some(fresh_arena);
         self.stats.arena_compactions += 1;
+        self.stats.arena_compaction_ns = self
+            .stats
+            .arena_compaction_ns
+            .saturating_add(started.elapsed().as_nanos() as u64);
         self.stats.arena_compaction_live_blocks = self
             .stats
             .arena_compaction_live_blocks

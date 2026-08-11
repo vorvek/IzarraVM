@@ -821,6 +821,10 @@ pub struct PerfCounters {
     pub jit_direct_arena_compaction_live_blocks: u64,
     pub jit_direct_arena_compaction_bytes: u64,
     pub jit_direct_arena_compaction_failures: u64,
+    /// Host wall nanoseconds spent rebuilding the executable arena. Separate from
+    /// `jit_direct_compile_ns`, which does NOT include compaction: on duke3d-486 the two are
+    /// comparable in size and only this one responds to `IZARRAVM_JIT_ARENA_MIB`.
+    pub jit_direct_arena_compaction_ns: u64,
     pub jit_direct_links_created: u64,
     pub jit_direct_links_cleared: u64,
     /// Reverse-index dependency IDs examined after a direct-mapped decode slot was displaced.

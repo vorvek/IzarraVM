@@ -66,6 +66,7 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "jit_direct_arena_compaction_bytes",
     "jit_direct_arena_compaction_failures",
     "jit_direct_arena_compaction_live_blocks",
+    "jit_direct_arena_compaction_ns",
     "jit_direct_arena_compactions",
     "jit_direct_blocks_installed",
     "jit_direct_blocks_installed_sixteen_bit",
@@ -324,6 +325,7 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
         "jit_direct_arena_compaction_live_blocks",
         "jit_direct_arena_compaction_bytes",
         "jit_direct_arena_compaction_failures",
+        "jit_direct_arena_compaction_ns",
         "jit_direct_reject_observer",
         "jit_direct_reject_interrupt_shadow",
         "jit_direct_reject_aggregate_accounting",
@@ -558,6 +560,7 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         jit_direct_arena_compaction_live_blocks: _,
         jit_direct_arena_compaction_bytes: _,
         jit_direct_arena_compaction_failures: _,
+        jit_direct_arena_compaction_ns: _,
         jit_direct_links_created: _,
         jit_direct_links_cleared: _,
         jit_direct_decode_dependencies_scanned: _,
@@ -1512,6 +1515,8 @@ fn phase_mark_series_carries_the_break_and_smc_scan_columns() {
         jit_direct_unresolved_dynamic_hidden: 17,
         direct_page_hits: 18,
         direct_page_misses: 19,
+        jit_direct_arena_compactions: 20,
+        jit_direct_arena_compaction_ns: 21,
         ..Default::default()
     };
 
@@ -1553,6 +1558,8 @@ fn phase_mark_series_carries_the_break_and_smc_scan_columns() {
         ("jit_direct_unresolved_dynamic_hidden", 17),
         ("direct_page_hits", 18),
         ("direct_page_misses", 19),
+        ("jit_direct_arena_compactions", 20),
+        ("jit_direct_arena_compaction_ns", 21),
     ] {
         assert_eq!(
             row.get(key).and_then(|v| v.as_u64()),

@@ -12,9 +12,56 @@ pub(crate) struct ExecutableBuffer {
     len: usize,
 }
 
-/// Maximum virtual memory reserved for direct blocks. Each block owns one host page so completed
+/// Default virtual memory reserved for direct blocks. Each block owns one host page so completed
 /// blocks can be sealed Read+Execute while unused slots remain Read+Write.
-pub(crate) const EXECUTABLE_ARENA_LEN: usize = 32 * 1024 * 1024;
+///
+/// At 4 KiB pages this is 8,192 slots. Duke3D-486 fills them and then compacts 1,205 times in one
+/// BENCH2 demo, 6.7% of demo wall, because `arena_compaction_can_reclaim` admits a whole-arena
+/// rebuild for a single dead slot and mean occupancy at that moment is 95.9%
+/// (`dev_docs/duke3d-open-area-profile-results.md` §4). Compaction cost scales with LIVE bytes
+/// copied, not with arena size, so capacity is the cheap dial: see `executable_arena_len`.
+const DEFAULT_ARENA_MIB: usize = 32;
+const MIN_ARENA_MIB: usize = 8;
+/// Upper clamp on `IZARRAVM_JIT_ARENA_MIB`, set by two hard structural ceilings rather than taste:
+///
+/// - `BlockId` carries a **u16** metadata-slot index, and a live block owns exactly one arena
+///   slot, so `blocks.len()` can reach the slot capacity. At the 4 KiB minimum page size a
+///   256 MiB arena is exactly 65,536 slots; the 65,536th `fresh_block_id` would fail its
+///   `u16::try_from` and permanently set `BlockCache::disabled`, silently dropping the run to the
+///   interpreter.
+/// - `DEFAULT_ENTRY_CAP` (131,072 metadata entries) is required to stay strictly above the slot
+///   capacity, so that arena pressure resets compiled code before the metadata map fills
+///   (`default_metadata_is_bounded_above_the_executable_arena`).
+///
+/// 192 MiB is 49,152 slots at 4 KiB, comfortably under both, and 6x the default. Raising this
+/// further is a design slice (widen `BlockId`'s index, scale `entry_cap`), not a constant edit.
+const MAX_ARENA_MIB: usize = 192;
+
+const _: () = assert!(MAX_ARENA_MIB * 256 < 65_536);
+const _: () = assert!(MIN_ARENA_MIB <= DEFAULT_ARENA_MIB && DEFAULT_ARENA_MIB <= MAX_ARENA_MIB);
+
+/// Live sweep knob: `IZARRAVM_JIT_ARENA_MIB=<n>` sizes the executable arena at construction,
+/// clamped to `MIN_ARENA_MIB..=MAX_ARENA_MIB`. Read once, cached, exactly like
+/// `IZARRAVM_DECODE_CACHE_LINES`, so one release binary can run both arms of an A/B.
+///
+/// Guest-INERT, unlike the decode-cache knob: nothing about arena size is charged to guest bus
+/// clocks or master ticks, and no block is compiled differently because of it. Only the wall
+/// spent rebuilding the arena moves. The fixture frame hashes and DUKEMARK invariants must be
+/// unchanged across values; if one moves, this claim is wrong and it is a bug, not a re-pin.
+pub(crate) fn executable_arena_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| arena_len_from_env(std::env::var("IZARRAVM_JIT_ARENA_MIB").ok().as_deref()))
+}
+
+/// The pure half of `executable_arena_len`, so the clamp is testable without touching a
+/// process-global `OnceLock` that another test may already have initialised.
+fn arena_len_from_env(value: Option<&str>) -> usize {
+    let mib = value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mib| mib.clamp(MIN_ARENA_MIB, MAX_ARENA_MIB))
+        .unwrap_or(DEFAULT_ARENA_MIB);
+    mib * 1024 * 1024
+}
 
 /// A bounded collection of one-page executable-code spans, installed through `install`. Only
 /// span BASES are valid entries; the registry records every span as `(offset, page_len)` in
@@ -84,7 +131,7 @@ impl ExecutableArena {
     /// Reserve the fixed-size arena as Read+Write memory. Individual pages become Read+Execute as
     /// blocks are installed. Unsupported hosts and allocation failure both return `None`.
     pub(crate) fn new() -> Option<Self> {
-        Self::with_len(EXECUTABLE_ARENA_LEN)
+        Self::with_len(executable_arena_len())
     }
 
     fn with_len(total_len: usize) -> Option<Self> {

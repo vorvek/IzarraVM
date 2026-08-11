@@ -876,8 +876,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // Dropping MMX removes `X87`'s `[u64; 8]` MM register file, moving the pin 4544 -> 4480. The
     // MM file WAS in the x87 canonical payload, so this is the one entry in this list that also
     // shrinks a payload (134 -> 70 bytes); see cpu_test.rs's twin comment for the layout half.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4480);
+    // The JIT arena-size slice adds one PerfCounters field (jit_direct_arena_compaction_ns;
+    // 8 bytes), moving the pin 4480 -> 4488 -- measured, not derived. Host wall nanoseconds are
+    // not architectural state, so both canonical payloads are unchanged by it.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4480);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
 }

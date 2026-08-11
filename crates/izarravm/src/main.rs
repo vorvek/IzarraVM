@@ -1849,6 +1849,9 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "jit_direct_compile_ns": mark.perf.jit_direct_compile_ns,
                 "jit_direct_cache_resets": mark.perf.jit_direct_cache_resets,
                 "jit_direct_arena_compactions": mark.perf.jit_direct_arena_compactions,
+                // The wall the compaction rebuild actually cost, measured rather than
+                // regressed out of interval wall. `jit_direct_compile_ns` does NOT include it.
+                "jit_direct_arena_compaction_ns": mark.perf.jit_direct_arena_compaction_ns,
                 // Batch-break histogram. These say what LIMITS batch length, which is the
                 // difference between "the guest changed shape" and "we stopped being able to
                 // stay in a straight line". `brk_cont_decode_miss` rising with a falling

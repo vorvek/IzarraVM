@@ -321,6 +321,10 @@ pub(crate) struct BlockCacheStats {
     pub arena_compaction_live_blocks: u64,
     pub arena_compaction_bytes: u64,
     pub arena_compaction_failures: u64,
+    /// Host wall nanoseconds inside `compact_arena`'s successful body. The §2 regression in
+    /// `dev_docs/duke3d-open-area-profile-results.md` INFERRED 7.44 ms per event from interval
+    /// wall; this measures it.
+    pub arena_compaction_ns: u64,
     pub links: u64,
     pub unlinks: u64,
     pub decode_dependencies_scanned: u64,

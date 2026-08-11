@@ -1465,6 +1465,7 @@ impl CpuGsw {
         self.perf.jit_direct_arena_compaction_live_blocks += stats.arena_compaction_live_blocks;
         self.perf.jit_direct_arena_compaction_bytes += stats.arena_compaction_bytes;
         self.perf.jit_direct_arena_compaction_failures += stats.arena_compaction_failures;
+        self.perf.jit_direct_arena_compaction_ns += stats.arena_compaction_ns;
         self.perf.jit_direct_links_created += stats.links;
         self.perf.jit_direct_links_cleared += stats.unlinks;
         self.perf.jit_direct_decode_dependencies_scanned += stats.decode_dependencies_scanned;

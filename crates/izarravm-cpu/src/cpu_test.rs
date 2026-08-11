@@ -1868,7 +1868,12 @@ fn pending_flags_offset() {
     // above this is a SHRINK of dead architectural state, so it pulls the fields after it toward
     // the front of the struct rather than pushing them apart -- but it is still a cache-line
     // reshuffle of the hot region, so it is measured by the fixture sweep, not assumed inert.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4480);
+    // The arena-size slice adds one PerfCounters field (jit_direct_arena_compaction_ns; 8 bytes),
+    // moving this pin 4480 -> 4488 -- measured off a failing-test readout, not derived. It belongs
+    // in PerfCounters rather than at the CpuGsw tail because the phase-mark series carries
+    // `PerfCounters` by value and this counter's whole purpose is to appear per-interval beside
+    // jit_direct_arena_compactions, which is where compaction wall is read.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
