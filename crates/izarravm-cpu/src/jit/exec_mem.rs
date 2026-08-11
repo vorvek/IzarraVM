@@ -31,7 +31,8 @@ pub(crate) struct ExecutableBuffer {
 ///
 /// The arms did not overlap across the eight duke3d-486 legs and every deterministic counter was
 /// byte-identical within each arm. doom-586 takes 2 compactions in a whole run, predicted no
-/// change and measured none (whole counter set byte-identical, frame hash unchanged).
+/// change and measured none (installs, resets and frame hash identical; only the two arena
+/// counters differ, 2 compactions/3.48 ms at 32 MiB vs 0/0 at 128 MiB, as the size change forces).
 ///
 /// What it COSTS, because a default is a posture: 128 MiB of commit charge instead of 32, and two
 /// arenas (256 MiB) live for the duration of a rebuild. Commit, not working set -- untouched slots
@@ -48,9 +49,10 @@ const MIN_ARENA_MIB: usize = 8;
 ///
 /// - `BlockId` carries a **u16** metadata-slot index, and a live block owns exactly one arena
 ///   slot, so `blocks.len()` can reach the slot capacity. At the 4 KiB minimum page size a
-///   256 MiB arena is exactly 65,536 slots; the 65,536th `fresh_block_id` would fail its
-///   `u16::try_from` and permanently set `BlockCache::disabled`, silently dropping the run to the
-///   interpreter.
+///   256 MiB arena is exactly 65,536 slots (indices 0..=65,535 all fit u16; the first
+///   `u16::try_from` failure is at index 65,536, i.e. strictly beyond 256 MiB) — so the clamp
+///   below is conservative in the safe direction. Crossing the real cliff would permanently set
+///   `BlockCache::disabled`, silently dropping the run to the interpreter.
 /// - `DEFAULT_ENTRY_CAP` (131,072 metadata entries) is required to stay strictly above the slot
 ///   capacity, so that arena pressure resets compiled code before the metadata map fills
 ///   (`default_metadata_is_bounded_above_the_executable_arena`).
