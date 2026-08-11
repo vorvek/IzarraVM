@@ -62,10 +62,9 @@ again with the port present.
   MPU-401 keeps both.
 - **A real cable works, and is not necessary.** If the host has a MIDI
   interface, a DIN lead from its MIDI OUT to its MIDI IN joins the two endpoints
-  in hardware and this procedure otherwise stands. It has no advantage: the
-  music leaves the machine and comes back over a 31.25 kbaud wire, which is the
-  one part of a 1990s MIDI rig worth being glad to be rid of. Use it when the
-  receiver is genuinely external.
+  in hardware and this procedure otherwise stands. It has no advantage over the
+  virtual cable: the music leaves the machine and comes back over a 31.25 kbaud
+  serial wire. Use it when the receiver is genuinely external.
 - **Two other receivers exist.** The P330 selector also offers **Off**, and
   **Munt (MT-32)**, which is played inside the emulator rather than by the host.
   See [MT-32 ROMs with the P330 receiver](mt32-roms.md). The internal wavetable

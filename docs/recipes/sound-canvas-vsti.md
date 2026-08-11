@@ -5,8 +5,9 @@
 
 The Sound Canvas is the instrument a great many mid-1990s General MIDI
 soundtracks were written on and mixed against. A game's MIDI music is a score,
-not a recording, and it sounds like its composer intended only when the
-instrument answering it is the one that was on the desk. Roland's Sound Canvas
+not a recording: what reaches the ear depends on the instrument that plays the
+score, and it matches what the composer heard only on the same instrument the
+score was written against. Roland's Sound Canvas
 VA plug-in is that instrument, and it can be placed at the end of the P330 MIDI
 route: SC-55 and SC-88 class playback, from an unmodified game.
 
