@@ -3916,3 +3916,68 @@ fn is_ring0_protected_matches_the_unfolded_predicate_over_the_state_space() {
         "the state list must exercise both answers"
     );
 }
+
+/// A6: `record_write_page` early-outs on `last_written_page` before its two linear scans of the
+/// 8-slot `written_pages` array. The early-out is only sound if it is EXACT -- a skipped call
+/// must be one that would have changed nothing -- so this pins the array and the count against
+/// every shape that could expose a difference: repeats, alternation (where the one-entry memory
+/// must not help), overflow, and the instruction boundary that clears it.
+///
+/// The last case is the one that makes the reset load-bearing: without clearing the sentinel in
+/// `begin_instruction`, the first store of the next instruction to the same page would be
+/// skipped, `written_count` would stay 0, and the prefetch-queue invalidation that reads
+/// `written_pages` would miss its own code page.
+#[test]
+fn record_write_page_early_out_tracks_the_same_pages_as_a_full_scan() {
+    let page_addr = |page: u32| page << 12;
+
+    // Repeats collapse to one entry.
+    let mut cpu = CpuGsw::default();
+    for _ in 0..8 {
+        cpu.record_write_page(page_addr(0x20) + 0x40);
+    }
+    assert_eq!(cpu.written_count, 1);
+    assert_eq!(cpu.written_pages[0], Some(0x20));
+    assert!(!cpu.written_pages_overflow);
+
+    // Alternation: the one-entry memory must not suppress the second page, and must not let a
+    // page already in the array be added twice.
+    let mut cpu = CpuGsw::default();
+    for _ in 0..4 {
+        cpu.record_write_page(page_addr(0x20));
+        cpu.record_write_page(page_addr(0x21));
+    }
+    assert_eq!(cpu.written_count, 2);
+    assert_eq!(cpu.written_pages[0], Some(0x20));
+    assert_eq!(cpu.written_pages[1], Some(0x21));
+    assert!(!cpu.written_pages_overflow);
+
+    // Overflow: the ninth distinct page sets the flag, and repeating it keeps the flag set and
+    // the array untouched.
+    let mut cpu = CpuGsw::default();
+    for page in 0..TRACKED_WRITE_PAGES as u32 + 1 {
+        cpu.record_write_page(page_addr(0x100 + page));
+    }
+    assert_eq!(cpu.written_count, TRACKED_WRITE_PAGES as u8);
+    assert!(cpu.written_pages_overflow);
+    let filled = cpu.written_pages;
+    cpu.record_write_page(page_addr(0x100 + TRACKED_WRITE_PAGES as u32));
+    assert_eq!(cpu.written_pages, filled);
+    assert!(cpu.written_pages_overflow);
+    assert_eq!(cpu.written_count, TRACKED_WRITE_PAGES as u8);
+
+    // The instruction boundary clears the memory: the same page recorded again next instruction
+    // must be recorded again, not skipped.
+    let mut cpu = CpuGsw::default();
+    cpu.record_write_page(page_addr(0x30));
+    assert_eq!(cpu.written_count, 1);
+    cpu.begin_instruction();
+    assert_eq!(cpu.written_count, 0);
+    assert_eq!(cpu.written_pages[0], None);
+    cpu.record_write_page(page_addr(0x30));
+    assert_eq!(
+        cpu.written_count, 1,
+        "the page must be recorded again after an instruction boundary"
+    );
+    assert_eq!(cpu.written_pages[0], Some(0x30));
+}

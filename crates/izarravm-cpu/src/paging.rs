@@ -60,6 +60,12 @@ pub const TLB_ENTRIES: usize = 1024;
 const _: () = assert!(TLB_ENTRIES.is_power_of_two());
 pub(crate) const PREFETCH_WINDOW_BYTES: usize = 32;
 pub(crate) const TRACKED_WRITE_PAGES: usize = 8;
+/// "No page recorded yet this instruction" for `CpuGsw::last_written_page`. A physical page
+/// number is `phys >> 12` over a 32-bit physical address, so the largest real value is 0xFFFFF
+/// and `u32::MAX` can never collide with one. A sentinel rather than an `Option` so the hot
+/// early-out is one compare against a plain word.
+pub(crate) const NO_LAST_WRITTEN_PAGE: u32 = u32::MAX;
+const _: () = assert!(NO_LAST_WRITTEN_PAGE > u32::MAX >> 12);
 pub(crate) const DIRECT_PAGE_CACHE_LINES: usize = 64;
 pub(crate) const FETCH_PAGE_CACHE_ENTRIES: usize = 4;
 

@@ -74,7 +74,8 @@ pub(crate) use flags::{
 #[allow(unused_imports)]
 pub(crate) use paging::{
     CodePageCache, DIRECT_PAGE_CACHE_LINES, DirectPageCache, DirectPageCacheEntry, FetchPageCache,
-    PREFETCH_WINDOW_BYTES, PrefetchWindow, TRACKED_WRITE_PAGES, Tlb, TlbEntry,
+    NO_LAST_WRITTEN_PAGE, PREFETCH_WINDOW_BYTES, PrefetchWindow, TRACKED_WRITE_PAGES, Tlb,
+    TlbEntry,
 };
 
 /// The modelled TLB's entry count, and therefore its direct-mapped collision stride in pages.
@@ -1766,6 +1767,20 @@ pub struct CpuGsw {
     /// Lever 1 hit/miss counters, at the tail for the same layout reason; see
     /// `FastMapProbeCounters`.
     fast_map_probe: FastMapProbeCounters,
+    /// The page `record_write_page` recorded most recently THIS instruction, or
+    /// `NO_LAST_WRITTEN_PAGE` when it has recorded none yet. A one-compare early-out in front of
+    /// that function's two linear scans of `written_pages`, which every guest store pays.
+    ///
+    /// Exact, not approximate: it is cleared by `begin_instruction` in the same breath as
+    /// `written_count` / `written_pages_overflow`, so a match can only mean the page was recorded
+    /// during THIS instruction and is therefore still present in `written_pages` (nothing removes
+    /// an entry mid-instruction) -- or that the array had already overflowed on it, in which case
+    /// `written_pages_overflow` is already set and re-setting it is a no-op. Either way the
+    /// skipped work is work that would have changed nothing.
+    ///
+    /// At the `CpuGsw` tail for the layout reason the fields above document, and always the
+    /// sentinel at an instruction boundary, so it cannot move the derived `CpuGsw` equality.
+    last_written_page: u32,
     /// The N5 census gate, hoisted OUT of the boxed counter block below and kept here as a bare
     /// byte. This is the only part of the instrument the interpreter's per-access path reads, and
     /// reading it through the box would cost a second dependent load on 1.9 G doom accesses for
@@ -1873,6 +1888,7 @@ impl Default for CpuGsw {
             ))]
             fast_map_serve_enabled: FastMapServeGate::default(),
             fast_map_probe: FastMapProbeCounters::default(),
+            last_written_page: NO_LAST_WRITTEN_PAGE,
             rmw_census_enabled: rmw_census_default(),
             fault_site: FaultSite::default(),
         };

@@ -187,6 +187,15 @@ impl CpuGsw {
 
     pub(super) fn record_write_page(&mut self, physical: u32) {
         let page = physical >> 12;
+        // One compare in front of the two linear scans below. A repeat store to the page the
+        // last one hit is by far the common shape (a string move, a stack sequence, any loop
+        // walking a buffer), and this instruction already recorded that page, so both scans
+        // would run to their conclusion and change nothing. See `CpuGsw::last_written_page` for
+        // why a match is exact rather than a guess.
+        if self.last_written_page == page {
+            return;
+        }
+        self.last_written_page = page;
         if self.written_pages.contains(&Some(page)) {
             return;
         }
@@ -563,6 +572,7 @@ impl CpuGsw {
         }
         self.written_count = 0;
         self.written_pages_overflow = false;
+        self.last_written_page = NO_LAST_WRITTEN_PAGE;
     }
 
     pub fn is_protected_mode(&self) -> bool {
