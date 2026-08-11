@@ -1114,6 +1114,15 @@ fn rmw_census_default() -> bool {
     })
 }
 
+/// Seed for `CpuGsw::slot_census_enabled`, read once per process from `IZARRAVM_SLOT_CENSUS`.
+/// The `rmw_census_default` pattern exactly.
+fn slot_census_default() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("IZARRAVM_SLOT_CENSUS").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 /// Gate for the slow-read page histogram (`IZARRAVM_SLOW_READ_HISTO=1`). Cached like
 /// `rmw_census_default`, and read ONCE at CPU construction rather than per access -- the per-access
 /// gate is the `Option`'s null test on the slot below, which is the same one relaxed load.
@@ -1265,6 +1274,35 @@ pub struct FastMapAuditCounters {
     pub census_rmw_pairs: u64,
     /// Whether the census half is armed. Read from `IZARRAVM_RMW_CENSUS` once per process.
     pub census_enabled: bool,
+    /// FastMap slot rejections attributed to the alignment clause ALONE -- the access is page-local
+    /// and would otherwise have been served. This is the population the interpreter data-path
+    /// slice targets, and it is cross-checked against `data_slow_reads`, NOT against
+    /// `interp_fast_map_misses`: `call_out_stack_frame_resident` calls `lookup_access` directly
+    /// and deliberately bypasses the probe counters, so the reject counters and the probe counters
+    /// have different denominators by design.
+    pub slot_reject_misaligned: u64,
+    /// Rejections attributed to `offset + bytes > PAGE_SIZE`. Sized separately because a
+    /// page-crossing access is split into page-local fragments upstream and each fragment probes
+    /// again, so this counter and the probe counters do not divide the same way.
+    pub slot_reject_page_cross: u64,
+    /// Rejections attributed to no storage, a dead page, an uncommitted bias, or an unavailable
+    /// physical page -- the ordinary cold miss.
+    pub slot_reject_absent: u64,
+    /// Rejections attributed to a stale `mapping_epochs[index]`. Identically zero here is B2b's
+    /// gate: it is what says the interpreter may later read the one-word load bias instead of
+    /// walking five arrays.
+    pub slot_reject_epoch: u64,
+    /// Rejections attributed to the PAGE_USER / PAGE_WRITABLE test against the live CPL and
+    /// CR0.WP.
+    pub slot_reject_permission: u64,
+    /// Misaligned accesses SERVED from the FastMap. Zero before the admission slice lands; after
+    /// it, this should approximate what `slot_reject_misaligned` used to be.
+    pub slot_admit_misaligned: u64,
+    /// Whether the slot-reject census is armed. Read from `IZARRAVM_SLOT_CENSUS` once per
+    /// process, and reported from the LIVE `CpuGsw` byte rather than the stored copy (the
+    /// `census_enabled` pattern) so a JSON reader cannot mistake an unarmed run for an armed one
+    /// that saw nothing.
+    pub slot_reject_enabled: bool,
     /// Instrument scratch, not a counter: `perf.instructions` at the last census read. Constant
     /// across one instruction's accesses, which is what makes the same-instruction test a plain
     /// compare. Public only so out-of-crate consumers can name every field of this struct.
@@ -1289,6 +1327,13 @@ impl Default for FastMapAuditCounters {
             census_writes: 0,
             census_rmw_pairs: 0,
             census_enabled: rmw_census_default(),
+            slot_reject_misaligned: 0,
+            slot_reject_page_cross: 0,
+            slot_reject_absent: 0,
+            slot_reject_epoch: 0,
+            slot_reject_permission: 0,
+            slot_admit_misaligned: 0,
+            slot_reject_enabled: slot_census_default(),
             last_read_insn: 0,
             last_read_page: u32::MAX,
         }
@@ -1887,6 +1932,18 @@ pub struct CpuGsw {
     /// leaves `pending_flags` on its pinned offset -- measured, not assumed. The counters
     /// themselves are `JitState::fast_map_audit`; see that field for why they are not here.
     rmw_census_enabled: bool,
+    /// The slot-reject census gate. Same shape and same reasoning as `rmw_census_enabled`
+    /// immediately above: a bare `CpuGsw` byte in an existing padding hole, because it is read on
+    /// the interpreter's per-access FastMap miss path and reaching the counters through
+    /// `jit_direct.fast_map_audit` (a `Box`) would put a dependent load in front of the branch on
+    /// an instrument that is off on every default run.
+    ///
+    /// It must be the FIRST conjunct at its call site, with the callee `#[cold] #[inline(never)]`:
+    /// a gate INSIDE the callee still pays for the call. That ordering is not a style preference
+    /// -- a disarmed histogram whose conjunction was written the other way cost +2.2% wall on
+    /// duke3d-486, and this instrument's disarm was gated on an interleaved A/B/B/A before the
+    /// behavioural steps that consume it were allowed to land.
+    slot_census_enabled: bool,
     /// Where the last fatal `CpuError` was raised, for the machine's stop
     /// report. Written by all three sites that turn an `InternalFault` into a
     /// fatal `CpuError`, so it can never name the wrong fault; read ONLY on the
@@ -1985,6 +2042,7 @@ impl Default for CpuGsw {
             fast_map_probe: FastMapProbeCounters::default(),
             last_written_page: NO_LAST_WRITTEN_PAGE,
             rmw_census_enabled: rmw_census_default(),
+            slot_census_enabled: slot_census_default(),
             fault_site: FaultSite::default(),
         };
         // The literal above is the only place a `CpuGsw` picks a mode without going through

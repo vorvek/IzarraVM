@@ -890,6 +890,9 @@ impl CpuGsw {
             // The live gate is the bare `CpuGsw` byte, not the stored copy; report that one so a
             // reader of the JSON cannot mistake an unarmed run for an armed one that saw nothing.
             census_enabled: self.rmw_census_enabled,
+            // Same rule for the slot-reject half: report the LIVE gate byte, so five zero reject
+            // counters can be read as "the instrument was off", never as "nothing was refused".
+            slot_reject_enabled: self.slot_census_enabled,
             ..counters
         }
     }

@@ -729,3 +729,144 @@ fn a_same_mapping_refill_that_drops_user_flips_the_load_bias_tag() {
         "the write refill's fresh permissions must reach the load bias (R1)"
     );
 }
+
+/// `classify_reject` must attribute a refusal to the clause `lookup_access` reaches FIRST.
+///
+/// This is the coupling between the two ladders. They are written adjacently in `fast_map.rs`
+/// and cannot share code (`lookup_access` must not widen its hot return value to carry a reason
+/// -- that taxes the DISARMED path through the return ABI), so the parity is pinned here
+/// instead. Every case below is DOUBLY rejecting on purpose: the single-cause cases would pass
+/// under any ordering and prove nothing.
+#[test]
+fn classify_reject_follows_lookup_access_ladder_order() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = FastMap::default();
+    // A page whose read bias is live at MAPPING_EPOCH, supervisor-only and non-writable, so
+    // permission and epoch clauses can both be provoked at will.
+    let base = 0x8123_4000u32;
+    assert!(map.populate_read(
+        base,
+        0x0012_3000,
+        page(&mut bytes, 0x0012_3000, false),
+        PagePermissions {
+            writable: false,
+            user: false,
+        },
+        false,
+    ));
+
+    // Misaligned AND epoch-stale. `lookup_access` tests alignment before it ever indexes the
+    // epoch array, so the answer must be Misaligned.
+    assert_eq!(
+        map.classify_reject(
+            base + 0x101,
+            MAPPING_EPOCH + 1,
+            BusWidth::Word,
+            false,
+            false,
+            false
+        ),
+        SlotReject::Misaligned,
+    );
+    assert!(
+        map.lookup_access(
+            base + 0x101,
+            MAPPING_EPOCH + 1,
+            BusWidth::Word,
+            false,
+            false,
+            false
+        )
+        .is_none()
+    );
+
+    // Page-crossing AND misaligned. The crossing clause is the left operand of `lookup_access`'s
+    // `||`, and `||` evaluates left to right, so crossing wins.
+    assert_eq!(
+        map.classify_reject(
+            base + 0xfff,
+            MAPPING_EPOCH,
+            BusWidth::Word,
+            false,
+            false,
+            false
+        ),
+        SlotReject::PageCross,
+    );
+
+    // Epoch-stale AND permission-refused (user access to a supervisor page). The epoch array is
+    // consulted before the flags word.
+    assert_eq!(
+        map.classify_reject(
+            base + 0x100,
+            MAPPING_EPOCH + 1,
+            BusWidth::Word,
+            false,
+            true,
+            false
+        ),
+        SlotReject::Epoch,
+    );
+
+    // Live and current, but a CPL-3 accessor on a supervisor page: Permission, not Absent.
+    assert_eq!(
+        map.classify_reject(
+            base + 0x100,
+            MAPPING_EPOCH,
+            BusWidth::Word,
+            false,
+            true,
+            false
+        ),
+        SlotReject::Permission,
+    );
+
+    // No write bias was ever published for this page, so a write is Absent -- and Absent is
+    // reached only AFTER the epoch test, which this case also has to pass.
+    assert_eq!(
+        map.classify_reject(
+            base + 0x100,
+            MAPPING_EPOCH,
+            BusWidth::Word,
+            true,
+            false,
+            false
+        ),
+        SlotReject::Absent,
+    );
+
+    // An entirely unpopulated page is Absent too, from the liveness clause.
+    assert_eq!(
+        map.classify_reject(
+            0x9000_0100,
+            MAPPING_EPOCH,
+            BusWidth::Word,
+            false,
+            false,
+            false
+        ),
+        SlotReject::Absent,
+    );
+
+    // And the classifier never contradicts the ladder: everything it classifies was refused.
+    for (linear, epoch, width, write, user) in [
+        (
+            base + 0x101,
+            MAPPING_EPOCH + 1,
+            BusWidth::Word,
+            false,
+            false,
+        ),
+        (base + 0xfff, MAPPING_EPOCH, BusWidth::Word, false, false),
+        (base + 0x100, MAPPING_EPOCH + 1, BusWidth::Word, false, true),
+        (base + 0x100, MAPPING_EPOCH, BusWidth::Word, false, true),
+        (base + 0x100, MAPPING_EPOCH, BusWidth::Word, true, false),
+        (0x9000_0100, MAPPING_EPOCH, BusWidth::Word, false, false),
+    ] {
+        assert!(
+            map.lookup_access(linear, epoch, width, write, user, false)
+                .is_none(),
+            "classify_reject was asked about an access lookup_access ADMITS ({linear:#x})"
+        );
+    }
+}

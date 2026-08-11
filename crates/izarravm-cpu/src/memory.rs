@@ -232,8 +232,53 @@ impl CpuGsw {
             }
             None => {
                 self.fast_map_probe.misses += 1;
+                // The armed byte is the FIRST conjunct and is a bare `CpuGsw` field, so a
+                // disarmed run pays one already-resident byte load and a not-taken branch, with
+                // no `Box` deref and no call. See `slot_census_enabled`.
+                if self.slot_census_enabled {
+                    self.note_slot_reject(linear, mapping_epoch, width, write, user, write_protect);
+                }
                 None
             }
+        }
+    }
+
+    /// Attribute one FastMap refusal to the clause that caused it. Behind a call-site gate, and
+    /// `#[cold] #[inline(never)]` on the `FastMap` side, so nothing here is on a default run's
+    /// path. The accessor state is passed in rather than re-derived because the caller has all
+    /// six values in registers already and this must attribute against the SAME state the
+    /// refusal was decided under.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[cold]
+    #[inline(never)]
+    fn note_slot_reject(
+        &mut self,
+        linear: u32,
+        mapping_epoch: u64,
+        width: BusWidth,
+        write: bool,
+        user: bool,
+        write_protect: bool,
+    ) {
+        let reason = self.jit_fast_map.classify_reject(
+            linear,
+            mapping_epoch,
+            width,
+            write,
+            user,
+            write_protect,
+        );
+        let audit = &mut *self.jit_direct.fast_map_audit;
+        match reason {
+            jit::fast_map::SlotReject::PageCross => audit.slot_reject_page_cross += 1,
+            jit::fast_map::SlotReject::Misaligned => audit.slot_reject_misaligned += 1,
+            jit::fast_map::SlotReject::Absent => audit.slot_reject_absent += 1,
+            jit::fast_map::SlotReject::Epoch => audit.slot_reject_epoch += 1,
+            jit::fast_map::SlotReject::Permission => audit.slot_reject_permission += 1,
         }
     }
 
@@ -571,6 +616,14 @@ impl CpuGsw {
             // predicate now -- `should_split` forwards to `BusWidth::misaligned_at` too.
             tally.misaligned += u64::from(width.misaligned_at(linear));
         }
+    }
+
+    /// Arm or disarm the FastMap slot-reject census without the environment variable, so a test
+    /// can drive the instrument in-process (`slot_census_default` is a `OnceLock` and therefore
+    /// not per-test settable). Does NOT clear the counters: they live on `fast_map_audit` and are
+    /// reset by `reset_perf_counters` with everything else.
+    pub fn set_slot_census_enabled(&mut self, enabled: bool) {
+        self.slot_census_enabled = enabled;
     }
 
     /// Arm or disarm the slow-read page histogram without the environment variable, so a test can

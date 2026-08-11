@@ -3638,6 +3638,16 @@ mod fpu_flags;
 mod legacy_system;
 #[path = "cpu_persona_system_test.rs"]
 mod persona_system;
+/// The FastMap slot-reject census. Nested here for `TestBus` and for the same reason the
+/// histogram is: it needs a bus that genuinely serves direct pages, so a populated FastMap is
+/// reachable and a refusal is attributable to a clause rather than to a cold map.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_slot_census_test.rs"]
+mod slot_census;
 /// The slow-read page histogram (N2's diagnostic). Nested here for the `TestBus` fixture and, in
 /// particular, for its `non_direct_read_pages` seam: `direct_memory_bytes` does NOT consult
 /// `direct_pages_enabled`, so every aligned in-range `DataRead` comes back `direct: true` and

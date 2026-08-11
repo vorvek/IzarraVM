@@ -383,6 +383,24 @@ pub(crate) const NATIVE_LOAD_BIAS_SUPERVISOR: usize = LOAD_BIAS_SUPERVISOR;
 #[allow(dead_code)]
 pub(crate) const NATIVE_LOAD_BIAS_TAG_MASK: usize = LOAD_BIAS_TAG_MASK;
 
+/// The reason `FastMap::lookup_access` refused, as attributed by `FastMap::classify_reject`.
+/// One variant per clause GROUP in that ladder, not one per clause: the census question is
+/// "which class of refusal dominates", and splitting `Absent` five ways would only make the
+/// table longer without changing any decision it feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotReject {
+    /// `offset + bytes > PAGE_SIZE` -- the access straddles a page boundary.
+    PageCross,
+    /// Not naturally aligned for its width. This is the population the datapath slice targets.
+    Misaligned,
+    /// No storage, page not live, no committed bias, or no physical page: nothing to serve from.
+    Absent,
+    /// The page is live but its mapping epoch is stale. Zero here is B2b's gate.
+    Epoch,
+    /// PAGE_USER / PAGE_WRITABLE refusal against the live CPL and CR0.WP.
+    Permission,
+}
+
 impl FastMap {
     /// Resolve a populated linear mapping for the interpreter without revisiting the small TLB.
     /// A write bias exists only after the page walker has committed the PTE dirty bit, so a hit is
@@ -440,6 +458,84 @@ impl FastMap {
             ptr: bias.wrapping_add(linear as usize) as *mut u8,
             kind: decode_kind(flags),
         })
+    }
+
+    /// Why `lookup_access` refused, for the step-0 reject census. Runs ONLY when the census is
+    /// armed, so it re-runs the (already-failed, side-effect-free) clauses rather than making
+    /// `lookup_access` widen its hot return value to carry a reason -- a diagnostic field in the
+    /// return ABI taxes the DISARMED path through register allocation, which is the whole cost
+    /// this instrument is trying not to have.
+    ///
+    /// # Coupling: the clause order below MUST match `lookup_access`'s, clause for clause
+    ///
+    /// The census answers "which reason dominates". An access that is both misaligned and
+    /// epoch-stale must be attributed to whichever clause `lookup_access` reaches FIRST, or the
+    /// reading is wrong in exactly the way that makes a slice get sized against the wrong
+    /// population. The two ladders are written adjacently and are pinned by
+    /// `classify_reject_follows_lookup_access_ladder_order` in `fast_map_test.rs`; that test is
+    /// the coupling, not this comment. If you reorder `lookup_access`, reorder this too.
+    ///
+    /// Note the ONE place the two texts differ deliberately: `lookup_access` folds page-cross and
+    /// misalignment into a single `||`, which has a defined evaluation order (left to right), so
+    /// page-cross is genuinely first. This function separates them to name them.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn classify_reject(
+        &self,
+        linear: u32,
+        mapping_epoch: u64,
+        width: BusWidth,
+        write: bool,
+        user: bool,
+        write_protect: bool,
+    ) -> SlotReject {
+        let offset = linear & PAGE_MASK;
+        if offset
+            .checked_add(width.bytes())
+            .is_none_or(|end| end > PAGE_SIZE as u32)
+        {
+            return SlotReject::PageCross;
+        }
+        if width.misaligned_at(linear) {
+            return SlotReject::Misaligned;
+        }
+        let index = (linear >> PAGE_SHIFT) as usize;
+        let Some(storage) = self.storage.as_ref() else {
+            return SlotReject::Absent;
+        };
+        if !FastMapStorage::bit(&storage.live_pages, index) {
+            return SlotReject::Absent;
+        }
+        if storage.mapping_epochs[index] != mapping_epoch {
+            return SlotReject::Epoch;
+        }
+        let flags = storage.flags[index];
+        let bias_available = if write {
+            flags & HAS_WRITE_BIAS != 0 && storage.write_biases[index] != UNAVAILABLE_BIAS
+        } else {
+            flags & HAS_READ_BIAS != 0 && storage.read_biases[index] != UNAVAILABLE_BIAS
+        };
+        if !bias_available {
+            return SlotReject::Absent;
+        }
+        if user && flags & PAGE_USER == 0 {
+            return SlotReject::Permission;
+        }
+        if write && (user || write_protect) && flags & PAGE_WRITABLE == 0 {
+            return SlotReject::Permission;
+        }
+        if storage.physical_pages[index] == UNAVAILABLE_PHYSICAL_PAGE {
+            return SlotReject::Absent;
+        }
+        // Unreachable from a real refusal: every clause above mirrors one of `lookup_access`'s,
+        // so reaching here means the two ladders have drifted. Attribute it to `Absent` rather
+        // than panicking on a diagnostic path, and let the ladder-order test be what catches it.
+        debug_assert!(
+            false,
+            "classify_reject found no failing clause for an access lookup_access refused; the two \
+             ladders have drifted"
+        );
+        SlotReject::Absent
     }
 
     #[cfg(test)]
