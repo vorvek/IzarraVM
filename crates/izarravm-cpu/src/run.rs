@@ -15,6 +15,19 @@ pub(super) fn diff_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
 }
 
+/// The EXACT per-instruction cap test the screens in `run_budgeted_inner` stand in front of:
+/// `total + (S(raw) - S(raw_e)) >= cap`, asked of the bus without a divide. Split out so both
+/// screen arms fall through to one copy of it (they differ only in how they screen, never in the
+/// question they fall back to). An effectively-unbounded `cap` makes the target unreachable, which
+/// `checked_add` returning `None` answers as "not at the cap"; see the derivation at the call site.
+#[inline]
+fn exact_cap_test<B: CpuBus>(bus: &mut B, bus_at_entry: u64, cap: u64, total: u64) -> bool {
+    match bus_at_entry.checked_add(cap - total) {
+        None => false,
+        Some(target) => bus.in_batch_scaled_bus_clocks_at_least(target),
+    }
+}
+
 /// Whether an opcode is a port-I/O instruction (IN / OUT / INS / OUTS), for the unit simulator's
 /// `touches_io` fact. IN (0xE4/0xE5 imm, 0xEC/0xED DX) and the string forms INS (0x6C/0x6D) / OUTS
 /// (0x6E/0x6F) plus OUT (0xE6/0xE7 imm, 0xEE/0xEF DX). OUT/INS/OUTS are also non-continuable, so the
@@ -621,6 +634,10 @@ impl CpuGsw {
         // the cap test below for the derivation.
         let raw_at_entry = bus.in_batch_raw_bus_clocks();
         let cap_screen_scale = bus.in_batch_scaled_bus_clocks_screen_scale();
+        // `F == 1` in every persona this tree ships (see the cap test below). Resolving it here,
+        // once, lets the loop take an arm with the multiply folded out instead of asking a
+        // batch-constant question per instruction.
+        let unit_cap_screen_scale = cap_screen_scale == 1;
         // First-touch policy, decided ONCE per run: the knob is process-constant (see
         // `decode_pack_enabled`) and the loop below is the exact code the packed arm exists to
         // make cheaper, so asking per continuation would put back some of what it removes.
@@ -863,8 +880,24 @@ impl CpuGsw {
             // and if either the product or the sum overflows u64 the screen is treated as passed
             // rather than wrapped. `F == 0` means the bus offers no bound at all — then there is
             // no screen and every ask goes to the exact test, which is the pre-screen behaviour.
+            //
+            // `F == 1` is not a special case of the arithmetic, it is the ONLY case in this tree
+            // (386 23/31, 486 1/3, 586 16/105 -- every ratio is below 1, and `F` is
+            // `ceil(num/den).max(1)`), so the general arm's `checked_mul` is a multiply by one
+            // that every interpreted instruction pays. `unit_cap_screen_scale` is resolved once
+            // at run entry from the same batch-constant `F`, and its arm is the general arm with
+            // `checked_mul(1)` -- exact for every input, so nothing else can be dropped -- folded
+            // away. The general arm stays for any future `F > 1`; the two arms are the same
+            // predicate.
             let hit_cap = if total >= cap {
                 true
+            } else if unit_cap_screen_scale {
+                let screened = bus
+                    .in_batch_raw_bus_clocks()
+                    .wrapping_sub(raw_at_entry)
+                    .checked_add(total)
+                    .is_some_and(|bound| bound < cap);
+                !screened && exact_cap_test(bus, bus_at_entry, cap, total)
             } else if cap_screen_scale != 0
                 && bus
                     .in_batch_raw_bus_clocks()
@@ -875,10 +908,7 @@ impl CpuGsw {
             {
                 false
             } else {
-                match bus_at_entry.checked_add(cap - total) {
-                    None => false,
-                    Some(target) => bus.in_batch_scaled_bus_clocks_at_least(target),
-                }
+                exact_cap_test(bus, bus_at_entry, cap, total)
             };
             if hit_cap {
                 self.perf.brk_cap += 1;

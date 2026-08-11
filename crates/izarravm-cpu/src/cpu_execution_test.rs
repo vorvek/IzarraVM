@@ -2518,11 +2518,15 @@ fn cap_screen_matches_the_exact_test_at_the_boundary() {
     // the boundary: pin the run that ends exactly ON the cap, and the run whose cap sits one
     // clock beyond that same instruction's value, which must NOT end there.
     //
-    // Both scalings are checked. (1, 1) makes the screen's bound equal the exact figure, so the
-    // screen alone decides. A 586-shaped (7, 30) makes `F = ceil(7/30) = 1` a LOOSE bound - the
-    // screen passes long before the exact test can be true - so the fall-through arm is the one
-    // that produces every answer. A conservativeness bug in either direction moves a boundary.
-    for scale in [(1u64, 1u64), (7, 30)] {
+    // Three scalings are checked, and they cover BOTH screen arms. (1, 1) makes the screen's
+    // bound equal the exact figure, so the screen alone decides. A 586-shaped (7, 30) makes
+    // `F = ceil(7/30) = 1` a LOOSE bound - the screen passes long before the exact test can be
+    // true - so the fall-through arm is the one that produces every answer. Both of those have
+    // `F == 1` and so take the hoisted unit arm, which is every persona this tree ships; (30, 7)
+    // gives `F = 5` and is the only case that reaches the general `checked_mul` arm, so that arm
+    // cannot rot into an untested branch. A conservativeness bug in either direction, in either
+    // arm, moves a boundary.
+    for scale in [(1u64, 1u64), (7, 30), (30, 7)] {
         // A probe run under a generous cap tells us the exact value V the cap test reached on
         // the instruction it broke at, and how many instructions that took.
         let (probe_instructions, probe_brk_cap, boundary) = cap_boundary_probe(scale, 10_000);
