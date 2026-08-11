@@ -52,7 +52,9 @@ manual](resonique2/manual.md):
   offers a choice. This is fully modeled.
 - **Too loud, too quiet, or the music drowning the effects**: run `SNDMIXER`.
   It provides a fader per source (music, digital audio, CD, MIDI, PC speaker),
-  and the levels are saved between sessions.
+  and the levels are saved between sessions. If everything is quiet with MASTER
+  already at 10, the `AMP` fader adds output gain in 6 dB positions — at the
+  cost of headroom, so a loud game may then distort.
 - **General MIDI / wavetable**: select MPU-401 output at port `300`. Toka-DOS
   advertises it as `P300` in `BLASTER`. This represents a daughterboard fitted
   to the ReSonique 2's internal pin headers, which IzarraVM emulates through

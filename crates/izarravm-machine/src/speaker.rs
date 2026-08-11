@@ -9,9 +9,15 @@ use std::collections::VecDeque;
 
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
-/// Output level for an enabled membrane. Audible, with headroom against the OPL
-/// and DSP sums. Bipolar so a toggling square wave carries no DC bias.
-const SPEAKER_AMPLITUDE: i64 = 8000;
+/// Output level for an enabled membrane. Bipolar so a toggling square wave
+/// carries no DC bias.
+///
+/// The swing is +/- this, so 5120 peak to peak, which is 86Box's mode-3 beeper
+/// (`snd_speaker.c`, 0..0x1400) exactly. It was 8000 -- 16000 peak to peak --
+/// until the beeper's level against a full-scale digital voice leg was measured
+/// through both emulators' whole chains and came out 9.88 dB hot; see the
+/// routing note on `MIX_HEADROOM` in `timing.rs`, which carries the derivation.
+const SPEAKER_AMPLITUDE: i64 = 2560;
 
 /// The host DAC rate the ring is produced at.
 const DAC_HZ: u32 = 44_100;

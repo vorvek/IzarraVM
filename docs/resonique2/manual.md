@@ -155,10 +155,10 @@ flags again  flags=--sb-irq 5
 
 ## Setting the volume
 
-Use the `SNDMIXER` utility to set the card's volume levels. It presents six
-vertical faders over the card's own mixer: MASTER, FMSYNTH, WAVE, CD-ROM, MIDI
-and the PC speaker. Each level is applied as the fader moves, saved to a file,
-and restored on the next boot from `AUTOEXEC.BAT`.
+Use the `SNDMIXER` utility to set the card's volume levels. It presents seven
+vertical faders over the card's own mixer: MASTER, FMSYNTH, WAVE, CD-ROM, MIDI,
+the PC speaker, and AMP. Each level is applied as the fader moves, saved to a
+file, and restored on the next boot from `AUTOEXEC.BAT`.
 
 ```
 C:\> SNDMIXER
@@ -178,7 +178,7 @@ whole range below them. Each step is 4 dB, which spreads the ten positions
 evenly rather than crowding them into the top of a 62 dB scale. The full
 switch list is in [SNDMIXER](../toka-dos/commands.md#sndmixer).
 
-Two of the six are not plain Sound Blaster registers:
+Two of the seven are not plain Sound Blaster registers:
 
 - **PC speaker** is the card's PC-SPK input (mixer register `0x3B`). That input
   is two bits wide on the real chip, so the fader has four positions, not ten.
@@ -192,6 +192,46 @@ Two of the six are not plain Sound Blaster registers:
   control elsewhere in the machine, so a program that cleared the mixer's
   registers would otherwise silence it with no indication of the cause. Mute
   the wavetable with the mute bit.
+
+### Output gain (AMP)
+
+The seventh fader is not a volume control. It is the card's output amplifier,
+and it is the only control on the card that adds level rather than taking it
+away.
+
+It sits on the card's internal bus, beside the master: it raises the FM
+synthesis, the digital audio the Sound Blaster DSP plays, and the PC-speaker
+input. CD audio and the Windows Sound System codec do not pass through it —
+those two legs reach the summing node carrying only their own attenuation — so
+the AMP fader does not lift a Red Book track or a WSS recording.
+
+| Register | Bits | Field | Positions |
+| --- | --- | --- | --- |
+| `0x41` | D7-D6 | Output gain, left | 0, 1, 2, 3 |
+| `0x42` | D7-D6 | Output gain, right | 0, 1, 2, 3 |
+
+Each position is 6 dB:
+
+| Position | Gain | Fader step |
+| --- | --- | --- |
+| 0 | 0 dB | 0 |
+| 1 | +6 dB | 3 |
+| 2 | +12 dB | 7 |
+| 3 | +18 dB | 10 |
+
+Position 0 is the power-on setting, and it is the bottom of the fader's travel
+rather than a mute: an amplifier at 0 dB is an amplifier passing its input
+through, and everything above it is gain the card was not applying before. The
+two registers are written together — `SNDMIXER` moves both from one fader,
+because a difference between them is a balance change and not a level.
+
+**The gain can clip.** The mix reserves 6 dB of headroom where the card's legs
+are summed, which is exactly enough to absorb one of them driven to full scale.
+The amplifier is applied to its three legs before that sum, so position 1 spends
+the reserve. Positions 2 and 3 are past it, and a hot source — a full-scale DSP
+voice, or the FM and the voice playing together — will distort. The card offers
+the positions and the fader offers them; neither one refuses the setting or
+quietly limits it. Use them to lift a quiet game, not to make a loud one louder.
 
 ## Digital audio (Sound Blaster 16 compatible)
 

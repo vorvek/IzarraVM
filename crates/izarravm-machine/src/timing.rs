@@ -94,22 +94,25 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 ///   leg is 65534 peak-to-peak through `dsp * voice / 3.0 * master`. The `/3`
 ///   and the master are common to both and cancel, leaving
 ///   `5120 * 0.4467 / 65534` = **-29.13 dB**.
-/// - here: the beeper swings +/-`SPEAKER_AMPLITUDE` (8000, so 16000
-///   peak-to-peak), then `0x3B * master`, and voice is 65534 peak-to-peak. This
-///   scalar and the master are likewise common and cancel, leaving
-///   `16000 * 0.4467 / 65534` = **-19.25 dB**.
+/// - here: the beeper swings +/-`SPEAKER_AMPLITUDE`, then `0x3B * master`, and
+///   voice is 65534 peak-to-peak. This scalar and the master are likewise
+///   common and cancel, leaving `swing * 0.4467 / 65534`.
 ///
-/// So the beeper rests 9.88 dB hotter than 86Box's, and the whole of that gap
-/// is `SPEAKER_AMPLITUDE`: 20*log10(16000/5120) is 9.90 dB. The per-leg `/3`
-/// versus this post-sum 0.5 does NOT contribute, because each applies to the
-/// beeper and to the reference alike.
+/// That measurement is now taken, and it closed the gap. `SPEAKER_AMPLITUDE`
+/// was 8000 -- a 16000 peak-to-peak swing, giving `16000 * 0.4467 / 65534` =
+/// **-19.25 dB**, which rested 9.88 dB hotter than 86Box's -29.13. The whole of
+/// that gap was the constant: 20*log10(16000/5120) is 9.90 dB. It is now 2560,
+/// so the swing is 5120 peak-to-peak, the same number 86Box's is, and the two
+/// beepers land on the same -29.13 dB against their own full-scale voice legs.
+/// The per-leg `/3` versus this post-sum 0.5 did NOT contribute either way,
+/// because each applies to the beeper and to the reference alike.
 ///
-/// Wiring `0x3B` closed 13.02 dB (6.02 of reserve the beeper was skipping, plus
-/// the 7.0 the card's own default PC-SPK level takes off) and this is where it
-/// was left. The remaining 9.88 dB is the beeper's own model, not the mixer's:
-/// closing it means moving `SPEAKER_AMPLITUDE`, which changes every PC-speaker
-/// title and belongs to its own measurement, not to a change that gave the
-/// mixer a register it was missing.
+/// Wiring `0x3B` had already closed 13.02 dB (6.02 of reserve the beeper was
+/// skipping, plus the 7.0 the card's own default PC-SPK level takes off). The
+/// remaining 9.88 dB was the beeper's own model rather than the mixer's, which
+/// is why it waited for a change of its own: moving `SPEAKER_AMPLITUDE` makes
+/// every PC-speaker title quieter, and that is a guest-visible decision, not a
+/// side effect of giving the mixer a register it was missing.
 pub const MIX_HEADROOM: f32 = 0.5;
 
 pub const PIT_INPUT_HZ: u32 = 1_193_182;

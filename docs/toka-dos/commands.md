@@ -431,7 +431,7 @@ almost always assume, but a few require IRQ 5. See
 ## SNDMIXER
 
 Sets the volume levels on the [ReSonique 2](../resonique2/manual.md) card's
-mixer. The full-screen display presents six vertical faders, one per source.
+mixer. The full-screen display presents seven vertical faders, one per source.
 
 ```
 SNDMIXER                full-screen mixer
@@ -443,15 +443,17 @@ SNDMIXER /W n           WAVE        SB16 DSP and WSS codec
 SNDMIXER /C n           CD-ROM      Red Book audio
 SNDMIXER /I n           MIDI        wavetable synthesis
 SNDMIXER /P n           PC speaker  four positions: 0 3 7 10
+SNDMIXER /A n           AMP         output gain, same four positions
 SNDMIXER /S             suppress all output
 SNDMIXER /?             usage
 ```
 
-Tab and the arrow keys select a fader, Up and Down move it, Home and End set it
-to full and to mute, and the digit keys set a level directly. Each level is
-applied to the hardware as it is set.
+Tab and the arrow keys select a fader, Up and Down move it, Home and End send it
+to the top and the bottom of its travel, and the digit keys set a level directly.
+The bottom is a mute on the six faders that attenuate, and 0 dB — no gain — on
+`AMP`, which amplifies. Each level is applied to the hardware as it is set.
 
-Two buttons sit along the bottom of the box, after the six faders on the same
+Two buttons sit along the bottom of the box, after the seven faders on the same
 Tab ring. **Accept** leaves the mixer with the levels that were set still in
 effect and prints `Settings applied.` **Cancel** restores the levels that were
 in effect when the mixer was opened, which is what **Esc** has always done.
@@ -467,6 +469,21 @@ distinguishable positions, with 10 the level the card powers on at and 0 a mute.
 The PC-speaker fader has four positions rather than ten, because the card gives
 that input two bits and not five. A value between two positions rounds up to the
 next one, so a low setting does not become silence.
+
+`AMP` is the card's output gain (mixer registers `0x41` and `0x42`), and it is
+the one fader that adds level instead of removing it. It has the same four
+positions as the PC speaker, for the same reason — the register is two bits
+wide — but they run upwards: step 0 is 0 dB, step 3 is +6 dB, step 7 is +12 dB
+and step 10 is +18 dB. Step 0 is the power-on setting and is not a mute; it is
+the amplifier turned off. A value between two positions rounds up, as the PC
+speaker's does.
+
+Gain above 0 dB can clip. The mix reserves 6 dB of headroom after the mixer,
+enough to absorb one leg driven to full scale, and step 3 spends it. Steps 7 and
+10 are past it, and a hot source will distort. The card offers those positions,
+so this fader offers them; raising the output gain is a choice, the same choice
+the hardware gives. To make a quiet game louder, try `AMP` after `MASTER` is
+already at 10, not before.
 
 A MIDI level of 0 writes the wavetable mute bit rather than a level of zero. The
 card treats a level of zero on the wavetable as the quietest audible step, not
@@ -496,9 +513,10 @@ so to keep levels in some other file use the command-line form:
 `SNDMIXER /M 8 /F 6 /CFG C:\GAMES\QUIET.CFG`.
 
 The file is plain text and may be edited with `TYPE` or TOKAEDIT. Lines are
-`CHANNEL=step`. Spaces around the `=` are permitted, `;` and `#` start a
-comment, and a line the parser does not recognise is skipped rather than
-refused.
+`CHANNEL=step`, with the channel one of `MASTER`, `FMSYNTH`, `WAVE`, `CD`,
+`MIDI`, `SPEAKER` or `AMP`. Spaces around the `=` are permitted, `;` and `#`
+start a comment, and a line the parser does not recognise is skipped rather than
+refused. A channel the file leaves out keeps whatever level the card is holding.
 
 The default file is in the root of `C:` rather than in `C:\DOS`, because `C:` is
 not always the Toka-DOS image. When IzarraVM is pointed at a folder of games,
