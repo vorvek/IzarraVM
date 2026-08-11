@@ -1091,7 +1091,19 @@ impl CpuGsw {
                 self.read_system_linear(bus, base + 72 + k as u32 * 4, BusWidth::Word)? as u16;
             // A null data segment (ES/DS/FS/GS) is legal and just unusable; CS and SS
             // must be loadable.
-            if selector & !0x7 == 0 && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss) {
+            //
+            // "Unusable" is a PROTECTED-MODE statement. The incoming EFLAGS -- VM included --
+            // was committed above, before this loop, so `is_v86_mode` here already answers for
+            // the task being switched TO: if it is a V86 task, selector 0 is not the null
+            // descriptor at all but an ordinary 8086 segment at base 0, and it must be built
+            // like every other V86 segment (limit 0xFFFF, real-mode access). Leaving it at
+            // `Default::default()` gave such a task a limit-0 DS that faults on its first
+            // access -- and, since `load_segment_real_mode` no longer re-stamps the limit,
+            // the JIT's `LoadSegReal` lowering would no longer paper over it either.
+            if selector & !0x7 == 0
+                && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss)
+                && !self.is_v86_mode()
+            {
                 self.registers.set_segment(
                     *segment,
                     SegmentRegister {
@@ -1215,17 +1227,65 @@ impl CpuGsw {
                 self.invalidate_code_caches_for_cs_load();
             }
         } else {
-            self.load_segment_real(segment, selector);
+            self.load_segment_real_mode(segment, selector);
         }
         Ok(())
     }
 
+    /// The CANONICALIZING real-mode segment install: every field written from
+    /// `SegmentRegister::real`, including `limit = 0xFFFF`.
+    ///
+    /// This is the right form only where the architecture really does rebuild the whole
+    /// descriptor cache: V86 entry and V86 segment loads (386 PRM 26.3.1 -- a V86 task
+    /// addresses memory like the 8086, 64 KB, no exceptions), the V86-exit data-segment
+    /// clear, and the boot/reset paths. An ordinary REAL-MODE `MOV Sreg, r16` must NOT
+    /// come here -- see `load_segment_real_mode`.
     pub(super) fn load_segment_real(&mut self, segment: SegmentIndex, selector: u16) {
         self.registers
             .set_segment(segment, SegmentRegister::real(selector));
         if segment == SegmentIndex::Cs {
             self.invalidate_code_caches_for_cs_load();
         }
+    }
+
+    /// A segment load taken with CR0.PE clear and VM clear: plain real mode.
+    ///
+    /// Real mode does not re-derive a descriptor -- there is no table to read. The 386
+    /// recomputes only what the selector determines (base = selector << 4) and the access
+    /// rights; the cached LIMIT is left exactly as the last protected-mode load left it.
+    /// That single omission is what "unreal"/flat-real mode IS: software enters protected
+    /// mode, loads a 4 GB-limit data descriptor into DS/ES/FS/GS/SS, drops CR0.PE, and goes
+    /// on addressing 4 GB from real mode. Stamping the limit back to 0xFFFF here destroys
+    /// it, and every `mov eax,[esi+ecx*8]` past 64 KB becomes a #GP.
+    ///
+    /// CS is the documented exception: a real-mode CS load re-canonicalizes to 0xFFFF, so a
+    /// far jump out of protected mode really does give back a 64 KB code segment. (We do not
+    /// offer a "big real-mode CS" escape hatch.)
+    ///
+    /// WHICH FIELDS ARE PRESERVED, and why exactly one. The real-mode limit check
+    /// (`segment_linear_range` / `segment_linear_byte` in `memory.rs`) consults `base`,
+    /// `limit` and `access`; `default_size_32` is reached only through the expand-down
+    /// ceiling, which is gated on protected-and-not-V86 and so is dead in real mode. `limit`
+    /// is therefore the ONLY field a 4 GB real-mode data segment needs carried over, and it
+    /// is the only one carried. `default_size_32` is deliberately re-stamped false rather
+    /// than preserved: its other reader is `stack_is_32bit`, and preserving it would hand
+    /// real mode a 32-bit implicit stack as a silent side effect of this fix. (DOSBox-X's
+    /// `CPU_SetSegGeneral` makes the same limit-only choice; 86Box happens to keep SS's B
+    /// bit too. If a guest ever needs a big real-mode stack, that is its own slice with its
+    /// own evidence.)
+    fn load_segment_real_mode(&mut self, segment: SegmentIndex, selector: u16) {
+        if segment == SegmentIndex::Cs {
+            self.load_segment_real(segment, selector);
+            return;
+        }
+        let limit = self.registers.segment(segment).limit;
+        self.registers.set_segment(
+            segment,
+            SegmentRegister {
+                limit,
+                ..SegmentRegister::real(selector)
+            },
+        );
     }
 
     fn load_protected_segment<B: CpuBus>(

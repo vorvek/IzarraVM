@@ -574,9 +574,19 @@ impl CpuGsw {
     /// B bit (386 PRM 16.2: "the size of stack pointer ... used by the processor
     /// for implicit stack references" is controlled by SS.B, independent of
     /// operand size, gate size, or CS's D bit). Real mode and V86 always load SS
-    /// through `load_segment_real`/`SegmentRegister::real`, which sets
-    /// `default_size_32: false`, so this is 16-bit there too -- one rule covers
-    /// every mode. Backed by the cached `SegmentRegister.default_size_32` field
+    /// through `load_segment_real`/`load_segment_real_mode`, both of which stamp
+    /// `default_size_32: false` -- the real-mode load preserves the cached LIMIT
+    /// (unreal mode) but deliberately not the B bit -- so THIS query reads 16-bit
+    /// in every mode without a mode test.
+    ///
+    /// That is a statement about SS here, not about the field generally:
+    /// `default_size_32` is also read off CS for the decode default size
+    /// (`emit_input.rs`'s address/operand-size derivation, the JIT mode key, the
+    /// decode-cache key), and off any segment for the protected-mode expand-down
+    /// ceiling. Those readers are unaffected because CS re-canonicalizes on every
+    /// real-mode load and the expand-down arm is gated on protected-and-not-V86.
+    ///
+    /// Backed by the cached `SegmentRegister.default_size_32` field
     /// (populated from descriptor bit 22 in `descriptor_to_segment`), so this is a
     /// field read, not a descriptor decode: safe in the push/pop hot path.
     #[inline]

@@ -249,21 +249,38 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // `OperandSize::Word` whatever the prefix says. `mov_r32_imm32` into the scratch
             // first because there is no 16-bit immediate form on the encoder and none is worth
             // adding for one kind; the upper half of RDX is dead either way.
-            // `MOV Sreg, r16` in real mode or V86: the five field writes `load_segment_real`
-            // performs, and nothing else. `set_segment` is one array-element assignment, and the
-            // only extra work `load_segment_real` does is a CS-only code-cache invalidation that
-            // DS and ES never reach.
+            // `MOV Sreg, r16` in real mode or V86: the field writes `load_segment_real_mode`
+            // performs for a non-CS segment, and nothing else. `set_segment` is one
+            // array-element assignment, and the only extra work the interpreter does is a
+            // CS-only code-cache invalidation that DS and ES never reach (`classify` lowers
+            // only `/0` and `/3`, so `segment` here is only ever ES or DS).
             //
             // Every constant comes from `SegmentRegister::real` rather than being written out
             // here, so the two cannot drift. Only `base = selector << 4` is duplicated, and a
             // differential pins it.
             //
-            // The limit and access stores are NOT redundant on the grounds that this is real mode.
-            // Unreal mode is exactly a real-mode segment carrying a protected-mode limit, and
-            // `load_segment_real` stamps the limit back to 0xFFFF unconditionally. Skipping it
-            // would leave a 4 GB limit live, and `emit_segmented_linear_address` omits the limit
-            // compare entirely when the limit is `u32::MAX`, so the divergence would go on to
-            // suppress limit faults in later blocks rather than staying local.
+            // There is deliberately NO limit store: a real-mode segment load leaves the cached
+            // limit alone, which is what unreal/flat-real mode is (see
+            // `CpuGsw::load_segment_real_mode`). `emit_segmented_linear_address` bakes the
+            // ENTRY limit of every segment it addresses through, and the compile walk's
+            // dirty-segment rule ends the block at the first later slot that touches a segment
+            // a `LoadSegReal` has written, so the baked limit can never go stale behind this.
+            //
+            // The same lowering is admitted under V86, where the limit must be 0xFFFF. It is,
+            // and that is now true by construction rather than by luck: BOTH V86 entries
+            // canonicalize all six segments -- the IRET-into-V86 tail calls `load_segment_real`
+            // directly, and a task switch into a V86 task commits EFLAGS.VM before its
+            // segment-restore loop, so every selector that loop handles goes through
+            // `load_segment_checked`'s V86 branch, INCLUDING a null one (that branch's
+            // null-selector short-circuit is explicitly gated off in V86; see `task_switch`).
+            // Every in-V86 load thereafter takes the same branch. So "leave the limit" and
+            // "write 0xFFFF" coincide there, and omitting the store is correct in both modes.
+            // `task_switch_into_v86_builds_a_null_data_selector_as_a_real_mode_segment` is the
+            // test that keeps the one hole in that argument closed.
+            //
+            // The access store IS still required: it is what a real-mode load recomputes.
+            // `default_size_32` rides along in the same 16-bit store because it is re-stamped
+            // false rather than preserved (again, see `load_segment_real_mode`).
             DirectKind::LoadSegReal { segment, src } => {
                 const REAL: SegmentRegister = SegmentRegister::real(0);
                 let base = segment_field_base(segment);
@@ -277,7 +294,6 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     Reg::RDX,
                     u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
                 );
-                e.store_u32_imm_disp32(Reg::R15, base + limit_offset(), REAL.limit);
                 e.store_r16_disp32(Reg::R15, base + access_offset(), Reg::RDX);
                 e.shift_r32_imm8(4, Reg::RAX, 4);
                 e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
@@ -3783,10 +3799,6 @@ fn selector_offset() -> i32 {
 
 fn base_offset() -> i32 {
     core::mem::offset_of!(SegmentRegister, base) as i32
-}
-
-fn limit_offset() -> i32 {
-    core::mem::offset_of!(SegmentRegister, limit) as i32
 }
 
 /// `access` and `default_size_32` are adjacent, and the emitter writes both with one 16-bit

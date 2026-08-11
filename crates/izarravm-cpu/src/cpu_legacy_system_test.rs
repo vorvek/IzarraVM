@@ -1982,3 +1982,289 @@ fn popfd_can_never_set_vm_at_any_cpl() {
     cpu.cycle(&mut bus).unwrap();
     assert_eq!(cpu.registers.eflags & FLAG_VM, 0, "POPFD must never set VM");
 }
+
+// ---- Unreal / flat-real mode: the real-mode segment load preserves the cached limit ----
+
+/// A 4 GB flat data descriptor at GDT selector 0x10 (base 0, limit 0xFFFFF with G=1,
+/// access 0x93), the shape SpeedSys/DOS4GW-style loaders install before dropping back to
+/// real mode. `memory` is sized past 1 MB so a >64 KB access has somewhere to land.
+fn unreal_world(code: &[u8]) -> (CpuGsw, Vec<u8>) {
+    let mut memory = vec![0u8; 0x11_0010];
+    memory[..code.len()].copy_from_slice(code);
+    let flat = 0x00cf_9300u32;
+    memory[0x110..0x114].copy_from_slice(&0x0000_ffffu32.to_le_bytes());
+    memory[0x114..0x118].copy_from_slice(&flat.to_le_bytes());
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.load_segment_real(SegmentIndex::Ss, 0);
+    cpu.registers.eip = 0;
+    cpu.registers.set_esp(0x80);
+    cpu.gdtr = DescriptorTable {
+        base: 0x100,
+        limit: 0xff,
+    };
+    (cpu, memory)
+}
+
+#[test]
+fn real_mode_segment_load_preserves_a_protected_mode_limit() {
+    // The whole unreal-mode sequence, driven as instructions: enter protected mode with a
+    // 4 GB data descriptor in DS, clear CR0.PE, reload DS in real mode, then read a dword
+    // 1 MB up. The final load is the one that used to stamp `limit = 0xFFFF` and turn every
+    // subsequent >64 KB access into #GP (SpeedSys 4.78 hung in exactly this shape).
+    let (mut cpu, memory) = unreal_world(&[
+        0xb8, 0x10, 0x00, // mov ax, 0x10
+        0x8e, 0xd8, // mov ds, ax        -- protected-mode load, limit 4 GB
+        0x0f, 0x20, 0xc0, // mov eax, cr0
+        0x24, 0xfe, // and al, 0xfe
+        0x0f, 0x22, 0xc0, // mov cr0, eax     -- PE 1 -> 0
+        0xb8, 0x00, 0x00, // mov ax, 0
+        0x8e, 0xd8, // mov ds, ax        -- REAL-mode load
+        0x67, 0x66, 0x8b, 0x05, 0x00, 0x00, 0x11, 0x00, // mov eax, [dword 0x110000]
+    ]);
+    let mut bus = TestBus::with_memory(memory);
+    bus.memory[0x11_0000..0x11_0004].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    cpu.control.cr0 |= CR0_PE;
+
+    for _ in 0..5 {
+        cpu.cycle(&mut bus).unwrap();
+    }
+    assert!(
+        !cpu.is_protected_mode(),
+        "PE must be clear before the reload"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).limit,
+        0xffff_ffff,
+        "clearing CR0.PE must not touch a descriptor cache"
+    );
+
+    cpu.cycle(&mut bus).unwrap(); // mov ax, 0
+    cpu.cycle(&mut bus).unwrap(); // mov ds, ax  -- the real-mode load under test
+    let ds = cpu.registers.segment(SegmentIndex::Ds);
+    assert_eq!(ds.selector, 0, "the selector IS recomputed");
+    assert_eq!(ds.base, 0, "base = selector << 4 IS recomputed");
+    assert_eq!(ds.access, 0x93, "access IS recomputed");
+    assert!(!ds.default_size_32, "B is re-stamped false, not preserved");
+    assert_eq!(
+        ds.limit, 0xffff_ffff,
+        "the cached limit survives a real-mode load -- this IS unreal mode"
+    );
+
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        cpu.registers.eax(),
+        0xdead_beef,
+        "a 1 MB-up read through the unreal DS must complete, not #GP"
+    );
+}
+
+#[test]
+fn real_mode_cs_load_recanonicalizes_the_limit() {
+    // CS is the documented exception: a real-mode CS load rebuilds the whole descriptor,
+    // so a far jump out of protected mode really does give back a 64 KB code segment.
+    // DS, loaded in the same breath, keeps its big limit -- that split is the hardware's.
+    let (mut cpu, memory) = unreal_world(&[]);
+    let mut bus = TestBus::with_memory(memory);
+    let big = SegmentRegister::flat(0x10, 0x93);
+    cpu.registers.set_segment(SegmentIndex::Cs, big);
+    cpu.registers.set_segment(SegmentIndex::Ds, big);
+
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, 0x1234)
+        .unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ds, 0x1234)
+        .unwrap();
+
+    let cs = cpu.registers.cs();
+    assert_eq!(cs.limit, 0xffff, "a real-mode CS load re-canonicalizes");
+    assert_eq!(cs.base, 0x1_2340);
+    assert!(!cs.default_size_32);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).limit,
+        0xffff_ffff,
+        "a data segment loaded at the same moment keeps its limit"
+    );
+}
+
+#[test]
+fn v86_segment_load_forces_the_64k_limit() {
+    // V86 is not unreal mode: a V86 task addresses memory like the 8086, 64 KB, no
+    // exceptions (386 PRM 26.3.1). A stale big limit must not survive into it.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+
+    cpu.load_segment(&mut bus, SegmentIndex::Ds, 0x0a00)
+        .unwrap();
+
+    let ds = cpu.registers.segment(SegmentIndex::Ds);
+    assert_eq!(ds.limit, 0xffff, "V86 forces the 64 KB limit");
+    assert_eq!(ds.base, 0xa000);
+    assert!(!ds.default_size_32);
+}
+
+#[test]
+fn clearing_cr0_pe_leaves_every_segment_cache_untouched() {
+    // The PE 1 -> 0 transition itself rebuilds nothing. Both prior-art checkouts agree
+    // (86Box's CR0 write and DOSBox-X's CPU_SET_CRX touch no segment field), and it is
+    // what makes the sequence above reach real mode with the big limit still live.
+    let (mut cpu, memory) = unreal_world(&[0x0f, 0x22, 0xc0]); // mov cr0, eax
+    let mut bus = TestBus::with_memory(memory);
+    cpu.control.cr0 |= CR0_PE;
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+        SegmentIndex::Ss,
+    ] {
+        cpu.registers
+            .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+    }
+    let before = cpu.registers.segments;
+    cpu.registers.set_eax(0); // clears PE
+
+    cpu.cycle(&mut bus).unwrap();
+
+    assert!(!cpu.is_protected_mode());
+    assert_eq!(
+        cpu.registers.segments, before,
+        "clearing PE must not rewrite any descriptor cache"
+    );
+}
+
+#[test]
+fn a_real_mode_only_guest_never_sees_a_limit_other_than_0xffff() {
+    // Boot-normal invariance: with no protected-mode excursion there is no big limit to
+    // preserve, so every segment load still yields the canonical real-mode descriptor.
+    // This is what keeps the fix invisible to guests that never enter unreal mode.
+    let (mut cpu, memory) = unreal_world(&[
+        0xb8, 0x00, 0x20, // mov ax, 0x2000
+        0x8e, 0xd8, // mov ds, ax
+        0x8e, 0xc0, // mov es, ax
+        0x8e, 0xd0, // mov ss, ax
+        0xea, 0x00, 0x00, 0x00, 0x30, // jmp far 0x3000:0
+    ]);
+    let mut bus = TestBus::with_memory(memory);
+    for _ in 0..5 {
+        cpu.cycle(&mut bus).unwrap();
+    }
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+        SegmentIndex::Ss,
+    ] {
+        let descriptor = cpu.registers.segment(segment);
+        assert_eq!(descriptor.limit, 0xffff, "{segment:?} limit");
+        assert_eq!(descriptor.access, 0x93, "{segment:?} access");
+        assert!(!descriptor.default_size_32, "{segment:?} B bit");
+    }
+}
+
+/// A hardware task switch INTO a V86 task with a null DS selector.
+///
+/// Selector 0 in a V86 task's DS is not the protected-mode null descriptor -- it is an
+/// ordinary 8086 segment at base 0, and the task-switch restore loop must build it the way
+/// every other V86 segment load does: base 0, limit 0xFFFF, the real-mode access byte. The
+/// loop's null-selector short-circuit used to install `Default::default()` (limit 0, access
+/// 0) for it, which is only right in protected mode.
+///
+/// This became reachable-and-visible with the unreal-mode fix. Before it, the JIT's
+/// `LoadSegReal` lowering re-stamped 0xFFFF over the bad descriptor on the next
+/// `MOV DS, r16` and silently repaired the state; now neither role writes the limit, so a
+/// natively-executed segment load in such a task would have diverged from the interpreter.
+#[test]
+fn task_switch_into_v86_builds_a_null_data_selector_as_a_real_mode_segment() {
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+        &[0xea, 0x00, 0x00, 0x18, 0x00],
+        &[RING0_CODE, ring0_data, new_tss, old_tss],
+    );
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x380 + 32, 0x200); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0002_0002); // EFLAGS: VM set
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x0a00); // ES
+    put16(&mut memory, 0x380 + 76, 0x0a00); // CS
+    put16(&mut memory, 0x380 + 80, 0x0900); // SS
+    put16(&mut memory, 0x380 + 84, 0x0000); // DS -- null, and perfectly ordinary in V86
+    put16(&mut memory, 0x380 + 88, 0x0000); // FS
+    put16(&mut memory, 0x380 + 92, 0x0000); // GS
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.cycle(&mut bus).unwrap();
+
+    assert!(cpu.is_v86_mode(), "the incoming task's EFLAGS carried VM");
+    assert_eq!(cpu.current_privilege_level(), 3, "a V86 task runs at CPL 3");
+    for segment in [SegmentIndex::Ds, SegmentIndex::Fs, SegmentIndex::Gs] {
+        assert_eq!(
+            cpu.registers.segment(segment),
+            SegmentRegister::real(0),
+            "{segment:?} must be an 8086 segment, not a null descriptor"
+        );
+    }
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Es),
+        SegmentRegister::real(0x0a00),
+        "the non-null V86 segments take the same rule"
+    );
+}
+
+#[test]
+fn task_switch_into_protected_mode_still_builds_a_null_data_selector_as_unusable() {
+    // The companion to the case above, and the reason the repair must be VM-gated: outside
+    // V86 a null selector really is the null descriptor -- loadable without fault, base 0,
+    // limit 0, and #GP on the first access through it (386 PRM 6.3.3).
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+        &[0xea, 0x00, 0x00, 0x18, 0x00],
+        &[RING0_CODE, ring0_data, new_tss, old_tss],
+    );
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x380 + 32, 0x200); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS: VM clear
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x10); // ES
+    put16(&mut memory, 0x380 + 76, 0x08); // CS
+    put16(&mut memory, 0x380 + 80, 0x10); // SS
+    put16(&mut memory, 0x380 + 84, 0x0000); // DS -- the null descriptor
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.cycle(&mut bus).unwrap();
+
+    assert!(!cpu.is_v86_mode());
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds),
+        SegmentRegister::default(),
+        "a protected-mode null selector stays the unusable null descriptor"
+    );
+}
