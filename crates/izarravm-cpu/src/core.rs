@@ -605,8 +605,17 @@ impl CpuGsw {
     /// there. A future protected-mode guest that legitimately issued an HLE INT at
     /// CPL 0 would have it deferred until it next left ring-0 PM; revisit this gate
     /// when PM DOS-extender / DPMI support lands.
+    ///
+    /// Written as three INDEPENDENT tests rather than `is_protected_mode() && !is_v86_mode()
+    /// && ...`, because `is_v86_mode()` re-tests CR0.PE itself: that form asks
+    /// `PE && !(PE && VM) && cpl == 0`, which is the same predicate with one redundant CR0 load
+    /// and branch. `finish_instruction` asks this on every retired instruction (V86-monitor
+    /// residency attribution), so the redundancy is per-instruction. Identical by boolean
+    /// algebra: `PE && (!PE || !VM) == PE && !VM`.
     pub fn is_ring0_protected(&self) -> bool {
-        self.is_protected_mode() && !self.is_v86_mode() && self.current_privilege_level() == 0
+        self.is_protected_mode()
+            && self.registers.eflags & FLAG_VM == 0
+            && self.current_privilege_level() == 0
     }
 
     /// The CPU mode/size bitmask a compiled JIT block is keyed by (spec §2.2): a block compiled

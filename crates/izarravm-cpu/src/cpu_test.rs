@@ -3863,3 +3863,56 @@ fn pod_key_hasher_spreads_the_low_bits_hashbrown_indexes_with() {
     );
     assert!(worst <= 8, "worst bucket depth {worst} for {keys} keys");
 }
+
+/// A4: `is_ring0_protected()` folds out a redundant CR0.PE test. It is asked on every retired
+/// instruction, so the fold has to be exactly equivalent, not merely equivalent on the states a
+/// game happens to reach. This walks the whole reachable CPU state space for the predicate --
+/// CR0.PE x EFLAGS.VM x CPL, restricted to architecturally consistent combinations (real mode is
+/// always CPL 0, a V86 task is always CPL 3, which `current_privilege_level` itself asserts) --
+/// and compares against the pre-fold expression spelled out independently.
+#[test]
+fn is_ring0_protected_matches_the_unfolded_predicate_over_the_state_space() {
+    let states: [(bool, bool, u8); 6] = [
+        (false, false, 0), // real mode
+        (true, false, 0),  // protected, ring 0 -- the only true case
+        (true, false, 1),
+        (true, false, 2),
+        (true, false, 3), // protected, ring 3
+        (true, true, 3),  // V86 task
+    ];
+
+    let mut saw_true = false;
+    let mut saw_false = false;
+    for (pe, vm, cpl) in states {
+        let mut cpu = CpuGsw::default();
+        cpu.control.cr0 = if pe {
+            cpu.control.cr0 | CR0_PE
+        } else {
+            cpu.control.cr0 & !CR0_PE
+        };
+        cpu.registers.eflags = if vm {
+            cpu.registers.eflags | FLAG_VM
+        } else {
+            cpu.registers.eflags & !FLAG_VM
+        };
+        cpu.cpl = cpl;
+
+        // The pre-fold expression, written out here so the fold is checked against something
+        // other than itself.
+        let unfolded =
+            cpu.is_protected_mode() && !cpu.is_v86_mode() && cpu.current_privilege_level() == 0;
+        let folded = cpu.is_ring0_protected();
+        assert_eq!(
+            folded, unfolded,
+            "PE={pe} VM={vm} CPL={cpl}: folded predicate disagrees with the unfolded one"
+        );
+        // Independently: ring-0 protected mode is PE set, VM clear, CPL 0.
+        assert_eq!(folded, pe && !vm && cpl == 0, "PE={pe} VM={vm} CPL={cpl}");
+        saw_true |= folded;
+        saw_false |= !folded;
+    }
+    assert!(
+        saw_true && saw_false,
+        "the state list must exercise both answers"
+    );
+}
