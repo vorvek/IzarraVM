@@ -368,6 +368,24 @@ impl Vega {
         self.margo.busy_ns()
     }
 
+    /// Whether the DMA pusher is enabled and still has commands to consume.
+    ///
+    /// This is the ONE case where a batch boundary is guest-observable through
+    /// Margo rather than merely convenient: `pump_pusher` runs at batch end and
+    /// stalls on `busy_ns() == 0`, so it consumes at most one COMMAND per batch.
+    /// Section 7.9 makes `PUSH_GET` a readable register and section 9 promises
+    /// that "the pusher's PUSH_GET advances through the ring as it consumes
+    /// commands" and that software feeding it "as a producer to its consumer
+    /// behaves as it would on the real part". Draining at batch cadence instead
+    /// of at the modeled completion cadence would stretch a ~740 ns glyph expand
+    /// to a whole batch cap -- up to ~1350x -- and that is visible in PUSH_GET.
+    /// So `Machine::vega_edge_ticks` keeps the busy deadline exactly while this
+    /// is true, and drops it otherwise.
+    pub(crate) fn pusher_has_queued_work(&self) -> bool {
+        let p = self.margo.pusher();
+        p.enabled && p.size != 0 && p.get != p.put
+    }
+
     /// Tell Margo the write that just moved its busy time landed `elapsed_ns`
     /// into the current batch. Only `MachineBus::write_memory_byte_recorded`
     /// calls this, and only on `VideoWrite::ArmedBlit`; `pump_pusher` must NOT,

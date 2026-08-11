@@ -1469,10 +1469,33 @@ fn approximate_class_keeps_the_1ms_fallback_even_with_audio_active() {
     }
 }
 
+/// Arm the DMA pusher over a zeroed ring with the doorbell rung, so
+/// `Vega::pusher_has_queued_work` is true. The ring words are all zero: header
+/// `method` 0, `count` 0, which consumes a word and writes nothing, so the pump
+/// is exercised without any command side effect this test would have to model.
+fn margo_arm_pusher_ring(machine: &mut Machine) {
+    write_mmio_reg(machine, 0x84, 0x0001_0000); // PUSH_BASE (zeroed guest RAM)
+    write_mmio_reg(machine, 0x88, 0x1000); // PUSH_SIZE
+    write_mmio_reg(machine, 0x80, 1); // PUSH_CTRL = ENABLE
+    write_mmio_reg(machine, 0x8c, 8); // PUSH_PUT = doorbell: two words queued
+    assert!(
+        machine.vega.pusher_has_queued_work(),
+        "the ring must read as having queued work"
+    );
+}
+
 #[test]
-fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
-    // The blit engine's BUSY flag is MMIO, so the guest's spin-wait cannot end
-    // its own batch: only the cap can.
+fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge_for_the_pusher() {
+    // The blit deadline is armed ONLY while the DMA pusher has queued work, and
+    // this is the first batch-level coverage section 9's pusher clause has had.
+    //
+    // `Vega::pump_pusher` runs at batch end and stalls on `busy_ns() == 0`, so
+    // it consumes at most ONE command per batch. Section 9 promises PUSH_GET
+    // "advances through the ring as it consumes commands"; without a batch
+    // boundary at each modeled completion the ring would drain at batch cadence
+    // instead -- a whole cap per ~740 ns operation. STATUS.BUSY does NOT need
+    // the boundary (the analytic peek answers it at the read instant), which is
+    // why the term is conditional rather than unconditional now.
     for mode in [
         GswMode::Gsw586,
         GswMode::Gsw486,
@@ -1483,10 +1506,8 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
         machine.set_mode(mode);
 
         // 1. The arming write does NOT end its own batch. It used to, and that
-        //    break cost ~5% wall on Margo-heavy fixtures (see
-        //    `Machine::vega_edge_ticks`); a mid-batch STATUS read now answers
-        //    analytically instead, so the deadline term below is the only half
-        //    left. Pinned here because this test is what the break was for.
+        //    break plus the unconditional deadline jointly cost ~5% wall on
+        //    Margo-heavy fixtures (see `Machine::vega_edge_ticks`).
         machine.io_touched = false;
         margo_start_fill(&mut machine);
         assert!(
@@ -1494,24 +1515,44 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge() {
             "{mode:?}: the COMMAND write must NOT end the batch"
         );
 
-        // 2. The cap is the modeled busy time, not a fallback. A 5x4 PATCOPY is
-        //    100 ns setup + 20 pixels * 5 ns = 200 ns, well inside every
-        //    fallback, so only the deadline term can produce this value.
+        // 2. A 5x4 PATCOPY is 100 ns setup + 20 pixels * 5 ns = 200 ns, well
+        //    inside every fallback, so only the deadline term can produce this
+        //    value -- which makes the two arms below distinguishable.
         let busy_ns = machine.vega.blitter_busy_ns();
         assert_eq!(busy_ns, 200, "{mode:?}");
-        let expected = machine
+        let blit_edge = machine
             .timeline
             .cpu_clocks_until(timeline::DeviceClock::MargoNs, busy_ns, 1_000_000_000)
             .unwrap();
         assert!(
-            expected < mode.clock_hz() / u64::from(DAC_HZ),
+            blit_edge < mode.clock_hz() / u64::from(DAC_HZ),
             "{mode:?}: the blit edge must be shorter than either fallback"
         );
-        assert_eq!(machine.event_batch_cap(u64::MAX), expected, "{mode:?}");
 
-        // 3. Draining exactly that much device time clears BUSY, so the guest's
-        //    spin exits in the next batch instead of burning a whole cap.
-        machine.advance_devices_clocks(expected);
+        // 3. With NO pusher work the batch is NOT cut at the completion edge.
+        //    The guest can still see BUSY drop on time -- through the peek, not
+        //    through the batch boundary.
+        assert_ne!(
+            machine.event_batch_cap(u64::MAX),
+            blit_edge,
+            "{mode:?}: an idle pusher must not arm the blit deadline"
+        );
+        assert!(
+            machine.event_batch_cap(u64::MAX) > blit_edge,
+            "{mode:?}: without the blit term the cap falls back to a longer edge"
+        );
+
+        // 4. Ring the doorbell and the deadline comes back, exactly.
+        margo_arm_pusher_ring(&mut machine);
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            blit_edge,
+            "{mode:?}: a pusher with queued work must arm the blit deadline"
+        );
+
+        // 5. Draining exactly that much device time clears BUSY, so the pump
+        //    consumes its next command at the modeled cadence.
+        machine.advance_devices_clocks(blit_edge);
         assert_eq!(
             machine.vega.blitter_busy_ns(),
             0,

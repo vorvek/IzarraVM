@@ -1108,46 +1108,61 @@ impl Machine {
     /// fresh scan" contract. They cost a bool test and a `u64` field read when
     /// idle, which is what the cache was buying elsewhere anyway.
     ///
-    /// The blit term is a real device deadline whose absence was load-bearing in
-    /// a way nothing recorded: STATUS.BUSY lives in MMIO, so the BIOS's
-    /// `margo_wait` spin (`mov eax,[fs:MARGO_MMIO+8]` / `test al,1` / `jnz`,
-    /// izbios-lfb.inc) cannot break its own batch. BUSY therefore stayed set for
-    /// the WHOLE remaining batch however short the operation was, and the guest
-    /// paid a full batch cap per wait -- the DAC-period fallback was the only
-    /// thing keeping that bill down on the 386 tier, and raising the fallback to
-    /// 1 ms alone stopped POST from clearing the RAM test inside its 20M-cycle
-    /// budget. With the deadline here the wait costs exactly the busy time the
-    /// engine modeled (a glyph expand is ~740 ns, ~16 clocks at 22 MHz). A blit
-    /// can now be armed mid-batch and first seen by the FOLLOWING batch entry, at
-    /// which point `blitter_busy_ns` already reports the credited remainder --
-    /// `Margo::advance_busy` spends the arm-time credit before draining, so the
-    /// raw `busy_ns` this term reads is the truth at a batch boundary.
+    /// WHY THE BLIT TERM IS ARMED ONLY FOR THE PUSHER. Section 9 of
+    /// `docs/vega/vega-technical-reference.md` makes two promises about Margo's
+    /// timing, and they are observable through two DIFFERENT registers. Batch
+    /// geometry is not itself part of the contract; what a guest can READ is.
     ///
-    /// UNCONDITIONAL ACROSS TIMING CLASSES. This term applies in the Approximate
-    /// class as well. The tier is a CPU-speed policy, never a device-behavior
-    /// one, and no `GswMode` reaches margo.rs, so
-    /// `docs/vega/vega-technical-reference.md` section 9 is not something the
-    /// Approximate class gets to opt out of.
+    /// STATUS.BUSY no longer needs a batch boundary. `Margo::status_busy_after`
+    /// answers a mid-batch poll at the READ instant, and `Margo::busy_credit_ns`
+    /// makes the batch-end drain measure from the ARM instant, so the clause
+    /// "software cannot observe the engine as idle until the modeled time has
+    /// passed" holds no matter where the batch ends -- the same way
+    /// `Counter::count_after` retired the PIT's need for a fine batch grain.
+    /// That is what licensed dropping the arming-edge `io_touched` break, and it
+    /// is what licenses dropping this term for every guest that is not using the
+    /// pusher.
     ///
-    /// Section 9 has two clauses, and BOTH are held by this term plus the lazy
-    /// STATUS peek. The IDLE-EARLY clause -- software cannot observe the engine
-    /// as idle until the modeled time has passed -- holds because
-    /// `Margo::busy_ns_after` measures from the arm instant, not from batch
-    /// start, and the batch-end drain credits that same offset back. The
-    /// EXACTNESS clause -- the cost model is "exact by construction ... a
-    /// stronger guarantee than the CPU compatibility modes" -- holds because the
-    /// poll answers with the busy time as of the READ rather than as of batch
-    /// start, the way `Counter::count_after` and `Pit::out_after` peek the PIT.
+    /// PUSH_GET still does. `Vega::pump_pusher` runs at batch end and stalls on
+    /// `busy_ns() == 0`, so it consumes at most one COMMAND per batch, and
+    /// section 7.9 makes PUSH_GET readable ("Equals PUSH_PUT when the ring is
+    /// drained"). Section 9 promises PUSH_GET "advances through the ring as it
+    /// consumes commands" and that software feeding the pusher "as a producer to
+    /// its consumer behaves as it would on the real part". Without this deadline
+    /// a ring drains at batch cadence rather than at the modeled completion
+    /// cadence -- up to a 1 ms cap per ~740 ns glyph expand, ~1350x slow, which
+    /// would also make the pusher slower than the direct register writes it
+    /// exists to replace. So the term is kept EXACTLY while the pusher has work
+    /// (`Vega::pusher_has_queued_work`) and dropped otherwise. Unconditional
+    /// across timing classes while armed: the tier is a CPU-speed policy, never
+    /// a device-behavior one, and no `GswMode` reaches margo.rs.
     ///
-    /// HOW IT WAS BOUGHT BEFORE, and what that cost. Until the peek landed, the
-    /// exactness clause was bought by a SECOND half: `VideoWrite::ArmedBlit` set
-    /// `io_touched` in `MachineBus::write_memory_byte_recorded`, ending the batch
-    /// on the arming write, because a `margo_wait` MMIO spin cannot break its own
-    /// batch and BUSY only moved when devices advanced. It worked, and it was
-    /// expensive. The measurement is kept because it is the acceptance target for
-    /// removing the break: ending a batch on the arming write raised BATCH
-    /// ENTRIES on Margo-heavy Approximate-class workloads by ~5.9%, and wall
-    /// followed it:
+    /// The arm-time credit makes this safe from the other side. A blit is now
+    /// routinely completed MID-batch with no boundary at its completion instant,
+    /// so `advance_busy` must not bill it for time before it started;
+    /// `Margo::advance_busy` spends the credit first, which is what keeps the
+    /// raw `busy_ns` this term reads true at a batch boundary.
+    ///
+    /// WHAT THIS COSTS, AND THE TRUTH TABLE THAT PRICES IT. The mechanism has
+    /// two halves -- (1) this busy deadline term, (2) the `VideoWrite::ArmedBlit`
+    /// `io_touched` break, since removed -- and they are NON-ADDITIVE. Every
+    /// quadrant has now been measured:
+    ///
+    ///   | (1) deadline | (2) break | three fixture hashes | prince entries |
+    ///   |--------------|-----------|----------------------|----------------|
+    ///   | on           | on        | post-slice           | 1,306,336,687  |
+    ///   | off          | on        | post-slice           | --             |
+    ///   | on           | off       | post-slice           | 1,306,334,801  |
+    ///   | off          | off       | PRE-slice            | 1,233,464,425  |
+    ///
+    /// EITHER HALF ALONE IS INERT; only the pair moves anything. `13ade802` said
+    /// "half 2 alone is sufficient to move them" -- that was an INFERENCE from
+    /// the (off, on) probe, never a measurement of (on, off), and the (on, off)
+    /// row above refutes it: removing the break alone moved prince entries by
+    /// 1,886 in 1.306 BILLION and left all three hashes byte-identical. Do not
+    /// re-litigate this by re-deriving it from one quadrant.
+    ///
+    /// The price of the pair, measured when it was bought:
     ///
     ///   | fixture    | entries          | wall s          |
     ///   |------------|------------------|-----------------|
@@ -1160,13 +1175,23 @@ impl Machine {
     /// 30.00), so those are wall-for-wall comparisons, not a real-time-factor
     /// artifact. gp2-586's entries move only 0.08% and its wall difference is
     /// inside host noise, which is the control that makes entries the causal
-    /// variable rather than a coincidence. A probe gating the break to the
-    /// Accurate class recovered the entry counts EXACTLY (prince back to
-    /// 1,233,464,425) and the wall with them -- so that was the whole cost, and
-    /// removing the break has to land back on those same numbers.
+    /// variable rather than a coincidence.
+    ///
+    /// HISTORY, so the 386 tier's stake is not lost: this deadline was added
+    /// because the BIOS `margo_wait` spin (`mov eax,[fs:MARGO_MMIO+8]` /
+    /// `test al,1` / `jnz`, izbios-lfb.inc) is an MMIO poll that cannot break
+    /// its own batch, so BUSY stayed set for the whole remaining batch and POST
+    /// could not clear the RAM test inside its 20M-cycle budget. The peek is a
+    /// better fix than the deadline was: the spin now reads BUSY drop at the
+    /// modeled instant WITHIN its batch and exits there, instead of needing the
+    /// batch to end underneath it.
     fn vega_edge_ticks(&self) -> Option<u64> {
         let blit_busy_ns = self.vega.blitter_busy_ns();
-        let blit = if blit_busy_ns > 0 {
+        // The busy deadline is armed ONLY for the pusher (see
+        // `Vega::pusher_has_queued_work`). STATUS.BUSY does not need it: the
+        // analytic peek answers a mid-batch read at the read instant, so where
+        // the batch ends stopped being observable through that register.
+        let blit = if blit_busy_ns > 0 && self.vega.pusher_has_queued_work() {
             self.timeline.master_ticks_until(
                 timeline::DeviceClock::MargoNs,
                 blit_busy_ns,

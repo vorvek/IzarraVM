@@ -3247,3 +3247,61 @@ fn an_overlapping_write_does_not_restamp_the_blit_origin() {
         "an overlapping write must not move the instant the blit is timed from"
     );
 }
+
+#[test]
+fn a_batch_is_not_cut_at_blit_completion_but_the_read_is_still_exact_across_it() {
+    // The phase-2 property: with no pusher work the blit completion instant is
+    // no longer a batch boundary, so a whole blit begins AND ends inside one
+    // batch -- and STATUS.BUSY must still flip at exactly the modeled instant,
+    // read from inside that same batch. This is what licenses dropping the
+    // deadline term: section 9 constrains what software can OBSERVE, and the
+    // peek keeps that exact without help from batch geometry.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    machine.run_cycles(5_000).unwrap();
+    program_small_margo_fill(&mut machine);
+    write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL, at offset ~0
+    assert_eq!(machine.vega.blitter_busy_ns(), 200); // 20 px: 100 + 20*5
+
+    // The batch is NOT capped at the 200 ns completion edge any more.
+    let blit_edge = machine
+        .timeline
+        .cpu_clocks_until(timeline::DeviceClock::MargoNs, 200, 1_000_000_000)
+        .unwrap();
+    let cap = machine.event_batch_cap(u64::MAX);
+    assert!(
+        cap > blit_edge,
+        "the batch must no longer be cut at the blit edge: cap {cap}, edge {blit_edge}"
+    );
+
+    // Sweep in-batch offsets ACROSS the completion instant, all inside that one
+    // uncapped batch. BUSY must be set strictly before the modeled instant and
+    // clear from it onward -- one transition, at the right clock.
+    let mut transitions = Vec::new();
+    let mut previous = None;
+    for core in 0..=(blit_edge + 8) {
+        let busy = read_margo_status_at(&mut machine, 0, core).0 & 1;
+        if previous.is_some_and(|p| p != busy) {
+            transitions.push((core, busy));
+        }
+        previous = Some(busy);
+    }
+    assert_eq!(
+        transitions.len(),
+        1,
+        "STATUS.BUSY must flip exactly once across the completion instant, got {transitions:?}"
+    );
+    let (flip_at, level) = transitions[0];
+    assert_eq!(level, 0, "the single transition must be busy -> idle");
+    // The read charges its own bus time before the peek, so the observed flip
+    // lands at or just before the bare-offset edge; it must never be LATE (that
+    // would be idle-late) and never at zero (that would be idle-early).
+    assert!(
+        flip_at > 0 && flip_at <= blit_edge,
+        "the flip must land at the modeled edge {blit_edge}, got {flip_at}"
+    );
+
+    // And the engine is genuinely still busy in the machine's own state at the
+    // batch boundary: nothing drained it early to make the sweep above pass.
+    assert_eq!(machine.vega.blitter_busy_ns(), 200);
+}
