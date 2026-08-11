@@ -530,11 +530,27 @@ impl CpuGsw {
         }
     }
 
-    /// True when the slow-read page histogram is armed. The whole per-access gate: one null test
-    /// on a tail field, and the ONLY thing a default run pays for the instrument. Kept as a call
-    /// -site predicate rather than a test inside `note_slow_read_page`, because a gate inside the
-    /// callee still pays for the call on hundreds of millions of accesses -- the recorded lesson
-    /// behind `barrier_census_active` and `census_enabled`.
+    /// True when the slow-read page histogram is armed.
+    ///
+    /// Kept as a call-site predicate rather than a test inside `note_slow_read_page`, because a
+    /// gate inside the callee still pays for the CALL on hundreds of millions of accesses -- the
+    /// recorded lesson behind `barrier_census_active` and `census_enabled`.
+    ///
+    /// **It must be the LAST conjunct at every call site.** This is a load from a `CpuGsw` tail
+    /// field; `read.direct` and `kind` are values the caller already holds in registers. Written
+    /// first, the load happens on every read that reaches the site -- 2,769,793,893 of them on
+    /// wolf3d-586, of which only 1,371,552,807 are slow. Written last it is short-circuited away
+    /// on all 1.4 G direct reads, for an instrument that is OFF on every default run.
+    ///
+    /// The ordering is justified by that count, NOT by a measured wall delta, and the distinction
+    /// is worth keeping because the measurement was attempted and FAILED TO RESOLVE. Two
+    /// wolf3d-586 A/B/B/A rounds put the load-first ordering at +2.20% and the load-last ordering
+    /// at +1.00% against main, but in both rounds the WITHIN-arm spread (2.06-3.17%) equalled or
+    /// exceeded the cross-arm delta, and the same binary drifted from 289.7 s to 331.1 s to
+    /// 296.4 s over one session on identical work. Neither number separates from that noise. This
+    /// ordering costs nothing, changes no behaviour (`&&` short-circuits and all three conjuncts
+    /// are side-effect-free), and is the shape the default-off-instrument discipline asks for --
+    /// which is reason enough without a wall claim it cannot support.
     #[inline]
     pub(super) fn slow_read_histo_armed(&self) -> bool {
         self.slow_read_histo.0.is_some()
@@ -1037,7 +1053,7 @@ impl CpuGsw {
         }
         let read = bus.read_memory_direct(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, read.direct);
-        if self.slow_read_histo_armed() && !read.direct && kind == BusAccessKind::DataRead {
+        if !read.direct && kind == BusAccessKind::DataRead && self.slow_read_histo_armed() {
             self.note_slow_read_page(linear, BusWidth::Byte);
         }
         Ok(read.value as u8)
@@ -1347,7 +1363,7 @@ impl CpuGsw {
         }
         let read = bus.read_memory_direct(physical, width, kind)?;
         self.record_data_read(kind, read.direct);
-        if self.slow_read_histo_armed() && !read.direct && kind == BusAccessKind::DataRead {
+        if !read.direct && kind == BusAccessKind::DataRead && self.slow_read_histo_armed() {
             self.note_slow_read_page(linear, width);
         }
         Ok(read.value)
