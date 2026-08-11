@@ -2947,12 +2947,12 @@ impl MachineBus<'_> {
     }
 }
 
+/// One-line forward to the single spelling of the alignment predicate
+/// (`BusWidth::misaligned_at`). Kept as a named free function only because four call sites read
+/// better as "does this access split" than as "is it misaligned"; it adds no logic of its own.
+#[inline]
 fn should_split(address: u32, width: BusWidth) -> bool {
-    match width {
-        BusWidth::Byte => false,
-        BusWidth::Word => address & 0x1 != 0,
-        BusWidth::Dword => address & 0x3 != 0,
-    }
+    width.misaligned_at(address)
 }
 
 fn rom_offset(address: u32, width: usize) -> Option<usize> {

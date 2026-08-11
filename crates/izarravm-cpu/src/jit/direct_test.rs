@@ -2323,3 +2323,46 @@ fn a_changed_republish_panics() {
     slots.publish(TABLE_SLOT_FLAGS, 0x1000);
     slots.publish(TABLE_SLOT_FLAGS, 0x2000);
 }
+
+/// Pin the two independent spellings of "naturally aligned" where they MUST agree.
+///
+/// `BusWidth::misaligned_at` is the single Rust spelling used by the interpreter and the bus.
+/// The emitter cannot share it: it works in `MemoryWidth`, which carries `Qword`/`Tbyte`, and
+/// emits `and r32, alignment_bytes() - 1` into machine code rather than calling Rust.
+///
+/// `Qword`/`Tbyte` are DELIBERATELY absent from this test: `alignment_bytes()` is BELOW the
+/// access size for those two (both answer 4), because a 4-aligned Qword at page offset 0xFFC
+/// still crosses and a Tbyte at 0xFF8 does -- see `emit_wide_page_guard`'s comment. Folding the
+/// two predicates would either break that or contaminate the shared one. What the carve-out owes
+/// is exactly this: agreement on the overlapping domain, so the two cannot drift where a reader
+/// would assume they match.
+#[test]
+fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
+    assert_eq!(
+        MemoryWidth::Byte.alignment_bytes(),
+        izarravm_bus::BusWidth::Byte.bytes()
+    );
+    assert_eq!(
+        MemoryWidth::Word.alignment_bytes(),
+        izarravm_bus::BusWidth::Word.bytes()
+    );
+    assert_eq!(
+        MemoryWidth::Dword.alignment_bytes(),
+        izarravm_bus::BusWidth::Dword.bytes()
+    );
+
+    // And the mask form the emitter encodes is the same mask `misaligned_at` applies.
+    for width in [
+        izarravm_bus::BusWidth::Byte,
+        izarravm_bus::BusWidth::Word,
+        izarravm_bus::BusWidth::Dword,
+    ] {
+        for address in 0u32..8 {
+            assert_eq!(
+                width.misaligned_at(address),
+                address % width.bytes() != 0,
+                "misaligned_at({width:?}, {address:#x})"
+            );
+        }
+    }
+}

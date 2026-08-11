@@ -237,6 +237,22 @@ impl BusWidth {
         }
     }
 
+    /// True when `address` is not naturally aligned for this width -- the single spelling of a
+    /// predicate that used to be written four ways (`FastMap::lookup_access`'s two `matches!`
+    /// clauses, `CpuGsw::direct_access_page_local`'s `match`, and `MachineBus`'s free
+    /// `should_split`).
+    ///
+    /// NOT the `#AC` question. That one is asked of the EFFECTIVE address at CPL 3 with CR0.AM and
+    /// EFLAGS.AC set (`izarravm-cpu`'s `check_alignment`) and raises a fault; this one is asked of
+    /// a linear or physical address and decides only whether the bus splits the access into bytes.
+    ///
+    /// `bytes()` is 1/2/4, so `address & (bytes - 1)` reproduces all three arms exactly, including
+    /// `Byte => false`.
+    #[inline]
+    pub const fn misaligned_at(self, address: u32) -> bool {
+        address & (self.bytes() - 1) != 0
+    }
+
     pub const fn byte_enable(self, address: u32) -> u8 {
         match self {
             Self::Byte => 1 << (address & 0x3),

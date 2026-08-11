@@ -402,8 +402,7 @@ impl FastMap {
         if offset
             .checked_add(width.bytes())
             .is_none_or(|end| end > PAGE_SIZE as u32)
-            || matches!(width, BusWidth::Word) && linear & 1 != 0
-            || matches!(width, BusWidth::Dword) && linear & 3 != 0
+            || width.misaligned_at(linear)
         {
             return None;
         }

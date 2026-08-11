@@ -565,10 +565,11 @@ impl CpuGsw {
         if let Some(tally) = self.slow_read_histo.0.as_mut() {
             *tally.pages.entry(linear >> 12).or_insert(0) += 1;
             tally.total += 1;
-            // The same predicate `MachineBus::should_split` applies, restated on the CPU side
-            // rather than asked of the bus: a word off an odd address or a dword off a multiple of
-            // four is refused a direct page BEFORE the region test runs.
-            tally.misaligned += u64::from(linear & (width.bytes() - 1) != 0);
+            // The same predicate `MachineBus::should_split` applies, asked on the CPU side rather
+            // than of the bus: a word off an odd address or a dword off a multiple of four is
+            // refused a direct page BEFORE the region test runs. It is literally the same
+            // predicate now -- `should_split` forwards to `BusWidth::misaligned_at` too.
+            tally.misaligned += u64::from(width.misaligned_at(linear));
         }
     }
 
@@ -658,11 +659,7 @@ impl CpuGsw {
         if offset + width.bytes() as usize > 0x1000 {
             return false;
         }
-        match width {
-            BusWidth::Byte => true,
-            BusWidth::Word => physical & 1 == 0,
-            BusWidth::Dword => physical & 3 == 0,
-        }
+        !width.misaligned_at(physical)
     }
 
     #[inline]
