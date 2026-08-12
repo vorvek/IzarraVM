@@ -987,6 +987,23 @@ impl Vega {
         self.owns_memory_uncached(address, width)
     }
 
+    /// True iff NO byte in `address .. address + bytes` is claimed by any Vega aperture.
+    ///
+    /// Asked byte by byte ON PURPOSE, and the reason is the whole point of the query. Every
+    /// `*_offset` predicate above requires the WHOLE access to be in range --
+    /// `distira_lfb_offset` tests `offset + width <= DISTIRA_PCI_TEX_OFFSET`,
+    /// `distira_texture_offset` tests `offset + width <= DISTIRA_PCI_BAR_SIZE` -- so a Word
+    /// straddling a window's end DECLINES WIDE while its base byte is still claimed. A wide
+    /// "declines" is therefore strictly WEAKER than "claims nothing here", and would not pin the
+    /// behaviour of a split loop that asks the question once per byte.
+    ///
+    /// `owns_memory` at width 1 asks exactly what that loop asks, and carries its own
+    /// `may_own_memory` pre-filter assertion, so this is the right primitive to build on.
+    #[cfg(debug_assertions)]
+    pub(crate) fn claims_no_byte_in(&self, address: u32, bytes: u32) -> bool {
+        (0..bytes).all(|i| !self.owns_memory(address.wrapping_add(i), 1))
+    }
+
     fn owns_memory_uncached(&self, address: u32, width: usize) -> bool {
         self.margo_banked_window_at(address)
             || self.legacy_gfx_offset(address, width).is_some()

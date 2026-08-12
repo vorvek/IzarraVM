@@ -1131,16 +1131,22 @@ fn fast_map_mode13_write_charges_video_wait_states_like_the_slow_path() {
     }
 }
 
-/// `lookup_access` rejects an unaligned width even on a page that is otherwise live in the
-/// FastMap (populated here by a prior ALIGNED dword read), so an unaligned probe misses by
-/// construction of the hit predicate, not merely because the page was never touched.
+/// `lookup_access` SERVES an unaligned width on a live page, and the bytes it returns are the
+/// bytes at the unaligned address.
+///
+/// This test asserted the opposite contract until the interpreter data-path slice: an unaligned
+/// probe used to miss by construction of the hit predicate. That refusal was one of five sites
+/// asking the same alignment question, and none of them was needed for the data move -- the hit
+/// tail's `bias.wrapping_add(linear)` is offset-agnostic and `read_fast_map_ptr` already used
+/// `read_unaligned`. The page is populated here by a prior ALIGNED dword read so that a served
+/// unaligned access is attributable to the predicate rather than to the page being cold.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn fast_map_probe_rejects_unaligned_widths() {
+fn fast_map_probe_serves_unaligned_widths_and_charges_them_as_a_split() {
     const BASE: u32 = 0x0000_4000;
     let mut memory = vec![0u8; 0x6000];
     memory[BASE as usize..BASE as usize + 8]
@@ -1160,27 +1166,34 @@ fn fast_map_probe_rejects_unaligned_widths() {
     .unwrap();
     assert!(cpu.jit_fast_map.has_read_mapping(BASE, BASE));
 
-    for (offset, width) in [
-        (1u32, OperandSize::Word),
-        (1, OperandSize::Dword),
-        (2, OperandSize::Dword),
+    for (offset, width, expected) in [
+        (1u32, OperandSize::Word, 0x3322u32),
+        (1, OperandSize::Dword, 0x5544_3322),
+        (2, OperandSize::Dword, 0x6655_4433),
     ] {
         let hits_before = cpu.fast_map_probe_counters().hits;
         let misses_before = cpu.fast_map_probe_counters().misses;
-        cpu.read_memory_sized(
-            &mut bus,
-            SegmentIndex::Ds,
-            BASE + offset,
-            width,
-            BusAccessKind::DataRead,
-        )
-        .unwrap();
+        let value = cpu
+            .read_memory_sized(
+                &mut bus,
+                SegmentIndex::Ds,
+                BASE + offset,
+                width,
+                BusAccessKind::DataRead,
+            )
+            .unwrap();
         assert_eq!(
             cpu.fast_map_probe_counters().hits,
-            hits_before,
-            "unaligned {width:?} at +{offset} took the fast path"
+            hits_before + 1,
+            "unaligned {width:?} at +{offset} did NOT take the fast path"
         );
-        assert!(cpu.fast_map_probe_counters().misses > misses_before);
+        assert_eq!(cpu.fast_map_probe_counters().misses, misses_before);
+        // Served through an unaligned pointer, so the bytes must be the ones at the unaligned
+        // address -- not a rounded-down or byte-swapped read.
+        assert_eq!(
+            value, expected,
+            "unaligned {width:?} at +{offset} returned the wrong bytes"
+        );
     }
 }
 
@@ -3636,6 +3649,15 @@ mod execution;
 mod fpu_flags;
 #[path = "cpu_legacy_system_test.rs"]
 mod legacy_system;
+/// Misaligned page-local accesses on the direct paths. Nested here for `TestBus`; see the file's
+/// header for what it does NOT prove (the charge's bit-identity, which needs `MachineBus`).
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_misaligned_datapath_test.rs"]
+mod misaligned_datapath;
 #[path = "cpu_persona_system_test.rs"]
 mod persona_system;
 /// The FastMap slot-reject census. Nested here for `TestBus` and for the same reason the

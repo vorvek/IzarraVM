@@ -755,8 +755,10 @@ fn classify_reject_follows_lookup_access_ladder_order() {
         false,
     ));
 
-    // Misaligned AND epoch-stale. `lookup_access` tests alignment before it ever indexes the
-    // epoch array, so the answer must be Misaligned.
+    // Misaligned AND epoch-stale. There is no alignment rung any more -- `lookup_access` SERVES
+    // misaligned accesses -- so the refusal is the epoch's and must be attributed to it. Before
+    // the admission slice this case read `Misaligned`; that it now reads `Epoch` is the two
+    // ladders staying coupled THROUGH a change to one of them, which is this test's whole job.
     assert_eq!(
         map.classify_reject(
             base + 0x101,
@@ -766,7 +768,7 @@ fn classify_reject_follows_lookup_access_ladder_order() {
             false,
             false
         ),
-        SlotReject::Misaligned,
+        SlotReject::Epoch,
     );
     assert!(
         map.lookup_access(
@@ -780,8 +782,22 @@ fn classify_reject_follows_lookup_access_ladder_order() {
         .is_none()
     );
 
-    // Page-crossing AND misaligned. The crossing clause is the left operand of `lookup_access`'s
-    // `||`, and `||` evaluates left to right, so crossing wins.
+    // Misaligned and otherwise fine: ADMITTED. Without this the case above would also pass
+    // against a ladder that still refused on alignment somewhere BELOW the epoch test.
+    assert!(
+        map.lookup_access(
+            base + 0x101,
+            MAPPING_EPOCH,
+            BusWidth::Word,
+            false,
+            false,
+            false
+        )
+        .is_some(),
+        "a page-local misaligned read must be served"
+    );
+
+    // Page-crossing. Page-locality is still refused, and still refused FIRST.
     assert_eq!(
         map.classify_reject(
             base + 0xfff,

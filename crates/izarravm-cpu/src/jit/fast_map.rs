@@ -391,7 +391,15 @@ pub(crate) const NATIVE_LOAD_BIAS_TAG_MASK: usize = LOAD_BIAS_TAG_MASK;
 pub(crate) enum SlotReject {
     /// `offset + bytes > PAGE_SIZE` -- the access straddles a page boundary.
     PageCross,
-    /// Not naturally aligned for its width. This is the population the datapath slice targets.
+    /// Not naturally aligned for its width.
+    ///
+    /// NEVER CONSTRUCTED after the admission slice, and that is the point rather than an
+    /// oversight: `lookup_access` no longer has an alignment rung, so nothing can be attributed
+    /// to one. The variant and its counter are kept so the collapse is VISIBLE in the report as
+    /// an explicit zero -- a reader comparing a pre-slice run against a post-slice one sees the
+    /// same key go to zero, instead of a key disappearing, which reads as an instrument change
+    /// rather than a result. The population itself moved to `slot_admit_misaligned`.
+    #[allow(dead_code)]
     Misaligned,
     /// No storage, page not live, no committed bias, or no physical page: nothing to serve from.
     Absent,
@@ -417,10 +425,19 @@ impl FastMap {
         write_protect: bool,
     ) -> Option<FastMapAccess> {
         let offset = linear & PAGE_MASK;
+        // PAGE-LOCALITY ONLY. The alignment refusal that used to sit here was one of five sites
+        // asking the same question, and the hit tail never needed it: `bias.wrapping_add(linear)`
+        // is offset-agnostic and `read_fast_map_ptr`/`write_fast_map_ptr` already use
+        // `read_unaligned`/`write_unaligned`. Alignment is now CLASSIFIED once, at the probe, and
+        // consumed once, by the charge.
+        //
+        // Its one correctness-load-bearing consumer was NOT this function:
+        // `call_out_stack_frame_resident` relied on it to exclude a based-SS frame at a linear
+        // address like 0xFFE. That clause moved there, explicitly, and that function's doc comment
+        // now names itself as its owner. Do not "restore" it here.
         if offset
             .checked_add(width.bytes())
             .is_none_or(|end| end > PAGE_SIZE as u32)
-            || width.misaligned_at(linear)
         {
             return None;
         }
@@ -496,9 +513,10 @@ impl FastMap {
         {
             return SlotReject::PageCross;
         }
-        if width.misaligned_at(linear) {
-            return SlotReject::Misaligned;
-        }
+        // No alignment clause: `lookup_access` no longer refuses on alignment, so attributing a
+        // refusal to it would be a lie about a ladder that does not have that rung. The
+        // `SlotReject::Misaligned` variant and its counter are kept, reading zero, precisely so
+        // the collapse is VISIBLE in the report rather than inferred from a missing key.
         let index = (linear >> PAGE_SHIFT) as usize;
         let Some(storage) = self.storage.as_ref() else {
             return SlotReject::Absent;

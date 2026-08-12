@@ -31,7 +31,9 @@ fn cpu_with_populated_page() -> (CpuGsw, TestBus, u32) {
     cpu.jit_direct.set_fast_map_enabled_for_test(true);
     cpu.refresh_fast_map_serve_gate();
     cpu.load_segment_real(SegmentIndex::Ds, 0);
-    let mut bus = TestBus::with_memory(vec![0; 0x8000]);
+    // Roomy enough that every case below can use a page of its OWN: a second access to a
+    // page a previous case populated would HIT, and the refusal under test would never happen.
+    let mut bus = TestBus::with_memory(vec![0; 0x2_0000]);
     bus.direct_pages_enabled = true;
 
     // Populate: an ALIGNED word read on page 4 goes through the DirectPageCache and publishes a
@@ -79,28 +81,28 @@ fn read_word(cpu: &mut CpuGsw, bus: &mut TestBus, offset: u32) {
 fn the_census_is_silent_until_it_is_armed() {
     let (mut cpu, mut bus, base) = cpu_with_populated_page();
 
-    // Misaligned word on the populated page: refused by `lookup_access`, served the slow way.
-    read_word(&mut cpu, &mut bus, base + 1);
+    // A read on a page nothing has populated: refused, and the refusal is an `Absent`. (It used
+    // to be a misaligned read on a live page; that access is SERVED now, so it is no longer a
+    // refusal at all and cannot exercise the gate.)
+    let _ = base;
+    read_word(&mut cpu, &mut bus, 0x9000);
     let audit = cpu.fast_map_audit_counters();
-    assert_eq!(audit.slot_reject_misaligned, 0);
+    assert_eq!(audit.slot_reject_absent, 0);
     assert!(!audit.slot_reject_enabled);
     // The refusal DID happen -- this is what stops the assertion above from being vacuous.
     let misses_unarmed = cpu.fast_map_probe_counters().misses;
     assert!(misses_unarmed > 0);
 
     cpu.set_slot_census_enabled(true);
-    read_word(&mut cpu, &mut bus, base + 1);
+    read_word(&mut cpu, &mut bus, 0xb000);
     let audit = cpu.fast_map_audit_counters();
-    assert_eq!(
-        audit.slot_reject_misaligned, 1,
-        "only the armed access counts"
-    );
+    assert_eq!(audit.slot_reject_absent, 1, "only the armed access counts");
     assert!(audit.slot_reject_enabled);
 
     cpu.set_slot_census_enabled(false);
-    read_word(&mut cpu, &mut bus, base + 1);
+    read_word(&mut cpu, &mut bus, 0xd000);
     let audit = cpu.fast_map_audit_counters();
-    assert_eq!(audit.slot_reject_misaligned, 1);
+    assert_eq!(audit.slot_reject_absent, 1);
     assert!(!audit.slot_reject_enabled);
 }
 
@@ -109,7 +111,8 @@ fn each_refusal_reason_lands_in_its_own_bucket() {
     let (mut cpu, mut bus, base) = cpu_with_populated_page();
     cpu.set_slot_census_enabled(true);
 
-    // Misaligned, page-local, on a live page with a current epoch.
+    // Misaligned, page-local, on a live page with a current epoch: SERVED now, so it must land in
+    // `slot_admit_misaligned` and in no reject bucket at all.
     read_word(&mut cpu, &mut bus, base + 1);
     // Page-crossing. This one splits upstream into two byte fragments, each of which probes on
     // its own page, so the crossing rejection is counted by the probe that sees the whole width.
@@ -118,7 +121,11 @@ fn each_refusal_reason_lands_in_its_own_bucket() {
     read_word(&mut cpu, &mut bus, 0x7000);
 
     let audit = cpu.fast_map_audit_counters();
-    assert_eq!(audit.slot_reject_misaligned, 1);
+    assert_eq!(audit.slot_admit_misaligned, 1);
+    assert_eq!(
+        audit.slot_reject_misaligned, 0,
+        "the alignment rung is gone; nothing may be attributed to it"
+    );
     assert_eq!(audit.slot_reject_page_cross, 1);
     assert!(
         audit.slot_reject_absent >= 1,
@@ -128,8 +135,6 @@ fn each_refusal_reason_lands_in_its_own_bucket() {
     // must stay empty. A classifier that fell through to a single catch-all would light them up.
     assert_eq!(audit.slot_reject_epoch, 0);
     assert_eq!(audit.slot_reject_permission, 0);
-    // Before the admission slice, no misaligned access is ever SERVED.
-    assert_eq!(audit.slot_admit_misaligned, 0);
 }
 
 #[test]
@@ -144,12 +149,17 @@ fn a_stale_mapping_epoch_is_attributed_to_the_epoch_bucket() {
     bus.direct_mapping_epoch += 1;
     // A read on a DIFFERENT page pulls the new epoch into `data_read_pages` via `insert`, which
     // is what makes the surviving entry on `base`'s page stale rather than merely unmatched.
+    // It is itself a refusal, so it is taken BEFORE the counters are sampled.
     read_word(&mut cpu, &mut bus, 0x5000);
+    let before = cpu.fast_map_audit_counters();
 
     read_word(&mut cpu, &mut bus, base + 2);
     let audit = cpu.fast_map_audit_counters();
     assert_eq!(
-        (audit.slot_reject_epoch, audit.slot_reject_misaligned),
+        (
+            audit.slot_reject_epoch - before.slot_reject_epoch,
+            audit.slot_reject_absent - before.slot_reject_absent
+        ),
         (1, 0),
         "an aligned access to a live-but-stale page is an Epoch refusal"
     );

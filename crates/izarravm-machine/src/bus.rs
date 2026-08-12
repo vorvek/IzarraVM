@@ -700,6 +700,44 @@ impl CpuBus for MachineBus<'_> {
                 direct: true,
             });
         }
+        // A MISALIGNED but page-local access into plain RAM. Today this falls through to
+        // `read_memory`, which declines wide at `vega`, hits `should_split`, and recurses one
+        // byte at a time; every byte re-asks `vega` and then reads the same `self.memory` slice.
+        //
+        // VALUE EQUALITY, argued from L-RAM per byte and never from a width-parameterised `vega`
+        // predicate. `direct_page_ram_bytes_unaligned` succeeds only if `direct_ram_bytes` does,
+        // which requires this page's `page_bases` entry to be non-`RAM_LOOKUP_SLOW`, which
+        // `ram_lookup_page_is_direct` grants only to a page with NO `memory_bar_overlaps` byte.
+        // That classification is page-granular BY CONSTRUCTION -- `ram_lookup_page_base` is
+        // evaluated per page over the whole `[start, end)` -- so no byte of this page is in the
+        // Distira BAR, so EVERY per-byte `vega` consultation in today's loop declines, whatever
+        // width the wide call would have used. The bytes then come from the same slice, assembled
+        // little-endian identically.
+        //
+        // Proving `read_wide_memory(address, width) == None` would prove NOTHING here: every
+        // `*_offset` predicate requires the whole access in range, so a wide decline is strictly
+        // weaker than "claims nothing", and a Word straddling a window's end declines wide while
+        // its base byte is still claimed.
+        if width.misaligned_at(address)
+            && let Some((address, start, end)) =
+                self.direct_page_ram_bytes_unaligned(address, width.bytes() as usize)
+        {
+            debug_assert!(
+                self.vega.claims_no_byte_in(address, width.bytes()),
+                "a direct RAM page claimed by a Vega aperture reached the unaligned admission"
+            );
+            self.charge_direct_ram_split(address, width, kind)?;
+            let data = &self.memory.as_slice()[start..end];
+            let value = match width {
+                BusWidth::Byte => u32::from(data[0]),
+                BusWidth::Word => u32::from(u16::from_le_bytes([data[0], data[1]])),
+                BusWidth::Dword => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            };
+            return Ok(DirectMemoryRead {
+                value,
+                direct: true,
+            });
+        }
         self.read_memory(address, width, kind)
             .map(|value| DirectMemoryRead {
                 value,
@@ -719,6 +757,32 @@ impl CpuBus for MachineBus<'_> {
         {
             let ws = self.data_access_wait_states(address, width);
             self.trace.record(kind, address, width, ws);
+            match width {
+                BusWidth::Byte => self.memory.write_u8(start, value as u8)?,
+                BusWidth::Word => self.memory.write_u16(start, value as u16)?,
+                BusWidth::Dword => self.memory.write_u32(start, value)?,
+            }
+            return Ok(DirectMemoryWrite { direct: true });
+        }
+        // The write twin of the unaligned admission in `read_memory_direct`; see that comment for
+        // the L-RAM per-byte argument. `Memory::write_u16`/`write_u32` take a BYTE offset and have
+        // no alignment requirement of their own, so the data path needs no change.
+        //
+        // Here the lemma is the SHARP one, and the assert is not decoration. `write_wide_memory`'s
+        // LFB arm SWALLOWS byte writes (`BusWidth::Byte => {}` while still returning `true`), so a
+        // byte-split write into the LFB is DROPPED where the wide write would have stored -- silent
+        // data loss, not a timing difference. It cannot arise today, because no BAR page is
+        // `direct_ram_bytes`-able; asserting L-RAM per byte is what stops a future BAR or decode
+        // change from making it arise silently.
+        if width.misaligned_at(address)
+            && let Some((address, start, _)) =
+                self.direct_page_ram_bytes_unaligned(address, width.bytes() as usize)
+        {
+            debug_assert!(
+                self.vega.claims_no_byte_in(address, width.bytes()),
+                "a direct RAM page claimed by a Vega aperture reached the unaligned admission"
+            );
+            self.charge_direct_ram_split(address, width, kind)?;
             match width {
                 BusWidth::Byte => self.memory.write_u8(start, value as u8)?,
                 BusWidth::Word => self.memory.write_u16(start, value as u16)?,
@@ -971,6 +1035,67 @@ impl CpuBus for MachineBus<'_> {
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
         self.charge_ram_only(address, width, kind);
+        Ok(())
+    }
+
+    /// Charge a page-local misaligned direct-RAM access as `width.bytes()` BYTE cycles, which is
+    /// exactly what `read_memory`'s `should_split` loop (and `write_memory_recorded`'s twin) does
+    /// today. Bit-identical to that loop in all three accounting fields, and the two arms are
+    /// bit-identical for DIFFERENT reasons, so both are argued.
+    ///
+    /// **Flat (`Approximate`) arm.** Today's loop recurses into `read_memory` per byte, and each
+    /// recursion re-applies A20 to its own `address + offset` before reaching
+    /// `data_access_wait_states(gated_i, Byte)`. Those N gatings collapse to ONE because `A20_MASK`
+    /// clears only bit 20 and `RAM_LOOKUP_PAGE_BITS` is 12, so bit 20 is constant across every byte
+    /// of one 4 KiB page -- the 1 MiB boundary is always a page boundary. Given page-locality,
+    /// `apply_a20(base + i) == apply_a20(base) + i` for every `i < width.bytes()`. For a non-device
+    /// address `data_access_wait_states` returns `cache.cost.l1`, never the `is_device_window` arm,
+    /// which is the second premise the caller owes. `record_memory_run` then advances
+    /// `elapsed_clocks` by `count * clocks_for(Byte, l1)`, bumps `access_count` by `count`, and in
+    /// `Full` mode pushes cycles at `address + i` -- identical in all three fields to N `record`
+    /// calls (its own doc, and the `record_instruction_fetch_run` precedent).
+    ///
+    /// The three `debug_assert`s pin exactly the three preconditions: A20 identity, page-locality,
+    /// and per-byte non-device. The third is checked over ALL N bytes, not just the base, because
+    /// a per-access question is strictly weaker than the per-byte one the split loop asks.
+    ///
+    /// **Accurate arm.** A literal per-byte transcription: same A20, same
+    /// `data_access_wait_states` per byte, same `trace.record`.
+    ///
+    /// DO NOT fold into `record_memory_run`: `data_access_wait_states`'s non-flat arm MUTATES the
+    /// modeled cache tag state, and those tags are CANONICAL STATE (`canonical_state.rs`, the
+    /// cosmetic-cache round trip). Collapsing the loop would change the modeled tag sequence and
+    /// therefore canonical state, on a persona whose whole point is that it does not approximate.
+    /// The temptation to "just use the run here too" is obvious and is the one wrong thing in this
+    /// function; the mutation test in `bus_split_charge_test.rs` exists to catch it.
+    fn charge_direct_ram_split(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        let count = width.bytes();
+        if self.flat_data_cost {
+            // L-A20: page-locality plus A20_MASK touching only bit 20 makes one gating equal N.
+            debug_assert_eq!(self.apply_a20(address), address);
+            debug_assert!(
+                (address as usize & RAM_LOOKUP_PAGE_MASK) + count as usize <= RAM_LOOKUP_PAGE_SIZE
+            );
+            // L-RAM, checked over ALL N bytes rather than at the base.
+            debug_assert!((0..count).all(|i| {
+                let at = address.wrapping_add(i);
+                at < 0x000A_0000 || !self.is_device_window(at, BusWidth::Byte)
+            }));
+            self.trace
+                .record_memory_run(kind, address, count, BusWidth::Byte, self.cache.cost.l1);
+            return Ok(());
+        }
+        let base = self.apply_a20(address);
+        for i in 0..count {
+            let at = base.wrapping_add(i);
+            let ws = self.data_access_wait_states(at, BusWidth::Byte);
+            self.trace.record(kind, at, BusWidth::Byte, ws);
+        }
         Ok(())
     }
 
@@ -2675,6 +2800,35 @@ impl MachineBus<'_> {
         if should_split(gated, access_width)
             || ((gated as usize & RAM_LOOKUP_PAGE_MASK) + bytes > RAM_LOOKUP_PAGE_SIZE)
         {
+            return None;
+        }
+        self.direct_ram_bytes(gated, bytes)
+            .map(|(start, end)| (gated, start, end))
+    }
+
+    /// `direct_page_ram_bytes` without the `should_split` term, and WITHOUT an `access_width`
+    /// parameter because it no longer asks an alignment question at all.
+    ///
+    /// A sibling rather than a relaxation of `direct_page_ram_bytes`: that function's other
+    /// callers are the bulk paths (`read_memory_bytes_direct`, `write_memory_bytes_direct`) whose
+    /// `access_width` contract is different -- they fold a RUN at the access width, and a
+    /// misaligned run would be mis-charged. Only the single-access direct read/write pair may
+    /// come here, and each pays for it by calling `charge_direct_ram_split` instead of a wide
+    /// charge.
+    ///
+    /// Page-locality is still required, and is what makes the byte-equality argument in
+    /// `read_memory_direct` a statement about a whole page rather than about one address.
+    #[inline]
+    fn direct_page_ram_bytes_unaligned(
+        &self,
+        address: u32,
+        bytes: usize,
+    ) -> Option<(u32, usize, usize)> {
+        let gated = self.apply_a20(address);
+        if gated != address || bytes == 0 {
+            return None;
+        }
+        if (gated as usize & RAM_LOOKUP_PAGE_MASK) + bytes > RAM_LOOKUP_PAGE_SIZE {
             return None;
         }
         self.direct_ram_bytes(gated, bytes)

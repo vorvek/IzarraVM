@@ -3429,3 +3429,108 @@ fn cached_icache_fetch_cost_matches_the_live_model_in_every_persona() {
         }
     }
 }
+
+/// `charge_direct_ram_split` must be BIT-IDENTICAL to the byte-splitting loop it replaces, in all
+/// three accounting fields, for every width, every misalignment, both timing classes and every
+/// tracing mode.
+///
+/// This is the single most load-bearing assertion in the interpreter data-path slice. The slice's
+/// whole premise is that admitting misaligned accesses to the interpreter's fast path changes
+/// WHERE the work happens and not WHAT the guest clock sees; the reference below is the actual
+/// production loop (`CpuBus::read_memory` takes `should_split` for exactly these addresses), so a
+/// charge that drifts fails here rather than as an unexplained frame-hash move six fixtures later.
+///
+/// The `Full`-mode cycle vector is compared element by element on purpose. `elapsed_clocks` alone
+/// would pass a charge that folded N byte cycles into one wide cycle of the same total clocks --
+/// which is precisely the mutation this test has to catch.
+#[test]
+fn charge_direct_ram_split_is_bit_identical_to_the_byte_splitting_loop() {
+    // RAM well below the 0xA0000 aperture, page-local for every case below.
+    const BASE: u32 = 0x0002_1000;
+    for mode in [
+        // Approximate: `flat_data_cost` true, so the split takes the `record_memory_run` arm.
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+        // Accurate: `flat_data_cost` false, so it takes the per-byte transcription whose
+        // wait-state lookups mutate the modeled cache tags.
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        for (width, offset) in [
+            (BusWidth::Word, 1u32),
+            (BusWidth::Dword, 1),
+            (BusWidth::Dword, 2),
+            (BusWidth::Dword, 3),
+            // Page-edge, still page-local: a Word at 0xFFD and a Dword at 0xFF9.
+            (BusWidth::Word, 0xffd),
+            (BusWidth::Dword, 0xff9),
+        ] {
+            for tracing in [TracingMode::Off, TracingMode::Counts, TracingMode::Full] {
+                let address = BASE + offset;
+                assert!(
+                    width.misaligned_at(address),
+                    "case ({width:?}, {offset:#x}) is not actually misaligned"
+                );
+
+                // Reference: the production byte loop, reached through `read_memory`.
+                let mut machine = test_machine();
+                machine.set_mode(mode);
+                machine.trace.set_tracing_mode(tracing);
+                let (ref_clocks, ref_accesses, ref_cycles) = with_bus(&mut machine, |bus| {
+                    bus.trace.clear();
+                    bus.read_memory(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+                    (
+                        bus.trace.elapsed_clocks(),
+                        bus.trace.access_count(),
+                        bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
+                    )
+                });
+
+                // Candidate: the new charge, on a freshly built machine so the Accurate class's
+                // modeled cache tags start from the same state the reference did.
+                let mut machine = test_machine();
+                machine.set_mode(mode);
+                machine.trace.set_tracing_mode(tracing);
+                let (got_clocks, got_accesses, got_cycles) = with_bus(&mut machine, |bus| {
+                    bus.trace.clear();
+                    bus.charge_direct_ram_split(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+                    (
+                        bus.trace.elapsed_clocks(),
+                        bus.trace.access_count(),
+                        bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
+                    )
+                });
+
+                let case = format!("{mode:?}/{tracing:?}/{width:?}@{offset:#x}");
+                assert_eq!(got_clocks, ref_clocks, "{case}: elapsed_clocks");
+                assert_eq!(got_accesses, ref_accesses, "{case}: access_count");
+                assert_eq!(
+                    got_cycles.len(),
+                    got_accesses as usize * usize::from(tracing == TracingMode::Full),
+                    "{case}: the Full-mode vector must hold one entry per access"
+                );
+                for (i, (a, b)) in got_cycles.iter().zip(ref_cycles.iter()).enumerate() {
+                    assert_eq!(a.kind, b.kind, "{case}: cycle {i} kind");
+                    assert_eq!(a.address, b.address, "{case}: cycle {i} address");
+                    assert_eq!(a.width, b.width, "{case}: cycle {i} width");
+                    assert_eq!(
+                        a.wait_states, b.wait_states,
+                        "{case}: cycle {i} wait states"
+                    );
+                    assert_eq!(a.clocks, b.clocks, "{case}: cycle {i} clocks");
+                }
+                assert_eq!(got_cycles.len(), ref_cycles.len(), "{case}: cycle count");
+                // A split really did happen -- otherwise every equality above is vacuous.
+                if tracing == TracingMode::Full {
+                    assert_eq!(
+                        ref_cycles.len(),
+                        width.bytes() as usize,
+                        "{case}: the reference did not split"
+                    );
+                }
+            }
+        }
+    }
+}

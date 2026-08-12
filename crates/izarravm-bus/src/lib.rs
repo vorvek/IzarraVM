@@ -958,6 +958,35 @@ pub trait CpuBus {
         self.charge_direct_memory(address, width, kind)
     }
 
+    /// Charge a page-local MISALIGNED direct-RAM access exactly as the byte-splitting bus path
+    /// charges it today: `width.bytes()` BYTE cycles at `address .. address + bytes`.
+    ///
+    /// That doubling (a misaligned word costs `2 x (2 + ws)` against an aligned word's
+    /// `1 x (2 + ws)`, because `BusCycle::clocks_for` ignores width entirely) is a SIDE EFFECT of
+    /// the splitting mechanism, not a modelled penalty -- nothing in tree says a misaligned access
+    /// costs two bus cycles. Reproducing it here is a requirement of the caller that stopped
+    /// splitting, not an endorsement of it: the point of admitting misaligned accesses to the
+    /// interpreter's fast path is to remove a slow-path excursion, bit-identically.
+    ///
+    /// Callers must have established RAM backing and page-locality, and the Mode13h aperture must
+    /// NOT come here -- its split has different DATA semantics, not merely different timing (a
+    /// byte write into the Distira LFB is swallowed where a wide write would have stored).
+    ///
+    /// The default DELEGATES, per byte, for the reason `charge_direct_ram_memory` above spells
+    /// out: a bus that overrides one of this family and forgets another must fail "correct but
+    /// slow", never "silently zero clocks".
+    fn charge_direct_ram_split(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        for i in 0..width.bytes() {
+            self.charge_direct_ram_memory(address.wrapping_add(i), BusWidth::Byte, kind)?;
+        }
+        Ok(())
+    }
+
     /// Return an upper bound on the raw clocks added by one cached direct-memory charge. `Some`
     /// remains valid until the bus reports a step break. A JIT uses it only after its CPU-side
     /// direct-page cache hit; `None` keeps the ordinary instruction path.

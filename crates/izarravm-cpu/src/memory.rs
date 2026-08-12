@@ -201,7 +201,9 @@ impl CpuGsw {
         linear: u32,
         width: BusWidth,
         write: bool,
+        split: bool,
     ) -> Option<(u32, *mut u8, bool)> {
+        debug_assert_eq!(split, width.misaligned_at(linear));
         if !self.fast_map_serve_enabled.enabled {
             return None;
         }
@@ -226,8 +228,22 @@ impl CpuGsw {
             user,
             write_protect,
         ) {
+            // KEEP THE APERTURE OUT. The Mode13h aperture's split has different DATA semantics,
+            // not merely different timing: it goes through `vega` per byte with video wait states
+            // rather than through RAM, and a byte write into the Distira LFB is swallowed where a
+            // wide write would have stored. Keeping the fast path conventional-RAM-only is what
+            // makes `charge_direct_ram_split` a legal charge on the arm below. One test against a
+            // discriminant already in a register, on the miss side of a branch the hit path
+            // predicts perfectly.
+            Some(access) if split && access.is_mode13() => {
+                self.fast_map_probe.misses += 1;
+                None
+            }
             Some(access) => {
                 self.fast_map_probe.hits += 1;
+                if self.slot_census_enabled && split {
+                    self.jit_direct.fast_map_audit.slot_admit_misaligned += 1;
+                }
                 Some((access.physical(), access.ptr(), access.is_mode13()))
             }
             None => {
@@ -311,14 +327,19 @@ impl CpuGsw {
     ///   It does NOT establish that the eight accesses are 4-aligned in LINEAR space, and an
     ///   earlier version of this comment claimed it did: `segment_linear_range` adds
     ///   `descriptor.base`, so an SS with base 2 and ESP 0x1000 puts the first slot at linear
-    ///   0xFFE, which is neither 4-aligned nor page-local. What actually excludes that -- and the
-    ///   paged cross-page splitter behind it -- is `FastMap::lookup_access` itself, which rejects
-    ///   `linear & 3 != 0` and `offset + width > PAGE_SIZE` before it looks at anything else
-    ///   (jit/fast_map.rs). **Those two rejections are load-bearing for this pre-check, not
-    ///   incidental to it.** Removing them as redundant -- they look redundant from the emitted
-    ///   store's side, which guards alignment itself -- would let a based-SS frame reach
-    ///   `write_memory_bus_width` unaligned, take `write_paged_cross_page`, and split into
-    ///   fragments this function never proved resident.
+    ///   0xFFE, which is neither 4-aligned nor page-local.
+    /// * **`linear` 4-aligned, per slot — THIS FUNCTION'S OWN CLAUSE, and the reason it exists.**
+    ///   It used to live inside `FastMap::lookup_access`, where it looked like one of five
+    ///   redundant spellings of the same alignment refusal and was removed as such. It is not
+    ///   redundant HERE. Without it a based-SS frame at linear 0xFFE reaches
+    ///   `write_memory_bus_width` unaligned, takes `write_paged_cross_page`, and splits into
+    ///   fragments this function never proved resident -- and this function cannot deliver a
+    ///   fault, so it must refuse instead. Since `lookup_access` now SERVES misaligned accesses,
+    ///   this clause is the only thing standing between a based-SS frame and a partially
+    ///   committed call-out. Do not remove it as redundant a second time.
+    ///
+    ///   Its page-local half stayed in `lookup_access`, which is still where that credit belongs:
+    ///   `offset + width > PAGE_SIZE` is refused there for every caller.
     /// * `segment_linear_range` per slot — the SS limit and the writability of the descriptor, the
     ///   same call `push`/`pop` will make, evaluated for every slot including the ones an ESP WRAP
     ///   sends to the far end of the address space. Wrapping is not special-cased: the offsets are
@@ -368,6 +389,10 @@ impl CpuGsw {
             let Ok(linear) = self.segment_linear_range(SegmentIndex::Ss, offset, 4, write) else {
                 return false;
             };
+            // Was `lookup_access`'s; now ours. See the `linear` 4-aligned bullet above.
+            if !linear.is_multiple_of(4) {
+                return false;
+            }
             let Some(access) = self.jit_fast_map.lookup_access(
                 linear,
                 mapping_epoch,
@@ -454,6 +479,7 @@ impl CpuGsw {
         any(target_os = "windows", target_os = "linux")
     ))]
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn finish_fast_map_read<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -461,12 +487,19 @@ impl CpuGsw {
         ptr: *mut u8,
         mode13: bool,
         width: BusWidth,
+        split: bool,
         kind: BusAccessKind,
     ) -> ExecResult<u32> {
-        if mode13 {
-            bus.charge_direct_memory(physical, width, kind)?;
-        } else {
-            bus.charge_direct_ram_memory(physical, width, kind)?;
+        // The one consumer of the `split` bit classified at the probe. Cost on the ALIGNED hot
+        // path is one additional predictable test against a value already in a register; that is
+        // the price of removing a full slow-path excursion from the misaligned population, and it
+        // is stated here rather than hidden.
+        match (mode13, split) {
+            // `split && mode13` cannot reach this function: the probe refuses it, so the aperture
+            // arm is only ever asked about an aligned access.
+            (true, _) => bus.charge_direct_memory(physical, width, kind)?,
+            (false, false) => bus.charge_direct_ram_memory(physical, width, kind)?,
+            (false, true) => bus.charge_direct_ram_split(physical, width, kind)?,
         }
         self.record_data_read(kind, true);
         self.perf.direct_data_pointer_reads += 1;
@@ -517,15 +550,40 @@ impl CpuGsw {
         ptr: *mut u8,
         mode13: bool,
         width: BusWidth,
+        split: bool,
         value: u32,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
         self.record_write_page(physical);
         let watched = self.code_write_watched(physical, width.bytes());
-        if mode13 {
-            bus.charge_direct_memory(physical, width, kind)?;
-        } else {
-            bus.charge_direct_ram_memory(physical, width, kind)?;
+        // See `finish_fast_map_read` for the routing; `split && mode13` is unreachable here too.
+        match (mode13, split) {
+            (true, _) => bus.charge_direct_memory(physical, width, kind)?,
+            (false, false) => bus.charge_direct_ram_memory(physical, width, kind)?,
+            (false, true) => bus.charge_direct_ram_split(physical, width, kind)?,
+        }
+        // `IZARRAVM_WATCH_WRITE` would otherwise go BLIND on misaligned stores. Its report hooks
+        // sit on the slow paths only (`write_linear_u8`, `write_linear_fragment`); this function
+        // had none, which was survivable exactly as long as a misaligned write could never reach
+        // it. Now it can, and this instrument's recorded failure mode is "silently sees nothing" --
+        // a debugging tool that answers "no writes here" when the writes moved. The label is
+        // distinct from the slow paths' `"sized"`/`"byte"` so a reader of the report can tell
+        // which path served the store, which is now diagnostically meaningful. Zero cost on the
+        // default build: `watch-write` is not a default feature and the whole block compiles out.
+        #[cfg(feature = "watch-write")]
+        if crate::write_watch_hits(crate::write_watch_packed(), physical, width.bytes()) {
+            crate::report_write_watch(
+                "fastmap",
+                self.registers.cs().selector,
+                self.registers.eip,
+                physical,
+                width.bytes(),
+                u64::from(value),
+                self.registers.segment(SegmentIndex::Es).selector,
+                self.registers.edi(),
+                self.registers.segment(SegmentIndex::Ds).selector,
+                self.registers.esi(),
+            );
         }
         let changed = Self::read_fast_map_ptr(ptr, width) != value;
         Self::write_fast_map_ptr(ptr, width, value);
@@ -626,6 +684,13 @@ impl CpuGsw {
         self.slot_census_enabled = enabled;
     }
 
+    /// Arm or disarm the N5 read/write/RMW census without the environment variable, so a test can
+    /// drive it in-process (`rmw_census_default` is a `OnceLock` and therefore not per-test
+    /// settable). The `set_slow_read_histo_enabled` precedent.
+    pub fn set_rmw_census_enabled(&mut self, enabled: bool) {
+        self.rmw_census_enabled = enabled;
+    }
+
     /// Arm or disarm the slow-read page histogram without the environment variable, so a test can
     /// drive the instrument in-process (`slow_read_histo_default` is a `OnceLock` and therefore
     /// not per-test settable). Arming clears whatever was collected.
@@ -706,13 +771,55 @@ impl CpuGsw {
         }
     }
 
+    /// Page-locality ALONE. This used to answer two questions -- "does the access stay inside one
+    /// page" and "is it naturally aligned" -- and refusing on the second was one of five sites
+    /// that made the same alignment refusal. The alignment half is now a CLASSIFICATION
+    /// (`BusWidth::misaligned_at`) whose only consumer is the charge; the data path never needed
+    /// it, because `read_direct_entry`/`write_direct_entry` already use
+    /// `read_unaligned`/`write_unaligned`.
     #[inline]
     fn direct_access_page_local(physical: u32, width: BusWidth) -> bool {
         let offset = (physical & 0x0fff) as usize;
-        if offset + width.bytes() as usize > 0x1000 {
-            return false;
+        offset + width.bytes() as usize <= 0x1000
+    }
+
+    /// The Mode13h VGA aperture, asked of a PHYSICAL address by the CPU rather than of the bus.
+    ///
+    /// No fallible trait method is needed for this: the CPU crate already owns the range.
+    /// `paging.rs` defines `VGA_APERTURE_START`/`VGA_APERTURE_END` as "the single source of truth
+    /// for the range", `jit/fast_map.rs` already imports them under the `MODE13_*` names that
+    /// `PageKind::Mode13` is classified by, and they are NUMERICALLY IDENTICAL to the bus's own
+    /// bound (`VGA_MODE13H_BASE .. VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE`, both
+    /// `0x000A_0000 .. 0x000B_0000`). Named here so nobody re-derives that equality or, worse,
+    /// re-invents a trait method to ask the bus a question the caller can already answer.
+    ///
+    /// A misaligned access to the aperture is REFUSED the direct path: the aperture's split goes
+    /// through `vega` per byte with video wait states, not through RAM, so keeping the direct
+    /// route conventional-RAM-only is what makes `charge_direct_ram_split` a legal charge.
+    #[inline]
+    fn is_mode13_aperture(physical: u32) -> bool {
+        (crate::paging::VGA_APERTURE_START..crate::paging::VGA_APERTURE_END).contains(&physical)
+    }
+
+    /// The charge for one direct sized access, routed by the alignment classification. The one
+    /// consumer of the `split` bit on this path.
+    ///
+    /// Callers must already have excluded the Mode13h aperture when `split` is true (see
+    /// `is_mode13_aperture`), so the `true` arm is always plain RAM.
+    #[inline]
+    fn charge_direct_sized<B: CpuBus>(
+        bus: &mut B,
+        physical: u32,
+        width: BusWidth,
+        split: bool,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        if split {
+            bus.charge_direct_ram_split(physical, width, kind)?;
+        } else {
+            bus.charge_direct_memory(physical, width, kind)?;
         }
-        !width.misaligned_at(physical)
+        Ok(())
     }
 
     #[inline]
@@ -725,6 +832,19 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<Option<u32>> {
         if !Self::direct_access_page_local(physical, width) {
+            return Ok(None);
+        }
+        // CLASSIFY BEFORE POPULATING. Relaxing the alignment half of the top-of-function refusal
+        // means a misaligned access now runs further into this function before it can decline, and
+        // between the old refusal point and any later decline sit `populate_fast_map_from_cached`,
+        // `data_read_pages.insert` and `populate_fast_map` -- SIDE EFFECTS that are invisible to a
+        // guest-state or clock gate. A populate-then-decline would install a DirectPageCache entry
+        // and a FastMap entry for a page it then refuses to serve, changing no guest byte and no
+        // clock, only which LATER accesses run fast. Both questions are answerable from `physical`
+        // and `width` alone, so both are asked here, above the first side effect, and the
+        // populate-vs-decline counter assertion in the test suite is what pins it.
+        let split = width.misaligned_at(physical);
+        if split && Self::is_mode13_aperture(physical) {
             return Ok(None);
         }
         if let Some(entry) = self.data_read_pages.get(physical) {
@@ -740,7 +860,7 @@ impl CpuGsw {
                 self.data_read_pages.mapping_epoch(),
                 false,
             );
-            bus.charge_direct_memory(physical, width, kind)?;
+            Self::charge_direct_sized(bus, physical, width, split, kind)?;
             self.record_data_read(kind, true);
             self.perf.direct_data_pointer_reads += 1;
             return Ok(Some(Self::read_direct_entry(entry, physical, width)));
@@ -762,7 +882,7 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.populate_fast_map(_linear, physical, page, false);
-        bus.charge_direct_memory(physical, width, kind)?;
+        Self::charge_direct_sized(bus, physical, width, split, kind)?;
         self.record_data_read(kind, true);
         self.perf.direct_data_pointer_reads += 1;
         Ok(Some(Self::read_direct_entry(
@@ -856,6 +976,12 @@ impl CpuGsw {
         if !Self::direct_access_page_local(physical, width) {
             return Ok(None);
         }
+        // Classify before populating; see `read_direct_page_cached` for why the ordering is a
+        // requirement rather than a tidiness preference.
+        let split = width.misaligned_at(physical);
+        if split && Self::is_mode13_aperture(physical) {
+            return Ok(None);
+        }
         if let Some(entry) = self.data_write_pages.get(physical) {
             #[cfg(all(
                 feature = "jit",
@@ -869,7 +995,7 @@ impl CpuGsw {
                 self.data_write_pages.mapping_epoch(),
                 true,
             );
-            bus.charge_direct_memory(physical, width, kind)?;
+            Self::charge_direct_sized(bus, physical, width, split, kind)?;
             let changed = Self::read_direct_entry(entry, physical, width) != value;
             Self::write_direct_entry(entry, physical, width, value);
             self.record_data_write(kind, true);
@@ -893,7 +1019,7 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.populate_fast_map(_linear, physical, page, true);
-        bus.charge_direct_memory(physical, width, kind)?;
+        Self::charge_direct_sized(bus, physical, width, split, kind)?;
         let entry = DirectPageCacheEntry {
             physical_page: page.physical_page,
             ptr: page.ptr,
@@ -1087,10 +1213,12 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         if let Some((physical, ptr, mode13)) =
-            self.fast_map_data_slot(linear, BusWidth::Byte, false)
+            // A byte access is aligned by definition, so `split` is a constant `false` here and
+            // folds away along with the charge selection it feeds.
+            self.fast_map_data_slot(linear, BusWidth::Byte, false, false)
         {
             return self
-                .finish_fast_map_read(bus, physical, ptr, mode13, BusWidth::Byte, kind)
+                .finish_fast_map_read(bus, physical, ptr, mode13, BusWidth::Byte, false, kind)
                 .map(|value| value as u8);
         }
         let physical = if self.control.cr0 & CR0_PG == 0 {
@@ -1137,7 +1265,9 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, BusWidth::Byte, true)
+        if let Some((physical, ptr, mode13)) =
+            // `split` is a constant `false` for a byte access; see `read_linear_u8`.
+            self.fast_map_data_slot(linear, BusWidth::Byte, true, false)
         {
             return self.finish_fast_map_write(
                 bus,
@@ -1145,6 +1275,7 @@ impl CpuGsw {
                 ptr,
                 mode13,
                 BusWidth::Byte,
+                false,
                 u32::from(value),
                 kind,
             );
@@ -1404,8 +1535,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false) {
-            return self.finish_fast_map_read(bus, physical, ptr, mode13, width, kind);
+        let split = width.misaligned_at(linear);
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false, split)
+        {
+            return self.finish_fast_map_read(bus, physical, ptr, mode13, width, split, kind);
         }
         let physical = self.translate_linear(bus, linear, false)?;
         if let Some(value) = self.read_direct_page_cached(bus, linear, physical, width, kind)? {
@@ -1440,8 +1573,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true) {
-            return self.finish_fast_map_write(bus, physical, ptr, mode13, width, value, kind);
+        let split = width.misaligned_at(linear);
+        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true, split) {
+            return self
+                .finish_fast_map_write(bus, physical, ptr, mode13, width, split, value, kind);
         }
         let physical = self.translate_linear(bus, linear, true)?;
         #[cfg(feature = "watch-write")]
