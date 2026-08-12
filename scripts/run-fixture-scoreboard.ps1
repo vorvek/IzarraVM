@@ -1059,3 +1059,11 @@ if ($failed.Count -gt 0) {
         $failed.Count, (($failed | ForEach-Object { "$($_.name) [$($_.invariant)]" }) -join ", "))
     exit 1
 }
+
+# Say 0 explicitly. Falling off the end leaves $LASTEXITCODE holding whatever
+# the last NATIVE command set, and the last native command here is the emulator
+# -- so a board on which every fixture passed reported exit 1 on 2026-08-12
+# purely because a guest had exited non-zero. That is the dangerous direction
+# for a gate: the obvious repair is to stop trusting this script's status, which
+# would also silence the real `exit 1` above and turn the gate into decoration.
+exit 0
