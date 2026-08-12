@@ -611,16 +611,26 @@ fn the_banked_direct_page_points_at_the_bank_it_names() {
     );
 }
 
-/// T5 -- a REP MOVS through the banked window, which is 99.97% of nascar's
-/// aperture traffic and had NO test at all.
+/// T5a -- the BULK COPY into the banked window must land in the bank it names.
 ///
-/// The slice exists to restore the bulk copy on exactly this path: before it,
-/// `direct_vga_bytes` refused on the zeroed token, `bulk_direct` went false, and
-/// the run fell back to one bus round-trip per iteration. A test exercising only
-/// ordinary stores misses the entire mechanism.
+/// WHY THIS TEST CHANGED, because the previous version proved less than it read
+/// as. It probed admission with `direct_memory_bytes` -- which returns a COUNT
+/// and never dereferences anything -- and then wrote its bytes with
+/// `write_physical_u8`. That is the ORDINARY path, and it does not touch the
+/// granted pointer at all: `bus.rs`'s `write_memory_byte_recorded` routes the
+/// byte to `Vega::write_memory_u8`, which derives the bank offset for itself in
+/// `margo_banked_window_offset` -- an INDEPENDENT second computation of
+/// `bank * 64K + offset`. So the bytes landed in the right bank by a route the
+/// aliasing mutation cannot reach, and S6 (`margo_banked_direct_page` drops the
+/// bank base, every bank aliasing bank 0) survived it.
+///
+/// `write_memory_bytes_direct` is the function the REP string path actually
+/// calls (`strings.rs`, both the MOVS and the STOS arm) and the only one that
+/// copies through the pointer `direct_write_page` grants. Its return value is
+/// the non-vacuity guard: a refusal returns 0 rather than writing anywhere else.
 #[test]
-fn a_rep_movs_into_the_banked_window_lands_correctly() {
-    const SRC: u32 = 0x2_0000;
+fn a_bulk_copy_into_the_banked_window_lands_in_the_named_bank() {
+    const BANK: u16 = 1;
     const COUNT: usize = 256;
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
@@ -628,35 +638,109 @@ fn a_rep_movs_into_the_banked_window_lands_correctly() {
     )
     .unwrap();
     assert!(machine.vega.set_vbe_mode(0x0101));
-    assert_eq!(machine.vega.vbe_window_control(0x0000, 1), Ok(1));
+    assert_eq!(machine.vega.vbe_window_control(0x0000, BANK), Ok(BANK));
 
+    let payload: Vec<u8> = (0..COUNT).map(|i| (i & 0xff) as u8).collect();
+    let put = with_bus(&mut machine, |bus| {
+        bus.write_memory_bytes_direct(
+            0x000a_0000,
+            &payload,
+            BusWidth::Byte,
+            BusAccessKind::DataWrite,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        put, COUNT,
+        "the banked window must be admitted for the bulk copy, or the slice's \
+         whole mechanism is inert -- and the placement assertions below would be \
+         asserting about bytes nobody wrote"
+    );
+
+    let vram = machine.vega.margo().vram();
+    let bank_bytes = 0x1_0000usize;
+    for i in 0..COUNT {
+        assert_eq!(
+            vram[BANK as usize * bank_bytes + i],
+            payload[i],
+            "byte {i} must land in bank {BANK} of the frame store"
+        );
+    }
+    assert!(
+        vram[..COUNT].iter().all(|&byte| byte == 0),
+        "and bank 0 must be UNTOUCHED -- every bank aliasing bank 0 is the \
+         mutation this test exists for, and it lands its bytes exactly here"
+    );
+}
+
+/// T5b -- and a real REP MOVS must REACH that bulk pair.
+///
+/// T5a proves the copy lands correctly once someone calls it. This proves the
+/// string path is who calls it, which is the slice's actual claim: 99.97% of
+/// nascar's aperture traffic is a REP MOVS, and before the slice
+/// `direct_vga_bytes` refused on the zeroed token, `bulk_direct` went false, and
+/// the run fell back to one bus round-trip per iteration.
+///
+/// NON-VACUITY, which matters more here than usual: the bytes land in the right
+/// bank under the per-iteration fallback TOO (that path recomputes the offset in
+/// `Vega::write_memory_u8`), so placement alone cannot tell the two mechanisms
+/// apart. `data_slow_writes` is what does: it is incremented once per non-direct
+/// sized access, the REP is the only memory write this program makes, and the
+/// bulk arm scores `data_direct_writes` instead.
+#[test]
+fn a_rep_movs_into_the_banked_window_takes_the_bulk_path() {
+    const SRC: u32 = 0x2_0000;
+    const BANK: u16 = 1;
+    const COUNT: usize = 256;
+    let rom = rom_with_code(&[
+        0xfc, // cld
+        0xb8, 0x00, 0x20, // mov ax, 2000h
+        0x8e, 0xd8, // mov ds, ax        (source at 0x20000)
+        0xb8, 0x00, 0xa0, // mov ax, A000h
+        0x8e, 0xc0, // mov es, ax        (the banked window)
+        0x31, 0xf6, // xor si, si
+        0x31, 0xff, // xor di, di
+        0xb9, 0x00, 0x01, // mov cx, 100h
+        0xf3, 0xa4, // rep movsb
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    assert_eq!(machine.vega.vbe_window_control(0x0000, BANK), Ok(BANK));
     for i in 0..COUNT {
         machine.write_physical_u8(SRC + i as u32, (i & 0xff) as u8);
     }
 
-    // The bulk path must ADMIT this range -- that is the mechanism under test.
-    let admitted = with_bus(&mut machine, |bus| {
-        bus.direct_memory_bytes(0x000a_0000, COUNT, BusWidth::Byte, BusAccessKind::DataWrite)
-    });
     assert_eq!(
-        admitted, COUNT,
-        "the banked window must be admitted for the bulk copy, or the slice's \
-         whole mechanism is inert"
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
     );
 
-    for i in 0..COUNT {
-        machine.write_physical_u8(0x000a_0000 + i as u32, (i & 0xff) as u8);
-    }
+    let perf = machine.cpu().perf_counters().clone();
+    assert_eq!(
+        perf.data_slow_writes, 0,
+        "the REP is this program's only memory write, so a single slow write \
+         means it took the per-iteration fallback the slice exists to remove"
+    );
+    assert!(
+        perf.data_direct_writes >= COUNT as u64,
+        "and the bulk arm must have scored all {COUNT} iterations, not {}",
+        perf.data_direct_writes
+    );
 
-    // Read the frame store directly: bank 1, so one window in.
     let vram = machine.vega.margo().vram();
+    let bank_bytes = 0x1_0000usize;
     for i in 0..COUNT {
         assert_eq!(
-            vram[0x1_0000 + i],
+            vram[BANK as usize * bank_bytes + i],
             (i & 0xff) as u8,
-            "byte {i} must land in bank 1 of the frame store"
+            "byte {i} must land in bank {BANK} of the frame store"
         );
     }
+    assert!(
+        vram[..COUNT].iter().all(|&byte| byte == 0),
+        "and bank 0 must be UNTOUCHED"
+    );
 }
 
 /// T3 -- THE C1 REGRESSION. Banked VESA, then `INT 10h AX=0003h`, must move the
@@ -735,12 +819,19 @@ fn a_banked_write_from_mode13_does_not_make_the_vga_authoritative() {
     );
 }
 
-/// R-4 -- the identity guard must fire through the REAL entry point.
+/// R-4a -- the identity guard must fire through the REAL `INT 10h` entry point.
 ///
-/// T2 and T3 call `Vega` methods directly, so reverting either token-compare
-/// wrapper to the bare token survives them. For 4F05 that revert is a live bug:
-/// the banked token is `0xff` before and after, so `0xff == 0xff` compares equal
-/// and the cached-pointer invalidation never fires.
+/// T2 and T3 call `Vega` methods directly, so reverting the `handle_int10`
+/// token-compare wrapper to the bare token survives them. For 4F05 that revert
+/// is a live bug: the banked token is `0xff` before and after, so `0xff == 0xff`
+/// compares equal and the cached-pointer invalidation never fires.
+///
+/// This pins the `video.rs` wrapper ONLY. The port-write wrapper in `bus.rs` is
+/// a second, independent comparison of the same identity, and no INT 10h reaches
+/// it -- see `a_bank_move_through_the_segsel_port_invalidates_the_data_map`,
+/// which is the test that pins it. Both reverts were run against this test: it
+/// catches the `video.rs` one and does NOT catch the `bus.rs` one, which is
+/// exactly the coverage boundary a reader should not have to guess at.
 #[test]
 fn a_guest_bank_switch_through_int10_invalidates_the_data_map() {
     let rom = rom_with_code(&[
@@ -783,7 +874,68 @@ fn a_guest_bank_switch_through_int10_invalidates_the_data_map() {
     );
 }
 
-/// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`/// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
+/// R-4b / S7 -- the OTHER identity wrapper, the one on the port-write path.
+///
+/// `bus.rs` compares `direct_write_identity` across every accepted device-port
+/// write, and that is a separate comparison from `handle_int10`'s. A guest moves
+/// the Margo window through the SEGSEL extension registers as well as through
+/// 4F05 -- `izbios-vbepm.inc`'s protected-mode stub uses exactly this pair -- so
+/// this path carries live bank moves and reverting it to the bare token is the
+/// same live bug as reverting the other one.
+///
+/// WHAT MAKES THIS DISTINGUISHING, which the INT 10h delta test could not be:
+/// the observation has to separate "the wrapper compared the BANK" from "the
+/// wrapper compared only the token". A bank move is precisely the transition
+/// where the bare token does NOT move (`0xff` while banked, whatever the bank),
+/// so the test asserts BOTH halves at once -- the key moved, the bare token did
+/// not, and the data map was still marked. Under the revert the third assertion
+/// is the only one that can fail, and it must.
+///
+/// The flag is cleared after the mode set for the reason the INT 10h test needed
+/// a delta: a 4F02 raises it on its own, so a bare `assert!(flag)` afterwards
+/// would pass on the mode set alone and say nothing about the bank move.
+#[test]
+fn a_bank_move_through_the_segsel_port_invalidates_the_data_map() {
+    const MARGO_EXT_INDEX: u16 = 0x03cb;
+    const MARGO_EXT_DATA: u16 = 0x03cd;
+    const SEGSEL_LO: u32 = 0x00;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101)); // banked
+    assert_eq!(machine.vega.margo_banked_window_key(), Some(0));
+
+    let token_before = machine.vega.direct_write_token();
+    machine.direct_data_map_changed = false;
+    with_bus(&mut machine, |bus| {
+        bus.write_io(MARGO_EXT_INDEX, BusWidth::Byte, SEGSEL_LO, false)
+            .unwrap();
+        bus.write_io(MARGO_EXT_DATA, BusWidth::Byte, 2, false)
+            .unwrap();
+    });
+
+    assert_eq!(
+        machine.vega.margo_banked_window_key(),
+        Some(2 * 0x1_0000),
+        "non-vacuous: the port write must actually have moved the window, or the \
+         invalidation assertion below is about nothing"
+    );
+    assert_eq!(
+        machine.vega.direct_write_token(),
+        token_before,
+        "and the BARE token must NOT have moved -- that is why comparing it \
+         instead of the identity is a live bug rather than a stylistic one"
+    );
+    assert!(
+        machine.direct_data_map_changed,
+        "a bank move through the SEGSEL port must mark the direct data map \
+         changed, or a cached pointer keeps serving the old bank"
+    );
+}
+
+/// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
 /// separate a LINEAR 4F02 request (bit 0x4000) from a banked one, and must
 /// count only ACCEPTED mode sets. A rejected mode leaves both alone -- otherwise
 /// a guest that probes the mode list would inflate whichever column it probed
