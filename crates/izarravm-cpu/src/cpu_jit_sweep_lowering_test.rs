@@ -230,6 +230,12 @@ mod f7_group;
 #[path = "cpu_jit_word_memory_test.rs"]
 mod word_memory;
 
+/// Guard 3: the misaligned memory admission at the two lean one-lookup sites. Nested here for the
+/// reason the modules above are: it wants this module's differential fixture (`ENTRY`,
+/// `STACK_TOP`, `flat_cpu`) rather than another copy of it.
+#[path = "cpu_jit_misaligned_memory_test.rs"]
+mod misaligned_memory;
+
 /// The rejected-row campaign's sixteen-bit REGISTER shift lane (Slice 3b), the repair for the
 /// relocation Slice 3 created. Nested here for the reason the three modules above are: it wants
 /// this module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a fifth copy.

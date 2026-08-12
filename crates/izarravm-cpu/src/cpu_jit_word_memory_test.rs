@@ -596,35 +596,39 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
 // The two guards, at two-byte width
 // ---------------------------------------------------------------------------------------------
 
-/// A MISALIGNED word operand side-exits instead of running natively.
+/// A MISALIGNED word operand at the sites guard 3 does NOT relax.
 ///
-/// `emit_wide_page_guard` requires `alignment_bytes()` alignment, which is 2 for Word, so an odd
-/// address is refused. That is a population cut with observable consequences -- one slot retires,
-/// EIP stops at the tested opcode, the interpreter finishes the instruction -- and it applies to
-/// all three of this slice's rows because all three go through the same guard.
+/// The three rows of this slice no longer agree, and the disagreement is the point. Guard 3 split
+/// `emit_wide_page_guard` into a page-crossing half and an alignment half, and relaxed the
+/// alignment half at the two LEAN one-lookup sites only:
+///
+/// * `add word [odd], imm8` is `AluMemDest`, a read-modify-write, which is site 6 and still
+///   refuses. An RMW slot needs a read deposit and a write deposit inside one slot, which is its
+///   own change.
+/// * `movzx bx, word [odd]` is a `Load` through the lean read site and now RUNS NATIVELY. Its row
+///   moved to `misaligned_memory`, whose harness asserts the split bus charge as an exact delta;
+///   it cannot live here, because this module's `lowered` asserts bus clocks EQUAL to the
+///   interpreter and a natively-served misaligned access deliberately charges more than
+///   `TestBus`'s non-splitting slow path does.
+/// * `mov word [odd], imm16` is a `Store` through the lean store site and moved with it.
+///
+/// What survives here is the row that still refuses, kept in this module because the `0x83` word
+/// forms are what this file exists to certify.
 ///
 /// The 386 admits misaligned accesses architecturally; refusing them natively is a missed lowering
 /// rather than a divergence, which is exactly what the interpreted re-execution below proves.
 #[test]
-fn a_misaligned_word_operand_exits_to_the_interpreter() {
-    let mut store = vec![0x66u8];
-    store.extend_from_slice(&disp32(&[0xc7], 0, MISALIGNED_OPERAND));
-    store.extend_from_slice(&0x1234u16.to_le_bytes());
-
+fn a_misaligned_word_read_modify_write_still_exits_to_the_interpreter() {
     let mut alu = vec![0x66u8];
     alu.extend_from_slice(&disp32(&[0x83], 0, MISALIGNED_OPERAND));
     alu.push(0x03);
 
-    let mut load = vec![0x66u8];
-    load.extend_from_slice(&disp32(&[0x0f, 0xb7], 3, MISALIGNED_OPERAND));
-
-    for (body, name) in [
-        (store, "mov word [odd], imm16"),
-        (alu, "add word [odd], imm8"),
-        (load, "movzx bx, word [odd]"),
-    ] {
-        guarded(&body, Seed::new(), alignment_exits, name);
-    }
+    guarded(
+        &alu,
+        Seed::new(),
+        alignment_exits,
+        "add word [odd], imm8 (AluMemDest, site 6)",
+    );
 }
 
 /// A word STORE into a watched chunk exits transactionally.

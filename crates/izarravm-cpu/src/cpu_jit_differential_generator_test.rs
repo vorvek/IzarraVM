@@ -413,6 +413,43 @@ fn assert_measured_pair(
     case: &GeneratedCase,
     exact_run_boundaries: bool,
 ) -> u64 {
+    assert_measured_pair_with_split(
+        interpreter,
+        interpreter_bus,
+        direct,
+        direct_bus,
+        pristine,
+        case,
+        exact_run_boundaries,
+        0,
+    )
+}
+
+/// As `assert_measured_pair`, but for a case that serves a MISALIGNED access natively.
+///
+/// `expected_split_bus_clocks` is the bus-clock excess the native role must show over the
+/// interpreted one, and it is not slack: it is asserted as an equality, so a deposit that is
+/// missing, doubled or mis-sized fails here exactly as it would in a dedicated fixture.
+///
+/// Why the two roles legitimately differ at all, since every other case in this file requires them
+/// to agree: guard 3 serves a page-local misaligned access inside the block and charges it one
+/// wide cycle plus `bytes - 1` byte cycles, while `lookup_access` refuses a misaligned width on
+/// the interpreted side, so that role leaves the FastMap for `TestBus::read_memory` -- a single
+/// cycle at zero wait states, no split. On the real `MachineBus` the two are EQUAL, because
+/// `BusCycle::clocks_for` ignores width there and the interpreter's `should_split` turns the
+/// access into a byte run; `TestBus` models neither, so the equality cannot be stated here and the
+/// difference is pinned as an exact number instead.
+#[allow(clippy::too_many_arguments)]
+fn assert_measured_pair_with_split(
+    interpreter: &mut CpuGsw,
+    interpreter_bus: &mut TestBus,
+    direct: &mut CpuGsw,
+    direct_bus: &mut TestBus,
+    pristine: &[u8],
+    case: &GeneratedCase,
+    exact_run_boundaries: bool,
+    expected_split_bus_clocks: u64,
+) -> u64 {
     restore_bus(interpreter_bus, pristine);
     restore_bus(direct_bus, pristine);
     arm(interpreter, case);
@@ -446,8 +483,8 @@ fn assert_measured_pair(
     assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
     assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
     assert_eq!(
-        direct_bus.trace.elapsed_clocks(),
-        interpreter_bus.trace.elapsed_clocks(),
+        direct_bus.trace.elapsed_clocks() - interpreter_bus.trace.elapsed_clocks(),
+        expected_split_bus_clocks,
         "{case:#?}"
     );
     direct
@@ -754,6 +791,20 @@ fn unaligned_cross_page_case() -> GeneratedCase {
     }
 }
 
+/// Three dword reads on one page: aligned at `0x18000`, MISALIGNED in-page at `0x18001`, and
+/// page-CROSSING at `0x18fff`.
+///
+/// Before guard 3 the last two both side-exited on `emit_wide_page_guard` and this test asserted
+/// two exits. The guard is now two halves and only the CROSSING one still refuses at the lean read
+/// site, so the contract here becomes sharper rather than weaker: exactly ONE exit, and the
+/// misaligned read is asserted to have been served -- by the split bus charge it deposits (one
+/// dword cycle plus three byte cycles, against the interpreted role's single non-split cycle) and
+/// by every architectural comparison in `assert_measured_pair_with_split` still holding.
+///
+/// This is the shape that would catch the two halves being emitted in the wrong order at scale: an
+/// alignment-first guard sends `0x18fff` into the recovery stub, which would serve four bytes
+/// across a page boundary the FastMap entry does not cover -- guest RAM and the exit count both
+/// move.
 #[test]
 fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
     let case = unaligned_cross_page_case();
@@ -777,8 +828,11 @@ fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
     let exits = direct
         .perf_counters()
         .jit_direct_exit_cross_page_or_alignment;
+    // One dword cycle plus three byte cycles at TestBus's dials (5 + 3*2), less the single
+    // non-splitting cycle the interpreted role pays (2), for the ONE misaligned in-page read.
+    const SPLIT_BUS_CLOCKS: u64 = 5 + 3 * 2 - 2;
     assert!(
-        assert_measured_pair(
+        assert_measured_pair_with_split(
             &mut interpreter,
             &mut interpreter_bus,
             &mut direct,
@@ -786,14 +840,16 @@ fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
             &pristine,
             &case,
             false,
+            SPLIT_BUS_CLOCKS,
         ) > 0
     );
-    assert!(
+    assert_eq!(
         direct
             .perf_counters()
-            .jit_direct_exit_cross_page_or_alignment
-            >= exits + 2,
-        "both dword fallbacks must exit before access: {case:#?}, perf={:#?}",
+            .jit_direct_exit_cross_page_or_alignment,
+        exits + 1,
+        "only the CROSSING dword may exit; the misaligned in-page one is served: {case:#?}, \
+         perf={:#?}",
         direct.perf_counters()
     );
 }

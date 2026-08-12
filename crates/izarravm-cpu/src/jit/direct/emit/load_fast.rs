@@ -10,7 +10,10 @@
 //! guard.
 //!
 //! The counter identity this file exists to preserve (design §2, the run.rs subtraction): RAM
-//! reads are counted STATICALLY at compile, only mode13 reads move dynamic lanes. So the lean
+//! reads are counted STATICALLY at compile, only mode13 reads move dynamic lanes — and a
+//! MISALIGNED RAM access deposits its extra byte cycles, which is a CLOCK quantity in
+//! `STACK_DWORD_READS`'s high half and not a read count, so the static identity survives it: one
+//! access still counts once. So the lean
 //! fast RAM arm touches NO counter and NO frame slot; every other lean case goes to a
 //! width-specific COUNTING stub that moves exactly the width's read lane on a mode13 success,
 //! after every status this access can refuse with (an emission-shape correction the L8 size
@@ -97,14 +100,35 @@ pub(super) fn emit_ram_read_pointer_fast(
     wrap: AddressWrap,
 ) {
     let map = memory.map.expect("native read has fast-map bases");
+    // HOISTED above the guard, because the alignment half below targets `slow`. `done` moves with
+    // it so the two stay adjacent. Both are still placed on every path: when
+    // `emit_segmented_linear_address` takes its `checked_sub` None arm it emits an unconditional
+    // jump and returns from ITSELF, not from here, so the rest of this function still emits (as
+    // dead code) and still places both labels.
+    let slow = e.label();
+    let done = e.label();
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
     if width.needs_alignment_guard() {
-        emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
+        // The two halves are called DIRECTLY, not through `emit_wide_page_guard`: that wrapper
+        // exists for the eleven sites that send both verdicts to one label, and this site does
+        // not. A page-CROSSING access still refuses -- the crossing bound is the only thing left
+        // keeping a served access inside the one page its entry was resolved against, which is
+        // why it is emitted first -- while a MISALIGNED page-local access now falls into this
+        // site's own slow stub and is served there.
+        emit_page_cross_bound(e, width, sides.cross_page_or_alignment);
+        // RDX is the scratch here, as it was before the decomposition: this precedes
+        // `emit_load_bias_probe`, whose contract is "RDX is untouched", and nothing downstream of
+        // it reads RDX. The STORE site cannot use RDX and uses RCX instead; see
+        // `emit_alignment_test`.
+        emit_alignment_test(e, width, Reg::RDX, slow);
     }
     emit_load_bias_probe(e, map);
 
-    let slow = e.label();
-    let done = e.label();
+    // Jumping past the probe into `slow` is legal, and neither fact is obvious:
+    // `emit_counting_read_stub` never reads incoming RDI -- it recomputes the page index from RAX
+    // and re-derives the kind from the flags byte -- and nothing in the stub writes RAX, so its
+    // own `test al, mask` sees the linear address this site formed.
+
     // BOTH privilege arms test both tag bits: a tagged entry's low bits are part of the VALUE,
     // so even a site allowed to read through it (cpl0 through a supervisor entry) must strip
     // them before forming the pointer — the store slice's round-one miscompile class.
@@ -390,6 +414,31 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     e.jnz(status_unavailable);
 
     // Fall-through: the mode13 resolve tail.
+    //
+    // Mode 13h keeps REFUSING misaligned accesses. Conservative rather than proven inequivalent:
+    // the interpreter splits an aperture access into bytes exactly as it splits RAM, but nothing
+    // has shown the VGA latch and plane state per access is equivalent under a split, and the
+    // population does not justify finding out -- wolf3d's entire aperture is 0.01% of its slow
+    // reads, and only the misaligned subset reaches here.
+    //
+    // Placed BEFORE `emit_read_permission_check`, matching where the pre-slice
+    // `emit_wide_page_guard` sat relative to every check: refusing later would re-attribute a
+    // cpl3 aperture case from alignment to Permission.
+    //
+    // The refusal returns status 1, so it lands on the site's `unavailable_or_kind` exit and is
+    // counted as `UnavailableOrKind`, not `CrossPageOrAlignment`. Deliberate: a new status would
+    // add a compare and a branch to EVERY read site's cold dispatch, roughly ten per block, which
+    // is emitted-size pressure on the exact constraint the watch-window redesign was built
+    // around. The mis-attribution is counters-only and bounded at 0.01%.
+    //
+    // Wrapped, because `emit_read_stub_pad` builds a stub for every GPR width INCLUDING Byte, and
+    // an unwrapped test would emit `test al, 0` plus an untakeable branch into both Byte stubs.
+    if width.needs_alignment_guard() {
+        // RAX, not RDI: RDI is still the raw probed entry here, and after the resolve below it
+        // would be a HOST pointer whose low bits carry the FastMap bias.
+        e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
+        e.jnz(status_unavailable);
+    }
     emit_read_permission_check(&mut e, cpl3, status_permission);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
@@ -410,6 +459,27 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     emit_read_pointer(&mut e, true, map, status_unavailable);
+    // The misaligned RAM read this stub now SERVES rather than refuses: charge the extra byte
+    // cycles it owes beyond the one wide cycle the block's static count already carries.
+    //
+    // CONDITIONAL, and that is not an optimisation. Every aligned access that reaches this tail
+    // -- a poisoned entry, a supervisor-tagged page read at cpl0, any refill -- must charge
+    // exactly what it charged before the slice, so the deposit has to be gated on the access
+    // really being misaligned rather than on it having come through the stub.
+    //
+    // The test is on RAX because `emit_read_pointer` ends `add rdi, rax`: RDI is now a HOST
+    // pointer whose low bits carry the FastMap bias, while RAX is still the linear address and
+    // nothing in this stub writes it. RDX is dead here -- the tail is `xor ecx, ecx` and return.
+    //
+    // Placed after the resolve, so the access is committed and can no longer refuse: a deposit
+    // followed by a status-1 return would charge for an access the interpreter is about to redo.
+    if width.needs_alignment_guard() {
+        let aligned = e.label();
+        e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
+        e.jz(aligned);
+        emit_dynamic_split_extra(&mut e, width.bytes() - 1);
+        e.place(aligned);
+    }
     e.xor_r64_self(Reg::RCX);
     emit_stub_return(&mut e);
 

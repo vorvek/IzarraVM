@@ -3776,6 +3776,32 @@ fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
     e.add_r64_to_mem_disp8(Reg::RSP, byte_counter_offset, Reg::RDX);
 }
 
+/// Deposit `extra` EXTRA byte cycles -- the ones a misaligned RAM access owes beyond the single
+/// wide cycle its static count already charges -- into the HIGH half of `STACK_DWORD_READS`.
+///
+/// The lane's low half is the block's static dword-read count and the two cannot interact:
+/// `emit_add_static_accounting` writes the low half with `mov r32, imm32` plus a 64-bit add and
+/// never touches the high half, and `emit_add_repeated_accounting`'s product is a small per-block
+/// count times at most `MAX_NATIVE_SELF_LOOP_ITERATIONS`. `run.rs` asserts that beside the unpack.
+///
+/// **The lane's name lies, and it is worth knowing why that was chosen.** This quantity rides in
+/// a lane called "dword reads" and is fed by STORES as well as reads. It is numerically right --
+/// `run.rs` prices `ram_byte_writes` through the same `jit_data_cost_clocks(Byte)` as
+/// `ram_byte_reads`, so one shared pool of extra byte cycles is exact -- and it costs nothing:
+/// the high half was already copied out by `emit_return` as part of a full 64-bit lane, already
+/// zeroed by the prologue's vector fill, and had no consumer. `STACK_RAM_DWORD_WRITES` has an
+/// equally free high half if a future reader would rather split reads from stores; the single
+/// pool is chosen because it is one deposit helper and one clock term.
+///
+/// Scratch: RDX, like both increment primitives above. Every caller is a STUB tail past the point
+/// where the access is committed, so RDX is dead there.
+fn emit_dynamic_split_extra(e: &mut Encoder, extra: u32) {
+    // Word or Dword. The x87 widths keep refusing misaligned accesses, so 7 and 9 never arrive.
+    debug_assert!(extra == 1 || extra == 3);
+    e.mov_r64_imm64(Reg::RDX, u64::from(extra) << 32);
+    e.add_r64_to_mem_disp8(Reg::RSP, STACK_DWORD_READS, Reg::RDX);
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
