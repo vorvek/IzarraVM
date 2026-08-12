@@ -436,6 +436,13 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     if width.needs_alignment_guard() {
         // RAX, not RDI: RDI is still the raw probed entry here, and after the resolve below it
         // would be a HOST pointer whose low bits carry the FastMap bias.
+        //
+        // `bytes() - 1` where the CALL SITE's guard tests `alignment_bytes() - 1`. The two agree
+        // for Byte, Word and Dword, which self-align, and diverge for Qword and Tbyte, which ask
+        // for 4 deliberately. That is safe here only because this pad is built for the three GPR
+        // widths alone -- `gpr_read_width_index` makes the other two `unreachable!()` -- so a
+        // wider width can never reach this test. If one ever routes to a lean site, these two
+        // spellings must be reconciled rather than left to agree by coincidence.
         e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
         e.jnz(status_unavailable);
     }
@@ -462,10 +469,22 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     // The misaligned RAM read this stub now SERVES rather than refuses: charge the extra byte
     // cycles it owes beyond the one wide cycle the block's static count already carries.
     //
-    // CONDITIONAL, and that is not an optimisation. Every aligned access that reaches this tail
-    // -- a poisoned entry, a supervisor-tagged page read at cpl0, any refill -- must charge
-    // exactly what it charged before the slice, so the deposit has to be gated on the access
-    // really being misaligned rather than on it having come through the stub.
+    // CONDITIONAL, and that is not an optimisation: an ALIGNED access really can reach this tail
+    // and must charge exactly what it charged before the slice.
+    //
+    // The route is narrow and worth naming precisely, because the two obvious candidates are both
+    // WRONG and stating them would make this comment argue against itself. A supervisor-tagged
+    // page read at cpl0 strips its tag and rejoins the fast arm INLINE, never entering this stub;
+    // a page with no committed read bias hits `emit_read_pointer`'s `UNAVAILABLE_BIAS` arm and
+    // returns status 1 without ever reaching this point.
+    //
+    // What does reach here is a page whose HOST BACKING is not 4 KiB-aligned. `derive_load_bias`
+    // poisons the LOAD bias when `read_bias & PAGE_MASK != 0` -- that bias carries the mode13 and
+    // supervisor tags in its low bits, so a bias with low bits of its own cannot be tagged --
+    // while `read_biases[index]` stays live, and `FastMap::populate` never requires the pointer to
+    // be page-aligned. So the site's probe sees poison, jumps here, and `emit_read_pointer`
+    // resolves the untagged read bias perfectly well. Every aligned wide read on such a page would
+    // be over-charged, permanently and silently, by an unconditional deposit.
     //
     // The test is on RAX because `emit_read_pointer` ends `add rdi, rax`: RDI is now a HOST
     // pointer whose low bits carry the FastMap bias, while RAX is still the linear address and

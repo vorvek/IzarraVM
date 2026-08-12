@@ -439,6 +439,10 @@ fn assert_measured_pair(
 /// `BusCycle::clocks_for` ignores width there and the interpreter's `should_split` turns the
 /// access into a byte run; `TestBus` models neither, so the equality cannot be stated here and the
 /// difference is pinned as an exact number instead.
+///
+/// The clause about `lookup_access` is the one that expires: the interpreter-datapath slice
+/// deletes that alignment rung. When this branch rebases onto it, re-derive the callers' expected
+/// deltas and rewrite this paragraph to describe whatever the interpreted role then does.
 #[allow(clippy::too_many_arguments)]
 fn assert_measured_pair_with_split(
     interpreter: &mut CpuGsw,
@@ -830,6 +834,12 @@ fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
         .jit_direct_exit_cross_page_or_alignment;
     // One dword cycle plus three byte cycles at TestBus's dials (5 + 3*2), less the single
     // non-splitting cycle the interpreted role pays (2), for the ONE misaligned in-page read.
+    //
+    // REBASE HAZARD: the trailing `- 2` is what the interpreted role pays only while
+    // `FastMap::lookup_access` still refuses a misaligned width. The interpreter-datapath slice
+    // deletes that rung and serves the access directly as a byte run. This assertion is exact, so
+    // it fails loudly; RE-DERIVE the term rather than tuning it. See the same note on
+    // `INTERPRETED_MISALIGNED_CLOCKS` in `cpu_jit_misaligned_memory_test.rs`.
     const SPLIT_BUS_CLOCKS: u64 = 5 + 3 * 2 - 2;
     assert!(
         assert_measured_pair_with_split(

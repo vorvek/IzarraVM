@@ -74,6 +74,19 @@ fn direct_cycle_clocks(bytes: u32) -> u64 {
 /// What the block-free interpreted role pays for ONE misaligned access: `lookup_access` refuses a
 /// misaligned width outright, so the access leaves the FastMap and lands on `TestBus::read_memory`
 /// / `write_memory`, which record a single cycle at zero wait states and never split.
+///
+/// **REBASE HAZARD — this constant is derived from a rung that the interpreter-datapath slice
+/// DELETES.** That branch removes the alignment rejection from `FastMap::lookup_access` (its
+/// replacement comment reads "PAGE-LOCALITY ONLY … Do not 'restore' it here") so that the
+/// interpreter serves a misaligned page-local access directly as a byte run instead of leaving the
+/// FastMap. Nothing in this file conflicts textually with that change: it will merge CLEAN and
+/// this number will simply be wrong.
+///
+/// It fails loudly rather than silently — every user is an `assert_eq!` on an exact delta — and
+/// the delta stays non-zero and still discriminates afterwards. **RE-DERIVE it from the
+/// post-rebase interpreted path and rewrite the paragraph above; do not tune it until the suite
+/// goes green.** The charge EQUALITY on the real bus is unaffected: that branch's
+/// `charge_direct_ram_split` reproduces the identical N x byte-cycle charge.
 const INTERPRETED_MISALIGNED_CLOCKS: u64 = 2;
 
 /// The bus-clock delta a natively-served misaligned `bytes`-wide access must produce against the
@@ -466,6 +479,98 @@ fn a_misaligned_word_read_into_a_sixteen_bit_destination_runs_natively() {
         body.extend_from_slice(&word_load(at));
         lowered_misaligned(&body, 2, &format!("movzx bx, word [{at:#x}]"));
     }
+}
+
+/// An ALIGNED read that reaches the counting read STUB must charge exactly what the inline fast
+/// arm charges. The read-side twin of `an_aligned_store_through_the_slow_stub_charges_no_split`.
+///
+/// Reaching this state is the whole difficulty, and the route is narrower than it looks. Neither
+/// of the two obvious candidates works: a supervisor-tagged page at cpl0 strips its tag and
+/// rejoins the fast arm inline, never entering the stub, and a page with no committed read bias
+/// hits `emit_read_pointer`'s `UNAVAILABLE_BIAS` arm and returns status 1 without reaching the
+/// deposit.
+///
+/// What does work is a page whose HOST BACKING is not 4 KiB-aligned. `derive_load_bias` poisons
+/// the LOAD bias when `read_bias & PAGE_MASK != 0` -- the load bias carries the mode13 and
+/// supervisor tags in its low bits, so a bias with low bits of its own cannot be tagged -- while
+/// `read_biases[index]` stays live and available. `FastMap::populate` does not require the pointer
+/// to be page-aligned, so the site's probe sees poison and jumps to the stub, and the stub's
+/// `emit_read_pointer` resolves the untagged read bias perfectly well. An aligned wide read then
+/// lands on the deposit point.
+///
+/// The fixture installs a MIRROR of the operand page at a deliberately odd host address. Reads
+/// resolve to `mirror + (linear - page_base)`, so seeding the mirror from the same fill keeps both
+/// roles reading identical bytes; the page is only read here, so the mirror never has to be
+/// written back.
+#[test]
+fn an_aligned_read_through_the_counting_stub_charges_no_split() {
+    // Leaked on purpose: the fast map holds a raw pointer into this buffer for the life of the
+    // test, and dropping it while an entry is live would dangle. One test's page is a fair trade
+    // against threading a lifetime through the fixture.
+    let mirror: &'static mut [u8] = Box::leak(vec![0u8; 0x2000].into_boxed_slice());
+    let fill = memory_fill();
+    // An ODD host address inside the buffer, so `bias = ptr - OPERAND_PAGE` has low bits set and
+    // `derive_load_bias` poisons the load bias. The offset is otherwise arbitrary.
+    let base = mirror.as_mut_ptr();
+    let skew = 1usize;
+    mirror[skew..skew + 0x1000]
+        .copy_from_slice(&fill[OPERAND_PAGE as usize..OPERAND_PAGE as usize + 0x1000]);
+    let ptr = unsafe { base.add(skew) };
+    assert_ne!(
+        (ptr as usize).wrapping_sub(OPERAND_PAGE as usize) & 0xfff,
+        0,
+        "the fixture's whole point is a bias with low bits set"
+    );
+
+    let at = OPERAND_PAGE + 0x120;
+    let mut roles = build(&dword_load(at));
+    // Re-populate the operand page's READ mapping over the mirror, on the native role only: the
+    // interpreted role must keep reading `bus.memory`, which holds the same bytes.
+    let ok = roles.native.jit_fast_map.populate_read(
+        OPERAND_PAGE,
+        OPERAND_PAGE,
+        izarravm_bus::DirectPage {
+            physical_page: OPERAND_PAGE,
+            ptr,
+            len: 0x1000,
+            writable: false,
+            mapping_epoch: roles.native_bus.direct_mapping_epoch,
+        },
+        jit::fast_map::PagePermissions::UNPAGED,
+        roles.native.physical_page_watched(OPERAND_PAGE),
+    );
+    assert!(ok, "the skewed mirror must map");
+    assert_eq!(
+        roles.native.jit_fast_map.load_bias_for_test(OPERAND_PAGE),
+        jit::fast_map::NATIVE_LOAD_BIAS_POISON,
+        "a non-page-aligned host backing must poison the LOAD bias, or this fixture is testing \
+         the inline fast arm instead of the stub"
+    );
+
+    let before = roles.native.perf_counters().jit_direct_side_exits;
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_side_exits - before,
+        0,
+        "the stub must SERVE the read, not refuse it"
+    );
+    for _ in 0..3 {
+        roles.interp.cycle(&mut roles.interp_bus).unwrap();
+    }
+    compare_state(&roles, "aligned read through the counting stub");
+    assert_eq!(
+        roles.native_bus.trace.elapsed_clocks(),
+        roles.interp_bus.trace.elapsed_clocks(),
+        "an ALIGNED read reaching the counting stub must charge exactly what the fast arm \
+         charges; an unconditional split deposit over-charges every read on a page whose host \
+         backing is not 4 KiB-aligned, permanently and silently"
+    );
 }
 
 /// A misaligned Dword read runs natively at all three misalignments, and the ALIGNED one is the

@@ -835,6 +835,15 @@ pub(super) fn emit_code_watch_table_branch(
     // exit -- never a missed invalidation. `code_watch.rs` const-asserts that the widest access's
     // worst-case span still fits the 32-bit window this guard tests.
     const GRANULE_MASK: u32 = (1 << NATIVE_CHUNK_SHIFT) - 1;
+    // The window bound `code_watch.rs` const-asserts is stated against a WIDEST access, and that
+    // number lives there because it is checked in a const context that cannot name this enum. Pin
+    // the two together here, where both are in scope, so a wider `MemoryWidth` fails the build
+    // rather than silently outgrowing the window it is checked against.
+    const _: () = assert!(
+        MemoryWidth::Tbyte.bytes() as usize
+            == crate::jit::code_watch::NATIVE_WIDEST_GUARDED_ACCESS_BYTES,
+        "code_watch's window bound must be stated against the widest guarded access"
+    );
     let n = ((width.bytes() - 1 + GRANULE_MASK) >> NATIVE_CHUNK_SHIFT) + 1;
 
     if n == 1 {

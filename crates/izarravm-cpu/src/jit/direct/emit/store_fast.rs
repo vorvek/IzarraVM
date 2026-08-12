@@ -550,6 +550,12 @@ fn emit_slow_stub(
     // Wrapped, because the pad builds a stub for every GPR width including Byte.
     if width.needs_alignment_guard() {
         // RAX is the linear address and this stub's front preserves it by contract.
+        //
+        // `bytes() - 1` where the CALL SITE's guard tests `alignment_bytes() - 1`: equal for the
+        // three self-aligning GPR widths, and this pad is built for those alone
+        // (`gpr_width_index` makes Qword and Tbyte `unreachable!()`). See the counting read stub
+        // for the same note; if a wider width ever routes to a lean site the two spellings must be
+        // reconciled rather than left to agree by coincidence.
         e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
         e.jnz(status_unavailable);
     }

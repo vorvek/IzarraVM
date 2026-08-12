@@ -90,13 +90,19 @@ const _: () = assert!(
 // to hold at any offset and the count is computed that way instead.
 //
 // What must hold now is the window bound the multi-granule arm relies on. That arm loads a 32-bit
-// window over the mask and tests `(1 << n) - 1` shifted left by `r = (address >> CHUNK_SHIFT) & 7`,
-// so the highest tested bit is `r + n - 1` with `r <= 7`; `r + n <= 32` keeps every tested bit
-// inside the window. Checked against the widest access the emitter can guard, Tbyte at ten bytes.
-// Pin it here, next to the shift it constrains, rather than in the emitter that consumes it.
-const WIDEST_GUARDED_ACCESS_BYTES: usize = 10;
+// window over the mask starting at the byte holding the first granule's bit, shifts the WINDOW
+// right by `r = (address >> CHUNK_SHIFT) & 7`, and ANDs `(1 << n) - 1` against it. (Equivalently,
+// and how it is easier to reason about: the tested mask sits at bit positions `r ..= r + n - 1` of
+// the unshifted window. The emitter shifts the window rather than the constant because `r` is a
+// runtime value and the constant is not.) With `r <= 7`, `r + n <= 32` keeps every tested bit
+// inside the window. Checked against the widest access the emitter can guard.
+//
+// Derived from `MemoryWidth::Tbyte` rather than restated: that enum is the emitter's, and this
+// crate cannot name it from a const context, so the two are pinned together by an assertion in
+// the emitter instead of by a literal that would silently go stale if a wider width appeared.
+pub(crate) const NATIVE_WIDEST_GUARDED_ACCESS_BYTES: usize = 10;
 const WIDEST_GRANULE_SPAN: usize =
-    ((WIDEST_GUARDED_ACCESS_BYTES - 1 + ((1_usize << CHUNK_SHIFT) - 1)) >> CHUNK_SHIFT) + 1;
+    ((NATIVE_WIDEST_GUARDED_ACCESS_BYTES - 1 + ((1_usize << CHUNK_SHIFT) - 1)) >> CHUNK_SHIFT) + 1;
 const _: () = assert!(
     7 + WIDEST_GRANULE_SPAN <= 32,
     "the emitted guard's granule window must cover the widest access at any offset"
