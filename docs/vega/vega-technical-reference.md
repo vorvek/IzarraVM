@@ -114,6 +114,38 @@ Scanline pitch is the visible width times bytes per pixel, with no padding. The
 largest surface, 1024x768 at 32-bit, is 3 MB, which leaves 1 MB of the frame
 store for offscreen use.
 
+### 3.1 Scanout timing
+
+Every mode refreshes at 60.000 Hz. The pixel clock is not a free parameter: it
+is whatever drives the mode's total dots at that rate, so the refresh rate is the
+same number in every mode and does not vary with resolution or depth.
+
+| Displayed resolution | Total dots | Total lines | Sync start | Sync width | Pixel clock |
+|----------------------|------------|-------------|------------|------------|-------------|
+| 640x400 | 800 | 449 | line 412 | 2 lines | 21.552 MHz |
+| 640x480 | 800 | 525 | line 490 | 2 lines | 25.200 MHz |
+| 800x600 | 1056 | 628 | line 601 | 4 lines | 39.790 MHz |
+| 1024x768 | 1344 | 806 | line 771 | 6 lines | 64.996 MHz |
+
+The totals and sync positions are the standard ones for these resolutions, so a
+period monitor locks to them. The clocks differ from the usual published figures
+in the third or fourth digit, because those are quoted at 59.94 Hz for 640x480
+and 60.32 Hz for 800x600 rather than at a flat 60. The 640x400 signal is the
+exception in kind rather than in degree: it is normally driven at 70 Hz, and
+Margo drives it at 60 like every other mode, so its clock is correspondingly
+lower.
+
+Mode `0x150` stores 320x240 but is line-doubled to the display, so it scans out
+on the 640x480 signal in the table.
+
+The vertical retrace interval is visible to software through Input Status 1
+(port `03DAh` bit 3) and Input Status 0 (port `03C2h` bit 7), the same two
+registers a VGA program polls. Reading `03DAh` still resets the attribute
+controller's address/data flip-flop, since that is a property of the port and
+not of the engine driving the display. Bits 1 and 2 of `03DAh` read 0 (no light
+pen is fitted) and so do the diagnostic DAC readback bits 4 and 5, which have no
+attribute-controller path to sample while Margo owns the display.
+
 ---
 
 ## 4. Pixel formats
@@ -160,11 +192,17 @@ success).
 | `4F01h` | Return mode information | Fills a ModeInfoBlock at `ES:DI` for the mode in `CX`: resolution, depth, pitch, color masks, and `PhysBasePtr = 0xE0000000`. |
 | `4F02h` | Set mode | Mode number in `BX`. Bit 14 (`0x4000`) requests the linear frame buffer. Bit 15 (`0x8000`) preserves memory. |
 | `4F03h` | Return current mode | Current mode number in `BX`. |
+| `4F05h` | Set/get display window | Banked access to the frame store through the legacy aperture at `A000h`. `BH=00h` selects the bank in `DX`, `BH=01h` returns it. `BL` selects the window and must be `00h`: only window A exists. The granularity and the window size are both 64 KB, so bank `n` maps frame store offset `n * 64 KB` to `A0000h`. Fails with status `03h` in a mode set for the linear frame buffer. |
 | `4F07h` | Set/get display start | `BL=00h` queues an `(x,y)` origin, `BL=01h` returns the active origin, and `BL=80h` queues the origin and waits for the next 60 Hz frame boundary. Used for panning and page flips. |
 | `4F08h` | Set/get DAC palette width | `BL=00h` selects the width requested in `BH` and `BL=01h` returns the active width in `BH`. Six-bit and eight-bit entries are supported. |
 | `4F09h` | Set/get palette data | `BL=00h` loads, `BL=01h` reads, and `BL=80h` loads at the next frame boundary. Entries at `ES:DI` are four-byte B,G,R,alignment records. `CX` is the count and `DX` the first index. |
+| `4F0Ah` | Return protected-mode interface | `BL=00h` returns a table of protected-mode entry points at `ES:DI`, `CX` bytes long. The table holds far-callable routines for set window, set display start, and set primary palette data, followed by the list of I/O ports they touch, so a protected-mode driver reaches them without `INT 10h`. Other `BL` values are not defined. |
 
 Functions `4F00h` through `4F03h` are the mode-setting core. The rest extend it.
+
+A mode set through `4F02h` reprograms the display timing. While a VBE mode is
+active the CRT status registers report that timing and not the timing of
+whatever VGA mode preceded it; see section 3 and section 9.
 
 ---
 
@@ -432,10 +470,51 @@ The one part that stays approximate is memory contention. A running operation
 consumes frame-store and host-port bandwidth that could stall a CPU access to the
 same memory. That coupling is approximated, not modeled exactly.
 
+### Display scanout
+
+Margo does not scan the frame store out pixel by pixel behind the CPU. It takes
+the whole visible surface in one step and presents that. A frame is therefore
+atomic: every pixel in it is read from the frame store at one instant, through
+one palette and one `DISP_START`, so no frame can be split between two display
+states. There is no partial frame, and no tearing.
+
+The frame rate governs when the display registers latch, not when the surface is
+read. A write to the frame store is visible in the next frame taken after it
+lands, which is why a program that wants a complete picture on screen either
+finishes drawing into an offscreen surface and flips with `DISP_START` (which
+does latch on the frame boundary, below) or accepts that a frame may be taken
+part-way through its drawing.
+
+This is the specified behavior of the part, not an approximation of something
+finer. It is what a driver may rely on, and it is why the display controller has
+no register describing where the beam is within the active area.
+
+Three properties follow, and software may depend on all three.
+
+- **The frame rate is pollable.** The vertical retrace interval reported by
+  `03DAh` and `03C2h` runs at the frame rate of the active mode: 60.000 Hz in
+  every VBE mode (section 3.1), and the VGA mode's own rate when a VGA mode is
+  active. It is the same clock that advances the frame boundary below, so a
+  program that paces on retrace and flips pages is pacing on one clock, not two.
+- **`DISP_START` takes effect at a frame boundary.** A write to `DISP_START`, or
+  a `4F07h` call with `BL=00h` or `BL=80h`, queues the new origin. It is applied
+  at the next frame boundary and never before it, so the frame being scanned out
+  when the write lands is unaffected and the following frame is drawn entirely
+  from the new origin. `BL=80h` additionally holds the caller until that
+  boundary, so the origin is live when the call returns. A queued origin that is
+  overwritten before the boundary is simply replaced; only the last one applies.
+  The frame boundary follows the retrace interval within the same blanking
+  period, which is the order a program panning during retrace expects.
+- **The palette is latched once per frame.** The DAC state is sampled once when
+  the frame is taken and the whole frame is decoded through that one sample, so a
+  palette load cannot split a frame between two color sets. `4F09h` with
+  `BL=80h` additionally holds the caller until the frame boundary, so the load is
+  in force for the frame that follows it.
+
 ### Other liberties
 
-- Mode changes and `DISP_START` take effect cleanly, without the analog timing
-  of a real RAMDAC.
+- Mode changes take effect cleanly, without the analog settling of a real
+  RAMDAC and monitor.
 - The video overlay scales by point sampling. Real silicon interpolated, for a
   smoother scaled image.
 
