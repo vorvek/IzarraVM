@@ -27,6 +27,9 @@ pwsh scripts/run-fixture-scoreboard.ps1 -Label before-slice
 
 .EXAMPLE
 pwsh scripts/run-fixture-scoreboard.ps1 -Fixtures doom-486,wolf3d-486 -Label quick
+
+.EXAMPLE
+pwsh scripts/run-fixture-scoreboard.ps1 -SelfTest
 #>
 
 param(
@@ -68,7 +71,8 @@ param(
     [string]$OneLookupLoad = "1",
     [switch]$RecordInvariants,
     [switch]$Force,
-    [switch]$ListFixtures
+    [switch]$ListFixtures,
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -76,6 +80,441 @@ $ErrorActionPreference = "Stop"
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $invariantPath = Join-Path $PSScriptRoot "fixture-scoreboard-invariants.json"
+$scoreboardSchema = "izarravm-fixture-scoreboard-v2"
+
+function Get-RequiredUInt64Property($InputObject, [string]$Name, [string]$Path) {
+    if ($null -eq $InputObject) {
+        throw "coverage accounting is missing $Path"
+    }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        throw "coverage accounting is missing $Path.$Name"
+    }
+    $value = $property.Value
+    if ($null -eq $value) {
+        throw "coverage accounting field $Path.$Name is null"
+    }
+    $integralTypes = @(
+        [SByte], [Byte], [Int16], [UInt16], [Int32], [UInt32], [Int64], [UInt64],
+        [Numerics.BigInteger]
+    )
+    if ($integralTypes -notcontains $value.GetType()) {
+        throw "coverage accounting field $Path.$Name is not an integer"
+    }
+    $wide = [Numerics.BigInteger]$value
+    if ($wide -lt [Numerics.BigInteger]::Zero -or
+        $wide -gt [Numerics.BigInteger][UInt64]::MaxValue) {
+        throw "coverage accounting field $Path.$Name is outside the UInt64 range"
+    }
+    return [UInt64]$wide
+}
+
+function Get-CoverageMetrics($Profile) {
+    if ($null -eq $Profile) {
+        throw "coverage accounting is missing the profile"
+    }
+    $perfProperty = $Profile.PSObject.Properties["perf"]
+    $stallsProperty = $Profile.PSObject.Properties["direct_stalls"]
+    if ($null -eq $perfProperty) {
+        throw "coverage accounting is missing perf"
+    }
+    if ($null -eq $stallsProperty) {
+        throw "coverage accounting is missing direct_stalls"
+    }
+
+    [UInt64]$total = Get-RequiredUInt64Property $perfProperty.Value "instructions" "perf"
+    [UInt64]$direct = Get-RequiredUInt64Property `
+        $perfProperty.Value "jit_direct_insns" "perf"
+    [UInt64]$entries = Get-RequiredUInt64Property `
+        $perfProperty.Value "jit_direct_entries" "perf"
+    [UInt64]$entries16 = Get-RequiredUInt64Property `
+        $perfProperty.Value "jit_direct_entries_sixteen_bit" "perf"
+    [UInt64]$insns16 = Get-RequiredUInt64Property `
+        $perfProperty.Value "jit_direct_insns_sixteen_bit" "perf"
+    [UInt64]$attempts = Get-RequiredUInt64Property `
+        $stallsProperty.Value "jit_direct_callout_executed" "direct_stalls"
+    [UInt64]$abnormal = Get-RequiredUInt64Property `
+        $stallsProperty.Value "side_exit_callout_abnormal" "direct_stalls"
+
+    if ($abnormal -gt $attempts) {
+        throw "coverage accounting has callout abnormal $abnormal above attempts $attempts"
+    }
+    [UInt64]$helper = $attempts - $abnormal
+    if ($helper -gt $direct) {
+        throw "coverage accounting has helper instructions $helper above direct instructions $direct"
+    }
+    if ($direct -gt $total) {
+        throw "coverage accounting has direct instructions $direct above total instructions $total"
+    }
+    if ($direct -gt 0 -and $entries -eq 0) {
+        throw "coverage accounting has $direct direct instructions with zero direct entries"
+    }
+    if ($entries16 -gt $entries) {
+        throw "coverage accounting has 16-bit entries $entries16 above direct entries $entries"
+    }
+    if ($insns16 -gt $direct) {
+        throw "coverage accounting has 16-bit instructions $insns16 above direct instructions $direct"
+    }
+    if ($insns16 -gt 0 -and $entries16 -eq 0) {
+        throw "coverage accounting has $insns16 16-bit instructions with zero 16-bit entries"
+    }
+    if ($total -eq 0 -and
+        ($direct -ne 0 -or $entries -ne 0 -or $entries16 -ne 0 -or $insns16 -ne 0 -or
+            $attempts -ne 0 -or $abnormal -ne 0)) {
+        throw "coverage accounting has zero total instructions with nonzero component counters"
+    }
+
+    [UInt64]$emitted = $direct - $helper
+    [UInt64]$interpreted = $total - $direct
+    $conserved = [Numerics.BigInteger]$emitted +
+        [Numerics.BigInteger]$helper +
+        [Numerics.BigInteger]$interpreted
+    if ($conserved -ne [Numerics.BigInteger]$total) {
+        throw "coverage accounting categories do not conserve total instructions"
+    }
+
+    $directCoverage = if ($total -eq 0) { 0.0 } else { [double]$direct / [double]$total }
+    $emittedCoverage = if ($total -eq 0) { 0.0 } else { [double]$emitted / [double]$total }
+    $helperCoverage = if ($total -eq 0) { 0.0 } else { [double]$helper / [double]$total }
+    $interpretedCoverage = if ($total -eq 0) {
+        0.0
+    } else {
+        [double]$interpreted / [double]$total
+    }
+    $directIpe = if ($entries -eq 0) { 0.0 } else { [double]$direct / [double]$entries }
+    $emittedIpe = if ($entries -eq 0) { 0.0 } else { [double]$emitted / [double]$entries }
+    $helperIpe = if ($entries -eq 0) { 0.0 } else { [double]$helper / [double]$entries }
+    $direct16Ipe = if ($entries16 -eq 0) { 0.0 } else {
+        [double]$insns16 / [double]$entries16
+    }
+
+    return [pscustomobject][ordered]@{
+        total_insns                  = $total
+        direct_insns                 = $direct
+        emitted_insns                = $emitted
+        helper_insns                 = $helper
+        interpreted_insns            = $interpreted
+        callout_attempts              = $attempts
+        callout_abnormal              = $abnormal
+        entries                       = $entries
+        entries_16bit                 = $entries16
+        insns_16bit                   = $insns16
+        direct_coverage               = $directCoverage
+        emitted_coverage              = $emittedCoverage
+        helper_coverage               = $helperCoverage
+        interpreted_coverage          = $interpretedCoverage
+        direct_insns_per_entry        = $directIpe
+        emitted_insns_per_entry       = $emittedIpe
+        helper_insns_per_entry        = $helperIpe
+        direct_insns_per_entry_16bit  = $direct16Ipe
+    }
+}
+
+function Add-CoverageMetrics($Result, $Profile) {
+    $coverage = Get-CoverageMetrics $Profile
+
+    $Result.instructions = $coverage.total_insns
+    $Result.entries = $coverage.entries
+    $Result.direct_insns = $coverage.direct_insns
+    $Result.emitted_insns = $coverage.emitted_insns
+    $Result.helper_insns = $coverage.helper_insns
+    $Result.interpreted_insns = $coverage.interpreted_insns
+    $Result.callout_attempts = $coverage.callout_attempts
+    $Result.callout_abnormal = $coverage.callout_abnormal
+    $Result.direct_coverage = [math]::Round($coverage.direct_coverage, 6)
+    $Result.emitted_coverage = [math]::Round($coverage.emitted_coverage, 6)
+    $Result.helper_coverage = [math]::Round($coverage.helper_coverage, 6)
+    $Result.interpreted_coverage = [math]::Round($coverage.interpreted_coverage, 6)
+    $Result.direct_insns_per_entry = [math]::Round($coverage.direct_insns_per_entry, 3)
+    $Result.emitted_insns_per_entry = [math]::Round($coverage.emitted_insns_per_entry, 3)
+    $Result.helper_insns_per_entry = [math]::Round($coverage.helper_insns_per_entry, 3)
+    $Result.entries_16bit = $coverage.entries_16bit
+    $Result.insns_16bit = $coverage.insns_16bit
+    $Result.insns_per_entry_16bit = [math]::Round(
+        $coverage.direct_insns_per_entry_16bit,
+        3
+    )
+
+    # Compatibility fields keep their v1 names and rounding.
+    $Result.native_insns = $coverage.direct_insns
+    $Result.native_coverage = [math]::Round($coverage.direct_coverage, 4)
+    $Result.insns_per_entry = $Result.direct_insns_per_entry
+    return $coverage
+}
+
+function Format-ScoreboardPercent([double]$Value) {
+    return [string]::Format(
+        [Globalization.CultureInfo]::InvariantCulture,
+        "{0:F2}%",
+        $Value * 100.0
+    )
+}
+
+function Format-ScoreboardDecimal([double]$Value) {
+    return [string]::Format(
+        [Globalization.CultureInfo]::InvariantCulture,
+        "{0:F3}",
+        $Value
+    )
+}
+
+function Get-ScoreboardMarkdown($Rows, [string]$BoardLabel, [string]$BoardArm,
+    [string]$StoreArm, [string]$LoadArm) {
+    $markdown = @()
+    $markdown += "# Fixture scoreboard$(if ($BoardLabel) { ": $BoardLabel" })"
+    $markdown += ""
+    $markdown += "Recorded $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), JIT arm ``$BoardArm``, one-lookup store ``$StoreArm``, one-lookup load ``$LoadArm``. rt is guest seconds per wall second; 1.0 is real time."
+    $markdown += "Direct insns/entry includes emitted instructions and successful helper instructions. Abnormal helper attempts replay in the interpreter and do not count as helper-retired instructions."
+    $markdown += ""
+    $markdown += "| fixture | rt | wall s | emitted | helper | interpreter | entries | direct insns/entry | emitted insns/entry | 16-bit direct insns/entry | invariant |"
+    $markdown += "|---|---|---|---|---|---|---|---|---|---|---|"
+    foreach ($row in $Rows) {
+        $has = { param($n) $row.PSObject.Properties.Name -contains $n }
+        $markdown += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10}{11} |" -f
+            $row.name,
+            $(if (& $has "real_time_factor") { $row.real_time_factor } else { "-" }),
+            $(if (& $has "wall_seconds") { $row.wall_seconds } else { "-" }),
+            $(if (& $has "emitted_coverage") {
+                    Format-ScoreboardPercent $row.emitted_coverage
+                } else { "-" }),
+            $(if (& $has "helper_coverage") {
+                    Format-ScoreboardPercent $row.helper_coverage
+                } else { "-" }),
+            $(if (& $has "interpreted_coverage") {
+                    Format-ScoreboardPercent $row.interpreted_coverage
+                } else { "-" }),
+            $(if (& $has "entries") { $row.entries } else { "-" }),
+            $(if (& $has "direct_insns_per_entry") {
+                    Format-ScoreboardDecimal $row.direct_insns_per_entry
+                } else { "-" }),
+            $(if (& $has "emitted_insns_per_entry") {
+                    Format-ScoreboardDecimal $row.emitted_insns_per_entry
+                } else { "-" }),
+            $(if (& $has "insns_per_entry_16bit") {
+                    Format-ScoreboardDecimal $row.insns_per_entry_16bit
+                } else { "-" }),
+            $row.invariant,
+            $(if ($row.contaminated) { " (contaminated)" } else { "" }))
+    }
+    $markdown += ""
+    foreach ($row in $Rows) {
+        if ($row.notes.Count -gt 0) {
+            $markdown += "* **$($row.name)**: $($row.notes -join '; ')"
+        }
+    }
+    return $markdown
+}
+
+function Assert-ScoreboardSelfTestEqual($Actual, $Expected, [string]$Message) {
+    if ($Actual -ne $Expected) {
+        throw "scoreboard self-test failed: $Message (expected $Expected, got $Actual)"
+    }
+}
+
+function Assert-ScoreboardSelfTestThrows([scriptblock]$Action, [string]$Expected,
+    [string]$Message) {
+    $failure = $null
+    try {
+        $null = & $Action
+    } catch {
+        $failure = $_.Exception.Message
+    }
+    if ($null -eq $failure) {
+        throw "scoreboard self-test failed: $Message did not throw"
+    }
+    if (-not $failure.Contains($Expected, [StringComparison]::Ordinal)) {
+        throw "scoreboard self-test failed: $Message threw '$failure', expected '$Expected'"
+    }
+}
+
+function New-CoverageSelfTestProfile([UInt64]$Total, [UInt64]$Direct,
+    [UInt64]$Entries, [UInt64]$Attempts, [UInt64]$Abnormal,
+    [UInt64]$StepBreak = 0, [UInt64]$Entries16 = 0, [UInt64]$Insns16 = 0) {
+    return [pscustomobject][ordered]@{
+        direct_native_coverage = if ($Total -eq 0) { 0.0 } else {
+            [double]$Direct / [double]$Total
+        }
+        perf = [pscustomobject][ordered]@{
+            instructions       = $Total
+            jit_direct_insns   = $Direct
+            jit_direct_entries = $Entries
+            jit_direct_entries_sixteen_bit = $Entries16
+            jit_direct_insns_sixteen_bit = $Insns16
+        }
+        direct_stalls = [pscustomobject][ordered]@{
+            jit_direct_callout_executed = $Attempts
+            side_exit_callout_abnormal  = $Abnormal
+            side_exit_callout_step_break = $StepBreak
+        }
+    }
+}
+
+function Invoke-ScoreboardSelfTest {
+    $noJit = Get-CoverageMetrics (New-CoverageSelfTestProfile 100 0 0 0 0)
+    Assert-ScoreboardSelfTestEqual $noJit.interpreted_insns 100 "no-JIT instructions"
+    Assert-ScoreboardSelfTestEqual $noJit.emitted_coverage 0.0 "no-JIT emitted coverage"
+    Assert-ScoreboardSelfTestEqual $noJit.helper_coverage 0.0 "no-JIT helper coverage"
+    Assert-ScoreboardSelfTestEqual $noJit.interpreted_coverage 1.0 "no-JIT coverage"
+
+    $allEmitted = Get-CoverageMetrics (New-CoverageSelfTestProfile 100 100 10 0 0)
+    Assert-ScoreboardSelfTestEqual $allEmitted.emitted_insns 100 "all-emitted instructions"
+    Assert-ScoreboardSelfTestEqual $allEmitted.direct_insns_per_entry 10.0 "all-emitted IPE"
+
+    $mixedProfile = New-CoverageSelfTestProfile 100 80 10 22 2
+    $mixed = Get-CoverageMetrics $mixedProfile
+    Assert-ScoreboardSelfTestEqual $mixed.emitted_insns 60 "mixed emitted instructions"
+    Assert-ScoreboardSelfTestEqual $mixed.helper_insns 20 "mixed helper instructions"
+    Assert-ScoreboardSelfTestEqual $mixed.interpreted_insns 20 "mixed interpreted instructions"
+    Assert-ScoreboardSelfTestEqual $mixed.direct_coverage 0.8 "mixed direct coverage"
+    Assert-ScoreboardSelfTestEqual $mixed.emitted_coverage 0.6 "mixed emitted coverage"
+    Assert-ScoreboardSelfTestEqual $mixed.helper_coverage 0.2 "mixed helper coverage"
+    Assert-ScoreboardSelfTestEqual $mixed.interpreted_coverage 0.2 "mixed interpreted coverage"
+    Assert-ScoreboardSelfTestEqual $mixed.direct_insns_per_entry 8.0 "mixed direct IPE"
+    Assert-ScoreboardSelfTestEqual $mixed.emitted_insns_per_entry 6.0 "mixed emitted IPE"
+    Assert-ScoreboardSelfTestEqual $mixed.helper_insns_per_entry 2.0 "mixed helper IPE"
+
+    $stepBreak = Get-CoverageMetrics (New-CoverageSelfTestProfile 1 1 1 1 0 1)
+    Assert-ScoreboardSelfTestEqual $stepBreak.helper_insns 1 "step-break helper retirement"
+
+    $zero = Get-CoverageMetrics (New-CoverageSelfTestProfile 0 0 0 0 0)
+    Assert-ScoreboardSelfTestEqual $zero.direct_coverage 0.0 "zero direct coverage"
+    Assert-ScoreboardSelfTestEqual $zero.emitted_coverage 0.0 "zero emitted coverage"
+    Assert-ScoreboardSelfTestEqual $zero.helper_coverage 0.0 "zero helper coverage"
+    Assert-ScoreboardSelfTestEqual $zero.interpreted_coverage 0.0 "zero interpreted coverage"
+    Assert-ScoreboardSelfTestEqual $zero.direct_insns_per_entry 0.0 "zero direct IPE"
+    Assert-ScoreboardSelfTestEqual $zero.emitted_insns_per_entry 0.0 "zero emitted IPE"
+    Assert-ScoreboardSelfTestEqual $zero.helper_insns_per_entry 0.0 "zero helper IPE"
+
+    $largeProfile = New-CoverageSelfTestProfile `
+        9007199254741001 9007199254740993 3 5 2
+    $largeProfile = $largeProfile | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+    $large = Get-CoverageMetrics $largeProfile
+    Assert-ScoreboardSelfTestEqual $large.direct_insns 9007199254740993 `
+        "large direct count"
+    Assert-ScoreboardSelfTestEqual $large.helper_insns 3 "large helper count"
+    Assert-ScoreboardSelfTestEqual $large.emitted_insns 9007199254740990 `
+        "large emitted count"
+    Assert-ScoreboardSelfTestEqual $large.interpreted_insns 8 "large interpreted count"
+
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 100 80 10 1 2)
+    } "abnormal 2 above attempts 1" "abnormal above attempts"
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 100 10 10 11 0)
+    } "helper instructions 11 above direct instructions 10" "helper above direct"
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 100 101 10 0 0)
+    } "direct instructions 101 above total instructions 100" "direct above total"
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 100 1 0 0 0)
+    } "direct instructions with zero direct entries" "direct instructions with zero entries"
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 0 0 0 1 1)
+    } "zero total instructions with nonzero component counters" `
+        "zero total with nonzero counters"
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 100 80 11 0 0 0 12 70)
+    } "16-bit entries 12 above direct entries 11" "16-bit entries above direct entries"
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 100 80 11 0 0 0 10 81)
+    } "16-bit instructions 81 above direct instructions 80" `
+        "16-bit instructions above direct instructions"
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics (New-CoverageSelfTestProfile 100 80 11 0 0 0 0 1)
+    } "16-bit instructions with zero 16-bit entries" `
+        "16-bit instructions with zero entries"
+
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics $null
+    } "missing the profile" "missing profile"
+    $missingPerf = New-CoverageSelfTestProfile 100 80 10 20 0
+    $missingPerf.PSObject.Properties.Remove("perf")
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics $missingPerf
+    } "missing perf" "missing perf block"
+    $missingStalls = New-CoverageSelfTestProfile 100 80 10 20 0
+    $missingStalls.PSObject.Properties.Remove("direct_stalls")
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics $missingStalls
+    } "missing direct_stalls" "missing direct-stalls block"
+
+    foreach ($missingName in @(
+            "instructions",
+            "jit_direct_insns",
+            "jit_direct_entries",
+            "jit_direct_entries_sixteen_bit",
+            "jit_direct_insns_sixteen_bit"
+        )) {
+        $missingPerfField = New-CoverageSelfTestProfile 100 80 10 20 0
+        $missingPerfField.perf.PSObject.Properties.Remove($missingName)
+        Assert-ScoreboardSelfTestThrows {
+            Get-CoverageMetrics $missingPerfField
+        } "missing perf.$missingName" "missing perf field $missingName"
+    }
+
+    $missingAttempts = New-CoverageSelfTestProfile 100 80 10 20 0
+    $missingAttempts.direct_stalls.PSObject.Properties.Remove("jit_direct_callout_executed")
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics $missingAttempts
+    } "missing direct_stalls.jit_direct_callout_executed" "missing callout attempts"
+    $missingAbnormal = New-CoverageSelfTestProfile 100 80 10 20 0
+    $missingAbnormal.direct_stalls.PSObject.Properties.Remove("side_exit_callout_abnormal")
+    Assert-ScoreboardSelfTestThrows {
+        Get-CoverageMetrics $missingAbnormal
+    } "missing direct_stalls.side_exit_callout_abnormal" "missing abnormal callouts"
+
+    $invalidValues = @(
+        [pscustomobject]@{ value = 1.5; expected = "is not an integer"; name = "fractional" },
+        [pscustomobject]@{ value = -1; expected = "outside the UInt64 range"; name = "negative" },
+        [pscustomobject]@{ value = $null; expected = "is null"; name = "null" },
+        [pscustomobject]@{ value = "100"; expected = "is not an integer"; name = "string" },
+        [pscustomobject]@{
+            value = [Numerics.BigInteger][UInt64]::MaxValue + [Numerics.BigInteger]::One
+            expected = "outside the UInt64 range"
+            name = "oversized"
+        }
+    )
+    foreach ($invalid in $invalidValues) {
+        $invalidProfile = New-CoverageSelfTestProfile 100 80 10 20 0
+        $invalidProfile.perf.instructions = $invalid.value
+        Assert-ScoreboardSelfTestThrows {
+            Get-CoverageMetrics $invalidProfile
+        } $invalid.expected "invalid $($invalid.name) counter"
+    }
+
+    $row = [ordered]@{
+        name = "mixed"
+        real_time_factor = 1.0
+        wall_seconds = 1.0
+        insns_per_entry_16bit = 0.0
+        invariant = "pass"
+        contaminated = $false
+        notes = @()
+    }
+    $null = Add-CoverageMetrics $row $mixedProfile
+    $json = [ordered]@{
+        schema = $scoreboardSchema
+        rows = @([pscustomobject]$row)
+    } | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+    Assert-ScoreboardSelfTestEqual $json.schema $scoreboardSchema "schema"
+    Assert-ScoreboardSelfTestEqual $json.rows[0].native_insns 80 "legacy native_insns alias"
+    Assert-ScoreboardSelfTestEqual $json.rows[0].native_coverage 0.8 "legacy native_coverage alias"
+    Assert-ScoreboardSelfTestEqual $json.rows[0].insns_per_entry 8.0 "legacy IPE alias"
+
+    $markdown = @(Get-ScoreboardMarkdown @([pscustomobject]$row) "self-test" "on" "1" "1")
+    $rendered = $markdown -join "`n"
+    if ($rendered -notmatch '\| emitted \| helper \| interpreter \|' -or
+        $rendered -notmatch 'Direct insns/entry includes emitted instructions' -or
+        $rendered -notmatch 'Abnormal helper attempts replay in the interpreter') {
+        throw "scoreboard self-test failed: Markdown coverage headers or IPE definition are missing"
+    }
+    Write-Host "fixture scoreboard self-test passed"
+}
+
+if ($SelfTest) {
+    Invoke-ScoreboardSelfTest
+    return
+}
 
 # A busy host inflates wall and therefore deflates rt. The number below is a
 # whole-machine percentage with the emulator's OWN consumption already
@@ -697,29 +1136,22 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         return $result
     }
 
-    $perf = $profile.perf
-    $entries = [double]$perf.jit_direct_entries
-    $entries16 = [double]$perf.jit_direct_entries_sixteen_bit
-    $insns16 = [double]$perf.jit_direct_insns_sixteen_bit
+    # Preserve the raw profile before validating the derived scoreboard fields. If a new or
+    # inconsistent counter contract fails below, the row fails but the evidence remains available.
+    if (-not [string]::IsNullOrWhiteSpace($KeepProfilesIn)) {
+        Copy-Item -LiteralPath $profilePath `
+            -Destination (Join-Path $KeepProfilesIn "$($Fixture.name).json") -Force
+    }
 
     $result.real_time_factor = [math]::Round($profile.real_time_factor, 4)
     $result.guest_seconds = [math]::Round($profile.guest_seconds, 3)
     $result.wall_seconds = [math]::Round($profile.wall_seconds, 3)
-    $result.instructions = $perf.instructions
-    $result.native_coverage = [math]::Round($profile.direct_native_coverage, 4)
-    $result.entries = $perf.jit_direct_entries
-    $result.native_insns = $perf.jit_direct_insns
-    # The campaign ranks by this, never by coverage. Coverage rising while
-    # entries FALL is blocks lengthening; coverage rising with entries flat is
-    # more short blocks, which loses.
-    $result.insns_per_entry = if ($entries -gt 0) {
-        [math]::Round([double]$perf.jit_direct_insns / $entries, 3)
-    } else { 0.0 }
-    $result.entries_16bit = $perf.jit_direct_entries_sixteen_bit
-    $result.insns_16bit = $perf.jit_direct_insns_sixteen_bit
-    $result.insns_per_entry_16bit = if ($entries16 -gt 0) {
-        [math]::Round($insns16 / $entries16, 3)
-    } else { 0.0 }
+    $coverageFailure = $null
+    try {
+        $null = Add-CoverageMetrics $result $profile
+    } catch {
+        $coverageFailure = $_.Exception.Message
+    }
     $result.stop = $profile.stop
 
     if ($backgroundLoad -ge $maximumBackgroundLoadPercent) {
@@ -730,6 +1162,9 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
 
     # --- invariants -------------------------------------------------------
     $failures = @()
+    if ($null -ne $coverageFailure) {
+        $failures += $coverageFailure
+    }
 
     if ($null -ne $Fixture.realticsMinimum) {
         if ($null -eq $profile.timedemo) {
@@ -844,18 +1279,6 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
 
     $result.invariant = if ($failures.Count -eq 0) { "pass" } else { "FAIL" }
     $result.notes += $failures
-
-    # Keep the RAW profile JSON, not just the handful of fields extracted above.
-    # It carries the whole perf block -- fastmap hit/miss, dev_write, the bus and
-    # stall counters, direct_stalls with its link and dormant splits -- and which
-    # of those matters is never known in advance. An earlier version of this
-    # script deleted them with the scratch tree, and answering "why is NASCAR
-    # slow" then needed a fresh 5-minute run for data that had already been
-    # computed and thrown away.
-    if (-not [string]::IsNullOrWhiteSpace($KeepProfilesIn)) {
-        Copy-Item -LiteralPath $profilePath `
-            -Destination (Join-Path $KeepProfilesIn "$($Fixture.name).json") -Force
-    }
 
     Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
     return $result
@@ -1001,7 +1424,7 @@ try {
 }
 
 $summary = [ordered]@{
-    schema           = "izarravm-fixture-scoreboard-v1"
+    schema           = $scoreboardSchema
     label            = $Label
     arm              = $Arm
     one_lookup_store = $OneLookupStore
@@ -1013,32 +1436,7 @@ $summary = [ordered]@{
 $jsonPath = Join-Path $ResultsDirectory "scoreboard.json"
 $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encoding utf8
 
-$markdown = @()
-$markdown += "# Fixture scoreboard$(if ($Label) { ": $Label" })"
-$markdown += ""
-$markdown += "Recorded $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), JIT arm ``$Arm``, one-lookup store ``$OneLookupStore``, one-lookup load ``$OneLookupLoad``. rt is guest seconds per wall second; 1.0 is real time."
-$markdown += ""
-$markdown += "| fixture | rt | wall s | coverage | entries | insns/entry | 16-bit insns/entry | invariant |"
-$markdown += "|---|---|---|---|---|---|---|---|"
-foreach ($row in $rows) {
-    $has = { param($n) $row.PSObject.Properties.Name -contains $n }
-    $markdown += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7}{8} |" -f
-        $row.name,
-        $(if (& $has "real_time_factor") { $row.real_time_factor } else { "-" }),
-        $(if (& $has "wall_seconds") { $row.wall_seconds } else { "-" }),
-        $(if (& $has "native_coverage") { $row.native_coverage } else { "-" }),
-        $(if (& $has "entries") { $row.entries } else { "-" }),
-        $(if (& $has "insns_per_entry") { $row.insns_per_entry } else { "-" }),
-        $(if (& $has "insns_per_entry_16bit") { $row.insns_per_entry_16bit } else { "-" }),
-        $row.invariant,
-        $(if ($row.contaminated) { " (contaminated)" } else { "" }))
-}
-$markdown += ""
-foreach ($row in $rows) {
-    if ($row.notes.Count -gt 0) {
-        $markdown += "* **$($row.name)**: $($row.notes -join '; ')"
-    }
-}
+$markdown = @(Get-ScoreboardMarkdown $rows $Label $Arm $OneLookupStore $OneLookupLoad)
 $markdownPath = Join-Path $ResultsDirectory "scoreboard.md"
 $markdown -join "`n" | Set-Content -LiteralPath $markdownPath -Encoding utf8
 

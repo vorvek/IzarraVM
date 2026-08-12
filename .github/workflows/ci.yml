@@ -42,6 +42,7 @@ jobs:
       - name: Policy self-checks
         shell: pwsh
         run: |
+          pwsh -NoProfile -File scripts/run-fixture-scoreboard.ps1 -SelfTest
           pwsh -NoProfile -File scripts/run-realtime-gate.ps1 -SelfTest
           cargo check -p izarravm --no-default-features
           # int-trace is off by default, so the workspace clippy/test steps below
