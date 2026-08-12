@@ -2234,7 +2234,22 @@ impl CpuGsw {
             exit.dword_reads & u64::from(u32::MAX) <= u64::from(u32::MAX) / 2,
             "static dword reads must not carry into the split-extra half"
         );
-        let dword_reads = exit.dword_reads;
+        // MASKED, and the mask must precede every consumer of this lane. `STACK_DWORD_READS`'s
+        // high half now carries `split_extra_bytes`: the extra byte cycles owed by MISALIGNED RAM
+        // accesses served natively at the two lean one-lookup sites, `bytes() - 1` apiece, and fed
+        // by stores as well as reads. The lane's name covers only the low half.
+        //
+        // Leaving the lane unmasked anywhere downstream is the quiet failure of this design: the
+        // mode13 subset assert below, the subtraction that follows it, and the `reads` total that
+        // feeds `data_direct_reads`, `jit_native_load_hits` and `direct_data_pointer_reads` would
+        // all absorb the split bytes and inflate by roughly 1.4 G on the payload fixture -- and
+        // inflate them PLAUSIBLY, so it would read as the slice working.
+        //
+        // One access still counts ONCE. `split_extra_bytes` is a CLOCK quantity, never an access
+        // count, which is what keeps every static count, every mode13 subset assert and every
+        // access-count perf counter semantically unchanged.
+        let dword_reads = exit.dword_reads & u64::from(u32::MAX);
+        let split_extra_bytes = exit.dword_reads >> 32;
         let mode13_byte_reads = exit.mode13_byte_reads & u64::from(u32::MAX);
         let mode13_word_reads = exit.mode13_byte_reads >> 32;
         let ram_byte_writes = exit.ram_byte_writes & u64::from(u32::MAX);
@@ -2335,6 +2350,20 @@ impl CpuGsw {
             .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Dword)
                     .saturating_mul(exit.ram_dword_writes),
+            )
+            // The misaligned split's EXTRA byte cycles, beyond the one wide cycle each access has
+            // already been charged above. Priced at the RAM byte dial for both reads and stores,
+            // which is what makes one shared pool exact: `ram_byte_reads` and `ram_byte_writes`
+            // take the same dial three and nine lines up. Never the Mode 13h dial -- both stubs
+            // refuse misaligned aperture traffic, so nothing in this pool came from an aperture.
+            //
+            // The result is the charge equality this slice rests on: a misaligned N-byte RAM
+            // access costs one wide cycle plus N-1 byte cycles, and `BusCycle::clocks_for` ignores
+            // width, so that is exactly N byte cycles -- the same number the interpreter's own
+            // splitting path charges for the same access.
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(split_extra_bytes),
             );
         bus.charge_bus_clocks_bulk(data_clocks);
         bus.charge_native_mode13_writes(izarravm_bus::NativeMode13Writes {

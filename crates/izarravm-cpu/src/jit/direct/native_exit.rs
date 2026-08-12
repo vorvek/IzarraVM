@@ -111,6 +111,13 @@ pub(crate) struct NativeExit {
     // Byte counters use the low lane and word counters use the high lane. Native chain bounds
     // keep both 32-bit lanes well below overflow while preserving the original exit layout.
     pub(crate) byte_reads: u64,
+    /// Low 32 bits: the block's STATIC dword-read count.
+    ///
+    /// High 32 bits: `split_extra_bytes` -- the EXTRA byte cycles owed by misaligned RAM accesses
+    /// served natively, `bytes() - 1` apiece, and fed by STORES as well as reads. The lane's name
+    /// covers only its low half; `run.rs` masks before every consumer and prices the high half
+    /// through `jit_data_cost_clocks(Byte)`, the same dial `ram_byte_writes` and `ram_byte_reads`
+    /// both take. See `frame.rs`'s `STACK_DWORD_READS` for why one shared pool is exact.
     pub(crate) dword_reads: u64,
     pub(crate) weighted_fp_clocks: u64,
     pub(crate) mode13_byte_reads: u64,

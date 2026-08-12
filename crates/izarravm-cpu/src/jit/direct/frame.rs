@@ -95,6 +95,22 @@ pub(super) const STACK_WEIGHTED_FP_CLOCKS: i8 = 88;
 pub(super) const STACK_INSTRUCTIONS: i8 = 96;
 pub(super) const STACK_RAW_CLOCKS: i8 = 104;
 pub(super) const STACK_BYTE_READS: i8 = 112;
+/// Low 32 bits: the block's STATIC dword-read count, written once by
+/// `emit_add_static_accounting`.
+///
+/// High 32 bits: `split_extra_bytes`, the extra byte cycles owed by MISALIGNED
+/// RAM accesses served natively at the two lean one-lookup sites -- `bytes() - 1`
+/// per access, deposited dynamically by `emit_dynamic_split_extra` from the load
+/// and store stubs' RAM tails.
+///
+/// The lane's NAME therefore lies twice over: the high half is not dword reads,
+/// and it is fed by stores as well as reads. Both are deliberate. It is
+/// numerically exact because `run.rs` prices `ram_byte_writes` through the same
+/// `jit_data_cost_clocks(Byte)` as `ram_byte_reads`, so one shared pool of extra
+/// byte cycles is the right shape; and it is free because this high half was
+/// already zeroed by the prologue, already copied out by `emit_return` as part of
+/// a full 64-bit lane, and had no consumer at all. `STACK_RAM_DWORD_WRITES` has
+/// an equally free high half if a future reader would rather split the pools.
 pub(super) const STACK_DWORD_READS: i8 = 120;
 pub(super) const STACK_ALU_ADDRESS_KIND: i32 = 128;
 pub(super) const STACK_ALU_OLD_RESULT: i32 = 136;
