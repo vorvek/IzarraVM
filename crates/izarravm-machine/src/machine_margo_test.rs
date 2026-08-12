@@ -76,6 +76,39 @@ fn vbe_current_mode_returns_the_set_mode() {
     assert_eq!(machine.cpu().registers.ebx() as u16, 0x4101);
 }
 
+/// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
+/// separate a LINEAR 4F02 request (bit 0x4000) from a banked one, and must
+/// count only ACCEPTED mode sets. A rejected mode leaves both alone -- otherwise
+/// a guest that probes the mode list would inflate whichever column it probed
+/// with, and the answer this instrument exists to give ("does GP2 run the LFB
+/// linearly or banked") would be read off noise.
+#[test]
+fn vbe_mode_set_window_counters_separate_linear_from_banked() {
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h (linear)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x03, 0x01, // mov bx, 0103h (banked)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0xff, 0x41, // mov bx, 01FFh | 4000h -- not in the table, rejected
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert_eq!(reason, StopReason::Halted);
+    assert_eq!(
+        machine.cpu().registers.eax() as u16,
+        0x014f,
+        "the third mode set must have been REJECTED for this test to be about \
+         accepted-only counting"
+    );
+    assert_eq!(machine.vega.vbe_mode_set_window_counts(), (1, 1));
+}
+
 #[test]
 fn vbe_banked_window_set_get_and_boundary_round_trip_in_guest() {
     let rom = rom_with_code(&[

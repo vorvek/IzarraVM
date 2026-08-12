@@ -84,6 +84,19 @@ pub(crate) struct Vega {
     margo_ext_index: u8,
     margo_ext_disp_x: u16,
     margo_ext_disp_y: u16,
+    // Recon instrument (2026-08-12): how many accepted 4F02 mode sets asked for
+    // the LINEAR framebuffer (request bit 0x4000) versus the banked 64 KB
+    // window. Diagnostic only -- deliberately OUTSIDE `canonical_projection`,
+    // like every other counter, so a capture cannot differ over it.
+    //
+    // WHY IT IS HERE: the LFB and the banked window are served by two different
+    // (and both currently slow) bus paths, so which one a fixture uses decides
+    // which of them is worth making fast. NASCAR was measured banked (2,325
+    // 4F05 window calls per 4G cycles); GP2 was unmeasured, and GP2 is the other
+    // VESA fixture. `IZARRAVM_VBE_TRACE=1` prints each mode set as it happens so
+    // a SHORT run answers the question without waiting for a full schedule.
+    vbe_mode_sets_linear: u32,
+    vbe_mode_sets_banked: u32,
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
@@ -101,6 +114,8 @@ impl Default for Vega {
             margo_ext_index: 0,
             margo_ext_disp_x: 0,
             margo_ext_disp_y: 0,
+            vbe_mode_sets_linear: 0,
+            vbe_mode_sets_banked: 0,
             // Izarra has no PCI BIOS yet, so Distira powers on with its fixed
             // BAR decoded. Guest drivers may still rewrite command and BAR0.
             distira_command: 0x0002,
@@ -147,7 +162,26 @@ impl Vega {
         self.margo_active = true;
         self.margo_linear = request & 0x4000 != 0;
         self.margo_bank = 0;
+        if self.margo_linear {
+            self.vbe_mode_sets_linear = self.vbe_mode_sets_linear.saturating_add(1);
+        } else {
+            self.vbe_mode_sets_banked = self.vbe_mode_sets_banked.saturating_add(1);
+        }
+        trace_vbe_mode_set(
+            request,
+            self.vbe_mode_sets_linear,
+            self.vbe_mode_sets_banked,
+        );
         true
+    }
+
+    /// Accepted 4F02 mode sets so far, as (linear, banked). Recon instrument;
+    /// see the field comments. Test-only: a fixture run reads the same numbers
+    /// off `IZARRAVM_VBE_TRACE`, which is the form that answers the question
+    /// without a build that carries a reporting path nobody else calls.
+    #[cfg(test)]
+    pub(crate) fn vbe_mode_set_window_counts(&self) -> (u32, u32) {
+        (self.vbe_mode_sets_linear, self.vbe_mode_sets_banked)
     }
 
     pub(crate) fn current_vbe_mode(&self) -> Option<u16> {
@@ -1160,6 +1194,31 @@ impl Vega {
         let offset = bank + (address - VGA_MODE13H_BASE) as usize;
         (offset < MARGO_VRAM_SIZE).then_some(offset)
     }
+}
+
+/// One line per accepted 4F02 mode set, under `IZARRAVM_VBE_TRACE`.
+///
+/// Gated at the CALL SITE by nothing at all on purpose: an accepted VBE mode set
+/// happens a handful of times in a whole run (GP2 sets one mode; NASCAR sets
+/// one), so this is not a hot path and the `OnceLock` read is already more
+/// machinery than the site needs. The env var is read once per process.
+fn trace_vbe_mode_set(request: u16, linear_total: u32, banked_total: u32) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_VBE_TRACE").is_some()) {
+        return;
+    }
+    let window = if request & 0x4000 != 0 {
+        "LINEAR"
+    } else {
+        "banked"
+    };
+    eprintln!(
+        "[VBE] 4F02 request={request:#06x} mode={:#05x} window={window} dont_clear={} \
+         totals: linear={linear_total} banked={banked_total}",
+        request & 0x01ff,
+        request & 0x8000 != 0,
+    );
 }
 
 fn read_ring_word(memory: &Memory, base: u32, size: u32, off: u32) -> u32 {
