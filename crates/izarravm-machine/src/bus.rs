@@ -399,6 +399,19 @@ impl RamWriteRecorder for RamWriteFootprint {
     }
 }
 
+/// Flatten a `direct_write_identity` to the single byte the wipe census records.
+///
+/// The census exists to answer "did the aperture mapping move", so it must see the
+/// COMPOSITE identity, not the raw VGA token: a 4F05 moves the mapping while the
+/// raw token sits still. `lib.rs`'s recorder already logs the composite, and two
+/// scales in one census would make its rows incomparable.
+fn vega_census_token(identity: (u8, Option<u32>)) -> u8 {
+    match identity.1 {
+        Some(base) => 0x80 | ((base >> 16) as u8 & 0x3f),
+        None => identity.0,
+    }
+}
+
 impl MachineBus<'_> {
     /// The fetch-byte certification loop shared by every poll shape family:
     /// certify each slot's warm-RAM fetch range (rejecting a BIOS-stub overlay
@@ -2304,8 +2317,10 @@ impl CpuBus for MachineBus<'_> {
                         port,
                         census_selector,
                         value as u8,
-                        direct_write_before.0,
-                        direct_write_after.0,
+                        // Composite, matching `lib.rs`'s recorder: two scales in
+                        // one census would make its rows incomparable.
+                        vega_census_token(direct_write_before),
+                        vega_census_token(direct_write_after),
                     );
                 }
                 self.mark_direct_data_map_changed();

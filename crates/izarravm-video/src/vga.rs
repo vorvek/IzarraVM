@@ -644,6 +644,14 @@ impl Vga {
     /// Whether the CPU can use the stock chained Mode 13h aperture as flat
     /// memory. The machine uses this to invalidate cached direct pages only
     /// when a VGA write actually changes their availability.
+    /// Whether the mode13 linear surface is the authoritative copy. Exposed so a
+    /// test can assert that a Margo-banked write did NOT set it -- the silent
+    /// half of the dirty-notification routing, which sets this from Margo offsets
+    /// when the guest was in mode 13h before its 4F02.
+    pub fn mode13_linear_authoritative(&self) -> bool {
+        self.mode13_linear_authoritative
+    }
+
     pub fn mode13h_direct_page_available(&self) -> bool {
         let aperture = self.gc.aperture();
         self.canonical_mode13_layout()

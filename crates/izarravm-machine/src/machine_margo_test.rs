@@ -559,31 +559,104 @@ fn banked_probe_and_copy_agree_for_every_page_of_the_window() {
     );
 }
 
-/// T2 -- a bank switch under a live host pointer must land in the NEW bank.
+/// T2 -- a bank switch must move which BYTES the pointer means.
 ///
-/// The pointer is handed out for bank 0, then 4F05 moves the window. Before this
-/// slice no pointer could exist here at all, which is exactly the property the
-/// slice removes.
+/// The previous version of this test asserted `margo_banked_window_key()` changed,
+/// which re-derives the very arithmetic under test: making the key ignore the
+/// offset entirely -- every bank aliasing bank 0 -- passed it. That is the single
+/// most important property the slice has, and it was unpinned.
+///
+/// This writes THROUGH the pointer and reads the frame store back, so the only way
+/// to pass is to point at the right bytes.
 #[test]
-fn banked_direct_page_follows_a_bank_switch() {
+fn the_banked_direct_page_points_at_the_bank_it_names() {
+    const BANK: u16 = 3;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101)); // banked
+
+    // Bank 0: write 0xAA through the host pointer at the window base.
+    let p0 = machine
+        .vega
+        .margo_banked_direct_page(0x000a_0000)
+        .expect("bank 0 page");
+    unsafe { *p0 = 0xAA };
+
+    assert_eq!(machine.vega.vbe_window_control(0x0000, BANK), Ok(BANK));
+
+    // Bank 3: the SAME physical page must now reach a different frame-store offset.
+    let p3 = machine
+        .vega
+        .margo_banked_direct_page(0x000a_0000)
+        .expect("bank 3 page");
+    unsafe { *p3 = 0x55 };
+
+    let vram = machine.vega.margo().vram();
+    let bank_bytes = 0x1_0000usize;
+    assert_eq!(
+        vram[0], 0xAA,
+        "bank 0's byte must still be at frame-store 0"
+    );
+    assert_eq!(
+        vram[BANK as usize * bank_bytes],
+        0x55,
+        "bank {BANK}'s byte must land {BANK} windows in, not aliased onto bank 0"
+    );
+    assert_ne!(
+        p0, p3,
+        "and the two pointers must differ -- equality here is the aliasing bug"
+    );
+}
+
+/// T5 -- a REP MOVS through the banked window, which is 99.97% of nascar's
+/// aperture traffic and had NO test at all.
+///
+/// The slice exists to restore the bulk copy on exactly this path: before it,
+/// `direct_vga_bytes` refused on the zeroed token, `bulk_direct` went false, and
+/// the run fell back to one bus round-trip per iteration. A test exercising only
+/// ordinary stores misses the entire mechanism.
+#[test]
+fn a_rep_movs_into_the_banked_window_lands_correctly() {
+    const SRC: u32 = 0x2_0000;
+    const COUNT: usize = 256;
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();
     assert!(machine.vega.set_vbe_mode(0x0101));
+    assert_eq!(machine.vega.vbe_window_control(0x0000, 1), Ok(1));
 
-    let bank0 = machine.vega.margo_banked_window_key();
-    assert_eq!(bank0, Some(0));
-    assert!(machine.vega.margo_banked_direct_page(0x000a_0000).is_some());
+    for i in 0..COUNT {
+        machine.write_physical_u8(SRC + i as u32, (i & 0xff) as u8);
+    }
 
-    assert_eq!(machine.vega.vbe_window_control(0x0000, 2), Ok(2));
+    // The bulk path must ADMIT this range -- that is the mechanism under test.
+    let admitted = with_bus(&mut machine, |bus| {
+        bus.direct_memory_bytes(0x000a_0000, COUNT, BusWidth::Byte, BusAccessKind::DataWrite)
+    });
     assert_eq!(
-        machine.vega.margo_banked_window_key(),
-        Some(2 * 0x1_0000),
-        "the key must move with the bank, or a cached pointer silently re-aims"
+        admitted, COUNT,
+        "the banked window must be admitted for the bulk copy, or the slice's \
+         whole mechanism is inert"
     );
-    assert_ne!(bank0, machine.vega.margo_banked_window_key());
+
+    for i in 0..COUNT {
+        machine.write_physical_u8(0x000a_0000 + i as u32, (i & 0xff) as u8);
+    }
+
+    // Read the frame store directly: bank 1, so one window in.
+    let vram = machine.vega.margo().vram();
+    for i in 0..COUNT {
+        assert_eq!(
+            vram[0x1_0000 + i],
+            (i & 0xff) as u8,
+            "byte {i} must land in bank 1 of the frame store"
+        );
+    }
 }
 
 /// T3 -- THE C1 REGRESSION. Banked VESA, then `INT 10h AX=0003h`, must move the
@@ -620,38 +693,97 @@ fn leaving_a_banked_mode_for_text_moves_the_direct_write_identity() {
     );
 }
 
-/// T4 -- one banked aperture write must not route Margo's dirt into the VGA.
-///
-/// `Vga::note_direct_write` opens with `debug_assert_ne!(direct_write_token(), 0)`,
-/// which is 0 by construction while banked, so a debug build would trip on the
-/// first write. Run from BOTH pre-4F02 states: they take different branches, and
-/// the mode-13h one is the branch that would set `mode13_linear_authoritative`
-/// from Margo offsets -- silent corruption rather than a loud assert.
+/// T4a -- banked from TEXT. Without the Margo arm this trips
+/// `debug_assert_ne!(direct_write_token(), 0)` at `vga.rs:747`.
 #[test]
-fn a_banked_aperture_write_does_not_disturb_legacy_vga_dirty_state() {
-    for pre_mode in [0x03u8, 0x13] {
-        let mut machine = Machine::new(
-            MachineProfile::gsw_386(16, VideoCard::Vega),
-            vec![0u8; BIOS_ROM_SIZE],
-        )
-        .unwrap();
-        if pre_mode == 0x13 {
-            assert!(machine.set_vga_mode(0x13));
-        }
-        assert!(machine.vega.set_vbe_mode(0x0101));
-
-        // Would fire `vga.rs:747`'s assert in a debug build without the Margo arm.
-        machine.vega.note_direct_write(0x000a_0100, 4);
-        machine.vega.note_direct_write_pages(0x0001);
-
-        assert!(
-            machine.vega.margo_banked_window_key().is_some(),
-            "pre_mode {pre_mode:#04x}: still banked after the notify"
-        );
-    }
+fn a_banked_write_from_text_does_not_notify_the_vga() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    machine.vega.note_direct_write(0x000a_0100, 4);
+    machine.vega.note_direct_write_pages(0x0001);
+    assert!(!machine.vega.legacy().mode13_linear_authoritative());
 }
 
-/// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
+/// T4b -- banked from MODE 13h, which is the branch that matters and which the
+/// previous single test never reached: `for pre_mode in [0x03, 0x13]` panicked on
+/// the text state first, so this one never ran.
+///
+/// Here `Vga::direct_write_token()` is 1, so the assert PASSES and `vga.rs:777-781`
+/// sets `mode13_linear_authoritative` from Margo offsets instead. Silent
+/// corruption, not a loud assert -- and the old test's only assertion
+/// (`key.is_some()`) could not have seen it either way.
+#[test]
+fn a_banked_write_from_mode13_does_not_make_the_vga_authoritative() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    machine.vega.note_direct_write(0x000a_0100, 4);
+    machine.vega.note_direct_write_pages(0x0001);
+
+    assert!(
+        !machine.vega.legacy().mode13_linear_authoritative(),
+        "Margo's writes must not make the VGA's mode13 surface authoritative"
+    );
+}
+
+/// R-4 -- the identity guard must fire through the REAL entry point.
+///
+/// T2 and T3 call `Vega` methods directly, so reverting either token-compare
+/// wrapper to the bare token survives them. For 4F05 that revert is a live bug:
+/// the banked token is `0xff` before and after, so `0xff == 0xff` compares equal
+/// and the cached-pointer invalidation never fires.
+#[test]
+fn a_guest_bank_switch_through_int10_invalidates_the_data_map() {
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x01, // mov bx, 0101h (banked)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0x31, 0xdb, // xor bx, bx (set window A)
+        0xba, 0x02, 0x00, // mov dx, 2 (bank 2)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    // The 4F02 alone already invalidates (the identity moves legacy -> banked), so
+    // an ABSOLUTE count proves nothing about the 4F05. Measure the DELTA against a
+    // run that stops after the mode set.
+    let mode_set_only = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x01, // mov bx, 0101h (banked)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut base =
+        Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), mode_set_only).unwrap();
+    assert_eq!(
+        base.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    let without_4f05 = base.cpu().perf_counters().direct_map_invalidations;
+
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.vega.margo_banked_window_key(), Some(2 * 0x1_0000));
+    assert!(
+        machine.cpu().perf_counters().direct_map_invalidations > without_4f05,
+        "a 4F05 through INT 10h must reach the data-map invalidation, or a cached \
+         pointer keeps serving the old bank"
+    );
+}
+
+/// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`/// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
 /// separate a LINEAR 4F02 request (bit 0x4000) from a banked one, and must
 /// count only ACCEPTED mode sets. A rejected mode leaves both alone -- otherwise
 /// a guest that probes the mode list would inflate whichever column it probed

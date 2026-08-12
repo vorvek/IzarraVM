@@ -338,6 +338,11 @@ impl Vega {
         if let Some(ptr) = self.margo_banked_direct_page(physical_page) {
             return Some(ptr);
         }
+        // STRUCTURAL, read side; see `direct_write_page` for why this is a line
+        // rather than a comment about caller behaviour.
+        if self.margo_banked_window_at(VGA_MODE13H_BASE) {
+            return None;
+        }
         if !self.mode13_direct_page_available() {
             return None;
         }
@@ -380,6 +385,14 @@ impl Vega {
         // pages the slice exists to serve.
         if let Some(ptr) = self.margo_banked_direct_page(physical_page) {
             return Some(ptr);
+        }
+        // STRUCTURAL: while Margo owns the window the VGA never serves it, even if
+        // the Margo arm above declined (an out-of-store bank, say). Without this
+        // line that case falls through to the VGA, which is unreachable today only
+        // because every caller pre-validates -- a guarantee downgraded to a caller
+        // contract. One line keeps it a guarantee.
+        if self.margo_banked_window_at(VGA_MODE13H_BASE) {
+            return None;
         }
         if self.direct_write_token() == 0 {
             return None;
