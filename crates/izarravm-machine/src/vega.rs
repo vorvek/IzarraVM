@@ -6,9 +6,9 @@
 use izarravm_bus::{BusWidth, Memory};
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 use izarravm_video::{
-    CGA_FB_SIZE, DAC_ENTRIES, Distira, HGC_FB_SIZE, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, Margo,
-    MargoDisplay, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE,
-    VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode,
+    CGA_FB_SIZE, DAC_ENTRIES, Distira, HGC_FB_SIZE, MARGO_FRAME_HZ, MARGO_MMIO_SIZE,
+    MARGO_VRAM_SIZE, Margo, MargoDisplay, MargoScanTiming, TextFrame, VGA_MODE13H_BASE,
+    VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode,
 };
 
 use crate::video_params::{
@@ -446,8 +446,39 @@ impl Vega {
         self.vga.read_port(port)
     }
 
+    /// Lazy-path read of 0x3DA / 0x3BA / 0x3C2, with `beam` in the dot unit of
+    /// whichever engine owns the display (see `margo_scanout`).
+    ///
+    /// While Margo is scanning out, the two halves come from different owners on
+    /// purpose. The SIDE EFFECTS stay the VGA core's: this is one chip, a 0x3DA
+    /// read still resets the attribute-controller flip-flop and still catches the
+    /// legacy raster up, and which alias is decoded (0x3DA versus 0x3BA) is still
+    /// the Misc Output color/mono bit's business. The BITS come from Margo,
+    /// because Margo is what the monitor is showing. An inactive alias returns
+    /// `None` with no side effects at all, exactly as the VGA path does.
     pub(crate) fn read_status_port_lazy(&mut self, port: u16, beam: u64) -> Option<u8> {
-        self.vga.read_status_port_lazy(port, beam)
+        let Some(scan) = self.margo_scanout() else {
+            return self.vga.read_status_port_lazy(port, beam);
+        };
+        match port {
+            0x3C2 => {
+                self.vga.catch_up();
+                Some(self.vga.status0_switch_sense_bits() | scan.status0_vretrace_bits(beam))
+            }
+            // Hercules cannot be the personality driving a Margo VBE mode (the
+            // HGC path is a mono-only legacy personality), but if some state
+            // ever put the two together, the HGC status register is the VGA
+            // core's own and stays with it rather than being answered from a
+            // frame clock it does not run on.
+            port if self.vga.status1_port_active(port) && self.vga.is_hercules_personality() => {
+                self.vga.read_status_port_lazy(port, beam)
+            }
+            port if self.vga.status1_port_active(port) => {
+                self.vga.status1_side_effects();
+                Some(scan.status1_bits(beam))
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
@@ -465,8 +496,23 @@ impl Vega {
         self.vga.write_port(port, value)
     }
 
+    /// The legacy VGA raster's beam. NOT the scanout beam while a VBE mode is on
+    /// screen -- that one lives in the timeline's Margo frame phase, not in a
+    /// device, and reaches this module as the `beam` argument. See
+    /// `Machine::scanout_beam_dots`.
     pub(crate) fn beam_dots(&self) -> u64 {
         self.vga.beam_dots()
+    }
+
+    /// Margo's scanout timing, when Margo owns the display.
+    ///
+    /// `None` for the VGA raster AND for Distira: Distira has its own 60 Hz
+    /// scanout and its own status path, and nothing about this slice claims to
+    /// have fixed 0x3DA for a 3D mode. Whatever the answer there is, it stays
+    /// what it is today.
+    pub(crate) fn margo_scanout(&self) -> Option<MargoScanTiming> {
+        (self.active_display() == ActiveDisplay::MargoLfb)
+            .then(|| MargoScanTiming::for_display(self.margo.display()))
     }
 
     pub(crate) fn dot_clock_hz(&self) -> u64 {
@@ -477,8 +523,14 @@ impl Vega {
         self.vga.frame_dots()
     }
 
-    pub(crate) fn dots_until_vretrace_start(&self) -> Option<u64> {
-        self.vga.dots_until_vretrace_start()
+    /// Dots to the next vertical-retrace start edge from `beam`, in the unit of
+    /// whichever engine owns the display. The VGA arm ignores `beam` and uses
+    /// its own live raster beam, which is the same value the caller passed.
+    pub(crate) fn dots_until_vretrace_start(&self, beam: u64) -> Option<u64> {
+        match self.margo_scanout() {
+            Some(scan) => scan.dots_until_vretrace_start(beam),
+            None => self.vga.dots_until_vretrace_start(),
+        }
     }
 
     #[cfg(feature = "jit")]
@@ -490,7 +542,10 @@ impl Vega {
 
     #[cfg(feature = "jit")]
     pub(crate) fn status1_bits(&self, beam: u64) -> u8 {
-        self.vga.status1_bits(beam)
+        match self.margo_scanout() {
+            Some(scan) => scan.status1_bits(beam),
+            None => self.vga.status1_bits(beam),
+        }
     }
 
     #[cfg(feature = "jit")]
@@ -505,8 +560,12 @@ impl Vega {
         bit: u8,
         target: bool,
     ) -> Option<u64> {
-        self.vga
-            .dots_until_status1_bit_change_from(beam, bit, target)
+        match self.margo_scanout() {
+            Some(scan) => scan.dots_until_status1_bit_change_from(beam, bit, target),
+            None => self
+                .vga
+                .dots_until_status1_bit_change_from(beam, bit, target),
+        }
     }
 
     pub(crate) fn advance(
@@ -546,7 +605,12 @@ impl Vega {
                 0 => 60.0,
                 dots => self.vga.dot_clock_hz() as f64 / dots as f64,
             },
-            ActiveDisplay::MargoLfb | ActiveDisplay::Distira => 60.0,
+            // Margo scans out at exactly MARGO_FRAME_HZ in every mode, which is
+            // the same constant its frame phase (and now its 0x3DA retrace)
+            // runs at -- not a coincidence and not a second number. Distira's
+            // own 60 Hz scanout is unrelated and unchanged.
+            ActiveDisplay::MargoLfb => MARGO_FRAME_HZ as f64,
+            ActiveDisplay::Distira => 60.0,
         };
         hz.clamp(50.0, 120.0)
     }

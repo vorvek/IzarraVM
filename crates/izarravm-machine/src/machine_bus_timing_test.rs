@@ -333,6 +333,135 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
     );
 }
 
+/// The Margo arm of `predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n`.
+///
+/// While a VBE mode owns the display the beam is no longer the VGA raster's; it
+/// is the timeline's Margo frame phase scaled into that mode's dots. That is a
+/// SECOND formula, and it carries the same obligation as the first: a mid-batch
+/// peek must equal a real `advance_devices` of the same clock total, because the
+/// lazy 0x3DA arm answers a guest from the peek and never from device state.
+///
+/// The sweep deliberately reaches past one 60 Hz frame (`420_000` dots at
+/// 640x480, and a 386 at 16 MHz covers that in ~1.1M clocks), so the
+/// frame-crossing case -- the one where a wrong formula drifts instead of merely
+/// being offset -- is really exercised; `any_wrap` fails the test if it is not.
+#[test]
+fn margo_predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() {
+    let mut any_wrap = false;
+    for prior_runs_core_clocks in [0u64, 61, 33_000] {
+        for core_clocks_so_far in [0u64, 100, 12_345, 450_000, 1_500_000] {
+            let mut predicted_machine = margo_test_machine();
+            let mut real_machine = margo_test_machine();
+            assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+            let frame_dots = real_machine
+                .vega
+                .margo_scanout()
+                .expect("a VBE mode must be active")
+                .frame_dots();
+
+            let predicted = with_bus(&mut predicted_machine, |bus| {
+                bus.prior_runs_core_clocks = prior_runs_core_clocks;
+                bus.core_clocks_so_far = core_clocks_so_far;
+                bus.predicted_beam()
+            });
+
+            let step = prior_runs_core_clocks + core_clocks_so_far;
+            // Whole frames this step will cross, computed from the same pure
+            // formula BEFORE the mutating advance: `dots` is
+            // `frames * frame_dots + beam` with `beam < frame_dots`, so the
+            // quotient IS the frame count.
+            let frames_crossed = real_machine
+                .timeline
+                .preview_margo_scanout(step, frame_dots)
+                .dots
+                / frame_dots;
+            real_machine.advance_devices(step);
+            if frames_crossed > 0 {
+                any_wrap = true;
+            }
+
+            assert_eq!(
+                predicted,
+                real_machine.scanout_beam_dots(),
+                "predicted_beam(prior={prior_runs_core_clocks}, core={core_clocks_so_far}) must \
+                 match a real advance_devices of the same clock total while Margo \
+                 owns the display"
+            );
+        }
+    }
+    assert!(
+        any_wrap,
+        "the sweep must cross a Margo frame boundary, or the wrap coverage is hollow"
+    );
+}
+
+/// The peek's OTHER half: `dots_until_status1_bit_change_from` must name the
+/// exact edge, not an approximate one. One dot short of the answer the bit still
+/// reads its old value; at the answer it reads the target. That is the property
+/// the JIT poll-skip search leans on -- it skips iterations up to but not across
+/// this distance -- so an off-by-one here is a guest that oversleeps a retrace.
+#[test]
+fn margo_status1_edge_peek_names_the_exact_dot() {
+    let machine = margo_test_machine();
+    let scan = machine
+        .vega
+        .margo_scanout()
+        .expect("a VBE mode must be active");
+    let frame_dots = scan.frame_dots();
+
+    let mut edges_checked = 0;
+    for start in [0u64, 1, 12_345, 400_000, 419_999] {
+        for bit in [0u8, 3] {
+            for target in [false, true] {
+                let beam = start % frame_dots;
+                let mask = 1u8 << bit;
+                let current = scan.status1_bits(beam) & mask != 0;
+                let Some(dots) = scan.dots_until_status1_bit_change_from(beam, bit, target) else {
+                    // `None` is only legitimate when the bit is already there.
+                    assert_eq!(
+                        current, target,
+                        "no edge was offered for bit {bit} -> {target} from beam \
+                         {beam}, but the bit is not already {target}"
+                    );
+                    continue;
+                };
+                assert!(dots >= 1, "an edge distance must make progress");
+                assert_eq!(
+                    scan.status1_bits((beam + dots - 1) % frame_dots) & mask != 0,
+                    current,
+                    "one dot before the edge, bit {bit} must still read its old value (beam {beam}, dots {dots})"
+                );
+                assert_eq!(
+                    scan.status1_bits((beam + dots) % frame_dots) & mask != 0,
+                    target,
+                    "at the edge, bit {bit} must read {target} (beam {beam}, dots {dots})"
+                );
+                edges_checked += 1;
+            }
+        }
+    }
+    assert!(
+        edges_checked >= 8,
+        "the sweep must exercise real edges in both directions on both bits, got \
+         {edges_checked}"
+    );
+}
+
+/// A 386 test machine sitting in VBE mode 0x101 (640x480x8, BANKED -- the window
+/// GP2 was measured asking for). The mode is set through `Vega::set_vbe_mode`,
+/// the same host-side entry point `INT 10h 4F02h` funnels into, rather than by
+/// running guest code: these tests are about the beam formula, and driving a ROM
+/// stub would put an arbitrary number of cycles between the mode set and the
+/// measurement. Tests that need the guest path itself are in the Margo file.
+fn margo_test_machine() -> Machine {
+    let mut machine = test_machine();
+    machine.run_cycles(5_000).unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    machine
+}
+
 #[test]
 fn batch_loop_publishes_prior_runs_core_clocks_before_every_run() {
     // Pins the run_until_tick batch loop's prior_runs_core_clocks updates
@@ -2764,7 +2893,7 @@ fn pc_speaker_ultrasonic_square_wave_averages_quietly() {
     assert!(audible > 0, "the audible reference tone must be audible");
     assert!(
         ultrasonic * 3 < audible * 2,
-        "an ultrasonic PIT2 square wave should average down instead of aliasing          at the leg's full scale: {ultrasonic} against a {audible} swing"
+        "an ultrasonic PIT2 square wave should average down instead of aliasing at the leg's full scale: {ultrasonic} against a {audible} swing"
     );
 }
 

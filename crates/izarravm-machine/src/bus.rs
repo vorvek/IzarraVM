@@ -57,7 +57,7 @@ impl Machine {
     pub(super) fn make_bus(&mut self) -> MachineBus<'_> {
         // Captured before the struct literal below since VEGA and trace are also
         // mutably borrowed by other fields in that same literal.
-        let beam_at_batch_start = self.vega.beam_dots();
+        let beam_at_batch_start = self.scanout_beam_dots();
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
         // Read from the CPU, the same authoritative mode owner that scale_bus
         // uses. Machine's active_mode copy is kept for bus register readback.

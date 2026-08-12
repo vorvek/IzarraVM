@@ -9,6 +9,7 @@
 
 mod modes;
 mod registers;
+mod scan;
 
 use modes::{BAYER_4X4, decode_argb, quantize_channel, yuv_to_argb};
 pub use modes::{
@@ -16,6 +17,7 @@ pub use modes::{
     vbe_mode,
 };
 pub use registers::*;
+pub use scan::{MARGO_FRAME_HZ, MargoScanTiming};
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 

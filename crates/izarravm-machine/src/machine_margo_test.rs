@@ -76,6 +76,230 @@ fn vbe_current_mode_returns_the_set_mode() {
     assert_eq!(machine.cpu().registers.ebx() as u16, 0x4101);
 }
 
+/// Sample 0x3DA through the real port path every `sample_ticks` of machine time
+/// for `window_ticks`, and report the mean master-tick period between rising
+/// edges of bit 3 (vertical retrace), plus the number of edges seen.
+///
+/// Deliberately drives the guest-visible port rather than the device, so a fix
+/// that only reaches the device API would not pass.
+fn vretrace_period_ticks(
+    machine: &mut Machine,
+    sample_ticks: u64,
+    window_ticks: u64,
+) -> (u64, u32) {
+    let mut previous = machine.read_io_port_u8(0x3da) & 0x08 != 0;
+    let (mut first, mut last, mut edges) = (None, 0u64, 0u32);
+    let mut elapsed = 0u64;
+    while elapsed < window_ticks {
+        machine.advance_devices_ticks(sample_ticks);
+        elapsed += sample_ticks;
+        let now = machine.read_io_port_u8(0x3da) & 0x08 != 0;
+        if now && !previous {
+            edges += 1;
+            first.get_or_insert(elapsed);
+            last = elapsed;
+        }
+        previous = now;
+    }
+    let first = first.expect("at least one vertical-retrace edge in the window");
+    assert!(
+        edges >= 2,
+        "need two edges to measure a period, saw {edges}"
+    );
+    ((last - first) / u64::from(edges - 1), edges)
+}
+
+/// THE BUG THIS SLICE FIXES. `4F02h` never touched the legacy VGA CRTC, so while
+/// a Margo mode was on screen 0x3DA reported the STALE legacy mode's retrace
+/// rate while `Margo::advance_frames` latched page flips at 60 Hz. A guest that
+/// paced on 0x3DA and flipped with `4F07h` -- which both VESA fixtures do -- ran
+/// two display clocks well over 10% apart.
+///
+/// The test measures the rate a guest can actually observe, before and after the
+/// mode set, on ONE machine. The "before" leg is not decoration: it is what makes
+/// the "after" assertion non-vacuous, by showing the legacy clock this port used
+/// to report is a different number that the fix had to stop reporting.
+#[test]
+fn margo_3da_reports_the_margo_frame_rate_not_the_stale_legacy_mode() {
+    const SAMPLE_TICKS: u64 = 50_000; // ~7 samples inside a 2-line retrace window
+    const WINDOW_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 4; // 0.25 s of machine time
+    let margo_period = izarravm_core::MASTER_CLOCK_HZ / 60;
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    let (legacy_period, _) = vretrace_period_ticks(&mut machine, SAMPLE_TICKS, WINDOW_TICKS);
+    assert!(
+        legacy_period.abs_diff(margo_period) > margo_period / 100,
+        "the legacy VGA mode must run at a MEASURABLY different rate from Margo \
+         for this test to prove anything (legacy {legacy_period}, margo {margo_period})"
+    );
+
+    // Two modes with very different frame geometry (420,000 dots against
+    // 1,083,264). Both must land on the SAME 60 Hz, which is what says the rate
+    // comes from the frame clock and not from a dot count that happens to
+    // resemble the legacy mode's.
+    for mode in [0x0101u16, 0x0105] {
+        assert!(machine.vega.set_vbe_mode(mode));
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        let (vbe_period, edges) = vretrace_period_ticks(&mut machine, SAMPLE_TICKS, WINDOW_TICKS);
+        assert!(
+            edges >= 14,
+            "0.25 s at 60 Hz owes about 15 edges, saw {edges} in mode {mode:#06x}"
+        );
+        assert!(
+            vbe_period.abs_diff(margo_period) <= margo_period / 500,
+            "0x3DA in VBE mode {mode:#06x} must report Margo's frame rate: measured \
+         period {vbe_period} ticks against Margo's {margo_period}"
+        );
+    }
+}
+
+/// The other half of the same contract: 0x3DA's retrace and the frame boundary
+/// that latches `DISP_START` are ONE clock, in the right order.
+///
+/// A guest queues a page flip during vertical blanking and expects it to take
+/// effect at the start of the next frame -- so from the instant 0x3DA first
+/// reports retrace, the latch must land STRICTLY INSIDE the remaining blanking,
+/// never a whole frame later and never before the retrace it was queued in.
+/// Nothing enforced that before this slice, because the retrace edge came off
+/// the VGA CRTC and the latch off a 60 Hz phase that had no fixed relationship
+/// to it.
+#[test]
+fn margo_display_start_latches_inside_the_blanking_the_guest_polled_for() {
+    const SAMPLE_TICKS: u64 = 20_000;
+    let frame_ticks = izarravm_core::MASTER_CLOCK_HZ / 60;
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    // Advance to the first rising edge of the retrace bit, exactly as a guest
+    // pacing on 0x3DA would.
+    let mut previous = machine.read_io_port_u8(0x3da) & 0x08 != 0;
+    let mut waited = 0u64;
+    loop {
+        machine.advance_devices_ticks(SAMPLE_TICKS);
+        waited += SAMPLE_TICKS;
+        let now = machine.read_io_port_u8(0x3da) & 0x08 != 0;
+        if now && !previous {
+            break;
+        }
+        previous = now;
+        assert!(
+            waited < 2 * frame_ticks,
+            "no retrace edge within two frames"
+        );
+    }
+
+    // Queue a flip from inside that blanking interval.
+    assert!(machine.vega.program_display_start(640 * 480));
+    assert!(machine.margo().display_start_pending());
+
+    let mut to_latch = 0u64;
+    while machine.margo().display_start_pending() {
+        machine.advance_devices_ticks(SAMPLE_TICKS);
+        to_latch += SAMPLE_TICKS;
+        assert!(
+            to_latch <= frame_ticks,
+            "a flip queued at the retrace edge must latch within the same frame, \
+             not a whole frame later"
+        );
+    }
+    assert_eq!(machine.margo().display().start, 640 * 480);
+
+    // 640x480 blanks for 45 of its 525 lines and starts retrace 10 lines in, so
+    // 35 lines of blanking remain after the edge: 6.67% of a frame. The sampling
+    // grain and the up-to-one-sample lateness of the observed edge bound the
+    // error, so this asserts the ORDER OF MAGNITUDE of the gap, which is what
+    // distinguishes "same clock" from "unrelated clocks that happen to agree on
+    // rate".
+    let expected = frame_ticks * 35 / 525;
+    assert!(
+        to_latch.abs_diff(expected) <= 4 * SAMPLE_TICKS,
+        "the latch must fall {expected} ticks after the retrace edge (the remaining \
+         blanking), measured {to_latch}"
+    );
+}
+
+/// The JIT's poll-skip path reads `Vega::status1_bits` off a predicted beam and
+/// skips guest iterations right up to the edge it computes from
+/// `dots_until_status1_bit_change_from`. If that path and the port a guest
+/// actually reads ever disagreed about which clock 0x3DA runs on, the JIT would
+/// sleep through the retrace the guest was waiting for. Both arms are asked at
+/// the SAME beam, so this pins the agreement itself rather than the peek offset.
+#[cfg(feature = "jit")]
+#[test]
+fn margo_poll_skip_status_bits_agree_with_the_port_read() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    let mut saw_retrace = false;
+    let mut saw_active = false;
+    for _ in 0..4_000 {
+        machine.advance_devices_ticks(50_000);
+        let beam = machine.scanout_beam_dots();
+        let poll_skip = machine.vega.status1_bits(beam);
+        let port = machine
+            .vega
+            .read_status_port_lazy(0x3da, beam)
+            .expect("0x3DA is the active status1 alias in a color setup");
+        assert_eq!(
+            poll_skip, port,
+            "the poll-skip status bits and the port read must agree at beam {beam}"
+        );
+        saw_retrace |= port & 0x08 != 0;
+        saw_active |= port & 0x01 == 0;
+    }
+    assert!(
+        saw_retrace && saw_active,
+        "the sweep must observe both retrace and active display, or it pins nothing"
+    );
+}
+
+/// The wall-pacing path (`advance_wall_shortfall`) stops the machine at each
+/// vertical-retrace start edge so a guest polling for it cannot miss a window
+/// that opens and closes inside one pacing top-up. That edge has to be Margo's
+/// while Margo is scanning out, or the pacing lands on the legacy raster's edges
+/// and the guest misses every one of Margo's.
+#[test]
+fn margo_owns_the_vretrace_edge_the_wall_pacing_stops_at() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    assert!(machine.vega.set_vbe_mode(0x0105));
+
+    let beam = machine.scanout_beam_dots();
+    let scan = machine
+        .vega
+        .margo_scanout()
+        .expect("a VBE mode must be active");
+    assert_eq!(
+        machine.vega.dots_until_vretrace_start(beam),
+        scan.dots_until_vretrace_start(beam)
+    );
+    // Non-vacuous: 1024x768 and mode 13h do not share an edge distance, so the
+    // equality above is a routing claim and not a coincidence.
+    assert_ne!(
+        machine.vega.dots_until_vretrace_start(beam),
+        machine.vega.legacy().dots_until_vretrace_start()
+    );
+}
+
 /// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
 /// separate a LINEAR 4F02 request (bit 0x4000) from a banked one, and must
 /// count only ACCEPTED mode sets. A rejected mode leaves both alone -- otherwise

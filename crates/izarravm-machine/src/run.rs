@@ -908,7 +908,7 @@ impl Machine {
             // Capture live timing state before the fields move into MachineBus.
             let timeline_at_batch_start = self.timeline;
             let master_ticks_at_batch_start = self.timeline.now_ticks();
-            let beam_at_batch_start = self.vega.beam_dots();
+            let beam_at_batch_start = self.scanout_beam_dots();
             let trace_elapsed_at_batch_start = trace_before;
             let bus_rem_at_batch_start = self.bus_rem;
             // bus_timing's (num, den), read from the same authoritative CPU mode

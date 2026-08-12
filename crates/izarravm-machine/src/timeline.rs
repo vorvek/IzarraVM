@@ -7,7 +7,11 @@ use crate::timing::PIT_INPUT_HZ;
 
 const MICROSECOND_HZ: u64 = 1_000_000;
 pub(crate) const NANOSECOND_HZ: u64 = 1_000_000_000;
-pub(crate) const MARGO_FRAME_HZ: u64 = 60;
+/// Re-exported, not redeclared. Margo's frame rate is its own datasheet number
+/// (`izarravm_video::margo::scan`), and the scanout timing a guest polls through
+/// 0x3DA is derived from the SAME constant this phase accumulator runs at. A
+/// local copy here is precisely how the display ended up with two clocks.
+pub(crate) use izarravm_video::MARGO_FRAME_HZ;
 const DISTIRA_LINE_HZ: u64 = 525 * 60;
 
 const fn saturating_u64(value: u128) -> u64 {
@@ -111,6 +115,15 @@ pub(crate) struct DeviceAdvance {
     pub margo_frames: u64,
     pub distira_lines: u64,
     pub vga_dots: u64,
+}
+
+/// Margo's scanout position at some instant: `beam` is the dot inside the
+/// current frame (0 is the first active display dot), `dots` the whole dots
+/// elapsed, which a caller subtracts across two instants to get a distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MargoScanout {
+    pub dots: u64,
+    pub beam: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,6 +443,67 @@ impl Timeline {
         let ticks = self.master_ticks_for_cpu_clocks(cpu_clocks);
         let mut margo = self.margo;
         margo.advance(ticks, NANOSECOND_HZ)
+    }
+
+    /// Margo's scanout beam, in dots, after a `cpu_clocks` advance -- and the
+    /// whole dots that advance would produce, for a caller measuring a distance
+    /// rather than a position.
+    ///
+    /// DERIVED FROM THE FRAME PHASE, NOT FROM A SECOND ACCUMULATOR. `frame_dots`
+    /// dots occupy exactly one [`MARGO_FRAME_HZ`] frame, so the beam is the
+    /// fractional part of the `margo_frame` phase scaled into dots, and the
+    /// dot count is `floor(total_phase * frame_dots / MASTER_CLOCK_HZ)` -- the
+    /// same partition a real accumulator at `frame_dots * MARGO_FRAME_HZ` would
+    /// make, because `frame_dots * (a * MASTER + b) / MASTER` is exactly
+    /// `a * frame_dots + b * frame_dots / MASTER`.
+    ///
+    /// That identity is the whole point. A separate dot accumulator would be a
+    /// SECOND 60 Hz clock, free to drift out of phase with the one that latches
+    /// `DISP_START` -- and two display clocks a fixed fraction of a frame apart
+    /// is a milder version of the bug this replaced. Deriving both from one
+    /// phase makes "the retrace a guest polls for" and "the frame boundary that
+    /// applies a queued page flip" the same edge by construction, forever, with
+    /// no re-locking needed after a mode set.
+    ///
+    /// Runs on a COPY of the phase accumulator, like `preview_microseconds`, so
+    /// a mid-batch peek and the real advance that follows it cannot disagree.
+    pub(crate) fn preview_margo_scanout(self, cpu_clocks: u64, frame_dots: u64) -> MargoScanout {
+        if frame_dots == 0 {
+            return MargoScanout { dots: 0, beam: 0 };
+        }
+        let ticks = self.master_ticks_for_cpu_clocks(cpu_clocks);
+        let mut margo_frame = self.margo_frame;
+        let frames = margo_frame.advance(ticks, MARGO_FRAME_HZ);
+        let beam =
+            saturating_u64(margo_frame.remainder() as u128 * frame_dots as u128) / MASTER_CLOCK_HZ;
+        MargoScanout {
+            dots: frames.saturating_mul(frame_dots).saturating_add(beam),
+            beam,
+        }
+    }
+
+    /// Master ticks until Margo's beam has advanced `dots` further, or `None`
+    /// for a mode with no frame geometry.
+    ///
+    /// The equivalent dot-clock phase is the frame phase scaled by `frame_dots`
+    /// (see `preview_margo_scanout` for why that scaling is exact), so this
+    /// answers through the same `RatePhase::ticks_until` every other device
+    /// deadline uses, at the derived rate `frame_dots * MARGO_FRAME_HZ`.
+    pub(crate) fn margo_master_ticks_until_dots(self, dots: u64, frame_dots: u64) -> Option<u64> {
+        if frame_dots == 0 {
+            return None;
+        }
+        let dot_hz = frame_dots.checked_mul(MARGO_FRAME_HZ)?;
+        let scaled = self.margo_frame.remainder() as u128 * frame_dots as u128;
+        let remainder = (scaled % MASTER_CLOCK_HZ as u128) as u64;
+        RatePhase::with_remainder(remainder).ticks_until(dots, dot_hz)
+    }
+
+    /// `margo_master_ticks_until_dots` in CPU clocks, matching
+    /// `cpu_clocks_until`'s rounding and its "always make progress" floor.
+    pub(crate) fn margo_cpu_clocks_until_dots(self, dots: u64, frame_dots: u64) -> Option<u64> {
+        self.margo_master_ticks_until_dots(dots, frame_dots)
+            .map(|ticks| self.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
     }
 
     pub(crate) fn cpu_clocks_until(

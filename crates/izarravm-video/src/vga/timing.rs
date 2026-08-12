@@ -684,6 +684,147 @@ pub fn beam_vretrace(t: &CrtcTiming, dots: u64) -> bool {
     line >= t.vretrace_start && line < t.vretrace_end
 }
 
+/// The two GEOMETRY bits of Input Status Register 1, off a caller-supplied beam:
+/// bit 0 (display inactive / safe VRAM window) and bit 3 (vertical retrace).
+///
+/// `display_forced_inactive` is the caller's own "the display is not refreshing
+/// at all" verdict, which is where the two callers differ: the VGA core folds in
+/// its sequencer / attribute-controller / CGA gates, while Margo's VBE modes have
+/// none of those registers in their path and pass `false`. Everything else --
+/// which is to say all of the timing -- comes from `t`.
+///
+/// SHARED ON PURPOSE. `Vga::status1_bits` and `MargoScanTiming::status1_bits`
+/// both call this, so a guest that polls 0x3DA cannot see two different notions
+/// of "in retrace" depending on which engine owns the display.
+pub fn status1_geometry_bits(t: &CrtcTiming, beam: u64, display_forced_inactive: bool) -> u8 {
+    let mut status = 0u8;
+    if display_forced_inactive || !beam_display_enable(t, beam) {
+        status |= 0x01;
+    }
+    if beam_vretrace(t, beam) {
+        status |= 0x08;
+    }
+    status
+}
+
+/// Dots from `beam` to the first transition of Input Status 1 bit 3 (vertical
+/// retrace) or bit 0 (display inactive) to `target`. Pure geometry from `t`; the
+/// live beam is never moved.
+///
+/// THE ANALYTIC PEEK. A mid-batch 0x3DA read is answered from a PREDICTED beam
+/// rather than from device state, and the JIT's poll-skip binary search uses
+/// this distance as the deadline it may not cross. Both only stay honest if the
+/// answer here equals what a real advance of the same clocks would produce, so
+/// this is the ONE implementation, shared by the VGA core and by Margo
+/// (`status1_geometry_bits` is its companion, and the pair has to agree: this
+/// returns `None` exactly when the bit already has the target value, so a caller
+/// that sees `None` knows the state is settled, not that the geometry is unusable
+/// -- the unusable cases return `None` too, and both mean "do not schedule").
+///
+/// `display_forced_inactive` carries the same meaning as in
+/// `status1_geometry_bits`; when it is set, bit 0 never transitions and this
+/// returns `None`.
+///
+/// IT IS A CLOSURE, and that is not decoration. Only the bit-0 arm consults it,
+/// while the DOMINANT caller is the bit-3 vertical-retrace poll (doom and
+/// wolf3d spin on exactly that). The VGA's verdict costs a sequencer read and a
+/// personality test; taking it eagerly at the call site would have added that
+/// work to every retrace poll, which is not what "the extraction is a pure move"
+/// is supposed to mean. Deferring it keeps this function's cost identical to the
+/// method it was lifted out of, arm for arm.
+pub fn dots_until_status1_bit_change(
+    t: &CrtcTiming,
+    beam: u64,
+    bit: u8,
+    target: bool,
+    display_forced_inactive: impl FnOnce() -> bool,
+) -> Option<u64> {
+    let htotal = htotal_dots(t);
+    let frame = t.frame_dots();
+    if htotal == 0 || frame == 0 || t.vtotal == 0 {
+        return None;
+    }
+    let beam = beam % frame;
+    match bit {
+        3 => {
+            if t.vretrace_start >= t.vretrace_end || t.vretrace_end > t.vtotal {
+                return None;
+            }
+            let current = beam_vretrace(t, beam);
+            if current == target {
+                return None;
+            }
+            let line = if target {
+                t.vretrace_start
+            } else {
+                t.vretrace_end
+            };
+            let edge = u64::from(line).checked_mul(htotal)?;
+            Some(if beam < edge {
+                edge - beam
+            } else {
+                frame - beam + edge
+            })
+        }
+        0 => {
+            // Called here and only here, in the position the method evaluated
+            // it in, so the work this arm does is unchanged term for term.
+            if display_forced_inactive()
+                || t.hdisp_end == 0
+                || u64::from(t.hdisp_end) > htotal
+                || t.vdisp_end == 0
+                || t.vdisp_end > t.vtotal
+            {
+                return None;
+            }
+            let current = !beam_display_enable(t, beam);
+            if current == target {
+                return None;
+            }
+            let line = beam_line(t, beam);
+            let dot = u64::from(beam_dot(t, beam));
+            if target {
+                Some(u64::from(t.hdisp_end) - dot)
+            } else if line + 1 < t.vdisp_end {
+                Some(htotal - dot)
+            } else {
+                Some(frame - beam)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Dots from `beam` to the next vertical-retrace START edge (the first dot of
+/// scan line `vretrace_start`).
+///
+/// If the beam sits at or past the edge on this frame (on the edge, inside the
+/// retrace window, or in the bottom border below it), the result is the NEXT
+/// frame's edge, up to a full frame ahead, so the returned distance is never
+/// zero -- which is what makes a caller that loops "advance to the edge, run a
+/// little, repeat" terminate. `None` when the geometry is unusable (zero-dot
+/// frame, or a retrace edge outside the frame), so callers skip edge-aware
+/// scheduling. Shared by the VGA core and Margo for the same reason as
+/// `dots_until_status1_bit_change`.
+pub fn dots_until_vretrace_start(t: &CrtcTiming, beam: u64) -> Option<u64> {
+    let frame = t.frame_dots();
+    if frame == 0 {
+        return None;
+    }
+    let edge = u64::from(t.vretrace_start) * htotal_dots(t);
+    if edge >= frame {
+        return None;
+    }
+    // A mode switch to a smaller frame can leave `beam` beyond the new frame
+    // until the next advance() wraps it; normalize first.
+    let beam = beam % frame;
+    Some(if beam < edge {
+        edge - beam
+    } else {
+        frame - beam + edge
+    })
+}
+
 /// True when the beam is inside the horizontal blanking/retrace interval:
 /// past the active dots on the current scan line. `CrtcTiming` does not carry
 /// a separate horizontal retrace start/width (only the CGA/MDA/VGA personalities

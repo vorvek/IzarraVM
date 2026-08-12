@@ -355,7 +355,10 @@ fn load_asymmetric_stereo(machine: &mut Machine, frames: u32) {
 fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
     // Captured before the struct literal below since VEGA and trace are also
     // mutably borrowed by other fields in that same literal.
-    let beam_at_batch_start = machine.vega.beam_dots();
+    // `scanout_beam_dots`, not `vega.beam_dots()`: this helper is a hand copy of
+    // `Machine::make_bus`, and a copy that captured the legacy raster's beam
+    // would silently hand every Margo-mode test a beam from the wrong clock.
+    let beam_at_batch_start = machine.scanout_beam_dots();
     let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
     let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.cpu.level());
     let icache_fetch_clocks = u64::from(izarravm_bus::BusCycle::clocks_for(

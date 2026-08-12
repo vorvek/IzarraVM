@@ -704,21 +704,53 @@ impl Machine {
     /// onto (or a dot or two past) the edge. `None` means the CRTC has no usable
     /// frame geometry.
     fn clocks_to_vretrace_start(&self) -> Option<u64> {
-        let edge_dots = self.vega.dots_until_vretrace_start()?;
-        self.timeline.cpu_clocks_until(
-            timeline::DeviceClock::Vga,
-            edge_dots,
-            self.vega.dot_clock_hz(),
-        )
+        let edge_dots = self
+            .vega
+            .dots_until_vretrace_start(self.scanout_beam_dots())?;
+        match self.vega.margo_scanout() {
+            Some(scan) => self
+                .timeline
+                .margo_cpu_clocks_until_dots(edge_dots, scan.frame_dots()),
+            None => self.timeline.cpu_clocks_until(
+                timeline::DeviceClock::Vga,
+                edge_dots,
+                self.vega.dot_clock_hz(),
+            ),
+        }
     }
 
     fn master_ticks_to_vretrace_start(&self) -> Option<u64> {
-        let edge_dots = self.vega.dots_until_vretrace_start()?;
-        self.timeline.master_ticks_until(
-            timeline::DeviceClock::Vga,
-            edge_dots,
-            self.vega.dot_clock_hz(),
-        )
+        let edge_dots = self
+            .vega
+            .dots_until_vretrace_start(self.scanout_beam_dots())?;
+        match self.vega.margo_scanout() {
+            Some(scan) => self
+                .timeline
+                .margo_master_ticks_until_dots(edge_dots, scan.frame_dots()),
+            None => self.timeline.master_ticks_until(
+                timeline::DeviceClock::Vga,
+                edge_dots,
+                self.vega.dot_clock_hz(),
+            ),
+        }
+    }
+
+    /// The beam of whichever engine is scanning out, in that engine's dot unit.
+    ///
+    /// The VGA raster keeps its beam in the device; Margo's lives in the
+    /// timeline's frame phase, because that is the phase whose whole events
+    /// latch `DISP_START`. Every producer of a `beam_at_batch_start` and every
+    /// consumer of `Vega::status1_bits` goes through this one function, so the
+    /// two never get crossed.
+    pub(super) fn scanout_beam_dots(&self) -> u64 {
+        match self.vega.margo_scanout() {
+            Some(scan) => {
+                self.timeline
+                    .preview_margo_scanout(0, scan.frame_dots())
+                    .beam
+            }
+            None => self.vega.beam_dots(),
+        }
     }
 
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
@@ -1440,6 +1472,15 @@ impl MachineBus<'_> {
     /// in `advance_devices` at batch end.
     pub(super) fn predicted_beam(&self) -> u64 {
         let in_batch_clocks = self.in_batch_clocks();
+        // Margo's beam is a position in its frame phase, not an offset from a
+        // device-held beam, so this arm needs no `beam_at_batch_start` term at
+        // all: the phase accumulator already carries where the frame started.
+        if let Some(scan) = self.vega.margo_scanout() {
+            return self
+                .timeline_at_batch_start
+                .preview_margo_scanout(in_batch_clocks, scan.frame_dots())
+                .beam;
+        }
         let (_, whole_dots) = self
             .timeline_at_batch_start
             .preview_cpu_clocks(in_batch_clocks, self.vega.dot_clock_hz());
@@ -1457,6 +1498,20 @@ impl MachineBus<'_> {
         let current_clocks = self.in_batch_clocks();
         if candidate_clocks < current_clocks {
             return None;
+        }
+        // The DISTANCE has to be measured in the same dot unit the edge came
+        // back in, which is Margo's while Margo is scanning out. Both arms are
+        // differential: the beam-inside-the-frame wraps, the whole-dot count
+        // does not, so it is the latter that gets subtracted.
+        if let Some(scan) = self.vega.margo_scanout() {
+            let frame_dots = scan.frame_dots();
+            let current = self
+                .timeline_at_batch_start
+                .preview_margo_scanout(current_clocks, frame_dots);
+            let candidate = self
+                .timeline_at_batch_start
+                .preview_margo_scanout(candidate_clocks, frame_dots);
+            return candidate.dots.checked_sub(current.dots);
         }
         let (_, current_dots) = self
             .timeline_at_batch_start

@@ -14,8 +14,9 @@ pub use vga::{CGA_FB_SIZE, HGC_FB_SIZE, VGA_PLANAR_SIZE, Vga, VgaRaster};
 pub use distira::*;
 
 pub use margo::{
-    Channel, MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo,
-    MargoDisplay, PixelFormat, VbeMode, bytes_per_pixel, pixel_format, vbe_mode,
+    Channel, MARGO_FRAME_HZ, MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
+    Margo, MargoDisplay, MargoScanTiming, PixelFormat, VbeMode, bytes_per_pixel, pixel_format,
+    vbe_mode,
 };
 
 pub const MODE13H_WIDTH: u32 = 320;

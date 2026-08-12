@@ -41,7 +41,8 @@ pub use legacy::{
 pub use scanout::VgaRaster;
 pub use timing::{
     Attribute, CrtcRegs, CrtcTiming, Sequencer, beam_display_enable, beam_dot, beam_hsync,
-    beam_line, beam_vretrace, htotal_dots,
+    beam_line, beam_vretrace, dots_until_status1_bit_change, dots_until_vretrace_start,
+    htotal_dots, status1_geometry_bits,
 };
 use timing::{
     VGA_COLOR_SWITCH_SENSE, VGA_DOT_CLOCK_25_HZ, VGA_DOT_CLOCK_28_HZ, vgabios_attr_regs,
@@ -256,22 +257,7 @@ impl Vga {
     /// frame) or the retrace edge falls outside the frame, so callers skip
     /// edge-aware scheduling.
     pub fn dots_until_vretrace_start(&self) -> Option<u64> {
-        let frame = self.frame_dots();
-        if frame == 0 {
-            return None;
-        }
-        let edge = u64::from(self.crtc.vretrace_start) * htotal_dots(&self.crtc);
-        if edge >= frame {
-            return None;
-        }
-        // A mode switch to a smaller frame can leave `beam` beyond the new
-        // frame until the next advance() wraps it; normalize first.
-        let beam = self.beam % frame;
-        Some(if beam < edge {
-            edge - beam
-        } else {
-            frame - beam + edge
-        })
+        timing::dots_until_vretrace_start(&self.crtc, self.beam)
     }
 
     /// Dots from a caller-supplied beam to the first positive transition of
@@ -284,70 +270,46 @@ impl Vga {
         bit: u8,
         target: bool,
     ) -> Option<u64> {
-        let htotal = htotal_dots(&self.crtc);
-        let frame = self.frame_dots();
-        if htotal == 0 || frame == 0 || self.crtc.vtotal == 0 {
-            return None;
-        }
-        let beam = beam % frame;
-        match bit {
-            3 => {
-                if self.crtc.vretrace_start >= self.crtc.vretrace_end
-                    || self.crtc.vretrace_end > self.crtc.vtotal
-                {
-                    return None;
-                }
-                let current = beam_vretrace(&self.crtc, beam);
-                if current == target {
-                    return None;
-                }
-                let line = if target {
-                    self.crtc.vretrace_start
-                } else {
-                    self.crtc.vretrace_end
-                };
-                let edge = u64::from(line).checked_mul(htotal)?;
-                Some(if beam < edge {
-                    edge - beam
-                } else {
-                    frame - beam + edge
-                })
-            }
-            0 => {
-                let display_forced_inactive = !self.display_refresh_enabled
-                    || !self.attr.pas
-                    || !self.sequencer_outputs_enabled()
-                    || (self.is_cga_personality()
-                        && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0);
-                if display_forced_inactive
-                    || self.crtc.hdisp_end == 0
-                    || u64::from(self.crtc.hdisp_end) > htotal
-                    || self.crtc.vdisp_end == 0
-                    || self.crtc.vdisp_end > self.crtc.vtotal
-                {
-                    return None;
-                }
-                let current = !beam_display_enable(&self.crtc, beam);
-                if current == target {
-                    return None;
-                }
-                let line = beam_line(&self.crtc, beam);
-                let dot = u64::from(beam_dot(&self.crtc, beam));
-                if target {
-                    Some(u64::from(self.crtc.hdisp_end) - dot)
-                } else if line + 1 < self.crtc.vdisp_end {
-                    Some(htotal - dot)
-                } else {
-                    Some(frame - beam)
-                }
-            }
-            _ => None,
-        }
+        timing::dots_until_status1_bit_change(&self.crtc, beam, bit, target, || {
+            self.display_forced_inactive()
+        })
+    }
+
+    /// The VGA core's own "the display is not refreshing at all" verdict, from
+    /// the registers outside the CRTC that can blank the screen. Margo's VBE
+    /// modes reach none of these, which is why the geometry helpers take it as a
+    /// parameter instead of reading it themselves.
+    fn display_forced_inactive(&self) -> bool {
+        !self.display_refresh_enabled
+            || !self.attr.pas
+            || !self.sequencer_outputs_enabled()
+            || (self.is_cga_personality() && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0)
     }
 
     /// Whether 0x3DA is the active color Input Status 1 alias.
     pub fn color_status1_port_active(&self) -> bool {
         self.status1_port_selected(0x3da)
+    }
+
+    /// Whether `port` is the ACTIVE Input Status 1 alias (0x3DA in a color
+    /// setup, 0x3BA in a mono one). The inactive alias is not decoded at all --
+    /// no bits, and no side effects either.
+    ///
+    /// Public because Margo's scanout timing owns the BITS of a status read
+    /// while a VBE mode is on screen, but the VGA core still owns which PORT is
+    /// decoded and what a read does to the chip; splitting those two would let
+    /// the aliasing rule drift between the two display owners.
+    pub fn status1_port_active(&self, port: u16) -> bool {
+        self.status1_port_selected(port)
+    }
+
+    /// Input Status 0's display-switch sense bit (bit 4), which is a wired strap
+    /// selected by Misc Output and has nothing to do with the beam. Exposed for
+    /// the same reason as `status1_port_active`: while Margo is scanning out,
+    /// bit 7 of 0x3C2 comes from Margo's frame clock but bit 4 still comes from
+    /// here.
+    pub fn status0_switch_sense_bits(&self) -> u8 {
+        if self.switch_sense_bit() { 0x10 } else { 0x00 }
     }
 
     pub fn dot_clock_hz(&self) -> u64 {
@@ -1221,23 +1183,16 @@ impl Vga {
     /// `self.work` buffer, so it is equally valid for a beam ahead of what
     /// `catch_up` has actually rendered.
     pub fn status1_bits(&self, beam: u64) -> u8 {
-        let mut status = 0u8;
-        let display_disabled = !self.display_refresh_enabled
-            || !self.attr.pas
-            || !self.sequencer_outputs_enabled()
-            || (self.is_cga_personality() && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0);
-        let display_inactive = display_disabled || !beam_display_enable(&self.crtc, beam);
-        if display_inactive {
-            status |= 0x01; // display inactive / safe VRAM window
-        }
+        // Bits 0 and 3 are pure geometry plus the blanking gates; the shared
+        // helper is what keeps them identical to the Margo path and to the
+        // analytic peek that predicts their transitions.
+        let mut status =
+            timing::status1_geometry_bits(&self.crtc, beam, self.display_forced_inactive());
         if self.is_cga_personality() {
             if self.cga.light_pen_triggered {
                 status |= 0x02;
             }
             status |= 0x04; // no light pen switch is pressed/attached
-        }
-        if beam_vretrace(&self.crtc, beam) {
-            status |= 0x08; // vertical retrace
         }
         status |= self.video_status_mux_bits(beam);
         status
