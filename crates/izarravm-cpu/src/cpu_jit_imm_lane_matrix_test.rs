@@ -1092,18 +1092,6 @@ fn unaligned_lane_then_store_image(imm: u32) -> Vec<u8> {
     memory
 }
 
-/// Which side exit a fixture's self-store is expected to take before it commits. Both are
-/// "the store did not commit inside the block"; they differ in which guard got there first, and
-/// pinning that is what stops the aligned fixture from standing in for the unaligned one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SelfStoreExit {
-    /// The dword store is 4-byte aligned, so the code-watch guard is the first to refuse it.
-    CodeWatch,
-    /// The dword store is misaligned, so the wide-access page guard refuses it first and the
-    /// code-watch check is never reached.
-    CrossPageOrAlignment,
-}
-
 /// One in-flight fixture: its bytes, where its lane is, and what the block looks like.
 struct InFlightCase {
     label: &'static str,
@@ -1116,7 +1104,6 @@ struct InFlightCase {
     /// The immediate the ADD uses on the FIRST pass: the new one when the store runs before it,
     /// the original when it runs after.
     first_pass_imm_is_new: bool,
-    exit: SelfStoreExit,
 }
 
 /// Step the CPU until it reaches `target_eip`, entering native code where it can. Bounded so a
@@ -1141,12 +1128,20 @@ fn step_until(cpu: &mut CpuGsw, bus: &mut TestBus, target_eip: u32, context: &st
 /// fires, the lane still holds the old bytes at the exit, the replayed store is accepted, the
 /// block survives, and the re-entered block reads the new immediate.
 ///
-/// Four fixtures: both slot orders, at both alignments. The alignment split is not cosmetic. An
-/// aligned self-store is refused by the code-watch guard; a misaligned one is refused earlier, by
-/// the wide-access page guard, and never reaches the code-watch check at all. Two of Doom's four
-/// real patch sites are misaligned, so the aligned fixture alone would leave the path the guest
-/// actually takes about a million times a run completely unexercised. Each case pins WHICH guard
-/// fired and that the other one did not.
+/// Four fixtures: both slot orders, at both alignments. The alignment split is not cosmetic — two
+/// of Doom's four real patch sites are misaligned, so the aligned fixture alone would leave the
+/// path the guest actually takes about a million times a run unexercised.
+///
+/// **All four now exit on the CODE WATCH, and the two misaligned rows changed meaning with guard 3
+/// rather than merely changing counters.** They used to exit on the wide-access page guard, which
+/// refused every misaligned store before the code-watch check could run — so the rows named for
+/// the Doom shape were in fact certifying the alignment refusal and never reaching the guard they
+/// were built to exercise. The lean store site now serves a page-local misaligned store through
+/// its slow stub, which runs `emit_watched_store_guard`, so the self-store really does meet the
+/// code watch at both alignments.
+///
+/// That is why the expected-exit field is gone: there is one answer for all four rows, and each
+/// still pins that the OTHER guard did not fire.
 #[test]
 fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
     const ORIGINAL_IMM: u32 = 0x0000_0003;
@@ -1162,7 +1157,6 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
             instructions: 5,
             hlt: ENTRY + 14,
             first_pass_imm_is_new: true,
-            exit: SelfStoreExit::CodeWatch,
         },
         InFlightCase {
             label: "aligned, lane before the store",
@@ -1172,7 +1166,6 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
             instructions: 5,
             hlt: ENTRY + 14,
             first_pass_imm_is_new: false,
-            exit: SelfStoreExit::CodeWatch,
         },
         InFlightCase {
             label: "unaligned (the Doom shape), store before the lane",
@@ -1182,7 +1175,6 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
             instructions: 4,
             hlt: ENTRY + 12,
             first_pass_imm_is_new: true,
-            exit: SelfStoreExit::CrossPageOrAlignment,
         },
         InFlightCase {
             label: "unaligned, lane before the store",
@@ -1192,17 +1184,11 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
             instructions: 5,
             hlt: ENTRY + 14,
             first_pass_imm_is_new: false,
-            exit: SelfStoreExit::CrossPageOrAlignment,
         },
     ];
 
     for case in cases {
         let label = case.label;
-        assert_eq!(
-            case.lane % 4 == 0,
-            case.exit == SelfStoreExit::CodeWatch,
-            "{label}: the fixture's alignment and its expected guard disagree"
-        );
         let first_pass_imm = if case.first_pass_imm_is_new {
             NEW_IMM
         } else {
@@ -1244,28 +1230,14 @@ fn a_block_that_patches_its_own_lane_side_exits_and_survives() {
         let watch = after.jit_direct_exit_code_watch - before.jit_direct_exit_code_watch;
         let alignment = after.jit_direct_exit_cross_page_or_alignment
             - before.jit_direct_exit_cross_page_or_alignment;
-        match case.exit {
-            SelfStoreExit::CodeWatch => {
-                assert!(
-                    watch > 0,
-                    "{label}: the store into watched code must side-exit on the code watch"
-                );
-                assert_eq!(
-                    alignment, 0,
-                    "{label}: an aligned store must not be refused by the page guard first"
-                );
-            }
-            SelfStoreExit::CrossPageOrAlignment => {
-                assert!(
-                    alignment > 0,
-                    "{label}: a misaligned store must side-exit on the wide-access page guard"
-                );
-                assert_eq!(
-                    watch, 0,
-                    "{label}: the page guard runs first, so the code-watch check is never reached"
-                );
-            }
-        }
+        assert!(
+            watch > 0,
+            "{label}: the store into watched code must side-exit on the code watch"
+        );
+        assert_eq!(
+            alignment, 0,
+            "{label}: no self-store may be refused by the page guard first"
+        );
         assert_eq!(
             read32(&native_bus.memory, case.lane),
             ORIGINAL_IMM,

@@ -138,12 +138,48 @@ fn map_page(cpu: &mut CpuGsw, bus: &mut TestBus, page: u32) {
 /// Compile `mov esi,esi / body / mov edi,edi / hlt` at `ENTRY` on the native role, warm the same
 /// decode lines on the interpreter role, and seed both identically.
 fn build(body: &[u8]) -> Roles {
+    build_watching(body, None)
+}
+
+/// As `build`, but marks one byte as code on BOTH roles before the pages are mapped.
+///
+/// Marking makes the page's PAGE_WATCHED bit set, which POISONS its store bias -- so an aligned
+/// store to any other offset on that page reaches `emit_slow_stub` instead of the site's fast arm,
+/// passes the code-watch guard (its own granule is unmarked), and lands through the stub's RAM
+/// counter arm. That is the only way to build an aligned store that reaches the stub, and it is
+/// what the unconditional-deposit row needs.
+///
+/// The mark goes on BOTH roles: the watch is guest-visible through the interpreter's own SMC
+/// bookkeeping, so watching one role would compare two different machines. It goes BEFORE
+/// `map_page`, because the mark's edge sweep invalidates any live fast-map entry on the marked
+/// page whose watched bit is clear -- marking after populating would clear the entry just
+/// installed.
+fn build_watching(body: &[u8], watch: Option<u32>) -> Roles {
+    build_slots(&[body], watch)
+}
+
+/// As `build`, for a pair of tested opcodes rather than one.
+fn build_two_body(first: &[u8], second: &[u8]) -> Roles {
+    build_slots(&[first, second], None)
+}
+
+/// Each element of `bodies` is one tested opcode, and each gets its own warmed decode line: a
+/// missing one makes `compile` ask for a retry rather than produce a block. The compiled block
+/// must then cover `bodies.len() + 2` slots -- asserted rather than assumed, because a body that
+/// silently failed to compile as one block would leave the tested opcode on the interpreter and
+/// the fixture would certify nothing.
+fn build_slots(bodies: &[&[u8]], watch: Option<u32>) -> Roles {
     let mut code = MOV_ESI_ESI.to_vec();
+    let mut starts = vec![ENTRY];
     let body_at = ENTRY + code.len() as u32;
-    code.extend_from_slice(body);
-    let tail_at = ENTRY + code.len() as u32;
+    for body in bodies {
+        starts.push(ENTRY + code.len() as u32);
+        code.extend_from_slice(body);
+    }
+    starts.push(ENTRY + code.len() as u32);
     code.extend_from_slice(&MOV_EDI_EDI);
     code.push(0xf4);
+    let slots = (bodies.len() + 2) as u8;
 
     let mut memory = memory_fill();
     // A NOP before the entry, so the block is reachable as a continuation as well as directly.
@@ -158,7 +194,6 @@ fn build(body: &[u8]) -> Roles {
         bus.direct_pages_enabled = true;
         bus.direct_page_clocks = true;
     }
-    let starts = [ENTRY, body_at, tail_at];
     for (cpu, bus) in [
         (&mut native, &mut native_bus),
         (&mut interp, &mut interp_bus),
@@ -167,6 +202,9 @@ fn build(body: &[u8]) -> Roles {
         for &linear in &starts {
             cpu.set_eip(linear);
             cpu.fetch_decoded(bus, linear).unwrap();
+        }
+        if let Some(at) = watch {
+            cpu.mark_decode_code_for_test(at, 1);
         }
         for page in [
             OPERAND_PAGE,
@@ -191,8 +229,8 @@ fn build(body: &[u8]) -> Roles {
         jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
     };
     assert_eq!(
-        compilation.span.instructions, 3,
-        "the block must cover all three slots, so the tested opcode really ran natively"
+        compilation.span.instructions, slots,
+        "the block must cover every slot, so the tested opcode really ran natively"
     );
     let id = native
         .jit_direct
@@ -346,10 +384,17 @@ fn guarded(body: &[u8], exits: fn(&CpuGsw) -> u64, context: &str) {
     // assertion that separates "refused before the access" from "refused after it", and it is the
     // whole content of the Mode 13h store row -- an aperture byte written before the refusal would
     // be written a second time by the interpreter's re-execution.
+    // Reported as the first differing index rather than as two 700 KiB arrays: a refusal that
+    // wrote before exiting differs in one or two bytes, and the address is the diagnosis.
+    let touched = roles
+        .native_bus
+        .memory
+        .iter()
+        .zip(ram_before.iter())
+        .position(|(now, before)| now != before);
     assert_eq!(
-        &roles.native_bus.memory[..],
-        &ram_before[..],
-        "{context}: the refusal must leave guest RAM untouched"
+        touched, None,
+        "{context}: the refusal must leave guest RAM untouched, but byte {touched:?} moved -- a          refusal placed AFTER the write means the interpreter's re-execution writes it twice"
     );
     roles.interp.cycle(&mut roles.interp_bus).unwrap();
     compare_state(&roles, &format!("{context}: at the guard"));
@@ -500,6 +545,186 @@ fn a_misaligned_mode13_read_still_exits() {
     }
     let at = MODE13_PAGE + 0x101;
     guarded(&dword_load(at), kind_exits, "mov ebx, dword [mode13+1]");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The admission matrix: stores
+// ---------------------------------------------------------------------------------------------
+
+/// `mov word [at], imm16` — a Word STORE through the lean one-lookup store site.
+fn word_store(at: u32, value: u16) -> Vec<u8> {
+    let mut body = vec![0x66u8];
+    body.extend_from_slice(&disp32(&[0xc7], 0, at));
+    body.extend_from_slice(&value.to_le_bytes());
+    body
+}
+
+/// `mov dword [at], imm32`.
+fn dword_store(at: u32, value: u32) -> Vec<u8> {
+    let mut body = disp32(&[0xc7], 0, at);
+    body.extend_from_slice(&value.to_le_bytes());
+    body
+}
+
+/// A misaligned Word or Dword store runs natively, writes the right bytes, and charges the split.
+///
+/// The whole-array guest-RAM compare in `compare_state` is what makes this a real assertion:
+/// `memory_fill` puts a distinct byte at every address, so a store of the wrong WIDTH or to the
+/// wrong ADDRESS changes bytes the interpreter left alone.
+#[test]
+fn a_misaligned_store_runs_natively_and_charges_the_split() {
+    for offset in (1..0x10).step_by(2) {
+        let at = OPERAND_PAGE + 0x600 + offset;
+        lowered_misaligned(&word_store(at, 0x1234), 2, &format!("mov word [{at:#x}]"));
+    }
+    for offset in 1..4 {
+        let at = OPERAND_PAGE + 0x700 + offset;
+        lowered_misaligned(
+            &dword_store(at, 0x1020_3040),
+            4,
+            &format!("mov dword [{at:#x}]"),
+        );
+    }
+}
+
+/// **The store VALUE must be the slot's own.** Two store slots, the second misaligned, the first
+/// writing a distinguishable value.
+///
+/// This row exists for one specific wrong shape, and it was written and watched to FAIL against it
+/// before the fix landed. The slow stub's contract is "RAX = linear address, RDX = store value",
+/// and `emit_slow_stub` spills RDX as its second instruction. But `emit_store_fast` materialises
+/// the value into RDX three emissions AFTER the point the guard sits. Retarget the alignment half
+/// in place -- the obvious edit, and the one the read site takes -- and the jump into the stub
+/// happens before the value exists: the stub spills, then stores, whatever RDX held from the
+/// PREVIOUS slot. Silent wrong-value store into guest RAM, no fault, no counter.
+///
+/// Two slots with different values is the only shape where a stale RDX is visible: with one slot,
+/// or with two slots writing the same value, the wrong register still holds a plausible number.
+///
+/// The fix splits the guard around the value materialisation and gives the alignment half RCX,
+/// which is free by the store pad's own rule. This row is what guards that split against a future
+/// tidy-up that hoists the alignment half back next to the crossing bound.
+#[test]
+fn a_misaligned_store_writes_its_own_value_not_the_previous_slots() {
+    // The first slot is ALIGNED, so it takes the fast arm and leaves its value in RDX; the second
+    // is misaligned and goes through the stub. Distinguishable values, and neither is the other's
+    // truncation.
+    let first = OPERAND_PAGE + 0x800;
+    let second = OPERAND_PAGE + 0x901;
+    // Four slots now, not three: the fixture's own leading and trailing moves plus two stores.
+    let mut roles = build_two_body(&word_store(first, 0xa5a5), &word_store(second, 0x3c3c));
+    let retired = roles.native.perf_counters().jit_direct_insns;
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - retired,
+        4,
+        "all four slots must retire natively"
+    );
+    for _ in 0..4 {
+        roles.interp.cycle(&mut roles.interp_bus).unwrap();
+    }
+    // The whole-array compare is the primary assertion; the explicit read below names the failure
+    // so a reader does not have to diff two 700 KiB arrays to see what went wrong.
+    let stored = u16::from_le_bytes([
+        roles.native_bus.memory[second as usize],
+        roles.native_bus.memory[second as usize + 1],
+    ]);
+    assert_eq!(
+        stored, 0x3c3c,
+        "the misaligned store wrote {stored:#06x}: with the alignment half emitted BEFORE \
+         `emit_read_store_value`, the slow stub spills and stores the PREVIOUS slot's value"
+    );
+    compare_state(&roles, "two stores, the second misaligned");
+    assert_eq!(
+        roles.native_bus.trace.elapsed_clocks() - roles.interp_bus.trace.elapsed_clocks(),
+        expected_split_delta(2),
+        "exactly one of the two stores is misaligned"
+    );
+}
+
+/// An ALIGNED store that reaches the SLOW STUB must charge exactly what the fast arm charges.
+///
+/// This is the row that keeps the stub's RAM deposit CONDITIONAL, and the population it protects
+/// is not exotic: a watched page's store bias is poisoned, so every store to a watched page goes
+/// through this stub, and watched pages are the hot store class on the self-modifying-code
+/// fixtures. Poisoned and supervisor entries arrive the same way. An unconditional
+/// `emit_dynamic_split_extra` in the stub's RAM counter arm would over-charge every one of them.
+///
+/// The page is watched at one byte; the store is at a different offset, so its own granule is
+/// unmarked and the code-watch guard passes. Bus clocks must match the interpreter EXACTLY.
+#[test]
+fn an_aligned_store_through_the_slow_stub_charges_no_split() {
+    let watched_byte = OPERAND_PAGE + 0xa00;
+    let at = OPERAND_PAGE + 0xb00;
+    let mut roles = build_watching(&word_store(at, 0x5aa5), Some(watched_byte));
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    for _ in 0..3 {
+        roles.interp.cycle(&mut roles.interp_bus).unwrap();
+    }
+    compare_state(&roles, "aligned store through the slow stub");
+    assert_eq!(
+        roles.native_bus.trace.elapsed_clocks(),
+        roles.interp_bus.trace.elapsed_clocks(),
+        "an ALIGNED store reaching the slow stub must charge exactly what the fast arm charges; \
+         an unconditional split deposit over-charges every watched, poisoned and supervisor page"
+    );
+}
+
+/// A misaligned Mode 13h aperture store stays refused, and -- the whole point of where the refusal
+/// sits -- writes NO byte before refusing.
+///
+/// The read stub has separate mode13 and RAM tails; the slow STORE stub does not. Both kind arms
+/// fall into a shared `store` label and the kind is re-split only AFTER the write, so a refusal
+/// placed "in the mode13 tail" by analogy with the read side would land after the aperture byte
+/// had been written -- and the block would then side-exit, so the interpreter would re-execute the
+/// instruction and write it a SECOND time. The refusal therefore sits at the `mode13` label,
+/// before the permission check, and `guarded`'s whole-RAM snapshot is what proves it.
+#[test]
+fn a_misaligned_mode13_store_still_exits_without_writing() {
+    for offset in [1u32, 3] {
+        let at = MODE13_PAGE + 0x200 + offset;
+        guarded(
+            &word_store(at, 0x1234),
+            kind_exits,
+            &format!("mov word [mode13+{offset}]"),
+        );
+    }
+    guarded(
+        &dword_store(MODE13_PAGE + 0x301, 0x1020_3040),
+        kind_exits,
+        "mov dword [mode13+1]",
+    );
+}
+
+/// A page-CROSSING store still refuses, at both widths. The crossing bound is emitted before the
+/// alignment half here for the same reason it is at the read site.
+#[test]
+fn a_page_crossing_store_still_exits() {
+    guarded(
+        &word_store(OPERAND_PAGE + 0xfff, 0x1234),
+        alignment_exits,
+        "mov word [page+0xfff] crosses",
+    );
+    for offset in [0xffdu32, 0xffe, 0xfff] {
+        let at = OPERAND_PAGE + offset;
+        guarded(
+            &dword_store(at, 0x1020_3040),
+            alignment_exits,
+            &format!("mov dword [{at:#x}] crosses"),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -14,7 +14,12 @@
 //!
 //! Stub calling convention: RAX = linear address, RDX = store value (GPR stubs), RDI = the
 //! probed entry. The page index is NOT part of the contract — every stub that needs it
-//! recomputes it from RAX, so a site may clobber RCX between probe and call. Every stub's
+//! recomputes it from RAX, so a site may clobber RCX between probe and call. **Guard 3 depends on
+//! both halves of that: the site's alignment test is emitted AFTER `emit_read_store_value`, so
+//! that a misaligned access entering the slow stub finds the value in RDX as the contract
+//! promises, and it uses RCX as its scratch precisely because the page index is disposable.
+//! Moving that test back above the value materialisation produces a store of the PREVIOUS slot's
+//! value — silent, and not a fault.** Every stub's
 //! prologue is
 //! `pop qword [rsp + STACK_STUB_RETURN]`, which parks the return address AND restores RSP to
 //! the frame level in one instruction — so every frame-offset helper (counters, watch guard,
@@ -124,19 +129,45 @@ pub(super) fn emit_store_fast(
     wrap: AddressWrap,
 ) {
     let map = memory.map.expect("native store has fast-map bases");
+    // HOISTED above the guard, because both halves below reference `slow`. The other three labels
+    // move with it so the set stays in one place.
+    let aux = e.label();
+    let slow = e.label();
+    let done = e.label();
+    let fast_join = e.label();
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
     if width.needs_alignment_guard() {
-        emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
+        // The two halves are called DIRECTLY and, uniquely at this site, they are SPLIT AROUND THE
+        // VALUE MATERIALISATION. The crossing half keeps its position and its RDX scratch; the
+        // alignment half cannot.
+        emit_page_cross_bound(e, width, sides.cross_page_or_alignment);
     }
     emit_store_bias_probe(e, map);
     // The value is materialized BEFORE the tag branch so the fast arm and both stubs share it
     // (the stubs receive it in RDX; the slow stub spills it across its own front — review F1).
     emit_read_store_value(e, source, width, Reg::RDX);
+    if width.needs_alignment_guard() {
+        // AFTER the value, and on RCX rather than RDX. Both halves of that are load-bearing and
+        // neither failure faults.
+        //
+        // AFTER, because `slow` is the slow stub and the stub's contract is "RAX = linear address,
+        // RDX = store value" -- it spills RDX as its SECOND instruction and reloads it to store.
+        // A `jnz slow` emitted with the crossing half, three emissions above, arrives before the
+        // value exists, so the stub spills and stores whatever RDX held from the PREVIOUS slot: a
+        // silent wrong-value store into guest RAM.
+        //
+        // RCX, because RDX now holds that value and the two guard halves both use their scratch
+        // destructively. RCX is free by this pad's own rule -- the page index is not part of the
+        // stub contract, and every stub that needs it recomputes it from RAX. Neither the fast arm
+        // nor the aux arm reads RCX after the probe, and `emit_mode13_dirty_bit` recomputes the
+        // page index from RAX as its first two instructions.
+        //
+        // `and r32, imm32` is `81 /4 id` and `mov r32, r32` is `89 /r` at either register, so this
+        // is the same four instructions at the same four encoding lengths as before the slice:
+        // zero added bytes at the site.
+        emit_alignment_test(e, width, Reg::RCX, slow);
+    }
 
-    let aux = e.label();
-    let slow = e.label();
-    let done = e.label();
-    let fast_join = e.label();
     // BOTH privilege arms test both tag bits: a tagged entry's low bits are part of the VALUE,
     // so even a site allowed to store through it (cpl0 through a supervisor entry) must strip
     // them before forming the pointer — an untested bit 1 would store at address+2, the
@@ -498,6 +529,30 @@ fn emit_slow_stub(
     e.mov_r32_imm32(Reg::RCX, u32::from(NATIVE_RAM_KIND));
     e.jmp(store);
     e.place(mode13);
+    // Mode 13h keeps REFUSING a misaligned access, and WHERE this sits is the whole content of it.
+    //
+    // The counting READ stub has separate mode13 and RAM tails, so its refusal drops naturally
+    // into the mode13 one. This stub has no such tail: both kind arms fall into the shared `store`
+    // label below and the kind is re-split only AFTER the write. A refusal placed "in the mode13
+    // tail" by analogy with the read side would therefore land after the aperture byte had already
+    // been written -- and the block would then side-exit, so the interpreter re-executes the
+    // instruction and writes it a SECOND time. A double write to the aperture, caused by the very
+    // mitigation meant to keep the aperture off this path.
+    //
+    // It also sits BEFORE `emit_write_permission_check`, matching where the pre-slice
+    // `emit_wide_page_guard` sat relative to every check: refusing later would re-attribute a cpl3
+    // supervisor-aperture case from alignment to Permission.
+    //
+    // Status 1, so this lands on the site's `unavailable_or_kind` exit rather than
+    // `cross_page_or_alignment`. Deliberate and counters-only; see the read stub for the size
+    // argument against a dedicated status.
+    //
+    // Wrapped, because the pad builds a stub for every GPR width including Byte.
+    if width.needs_alignment_guard() {
+        // RAX is the linear address and this stub's front preserves it by contract.
+        e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
+        e.jnz(status_unavailable);
+    }
     e.mov_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.place(store);
     e.shift_r64_imm8(4, Reg::RCX, 32);
@@ -535,6 +590,26 @@ fn emit_slow_stub(
         MemoryWidth::Qword | MemoryWidth::Tbyte => {
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
+    }
+    // The misaligned RAM store this stub now SERVES rather than refuses: charge the extra byte
+    // cycles it owes beyond the one wide cycle the increment above accounts for. Placed here, in
+    // the RAM counter arm, because by this point the store has landed and the code-watch guard has
+    // passed -- the access is committed and can no longer refuse.
+    //
+    // CONDITIONAL, and on this side that is not a formality. Everything the site cannot serve
+    // inline arrives here: poisoned entries, supervisor entries at cpl3, and -- the population
+    // that matters -- every store to a WATCHED page, because a watch edge poisons the page's store
+    // bias. Those are ordinary ALIGNED stores and they must charge exactly what they charged
+    // before this slice. An unconditional deposit over-charges all of them.
+    //
+    // RAX is still the linear address: the front preserves it by contract and the store above went
+    // through RDI. RDX holds the reloaded store value and is dead from here.
+    if width.needs_alignment_guard() {
+        let aligned = e.label();
+        e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
+        e.jz(aligned);
+        emit_dynamic_split_extra(&mut e, width.bytes() - 1);
+        e.place(aligned);
     }
     e.xor_r64_self(Reg::RCX);
     e.jmp(counted);

@@ -2844,15 +2844,30 @@ fn native_store_watch_covers_overlap_cross_chunk_and_same_value_cases() {
             expected_exits,
             "target={target:#x} marked={marked:#x} same={same_value}"
         );
+        // EVERY row now exits on CODE_WATCH, including the misaligned `0x410f` one, and that row
+        // changed meaning with guard 3 rather than merely changing counters.
+        //
+        // It used to exit on ALIGNMENT: `emit_wide_page_guard` refused the misaligned dword before
+        // the watch guard could run, so the row asserted the refusal and never reached the thing it
+        // was named for. The lean store site now serves a page-local misaligned store through its
+        // slow stub, which runs `emit_watched_store_guard` -- so the store at `0x410f` spans
+        // granules `0x10f..0x112`, the marked byte `0x4110` is one of them, and the guard's
+        // multi-granule window arm catches it.
+        //
+        // That makes this the end-to-end exercise of the window arm on a MISALIGNED input, which
+        // nothing in the tree had before, and it is what the emitter's worst-case granule span
+        // exists for: the span must hold at any offset, not only at an alignment the backend used
+        // to guarantee.
         assert_eq!(
             cpu.perf_counters().jit_direct_exit_code_watch - code_watch_exits,
-            if target & 3 == 0 { expected_exits } else { 0 },
+            expected_exits,
             "target={target:#x} marked={marked:#x} same={same_value}: {:?}",
             cpu.perf_counters()
         );
         assert_eq!(
             cpu.perf_counters().jit_direct_exit_cross_page_or_alignment - alignment_exits,
-            if target & 3 == 0 { 0 } else { expected_exits },
+            0,
+            "no row may refuse on alignment any more: target={target:#x}",
         );
         assert_eq!(cpu.jit_direct.len(), cached_blocks);
     }
