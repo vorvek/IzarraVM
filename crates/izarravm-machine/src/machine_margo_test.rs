@@ -300,6 +300,220 @@ fn margo_owns_the_vretrace_edge_the_wall_pacing_stops_at() {
     );
 }
 
+/// GUARANTEE 1 of the section 9 contract, exact-edge form: a queued `DISP_START`
+/// is applied AT the frame boundary and at no earlier instant.
+///
+/// The existing `vbe_display_start_latches_on_the_next_margo_frame` shows the
+/// flip is deferred and lands within a frame; it does not show WHERE. This walks
+/// the machine to one master tick short of the boundary and requires the flip to
+/// still be queued there, which is the only form that distinguishes "latched at
+/// the boundary" from "latched somewhere in the neighbourhood".
+#[test]
+fn margo_display_start_is_applied_at_the_frame_boundary_and_not_one_tick_before() {
+    let frame_ticks = izarravm_core::MASTER_CLOCK_HZ / 60;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    // Land somewhere mid-frame, so the boundary this measures is a real edge and
+    // not the phase the machine happens to boot on.
+    machine.advance_devices_ticks(frame_ticks / 3);
+    assert!(machine.vega.program_display_start(640 * 480));
+    assert!(machine.margo().display_start_pending());
+
+    let to_edge = machine
+        .timeline
+        .master_ticks_until(
+            crate::timeline::DeviceClock::MargoFrame,
+            1,
+            crate::timeline::MARGO_FRAME_HZ,
+        )
+        .expect("the frame clock is running");
+    assert!(
+        to_edge > 1 && to_edge <= frame_ticks,
+        "the next boundary must be inside one frame and not already due, got {to_edge}"
+    );
+
+    machine.advance_devices_ticks(to_edge - 1);
+    assert!(
+        machine.margo().display_start_pending(),
+        "one master tick short of the frame boundary the flip must still be QUEUED"
+    );
+    assert_eq!(
+        machine.margo().display().start,
+        0,
+        "and the scanned-out origin must not have moved yet"
+    );
+
+    machine.advance_devices_ticks(1);
+    assert!(!machine.margo().display_start_pending());
+    assert_eq!(machine.margo().display().start, 640 * 480);
+}
+
+/// The same guarantee for `4F07h BL=80h`, which additionally STALLS the caller to
+/// that boundary. The stall must be exactly the distance to the next frame edge:
+/// shorter and the caller returns before its flip is live, longer and the BIOS
+/// is burning guest time it did not owe.
+#[test]
+fn margo_display_start_wait_stalls_exactly_to_the_frame_boundary() {
+    let frame_ticks = izarravm_core::MASTER_CLOCK_HZ / 60;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    machine.advance_devices_ticks(frame_ticks / 3);
+    assert!(machine.vega.program_display_start(640 * 480));
+
+    let to_edge = machine
+        .timeline
+        .master_ticks_until(
+            crate::timeline::DeviceClock::MargoFrame,
+            1,
+            crate::timeline::MARGO_FRAME_HZ,
+        )
+        .expect("the frame clock is running");
+    let stalled_before = machine.io_stall_ticks();
+    machine.stall_until_margo_frame();
+
+    assert_eq!(
+        machine.io_stall_ticks() - stalled_before,
+        to_edge,
+        "the retrace wait must stall exactly to the next frame boundary"
+    );
+    assert!(to_edge < frame_ticks, "and never a whole frame");
+    assert!(
+        !machine.margo().display_start_pending(),
+        "the stall must carry the machine THROUGH the boundary, so the flip is \
+         live when the caller returns"
+    );
+    assert_eq!(machine.margo().display().start, 640 * 480);
+}
+
+/// The batch cap owes the same edge. `Machine::vega_edge_ticks` arms a deadline
+/// on a pending `DISP_START` so no batch can run past the boundary that applies
+/// it -- otherwise a guest that flips and then polls would see the origin move
+/// up to a whole batch cap late, which on the coarse 1 ms cap is a sixteenth of
+/// a frame.
+#[test]
+fn margo_pending_display_start_caps_the_batch_at_the_frame_boundary() {
+    let frame_ticks = izarravm_core::MASTER_CLOCK_HZ / 60;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    // Walk up to within ~17 us of the boundary. The term only BINDS when the
+    // frame edge is nearer than the other caps: a whole 16.67 ms frame is far
+    // longer than the ~1 ms coarse cap, so a mid-frame test would assert
+    // nothing about this deadline and pass no matter what it did.
+    let to_edge = machine
+        .timeline
+        .master_ticks_until(
+            crate::timeline::DeviceClock::MargoFrame,
+            1,
+            crate::timeline::MARGO_FRAME_HZ,
+        )
+        .expect("the frame clock is running");
+    machine.advance_devices_ticks(to_edge - frame_ticks / 1_000);
+
+    // Nothing queued: the cap comes from some other, longer term.
+    let idle_cap = machine.event_batch_cap(u64::MAX);
+    assert!(machine.vega.program_display_start(640 * 480));
+    let edge_clocks = machine
+        .timeline
+        .cpu_clocks_until(
+            crate::timeline::DeviceClock::MargoFrame,
+            1,
+            crate::timeline::MARGO_FRAME_HZ,
+        )
+        .expect("the frame clock is running");
+    assert!(
+        edge_clocks < idle_cap,
+        "the frame edge must be shorter than the idle cap for this to be \
+         distinguishable (edge {edge_clocks}, idle {idle_cap})"
+    );
+    assert_eq!(
+        machine.event_batch_cap(u64::MAX),
+        edge_clocks,
+        "a queued flip must cap the batch at the frame boundary"
+    );
+}
+
+/// GUARANTEE 2: the palette is sampled ONCE per scanout, so a frame is decoded
+/// entirely under one DAC state -- no tearing between the top and bottom of the
+/// screen, and no stale palette carried across frames.
+///
+/// BE PRECISE ABOUT WHAT THIS CAN AND CANNOT SHOW. The "once per scanout" half
+/// is enforced by the TYPE, not by this test: `Margo::scanout_argb(&palette)`
+/// receives one immutable snapshot the caller sampled before the call, so there
+/// is no seam through which a second DAC state could enter, and nothing a test
+/// can do from outside will mutate the palette part-way down the surface.
+///
+/// What the assertions actually pin is the pair of properties that WOULD break
+/// if that structure were dismantled: every pixel of a capture decodes through
+/// the correct entry for its own index -- so a scanout that re-mapped part of
+/// the surface through anything else is caught -- and the next capture picks up
+/// a palette change, so a cached or stale snapshot is caught. Mutations N5 and
+/// N6 are the two shapes, and both fail here.
+#[test]
+fn margo_scanout_decodes_a_whole_frame_under_one_palette_snapshot() {
+    const RED: u32 = 0x00ff_0000;
+    const GREEN: u32 = 0x0000_ff00;
+    const BLUE: u32 = 0x0000_00ff;
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    // Index 0 on the top half of the surface, index 1 on the bottom half, so a
+    // scanout that changed palettes part-way down would split along the same
+    // axis and be caught by the per-half colour sets below.
+    for y in 0..480usize {
+        let index = u8::from(y >= 240);
+        for x in 0..640usize {
+            machine.vega.margo_mut().write_vram_u8(y * 640 + x, index);
+        }
+    }
+    // 6-bit DAC components; 0x3F bit-replicates to 0xFF in the ARGB the scanout emits.
+    machine.video_mut().set_dac_entry(0, 0x3f, 0x00, 0x00);
+    machine.video_mut().set_dac_entry(1, 0x00, 0x3f, 0x00);
+
+    fn halves(machine: &mut Machine) -> (Vec<u32>, Vec<u32>) {
+        let (words, width, height) = machine.frame_argb();
+        assert_eq!((width, height), (640, 480));
+        let mut top: Vec<u32> = words[..width * 240].to_vec();
+        let mut bottom: Vec<u32> = words[width * 240..].to_vec();
+        top.sort_unstable();
+        top.dedup();
+        bottom.sort_unstable();
+        bottom.dedup();
+        (top, bottom)
+    }
+
+    assert_eq!(
+        halves(&mut machine),
+        (vec![RED], vec![GREEN]),
+        "each half must be a single colour: one palette snapshot, no tearing"
+    );
+
+    machine.video_mut().set_dac_entry(0, 0x00, 0x00, 0x3f);
+    assert_eq!(
+        halves(&mut machine),
+        (vec![BLUE], vec![GREEN]),
+        "the next scanout must sample the CURRENT palette, not a cached one"
+    );
+}
+
 /// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
 /// separate a LINEAR 4F02 request (bit 0x4000) from a banked one, and must
 /// count only ACCEPTED mode sets. A rejected mode leaves both alone -- otherwise
