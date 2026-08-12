@@ -19,16 +19,22 @@ const MEMORY_LEN: usize = 0x20_000;
 // everything the first one missed) would not be caught here. It is a check on retirement count,
 // not a general truncation detector.
 //
-// `index & 15 == 0` and `== 1` deliberately aim the first `0x8b` load at a cold or page-
-// straddling target (see `memory_target` below), so that ONE load takes a genuine, pre-existing
-// unresolved-static-unbound exit and re-enters through a second native block instead of
-// continuing the first. That is a real split, not a truncation, so it costs one instruction off
-// the fully-native count; `GeneratedCase::cold_memory_target` records which cases hit it so the
-// comparison below can expect the right number instead of a single constant.
+// `index & 15 == 1` deliberately aims the first `0x8b` load at a PAGE-STRADDLING target (see
+// `memory_target` below), so that ONE load takes a genuine, pre-existing exit and re-enters
+// through a second native block instead of continuing the first. That is a real split, not a
+// truncation, so it costs one instruction off the fully-native count;
+// `GeneratedCase::memory_slot_exits` records which cases hit it so the comparison below can
+// expect the right number instead of a single constant.
+//
+// `index & 15 == 0` used to be bundled in with it. Its target `0x1_8001` is MISALIGNED but
+// page-local, and before guard 3 the wide-access guard refused it exactly as it refuses the
+// straddling one, so the two looked like a single "cold or unaligned" class. They are not: the
+// guard is now two halves and only the page-CROSSING half still refuses, so case 0 retires its
+// memory slot natively and case 1 does not. Splitting them is what keeps this constant a real
+// check rather than a number that absorbs whatever the backend happens to do.
 // 31 until the 2026-08-09 group-2 slice added the `0xC0 /4` SHL r8 slot beside the rotate.
 const GENERATED_BLOCK_NATIVE_INSTRUCTIONS: u64 = 32;
-const GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY: u64 =
-    GENERATED_BLOCK_NATIVE_INSTRUCTIONS - 1;
+const GENERATED_BLOCK_NATIVE_INSTRUCTIONS_SLOT_EXITS: u64 = GENERATED_BLOCK_NATIVE_INSTRUCTIONS - 1;
 
 #[derive(Debug)]
 struct GeneratedCase {
@@ -38,7 +44,8 @@ struct GeneratedCase {
     gpr: [u32; 8],
     eflags: u32,
     cap: u64,
-    cold_memory_target: bool,
+    /// This case's memory slot takes a side exit, so one fewer instruction retires natively.
+    memory_slot_exits: bool,
 }
 
 struct Rng(u64);
@@ -86,10 +93,12 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     let data = 0x1_0000 + index * 0x40;
     let op = ((index + mode_offset) & 7) as u8;
     let byte_lane = ((index + mode_offset) & 7) as u8;
-    let cold_memory_target = matches!(index & 15, 0 | 1);
+    let memory_slot_exits = index & 15 == 1;
     let memory_target = match index & 15 {
-        0 => 0x1_8001, // isolated, unaligned page: the native map is deliberately cold
-        1 => 0x1_8fff, // dword straddles two pages
+        // Misaligned but PAGE-LOCAL: refused before guard 3, served natively after it.
+        0 => 0x1_8001,
+        // The dword straddles two pages, so the crossing bound refuses it at every site.
+        1 => 0x1_8fff,
         _ => data,
     };
     let mut bytes = Vec::with_capacity(128);
@@ -231,7 +240,7 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
         gpr,
         eflags,
         cap: 256 + u64::from(rng.u32() & 3) * 128,
-        cold_memory_target,
+        memory_slot_exits,
     }
 }
 
@@ -335,6 +344,13 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) {
     for bus in [&mut interpreter_bus, &mut direct_bus] {
         bus.direct_pages_enabled = true;
         bus.direct_page_clocks = true;
+        // The randomized sweep generates MISALIGNED wide accesses, which the JIT now serves inside
+        // the block. It charges one wide cycle plus `bytes - 1` byte cycles where the interpreter
+        // charges `bytes` byte cycles -- equal on the production bus, because `clocks_for` ignores
+        // width, and unequal on `TestBus`'s default 0/1/3 dial. Flatten the dial so the fixture
+        // satisfies the premise the charge model is built on and the bus-clock EQUALITY below
+        // means what it says, rather than being weakened to an inequality or an allowance.
+        bus.flat_direct_page_clocks = true;
     }
 
     for case in &cases {
@@ -375,8 +391,8 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) {
             interpreter_bus.trace.elapsed_clocks(),
             "bus clocks differ: {case:#?}"
         );
-        let expected_native_instructions = if case.cold_memory_target {
-            GENERATED_BLOCK_NATIVE_INSTRUCTIONS_COLD_MEMORY
+        let expected_native_instructions = if case.memory_slot_exits {
+            GENERATED_BLOCK_NATIVE_INSTRUCTIONS_SLOT_EXITS
         } else {
             GENERATED_BLOCK_NATIVE_INSTRUCTIONS
         };
@@ -432,17 +448,16 @@ fn assert_measured_pair(
 /// missing, doubled or mis-sized fails here exactly as it would in a dedicated fixture.
 ///
 /// Why the two roles legitimately differ at all, since every other case in this file requires them
-/// to agree: guard 3 serves a page-local misaligned access inside the block and charges it one
-/// wide cycle plus `bytes - 1` byte cycles, while `lookup_access` refuses a misaligned width on
-/// the interpreted side, so that role leaves the FastMap for `TestBus::read_memory` -- a single
-/// cycle at zero wait states, no split. On the real `MachineBus` the two are EQUAL, because
-/// `BusCycle::clocks_for` ignores width there and the interpreter's `should_split` turns the
-/// access into a byte run; `TestBus` models neither, so the equality cannot be stated here and the
-/// difference is pinned as an exact number instead.
+/// to agree: guard 3 charges a page-local misaligned access as one WIDE cycle plus `bytes - 1`
+/// byte cycles, while the interpreted role charges `bytes` BYTE cycles through
+/// `charge_direct_ram_split`. The `bytes - 1` byte cycles cancel, and what remains is that
+/// `TestBus`'s direct dial is width-DEPENDENT, so its wide cycle and its byte cycle are not the
+/// same size.
 ///
-/// The clause about `lookup_access` is the one that expires: the interpreter-datapath slice
-/// deletes that alignment rung. When this branch rebases onto it, re-derive the callers' expected
-/// deltas and rewrite this paragraph to describe whatever the interpreted role then does.
+/// On a real `MachineBus` they are: `BusCycle::clocks_for` ignores width, the residual is zero,
+/// and the two roles agree exactly. That equality is the charge claim this slice rests on and is
+/// asserted directly in `machine_bus_timing_test.rs`. It cannot be stated against `TestBus`, so
+/// the fixture artifact is pinned as an exact number instead of being papered over with slack.
 #[allow(clippy::too_many_arguments)]
 fn assert_measured_pair_with_split(
     interpreter: &mut CpuGsw,
@@ -638,7 +653,7 @@ fn paging_alias_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
-        cold_memory_target: false,
+        memory_slot_exits: false,
     }
 }
 
@@ -723,7 +738,7 @@ fn linked_successor_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 4096,
-        cold_memory_target: false,
+        memory_slot_exits: false,
     }
 }
 
@@ -791,7 +806,7 @@ fn unaligned_cross_page_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
-        cold_memory_target: false,
+        memory_slot_exits: false,
     }
 }
 
@@ -832,15 +847,15 @@ fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
     let exits = direct
         .perf_counters()
         .jit_direct_exit_cross_page_or_alignment;
-    // One dword cycle plus three byte cycles at TestBus's dials (5 + 3*2), less the single
-    // non-splitting cycle the interpreted role pays (2), for the ONE misaligned in-page read.
+    // The ONE misaligned in-page read, at TestBus's dials. Native charges one dword cycle (5) plus
+    // three byte cycles from the split deposit (3*2); the interpreted role charges four byte
+    // cycles (4*2), because `FastMap::lookup_access` no longer refuses a misaligned width and the
+    // charge routes to `charge_direct_ram_split`. The three deposited byte cycles appear on both
+    // sides and cancel, leaving the dword-versus-byte dial difference: 5 - 2.
     //
-    // REBASE HAZARD: the trailing `- 2` is what the interpreted role pays only while
-    // `FastMap::lookup_access` still refuses a misaligned width. The interpreter-datapath slice
-    // deletes that rung and serves the access directly as a byte run. This assertion is exact, so
-    // it fails loudly; RE-DERIVE the term rather than tuning it. See the same note on
-    // `INTERPRETED_MISALIGNED_CLOCKS` in `cpu_jit_misaligned_memory_test.rs`.
-    const SPLIT_BUS_CLOCKS: u64 = 5 + 3 * 2 - 2;
+    // On a real `MachineBus` this residual is ZERO -- `clocks_for` ignores width -- which is the
+    // charge equality itself, asserted in `machine_bus_timing_test.rs`.
+    const SPLIT_BUS_CLOCKS: u64 = 5 - 2;
     assert!(
         assert_measured_pair_with_split(
             &mut interpreter,
@@ -883,7 +898,7 @@ fn faulting_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
-        cold_memory_target: false,
+        memory_slot_exits: false,
     }
 }
 
@@ -979,7 +994,7 @@ fn watched_store_case(value: u32, target: u32) -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 256,
-        cold_memory_target: false,
+        memory_slot_exits: false,
     }
 }
 
@@ -1185,7 +1200,7 @@ fn a20_case() -> GeneratedCase {
         gpr,
         eflags: 0x202,
         cap: 128,
-        cold_memory_target: false,
+        memory_slot_exits: false,
     }
 }
 

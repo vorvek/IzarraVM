@@ -2777,6 +2777,24 @@ struct TestBus {
     // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
     // timing-free, so keep that default and let direct-memory differential tests request clocks.
     direct_page_clocks: bool,
+    // Make the direct-page dial width-INDEPENDENT, mirroring the production bus.
+    //
+    // `TestBus`'s dial charges 0/1/3 wait states for Byte/Word/Dword, which `MachineBus` does not:
+    // there, `BusCycle::clocks_for` ignores width entirely and one byte cycle costs exactly what
+    // one dword cycle costs. That difference is invisible until something charges the SAME access
+    // two different ways -- which is exactly what a natively-served MISALIGNED access does. The
+    // JIT charges it as one wide cycle plus `bytes - 1` byte cycles; the interpreter charges it as
+    // `bytes` byte cycles through `charge_direct_ram_split`. Those are equal on the production bus
+    // and differ by `wide - byte` here, so a differential fixture asserting bus-clock EQUALITY
+    // cannot hold on a width-dependent dial no matter which role is right.
+    //
+    // Setting this makes the fixture satisfy the premise the production charge model is built on,
+    // so the equality assertion means what it says. The trade, stated rather than hidden: with a
+    // flat dial the bus-clock axis can no longer distinguish an access's WIDTH, so a lowering that
+    // widened an access would have to be caught by guest RAM or by the registers instead -- which
+    // is where a widened access shows up anyway, and every fixture that keeps the default dial
+    // still has the clock axis too. Default false, so no existing test's numbers move.
+    flat_direct_page_clocks: bool,
     // Opt-in batch-clock reporting for tight event-budget tests. Historical CPU tests leave it
     // off because their TestBus predates machine-level combined core/bus caps.
     report_batch_clocks: bool,
@@ -2821,6 +2839,7 @@ impl TestBus {
             deny_instruction_prefetch_direct_page: false,
             uniform_native_fetches: false,
             direct_page_clocks: false,
+            flat_direct_page_clocks: false,
             report_batch_clocks: false,
             batch_bus_scale: (1, 1),
             page_walk_bound_available: true,
@@ -2835,6 +2854,15 @@ impl TestBus {
             mode13_word_writes: 0,
             mode13_dword_writes: 0,
             direct_mapping_epoch: 1,
+        }
+    }
+
+    /// The direct-page dial actually charged, honouring `flat_direct_page_clocks`.
+    fn direct_dial(&self, width: BusWidth) -> u8 {
+        if self.flat_direct_page_clocks {
+            Self::direct_page_wait_states(BusWidth::Byte)
+        } else {
+            Self::direct_page_wait_states(width)
         }
     }
 
@@ -3115,7 +3143,7 @@ impl CpuBus for TestBus {
         if self.direct_page_clocks {
             u64::from(izarravm_bus::BusCycle::clocks_for(
                 width,
-                Self::direct_page_wait_states(width),
+                self.direct_dial(width),
             ))
         } else {
             0
@@ -3207,7 +3235,7 @@ impl CpuBus for TestBus {
             let wait_states = if (0x000a_0000..0x000b_0000).contains(&address) {
                 Self::mode13_wait_states(width)
             } else {
-                Self::direct_page_wait_states(width)
+                self.direct_dial(width)
             };
             self.trace.record(kind, address, width, wait_states);
         }
@@ -3228,7 +3256,7 @@ impl CpuBus for TestBus {
     ) -> Result<(), BusError> {
         if self.direct_page_clocks {
             self.trace
-                .record(kind, address, width, Self::direct_page_wait_states(width));
+                .record(kind, address, width, self.direct_dial(width));
         }
         Ok(())
     }

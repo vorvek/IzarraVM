@@ -20,20 +20,22 @@
 //! | non-relaxed sites still exit | a site being relaxed that this slice does not touch |
 //! | the split charge | the deposit being omitted, or sized `bytes()` instead of `bytes() - 1` |
 //!
-//! **The bus-clock comparison against the interpreter is NOT the shape used here, and that is a
-//! substantive point rather than a convenience.** The design's charge-equality claim -- a
-//! misaligned N-byte access costs N byte cycles natively and interpreted alike -- is a property of
-//! `MachineBus`, where `BusCycle::clocks_for` ignores width and the interpreter's `should_split`
-//! turns a misaligned access into N byte reads. `TestBus` models neither: its direct-page wait
-//! states are width-dependent (0/1/3 for Byte/Word/Dword) and its slow read path charges ONE cycle
-//! at zero wait states without splitting. A `native == interpreted` bus-clock assertion here would
-//! therefore assert something false about `TestBus` while proving nothing about the real bus.
+//! **The bus-clock comparison against the interpreter is NOT a plain equality here, and the reason
+//! is a `TestBus` modelling artifact rather than a divergence.** The design's charge-equality claim
+//! -- a misaligned N-byte access costs N byte cycles natively and interpreted alike -- is a
+//! property of `MachineBus`, where `BusCycle::clocks_for` ignores width. `TestBus`'s direct-page
+//! wait states are width-DEPENDENT (0/1/3 for Byte/Word/Dword), so the one wide cycle the native
+//! side charges is not the same size as the byte cycle the interpreted side charges in its place.
 //!
-//! So the rows below assert the exact bus-clock DELTA at `TestBus`'s own dials instead, which is
-//! strictly sharper for the thing this slice can get wrong: it pins that a misaligned N-byte
-//! access charges one wide cycle plus exactly `N - 1` byte cycles. Off-by-one in either direction
-//! fails. The charge EQUALITY against the real bus is asserted at the dial level in
-//! `izarravm-machine`'s `machine_bus_timing_test.rs`, where a real `MachineBus` exists.
+//! Both sides now emit `N - 1` byte cycles for the split -- native from the stub deposit,
+//! interpreted from `charge_direct_ram_split`, since `FastMap::lookup_access` no longer refuses a
+//! misaligned width -- so those terms cancel and the whole residual is `wide_cycle - byte_cycle`.
+//! On a real `MachineBus` that residual is exactly ZERO, which is the charge equality itself,
+//! asserted at the dial level in `izarravm-machine`'s `machine_bus_timing_test.rs`.
+//!
+//! So the rows below assert that exact residual, which is sharper than an equality would be: the
+//! deposit is matched term-for-term by the interpreter's own split, so an omitted, doubled or
+//! mis-sized deposit moves the number immediately.
 //!
 //! Everything else -- registers, lazy flags, EFLAGS, the halt latch, core clocks and the WHOLE of
 //! guest RAM -- is still compared against a block-free interpreted role, and the whole-array RAM
@@ -71,30 +73,31 @@ fn direct_cycle_clocks(bytes: u32) -> u64 {
     }
 }
 
-/// What the block-free interpreted role pays for ONE misaligned access: `lookup_access` refuses a
-/// misaligned width outright, so the access leaves the FastMap and lands on `TestBus::read_memory`
-/// / `write_memory`, which record a single cycle at zero wait states and never split.
+/// What a natively-served misaligned `bytes`-wide access costs OVER the interpreted role, at
+/// `TestBus`'s dials.
 ///
-/// **REBASE HAZARD — this constant is derived from a rung that the interpreter-datapath slice
-/// DELETES.** That branch removes the alignment rejection from `FastMap::lookup_access` (its
-/// replacement comment reads "PAGE-LOCALITY ONLY … Do not 'restore' it here") so that the
-/// interpreter serves a misaligned page-local access directly as a byte run instead of leaving the
-/// FastMap. Nothing in this file conflicts textually with that change: it will merge CLEAN and
-/// this number will simply be wrong.
+/// Derived, not measured, and the derivation is the interesting part:
 ///
-/// It fails loudly rather than silently — every user is an `assert_eq!` on an exact delta — and
-/// the delta stays non-zero and still discriminates afterwards. **RE-DERIVE it from the
-/// post-rebase interpreted path and rewrite the paragraph above; do not tune it until the suite
-/// goes green.** The charge EQUALITY on the real bus is unaffected: that branch's
-/// `charge_direct_ram_split` reproduces the identical N x byte-cycle charge.
-const INTERPRETED_MISALIGNED_CLOCKS: u64 = 2;
-
-/// The bus-clock delta a natively-served misaligned `bytes`-wide access must produce against the
-/// interpreted role, at `TestBus`'s dials: one wide cycle for the access the static count already
-/// carries, plus `bytes - 1` byte cycles from the split deposit, less what the interpreter paid.
+/// * **Native** charges one WIDE cycle — the one the block's static count already carries — plus
+///   `bytes - 1` byte cycles from the split deposit.
+/// * **Interpreted** now charges `bytes` BYTE cycles. `FastMap::lookup_access` no longer has an
+///   alignment rung, so a misaligned page-local access is SERVED from the fast map rather than
+///   leaving it, and the charge routes to `CpuBus::charge_direct_ram_split` — whose default
+///   implementation is `bytes` calls to `charge_direct_ram_memory` at `BusWidth::Byte`, which is
+///   what `TestBus` inherits.
+///
+/// So the difference collapses to `wide_cycle(bytes) - byte_cycle`: the `bytes - 1` byte cycles
+/// appear on BOTH sides and cancel. **Everything that remains is `TestBus`'s width-DEPENDENT
+/// direct dial** (0/1/3 wait states for Byte/Word/Dword). On a real `MachineBus`, where
+/// `BusCycle::clocks_for` ignores width, this quantity is exactly ZERO — which is the charge
+/// equality this slice rests on, asserted directly in `machine_bus_timing_test.rs`.
+///
+/// That makes the residual here a pure fixture artifact rather than a divergence, and it is a
+/// sharper assertion than it was before the interpreter slice landed: the deposit is now matched
+/// term-for-term by the interpreter's own split, so an omitted, doubled or mis-sized deposit moves
+/// this number immediately.
 fn expected_split_delta(bytes: u32) -> u64 {
-    direct_cycle_clocks(bytes) + u64::from(bytes - 1) * direct_cycle_clocks(1)
-        - INTERPRETED_MISALIGNED_CLOCKS
+    direct_cycle_clocks(bytes) - direct_cycle_clocks(1)
 }
 
 /// A distinct byte at every address, so a store of the wrong WIDTH or the wrong VALUE changes
@@ -333,10 +336,13 @@ fn lowered_misaligned(body: &[u8], bytes: u32, context: &str) {
         roles.interp.cycle(&mut roles.interp_bus).unwrap();
     }
     compare_state(&roles, context);
+    // Additive rather than a subtraction of the two totals: a mutation that DROPS the deposit
+    // makes the native role cheaper than the interpreted one, and `u64` subtraction would panic on
+    // the underflow instead of reporting the two numbers.
     assert_eq!(
-        roles.native_bus.trace.elapsed_clocks() - roles.interp_bus.trace.elapsed_clocks(),
-        expected_split_delta(bytes),
-        "{context}: the split charge must be one wide cycle plus {} byte cycles",
+        roles.native_bus.trace.elapsed_clocks(),
+        roles.interp_bus.trace.elapsed_clocks() + expected_split_delta(bytes),
+        "{context}: native must charge one wide cycle plus {} byte cycles where the interpreter          charges {bytes} byte cycles",
         bytes - 1
     );
 }
@@ -747,8 +753,8 @@ fn a_misaligned_store_writes_its_own_value_not_the_previous_slots() {
     );
     compare_state(&roles, "two stores, the second misaligned");
     assert_eq!(
-        roles.native_bus.trace.elapsed_clocks() - roles.interp_bus.trace.elapsed_clocks(),
-        expected_split_delta(2),
+        roles.native_bus.trace.elapsed_clocks(),
+        roles.interp_bus.trace.elapsed_clocks() + expected_split_delta(2),
         "exactly one of the two stores is misaligned"
     );
 }
