@@ -819,18 +819,34 @@ pub(super) fn emit_code_watch_table_branch(
     // probing each bit, load a window over the mask and test a shifted constant against it. One
     // load, one dynamic shift, one AND, for EVERY width.
     //
-    // `n` is computed here, at emit time, from the width alone. That is offset-independent only
-    // because `emit_wide_page_guard` refuses unaligned accesses and `CHUNK_SHIFT <= 2` keeps every
-    // aligned width inside one granule walk -- at a shift of 3 a 4-aligned Qword at offset 4 mod 8
-    // would span two granules while this formula says one, a MISSED invalidation. `code_watch.rs`
-    // const-asserts that precondition beside the shift itself.
-    let n = ((width.bytes() - 1) >> NATIVE_CHUNK_SHIFT) + 1;
+    // `n` is computed here, at emit time, from the width alone, and it is the granule span an
+    // access of this width can reach at ANY offset: an N-byte access starting anywhere inside a
+    // granule touches at most `ceil((N + G - 1) / G)` of them, which is the expression below.
+    //
+    // Written as a worst case rather than as the ALIGNED span because the alignment test is no
+    // longer emitted at every call site -- the lean one-lookup load and store sites serve
+    // misaligned page-local accesses natively -- so the count must not depend on an alignment
+    // nobody promises. At `CHUNK_SHIFT == 0` (the shipped granule) `GRANULE_MASK` is zero and this
+    // is identical to the aligned formula, so the repair emits byte-identical code today; its only
+    // evidence is a mutation that raises the shift and stores at an ODD offset.
+    //
+    // Erring high is safe in one direction only, and that is the direction taken: a larger `n` can
+    // report a MISS on a granule the access does not touch -- a false WATCHED, i.e. a spurious side
+    // exit -- never a missed invalidation. `code_watch.rs` const-asserts that the widest access's
+    // worst-case span still fits the 32-bit window this guard tests.
+    const GRANULE_MASK: u32 = (1 << NATIVE_CHUNK_SHIFT) - 1;
+    let n = ((width.bytes() - 1 + GRANULE_MASK) >> NATIVE_CHUNK_SHIFT) + 1;
 
     if n == 1 {
         // One granule, one probe: the window sequence below is bigger than a single `bt`, and byte
         // stores dominate Doom's inner loop, so the whole change only SHRINKS emitted code if this
         // case keeps the cheap form. At `CHUNK_SHIFT == 0` the granule index IS the page offset,
         // so the shift is omitted entirely rather than emitted as `shr ecx, 0`.
+        //
+        // Under the worst-case `n` above, `n == 1` requires `width.bytes() == 1` at EVERY shift --
+        // a Byte access, which cannot straddle a granule at any offset. So the single-`bt` form
+        // stays exactly right once alignment is no longer promised; it is not reachable by a wide
+        // access that merely happens to be aligned.
         e.mov_r32_r32(Reg::RCX, Reg::RAX);
         e.and_r32_imm32(Reg::RCX, 0x0fff);
         if NATIVE_CHUNK_SHIFT != 0 {

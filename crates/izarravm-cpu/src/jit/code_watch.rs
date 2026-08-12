@@ -81,19 +81,25 @@ const _: () = assert!(
     "the last byte of a page must index a bit inside the chunk mask"
 );
 
-// The guard counts the granules an access spans at EMIT time, from the width alone:
-// `n = ((width.bytes() - 1) >> CHUNK_SHIFT) + 1`. That count is independent of the access's offset
-// only while the backend's alignment guarantee keeps every legal access inside one granule walk.
-// `emit_wide_page_guard` refuses unaligned accesses and the strongest alignment it promises is 4
-// bytes, so at a shift of 3 a 4-aligned Qword sitting at offset 4 mod 8 spans TWO granules while
-// the formula says one, and the second granule's bit is never tested. That is a missed
-// invalidation: no fault, no counter, nothing until the overwritten code runs. Pin the
-// precondition here, next to the shift it constrains, rather than in the emitter that consumes it.
-// Written against the granule SIZE rather than as `CHUNK_SHIFT <= 2` because at a shift of 0 the
-// latter compares against the type's minimum and clippy rejects it as always true.
+// The guard counts the granules an access spans at EMIT time, from the width alone, as the
+// WORST CASE over every offset: `n = ((width.bytes() - 1 + (G - 1)) >> CHUNK_SHIFT) + 1` with
+// `G = 1 << CHUNK_SHIFT`. It used to count the ALIGNED span and this assert used to legalise that
+// by pinning the granule size at or below the emitter's weakest alignment promise (4 bytes), so
+// that no legal access could straddle. The emitter no longer earns that premise: the lean
+// one-lookup load and store sites serve MISALIGNED page-local accesses natively, so the span has
+// to hold at any offset and the count is computed that way instead.
+//
+// What must hold now is the window bound the multi-granule arm relies on. That arm loads a 32-bit
+// window over the mask and tests `(1 << n) - 1` shifted left by `r = (address >> CHUNK_SHIFT) & 7`,
+// so the highest tested bit is `r + n - 1` with `r <= 7`; `r + n <= 32` keeps every tested bit
+// inside the window. Checked against the widest access the emitter can guard, Tbyte at ten bytes.
+// Pin it here, next to the shift it constrains, rather than in the emitter that consumes it.
+const WIDEST_GUARDED_ACCESS_BYTES: usize = 10;
+const WIDEST_GRANULE_SPAN: usize =
+    ((WIDEST_GUARDED_ACCESS_BYTES - 1 + ((1_usize << CHUNK_SHIFT) - 1)) >> CHUNK_SHIFT) + 1;
 const _: () = assert!(
-    (1_usize << CHUNK_SHIFT) <= 4,
-    "the emitted guard's granule count is offset-independent only up to 4-byte granules"
+    7 + WIDEST_GRANULE_SPAN <= 32,
+    "the emitted guard's granule window must cover the widest access at any offset"
 );
 
 /// A page's granule bits, plus ONE trailing word of padding that is never set.
