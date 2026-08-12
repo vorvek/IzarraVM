@@ -458,11 +458,19 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         // than a blanket refusal, or that regresses.
                         //
                         // A missed lowering rather than a hazard, and the reason is economics.
-                        // `emit_wide_page_guard` refuses every odd word address, and 16-bit DOS
-                        // code has no alignment discipline. Today an odd operand simply ends the
-                        // block; admitted, it sits INSIDE the block and side-exits at that slot
-                        // on every execution, so nothing after it retires natively. Admit it when
-                        // a census row prices that exit.
+                        // 16-bit DOS code has no alignment discipline, and an `AluMemDest` slot
+                        // lowers through `emit_alu_mem_dest` -- one of the ELEVEN memory sites
+                        // that still refuse a misaligned access outright. Guard 3 relaxed only the
+                        // two lean one-lookup sites (the plain load and the plain store), so
+                        // naming the guard here would now be wrong: the refusal is the SITE's, not
+                        // the guard's. Admitted today, an odd operand would sit INSIDE the block
+                        // and side-exit at that slot on every execution, so nothing after it
+                        // retires natively.
+                        //
+                        // This is the hook for the read-modify-write follow-on. An RMW slot needs
+                        // a read deposit AND a write deposit inside one slot -- guard 3's stubs
+                        // each carry one -- which is what has to be built before this arm can be
+                        // opened, not a census row.
                         DecodedOperand::Mem(_)
                             if insn.operand_size == OperandSize::Word && op != 7 =>
                         {

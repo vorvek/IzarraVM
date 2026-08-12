@@ -54,7 +54,7 @@
 //! | `emit_alu_mem_dest`'s Word READ -> `load_r32_disp8` | `the_word_memory_alu_*` | lazy flags |
 //! | `emit_alu_candidate`'s Word arm -> `alu_r32_r32` | `the_word_memory_alu_*` | lazy flags, at `add ..., 0x80` |
 //! | `emit_commit_alu_candidate`'s Word `width_tag` -> `0x200` | `the_word_memory_alu_*` | lazy flags |
-//! | `needs_alignment_guard` -> `!matches!(self, Byte \| Word)` | `a_misaligned_word_operand_*` | retirement count, 3 where 1 is allowed |
+//! | `needs_alignment_guard` -> `!matches!(self, Byte \| Word)` | `a_misaligned_word_read_modify_write_still_exits_*` | retirement count, 3 where 1 is allowed. **Re-derived after guard 3**, and the row changed shape: it used to be caught by three fixtures at once, and two of those now run misaligned Word accesses NATIVELY. What still discriminates is the read-modify-write row, which lowers through a site guard 3 did not relax — so the mutation removes the only guard that row has |
 //! | dropping `emit_watched_store_guard` from `emit_store`'s RAM arm | `a_watched_word_store_*` | retirement count, 3 where 1 is allowed |
 //!
 //! The first row is the one that matters most: it is the pre-slice emitter verbatim, so it says

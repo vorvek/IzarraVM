@@ -585,10 +585,13 @@ fn word_size_alu_carry_forms_stay_refused() {
 /// The MEMORY shapes of forms 1 and 3 stay refused at Word size while their Dword shapes ship.
 ///
 /// A missed lowering rather than a hazard, and the reason is economics rather than semantics:
-/// `emit_wide_page_guard` refuses every odd word address, and 16-bit DOS code has no alignment
-/// discipline. Refused, an odd operand ends the block. Admitted, it sits inside the block and
-/// side-exits at that slot on every execution, so nothing after it retires natively. The Dword
-/// rows in the same arms must keep compiling, which is the second half of what this asserts.
+/// 16-bit DOS code has no alignment discipline, and these forms lower through the read-modify-write
+/// memory site, one of the eleven that still refuse a misaligned access outright. (Guard 3 relaxed
+/// only the two lean one-lookup sites, so the refusal is the SITE's rather than the guard's --
+/// this comment used to name `emit_wide_page_guard` and would now be wrong.) Refused, an odd
+/// operand ends the block. Admitted, it sits inside the block and side-exits at that slot on every
+/// execution, so nothing after it retires natively. The Dword rows in the same arms must keep
+/// compiling, which is the second half of what this asserts.
 ///
 /// CMP is the exception and it is load-bearing rather than an inconsistency: `0x39` and `0x3b`
 /// have been compiling word memory in quake's renderer since before this slice, and they do not

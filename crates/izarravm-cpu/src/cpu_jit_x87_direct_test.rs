@@ -2116,10 +2116,14 @@ fn a_lowered_fldcw_is_visible_to_a_later_fistp_in_the_same_block() {
     );
 }
 
-/// THE ALIGNMENT-WIDTH TEST. `emit_wide_page_guard` refuses any access not aligned to
-/// `width.bytes()`, so a control word pinned at `MemoryWidth::Dword` side-exits at every address
-/// that is 2-aligned but not 4-aligned. Quake keeps the saved and the chop-mode word in adjacent
-/// 2-byte slots, so one of each pair is always in that state.
+/// THE ALIGNMENT-WIDTH TEST. The x87 memory site refuses any access not aligned to its
+/// `alignment_bytes()`, so a control word pinned at `MemoryWidth::Dword` side-exits at every
+/// address that is 2-aligned but not 4-aligned. Quake keeps the saved and the chop-mode word in
+/// adjacent 2-byte slots, so one of each pair is always in that state.
+///
+/// Still true after guard 3, and worth saying why rather than leaving it to be re-derived: that
+/// slice relaxed the alignment half of the guard at the two LEAN one-lookup sites only. The x87
+/// site is not one of them and refuses exactly as before.
 ///
 /// 0x202 is deliberate. The other x87 fixtures in this file sit at 4-aligned addresses and could
 /// not tell the two widths apart.
@@ -2629,6 +2633,9 @@ fn fcom_m64_condition_bits_match_the_interpreter_above_equal_and_below() {
 /// decision. `DATA + 4` is 4-aligned (0x204) but not 8-aligned, and the guard must admit it:
 /// the interpreter's `read_qword` requires only 4-alignment per half (`fpu_exec.rs:720-740`),
 /// so an 8-byte alignment requirement here would wrongly refuse a legitimate access.
+///
+/// Guard 3 does not widen this. The x87 site keeps both halves of the guard pointed at its side
+/// exit, so a 2-aligned m64 is still refused and this row is still the boundary it was.
 fn four_aligned_m64_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;
