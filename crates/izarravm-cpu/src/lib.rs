@@ -112,6 +112,18 @@ static WRITE_WATCH_LIMIT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(WRITE_WATCH_REPORT_LIMIT_DEFAULT);
 const WRITE_WATCH_REPORT_LIMIT_DEFAULT: u32 = 200_000;
 
+/// How many watched stores have been reported this process. The report itself goes to `stderr`,
+/// which a unit test cannot capture in-process, so this is what makes the instrument ASSERTABLE:
+/// a test arms the watch, issues a store, and checks the count advanced.
+///
+/// That matters more here than the counter's own usefulness. This instrument's recorded failure
+/// mode is "silently sees nothing" -- it answers "no writes here" when the writes moved to a path
+/// that has no hook -- so every hook it has needs one execution proving it fires.
+#[cfg(feature = "watch-write")]
+pub fn write_watch_report_count() -> u32 {
+    WRITE_WATCH_REPORTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Raise or lower the watch report cap. Zero restores the default.
 pub fn set_write_watch_limit(limit: u32) {
     let limit = if limit == 0 {
@@ -1281,9 +1293,14 @@ pub struct FastMapAuditCounters {
     /// and deliberately bypasses the probe counters, so the reject counters and the probe counters
     /// have different denominators by design.
     pub slot_reject_misaligned: u64,
-    /// Rejections attributed to `offset + bytes > PAGE_SIZE`. Sized separately because a
-    /// page-crossing access is split into page-local fragments upstream and each fragment probes
-    /// again, so this counter and the probe counters do not divide the same way.
+    /// Rejections attributed to `offset + bytes > PAGE_SIZE`.
+    ///
+    /// EXACTLY ONE PER CROSSING SIZED ACCESS, and that is sharper than it looks. After 4g the only
+    /// site that can reject on page-cross is the entry probe: the fragment probe's one production
+    /// caller is `read/write_paged_cross_page`, which by construction hands it page-LOCAL
+    /// fragments, so it can never reject on this clause. The counter is therefore an exact census
+    /// of crossing sized accesses, which is what makes it the measure of the 1 + N probe cost the
+    /// reorder introduced -- and the reason to keep it after the alignment counters go.
     pub slot_reject_page_cross: u64,
     /// Rejections attributed to no storage, a dead page, an uncommitted bias, or an unavailable
     /// physical page -- the ordinary cold miss.

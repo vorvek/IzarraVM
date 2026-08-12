@@ -84,7 +84,8 @@ impl CpuGsw {
     /// Bundling the two here means a test cannot arm the map into a stale-mirror state at all.
     #[cfg(test)]
     pub(crate) fn set_fast_map_enabled_for_test(&mut self, enabled: bool) {
-        self.jit_direct.set_fast_map_enabled_for_test(enabled);
+        self.jit_direct
+            .set_fast_map_enabled_for_test_without_mirror_refresh(enabled);
         self.refresh_fast_map_serve_gate();
     }
 
@@ -257,6 +258,12 @@ impl CpuGsw {
             // makes `charge_direct_ram_split` a legal charge on the arm below. One test against a
             // discriminant already in a register, on the miss side of a branch the hit path
             // predicts perfectly.
+            // NOTE for whoever reconciles the counters: this arm bumps `fast_map_probe.misses`
+            // but does NOT call `note_slot_reject`, because `lookup_access` ADMITTED the access --
+            // there is no refused clause to attribute. So the five `slot_reject_*` counters do not
+            // sum to `fast_map_probe.misses`; the difference is exactly this arm's count. That is
+            // correct, not a discrepancy, and it is written here because it will not look correct
+            // to anyone adding the columns up.
             Some(access) if split && access.is_mode13() => {
                 self.fast_map_probe.misses += 1;
                 None
@@ -1461,8 +1468,26 @@ impl CpuGsw {
         // `fast_map_probe.misses` and the census counts. All of that is invisible to every state
         // assertion, which is why
         // `exactly_one_probe_and_one_census_note_per_page_local_sized_access` exists.
+        // The census note is SCOPED TO PAGE-LOCAL ACCESSES, and the crossing test is its second
+        // conjunct rather than a separate branch. `&&` short-circuits, so a default (disarmed) run
+        // never evaluates it and the reorder 4g bought is not given back.
+        //
+        // Why it has to be scoped. The probe moved above the crossing test; the census did not
+        // have to, and must not. A crossing access is split into page-local fragments that EACH
+        // note the census, so noting it here as well would count it 1 + N times where it used to
+        // count N. That is not merely an inflated total: `census_note_write` scores a
+        // read-modify-write pair when the same instruction already read the same linear PAGE, so
+        // an entry-level note at the first fragment's page -- while `last_read_page` still matches
+        // -- would MANUFACTURE a pair, and an instruction that reads then crossing-writes one page
+        // would score two where it scores one. A census that silently over-reports is exactly how
+        // a slice gets sized against a population that does not exist.
+        //
+        // The PROBE's own 1 + N on crossing accesses is real, deliberate and measured; see the
+        // crossing-test comment below and `slot_reject_page_cross`.
         #[cfg(feature = "jit")]
-        if self.rmw_census_enabled {
+        if self.rmw_census_enabled
+            && !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()))
+        {
             self.census_note_read(linear);
         }
         #[cfg(all(
@@ -1524,8 +1549,26 @@ impl CpuGsw {
         // `fast_map_probe.misses` and the census counts. All of that is invisible to every state
         // assertion, which is why
         // `exactly_one_probe_and_one_census_note_per_page_local_sized_access` exists.
+        // The census note is SCOPED TO PAGE-LOCAL ACCESSES, and the crossing test is its second
+        // conjunct rather than a separate branch. `&&` short-circuits, so a default (disarmed) run
+        // never evaluates it and the reorder 4g bought is not given back.
+        //
+        // Why it has to be scoped. The probe moved above the crossing test; the census did not
+        // have to, and must not. A crossing access is split into page-local fragments that EACH
+        // note the census, so noting it here as well would count it 1 + N times where it used to
+        // count N. That is not merely an inflated total: `census_note_write` scores a
+        // read-modify-write pair when the same instruction already read the same linear PAGE, so
+        // an entry-level note at the first fragment's page -- while `last_read_page` still matches
+        // -- would MANUFACTURE a pair, and an instruction that reads then crossing-writes one page
+        // would score two where it scores one. A census that silently over-reports is exactly how
+        // a slice gets sized against a population that does not exist.
+        //
+        // The PROBE's own 1 + N on crossing accesses is real, deliberate and measured; see the
+        // crossing-test comment below and `slot_reject_page_cross`.
         #[cfg(feature = "jit")]
-        if self.rmw_census_enabled {
+        if self.rmw_census_enabled
+            && !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()))
+        {
             self.census_note_write(linear);
         }
         #[cfg(all(

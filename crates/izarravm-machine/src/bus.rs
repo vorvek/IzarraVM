@@ -1067,7 +1067,7 @@ impl CpuBus for MachineBus<'_> {
     /// cosmetic-cache round trip). Collapsing the loop would change the modeled tag sequence and
     /// therefore canonical state, on a persona whose whole point is that it does not approximate.
     /// The temptation to "just use the run here too" is obvious and is the one wrong thing in this
-    /// function; the mutation test in `bus_split_charge_test.rs` exists to catch it.
+    /// function; the mutation test in `machine_bus_timing_test.rs` exists to catch it.
     fn charge_direct_ram_split(
         &mut self,
         address: u32,
@@ -1075,17 +1075,32 @@ impl CpuBus for MachineBus<'_> {
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
         let count = width.bytes();
+        // BOTH ARMS OWE THESE, so they are asserted before the branch rather than inside it.
+        //
+        // The Accurate arm gates A20 ONCE and then adds `i`, exactly as the flat arm collapses N
+        // gatings into one, so it leans on L-A20 and page-locality just as hard. A violation there
+        // is worse, not milder: it produces a wrong ADDRESS SEQUENCE, and this arm's addresses
+        // feed `data_access_wait_states`, whose modeled cache-tag mutations are CANONICAL STATE.
+        // Asserting only in the flat arm would have left the canonical-state arm -- the one whose
+        // whole reason for existing is that its tags must not be disturbed -- unguarded.
+        //
+        // L-A20: `A20_MASK` clears only bit 20 and a page is 4 KiB, so the 1 MiB boundary is
+        // always a page boundary; given page-locality, `apply_a20(base + i) == apply_a20(base) + i`
+        // for every `i < width.bytes()`.
+        debug_assert_eq!(self.apply_a20(address), address);
+        debug_assert!(
+            (address as usize & RAM_LOOKUP_PAGE_MASK) + count as usize <= RAM_LOOKUP_PAGE_SIZE
+        );
+        // L-RAM, checked over ALL N bytes rather than at the base. The flat arm NEEDS this (it
+        // hardcodes `cache.cost.l1` instead of asking `data_access_wait_states`); the Accurate arm
+        // would still be equal to the old loop without it, since that loop routed device bytes the
+        // same way. It is asserted for both anyway because it is a CALLER precondition of this
+        // method either way -- the aperture must never reach here.
+        debug_assert!((0..count).all(|i| {
+            let at = address.wrapping_add(i);
+            at < 0x000A_0000 || !self.is_device_window(at, BusWidth::Byte)
+        }));
         if self.flat_data_cost {
-            // L-A20: page-locality plus A20_MASK touching only bit 20 makes one gating equal N.
-            debug_assert_eq!(self.apply_a20(address), address);
-            debug_assert!(
-                (address as usize & RAM_LOOKUP_PAGE_MASK) + count as usize <= RAM_LOOKUP_PAGE_SIZE
-            );
-            // L-RAM, checked over ALL N bytes rather than at the base.
-            debug_assert!((0..count).all(|i| {
-                let at = address.wrapping_add(i);
-                at < 0x000A_0000 || !self.is_device_window(at, BusWidth::Byte)
-            }));
             self.trace
                 .record_memory_run(kind, address, count, BusWidth::Byte, self.cache.cost.l1);
             return Ok(());

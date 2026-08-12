@@ -36,6 +36,41 @@ fn flat_cpu_and_bus() -> (CpuGsw, TestBus) {
     (cpu, bus)
 }
 
+/// A PAGED fixture: two adjacent linear pages mapped to two adjacent physical frames, both
+/// writable and both primed into the FastMap. Paging must be ON for any crossing-scoped behaviour
+/// to be reachable at all -- `linear_range_crosses_page` is consulted only when it is.
+fn paged_cpu_and_bus() -> (CpuGsw, TestBus, u32) {
+    const DIRECTORY: u32 = 0x1000;
+    const TABLE: u32 = 0x2000;
+    const LINEAR: u32 = 0x0000_3000;
+    const FRAME0: u32 = 0x0000_6000;
+    const FRAME1: u32 = 0x0000_7000;
+
+    let mut memory = vec![0u8; 0x9000];
+    memory[DIRECTORY as usize..DIRECTORY as usize + 4].copy_from_slice(&(TABLE | 7).to_le_bytes());
+    let pte0 = TABLE as usize + (((LINEAR >> 12) as usize) & 0x3ff) * 4;
+    let pte1 = TABLE as usize + ((((LINEAR + 0x1000) >> 12) as usize) & 0x3ff) * 4;
+    memory[pte0..pte0 + 4].copy_from_slice(&(FRAME0 | 7).to_le_bytes());
+    memory[pte1..pte1 + 4].copy_from_slice(&(FRAME1 | 7).to_le_bytes());
+
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_pages_writable = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_fast_map_enabled_for_test(true);
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.control.cr3 = DIRECTORY;
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+
+    // Prime both pages for read AND write, so nothing below can be blamed on a cold map.
+    for page in [LINEAR, LINEAR + 0x1000] {
+        write_sized(&mut cpu, &mut bus, page, BusWidth::Dword, 0);
+        read_dword(&mut cpu, &mut bus, page);
+    }
+    (cpu, bus, LINEAR)
+}
+
 fn read_word(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32) -> u32 {
     cpu.read_memory_bus_width(
         bus,
@@ -372,4 +407,108 @@ fn a_based_ss_frame_is_refused_by_the_relocated_alignment_clause() {
         !cpu.call_out_stack_frame_resident(8, true),
         "a based-SS frame at a 2-mod-4 PAGE-LOCAL linear address was ADMITTED; the relocated          is_multiple_of(4) clause is missing"
     );
+}
+
+/// A page-CROSSING sized access must note the N5 census exactly ONCE PER FRAGMENT, never once
+/// more at the entry.
+///
+/// 4g moved the FastMap probe above the crossing test, which is deliberate and costs a crossing
+/// access one extra probe (1 + N). The census must NOT follow it up, and the reason is sharper
+/// than an inflated total: `census_note_write` scores a read-modify-write pair when the same
+/// instruction already read the same linear PAGE. An entry-level note fires at the first
+/// fragment's page while `last_read_page` still matches, so an instruction that reads a page and
+/// then crossing-writes it would score TWO pairs where it scores one -- a manufactured pair, in
+/// the one counter the whole N5 interleaving question is decided on.
+///
+/// Paging is ON here on purpose: `linear_range_crosses_page` is only consulted when it is, so a
+/// real-mode fixture cannot exercise the scoping at all.
+#[test]
+fn a_crossing_access_notes_the_census_once_per_fragment_and_never_at_the_entry() {
+    let (mut cpu, mut bus, base) = paged_cpu_and_bus();
+    cpu.set_rmw_census_enabled(true);
+
+    // A page-local dword: one access, one census note. The control.
+    let before = cpu.fast_map_audit_counters();
+    read_dword(&mut cpu, &mut bus, base);
+    let after = cpu.fast_map_audit_counters();
+    assert_eq!(
+        after.census_reads - before.census_reads,
+        1,
+        "a page-local dword must note the census exactly once"
+    );
+
+    // A dword straddling the page boundary at +0xffe splits into two WORD fragments
+    // (`page_local_fragment_width` never returns a width that would itself cross), so the census
+    // must advance by exactly TWO -- not three.
+    let before = cpu.fast_map_audit_counters();
+    read_dword(&mut cpu, &mut bus, base + 0xffe);
+    let after = cpu.fast_map_audit_counters();
+    assert_eq!(
+        after.census_reads - before.census_reads,
+        2,
+        "a crossing dword must note the census once per page-local fragment, not 1 + N"
+    );
+
+    // THE MANUFACTURED PAIR. One instruction epoch: read page P, then crossing-write starting in
+    // page P. The read scores `last_read_page = P`. If the entry noted the write's census at
+    // linear `base + 0xffe` -- still page P -- it would score an RMW pair, and the first fragment
+    // would then score a second one.
+    let before = cpu.fast_map_audit_counters();
+    read_dword(&mut cpu, &mut bus, base);
+    write_sized(
+        &mut cpu,
+        &mut bus,
+        base + 0xffe,
+        BusWidth::Dword,
+        0x1234_5678,
+    );
+    let after = cpu.fast_map_audit_counters();
+    assert_eq!(
+        after.census_rmw_pairs - before.census_rmw_pairs,
+        1,
+        "the crossing write manufactured an extra read-modify-write pair"
+    );
+}
+
+/// R14: `finish_fast_map_write`'s `IZARRAVM_WATCH_WRITE` hook FIRES for a misaligned store.
+///
+/// Before this slice a misaligned store could not reach `finish_fast_map_write`, so the two slow
+/// paths' hooks (`write_linear_u8`, `write_linear_fragment`) saw every watched store and the
+/// absence of a hook here was survivable. After the admission it is not: misaligned stores are
+/// served here, and a hook that was never executed would let the instrument answer "no writes to
+/// this range" while the writes simply moved -- which is this instrument's documented failure
+/// mode, not a hypothetical one.
+///
+/// **This test only compiles under `--features watch-write`**, so it does NOT run on a default CI
+/// leg. Run it explicitly: `cargo test -p izarravm-cpu --features watch-write watch_write`.
+/// Its value is that the argument list is type-checked and the hook is executed at least once.
+#[cfg(feature = "watch-write")]
+#[test]
+fn the_watch_write_hook_fires_for_a_misaligned_store_served_by_the_fast_map() {
+    let (mut cpu, mut bus) = flat_cpu_and_bus();
+    const PAGE: u32 = 0x0002_1000;
+    let linear = PAGE + 1; // misaligned, page-local
+
+    // Warm the page so the store below is genuinely served by the FastMap rather than the slow
+    // path (whose hook already existed and would make this test pass for the wrong reason).
+    write_sized(&mut cpu, &mut bus, linear, BusWidth::Word, 0);
+
+    crate::set_write_watch(linear, 2);
+    let before_reports = crate::write_watch_report_count();
+    let before_hits = cpu.fast_map_probe_counters().hits;
+
+    write_sized(&mut cpu, &mut bus, linear, BusWidth::Word, 0xbeef);
+
+    assert_eq!(
+        cpu.fast_map_probe_counters().hits,
+        before_hits + 1,
+        "the watched store did not take the FastMap path; this test would be proving the SLOW \
+         path's hook, which already existed"
+    );
+    assert_eq!(
+        crate::write_watch_report_count(),
+        before_reports + 1,
+        "finish_fast_map_write did not report a watched MISALIGNED store"
+    );
+    crate::set_write_watch(0, 0);
 }

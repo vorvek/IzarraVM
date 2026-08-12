@@ -927,7 +927,15 @@ impl BlockCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_fast_map_enabled_for_test(&mut self, enabled: bool) {
+    /// Arm the FastMap WITHOUT refreshing `CpuGsw::fast_map_serve_enabled`.
+    ///
+    /// The long name is the guard rail. This moves an input to `fast_map_population_enabled()`
+    /// and so owes that predicate's mirror a refresh, but it cannot pay one -- the mirror lives on
+    /// `CpuGsw`. Call `CpuGsw::set_fast_map_enabled_for_test`, which does both. Calling this
+    /// directly leaves the mirror stale, which used to be survivable only because every consumer
+    /// recomputed the predicate; one consumer now reads the mirror, and a stale one stops a JIT
+    /// block from ever compiling.
+    pub(crate) fn set_fast_map_enabled_for_test_without_mirror_refresh(&mut self, enabled: bool) {
         self.fast_map_enabled_for_test = enabled;
     }
 

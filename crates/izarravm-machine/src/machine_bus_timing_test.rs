@@ -3466,71 +3466,157 @@ fn charge_direct_ram_split_is_bit_identical_to_the_byte_splitting_loop() {
             (BusWidth::Dword, 0xff9),
         ] {
             for tracing in [TracingMode::Off, TracingMode::Counts, TracingMode::Full] {
-                let address = BASE + offset;
-                assert!(
-                    width.misaligned_at(address),
-                    "case ({width:?}, {offset:#x}) is not actually misaligned"
-                );
-
-                // Reference: the production byte loop, reached through `read_memory`.
-                let mut machine = test_machine();
-                machine.set_mode(mode);
-                machine.trace.set_tracing_mode(tracing);
-                let (ref_clocks, ref_accesses, ref_cycles) = with_bus(&mut machine, |bus| {
-                    bus.trace.clear();
-                    bus.read_memory(address, width, BusAccessKind::DataRead)
-                        .unwrap();
-                    (
-                        bus.trace.elapsed_clocks(),
-                        bus.trace.access_count(),
-                        bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
-                    )
-                });
-
-                // Candidate: the new charge, on a freshly built machine so the Accurate class's
-                // modeled cache tags start from the same state the reference did.
-                let mut machine = test_machine();
-                machine.set_mode(mode);
-                machine.trace.set_tracing_mode(tracing);
-                let (got_clocks, got_accesses, got_cycles) = with_bus(&mut machine, |bus| {
-                    bus.trace.clear();
-                    bus.charge_direct_ram_split(address, width, BusAccessKind::DataRead)
-                        .unwrap();
-                    (
-                        bus.trace.elapsed_clocks(),
-                        bus.trace.access_count(),
-                        bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
-                    )
-                });
-
-                let case = format!("{mode:?}/{tracing:?}/{width:?}@{offset:#x}");
-                assert_eq!(got_clocks, ref_clocks, "{case}: elapsed_clocks");
-                assert_eq!(got_accesses, ref_accesses, "{case}: access_count");
-                assert_eq!(
-                    got_cycles.len(),
-                    got_accesses as usize * usize::from(tracing == TracingMode::Full),
-                    "{case}: the Full-mode vector must hold one entry per access"
-                );
-                for (i, (a, b)) in got_cycles.iter().zip(ref_cycles.iter()).enumerate() {
-                    assert_eq!(a.kind, b.kind, "{case}: cycle {i} kind");
-                    assert_eq!(a.address, b.address, "{case}: cycle {i} address");
-                    assert_eq!(a.width, b.width, "{case}: cycle {i} width");
-                    assert_eq!(
-                        a.wait_states, b.wait_states,
-                        "{case}: cycle {i} wait states"
+                // BOTH DIRECTIONS. `write_memory_recorded` has its own `should_split` byte loop
+                // (a separate site from `read_memory`'s), and the write path is where a charge
+                // error would be worst, so the write twin is a reference here rather than an
+                // assumed mirror of the read.
+                for kind in [BusAccessKind::DataRead, BusAccessKind::DataWrite] {
+                    let address = BASE + offset;
+                    assert!(
+                        width.misaligned_at(address),
+                        "case ({width:?}, {offset:#x}) is not actually misaligned"
                     );
-                    assert_eq!(a.clocks, b.clocks, "{case}: cycle {i} clocks");
-                }
-                assert_eq!(got_cycles.len(), ref_cycles.len(), "{case}: cycle count");
-                // A split really did happen -- otherwise every equality above is vacuous.
-                if tracing == TracingMode::Full {
+
+                    // Reference: the production byte loop, reached through `read_memory` /
+                    // `write_memory` according to the direction under test.
+                    let mut machine = test_machine();
+                    machine.set_mode(mode);
+                    machine.trace.set_tracing_mode(tracing);
+                    let (ref_clocks, ref_accesses, ref_cycles) = with_bus(&mut machine, |bus| {
+                        bus.trace.clear();
+                        if kind == BusAccessKind::DataRead {
+                            bus.read_memory(address, width, kind).unwrap();
+                        } else {
+                            bus.write_memory(address, width, 0x5a5a_5a5a, kind).unwrap();
+                        }
+                        (
+                            bus.trace.elapsed_clocks(),
+                            bus.trace.access_count(),
+                            bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
+                        )
+                    });
+
+                    // Candidate: the new charge, on a freshly built machine so the Accurate class's
+                    // modeled cache tags start from the same state the reference did.
+                    let mut machine = test_machine();
+                    machine.set_mode(mode);
+                    machine.trace.set_tracing_mode(tracing);
+                    let (got_clocks, got_accesses, got_cycles) = with_bus(&mut machine, |bus| {
+                        bus.trace.clear();
+                        bus.charge_direct_ram_split(address, width, kind).unwrap();
+                        (
+                            bus.trace.elapsed_clocks(),
+                            bus.trace.access_count(),
+                            bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
+                        )
+                    });
+
+                    let case = format!("{mode:?}/{tracing:?}/{kind:?}/{width:?}@{offset:#x}");
+                    assert_eq!(got_clocks, ref_clocks, "{case}: elapsed_clocks");
+                    assert_eq!(got_accesses, ref_accesses, "{case}: access_count");
                     assert_eq!(
-                        ref_cycles.len(),
-                        width.bytes() as usize,
-                        "{case}: the reference did not split"
+                        got_cycles.len(),
+                        got_accesses as usize * usize::from(tracing == TracingMode::Full),
+                        "{case}: the Full-mode vector must hold one entry per access"
                     );
+                    for (i, (a, b)) in got_cycles.iter().zip(ref_cycles.iter()).enumerate() {
+                        assert_eq!(a.kind, b.kind, "{case}: cycle {i} kind");
+                        assert_eq!(a.address, b.address, "{case}: cycle {i} address");
+                        assert_eq!(a.width, b.width, "{case}: cycle {i} width");
+                        assert_eq!(
+                            a.wait_states, b.wait_states,
+                            "{case}: cycle {i} wait states"
+                        );
+                        assert_eq!(a.clocks, b.clocks, "{case}: cycle {i} clocks");
+                    }
+                    assert_eq!(got_cycles.len(), ref_cycles.len(), "{case}: cycle count");
+                    // A split really did happen -- otherwise every equality above is vacuous.
+                    if tracing == TracingMode::Full {
+                        assert_eq!(
+                            ref_cycles.len(),
+                            width.bytes() as usize,
+                            "{case}: the reference did not split"
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+/// SF-5 / L-RAM: the `claims_no_byte_in` guard behind the unaligned direct admission WOULD catch
+/// a Distira-BAR page, so "no BAR page is `direct_ram_bytes`-able" is a CHECKED claim and not an
+/// assumed one.
+///
+/// Why this matters more than a timing detail: `write_wide_memory`'s LFB arm SWALLOWS byte writes
+/// (`BusWidth::Byte => {}` while still returning `true`), so a byte-split write into the BAR is
+/// DROPPED where the wide write would have stored -- silent data loss, not a re-timing. The
+/// unaligned admission is only safe because `ram_lookup_page_is_direct` refuses every page the
+/// BAR overlaps, page-granularly.
+///
+/// The test has two halves and needs both:
+///
+/// 1. **Unmutated (this test).** With the BAR decoding over a RAM page, the admission must
+///    DECLINE that page -- unreachable by construction -- while an ordinary RAM page is still
+///    admitted. Proving the decline alone would be the fixtures-that-cannot-fail shape, hence the
+///    positive control.
+/// 2. **Mutated (recorded in the branch's mutation ledger).** Forcing `ram_lookup_page_is_direct`
+///    to return `true` for a `memory_bar_overlaps` page makes the admission accept it, and
+///    `claims_no_byte_in`'s `debug_assert` then fires. That is what gives half 1 its teeth.
+#[test]
+fn a_distira_bar_page_is_refused_the_unaligned_direct_admission() {
+    // 64 MiB so a 16 MiB-aligned BAR can be parked at 32 MiB, INSIDE guest RAM -- which is the
+    // only way to build the overlap this guard exists for.
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(64, VideoCard::Vega),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+    const BAR: u32 = 0x0200_0000;
+    const PLAIN: u32 = 0x0100_0000;
+
+    // BAR base lives in config byte 0x13 (bits 31..24), and bit 1 of the command word enables
+    // memory decode. Both are needed before `memory_bar_overlaps` answers true.
+    machine.vega.pci_write_config_byte(0x13, (BAR >> 24) as u8);
+    machine.vega.pci_write_config_byte(0x04, 0x02);
+    let memory_len = machine.memory.len();
+    machine.ram_lookup.rebuild(memory_len, &machine.vega);
+
+    assert!(
+        machine
+            .vega
+            .memory_bar_overlaps(BAR as usize, BAR as usize + 0x1000),
+        "the BAR is not actually decoding over that page; the refusal below would be vacuous"
+    );
+    assert!(
+        machine.vega.claims_no_byte_in(PLAIN, 4),
+        "an ordinary RAM page must be claimed by nothing"
+    );
+    assert!(
+        !machine.vega.claims_no_byte_in(BAR, 4),
+        "the guard cannot see a page the BAR decodes; it would never fire on a real regression"
+    );
+
+    with_bus(&mut machine, |bus| {
+        // A MISALIGNED read of ordinary RAM: admitted, `direct: true`. The positive control -- it
+        // is what makes the refusal below a statement about the BAR and not about the width.
+        let plain = bus
+            .read_memory_direct(PLAIN + 1, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        assert!(
+            plain.direct,
+            "a misaligned read of plain RAM was not admitted; the BAR case proves nothing"
+        );
+
+        // The same shape over the BAR page: must NOT take the direct admission. If it did, the
+        // per-byte `debug_assert` would fire; that it does not reach the assert at all is the
+        // by-construction half of the argument.
+        let bar = bus
+            .read_memory_direct(BAR + 1, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        assert!(
+            !bar.direct,
+            "a Distira-BAR page was admitted to the unaligned direct path"
+        );
+    });
 }
