@@ -999,7 +999,12 @@ impl Vega {
     ///
     /// `owns_memory` at width 1 asks exactly what that loop asks, and carries its own
     /// `may_own_memory` pre-filter assertion, so this is the right primitive to build on.
-    #[cfg(debug_assertions)]
+    ///
+    /// NOT `#[cfg(debug_assertions)]`, even though its only caller is a `debug_assert!`:
+    /// `debug_assert!` expands to `if cfg!(debug_assertions) { .. }`, so its argument is still
+    /// TYPE-CHECKED and compiled in a release build. Gating the method made the release build fail
+    /// to compile while every debug build and the whole test suite stayed green.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn claims_no_byte_in(&self, address: u32, bytes: u32) -> bool {
         (0..bytes).all(|i| !self.owns_memory(address.wrapping_add(i), 1))
     }
