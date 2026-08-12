@@ -28,21 +28,19 @@
 //! * **The alignment guard is a population cut, not a formality.** `emit_wide_page_guard` refuses
 //!   an odd address, so a misaligned word access side-exits and the interpreter runs it. That is
 //!   observable state (a retirement count and an EIP), and `misaligned_word_*` pins it.
-//! * **The code-watch LAST-BYTE probe is dead at Word, provably.** `emit_code_watch_table_branch`
-//!   probes the access's last byte as well as its first whenever `needs_alignment_guard()`. For
-//!   Word that second probe can never disagree with the first: the watch bitmap is indexed at
-//!   `CHUNK_SHIFT` granularity (`(addr & 0xfff) >> CHUNK_SHIFT`) and a 2-ALIGNED two-byte
-//!   access lies inside one
-//!   16-byte chunk, so both bytes index the same bit. It is the same argument that makes the
-//!   page-crossing compare dead for the three self-aligning widths. So the watch fixture below
-//!   asserts the transactional exit rather than a straddle, which cannot be constructed.
+//! * **The code-watch guard cannot report a straddle at ALIGNED Word.** `emit_code_watch_table_
+//!   branch` tests every granule the access spans, as one shifted mask against a 32-bit window
+//!   over the page's watch bitmap. A 2-aligned two-byte access spans two one-byte granules whose
+//!   bits are adjacent in that window, so the fixture below asserts the TRANSACTIONAL exit -- the
+//!   store refused before any byte landed -- rather than a cross-word straddle, which this
+//!   fixture's addresses cannot construct.
 //!
-//! Both of those bullets are the same structural fact seen twice, and it is worth stating in the
-//! direction that is easy to get backwards: **the Word path is guarded MORE tightly than the Dword
-//! path, not less.** `emit_wide_page_guard` refuses every odd address, which makes a page straddle
-//! impossible and the crossing compare provably dead; the same refusal is what confines the access
-//! to one watch chunk. A reviewer arriving at "sixteen-bit memory forms" primed to look for a
-//! weaker guard will find a stricter one.
+//!   This bullet used to say something different and wrong on both clauses, and the correction is
+//!   worth keeping visible because both errors were invisible from inside this file. It claimed
+//!   the guard "probes the access's LAST BYTE as well as its first", which stopped being true when
+//!   the guard moved to the window test; and it justified the claim with a "16-byte chunk", a
+//!   granule size that has not existed since `CHUNK_SHIFT` went to 0 and granules became single
+//!   bytes. Neither clause was about this slice's Word rows at all.
 //!
 //! Mutation record for this file. Nine, all applied by hand, observed, and restored; the failing
 //! assertion quoted is the FIRST one each produced.
@@ -633,11 +631,13 @@ fn a_misaligned_word_read_modify_write_still_exits_to_the_interpreter() {
 
 /// A word STORE into a watched chunk exits transactionally.
 ///
-/// The bitmap is indexed at `CHUNK_SHIFT` granularity, so a 2-aligned two-byte access is watched or not
-/// as a unit -- see the module docs on why the last-byte probe cannot disagree with the first. What
-/// this row certifies is the part that is not a tautology: the exit happens BEFORE any byte is
-/// written, so `compare_state` at the guard sees the operand untouched, and the interpreter's own
-/// re-execution then produces whatever the SMC path produces on both roles alike.
+/// The guard tests every granule the access spans as one shifted mask, so a two-byte access whose
+/// first byte is marked is watched whatever its alignment -- see the module docs, and note that
+/// the "last-byte probe" this comment used to appeal to has not existed since the guard became a
+/// window test. What this row certifies is the part that is not a tautology: the exit happens
+/// BEFORE any byte is written, so `compare_state` at the guard sees the operand untouched, and the
+/// interpreter's own re-execution then produces whatever the SMC path produces on both roles
+/// alike.
 #[test]
 fn a_watched_word_store_exits_before_writing() {
     let mut store = vec![0x66u8];
