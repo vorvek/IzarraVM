@@ -3505,26 +3505,85 @@ fn emit_store_write_resolve(
     }
 }
 
-fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
-    debug_assert!(width.needs_alignment_guard());
-    e.mov_r32_r32(Reg::RDX, Reg::RAX);
-    e.and_r32_imm32(Reg::RDX, width.alignment_bytes() - 1);
-    e.cmp_r32_imm32(Reg::RDX, 0);
-    e.jnz(side);
+/// The wide guard's PAGE-CROSSING half: refuse an access whose last byte lands on the next page.
+/// Scratch: RDX. Four instructions, and it must be emitted BEFORE the alignment half (see
+/// `emit_wide_page_guard`).
+///
+/// The crossing bound uses `bytes()` (the transaction's actual size), not `alignment_bytes()`
+/// (the guard's alignment requirement). For a Byte, Word or Dword access that is also ALIGNED the
+/// two are equal and this check cannot fire: an aligned access of size N can never sit within N
+/// bytes of the page end. It stopped being dead there the moment the lean one-lookup load and
+/// store sites began serving MISALIGNED accesses natively -- a Word at offset 0xFFF or a Dword at
+/// 0xFFD-0xFFF really does straddle -- and at those two sites this compare is now the ONLY thing
+/// keeping a served access inside the one page its FastMap entry was resolved against.
+///
+/// It was already LIVE for the two wide widths, both of which have `alignment_bytes() = 4` below
+/// their size. A 4-aligned Qword can start as late as offset 0xFFC and its second dword half
+/// crosses into the next page. A 4-aligned Tbyte is worse: 10 bytes against a 4-byte alignment
+/// refuses everything from 0xFF8 up, which is what keeps `write_extended80`'s trailing word at +8
+/// inside the page the pointer was resolved against.
+fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, cross: Label) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, 0x0fff);
-    // The crossing bound uses `bytes()` (the transaction's actual size), not
-    // `alignment_bytes()` (the guard's alignment requirement). For Byte, Word and Dword the two
-    // are equal, so this check is dead code there: an aligned access of size N can never sit
-    // within N bytes of the page end.
-    //
-    // It is LIVE for the two wide widths, both of which have alignment_bytes() = 4 below their
-    // size. A 4-aligned Qword can start as late as offset 0xFFC and its second dword half crosses
-    // into the next page. A 4-aligned Tbyte is worse: 10 bytes against a 4-byte alignment refuses
-    // everything from 0xFF8 up, which is what keeps `write_extended80`'s trailing word at +8
-    // inside the page the pointer was resolved against.
     e.cmp_r32_imm32(Reg::RDX, 0x1000 - width.bytes());
-    e.jcc(7, side);
+    e.jcc(7, cross);
+}
+
+/// The wide guard's ALIGNMENT half. Four instructions, and the only half whose target varies by
+/// call site: eleven sites send it to `cross_page_or_alignment` (through `emit_wide_page_guard`),
+/// the two lean one-lookup sites send it to their own slow stub instead.
+///
+/// **`scratch` has exactly two legal values, and passing the wrong one produces a silent wrong
+/// answer rather than a fault.**
+///
+/// * `Reg::RDX` at twelve of the thirteen sites -- the eleven refusing sites plus the lean READ
+///   site, where the guard precedes `emit_load_bias_probe` and that pad's contract is "RDX is
+///   untouched" (`emit/load_fast.rs`).
+/// * `Reg::RCX` at the lean STORE site, and ONLY there, and only because the alignment half is
+///   emitted AFTER `emit_read_store_value` has put the store value in RDX. RCX is free by the
+///   store pad's own rule: the page index is not part of the stub contract, and every stub that
+///   needs it recomputes it from RAX.
+///
+/// Backwards is undetectable at runtime: RDX at the store site clobbers the value the slow stub
+/// spills and stores, and RCX at any other site clobbers a live page index. `and r32, imm32` is
+/// `81 /4 id` and `mov r32, r32` is `89 /r` at either register, so both spellings are the same
+/// four instructions at the same four encoding lengths.
+fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misaligned: Label) {
+    debug_assert!(
+        matches!(scratch, Reg::RDX | Reg::RCX),
+        "the alignment test's scratch is RDX everywhere except the lean store site, where the \
+         value materialisation owns RDX and the scratch must be RCX"
+    );
+    e.mov_r32_r32(scratch, Reg::RAX);
+    e.and_r32_imm32(scratch, width.alignment_bytes() - 1);
+    e.cmp_r32_imm32(scratch, 0);
+    e.jnz(misaligned);
+}
+
+/// Both halves, both verdicts to one label: the eleven sites that refuse a wide access outright.
+///
+/// SIZE-identical to the pre-decomposition emission -- eight instructions, two not-taken branches
+/// on the aligned path, same verdict, same side exit -- but deliberately NOT byte-identical: the
+/// two tests swap positions, so the `and` immediates move and the `jnz` and `ja` trade places.
+/// Every branch this emitter produces is a fixed-length near form, so the swap cannot move a
+/// block's size either.
+///
+/// **The crossing bound comes FIRST, and that ordering is load-bearing rather than cosmetic.** At
+/// the two relaxed sites the alignment half's target is a local recovery path that serves the
+/// access, and a page-CROSSING access must never reach it. Testing the crossing bound first makes
+/// that structural instead of a second test inside the recovery. The wrapper keeps the same order
+/// so there is one order to reason about, not two.
+///
+/// **Precondition, stated rather than assumed: no caller may rely on the host flag state this
+/// leaves behind.** The reorder changes it -- ZF/CF now come from the crossing `cmp` rather than
+/// the alignment one. Every consumer at all thirteen sites establishes its own flags before
+/// branching (`emit_load_bias_probe` and `emit_store_bias_probe` both end in a `test`,
+/// `emit_ram_read_pointer_inner`'s next flag setter is a shift), and guest EFLAGS live in RBP,
+/// never in host flags across a memory front.
+fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
+    debug_assert!(width.needs_alignment_guard());
+    emit_page_cross_bound(e, width, side);
+    emit_alignment_test(e, width, Reg::RDX, side);
 }
 
 fn emit_pending_inc_dec(e: &mut Encoder, is_dec: bool, width: MemoryWidth, old: Reg, result: Reg) {
