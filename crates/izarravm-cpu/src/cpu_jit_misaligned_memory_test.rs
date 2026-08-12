@@ -728,6 +728,80 @@ fn a_page_crossing_store_still_exits() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The code-watch granule span, at an offset only a misaligned store can reach
+// ---------------------------------------------------------------------------------------------
+
+/// A misaligned Dword store STRADDLING the mask's `u64` word boundary, with the watch bit on each
+/// byte of its span in turn.
+///
+/// This row is the reason the emitter's granule span is computed as a WORST CASE over offsets
+/// rather than as the span of an aligned access. Until the store site served misaligned accesses
+/// there was no way to construct it: the alignment guard refused the store before the code-watch
+/// guard could run, so every input the watch guard had ever seen was aligned, and a span formula
+/// that only held for aligned accesses was indistinguishable from a correct one.
+///
+/// Page offset 63 puts the store's four bytes at 63, 64, 65, 66 -- straddling the mask word
+/// boundary at bit 64 at the shipped one-byte granule, which is the guard's multi-granule window
+/// arm on a misaligned input.
+///
+/// **Byte 66 is the discriminating row and the others are not, which is worth stating because two
+/// of them fail for the wrong reason under the granule mutation:**
+///
+/// | watched byte | shipped shift 0 | under the mutation (shift 1, aligned-span `n = 2`) |
+/// |---|---|---|
+/// | **66** — the access's LAST byte | granule 66, tested → exits | granule **33**, which `n = 2` never tests → does NOT exit. **The discriminating row** |
+/// | 65 | granule 65 → exits | granule 32, tested by both formulas → exits. A control, not evidence |
+/// | 62 — must NOT exit | granule 62, outside the access → does not exit | granule 31, which byte 63 also occupies, so a WATCHED verdict is CORRECT at 2-byte granules → exits, red for the right reason at the wrong granularity |
+///
+/// The byte-62 row is therefore **SHIPPED-SHIFT-ONLY**: it cannot be made shift-independent,
+/// because at any coarser granule some nearby non-member byte shares a member granule. Leaving it
+/// unqualified would be worse than having no row at all — the suite would go red under the
+/// mutation without the granule bug being the cause, and that reads as passing evidence.
+#[test]
+fn a_straddling_misaligned_store_sees_every_granule_of_its_span() {
+    let base = OPERAND_PAGE + 63;
+    // Each byte the store actually occupies must produce a watch exit. Byte 66 is the one the
+    // aligned-span formula gets wrong at a coarser granule.
+    for watched in [base, base + 1, base + 2, base + 3] {
+        let mut roles = build_watching(&dword_store(base, 0x1020_3040), Some(watched));
+        let before = roles.native.perf_counters().jit_direct_exit_code_watch;
+        assert!(
+            roles
+                .native
+                .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+                .unwrap(),
+            "watched={watched:#x}: block did not run natively"
+        );
+        assert_eq!(
+            roles.native.perf_counters().jit_direct_exit_code_watch - before,
+            1,
+            "watched={watched:#x}: a store spanning {base:#x}..={:#x} must see the watch bit on \
+             EVERY byte of its span, including its last",
+            base + 3
+        );
+    }
+
+    // SHIPPED-SHIFT-ONLY. A byte outside the store's span must NOT be watched -- at ONE-BYTE
+    // granules. At any coarser granule byte 62 shares a granule with byte 63, which the store does
+    // occupy, so a watch exit here would be CORRECT rather than a defect. Do not read a failure of
+    // this row under a granule-size change as evidence of anything.
+    let mut roles = build_watching(&dword_store(base, 0x1020_3040), Some(OPERAND_PAGE + 62));
+    let before = roles.native.perf_counters().jit_direct_exit_code_watch;
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_exit_code_watch - before,
+        0,
+        "a byte outside the store's span must not be watched at one-byte granules"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // The sites this slice does NOT relax
 // ---------------------------------------------------------------------------------------------
 

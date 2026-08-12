@@ -2506,6 +2506,42 @@ fn the_misaligned_split_charge_stays_inside_the_per_access_budget_bound_on_every
     }
 }
 
+/// **The charge equality guard 3 rests on**: a page-local misaligned N-byte RAM access costs the
+/// same whether the JIT serves it inside a block or the interpreter splits it.
+///
+/// * Natively, after the slice: one WIDE cycle from the block's static count, plus `N - 1` byte
+///   cycles from the split deposit, both priced at `jit_data_cost_clocks`.
+/// * Interpreted: `lookup_access` refuses a misaligned width, `should_split` fires, and the access
+///   becomes N byte reads each charged the RAM wait states.
+///
+/// The two are equal for exactly one reason -- `BusCycle::clocks_for` ignores width -- and that is
+/// what this asserts. Make `clocks_for` width-dependent and the equality breaks silently: the JIT
+/// would over- or under-charge every misaligned access by `wide - byte` clocks, with no fault, no
+/// counter, and no differential fixture able to see it, because the CPU crate's `TestBus` models a
+/// width-DEPENDENT dial and cannot state this property at all.
+#[test]
+fn a_misaligned_access_costs_the_same_split_natively_and_interpreted() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            let byte = bus.jit_data_cost_clocks(BusWidth::Byte);
+            for (width, bytes) in [(BusWidth::Word, 2u64), (BusWidth::Dword, 4)] {
+                let native = bus.jit_data_cost_clocks(width) + (bytes - 1) * byte;
+                let interpreted = bytes * byte;
+                assert_eq!(
+                    native,
+                    interpreted,
+                    "{mode:?} {width:?}: the JIT charges one wide cycle plus {} byte cycles \
+                     ({native}) where the interpreter's split charges {bytes} byte cycles \
+                     ({interpreted}); they agree only while `clocks_for` ignores width",
+                    bytes - 1
+                );
+            }
+        });
+    }
+}
+
 #[test]
 fn approximate_video_wait_states_keep_the_doom_calibration() {
     assert_eq!(video_wait_states_approx(CpuPersona::I486), 45);
