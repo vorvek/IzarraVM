@@ -58,6 +58,7 @@ impl Machine {
         // Captured before the struct literal below since VEGA and trace are also
         // mutably borrowed by other fields in that same literal.
         let beam_at_batch_start = self.scanout_beam_dots();
+        let margo_scanout_at_batch_start = self.vega.margo_scanout().is_some();
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
         // Read from the CPU, the same authoritative mode owner that scale_bus
         // uses. Machine's active_mode copy is kept for bus register readback.
@@ -133,6 +134,7 @@ impl Machine {
             timeline_at_batch_start: self.timeline,
             master_ticks_at_batch_start: self.timeline.now_ticks(),
             beam_at_batch_start,
+            margo_scanout_at_batch_start,
             trace_elapsed_at_batch_start,
             bus_rem_at_batch_start: self.bus_rem,
             bus_num_at_batch_start,

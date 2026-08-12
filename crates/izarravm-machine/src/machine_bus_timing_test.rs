@@ -448,6 +448,121 @@ fn margo_status1_edge_peek_names_the_exact_dot() {
     );
 }
 
+/// The display owner is NOT pinned for the length of a batch, and this branch is
+/// what made that matter. `beam_at_batch_start` is captured in the dot unit of
+/// whichever engine owns the display at batch entry, and a Margo dot and a VGA
+/// dot are both a bare `u64`. `Distira::display_enabled` moves on a plain MMIO
+/// write to FBIINIT0, which is a bus-side write in the MIDDLE of a batch -- so a
+/// guest can hand the display from Margo to Distira with no batch boundary in
+/// between, and tomb-raider-3dfx does precisely that after probing 101h.
+///
+/// Without the owner snapshot, `predicted_beam` would spend the rest of that
+/// batch folding in-batch VGA dots onto a MARGO anchor (up to 1,083,263 at mode
+/// 0x105) and reducing it modulo the LEGACY frame -- a wrong beam, and therefore
+/// wrong 0x3DA / 0x3C2 bits, for every read until the batch ended.
+///
+/// Differential form, the same discipline as the peek twin above: the predicted
+/// beam after the handover must equal a real `advance_devices` of the same clock
+/// total read off the live VGA raster. The setup deliberately leaves the two
+/// engines' beams far apart, so an anchor taken from the wrong one cannot
+/// coincide with the right answer.
+#[test]
+fn predicted_beam_survives_a_mid_batch_handover_of_the_display() {
+    const STEP: u64 = 12_345;
+
+    let mut predicted_machine = distira_handover_machine();
+    let mut real_machine = distira_handover_machine();
+    assert_eq!(predicted_machine.timeline, real_machine.timeline);
+
+    let margo_beam = predicted_machine.scanout_beam_dots();
+    let vga_beam = predicted_machine.vega.beam_dots();
+    assert!(
+        margo_beam.abs_diff(vga_beam) > 1_000,
+        "the two engines' beams must be far apart for this to be able to fail \
+         (margo {margo_beam}, vga {vga_beam})"
+    );
+
+    let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
+        assert!(
+            bus.vega.margo_scanout().is_some(),
+            "the batch must START with Margo owning the display"
+        );
+        let before = bus.trace.elapsed_clocks();
+        enable_distira_display(bus);
+        // The handover write charges bus clocks of its own, and the prediction
+        // folds them in. Read them back rather than assuming a cost, so the
+        // real leg below advances by the SAME total.
+        let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+        assert!(raw_bus_clocks > 0, "the MMIO write must charge bus time");
+        assert!(
+            bus.vega.margo_scanout().is_none(),
+            "the FBIINIT0 write must have handed the display over MID-BATCH"
+        );
+        bus.core_clocks_so_far = STEP;
+        (bus.predicted_beam(), raw_bus_clocks)
+    });
+
+    // The real machine takes the same handover and then really advances.
+    with_bus(&mut real_machine, enable_distira_display);
+    let step = STEP + real_machine.scale_bus(raw_bus_clocks);
+    real_machine.advance_devices(step);
+
+    assert_eq!(
+        predicted,
+        real_machine.vega.beam_dots(),
+        "after the display changes hands mid-batch the prediction must follow \
+         the VGA raster, not a stale Margo anchor"
+    );
+
+    // WHY THE OPPOSITE MUTATION IS UNDETECTABLE, stated rather than left as a
+    // hole in the ledger. Hardwiring the owner flag TRUE changes nothing on a
+    // batch that started VGA-owned, because the fallback does not compute a
+    // DIFFERENT anchor there -- it re-derives the same one. Devices advance only
+    // at batch end, so the VGA raster's beam is constant for the life of a bus
+    // and equals what was captured. The flag chooses between two values that are
+    // equal whenever it is false, which is exactly why it is safe.
+    let mut legacy = test_machine();
+    legacy.run_cycles(5_000).unwrap();
+    assert!(legacy.vega.margo_scanout().is_none());
+    with_bus(&mut legacy, |bus| {
+        assert!(!bus.margo_scanout_at_batch_start);
+        assert_eq!(bus.beam_at_batch_start, bus.vega.beam_dots());
+    });
+}
+
+/// A 386 machine in VBE mode 0x105 (1,083,264 dots per frame, comfortably wider
+/// than the legacy 640x400 raster) with Distira's init writes unlocked, run far
+/// enough that the Margo and VGA beams have drifted apart.
+fn distira_handover_machine() -> Machine {
+    let mut machine = test_machine();
+    machine.run_cycles(5_000).unwrap();
+    with_bus(&mut machine, |bus| {
+        // PCI config 0x40 = initEnable, the write-protect on the FBIINIT
+        // registers. Without it the FBIINIT0 write below is silently dropped.
+        let address = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | 0x40;
+        bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, address, false)
+            .unwrap();
+        bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, 1, false)
+            .unwrap();
+    });
+    assert!(machine.vega.set_vbe_mode(0x0105));
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    machine.advance_devices_clocks(9_999);
+    machine
+}
+
+/// Clear FBIINIT0's VGA_PASS bit through the bus, which is what hands the
+/// display from whatever owns it to Distira.
+fn enable_distira_display(bus: &mut MachineBus<'_>) {
+    bus.write_memory(
+        DISTIRA_MMIO_BASE + izarravm_video::SST_FBI_INIT0 as u32,
+        BusWidth::Dword,
+        0,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+}
+
 /// A 386 test machine sitting in VBE mode 0x101 (640x480x8, BANKED -- the window
 /// GP2 was measured asking for). The mode is set through `Vega::set_vbe_mode`,
 /// the same host-side entry point `INT 10h 4F02h` funnels into, rather than by

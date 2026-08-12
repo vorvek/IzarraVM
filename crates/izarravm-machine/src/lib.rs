@@ -2935,6 +2935,13 @@ struct MachineBus<'a> {
     timeline_at_batch_start: Timeline,
     master_ticks_at_batch_start: u64,
     beam_at_batch_start: u64,
+    // WHICH ENGINE'S DOT UNIT `beam_at_batch_start` IS IN. A Margo dot and a VGA
+    // dot are both a `u64` and neither carries its unit, and the display owner
+    // is not pinned for the length of a batch: a write to Distira's FBIINIT0 /
+    // FBIINIT1 hands the display over mid-batch from the bus side. Without this
+    // flag `predicted_beam` would keep folding in-batch VGA dots onto a stale
+    // MARGO anchor for the rest of such a batch. See `scanout_beam_dots`.
+    margo_scanout_at_batch_start: bool,
     trace_elapsed_at_batch_start: u64,
     bus_rem_at_batch_start: u64,
     // bus_timing(cpu.level())'s (num, den) ratio, copied at bus construction from

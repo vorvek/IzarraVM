@@ -909,6 +909,7 @@ impl Machine {
             let timeline_at_batch_start = self.timeline;
             let master_ticks_at_batch_start = self.timeline.now_ticks();
             let beam_at_batch_start = self.scanout_beam_dots();
+            let margo_scanout_at_batch_start = self.vega.margo_scanout().is_some();
             let trace_elapsed_at_batch_start = trace_before;
             let bus_rem_at_batch_start = self.bus_rem;
             // bus_timing's (num, den), read from the same authoritative CPU mode
@@ -1073,6 +1074,7 @@ impl Machine {
                     timeline_at_batch_start,
                     master_ticks_at_batch_start,
                     beam_at_batch_start,
+                    margo_scanout_at_batch_start,
                     trace_elapsed_at_batch_start,
                     bus_rem_at_batch_start,
                     bus_num_at_batch_start,

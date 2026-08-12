@@ -742,6 +742,19 @@ impl Machine {
     /// latch `DISP_START`. Every producer of a `beam_at_batch_start` and every
     /// consumer of `Vega::status1_bits` goes through this one function, so the
     /// two never get crossed.
+    ///
+    /// THE UNIT IS NOT SELF-DESCRIBING, which matters because a value taken from
+    /// here is often held across time. A Margo dot and a VGA dot are both plain
+    /// `u64`, and the display owner CAN change between the moment one is taken
+    /// and the moment it is used: `Distira::display_enabled` moves on a plain
+    /// MMIO write to FBIINIT0 / FBIINIT1, which is a bus-side write reachable in
+    /// the middle of a CPU batch, and tomb-raider-3dfx makes exactly that
+    /// transition after probing 101h. So any holder of this value must record
+    /// which engine it came from; `MachineBus::margo_scanout_at_batch_start` is
+    /// that record for the batch anchor, and `predicted_beam` is the consumer
+    /// that has to act on it. (The VGA -> Margo direction is HLE-only and lands
+    /// on a batch boundary, but the Margo -> Distira one does not, so the
+    /// discipline is unconditional rather than argued case by case.)
     pub(super) fn scanout_beam_dots(&self) -> u64 {
         match self.vega.margo_scanout() {
             Some(scan) => {
@@ -1481,14 +1494,28 @@ impl MachineBus<'_> {
                 .preview_margo_scanout(in_batch_clocks, scan.frame_dots())
                 .beam;
         }
+        // The anchor is only usable if it is a VGA dot, and it is a MARGO dot
+        // whenever Margo owned the display when this batch started. That is not
+        // hypothetical: `Distira::display_enabled` moves on a plain FBIINIT0 /
+        // FBIINIT1 MMIO write, which is a bus-side write in the middle of a
+        // batch, so a guest can hand the display from Margo to Distira without
+        // ever reaching a batch boundary -- tomb-raider-3dfx probes 101h and
+        // then does exactly that. Fall back to the VGA's own beam, which is
+        // still exactly its batch-start value because devices advance only at
+        // batch end; the whole-dot term below is the same either way.
+        let anchor = if self.margo_scanout_at_batch_start {
+            self.vega.beam_dots()
+        } else {
+            self.beam_at_batch_start
+        };
         let (_, whole_dots) = self
             .timeline_at_batch_start
             .preview_cpu_clocks(in_batch_clocks, self.vega.dot_clock_hz());
         let frame = self.vega.frame_dots();
         if frame == 0 {
-            return self.beam_at_batch_start; // guard: un-programmed CRTC, mirrors Vga::advance
+            return anchor; // guard: un-programmed CRTC, mirrors Vga::advance
         }
-        (self.beam_at_batch_start + whole_dots) % frame
+        (anchor + whole_dots) % frame
     }
 
     /// Whole VGA dots between the current in-batch instant and a projected

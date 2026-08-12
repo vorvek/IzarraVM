@@ -359,6 +359,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
     // `Machine::make_bus`, and a copy that captured the legacy raster's beam
     // would silently hand every Margo-mode test a beam from the wrong clock.
     let beam_at_batch_start = machine.scanout_beam_dots();
+    let margo_scanout_at_batch_start = machine.vega.margo_scanout().is_some();
     let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
     let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.cpu.level());
     let icache_fetch_clocks = u64::from(izarravm_bus::BusCycle::clocks_for(
@@ -429,6 +430,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         timeline_at_batch_start: machine.timeline,
         master_ticks_at_batch_start: machine.timeline.now_ticks(),
         beam_at_batch_start,
+        margo_scanout_at_batch_start,
         trace_elapsed_at_batch_start,
         bus_rem_at_batch_start: machine.bus_rem,
         bus_num_at_batch_start,

@@ -524,12 +524,26 @@ impl Vega {
     }
 
     /// Dots to the next vertical-retrace start edge from `beam`, in the unit of
-    /// whichever engine owns the display. The VGA arm ignores `beam` and uses
-    /// its own live raster beam, which is the same value the caller passed.
+    /// whichever engine owns the display.
+    ///
+    /// The VGA arm ignores `beam` and reads its own live raster beam instead.
+    /// That is only correct because every caller sources `beam` from
+    /// `Machine::scanout_beam_dots`, whose non-Margo arm returns exactly that
+    /// same value -- a silent coupling between two functions in different
+    /// modules, so the debug assertion below states it rather than leaving the
+    /// next reader to rediscover it.
     pub(crate) fn dots_until_vretrace_start(&self, beam: u64) -> Option<u64> {
         match self.margo_scanout() {
             Some(scan) => scan.dots_until_vretrace_start(beam),
-            None => self.vga.dots_until_vretrace_start(),
+            None => {
+                debug_assert_eq!(
+                    beam,
+                    self.vga.beam_dots(),
+                    "the VGA arm answers from its own beam, so a caller passing \
+                     anything else is asking a question this cannot answer"
+                );
+                self.vga.dots_until_vretrace_start()
+            }
         }
     }
 
