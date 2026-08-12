@@ -2449,6 +2449,63 @@ fn native_mode13_page_batches_charge_video_timing_and_move_generation_once() {
     assert_eq!(machine.video().cpu_read_chain4(0xF123), 0x6B);
 }
 
+/// The JIT serves a MISALIGNED page-local wide access natively and charges it `bytes()` RAM byte
+/// cycles, where `compute_iteration_upper` prices the same access as one WIDE cycle. That the
+/// per-access budget bound still dominates is a real invariant held today by a margin nobody had
+/// written down: every `*_data_upper` term in that bound is maxed against the Mode 13h dial
+/// (`video_wait_states_approx`, 45 on I486 and 147 on I586), which swamps the worst split charge.
+///
+/// Assert the relation against a real `MachineBus` so a DIAL change fails a test rather than only
+/// a debug build.
+///
+/// Three things this test is and is not:
+///
+/// * It is NEW. Nothing in the tree compares an actual charge against `iteration_upper`; the
+///   `per_hop_estimate <= global_block_upper` debug assert compares two BOUNDS, and batch-cap
+///   overshoot is separately declared accepted and bounded in `run.rs`.
+/// * The multiplicand is `split_byte`, the plain RAM dial, NOT the `*_data_upper` form. The latter
+///   carries the same Mode 13h `max` as the bounds it would be compared against, so the relation
+///   would reduce to `2X <= X` and fail on every persona today.
+/// * It does not subsume `compute_iteration_upper`'s `debug_assert`, and that assert does not
+///   subsume it. This covers dial changes on ALREADY-ADMITTED personas. Only the assert covers the
+///   Accurate class being admitted to direct blocks, because a test that iterates "the admitted
+///   personas" cannot notice that the admitted set grew.
+#[test]
+fn the_misaligned_split_charge_stays_inside_the_per_access_budget_bound_on_every_admitted_persona()
+{
+    // The Approximate class, which is exactly the set that runs a direct block at all: `run.rs`
+    // returns `Skipped` unless `uses_approximate_timing()`, i.e. I486 or I586.
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        assert!(
+            mode.uses_approximate_timing(),
+            "{mode:?} must be in the class that runs direct blocks"
+        );
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            let split_byte = bus.jit_data_cost_clocks(BusWidth::Byte);
+            let word_upper = bus
+                .jit_data_cost_clocks(BusWidth::Word)
+                .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word));
+            let dword_upper = bus
+                .jit_data_cost_clocks(BusWidth::Dword)
+                .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
+            assert!(
+                split_byte * 2 <= word_upper,
+                "{mode:?}: a misaligned word charges {} RAM byte cycles against a word bound of \
+                 {word_upper}",
+                split_byte * 2
+            );
+            assert!(
+                split_byte * 4 <= dword_upper,
+                "{mode:?}: a misaligned dword charges {} RAM byte cycles against a dword bound of \
+                 {dword_upper}",
+                split_byte * 4
+            );
+        });
+    }
+}
+
 #[test]
 fn approximate_video_wait_states_keep_the_doom_calibration() {
     assert_eq!(video_wait_states_approx(CpuPersona::I486), 45);

@@ -1569,6 +1569,21 @@ impl CpuGsw {
             .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word))
             .max(bus.jit_data_cost_clocks(BusWidth::Byte))
             .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
+        // The same misaligned-split relation `compute_iteration_upper` asserts, against the bound
+        // this function builds. Same multiplicand and for the same reason: `split_byte` is the
+        // plain RAM dial, never `max_read`, which carries the Mode 13h `max` that makes the
+        // relation hold and would reduce it to `4X <= X`.
+        //
+        // Worth knowing where this one sits: `compute_global_block_upper` is dead in release
+        // except as the memo and as the input to the `per_hop_estimate <= global_block_upper`
+        // debug assert, so this is an assertion inside a bound that is itself only asserted
+        // against. It is here so a dial change cannot make one of the two bounds stop dominating
+        // while the other still does.
+        let split_byte = bus.jit_data_cost_clocks(BusWidth::Byte);
+        debug_assert!(
+            split_byte.saturating_mul(4) <= max_read,
+            "a misaligned dword charges 4 RAM byte cycles; the global read bound must dominate it"
+        );
         let max_store = max_read;
         let per_instruction_bus = bus
             .jit_fetch_cost_clocks()
@@ -1707,6 +1722,40 @@ impl CpuGsw {
         let dword_data_upper = bus
             .jit_data_cost_clocks(BusWidth::Dword)
             .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
+        // A MISALIGNED wide access is served natively at the two lean one-lookup sites and charges
+        // `bytes()` RAM byte cycles where this bound prices it as ONE wide cycle. That the bound
+        // still dominates is true today only because every `*_data_upper` term above is maxed
+        // against the Mode 13h dial (`video_wait_states_approx` is 45 on I486 and 147 on I586,
+        // against `cache.cost.l1` = 2 / 0), so all three are 47 / 149 while the worst split charge
+        // is 16 / 8. That is a margin nobody had written down. The Accurate class, where it would
+        // vanish, never reaches here -- `run_direct_block` returns `Skipped` unless the mode uses
+        // approximate timing.
+        //
+        // Assert the relation rather than inflate the bound. Inflating would shrink `budget_quota`
+        // (`available / iteration_upper`) for EVERY block with a wide access on every fixture,
+        // misaligned traffic or not: a guest-visible admission change bought for an invariant that
+        // is not violated.
+        //
+        // The multiplicand is `split_byte`, the plain RAM dial, and NOT `byte_data_upper`. The
+        // latter carries the same Mode 13h `max` as the two bounds it would be compared against,
+        // so `byte_data_upper * 2 <= word_data_upper` reduces to `2X <= X` and fires on the first
+        // native block of every debug build. A misaligned access never takes the aperture dial:
+        // the two stubs refuse misaligned Mode 13h traffic outright, and the split's extra byte
+        // cycles are priced at `jit_data_cost_clocks(Byte)` where the exit is accounted.
+        //
+        // This does not subsume the persona dial test beside `MachineBus`, and that test does not
+        // subsume this: the test covers dial changes on ALREADY-ADMITTED personas and can run in
+        // release CI; only this assert covers the Accurate class being admitted, because a test
+        // that iterates "the admitted personas" cannot notice that the admitted set grew.
+        let split_byte = bus.jit_data_cost_clocks(BusWidth::Byte);
+        debug_assert!(
+            split_byte.saturating_mul(2) <= word_data_upper,
+            "a misaligned word charges 2 RAM byte cycles; the word bound must dominate it"
+        );
+        debug_assert!(
+            split_byte.saturating_mul(4) <= dword_data_upper,
+            "a misaligned dword charges 4 RAM byte cycles; the dword bound must dominate it"
+        );
         let data_upper = byte_data_upper
             .saturating_mul(u64::from(block.byte_reads()))
             .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_reads())))
@@ -2175,6 +2224,16 @@ impl CpuGsw {
         let raw_clocks = exit.raw_clocks.saturating_add(fp.clocks);
         let byte_reads = exit.byte_reads & u64::from(u32::MAX);
         let word_reads = exit.byte_reads >> 32;
+        // The static dword-read count must not carry into the lane's HIGH half, which is about to
+        // become a second quantity's storage the way `STACK_BYTE_READS` has packed word reads over
+        // byte reads since that lane shipped. It cannot: `emit_add_static_accounting` writes the
+        // low half with `mov r32, imm32` and a 64-bit add, so it never touches the high half, and
+        // `emit_add_repeated_accounting`'s product is a small per-block count times at most
+        // `MAX_NATIVE_SELF_LOOP_ITERATIONS`. Checkable rather than argued.
+        debug_assert!(
+            exit.dword_reads & u64::from(u32::MAX) <= u64::from(u32::MAX) / 2,
+            "static dword reads must not carry into the split-extra half"
+        );
         let dword_reads = exit.dword_reads;
         let mode13_byte_reads = exit.mode13_byte_reads & u64::from(u32::MAX);
         let mode13_word_reads = exit.mode13_byte_reads >> 32;
