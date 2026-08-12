@@ -990,6 +990,23 @@ pub trait CpuBus {
     /// Return an upper bound on the raw clocks added by one cached direct-memory charge. `Some`
     /// remains valid until the bus reports a step break. A JIT uses it only after its CPU-side
     /// direct-page cache hit; `None` keeps the ordinary instruction path.
+    ///
+    /// **This bounds ONE bus cycle, not one guest access, and the two stopped being the same
+    /// thing.** `BusCycle::clocks_for` ignores `width` entirely -- it is `2 + wait_states` -- so
+    /// every implementation of this method returns the same number for Byte, Word and Dword. A
+    /// MISALIGNED access is split into `width.bytes()` byte cycles by every charging path that
+    /// serves one, so its true cost is `width.bytes()` times what this returns: 2x for a Word, 4x
+    /// for a Dword.
+    ///
+    /// That was invisible while the direct JIT side-exited on every misaligned access. It no
+    /// longer does at its two lean one-lookup sites, and the interpreter's own direct-RAM path
+    /// serves misaligned accesses as a byte run. **A caller certifying a budget, a step break or a
+    /// batch cap against this value owes the `width.bytes()` multiplier itself** -- this method
+    /// cannot apply it, because it does not know the access's alignment.
+    ///
+    /// There is no production caller in the tree as this is written; the two that exist are tests
+    /// and the canonical-state dump. The warning is here rather than at a call site for exactly
+    /// that reason: the next caller is the one that would get it wrong, and nothing would fault.
     fn jit_direct_memory_max_clocks(&self, _width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
         None
     }

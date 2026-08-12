@@ -1114,6 +1114,9 @@ impl CpuBus for MachineBus<'_> {
         Ok(())
     }
 
+    /// Per-CYCLE, not per-access: `BusCycle::clocks_for` ignores width, so this returns the same
+    /// value for all three widths and a MISALIGNED access costs `width.bytes()` times it. See the
+    /// trait's declaration for the full caveat and for why the multiplier is the caller's.
     fn jit_direct_memory_max_clocks(&self, width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
         let ram_wait_states = if self.flat_data_cost {
             self.cache.cost.l1
