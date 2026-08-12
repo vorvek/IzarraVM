@@ -2286,7 +2286,9 @@ impl CpuBus for MachineBus<'_> {
         {
             return Ok(());
         }
-        let direct_write_before = self.vega.direct_write_token();
+        // IDENTITY, not the bare token: a 4F05 that moves margo_bank leaves the token
+        // at its banked value while changing which bytes a live pointer means.
+        let direct_write_before = self.vega.direct_write_identity();
         // Sampled BEFORE the write, because writing an index port is what moves the selector. Gated
         // at the call site: disarmed, this is one bool test on a device port write.
         let census_selector = if self.vga_wipe_census.enabled && self.vega.port_enabled(port) {
@@ -2295,15 +2297,15 @@ impl CpuBus for MachineBus<'_> {
             0
         };
         if self.vega.port_enabled(port) && self.vega.write_port(port, value as u8) {
-            let direct_write_after = self.vega.direct_write_token();
+            let direct_write_after = self.vega.direct_write_identity();
             if direct_write_after != direct_write_before {
                 if self.vga_wipe_census.enabled {
                     self.vga_wipe_census.record_token_change(
                         port,
                         census_selector,
                         value as u8,
-                        direct_write_before,
-                        direct_write_after,
+                        direct_write_before.0,
+                        direct_write_after.0,
                     );
                 }
                 self.mark_direct_data_map_changed();

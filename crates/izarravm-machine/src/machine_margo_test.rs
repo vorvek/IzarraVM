@@ -514,6 +514,143 @@ fn margo_scanout_decodes_a_whole_frame_under_one_palette_snapshot() {
     );
 }
 
+/// T6 -- THE PROBE/COPY AGREEMENT INVARIANT, which the whole mechanism rests on.
+///
+/// `direct_vga_bytes` decides `bulk_direct`; `direct_write_page` produces the
+/// pointer. If the first says yes where the second says no, every REP run builds a
+/// 4 KiB buffer, issues a full bulk source read, then abandons -- and because the
+/// loop re-enters at L-1 the waste repeats at L, L-1, ..., 1. QUADRATIC. That is
+/// what makes partial admission unshippable rather than merely wasteful, and
+/// nothing pinned it before this slice.
+#[test]
+fn banked_probe_and_copy_agree_for_every_page_of_the_window() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101)); // banked
+    assert!(machine.vega.margo_banked_window_key().is_some());
+
+    let mut checked = 0;
+    for page in (0..0x1_0000u32).step_by(0x1000) {
+        let address = 0x000a_0000 + page;
+        let probe = with_bus(&mut machine, |bus| {
+            bus.direct_memory_bytes(address, 4, BusWidth::Dword, BusAccessKind::DataWrite)
+        });
+        let pointer = machine.vega.direct_write_page(address).is_some();
+        assert_eq!(
+            probe == 4,
+            pointer,
+            "probe and copy disagree at {address:#x}: probe said {probe}, pointer {pointer}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 16, "the banked window is 16 pages");
+    assert!(
+        with_bus(&mut machine, |bus| bus.direct_memory_bytes(
+            0x000a_0000,
+            4,
+            BusWidth::Dword,
+            BusAccessKind::DataWrite
+        )) == 4,
+        "non-vacuous: the window must actually be ADMITTED, or the equality above \
+         is two nos agreeing"
+    );
+}
+
+/// T2 -- a bank switch under a live host pointer must land in the NEW bank.
+///
+/// The pointer is handed out for bank 0, then 4F05 moves the window. Before this
+/// slice no pointer could exist here at all, which is exactly the property the
+/// slice removes.
+#[test]
+fn banked_direct_page_follows_a_bank_switch() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    let bank0 = machine.vega.margo_banked_window_key();
+    assert_eq!(bank0, Some(0));
+    assert!(machine.vega.margo_banked_direct_page(0x000a_0000).is_some());
+
+    assert_eq!(machine.vega.vbe_window_control(0x0000, 2), Ok(2));
+    assert_eq!(
+        machine.vega.margo_banked_window_key(),
+        Some(2 * 0x1_0000),
+        "the key must move with the bank, or a cached pointer silently re-aims"
+    );
+    assert_ne!(bank0, machine.vega.margo_banked_window_key());
+}
+
+/// T3 -- THE C1 REGRESSION. Banked VESA, then `INT 10h AX=0003h`, must move the
+/// compared identity.
+///
+/// `select_legacy` clears `margo_active` and touches nothing else. The token is 0
+/// before and 0 after (the VGA reports 0 for text), and bank and linear do not
+/// move -- so the design's original `(token, bank, linear)` tuple was INVARIANT
+/// across a transition that flips the mapping, leaving a live pointer into Margo
+/// VRAM serving legacy VGA writes. That is the shutdown path of both measured
+/// fixtures.
+#[test]
+fn leaving_a_banked_mode_for_text_moves_the_direct_write_identity() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    let banked = machine.vega.direct_write_identity();
+    assert!(machine.vega.margo_banked_direct_page(0x000a_0000).is_some());
+
+    machine.vega.select_legacy();
+
+    assert!(
+        machine.vega.margo_banked_direct_page(0x000a_0000).is_none(),
+        "the grant must be revoked"
+    );
+    assert_ne!(
+        banked,
+        machine.vega.direct_write_identity(),
+        "and the IDENTITY must move with it -- this is the assertion the \
+         (token, bank, linear) tuple failed"
+    );
+}
+
+/// T4 -- one banked aperture write must not route Margo's dirt into the VGA.
+///
+/// `Vga::note_direct_write` opens with `debug_assert_ne!(direct_write_token(), 0)`,
+/// which is 0 by construction while banked, so a debug build would trip on the
+/// first write. Run from BOTH pre-4F02 states: they take different branches, and
+/// the mode-13h one is the branch that would set `mode13_linear_authoritative`
+/// from Margo offsets -- silent corruption rather than a loud assert.
+#[test]
+fn a_banked_aperture_write_does_not_disturb_legacy_vga_dirty_state() {
+    for pre_mode in [0x03u8, 0x13] {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Vega),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap();
+        if pre_mode == 0x13 {
+            assert!(machine.set_vga_mode(0x13));
+        }
+        assert!(machine.vega.set_vbe_mode(0x0101));
+
+        // Would fire `vga.rs:747`'s assert in a debug build without the Margo arm.
+        machine.vega.note_direct_write(0x000a_0100, 4);
+        machine.vega.note_direct_write_pages(0x0001);
+
+        assert!(
+            machine.vega.margo_banked_window_key().is_some(),
+            "pre_mode {pre_mode:#04x}: still banked after the notify"
+        );
+    }
+}
+
 /// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
 /// separate a LINEAR 4F02 request (bit 0x4000) from a banked one, and must
 /// count only ACCEPTED mode sets. A rejected mode leaves both alone -- otherwise

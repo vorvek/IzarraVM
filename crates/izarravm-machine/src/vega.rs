@@ -327,10 +327,17 @@ impl Vega {
     }
 
     pub(crate) fn mode13_direct_page_available(&self) -> bool {
-        !self.margo_banked_window_at(VGA_MODE13H_BASE) && self.vga.mode13h_direct_page_available()
+        self.margo_banked_window_key().is_some()
+            || (!self.margo_banked_window_at(VGA_MODE13H_BASE)
+                && self.vga.mode13h_direct_page_available())
     }
 
     pub(crate) fn mode13_direct_page(&mut self, physical_page: u32) -> Option<*mut u8> {
+        // Read side of the banked window, for the same reason as the write side:
+        // `mode13_direct_page_available` is forced false while Margo is banked.
+        if let Some(ptr) = self.margo_banked_direct_page(physical_page) {
+            return Some(ptr);
+        }
         if !self.mode13_direct_page_available() {
             return None;
         }
@@ -341,7 +348,20 @@ impl Vega {
         self.vga.mode13h_direct_page_ptr(offset)
     }
 
+    /// Non-zero when a host pointer for the legacy aperture is available.
+    ///
+    /// PROBE/COPY AGREEMENT: this is what `direct_vga_bytes` consults to decide
+    /// `bulk_direct`, while `direct_write_page` produces the pointer. If this said
+    /// yes where that says no, every bulk attempt would be a wasted 4 KiB source
+    /// read followed by a fallback -- and because the REP loop re-enters at L-1,
+    /// that waste repeats at L, L-1, ..., 1. Quadratic, not incidental. The banked
+    /// arm below is what keeps the two in step; `T6` pins it.
     pub(crate) fn direct_write_token(&self) -> u8 {
+        if self.margo_banked_window_key().is_some() {
+            // Distinct from the VGA's own tokens so a transition between the two
+            // owners always MOVES the token, never merely re-uses a value.
+            return 0xff;
+        }
         if self.margo_banked_window_at(VGA_MODE13H_BASE) {
             0
         } else {
@@ -355,6 +375,12 @@ impl Vega {
     }
 
     pub(crate) fn direct_write_page(&mut self, physical_page: u32) -> Option<*mut u8> {
+        // Margo's banked window first: while it owns the aperture the VGA token is
+        // 0 by construction, so without this arm the function refuses exactly the
+        // pages the slice exists to serve.
+        if let Some(ptr) = self.margo_banked_direct_page(physical_page) {
+            return Some(ptr);
+        }
         if self.direct_write_token() == 0 {
             return None;
         }
@@ -365,14 +391,36 @@ impl Vega {
         self.vga.direct_write_page_ptr(offset)
     }
 
+    /// Dirty-notify the engine that OWNS the address, not whichever one the
+    /// address range historically belonged to.
+    ///
+    /// `Vga::note_direct_write` opens with `debug_assert_ne!(direct_write_token(),
+    /// 0)`, and that token is 0 by construction while Margo is banked -- so once
+    /// the banked window is admitted, routing every aperture write into the VGA
+    /// fires that assert on the FIRST write in any debug build. In release it is
+    /// worse: legacy mode13 dirty state gets mutated from Margo offsets, and if the
+    /// guest was in mode 13h before the 4F02 the token is 1, the assert passes, and
+    /// `mode13_linear_authoritative` is set from Margo offsets -- silent corruption.
+    ///
+    /// While Margo owns the window its writes are Margo's business. Nothing is
+    /// forwarded to the VGA, which is also what keeps `arm_graphics_settle` off
+    /// this path.
     pub(crate) fn note_direct_write(&mut self, address: u32, bytes: usize) {
+        if self.margo_banked_window_at(address) {
+            return;
+        }
         let Some(offset) = address.checked_sub(VGA_MODE13H_BASE) else {
             return;
         };
         self.vga.note_direct_write(offset as usize, bytes);
     }
 
+    /// The page-granular twin. The JIT reports dirty PAGES with no address, so the
+    /// owner is decided by who owns the window itself.
     pub(crate) fn note_direct_write_pages(&mut self, dirty_pages: u16) {
+        if self.margo_banked_window_at(VGA_MODE13H_BASE) {
+            return;
+        }
         self.vga.note_direct_write_pages(dirty_pages);
     }
 
@@ -1256,6 +1304,65 @@ impl Vega {
             return None;
         }
         Some(offset)
+    }
+
+    /// THE SHARED PREDICATE. Every question about the banked window -- "is a host
+    /// pointer available", "which bytes does it mean", "has the mapping changed" --
+    /// is answered from this one function, so the three cannot disagree.
+    ///
+    /// `Some(bank)` exactly when a banked Margo window owns the legacy aperture.
+    /// `None` covers every way it can stop owning it: no VESA mode
+    /// (`margo_active` false, which `select_legacy` clears and nothing else in the
+    /// identity tracked), a linear-framebuffer mode, or a bank whose 64 KiB window
+    /// does not lie wholly inside the frame store.
+    ///
+    /// THE INVARIANT THIS EXISTS FOR: anything that can change the return of
+    /// `margo_banked_direct_page` changes the return of this function, and
+    /// `direct_write_identity` is built from it -- so a mapping change cannot be
+    /// invisible to the cached-pointer guard. That is provable here rather than by
+    /// enumerating call sites, which is what the previous design got wrong.
+    pub(crate) fn margo_banked_window_key(&self) -> Option<u32> {
+        // `margo_banked_direct_page` derives a window base by multiplying the bank
+        // by the window size and requires the result to lie in the frame store. It
+        // is page-independent -- the same key answers for every page of the
+        // window -- only because the store divides evenly by the window.
+        const { assert!(MARGO_VRAM_SIZE.is_multiple_of(VGA_PLANAR_WINDOW_SIZE as usize)) };
+        if !self.margo_active || self.margo_linear {
+            return None;
+        }
+        let base = u32::from(self.margo_bank).checked_mul(VGA_PLANAR_WINDOW_SIZE)?;
+        let end = base.checked_add(VGA_PLANAR_WINDOW_SIZE)?;
+        (end as usize <= MARGO_VRAM_SIZE).then_some(base)
+    }
+
+    /// A host pointer to one 4 KiB page of the banked Margo window, or `None`.
+    ///
+    /// Written in terms of `margo_banked_window_key` rather than repeating its
+    /// conditions, so the identity that guards cached copies of this pointer and
+    /// the grant itself cannot drift apart.
+    pub(crate) fn margo_banked_direct_page(&mut self, physical_page: u32) -> Option<*mut u8> {
+        let base = self.margo_banked_window_key()?;
+        let offset = physical_page.checked_sub(VGA_MODE13H_BASE)?;
+        if offset & 0x0fff != 0 || offset >= VGA_PLANAR_WINDOW_SIZE {
+            return None;
+        }
+        let start = base.checked_add(offset)? as usize;
+        let vram = self.margo.vram_mut();
+        (start + 0x1000 <= vram.len()).then(|| vram[start..].as_mut_ptr())
+    }
+
+    /// What the cached-pointer guards compare across a potentially mapping-moving
+    /// operation. The VGA's own token, plus the banked-window key.
+    ///
+    /// The key is what the previous `(token, bank, linear)` tuple was missing:
+    /// `select_legacy` clears `margo_active` and touches nothing else, so across
+    /// banked-VESA -> INT 10h mode 03h the old tuple was INVARIANT while the
+    /// mapping flipped, leaving a live pointer into Margo VRAM serving legacy VGA.
+    pub(crate) fn direct_write_identity(&self) -> (u8, Option<u32>) {
+        (
+            self.vga.direct_write_token(),
+            self.margo_banked_window_key(),
+        )
     }
 
     fn margo_banked_window_at(&self, address: u32) -> bool {

@@ -111,9 +111,9 @@ impl Machine {
     /// The CPU registers are intact here: a software interrupt only pushes
     /// flags/CS/IP.
     pub(super) fn handle_int10(&mut self) {
-        let direct_write_before = self.vega.direct_write_token();
+        let direct_write_before = self.vega.direct_write_identity();
         self.handle_int10_inner();
-        if self.vega.direct_write_token() != direct_write_before {
+        if self.vega.direct_write_identity() != direct_write_before {
             self.mark_direct_data_map_changed();
         }
     }
