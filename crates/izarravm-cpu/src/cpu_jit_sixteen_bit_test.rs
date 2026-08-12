@@ -82,7 +82,7 @@ fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
 /// mapped for read and write. A memory-form slot silently never compiles without this, and the
 /// test then passes interpreted.
 fn arm_native_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, pages: &[u32]) {
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     for &page in pages {
         map_direct_page(
             cpu,

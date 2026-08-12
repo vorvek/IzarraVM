@@ -28,8 +28,7 @@ use super::*;
 /// access that populates the map. Returns the linear base of the populated page.
 fn cpu_with_populated_page() -> (CpuGsw, TestBus, u32) {
     let mut cpu = CpuGsw::default();
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
-    cpu.refresh_fast_map_serve_gate();
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     // Roomy enough that every case below can use a page of its OWN: a second access to a
     // page a previous case populated would HIT, and the refusal under test would never happen.

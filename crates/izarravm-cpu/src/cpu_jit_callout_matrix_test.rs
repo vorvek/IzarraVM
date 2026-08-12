@@ -906,7 +906,7 @@ fn lane_and_call_out_starts() -> [u32; 5] {
 
 fn lane_cpu() -> CpuGsw {
     let mut cpu = flat_cpu();
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.set_eip(LANE_ENTRY);
     cpu
 }
@@ -1141,8 +1141,7 @@ fn warm_pages(roles: &mut Roles, pages: &[u32]) {
         (&mut roles.native, &mut roles.native_bus),
         (&mut roles.interp, &mut roles.interp_bus),
     ] {
-        cpu.jit_direct.set_fast_map_enabled_for_test(true);
-        cpu.refresh_fast_map_serve_gate();
+        cpu.set_fast_map_enabled_for_test(true);
         for &page in pages {
             let value = cpu
                 .read_memory_bus_width(
@@ -1173,8 +1172,7 @@ fn warm_pages(roles: &mut Roles, pages: &[u32]) {
 /// than the gate.
 fn arm_fast_map_gate(roles: &mut Roles) {
     for cpu in [&mut roles.native, &mut roles.interp] {
-        cpu.jit_direct.set_fast_map_enabled_for_test(true);
-        cpu.refresh_fast_map_serve_gate();
+        cpu.set_fast_map_enabled_for_test(true);
     }
 }
 

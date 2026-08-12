@@ -27,8 +27,7 @@ use super::*;
 /// and covers the whole low megabyte including the Mode13h aperture.
 fn flat_cpu_and_bus() -> (CpuGsw, TestBus) {
     let mut cpu = CpuGsw::default();
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
-    cpu.refresh_fast_map_serve_gate();
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.registers
         .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
     let mut bus = TestBus::with_memory(vec![0u8; 0x000c_0000]);

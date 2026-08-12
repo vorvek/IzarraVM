@@ -31,7 +31,7 @@ const ALIAS_IMM: u32 = 0x9090_9090;
 
 fn flat_cpu() -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.set_mode(GswMode::Gsw486);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers

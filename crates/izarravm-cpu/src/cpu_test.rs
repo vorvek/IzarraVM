@@ -2640,7 +2640,7 @@ fn a_vga_aperture_change_drops_the_aperture_and_keeps_ram_live_at_the_same_epoch
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
 
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x2000, BusAccessKind::DataRead)
         .unwrap();
@@ -2685,7 +2685,7 @@ fn a_bus_decode_change_still_drops_ram_and_vga_direct_pages() {
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
 
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x2000, BusAccessKind::DataRead)
         .unwrap();

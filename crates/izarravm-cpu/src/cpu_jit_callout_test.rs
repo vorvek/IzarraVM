@@ -816,8 +816,7 @@ fn resident_stack_cpu() -> (CpuGsw, TestBus) {
     let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
     bus.direct_pages_enabled = true;
     bus.direct_page_clocks = true;
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
-    cpu.refresh_fast_map_serve_gate();
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.registers.gpr = FRAME_SEED;
     cpu.registers.set_esp(STACK_TOP);
     for page in [(STACK_TOP - 0x1000) & !0xfff, STACK_TOP & !0xfff] {

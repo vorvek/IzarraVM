@@ -76,7 +76,7 @@ fn instruction(form: Form, width: Width, imm: u32, target: Option<u32>) -> Vec<u
 
 fn flat_cpu(mode: GswMode) -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.set_mode(mode);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers

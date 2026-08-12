@@ -35,7 +35,7 @@ fn fixture_in_mode(code: &[u8], mode: GswMode) -> (CpuGsw, TestBus) {
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     let mut cpu = fresh_in_mode(mode);
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
     (cpu, bus)
@@ -1253,7 +1253,7 @@ fn disabled_native_continuations_leave_direct_counters_cold() {
         &mut bus,
         &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
     );
-    cpu.jit_direct.set_fast_map_enabled_for_test(false);
+    cpu.set_fast_map_enabled_for_test(false);
     cpu.set_jit_auto_admit(false);
     cpu.registers.eip = ENTRY;
 
@@ -1838,7 +1838,7 @@ fn flat_fixture(entry: u32, code: &[u8]) -> (CpuGsw, TestBus) {
         cpu.registers.set_segment(segment, descriptor);
     }
     cpu.registers.eip = entry;
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
     (cpu, bus)
@@ -1959,7 +1959,7 @@ fn sixteen_bit_stack_fixture(entry: u32, code: &[u8]) -> (CpuGsw, TestBus) {
     cpu.registers.set_segment(SegmentIndex::Ss, ss);
     cpu.registers.set_esp(0x1234_0800);
     cpu.registers.eip = entry;
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
     (cpu, bus)
@@ -2142,7 +2142,7 @@ fn flat_code_sixteen_bit_stack_fixture(entry: u32, code: &[u8]) -> (CpuGsw, Test
     cpu.registers.set_segment(SegmentIndex::Ss, ss);
     cpu.registers.set_esp(0x1234_0800);
     cpu.registers.eip = entry;
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
     (cpu, bus)
@@ -2416,7 +2416,7 @@ fn a_leave_on_a_thirty_two_bit_stack_enters_the_block() {
     let mut cpu = fresh();
     cpu.registers.set_esp(0x0800);
     cpu.registers.eip = ENTRY;
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
     warm(

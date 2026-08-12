@@ -2242,7 +2242,7 @@ const QUAKE_CS_LIMIT: u32 = 0x016e_ffff;
 
 fn quake_segment_cpu(entry: u32, paging: bool) -> CpuGsw {
     let mut cpu = flat_stack_cpu(entry);
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     if paging {
         cpu.control.cr0 |= CR0_PG | CR0_WP;
         cpu.control.cr3 = 0x3000;

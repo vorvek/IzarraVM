@@ -3493,7 +3493,7 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_stack_push() {
     for bus in [&mut interp_bus, &mut native_bus] {
         bus.direct_pages_enabled = true;
     }
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     map_direct_page(
         &mut native,
         &mut native_bus,
@@ -3612,7 +3612,7 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_stack_pop() {
     for bus in [&mut interp_bus, &mut native_bus] {
         bus.direct_pages_enabled = true;
     }
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     for page in [0x0000u32, 0xf000] {
         map_direct_page(
             &mut native,
@@ -3732,7 +3732,7 @@ fn a_word_pop_into_sp_takes_the_loaded_word_not_the_advanced_pointer() {
     for bus in [&mut interp_bus, &mut native_bus] {
         bus.direct_pages_enabled = true;
     }
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     // Both the code page and the stack page. Mapping only the stack page leaves the block
     // uncompilable, and the test would then pass on interpreted execution.
     for page in [0x0000u32, 0xf000] {
@@ -3828,7 +3828,7 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_call() {
     for bus in [&mut interp_bus, &mut native_bus] {
         bus.direct_pages_enabled = true;
     }
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     for page in [0x0000u32, 0xf000] {
         map_direct_page(
             &mut native,
@@ -3956,7 +3956,7 @@ fn sixteen_bit_ret_case(release: u16) {
     for bus in [&mut interp_bus, &mut native_bus] {
         bus.direct_pages_enabled = true;
     }
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     for page in [0x0000u32, 0xf000] {
         map_direct_page(
             &mut native,
@@ -4361,7 +4361,7 @@ fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faul
     }
     native.registers.eip = ENTRY;
     interp.registers.eip = ENTRY;
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     map_direct_page(
         &mut native,
         &mut native_bus,
@@ -4821,7 +4821,7 @@ fn finite_cs_call_through_memory_limit_exit_preserves_restart_state_and_faults_p
     }
     native.registers.eip = ENTRY;
     interp.registers.eip = ENTRY;
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     // Page 0 covers the source dword at 0x800 AND the stack cell at 0x0ffc, so both lanes are
     // available and the CS limit is the only thing that can refuse.
     map_direct_page(
@@ -4968,7 +4968,7 @@ fn a_call_through_memory_whose_push_lands_on_watched_code_side_exits() {
     }
     native.registers.eip = ENTRY;
     interp.registers.eip = ENTRY;
-    native.jit_direct.set_fast_map_enabled_for_test(true);
+    native.set_fast_map_enabled_for_test(true);
     map_direct_page(
         &mut native,
         &mut native_bus,
@@ -5855,7 +5855,7 @@ fn a_jmp_through_memory_links_and_transfers_natively_on_the_second_entry() {
     // `NativeMapBases` to exist before `compile` will emit it, so force the map on the way the
     // compile-outcome fixtures do.
     drive(&mut cpu, &mut bus);
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
 
@@ -5972,7 +5972,7 @@ fn a_call_through_a_register_links_and_transfers_natively_on_the_second_entry() 
     // store guard will let the push through rather than side exit at `UnavailableOrKind`. The
     // stack write lands at 0xffc, page 0, the same page the code sits on.
     drive(&mut cpu, &mut bus);
-    cpu.jit_direct.set_fast_map_enabled_for_test(true);
+    cpu.set_fast_map_enabled_for_test(true);
     map_direct_page(
         &mut cpu,
         &mut bus,
@@ -6711,7 +6711,7 @@ fn an_override_naming_an_inaccessible_segment_refuses_to_compile_at_all() {
                 cpu.fetch_decoded(&mut bus, lin).expect("fixture decode");
             }
             cpu.set_eip(ENTRY);
-            cpu.jit_direct.set_fast_map_enabled_for_test(true);
+            cpu.set_fast_map_enabled_for_test(true);
             map_direct_page(
                 &mut cpu,
                 &mut bus,
@@ -6836,7 +6836,7 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
         for cpu in [&mut native, &mut interp] {
             cpu.registers.eip = ENTRY;
         }
-        native.jit_direct.set_fast_map_enabled_for_test(true);
+        native.set_fast_map_enabled_for_test(true);
         map_direct_page(
             &mut native,
             &mut native_bus,

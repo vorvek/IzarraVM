@@ -69,6 +69,25 @@ impl CpuGsw {
         self.fast_map_serve_enabled.enabled = self.fast_map_population_enabled();
     }
 
+    /// Arm the FastMap for a test AND refresh the serve-gate mirror in one step.
+    ///
+    /// `JitState::set_fast_map_enabled_for_test` moves an INPUT to
+    /// `fast_map_population_enabled()`, so by that predicate's own contract -- "must be called
+    /// from EVERY site that can change this predicate's inputs" -- it owes a refresh. It could not
+    /// pay one itself: it lives on `JitState`, and the mirror lives on `CpuGsw`. Test call sites
+    /// were therefore expected to remember, and roughly half of them did not.
+    ///
+    /// That was survivable only while every consumer recomputed the predicate instead of reading
+    /// the mirror. It stopped being survivable the moment `populate_fast_map_from_cached` started
+    /// reading the mirror (which is the point -- the serve gate should be established once), and
+    /// it surfaced as a JIT block failing to compile because no FastMap entry was ever published.
+    /// Bundling the two here means a test cannot arm the map into a stale-mirror state at all.
+    #[cfg(test)]
+    pub(crate) fn set_fast_map_enabled_for_test(&mut self, enabled: bool) {
+        self.jit_direct.set_fast_map_enabled_for_test(enabled);
+        self.refresh_fast_map_serve_gate();
+    }
+
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -143,7 +162,10 @@ impl CpuGsw {
         mapping_epoch: u64,
         write: bool,
     ) {
-        if !self.fast_map_population_enabled() {
+        // The CACHED mirror, not the uncached predicate it mirrors. This sits on the path whose
+        // hit already read the mirror, so recomputing the predicate here was the serve gate asked
+        // twice. `fast_map_data_slot`'s debug_assert already proves the two agree.
+        if !self.fast_map_serve_enabled.enabled {
             return;
         }
         self.populate_fast_map_active(
@@ -1425,10 +1447,54 @@ impl CpuGsw {
                 .map(u32::from);
         }
         let linear = self.segment_linear_range(segment, offset, width.bytes(), false)?;
+        // ---- census gate + `split` classification + THE PROBE ----
+        //
+        // EXACTLY ONE PROBE PER PAGE-LOCAL SIZED ACCESS, on the hit path and the miss path alike.
+        // That invariant used to be a comment on `read_linear_fragment`; it is now structural,
+        // because there is one probe site per ENTRY POINT and the shared tail
+        // (`*_after_probe`) has none. The census gate and the classification belong to the probe
+        // and move WITH it -- the tail must not re-run either.
+        //
+        // A hoist that left this function falling into the PROBING fragment entry rather than
+        // into the probe-less tail would pay the epoch/CPL/CR0.WP preamble TWICE on every miss --
+        // the ~2.66 ns/access cost behind a recorded 4.6% wall regression -- and would double
+        // `fast_map_probe.misses` and the census counts. All of that is invisible to every state
+        // assertion, which is why
+        // `exactly_one_probe_and_one_census_note_per_page_local_sized_access` exists.
+        #[cfg(feature = "jit")]
+        if self.rmw_census_enabled {
+            self.census_note_read(linear);
+        }
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        {
+            let split = width.misaligned_at(linear);
+            if let Some((physical, ptr, mode13)) =
+                self.fast_map_data_slot(linear, width, false, split)
+            {
+                return self.finish_fast_map_read(bus, physical, ptr, mode13, width, split, kind);
+            }
+        }
+        // REORDERED BEHIND THE PROBE, and behaviour-identical. On a hit, page-locality was already
+        // proved by the probe with the identical inequality (`offset + bytes > PAGE_SIZE` there vs
+        // `(linear & 0xfff) + width > 0x1000` here), so a crossing access can never reach the hit
+        // tail. On a miss, control arrives here exactly as before. A paging-DISABLED crossing
+        // access is unaffected in both orderings: the probe rejects it on page-locality and this
+        // test is false because paging is off, so it goes wide to the bus, as today.
+        //
+        // What the hit path saves: one CR0 load and test, one add/and/cmp, and the duplicate
+        // `width == Byte` test the old `read_linear_fragment` entry performed.
+        //
+        // What a CROSSING access now pays: one extra probe. It is refused here on page-locality,
+        // then `read_paged_cross_page` splits it and each fragment probes on its own page, so the
+        // count is 1 + N rather than N. `slot_reject_page_cross` measures that population.
         if self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()) {
             return self.read_paged_cross_page(bus, linear, width.bytes(), kind);
         }
-        self.read_linear_fragment(bus, linear, width, kind)
+        self.read_linear_fragment_after_probe(bus, linear, width, kind)
     }
 
     pub(super) fn write_memory_bus_width<B: CpuBus>(
@@ -1444,10 +1510,43 @@ impl CpuGsw {
             return self.write_memory_u8(bus, segment, offset, value as u8, kind);
         }
         let linear = self.segment_linear_range(segment, offset, width.bytes(), true)?;
+        // ---- census gate + `split` classification + THE PROBE ----
+        //
+        // EXACTLY ONE PROBE PER PAGE-LOCAL SIZED ACCESS, on the hit path and the miss path alike.
+        // That invariant used to be a comment on `read_linear_fragment`; it is now structural,
+        // because there is one probe site per ENTRY POINT and the shared tail
+        // (`*_after_probe`) has none. The census gate and the classification belong to the probe
+        // and move WITH it -- the tail must not re-run either.
+        //
+        // A hoist that left this function falling into the PROBING fragment entry rather than
+        // into the probe-less tail would pay the epoch/CPL/CR0.WP preamble TWICE on every miss --
+        // the ~2.66 ns/access cost behind a recorded 4.6% wall regression -- and would double
+        // `fast_map_probe.misses` and the census counts. All of that is invisible to every state
+        // assertion, which is why
+        // `exactly_one_probe_and_one_census_note_per_page_local_sized_access` exists.
+        #[cfg(feature = "jit")]
+        if self.rmw_census_enabled {
+            self.census_note_write(linear);
+        }
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        {
+            let split = width.misaligned_at(linear);
+            if let Some((physical, ptr, mode13)) =
+                self.fast_map_data_slot(linear, width, true, split)
+            {
+                return self
+                    .finish_fast_map_write(bus, physical, ptr, mode13, width, split, value, kind);
+            }
+        }
+        // Reordered behind the probe; see `read_memory_bus_width` for the proof.
         if self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()) {
             return self.write_paged_cross_page(bus, linear, width.bytes(), value, kind);
         }
-        self.write_linear_fragment(bus, linear, width, value, kind)
+        self.write_linear_fragment_after_probe(bus, linear, width, value, kind)
     }
 
     #[inline]
@@ -1535,11 +1634,29 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        let split = width.misaligned_at(linear);
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, false, split)
         {
-            return self.finish_fast_map_read(bus, physical, ptr, mode13, width, split, kind);
+            let split = width.misaligned_at(linear);
+            if let Some((physical, ptr, mode13)) =
+                self.fast_map_data_slot(linear, width, false, split)
+            {
+                return self.finish_fast_map_read(bus, physical, ptr, mode13, width, split, kind);
+            }
         }
+        self.read_linear_fragment_after_probe(bus, linear, width, kind)
+    }
+
+    /// The shared, PROBE-LESS tail of a sized read. Reached from `read_memory_bus_width` (which
+    /// probed) and from `read_linear_fragment` (which probed), and it must never probe itself --
+    /// that is what makes "exactly one probe per page-local sized access" structural rather than
+    /// a convention. It must not re-run the census gate or the `split` classification either;
+    /// both belong to the probe.
+    fn read_linear_fragment_after_probe<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> ExecResult<u32> {
         let physical = self.translate_linear(bus, linear, false)?;
         if let Some(value) = self.read_direct_page_cached(bus, linear, physical, width, kind)? {
             return Ok(value);
@@ -1573,11 +1690,27 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        let split = width.misaligned_at(linear);
-        if let Some((physical, ptr, mode13)) = self.fast_map_data_slot(linear, width, true, split) {
-            return self
-                .finish_fast_map_write(bus, physical, ptr, mode13, width, split, value, kind);
+        {
+            let split = width.misaligned_at(linear);
+            if let Some((physical, ptr, mode13)) =
+                self.fast_map_data_slot(linear, width, true, split)
+            {
+                return self
+                    .finish_fast_map_write(bus, physical, ptr, mode13, width, split, value, kind);
+            }
         }
+        self.write_linear_fragment_after_probe(bus, linear, width, value, kind)
+    }
+
+    /// The shared, PROBE-LESS tail of a sized write. See `read_linear_fragment_after_probe`.
+    fn write_linear_fragment_after_probe<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
         let physical = self.translate_linear(bus, linear, true)?;
         #[cfg(feature = "watch-write")]
         if crate::write_watch_hits(crate::write_watch_packed(), physical, width.bytes()) {
