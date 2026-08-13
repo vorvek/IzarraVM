@@ -748,6 +748,61 @@ impl MachineBus<'_> {
         let ws = self.data_access_wait_states(address, width);
         self.trace.record(kind, address, width, ws);
     }
+
+    /// The classification tail of `charge_physical_instruction_fetch_run`: A20 folding, the
+    /// uniform-region test, the I-cache-vs-device-window split, and the exact per-byte fallback.
+    /// Out of line ON PURPOSE: this body is why ThinLTO used to refuse to inline the whole
+    /// method, leaving the warm below-aperture fast path paying a call frame per instruction.
+    /// The head owns the `count != 0` and below-0xA0000 screens, so every caller arrives here
+    /// with a run that genuinely needs classifying.
+    #[cold]
+    #[inline(never)]
+    fn charge_classified_instruction_fetch_run(
+        &mut self,
+        physical_start: u32,
+        count: u32,
+    ) -> Result<(), BusError> {
+        let first = self.apply_a20(physical_start);
+        let last = self.apply_a20(physical_start.wrapping_add(count - 1));
+        let first_ws = self.code_fetch_wait_states(first);
+        // Uniform iff every byte lands in the same wait-state region with no A20 wrap
+        // between the ends. apply_a20 already folded both ends, so equal wait-states on
+        // contiguous post-A20 addresses means the whole run is one region. The endpoint-only
+        // test relies on `count` being one instruction's length (at most 15 bytes), far smaller
+        // than any wait-state region: a narrower region wholly contained between two matching
+        // endpoints cannot exist at that scale. A caller passing a large `count` must not assume
+        // this holds; the non-uniform branch's exact per-byte loop is the safe fallback regardless.
+        let uniform =
+            last == first.wrapping_add(count - 1) && first_ws == self.code_fetch_wait_states(last);
+        if uniform {
+            // I-cache model: an instruction whose bytes lie in cacheable RAM is
+            // delivered by the I-cache in ONE bus access, not one per byte. The
+            // per-byte bus cost (>= 2 clocks/byte) is a slow-bus artifact; on a part
+            // with an instruction cache a hit returns the whole (pre-decoded) line in
+            // a single fetch. Charging per byte here floors every mode's Dhrystone/
+            // Sieve far below its era band (the floor is the same clocks in every
+            // mode, so the fast modes can never separate). One access per instruction
+            // makes the bands reachable for the slower modes and lifts the fast modes
+            // toward (though not all the way to, see bench_reference.rs) their targets.
+            //
+            // ROM / device code (uncached) keeps the exact per-byte charge: those
+            // windows are not I-cached, so `is_device_window` routes them to the
+            // per-byte loop below to preserve firmware/POST and device-execution
+            // timing unchanged.
+            if first >= 0x000A_0000 && self.is_device_window(first, BusWidth::Byte) {
+                self.trace
+                    .record_instruction_fetch_run(first, count, first_ws);
+            } else {
+                // Single I-cache access for the whole instruction run.
+                self.trace.record_instruction_fetch_run(first, 1, first_ws);
+            }
+        } else {
+            for i in 0..count {
+                self.charge_instruction_fetch(physical_start.wrapping_add(i))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl CpuBus for MachineBus<'_> {
@@ -1565,6 +1620,12 @@ impl CpuBus for MachineBus<'_> {
         self.charge_physical_instruction_fetch_run(start, count)
     }
 
+    // Inlinable on purpose. The warm-fetch profile showed this call as a standing leaf (5.96%
+    // SELF on JIT-off prince-486) not because the fast path is expensive but because ThinLTO
+    // declined to inline a body that carries the whole classification tail. The head below is
+    // small enough to inline into `charge_fetch_run`; the tail moves to the `#[inline(never)]`
+    // helper so it cannot drag the head out of line again.
+    #[inline]
     fn charge_physical_instruction_fetch_run(
         &mut self,
         physical_start: u32,
@@ -1579,7 +1640,7 @@ impl CpuBus for MachineBus<'_> {
         // `code_fetch_wait_states` is the per-mode I-cache constant for any
         // address below 0xA0000 (the device-window gate only engages at or above
         // it); and a contiguous run below 0xA0000 is uniform by construction.
-        // The classification below would therefore always land in the uniform
+        // The classification would therefore always land in the uniform
         // cacheable-RAM arm and charge ONE I-cache access at the constant
         // wait-state, so charge exactly that in one step. ROM/device/A20-edge
         // runs keep the full classification, byte-for-byte.
@@ -1609,46 +1670,7 @@ impl CpuBus for MachineBus<'_> {
             }
             return Ok(());
         }
-        let first = self.apply_a20(physical_start);
-        let last = self.apply_a20(physical_start.wrapping_add(count - 1));
-        let first_ws = self.code_fetch_wait_states(first);
-        // Uniform iff every byte lands in the same wait-state region with no A20 wrap
-        // between the ends. apply_a20 already folded both ends, so equal wait-states on
-        // contiguous post-A20 addresses means the whole run is one region. The endpoint-only
-        // test relies on `count` being one instruction's length (at most 15 bytes), far smaller
-        // than any wait-state region: a narrower region wholly contained between two matching
-        // endpoints cannot exist at that scale. A caller passing a large `count` must not assume
-        // this holds; the non-uniform branch's exact per-byte loop is the safe fallback regardless.
-        let uniform =
-            last == first.wrapping_add(count - 1) && first_ws == self.code_fetch_wait_states(last);
-        if uniform {
-            // I-cache model: an instruction whose bytes lie in cacheable RAM is
-            // delivered by the I-cache in ONE bus access, not one per byte. The
-            // per-byte bus cost (>= 2 clocks/byte) is a slow-bus artifact; on a part
-            // with an instruction cache a hit returns the whole (pre-decoded) line in
-            // a single fetch. Charging per byte here floors every mode's Dhrystone/
-            // Sieve far below its era band (the floor is the same clocks in every
-            // mode, so the fast modes can never separate). One access per instruction
-            // makes the bands reachable for the slower modes and lifts the fast modes
-            // toward (though not all the way to, see bench_reference.rs) their targets.
-            //
-            // ROM / device code (uncached) keeps the exact per-byte charge: those
-            // windows are not I-cached, so `is_device_window` routes them to the
-            // per-byte loop below to preserve firmware/POST and device-execution
-            // timing unchanged.
-            if first >= 0x000A_0000 && self.is_device_window(first, BusWidth::Byte) {
-                self.trace
-                    .record_instruction_fetch_run(first, count, first_ws);
-            } else {
-                // Single I-cache access for the whole instruction run.
-                self.trace.record_instruction_fetch_run(first, 1, first_ws);
-            }
-        } else {
-            for i in 0..count {
-                self.charge_instruction_fetch(physical_start.wrapping_add(i))?;
-            }
-        }
-        Ok(())
+        self.charge_classified_instruction_fetch_run(physical_start, count)
     }
 
     fn read_io(

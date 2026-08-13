@@ -405,6 +405,14 @@ impl CpuGsw {
 
     /// The charge + eip advance shared by both entry points, past the point where the physical
     /// start is known.
+    ///
+    /// Inlinable on purpose, with the crossing arm outlined: this call was a standing 4.88%
+    /// SELF leaf on JIT-off prince-486 purely because the crossing tail made the body too big
+    /// for ThinLTO's default. The crossing arm is UNREACHABLE from a cached line anyway:
+    /// `DecodeCache::put` refuses any insert that straddles a page linearly or physically, so
+    /// every warm caller arrives with `first_count == count` and the outlined helper serves
+    /// only the cold `line_phys_start == None` fallback.
+    #[inline]
     fn charge_fetch_run<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -417,16 +425,33 @@ impl CpuGsw {
         if first_count == count {
             bus.charge_physical_instruction_fetch_run(physical, count)?;
         } else {
-            let tail_linear = lin.wrapping_add(first_count);
-            let tail_physical = self.translate_code_linear(bus, tail_linear)?;
-            if tail_physical == physical.wrapping_add(first_count) {
-                bus.charge_physical_instruction_fetch_run(physical, count)?;
-            } else {
-                bus.charge_physical_instruction_fetch_run(physical, first_count)?;
-                bus.charge_physical_instruction_fetch_run(tail_physical, count - first_count)?;
-            }
+            self.charge_crossing_fetch_run(bus, lin, physical, count, first_count)?;
         }
         self.registers.eip = self.registers.eip.wrapping_add(u32::from(len));
+        Ok(())
+    }
+
+    /// The page-crossing arm of `charge_fetch_run`, cold by construction (see the note there).
+    /// EIP is NOT advanced here: the caller advances it after either arm, preserving the
+    /// existing order of charge, then translation fault, then advance.
+    #[cold]
+    #[inline(never)]
+    fn charge_crossing_fetch_run<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        physical: u32,
+        count: u32,
+        first_count: u32,
+    ) -> ExecResult<()> {
+        let tail_linear = lin.wrapping_add(first_count);
+        let tail_physical = self.translate_code_linear(bus, tail_linear)?;
+        if tail_physical == physical.wrapping_add(first_count) {
+            bus.charge_physical_instruction_fetch_run(physical, count)?;
+        } else {
+            bus.charge_physical_instruction_fetch_run(physical, first_count)?;
+            bus.charge_physical_instruction_fetch_run(tail_physical, count - first_count)?;
+        }
         Ok(())
     }
 
