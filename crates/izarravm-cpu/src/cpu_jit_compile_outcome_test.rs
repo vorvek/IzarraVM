@@ -3249,3 +3249,154 @@ fn call_through_memory_respects_the_stack_access_cap() {
     );
     assert!(call_block.dynamic_successor);
 }
+
+/// The `Rejected` row attribution closes: every rejected-target exit is either charged to a row
+/// or counted in the residual.
+///
+/// `note_unbound_rejected_at` used to drop an exit whose entry linear was not in
+/// `rejected_barrier` with no trace at all, which is the barrier census's analogue of the link
+/// census's `missing_id`. Without the residual the C3 identity below cannot be evaluated on a
+/// fixture run at all, and a shortfall reads as a smaller `Rejected` population rather than as an
+/// instrument gap.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn barrier_census_closure_counts_rejected_exits_the_map_cannot_attribute() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, DIRECT_BARRIER]);
+    cpu.enable_direct_barrier_census(true);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let _ = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+
+    // ENTRY is in the rejected-span map; a linear the compiler never refused is not.
+    const UNMAPPED: u32 = ENTRY + 0x4000;
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, UNMAPPED);
+    cpu.jit_direct
+        .note_dynamic_miss_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+    cpu.jit_direct
+        .note_dynamic_miss_target(jit::direct::UnboundTarget::Rejected, UNMAPPED);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    assert_eq!(
+        snapshot.rejected_unattributed, 1,
+        "the exit at an unmapped linear must be counted, not dropped"
+    );
+    assert_eq!(snapshot.dynamic_rejected_unattributed, 1);
+
+    let class = |targets: &[(&'static str, u64)]| {
+        targets
+            .iter()
+            .find(|(label, _)| *label == "rejected")
+            .expect("rejected class")
+            .1
+    };
+    let static_rejected = class(&snapshot.unbound_targets);
+    let dynamic_rejected = class(&snapshot.dynamic_miss_targets);
+    assert_eq!(static_rejected, 2);
+    assert_eq!(dynamic_rejected, 2);
+
+    // C3, both lanes: row sum + residual == the class total.
+    let row_static: u64 = snapshot.rows.iter().map(|row| row.unbound_exits).sum();
+    let row_dynamic: u64 = snapshot
+        .rows
+        .iter()
+        .map(|row| row.dynamic_unbound_exits)
+        .sum();
+    assert_eq!(row_static + snapshot.rejected_unattributed, static_rejected);
+    assert_eq!(
+        row_dynamic + snapshot.dynamic_rejected_unattributed,
+        dynamic_rejected
+    );
+}
+
+/// A second rejection at a linear the map already holds OVERWRITES the first, and that is the
+/// only honest signal the census has for stale-hit mis-attribution.
+///
+/// The residual above cannot see this hazard: an overwritten key still resolves, so the exit is
+/// charged to a row (the wrong one, or a stale one) and the residual stays zero. The map is never
+/// pruned and is keyed on linear alone, so a recompiled-then-accepted linear keeps answering with
+/// the barrier that refused an earlier block there.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn barrier_census_closure_counts_a_rejected_map_overwrite() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, DIRECT_BARRIER]);
+    cpu.enable_direct_barrier_census(true);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let _ = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        cpu.direct_barrier_census_snapshot()
+            .expect("enabled census snapshot")
+            .rejected_barrier_overwrites,
+        0,
+        "the first rejection at a linear claims a free slot"
+    );
+
+    let _ = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        cpu.direct_barrier_census_snapshot()
+            .expect("enabled census snapshot")
+            .rejected_barrier_overwrites,
+        1,
+        "a second rejection at the same linear displaces the first row's claim"
+    );
+}
+
+/// The carried totals are the arrays they claim to summarize, and the perf-counter join actually
+/// reads `PerfCounters` rather than re-deriving the census's own numbers.
+///
+/// The perf counters are set by hand here: `note_unbound_target` is the census hook and does not
+/// touch them, so a join that returned `classified_static` would be indistinguishable from a real
+/// one without a fixture that drives the two apart.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn barrier_census_closure_totals_match_the_class_arrays_and_the_perf_counters() {
+    let mut cpu = CpuGsw::default();
+    cpu.enable_direct_barrier_census(true);
+    for kind in [
+        jit::direct::UnboundTarget::Absent,
+        jit::direct::UnboundTarget::Seen,
+        jit::direct::UnboundTarget::Seen,
+    ] {
+        cpu.jit_direct.note_unbound_target(kind, ENTRY);
+    }
+    cpu.jit_direct
+        .note_dynamic_miss_target(jit::direct::UnboundTarget::Compiled, ENTRY);
+    cpu.perf.jit_direct_unresolved_static_unbound = 11;
+    cpu.perf.jit_direct_unresolved_dynamic_miss_or_unbound = 5;
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    assert_eq!(
+        snapshot.classified_static,
+        snapshot
+            .unbound_targets
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+    );
+    assert_eq!(snapshot.classified_static, 3);
+    assert_eq!(
+        snapshot.classified_dynamic,
+        snapshot
+            .dynamic_miss_targets
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+    );
+    assert_eq!(snapshot.classified_dynamic, 1);
+    assert_eq!(snapshot.static_unbound_exits, 11);
+    assert_eq!(snapshot.dynamic_miss_exits, 5);
+}

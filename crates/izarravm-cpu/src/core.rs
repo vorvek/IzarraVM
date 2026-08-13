@@ -1205,10 +1205,22 @@ impl CpuGsw {
         }
     }
 
+    /// The census snapshot, JOINED with the two perf counters its classes are designed to close
+    /// on. This is the only seam where that join can happen: the census lives on `JitState` and
+    /// cannot see `PerfCounters`, and `direct_barrier_census_json` receives a snapshot and no CPU.
+    /// `CpuGsw` owns both.
     pub fn direct_barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
         #[cfg(feature = "jit")]
         {
-            self.jit_direct.barrier_census_snapshot()
+            #[allow(unused_mut)]
+            let mut snapshot = self.jit_direct.barrier_census_snapshot()?;
+            #[cfg(feature = "barrier-census-closure")]
+            {
+                snapshot.static_unbound_exits = self.perf.jit_direct_unresolved_static_unbound;
+                snapshot.dynamic_miss_exits =
+                    self.perf.jit_direct_unresolved_dynamic_miss_or_unbound;
+            }
+            Some(snapshot)
         }
         #[cfg(not(feature = "jit"))]
         {

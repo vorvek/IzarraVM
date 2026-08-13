@@ -1534,6 +1534,47 @@ pub struct DirectBarrierCensusSnapshot {
     /// not name it, which is a capacity answer; anything else means it does not exist yet, which
     /// is a compilation answer. Nothing distinguished the two before.
     pub dynamic_miss_targets: Vec<(&'static str, u64)>,
+    /// Sum of `unbound_targets` — what the census believes it classified on the static lane.
+    ///
+    /// Carried so the run-total identity `classified_static == static_unbound_exits` is readable
+    /// inside ONE object instead of by subtracting across two JSON blocks by hand.
+    #[cfg(feature = "barrier-census-closure")]
+    pub classified_static: u64,
+    /// `PerfCounters::jit_direct_unresolved_static_unbound`, re-emitted here — NOT a new perf key.
+    ///
+    /// Populated at `CpuGsw::direct_barrier_census_snapshot`, the only seam that owns both the
+    /// census (on `JitState`) and the counters. It reads zero out of `DirectBarrierCensus`.
+    ///
+    /// The identity holds only when the census is armed at process start via
+    /// `IZARRAVM_DIRECT_BARRIER_CENSUS=1`. `enable_direct_barrier_census` can arm mid-run, and
+    /// then the difference is exactly the pre-arm exits rather than a classifier defect — check
+    /// the arm before suspecting the classes.
+    ///
+    /// Two further ways the two sides can part company, both by construction:
+    ///  * `reset_perf_counters` zeroes `PerfCounters` and does NOT touch the census (test-only
+    ///    caller today, but a future production caller would break the identity silently);
+    ///  * `JitState::clone` drops the census entirely, so a cloned CPU keeps the counters and
+    ///    starts the classification from nothing.
+    #[cfg(feature = "barrier-census-closure")]
+    pub static_unbound_exits: u64,
+    /// Sum of `dynamic_miss_targets`.
+    #[cfg(feature = "barrier-census-closure")]
+    pub classified_dynamic: u64,
+    /// `PerfCounters::jit_direct_unresolved_dynamic_miss_or_unbound`, same treatment and same
+    /// caveats as `static_unbound_exits`.
+    #[cfg(feature = "barrier-census-closure")]
+    pub dynamic_miss_exits: u64,
+    /// `Rejected`-class static exits no row could be found for. See the field of the same name on
+    /// `DirectBarrierCensus`: it counts DROPPED exits and is blind to MISDIRECTED ones.
+    #[cfg(feature = "barrier-census-closure")]
+    pub rejected_unattributed: u64,
+    /// The dynamic-lane twin.
+    #[cfg(feature = "barrier-census-closure")]
+    pub dynamic_rejected_unattributed: u64,
+    /// Rejections that displaced an existing entry in the linear-keyed rejected-span map — the
+    /// honest signal for stale-hit mis-attribution, which neither residual above can detect.
+    #[cfg(feature = "barrier-census-closure")]
+    pub rejected_barrier_overwrites: u64,
     #[cfg(feature = "direct-admission-census")]
     /// Partial attribution of Direct admission declines as (label, count). It intentionally does
     /// not include every route that can return to the interpreter.

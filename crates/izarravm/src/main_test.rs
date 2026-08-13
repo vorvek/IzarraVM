@@ -417,6 +417,46 @@ fn direct_barrier_census_json_omits_admission_declines_without_feature() {
     assert!(report.get("admission_declines").is_none());
 }
 
+/// The closure block is a property of the census's own output, so its key set is pinned here.
+///
+/// All keys live inside `direct_barrier_census`; none is a `perf` key, which is why
+/// `perf_counter_json_exposes_the_complete_counter_surface` is untouched by this feature.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn direct_barrier_census_json_exposes_the_closure_block() {
+    let mut cpu = izarravm_cpu::CpuGsw::default();
+    assert!(direct_barrier_census_json(cpu.direct_barrier_census_snapshot()).is_null());
+    cpu.enable_direct_barrier_census(true);
+
+    let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
+    assert_eq!(
+        report["closure"],
+        serde_json::json!({
+            "classified_static": 0,
+            "static_unbound_exits": 0,
+            "unattributed_static": 0,
+            "classified_dynamic": 0,
+            "dynamic_miss_exits": 0,
+            "unattributed_dynamic": 0,
+            "rejected_unattributed": 0,
+            "dynamic_rejected_unattributed": 0,
+            "rejected_barrier_overwrites": 0,
+        })
+    );
+}
+
+/// The default build emits no `closure` key at all, rather than a block of nulls: a placeholder
+/// would change every profile JSON the campaign diffs against without announcing it.
+#[cfg(not(feature = "barrier-census-closure"))]
+#[test]
+fn direct_barrier_census_json_omits_the_closure_block_without_feature() {
+    let mut cpu = izarravm_cpu::CpuGsw::default();
+    cpu.enable_direct_barrier_census(true);
+
+    let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
+    assert!(report.get("closure").is_none());
+}
+
 #[cfg(feature = "direct-link-refusal-census")]
 #[test]
 fn direct_link_refusal_census_json_exposes_ordered_zero_snapshot() {

@@ -1075,6 +1075,35 @@ pub(crate) struct DirectBarrierCensus {
     /// honest reading — `runtime_hits` counts executions of an instruction SHAPE and an
     /// executing instruction has no stop arm.
     runtime_hits: HashMap<BarrierShape, u64>,
+    /// `Rejected`-class STATIC exits whose entry linear was absent from `rejected_barrier`, i.e.
+    /// the exits `note_unbound_rejected_at` used to drop with no trace. This is the barrier
+    /// census's analogue of the link census's `missing_id`, and without it the row-attribution
+    /// identity
+    ///
+    ///     sum(row.unbound_exits) + rejected_unattributed == unbound[Rejected]
+    ///
+    /// cannot be evaluated on a fixture run at all. A nonzero value is not automatically a defect:
+    /// a block rejected before the census was armed, a rejection installed by an arm that does not
+    /// record, or an entry invalidated and recompiled at another linear all land here honestly.
+    ///
+    /// CAVEAT, and it is the reason `rejected_barrier_overwrites` exists beside it: this residual
+    /// CANNOT see stale-hit mis-attribution. `rejected_barrier` is never pruned and is keyed on
+    /// linear alone, so an exit that resolves to a stale or colliding row is charged to that row
+    /// and leaves the residual at zero. The residual detects DROPPED exits, never MISDIRECTED ones.
+    #[cfg(feature = "barrier-census-closure")]
+    rejected_unattributed: u64,
+    /// The dynamic-lane twin of `rejected_unattributed`, carried separately because Slice 4's
+    /// lesson is that the two lanes move by wildly different factors for the same row.
+    #[cfg(feature = "barrier-census-closure")]
+    dynamic_rejected_unattributed: u64,
+    /// How many times a rejection claimed a linear `rejected_barrier` already held. This is the
+    /// honest signal for the stale-hit hazard the two residuals above are blind to: an overwritten
+    /// key still resolves, so its exits are attributed — to the row recorded LAST. Duke runs
+    /// DOS4GW protected mode over JEMMEX with paging and overlays, which is exactly the workload
+    /// where linear-only keys collide, so a large value here devalues the row ranking even while
+    /// both residuals read zero.
+    #[cfg(feature = "barrier-census-closure")]
+    rejected_barrier_overwrites: u64,
     #[cfg(feature = "direct-admission-census")]
     /// Partial attribution of dispatcher declines. Other routes remain outside this array.
     admission_declines: [u64; AdmissionDecline::COUNT],
@@ -1098,6 +1127,10 @@ impl DirectBarrierCensus {
     /// Attribute one rejected-target exit back to the barrier that refused that block.
     fn note_unbound_rejected_at(&mut self, linear: u32) {
         let Some(&key) = self.rejected_barrier.get(&linear) else {
+            #[cfg(feature = "barrier-census-closure")]
+            {
+                self.rejected_unattributed = self.rejected_unattributed.saturating_add(1);
+            }
             return;
         };
         let row = self.rows.entry(key).or_default();
@@ -1108,6 +1141,11 @@ impl DirectBarrierCensus {
     /// fixes and Slice 4 showed they move by wildly different factors for the same row.
     fn note_dynamic_rejected_at(&mut self, linear: u32) {
         let Some(&key) = self.rejected_barrier.get(&linear) else {
+            #[cfg(feature = "barrier-census-closure")]
+            {
+                self.dynamic_rejected_unattributed =
+                    self.dynamic_rejected_unattributed.saturating_add(1);
+            }
             return;
         };
         let row = self.rows.entry(key).or_default();
@@ -1126,7 +1164,14 @@ impl DirectBarrierCensus {
             stop,
         };
         if stop.installs_rejected_span() {
-            self.rejected_barrier.insert(entry_linear, key);
+            let displaced = self.rejected_barrier.insert(entry_linear, key);
+            #[cfg(feature = "barrier-census-closure")]
+            if displaced.is_some() {
+                self.rejected_barrier_overwrites =
+                    self.rejected_barrier_overwrites.saturating_add(1);
+            }
+            #[cfg(not(feature = "barrier-census-closure"))]
+            let _ = displaced;
         }
         // Register the shape so `note_interpreted` can find it with one probe and without ever
         // creating a row for an instruction that never barriered.
@@ -1199,6 +1244,24 @@ impl DirectBarrierCensus {
                 .iter()
                 .map(|kind| (kind.label(), self.unbound_dynamic[*kind as usize]))
                 .collect(),
+            // Derived here rather than counted at runtime: the arrays already hold everything, so
+            // the totals cost the hot path nothing at all.
+            #[cfg(feature = "barrier-census-closure")]
+            classified_static: self.unbound.iter().sum(),
+            #[cfg(feature = "barrier-census-closure")]
+            classified_dynamic: self.unbound_dynamic.iter().sum(),
+            // Filled by the CpuGsw seam, which is the only place that can see both the census and
+            // `PerfCounters`. Zero here is a placeholder, never an observation.
+            #[cfg(feature = "barrier-census-closure")]
+            static_unbound_exits: 0,
+            #[cfg(feature = "barrier-census-closure")]
+            dynamic_miss_exits: 0,
+            #[cfg(feature = "barrier-census-closure")]
+            rejected_unattributed: self.rejected_unattributed,
+            #[cfg(feature = "barrier-census-closure")]
+            dynamic_rejected_unattributed: self.dynamic_rejected_unattributed,
+            #[cfg(feature = "barrier-census-closure")]
+            rejected_barrier_overwrites: self.rejected_barrier_overwrites,
             #[cfg(feature = "direct-admission-census")]
             admission_declines: AdmissionDecline::ALL
                 .iter()

@@ -21,6 +21,11 @@ direct-admission-census = ["jit"]
 # Per-static-cell Direct link refusal census. Compiled out unless selected, then armed with
 # IZARRAVM_DIRECT_LINK_REFUSAL_CENSUS=1.
 direct-link-refusal-census = ["jit"]
+# Closure accounting for the Direct barrier census: the Rejected-row attribution residual and the
+# run-total identities, emitted into the census JSON so exact closure is a property of the
+# instrument's own output rather than a hand check across two blocks. Armed together with the
+# census itself by IZARRAVM_DIRECT_BARRIER_CENSUS=1.
+barrier-census-closure = ["jit"]
 # Per-helper and per-port Direct call-out attribution. Compiled out unless selected, then armed
 # with IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION=1.
 direct-callout-attribution = ["jit"]

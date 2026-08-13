@@ -1762,6 +1762,31 @@ fn direct_barrier_census_json(
             .map(|(label, count)| json!({ "kind": label, "count": count }))
             .collect::<Vec<_>>(),
     });
+    // Inserted AFTER the `json!` under cfg, following the poll-head-probe precedent: emitting the
+    // keys as `null` when the feature is off would silently change every profile JSON the campaign
+    // diffs against, which is worse than a broken pin because nothing announces it.
+    #[cfg(feature = "barrier-census-closure")]
+    let report = {
+        let mut report = report;
+        report["closure"] = json!({
+            "classified_static": snapshot.classified_static,
+            "static_unbound_exits": snapshot.static_unbound_exits,
+            // Must be zero. Nonzero means the census saw fewer exits than the counter did, which
+            // is a mid-run arm or a classifier gap, never a fact about the guest.
+            "unattributed_static": snapshot
+                .static_unbound_exits
+                .saturating_sub(snapshot.classified_static),
+            "classified_dynamic": snapshot.classified_dynamic,
+            "dynamic_miss_exits": snapshot.dynamic_miss_exits,
+            "unattributed_dynamic": snapshot
+                .dynamic_miss_exits
+                .saturating_sub(snapshot.classified_dynamic),
+            "rejected_unattributed": snapshot.rejected_unattributed,
+            "dynamic_rejected_unattributed": snapshot.dynamic_rejected_unattributed,
+            "rejected_barrier_overwrites": snapshot.rejected_barrier_overwrites,
+        });
+        report
+    };
     #[cfg(feature = "direct-admission-census")]
     let report = {
         let mut report = report;
