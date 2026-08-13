@@ -26,19 +26,50 @@ fn fresh_in_mode(mode: GswMode) -> CpuGsw {
 }
 
 fn fixture(code: &[u8]) -> (CpuGsw, TestBus) {
-    fixture_in_mode(code, GswMode::Gsw586)
+    fixture_at(ENTRY, code)
 }
 
 fn fixture_in_mode(code: &[u8], mode: GswMode) -> (CpuGsw, TestBus) {
-    let mut memory = vec![0; 0x2000];
-    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
+    fixture_at_in_mode(ENTRY, code, mode)
+}
+
+fn fixture_at(entry: u32, code: &[u8]) -> (CpuGsw, TestBus) {
+    fixture_at_in_mode(entry, code, GswMode::Gsw586)
+}
+
+fn fixture_at_in_mode(entry: u32, code: &[u8], mode: GswMode) -> (CpuGsw, TestBus) {
+    let memory_len = (entry as usize + code.len()).max(0x2000);
+    let mut memory = vec![0; memory_len];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     let mut cpu = fresh_in_mode(mode);
+    cpu.registers.eip = entry;
     cpu.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
     (cpu, bus)
+}
+
+#[cfg(feature = "direct-admission-census")]
+fn admission_declines(cpu: &CpuGsw) -> [u64; 4] {
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("admission census must be enabled");
+    assert_eq!(
+        snapshot
+            .admission_declines
+            .iter()
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>(),
+        [
+            "heat_refusal",
+            "key_failure",
+            "dormant_probe",
+            "rejected_probe",
+        ]
+    );
+    std::array::from_fn(|index| snapshot.admission_declines[index].1)
 }
 
 fn warm(cpu: &mut CpuGsw, bus: &mut TestBus, addresses: &[u32]) {
@@ -169,6 +200,195 @@ fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
     assert_eq!(row.native_prefix_instructions, 4);
     assert_eq!(row.native_suffix_instructions, 4);
     assert_eq!(row.runtime_hits, 1);
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_attributes_a_heat_refusal_at_the_production_seam() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    cpu.enable_direct_barrier_census(true);
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(8);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("heat refusal");
+
+    assert_eq!(admission_declines(&cpu), [1, 0, 0, 0]);
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_attributes_a_key_failure_at_the_production_seam() {
+    const BIOS_ENTRY: u32 = 0x000f_0000;
+    let (mut cpu, mut bus) = fixture_at(BIOS_ENTRY, &[0x40, 0x41, 0x42]);
+    cpu.load_segment_real(SegmentIndex::Cs, 0xf000);
+    let mut cs = cpu.registers.segment(SegmentIndex::Cs);
+    cs.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    cpu.registers.eip = 0;
+    cpu.enable_direct_barrier_census(true);
+    cpu.set_sixteen_bit_admission_level(1);
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(1);
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, BIOS_ENTRY)
+        .expect("fixture decode");
+
+    cpu.try_direct_continuation_for_test(&mut bus, BIOS_ENTRY, true)
+        .expect("key refusal");
+
+    assert_eq!(admission_declines(&cpu), [0, 1, 0, 0]);
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_attributes_a_cooled_dormant_before_lifting_it() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    cpu.enable_direct_barrier_census(true);
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(1);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("first observation");
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    cpu.sync_smc_heat();
+    let jit = &mut *cpu.jit_direct;
+    jit.direct.demote_smc_hot(&mut jit.smc_heat, key, 0);
+    cpu.perf.instructions = 1u64 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("cooled dormant probe");
+
+    assert_eq!(admission_declines(&cpu), [0, 0, 1, 0]);
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Compile
+    ));
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_attributes_a_rejected_probe_at_the_production_seam() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    cpu.enable_direct_barrier_census(true);
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(1);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("first observation");
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    cpu.jit_direct
+        .reject(jit::direct::RejectedSpan::new(key, 1).expect("rejected fixture span"));
+    cpu.sweep_block_watch_edges();
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("rejected probe");
+
+    assert_eq!(admission_declines(&cpu), [0, 0, 0, 1]);
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_leaves_first_touch_and_seen_compile_unattributed() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    cpu.enable_direct_barrier_census(true);
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(1);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("first touch");
+    assert_eq!(admission_declines(&cpu), [0; 4]);
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("seen compile");
+    assert_eq!(admission_declines(&cpu), [0; 4]);
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_is_a_partial_subset_of_consulted_declines() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    cpu.enable_direct_barrier_census(true);
+    cpu.jit_direct.set_admission_heat_for_test(8);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+    let mut consulted_declines = 0u64;
+
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("auto-admit refusal"),
+        ContinuationDispatch::Declined
+    );
+    consulted_declines += 1;
+    cpu.set_jit_auto_admit(true);
+    assert_eq!(
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("heat refusal"),
+        ContinuationDispatch::Declined
+    );
+    consulted_declines += 1;
+
+    let attributed: u64 = admission_declines(&cpu).into_iter().sum();
+    assert_eq!(attributed, 1);
+    assert!(attributed < consulted_declines);
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_off_keeps_the_snapshot_absent_on_a_refusal() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(8);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("unprofiled heat refusal");
+
+    assert!(cpu.direct_barrier_census_snapshot().is_none());
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn admission_census_preserves_the_cooled_dormant_dispatch_and_state() {
+    fn drive(enabled: bool) -> (ContinuationDispatch, CpuGsw, jit::direct::BlockKey) {
+        let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+        cpu.enable_direct_barrier_census(enabled);
+        cpu.set_jit_auto_admit(true);
+        cpu.jit_direct.set_admission_heat_for_test(1);
+        warm(&mut cpu, &mut bus, &[ENTRY]);
+        cpu.dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("first observation");
+        let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+        cpu.sync_smc_heat();
+        let jit = &mut *cpu.jit_direct;
+        jit.direct.demote_smc_hot(&mut jit.smc_heat, key, 0);
+        cpu.perf.instructions = 1u64 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+
+        let dispatch = cpu
+            .dispatch_continuation_for_test(&mut bus, ENTRY, true, true)
+            .expect("cooled dormant dispatch");
+        (dispatch, cpu, key)
+    }
+
+    let (off_dispatch, mut off, off_key) = drive(false);
+    let (on_dispatch, mut on, on_key) = drive(true);
+    assert_eq!(off_dispatch, ContinuationDispatch::Declined);
+    assert_eq!(on_dispatch, off_dispatch);
+    assert_eq!(on.registers, off.registers);
+    assert_eq!(
+        format!("{:?}", on.perf_counters()),
+        format!("{:?}", off.perf_counters())
+    );
+    assert!(matches!(
+        off.jit_direct.probe(off_key),
+        jit::direct::BlockProbe::Compile
+    ));
+    assert!(matches!(
+        on.jit_direct.probe(on_key),
+        jit::direct::BlockProbe::Compile
+    ));
+    assert!(off.direct_barrier_census_snapshot().is_none());
+    assert_eq!(admission_declines(&on), [0, 0, 1, 0]);
 }
 
 #[test]

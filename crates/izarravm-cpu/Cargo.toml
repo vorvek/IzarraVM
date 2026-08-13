@@ -15,6 +15,9 @@ authors.workspace = true
 # build for unsupported hosts and differential checks.
 default = ["jit"]
 jit = []
+# Partial Direct admission attribution. The dispatcher hooks are compiled out unless this
+# diagnostic feature is selected, then armed with IZARRAVM_DIRECT_BARRIER_CENSUS=1.
+direct-admission-census = ["jit"]
 # Diagnostic guest-store watchpoint (IZARRAVM_WATCH_WRITE). OFF by default: the check sits
 # on the store hot path, and leaving it compiled in measured ~10% on a 586 16-bit workload
 # even while disarmed. Build with `--features watch-write` when hunting a corruption.

@@ -33,6 +33,8 @@ use census::{BarrierStop, SuffixSeed, record_structural_barrier};
 // The stall/census TAXONOMY lives in `census.rs` beside the builder that already consumed it
 // (`stall_snapshot`, `snapshot`), moved verbatim to keep this file under the source-line ceiling.
 // Re-exported from here because every out-of-module path names them through `jit::direct`.
+#[cfg(feature = "direct-admission-census")]
+pub(crate) use census::AdmissionDecline;
 pub(crate) use census::{
     BlockCacheStats, DirectBarrierCensus, DirectStallTally, DormantReason, LinkClearCause,
     LinkRefusal, UnboundTarget, barrier_census_default,
@@ -1633,6 +1635,21 @@ impl BlockCache {
                     UnboundTarget::CompiledRetired
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "direct-admission-census")]
+    /// Classify the authoritative state behind a `BlockProbe::Rejected` result for the opt-in
+    /// admission census. A disabled cache synthesizes that probe result regardless of entry state,
+    /// so it has no Dormant or Rejected label.
+    pub(crate) fn classify_rejected_probe(&self, key: BlockKey) -> Option<AdmissionDecline> {
+        if self.disabled {
+            return None;
+        }
+        match self.entries.get(&key) {
+            Some(BlockState::Dormant(_)) => Some(AdmissionDecline::DormantProbe),
+            Some(BlockState::Rejected(_)) => Some(AdmissionDecline::RejectedProbe),
+            None | Some(BlockState::Seen | BlockState::Compiled(_)) => None,
         }
     }
 

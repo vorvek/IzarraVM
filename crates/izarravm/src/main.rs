@@ -1734,7 +1734,7 @@ fn direct_barrier_census_json(
     let Some(snapshot) = snapshot else {
         return serde_json::Value::Null;
     };
-    json!({
+    let report = json!({
         "rows": snapshot.rows.iter().map(direct_barrier_census_row_json).collect::<Vec<_>>(),
         "unbound_targets": snapshot
             .unbound_targets
@@ -1746,7 +1746,19 @@ fn direct_barrier_census_json(
             .iter()
             .map(|(label, count)| json!({ "kind": label, "count": count }))
             .collect::<Vec<_>>(),
-    })
+    });
+    #[cfg(feature = "direct-admission-census")]
+    let report = {
+        let mut report = report;
+        report["admission_declines"] = serde_json::Value::from_iter(
+            snapshot
+                .admission_declines
+                .iter()
+                .map(|(label, count)| json!({ "kind": label, "count": count })),
+        );
+        report
+    };
+    report
 }
 
 /// The whole-run BIOS fixed-disk census. All zero unless `IZARRAVM_INT13_PROFILE=1`.

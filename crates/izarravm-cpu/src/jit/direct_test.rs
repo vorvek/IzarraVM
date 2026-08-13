@@ -2209,6 +2209,56 @@ fn unbound_target_classes_are_exhaustive() {
     );
 }
 
+#[cfg(any(
+    all(
+        feature = "direct-admission-census",
+        target_os = "windows",
+        target_arch = "x86_64"
+    ),
+    all(
+        feature = "direct-admission-census",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )
+))]
+#[test]
+fn admission_census_rejected_probe_classifier_covers_every_cache_state_and_disabled_cache() {
+    let mut cache = BlockCache::default();
+    let absent = key(0x1800);
+    assert_eq!(cache.classify_rejected_probe(absent), None);
+
+    let seen = key(0x1900);
+    assert!(matches!(cache.probe(seen), BlockProbe::Interpret));
+    assert_eq!(cache.classify_rejected_probe(seen), None);
+
+    let dormant = key(0x1a00);
+    assert!(matches!(cache.probe(dormant), BlockProbe::Interpret));
+    cache.dormant(dormant, DormantReason::CompileRetry);
+    assert_eq!(
+        cache.classify_rejected_probe(dormant),
+        Some(AdmissionDecline::DormantProbe)
+    );
+
+    let rejected = key(0x1b00);
+    assert!(matches!(cache.probe(rejected), BlockProbe::Interpret));
+    cache.reject(RejectedSpan {
+        key: rejected,
+        guest_len: 1,
+    });
+    assert_eq!(
+        cache.classify_rejected_probe(rejected),
+        Some(AdmissionDecline::RejectedProbe)
+    );
+
+    let compiled = key(0x1c00);
+    install_trivial(&mut cache, compiled, 1);
+    assert_eq!(cache.classify_rejected_probe(compiled), None);
+
+    cache.direct.disabled = true;
+    assert_eq!(cache.classify_rejected_probe(dormant), None);
+    assert_eq!(cache.classify_rejected_probe(rejected), None);
+}
+
 /// The three link-clear causes account for every cleared link: their sum equals the aggregate
 /// `BlockCacheStats::unlinks` that feeds `jit_direct_links_cleared`. The aggregate is fed
 /// independently rather than derived, so this is the cross-check that they have not drifted --

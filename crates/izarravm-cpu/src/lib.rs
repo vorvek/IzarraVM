@@ -1473,6 +1473,10 @@ pub struct DirectBarrierCensusSnapshot {
     /// not name it, which is a capacity answer; anything else means it does not exist yet, which
     /// is a compilation answer. Nothing distinguished the two before.
     pub dynamic_miss_targets: Vec<(&'static str, u64)>,
+    #[cfg(feature = "direct-admission-census")]
+    /// Partial attribution of Direct admission declines as (label, count). It intentionally does
+    /// not include every route that can return to the interpreter.
+    pub admission_declines: Vec<(&'static str, u64)>,
 }
 
 /// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here

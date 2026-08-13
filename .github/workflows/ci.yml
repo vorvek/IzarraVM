@@ -52,6 +52,10 @@ jobs:
           # uncompiled behind a green CI. `cargo check` alone builds no test target.
           cargo check -p izarravm --features int-trace
           cargo test -p izarravm-cpu --features int-trace int_trace
+          cargo check -p izarravm --no-default-features --features direct-admission-census
+          cargo test -p izarravm-cpu --no-default-features --features direct-admission-census admission_census
+          cargo test -p izarravm --no-default-features --features direct-admission-census direct_barrier_census_json_exposes_ordered_zero_admission_declines
+          cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-admission-census -- -D warnings
 
       - name: Format
         run: cargo fmt --check

@@ -316,6 +316,7 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     assert!(report["perf"]["jit_direct_entries"].as_u64().is_some());
     assert!(report["perf"]["jit_direct_insns"].as_u64().is_some());
     assert!(report["perf"]["jit_direct_side_exits"].as_u64().is_some());
+    assert!(report["direct_barrier_census"].is_null());
     for field in [
         "jit_direct_exit_cross_page_or_alignment",
         "jit_direct_exit_unavailable_or_kind",
@@ -371,6 +372,35 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     }
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn direct_barrier_census_json_exposes_ordered_zero_admission_declines() {
+    let mut cpu = izarravm_cpu::CpuGsw::default();
+    assert!(direct_barrier_census_json(cpu.direct_barrier_census_snapshot()).is_null());
+    cpu.enable_direct_barrier_census(true);
+
+    let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
+    assert_eq!(
+        report["admission_declines"],
+        serde_json::json!([
+            { "kind": "heat_refusal", "count": 0 },
+            { "kind": "key_failure", "count": 0 },
+            { "kind": "dormant_probe", "count": 0 },
+            { "kind": "rejected_probe", "count": 0 },
+        ])
+    );
+}
+
+#[cfg(not(feature = "direct-admission-census"))]
+#[test]
+fn direct_barrier_census_json_omits_admission_declines_without_feature() {
+    let mut cpu = izarravm_cpu::CpuGsw::default();
+    cpu.enable_direct_barrier_census(true);
+
+    let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
+    assert!(report.get("admission_declines").is_none());
 }
 
 #[test]

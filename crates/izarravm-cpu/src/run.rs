@@ -1227,15 +1227,31 @@ impl CpuGsw {
             .decode_cache
             .direct_hot_at(screen.slot, self.jit_direct.admission_heat())
         {
+            #[cfg(feature = "direct-admission-census")]
+            if self.jit_direct.barrier_census_active() {
+                self.jit_direct
+                    .note_admission_decline(jit::direct::AdmissionDecline::HeatRefusal);
+            }
             return Ok(DirectContinuation::Interpret);
         }
         let Some(key) = jit::direct::key_for_phys(self, lin, d, screen.phys_start) else {
+            #[cfg(feature = "direct-admission-census")]
+            if self.jit_direct.barrier_census_active() {
+                self.jit_direct
+                    .note_admission_decline(jit::direct::AdmissionDecline::KeyFailure);
+            }
             return Ok(DirectContinuation::Interpret);
         };
         let probe = self.jit_direct.probe(key);
         let block = match probe {
             jit::direct::BlockProbe::Interpret => return Ok(DirectContinuation::Interpret),
             jit::direct::BlockProbe::Rejected => {
+                #[cfg(feature = "direct-admission-census")]
+                if self.jit_direct.barrier_census_active()
+                    && let Some(kind) = self.jit_direct.classify_rejected_probe(key)
+                {
+                    self.jit_direct.note_admission_decline(kind);
+                }
                 // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out lifts
                 // back to Seen here, so the next encounter re-admits through the normal path.
                 // Dormants without a heat stamp (Retry, G4 cover failure) stay parked. On the cold

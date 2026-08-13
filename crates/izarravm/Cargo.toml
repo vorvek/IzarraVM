@@ -15,6 +15,8 @@ authors.workspace = true
 # interpreter-only build, while the release binary accepts `--interpreter` at launch.
 default = ["jit"]
 jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
+# Passthrough for the compile-time Direct admission census; see izarravm-cpu.
+direct-admission-census = ["jit", "izarravm-cpu/direct-admission-census"]
 # Passthrough for the store watchpoint; see izarravm-cpu.
 watch-write = ["izarravm-cpu/watch-write"]
 # Passthrough for the guest INT n tracer; see izarravm-cpu.

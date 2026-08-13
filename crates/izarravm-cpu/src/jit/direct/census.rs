@@ -3,10 +3,38 @@
 
 //! The Direct backend's structural-stop census and the diagnostic reporting surface on
 //! `JitState`: the per-barrier rows, the unbound-exit and dynamic-miss class tallies, and the
-//! stall snapshot. Split out of `direct.rs` verbatim to keep that file under the source-line
-//! ceiling; nothing here changed but the visibility the module boundary forces.
+//! stall snapshot. Split out of `direct.rs` to keep that file under the source-line ceiling.
 
 use super::*;
+
+#[cfg(feature = "direct-admission-census")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionDecline {
+    HeatRefusal,
+    KeyFailure,
+    DormantProbe,
+    RejectedProbe,
+}
+
+#[cfg(feature = "direct-admission-census")]
+impl AdmissionDecline {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::HeatRefusal,
+        Self::KeyFailure,
+        Self::DormantProbe,
+        Self::RejectedProbe,
+    ];
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::HeatRefusal => "heat_refusal",
+            Self::KeyFailure => "key_failure",
+            Self::DormantProbe => "dormant_probe",
+            Self::RejectedProbe => "rejected_probe",
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------------
 // The compile-walk side of the census: the structural-stop recorder and the forward scan that
@@ -812,9 +840,18 @@ pub(crate) struct DirectBarrierCensus {
     /// honest reading — `runtime_hits` counts executions of an instruction SHAPE and an
     /// executing instruction has no stop arm.
     runtime_hits: HashMap<BarrierShape, u64>,
+    #[cfg(feature = "direct-admission-census")]
+    /// Partial attribution of dispatcher declines. Other routes remain outside this array.
+    admission_declines: [u64; AdmissionDecline::COUNT],
 }
 
 impl DirectBarrierCensus {
+    #[cfg(feature = "direct-admission-census")]
+    fn note_admission_decline(&mut self, kind: AdmissionDecline) {
+        self.admission_declines[kind as usize] =
+            self.admission_declines[kind as usize].saturating_add(1);
+    }
+
     fn note_unbound(&mut self, kind: UnboundTarget) {
         self.unbound[kind as usize] += 1;
     }
@@ -927,6 +964,11 @@ impl DirectBarrierCensus {
                 .iter()
                 .map(|kind| (kind.label(), self.unbound_dynamic[*kind as usize]))
                 .collect(),
+            #[cfg(feature = "direct-admission-census")]
+            admission_declines: AdmissionDecline::ALL
+                .iter()
+                .map(|kind| (kind.label(), self.admission_declines[*kind as usize]))
+                .collect(),
         }
     }
 }
@@ -994,6 +1036,13 @@ impl crate::jit::JitState {
     pub(crate) fn note_barrier_census_interpreted(&mut self, insn: &DecodedInsn) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
             census.note_interpreted(insn);
+        }
+    }
+
+    #[cfg(feature = "direct-admission-census")]
+    pub(crate) fn note_admission_decline(&mut self, kind: AdmissionDecline) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.note_admission_decline(kind);
         }
     }
 
