@@ -844,6 +844,9 @@ pub(super) fn emit_code_watch_table_branch(
             == crate::jit::code_watch::NATIVE_WIDEST_GUARDED_ACCESS_BYTES,
         "code_watch's window bound must be stated against the widest guarded access"
     );
+    // `bytes() - 1` is the access's EXTENT here, the offset of its last byte, which is what
+    // decides how many granules the access spans. Not an alignment mask and not the split charge,
+    // both of which share the spelling and neither of which would be correct.
     let n = ((width.bytes() - 1 + GRANULE_MASK) >> NATIVE_CHUNK_SHIFT) + 1;
 
     if n == 1 {

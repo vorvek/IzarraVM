@@ -1595,6 +1595,11 @@ impl CpuGsw {
         // debug assert, so this is an assertion inside a bound that is itself only asserted
         // against. It is here so a dial change cannot make one of the two bounds stop dominating
         // while the other still does.
+        // The multiplicand is the TOTAL byte cycles a misaligned dword charges, which is
+        // `MemoryWidth::bytes()`, and NOT `MemoryWidth::split_extra_bytes()`. The emitter deposits
+        // only the EXTRA cycles because the block already charged one wide cycle statically; this
+        // bound has no such prior charge to net against, so substituting the emitter's quantity
+        // here would weaken the assert from 4 to 3.
         let split_byte = bus.jit_data_cost_clocks(BusWidth::Byte);
         debug_assert!(
             split_byte.saturating_mul(4) <= max_read,
@@ -1763,6 +1768,9 @@ impl CpuGsw {
         // subsume this: the test covers dial changes on ALREADY-ADMITTED personas and can run in
         // release CI; only this assert covers the Accurate class being admitted, because a test
         // that iterates "the admitted personas" cannot notice that the admitted set grew.
+        // Both multiplicands below are TOTAL byte cycles, `MemoryWidth::bytes()`, not the
+        // emitter's `split_extra_bytes()`. The emitter nets against a wide cycle the block already
+        // charged; these bounds do not, so the emitter's quantity would weaken 2 to 1 and 4 to 3.
         let split_byte = bus.jit_data_cost_clocks(BusWidth::Byte);
         debug_assert!(
             split_byte.saturating_mul(2) <= word_data_upper,

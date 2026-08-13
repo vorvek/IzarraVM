@@ -3351,6 +3351,9 @@ fn emit_segmented_linear_address(
     emit_effective_address(e, addr, wrap);
     let descriptor = memory.segments.descriptor(addr.segment);
     if descriptor.limit != u32::MAX {
+        // `bytes() - 1` here is the access's EXTENT, the offset of its last byte, not an alignment
+        // mask and not the split charge. It shares a spelling with `split_extra_bytes` and
+        // nothing else, so it stays written out rather than adopting either name.
         let Some(max_start) = descriptor.limit.checked_sub(width.bytes() - 1) else {
             e.jmp(
                 sides
@@ -3572,7 +3575,7 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
          value materialisation owns RDX and the scratch must be RCX"
     );
     e.mov_r32_r32(scratch, Reg::RAX);
-    e.and_r32_imm32(scratch, width.alignment_bytes() - 1);
+    e.and_r32_imm32(scratch, width.alignment_mask());
     e.cmp_r32_imm32(scratch, 0);
     e.jnz(misaligned);
 }

@@ -248,6 +248,12 @@ impl BusWidth {
     ///
     /// `bytes()` is 1/2/4, so `address & (bytes - 1)` reproduces all three arms exactly, including
     /// `Byte => false`.
+    ///
+    /// The JIT emitter does NOT call this. It works in `MemoryWidth`, which carries two widths
+    /// this enum does not have, and whose `alignment_bytes()` is deliberately below their size
+    /// because the interpreter issues an m64 as two independently 4-aligned dword transactions.
+    /// Its mirror of this predicate is `MemoryWidth::alignment_mask`. The two are kept apart on
+    /// purpose: folding Qword and Tbyte into this one would be a category error.
     #[inline]
     pub const fn misaligned_at(self, address: u32) -> bool {
         address & (self.bytes() - 1) != 0

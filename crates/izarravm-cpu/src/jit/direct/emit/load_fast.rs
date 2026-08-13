@@ -348,6 +348,20 @@ pub(crate) struct ReadStubPad {
     any(target_os = "windows", target_os = "linux")
 ))]
 pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
+    // The deposit gate inside these stubs encodes `alignment_mask()` while the mode13 refusal
+    // encodes `bytes() - 1`. For the three widths this pad builds the two are equal, so the two
+    // spellings emit the same immediate and the split is a naming change with no byte behind it.
+    //
+    // Asserted at compile time rather than pinned as a golden byte hash: these stubs never appear
+    // in an emitted block, so no block comparison can see them, and a hash would only record what
+    // the current build happens to produce. This states the property the equality depends on, and
+    // it fails to COMPILE if a future width array or dial change breaks it.
+    const _: () = assert!(
+        MemoryWidth::Byte.alignment_mask() == MemoryWidth::Byte.bytes() - 1
+            && MemoryWidth::Word.alignment_mask() == MemoryWidth::Word.bytes() - 1
+            && MemoryWidth::Dword.alignment_mask() == MemoryWidth::Dword.bytes() - 1,
+        "the read stub pad's two mask spellings must agree at every width the pad builds"
+    );
     let mut code = Vec::new();
     let mut offsets = [0usize; READ_STUB_COUNT];
     let mut cursor = 0usize;
@@ -437,12 +451,16 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
         // RAX, not RDI: RDI is still the raw probed entry here, and after the resolve below it
         // would be a HOST pointer whose low bits carry the FastMap bias.
         //
-        // `bytes() - 1` where the CALL SITE's guard tests `alignment_bytes() - 1`. The two agree
-        // for Byte, Word and Dword, which self-align, and diverge for Qword and Tbyte, which ask
-        // for 4 deliberately. That is safe here only because this pad is built for the three GPR
-        // widths alone -- `gpr_read_width_index` makes the other two `unreachable!()` -- so a
-        // wider width can never reach this test. If one ever routes to a lean site, these two
-        // spellings must be reconciled rather than left to agree by coincidence.
+        // `bytes() - 1`, NOT `alignment_mask()`, and the difference is deliberate rather than
+        // historical. This is a REFUSAL: a nonzero result defers the access to the interpreter.
+        // The question it asks is "is this one natural transaction of its full width", which the
+        // aperture can serve, and only `bytes() - 1` asks that. The deposit gate further down
+        // this pad asks the guard's question instead and reads `alignment_mask()`.
+        //
+        // The direction matters if a wide width ever routes to a lean site. A SMALLER mask
+        // refuses FEWER accesses, so `alignment_mask()` here would ADMIT every Qword address
+        // congruent to 4 mod 8 that is refused today. Widening the pad means revisiting this
+        // gate, not switching its spelling.
         e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
         e.jnz(status_unavailable);
     }
@@ -494,9 +512,18 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     // followed by a status-1 return would charge for an access the interpreter is about to redo.
     if width.needs_alignment_guard() {
         let aligned = e.label();
-        e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
+        // The GUARD's mask, deliberately: this gate asks "did the call-site alignment test
+        // consider this misaligned", because that test is the only alignment-caused route into
+        // this stub, and the deposit must charge exactly the accesses it refused. Contrast the
+        // mode13 refusal near the top of this pad, which asks a different question and keeps
+        // `bytes() - 1`.
+        e.test_r8_low_imm8(Reg::RAX, width.alignment_mask() as u8);
         e.jz(aligned);
-        emit_dynamic_split_extra(&mut e, width.bytes() - 1);
+        // Gate and deposit are read from the same width model on purpose. They agree for the
+        // three widths this pad builds; for a wide width they would not, and a site that gated on
+        // one model and charged from the other would decide "split" on a 4-byte criterion and
+        // then bill an 8-byte penalty.
+        emit_dynamic_split_extra(&mut e, width.split_extra_bytes());
         e.place(aligned);
     }
     e.xor_r64_self(Reg::RCX);

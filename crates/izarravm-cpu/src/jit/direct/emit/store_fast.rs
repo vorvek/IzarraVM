@@ -368,6 +368,16 @@ pub(crate) fn emit_store_stub_pad(
     map: NativeMapBases,
     code_watch_tables: [usize; 2],
 ) -> StoreStubPad {
+    // Same compile-time equality the read pad asserts, and for the same reason: the deposit gate
+    // encodes `alignment_mask()` while the mode13 refusal encodes `bytes() - 1`, and they agree
+    // at every width this pad builds. See `emit_read_stub_pad` for why this is a const assert
+    // rather than a golden byte pin.
+    const _: () = assert!(
+        MemoryWidth::Byte.alignment_mask() == MemoryWidth::Byte.bytes() - 1
+            && MemoryWidth::Word.alignment_mask() == MemoryWidth::Word.bytes() - 1
+            && MemoryWidth::Dword.alignment_mask() == MemoryWidth::Dword.bytes() - 1,
+        "the store stub pad's two mask spellings must agree at every width the pad builds"
+    );
     let mut code = Vec::new();
     let mut offsets = [0usize; STORE_STUB_COUNT];
     let mut cursor = 0usize;
@@ -551,11 +561,14 @@ fn emit_slow_stub(
     if width.needs_alignment_guard() {
         // RAX is the linear address and this stub's front preserves it by contract.
         //
-        // `bytes() - 1` where the CALL SITE's guard tests `alignment_bytes() - 1`: equal for the
-        // three self-aligning GPR widths, and this pad is built for those alone
-        // (`gpr_width_index` makes Qword and Tbyte `unreachable!()`). See the counting read stub
-        // for the same note; if a wider width ever routes to a lean site the two spellings must be
-        // reconciled rather than left to agree by coincidence.
+        // `bytes() - 1`, NOT `alignment_mask()`, for the reason spelled out at the counting read
+        // stub's matching refusal: this gate asks "is this one natural transaction of its full
+        // width", the aperture question, while the deposit gate further down this pad asks the
+        // call-site guard's question and reads `alignment_mask()`.
+        //
+        // A SMALLER mask refuses FEWER accesses, so substituting the guard's mask here would
+        // weaken the refusal for wide widths rather than tighten it. Getting this gate wrong once
+        // already produced a double write to the aperture; widening the pad means revisiting it.
         e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
         e.jnz(status_unavailable);
     }
@@ -612,9 +625,18 @@ fn emit_slow_stub(
     // through RDI. RDX holds the reloaded store value and is dead from here.
     if width.needs_alignment_guard() {
         let aligned = e.label();
-        e.test_r8_low_imm8(Reg::RAX, (width.bytes() - 1) as u8);
+        // The GUARD's mask, deliberately: this gate asks "did the call-site alignment test
+        // consider this misaligned", because that test is the only alignment-caused route into
+        // this stub, and the deposit must charge exactly the accesses it refused. Contrast the
+        // mode13 refusal near the top of this pad, which asks a different question and keeps
+        // `bytes() - 1`.
+        e.test_r8_low_imm8(Reg::RAX, width.alignment_mask() as u8);
         e.jz(aligned);
-        emit_dynamic_split_extra(&mut e, width.bytes() - 1);
+        // Gate and deposit are read from the same width model on purpose. They agree for the
+        // three widths this pad builds; for a wide width they would not, and a site that gated on
+        // one model and charged from the other would decide "split" on a 4-byte criterion and
+        // then bill an 8-byte penalty.
+        emit_dynamic_split_extra(&mut e, width.split_extra_bytes());
         e.place(aligned);
     }
     e.xor_r64_self(Reg::RCX);

@@ -2814,6 +2814,58 @@ fn a_changed_republish_panics() {
 /// two predicates would either break that or contaminate the shared one. What the carve-out owes
 /// is exactly this: agreement on the overlapping domain, so the two cannot drift where a reader
 /// would assume they match.
+/// The two `MemoryWidth` vocabulary accessors pinned at EVERY width, including the two the
+/// emitter's pads never build.
+///
+/// This exists because the two are equal for Byte, Word and Dword, which is every width that
+/// reaches their call sites today. Any test built only from those three passes with the two
+/// method bodies swapped, so it would certify nothing about which name means what. Qword and
+/// Tbyte are the only widths where the distinction is observable, and the `assert_ne!` at the end
+/// is the line that fails if the two are ever folded back into one.
+#[test]
+fn memory_width_alignment_mask_and_split_charge_are_distinct_facts() {
+    // (name, width, alignment_mask, split_extra_bytes). The name is carried rather than derived:
+    // `MemoryWidth` has no `Debug` impl and this test is not a reason to give a hot emitter enum
+    // one.
+    for (name, width, mask, extra) in [
+        ("Byte", MemoryWidth::Byte, 0, 0),
+        ("Word", MemoryWidth::Word, 1, 1),
+        ("Dword", MemoryWidth::Dword, 3, 3),
+        ("Qword", MemoryWidth::Qword, 3, 7),
+        ("Tbyte", MemoryWidth::Tbyte, 3, 9),
+    ] {
+        assert_eq!(width.alignment_mask(), mask, "alignment_mask({name})");
+        assert_eq!(
+            width.split_extra_bytes(),
+            extra,
+            "split_extra_bytes({name})"
+        );
+    }
+
+    // The separation itself, at the two widths that can express it. An alignment mask asks how
+    // the address must be shaped; the split charge says how many extra byte cycles a misaligned
+    // access owes. They coincide only where the width self-aligns.
+    assert_ne!(
+        MemoryWidth::Qword.alignment_mask(),
+        MemoryWidth::Qword.split_extra_bytes()
+    );
+    assert_ne!(
+        MemoryWidth::Tbyte.alignment_mask(),
+        MemoryWidth::Tbyte.split_extra_bytes()
+    );
+
+    // The mask is exactly one below the requirement it enforces, at every width.
+    for width in [
+        MemoryWidth::Byte,
+        MemoryWidth::Word,
+        MemoryWidth::Dword,
+        MemoryWidth::Qword,
+        MemoryWidth::Tbyte,
+    ] {
+        assert_eq!(width.alignment_mask(), width.alignment_bytes() - 1);
+    }
+}
+
 #[test]
 fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
     assert_eq!(

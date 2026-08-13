@@ -3447,6 +3447,33 @@ impl MemoryWidth {
         }
     }
 
+    /// The mask an alignment test ANDs against a linear address: nonzero means the access does
+    /// not meet this width's alignment requirement. The `MemoryWidth` counterpart of
+    /// `BusWidth::misaligned_at`, which cannot be reused here because the two carve Qword and
+    /// Tbyte differently -- see `alignment_bytes` above for why those two ask for 4.
+    ///
+    /// Read this at a site that asks the GUARD's question, "did the call-site alignment test
+    /// consider this misaligned". A site asking whether the access is one natural transaction of
+    /// its full width wants `bytes() - 1` instead, and the two Mode 13h refusals in `load_fast`
+    /// and `store_fast` are exactly that: a smaller mask refuses fewer accesses, so substituting
+    /// this method there would WEAKEN a deliberately conservative aperture gate.
+    pub(crate) const fn alignment_mask(self) -> u32 {
+        self.alignment_bytes() - 1
+    }
+
+    /// Extra byte cycles a misaligned access of this width owes the bus, beyond the single wide
+    /// cycle the block already charged statically. The interpreter charges all `bytes()` of them
+    /// (`BusWidth::charge_direct_ram_split` loops `0..width.bytes()`) because it never charged a
+    /// wide cycle first, so the JIT owes exactly one fewer.
+    ///
+    /// NOT the alignment mask, which it happens to equal for the three self-aligning widths.
+    /// `split_extra_bytes` is the name this quantity already carries at the lane that receives it
+    /// (`frame.rs`, `native_exit.rs`, `run.rs`), so it keeps that name here rather than gaining a
+    /// fourth one.
+    pub(crate) const fn split_extra_bytes(self) -> u32 {
+        self.bytes() - 1
+    }
+
     pub(crate) const fn needs_alignment_guard(self) -> bool {
         !matches!(self, Self::Byte)
     }
