@@ -345,17 +345,28 @@ impl CpuGsw {
         Ok(())
     }
 
-    /// Read a dword from a linear address through paging with implicit-supervisor
-    /// semantics (see `translate_linear_system`). Used for IDT/GDT/LDT descriptor
-    /// reads and TSS field access, none of which are checked against the current
-    /// CPL.
+    /// Dword form of `read_system_linear`.
     fn read_system_linear_u32<B: CpuBus>(&mut self, bus: &mut B, linear: u32) -> ExecResult<u32> {
-        let physical = self.translate_linear_system(bus, linear, false)?;
-        Ok(bus.read_memory(physical, BusWidth::Dword, BusAccessKind::DataRead)?)
+        self.read_system_linear(bus, linear, BusWidth::Dword)
     }
 
-    /// Read a byte or word from a linear address through paging with
-    /// implicit-supervisor semantics. See `read_system_linear_u32`.
+    /// Read a byte, word or dword from a linear address through paging with
+    /// implicit-supervisor semantics (see `translate_linear_system`). Used for IDT/GDT/LDT
+    /// descriptor reads, TSS field access and the TSS I/O permission bitmap, none of which
+    /// are checked against the current CPL.
+    ///
+    /// `read_memory_direct`, not `read_memory`: system structures (GDT/LDT/IDT, the TSS
+    /// and its I/O bitmap) live in plain RAM in every guest that boots, and the direct arm
+    /// skips the per-call device-window probing `read_memory` does before it reaches the
+    /// same slice. The arm is entered only when `direct_page_ram_bytes` succeeds, and it
+    /// charges the same `data_access_wait_states` + `trace.record` pair at the same
+    /// address as `read_memory`'s direct-RAM arm; the misaligned arm charges
+    /// `charge_direct_ram_split`. Anything else falls through to `read_memory` unchanged,
+    /// so the charge is bit-identical either way.
+    ///
+    /// The `direct` flag is dropped rather than fed to `record_data_read`: system reads have
+    /// never contributed to `data_direct_reads`/`data_slow_reads`, and those counters are
+    /// pinned by the census and bench JSON, so accounting for them here would move them.
     pub(super) fn read_system_linear<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -363,7 +374,9 @@ impl CpuGsw {
         width: BusWidth,
     ) -> ExecResult<u32> {
         let physical = self.translate_linear_system(bus, linear, false)?;
-        Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
+        Ok(bus
+            .read_memory_direct(physical, width, BusAccessKind::DataRead)?
+            .value)
     }
 
     /// Write a value to a linear address through paging with implicit-supervisor

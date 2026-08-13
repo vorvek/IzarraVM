@@ -4057,3 +4057,105 @@ fn a_bus_master_base_over_the_status_port_keeps_its_decode() {
         );
     });
 }
+
+/// `Cpu::read_system_linear` reads GDT/LDT/IDT descriptors, TSS fields and the TSS I/O
+/// permission bitmap through `read_memory_direct` rather than `read_memory`, to skip the
+/// device-window probing `read_memory` does before it reaches the same RAM slice. That is
+/// only legitimate if the two agree on BOTH the value and the recorded charge, because every
+/// derived clock in the machine comes off `trace`.
+///
+/// This pins that equality at the widths the system-read family uses (Byte and Word for
+/// selectors, access bytes and the I/O bitmap; Dword for descriptor halves), aligned and
+/// misaligned -- misaligned matters because a TSS base is arbitrary, so the Word read of
+/// TSS+0x66 lands on an odd address whenever the base is odd.
+///
+/// The `direct` assertion is what stops this from being vacuous: without it a fallthrough to
+/// `read_memory` would make the test compare `read_memory` against itself and pass forever.
+///
+/// `data_access_wait_states` consults the data-cache tag array, which is STATEFUL: the first
+/// touch of a line is a miss and costs more than every later one. A plain A-then-B pair reads
+/// that miss as a difference between the two paths (it charged 5 against 2 while this test was
+/// being written). So each address is warmed first and then measured A/B/A/B -- both repeats
+/// must agree, which also catches a path that only looks equal on its first call.
+///
+/// BOTH timing classes, because they do not share a misaligned arm: the Approximate class
+/// (`flat_data_cost`) folds a split into one `record_memory_run`, while the Accurate class
+/// records N byte cycles. `access_count` is asserted alongside `elapsed_clocks` for the same
+/// reason -- a future fold that collapsed N cycles into one run of equal total cost would keep
+/// the clocks equal and still change what the trace reports.
+#[test]
+fn a_direct_system_read_charges_exactly_what_the_general_read_charges() {
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        const BASE: u32 = 0x2000;
+        for i in 0..8u32 {
+            machine.write_physical_u8(BASE + i, 0x10 + i as u8);
+        }
+
+        with_bus(&mut machine, |bus| {
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                for offset in [0, 1] {
+                    let address = BASE + offset;
+
+                    // Warm the line so the tag-array miss is not attributed to whichever path
+                    // runs first.
+                    bus.read_memory(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+
+                    let mut direct_reads = Vec::new();
+                    let mut general_reads = Vec::new();
+                    for _ in 0..2 {
+                        let clocks = bus.trace.elapsed_clocks();
+                        let accesses = bus.trace.access_count();
+                        let direct = bus
+                            .read_memory_direct(address, width, BusAccessKind::DataRead)
+                            .unwrap();
+                        direct_reads.push((
+                            direct,
+                            bus.trace.elapsed_clocks() - clocks,
+                            bus.trace.access_count() - accesses,
+                        ));
+
+                        let clocks = bus.trace.elapsed_clocks();
+                        let accesses = bus.trace.access_count();
+                        let general = bus
+                            .read_memory(address, width, BusAccessKind::DataRead)
+                            .unwrap();
+                        general_reads.push((
+                            general,
+                            bus.trace.elapsed_clocks() - clocks,
+                            bus.trace.access_count() - accesses,
+                        ));
+                    }
+
+                    for (direct, direct_clocks, direct_accesses) in &direct_reads {
+                        assert!(
+                            direct.direct,
+                            "{mode:?} {width:?} at {address:#x} did not take the direct arm; the \
+                             equalities below would compare read_memory against itself"
+                        );
+                        for (general, general_clocks, general_accesses) in &general_reads {
+                            assert_eq!(
+                                direct.value, *general,
+                                "{mode:?} {width:?} at {address:#x} read a different value \
+                                 through the direct arm"
+                            );
+                            assert_eq!(
+                                direct_clocks, general_clocks,
+                                "{mode:?} {width:?} at {address:#x} charged a different number of \
+                                 clocks through the direct arm; every system read would move the \
+                                 machine's timing"
+                            );
+                            assert_eq!(
+                                direct_accesses, general_accesses,
+                                "{mode:?} {width:?} at {address:#x} recorded a different number \
+                                 of bus accesses through the direct arm"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
