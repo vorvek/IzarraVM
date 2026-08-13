@@ -423,6 +423,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         pending_device_memory_write_range: &mut machine.pending_device_memory_write_range,
         direct_map_changed: &mut machine.direct_map_changed,
         direct_data_map_changed: &mut machine.direct_data_map_changed,
+        aperture_content_changed: &mut machine.aperture_content_changed,
         direct_mapping_epoch: &mut machine.direct_mapping_epoch,
         vga_wipe_census: &mut machine.vga_wipe_census,
         core_clocks_so_far: 0,
@@ -752,4 +753,174 @@ fn firmware_fetch_window_admits_exactly_the_bios32_entry_points() {
         with_bus(&mut machine, |bus| bus.note_code_fetch_linear(linear));
         assert_eq!(machine.pending_bios32, Some(Bios32Call::Directory));
     }
+}
+
+/// A change to what physical 0xA0000 ALIASES must not replay a stale decoded instruction.
+///
+/// The trigger is the planar read map select (GC index 4): in mode 0x0D, a CPU read at
+/// A000:0 returns the selected plane's byte, so flipping the register changes what the same
+/// physical address CONTAINS without any memory write. The SMC write watch therefore never
+/// fires, and the only thing standing between the guest and a stale decode is the decode
+/// generation. The program plants different code in plane 1 (marker 0xBB) and plane 0
+/// (marker 0xAA) at A000:0, executes plane 0, flips read map select with ONE port write,
+/// and executes the same linear address again. The second execution must run plane 1's
+/// bytes.
+///
+/// Plane 1 is planted FIRST, deliberately: after the first far call caches the decode
+/// line, the only operation before the second call is the port write, so a pass here
+/// cannot be explained by a write-path invalidation.
+#[test]
+fn aperture_remap_reaches_the_decode_cache() {
+    #[rustfmt::skip]
+    const PROG: &[u8] = &[
+        0xB8, 0x0D, 0x00,             // mov ax,0x000D   planar 320x200x16, aperture A0000
+        0xCD, 0x10,                   // int 10h
+        0xB8, 0x00, 0xA0,             // mov ax,0xA000
+        0x8E, 0xC0,                   // mov es,ax
+        0xBA, 0xC4, 0x03,             // mov dx,0x3C4    sequencer
+        0xB8, 0x02, 0x02,             // mov ax,0x0202   map mask := plane 1
+        0xEF,                         // out dx,ax
+        0xBE, 0x5D, 0x01,             // mov si,0x015D   BB template
+        0xBF, 0x00, 0x00,             // mov di,0
+        0xB9, 0x06, 0x00,             // mov cx,6
+        0xF3, 0xA4,                   // rep movsb       plane 1 := marker 0xBB code
+        0xB8, 0x02, 0x01,             // mov ax,0x0102   map mask := plane 0
+        0xEF,                         // out dx,ax
+        0xBE, 0x57, 0x01,             // mov si,0x0157   AA template
+        0xBF, 0x00, 0x00,             // mov di,0
+        0xB9, 0x06, 0x00,             // mov cx,6
+        0xF3, 0xA4,                   // rep movsb       plane 0 := marker 0xAA code
+        0xBA, 0xCE, 0x03,             // mov dx,0x3CE    graphics controller
+        0xB8, 0x04, 0x00,             // mov ax,0x0004   read map select := plane 0
+        0xEF,                         // out dx,ax
+        0x9A, 0x00, 0x00, 0x00, 0xA0, // call far 0xA000:0x0000   caches the decode line
+        0xA0, 0x10, 0x02,             // mov al,[0x0210]
+        0xA2, 0x11, 0x02,             // mov [0x0211],al          save the first marker
+        0xB8, 0x04, 0x01,             // mov ax,0x0104   read map select := plane 1 (TRIGGER)
+        0xEF,                         // out dx,ax
+        0x9A, 0x00, 0x00, 0x00, 0xA0, // call far 0xA000:0x0000   must re-decode
+        0xA0, 0x10, 0x02,             // mov al,[0x0210]
+        0xA2, 0x12, 0x02,             // mov [0x0212],al          save the second marker
+        0xB8, 0x04, 0x00,             // mov ax,0x0004   read map select := plane 0 AGAIN
+        0xEF,                         // out dx,ax
+        0x9A, 0x00, 0x00, 0x00, 0xA0, // call far 0xA000:0x0000   must re-decode AGAIN
+        0xCD, 0x20,                   // int 20h
+        // 0x0157: plane-0 payload
+        0xC6, 0x06, 0x10, 0x02, 0xAA, // mov byte [0x0210],0xAA
+        0xCB,                         // retf
+        // 0x015D: plane-1 payload
+        0xC6, 0x06, 0x10, 0x02, 0xBB, // mov byte [0x0210],0xBB
+        0xCB,                         // retf
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let base = u32::from(DOS_LOAD_SEGMENT) << 4;
+    assert_eq!(
+        machine.read_physical_u8(base + 0x211),
+        0xAA,
+        "sanity: the first call must execute plane 0's bytes"
+    );
+    assert_eq!(
+        machine.read_physical_u8(base + 0x212),
+        0xBB,
+        "the read-map flip changed what A000:0 contains; executing the OLD bytes means a \
+         stale decoded instruction was replayed"
+    );
+    // The third leg is the RE-ARM pin. The first flush clears the aperture flag on its way
+    // through the generation bump; if the re-decode of plane 1's bytes did not set it again,
+    // flipping BACK to plane 0 would replay the cached plane-1 line and read 0xBB here.
+    assert_eq!(
+        machine.read_physical_u8(base + 0x210),
+        0xAA,
+        "remapping BACK must re-decode too: the flag must re-arm on every aperture insert, \
+         not only on the first"
+    );
+}
+
+/// The aperture flush is SELF-LIMITING: one flush per aperture line inserted, not one per
+/// VGA register write forever. Two identical runs that differ only in how many times they
+/// poke a VGA register after the one aperture execution must end at the SAME decode
+/// generation, because the first poke's flush clears the flag and the later pokes find it
+/// clear. A never-clearing mutation gives the longer machine extra generation bumps.
+#[test]
+fn aperture_flush_is_self_limiting() {
+    fn run(extra_outs: usize) -> u32 {
+        let mut prog = vec![
+            0xB8, 0x00, 0xB8, // mov ax,0xB800    text mode 3 aperture, live at boot
+            0x8E, 0xC0, // mov es,ax
+            0xBE, 0x00, 0x00, // mov si,PAYLOAD (patched below)
+            0xBF, 0x00, 0x00, // mov di,0
+            0xB9, 0x06, 0x00, // mov cx,6
+            0xF3, 0xA4, // rep movsb        plant the payload at B800:0
+            0x9A, 0x00, 0x00, 0x00, 0xB8, // call far 0xB800:0    decode from the aperture
+            0xBA, 0xCE, 0x03, // mov dx,0x3CE
+        ];
+        for _ in 0..extra_outs {
+            prog.extend_from_slice(&[0xB8, 0x04, 0x00]); // mov ax,0x0004
+            prog.push(0xEF); // out dx,ax   an accepted VGA write, batch ends
+        }
+        prog.extend_from_slice(&[0xCD, 0x20]); // int 20h
+        let payload_offset = 0x100 + prog.len() as u16;
+        prog.extend_from_slice(&[0xC6, 0x06, 0x10, 0x02, 0xAA, 0xCB]);
+        prog[6] = payload_offset as u8;
+        prog[7] = (payload_offset >> 8) as u8;
+        let mut machine =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &prog).unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert_eq!(
+            machine.read_physical_u8((u32::from(DOS_LOAD_SEGMENT) << 4) + 0x210),
+            0xAA,
+            "sanity: the aperture code executed"
+        );
+        machine.cpu.decode_cache_generation()
+    }
+    assert_eq!(
+        run(1),
+        run(3),
+        "extra VGA writes after the flush must not keep flushing: the flag failed to clear"
+    );
+}
+
+/// The CGA and text arms of int10_set_mode_number never move the direct-write identity, so
+/// before this fix they reached no decode invalidation at all. With aperture code live, a
+/// mode set through the CGA arm must bump the decode generation exactly once relative to an
+/// identical run whose far call is replaced by NOPs; the NOP run doubles as the cost pin,
+/// proving a guest that never executes from VRAM pays no flush for the same INT 10h.
+#[test]
+fn a_text_arm_mode_set_reaches_aperture_code() {
+    fn run(execute: bool) -> u32 {
+        let mut prog = vec![
+            0xB8, 0x00, 0xB8, // mov ax,0xB800
+            0x8E, 0xC0, // mov es,ax
+            0xBE, 0x00, 0x00, // mov si,PAYLOAD (patched below)
+            0xBF, 0x00, 0x00, // mov di,0
+            0xB9, 0x06, 0x00, // mov cx,6
+            0xF3, 0xA4, // rep movsb
+        ];
+        if execute {
+            prog.extend_from_slice(&[0x9A, 0x00, 0x00, 0x00, 0xB8]); // call far 0xB800:0
+        } else {
+            prog.extend_from_slice(&[0x90, 0x90, 0x90, 0x90, 0x90]); // same length, no decode
+        }
+        prog.extend_from_slice(&[
+            0xB8, 0x84, 0x00, // mov ax,0x0084   CGA mode 4, no clear: the CGA arm
+            0xCD, 0x10, // int 10h
+            0xCD, 0x20, // int 20h
+        ]);
+        let payload_offset = 0x100 + prog.len() as u16;
+        prog.extend_from_slice(&[0xC6, 0x06, 0x10, 0x02, 0xAA, 0xCB]);
+        prog[6] = payload_offset as u8;
+        prog[7] = (payload_offset >> 8) as u8;
+        let mut machine =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &prog).unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        machine.cpu.decode_cache_generation()
+    }
+    assert_eq!(
+        run(true),
+        run(false) + 1,
+        "with aperture code live the CGA-arm mode set must flush exactly once; without it, \
+         the same INT 10h must flush nothing"
+    );
 }

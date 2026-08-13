@@ -892,6 +892,13 @@ impl Machine {
                 self.cpu.note_direct_data_map_changed();
                 self.direct_data_map_changed = false;
             }
+            // AFTER the two direct-map arms, so a coarse invalidation that already ran leaves
+            // this a no-op (the flush cleared the aperture flag). One bool test per batch when
+            // nothing was raised.
+            if self.aperture_content_changed {
+                self.cpu.note_aperture_content_changed();
+                self.aperture_content_changed = false;
+            }
             // pending_soft_int is posted at a stub LANDING (V86 or real mode), so
             // for a monitor-reflected V86 INT it is set only after the monitor has
             // IRETed back into V86 with the real-mode frame in place, and serviced
@@ -1001,6 +1008,7 @@ impl Machine {
                     pending_device_memory_write_range,
                     direct_map_changed,
                     direct_data_map_changed,
+                    aperture_content_changed,
                     #[cfg(feature = "jit")]
                     poll_skip_diagnostics,
                     #[cfg(test)]
@@ -1067,6 +1075,7 @@ impl Machine {
                     pending_device_memory_write_range,
                     direct_map_changed,
                     direct_data_map_changed,
+                    aperture_content_changed,
                     direct_mapping_epoch: &mut self.direct_mapping_epoch,
                     vga_wipe_census: &mut self.vga_wipe_census,
                     core_clocks_so_far: 0,

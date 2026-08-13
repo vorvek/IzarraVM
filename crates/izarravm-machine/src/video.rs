@@ -112,6 +112,11 @@ impl Machine {
     /// flags/CS/IP.
     pub(super) fn handle_int10(&mut self) {
         let direct_write_before = self.vega.direct_write_identity();
+        // Unconditional, NOT behind the identity compare below: the CGA and text arms of
+        // int10_set_mode_number reach legacy_mut() without moving the identity at all, yet a
+        // text-mode set re-points what physical B8000/A0000 alias. The CPU-side gate keeps the
+        // breadth free for guests that hold no aperture code.
+        self.aperture_content_changed = true;
         self.handle_int10_inner();
         if self.vega.direct_write_identity() != direct_write_before {
             self.mark_direct_data_map_changed();

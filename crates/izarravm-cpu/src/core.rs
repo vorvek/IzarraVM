@@ -265,6 +265,22 @@ impl CpuGsw {
     /// mask (port 0x3C5, sequencer index 2) cycling planes 0-3. The global form threw away 43.3M
     /// live entries doing it, 88.1% of them RAM whose host pointers had not moved.
     /// Evidence: `.bench/results/fastmap-wipe-20260803/README.md`.
+    /// The APERTURE REMAP edge: what physical 0xA0000-0xBFFFF CONTAINS changed without any
+    /// memory write, so the SMC marks cannot have seen it. Read-side register moves (GC read map
+    /// select, read mode, odd/even), mode-set arms that never touch the direct-write identity,
+    /// and anything else that re-points the window all land here via the machine's batch
+    /// boundary.
+    ///
+    /// Gated on the decode cache actually holding aperture code, which no fixture on the board
+    /// ever does: for everything else this is one bool load. When it IS set, the full
+    /// invalidation runs, and clears the flag on the way through, so a guest cycling the
+    /// aperture pays one flush per aperture line inserted, not one per cycle.
+    pub fn note_aperture_content_changed(&mut self) {
+        if self.decode_cache.has_aperture_code {
+            self.invalidate_code_caches();
+        }
+    }
+
     pub fn note_direct_data_map_changed(&mut self) {
         self.data_read_pages
             .invalidate_physical_range(VGA_APERTURE_START, VGA_APERTURE_END);

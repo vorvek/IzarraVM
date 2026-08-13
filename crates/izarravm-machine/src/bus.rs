@@ -127,6 +127,7 @@ impl Machine {
             pending_device_memory_write_range: &mut self.pending_device_memory_write_range,
             direct_map_changed: &mut self.direct_map_changed,
             direct_data_map_changed: &mut self.direct_data_map_changed,
+            aperture_content_changed: &mut self.aperture_content_changed,
             direct_mapping_epoch: &mut self.direct_mapping_epoch,
             vga_wipe_census: &mut self.vga_wipe_census,
             core_clocks_so_far: 0,
@@ -2354,6 +2355,14 @@ impl CpuBus for MachineBus<'_> {
             0
         };
         if self.vega.port_enabled(port) && self.vega.write_port(port, value as u8) {
+            // ANY accepted VGA register write may re-point what the aperture READS as, and the
+            // read-side registers (GC read map select, read mode, odd/even) are in NO identity:
+            // in every planar mode the write identity below is pinned at (0, None), so gating
+            // this on an identity change would leave the read side uncovered, which was a
+            // measured stale-decode replay. The CPU applies it at the batch boundary behind a
+            // has-aperture-code test, so for a guest that never executes from VRAM this store
+            // is the entire cost.
+            *self.aperture_content_changed = true;
             let direct_write_after = self.vega.direct_write_identity();
             if direct_write_after != direct_write_before {
                 if self.vga_wipe_census.enabled {

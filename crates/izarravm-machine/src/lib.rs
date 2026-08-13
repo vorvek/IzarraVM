@@ -1074,6 +1074,12 @@ pub struct Machine {
     // Set when only a device data aperture changes. The CPU drops data pointers
     // and its FastMap while retaining decoded and compiled code.
     direct_data_map_changed: bool,
+    /// Raised on ANY accepted VGA port write and on every INT 10h, applied at the batch
+    /// boundary as `CpuGsw::note_aperture_content_changed`. Deliberately broad: enumerating
+    /// which registers can re-point the aperture's READ datapath is exactly the identity-drift
+    /// hazard the write-side token comments warn about, and the CPU-side gate makes breadth
+    /// free (one bool load) for every guest that does not execute from VRAM.
+    aperture_content_changed: bool,
     // Generation stamped onto every direct host pointer. Any change that can
     // replace or reinterpret a mapping advances it before another CPU batch.
     direct_mapping_epoch: u64,
@@ -1429,6 +1435,7 @@ impl Machine {
             pending_device_memory_write_range: None,
             direct_map_changed: false,
             direct_data_map_changed: false,
+            aperture_content_changed: false,
             vga_wipe_census: vga_wipe_census::VgaWipeCensus::default(),
             direct_mapping_epoch: 1,
             host_profile: MachineHostProfile::default(),
@@ -2908,6 +2915,7 @@ struct MachineBus<'a> {
     pending_device_memory_write_range: &'a mut Option<(u32, u32)>,
     direct_map_changed: &'a mut bool,
     direct_data_map_changed: &'a mut bool,
+    pub(crate) aperture_content_changed: &'a mut bool,
     direct_mapping_epoch: &'a mut u64,
     // Env-gated attribution for the direct-write-token seam; see `vga_wipe_census`.
     vga_wipe_census: &'a mut crate::vga_wipe_census::VgaWipeCensus,

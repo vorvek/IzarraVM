@@ -3179,6 +3179,14 @@ struct DecodeCache {
     /// bookkeeping, excluded from CPU equality like the rest of the cache.
     #[cfg(feature = "jit")]
     poll_neg_gens: Box<[u32]>,
+    /// Whether any LIVE line MAY have been decoded from the VGA aperture (physical pages
+    /// 0xA0..=0xBF). A conservative over-approximation: set on insert, cleared only by the
+    /// generation bump, never by single-line displacement. Consumers use it to decide whether an
+    /// aperture REMAP (a mapping change with no memory write, invisible to the SMC marks) must
+    /// pay a full code-cache invalidation. Self-limiting by construction: the flush it buys runs
+    /// through `invalidate_and_clear_code_marks`, which clears it, so the worst case is one flush
+    /// per aperture line INSERTED, not one per remap forever.
+    has_aperture_code: bool,
     /// Direct-mapped negative cache: packed (lin:32 | d:1 | valid:1 |
     /// gen:30) entries. A live entry means "the last full backward scan at
     /// this (lin, d) found no poll shape for code-byte-only reasons and no
@@ -3295,6 +3303,7 @@ impl DecodeCache {
             code_page_lin: std::collections::HashMap::default(),
             #[cfg(feature = "jit")]
             poll_neg_gens: vec![0u32; POLL_NEG_GEN_SLOTS].into_boxed_slice(),
+            has_aperture_code: false,
             #[cfg(feature = "jit")]
             poll_neg: vec![0u64; POLL_NEG_SLOTS].into_boxed_slice(),
         }
@@ -3648,6 +3657,12 @@ impl DecodeCache {
         self.mark_code_range(phys, insn.len);
 
         let page = phys >> 12;
+        // The aperture-code flag: one range test on a value already in hand. 0xA0..=0xBF is
+        // exactly the four windows the GC aperture can select (A0000/128K, A0000/64K, B0000/32K,
+        // B8000/32K), Hercules and mono included.
+        if (0xA0..=0xBF).contains(&page) {
+            self.has_aperture_code = true;
+        }
         match self.code_page_lin.entry(page) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(PageCodeInfo {
@@ -3827,6 +3842,10 @@ impl DecodeCache {
     /// Invalidate every cached line and drop every matching code watch. The generation advance and
     /// watch clear stay one operation so no dead decode line can leave an unowned native watch.
     fn invalidate_and_clear_code_marks(&mut self) {
+        // No line survives a generation bump, so no aperture line does either. Clearing here is
+        // what makes the aperture-remap flush self-limiting: the flush it triggers lands in this
+        // function and disarms it until aperture code is genuinely decoded again.
+        self.has_aperture_code = false;
         if self.generation == u32::MAX {
             // Clear old generation-1 lines before 1 can become live again.
             self.clear_lines();
