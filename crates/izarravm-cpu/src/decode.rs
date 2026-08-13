@@ -324,6 +324,13 @@ impl CpuGsw {
             let inserted = self
                 .decode_cache
                 .put(lin, insn, cs.default_size_32, physical);
+            // The aperture-code flag, set HERE rather than inside `put`: the flag lives at the
+            // CpuGsw tail (see `ApertureCodeFlag`) and this is the only production caller of
+            // `put`. 0xA0..=0xBF is exactly the four windows the GC aperture can select. Gated
+            // on the insert landing, since a rejected straddler leaves no line to go stale.
+            if inserted.inserted && (0xA0..=0xBF).contains(&(physical >> 12)) {
+                self.has_aperture_code.0 = true;
+            }
             // E1 sweep, synchronous with the mark (watched-page-bit design D4): `put` may have
             // crossed a page's unwatched -> watched edge, and a native block's CALLOUT can be
             // the caller here, returning into emitted code that keeps storing — so the

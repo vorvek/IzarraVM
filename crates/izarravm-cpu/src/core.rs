@@ -124,6 +124,10 @@ impl CpuGsw {
         // Paging, mode, A20, and physical-map changes route through here. Any can make the same
         // linear address decode from different bytes, so invalidate the lines and their SMC marks.
         self.decode_cache.invalidate_and_clear_code_marks();
+        // No line survives the bump, so no aperture line does either. Clearing here is what
+        // makes the aperture-remap flush self-limiting: the flush it triggers lands in this
+        // function and disarms it until aperture code is genuinely decoded again.
+        self.has_aperture_code.0 = false;
     }
 
     pub(super) fn invalidate_translation_code_caches(&mut self) {
@@ -276,7 +280,7 @@ impl CpuGsw {
     /// invalidation runs, and clears the flag on the way through, so a guest cycling the
     /// aperture pays one flush per aperture line inserted, not one per cycle.
     pub fn note_aperture_content_changed(&mut self) {
-        if self.decode_cache.has_aperture_code {
+        if self.has_aperture_code.0 {
             self.invalidate_code_caches();
         }
     }
@@ -505,6 +509,10 @@ impl CpuGsw {
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
                     self.decode_cache.invalidate_and_clear_code_marks();
+                    // The second of the two generation-bump call sites; same clearing rule as
+                    // invalidate_decode_frontend, or an SMC wholesale flush would leave the
+                    // aperture flag armed with no line behind it.
+                    self.has_aperture_code.0 = false;
                     #[cfg(feature = "jit")]
                     self.jit_direct.invalidate_translation();
                 }
