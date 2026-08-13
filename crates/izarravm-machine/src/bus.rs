@@ -664,6 +664,63 @@ const A20_MASK: u32 = !(1 << 20);
 /// Every other (8-bit-decoded) port takes consecutive bytes at `port`, `port+1`,
 /// ... - exactly the VGA index/data-pair behaviour a single 16-bit `OUT` to
 /// `0x3C4`/`0x3CE`/`0x3D4` relies on to set an index and its datum at once.
+impl MachineBus<'_> {
+    /// The VGA status ports (3DA/3BA/3C2), lifted out of `read_io` unchanged so the hot 0x3DA
+    /// fast path near the top of that function and the in-order arm run ONE body instead of two
+    /// copies that could drift apart.
+    ///
+    /// `None` means decline and fall through, which is exactly what the inactive status1 alias
+    /// does in the non-lazy class. The lazy class answers 0xFF itself rather than declining.
+    fn read_vga_status_port(&mut self, port: u16, skip_io_touched: bool) -> Option<u32> {
+        if self.lazy_port_reads || self.lazy_ports_386 {
+            let beam = self.predicted_beam();
+            if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
+                return Some(u32::from(value));
+            }
+            // Inactive alias (e.g. 3BA polled in a color setup): no side
+            // effects, matching `Vga::read_port`'s existing
+            // `status1_port_selected` gate, and -- since this arm's static
+            // port set is disjoint from every other device's decoded ports
+            // (grep-confirmed: nothing else claims 0x3B0..=0x3DF) -- the same
+            // 0xFF the non-lazy path's fallthrough to `device_ports`'s passive
+            // table would eventually produce. Returned directly, without
+            // setting io_touched, so an inactive-alias poll stays lazy too
+            // instead of silently falling back to the old behavior.
+            return Some(0xff);
+        }
+        if !skip_io_touched {
+            *self.io_touched = true;
+        }
+        // The BEAM peek is taken in BOTH timing classes, on exactly the
+        // same grounds as the 0x61 OUT peek and the 0x40-0x42 counter
+        // peek below: it changes only the VALUE, never whether the batch
+        // ends. `io_touched` is already set above, so this arm keeps the
+        // batch-ending behavior the Accurate class has always had; only
+        // the bits reported change.
+        //
+        // Why the Accurate class needs it. Without the peek this arm
+        // read the LIVE beam, which is the beam as of BATCH START, and
+        // only then ended the batch -- so a retrace poll reported a
+        // position up to a whole batch stale. That was bounded at a
+        // DAC period while the fine fallback was unconditional, but
+        // `fine_batch_grain_required` now gates it (and no term in that
+        // gate covers a display poll: 3DA/3BA arm nothing), so an
+        // otherwise-idle 386 guest polling retrace sits on the 1 ms
+        // coarse cap and reads a beam up to 1 ms old. The deadline cache
+        // does not bound it either: `vega_edge_ticks` carries the Margo
+        // blit and DISPLAY_START terms, not a retrace edge.
+        //
+        // `read_status_port_lazy` is the same function the lazy arm
+        // above calls and performs the identical guest-visible side
+        // effects a `read_port` of these three ports would
+        // (`status1_side_effects` / `catch_up`); it declines exactly
+        // where `read_port` declines -- the inactive status1 alias --
+        // so the fallthrough at the call site is unchanged.
+        let beam = self.predicted_beam();
+        self.vega.read_status_port_lazy(port, beam).map(u32::from)
+    }
+}
+
 const fn io_word_sub_port(port: u16, index: u32) -> u16 {
     if port == ata::PRIMARY_CMD_BASE || port == ide::SECONDARY_CMD_BASE {
         port
@@ -1688,6 +1745,38 @@ impl CpuBus for MachineBus<'_> {
             return Ok(value);
         }
 
+        // THE 0x3DA FAST PATH. GP2 reads this one port 2.003 billion times in a run, and in
+        // decode order it walks `port_disabled` plus four UART/LPT range checks first, every
+        // time. Answer it here instead. `Uart16450::read_port` and `Lpt::read_port` alone are
+        // 1.635% and 0.483% SELF on the gp2 profile, and this is that traffic.
+        //
+        // WHY HERE AND NOT HIGHER, which is the whole correctness argument:
+        //
+        // * ABOVE the `width != BusWidth::Byte` block would be wrong. A word `IN` from 0x3DA
+        //   decomposes into 0x3DA and 0x3DB and records THREE bus accesses; answering the word
+        //   here would return a zero-extended byte and record one, moving recorded bus clocks.
+        // * ABOVE the bus-master check would be wrong. `piix_ide_bm_base` is guest-programmable
+        //   through BAR4 and masked only with `!0x0f`, so a guest can point the 16-byte
+        //   bus-master block at 0x03D0, where `BusMasterIde::owns_io` claims 0x3DA and wins
+        //   today. Hoisting past it would silently reassign that decode to the VGA.
+        // * ABOVE `pci.read_io` buys nothing: it claims only 0xCF8-0xCFF.
+        //
+        // What it DOES skip is `port_disabled` and the four serial/LPT range checks, and those
+        // are safe to skip because `port_enabled`/`port_disabled` are exact complements at this
+        // port (both reduce to `video_subsystem_enabled()` for 0x3B0..=0x3DF except 0x3C3), and
+        // COM1/COM2/LPT1/LPT2 bases are `const` with no setter, claiming 0x3F8/0x2F8 +7 and
+        // 0x378/0x278 +2. None can reach 0x3DA.
+        //
+        // 0x3DA ONLY, deliberately: 0x3BA sits beside the 0x3BC LPT range and 0x3C2 is the
+        // write-side dot-clock port, so hoisting the trio would change decode precedence.
+        // A decline falls through to the in-order arm, which is unchanged.
+        if port == 0x3DA
+            && self.vega.port_enabled(port)
+            && let Some(value) = self.read_vga_status_port(port, skip_io_touched)
+        {
+            return Ok(value);
+        }
+
         if self.vega.port_disabled(port) {
             if !skip_io_touched {
                 *self.io_touched = true;
@@ -1736,54 +1825,9 @@ impl CpuBus for MachineBus<'_> {
         // write itself sets io_touched and ends the batch, so no further lazy read
         // can observe the stale prediction within the same batch.
         if matches!(port, 0x3DA | 0x3BA | 0x3C2) && self.vega.port_enabled(port) {
-            if self.lazy_port_reads || self.lazy_ports_386 {
-                let beam = self.predicted_beam();
-                if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
-                    return Ok(u32::from(value));
-                }
-                // Inactive alias (e.g. 3BA polled in a color setup): no side
-                // effects, matching `Vga::read_port`'s existing
-                // `status1_port_selected` gate, and -- since this arm's static
-                // port set is disjoint from every other device's decoded ports
-                // (grep-confirmed: nothing else claims 0x3B0..=0x3DF) -- the same
-                // 0xFF the non-lazy path's fallthrough to `device_ports`'s passive
-                // table would eventually produce. Returned directly, without
-                // setting io_touched, so an inactive-alias poll stays lazy too
-                // instead of silently falling back to the old behavior.
-                return Ok(0xff);
-            } else {
-                if !skip_io_touched {
-                    *self.io_touched = true;
-                }
-                // The BEAM peek is taken in BOTH timing classes, on exactly the
-                // same grounds as the 0x61 OUT peek and the 0x40-0x42 counter
-                // peek below: it changes only the VALUE, never whether the batch
-                // ends. `io_touched` is already set above, so this arm keeps the
-                // batch-ending behavior the Accurate class has always had; only
-                // the bits reported change.
-                //
-                // Why the Accurate class needs it. Without the peek this arm
-                // read the LIVE beam, which is the beam as of BATCH START, and
-                // only then ended the batch -- so a retrace poll reported a
-                // position up to a whole batch stale. That was bounded at a
-                // DAC period while the fine fallback was unconditional, but
-                // `fine_batch_grain_required` now gates it (and no term in that
-                // gate covers a display poll: 3DA/3BA arm nothing), so an
-                // otherwise-idle 386 guest polling retrace sits on the 1 ms
-                // coarse cap and reads a beam up to 1 ms old. The deadline cache
-                // does not bound it either: `vega_edge_ticks` carries the Margo
-                // blit and DISPLAY_START terms, not a retrace edge.
-                //
-                // `read_status_port_lazy` is the same function the lazy arm
-                // above calls and performs the identical guest-visible side
-                // effects a `read_port` of these three ports would
-                // (`status1_side_effects` / `catch_up`); it declines exactly
-                // where `read_port` declines -- the inactive status1 alias --
-                // so the fallthrough below is unchanged.
-                let beam = self.predicted_beam();
-                if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
-                    return Ok(u32::from(value));
-                }
+            // 0x3DA already answered above unless it declined; 3BA and 3C2 arrive here in order.
+            if let Some(value) = self.read_vga_status_port(port, skip_io_touched) {
+                return Ok(value);
             }
         } else if self.vega.port_enabled(port)
             && let Some(value) = self.vega.read_port(port)

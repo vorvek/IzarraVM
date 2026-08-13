@@ -3957,3 +3957,103 @@ fn a_distira_bar_page_is_refused_the_unaligned_direct_admission() {
         );
     });
 }
+
+/// A word `IN` from 0x3DA must still decompose into two byte cycles at 0x3DA and 0x3DB.
+///
+/// This pins the reason the 0x3DA fast path sits BELOW the `width != BusWidth::Byte` block
+/// rather than at the top of `read_io`. Hoisting it above that block would answer the whole
+/// word from the status port: the returned value would lose the 0x3DB byte, and the run would
+/// record one bus access where the decomposition records three (the outer word plus one per
+/// byte), moving recorded bus clocks and therefore every clock derived from them.
+#[test]
+fn a_word_read_of_the_status_port_still_decomposes_into_two_byte_cycles() {
+    let mut machine = test_machine();
+    let (word, byte_3da, byte_3db, word_clocks, byte_clocks) = with_bus(&mut machine, |bus| {
+        let before = bus.trace.elapsed_clocks();
+        let word = bus.read_io(0x3DA, BusWidth::Word, 0, false).unwrap();
+        let word_clocks = bus.trace.elapsed_clocks() - before;
+
+        let before = bus.trace.elapsed_clocks();
+        let byte_3da = bus.read_io(0x3DA, BusWidth::Byte, 0, false).unwrap();
+        let byte_3db = bus.read_io(0x3DB, BusWidth::Byte, 0, false).unwrap();
+        let byte_clocks = bus.trace.elapsed_clocks() - before;
+        (word, byte_3da, byte_3db, word_clocks, byte_clocks)
+    });
+
+    assert_eq!(
+        word & 0xff00,
+        (byte_3db & 0xff) << 8,
+        "the high byte of a word read must come from 0x3DB, not from the status port"
+    );
+    assert_eq!(
+        byte_3da & 0xfe,
+        word & 0xfe,
+        "the low byte must still be the status port (bit 0 is beam-dependent and excluded)"
+    );
+    assert!(
+        word_clocks > byte_clocks,
+        "a word read records its own outer access on top of the two byte cycles \
+         (word {word_clocks}, two bytes {byte_clocks})"
+    );
+}
+
+/// The IDE bus-master block keeps precedence at 0x3DA when a guest points BAR4 at it.
+///
+/// This pins the reason the 0x3DA fast path sits BELOW the bus-master check. `piix_ide_bm_base`
+/// is guest-programmable through PCI config BAR4 and is masked only with `!0x0f`, so 0x03D0 is
+/// reachable and `BusMasterIde::owns_io` then claims the whole 0x03D0..=0x03DF block including
+/// 0x3DA. Hoisting the fast path above that check would silently reassign the decode to the VGA.
+///
+/// Observed through the attribute flip-flop rather than through the returned byte, because both
+/// arms can legitimately return the same value: the bus-master registers read back 0 here and the
+/// VGA status bits are 0 at some beam positions, so a value comparison is vacuous. The flip-flop
+/// is not: only a VGA status read resets it, so if it survives the read, the VGA did not answer.
+/// The indirect observation technique is the one used by
+/// `lazy_3da_read_still_resets_the_attribute_flip_flop_and_calls_catch_up` above.
+#[test]
+fn a_bus_master_base_over_the_status_port_keeps_its_decode() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+
+    // PIIX4 IDE function (bus 0, device 7, function 1), BAR4 = 0x03D0. Driven through PCI
+    // config space the way a guest does, rather than by reaching into the device.
+    const IDE_DEVFN: u32 = (7 << 3) | 1;
+    with_bus(&mut machine, |bus| {
+        for (offset, byte) in [(0x20u32, 0xD0u32), (0x21, 0x03), (0x22, 0x00), (0x23, 0x00)] {
+            let address = 0x8000_0000 | (IDE_DEVFN << 8) | (offset & 0xfc);
+            bus.write_io(0x0cf8, BusWidth::Dword, address, false)
+                .unwrap();
+            bus.write_io(0x0cfc + (offset & 0x03) as u16, BusWidth::Byte, byte, false)
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        machine.pci.ide_bus_master_io_base(),
+        Some(0x03D0),
+        "the base must land where the test needs it, or the assertion below is vacuous"
+    );
+
+    with_bus(&mut machine, |bus| {
+        // Arm the flip-flop in its DATA phase with exactly one 0x3C0 write, per the technique
+        // documented on the lazy-3DA test above.
+        bus.write_io(0x3C0, BusWidth::Byte, 0x05, false).unwrap();
+        assert_eq!(
+            bus.read_io(0x3C0, BusWidth::Byte, 0, false).unwrap(),
+            0x05,
+            "sanity: the index write took effect"
+        );
+
+        // The read under test. The bus-master block owns this port, so the VGA must not see it
+        // and the flip-flop must survive.
+        let _ = bus.read_io(0x3DA, BusWidth::Byte, 0, false).unwrap();
+
+        // Still in the DATA phase means no VGA status read happened: this write is consumed as
+        // data for index 0x05, so the index read-back is unchanged.
+        bus.write_io(0x3C0, BusWidth::Byte, 0x0A, false).unwrap();
+        assert_eq!(
+            bus.read_io(0x3C0, BusWidth::Byte, 0, false).unwrap(),
+            0x05,
+            "the VGA answered 0x3DA and reset the attribute flip-flop, so the bus-master              block lost a decode it owns"
+        );
+    });
+}
