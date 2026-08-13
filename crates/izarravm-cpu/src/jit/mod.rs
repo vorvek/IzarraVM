@@ -186,6 +186,8 @@ pub(crate) struct JitState {
     /// (watched-page-bit design D4). Non-empty only between the acquiring call and its
     /// `CpuGsw::sweep_block_watch_edges` drain; `install`/`reject` assert that.
     pub(crate) pending_watch_edges: Vec<u32>,
+    #[cfg(feature = "direct-callout-attribution")]
+    pub(crate) direct_callout_attribution: Option<Box<direct::CallOutAttribution>>,
 }
 
 /// Seed for `JitState::one_lookup_store`, read once per process from
@@ -234,6 +236,8 @@ impl JitState {
             code_watch: Box::default(),
             fast_map_audit: Box::default(),
             pending_watch_edges: Vec::new(),
+            #[cfg(feature = "direct-callout-attribution")]
+            direct_callout_attribution: direct::direct_callout_attribution_default(),
         }
     }
 }
@@ -266,6 +270,8 @@ impl Clone for JitState {
             code_watch: Box::default(),
             fast_map_audit: Box::default(),
             pending_watch_edges: Vec::new(),
+            #[cfg(feature = "direct-callout-attribution")]
+            direct_callout_attribution: None,
         }
     }
 }

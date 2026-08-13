@@ -998,6 +998,148 @@ fn a_pushad_frame_that_hits_watched_code_is_refused_with_zero_partial_effects() 
     );
 }
 
+#[cfg(feature = "direct-callout-attribution")]
+fn callout_helper_counts(
+    snapshot: &DirectCallOutAttributionSnapshot,
+    helper: &str,
+) -> DirectCallOutOutcomeCounts {
+    snapshot
+        .helpers
+        .iter()
+        .find(|row| row.helper == helper)
+        .unwrap()
+        .counts
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[test]
+fn callout_attribution_splits_every_port_outcome() {
+    for (lazy, fails, expected) in [
+        (
+            true,
+            false,
+            DirectCallOutOutcomeCounts {
+                attempts: 1,
+                continued: 1,
+                step_break: 0,
+                abnormal: 0,
+            },
+        ),
+        (
+            false,
+            false,
+            DirectCallOutOutcomeCounts {
+                attempts: 1,
+                continued: 0,
+                step_break: 1,
+                abnormal: 0,
+            },
+        ),
+        (
+            true,
+            true,
+            DirectCallOutOutcomeCounts {
+                attempts: 1,
+                continued: 0,
+                step_break: 0,
+                abnormal: 1,
+            },
+        ),
+    ] {
+        let (mut fixture, _, _) = slot_block(|bus| {
+            bus.lazy_io_reads = lazy;
+            bus.io_read_fails = fails;
+            bus.io_read_value = Some(0x5a);
+        });
+        fixture.cpu.enable_direct_callout_attribution_for_test();
+        assert!(
+            fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap()
+        );
+
+        let snapshot = fixture.cpu.direct_callout_attribution_snapshot().unwrap();
+        assert_eq!(snapshot.helpers.len(), 3);
+        assert_eq!(callout_helper_counts(&snapshot, "in_al_dx"), expected);
+        assert_eq!(callout_helper_counts(&snapshot, "pushad").attempts, 0);
+        assert_eq!(callout_helper_counts(&snapshot, "popad").attempts, 0);
+        assert_eq!(snapshot.ports.len(), 1);
+        assert_eq!(snapshot.ports[0].port, PORT);
+        assert_eq!(snapshot.ports[0].counts, expected);
+        assert_eq!(snapshot.totals, expected);
+    }
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[test]
+fn callout_attribution_orders_ports_and_survives_unrelated_resets() {
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    bus.lazy_io_reads = true;
+    bus.io_read_value = Some(0x5a);
+    cpu.enable_direct_callout_attribution_for_test();
+
+    for port in [0x03dau16, 0x0201] {
+        cpu.registers.set_edx(u32::from(port));
+        assert!(jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0) >= 0);
+    }
+    assert!(jit::direct::push_all_dword_for_test(&mut cpu, &mut bus) >= 0);
+    assert!(jit::direct::pop_all_dword_for_test(&mut cpu, &mut bus) >= 0);
+
+    let expected = cpu.direct_callout_attribution_snapshot().unwrap();
+    assert_eq!(expected.ports.len(), 2);
+    assert_eq!(expected.ports[0].port, 0x0201);
+    assert_eq!(expected.ports[1].port, 0x03da);
+    assert_eq!(expected.totals.attempts, 4);
+    assert_eq!(expected.totals.continued, 4);
+    assert_eq!(callout_helper_counts(&expected, "in_al_dx").attempts, 2);
+    assert_eq!(callout_helper_counts(&expected, "pushad").continued, 1);
+    assert_eq!(callout_helper_counts(&expected, "popad").continued, 1);
+
+    cpu.reset_perf_counters();
+    assert_eq!(
+        cpu.direct_callout_attribution_snapshot(),
+        Some(expected.clone())
+    );
+    cpu.jit_direct.clear();
+    assert_eq!(cpu.direct_callout_attribution_snapshot(), Some(expected));
+    assert!(cpu.clone().direct_callout_attribution_snapshot().is_none());
+
+    let env_armed = std::env::var("IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION").as_deref() == Ok("1");
+    cpu.reset();
+    let fresh = cpu.direct_callout_attribution_snapshot();
+    assert_eq!(fresh.is_some(), env_armed);
+    if let Some(fresh) = fresh {
+        assert_eq!(fresh.totals, DirectCallOutOutcomeCounts::default());
+        assert!(fresh.ports.is_empty());
+    }
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[test]
+fn callout_attribution_counts_each_memory_helper_refusal() {
+    let mut push_cpu = flat_cpu();
+    push_cpu.enable_direct_callout_attribution_for_test();
+    push_cpu.registers.set_esp(STACK_TOP);
+    let mut push_bus = TestBus::with_memory(vec![0u8; 0x5000]);
+    push_bus.direct_pages_enabled = true;
+    assert!(jit::direct::push_all_dword_for_test(&mut push_cpu, &mut push_bus) < 0);
+    // The direct helper seam bypasses the emitted side-exit stub, so mirror that one outer note.
+    push_cpu.jit_direct.note_side_exit_callout_abnormal();
+    let push = push_cpu.direct_callout_attribution_snapshot().unwrap();
+    assert_eq!(callout_helper_counts(&push, "pushad").abnormal, 1);
+
+    let mut pop_cpu = flat_cpu();
+    pop_cpu.enable_direct_callout_attribution_for_test();
+    pop_cpu.registers.set_esp(STACK_TOP - 32);
+    let mut pop_bus = TestBus::with_memory(vec![0u8; 0x5000]);
+    pop_bus.direct_pages_enabled = true;
+    assert!(jit::direct::pop_all_dword_for_test(&mut pop_cpu, &mut pop_bus) < 0);
+    pop_cpu.jit_direct.note_side_exit_callout_abnormal();
+    let pop = pop_cpu.direct_callout_attribution_snapshot().unwrap();
+    assert_eq!(callout_helper_counts(&pop, "popad").abnormal, 1);
+}
+
 #[test]
 fn a_pushad_that_would_read_the_frame_is_not_refused_by_the_code_watch() {
     // What stops the row above from being vacuous in the wrong direction: the code-watch clause is

@@ -444,6 +444,8 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // mechanism ran at all. Counted before the refusal below so "abnormal / executed" is a real
     // ratio rather than a count of one arm.
     cpu.jit_direct.note_callout_executed();
+    #[cfg(feature = "direct-callout-attribution")]
+    let original_port = cpu.read_gpr16(2);
 
     // THE PERMISSION-CHECKED PORT IS REFUSED, BEFORE ANYTHING RUNS. This is the first statement
     // in the body on purpose: at this point the helper has read two fields and done nothing else,
@@ -467,6 +469,12 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // why it has to be structural rather than tested-by-the-fixtures; `paged_v86_call_out_is_...`
     // in cpu_jit_callout_test.rs is the fixture that does reach it.
     if cpu.is_v86_mode() || cpu.current_privilege_level() > cpu.iopl() {
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PortReadAlDx,
+            Some(original_port),
+            CallOutOutcome::Abnormal,
+        );
         return STATUS_ABNORMAL;
     }
 
@@ -502,9 +510,21 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // the interpreter's own gate, it is cheap once the TSS branch is unreachable, and if the two
     // predicates ever drift apart this refuses rather than proceeds.
     if cpu.check_io_permission(bus, port, BusWidth::Byte).is_err() {
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PortReadAlDx,
+            Some(original_port),
+            CallOutOutcome::Abnormal,
+        );
         return STATUS_ABNORMAL;
     }
     let Ok(value) = bus.read_io(port, BusWidth::Byte, now, ring0) else {
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PortReadAlDx,
+            Some(original_port),
+            CallOutOutcome::Abnormal,
+        );
         return STATUS_ABNORMAL;
     };
     cpu.write_gpr8(0, value as u8);
@@ -518,8 +538,25 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
 
     // The SAME constant the interpreter's `0xec` arm charges, shared rather than copied, so the
     // exact-clocks claim cannot drift out from under this module.
-    i64::from(IN_AL_DX_CORE_CLOCKS)
-        | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+    #[cfg(feature = "direct-callout-attribution")]
+    {
+        let step_break = bus.requires_step_break();
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PortReadAlDx,
+            Some(original_port),
+            if step_break {
+                CallOutOutcome::StepBreak
+            } else {
+                CallOutOutcome::Continued
+            },
+        );
+        i64::from(IN_AL_DX_CORE_CLOCKS) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+    }
+    #[cfg(not(feature = "direct-callout-attribution"))]
+    {
+        i64::from(IN_AL_DX_CORE_CLOCKS)
+            | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+    }
 }
 
 /// Resolve the published bus for a helper instantiation, or `None` if the window is not open.
@@ -585,6 +622,12 @@ unsafe extern "C" fn push_all_dword<B: CpuBus>(
     // address, a width and a kind. No device observes the time at which these stores happen, so
     // there is no timestamp to get wrong.
     if !cpu.call_out_stack_frame_resident(CALL_OUT_STACK_FRAME_DWORDS, true) {
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PushAllDword,
+            None,
+            CallOutOutcome::Abnormal,
+        );
         return STATUS_ABNORMAL;
     }
     let registers = cpu.registers.clone();
@@ -594,14 +637,37 @@ unsafe extern "C" fn push_all_dword<B: CpuBus>(
             "a resident PUSHAD frame faulted inside a call-out slot"
         );
         cpu.registers = registers;
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PushAllDword,
+            None,
+            CallOutOutcome::Abnormal,
+        );
         return STATUS_ABNORMAL;
     }
 
     // The SAME constant the interpreter's `0x60` arm charges, and the same step-break question
     // `run_straight_line` asks after every interpreted instruction. Both are shared rather than
     // restated so the exact-clocks claim cannot drift out from under this module.
-    i64::from(PUSH_ALL_CORE_CLOCKS)
-        | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+    #[cfg(feature = "direct-callout-attribution")]
+    {
+        let step_break = bus.requires_step_break();
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PushAllDword,
+            None,
+            if step_break {
+                CallOutOutcome::StepBreak
+            } else {
+                CallOutOutcome::Continued
+            },
+        );
+        i64::from(PUSH_ALL_CORE_CLOCKS) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+    }
+    #[cfg(not(feature = "direct-callout-attribution"))]
+    {
+        i64::from(PUSH_ALL_CORE_CLOCKS)
+            | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+    }
 }
 
 /// `0x61` POPAD through the interpreter's own stack path. Same two-phase shape as
@@ -632,6 +698,12 @@ unsafe extern "C" fn pop_all_dword<B: CpuBus>(
     cpu.jit_direct.note_callout_executed();
 
     if !cpu.call_out_stack_frame_resident(CALL_OUT_STACK_FRAME_DWORDS, false) {
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PopAllDword,
+            None,
+            CallOutOutcome::Abnormal,
+        );
         return STATUS_ABNORMAL;
     }
     let registers = cpu.registers.clone();
@@ -641,10 +713,34 @@ unsafe extern "C" fn pop_all_dword<B: CpuBus>(
             "a resident POPAD frame faulted inside a call-out slot"
         );
         cpu.registers = registers;
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PopAllDword,
+            None,
+            CallOutOutcome::Abnormal,
+        );
         return STATUS_ABNORMAL;
     }
 
-    i64::from(POP_ALL_CORE_CLOCKS) | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+    #[cfg(feature = "direct-callout-attribution")]
+    {
+        let step_break = bus.requires_step_break();
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PopAllDword,
+            None,
+            if step_break {
+                CallOutOutcome::StepBreak
+            } else {
+                CallOutOutcome::Continued
+            },
+        );
+        i64::from(POP_ALL_CORE_CLOCKS) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+    }
+    #[cfg(not(feature = "direct-callout-attribution"))]
+    {
+        i64::from(POP_ALL_CORE_CLOCKS)
+            | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+    }
 }
 
 /// Drive `push_all_dword` exactly as an emitted slot does, for the helper-level tests.

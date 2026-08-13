@@ -1139,6 +1139,11 @@ impl CpuGsw {
             .set_direct_link_refusal_census_enabled(enabled);
     }
 
+    #[cfg(all(test, feature = "direct-callout-attribution"))]
+    pub(crate) fn enable_direct_callout_attribution_for_test(&mut self) {
+        self.jit_direct.enable_direct_callout_attribution_for_test();
+    }
+
     /// Admit `OperandSize::Word` operands to the Direct backend below I586.
     ///
     /// Seeded from `IZARRAVM_JIT16_486` at construction; this is the programmatic form the A/B
@@ -1190,6 +1195,11 @@ impl CpuGsw {
     #[cfg(feature = "direct-link-refusal-census")]
     pub fn direct_link_refusal_census_snapshot(&self) -> Option<DirectLinkRefusalCensusSnapshot> {
         self.jit_direct.direct_link_refusal_census_snapshot()
+    }
+
+    #[cfg(feature = "direct-callout-attribution")]
+    pub fn direct_callout_attribution_snapshot(&self) -> Option<DirectCallOutAttributionSnapshot> {
+        self.jit_direct.direct_callout_attribution_snapshot()
     }
 
     pub fn is_paging_enabled(&self) -> bool {

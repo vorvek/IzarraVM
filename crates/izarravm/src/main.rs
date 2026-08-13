@@ -1657,6 +1657,11 @@ fn write_hdd_profile_json(
         report["direct_link_refusal_census"] =
             direct_link_refusal_census_json(machine.cpu().direct_link_refusal_census_snapshot());
     }
+    #[cfg(feature = "direct-callout-attribution")]
+    {
+        report["direct_callout_attribution"] =
+            direct_callout_attribution_json(machine.cpu().direct_callout_attribution_snapshot());
+    }
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
 }
@@ -1800,6 +1805,89 @@ fn direct_link_refusal_census_json(
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+fn direct_callout_attribution_json(
+    snapshot: Option<izarravm_cpu::DirectCallOutAttributionSnapshot>,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    let expected_helpers = ["in_al_dx", "pushad", "popad"];
+    assert_eq!(snapshot.helpers.len(), expected_helpers.len());
+    for (row, expected) in snapshot.helpers.iter().zip(expected_helpers) {
+        assert_eq!(row.helper, expected);
+        assert_callout_counts_closed(row.counts);
+    }
+    let helper_totals = snapshot.helpers.iter().fold(
+        izarravm_cpu::DirectCallOutOutcomeCounts::default(),
+        |sum, row| add_callout_counts(sum, row.counts),
+    );
+    assert_eq!(snapshot.totals, helper_totals);
+    assert_callout_counts_closed(snapshot.totals);
+
+    let mut last_port = None;
+    let mut port_totals = izarravm_cpu::DirectCallOutOutcomeCounts::default();
+    for row in &snapshot.ports {
+        assert!(row.counts.attempts != 0);
+        if let Some(last) = last_port {
+            assert!(last < row.port, "Direct call-out ports are not ordered");
+        }
+        last_port = Some(row.port);
+        assert_callout_counts_closed(row.counts);
+        port_totals = add_callout_counts(port_totals, row.counts);
+    }
+    assert_eq!(port_totals, snapshot.helpers[0].counts);
+
+    json!({
+        "schema": "izarravm-direct-callout-attribution-v1",
+        "helpers": snapshot.helpers.iter().map(|row| json!({
+            "helper": row.helper,
+            "attempts": row.counts.attempts,
+            "continued": row.counts.continued,
+            "step_break": row.counts.step_break,
+            "abnormal": row.counts.abnormal,
+        })).collect::<Vec<_>>(),
+        "ports": snapshot.ports.iter().map(|row| json!({
+            "port": row.port,
+            "attempts": row.counts.attempts,
+            "continued": row.counts.continued,
+            "step_break": row.counts.step_break,
+            "abnormal": row.counts.abnormal,
+        })).collect::<Vec<_>>(),
+        "totals": {
+            "attempts": snapshot.totals.attempts,
+            "continued": snapshot.totals.continued,
+            "step_break": snapshot.totals.step_break,
+            "abnormal": snapshot.totals.abnormal,
+        },
+    })
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+fn add_callout_counts(
+    left: izarravm_cpu::DirectCallOutOutcomeCounts,
+    right: izarravm_cpu::DirectCallOutOutcomeCounts,
+) -> izarravm_cpu::DirectCallOutOutcomeCounts {
+    izarravm_cpu::DirectCallOutOutcomeCounts {
+        attempts: left.attempts.checked_add(right.attempts).unwrap(),
+        continued: left.continued.checked_add(right.continued).unwrap(),
+        step_break: left.step_break.checked_add(right.step_break).unwrap(),
+        abnormal: left.abnormal.checked_add(right.abnormal).unwrap(),
+    }
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+fn assert_callout_counts_closed(counts: izarravm_cpu::DirectCallOutOutcomeCounts) {
+    assert_eq!(
+        counts.attempts,
+        counts
+            .continued
+            .checked_add(counts.step_break)
+            .and_then(|sum| sum.checked_add(counts.abnormal))
+            .unwrap()
+    );
 }
 
 /// The whole-run BIOS fixed-disk census. All zero unless `IZARRAVM_INT13_PROFILE=1`.

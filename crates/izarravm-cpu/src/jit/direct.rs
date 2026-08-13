@@ -4,6 +4,8 @@
 //! Admission and storage for page-local direct-code blocks.
 
 mod callout;
+#[cfg(feature = "direct-callout-attribution")]
+mod callout_attribution;
 mod census;
 mod classify;
 mod emit;
@@ -23,6 +25,10 @@ pub(crate) use callout::{
 pub(crate) use callout::{
     STATUS_STEP_BREAK_BIT, pop_all_dword_for_test, port_read_al_dx_for_test,
     push_all_dword_for_test,
+};
+#[cfg(feature = "direct-callout-attribution")]
+pub(crate) use callout_attribution::{
+    CallOutAttribution, CallOutOutcome, direct_callout_attribution_default,
 };
 
 use std::{collections::HashMap, sync::Arc};

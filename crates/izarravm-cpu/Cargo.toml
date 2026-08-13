@@ -21,6 +21,9 @@ direct-admission-census = ["jit"]
 # Per-static-cell Direct link refusal census. Compiled out unless selected, then armed with
 # IZARRAVM_DIRECT_LINK_REFUSAL_CENSUS=1.
 direct-link-refusal-census = ["jit"]
+# Per-helper and per-port Direct call-out attribution. Compiled out unless selected, then armed
+# with IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION=1.
+direct-callout-attribution = ["jit"]
 # Diagnostic guest-store watchpoint (IZARRAVM_WATCH_WRITE). OFF by default: the check sits
 # on the store hot path, and leaving it compiled in measured ~10% on a 586 16-bit workload
 # even while disarmed. Build with `--features watch-write` when hunting a corruption.

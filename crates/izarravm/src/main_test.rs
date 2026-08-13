@@ -324,6 +324,13 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     );
     #[cfg(not(feature = "direct-link-refusal-census"))]
     assert!(report.get("direct_link_refusal_census").is_none());
+    #[cfg(feature = "direct-callout-attribution")]
+    assert_eq!(
+        report.get("direct_callout_attribution"),
+        Some(&serde_json::Value::Null)
+    );
+    #[cfg(not(feature = "direct-callout-attribution"))]
+    assert!(report.get("direct_callout_attribution").is_none());
     for field in [
         "jit_direct_exit_cross_page_or_alignment",
         "jit_direct_exit_unavailable_or_kind",
@@ -478,6 +485,118 @@ fn direct_link_refusal_census_json_preserves_nonzero_rows_and_closures() {
     assert_eq!(report["rows"][0]["source"]["generation"], 11);
     assert_eq!(report["rows"][0]["target"]["last_attempted_generation"], 12);
     assert_eq!(report["rows"][0]["buckets"][2]["count"], 1);
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[test]
+fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
+    use izarravm_cpu::{
+        DirectCallOutAttributionHelperRow as HelperRow, DirectCallOutAttributionPortRow as PortRow,
+        DirectCallOutAttributionSnapshot as Snapshot, DirectCallOutOutcomeCounts as Counts,
+    };
+
+    let snapshot = Snapshot {
+        helpers: vec![
+            HelperRow {
+                helper: "in_al_dx",
+                counts: Counts {
+                    attempts: 3,
+                    continued: 1,
+                    step_break: 1,
+                    abnormal: 1,
+                },
+            },
+            HelperRow {
+                helper: "pushad",
+                counts: Counts {
+                    attempts: 2,
+                    continued: 2,
+                    step_break: 0,
+                    abnormal: 0,
+                },
+            },
+            HelperRow {
+                helper: "popad",
+                counts: Counts {
+                    attempts: 1,
+                    continued: 0,
+                    step_break: 0,
+                    abnormal: 1,
+                },
+            },
+        ],
+        ports: vec![
+            PortRow {
+                port: 0x0201,
+                counts: Counts {
+                    attempts: 1,
+                    continued: 1,
+                    step_break: 0,
+                    abnormal: 0,
+                },
+            },
+            PortRow {
+                port: 0x03da,
+                counts: Counts {
+                    attempts: 2,
+                    continued: 0,
+                    step_break: 1,
+                    abnormal: 1,
+                },
+            },
+        ],
+        totals: Counts {
+            attempts: 6,
+            continued: 3,
+            step_break: 1,
+            abnormal: 2,
+        },
+    };
+
+    assert_eq!(
+        direct_callout_attribution_json(Some(snapshot)),
+        serde_json::json!({
+            "schema": "izarravm-direct-callout-attribution-v1",
+            "helpers": [
+                { "helper": "in_al_dx", "attempts": 3, "continued": 1, "step_break": 1, "abnormal": 1 },
+                { "helper": "pushad", "attempts": 2, "continued": 2, "step_break": 0, "abnormal": 0 },
+                { "helper": "popad", "attempts": 1, "continued": 0, "step_break": 0, "abnormal": 1 },
+            ],
+            "ports": [
+                { "port": 0x0201, "attempts": 1, "continued": 1, "step_break": 0, "abnormal": 0 },
+                { "port": 0x03da, "attempts": 2, "continued": 0, "step_break": 1, "abnormal": 1 },
+            ],
+            "totals": { "attempts": 6, "continued": 3, "step_break": 1, "abnormal": 2 },
+        })
+    );
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[test]
+#[should_panic]
+fn direct_callout_attribution_json_rejects_an_open_row() {
+    use izarravm_cpu::{
+        DirectCallOutAttributionHelperRow as HelperRow,
+        DirectCallOutAttributionSnapshot as Snapshot, DirectCallOutOutcomeCounts as Counts,
+    };
+    let open = Counts {
+        attempts: 1,
+        ..Counts::default()
+    };
+    let _ = direct_callout_attribution_json(Some(Snapshot {
+        helpers: ["in_al_dx", "pushad", "popad"]
+            .into_iter()
+            .map(|helper| HelperRow {
+                helper,
+                counts: open,
+            })
+            .collect(),
+        ports: Vec::new(),
+        totals: Counts {
+            attempts: 3,
+            ..Counts::default()
+        },
+    }));
 }
 
 #[test]

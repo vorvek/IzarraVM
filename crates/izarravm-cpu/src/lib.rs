@@ -1507,6 +1507,37 @@ pub struct DirectLinkRefusalCensusSnapshot {
     pub rows: Vec<DirectLinkRefusalCensusRow>,
 }
 
+#[cfg(feature = "direct-callout-attribution")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectCallOutOutcomeCounts {
+    pub attempts: u64,
+    pub continued: u64,
+    pub step_break: u64,
+    pub abnormal: u64,
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectCallOutAttributionHelperRow {
+    pub helper: &'static str,
+    pub counts: DirectCallOutOutcomeCounts,
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectCallOutAttributionPortRow {
+    pub port: u16,
+    pub counts: DirectCallOutOutcomeCounts,
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectCallOutAttributionSnapshot {
+    pub helpers: Vec<DirectCallOutAttributionHelperRow>,
+    pub ports: Vec<DirectCallOutAttributionPortRow>,
+    pub totals: DirectCallOutOutcomeCounts,
+}
+
 /// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here
 /// used to fold into a state (`Dormant`), a bool (`try_link_inner` returning false) or one
 /// catch-all counter (`SideExitReason::Other`), which is why the three largest unattributed exit

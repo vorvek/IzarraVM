@@ -61,6 +61,11 @@ jobs:
           cargo test -p izarravm --no-default-features --features direct-link-refusal-census direct_link_refusal_census_json
           cargo test -p izarravm --no-default-features --features direct-link-refusal-census hdd_profile_json_reports_fixed_time_and_native_metrics
           cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-link-refusal-census -- -D warnings
+          cargo check -p izarravm --no-default-features --features direct-callout-attribution
+          cargo test -p izarravm-cpu --no-default-features --features direct-callout-attribution callout_attribution
+          cargo test -p izarravm --no-default-features --features direct-callout-attribution direct_callout_attribution_json
+          cargo test -p izarravm --no-default-features --features direct-callout-attribution hdd_profile_json_reports_fixed_time_and_native_metrics
+          cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-callout-attribution -- -D warnings
 
       - name: Format
         run: cargo fmt --check
