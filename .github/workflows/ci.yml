@@ -56,6 +56,11 @@ jobs:
           cargo test -p izarravm-cpu --no-default-features --features direct-admission-census admission_census
           cargo test -p izarravm --no-default-features --features direct-admission-census direct_barrier_census_json_exposes_ordered_zero_admission_declines
           cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-admission-census -- -D warnings
+          cargo check -p izarravm --no-default-features --features direct-link-refusal-census
+          cargo test -p izarravm-cpu --no-default-features --features direct-link-refusal-census link_refusal
+          cargo test -p izarravm --no-default-features --features direct-link-refusal-census direct_link_refusal_census_json
+          cargo test -p izarravm --no-default-features --features direct-link-refusal-census hdd_profile_json_reports_fixed_time_and_native_metrics
+          cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-link-refusal-census -- -D warnings
 
       - name: Format
         run: cargo fmt --check

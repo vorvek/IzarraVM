@@ -39,6 +39,8 @@ pub(crate) use census::{
     BlockCacheStats, DirectBarrierCensus, DirectStallTally, DormantReason, LinkClearCause,
     LinkRefusal, UnboundTarget, barrier_census_default,
 };
+#[cfg(feature = "direct-link-refusal-census")]
+pub(crate) use census::{DirectLinkRefusalCensus, direct_link_refusal_census_default};
 
 use super::code_watch::NativeCodeWatch;
 #[cfg(target_os = "windows")]
@@ -648,6 +650,11 @@ impl BlockId {
     fn index(self) -> usize {
         usize::from(self.0 as u16)
     }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    fn generation(self) -> u64 {
+        self.0 >> Self::INDEX_BITS
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,6 +814,8 @@ pub(crate) struct BlockCache {
     stats: BlockCacheStats,
     /// See `DirectStallTally`: never drained, never reset.
     stalls: DirectStallTally,
+    #[cfg(feature = "direct-link-refusal-census")]
+    direct_link_refusal_census: Option<Box<DirectLinkRefusalCensus>>,
     #[cfg(test)]
     defer_short_for_test: bool,
     #[cfg(test)]
@@ -883,6 +892,8 @@ impl BlockCache {
             heat_resets: 0,
             stats: BlockCacheStats::default(),
             stalls: DirectStallTally::default(),
+            #[cfg(feature = "direct-link-refusal-census")]
+            direct_link_refusal_census: direct_link_refusal_census_default(),
             #[cfg(test)]
             defer_short_for_test: false,
             #[cfg(test)]
@@ -1115,6 +1126,8 @@ impl BlockCache {
             // A recycled slot must not serve the retired occupant's cost bound to its successor.
             self.iteration_upper_cache[index] = 0;
         }
+        #[cfg(feature = "direct-link-refusal-census")]
+        self.register_direct_link_refusal_cells(id, compilation.emitted_static_targets);
         self.register_decode_dependencies(id, &decode_slots[..decode_slot_len]);
         if compilation.dynamic_successor {
             let cell = &compilation.link_cells[0];
@@ -1131,6 +1144,38 @@ impl BlockCache {
         });
         self.make_link_visible(id);
         Some(id)
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    fn register_direct_link_refusal_cells(
+        &mut self,
+        id: BlockId,
+        emitted_static_targets: [Option<LinkTarget>; 2],
+    ) {
+        let Some(index) = self.active_index(id) else {
+            return;
+        };
+        let block = self.blocks[index];
+        let segment_write = block.is_segment_write_block();
+        for (slot, target) in emitted_static_targets.into_iter().enumerate() {
+            self.link_cells[index][slot].set_direct_link_refusal_census_id(0);
+            let Some(target) = target else {
+                continue;
+            };
+            let census_id = self
+                .direct_link_refusal_census
+                .as_mut()
+                .map_or(0, |census| {
+                    census.register(
+                        block.span.key,
+                        id.generation(),
+                        slot as u8,
+                        target,
+                        segment_write,
+                    )
+                });
+            self.link_cells[index][slot].set_direct_link_refusal_census_id(census_id);
+        }
     }
 
     /// Prevent repeated compilation attempts for a block the emitter cannot handle.
@@ -1376,15 +1421,26 @@ impl BlockCache {
             }
         }
         let mut links = 0;
+        #[cfg(feature = "direct-link-refusal-census")]
+        let mut cleared_cells = Vec::new();
         for sources in self.inbound.values() {
             for source in sources {
                 let index = source.block.index();
                 if self.active_index(source.block) == Some(index) {
-                    self.link_cells[index][usize::from(source.slot)].clear();
-                    self.outbound[index][usize::from(source.slot)] = None;
+                    let slot = usize::from(source.slot);
+                    #[cfg(feature = "direct-link-refusal-census")]
+                    if let Some(target) = self.outbound[index][slot] {
+                        cleared_cells.push((index, slot, target));
+                    }
+                    self.link_cells[index][slot].clear();
+                    self.outbound[index][slot] = None;
                     links += 1;
                 }
             }
+        }
+        #[cfg(feature = "direct-link-refusal-census")]
+        for (index, slot, target) in cleared_cells {
+            self.note_direct_link_cleared(index, slot, LinkClearCause::Flushed, target);
         }
         self.inbound.clear();
         self.waiting.clear();
@@ -1655,6 +1711,85 @@ impl BlockCache {
 
     pub(crate) fn take_stats(&mut self) -> BlockCacheStats {
         std::mem::take(&mut self.stats)
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn direct_link_refusal_census_active(&self) -> bool {
+        self.direct_link_refusal_census.is_some()
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn note_direct_link_refusal_exit(&mut self, id: u32) {
+        if let Some(census) = self.direct_link_refusal_census.as_mut() {
+            census.note_exit(id);
+        }
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn direct_link_refusal_census_snapshot(
+        &self,
+    ) -> Option<crate::DirectLinkRefusalCensusSnapshot> {
+        self.direct_link_refusal_census
+            .as_deref()
+            .map(DirectLinkRefusalCensus::snapshot)
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn set_direct_link_refusal_census_enabled(&mut self, enabled: bool) {
+        assert!(
+            self.blocks.is_empty(),
+            "Direct link refusal census cannot be toggled with installed blocks"
+        );
+        self.direct_link_refusal_census =
+            enabled.then(|| Box::new(DirectLinkRefusalCensus::default()));
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    fn note_direct_link_refused(
+        &mut self,
+        source_index: usize,
+        slot: usize,
+        reason: LinkRefusal,
+        target: BlockId,
+    ) {
+        let id = self.link_cells[source_index][slot].direct_link_refusal_census_id();
+        if let Some(census) = self.direct_link_refusal_census.as_mut() {
+            census.refused(id, reason, target.generation());
+        }
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    fn note_direct_link_linked(&mut self, source_index: usize, slot: usize, target: BlockId) {
+        let id = self.link_cells[source_index][slot].direct_link_refusal_census_id();
+        if let Some(census) = self.direct_link_refusal_census.as_mut() {
+            census.linked(id, target.generation());
+        }
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    fn note_direct_link_cleared(
+        &mut self,
+        source_index: usize,
+        slot: usize,
+        cause: LinkClearCause,
+        target: BlockId,
+    ) {
+        let id = self.link_cells[source_index][slot].direct_link_refusal_census_id();
+        if let Some(census) = self.direct_link_refusal_census.as_mut() {
+            census.cleared(id, cause, target.generation());
+        }
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    fn close_direct_link_rows(&mut self, index: usize) {
+        let ids = self.link_cells[index]
+            .each_ref()
+            .map(|cell| cell.direct_link_refusal_census_id());
+        if let Some(census) = self.direct_link_refusal_census.as_mut() {
+            for id in ids {
+                census.close(id);
+            }
+        }
     }
 
     /// The block's compile-time segment snapshot, which no longer rides the `CompiledBlock`
@@ -1991,9 +2126,24 @@ impl BlockCache {
         for portal in &self.block_portals {
             portal.clear();
         }
+        #[cfg(not(feature = "direct-link-refusal-census"))]
         for cells in &self.link_cells {
             cells[0].clear();
             cells[1].clear();
+        }
+        #[cfg(feature = "direct-link-refusal-census")]
+        for index in 0..self.link_cells.len() {
+            for slot in 0..2 {
+                let target = self.outbound[index][slot].take();
+                self.link_cells[index][slot].clear();
+                if let Some(target) = target {
+                    self.note_direct_link_cleared(index, slot, LinkClearCause::Reset, target);
+                }
+            }
+        }
+        #[cfg(feature = "direct-link-refusal-census")]
+        for index in 0..self.link_cells.len() {
+            self.close_direct_link_rows(index);
         }
         self.stats.unlinks += links;
         self.stalls.links_cleared[LinkClearCause::Reset as usize] += links;
@@ -2086,8 +2236,11 @@ impl BlockCache {
             self.stalls.link_refusals[LinkRefusal::Inactive as usize] += 1;
             return false;
         };
+        let slot_index = usize::from(slot);
         let Some(target_index) = self.active_index(target) else {
             self.stalls.link_refusals[LinkRefusal::Inactive as usize] += 1;
+            #[cfg(feature = "direct-link-refusal-census")]
+            self.note_direct_link_refused(source_index, slot_index, LinkRefusal::Inactive, target);
             return false;
         };
         let source_block = self.blocks[source_index];
@@ -2126,14 +2279,17 @@ impl BlockCache {
         };
         if let Some(refusal) = refusal {
             self.stalls.link_refusals[refusal as usize] += 1;
+            #[cfg(feature = "direct-link-refusal-census")]
+            self.note_direct_link_refused(source_index, slot_index, refusal, target);
             return false;
         }
-        let slot_index = usize::from(slot);
         if self.outbound[source_index][slot_index] == Some(target) {
             if let Some(target_eip) = target_eip {
                 self.link_cells[source_index][slot_index]
                     .set_dynamic(target_eip, self.block_portals[target_index].as_ref());
             }
+            #[cfg(feature = "direct-link-refusal-census")]
+            self.note_direct_link_linked(source_index, slot_index, target);
             return true;
         }
         self.unlink_outbound(source, slot, LinkClearCause::Replaced);
@@ -2161,6 +2317,8 @@ impl BlockCache {
             slot,
         });
         self.stats.links += 1;
+        #[cfg(feature = "direct-link-refusal-census")]
+        self.note_direct_link_linked(source_index, slot_index, target);
         true
     }
 
@@ -2185,6 +2343,8 @@ impl BlockCache {
         }
         self.stats.unlinks += 1;
         self.stalls.links_cleared[cause as usize] += 1;
+        #[cfg(feature = "direct-link-refusal-census")]
+        self.note_direct_link_cleared(source_index, slot_index, cause, target);
     }
 
     fn unlink_block(&mut self, id: BlockId) {
@@ -2203,15 +2363,16 @@ impl BlockCache {
             for link in inbound {
                 let source_index = link.block.index();
                 if self.active_index(link.block) == Some(source_index) {
-                    self.link_cells[source_index][usize::from(link.slot)].clear();
-                    self.outbound[source_index][usize::from(link.slot)] = None;
-                    if let Some(successor) =
-                        self.blocks[source_index].successors[usize::from(link.slot)]
-                    {
+                    let slot = usize::from(link.slot);
+                    self.link_cells[source_index][slot].clear();
+                    self.outbound[source_index][slot] = None;
+                    if let Some(successor) = self.blocks[source_index].successors[slot] {
                         self.waiting.entry(successor).or_default().push(link);
                     }
                     self.stats.unlinks += 1;
                     self.stalls.links_cleared[LinkClearCause::Retired as usize] += 1;
+                    #[cfg(feature = "direct-link-refusal-census")]
+                    self.note_direct_link_cleared(source_index, slot, LinkClearCause::Retired, id);
                 }
             }
         }
@@ -2241,6 +2402,8 @@ impl BlockCache {
                 .remove(&self.link_cells[index][0].address());
         }
         self.unlink_block(id);
+        #[cfg(feature = "direct-link-refusal-census")]
+        self.close_direct_link_rows(index);
         self.block_active[index] = false;
         self.blocks[index].entry = 0;
         self.blocks[index].body_entry = 0;
@@ -2333,6 +2496,10 @@ impl Drop for BlockCache {
 impl Clone for BlockCache {
     fn clone(&self) -> Self {
         let mut cache = Self::new(self.decode_slot_count());
+        #[cfg(feature = "direct-link-refusal-census")]
+        {
+            cache.direct_link_refusal_census = None;
+        }
         cache.backend_enabled = self.backend_enabled;
         cache.admission_heat = self.admission_heat;
         cache.entry_cap = self.entry_cap;
@@ -2424,6 +2591,8 @@ pub(crate) struct Compilation {
     /// from the successor match falls to the fall-through arm, which is a wrong edge rather than
     /// a missing one, and nothing observable in guest state or in the block's shape shows it.
     pub(crate) successors: [Option<LinkTarget>; 2],
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) emitted_static_targets: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
     body_offset: usize,
     /// Physical start of each mutable immediate this block's emitted code reads from guest RAM,
@@ -5327,6 +5496,71 @@ fn compile_with_instruction_limit(
                     | DirectKind::CallMem { .. }
             )
         );
+    #[cfg(feature = "direct-link-refusal-census")]
+    struct TerminalLinks {
+        targets: [Option<LinkTarget>; 2],
+        successor_mask: [bool; 2],
+        emitted_mask: [bool; 2],
+    }
+    #[cfg(feature = "direct-link-refusal-census")]
+    let terminal_links = match slots.last().map(|slot| slot.kind) {
+        Some(DirectKind::Jcc { taken_delta, .. }) => TerminalLinks {
+            targets: [
+                Some(fallthrough),
+                Some(LinkTarget {
+                    linear: entry_lin.wrapping_add(taken_delta),
+                    mode_key: key.mode_key,
+                }),
+            ],
+            successor_mask: [true, !self_loop],
+            emitted_mask: [!self_loop; 2],
+        },
+        Some(
+            DirectKind::Call { target_delta, .. }
+            | DirectKind::Call16 { target_delta, .. }
+            | DirectKind::Jmp { target_delta },
+        ) => TerminalLinks {
+            targets: [
+                Some(LinkTarget {
+                    linear: entry_lin.wrapping_add(target_delta),
+                    mode_key: key.mode_key,
+                }),
+                None,
+            ],
+            successor_mask: [true, false],
+            emitted_mask: [true, false],
+        },
+        Some(
+            DirectKind::Ret { .. }
+            | DirectKind::Ret16 { .. }
+            | DirectKind::JmpMem { .. }
+            | DirectKind::CallReg { .. }
+            | DirectKind::CallMem { .. },
+        ) => TerminalLinks {
+            targets: [None, None],
+            successor_mask: [false, false],
+            emitted_mask: [false, false],
+        },
+        _ => TerminalLinks {
+            targets: [Some(fallthrough), None],
+            successor_mask: [true, false],
+            emitted_mask: [true, false],
+        },
+    };
+    #[cfg(feature = "direct-link-refusal-census")]
+    let successors = if segment_write_block {
+        [None, None]
+    } else {
+        [
+            terminal_links.successor_mask[0]
+                .then_some(terminal_links.targets[0])
+                .flatten(),
+            terminal_links.successor_mask[1]
+                .then_some(terminal_links.targets[1])
+                .flatten(),
+        ]
+    };
+    #[cfg(not(feature = "direct-link-refusal-census"))]
     let successors = match slots.last().map(|slot| slot.kind) {
         _ if segment_write_block => [None, None],
         Some(DirectKind::Jcc { taken_delta, .. }) => [
@@ -5356,6 +5590,15 @@ fn compile_with_instruction_limit(
         ) => [None, None],
         _ => [Some(fallthrough), None],
     };
+    #[cfg(feature = "direct-link-refusal-census")]
+    let emitted_static_targets = [
+        terminal_links.emitted_mask[0]
+            .then_some(terminal_links.targets[0])
+            .flatten(),
+        terminal_links.emitted_mask[1]
+            .then_some(terminal_links.targets[1])
+            .flatten(),
+    ];
     let link_cells = [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())];
     let emitted = emit::emit(EmitInput {
         slots: &slots,
@@ -5411,6 +5654,8 @@ fn compile_with_instruction_limit(
         x87_exit_top,
         dynamic_successor,
         successors,
+        #[cfg(feature = "direct-link-refusal-census")]
+        emitted_static_targets,
         link_cells,
         body_offset: emitted.body_offset,
         imm_lanes,

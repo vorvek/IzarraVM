@@ -2153,6 +2153,348 @@ fn unbound_exit_classes_sum_to_the_static_unbound_counter() {
     );
 }
 
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn link_refusal_census_runtime_id_is_written_only_for_static_unbound() {
+    const ENTRY: u32 = 0x300;
+    const TARGET: u32 = 0x400;
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize..ENTRY as usize + 10]
+        .copy_from_slice(&[0xb8, 1, 0, 0, 0, 0xe9, 0xf6, 0, 0, 0]);
+    memory[TARGET as usize..TARGET as usize + 2].copy_from_slice(&[0xeb, 0xfe]);
+    let mut cpu = flat_stack_cpu(ENTRY);
+    cpu.enable_direct_link_refusal_census(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[ENTRY, ENTRY + 5, TARGET]);
+    let source = install_fixture_block(&mut cpu, ENTRY);
+
+    arm_stack_fixture(&mut cpu, ENTRY, 0x800);
+    let unbound = invoke_native_entry(&mut cpu, source, 4);
+    assert_eq!(
+        unbound.unresolved_reason,
+        jit::direct::UnresolvedReason::StaticUnbound
+    );
+    assert_eq!(unbound.direct_link_refusal_census_id, 1);
+
+    let target = install_fixture_block(&mut cpu, TARGET);
+    assert!(cpu.jit_direct.hide_portal_for_test(target.id()));
+    arm_stack_fixture(&mut cpu, ENTRY, 0x800);
+    let hidden = invoke_native_entry(&mut cpu, source, 4);
+    assert_eq!(
+        hidden.unresolved_reason,
+        jit::direct::UnresolvedReason::StaticHidden
+    );
+    assert_eq!(hidden.direct_link_refusal_census_id, 0);
+
+    let target_key = jit::direct::key_for(&cpu, TARGET, true).unwrap();
+    cpu.jit_direct
+        .revalidate_translation(target_key)
+        .expect("target revalidation");
+    arm_stack_fixture(&mut cpu, ENTRY, 0x800);
+    let linked = invoke_native_entry(&mut cpu, source, 1);
+    assert_eq!(
+        linked.unresolved_reason,
+        jit::direct::UnresolvedReason::None
+    );
+    assert_eq!(linked.direct_link_refusal_census_id, 0);
+
+    const RET: u32 = 0x500;
+    cpu.jit_direct.clear();
+    cpu.enable_direct_link_refusal_census(true);
+    bus.memory[RET as usize] = 0xc3;
+    decode_fixture(&mut cpu, &mut bus, &[RET]);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        0x800,
+        0x800,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let ret = install_fixture_block(&mut cpu, RET);
+    arm_stack_fixture(&mut cpu, RET, 0x800);
+    bus.memory[0x800..0x804].copy_from_slice(&TARGET.to_le_bytes());
+    let dynamic = invoke_native_entry(&mut cpu, ret, 4);
+    assert_eq!(
+        dynamic.unresolved_reason,
+        jit::direct::UnresolvedReason::DynamicMissOrUnbound
+    );
+    assert_eq!(dynamic.direct_link_refusal_census_id, 0);
+
+    let target = install_fixture_block(&mut cpu, TARGET);
+    arm_stack_fixture(&mut cpu, RET, 0x800);
+    bus.memory[0x800..0x804].copy_from_slice(&TARGET.to_le_bytes());
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, ret).unwrap());
+    assert!(cpu.jit_direct.hide_portal_for_test(target.id()));
+    arm_stack_fixture(&mut cpu, RET, 0x800);
+    bus.memory[0x800..0x804].copy_from_slice(&TARGET.to_le_bytes());
+    let dynamic_hidden = invoke_native_entry(&mut cpu, ret, 4);
+    assert_eq!(
+        dynamic_hidden.unresolved_reason,
+        jit::direct::UnresolvedReason::DynamicHidden
+    );
+    assert_eq!(dynamic_hidden.direct_link_refusal_census_id, 0);
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn link_refusal_census_routes_both_segment_write_jcc_arms() {
+    const ENTRY: u32 = 0x300;
+    const FALLTHROUGH: u32 = 0x307;
+    const TAKEN: u32 = 0x310;
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize..FALLTHROUGH as usize].copy_from_slice(&[
+        0x66, 0x8e, 0xd8, // mov ds,ax
+        0x39, 0xd1, // cmp ecx,edx
+        0x75, 0x09, // jne TAKEN
+    ]);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    cpu.set_eip(ENTRY);
+    cpu.enable_direct_link_refusal_census(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[ENTRY, ENTRY + 3, ENTRY + 5]);
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("segment Jcc compile");
+    assert_eq!(compilation.successors, [None, None]);
+    assert_eq!(
+        compilation.emitted_static_targets,
+        [
+            Some(jit::links::LinkTarget {
+                linear: FALLTHROUGH,
+                mode_key: compilation.span.key.mode_key,
+            }),
+            Some(jit::links::LinkTarget {
+                linear: TAKEN,
+                mode_key: compilation.span.key.mode_key,
+            }),
+        ]
+    );
+    let key = compilation.span.key;
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("segment Jcc install");
+    let block = cpu.jit_direct.block(id).expect("installed segment Jcc");
+    assert!(block.is_segment_write_block());
+
+    let snapshot = cpu
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(snapshot.rows.len(), 2);
+    assert_eq!(snapshot.rows[0].slot, 0);
+    assert_eq!(snapshot.rows[0].target_linear, FALLTHROUGH);
+    assert_eq!(snapshot.rows[0].state, "suppressed");
+    assert_eq!(snapshot.rows[1].slot, 1);
+    assert_eq!(snapshot.rows[1].target_linear, TAKEN);
+    assert_eq!(snapshot.rows[1].state, "suppressed");
+
+    arm_stack_fixture(&mut cpu, ENTRY, 0x800);
+    cpu.registers.set_eax(0x10);
+    cpu.registers.set_ecx(7);
+    cpu.registers.set_edx(7);
+    let fallthrough = invoke_native_entry(&mut cpu, block, 1);
+    assert_eq!(
+        fallthrough.unresolved_reason,
+        jit::direct::UnresolvedReason::StaticUnbound
+    );
+    assert_eq!(
+        fallthrough.direct_link_refusal_census_id,
+        snapshot.rows[0].id
+    );
+
+    make_data_segments_flat(&mut cpu);
+    arm_stack_fixture(&mut cpu, ENTRY, 0x800);
+    cpu.registers.set_eax(0x10);
+    cpu.registers.set_ecx(8);
+    cpu.registers.set_edx(7);
+    let taken = invoke_native_entry(&mut cpu, block, 1);
+    assert_eq!(
+        taken.unresolved_reason,
+        jit::direct::UnresolvedReason::StaticUnbound
+    );
+    assert_eq!(taken.direct_link_refusal_census_id, snapshot.rows[1].id);
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn link_refusal_census_uses_segment_write_control_targets() {
+    for (entry, target, opcode, label) in [
+        (0x400u32, 0x450u32, 0xe9u8, "Jmp"),
+        (0x500u32, 0x550u32, 0xe8u8, "Call"),
+    ] {
+        let mut memory = vec![0; 0x1000];
+        memory[entry as usize..entry as usize + 8]
+            .copy_from_slice(&[0x66, 0x8e, 0xd8, opcode, 0x48, 0x00, 0x00, 0x00]);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        let mut cs = cpu.registers.cs();
+        cs.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.set_eip(entry);
+        cpu.enable_direct_link_refusal_census(true);
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        decode_fixture(&mut cpu, &mut bus, &[entry, entry + 3]);
+        map_direct_page(
+            &mut cpu,
+            &mut bus,
+            0x800,
+            0x800,
+            jit::fast_map::PagePermissions::UNPAGED,
+            false,
+            true,
+        );
+
+        let compilation = jit::direct::compile(&mut cpu, entry, true)
+            .unwrap_or_else(|| panic!("segment {label} compile"));
+        assert_eq!(compilation.successors, [None, None], "{label}");
+        let emitted = compilation.emitted_static_targets[0].expect("static cell target");
+        assert_eq!(emitted.linear, target, "{label}");
+        assert_ne!(
+            emitted.linear,
+            entry + 8,
+            "{label} must not use fallthrough"
+        );
+        assert_eq!(compilation.emitted_static_targets[1], None, "{label}");
+        let key = compilation.span.key;
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        cpu.jit_direct
+            .install(&compilation)
+            .unwrap_or_else(|| panic!("segment {label} install"));
+        let snapshot = cpu
+            .direct_link_refusal_census_snapshot()
+            .expect("armed census");
+        assert_eq!(snapshot.rows.len(), 1, "{label}");
+        assert_eq!(snapshot.rows[0].slot, 0, "{label}");
+        assert_eq!(snapshot.rows[0].target_linear, target, "{label}");
+        assert_eq!(snapshot.rows[0].state, "suppressed", "{label}");
+    }
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn link_refusal_census_omits_dynamic_and_self_loop_cells() {
+    const RET: u32 = 0x600;
+    let mut ret_cpu = flat_stack_cpu(RET);
+    ret_cpu.enable_direct_link_refusal_census(true);
+    let mut ret_bus = TestBus::with_memory(vec![0; 0x1000]);
+    ret_bus.memory[RET as usize] = 0xc3;
+    ret_bus.direct_pages_enabled = true;
+    ret_bus.direct_page_clocks = true;
+    decode_fixture(&mut ret_cpu, &mut ret_bus, &[RET]);
+    map_direct_page(
+        &mut ret_cpu,
+        &mut ret_bus,
+        0x800,
+        0x800,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let ret = jit::direct::compile(&mut ret_cpu, RET, true).expect("Ret compile");
+    assert!(ret.dynamic_successor);
+    assert_eq!(ret.emitted_static_targets, [None, None]);
+    let ret_key = ret.span.key;
+    assert!(matches!(
+        ret_cpu.jit_direct.probe(ret_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    ret_cpu.jit_direct.install(&ret).expect("Ret install");
+    assert!(
+        ret_cpu
+            .direct_link_refusal_census_snapshot()
+            .expect("armed Ret census")
+            .rows
+            .is_empty()
+    );
+
+    const LOOP: u32 = 0x700;
+    let mut loop_cpu = flat_stack_cpu(LOOP);
+    loop_cpu.enable_direct_link_refusal_census(true);
+    let mut loop_bus = TestBus::with_memory(vec![0; 0x1000]);
+    loop_bus.memory[LOOP as usize..LOOP as usize + 2].copy_from_slice(&[0x75, 0xfe]);
+    loop_bus.direct_pages_enabled = true;
+    loop_bus.direct_page_clocks = true;
+    decode_fixture(&mut loop_cpu, &mut loop_bus, &[LOOP]);
+    let loop_block = jit::direct::compile(&mut loop_cpu, LOOP, true).expect("self-loop compile");
+    assert!(loop_block.self_loop);
+    assert_eq!(
+        loop_block.successors[0].map(|target| target.linear),
+        Some(LOOP + 2)
+    );
+    assert_eq!(loop_block.successors[1], None);
+    assert_eq!(loop_block.emitted_static_targets, [None, None]);
+    let loop_key = loop_block.span.key;
+    assert!(matches!(
+        loop_cpu.jit_direct.probe(loop_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    loop_cpu
+        .jit_direct
+        .install(&loop_block)
+        .expect("self-loop install");
+    assert!(
+        loop_cpu
+            .direct_link_refusal_census_snapshot()
+            .expect("armed self-loop census")
+            .rows
+            .is_empty()
+    );
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn link_refusal_census_registers_ordinary_fallthrough() {
+    const ENTRY: u32 = 0x800;
+    let mut cpu = flat_stack_cpu(ENTRY);
+    cpu.enable_direct_link_refusal_census(true);
+    let mut bus = TestBus::with_memory(vec![0; 0x1000]);
+    bus.memory[ENTRY as usize..ENTRY as usize + 3].copy_from_slice(&[0x90; 3]);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let compilation =
+        jit::direct::compile_with_instruction_limit_for_test(&mut cpu, ENTRY, true, 3)
+            .expect("NOP compile");
+    assert_eq!(
+        compilation.emitted_static_targets[0].map(|target| target.linear),
+        Some(ENTRY + 3)
+    );
+    assert_eq!(compilation.emitted_static_targets[1], None);
+    let key = compilation.span.key;
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    cpu.jit_direct.install(&compilation).expect("NOP install");
+    let snapshot = cpu
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.rows[0].slot, 0);
+    assert_eq!(snapshot.rows[0].target_linear, ENTRY + 3);
+    assert_eq!(snapshot.rows[0].state, "not_attempted");
+}
+
 /// The dynamic-miss lane closes on its own counter the same way. Same classifier, separate
 /// census array, and the same `key_for` hole -- so it needs its own witness rather than an
 /// argument by symmetry.

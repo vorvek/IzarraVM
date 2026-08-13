@@ -1926,6 +1926,21 @@ fn emit_store_unresolved_reason(e: &mut Encoder, reason: UnresolvedReason) {
     );
 }
 
+#[cfg(feature = "direct-link-refusal-census")]
+fn emit_store_direct_link_refusal_census_id(e: &mut Encoder) {
+    e.load_r32_disp32(
+        Reg::RDX,
+        Reg::RCX,
+        core::mem::offset_of!(LinkCell, direct_link_refusal_census_id) as i32,
+    );
+    e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
+    e.store_r32_disp32(
+        Reg::RAX,
+        core::mem::offset_of!(NativeExit, direct_link_refusal_census_id) as i32,
+        Reg::RDX,
+    );
+}
+
 fn emit_advance_eip(e: &mut Encoder, delta: u32) {
     if delta == 0 {
         return;
@@ -2040,6 +2055,8 @@ fn emit_completed_path(
         e.cmp_r64_r64(Reg::RDX, Reg::RDI);
         e.jnz(hidden);
         emit_store_unresolved_reason(e, UnresolvedReason::StaticUnbound);
+        #[cfg(feature = "direct-link-refusal-census")]
+        emit_store_direct_link_refusal_census_id(e);
         e.jmp(returning);
         e.place(hidden);
         emit_store_unresolved_reason(e, UnresolvedReason::StaticHidden);

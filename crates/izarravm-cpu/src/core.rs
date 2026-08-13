@@ -1133,6 +1133,12 @@ impl CpuGsw {
         let _ = enabled;
     }
 
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub fn enable_direct_link_refusal_census(&mut self, enabled: bool) {
+        self.jit_direct
+            .set_direct_link_refusal_census_enabled(enabled);
+    }
+
     /// Admit `OperandSize::Word` operands to the Direct backend below I586.
     ///
     /// Seeded from `IZARRAVM_JIT16_486` at construction; this is the programmatic form the A/B
@@ -1179,6 +1185,11 @@ impl CpuGsw {
         {
             None
         }
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub fn direct_link_refusal_census_snapshot(&self) -> Option<DirectLinkRefusalCensusSnapshot> {
+        self.jit_direct.direct_link_refusal_census_snapshot()
     }
 
     pub fn is_paging_enabled(&self) -> bool {

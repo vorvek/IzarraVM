@@ -317,6 +317,13 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     assert!(report["perf"]["jit_direct_insns"].as_u64().is_some());
     assert!(report["perf"]["jit_direct_side_exits"].as_u64().is_some());
     assert!(report["direct_barrier_census"].is_null());
+    #[cfg(feature = "direct-link-refusal-census")]
+    assert_eq!(
+        report.get("direct_link_refusal_census"),
+        Some(&serde_json::Value::Null)
+    );
+    #[cfg(not(feature = "direct-link-refusal-census"))]
+    assert!(report.get("direct_link_refusal_census").is_none());
     for field in [
         "jit_direct_exit_cross_page_or_alignment",
         "jit_direct_exit_unavailable_or_kind",
@@ -401,6 +408,76 @@ fn direct_barrier_census_json_omits_admission_declines_without_feature() {
 
     let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
     assert!(report.get("admission_declines").is_none());
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn direct_link_refusal_census_json_exposes_ordered_zero_snapshot() {
+    let mut cpu = izarravm_cpu::CpuGsw::default();
+    assert!(direct_link_refusal_census_json(cpu.direct_link_refusal_census_snapshot()).is_null());
+    cpu.enable_direct_link_refusal_census(true);
+    assert_eq!(
+        direct_link_refusal_census_json(cpu.direct_link_refusal_census_snapshot()),
+        serde_json::json!({
+            "seen": 0,
+            "missing_id": 0,
+            "invalid_id": 0,
+            "rows": [],
+        })
+    );
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn direct_link_refusal_census_json_preserves_nonzero_rows_and_closures() {
+    let snapshot = izarravm_cpu::DirectLinkRefusalCensusSnapshot {
+        seen: 3,
+        missing_id: 1,
+        invalid_id: 1,
+        rows: vec![izarravm_cpu::DirectLinkRefusalCensusRow {
+            id: 7,
+            source_linear: 0x1000,
+            source_physical: 0x2000,
+            source_mode_key: 3,
+            source_generation: 11,
+            slot: 1,
+            target_linear: 0x1100,
+            target_mode_key: 3,
+            last_target_generation: Some(12),
+            state: "refused_segment_layout",
+            unbound_exits: 1,
+            buckets: vec![
+                ("suppressed", 0),
+                ("not_attempted", 0),
+                ("refused_segment_layout", 1),
+            ],
+        }],
+    };
+    assert_eq!(
+        snapshot.seen,
+        snapshot.missing_id
+            + snapshot.invalid_id
+            + snapshot
+                .rows
+                .iter()
+                .map(|row| row.unbound_exits)
+                .sum::<u64>()
+    );
+    assert_eq!(
+        snapshot.rows[0].unbound_exits,
+        snapshot.rows[0]
+            .buckets
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+    );
+
+    let report = direct_link_refusal_census_json(Some(snapshot));
+    assert_eq!(report["seen"], 3);
+    assert_eq!(report["rows"][0]["id"], 7);
+    assert_eq!(report["rows"][0]["source"]["generation"], 11);
+    assert_eq!(report["rows"][0]["target"]["last_attempted_generation"], 12);
+    assert_eq!(report["rows"][0]["buckets"][2]["count"], 1);
 }
 
 #[test]

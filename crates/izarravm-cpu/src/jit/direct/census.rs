@@ -539,6 +539,241 @@ impl LinkRefusal {
     }
 }
 
+#[cfg(feature = "direct-link-refusal-census")]
+const LINK_REFUSAL_BUCKET_OFFSET: usize = 2;
+#[cfg(feature = "direct-link-refusal-census")]
+const LINK_CLEAR_BUCKET_OFFSET: usize = LINK_REFUSAL_BUCKET_OFFSET + LinkRefusal::COUNT;
+#[cfg(feature = "direct-link-refusal-census")]
+const UNEXPECTED_LINKED_BUCKET: usize = LINK_CLEAR_BUCKET_OFFSET + LinkClearCause::COUNT;
+#[cfg(feature = "direct-link-refusal-census")]
+const CLOSED_BUCKET: usize = UNEXPECTED_LINKED_BUCKET + 1;
+#[cfg(feature = "direct-link-refusal-census")]
+const DIRECT_LINK_REFUSAL_BUCKET_COUNT: usize = CLOSED_BUCKET + 1;
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectLinkRefusalState {
+    Suppressed,
+    Waiting,
+    Refused { reason: LinkRefusal },
+    Linked,
+    Cleared { cause: LinkClearCause },
+    Closed,
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+impl DirectLinkRefusalState {
+    fn bucket(self) -> usize {
+        match self {
+            Self::Suppressed => 0,
+            Self::Waiting => 1,
+            Self::Refused { reason, .. } => LINK_REFUSAL_BUCKET_OFFSET + reason as usize,
+            Self::Linked => UNEXPECTED_LINKED_BUCKET,
+            Self::Cleared { cause, .. } => LINK_CLEAR_BUCKET_OFFSET + cause as usize,
+            Self::Closed => CLOSED_BUCKET,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Suppressed => "suppressed",
+            Self::Waiting => "not_attempted",
+            Self::Refused { reason, .. } => link_refusal_bucket_label(reason),
+            Self::Linked => "unexpected_linked",
+            Self::Cleared { cause, .. } => link_clear_bucket_label(cause),
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+fn link_refusal_bucket_label(reason: LinkRefusal) -> &'static str {
+    match reason {
+        LinkRefusal::Inactive => "refused_inactive",
+        LinkRefusal::StaleEpoch => "refused_stale_epoch",
+        LinkRefusal::SegmentLayout => "refused_segment_layout",
+        LinkRefusal::BlockShape => "refused_block_shape",
+        LinkRefusal::DynamicIntegerToFloat => "refused_dynamic_integer_to_float",
+        LinkRefusal::DynamicFloatToInteger => "refused_dynamic_float_to_integer",
+        LinkRefusal::MissingX87Pad => "refused_missing_x87_pad",
+    }
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+fn link_clear_bucket_label(cause: LinkClearCause) -> &'static str {
+    match cause {
+        LinkClearCause::Replaced => "cleared_replaced",
+        LinkClearCause::Retired => "cleared_retired",
+        LinkClearCause::Flushed => "cleared_flushed",
+        LinkClearCause::Reset => "cleared_reset",
+    }
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+fn direct_link_refusal_bucket_labels() -> [&'static str; DIRECT_LINK_REFUSAL_BUCKET_COUNT] {
+    let mut labels = [""; DIRECT_LINK_REFUSAL_BUCKET_COUNT];
+    labels[0] = "suppressed";
+    labels[1] = "not_attempted";
+    let mut index = 0;
+    while index < LinkRefusal::COUNT {
+        labels[LINK_REFUSAL_BUCKET_OFFSET + index] =
+            link_refusal_bucket_label(LinkRefusal::ALL[index]);
+        index += 1;
+    }
+    index = 0;
+    while index < LinkClearCause::COUNT {
+        labels[LINK_CLEAR_BUCKET_OFFSET + index] =
+            link_clear_bucket_label(LinkClearCause::ALL[index]);
+        index += 1;
+    }
+    labels[UNEXPECTED_LINKED_BUCKET] = "unexpected_linked";
+    labels[CLOSED_BUCKET] = "closed";
+    labels
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+struct DirectLinkRefusalCell {
+    source: BlockKey,
+    source_generation: u64,
+    slot: u8,
+    target: LinkTarget,
+    state: DirectLinkRefusalState,
+    last_target_generation: Option<u64>,
+    unbound_exits: u64,
+    buckets: [u64; DIRECT_LINK_REFUSAL_BUCKET_COUNT],
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+#[derive(Default)]
+pub(crate) struct DirectLinkRefusalCensus {
+    seen: u64,
+    missing_id: u64,
+    invalid_id: u64,
+    rows: Vec<DirectLinkRefusalCell>,
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+impl DirectLinkRefusalCensus {
+    pub(super) fn register(
+        &mut self,
+        source: BlockKey,
+        source_generation: u64,
+        slot: u8,
+        target: LinkTarget,
+        suppressed: bool,
+    ) -> u32 {
+        let id = self
+            .rows
+            .len()
+            .checked_add(1)
+            .and_then(|id| u32::try_from(id).ok())
+            .expect("direct link-refusal census row ID exhausted");
+        self.rows.push(DirectLinkRefusalCell {
+            source,
+            source_generation,
+            slot,
+            target,
+            state: if suppressed {
+                DirectLinkRefusalState::Suppressed
+            } else {
+                DirectLinkRefusalState::Waiting
+            },
+            last_target_generation: None,
+            unbound_exits: 0,
+            buckets: [0; DIRECT_LINK_REFUSAL_BUCKET_COUNT],
+        });
+        id
+    }
+
+    fn row_mut(&mut self, id: u32) -> Option<&mut DirectLinkRefusalCell> {
+        let index = id.checked_sub(1)? as usize;
+        self.rows.get_mut(index)
+    }
+
+    pub(super) fn refused(&mut self, id: u32, reason: LinkRefusal, target_generation: u64) {
+        if let Some(row) = self.row_mut(id) {
+            row.state = DirectLinkRefusalState::Refused { reason };
+            row.last_target_generation = Some(target_generation);
+        }
+    }
+
+    pub(super) fn linked(&mut self, id: u32, target_generation: u64) {
+        if let Some(row) = self.row_mut(id) {
+            row.state = DirectLinkRefusalState::Linked;
+            row.last_target_generation = Some(target_generation);
+        }
+    }
+
+    pub(super) fn cleared(&mut self, id: u32, cause: LinkClearCause, target_generation: u64) {
+        if let Some(row) = self.row_mut(id) {
+            row.state = DirectLinkRefusalState::Cleared { cause };
+            row.last_target_generation = Some(target_generation);
+        }
+    }
+
+    pub(super) fn close(&mut self, id: u32) {
+        if let Some(row) = self.row_mut(id) {
+            row.state = DirectLinkRefusalState::Closed;
+        }
+    }
+
+    pub(super) fn note_exit(&mut self, id: u32) {
+        self.seen += 1;
+        if id == 0 {
+            self.missing_id += 1;
+            return;
+        }
+        let Some(row) = self.row_mut(id) else {
+            self.invalid_id += 1;
+            return;
+        };
+        let bucket = row.state.bucket();
+        row.unbound_exits += 1;
+        row.buckets[bucket] += 1;
+    }
+
+    pub(super) fn snapshot(&self) -> crate::DirectLinkRefusalCensusSnapshot {
+        let labels = direct_link_refusal_bucket_labels();
+        crate::DirectLinkRefusalCensusSnapshot {
+            seen: self.seen,
+            missing_id: self.missing_id,
+            invalid_id: self.invalid_id,
+            rows: self
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| crate::DirectLinkRefusalCensusRow {
+                    id: u32::try_from(index + 1).expect("registered census row ID must fit u32"),
+                    source_linear: row.source.linear,
+                    source_physical: row.source.physical,
+                    source_mode_key: row.source.mode_key,
+                    source_generation: row.source_generation,
+                    slot: row.slot,
+                    target_linear: row.target.linear,
+                    target_mode_key: row.target.mode_key,
+                    last_target_generation: row.last_target_generation,
+                    state: row.state.label(),
+                    unbound_exits: row.unbound_exits,
+                    buckets: labels
+                        .iter()
+                        .copied()
+                        .zip(row.buckets.iter().copied())
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+pub(crate) fn direct_link_refusal_census_default() -> Option<Box<DirectLinkRefusalCensus>> {
+    matches!(
+        std::env::var("IZARRAVM_DIRECT_LINK_REFUSAL_CENSUS").as_deref(),
+        Ok("1")
+    )
+    .then(|| Box::new(DirectLinkRefusalCensus::default()))
+}
+
 /// Result of `classify_unbound_target`. Diagnostic.
 ///
 /// EXHAUSTIVE AND MUTUALLY EXCLUSIVE by construction: every unbound-exit classification call

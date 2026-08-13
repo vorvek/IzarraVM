@@ -2429,6 +2429,11 @@ impl CpuGsw {
             jit::direct::UnresolvedReason::StaticUnbound => {
                 self.perf.jit_direct_unresolved_exits += 1;
                 self.perf.jit_direct_unresolved_static_unbound += 1;
+                #[cfg(feature = "direct-link-refusal-census")]
+                if self.jit_direct.direct_link_refusal_census_active() {
+                    self.jit_direct
+                        .note_direct_link_refusal_exit(exit.direct_link_refusal_census_id);
+                }
                 // Gated at the CALL SITE, not inside the classifier: this is 56% of all stint
                 // ends and `key_for` reads segment state and builds a three-word key.
                 if self.jit_direct.barrier_census_active() {

@@ -1580,7 +1580,8 @@ fn write_hdd_profile_json(
         .map(|phase| phase.wall_ns)
         .sum::<u64>();
     let total_wall_ns = wall.as_nanos().min(u128::from(u64::MAX)) as u64;
-    let report = json!({
+    #[allow(unused_mut)]
+    let mut report = json!({
         "schema": "izarravm-hdd-profile-v1",
         "workload": workload.display().to_string(),
         "mode": mode.canonical_name(),
@@ -1651,6 +1652,11 @@ fn write_hdd_profile_json(
             machine.cpu().code_watch_edge_counters(),
         ),
     });
+    #[cfg(feature = "direct-link-refusal-census")]
+    {
+        report["direct_link_refusal_census"] =
+            direct_link_refusal_census_json(machine.cpu().direct_link_refusal_census_snapshot());
+    }
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
 }
@@ -1759,6 +1765,41 @@ fn direct_barrier_census_json(
         report
     };
     report
+}
+
+#[cfg(feature = "direct-link-refusal-census")]
+fn direct_link_refusal_census_json(
+    snapshot: Option<izarravm_cpu::DirectLinkRefusalCensusSnapshot>,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    json!({
+        "seen": snapshot.seen,
+        "missing_id": snapshot.missing_id,
+        "invalid_id": snapshot.invalid_id,
+        "rows": snapshot.rows.iter().map(|row| json!({
+            "id": row.id,
+            "source": {
+                "linear": row.source_linear,
+                "physical": row.source_physical,
+                "mode_key": row.source_mode_key,
+                "generation": row.source_generation,
+            },
+            "slot": row.slot,
+            "target": {
+                "linear": row.target_linear,
+                "mode_key": row.target_mode_key,
+                "last_attempted_generation": row.last_target_generation,
+            },
+            "state": row.state,
+            "unbound_exits": row.unbound_exits,
+            "buckets": row.buckets.iter().map(|(kind, count)| json!({
+                "kind": kind,
+                "count": count,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// The whole-run BIOS fixed-disk census. All zero unless `IZARRAVM_INT13_PROFILE=1`.

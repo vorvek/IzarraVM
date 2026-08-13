@@ -135,4 +135,6 @@ pub(crate) struct NativeExit {
     pub(crate) trace_ptr: usize,
     pub(crate) dynamic_link_cell: usize,
     pub(crate) dynamic_target_eip: u32,
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) direct_link_refusal_census_id: u32,
 }

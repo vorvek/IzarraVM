@@ -131,6 +131,8 @@ pub(crate) fn zero_portal() -> &'static BlockPortal {
 pub(crate) struct LinkCell {
     pub(crate) portal: AtomicUsize,
     pub(crate) target_eip: AtomicU32,
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) direct_link_refusal_census_id: AtomicU32,
     /// The baked `x87_entry_top` of the block this cell is bound to, or `NO_ENTRY_TOP` when the
     /// target has none. The shared x87 re-entry pad compares it against the CPU's live TOP and
     /// bails when they differ, because a float block's emitted code addresses its register cache
@@ -167,9 +169,22 @@ impl LinkCell {
         Self {
             portal: AtomicUsize::new(zero_portal().address()),
             target_eip: AtomicU32::new(0),
+            #[cfg(feature = "direct-link-refusal-census")]
+            direct_link_refusal_census_id: AtomicU32::new(0),
             entry_top: AtomicU8::new(NO_ENTRY_TOP),
             spilling: AtomicU8::new(0),
         }
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn set_direct_link_refusal_census_id(&self, id: u32) {
+        self.direct_link_refusal_census_id
+            .store(id, Ordering::Release);
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn direct_link_refusal_census_id(&self) -> u32 {
+        self.direct_link_refusal_census_id.load(Ordering::Acquire)
     }
 
     pub(crate) fn address(&self) -> usize {

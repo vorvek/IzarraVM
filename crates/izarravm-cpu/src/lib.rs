@@ -1479,6 +1479,34 @@ pub struct DirectBarrierCensusSnapshot {
     pub admission_declines: Vec<(&'static str, u64)>,
 }
 
+/// One emitted static successor cell in the opt-in Direct link refusal census.
+#[cfg(feature = "direct-link-refusal-census")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectLinkRefusalCensusRow {
+    pub id: u32,
+    pub source_linear: u32,
+    pub source_physical: u32,
+    pub source_mode_key: u32,
+    pub source_generation: u64,
+    pub slot: u8,
+    pub target_linear: u32,
+    pub target_mode_key: u32,
+    pub last_target_generation: Option<u64>,
+    pub state: &'static str,
+    pub unbound_exits: u64,
+    pub buckets: Vec<(&'static str, u64)>,
+}
+
+/// Deterministically ordered snapshot of the opt-in Direct link refusal census.
+#[cfg(feature = "direct-link-refusal-census")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectLinkRefusalCensusSnapshot {
+    pub seen: u64,
+    pub missing_id: u64,
+    pub invalid_id: u64,
+    pub rows: Vec<DirectLinkRefusalCensusRow>,
+}
+
 /// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here
 /// used to fold into a state (`Dormant`), a bool (`try_link_inner` returning false) or one
 /// catch-all counter (`SideExitReason::Other`), which is why the three largest unattributed exit

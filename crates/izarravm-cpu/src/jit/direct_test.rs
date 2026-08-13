@@ -74,6 +74,8 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         x87_exit_top: 0,
         dynamic_successor: false,
         successors: [None, None],
+        #[cfg(feature = "direct-link-refusal-census")]
+        emitted_static_targets: [None, None],
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
         body_offset: 0,
         imm_lanes: [NO_IMM_LANE; MAX_BLOCK_IMM_LANES],
@@ -2128,6 +2130,432 @@ fn compiled_block_stays_small_enough_to_copy_per_entry() {
         120,
         "CompiledBlock size changed; if a field was added, check it is actually read on the \
          uniform-fetch entry path before letting it ride every per-entry copy"
+    );
+}
+
+#[test]
+fn direct_exit_and_link_cell_layouts_are_pinned() {
+    assert_eq!(core::mem::size_of::<NativeExit>(), 144);
+    assert_eq!(core::mem::align_of::<NativeExit>(), 8);
+    assert_eq!(core::mem::offset_of!(NativeExit, unresolved_reason), 116);
+    assert_eq!(core::mem::offset_of!(NativeExit, dynamic_target_eip), 136);
+    #[cfg(feature = "direct-link-refusal-census")]
+    {
+        assert_eq!(
+            core::mem::offset_of!(NativeExit, direct_link_refusal_census_id),
+            140
+        );
+        assert_eq!(core::mem::size_of::<LinkCell>(), 24);
+        assert_eq!(core::mem::align_of::<LinkCell>(), 8);
+        assert_eq!(core::mem::offset_of!(LinkCell, portal), 0);
+        assert_eq!(core::mem::offset_of!(LinkCell, target_eip), 8);
+        assert_eq!(
+            core::mem::offset_of!(LinkCell, direct_link_refusal_census_id),
+            12
+        );
+        assert_eq!(core::mem::offset_of!(LinkCell, entry_top), 16);
+        assert_eq!(core::mem::offset_of!(LinkCell, spilling), 17);
+    }
+    #[cfg(not(feature = "direct-link-refusal-census"))]
+    {
+        assert_eq!(core::mem::size_of::<LinkCell>(), 16);
+        assert_eq!(core::mem::align_of::<LinkCell>(), 8);
+        assert_eq!(core::mem::offset_of!(LinkCell, portal), 0);
+        assert_eq!(core::mem::offset_of!(LinkCell, target_eip), 8);
+        assert_eq!(core::mem::offset_of!(LinkCell, entry_top), 12);
+        assert_eq!(core::mem::offset_of!(LinkCell, spilling), 13);
+    }
+}
+
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+    assert_eq!(
+        cache.direct_link_refusal_census_snapshot(),
+        Some(crate::DirectLinkRefusalCensusSnapshot::default())
+    );
+
+    let source = key(0x1000);
+    let fallthrough = LinkTarget {
+        linear: 0x1100,
+        mode_key: source.mode_key,
+    };
+    let taken = LinkTarget {
+        linear: 0x1200,
+        mode_key: source.mode_key,
+    };
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut compilation = trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    compilation.successors = [Some(fallthrough), Some(taken)];
+    compilation.emitted_static_targets = [Some(fallthrough), Some(taken)];
+    cache.install(&compilation).expect("source install");
+
+    let snapshot = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(
+        snapshot.rows.len(),
+        2,
+        "Jcc must register both emitted arms"
+    );
+    assert_eq!(snapshot.rows[0].id, 1);
+    assert_eq!(snapshot.rows[0].slot, 0);
+    assert_eq!(snapshot.rows[0].target_linear, fallthrough.linear);
+    assert_eq!(snapshot.rows[0].state, "not_attempted");
+    assert_eq!(snapshot.rows[1].id, 2);
+    assert_eq!(snapshot.rows[1].slot, 1);
+    assert_eq!(snapshot.rows[1].target_linear, taken.linear);
+    let labels: Vec<&str> = snapshot.rows[0]
+        .buckets
+        .iter()
+        .map(|(label, _)| *label)
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "suppressed",
+            "not_attempted",
+            "refused_inactive",
+            "refused_stale_epoch",
+            "refused_segment_layout",
+            "refused_block_shape",
+            "refused_dynamic_integer_to_float",
+            "refused_dynamic_float_to_integer",
+            "refused_missing_x87_pad",
+            "cleared_replaced",
+            "cleared_retired",
+            "cleared_flushed",
+            "cleared_reset",
+            "unexpected_linked",
+            "closed",
+        ]
+    );
+
+    cache.note_direct_link_refusal_exit(1);
+    cache.note_direct_link_refusal_exit(2);
+    cache.note_direct_link_refusal_exit(0);
+    cache.note_direct_link_refusal_exit(u32::MAX);
+    cache.clear();
+    cache.note_direct_link_refusal_exit(1);
+    let snapshot = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("reset retains census rows");
+    assert_eq!(snapshot.seen, 5);
+    assert_eq!(snapshot.missing_id, 1);
+    assert_eq!(snapshot.invalid_id, 1);
+    assert_eq!(snapshot.rows[0].state, "closed");
+    assert_eq!(snapshot.rows[0].unbound_exits, 2);
+    assert_eq!(snapshot.rows[1].unbound_exits, 1);
+    assert_eq!(
+        snapshot.seen,
+        snapshot.missing_id
+            + snapshot.invalid_id
+            + snapshot
+                .rows
+                .iter()
+                .map(|row| row.unbound_exits)
+                .sum::<u64>()
+    );
+    for row in &snapshot.rows {
+        assert_eq!(
+            row.unbound_exits,
+            row.buckets.iter().map(|(_, count)| count).sum::<u64>()
+        );
+    }
+}
+
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn direct_link_refusal_census_registers_before_the_first_link_attempt() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+    let source = key(0x1800);
+    let target = key(0x1900);
+    let target_id = install_trivial(&mut cache, target, 1);
+
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut compilation = trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    compilation.successors = [
+        Some(LinkTarget {
+            linear: target.linear,
+            mode_key: target.mode_key,
+        }),
+        None,
+    ];
+    compilation.emitted_static_targets = compilation.successors;
+    cache.install(&compilation).expect("source install");
+
+    let snapshot = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.source_linear == source.linear)
+        .expect("source row");
+    assert_eq!(row.state, "unexpected_linked");
+    assert_eq!(row.last_target_generation, Some(target_id.generation()));
+}
+
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn direct_link_refusal_census_clone_is_unarmed() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+    install_trivial(&mut cache, key(0x1a00), 1);
+    assert!(cache.direct_link_refusal_census_snapshot().is_some());
+    assert!(
+        cache
+            .clone()
+            .direct_link_refusal_census_snapshot()
+            .is_none()
+    );
+}
+
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+#[should_panic(expected = "cannot be toggled with installed blocks")]
+fn direct_link_refusal_census_cannot_toggle_with_live_blocks() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+    install_trivial(&mut cache, key(0x1b00), 1);
+    cache.set_direct_link_refusal_census_enabled(false);
+}
+
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn direct_link_refusal_state_machine_maps_every_bucket() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+    let source = key(0x1c00);
+    let target = key(0x1d00);
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut compilation = trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    compilation.successors = [
+        Some(LinkTarget {
+            linear: target.linear,
+            mode_key: target.mode_key,
+        }),
+        None,
+    ];
+    compilation.emitted_static_targets = compilation.successors;
+    let source_id = cache.install(&compilation).expect("source install");
+    let target_id = install_trivial(&mut cache, target, 1);
+    let source_index = source_id.index();
+
+    // The two retired dynamic refusal variants and Reset's immediately closed state have no
+    // stable guest route. Pin the same transition functions used by the live sites instead.
+    for reason in LinkRefusal::ALL {
+        cache.note_direct_link_refused(source_index, 0, reason, target_id);
+        cache.note_direct_link_refusal_exit(1);
+    }
+    for cause in LinkClearCause::ALL {
+        cache.note_direct_link_cleared(source_index, 0, cause, target_id);
+        cache.note_direct_link_refusal_exit(1);
+    }
+    cache.note_direct_link_linked(source_index, 0, target_id);
+    cache.note_direct_link_refusal_exit(1);
+
+    let snapshot = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    let row = &snapshot.rows[0];
+    for (label, count) in &row.buckets {
+        let exercised = label.starts_with("refused_")
+            || label.starts_with("cleared_")
+            || *label == "unexpected_linked";
+        assert_eq!(*count, u64::from(exercised), "bucket {label}");
+    }
+    assert_eq!(
+        row.unbound_exits,
+        (LinkRefusal::COUNT + LinkClearCause::COUNT + 1) as u64
+    );
+    assert_eq!(row.last_target_generation, Some(target_id.generation()));
+}
+
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn segment_write_static_cell_is_registered_as_suppressed_fallthrough() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+    let source = key(0x2000);
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut compilation = trivial_compilation(BlockSpan::new(source, 3, 1).expect("source span"));
+    compilation.emitted_static_targets = [
+        Some(LinkTarget {
+            linear: source.linear + 3,
+            mode_key: source.mode_key,
+        }),
+        None,
+    ];
+    cache.install(&compilation).expect("source install");
+
+    cache.note_direct_link_refusal_exit(1);
+    let snapshot = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.rows[0].slot, 0);
+    assert_eq!(snapshot.rows[0].target_linear, source.linear + 3);
+    assert_eq!(snapshot.rows[0].state, "suppressed");
+    assert_eq!(snapshot.rows[0].buckets[0], ("suppressed", 1));
+}
+
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn link_refusal_census_preserves_generation_history_through_retry_and_source_retire() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+    let source = key(0x3000);
+    let target = key(0x3100);
+    let target_link = LinkTarget {
+        linear: target.linear,
+        mode_key: target.mode_key,
+    };
+
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.successors = [Some(target_link), None];
+    source_compilation.emitted_static_targets = source_compilation.successors;
+    cache.install(&source_compilation).expect("source install");
+
+    assert!(matches!(cache.probe(target), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(target), BlockProbe::Compile));
+    let mut target_g1 = trivial_compilation(BlockSpan::new(target, 1, 1).expect("target span"));
+    target_g1.segment_layout.data[segment_index(SegmentIndex::Ds)].selector ^= 8;
+    let target_g1_id = cache.install(&target_g1).expect("first target install");
+    cache.note_direct_link_refusal_exit(1);
+    let refused = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(refused.rows[0].state, "refused_segment_layout");
+    assert_eq!(
+        refused.rows[0].last_target_generation,
+        Some(target_g1_id.generation())
+    );
+    assert_eq!(refused.rows[0].buckets[4].1, 1);
+
+    assert_eq!(cache.retire_physical_range_for_test(target.physical, 1), 1);
+    assert!(matches!(cache.probe(target), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(target), BlockProbe::Compile));
+    let target_g2 = trivial_compilation(BlockSpan::new(target, 1, 1).expect("target retry span"));
+    let target_g2_id = cache.install(&target_g2).expect("second target install");
+    assert_ne!(target_g1_id.generation(), target_g2_id.generation());
+    cache.note_direct_link_refusal_exit(1);
+
+    let linked = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(linked.rows[0].state, "unexpected_linked");
+    assert_eq!(
+        linked.rows[0].last_target_generation,
+        Some(target_g2_id.generation())
+    );
+    assert_eq!(linked.rows[0].buckets[4].1, 1);
+    assert_eq!(linked.rows[0].buckets[13].1, 1);
+
+    assert_eq!(cache.retire_physical_range_for_test(source.physical, 1), 1);
+    cache.note_direct_link_refusal_exit(1);
+    let closed = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(closed.rows[0].state, "closed");
+    assert_eq!(
+        closed.rows[0].last_target_generation,
+        Some(target_g2_id.generation())
+    );
+    assert_eq!(closed.rows[0].buckets[4].1, 1);
+    assert_eq!(closed.rows[0].buckets[13].1, 1);
+    assert_eq!(closed.rows[0].buckets[14].1, 1);
+    assert_eq!(closed.rows[0].unbound_exits, 3);
+
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut source_retry =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source retry span"));
+    source_retry.successors = [Some(target_link), None];
+    source_retry.emitted_static_targets = source_retry.successors;
+    cache.install(&source_retry).expect("source retry install");
+    let retried = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    let source_rows: Vec<_> = retried
+        .rows
+        .iter()
+        .filter(|row| row.source_linear == source.linear)
+        .collect();
+    assert_eq!(source_rows.len(), 2);
+    assert_eq!(source_rows[0].state, "closed");
+    assert!(source_rows[1].id > source_rows[0].id);
+    assert_eq!(source_rows[1].state, "unexpected_linked");
+    assert_eq!(
+        source_rows[1].last_target_generation,
+        Some(target_g2_id.generation())
+    );
+
+    cache.clear();
+    let reset = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("reset retains census");
+    let source_rows: Vec<_> = reset
+        .rows
+        .iter()
+        .filter(|row| row.source_linear == source.linear)
+        .collect();
+    assert_eq!(source_rows[1].state, "closed");
+    assert_eq!(
+        source_rows[1].last_target_generation,
+        Some(target_g2_id.generation())
     );
 }
 
