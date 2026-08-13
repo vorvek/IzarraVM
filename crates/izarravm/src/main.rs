@@ -12,6 +12,7 @@ mod cmos;
 mod crt;
 mod gui;
 mod host_input;
+mod ipe_trace;
 mod prefs;
 #[cfg(windows)]
 mod riprofile;
@@ -188,8 +189,23 @@ struct Cli {
     cycles: Option<u64>,
     #[arg(long)]
     margo_test_pattern: bool,
-    #[arg(long, env = "IZARRAVM_DOSROOT")]
+    /// Fallback C: root. Also read from `IZARRAVM_DOSROOT`, which is why the value parser
+    /// accepts an EMPTY string: clap's stock `PathBuf` parser rejects one, and it rejects it
+    /// the same way whether the empty value came from the command line or from the
+    /// environment. A shell (or a campaign script) that leaves `IZARRAVM_DOSROOT=` set to an
+    /// empty value therefore made EVERY invocation of the emulator fail with
+    /// "a value is required for '--dosroot <DOSROOT>' but none was supplied", naming an
+    /// argument the user never typed. An empty path is not a root, so it reads as absent
+    /// instead; `resolve_with` drops it.
+    #[arg(long, env = "IZARRAVM_DOSROOT", value_parser = empty_tolerant_path)]
     dosroot: Option<PathBuf>,
+}
+
+/// A `PathBuf` value parser that accepts the empty string. See the `dosroot` comment: the point
+/// is that an empty ENVIRONMENT value must not be a hard parse error. Callers treat an empty
+/// path as absent.
+fn empty_tolerant_path(value: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(PathBuf::from(value))
 }
 
 /// Arm the diagnostic guest-store watchpoint from `IZARRAVM_WATCH_WRITE=<hex>[,<hex len>]`
@@ -1294,6 +1310,15 @@ fn run_boot_hdd_folder(
         machine.arm_periodic_phase_marks(per_ms.saturating_mul(ms), budget);
         machine.record_host_phase_mark(izarravm_machine::phase_mark::BENCH_START);
     }
+    // Windowed IPE trace, off unless IZARRAVM_IPE_WINDOW_TRACE names a writable path. The parent
+    // is checked HERE rather than at write time so a bad path fails in a second instead of after
+    // a multi-minute fixture run. Read-only observer: it neither slices the run nor writes
+    // anything from inside it. See `ipe_trace`.
+    let ipe_trace_path = ipe_trace::requested_path();
+    if let Some(path) = &ipe_trace_path {
+        validate_output_parent(path, "IPE window trace")?;
+        machine.arm_ipe_window_trace(ipe_trace::WINDOW_ENTRIES);
+    }
     // Headless capture of the HOST audio mix (`IZARRAVM_AUDIO_WAV=<path>`).
     // Everything else headless observes the guest SIDE of the sound card: the
     // per-second `[SB]` trace proves the DSP is programmed and that DMA is
@@ -1412,6 +1437,17 @@ fn run_boot_hdd_folder(
     // plus the loop's several early returns) is never bounded on the right.
     if phase_interval_ms.is_some() {
         machine.record_host_phase_mark(izarravm_machine::phase_mark::BENCH_END);
+    }
+    // Written AFTER the wall reading, for the same reason the phase marks are closed here: the
+    // render walks every window and touches the filesystem, and neither belongs inside the
+    // measured interval.
+    if let Some(path) = &ipe_trace_path {
+        ipe_trace::write_trace(path, &machine)?;
+        println!(
+            "ipe window trace: {} windows -> {}",
+            machine.ipe_windows().len() + usize::from(machine.ipe_window_tail().is_some()),
+            path.display()
+        );
     }
     #[cfg(windows)]
     if let Some((Some(sampler), path)) = rip_sampler {
@@ -2483,13 +2519,20 @@ units_over_64={} units_over_128={} units_over_256={} excl_units={excl_units}",
 }
 
 fn validate_profile_json_parent(path: &Path) -> Result<(), Box<dyn Error>> {
+    validate_output_parent(path, "profile JSON")
+}
+
+/// Fail early when a host output path names a directory that does not exist. `what` names the
+/// output in the message, so a run that would only fail at the END (after the guest work is
+/// already spent) fails at startup instead.
+fn validate_output_parent(path: &Path, what: &str) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         && !parent.exists()
     {
         return Err(format!(
-            "profile JSON parent directory does not exist: {}",
+            "{what} parent directory does not exist: {}",
             parent.display()
         )
         .into());

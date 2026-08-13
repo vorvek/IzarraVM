@@ -1277,6 +1277,45 @@ pub struct Machine {
     // within the total that later fed advance_devices.
     #[cfg(test)]
     test_batch_core_totals: Vec<u64>,
+    /// Windowed IPE trace (see `arm_ipe_window_trace`). Read-only observer, off by default.
+    /// `next_ipe_window_entries` is `u64::MAX` when disarmed, the same sentinel discipline
+    /// `next_phase_mark_ticks` uses, so the run loop's disabled path is one compare.
+    next_ipe_window_entries: u64,
+    ipe_window_entries: u64,
+    ipe_window_start_entries: u64,
+    ipe_window_start_insns: u64,
+    ipe_windows: Vec<IpeWindow>,
+}
+
+/// One window of the windowed instructions-per-entry (IPE) trace: how many direct-JIT
+/// entries closed the window and how many guest instructions those entries retired.
+///
+/// A window is closed at a BATCH boundary, not at an exact entry count, so `entries` is
+/// recorded as measured rather than assumed to equal the armed window size (a single batch
+/// can carry many entries past the boundary). Consumers wanting a min-window IPE are
+/// tolerant of that jitter; consumers wanting exact window arithmetic are not, and must not
+/// use this instrument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpeWindow {
+    /// 0-based index in the order the windows closed.
+    pub index: u64,
+    /// Direct entries retired inside this window (>= the armed size for a full window).
+    pub entries: u64,
+    /// Guest instructions retired by those entries.
+    pub direct_insns: u64,
+    /// True for the trailing window, which the run ended before it reached the armed size.
+    pub partial: bool,
+}
+
+impl IpeWindow {
+    /// Instructions per direct entry for this window. Zero entries reads as 0.0 rather than
+    /// NaN so a consumer that sorts for a minimum does not have to special-case it.
+    pub fn ipe(&self) -> f64 {
+        if self.entries == 0 {
+            return 0.0;
+        }
+        self.direct_insns as f64 / self.entries as f64
+    }
 }
 
 /// The GUI virtual pointer space the relative-delta synthesis spans: x 0..639,
@@ -1444,6 +1483,11 @@ impl Machine {
             next_phase_mark_ticks: u64::MAX,
             periodic_phase_mark_interval: 0,
             post_phase_marked: false,
+            next_ipe_window_entries: u64::MAX,
+            ipe_window_entries: 0,
+            ipe_window_start_entries: 0,
+            ipe_window_start_insns: 0,
+            ipe_windows: Vec::new(),
             pending_toka_service: None,
             toka_service_status: 0,
             katea_root: None,
@@ -2007,6 +2051,88 @@ impl Machine {
             fast_map_audit: self.cpu.fast_map_audit_counters(),
             cpu_profile: None,
         });
+    }
+
+    /// Arm the windowed IPE trace: every `window_entries` direct-JIT entries, close a window
+    /// recording the entries and the guest instructions they retired. `0` disarms.
+    ///
+    /// A pure OBSERVER. It reads two counters the run loop already maintains
+    /// (`jit_direct_entries` / `jit_direct_insns`, incremented unconditionally in the direct
+    /// backend), records nothing else, and never slices a run: no `run_until_*` call boundary
+    /// moves, no device schedule is touched, and nothing is written to disk from inside the
+    /// loop. The host reads `ipe_windows`/`ipe_window_tail` after the run returns.
+    ///
+    /// APPROXIMATION, by design: the boundary is tested once per batch, so a window closes at
+    /// the first batch boundary at or past its entry target and carries however many entries
+    /// that batch happened to add. Each window therefore records its ACTUAL entry count rather
+    /// than the armed size. The consumer of this trace is a min-window IPE, which is tolerant
+    /// of a few thousand entries of boundary jitter against a window of millions.
+    pub fn arm_ipe_window_trace(&mut self, window_entries: u64) {
+        self.ipe_windows.clear();
+        if window_entries == 0 {
+            self.ipe_window_entries = 0;
+            self.next_ipe_window_entries = u64::MAX;
+            return;
+        }
+        let perf = self.cpu.perf_counters();
+        self.ipe_window_start_entries = perf.jit_direct_entries;
+        self.ipe_window_start_insns = perf.jit_direct_insns;
+        self.ipe_window_entries = window_entries;
+        self.next_ipe_window_entries = self.ipe_window_start_entries.saturating_add(window_entries);
+    }
+
+    /// The windows closed so far, in the order they closed.
+    pub fn ipe_windows(&self) -> &[IpeWindow] {
+        &self.ipe_windows
+    }
+
+    /// The still-open trailing window, computed from the live counters. `None` when the trace
+    /// is disarmed or the tail is empty. Meant to be read once, after the run returns.
+    pub fn ipe_window_tail(&self) -> Option<IpeWindow> {
+        if self.next_ipe_window_entries == u64::MAX {
+            return None;
+        }
+        let perf = self.cpu.perf_counters();
+        let entries = perf
+            .jit_direct_entries
+            .saturating_sub(self.ipe_window_start_entries);
+        if entries == 0 {
+            return None;
+        }
+        Some(IpeWindow {
+            index: self.ipe_windows.len() as u64,
+            entries,
+            direct_insns: perf
+                .jit_direct_insns
+                .saturating_sub(self.ipe_window_start_insns),
+            partial: true,
+        })
+    }
+
+    /// The armed window size in entries, or 0 when disarmed. Reported in the trace header so a
+    /// reader can tell a full window from the tail without trusting the flag alone.
+    pub fn ipe_window_size(&self) -> u64 {
+        self.ipe_window_entries
+    }
+
+    /// Close one IPE window. COLD and never inlined for the same reason
+    /// `fire_periodic_phase_mark` is: it sits one branch off a layout-sensitive run loop.
+    #[cold]
+    #[inline(never)]
+    fn close_ipe_window(&mut self) {
+        let perf = self.cpu.perf_counters();
+        let (entries_now, insns_now) = (perf.jit_direct_entries, perf.jit_direct_insns);
+        self.ipe_windows.push(IpeWindow {
+            index: self.ipe_windows.len() as u64,
+            entries: entries_now.saturating_sub(self.ipe_window_start_entries),
+            direct_insns: insns_now.saturating_sub(self.ipe_window_start_insns),
+            partial: false,
+        });
+        self.ipe_window_start_entries = entries_now;
+        self.ipe_window_start_insns = insns_now;
+        // Measured from the entries seen NOW, not from the previous target: a batch that
+        // overshot the boundary must not leave the next window short by the overshoot.
+        self.next_ipe_window_entries = entries_now.saturating_add(self.ipe_window_entries.max(1));
     }
 
     /// Place the POST->boot boundary, once, at the first INT 19h.

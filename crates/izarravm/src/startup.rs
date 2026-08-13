@@ -326,13 +326,27 @@ fn load_state_glide_ovl(state_dir: &Path) -> Option<Vec<u8>> {
     }
 }
 
+/// The C: root the command line asks for: `--c-drive` wins, then `--dosroot`.
+///
+/// An EMPTY `--dosroot` (which is what a stray `IZARRAVM_DOSROOT=` in the environment produces)
+/// is absent, NOT a root at the current directory. The value parser accepts the empty string
+/// only so that stray variable cannot fail every invocation at parse time; this is where it is
+/// dropped.
+pub(crate) fn c_drive_override(cli: &Cli) -> Option<PathBuf> {
+    cli.c_drive.clone().or_else(|| {
+        cli.dosroot
+            .clone()
+            .filter(|path| !path.as_os_str().is_empty())
+    })
+}
+
 fn resolve_with(
     cli: &Cli,
     locations: &StartupLocations,
     mut read_text: impl FnMut(&Path) -> io::Result<String>,
 ) -> Result<ResolvedStartup, StartupError> {
     let (mut config, presence) = load_config_snapshot(cli.config.as_deref(), &mut read_text)?;
-    let c_drive = cli.c_drive.clone().or_else(|| cli.dosroot.clone());
+    let c_drive = c_drive_override(cli);
     let uses_default_c_root = c_drive.is_none() && !presence.c_drive;
     let external_midi_port = cli.midi_port.as_ref().map(|name| MidiPortId {
         name: name.clone(),

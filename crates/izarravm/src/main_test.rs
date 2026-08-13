@@ -184,6 +184,49 @@ fn cli_parses_munt_roms_and_stable_external_port_identity() {
     );
 }
 
+/// The exact shape every fixture run and every campaign script uses. It has no business
+/// failing to parse, and when it did, the message named `--dosroot` -- an argument that is
+/// nowhere on this command line -- because `--dosroot` also reads `IZARRAVM_DOSROOT` and clap's
+/// stock `PathBuf` parser rejects an empty value from the environment exactly as it would from
+/// the command line. This test parses the invocation; the one below covers the empty value.
+#[test]
+fn cli_parses_the_standard_fixture_invocation() {
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--cpu",
+        "486",
+        "--memory-mib",
+        "64",
+        "--video",
+        "vega",
+        "--hdd-folder",
+        "fixture",
+        "--cycles",
+        "1000",
+    ])
+    .expect("the standard fixture invocation must parse");
+    assert_eq!(cli.cpu, Some(GswMode::Gsw486));
+    assert_eq!(cli.memory_mib, Some(64));
+    assert_eq!(cli.hdd_folder.as_deref(), Some(Path::new("fixture")));
+    assert_eq!(cli.cycles, Some(1000));
+}
+
+/// An empty `--dosroot` (the command-line spelling of an `IZARRAVM_DOSROOT=` left set to
+/// nothing) must PARSE and then read as absent, rather than aborting the run. Passing it
+/// explicitly is how this can be tested without mutating the process environment, which is
+/// unsafe and would race the other tests in this binary; clap resolves an explicit value and
+/// an environment value through the same parser, so this covers both.
+#[test]
+fn empty_dosroot_parses_and_is_not_a_c_drive() {
+    let cli = Cli::try_parse_from(["izarravm", "--dosroot", ""])
+        .expect("an empty dosroot must not fail the parse");
+    assert_eq!(cli.dosroot.as_deref(), Some(Path::new("")));
+    assert!(
+        crate::startup::c_drive_override(&cli).is_none(),
+        "an empty dosroot must not become the C: root"
+    );
+}
+
 #[test]
 fn cli_accepts_explicit_interpreter_backend() {
     let cli = Cli::try_parse_from(["izarravm", "--interpreter"]).unwrap();

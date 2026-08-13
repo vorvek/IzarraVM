@@ -883,6 +883,12 @@ impl Machine {
             if self.next_phase_mark_ticks <= self.timeline.now_ticks() {
                 self.fire_periodic_phase_mark();
             }
+            // Windowed IPE trace, gated on the same kind of `u64::MAX` sentinel: one load of a
+            // counter the direct backend already maintains and one compare, per batch. See
+            // `arm_ipe_window_trace` for why the boundary is approximate.
+            if self.cpu.perf_counters().jit_direct_entries >= self.next_ipe_window_entries {
+                self.close_ipe_window();
+            }
             if self.direct_map_changed {
                 self.cpu.note_direct_map_changed();
                 self.direct_map_changed = false;
