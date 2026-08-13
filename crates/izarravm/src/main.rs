@@ -1650,6 +1650,10 @@ fn write_hdd_profile_json(
             machine.cpu().fast_map_probe_counters(),
             machine.cpu().fast_map_audit_counters(),
             machine.cpu().code_watch_edge_counters(),
+            #[cfg(feature = "poll-head-probe")]
+            Some(machine.cpu().poll_head_probe()),
+            #[cfg(not(feature = "poll-head-probe"))]
+            None,
         ),
     });
     #[cfg(feature = "direct-link-refusal-census")]

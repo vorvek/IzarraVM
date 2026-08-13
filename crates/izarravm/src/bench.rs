@@ -15,6 +15,8 @@ struct BenchRun {
     /// Memory-poll subset, stored outside PerfCounters on the CPU (layout
     /// preservation; see PollSkipMemoryCounters) and captured here alongside.
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
+    /// Poll-head probe subset, present only in a `poll-head-probe` build.
+    poll_head_probe: Option<izarravm_cpu::PollHeadProbeCounters>,
     /// Lever 1 (interpreter FastMap serve path) hit/miss subset, stored outside PerfCounters on
     /// the CPU for the same layout-preservation reason; see FastMapProbeCounters.
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
@@ -97,6 +99,10 @@ fn run_bench_one_profiled(
         wall,
         perf,
         poll_skip_memory: machine.cpu().poll_skip_memory(),
+        #[cfg(feature = "poll-head-probe")]
+        poll_head_probe: Some(machine.cpu().poll_head_probe()),
+        #[cfg(not(feature = "poll-head-probe"))]
+        poll_head_probe: None,
         fast_map_probe: machine.cpu().fast_map_probe_counters(),
         fast_map_audit: machine.cpu().fast_map_audit_counters(),
         code_watch_edges: machine.cpu().code_watch_edge_counters(),
@@ -949,6 +955,7 @@ fn write_profile_json(
                 profiled.fast_map_probe,
                 profiled.fast_map_audit,
                 profiled.code_watch_edges,
+                profiled.poll_head_probe,
             ),
         },
     });
@@ -962,8 +969,14 @@ pub(super) fn perf_counters_json(
     fast_map_probe: izarravm_cpu::FastMapProbeCounters,
     fast_map_audit: izarravm_cpu::FastMapAuditCounters,
     code_watch_edges: izarravm_cpu::CodeWatchEdgeCounters,
+    // Consumed only by the `poll-head-probe` arm below; the parameter stays in the signature
+    // unconditionally so the four call sites do not each need a cfg.
+    #[cfg_attr(not(feature = "poll-head-probe"), expect(unused_variables))] poll_head_probe: Option<
+        izarravm_cpu::PollHeadProbeCounters,
+    >,
 ) -> serde_json::Value {
-    json!({
+    #[cfg_attr(not(feature = "poll-head-probe"), expect(unused_mut))]
+    let mut value = json!({
         "code_watch_sticky_page_edges": code_watch_edges.sticky_page_edges,
         "code_watch_block_page_edges": code_watch_edges.block_page_edges,
         "code_watch_block_page_releases": code_watch_edges.block_page_releases,
@@ -992,6 +1005,7 @@ pub(super) fn perf_counters_json(
         "poll_head_prefilter_rejects": perf.poll_head_prefilter_rejects,
         "poll_skip_memory_spans": poll_skip_memory.spans,
         "poll_skip_memory_iterations": poll_skip_memory.iterations,
+
         "code_invalidations": perf.code_invalidations,
         "data_direct_reads": perf.data_direct_reads,
         "data_slow_reads": perf.data_slow_reads,
@@ -1101,7 +1115,38 @@ pub(super) fn perf_counters_json(
         "jit_paged_tlb_successes": perf.jit_paged_tlb_successes,
         "monitor_trips_vec13": perf.monitor_trips_vec13,
         "monitor_resident_core_clocks": perf.monitor_resident_core_clocks,
-    })
+    });
+    // Present ONLY in a poll-head-probe build. A default build's counter surface must not
+    // change at all: `perf_counter_json_exposes_the_complete_counter_surface` pins the exact
+    // key set, and emitting these as nulls when the feature is off would break that pin and,
+    // worse, silently alter every default profile JSON the campaign compares against.
+    #[cfg(feature = "poll-head-probe")]
+    if let Some(probe) = poll_head_probe
+        && let Some(map) = value.as_object_mut()
+    {
+        map.insert(
+            "poll_head_probe_head_line_cold".into(),
+            probe.head_line_cold.into(),
+        );
+        map.insert(
+            "poll_head_probe_prefilter_reject".into(),
+            probe.prefilter_reject.into(),
+        );
+        map.insert(
+            "poll_head_probe_negative_cacheable".into(),
+            probe.negative_cacheable.into(),
+        );
+        map.insert(
+            "poll_head_probe_negative_volatile".into(),
+            probe.negative_volatile.into(),
+        );
+        map.insert("poll_head_probe_found".into(), probe.found.into());
+        map.insert(
+            "poll_head_probe_last_found_head".into(),
+            probe.last_found_head.into(),
+        );
+    }
+    value
 }
 
 pub(super) fn print_perf_counter_row(

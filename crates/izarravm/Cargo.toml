@@ -19,6 +19,8 @@ jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
 direct-admission-census = ["jit", "izarravm-cpu/direct-admission-census"]
 # Passthrough for the per-cell Direct link refusal census; see izarravm-cpu.
 direct-link-refusal-census = ["jit", "izarravm-cpu/direct-link-refusal-census"]
+# Passthrough for the read-only poll-head probe; see izarravm-cpu.
+poll-head-probe = ["jit", "izarravm-cpu/poll-head-probe", "izarravm-machine/poll-head-probe"]
 # Passthrough for the Direct call-out attribution diagnostic; see izarravm-cpu.
 direct-callout-attribution = ["jit", "izarravm-cpu/direct-callout-attribution"]
 # Passthrough for the store watchpoint; see izarravm-cpu.

@@ -1105,6 +1105,45 @@ impl PartialEq for ApertureCodeFlag {
 }
 impl Eq for ApertureCodeFlag {}
 
+/// What the poll-loop classifier WOULD have said at each straight-line run boundary, tallied
+/// while the Direct backend owns execution and the real classifier is therefore switched off.
+///
+/// This is the go/no-go for extending the analytic poll skip to Direct. `poll_skip_eligible`
+/// returns false whenever `jit_direct.backend_enabled()`, and `poll_skip_policy` independently
+/// admits only `ExecutionBackend::Interpreter`, so on every scoreboard fixture the classifier
+/// never runs and every existing poll counter reads zero. That is a gate, not a measurement:
+/// it says nothing about whether the classifier WOULD find anything. These five say exactly that.
+///
+/// Read-only by construction. `poll_head_possible` and `build_poll_loop` both take `&CpuGsw`;
+/// the mutation in the real path (the prefilter reject counter, the negative-cache store)
+/// belongs to the `poll_loop` WRAPPER, which this deliberately does not call. So the probe
+/// cannot perturb the classifier state it is measuring, and it leaves
+/// `poll_head_prefilter_rejects` and the negative cache untouched.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PollHeadProbeCounters {
+    /// The head line is not warm in the decode cache, so the classifier could not have looked.
+    pub head_line_cold: u64,
+    /// The cheap opcode prefilter rejected the head.
+    pub prefilter_reject: u64,
+    /// Full scan, no shape matched, for code-byte reasons.
+    pub negative_cacheable: u64,
+    /// Full scan, a shape matched but a register or segment check failed.
+    pub negative_volatile: u64,
+    /// A certified poll shape WAS found. This is the number that decides the lever.
+    pub found: u64,
+    /// Linear address of the most recent `found` head, so the block can be identified later
+    /// without trusting a top-N ranking.
+    pub last_found_head: u32,
+}
+
+impl PartialEq for PollHeadProbeCounters {
+    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for PollHeadProbeCounters {}
+
 /// Lever 1 (interpreter FastMap serve path) hit/miss counters. Kept OUT of `PerfCounters` and at
 /// the very tail of `CpuGsw`, following the `PollSkipMemoryCounters` pattern
 /// exactly: these two fields were first added directly to `PerfCounters` and, AT THE TIME, moved
@@ -1990,6 +2029,11 @@ pub struct CpuGsw {
     poll_skip_memory: PollSkipMemoryCounters,
     /// See `ApertureCodeFlag`; at the tail so `pending_flags` keeps its pinned offset.
     pub(crate) has_aperture_code: ApertureCodeFlag,
+    /// Poll-head probe tally, feature-gated and at the tail for exactly the reason the field
+    /// above is: this must not move `pending_flags` off its pinned offset. See
+    /// `PollHeadProbeCounters`.
+    #[cfg(feature = "poll-head-probe")]
+    poll_head_probe: PollHeadProbeCounters,
     /// Cached mirror of `fast_map_population_enabled()`, refreshed at every state change that
     /// predicate depends on (`set_mode`, `finish_direct_execution_transition` -- see
     /// `memory.rs::refresh_fast_map_serve_gate` for the exact call-site inventory). The
@@ -2138,6 +2182,8 @@ impl Default for CpuGsw {
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
             has_aperture_code: ApertureCodeFlag(false),
+            #[cfg(feature = "poll-head-probe")]
+            poll_head_probe: PollHeadProbeCounters::default(),
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",

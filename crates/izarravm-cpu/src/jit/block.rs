@@ -631,6 +631,54 @@ impl CpuGsw {
     /// cached. `&mut self` mutates host bookkeeping only (cache slots and
     /// perf counters), never guest state. The loop-head prefilter answers
     /// the dominant non-poll boundaries before any cache probe or scan.
+    /// Tally what `poll_loop` WOULD have answered here, without answering it and without
+    /// touching anything it maintains.
+    ///
+    /// Deliberately does NOT call `poll_loop`: that wrapper bumps `poll_head_prefilter_rejects`
+    /// and writes the negative cache, and a probe that moved either would be measuring itself.
+    /// It calls the two read-only pieces directly, both of which take `&CpuGsw`.
+    ///
+    /// Deliberately does NOT consult `poll_skip_eligible` either. That predicate is false
+    /// whenever the Direct backend is enabled, which is precisely the configuration this probe
+    /// exists to measure; gating on it would return "no" on every fixture and answer nothing.
+    /// The persona and privilege terms of that predicate are still worth knowing, so they are
+    /// applied here in the same order minus the backend term.
+    #[cfg(feature = "poll-head-probe")]
+    pub fn probe_poll_head(&mut self) {
+        let eligible_ignoring_backend = matches!(
+            self.persona(),
+            crate::CpuPersona::I486 | crate::CpuPersona::I586
+        ) && !self.interrupt_shadow
+            && (!self.is_protected_mode()
+                || (!self.is_v86_mode() && self.current_privilege_level() <= self.iopl()));
+        if !eligible_ignoring_backend {
+            self.poll_head_probe.head_line_cold += 1;
+            return;
+        }
+        let lin = self.linear_eip();
+        let d = self.registers.cs().default_size_32;
+        if !poll_head_possible(self, lin, d) {
+            self.poll_head_probe.prefilter_reject += 1;
+            return;
+        }
+        match build_poll_loop(self) {
+            PollScanOutcome::Found(poll) => {
+                self.poll_head_probe.found += 1;
+                if let Some((linear, _, _)) = poll.fetch(0) {
+                    self.poll_head_probe.last_found_head = linear;
+                }
+            }
+            PollScanOutcome::NegativeCacheable => self.poll_head_probe.negative_cacheable += 1,
+            PollScanOutcome::NegativeVolatile => self.poll_head_probe.negative_volatile += 1,
+        }
+    }
+
+    /// Read the probe tally. Diagnostic only.
+    #[cfg(feature = "poll-head-probe")]
+    pub fn poll_head_probe(&self) -> crate::PollHeadProbeCounters {
+        self.poll_head_probe
+    }
+
     pub fn poll_loop(&mut self) -> Option<PollLoop> {
         if !self.poll_skip_eligible() {
             return None;

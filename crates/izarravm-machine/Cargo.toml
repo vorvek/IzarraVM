@@ -14,6 +14,7 @@ authors.workspace = true
 # Forward the CPU template JIT by default. Disabling defaults keeps the interpreter-only path.
 default = ["jit"]
 jit = ["izarravm-cpu/jit"]
+poll-head-probe = ["jit", "izarravm-cpu/poll-head-probe"]
 
 [dependencies]
 thiserror.workspace = true

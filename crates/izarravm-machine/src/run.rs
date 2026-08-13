@@ -1196,6 +1196,13 @@ impl Machine {
                             }
                             align
                         } else {
+                            // The classifier is gated off here, which is the whole point: this
+                            // is the Direct configuration every scoreboard fixture runs in, and
+                            // it is why every poll counter reads zero on all ten of them. Tally
+                            // what the classifier WOULD have said, read-only, so the zeros can be
+                            // told apart from "there was nothing to find".
+                            #[cfg(feature = "poll-head-probe")]
+                            cpu.probe_poll_head();
                             false
                         };
                         // Logs the bus field itself (not an independent `batch_core`

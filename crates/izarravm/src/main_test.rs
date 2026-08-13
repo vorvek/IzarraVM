@@ -658,6 +658,7 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         fast_map_probe,
         fast_map_audit,
         code_watch_edges,
+        None,
     );
     let object = report.as_object().unwrap();
     let keys: Vec<_> = object.keys().map(String::as_str).collect();
@@ -716,6 +717,7 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
             ..Default::default()
         },
         izarravm_cpu::CodeWatchEdgeCounters::default(),
+        None,
     );
     let zero_object = zeros.as_object().unwrap();
     assert_eq!(zero_object.len(), PERF_COUNTER_KEYS.len());
