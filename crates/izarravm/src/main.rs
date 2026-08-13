@@ -1787,6 +1787,60 @@ fn direct_barrier_census_json(
         });
         report
     };
+    // B.3's dormant-heat histogram, a SIBLING block to `closure` rather than more keys inside it:
+    // the closure block is pinned key-for-key by
+    // `direct_barrier_census_json_exposes_the_closure_block`, and that pin is the thing that makes
+    // a silent schema drift fail loudly. Growing it would spend the pin instead of using it.
+    #[cfg(feature = "barrier-census-closure")]
+    let report = {
+        let mut report = report;
+        let class = |targets: &[(&'static str, u64)]| {
+            targets
+                .iter()
+                .find(|(label, _)| *label == "dormant_heat")
+                .map_or(0, |(_, count)| *count)
+        };
+        let head_static: u64 = snapshot
+            .dormant_heat_sites
+            .iter()
+            .map(|site| site.static_exits)
+            .sum();
+        let head_dynamic: u64 = snapshot
+            .dormant_heat_sites
+            .iter()
+            .map(|site| site.dynamic_exits)
+            .sum();
+        report["dormant_heat"] = json!({
+            // The C3 identity, readable inside ONE object: head + truncated tail must equal the
+            // class total on each lane. A nonzero difference is an instrument defect, never a
+            // fact about the guest.
+            "class_static": class(&snapshot.unbound_targets),
+            "class_dynamic": class(&snapshot.dynamic_miss_targets),
+            "head_static": head_static,
+            "head_dynamic": head_dynamic,
+            "truncated_static": snapshot.dormant_heat_truncated_static,
+            "truncated_dynamic": snapshot.dormant_heat_truncated_dynamic,
+            "unattributed_static": class(&snapshot.unbound_targets)
+                .saturating_sub(head_static + snapshot.dormant_heat_truncated_static),
+            "unattributed_dynamic": class(&snapshot.dynamic_miss_targets)
+                .saturating_sub(head_dynamic + snapshot.dormant_heat_truncated_dynamic),
+            "distinct_sites": snapshot.dormant_heat_distinct_sites,
+            "walked_entries_run_wide": snapshot.walked_entries_run_wide,
+            // Hex, per the `vga_wipe_census_json` port/selector/value precedent. A guest linear
+            // read as decimal is unusable: the reader's next move is to cross it against a map
+            // file, a disassembly or the SMC shape table, all of which are hex, and 141.7M exits'
+            // worth of addresses is not a place to make them convert by hand.
+            "sites": snapshot.dormant_heat_sites.iter().map(|site| json!({
+                "linear": format!("0x{:08X}", site.linear),
+                "static_exits": site.static_exits,
+                "dynamic_exits": site.dynamic_exits,
+                "compile_walked": site.compile_walked,
+                "imm_lane_matched": site.imm_lane_matched,
+                "disp_lane_matched": site.disp_lane_matched,
+            })).collect::<Vec<_>>(),
+        });
+        report
+    };
     #[cfg(feature = "direct-admission-census")]
     let report = {
         let mut report = report;

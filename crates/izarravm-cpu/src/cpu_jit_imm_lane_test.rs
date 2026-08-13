@@ -160,6 +160,51 @@ fn lane_fixture(imm: u32) -> (CpuGsw, TestBus, jit::direct::BlockId) {
     (cpu, bus, id)
 }
 
+/// B.3's lane-match export reports a POSITIVE: `imm_lane_for` fired on a walk from this entry, so
+/// the site's demotions are not a lane-coverage problem.
+///
+/// The other lane-probe fixture only ever observes `compile_walked` with both lane bits clear,
+/// which a build that hard-coded `imm_lane_matched = false` would pass. This is the fixture that
+/// proves the IMM bit can be set at all — and it is the column §B.4's hypothesis is read out of,
+/// so a column stuck at false would refute that hypothesis for free.
+///
+/// Named for the CI filter (`barrier_census_closure`) rather than for this file's own convention:
+/// the feature build runs by name, and a fixture the feature job never runs is not a gate.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn barrier_census_closure_dormant_heat_site_reports_a_matched_imm_lane() {
+    let mut cpu = flat_cpu();
+    let mut bus = test_bus(image(0x1234_5678));
+    cpu.enable_direct_barrier_census(true);
+    decode_at(&mut cpu, &mut bus, &block_starts());
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("fixture block compiles");
+    assert_eq!(
+        compilation.imm_lane_count(),
+        1,
+        "the fixture ADD did not take a lane; the assertion below would be vacuous"
+    );
+
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let site = snapshot
+        .dormant_heat_sites
+        .iter()
+        .find(|site| site.linear == ENTRY)
+        .expect("histogram site");
+    assert!(site.compile_walked);
+    assert!(
+        site.imm_lane_matched,
+        "imm_lane_for attached a lane on a walk from this entry"
+    );
+    assert!(
+        !site.disp_lane_matched,
+        "no 0x8a disp shape in this fixture"
+    );
+}
+
 /// The emitter: a lane block's result must equal the interpreter's, including after the guest
 /// patches the immediate between executions. The interpreter side runs the same bytes with no
 /// block at all, so it re-decodes the patched instruction and is the reference by construction.

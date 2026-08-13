@@ -1521,6 +1521,55 @@ pub struct DirectBarrierCensusRow {
     pub max_native_suffix: u8,
 }
 
+/// One block entry parked `Dormant(SpanHot)` by the G1 SMC-heat gate, with the lane-match answer
+/// for the compile walks that started there.
+///
+/// WALK, not TRIAL, throughout — the two are different mechanisms and conflating them misreads
+/// the column. A `lane trial` is the heat gate's one-per-key-per-epoch exception, which installs
+/// only if the compilation registered a mutable lane. A `compile walk` is any pass of
+/// `compile_with_instruction_limit` from this entry, trial or ordinary. What this record observes
+/// is walks; trials are a subset of them and the census cannot tell which pass was which.
+///
+/// The three booleans are the §B.4 test:
+///
+/// * `compile_walked == false` — no walk ever started from this entry. Widening the lane class
+///   cannot be shown to help this site, because nothing here has ever been offered to a lane
+///   matcher. See the field's own doc for why this is a WEAK negative.
+/// * `compile_walked && !imm_lane_matched && !disp_lane_matched` — a walk ran and no lane matcher
+///   fired on any of its slots. THIS is the population the "one-byte imm lane class" slice would
+///   convert, and its size against the whole is what confirms or refutes the hypothesis that the
+///   5.1M uncovered one-byte-imm patch events are what the failing lane trials are made of.
+/// * either lane bit set — a lane did match here, so the site's demotions are not a lane-coverage
+///   problem at all.
+#[cfg(feature = "barrier-census-closure")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectDormantHeatSite {
+    /// Block entry linear. Keyed on linear alone, so two dormant spans sharing a linear across
+    /// mode or physical merge — the same caveat the rejected-span map carries.
+    pub linear: u32,
+    /// Static-lane exits that landed on this dormant key.
+    pub static_exits: u64,
+    /// Dynamic-lane (computed RET/JMP/CALL) misses that landed on it.
+    pub dynamic_exits: u64,
+    /// A compile walk started from this entry at least once WHILE THE CENSUS WAS ARMED.
+    ///
+    /// A ONE-SIDED reading only. `true` is sound: a walk really did run. `false` is NOT proof that
+    /// no walk ever ran, and the reason is the same arming caveat `static_unbound_exits` carries —
+    /// `enable_direct_barrier_census` can arm mid-run, and `barrier_census_default` only arms at
+    /// process start when `IZARRAVM_DIRECT_BARRIER_CENSUS=1`. Every walk before the arm is
+    /// invisible, so a site walked only during warm-up reads `false` forever. `JitState::clone`
+    /// drops the census outright and produces the same false negative.
+    ///
+    /// Consequence for §B.4: the `compile_walked == false` bucket is an UPPER bound on "never
+    /// offered to a lane matcher", never a measurement of it. Only arm at process start before
+    /// reading that bucket as evidence for a policy parameter over a lane class.
+    pub compile_walked: bool,
+    /// `imm_lane_for` attached a lane on some slot of some walk from this entry.
+    pub imm_lane_matched: bool,
+    /// `disp_lane_for` did.
+    pub disp_lane_matched: bool,
+}
+
 /// Deterministically sorted snapshot of the Direct structural-stop census.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectBarrierCensusSnapshot {
@@ -1575,6 +1624,42 @@ pub struct DirectBarrierCensusSnapshot {
     /// honest signal for stale-hit mis-attribution, which neither residual above can detect.
     #[cfg(feature = "barrier-census-closure")]
     pub rejected_barrier_overwrites: u64,
+    /// B.3: the `dormant_heat` linear histogram, descending by total exits, head-limited.
+    ///
+    /// The census records addresses for the `Rejected` class alone, so the 141.7M `dormant_heat`
+    /// exits on duke3d-486 (35.7% of the static-unbound population, 45.5% at 586) could not be
+    /// told apart as fifty sites or fifty thousand — and the Track B fork between a targeted lane
+    /// class and a policy-parameter sweep turns on exactly that. This is the instrument that comes
+    /// before the knob.
+    #[cfg(feature = "barrier-census-closure")]
+    pub dormant_heat_sites: Vec<DirectDormantHeatSite>,
+    /// Static-lane exits below the published head. Summed, never dropped: with it,
+    /// `sum(dormant_heat_sites.static_exits) + dormant_heat_truncated_static` equals the
+    /// `dormant_heat` entry of `unbound_targets` exactly, at any head size.
+    #[cfg(feature = "barrier-census-closure")]
+    pub dormant_heat_truncated_static: u64,
+    /// The dynamic-lane twin, closing against `dynamic_miss_targets`.
+    #[cfg(feature = "barrier-census-closure")]
+    pub dormant_heat_truncated_dynamic: u64,
+    /// How many distinct linears the histogram holds. THE number B.3 is asked for: a small value
+    /// with a top-heavy head says targeted lane work, a large flat one says the policy sweep.
+    #[cfg(feature = "barrier-census-closure")]
+    pub dormant_heat_distinct_sites: u64,
+    /// How many distinct block entries a compile walk started from ANYWHERE IN THE RUN, which is
+    /// the set the per-site `compile_walked` column is looked up in.
+    ///
+    /// RUN-WIDE and named so. It counts every entry the backend ever walked — overwhelmingly
+    /// ordinary, never-dormant, successfully-compiled blocks — so it is a SUPERSET of the walked
+    /// dormant-heat sites and shares no denominator with `dormant_heat_distinct_sites`. Ratioing
+    /// the two produces a number that means nothing; the walked share of dormant-heat sites is
+    /// `dormant_heat_sites.iter().filter(|s| s.compile_walked).count()`, computed over the head.
+    ///
+    /// It is published inside the `dormant_heat` block anyway because it is the only thing that
+    /// distinguishes "the census was armed and walking" from "the census was armed too late to
+    /// see anything", which is exactly the arming caveat `compile_walked` carries: a zero here
+    /// with a non-empty site list means every `compile_walked == false` is an artifact.
+    #[cfg(feature = "barrier-census-closure")]
+    pub walked_entries_run_wide: u64,
     #[cfg(feature = "direct-admission-census")]
     /// Partial attribution of Direct admission declines as (label, count). It intentionally does
     /// not include every route that can return to the interpreter.

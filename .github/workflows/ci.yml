@@ -63,7 +63,7 @@ jobs:
           cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-link-refusal-census -- -D warnings
           cargo check -p izarravm --no-default-features --features barrier-census-closure
           cargo test -p izarravm-cpu --no-default-features --features barrier-census-closure barrier_census_closure
-          cargo test -p izarravm --no-default-features --features barrier-census-closure direct_barrier_census_json_exposes_the_closure_block
+          cargo test -p izarravm --no-default-features --features barrier-census-closure direct_barrier_census_json
           cargo test -p izarravm --no-default-features direct_barrier_census_json_omits_the_closure_block_without_feature
           cargo test -p izarravm --no-default-features --features barrier-census-closure hdd_profile_json_reports_fixed_time_and_native_metrics
           cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features barrier-census-closure -- -D warnings

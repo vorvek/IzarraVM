@@ -1104,10 +1104,92 @@ pub(crate) struct DirectBarrierCensus {
     /// both residuals read zero.
     #[cfg(feature = "barrier-census-closure")]
     rejected_barrier_overwrites: u64,
+    /// B.3: the `DormantHeat` linear histogram — block entry linear -> `(static, dynamic)` exits.
+    ///
+    /// `note_unbound_target` has always RECEIVED the entry linear and discarded it for every class
+    /// but `Rejected`, so the census could count 141.7M `dormant_heat` exits on duke and not say
+    /// whether they were fifty addresses or fifty thousand. The whole Track B fork — targeted lane
+    /// class versus policy-parameter sweep — turns on that one question, and no knob should be
+    /// swept against a class whose addresses are unknown.
+    ///
+    /// Keyed on linear alone and never pruned, exactly like `rejected_barrier`, and it inherits
+    /// that map's caveat unchanged: two dormant spans sharing a linear across mode/physical merge
+    /// into one row. Acceptable for a diagnostic whose question is "concentrated or diffuse".
+    ///
+    /// Both lanes in ONE map with two columns rather than two maps, mirroring `BarrierStats`:
+    /// Slice 4's lesson is that the two lanes move by wildly different factors for the same row,
+    /// so they must be separable — but they are separable as columns, and a site that exits both
+    /// ways is one site.
+    #[cfg(feature = "barrier-census-closure")]
+    dormant_heat_sites: HashMap<u32, DormantHeatStats>,
+    /// B.3's lane-match export: block entry linear -> `LaneProbe` bits, recorded by the compile
+    /// walk itself.
+    ///
+    /// This is the field that TESTS the §B.4 hypothesis "the 5.1M uncovered one-byte-imm patch
+    /// events are the population behind the 24,722 failing lane trials". A `WALKED` bit with no
+    /// `IMM`/`DISP` bit means a compile walk ran over these bytes and no lane matcher fired on any
+    /// slot of it — the region is not lane-shaped, whatever else is true of it. Joined against
+    /// `dormant_heat_sites` on the same key, that answers the hypothesis directly instead of
+    /// inferring it from two aggregates that were never shown to describe the same population.
+    ///
+    /// WALK, NOT TRIAL. The heat gate's `lane trial` is the one-per-key-per-epoch exception that
+    /// installs only when the compilation registered a lane; a `compile walk` is any pass of
+    /// `compile_with_instruction_limit`, trial or ordinary, and this map records walks. Trials are
+    /// a subset and nothing here can say which pass was one. That is fine for §B.4 — the question
+    /// is whether the BYTES are lane-shaped, and an ordinary walk answers it as well as a trial —
+    /// but the two words must not be swapped, because "a trial was spent here" is a claim about
+    /// the epoch budget that this record cannot support.
+    ///
+    /// Keyed on the block ENTRY linear, not on the laned instruction's own address, and that is
+    /// deliberate: the heat gate refuses per KEY, the trial budget is spent per KEY, and
+    /// `dormant_heat_sites` is keyed per KEY. Keying on the instruction would make the join a
+    /// coincidence of which 16-byte chunk the laned slot happened to fall in.
+    ///
+    /// A SET, not a tally: `compile_with_page_len` binary-searches the prefix length and re-walks
+    /// the same entry several times, so a count here would report host search effort as guest
+    /// behaviour. Bit-or is idempotent under that re-walk.
+    #[cfg(feature = "barrier-census-closure")]
+    lane_probes: HashMap<u32, u8>,
     #[cfg(feature = "direct-admission-census")]
     /// Partial attribution of dispatcher declines. Other routes remain outside this array.
     admission_declines: [u64; AdmissionDecline::COUNT],
 }
+
+/// The two exit columns of one `dormant_heat` site. Mirrors `BarrierStats`'s static/dynamic split.
+#[cfg(feature = "barrier-census-closure")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DormantHeatStats {
+    static_exits: u64,
+    dynamic_exits: u64,
+}
+
+/// Which lane matcher, if any, ever fired on a compile walk from a given block entry.
+///
+/// `WALKED` is carried apart from the two lane bits so the export can tell "a walk ran over these
+/// bytes and no matcher fired" from "no walk was ever seen here". Those are different answers to
+/// §B.4: the first says the region is genuinely not lane-shaped, the second says nothing at all
+/// about its shape, and only the first supports widening the lane class.
+///
+/// The second is also a WEAK negative — the census may simply have been armed after the walk. See
+/// `DirectDormantHeatSite::compile_walked` for that caveat, which bounds how far the absence can
+/// be read.
+#[cfg(feature = "barrier-census-closure")]
+pub(crate) mod lane_probe {
+    /// A compile walk started from this entry linear.
+    pub(crate) const WALKED: u8 = 1;
+    /// `imm_lane_for` attached a lane on some slot of that walk.
+    pub(crate) const IMM: u8 = 2;
+    /// `disp_lane_for` attached a lane on some slot of that walk.
+    pub(crate) const DISP: u8 = 4;
+}
+
+/// How many `dormant_heat` sites the snapshot publishes, descending by total exits.
+///
+/// The tail is not dropped: it is summed into `dormant_heat_truncated_*` so the closure identity
+/// below holds against the class total whatever this constant is. 64 matches the SMC trace's
+/// `REPORT_SITES`, and B.3's decision rule only needs the top 50.
+#[cfg(feature = "barrier-census-closure")]
+pub(crate) const DORMANT_HEAT_SITES: usize = 64;
 
 impl DirectBarrierCensus {
     #[cfg(feature = "direct-admission-census")]
@@ -1135,6 +1217,27 @@ impl DirectBarrierCensus {
         };
         let row = self.rows.entry(key).or_default();
         row.unbound_exits = row.unbound_exits.saturating_add(1);
+    }
+
+    /// Record one `DormantHeat` exit against the block entry linear it failed to reach.
+    ///
+    /// UNCONDITIONAL on the class already having been counted by `note_unbound`, which is what
+    /// makes the closure exact rather than approximate: there is no early return, no lookup that
+    /// can miss, and therefore no residual to carry. `rejected_barrier` needs a residual because
+    /// it resolves a linear through a map that may not hold it; this histogram IS the map.
+    #[cfg(feature = "barrier-census-closure")]
+    fn note_dormant_heat_at(&mut self, linear: u32, dynamic: bool) {
+        let site = self.dormant_heat_sites.entry(linear).or_default();
+        if dynamic {
+            site.dynamic_exits = site.dynamic_exits.saturating_add(1);
+        } else {
+            site.static_exits = site.static_exits.saturating_add(1);
+        }
+    }
+
+    #[cfg(feature = "barrier-census-closure")]
+    fn note_lane_probe(&mut self, entry_linear: u32, bits: u8) {
+        *self.lane_probes.entry(entry_linear).or_default() |= bits;
     }
 
     /// The dynamic-lane counterpart. Same map, separate column: the two lanes have different
@@ -1217,7 +1320,60 @@ impl DirectBarrierCensus {
         }
     }
 
+    /// Top-`DORMANT_HEAT_SITES` sites plus the summed tail, joined against the lane-probe set.
+    ///
+    /// Returns `(rows, truncated_static, truncated_dynamic, distinct_sites)`. The two truncated
+    /// sums are what keeps the C3-style closure identity
+    ///
+    ///     sum(rows.static_exits) + truncated_static == unbound[DormantHeat]
+    ///
+    /// true independently of the head size, which is the whole reason the tail is summed rather
+    /// than dropped: a truncated head would make the histogram silently under-report the class it
+    /// exists to explain, and that is exactly the instrument defect the Prince census's first run
+    /// turned out to be.
+    #[cfg(feature = "barrier-census-closure")]
+    fn dormant_heat_snapshot(&self) -> (Vec<crate::DirectDormantHeatSite>, u64, u64, u64) {
+        let mut sites: Vec<_> = self
+            .dormant_heat_sites
+            .iter()
+            .map(|(&linear, &stats)| (linear, stats))
+            .collect();
+        // Descending by TOTAL exits, tiebroken by linear so the head is deterministic across runs
+        // with identical counts -- a census whose head reorders between two runs cannot be diffed.
+        sites.sort_by(|(left_linear, left), (right_linear, right)| {
+            (right.static_exits + right.dynamic_exits)
+                .cmp(&(left.static_exits + left.dynamic_exits))
+                .then_with(|| left_linear.cmp(right_linear))
+        });
+        let distinct = sites.len() as u64;
+        let tail = sites.split_off(sites.len().min(DORMANT_HEAT_SITES));
+        let truncated_static = tail.iter().map(|(_, stats)| stats.static_exits).sum();
+        let truncated_dynamic = tail.iter().map(|(_, stats)| stats.dynamic_exits).sum();
+        let rows = sites
+            .into_iter()
+            .map(|(linear, stats)| {
+                let probe = self.lane_probes.get(&linear).copied().unwrap_or(0);
+                crate::DirectDormantHeatSite {
+                    linear,
+                    static_exits: stats.static_exits,
+                    dynamic_exits: stats.dynamic_exits,
+                    compile_walked: probe & lane_probe::WALKED != 0,
+                    imm_lane_matched: probe & lane_probe::IMM != 0,
+                    disp_lane_matched: probe & lane_probe::DISP != 0,
+                }
+            })
+            .collect();
+        (rows, truncated_static, truncated_dynamic, distinct)
+    }
+
     pub(crate) fn snapshot(&self) -> DirectBarrierCensusSnapshot {
+        #[cfg(feature = "barrier-census-closure")]
+        let (
+            dormant_heat_sites,
+            dormant_heat_truncated_static,
+            dormant_heat_truncated_dynamic,
+            dormant_heat_distinct_sites,
+        ) = self.dormant_heat_snapshot();
         let mut keyed_rows: Vec<_> = self
             .rows
             .iter()
@@ -1262,6 +1418,16 @@ impl DirectBarrierCensus {
             dynamic_rejected_unattributed: self.dynamic_rejected_unattributed,
             #[cfg(feature = "barrier-census-closure")]
             rejected_barrier_overwrites: self.rejected_barrier_overwrites,
+            #[cfg(feature = "barrier-census-closure")]
+            dormant_heat_sites,
+            #[cfg(feature = "barrier-census-closure")]
+            dormant_heat_truncated_static,
+            #[cfg(feature = "barrier-census-closure")]
+            dormant_heat_truncated_dynamic,
+            #[cfg(feature = "barrier-census-closure")]
+            dormant_heat_distinct_sites,
+            #[cfg(feature = "barrier-census-closure")]
+            walked_entries_run_wide: self.lane_probes.len() as u64,
             #[cfg(feature = "direct-admission-census")]
             admission_declines: AdmissionDecline::ALL
                 .iter()
@@ -1352,6 +1518,28 @@ impl crate::jit::JitState {
             if kind == UnboundTarget::Rejected {
                 census.note_unbound_rejected_at(linear);
             }
+            // B.3. The linear was already in hand and already discarded for this class; recording
+            // it is one more `if kind ==` arm and one more map, which is the smallest change that
+            // can answer "concentrated or diffuse" for the largest remaining lever.
+            #[cfg(feature = "barrier-census-closure")]
+            if kind == UnboundTarget::DormantHeat {
+                census.note_dormant_heat_at(linear, false);
+            }
+        }
+    }
+
+    /// Record that a compile walk from `entry_linear` ran, and which lane matcher (if any) fired
+    /// on it. See `DirectBarrierCensus::lane_probes` for why this is keyed on the block entry and
+    /// why it is a set rather than a tally.
+    ///
+    /// The CALLER gates on `barrier_census_active` before building the bits, the same contract
+    /// `note_barrier_census_interpreted` carries: this sits inside the compile loop and inside
+    /// `compile_with_page_len`'s prefix search, so an `is_some` check inside the callee would be
+    /// paid once per slot per search step.
+    #[cfg(feature = "barrier-census-closure")]
+    pub(crate) fn note_lane_probe(&mut self, entry_linear: u32, bits: u8) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.note_lane_probe(entry_linear, bits);
         }
     }
 
@@ -1396,6 +1584,10 @@ impl crate::jit::JitState {
             census.note_unbound_dynamic(kind);
             if kind == UnboundTarget::Rejected {
                 census.note_dynamic_rejected_at(linear);
+            }
+            #[cfg(feature = "barrier-census-closure")]
+            if kind == UnboundTarget::DormantHeat {
+                census.note_dormant_heat_at(linear, true);
             }
         }
     }

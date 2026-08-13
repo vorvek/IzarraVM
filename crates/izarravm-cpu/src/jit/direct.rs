@@ -6,7 +6,7 @@
 mod callout;
 #[cfg(feature = "direct-callout-attribution")]
 mod callout_attribution;
-mod census;
+pub(crate) mod census;
 mod classify;
 mod emit;
 mod native_exit;
@@ -4852,6 +4852,15 @@ fn compile_with_instruction_limit(
     let Some(key) = key_for(cpu, entry_lin, d) else {
         return CompileOutcome::Retry;
     };
+    // B.3: "a compile walk started here", recorded before anything can refuse the block, so a walk
+    // that stops on its first slot still counts as tried. `key.linear()` and not `entry_lin` on
+    // purpose -- `classify_unbound_exit` reports the same canonicalized value, and the whole point
+    // of this map is that it joins against the dormant-heat histogram on an identical key.
+    #[cfg(feature = "barrier-census-closure")]
+    if cpu.jit_direct.barrier_census_active() {
+        cpu.jit_direct
+            .note_lane_probe(key.linear(), census::lane_probe::WALKED);
+    }
     let cs = cpu.registers.cs();
     let entry_eip = entry_lin.wrapping_sub(cs.base);
     let mut slots = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
@@ -5283,10 +5292,16 @@ fn compile_with_instruction_limit(
         // could never match, but also a lane the block does not actually read through.
         // The two lane matchers are mutually exclusive by kind (`AluImm` vs `Load`), so at most
         // one fires per slot and both draw on the one `MAX_BLOCK_IMM_LANES` budget.
+        #[cfg(feature = "barrier-census-closure")]
+        let mut lane_probe_bits = 0u8;
         let kind = match imm_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
             Some((kind, lane)) => {
                 imm_lanes[imm_lane_count] = lane.physical;
                 imm_lane_count += 1;
+                #[cfg(feature = "barrier-census-closure")]
+                {
+                    lane_probe_bits |= census::lane_probe::IMM;
+                }
                 kind
             }
             None => match disp_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
@@ -5294,11 +5309,23 @@ fn compile_with_instruction_limit(
                     imm_lanes[imm_lane_count] = lane.physical;
                     imm_lane_count += 1;
                     disp_lane_count += 1;
+                    #[cfg(feature = "barrier-census-closure")]
+                    {
+                        lane_probe_bits |= census::lane_probe::DISP;
+                    }
                     kind
                 }
                 None => kind,
             },
         };
+        // B.3's lane-match export. Gated at the CALL SITE per the census contract, and only when a
+        // matcher actually fired: the `WALKED` bit is recorded once at the top of the walk, so the
+        // common no-lane slot pays a compare against zero and nothing else.
+        #[cfg(feature = "barrier-census-closure")]
+        if lane_probe_bits != 0 && cpu.jit_direct.barrier_census_active() {
+            cpu.jit_direct
+                .note_lane_probe(key.linear(), lane_probe_bits);
+        }
         fetch_lens[slots.len()] = insn.len;
         slots.push(DirectInsn {
             lin,

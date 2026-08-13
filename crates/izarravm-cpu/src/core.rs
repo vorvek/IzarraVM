@@ -1205,6 +1205,23 @@ impl CpuGsw {
         }
     }
 
+    /// Drive one `dormant_heat` exit into the census from OUTSIDE this crate.
+    ///
+    /// Exists for the `izarravm` crate's JSON-schema fixtures, which own the reporting surface and
+    /// cannot reach `JitState::note_unbound_target` (it is `pub(crate)`). Without it the only
+    /// dormant-heat JSON a downstream test can produce is the zero snapshot, and a zero snapshot
+    /// cannot tell a carried site list from a hard-coded empty one.
+    #[cfg(all(feature = "jit", feature = "barrier-census-closure"))]
+    pub fn note_dormant_heat_exit_for_test(&mut self, linear: u32, dynamic: bool) {
+        if dynamic {
+            self.jit_direct
+                .note_dynamic_miss_target(crate::jit::direct::UnboundTarget::DormantHeat, linear);
+        } else {
+            self.jit_direct
+                .note_unbound_target(crate::jit::direct::UnboundTarget::DormantHeat, linear);
+        }
+    }
+
     /// The census snapshot, JOINED with the two perf counters its classes are designed to close
     /// on. This is the only seam where that join can happen: the census lives on `JitState` and
     /// cannot see `PerfCounters`, and `direct_barrier_census_json` receives a snapshot and no CPU.

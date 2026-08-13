@@ -445,6 +445,74 @@ fn direct_barrier_census_json_exposes_the_closure_block() {
     );
 }
 
+/// B.3's histogram block is a SIBLING of `closure`, and its key set is pinned the same way and for
+/// the same reason: this JSON is what the campaign diffs, so a schema change must fail a test
+/// rather than quietly appear in a report.
+///
+/// The per-site rows are exercised by the cpu-crate fixtures; what this pins is the block's own
+/// shape, including the two `unattributed_*` keys, which are the C3 identity made readable
+/// in-place instead of reconstructed by hand from two other blocks.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn direct_barrier_census_json_exposes_the_dormant_heat_block() {
+    let mut cpu = izarravm_cpu::CpuGsw::default();
+    cpu.enable_direct_barrier_census(true);
+
+    let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
+    assert_eq!(
+        report["dormant_heat"],
+        serde_json::json!({
+            "class_static": 0,
+            "class_dynamic": 0,
+            "head_static": 0,
+            "head_dynamic": 0,
+            "truncated_static": 0,
+            "truncated_dynamic": 0,
+            "unattributed_static": 0,
+            "unattributed_dynamic": 0,
+            "distinct_sites": 0,
+            "walked_entries_run_wide": 0,
+            "sites": [],
+        })
+    );
+}
+
+/// A site with exits actually reaches the JSON, with the lane-match columns carried.
+///
+/// The zero-snapshot pin above would pass on a build whose `sites` array was hard-coded empty, and
+/// an empty array is exactly what a diffuse-versus-concentrated reading would misread as
+/// "concentrated on nothing".
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn direct_barrier_census_json_carries_dormant_heat_sites_and_their_lane_match() {
+    let mut cpu = izarravm_cpu::CpuGsw::default();
+    cpu.enable_direct_barrier_census(true);
+    cpu.note_dormant_heat_exit_for_test(0x1234, false);
+    cpu.note_dormant_heat_exit_for_test(0x1234, false);
+    cpu.note_dormant_heat_exit_for_test(0x1234, true);
+
+    let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
+    assert_eq!(report["dormant_heat"]["class_static"], 2);
+    assert_eq!(report["dormant_heat"]["class_dynamic"], 1);
+    assert_eq!(report["dormant_heat"]["head_static"], 2);
+    assert_eq!(report["dormant_heat"]["unattributed_static"], 0);
+    assert_eq!(report["dormant_heat"]["unattributed_dynamic"], 0);
+    assert_eq!(report["dormant_heat"]["distinct_sites"], 1);
+    assert_eq!(
+        report["dormant_heat"]["sites"],
+        serde_json::json!([{
+            // Hex, per the vga_wipe_census_json precedent: a guest linear is cross-referenced
+            // against a map file or a disassembly, and both are hex.
+            "linear": "0x00001234",
+            "static_exits": 2,
+            "dynamic_exits": 1,
+            "compile_walked": false,
+            "imm_lane_matched": false,
+            "disp_lane_matched": false,
+        }])
+    );
+}
+
 /// The default build emits no `closure` key at all, rather than a block of nulls: a placeholder
 /// would change every profile JSON the campaign diffs against without announcing it.
 #[cfg(not(feature = "barrier-census-closure"))]
@@ -455,6 +523,7 @@ fn direct_barrier_census_json_omits_the_closure_block_without_feature() {
 
     let report = direct_barrier_census_json(cpu.direct_barrier_census_snapshot());
     assert!(report.get("closure").is_none());
+    assert!(report.get("dormant_heat").is_none());
 }
 
 #[cfg(feature = "direct-link-refusal-census")]

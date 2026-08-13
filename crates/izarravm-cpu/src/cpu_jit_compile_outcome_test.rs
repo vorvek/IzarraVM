@@ -3400,3 +3400,233 @@ fn barrier_census_closure_totals_match_the_class_arrays_and_the_perf_counters() 
     assert_eq!(snapshot.static_unbound_exits, 11);
     assert_eq!(snapshot.dynamic_miss_exits, 5);
 }
+
+/// B.3's closure identity: the `dormant_heat` histogram accounts for every exit of its class, on
+/// both lanes, with the truncated tail carried rather than dropped.
+///
+/// This is the C3 standard the `Rejected` histogram already meets, and it is the reason the
+/// instrument comes before the knob: a head-limited histogram that silently under-reported its own
+/// class would answer "concentrated" for any workload, because the tail is where diffuse mass
+/// lives by definition.
+///
+/// Note what is NOT here: a residual. `note_dormant_heat_at` has no lookup that can miss, so
+/// unlike `rejected_unattributed` there is no honest way for an exit to go unrecorded, and a
+/// residual field would be a slot that could only ever read zero.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn barrier_census_closure_dormant_heat_histogram_closes_on_its_class() {
+    let mut cpu = CpuGsw::default();
+    cpu.enable_direct_barrier_census(true);
+
+    // Three sites, uneven counts, both lanes, plus one exit of a DIFFERENT dormant class at a
+    // fourth linear: `DormantOther` must not enter the histogram, or the join is by address
+    // rather than by class.
+    for _ in 0..5 {
+        cpu.jit_direct
+            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+    }
+    for _ in 0..2 {
+        cpu.jit_direct
+            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x40);
+    }
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80);
+    for _ in 0..3 {
+        cpu.jit_direct
+            .note_dynamic_miss_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+    }
+    cpu.jit_direct
+        .note_dynamic_miss_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80);
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::DormantOther, ENTRY + 0xc0);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let class = |targets: &[(&'static str, u64)]| {
+        targets
+            .iter()
+            .find(|(label, _)| *label == "dormant_heat")
+            .expect("dormant_heat class")
+            .1
+    };
+    let class_static = class(&snapshot.unbound_targets);
+    let class_dynamic = class(&snapshot.dynamic_miss_targets);
+    assert_eq!(class_static, 8);
+    assert_eq!(class_dynamic, 4);
+
+    let head_static: u64 = snapshot
+        .dormant_heat_sites
+        .iter()
+        .map(|site| site.static_exits)
+        .sum();
+    let head_dynamic: u64 = snapshot
+        .dormant_heat_sites
+        .iter()
+        .map(|site| site.dynamic_exits)
+        .sum();
+    assert_eq!(
+        head_static + snapshot.dormant_heat_truncated_static,
+        class_static,
+        "the static histogram must account for every dormant_heat exit of its class"
+    );
+    assert_eq!(
+        head_dynamic + snapshot.dormant_heat_truncated_dynamic,
+        class_dynamic
+    );
+    assert_eq!(
+        snapshot.dormant_heat_distinct_sites, 3,
+        "the DormantOther exit at a fourth linear must not enter the histogram"
+    );
+    assert!(
+        snapshot
+            .dormant_heat_sites
+            .iter()
+            .all(|site| site.linear != ENTRY + 0xc0)
+    );
+
+    // Descending by TOTAL exits: ENTRY (5+3), then ENTRY+0x40 (2+0), then ENTRY+0x80 (1+1).
+    let order: Vec<u32> = snapshot
+        .dormant_heat_sites
+        .iter()
+        .map(|site| site.linear)
+        .collect();
+    assert_eq!(order, vec![ENTRY, ENTRY + 0x40, ENTRY + 0x80]);
+    assert_eq!(snapshot.dormant_heat_sites[0].static_exits, 5);
+    assert_eq!(snapshot.dormant_heat_sites[0].dynamic_exits, 3);
+}
+
+/// The head is limited and the tail is SUMMED, so the identity above survives truncation.
+///
+/// Written as its own fixture because the closure test cannot see this: with three sites nothing
+/// is truncated, and a build that dropped the tail outright would pass it. This is the fixture
+/// that proves the head limit is real and that the residual it produces is carried.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn barrier_census_closure_dormant_heat_histogram_carries_its_truncated_tail() {
+    const SITES: usize = jit::direct::census::DORMANT_HEAT_SITES + 20;
+    let mut cpu = CpuGsw::default();
+    cpu.enable_direct_barrier_census(true);
+
+    // Site `index` takes `SITES - index` exits, so the ordering is total and the tail is the 20
+    // smallest.
+    for index in 0..SITES {
+        for _ in 0..(SITES - index) {
+            cpu.jit_direct.note_unbound_target(
+                jit::direct::UnboundTarget::DormantHeat,
+                ENTRY + (index as u32) * 0x10,
+            );
+        }
+    }
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    assert_eq!(
+        snapshot.dormant_heat_sites.len(),
+        jit::direct::census::DORMANT_HEAT_SITES,
+        "the published head is limited"
+    );
+    assert_eq!(snapshot.dormant_heat_distinct_sites, SITES as u64);
+    assert_ne!(
+        snapshot.dormant_heat_truncated_static, 0,
+        "a fixture with an empty tail cannot prove the tail is carried"
+    );
+
+    let class_static = snapshot
+        .unbound_targets
+        .iter()
+        .find(|(label, _)| *label == "dormant_heat")
+        .expect("dormant_heat class")
+        .1;
+    let head_static: u64 = snapshot
+        .dormant_heat_sites
+        .iter()
+        .map(|site| site.static_exits)
+        .sum();
+    assert_eq!(
+        head_static + snapshot.dormant_heat_truncated_static,
+        class_static
+    );
+    // The head really is the LARGEST sites, not the first ones the map happened to yield.
+    assert_eq!(snapshot.dormant_heat_sites[0].static_exits, SITES as u64);
+    assert_eq!(
+        snapshot.dormant_heat_sites[jit::direct::census::DORMANT_HEAT_SITES - 1].static_exits,
+        (SITES - jit::direct::census::DORMANT_HEAT_SITES + 1) as u64
+    );
+}
+
+/// A dormant-heat site whose entry a compile walk actually reached reads `compile_walked`, and one
+/// no walk ever started from does not.
+///
+/// This is the distinction §B.4 turns on. "A walk ran over these bytes and no matcher fired"
+/// argues for widening the lane class; "no walk was ever seen here" says nothing about the shape
+/// at all. A single boolean conflating them would answer neither question.
+///
+/// WALK, not trial: the compile below is an ordinary `jit::direct::compile`, not the heat gate's
+/// one-per-key-per-epoch lane trial. That is the point — the map records walks of either kind, and
+/// this fixture pins that an ordinary one sets the bit.
+#[cfg(feature = "barrier-census-closure")]
+#[test]
+fn barrier_census_closure_dormant_heat_site_reports_whether_a_walk_ever_reached_it() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0x43, DIRECT_BARRIER]);
+    cpu.enable_direct_barrier_census(true);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3, ENTRY + 4],
+    );
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+    // A SECOND entry, walked but never dormant. It exists to make `walked_entries_run_wide`
+    // provably larger than the walked dormant-heat set below, which is the whole reason that
+    // field carries "run_wide" in its name: it is a superset over every entry the backend touched
+    // and shares no denominator with `dormant_heat_distinct_sites`.
+    let _ = jit::direct::compile(&mut cpu, ENTRY + 1, true);
+
+    const NEVER_WALKED: u32 = ENTRY + 0x4000;
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+    cpu.jit_direct
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, NEVER_WALKED);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let site = |linear: u32| {
+        *snapshot
+            .dormant_heat_sites
+            .iter()
+            .find(|site| site.linear == linear)
+            .expect("histogram site")
+    };
+    assert!(
+        site(ENTRY).compile_walked,
+        "an ordinary compile walk ran from ENTRY, so its bytes were offered to both lane matchers"
+    );
+    assert!(
+        !site(NEVER_WALKED).compile_walked,
+        "no walk was ever seen here, so the absence of a lane says nothing about the shape"
+    );
+    // Neither lane matcher can fire on `INC r32`, so this fixture also pins that `compile_walked`
+    // is carried apart from the two lane bits rather than implied by them.
+    assert!(!site(ENTRY).imm_lane_matched);
+    assert!(!site(ENTRY).disp_lane_matched);
+
+    // `walked_entries_run_wide` is RUN-WIDE and is not a per-class figure. Exactly one of the two
+    // dormant-heat sites was walked, and the run walked at least two entries, so the field is
+    // strictly larger than the quantity a reader might mistake it for. Pinned so a future rename
+    // back to something class-shaped has to break a test rather than a reader.
+    let walked_dormant = snapshot
+        .dormant_heat_sites
+        .iter()
+        .filter(|site| site.compile_walked)
+        .count() as u64;
+    assert_eq!(walked_dormant, 1);
+    assert_eq!(snapshot.dormant_heat_distinct_sites, 2);
+    assert!(
+        snapshot.walked_entries_run_wide > walked_dormant,
+        "the walked set spans every entry the backend compiled, not only the dormant ones: \
+         {} run-wide against {walked_dormant} walked dormant sites",
+        snapshot.walked_entries_run_wide
+    );
+}
