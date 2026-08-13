@@ -6077,6 +6077,358 @@ fn a_call_through_a_register_links_and_transfers_natively_on_the_second_entry() 
     assert_eq!(cpu.registers.eip, TARGET + 3);
 }
 
+/// The dynamic link cell for `JmpReg`, modelled on
+/// `a_call_through_a_register_links_and_transfers_natively_on_the_second_entry`: run the jump once
+/// so the exit reports the MISS (the cell is still unbound), then again so the transfer goes
+/// NATIVE.
+///
+/// This is mutation M2's fixture in execution terms, and it is where the retarget trap would
+/// actually bite. `LinkCell::clear` resets the portal, `entry_top` and spilling but NOT
+/// `target_eip`, and a static `set` writes only the portal — so a cell that carries both a static
+/// successor and a dynamic binding keeps a stale `target_eip` across a static rebind, and a later
+/// jump landing on that value transfers natively into whatever the static rebind pointed at. The
+/// compile-side fixture pins `successors == [None, None]`; this one proves the dynamic edge that
+/// registration exists to serve really does bind and really does transfer.
+///
+/// Simpler than the `CallReg` twin in exactly one way, and that is the point of the kind: there is
+/// no push, so no stack widening, no `NativeMapBases` write mapping, and no ESP to check. The only
+/// guest state this instruction writes is EIP.
+#[test]
+fn a_jmp_through_a_register_links_and_transfers_natively_on_the_second_entry() {
+    const SOURCE: u32 = 0x100;
+    const TARGET: u32 = 0x300;
+    let mut memory = vec![0; 0x2000];
+    memory[SOURCE as usize..SOURCE as usize + 4].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xe3, // jmp ebx
+    ]);
+    memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&[
+        0x42, // inc edx
+        0x46, // inc esi
+        0x47, // inc edi
+        0xf4, // hlt
+    ]);
+
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    // `ebx` is guest state the warm-up run itself executes `jmp ebx` through, so it has to be live
+    // before the first interpreted pass, exactly as the CallReg twin needs it.
+    cpu.registers.set_ebx(TARGET);
+    drive(&mut cpu, &mut bus);
+
+    cpu.halted = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.eip = TARGET;
+    let target_key = jit::direct::key_for(&cpu, TARGET, true).expect("target decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(target_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let target_compilation = jit::direct::compile(&mut cpu, TARGET, true).expect("target block");
+    assert_eq!(target_compilation.span.instructions, 3);
+    cpu.jit_direct
+        .install(&target_compilation)
+        .expect("target install");
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    let source_key = jit::direct::key_for(&cpu, SOURCE, true).expect("source decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(source_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let source_compilation = jit::direct::compile(&mut cpu, SOURCE, true).expect("source block");
+    assert_eq!(source_compilation.span.instructions, 3);
+    assert!(source_compilation.dynamic_successor);
+    let source_id = cpu
+        .jit_direct
+        .install(&source_compilation)
+        .expect("source install");
+    let source_block = cpu
+        .jit_direct
+        .block(source_id)
+        .expect("source block remains live");
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source_block)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.registers.eip, TARGET,
+        "the target must be set even on the first, unresolved pass: JmpReg writes EIP before the \
+         link-cell check ever runs"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers,
+        transfers_before,
+        "the first pass cannot be a linked transfer: the cell is unbound when the native jump is \
+         made, and it is only bound afterward, in Rust, once the miss is reported"
+    );
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source_block)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+        1,
+        "the second pass must find the now-bound cell and its live portal, and jump straight into \
+         the target without a dispatcher round-trip"
+    );
+    // Anti-vacuity. Three from source (two fillers plus the jump) and three from target: six means
+    // the chain really crossed into the target natively rather than landing in the dispatcher.
+    assert_eq!(cpu.perf_counters().jit_direct_insns - insns_before, 6);
+    assert_eq!(cpu.registers.eip, TARGET + 3);
+}
+
+/// `JmpReg` in a FLAT code segment (`cs.limit == u32::MAX`), executed: it must run, transfer, and
+/// record ZERO segment-limit side exits.
+///
+/// Every other executing fixture for this kind uses `fresh()`, which is real mode with
+/// `cs.limit == 0xFFFF`, so the limit-check branch is present in all of them. Duke under DOS4GW —
+/// the workload the whole slice is ranked on — runs a flat CS, and `JmpReg` is the first emitter
+/// arm that allocates its side-exit label CONDITIONALLY on the limit being finite. So the shape
+/// production actually executes is the shape no fixture ran, and the two shapes differ in emitted
+/// code rather than only in a comparison result.
+///
+/// WHAT IT CATCHES, established by mutation rather than asserted. Moving the target load
+/// `mov RDX, home(dst)` inside the `limit != u32::MAX` block — an ordinary refactor slip, since
+/// everything else in this arm lives there — makes this fixture fail with EIP 2 against 768 while
+/// EVERY other `JmpReg` fixture stays green. The finite-CS fixture cannot see it because its jump
+/// never completes; the compile-shape fixture cannot see it because it never executes.
+///
+/// WHAT IT DOES NOT CATCH, recorded so the comment does not overclaim: emitting the limit check
+/// unconditionally is NOT caught here. On a flat CS the comparison is against `0xFFFF_FFFF` and
+/// the `ja` can never be taken, so the block still runs correctly and still reports zero exits.
+/// The zero assertions below are a statement about the flat path's OUTCOME, not a proof that the
+/// branch was elided.
+#[test]
+fn flat_cs_jmp_through_a_register_runs_with_no_segment_limit_exit() {
+    const SOURCE: u32 = 0x100;
+    const TARGET: u32 = 0x300;
+    let mut memory = vec![0; 0x2000];
+    memory[SOURCE as usize..SOURCE as usize + 4].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xe3, // jmp ebx
+    ]);
+    memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&[
+        0x42, // inc edx
+        0x46, // inc esi
+        0x47, // inc edi
+        0xf4, // hlt
+    ]);
+
+    let mut cpu = fresh_flat();
+    assert_eq!(
+        cpu.registers.cs().limit,
+        u32::MAX,
+        "this fixture is only worth running against a flat CS; a finite one is the other fixture"
+    );
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    cpu.registers.set_ebx(TARGET);
+    // Decoded by hand rather than by `drive`, unlike the real-mode link fixture. A flat CS lets
+    // `run_straight_line` admit and install these very blocks during the warm-up, and the manual
+    // `install` below would then be refused as a duplicate -- an install failure that says nothing
+    // about the kind under test.
+    for lin in [
+        SOURCE,
+        SOURCE + 1,
+        SOURCE + 2,
+        TARGET,
+        TARGET + 1,
+        TARGET + 2,
+        TARGET + 3,
+    ] {
+        cpu.registers.eip = lin;
+        cpu.fetch_decoded(&mut bus, lin).expect("fixture decode");
+    }
+
+    cpu.halted = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.eip = TARGET;
+    // The probe is what moves the key to `Seen`, and `install` refuses any other state. Not
+    // decoration: without it the install below returns None and the failure names nothing.
+    let target_key = jit::direct::key_for(&cpu, TARGET, true).expect("target decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(target_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let target_compilation = jit::direct::compile(&mut cpu, TARGET, true).expect("target block");
+    assert_eq!(target_compilation.span.instructions, 3);
+    cpu.jit_direct
+        .install(&target_compilation)
+        .expect("target install");
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    let source_key = jit::direct::key_for(&cpu, SOURCE, true).expect("source decode");
+    assert!(matches!(
+        cpu.jit_direct.probe(source_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let source_compilation = jit::direct::compile(&mut cpu, SOURCE, true).expect("source block");
+    assert_eq!(source_compilation.span.instructions, 3);
+    assert!(source_compilation.dynamic_successor);
+    let source_id = cpu
+        .jit_direct
+        .install(&source_compilation)
+        .expect("source install");
+    let source_block = cpu
+        .jit_direct
+        .block(source_id)
+        .expect("source block remains live");
+
+    let side_exits = cpu.perf_counters().jit_direct_side_exits;
+    let limit_exits = cpu.direct_stall_snapshot().side_exit_segment_limit;
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+
+    cpu.registers.eip = SOURCE;
+    cpu.registers.set_ebx(TARGET);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source_block)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.registers.eip, TARGET,
+        "the jump must complete and land on the target"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - insns_before,
+        3,
+        "all three slots retired natively: nothing side exited"
+    );
+    assert_eq!(
+        cpu.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
+        0,
+        "a flat CS emits no limit check at all, so it cannot report one"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_side_exits - side_exits,
+        0,
+        "and no side exit of any other kind either: JmpReg touches no memory"
+    );
+}
+
+/// `JmpReg` in a FINITE code segment: a target above `cs.limit` side exits, and the exit leaves the
+/// machine in a state the interpreter agrees with EXACTLY. This is mutation M4's fixture.
+///
+/// WHAT IT PINS, stated precisely, because the earlier wording overclaimed. The interpreter side
+/// of this comparison executes the two `inc` fillers and STOPS — it never runs the jump. So this
+/// is not a fault-delivery test and says nothing about where the #GP eventually surfaces. It is a
+/// RESTART-STATE test: after the native block side exits at the jump, the register file, memory,
+/// `elapsed_clocks`, `trace.elapsed_clocks()` and the retired-instruction count must all equal an
+/// interpreter that executed only the two instructions before it. `jit_direct_insns` advancing by
+/// exactly 2 is the anti-vacuity half — it is what proves the jump did not retire.
+///
+/// (The interpreter's own group-5 arm 4 performs no limit check, so the architectural fault
+/// surfaces on the following fetch. That is true and it is why the native exit must restart
+/// cleanly rather than deliver anything itself, but it is background for this fixture, not a
+/// claim this fixture verifies.)
+///
+/// Why that catches M4. `JmpReg` writes exactly ONE piece of guest state — EIP — so unlike
+/// `CallReg` there is no pushed byte and no ESP to protect. The atomicity surface is entirely the
+/// accounting the side exit is published with. Move the publication after `completed` and
+/// `completed_raw` advance and the exit hands the interpreter the jump's 7 clocks as though it had
+/// retired: the observed failure is `elapsed_clocks` 22 native against 18 interpreted.
+///
+/// The name deliberately drops the `_and_faults_precisely` suffix its `CallReg` sibling carries.
+/// Real mode, where `cs.limit` is 0xFFFF by construction (`fresh()`'s `load_segment_real`), for
+/// the reason that sibling gives: the check is identical either way and real mode is the simplest
+/// setting that exercises it. The flat-CS shape is covered by the fixture above.
+#[test]
+fn finite_cs_jmp_through_a_register_limit_exit_preserves_restart_state() {
+    const ENTRY: u32 = 0x100;
+    const JMP: u32 = ENTRY + 2;
+    // Above the real-mode 0xFFFF CS limit.
+    const TARGET: u32 = 0x1_0000;
+    let mut memory = vec![0; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + 4].copy_from_slice(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xe3, // jmp ebx
+    ]);
+
+    let mut native = fresh();
+    let mut interp = fresh();
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    for cpu in [&mut native, &mut interp] {
+        cpu.registers.set_ebx(TARGET);
+        cpu.registers.eip = ENTRY;
+    }
+
+    for lin in [ENTRY, ENTRY + 1, JMP] {
+        native.registers.eip = lin;
+        native
+            .fetch_decoded(&mut native_bus, lin)
+            .expect("fixture decode");
+        interp.registers.eip = lin;
+        interp
+            .fetch_decoded(&mut interp_bus, lin)
+            .expect("fixture decode");
+    }
+    native.registers.eip = ENTRY;
+    interp.registers.eip = ENTRY;
+
+    let key = jit::direct::key_for(&native, ENTRY, true).unwrap();
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut native, ENTRY, true).unwrap();
+    assert_eq!(compilation.span.instructions, 3);
+    let id = native.jit_direct.install(&compilation).unwrap();
+    let block = native
+        .jit_direct
+        .block(id)
+        .expect("installed block must be live");
+
+    let side_exits = native.perf_counters().jit_direct_side_exits;
+    let limit_exits = native.direct_stall_snapshot().side_exit_segment_limit;
+    let insns_before = native.perf_counters().jit_direct_insns;
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    interp.cycle(&mut interp_bus).unwrap();
+    interp.cycle(&mut interp_bus).unwrap();
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        native.registers.eip, JMP,
+        "the side exit must leave EIP at the jump itself: JmpReg writes EIP only after the limit \
+         guard passes, and the exit is published before the slot's completion accounting advances"
+    );
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.perf_counters().jit_direct_side_exits - side_exits, 1);
+    assert_eq!(
+        native.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
+        1
+    );
+    // Anti-vacuity: only the two fillers retired natively; the jump itself never completed.
+    assert_eq!(native.perf_counters().jit_direct_insns - insns_before, 2);
+}
+
 /// A ring-3 `JmpMem` whose source page is supervisor-only must side exit at the permission check
 /// before the dword is ever read, rather than completing the jump.
 ///

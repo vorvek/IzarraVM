@@ -1434,6 +1434,64 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 terminal = true;
                 break;
             }
+            // JMP r32, REGISTER form. `CallReg` minus the push and `JmpMem` minus the read, which
+            // leaves the smallest dynamic-successor arm there is: check the target against the CS
+            // limit, move it into RDX, take the dynamic path.
+            //
+            // No `MemorySideExits` and no parking slot, because this kind touches no memory: the
+            // limit check is its ONLY side exit, so the `side` label is allocated inside the
+            // `limit != u32::MAX` branch rather than above it. Allocating it unconditionally would
+            // leave an unreferenced exit on every flat-CS block, which is the common case.
+            //
+            // ORDER IS LOAD-BEARING, and differently from `CallReg`. `CallReg` publishes before
+            // its `sub esp, 4` so a faulting push leaves ESP untouched; this arm has no guest byte
+            // to protect at all. What it has instead is the resume point: the side exit records
+            // `completed` and `completed_raw` as they stand, so it must be pushed BEFORE they
+            // advance for this slot, or the interpreter re-enters past the very instruction that
+            // faulted with its 7 clocks already charged. That is mutation M4.
+            DirectKind::JmpReg { dst } => {
+                let limit = memory.segments.cs.limit;
+                if limit != u32::MAX {
+                    let side = e.label();
+                    let limit_exit = e.label();
+                    e.cmp_r32_imm32(home(dst), limit);
+                    e.jcc(7, limit_exit);
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
+                    side_exits.push((
+                        side,
+                        slot.lin.wrapping_sub(span.key.linear),
+                        side_exit(
+                            completed,
+                            completed_raw,
+                            completed_byte_reads,
+                            completed_word_reads,
+                            completed_dword_reads,
+                            completed_weighted_fp_clocks,
+                        ),
+                    ));
+                }
+                // Reading `home(dst)` is safe for EVERY dst including ESP: nothing in this arm has
+                // written a guest home, so the value is the architectural pre-instruction one.
+                e.mov_r32_r32(Reg::RDX, home(dst));
+                completed += 1;
+                completed_raw += slot.kind.raw_clocks() as u16;
+                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
+                completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
+                completed_dword_reads += slot.kind.dword_reads();
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                    x87_entry_top.is_some(),
+                    fetch_trace,
+                );
+                terminal = true;
+                break;
+            }
             // CALL r32, REGISTER form. Modelled on the `Call` arm above (the store, the publish,
             // then `sub esp, 4`), with two differences: the CS-limit check from `Ret`/`JmpMem`
             // runs FIRST, against `home(dst)` directly rather than a loaded dword, and the tail is

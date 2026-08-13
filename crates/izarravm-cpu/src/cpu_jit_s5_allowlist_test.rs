@@ -1231,6 +1231,60 @@ fn word_size_call_through_memory_stays_refused() {
     }
 }
 
+/// A 66-prefixed `FF /4` REGISTER form (`jmp bx`) must stay REFUSED — and here, unlike every
+/// paired fixture above, there is genuinely only ONE check that can refuse it.
+///
+/// The residual census row this pins is small and real: 78,585 exits at duke3d-486 against the
+/// 11.7M the Dword register form carries. It is deliberately left unlowered.
+///
+/// `JmpReg` is not `uses_stack()`, so the stack-width admission matrix never sees it — the
+/// escape hatch that redundantly covers `CallReg`, `CallMem` and `PushMem` at Word does not exist
+/// for this kind. `static_control_target` is `None` for a dynamic target, so the Word control
+/// clamp never sees it either. The classifier's `insn.operand_size != OperandSize::Dword` gate,
+/// shared with the memory form one line above it, is the whole defence. Deleting it is mutation
+/// M1, and this fixture is the only thing in the tree that goes red.
+///
+/// What the gate prevents is an EIP-mask miscompile: at Word size the interpreter reads TWO bytes
+/// for the target and masks EIP to 16 bits (`read_operand_sized(.., Word, ..)` then
+/// `target & operand_size.mask()`), while the Dword construction takes the full register and jumps
+/// unmasked. `jmp bx` with EBX = 0x1234_0500 lands at 0x0500 architecturally and at 0x1234_0500
+/// natively — two different blocks, not a rounding difference.
+///
+/// EXACT counts, paired against a POSITIVE CONTROL: the unprefixed `FF /4` register form at the
+/// same entry must lower and grow the block to four instructions. Without the control, "three
+/// instructions" is satisfied identically by correct refusal and by `JmpReg` never reaching the
+/// classifier at all. No stack widening is needed for either case, so the 0x66 prefix is the only
+/// difference between them.
+#[test]
+fn word_size_jmp_through_a_register_stays_refused() {
+    let cases: &[(&str, &[u8], u8)] = &[
+        ("unprefixed control", &[0xff, 0xe3], 4),
+        (
+            // 66 ff e3: jmp bx at Word operand size.
+            "0x66-prefixed",
+            &[0x66, 0xff, 0xe3],
+            3,
+        ),
+    ];
+
+    for &(label, form, expected_instructions) in cases {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, expected_instructions,
+            "{label}: the Dword form must lower and the Word form must stay refused"
+        );
+    }
+}
+
 /// A 66-prefixed `FF /4` must stay REFUSED, and nothing else in the crate can catch it.
 ///
 /// `0xff` is in the Word allowlist, so this form reaches the classifier and would otherwise

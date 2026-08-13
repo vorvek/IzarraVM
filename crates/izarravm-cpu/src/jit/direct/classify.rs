@@ -1504,7 +1504,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         addr: direct_addr(addr)?,
                     });
                 }
-                // /4 JMP r/m32, MEMORY form only. `0xff` is in the `OperandSize::Word` allowlist
+                // /4 JMP r/m32, BOTH operand forms. `0xff` is in the `OperandSize::Word` allowlist
                 // above, so a 66-prefixed `FF /4` in 32-bit code reaches this arm at Word size.
                 // NOTHING downstream refuses that: `uses_stack` is false for a jump, so the
                 // stack-width admission matrix never sees this kind, and `static_control_target`
@@ -1513,16 +1513,30 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // reaching here). At Word size the interpreter reads TWO bytes and masks EIP to
                 // 16 bits; lowering that as the Dword construction reads four bytes and jumps
                 // unmasked, a miscompile twice over.
+                //
+                // The gate is SHARED by the two operand forms rather than duplicated inside each,
+                // and it is the only thing refusing the register form at Word: the residual
+                // `0xFF /4` register word census row (78,585 exits) stays out through this line
+                // and nothing else. `jmp_reg_stays_refused_at_word_size` pins that, and deleting
+                // this check is mutation M1.
+                //
+                // The register form is lowered as `JmpReg`. The "census zero, PUSH-r32-style
+                // clock risk" note this arm used to carry recorded two objections and both have
+                // been answered: the duke3d-486 census reads 11,718,562 static exits and
+                // 11,736,700 interpreted executions here (32.8M/32.8M at 586, its fourth-largest
+                // rejected row), and the clock charge is not a guess -- `execute_extended.rs`
+                // group-5 arm 4 returns `clocks(7)` unconditionally, reading its target through
+                // `read_operand_sized`, which serves the register and memory operands alike.
                 if m.reg == 4 {
                     if insn.operand_size != OperandSize::Dword {
                         return None;
                     }
-                    let DecodedOperand::Mem(addr) = insn.operand? else {
-                        return None; // register form: census zero, PUSH-r32-style clock risk
+                    return match insn.operand? {
+                        DecodedOperand::Reg(dst) => Some(DirectKind::JmpReg { dst }),
+                        DecodedOperand::Mem(addr) => Some(DirectKind::JmpMem {
+                            addr: direct_addr(addr)?,
+                        }),
                     };
-                    return Some(DirectKind::JmpMem {
-                        addr: direct_addr(addr)?,
-                    });
                 }
                 if !matches!(m.reg, 0 | 1) {
                     return None;

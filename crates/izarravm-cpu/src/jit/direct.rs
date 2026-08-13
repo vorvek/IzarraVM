@@ -3237,10 +3237,12 @@ pub(crate) enum DirectKind {
     /// JMP r/m32, MEMORY form (0xFF /4): one dword read at `addr`, and EIP becomes the value
     /// read. Nothing else changes: no stack, no push, no flags.
     ///
-    /// The register form (mod == 3) is deliberately absent. It is architecturally `JMP r32`, and
-    /// the same PUSH-r32-style reasoning that keeps `PushMem`'s register form out applies here:
-    /// its clock charge is unverified against this corpus and the attribution census measures
-    /// zero occurrences of it.
+    /// The register form is `JmpReg`, below. It was absent for two reasons that have both since
+    /// been settled: the attribution census measured zero occurrences of it (the duke3d-486
+    /// census now reads 11,718,562 static exits, 11,736,700 interpreted executions, and 586 reads
+    /// 32.8M/32.8M -- its fourth-largest rejected row), and its clock charge was unverified
+    /// (`execute_extended.rs` group-5 arm 4 returns `clocks(7)` unconditionally, for the register
+    /// and memory operand alike, so it charges what this kind charges).
     ///
     /// `raw_clocks` carries an explicit 7, joining the `Call`/`Call16`/`Jmp` arm: the
     /// interpreter's group-5 arm 4 returns `clocks(7)`, and the `_ => 2` default would undercharge
@@ -3257,6 +3259,40 @@ pub(crate) enum DirectKind {
     /// cell's static edge is retargeted.
     JmpMem {
         addr: DirectAddr,
+    },
+    /// JMP r/m32, REGISTER form (`0xFF /4`, mod == 3): EIP becomes the register's value and
+    /// nothing else changes. `CallReg` minus the push, or `JmpMem` minus the memory read -- it
+    /// touches no memory at all, which makes it the simplest dynamic-successor kind in the set.
+    ///
+    /// Four properties, each inherited rather than invented, and each pinned by a mutation:
+    ///
+    /// * **Dword only, gated in `classify`.** `0xff` is on the `OperandSize::Word` allowlist, so a
+    ///   `66 FF /4` in 32-bit code reaches the arm at Word size, where the interpreter reads two
+    ///   bytes and masks EIP to 16 bits. Nothing downstream refuses that: `uses_stack` is false
+    ///   for a jump so the stack-width admission matrix never sees this kind, and
+    ///   `static_control_target` is `None` for a dynamic target so the Word control clamp never
+    ///   sees it either. The `/4` arm's existing `insn.operand_size != OperandSize::Dword` gate is
+    ///   the ONLY thing standing between this kind and a miscompile, and it is shared with the
+    ///   memory form rather than duplicated. The residual `0xFF /4` register WORD census row
+    ///   (78,585 exits) stays refused by it, deliberately.
+    /// * **`raw_clocks` 7**, joining the `Call`/`Call16`/`Jmp`/`JmpMem`/`CallReg`/`CallMem` arm.
+    ///   `execute_extended.rs` group-5 arm 4 reads its target through `read_operand_sized`, which
+    ///   serves both operand forms, and returns `Ok(clocks(7))` without branching on the shape. So
+    ///   the register form charges exactly what the memory form charges, and the `_ => 2` default
+    ///   would undercharge every one of them by 5.
+    /// * **No static successor.** `[None, None]` plus `dynamic_successor`, the shape `Ret`,
+    ///   `JmpMem` and `CallReg` share. The mutual-exclusion invariant on `JmpMem`'s doc comment
+    ///   applies unchanged: a `LinkCell` that was dynamically bound and is later statically
+    ///   rebound keeps its stale `target_eip`, and a later jump landing on that value transfers
+    ///   natively into the wrong block. Recording a static successor here would arm that trap.
+    /// * **The CS-limit check precedes the slot's completion accounting.** There is no guest byte
+    ///   to leave untouched -- this kind mutates only EIP -- so the atomicity question is entirely
+    ///   about WHICH EIP the side exit resumes at. Publishing the limit exit after `completed`
+    ///   and `completed_raw` advance would hand the interpreter a state in which the jump already
+    ///   retired, and it would re-enter past the instruction that faulted with its 7 clocks
+    ///   already charged.
+    JmpReg {
+        dst: u8,
     },
     /// CALL r32, REGISTER form (0xFF /2, mod == 3): the target is read from a GPR BEFORE the
     /// return EIP is pushed. One dword store to SS:[ESP-4], ESP falls by 4, then EIP becomes the
@@ -3546,6 +3582,7 @@ impl DirectKind {
             | Self::Call16 { .. }
             | Self::Jmp { .. }
             | Self::JmpMem { .. }
+            | Self::JmpReg { .. }
             | Self::CallReg { .. }
             | Self::CallMem { .. } => 7,
             // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
@@ -3973,6 +4010,7 @@ impl DirectKind {
                 | Self::Call16 { .. }
                 | Self::Jmp { .. }
                 | Self::JmpMem { .. }
+                | Self::JmpReg { .. }
                 | Self::Ret { .. }
                 | Self::Ret16 { .. }
                 | Self::Jcc { .. }
@@ -5552,6 +5590,7 @@ fn compile_with_instruction_limit(
                 DirectKind::Ret { .. }
                     | DirectKind::Ret16 { .. }
                     | DirectKind::JmpMem { .. }
+                    | DirectKind::JmpReg { .. }
                     | DirectKind::CallReg { .. }
                     | DirectKind::CallMem { .. }
             )
@@ -5594,6 +5633,7 @@ fn compile_with_instruction_limit(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
             | DirectKind::JmpMem { .. }
+            | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
             | DirectKind::CallMem { .. },
         ) => TerminalLinks {
@@ -5645,6 +5685,7 @@ fn compile_with_instruction_limit(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
             | DirectKind::JmpMem { .. }
+            | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
             | DirectKind::CallMem { .. },
         ) => [None, None],

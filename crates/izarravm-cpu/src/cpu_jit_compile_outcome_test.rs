@@ -3042,6 +3042,69 @@ fn a_call_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor()
     );
 }
 
+/// The REGISTER form of `0xFF /4`: `jmp ebx`, duke3d-486's fifth-largest rejected row
+/// (11,718,562 static exits, 11,736,700 interpreted executions; 32.8M/32.8M at 586).
+///
+/// `CallReg` minus the push and `JmpMem` minus the read, so what has to be pinned is exactly what
+/// neither sibling can pin for it: this is the first kind that is a terminal with a dynamic
+/// successor and touches NO MEMORY AT ALL. Three of the four assertions below are silent when
+/// wrong.
+///
+/// * `raw_clocks` 7. `execute_extended.rs` group-5 arm 4 reads its target through
+///   `read_operand_sized` -- which serves both operand forms -- and returns `Ok(clocks(7))`
+///   without branching on the shape, so the register form charges what the memory form charges.
+///   A missing arm rides the `_ => 2` default and undercharges every indirect jump by exactly 5,
+///   which is mutation M3 and which nothing else in the tree can see.
+/// * Every memory counter zero. `CallReg` has a store, `JmpMem` has a read, `CallMem` has both.
+///   Only this kind has neither, and a spurious count here would make `run.rs` subtract dynamic
+///   mode-13 counts from a static total that was never issued.
+/// * `dynamic_successor` with `successors == [None, None]`. This is mutation M2: recording a
+///   static successor alongside the dynamic binding arms the `LinkCell` retarget trap documented
+///   on `JmpMem`'s doc comment -- `LinkCell::clear` does not reset `target_eip`, so a cell that
+///   was dynamically bound and is later statically rebound transfers a later jump natively into
+///   the wrong block. The fall-through arm would record the bytes AFTER the jump as a successor,
+///   which is precisely that phantom edge.
+#[test]
+fn a_jmp_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor() {
+    let (mut cpu, mut bus) = fixture(&[
+        0x40, // inc eax
+        0x41, // inc ecx
+        0xff, 0xe3, // jmp ebx
+    ]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "two fillers plus the jump, and nothing past it: JmpReg is a terminal"
+    );
+    assert_eq!(
+        compilation.span.guest_len, 4,
+        "the span must end AT the jump: two one-byte fillers plus the two-byte FF /4 register form"
+    );
+    assert_eq!(
+        compilation.raw_clocks, 11,
+        "two 2-clock INCs plus a 7-clock JmpReg; the `_ => 2` default would read 6"
+    );
+    assert_eq!(compilation.dword_reads, 0);
+    assert_eq!(compilation.dword_stores, 0);
+    assert_eq!(compilation.byte_reads, 0);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.byte_stores, 0);
+    assert_eq!(compilation.word_stores, 0);
+    assert!(
+        compilation.dynamic_successor,
+        "without this, link_sources never learns the cell and every jump exits to the dispatcher \
+         forever"
+    );
+    assert_eq!(
+        compilation.successors,
+        [None, None],
+        "a dynamic target has no static successor; the fall-through arm would record the bytes \
+         after the jump as one, the phantom edge a stale dynamically-bound cell can transfer into"
+    );
+}
+
 /// The MEMORY form of `0xFF /2`: `call dword [0x800]`, doom's largest rejected census row.
 ///
 /// The accounting pin the emitter cannot state for itself. `CallMem` is the first kind that is a
