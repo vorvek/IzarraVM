@@ -41,6 +41,11 @@
 pub const DATA_SECTOR: usize = 2048;
 /// Bytes in a raw Red Book frame (the on-disc sector for AUDIO and MODE1/2352).
 pub const RAW_SECTOR: usize = 2352;
+// The audio-source contract in izarravm-core names the same quantity, and its
+// trait's return type is built from its own constant. If these ever disagree
+// the two sides of the seam stop type-checking against each other in a way that
+// is easy to misread as a trait mismatch, so fail here instead, at the source.
+const _: () = assert!(RAW_SECTOR == izarravm_core::AUDIO_FRAME_BYTES);
 /// Bytes in a MODE2 frame stored without sync and header (subheader leads).
 pub const MODE2_SECTOR: usize = 2336;
 /// Bytes in a frame stored with its 96-byte subchannel tail (2352 + 96).

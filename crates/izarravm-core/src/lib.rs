@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod canonical_state;
+mod cdaudio;
 mod clock;
 mod gsw;
 
@@ -13,6 +14,7 @@ pub use canonical_state::{
     CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateError, CanonicalStateView,
     CanonicalStateWriter,
 };
+pub use cdaudio::{AUDIO_FRAME_BYTES, AudioTrackSource};
 pub use clock::{ClockRate, MASTER_CLOCK_HZ};
 pub use gsw::{CacheGeometry, CpuPersona, GSW_MODE_SPECS, GswMode, GswModeSpec, L1Cache};
 
