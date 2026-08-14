@@ -98,6 +98,23 @@ start:
     mov dx, ST_DONE
     call expect_status
 
+    ; An IOCTL request that declares only the 13-byte fixed header must still
+    ; be served. Quake declares 13 and fills the command-specific fields past
+    ; it; the driver used to demand 26 here and answered error 5, so its CD
+    ; music was silent. Read the drive header back to prove the request ran
+    ; rather than merely returning a clean status.
+    mov byte [fail_code], 0x15
+    xor al, al
+    mov dl, 5
+    call setup_ioctl_input
+    mov byte [request], 13
+    call issue_request
+    mov dx, ST_DONE
+    call expect_status
+    mov ax, [control + 1]
+    or ax, [control + 3]
+    jz fail
+
     mov byte [fail_code], 0x14
     mov al, 13
     mov dl, 13

@@ -203,6 +203,19 @@ dispatch_request:
     je .init
     cmp byte [es:bx + RH_UNIT], 0
     jne .bad_unit
+    ; One length gate for every application-issued command, and it accepts the
+    ; 13-byte fixed header. The gate used to demand the FULL request size per
+    ; command (26 for either IOCTL, 27 for a read, 24 for a seek, 22 for a
+    ; play). That is not what callers write there: Quake declares 13 -- the
+    ; fixed part -- and then fills the command-specific fields past it, so
+    ; every one of its requests came back error 5 and the drive never saw a
+    ; CDB. Its CD music was silent for that one byte. Real drivers read the
+    ; command-specific fields on the strength of the COMMAND, not the declared
+    ; length, so that is what happens below. INIT keeps its own 23-byte check:
+    ; DOS is its only caller, it always passes the full header, and the
+    ; handler WRITES the break address back past byte 13.
+    cmp byte [es:bx + RH_LENGTH], 13
+    jb .bad_length
 
     cmp al, 3
     je .ioctl_in
@@ -239,29 +252,19 @@ dispatch_request:
     call request_init
     ret
 .ioctl_in:
-    cmp byte [es:bx + RH_LENGTH], 26
-    jb .bad_length
     call ioctl_input
     ret
 .ioctl_out:
-    cmp byte [es:bx + RH_LENGTH], 26
-    jb .bad_length
     call ioctl_output
     ret
 .short_ok:
-    cmp byte [es:bx + RH_LENGTH], 13
-    jb .bad_length
     xor ax, ax
     ret
 .open:
-    cmp byte [es:bx + RH_LENGTH], 13
-    jb .bad_length
     inc word [cs:open_count]
     xor ax, ax
     ret
 .close:
-    cmp byte [es:bx + RH_LENGTH], 13
-    jb .bad_length
     cmp word [cs:open_count], 0
     je .close_done
     dec word [cs:open_count]
@@ -269,33 +272,21 @@ dispatch_request:
     xor ax, ax
     ret
 .read_long:
-    cmp byte [es:bx + RH_LENGTH], 27
-    jb .bad_length
     call request_read_long
     ret
 .prefetch:
-    cmp byte [es:bx + RH_LENGTH], 27
-    jb .bad_length
     call request_seek
     ret
 .seek:
-    cmp byte [es:bx + RH_LENGTH], 24
-    jb .bad_length
     call request_seek
     ret
 .play:
-    cmp byte [es:bx + RH_LENGTH], 22
-    jb .bad_length
     call request_play
     ret
 .stop:
-    cmp byte [es:bx + RH_LENGTH], 13
-    jb .bad_length
     call request_stop
     ret
 .resume:
-    cmp byte [es:bx + RH_LENGTH], 13
-    jb .bad_length
     call request_resume
     ret
 .bad_length:
