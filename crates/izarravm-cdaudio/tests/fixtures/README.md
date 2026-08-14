@@ -14,7 +14,8 @@ the project's own license.
 | `tone.ogg` | Ogg Vorbis. |
 | `tone.flac` | FLAC with a populated `total_samples` (8820, the exact sample count). |
 | `tone.mp3` | LAME MP3 with a Xing header, so encoder delay and padding are declared. |
-| `tone-noxing.mp3` | VBR MP3 with no Xing header: the container's own frame count is an extrapolation and must not be trusted. |
+| `tone-noxing.mp3` | VBR MP3 with no Xing header, and short enough that symphonia declines to guess a length at all and reports `None`. |
+| `tone-3s-noxing.mp3` | The same encode at 3 s, which is long enough that symphonia *does* guess: it reports 107136 frames against a true 132300, 19% short, and reports it as a `Some`. This is the fixture that proves the packet walk is not inheriting the container's number, and the 0.2 s one cannot substitute for it. |
 | `tone-nolength.flac` | FLAC with `total_samples = 0`, which is legal and must not fail the mount. Byte-identical to `tone.flac` past the STREAMINFO block. |
 | `tone-22k-mono.wav` | 22.05 kHz mono: exercises resampling and channel duplication. |
 | `tone-opus.ogg` | Opus inside Ogg: sniffs as `OggS` and must be rejected by name. |
@@ -26,6 +27,15 @@ From the repository root:
 ```bash
 mkdir -p crates/izarravm-cdaudio/tests/fixtures && cd crates/izarravm-cdaudio/tests/fixtures && ffmpeg -y -f lavfi -i "sine=frequency=440:duration=0.2:sample_rate=44100" -ac 2 -c:a pcm_s16le tone.wav && ffmpeg -y -i tone.wav -c:a libvorbis -q:a 4 tone.ogg && ffmpeg -y -i tone.wav -c:a flac tone.flac && ffmpeg -y -i tone.wav -c:a libmp3lame -b:a 128k tone.mp3 && ffmpeg -y -i tone.wav -c:a libmp3lame -q:a 5 -write_xing 0 tone-noxing.mp3 && ffmpeg -y -f lavfi -i "sine=frequency=440:duration=0.2:sample_rate=22050" -ac 1 -c:a pcm_s16le tone-22k-mono.wav && ffmpeg -y -i tone.wav -c:a libopus -f ogg tone-opus.ogg && cd -
 ```
+
+The 3 s tagless MP3 is generated the same way from a longer tone:
+
+```bash
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3.0:sample_rate=44100" -ac 2 -c:a pcm_s16le tone-3s.wav && ffmpeg -y -i tone-3s.wav -c:a libmp3lame -q:a 5 -write_xing 0 crates/izarravm-cdaudio/tests/fixtures/tone-3s-noxing.mp3
+```
+
+Its intermediate `tone-3s.wav` is not kept: nothing decodes against it, and the
+sector count it implies (225) is written into the test as a constant.
 
 `tone-nolength.flac` is produced separately, through a pipe, so that ffmpeg
 cannot seek back and patch STREAMINFO's `total_samples` after the encode:

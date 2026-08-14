@@ -8,6 +8,10 @@
 //!
 //! See `dev_docs/2026-08-14-cd-audio-decoding-design.md`.
 
+mod probe;
 mod sniff;
 
+pub use probe::{
+    CD_SAMPLE_RATE, CdAudioError, SAMPLES_PER_FRAME, TrackInfo, probe_info, sectors_for,
+};
 pub use sniff::{Container, SNIFF_BYTES, sniff};

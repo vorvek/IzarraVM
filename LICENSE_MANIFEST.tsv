@@ -3,6 +3,7 @@ Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	0b87b634f5da93
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	8a836e2211363a304ed1cd6d483a39e3176cfc84e664caeb830916c7022c0fbb
 crates/izarravm-cdaudio/tests/fixtures/tone-22k-mono.wav	generated-test-fixture	IzarraVM project source	GPL-3.0-only	98b43874f2cdcac75465cf3df534f8654b635f24612f49f0158affb87a9d6234
+crates/izarravm-cdaudio/tests/fixtures/tone-3s-noxing.mp3	generated-test-fixture	IzarraVM project source	GPL-3.0-only	ceb025494e2764b21c26163b0b847ca52f365fcb5a00ac8a69e5ef1ea9ffa855
 crates/izarravm-cdaudio/tests/fixtures/tone-nolength.flac	generated-test-fixture	IzarraVM project source	GPL-3.0-only	86a212264efd2c976ad2f0eaa79be9165db31e097a7ab4f21bd3ed80ea454c70
 crates/izarravm-cdaudio/tests/fixtures/tone-noxing.mp3	generated-test-fixture	IzarraVM project source	GPL-3.0-only	e39dfabb52c38cbb296567fe03dc3004b6d1924c959ed01332b522c940ae087d
 crates/izarravm-cdaudio/tests/fixtures/tone-opus.ogg	generated-test-fixture	IzarraVM project source	GPL-3.0-only	c6b2f6ae9e939eebc70bb5426ef1874835018f40e4cddd464b1969d1cf1eeea0
