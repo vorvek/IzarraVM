@@ -119,6 +119,48 @@ fn cue_file_names_returns_every_file_in_sheet_order() {
 }
 
 #[test]
+fn cue_file_names_sees_the_first_file_line_behind_a_utf8_bom() {
+    // This loader has its own FILE scanner, independent of `parse_cue`, and it
+    // was blind to a BOM in its own way: `trimmed[..4]` over a BOM'd first line
+    // is the three BOM bytes plus one 'F', which is not "FILE", so the line is
+    // skipped and the file it names is never read from disk.
+    //
+    // Fixing `parse_cue` alone does not make the mount right, it only changes
+    // the failure's shape: the parser would then correctly list both files
+    // while this scanner still handed over only the second one, and the mount
+    // would die with "CUE names a file that was not supplied". Both scanners
+    // have to see the line.
+    let cue = concat!(
+        "\u{feff}FILE \"track01.bin\" BINARY\n",
+        "  TRACK 01 MODE1/2352\n",
+        "    INDEX 01 00:00:00\n",
+        "FILE \"track02.bin\" BINARY\n",
+        "  TRACK 02 AUDIO\n",
+        "    INDEX 01 00:00:00\n",
+    );
+
+    assert_eq!(cue_file_names(cue), vec!["track01.bin", "track02.bin"]);
+}
+
+#[test]
+fn cue_file_names_reads_a_line_whose_fourth_byte_is_mid_character() {
+    // `trimmed[..4]` slices *bytes*, and the length guard above it only proves
+    // there are four bytes to take, not that byte 4 begins a character. A REM
+    // comment written with an em-dash right after the keyword puts a
+    // three-byte sequence at bytes 3..6, so byte 4 lands inside it and the
+    // slice panics -- taking the whole mount down over a comment line that
+    // carries no information the loader wanted.
+    let cue = concat!(
+        "REM\u{2014}ripped by some tool\n",
+        "FILE \"track01.bin\" BINARY\n",
+        "  TRACK 01 AUDIO\n",
+        "    INDEX 01 00:00:00\n",
+    );
+
+    assert_eq!(cue_file_names(cue), vec!["track01.bin"]);
+}
+
+#[test]
 fn cue_file_names_is_empty_when_the_sheet_has_no_file_line() {
     let cue = concat!("  TRACK 01 MODE1/2352\n", "    INDEX 01 00:00:00\n",);
 

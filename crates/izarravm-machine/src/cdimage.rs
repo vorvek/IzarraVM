@@ -610,6 +610,19 @@ fn parse_cue(cue: &str) -> Result<(Vec<CueFile>, Vec<CueTrack>), String> {
     let mut pending: Option<(u8, TrackMode)> = None;
     let mut pending_pregap = 0u32;
 
+    // A sheet saved by a Windows editor often opens with a UTF-8 BOM, and
+    // `str::trim` will not take it off: U+FEFF is a `Cf` format character, not
+    // `White_Space`. Left in place it fuses onto the first line's keyword, so
+    // "FILE" arrives as "\u{FEFF}FILE", matches no arm below, and falls
+    // through the catch-all. Dropping a line silently is harmless for the
+    // comment keywords this parser ignores anyway, but a dropped *first* FILE
+    // line shifts every later FILE down one slot while tracks keep binding by
+    // `files.len().saturating_sub(1)` -- so the sheet mounts, raises nothing,
+    // and serves the wrong file's bytes. Stripping it once here, rather than
+    // per line, is deliberate: a BOM is a stream marker and only the first
+    // line can legitimately carry one.
+    let cue = cue.strip_prefix('\u{feff}').unwrap_or(cue);
+
     for line in cue.lines() {
         let trimmed = line.trim();
         let mut words = trimmed.split_whitespace();

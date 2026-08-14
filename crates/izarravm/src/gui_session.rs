@@ -2326,9 +2326,27 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
 /// sheet named after the CUE.
 fn cue_file_names(cue: &str) -> Vec<String> {
     let mut names = Vec::new();
-    for line in cue.lines() {
+    // The same UTF-8 BOM that `parse_cue` has to strip reaches here first, and
+    // this scanner is blind to it in its own way: the four bytes it compares
+    // against "FILE" on a BOM'd first line are the BOM's three plus a single
+    // 'F'. Fixing only `parse_cue` would not repair the mount, it would just
+    // move the damage -- the parser would list both files while this loop read
+    // only the second one off disk, and `from_cue_files` would refuse the mount
+    // for a file the user did in fact supply. Both scanners have to see the
+    // line, so both strip the marker once at the head of the stream.
+    for line in cue.strip_prefix('\u{feff}').unwrap_or(cue).lines() {
         let trimmed = line.trim();
-        if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("FILE") {
+        // `get` rather than a length check and a slice: the four bytes wanted
+        // here are bytes, and a line that reaches four of them still need not
+        // have a character boundary at byte 4 -- a REM comment opening with an
+        // em-dash or a smart quote puts a multi-byte sequence across that
+        // position, and slicing through it panics. A comment line the loader
+        // was going to ignore anyway must not be able to abort a mount, so ask
+        // for the prefix and let a mid-character answer be `None`.
+        let Some(keyword) = trimmed.get(..4) else {
+            continue;
+        };
+        if !keyword.eq_ignore_ascii_case("FILE") {
             continue;
         }
         let rest = trimmed[4..].trim_start();

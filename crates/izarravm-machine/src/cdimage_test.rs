@@ -339,6 +339,64 @@ fn cue_shares_one_file_across_two_tracks_then_a_third_in_another() {
 }
 
 #[test]
+fn cue_with_a_utf8_bom_still_binds_each_track_to_its_own_file() {
+    // Editors and rippers on Windows routinely save a sheet with a UTF-8 BOM,
+    // and `str::trim` does not remove it: U+FEFF is a `Cf` format character,
+    // not `White_Space`. So the first line's keyword arrives as
+    // "\u{FEFF}FILE", misses every arm of the keyword match, and falls through
+    // the catch-all -- the whole line is dropped.
+    //
+    // Dropping the *first* FILE line is not a cosmetic loss. Tracks bind to a
+    // file by `files.len().saturating_sub(1)`, so with the first FILE gone
+    // every track before the second one still binds to index 0 and index 0 is
+    // now the wrong file. The sheet mounts, no error is raised (the missing
+    // name is never looked up, so `from_cue_files` has nothing to complain
+    // about), and track 1 serves track 2's bytes. That is the silent
+    // wrong-data mount this whole class of fix exists to remove.
+    //
+    // Asserting the file *list* alone would not catch it: the damage lives in
+    // the index binding, so the markers below have to prove which file each
+    // track actually reads from.
+    let sheet = "FILE \"t1.bin\" BINARY\n\
+                 TRACK 01 AUDIO\n\
+                 INDEX 01 00:00:00\n\
+                 FILE \"t2.bin\" BINARY\n\
+                 TRACK 02 AUDIO\n\
+                 INDEX 01 00:00:00\n";
+    let with_bom = format!("\u{feff}{sheet}");
+
+    let (clean_files, clean_tracks) = parse_cue(sheet).unwrap();
+    let (bom_files, bom_tracks) = parse_cue(&with_bom).unwrap();
+    assert_eq!(bom_files, clean_files);
+    assert_eq!(
+        bom_tracks
+            .iter()
+            .map(|t| (t.number, t.file_index))
+            .collect::<Vec<_>>(),
+        clean_tracks
+            .iter()
+            .map(|t| (t.number, t.file_index))
+            .collect::<Vec<_>>()
+    );
+
+    let mut t1 = vec![0u8; 2 * RAW_SECTOR];
+    t1[0] = 0xE1;
+    let mut t2 = vec![0u8; 3 * RAW_SECTOR];
+    t2[0] = 0xE2;
+    let files = vec![("t1.bin".to_string(), t1), ("t2.bin".to_string(), t2)];
+
+    let img = CdImage::from_cue_files(&with_bom, files).unwrap();
+
+    assert_eq!(img.track_count(), 2);
+    assert_eq!((img.tracks()[0].start_lba, img.tracks()[0].sectors), (0, 2));
+    assert_eq!((img.tracks()[1].start_lba, img.tracks()[1].sectors), (2, 3));
+    assert_eq!(img.tracks()[0].image_offset, 0);
+    assert_eq!(img.tracks()[1].image_offset, 2 * RAW_SECTOR);
+    assert_eq!(img.read_audio_frame(0).unwrap()[0], 0xE1);
+    assert_eq!(img.read_audio_frame(2).unwrap()[0], 0xE2);
+}
+
+#[test]
 fn cue_keeps_the_file_type_token() {
     let cue = "FILE \"disc.bin\" BINARY\n\
                TRACK 01 MODE1/2048\n\
