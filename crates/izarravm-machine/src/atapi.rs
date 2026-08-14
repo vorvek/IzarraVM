@@ -377,6 +377,12 @@ impl AtapiDevice {
         };
         let next = lba.saturating_add(frames);
         self.mixer_lba = (next < self.play.end_lba).then_some(next);
+        // Warm the next track before the head reaches it. Without this, a play
+        // spanning the disc clips the opening of every track after the first,
+        // because a decode only starts when a frame is asked for.
+        if let Some(image) = self.image.as_ref() {
+            image.warm_upcoming(next);
+        }
     }
 
     /// Pull the next audio frame to render, advancing the play position by one

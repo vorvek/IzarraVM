@@ -199,6 +199,14 @@ impl std::fmt::Debug for CueSource {
     }
 }
 
+/// How far ahead of a track boundary the next track's decode is started, in
+/// frames.
+///
+/// 150 frames is two seconds: comfortably longer than a decode needs to get
+/// ahead of realtime playback, and short enough that warming never reaches a
+/// track the head is not about to arrive at.
+pub const PREFETCH_FRAMES: u32 = 150;
+
 /// A mounted CD image: the backing bytes plus the parsed track table.
 #[derive(Debug, Clone)]
 pub struct CdImage {
@@ -639,6 +647,38 @@ impl CdImage {
 
     pub fn tracks(&self) -> &[Track] {
         &self.tracks
+    }
+
+    /// Start the next track's decode if the play head at `lba` is within
+    /// [`PREFETCH_FRAMES`] of reaching it.
+    ///
+    /// Without this a play that spans the disc clips the opening of every track
+    /// after the first: a decode only begins when a frame is asked for, and by
+    /// then the head is already there, advancing in real time whether or not
+    /// anything has caught up.
+    ///
+    /// Cheap and idempotent -- a source already decoding ignores the touch --
+    /// so the mixer can call it on every frame it renders.
+    pub fn warm_upcoming(&self, lba: u32) {
+        let Some(track) = self.track_at_lba(lba) else {
+            return;
+        };
+        if track.end_lba().saturating_sub(lba) > PREFETCH_FRAMES {
+            return;
+        }
+        // Only the track that begins exactly where this one ends, so a disc of
+        // tracks shorter than the window warms one ahead rather than all of
+        // them -- which is the residency the decoder's bound exists to prevent.
+        let Some(next) = self.tracks.iter().find(|t| t.start_lba == track.end_lba()) else {
+            return;
+        };
+        if let Some(source) = self.audio_sources.get(&next.number) {
+            // Asking for frame 0 is what starts a decode, and the frame itself
+            // is thrown away. There is no separate "start" on the contract
+            // because the disc model has no business knowing that a source
+            // decodes at all -- only that its frames may not be ready yet.
+            let _ = source.frame(0);
+        }
     }
 
     /// Disc capacity in user sectors (the value READ CAPACITY reports, less one).

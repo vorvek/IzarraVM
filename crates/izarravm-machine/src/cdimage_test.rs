@@ -741,11 +741,19 @@ fn cue_file_line_without_a_name_is_rejected() {
 
 /// A stand-in decoder: reports a fixed length and serves frames stamped with
 /// their index, with everything from `ready` on withheld the way an unfinished
-/// decode withholds its tail.
+/// decode withholds its tail. It also records having been asked for anything,
+/// which is how a real source learns it should start decoding.
 #[derive(Debug)]
 struct FakeSource {
     sectors: u32,
     ready: u32,
+    touched: std::sync::atomic::AtomicBool,
+}
+
+impl FakeSource {
+    fn was_touched(&self) -> bool {
+        self.touched.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl izarravm_core::AudioTrackSource for FakeSource {
@@ -754,6 +762,8 @@ impl izarravm_core::AudioTrackSource for FakeSource {
     }
 
     fn frame(&self, index: u32) -> Option<[u8; RAW_SECTOR]> {
+        self.touched
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         (index < self.ready).then(|| {
             let mut frame = [0u8; RAW_SECTOR];
             frame[0] = 0xF0 | (index as u8 & 0x0F);
@@ -762,8 +772,19 @@ impl izarravm_core::AudioTrackSource for FakeSource {
     }
 }
 
+/// Build a fake source and return both the `CueSource` and a handle on the
+/// fake, so a test can ask whether it was touched.
+fn fake_pair(sectors: u32, ready: u32) -> (CueSource, std::sync::Arc<FakeSource>) {
+    let source = std::sync::Arc::new(FakeSource {
+        sectors,
+        ready,
+        touched: std::sync::atomic::AtomicBool::new(false),
+    });
+    (CueSource::Audio(source.clone()), source)
+}
+
 fn fake(sectors: u32, ready: u32) -> CueSource {
-    CueSource::Audio(std::sync::Arc::new(FakeSource { sectors, ready }))
+    fake_pair(sectors, ready).0
 }
 
 #[test]
@@ -968,4 +989,105 @@ fn a_repeated_file_section_is_still_rejected_through_the_new_entry_point() {
         err.contains("more than one FILE section"),
         "message was: {err}"
     );
+}
+
+/// Two audio tracks of `sectors` frames each, back to back, with a handle on
+/// the second one's source.
+fn two_track_disc(sectors: u32) -> (CdImage, std::sync::Arc<FakeSource>) {
+    let cue = "FILE \"a.ogg\" WAVE\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"b.ogg\" WAVE\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let (first, _first_handle) = fake_pair(sectors, sectors);
+    let (second, second_handle) = fake_pair(sectors, sectors);
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![("a.ogg".to_string(), first), ("b.ogg".to_string(), second)],
+    )
+    .unwrap();
+    (img, second_handle)
+}
+
+#[test]
+fn approaching_a_track_boundary_warms_the_next_track() {
+    // The play head advances in real time whether or not the decoder has caught
+    // up, so a track whose decode starts when the head arrives loses its
+    // opening. Starting it a couple of seconds early costs nothing and removes
+    // the clip for sequential play, which is what a game and the front panel
+    // both do.
+    let (img, second) = two_track_disc(1000);
+
+    // Far from the boundary, nothing ahead is touched.
+    img.warm_upcoming(500);
+    assert!(!second.was_touched());
+
+    // Within the prefetch window of track 2's start at LBA 1000.
+    img.warm_upcoming(1000 - PREFETCH_FRAMES);
+    assert!(second.was_touched());
+}
+
+#[test]
+fn warming_never_reaches_past_the_next_track() {
+    // The window is measured from the end of the track the head is in, so a
+    // track shorter than the window must not warm the one after the next: a
+    // disc of two-second tracks would otherwise warm the whole disc at once,
+    // which is exactly the residency the bound exists to prevent.
+    let cue = "FILE \"a.ogg\" WAVE\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"b.ogg\" WAVE\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"c.ogg\" WAVE\n\
+               TRACK 03 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let (a, _) = fake_pair(10, 10);
+    let (b, b_handle) = fake_pair(10, 10);
+    let (c, c_handle) = fake_pair(10, 10);
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![
+            ("a.ogg".to_string(), a),
+            ("b.ogg".to_string(), b),
+            ("c.ogg".to_string(), c),
+        ],
+    )
+    .unwrap();
+
+    img.warm_upcoming(0);
+
+    assert!(b_handle.was_touched(), "the next track was not warmed");
+    assert!(!c_handle.was_touched(), "a track two ahead was warmed");
+}
+
+#[test]
+fn warming_the_last_track_is_not_an_error() {
+    let (img, _second) = two_track_disc(1000);
+    // Inside the final track, and past the end of the disc entirely.
+    img.warm_upcoming(1999);
+    img.warm_upcoming(5000);
+}
+
+#[test]
+fn warming_leaves_a_raw_track_alone() {
+    // A raw track has nothing to start and no source to touch. Reaching into
+    // `audio_sources` for one would be a lookup that always misses, but the
+    // point is that the byte-backed path is untouched by prefetch.
+    let cue = "FILE \"d.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:02\n";
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![(
+            "d.bin".to_string(),
+            CueSource::Raw(vec![0u8; 4 * RAW_SECTOR]),
+        )],
+    )
+    .unwrap();
+    img.warm_upcoming(0);
+    img.warm_upcoming(1);
 }
