@@ -278,6 +278,58 @@ fn cue_reports_a_file_it_was_not_given() {
 }
 
 #[test]
+fn cue_refuses_a_supplied_file_the_sheet_never_named() {
+    // Silently ignoring a file the caller supplied is how the BOM bug hid for
+    // as long as it did: the loader read two files off disk, the parser listed
+    // one because the BOM had fused onto the first FILE keyword, and the extra
+    // file went nowhere without a word while a track bound to the wrong bytes.
+    // The two sides disagreed about what the sheet said, and only the quieter
+    // side got to decide. Nobody has to know what a BOM is to be told the
+    // counts do not match -- whatever the next cause of a dropped FILE line
+    // turns out to be, this refuses the mount instead of guessing.
+    let cue = "FILE \"named.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let files = vec![
+        ("named.bin".to_string(), vec![0u8; RAW_SECTOR]),
+        ("surplus.bin".to_string(), vec![0u8; RAW_SECTOR]),
+    ];
+
+    let err = CdImage::from_cue_files(cue, files).unwrap_err();
+
+    assert!(
+        err.contains("surplus.bin"),
+        "error should name the file the sheet never asked for: {err}"
+    );
+
+    // A sheet whose files are supplied exactly still mounts: the check has to
+    // be a count comparison, not a refusal to mount anything at all.
+    assert!(
+        CdImage::from_cue_files(cue, vec![("named.bin".to_string(), vec![0u8; RAW_SECTOR])])
+            .is_ok()
+    );
+}
+
+#[test]
+fn cue_reports_the_missing_file_by_name_when_a_supplied_one_is_also_surplus() {
+    // Counts alone cannot tell these two apart: one file named, one file
+    // supplied, and they are different files. The name lookup has to run
+    // first, so the caller is told which file the sheet wanted rather than
+    // being handed an arithmetic identity that happens to hold.
+    let cue = "FILE \"wanted.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let files = vec![("other.bin".to_string(), vec![0u8; RAW_SECTOR])];
+
+    let err = CdImage::from_cue_files(cue, files).unwrap_err();
+
+    assert!(
+        err.contains("wanted.bin"),
+        "error should name the file the sheet wanted: {err}"
+    );
+}
+
+#[test]
 fn cue_rejects_a_file_name_repeated_across_two_file_sections() {
     // Two separate FILE sections naming the same file is not the "two tracks,
     // one file" layout (that's a single FILE section with multiple TRACK

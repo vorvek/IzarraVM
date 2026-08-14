@@ -289,6 +289,12 @@ impl CdImage {
     /// byte origin: a track's offsets are relative to its own file, while the
     /// LBA timeline runs continuously across all of them. A track that is last
     /// in its file runs to that file's end.
+    ///
+    /// `files` must correspond exactly to the sheet's FILE lines, in any
+    /// order. A name the sheet declares and `files` omits is an error, and so
+    /// is the reverse -- a file supplied that the sheet never named means the
+    /// caller and this parser disagree about what the sheet says, which is not
+    /// a disagreement to resolve by mounting one side's reading in silence.
     pub fn from_cue_files(cue: &str, files: Vec<(String, Vec<u8>)>) -> Result<Self, String> {
         let (files_in_sheet, tracks) = parse_cue(cue)?;
         // A repeated FILE name is not the "two tracks share one file" layout
@@ -325,6 +331,49 @@ impl CdImage {
                 bytes: found.1.as_slice(),
                 file_type: file_type.clone(),
             });
+        }
+        // Every FILE the sheet names now has bytes behind it, but the reverse
+        // was never asked: a file the caller supplied and the sheet did not
+        // name simply vanished here. That silence is why the BOM bug went
+        // unnoticed -- the loader read two files off disk, `parse_cue` listed
+        // one because the marker had fused onto the first FILE keyword, and
+        // the extra went nowhere while a track bound to the wrong file's
+        // bytes. Two scanners disagreed about what the sheet said and only the
+        // quieter one got a vote.
+        //
+        // After the loop above, every sheet name matched some supplied file
+        // and sheet names are unique (checked at the top), so a count that
+        // still differs means strictly more was supplied than named. Checking
+        // it *here* rather than before the loop is what keeps a genuinely
+        // missing file reported by name: equal counts with different names is
+        // the loop's error to raise, and it names the file the sheet wanted.
+        //
+        // The loader dedups by name before reading, so a well-formed sheet
+        // cannot trip this. That is the point: it costs a comparison and it
+        // makes the next dropped FILE line loud, whatever the cause.
+        if files.len() != build_files.len() {
+            let unnamed: Vec<&str> = files
+                .iter()
+                .map(|(name, _bytes)| name.as_str())
+                .filter(|name| {
+                    !files_in_sheet
+                        .iter()
+                        .any(|(in_sheet, _type)| in_sheet.eq_ignore_ascii_case(name))
+                })
+                .collect();
+            // `unnamed` is empty when the surplus is a *repeat* of a name the
+            // sheet does name, so the counts carry the message on their own
+            // and the list only elaborates when it has something to say.
+            let detail = if unnamed.is_empty() {
+                String::new()
+            } else {
+                format!(" (not named by the sheet: {})", unnamed.join(", "))
+            };
+            return Err(format!(
+                "{} files were supplied for a CUE that names {}{detail}",
+                files.len(),
+                files_in_sheet.len()
+            ));
         }
         Self::build(tracks, &build_files)
     }
