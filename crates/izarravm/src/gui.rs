@@ -9,6 +9,9 @@ mod session;
 mod ui;
 
 pub use runtime::run;
+// The headless --cd-image mount goes through the same loader as the GUI mount,
+// so the accepted formats and the error messages stay one list.
+pub(crate) use session::load_cd_image_from_path;
 
 use crate::host_input::HostInputPolicy;
 use crate::prefs::{CrtStyle, GuiPrefs, KeyBinding, MAX_VOLUME};

@@ -301,7 +301,7 @@ pub(super) struct SessionUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SessionFailure {
+pub(crate) struct SessionFailure {
     message: String,
 }
 
@@ -2284,7 +2284,7 @@ fn prepare_cd_source(source: &CdSource) -> Result<(String, CdImage), SessionFail
     }
 }
 
-fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
+pub(crate) fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
     let is_cue = path
         .extension()
         .and_then(|extension| extension.to_str())

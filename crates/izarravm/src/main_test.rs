@@ -285,6 +285,26 @@ fn cli_accepts_hdd_folder_profile_json_output() {
 }
 
 #[test]
+fn cli_accepts_cd_image_with_hdd_folder() {
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--hdd-folder",
+        "game",
+        "--cd-image",
+        "disc/game.cue",
+    ])
+    .unwrap();
+
+    assert_eq!(cli.hdd_folder.as_deref(), Some(Path::new("game")));
+    assert_eq!(cli.cd_image.as_deref(), Some(Path::new("disc/game.cue")));
+}
+
+#[test]
+fn cli_rejects_cd_image_without_hdd_folder() {
+    assert!(Cli::try_parse_from(["izarravm", "--cd-image", "disc/game.cue"]).is_err());
+}
+
+#[test]
 fn machine_profile_environment_gate_is_explicit() {
     for value in [None, Some(""), Some("0")] {
         assert!(!machine_profile_requested(value));

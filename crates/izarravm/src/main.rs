@@ -151,6 +151,11 @@ struct Cli {
     /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
     #[arg(long, requires = "hdd_folder")]
     expect_test_exit: bool,
+    /// With --hdd-folder, mount a CD image (ISO or CUE/BIN, the formats the GUI
+    /// mount accepts) before boot. For fixtures whose game reads data, FMV or
+    /// CD audio from the disc.
+    #[arg(long, requires = "hdd_folder")]
+    cd_image: Option<PathBuf>,
     /// With --hdd-folder, type keys at fixed guest-cycle offsets: `cycles:text`
     /// steps separated by `;`, offsets strictly increasing, `\r` for Enter. For
     /// games whose benchmark window sits behind a title screen or a menu. The
@@ -352,6 +357,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             cli.expect_test_exit,
             cli.inject_keys.as_deref(),
             cli.inject_mouse.as_deref(),
+            cli.cd_image.as_deref(),
         );
     }
 
@@ -1472,6 +1478,7 @@ fn run_boot_hdd_folder(
     expect_test_exit: bool,
     inject_keys: Option<&str>,
     inject_mouse: Option<&str>,
+    cd_image: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(path) = profile_json {
         validate_profile_json_parent(path)?;
@@ -1485,6 +1492,11 @@ fn run_boot_hdd_folder(
         .map(|bytes| ("GLIDE2X.OVL".to_string(), bytes))
         .collect();
     machine.mount_hdd_folder_with_user_overrides(dir, overlays)?;
+    // Same loader the GUI mount uses, so the accepted formats and the error
+    // messages stay one list.
+    if let Some(path) = cd_image {
+        machine.mount_cd(gui::load_cd_image_from_path(path)?);
+    }
     maybe_enable_unit_sim(&mut machine);
     maybe_enable_smc_trace(&mut machine);
     // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
