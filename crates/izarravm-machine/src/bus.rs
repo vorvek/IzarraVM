@@ -177,8 +177,16 @@ impl Machine {
     /// dumping there is not free of guest-visible effect, on a machine the GUI
     /// can resume.
     pub fn read_linear_u8(&mut self, linear: u32) -> Option<u8> {
+        let physical = self.translate_linear_probe(linear)?;
+        Some(self.read_physical_u8(physical))
+    }
+
+    /// The linear-to-physical half of `read_linear_u8`, on its own. Same probe discipline: it
+    /// walks the guest's own tables with uncharged byte reads, sets no CR2, writes no accessed
+    /// bit, and returns `None` for an unmapped address. Host-side diagnostics only.
+    pub fn translate_linear_probe(&mut self, linear: u32) -> Option<u32> {
         if self.cpu.control.cr0 & 0x8000_0000 == 0 {
-            return Some(self.read_physical_u8(linear));
+            return Some(linear);
         }
         let directory = self.cpu.control.cr3 & !0xfff;
         let pde = self.walk_entry(directory + (linear >> 22) * 4);
@@ -199,7 +207,16 @@ impl Machine {
             }
             (pte & !0xfff) | (linear & 0xfff)
         };
-        Some(self.read_physical_u8(physical))
+        Some(physical)
+    }
+
+    /// `CpuBus::peek_direct_ram` against this machine's live bus, for the ONE thing a host-side
+    /// test needs it for: asking whether a physical address is the aligned, page-local, A20-clean
+    /// plain RAM that the call-out's phase P requires. Charges nothing, exactly as the trait
+    /// method it forwards to. Not a data path -- see that method's doc.
+    pub fn peek_direct_ram(&mut self, physical: u32, width: BusWidth) -> Option<u32> {
+        let bus = self.make_bus();
+        bus.peek_direct_ram(physical, width)
     }
 
     /// One page-table entry, assembled from four byte reads.
@@ -871,6 +888,22 @@ impl CpuBus for MachineBus<'_> {
                 value,
                 direct: false,
             })
+    }
+
+    /// The aligned arm of `read_memory_direct` above with the charge pair deleted, and built by
+    /// calling the SAME `direct_page_ram_bytes` predicate rather than by a parallel
+    /// reimplementation -- the two must agree byte for byte, because the one caller reads the same
+    /// address twice (once here, once through the charged arm) and pins the values equal.
+    ///
+    /// See the trait's doc for why nothing else may call this.
+    fn peek_direct_ram(&self, address: u32, width: BusWidth) -> Option<u32> {
+        let (_, start, end) = self.direct_page_ram_bytes(address, width.bytes() as usize, width)?;
+        let data = &self.memory.as_slice()[start..end];
+        Some(match width {
+            BusWidth::Byte => u32::from(data[0]),
+            BusWidth::Word => u32::from(u16::from_le_bytes([data[0], data[1]])),
+            BusWidth::Dword => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        })
     }
 
     fn write_memory_direct(

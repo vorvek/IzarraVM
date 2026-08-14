@@ -863,6 +863,30 @@ pub trait CpuBus {
         0
     }
 
+    /// PURITY PRIMITIVE FOR CALL-OUT PREFLIGHT ONLY. NOT A DATA PATH.
+    ///
+    /// Reads `width` bytes of plain guest RAM and charges NOTHING: no wait states, no
+    /// `trace.record`, no counter, no device. It exists for one caller shape -- a native call-out
+    /// helper that must decide whether it may proceed BEFORE it is allowed to commit any effect,
+    /// and that then re-reads the same bytes through the charged path so the charge order matches
+    /// the interpreter's exactly (`jit/direct/callout.rs`, phase P).
+    ///
+    /// ANY OTHER CALLER IS A BUG. A read that the guest can observe the timing of must go through
+    /// `read_memory_direct` or `read_memory`; using this instead silently deletes the access from
+    /// `elapsed_clocks` and from the bus trace, which are the currency every performance
+    /// comparison in this project is measured in. The default declines, so a bus without a
+    /// provably side-effect-free RAM arm keeps the helper's refusal as the only answer.
+    ///
+    /// `&self`, which is the contract rather than a convenience: an implementation that needs
+    /// `&mut self` is by construction doing something this must not do.
+    ///
+    /// A `Some` result additionally promises that `read_memory_direct(address, width, _)` will
+    /// take its ALIGNED direct-RAM arm and return the same value -- so the caller may pair the
+    /// probe with a charged re-read and know which charge it will pay.
+    fn peek_direct_ram(&self, _address: u32, _width: BusWidth) -> Option<u32> {
+        None
+    }
+
     fn direct_page(
         &mut self,
         _address: u32,

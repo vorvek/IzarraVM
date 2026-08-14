@@ -864,21 +864,26 @@ fn the_census_suffix_scan_applies_the_x87_block_cap() {
     );
 }
 
-/// The port opcodes are never admitted at `OperandSize::Word`, and this test is load-bearing
-/// rather than defensive.
+/// The port opcodes at `OperandSize::Word`: `0xED`/`0xEE`/`0xEF` are never admitted, `0xEC` now
+/// is. Load-bearing rather than defensive, in both directions.
 ///
 /// `key_for_phys`'s V86 safety argument used to rest on three gates, "any ONE sufficient". One of
 /// them (`try_direct_continuation` refusing every 16-bit boundary) is already conditional on
-/// `IZARRAVM_JIT16`, so the argument really rests on two, and this is one of the two: an `IN` in a
-/// V86 16-bit segment must stay a barrier, because operand size follows CS.D opcode-independently
-/// and V86 code is always CS.D = 0.
+/// `IZARRAVM_JIT16`, so the argument really rests on two, and the Word allowlist was one of the
+/// two: an `IN` in a V86 16-bit segment stayed a barrier, because operand size follows CS.D
+/// opcode-independently and V86 code is always CS.D = 0.
 ///
-/// That gate is a LIST under active change by this very campaign, and `0xEC` is the single largest
-/// row on PoP-586 at 25.6M runtime hits — a number that is a fault-path artifact, but one whose
-/// only warning lives in a git-ignored findings doc. A list defended by a document nobody reads is
-/// not defended. This pins it in the test suite instead.
+/// `0xEC` LEFT that argument on purpose, and its safety is now the helper's rather than the
+/// list's: `port_read_al_dx` proves the TSS I/O-permission answer purely before it commits
+/// anything, and refuses whatever it cannot prove. The Word admission and that helper arm are ONE
+/// change and must revert together -- the admission alone is measured negative
+/// (`classify.rs`, the 2026-08-11 note). This row pins the admission so a revert of one half
+/// cannot pass silently.
+///
+/// The other three keep the original claim. That gate is a LIST under active change by this very
+/// campaign, and a list defended by a git-ignored findings doc nobody reads is not defended.
 #[test]
-fn port_opcodes_are_never_admitted_at_word() {
+fn only_the_call_out_port_opcode_is_admitted_at_word() {
     for opcode in [0xecu8, 0xed, 0xee, 0xef] {
         // The un-prefixed CONTROL, and it is asserted, not just built. An earlier revision
         // constructed, configured and warmed this pair and then dropped it, so the test could not
@@ -919,10 +924,21 @@ fn port_opcodes_are_never_admitted_at_word() {
             .collect();
         warm(&mut word_cpu, &mut word_bus, &word_addresses);
         let compilation = compiled(jit::direct::compile(&mut word_cpu, ENTRY, true));
-        assert_eq!(
-            compilation.span.instructions, 3,
-            "{opcode:#04x} at Word must stop the block at three slots, not be lowered"
-        );
+        if opcode == 0xec {
+            assert_eq!(
+                compilation.span.instructions, 7,
+                "IN AL,DX at Word is the V86 port call-out slice and must join the block"
+            );
+            assert_eq!(
+                compilation.callout_slots, 1,
+                "the Word form must produce a call-out slot, not a silent lowering"
+            );
+        } else {
+            assert_eq!(
+                compilation.span.instructions, 3,
+                "{opcode:#04x} at Word must stop the block at three slots, not be lowered"
+            );
+        }
     }
 }
 

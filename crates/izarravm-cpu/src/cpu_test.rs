@@ -2976,6 +2976,39 @@ impl CpuBus for TestBus {
             })
     }
 
+    /// Mirrors `MachineBus`'s: the direct-RAM admission (which `direct_memory_bytes` already
+    /// expresses here, alignment and page-locality included) with NO trace push. The trace is the
+    /// axis every phase-P test asserts on, so a peek that pushed a cycle would make the
+    /// zero-charge claim untestable.
+    ///
+    /// `non_direct_read_pages` therefore doubles as the fixture knob for the non-RAM refusal, the
+    /// same way it does for the slow-read path.
+    fn peek_direct_ram(&self, address: u32, width: BusWidth) -> Option<u32> {
+        if self.direct_memory_bytes(
+            address,
+            width.bytes() as usize,
+            width,
+            BusAccessKind::DataRead,
+        ) != width.bytes() as usize
+        {
+            return None;
+        }
+        let start = address as usize;
+        Some(match width {
+            BusWidth::Byte => u32::from(self.memory[start]),
+            BusWidth::Word => u32::from(u16::from_le_bytes([
+                self.memory[start],
+                self.memory[start + 1],
+            ])),
+            BusWidth::Dword => u32::from_le_bytes([
+                self.memory[start],
+                self.memory[start + 1],
+                self.memory[start + 2],
+                self.memory[start + 3],
+            ]),
+        })
+    }
+
     fn write_memory_direct(
         &mut self,
         address: u32,

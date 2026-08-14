@@ -2427,6 +2427,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "side_exit_callout_step_break": snapshot.side_exit_callout_step_break,
         "side_exit_callout_abnormal": snapshot.side_exit_callout_abnormal,
         "jit_direct_callout_executed": snapshot.callout_executed,
+        "jit_direct_callout_port_v86_served": snapshot.callout_port_v86_served,
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
         "segment_write_block_head_entries": snapshot.segment_write_block_head_entries,
         "segment_write_block_head_insns": snapshot.segment_write_block_head_insns,

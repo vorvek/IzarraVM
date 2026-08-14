@@ -52,7 +52,9 @@
 //!   body, so they are already exactly what the interpreter would see.
 //!
 //! **Read by the helper:** `registers.gpr[2]` (DX), `registers.eflags` (IOPL and VM, through
-//! `iopl`/`is_v86_mode`), CPL, `tr`, `core_clocks_so_far`, `timing_rem`, the persona.
+//! `iopl`/`is_v86_mode`), CPL, `tr`, `core_clocks_so_far`, `timing_rem`, the persona, and -- on
+//! the TSS-bitmap arm only -- the TLB (read-only, `resident_translate_system`) and two bytes of
+//! plain guest RAM (uncharged, `CpuBus::peek_direct_ram`).
 //!
 //! **Written by the helper, normal path:** `registers.gpr[0]`'s low byte (AL), plus whatever the
 //! device behind the port does. Nothing else -- no clock counter, no `perf`, no EIP.
@@ -120,8 +122,9 @@
 //! partial frame and all -- at the same boundary a pre-slice barrier produced.
 //!
 //! The privilege gate the port class carries is DELIBERATELY ABSENT here, and the difference is
-//! the TSS. `0xEC`'s refusal exists because `check_io_permission` probes the IO-permission bitmap
-//! through `read_system_linear`, which page-walks. PUSHAD and POPAD are unprivileged instructions
+//! the TSS. `0xEC`'s two-phase probe exists because `check_io_permission` reads the IO-permission
+//! bitmap through `read_system_linear`, which page-walks. PUSHAD and POPAD are unprivileged
+//! instructions
 //! with no such probe: their only privilege-sensitive decision is page protection, and that is
 //! made by `FastMap::lookup_access` against the LIVE CPL and CR0.WP inside the pre-check, which
 //! fails closed to a refusal. So a CPL-3 or IOPL-restricted guest keeps its PUSHAD call-outs; only
@@ -130,23 +133,31 @@
 //!
 //! # The abnormal set, port class (`0xEC`) -- exactly three producers
 //!
-//! 1. **The permission-checked port, refused up front.** When `is_v86_mode() || CPL > IOPL`,
-//!    `check_io_permission` would probe the TSS bitmap through `read_system_linear` -- and under
-//!    paging that walk WRITES guest memory (PDE/PTE accessed bits), records `written_pages`, can
-//!    set CR2, advances bus clocks mid-run, can evict a TLB entry and invalidate the fast map
-//!    whose bases the running block has baked in, and can reach `note_code_write` with this
-//!    block's native code live on the stack -- which is the exact situation
-//!    `note_code_write_inner`'s "no compiled block is mid-execution" proof rules out. The helper
-//!    refuses that state as its FIRST statement, before anything has run. Fail-closed by
-//!    construction, not by argument.
-//! 2. `check_io_permission` returns `Err` anyway. Unreachable given (1) -- it is the
-//!    interpreter's own gate, kept so that if the two predicates ever drift apart this refuses
-//!    rather than proceeds. It runs BEFORE `read_io`, so no device has been addressed.
+//! 1. **The permission-checked port, refused by PHASE P.** When `is_v86_mode() || CPL > IOPL`,
+//!    `check_io_permission` reads the TSS bitmap through `read_system_linear` -- and under paging
+//!    a TLB MISS there walks, and the walk WRITES guest memory (PDE/PTE accessed bits), records
+//!    `written_pages`, can set CR2, advances bus clocks mid-run, can evict a TLB entry and
+//!    invalidate the fast map whose bases the running block has baked in, and can reach
+//!    `note_code_write` with this block's native code live on the stack -- which is the exact
+//!    situation `note_code_write_inner`'s "no compiled block is mid-execution" proof rules out.
+//!    The helper therefore answers that state with a PURE probe first: TLB hits only
+//!    (`resident_translate_system`), an uncharged RAM read (`CpuBus::peek_direct_ram`), and a
+//!    refusal on anything it cannot settle -- a miss, a non-RAM or misaligned physical, a TSS
+//!    limit overrun, or a bitmap bit that denies the port. Only then does phase C charge. Every
+//!    refusal is taken before ANY effect, so fail-closed is by construction, not by argument.
+//! 2. `check_io_permission` returns `Err` anyway. Runs only on the OTHER arm, where it is the
+//!    interpreter's own early return and is kept so that if the two predicates ever drift apart
+//!    this refuses rather than proceeds. It runs BEFORE `read_io`, so no device has been
+//!    addressed.
 //! 3. `bus.read_io` returns `Err`. For `MachineBus` the sole producer is the `UnsupportedPort`
 //!    fall-through, reached only after every device declined the port -- so no device observed
 //!    the access there either.
 //!
-//! **Zero partial effects.** On both, at the moment of return: `registers.gpr` is byte-identical
+//! Phase C's two charged re-reads are NOT a fourth producer: each address survived
+//! `direct_page_ram_bytes` inside the peek, so `read_memory_direct` takes its aligned direct-RAM
+//! arm and cannot fail. They are asserted, not handled.
+//!
+//! **Zero partial effects.** On every one of them, at the moment of return: `registers.gpr` is byte-identical
 //! to the pre-call state (AL is written only after a successful read), EFLAGS and `pending_flags`
 //! are untouched (IN writes no flags), EIP still holds the block-entry value, `elapsed_clocks`,
 //! `perf`, `timing_rem`, `written_pages` and `prefetch` are untouched, and no clocks are charged
@@ -243,7 +254,7 @@
 use super::emit::{emit_store_homes, gpr_offset};
 use super::*;
 use crate::{IN_AL_DX_CORE_CLOCKS, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS};
-use izarravm_bus::{BusWidth, CpuBus};
+use izarravm_bus::{BusAccessKind, BusWidth, CpuBus};
 
 /// How many dwords `PUSHAD`/`POPAD` move. Eight registers, one dword each -- the SP slot included,
 /// which POPAD reads and discards.
@@ -413,6 +424,71 @@ fn helper_offset(helper: CallOutHelper) -> i32 {
     (core::mem::offset_of!(CpuGsw, native_callout) + field) as i32
 }
 
+/// What phase P learned, and the only thing phase C is allowed to use. Physicals rather than
+/// linears on purpose: re-translating in phase C could take a different answer (and, on a miss, a
+/// page walk), so the translation happens exactly once, in the pure phase.
+#[derive(Clone, Copy)]
+struct PortPermissionProbe {
+    io_base_physical: u32,
+    /// The peeked values, carried only so phase C's charged re-read can be asserted equal.
+    io_base: u32,
+    bitmap_physical: u32,
+    bits: u32,
+}
+
+/// PHASE P for `port_read_al_dx`: the interpreter's `check_io_permission` TSS walk, redone with
+/// no effect of any kind, refusing wherever it cannot answer purely.
+///
+/// `&CpuGsw` and `&B` are the contract, not a convenience: neither reference can mutate, so "this
+/// runs before the helper is allowed to commit anything" is enforced by the compiler rather than
+/// argued. Each `None` is one lane of the design's abnormal set:
+///
+/// * P1 the TSS is too small to hold the io_base word;
+/// * P2 that word straddles a page (so one translate could not cover it);
+/// * P3/P7 a TLB MISS -- the interpreter would walk here, which is the whole hazard;
+/// * P4/P8 the physical is not aligned, page-local, A20-clean plain RAM;
+/// * P5 the bitmap byte is past the TSS limit -- the interpreter's `#GP(0)`;
+/// * P9 the bit is set -- the interpreter's other `#GP(0)`.
+///
+/// The two `#GP` lanes refuse rather than fault for the reason the caller states: raising from
+/// inside a live block is the hazard class this design will not open, and the interpreter raises
+/// the identical fault one instruction boundary later.
+///
+/// Byte width only, matching `0xEC`'s single-byte port access: the interpreter's loop over
+/// `port..port + width.bytes()` collapses to one iteration.
+fn port_permission_resident<B: CpuBus>(
+    cpu: &CpuGsw,
+    bus: &B,
+    port: u16,
+) -> Option<PortPermissionProbe> {
+    if cpu.tr.limit < 0x67 {
+        return None;
+    }
+    let io_base_linear = cpu.tr.base.wrapping_add(0x66);
+    if io_base_linear & 0xfff > 0xffe {
+        return None;
+    }
+    let io_base_physical = cpu.resident_translate_system(io_base_linear)?;
+    let io_base = bus.peek_direct_ram(io_base_physical, BusWidth::Word)?;
+
+    let byte_index = io_base + u32::from(port) / 8;
+    if byte_index > cpu.tr.limit {
+        return None;
+    }
+    let bitmap_physical = cpu.resident_translate_system(cpu.tr.base.wrapping_add(byte_index))?;
+    let bits = bus.peek_direct_ram(bitmap_physical, BusWidth::Byte)?;
+    if bits & (1 << (u32::from(port) % 8)) != 0 {
+        return None;
+    }
+
+    Some(PortPermissionProbe {
+        io_base_physical,
+        io_base,
+        bitmap_physical,
+        bits,
+    })
+}
+
 /// `0xEC` IN AL,DX through the interpreter's own port path.
 ///
 /// # Safety
@@ -447,42 +523,50 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     #[cfg(feature = "direct-callout-attribution")]
     let original_port = cpu.read_gpr16(2);
 
-    // THE PERMISSION-CHECKED PORT IS REFUSED, BEFORE ANYTHING RUNS. This is the first statement
-    // in the body on purpose: at this point the helper has read two fields and done nothing else,
-    // so "zero partial effects" is true by construction rather than by argument.
-    //
-    // `check_io_permission` takes its early return when `!is_v86_mode() && cpl <= iopl`. On the
-    // other branch it probes the TSS through `read_system_linear`, and under paging THAT WALK
-    // WRITES GUEST MEMORY: PDE/PTE accessed bits go through the page-walk write path, which
-    // records `written_pages`, can set CR2, advances bus clocks, can evict a TLB entry and
-    // invalidate the fast map whose bases this block has BAKED IN, and can reach
-    // `note_code_write` -- with this block's native code live on the stack, which is exactly the
-    // situation `note_code_write_inner`'s "no compiled block is mid-execution when this runs"
-    // proof (core.rs) says cannot happen.
-    //
-    // Supporting that would mean unwinding all five of those. Refusing it costs a privileged or
-    // V86 guest the call-out and nothing else: the native run ends at the call-out and the
-    // INTERPRETER executes the whole instruction, TSS probe included, exactly as it does today
-    // for a block that stopped at an IN barrier. Same boundary, same charge, same faults.
-    //
-    // Neither shipped fixture reaches it (both take the CPL0 early return), which is precisely
-    // why it has to be structural rather than tested-by-the-fixtures; `paged_v86_call_out_is_...`
-    // in cpu_jit_callout_test.rs is the fixture that does reach it.
-    if cpu.is_v86_mode() || cpu.current_privilege_level() > cpu.iopl() {
-        #[cfg(feature = "direct-callout-attribution")]
-        cpu.jit_direct.note_callout_attribution(
-            CallOutHelper::PortReadAlDx,
-            Some(original_port),
-            CallOutOutcome::Abnormal,
-        );
-        return STATUS_ABNORMAL;
-    }
+    let port = cpu.read_gpr16(2);
 
-    // The SMC assertion, and it now guards a path that has NO memory access left in it: the
-    // permission probe was the only one, and the guard above excluded it. `read_io` writes no
-    // guest memory and `write_gpr8` is register state, so both counters must come back unchanged.
-    // Placed to cover the whole remaining body rather than as a tripwire for a hazard that is
-    // still reachable -- the hazard is gone.
+    // PHASE P. Pure: no charge, no guest write, no `trace.record`, no device. It runs only in the
+    // state `check_io_permission` does NOT early-return from -- V86, or CPL > IOPL -- and it
+    // answers one question: can this instruction's TSS I/O-permission probe be satisfied without
+    // any effect the helper is not allowed to have?
+    //
+    // The effect it must avoid is the PAGE WALK. `read_system_linear` translates through
+    // `translate_linear_system`, and on a TLB miss that walks, and `write_page_walk_entry` sets
+    // accessed bits through `bus.write_memory` + `record_write_page` + `note_code_write` -- with
+    // this block's native code live on the stack, which is exactly the situation
+    // `note_code_write_inner`'s "no compiled block is mid-execution when this runs" proof
+    // (core.rs) says cannot happen. `resident_translate_system` therefore serves TLB HITS ONLY
+    // and has no fallthrough to the walk at all, and `peek_direct_ram` reads plain RAM without
+    // charging or recording. Every step of the probe can only answer or refuse.
+    //
+    // Refusing costs the guest the call-out and nothing else: the native run ends here and the
+    // INTERPRETER executes the whole instruction, TSS probe, page walk and `#GP` included,
+    // exactly as it does for a block that stopped at an IN barrier. Same boundary, same charge,
+    // same faults. The miss case is self-healing -- the interpreted IN refills the TLB and the
+    // next one is served natively.
+    //
+    // The DENIED cases (P5 limit overrun, P9 bitmap bit set) refuse for the same reason rather
+    // than raising the fault here: `#GP(0)` from inside a live block is the whole hazard class
+    // this design refuses to open, and the interpreter raises exactly that fault one boundary
+    // later. Design doc section 1.2 enumerates the lanes; each has its own fixture.
+    let permission = if cpu.is_v86_mode() || cpu.current_privilege_level() > cpu.iopl() {
+        let Some(probe) = port_permission_resident(cpu, bus, port) else {
+            #[cfg(feature = "direct-callout-attribution")]
+            cpu.jit_direct.note_callout_attribution(
+                CallOutHelper::PortReadAlDx,
+                Some(original_port),
+                CallOutOutcome::Abnormal,
+            );
+            return STATUS_ABNORMAL;
+        };
+        Some(probe)
+    } else {
+        None
+    };
+
+    // The SMC assertion. Phase P wrote nothing by construction; phase C's two reads are DATA
+    // reads through the same aligned direct-RAM arm the interpreter takes, and `read_io` writes
+    // no guest memory, so both counters must come back unchanged whichever arm ran.
     #[cfg(debug_assertions)]
     let written_before = (cpu.written_count, cpu.written_pages_overflow);
 
@@ -504,19 +588,64 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
         .core_clocks_so_far
         .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks.saturating_add(fp.clocks)));
 
-    let port = cpu.read_gpr16(2);
     let ring0 = cpu.is_ring0_protected();
-    // Kept even though the guard above has already established its early-return condition. It is
-    // the interpreter's own gate, it is cheap once the TSS branch is unreachable, and if the two
-    // predicates ever drift apart this refuses rather than proceeds.
-    if cpu.check_io_permission(bus, port, BusWidth::Byte).is_err() {
-        #[cfg(feature = "direct-callout-attribution")]
-        cpu.jit_direct.note_callout_attribution(
-            CallOutHelper::PortReadAlDx,
-            Some(original_port),
-            CallOutOutcome::Abnormal,
-        );
-        return STATUS_ABNORMAL;
+    // PHASE C. Committed: the charges happen here, in the interpreter's own order, and nothing
+    // below may refuse.
+    //
+    // The two arms are the two arms of `check_io_permission` itself. With `permission` absent the
+    // interpreter took its early return and charged NOTHING for the check, so the gate is re-run
+    // here verbatim: it is cheap when it early-returns, and if the two predicates ever drift
+    // apart this refuses rather than proceeds. With `permission` present the interpreter read the
+    // io_base word and one bitmap byte through `read_system_linear`, and those two charges are
+    // replayed at C1/C2 -- SAME addresses, SAME widths, SAME `DataRead` kind, SAME order, and
+    // before `read_io`, which is row 9 of the design's charge table.
+    //
+    // Phase P's peek read the same bytes with no charge; these read them again with one. They
+    // cannot disagree -- nothing between them writes guest memory -- and the two assertions pin
+    // it. The physical survived `direct_page_ram_bytes`, whose `should_split` term rejects
+    // exactly the misaligned case, so C1 is guaranteed the ALIGNED arm of `read_memory_direct`
+    // and `charge_direct_ram_split` is unreachable from here; C2 is a byte and cannot split at
+    // all. An `Err` is likewise unreachable for the same reason -- the aligned arm returns `Ok`
+    // unconditionally -- and is asserted rather than handled; the return keeps the helper honest
+    // for a bus that violates the trait's promise.
+    match permission {
+        None => {
+            if cpu.check_io_permission(bus, port, BusWidth::Byte).is_err() {
+                #[cfg(feature = "direct-callout-attribution")]
+                cpu.jit_direct.note_callout_attribution(
+                    CallOutHelper::PortReadAlDx,
+                    Some(original_port),
+                    CallOutOutcome::Abnormal,
+                );
+                return STATUS_ABNORMAL;
+            }
+        }
+        Some(probe) => {
+            let Ok(io_base) = bus.read_memory_direct(
+                probe.io_base_physical,
+                BusWidth::Word,
+                BusAccessKind::DataRead,
+            ) else {
+                debug_assert!(false, "phase C re-read of a peeked io_base word failed");
+                return STATUS_ABNORMAL;
+            };
+            debug_assert_eq!(
+                io_base.value, probe.io_base,
+                "the charged io_base re-read disagreed with the pure peek"
+            );
+            let Ok(bits) = bus.read_memory_direct(
+                probe.bitmap_physical,
+                BusWidth::Byte,
+                BusAccessKind::DataRead,
+            ) else {
+                debug_assert!(false, "phase C re-read of a peeked bitmap byte failed");
+                return STATUS_ABNORMAL;
+            };
+            debug_assert_eq!(
+                bits.value, probe.bits,
+                "the charged bitmap re-read disagreed with the pure peek"
+            );
+        }
     }
     let Ok(value) = bus.read_io(port, BusWidth::Byte, now, ring0) else {
         #[cfg(feature = "direct-callout-attribution")]
@@ -528,6 +657,13 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
         return STATUS_ABNORMAL;
     };
     cpu.write_gpr8(0, value as u8);
+    // The numerator the acceptance gate needs, and the reason it is separate from
+    // `callout_executed`: on a mixed guest that count sums the CPL0 arm and this one, so it
+    // cannot say whether the NEW arm ever served anything. Bumped last, so an abnormal return
+    // from any lane -- including the unreachable `read_io` error -- is excluded by construction.
+    if permission.is_some() {
+        cpu.jit_direct.note_callout_port_v86_served();
+    }
 
     #[cfg(debug_assertions)]
     debug_assert_eq!(

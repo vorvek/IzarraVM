@@ -4501,11 +4501,18 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     // `try_direct_continuation` refused every `!d` boundary and stopped being true when
     // `IZARRAVM_JIT16` defaulted to 1. The V86 conclusion now rests on per-opcode gates:
     //
-    //   * The PORT opcodes (0xEC and family): two gates, either sufficient. `classify`'s
-    //     Word-size allowlist excludes them, so in a CS.D = 0 segment they stay barriers; and
-    //     `run_direct_block` refuses to ENTER a call-out-bearing block whenever
-    //     `is_v86_mode() || CPL > IOPL`, so the 0xEC call-out slot cannot execute in V86 even
-    //     compiled into a 32-bit block.
+    //   * `0xED`/`0xEE`/`0xEF`: no `classify` arm at any size, plus the Word allowlist. Two
+    //     gates, either sufficient.
+    //   * `0xEC` (IN AL,DX): the Word allowlist NO LONGER excludes it, and that is deliberate.
+    //     Its call-out helper `port_read_al_dx` now SUPPORTS the V86 / CPL>IOPL state instead of
+    //     refusing it: a pure phase (TLB hits only, an uncharged RAM peek) proves the TSS
+    //     I/O-permission answer with no effect at all, and only then does a committed phase
+    //     charge and read the port, in the interpreter's own order. Anything the pure phase
+    //     cannot answer -- a TLB miss above all -- still returns the instruction to the
+    //     interpreter unexecuted. `run_direct_block`'s entry refusal is UNCHANGED and still
+    //     refuses dispatcher entries into a call-out-bearing block in that state; a CHAINED
+    //     entry bypasses it by construction, which is the mechanism the slice is for. See
+    //     `jit/direct/callout.rs` and the note on `classify`'s `0xec` arm.
     //   * PUSHF: its PUSHFD arm is refused by `stack_width_kind` in V86 (`StoreSource::Flags`,
     //     IOPL check), and its Word form is off the allowlist.
     //   * POPF, CLI, STI, INT, IRET: no `classify` arm at any size. That absence is now PINNED by

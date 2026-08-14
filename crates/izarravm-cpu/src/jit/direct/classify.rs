@@ -183,6 +183,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     //
     // `0xd3` (the shift-by-CL group) is a different arm entirely and stays out, with
     // `emit_shift_cl` still Dword-only.
+    //
+    // `0xec` (IN AL,DX) is the V86 PORT CALL-OUT slice, and it is admitted here only because the
+    // helper gained its second arm in the SAME commit. It is the first entry on this list whose
+    // value is zero on its own and NEGATIVE on its own -- see the long note on the `0xec`
+    // classifier arm below for the measurement that says so, and for why the pair moves together.
     if insn.operand_size == OperandSize::Word
         && !matches!(
             insn.opcode,
@@ -228,6 +233,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xe8
                 | 0xe9
                 | 0xeb
+                | 0xec
                 | 0x0f80..=0x0f8f
                 | 0xf6
                 | 0xfe
@@ -665,12 +671,32 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // Byte-wide and accumulator-implicit: no ModRM, no `insn.operand`, the port comes
             // from the live DX. The interpreter's 0xec arm does NOT consult `operand_size` (it
             // reads DX and writes AL at `BusWidth::Byte` unconditionally), so the form is
-            // operand-size-invariant -- but 0xec is deliberately absent from the Word-size
-            // allowlist above for the reason that list documents, so a 66-prefixed encoding falls
-            // to `None` and stays a barrier. The invariance is stated, not relied on.
+            // operand-size-invariant, and 0xec is now ON the Word-size allowlist above.
             //
-            // THE WORD-SIZE ADMISSION HAS BEEN TRIED AND IS PROVABLY INERT. Do not re-derive it
-            // from the census. `dev_docs/wolf3d-586-measurement-results.md` ranks this row at
+            // THE 2026-08-11 REFUTATION BELOW IS SUPERSEDED, and is kept because its measurement
+            // is still the reason the admission cannot travel alone. What it refuted was the ONE
+            // LINE version -- the allowlist entry with the helper's blanket V86 refusal left in
+            // place. That version is still provably negative, and re-deriving it from the census
+            // is still the mistake the note was written to stop.
+            //
+            // What changed is the helper. `dev_docs/wolf-v86-port-callout-design.md` takes the
+            // 08-11 numbers apart into THREE gates rather than the two the earlier reading saw,
+            // and shows that the 136.8M call-outs which executed could only have arrived by
+            // CHAINED entry (a chained transfer never returns to `run_direct_block`, so its
+            // entry gate cannot have refused them) -- i.e. links into a call-out block already
+            // bind and already fire at nine-figure volume on this exact fixture. The remaining
+            // 100% abnormal rate was the helper's first statement, and `port_read_al_dx` now has
+            // a two-phase arm that answers the TSS I/O-bitmap question purely (TLB hits only, an
+            // uncharged RAM peek, refuse on any doubt) and only then charges. The entry gate in
+            // `run.rs` is deliberately UNCHANGED: it refuses dispatcher entries as before, and
+            // the chain is what gets in.
+            //
+            // So the two changes are ONE change and must stay one: the allowlist entry without
+            // the helper arm buys a spill, a call, a reload and a side exit where a free barrier
+            // used to be. Reverting either half alone re-creates exactly the measurement below.
+            //
+            // The superseded reading, verbatim:
+            // `dev_docs/wolf3d-586-measurement-results.md` ranks this row at
             // 370,316,594 of 381,560,241 block-stopping hits (97.05%) on wolf3d-586 and recommends
             // exactly one line: `0xec` added to the list above. Built and run (2026-08-11,
             // A/B/B/A at ProcessorIndex 8, 12e9 clocks) it serves ZERO port reads natively, and
@@ -699,17 +725,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // 1,085 of 26,612,249 (doom-586) and 135,164 of 1,836,356,449 (gp2-586). The problem
             // is V86, not the mechanism.
             //
-            // What would make the Word admission worth having, in order of size:
-            //   1. A V86-CAPABLE PORT CALL-OUT: pre-check that the TSS I/O-permission bit for the
-            //      port is resident and readable through the FastMap serve path with no page walk,
-            //      the same shape `call_out_stack_frame_resident` already uses for the memory
-            //      class, and drop the blanket V86 refusal. That is the slice that unlocks 97% of
-            //      this census; it is a real slice, not a list entry.
-            //   2. Failing that, a compile-time refusal of a PORT call-out slot while
-            //      `is_v86_mode()` (sound because V86 is bit 2 of `jit_mode_key`, so a block
-            //      cannot be reused across the boundary) would make the admission provably
-            //      NEUTRAL rather than negative -- but neutral on every fixture in tree, which is
-            //      the dead-code-no-counter-can-gate case this list exists to refuse.
+            // The note's own item 1 -- "a V86-capable port call-out ... that is the slice that
+            // unlocks 97% of this census; it is a real slice, not a list entry" -- is the slice
+            // that shipped, with the residency probe read off the TLB and the bus rather than off
+            // the FastMap. Item 2 (a compile-time V86 refusal of the slot) is now moot.
+            // (End of the superseded reading.)
             //
             // The Approximate-class gate is INHERITED, not re-stated. `block_continuable`
             // (decode.rs) admits the IN forms only on I486/I586, so on the Accurate 386 class

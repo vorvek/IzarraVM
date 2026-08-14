@@ -405,6 +405,14 @@ pub(crate) struct DirectStallTally {
     /// DENOMINATOR the two counters above needed: an abnormal count of zero says nothing without
     /// it, because zero is also what a mechanism that never ran reports.
     pub callout_executed: u64,
+    /// Port call-outs SERVED through the TSS-bitmap arm -- the V86 / CPL>IOPL state whose
+    /// permission check the helper's two-phase probe now satisfies natively.
+    ///
+    /// Separate from `callout_executed` because that count sums both arms, so on a guest that
+    /// runs compiled INs at both privilege states it cannot say whether the bitmap arm served
+    /// anything at all. This is the numerator of the slice's non-vacuity ratio; `executed` stays
+    /// the denominator.
+    pub callout_port_v86_served: u64,
     /// G1 lane trials granted: hot-chunk compilations allowed through the heat gates on the
     /// one-per-key-per-epoch budget (`lane_trial_enabled`), and how many of them installed a
     /// lane-carrying block under a hot span. The gap between the two is trials that learned
@@ -1565,6 +1573,7 @@ impl crate::jit::JitState {
             side_exit_callout_step_break: self.stalls.side_exit_callout_step_break,
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
             callout_executed: self.stalls.callout_executed,
+            callout_port_v86_served: self.stalls.callout_port_v86_served,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             segment_write_block_head_entries: self.stalls.segment_write_block_head_entries,
             segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
@@ -1619,6 +1628,12 @@ impl crate::jit::JitState {
     /// reasoning as the two side-exit counters above.
     pub(crate) fn note_callout_executed(&mut self) {
         self.stalls.callout_executed += 1;
+    }
+
+    /// One increment on the call-out's already-off-native path, for the same reason
+    /// `note_callout_executed` is ungated: the gate would cost as much as the work.
+    pub(crate) fn note_callout_port_v86_served(&mut self) {
+        self.stalls.callout_port_v86_served += 1;
     }
 
     pub(crate) fn note_reject_callout_privileged(&mut self) {

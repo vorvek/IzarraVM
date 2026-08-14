@@ -470,6 +470,17 @@ const PAGED_TABLE: u32 = 0x3000;
 ///
 /// `deny` picks whether the bitmap refuses `PORT`. Either way the CONSULT is the subject.
 fn paged_ring3_io_cpu(deny: bool) -> (CpuGsw, TestBus) {
+    paged_ring3_io_cpu_with(deny, TSS_IO_MAP_OFFSET, 0x1000)
+}
+
+/// As `paged_ring3_io_cpu`, with the bitmap's distance from the TSS base and the TSS limit under
+/// the caller's control.
+///
+/// The distance is what puts the io_base WORD and the bitmap BYTE on different pages, which is
+/// the only way to separate phase P's two translate/peek pairs: with the default 0x100 offset
+/// both live in page 2 and a single TLB entry serves them, so a fixture built on it cannot tell
+/// P3 from P7 or P4 from P8.
+fn paged_ring3_io_cpu_with(deny: bool, io_map_offset: u16, limit: u32) -> (CpuGsw, TestBus) {
     let mut memory = vec![0u8; 0x9000];
     // PDE 0 -> the table: present, writable, user, accessed CLEAR.
     memory[PAGED_DIRECTORY as usize..PAGED_DIRECTORY as usize + 4]
@@ -479,8 +490,8 @@ fn paged_ring3_io_cpu(deny: bool) -> (CpuGsw, TestBus) {
         memory[pte..pte + 4].copy_from_slice(&((page << 12) | 0x07).to_le_bytes());
     }
     let base = TSS_BASE as usize;
-    memory[base + 0x66..base + 0x68].copy_from_slice(&TSS_IO_MAP_OFFSET.to_le_bytes());
-    let bitmap = base + usize::from(TSS_IO_MAP_OFFSET) + usize::from(PORT / 8);
+    memory[base + 0x66..base + 0x68].copy_from_slice(&io_map_offset.to_le_bytes());
+    let bitmap = base + usize::from(io_map_offset) + usize::from(PORT / 8);
     memory[bitmap] = if deny { 1 << (PORT % 8) } else { 0 };
 
     let mut cpu = CpuGsw::default();
@@ -506,7 +517,7 @@ fn paged_ring3_io_cpu(deny: bool) -> (CpuGsw, TestBus) {
     cpu.cpl = 3;
     cpu.registers.eflags = 0x202;
     cpu.tr.base = TSS_BASE;
-    cpu.tr.limit = 0x1000;
+    cpu.tr.limit = limit;
     cpu.registers.set_edx(u32::from(PORT));
     cpu.registers.set_eax(0xdead_beef);
 
@@ -609,17 +620,15 @@ fn the_interpreter_still_does_the_tss_probe_the_call_out_refused() {
 }
 
 #[test]
-fn v86_call_out_is_refused_before_the_tss_probe() {
+fn v86_call_out_on_a_cold_tlb_is_refused_before_the_tss_probe() {
     // The other half of the refused predicate, isolated: IOPL is 3 here, so the `CPL > IOPL` half
-    // is FALSE and only `is_v86_mode()` can produce the refusal.
+    // is FALSE and only `is_v86_mode()` can send the helper down the TSS-bitmap arm.
     //
-    // Helper-level, and it stays helper-level even though `run_direct_block` now carries the
-    // load-bearing gate, because THREE independent gates already keep a V86 guest away from the
-    // emitted path and none of them can be switched off from a fixture: no 16-bit block is built
-    // at all (`try_direct_continuation` interprets every `!d` boundary), a CS.D = 0 IN is outside
-    // `classify`'s Word allowlist and stays a barrier, and the dispatch gate refuses the entry.
-    // This test covers the innermost of the four, which is the one that has to hold if the outer
-    // three are ever relaxed by the 16-bit admission work.
+    // On a COLD TLB that arm refuses at P3, which is the lane the whole zero-partial-effects
+    // argument rests on: the interpreter would page-walk here, and a walk from inside a live
+    // block is what this design will not do. The warm counterpart is
+    // `a_v86_port_is_served_natively_once_the_tss_pages_are_tlb_resident`, and the two together
+    // are what say this refusal is the TLB's answer rather than a blanket one.
     let (mut cpu, mut bus) = paged_ring3_io_cpu(false);
     cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
     assert_eq!(cpu.current_privilege_level(), 3);
@@ -628,10 +637,390 @@ fn v86_call_out_is_refused_before_the_tss_probe() {
 
     let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
 
-    assert!(status < 0, "a V86 task must be refused");
+    assert!(status < 0, "a V86 task on a cold TLB must be refused");
     assert_eq!(before, cpu.registers);
     assert!(page_walk_writes(&bus).is_empty());
     assert_eq!(bus.last_read_io_core_clocks_so_far, None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The TSS-bitmap arm: phase P proves residency purely, phase C charges. One test per refusal
+// lane, each built so the lane it names is the ONLY one that can produce the refusal.
+// ---------------------------------------------------------------------------------------------
+
+/// The io-map offset that puts the bitmap byte on a DIFFERENT page from the io_base word:
+/// `0x2000 + 0x1000 + 0x3da/8 = 0x307b`, against the word at `0x2066`.
+const TSS_SPLIT_PAGE_IO_MAP_OFFSET: u16 = 0x1000;
+const IO_BASE_PAGE: u32 = 2;
+const SPLIT_BITMAP_PAGE: u32 = 3;
+
+/// Execute ONE interpreted `IN AL,DX` from this state and then rewind everything the assertions
+/// look at.
+///
+/// This is not fixture convenience, it is the mechanism: the interpreted instruction is what
+/// FILLS the two TLB entries phase P then requires, which is the design's self-healing claim --
+/// a miss costs one interpreted IN and the next one is served natively. Building the entries by
+/// hand would let the fixture pass against a phase P that read the wrong linear.
+fn warm_the_tss_tlb(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    let entry = 0x4000u32;
+    bus.memory[entry as usize] = 0xec;
+    bus.memory[entry as usize + 1] = 0xf4;
+    cpu.set_eip(entry);
+    cpu.cycle(bus).expect("the warming IN must retire");
+    assert!(
+        !page_walk_writes(bus).is_empty(),
+        "the warming pass never walked, so the TLB is not warm for the reason claimed"
+    );
+
+    cpu.registers.set_eax(0xdead_beef);
+    cpu.registers.set_edx(u32::from(PORT));
+    cpu.registers.eflags = 0x202;
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    cpu.written_count = 0;
+    cpu.written_pages_overflow = false;
+    bus.trace = BusTrace::default();
+    bus.last_read_io_core_clocks_so_far = None;
+    bus.io_reads.clear();
+    bus.io_touched = false;
+}
+
+/// A CPL-3 paged fixture whose TSS pages are already TLB-resident.
+fn warmed_tss_cpu(io_map_offset: u16, limit: u32) -> (CpuGsw, TestBus) {
+    let (mut cpu, mut bus) = paged_ring3_io_cpu_with(false, io_map_offset, limit);
+    warm_the_tss_tlb(&mut cpu, &mut bus);
+    (cpu, bus)
+}
+
+/// Everything a refusal must leave untouched, in one place so no lane's test can quietly assert
+/// less than another's.
+fn assert_refused_with_zero_partial_effects(
+    lane: &str,
+    status: i64,
+    cpu: &CpuGsw,
+    bus: &TestBus,
+    before: &Registers,
+    before_cr2: u32,
+) {
+    assert!(status < 0, "{lane}: the lane must refuse");
+    assert_eq!(before, &cpu.registers, "{lane}: a register was written");
+    assert_eq!(before_cr2, cpu.control.cr2, "{lane}: CR2 moved");
+    assert_eq!(cpu.written_count, 0, "{lane}: written_pages");
+    assert!(
+        !cpu.written_pages_overflow,
+        "{lane}: written_pages_overflow"
+    );
+    assert_eq!(cpu.elapsed_clocks, 0, "{lane}: charged core clocks");
+    assert!(
+        page_walk_writes(bus).is_empty(),
+        "{lane}: the refused path set a page-table accessed bit"
+    );
+    assert_eq!(
+        bus.trace.cycles().len(),
+        0,
+        "{lane}: the refused path recorded a bus cycle -- phase P must charge and record nothing"
+    );
+    assert_eq!(
+        bus.trace.elapsed_clocks(),
+        0,
+        "{lane}: the refused path advanced bus clocks"
+    );
+    assert_eq!(
+        bus.last_read_io_core_clocks_so_far, None,
+        "{lane}: the refused path reached the device"
+    );
+}
+
+#[test]
+fn a_v86_port_is_served_natively_once_the_tss_pages_are_tlb_resident() {
+    // THE POINT OF THE SLICE. Same state as the cold test above, one interpreted IN later.
+    let (mut cpu, mut bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+    cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+    assert!(cpu.is_v86_mode());
+    assert_eq!(cpu.iopl(), 3, "only the V86 half may select the arm");
+    let served_before = cpu.direct_stall_snapshot().callout_port_v86_served;
+
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+
+    assert!(status >= 0, "a permitted V86 port must be served");
+    assert_eq!(
+        status & 0xffff_ffff,
+        i64::from(IN_AL_DX_CORE_CLOCKS),
+        "the served V86 arm must charge the interpreter's own constant"
+    );
+    assert_eq!(
+        cpu.registers.eax(),
+        0xdead_be5a,
+        "the port byte lands in AL"
+    );
+    assert!(
+        page_walk_writes(&bus).is_empty(),
+        "the served path page-walked -- the whole hazard the design refuses"
+    );
+    assert_eq!(cpu.written_count, 0, "the served path wrote guest memory");
+    assert_eq!(
+        cpu.direct_stall_snapshot().callout_port_v86_served - served_before,
+        1,
+        "the served count must attribute this to the bitmap arm, not to the CPL0 one"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        stalls.callout_executed, 1,
+        "the denominator must count this call-out too"
+    );
+    assert_eq!(stalls.side_exit_callout_abnormal, 0);
+}
+
+#[test]
+fn the_cpl0_arm_does_not_count_as_a_bitmap_serve() {
+    // The counter's own non-vacuity: `callout_port_v86_served` must separate the two arms, or the
+    // acceptance ratio is measuring `callout_executed` twice.
+    let mut cpu = flat_cpu();
+    cpu.registers.set_edx(u32::from(PORT));
+    let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+    bus.lazy_io_reads = true;
+    bus.io_read_value = Some(0x5a);
+
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+
+    assert!(status >= 0);
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_executed, 1);
+    assert_eq!(
+        stalls.callout_port_v86_served, 0,
+        "the CPL0 arm must not be counted as a bitmap serve"
+    );
+}
+
+#[test]
+fn the_bitmap_arm_charges_exactly_what_the_interpreter_charges() {
+    // CHARGE IDENTITY, on the axis that carries it: the ordered list of DATA and IO bus cycles.
+    //
+    // A/B/A/B on ONE machine, not a single A-then-B pair. Wait states are priced against a data
+    // cache tag array on the production bus, so the FIRST touch of a line is not the price of the
+    // second: an A-then-B pair compares a cold A against a warm B and passes on an arm that
+    // charges differently. Interleaving twice makes the second pair a repeat of the first, and
+    // all four legs must agree.
+    let (mut cpu, mut bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+    let entry = 0x4000u32;
+
+    let interesting = |bus: &TestBus| -> Vec<(BusAccessKind, u32, BusWidth)> {
+        bus.trace
+            .cycles()
+            .iter()
+            .filter(|cycle| matches!(cycle.kind, BusAccessKind::DataRead | BusAccessKind::IoRead))
+            .map(|cycle| (cycle.kind, cycle.address, cycle.width))
+            .collect()
+    };
+
+    let mut legs: Vec<Vec<(BusAccessKind, u32, BusWidth)>> = Vec::new();
+    for leg in 0..4 {
+        bus.trace = BusTrace::default();
+        cpu.registers.set_eax(0xdead_beef);
+        cpu.registers.set_edx(u32::from(PORT));
+        cpu.elapsed_clocks = 0;
+        cpu.core_clocks_so_far = 0;
+        if leg % 2 == 0 {
+            cpu.set_eip(entry);
+            cpu.cycle(&mut bus).expect("the interpreted IN must retire");
+        } else {
+            let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+            assert!(status >= 0, "leg {leg}: the helper must serve");
+        }
+        assert_eq!(
+            cpu.registers.eax(),
+            0xdead_be5a,
+            "leg {leg}: both roles must land the port byte"
+        );
+        legs.push(interesting(&bus));
+    }
+
+    assert_eq!(legs[0], legs[1], "interpreter/helper pair 1 disagreed");
+    assert_eq!(legs[2], legs[3], "interpreter/helper pair 2 disagreed");
+    assert_eq!(legs[1], legs[3], "the helper's own two legs disagreed");
+    // Non-vacuity: the shape really is the io_base word, the bitmap byte and the port, in that
+    // order. An empty or truncated list would satisfy every assertion above.
+    assert_eq!(
+        legs[0],
+        vec![
+            (BusAccessKind::DataRead, TSS_BASE + 0x66, BusWidth::Word),
+            (
+                BusAccessKind::DataRead,
+                TSS_BASE + u32::from(TSS_IO_MAP_OFFSET) + u32::from(PORT) / 8,
+                BusWidth::Byte
+            ),
+            (BusAccessKind::IoRead, u32::from(PORT), BusWidth::Byte),
+        ],
+        "the charge ORDER is the claim; this is what section 2 of the design pins"
+    );
+}
+
+#[test]
+fn every_phase_p_lane_refuses_with_zero_partial_effects() {
+    // One case per refusal lane. Each starts from a state that would otherwise SERVE -- the warm
+    // fixture above -- and breaks exactly one premise, so a lane that stopped firing would show up
+    // as a SERVED port rather than as a silently different refusal (`fixtures-that-cannot-fail`).
+    #[allow(clippy::type_complexity)]
+    let lanes: Vec<(&str, u16, u32, Box<dyn Fn(&mut CpuGsw, &mut TestBus)>)> = vec![
+        (
+            // P1: the TSS cannot even hold the io_base word.
+            "P1 limit below 0x67",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tr.limit = 0x66),
+        ),
+        (
+            // P2: the word straddles a page, so one translate cannot cover it.
+            "P2 io_base word straddles a page",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tr.base = 0x2f99),
+        ),
+        (
+            // P3: the io_base page is not resident. This is the lane that stands in for the page
+            // walk the interpreter would take.
+            "P3 io_base page TLB miss",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tlb.invalidate(IO_BASE_PAGE)),
+        ),
+        (
+            // P4a: MISALIGNED io_base word. `should_split` rejects it, so the peek declines --
+            // the kill condition the design's section 6.0 falsification was written against.
+            "P4 misaligned io_base word",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tr.base = TSS_BASE + 1),
+        ),
+        (
+            // P4b: the page is readable but not plain direct RAM.
+            "P4 io_base page is not direct RAM",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|_: &mut CpuGsw, bus: &mut TestBus| {
+                bus.non_direct_read_pages.push(IO_BASE_PAGE)
+            }),
+        ),
+        (
+            // P5: the bitmap byte is past the limit -- the interpreter's first `#GP(0)`.
+            "P5 bitmap byte past the TSS limit",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tr.limit = 0x100),
+        ),
+        (
+            // P7: the BITMAP page is not resident while the io_base page is. Needs the split-page
+            // TSS, or one TLB entry covers both and the lane is unreachable.
+            "P7 bitmap page TLB miss",
+            TSS_SPLIT_PAGE_IO_MAP_OFFSET,
+            0x2000,
+            Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tlb.invalidate(SPLIT_BITMAP_PAGE)),
+        ),
+        (
+            // P8: the bitmap page is readable but not plain direct RAM.
+            "P8 bitmap page is not direct RAM",
+            TSS_SPLIT_PAGE_IO_MAP_OFFSET,
+            0x2000,
+            Box::new(|_: &mut CpuGsw, bus: &mut TestBus| {
+                bus.non_direct_read_pages.push(SPLIT_BITMAP_PAGE)
+            }),
+        ),
+        (
+            // P9: the guest TRAPS this port -- the interpreter's other `#GP(0)`. The byte is
+            // flipped after warming so the warm pass itself stays clean.
+            "P9 bitmap bit set",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|_: &mut CpuGsw, bus: &mut TestBus| {
+                let at = TSS_BASE as usize + usize::from(TSS_IO_MAP_OFFSET) + usize::from(PORT / 8);
+                bus.memory[at] = 1 << (PORT % 8);
+            }),
+        ),
+    ];
+
+    for (lane, io_map_offset, limit, break_it) in lanes {
+        // The control: unbroken, this exact fixture SERVES. Without it a lane could pass because
+        // the fixture never worked, which is the whole point of proving a guard fires.
+        let (mut control, mut control_bus) = warmed_tss_cpu(io_map_offset, limit);
+        assert!(
+            jit::direct::port_read_al_dx_for_test(&mut control, &mut control_bus, 0, 0) >= 0,
+            "{lane}: the UNBROKEN fixture must serve, or this lane proves nothing"
+        );
+
+        let (mut cpu, mut bus) = warmed_tss_cpu(io_map_offset, limit);
+        break_it(&mut cpu, &mut bus);
+        let before = cpu.registers.clone();
+        let before_cr2 = cpu.control.cr2;
+
+        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+
+        assert_refused_with_zero_partial_effects(lane, status, &cpu, &bus, &before, before_cr2);
+        assert_eq!(
+            cpu.direct_stall_snapshot().callout_port_v86_served,
+            0,
+            "{lane}: a refusal was counted as a serve"
+        );
+    }
+}
+
+#[test]
+fn the_interpreter_raises_the_gp_the_denied_lanes_refused() {
+    // What stops the two `#GP` lanes above from being vacuous: from the SAME state the
+    // interpreter really does fault, so refusing costs the guest nothing but the call-out and the
+    // architectural answer is unchanged.
+    for (lane, limit, deny) in [("P5 limit", 0x100u32, false), ("P9 bit", 0x1000, true)] {
+        let (mut cpu, mut bus) = paged_ring3_io_cpu_with(deny, TSS_IO_MAP_OFFSET, limit);
+        let entry = 0x4000u32;
+        bus.memory[entry as usize] = 0xec;
+        bus.memory[entry as usize + 1] = 0xf4;
+        cpu.set_eip(entry);
+
+        // Not unwrapped: the #GP has no IDT to land in and nests. The subject is that the
+        // instruction did NOT retire and AL did not move.
+        let _ = cpu.cycle(&mut bus);
+        assert_eq!(
+            cpu.registers.eax(),
+            0xdead_beef,
+            "{lane}: the interpreter served a port the helper refused as denied"
+        );
+    }
+}
+
+#[test]
+fn a_word_size_in_al_dx_joins_the_block_instead_of_ending_it() {
+    // G1, the classifier half of the slice, and it must move in the same commit as the helper
+    // arm: on its own it buys a spill, a call, a reload and a side exit where a free barrier used
+    // to be (classify.rs records the measurement).
+    //
+    // `66 EC` mid-block, never at entry -- an opcode at a block's entry slot parks the block on
+    // the interpreter and certifies nothing.
+    let mut code = vec![0x89, 0xf6];
+    code.extend_from_slice(&[0x66, 0xec]);
+    code.extend_from_slice(&[0x89, 0xff, 0xf4]);
+
+    let mut memory = vec![0u8; 0x5000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    cpu.registers.set_esp(STACK_TOP);
+    for offset in [0u32, 2, 4] {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.fetch_decoded(&mut bus, linear).unwrap();
+    }
+    let compilation = match jit::direct::compile(&mut cpu, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        _ => panic!("a Word-size IN AL,DX is still a barrier -- the allowlist entry is missing"),
+    };
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the block must extend THROUGH the 66-prefixed call-out"
+    );
+    assert_eq!(compilation.callout_slots, 1);
 }
 
 #[test]

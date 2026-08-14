@@ -208,6 +208,161 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
+/// What the whole TSS geometry of a live TOKAEMM monitor is, measured rather than read off the
+/// assembler source.
+#[derive(Debug, Clone, Copy)]
+// Every field is read, but only through `Debug` -- which dead-code analysis does not count. They
+// are here to be PRINTED: the design owes a measured TR.base/io_base, not a boolean.
+#[allow(dead_code)]
+struct TssIoProbe {
+    tr_base: u32,
+    tr_limit: u32,
+    io_base: u16,
+    io_base_linear: u32,
+    io_base_physical: u32,
+    bitmap_linear: u32,
+    bitmap_physical: u32,
+    bitmap_byte: u8,
+}
+
+/// THE FALSIFICATION FOR THE V86 PORT CALL-OUT (design doc section 6.0), and it runs before that
+/// helper exists rather than after, because it can kill the slice outright.
+///
+/// The helper's phase P proves the TSS I/O-permission bitmap is readable with no charge and no
+/// page walk, then re-reads it through the charged path. Every step of that is conditional on
+/// geometry the guest chooses:
+///
+/// * `TR.base + 0x66` must be EVEN, or `should_split` rejects the word and the pure peek returns
+///   `None` on every single call -- the helper would refuse always and the slice would be inert;
+/// * the word must be page-local, which is phase P's own P2 test;
+/// * the bitmap byte for the polled port must be inside `TR.limit` and clear, or the interpreter
+///   raises `#GP(0)` and there is nothing to serve;
+/// * both physicals must be plain, A20-clean, page-local RAM, or the peek declines.
+///
+/// `tokaemm.asm` says all of these statically (`align 16` before `tss:`, `io_base = 0x68`, an
+/// all-zero bitmap with only port 0x92 trapped, limit 0x2068). Static reading is not measurement:
+/// the driver is relocated at load time and the monitor pages it. This boots the thing and looks.
+#[test]
+#[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+fn tokaemm_tss_io_bitmap_is_readable_by_a_pure_preflight_probe() {
+    // 0x3DA is wolf3d's VL_WaitVBL poll -- the address the whole lever exists for.
+    const PROBE_PORT: u16 = 0x03da;
+
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    // The 586 persona, because that is the one wolf3d-586 runs and the one whose Approximate
+    // class admits the IN forms at all.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-tss-probe",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+
+    // Sample finely and only while the guest is busy, for the reasons `sample_v86_while_busy`
+    // documents. Not that helper itself: the probe needs `&mut Machine` to walk the tables.
+    let mut probes: Vec<TssIoProbe> = Vec::new();
+    for _ in 0..4_000u32 {
+        let stop = machine
+            .run_until_halt_or_cycles(200_000)
+            .expect("machine run");
+        if let StopReason::CpuError(message) = &stop {
+            panic!(
+                "CPU fault while probing the TSS: {message}\n{}",
+                machine.screen_text().as_text()
+            );
+        }
+        if !machine.in_v86() {
+            continue;
+        }
+        let tr_base = machine.cpu().tr.base;
+        let tr_limit = machine.cpu().tr.limit;
+        let io_base_linear = tr_base + 0x66;
+        let Some(io_base_physical) = machine.translate_linear_probe(io_base_linear) else {
+            continue;
+        };
+        let Some(io_base) = machine.peek_direct_ram(io_base_physical, izarravm_bus::BusWidth::Word)
+        else {
+            // Recorded as a refusal by leaving the sample out; the assertions below fail loudly
+            // on an empty vector rather than passing vacuously.
+            continue;
+        };
+        let bitmap_linear = tr_base + io_base + u32::from(PROBE_PORT) / 8;
+        let Some(bitmap_physical) = machine.translate_linear_probe(bitmap_linear) else {
+            continue;
+        };
+        let Some(bitmap_byte) =
+            machine.peek_direct_ram(bitmap_physical, izarravm_bus::BusWidth::Byte)
+        else {
+            continue;
+        };
+        probes.push(TssIoProbe {
+            tr_base,
+            tr_limit,
+            io_base: io_base as u16,
+            io_base_linear,
+            io_base_physical,
+            bitmap_linear,
+            bitmap_physical,
+            bitmap_byte: bitmap_byte as u8,
+        });
+        if probes.len() >= 8 {
+            break;
+        }
+    }
+
+    assert!(
+        !probes.is_empty(),
+        "no V86 sample resolved the TSS through the pure probe -- the fixture proves nothing, \
+         and if this is what the helper sees then phase P refuses on every call"
+    );
+    // The measured geometry, printed so the design's numbers are answerable from a test log.
+    for probe in &probes {
+        println!("TSS probe: {probe:?}");
+    }
+
+    for probe in &probes {
+        assert!(
+            probe.tr_limit >= 0x67,
+            "{probe:?}: TSS limit does not cover the io_base word (phase P1)"
+        );
+        assert_eq!(
+            probe.io_base_linear & 1,
+            0,
+            "{probe:?}: the io_base word is MISALIGNED -- `should_split` rejects it, the pure \
+             peek returns None on every call, and the slice is inert before it is written"
+        );
+        assert!(
+            probe.io_base_linear & 0xfff <= 0xffe,
+            "{probe:?}: the io_base word straddles a page boundary (phase P2)"
+        );
+        assert_eq!(
+            probe.io_base, 0x0068,
+            "{probe:?}: TOKAEMM's io_base moved away from the 0x68 the driver source sets"
+        );
+        let byte_index = u32::from(probe.io_base) + u32::from(PROBE_PORT) / 8;
+        assert!(
+            byte_index <= probe.tr_limit,
+            "{probe:?}: the 0x3DA bitmap byte is past the TSS limit -- the interpreter raises \
+             #GP(0) here and there is nothing for the call-out to serve"
+        );
+        assert_eq!(
+            probe.bitmap_byte & (1 << (PROBE_PORT % 8)),
+            0,
+            "{probe:?}: TOKAEMM traps 0x3DA -- phase P9 denies and the lever has no target"
+        );
+    }
+}
+
 #[test]
 #[ignore = "boots six full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_small_ram_layouts_do_not_expose_out_of_range_pools() {

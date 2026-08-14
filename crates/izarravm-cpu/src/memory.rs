@@ -442,6 +442,50 @@ impl CpuGsw {
         true
     }
 
+    /// `translate_linear_system`'s supervisor READ case, reduced to its TLB-HIT clause and made
+    /// `&self`. `None` means "not provably resident", never "faults".
+    ///
+    /// This exists so a call-out helper can decide whether it may proceed BEFORE it is allowed to
+    /// commit anything. The reason the full translator is unusable there is one branch: on a miss
+    /// it walks the tables, and `write_page_walk_entry` sets accessed bits through
+    /// `bus.write_memory` + `record_write_page` + `note_code_write` -- with this block's native
+    /// code live on the stack, which `note_code_write_inner`'s "no compiled block is
+    /// mid-execution" proof says cannot happen. THERE IS NO FALLTHROUGH TO THE WALK HERE. That
+    /// absence is the whole zero-partial-effects argument, so do not add one.
+    ///
+    /// Why a hit always serves a supervisor read, so that `None` really does mean only "miss":
+    /// the accessor is `Supervisor`, so `user = false` and `write = false`, which makes
+    /// `translate_linear_checked`'s `permitted` clause `!write || !wp || e.writable` and its
+    /// D-bit clause `!write || e.dirty` both unconditionally true. `Tlb::lookup` itself is a
+    /// `&self` array read with no LRU and no generation bump -- it mutates nothing.
+    ///
+    /// Paging off returns the linear unchanged, matching that function's own early return, which
+    /// takes its `record_write_page` branch only for a write.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn resident_translate_system(&self, linear: u32) -> Option<u32> {
+        if !self.is_paging_enabled() {
+            return Some(linear);
+        }
+        let entry = self.tlb.lookup(linear >> 12)?;
+        Some(entry.phys | (linear & 0x0000_0fff))
+    }
+
+    /// Fail-closed stand-in, same shape and same reason as `call_out_stack_frame_resident`'s
+    /// below: no emitted block exists on these targets, so nothing can call this, and `None`
+    /// keeps the helper's refusal the only possible answer if that ever changes.
+    #[cfg(not(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    pub(crate) fn resident_translate_system(&self, _linear: u32) -> Option<u32> {
+        None
+    }
+
     /// Fail-closed stand-in where there is no FastMap to prove residency against. Emitted blocks --
     /// and therefore call-out slots -- do not exist on these targets either, so this is
     /// unreachable; returning `false` keeps the helper's refusal the only possible answer if it
