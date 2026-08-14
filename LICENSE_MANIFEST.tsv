@@ -2,6 +2,14 @@ path	class	origin	license	sha256
 Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	0b87b634f5da93684f052850bf3806c544a52c7e0ba4f710af1b39ede7a06efd
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	8a836e2211363a304ed1cd6d483a39e3176cfc84e664caeb830916c7022c0fbb
+crates/izarravm-cdaudio/tests/fixtures/tone-22k-mono.wav	generated-test-fixture	IzarraVM project source	GPL-3.0-only	98b43874f2cdcac75465cf3df534f8654b635f24612f49f0158affb87a9d6234
+crates/izarravm-cdaudio/tests/fixtures/tone-nolength.flac	generated-test-fixture	IzarraVM project source	GPL-3.0-only	86a212264efd2c976ad2f0eaa79be9165db31e097a7ab4f21bd3ed80ea454c70
+crates/izarravm-cdaudio/tests/fixtures/tone-noxing.mp3	generated-test-fixture	IzarraVM project source	GPL-3.0-only	e39dfabb52c38cbb296567fe03dc3004b6d1924c959ed01332b522c940ae087d
+crates/izarravm-cdaudio/tests/fixtures/tone-opus.ogg	generated-test-fixture	IzarraVM project source	GPL-3.0-only	c6b2f6ae9e939eebc70bb5426ef1874835018f40e4cddd464b1969d1cf1eeea0
+crates/izarravm-cdaudio/tests/fixtures/tone.flac	generated-test-fixture	IzarraVM project source	GPL-3.0-only	58744cbf8dc41a77e4207ad6a9324b44862b3e56b927b7c621dcf2541fd5d6d0
+crates/izarravm-cdaudio/tests/fixtures/tone.mp3	generated-test-fixture	IzarraVM project source	GPL-3.0-only	f975bf874206ab442861d63682a260561c275e403d461247e3b6a708f82eb542
+crates/izarravm-cdaudio/tests/fixtures/tone.ogg	generated-test-fixture	IzarraVM project source	GPL-3.0-only	e0e1355c548a2b5135c40a7a48555937a5c69a95241d490059f770b5974ac005
+crates/izarravm-cdaudio/tests/fixtures/tone.wav	generated-test-fixture	IzarraVM project source	GPL-3.0-only	b2704439a1ed0f31c3c3a6042e3cca65d9dac10839cd2c14681a53d02379dd4f
 crates/izarravm-cpu/tests/fixtures/conformance_sample.json	test-fixture	IzarraVM project	GPL-3.0-only	6191f0dc08877a7a1d0630386c3337a9aa4b4cb08fe6506c1fcd75769182164a
 crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	1d531809b75b516e17b90698ce7c79093a582ac192f1716903cc5217d7041da8
 crates/izarravm-firmware/roms/boot-suite/results.inc	generated-source	IzarraVM boot suite	GPL-3.0-only	1b59bb368a2089b05b118059cbdcd38a8a8e02bf02f6d9e4acf6a7c332e37db7
