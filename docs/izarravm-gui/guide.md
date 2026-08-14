@@ -180,10 +180,25 @@ file picker.
 **CD-ROM (D:)** accepts three sources:
 
 - An **ISO** image, mounted as a single data track.
-- A **CUE/BIN** pair, with the `.cue` parsed against its matching `.bin`.
+- A **CUE** sheet with the files it names. Data tracks must be raw images
+  (`BINARY`, or `MOTOROLA` for big-endian samples). Audio tracks may be raw, or
+  encoded as Ogg Vorbis, MP3, WAV, or FLAC, one file per track. A sheet naming
+  no file at all is read against the `.bin` beside it.
 - A **host folder**, built into an ISO9660 image on the fly. Files are read
   lazily from the folder as the guest requests sectors, rather than copied
   up front, up to about 650 MB.
+
+An encoded audio track is decoded as it is played, and the track lengths in the
+table of contents come from the audio itself rather than from the file sizes. A
+sheet's `FILE` type token is not used to identify an encoded file; the contents
+are, because rippers commonly write a token that does not match what the file
+holds. Sample rates other than 44.1 kHz, and mono, are converted.
+
+A file in a format the emulator does not decode -- Opus, AAC, and Monkey's Audio
+among others -- is refused when the disc is mounted, and the message names the
+file. A disc is not mounted with tracks that would play incorrectly. The same
+applies to a sheet whose layout cannot be represented: an encoded file carrying
+a data track, or named by more than one `TRACK`.
 
 A CD image and a CD folder are mutually exclusive. Mounting one clears the
 other. There is no equivalent host-folder option for the floppy drive; A:
