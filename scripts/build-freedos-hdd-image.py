@@ -325,7 +325,7 @@ def main(check: bool = False) -> int:
     # load). After the loop, the closed footer box (single-line CP437 border,
     # 78 cols including the corners) tells the user text mode is active and how
     # to reach the visual workbench; the whole boot stays within the 25-row
-    # screen budget (10 logo + 4 box + 5 tree lines + 2 ReSonique2 rows
+    # screen budget (10 logo + 4 box + 5 tree lines + 2 ReSonique II rows
     # [heading + values] + 3 footer + 1 shell prompt = 25 -- the screen is
     # exactly full; any component that grows a row must take one from another
     # owner) so nothing scrolls the logo off row 0. (the kernel welcome box is

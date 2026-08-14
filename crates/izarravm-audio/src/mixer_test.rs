@@ -468,7 +468,7 @@ fn pc_speaker_register_decodes_two_bits_and_attenuates() {
     assert!((mixer.speaker_gain() - 10f32.powf(-14.0 / 20.0)).abs() < 1e-4);
 }
 
-/// The ReSonique 2 wavetable leg (`0x50`/`0x51`) is this card's own extension:
+/// The ReSonique II wavetable leg (`0x50`/`0x51`) is this card's own extension:
 /// a real CT1745 has no register for a wavetable, because a real CT1745 has no
 /// wavetable. It carries the card's ordinary 5-bit D7-D3 level so a guest
 /// programs it with the sequence it already uses for master/voice/FM/CD, and it

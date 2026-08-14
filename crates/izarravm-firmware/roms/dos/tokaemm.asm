@@ -2043,7 +2043,7 @@ monitor_body:
     jmp .done_gp
 
 ; ---- Two-byte privileged 0F ops (386MAX QMAX_I0D GP_ESCOD, adapted to the
-; Izarra 3000). A V86 task is CPL 3, so the CPU #GP(0)s every MOV CRn/DRn,
+; Izarra3000). A V86 task is CPL 3, so the CPU #GP(0)s every MOV CRn/DRn,
 ; CLTS, and LMSW into this monitor; the reference managers EMULATE them
 ; transparently (386MAX GP_MOV_*/GP_GRP7, JEMM ExtendedOp) rather than
 ; reflect -- extenders read CR0 through this path during their real-mode-vs-

@@ -1297,11 +1297,11 @@ fn vbe_controller_info_fills_the_block() {
     let oem = read_u32(&mut machine, base + 0x06);
     assert_eq!(oem >> 16, u32::from(izarravm_firmware::IZARRA_BIOS_SEG));
     let oem_linear = ((oem >> 16) << 4) + (oem & 0xffff);
-    let text: Vec<u8> = (0..26)
+    let text: Vec<u8> = (0..25)
         .map(|i| machine.read_physical_u8(oem_linear + i))
         .collect();
-    assert_eq!(&text, b"Izarra 3000 VEGA/Margo VBE");
-    assert_eq!(machine.read_physical_u8(oem_linear + 26), 0);
+    assert_eq!(&text, b"Izarra3000 VEGA/Margo VBE");
+    assert_eq!(machine.read_physical_u8(oem_linear + 25), 0);
 
     // The three VBE 2.0 OEM pointers at 0x16/0x1A/0x1E stay null. They are only
     // interesting because the mode list used to start at 0x14 and fill them with

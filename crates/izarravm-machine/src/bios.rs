@@ -1260,7 +1260,7 @@ impl Machine {
     }
 
     /// Service INT 18h (DISKLESS BOOT HOOK). On a real PC this entered ROM BASIC;
-    /// the Izarra 3000 has none, so it reports no bootable device and halts. The
+    /// the Izarra3000 has none, so it reports no bootable device and halts. The
     /// halt stub clears IF first, so the machine genuinely stops rather than
     /// spinning on the timer tick.
     pub(super) fn handle_int18(&mut self) {

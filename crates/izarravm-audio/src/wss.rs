@@ -273,7 +273,7 @@ impl Ad1848 {
         match offset {
             // Config/ID region. Offset 1 SELECTS the codec's resources, in the
             // same nibble encoding `read_config` reports them: high nibble IRQ,
-            // low nibble DMA. ReSonique 2 is the writable-config-register
+            // low nibble DMA. ReSonique II is the writable-config-register
             // variant of the WSS board glue, which is how real WSS/SB combo
             // chips behaved -- the OPTi 82C930 pairs WSS with SB Pro and lets a
             // driver move between them at runtime, no power cycle.

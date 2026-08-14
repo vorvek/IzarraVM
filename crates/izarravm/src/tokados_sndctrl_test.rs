@@ -191,7 +191,7 @@ fn sndctrl_status_reads_the_hardware_and_changes_nothing() {
 fn sndctrl_boot_summary_tree_prints_two_rows_and_changes_nothing() {
     let (machine, dir) = boot_with_sndctrl("sndctrl_boot_tree", "/B /T");
     let screen = machine.screen_text().as_text();
-    let heading = "\u{00C3}\u{00C4}> ReSonique2 Configuration [Run SNDCTRL to change]";
+    let heading = "\u{00C3}\u{00C4}> ReSonique II Configuration [Run SNDCTRL to change]";
     let summary = "\u{00B3}     SB16 220 I7 D1 H5   WSS 530 I11 D0   MIDI 300 I9";
     assert!(
         screen.lines().any(|line| line == heading),
@@ -230,7 +230,7 @@ fn sndctrl_boot_summary_tree_prints_two_rows_and_changes_nothing() {
 fn sndctrl_boot_summary_plain_has_no_tree_glyphs() {
     let (machine, dir) = boot_with_sndctrl("sndctrl_boot_plain", "/B");
     let screen = machine.screen_text().as_text();
-    let heading = "ReSonique2 Configuration [Run SNDCTRL to change]";
+    let heading = "ReSonique II Configuration [Run SNDCTRL to change]";
     let summary = "     SB16 220 I7 D1 H5   WSS 530 I11 D0   MIDI 300 I9";
     assert!(
         screen.lines().any(|line| line == heading),

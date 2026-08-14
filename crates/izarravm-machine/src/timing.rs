@@ -18,7 +18,7 @@ pub const DAC_HZ: u32 = 44_100;
 /// host drain, which is worth reporting rather than absorbing silently.
 pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 
-/// Digital headroom reserved below full scale on the ReSonique 2's summing
+/// Digital headroom reserved below full scale on the ReSonique II's summing
 /// node, as a linear gain: 0.5 is -6.02 dB, exactly one bit.
 ///
 /// The CT1745 powers on with master, voice, FM and CD all at level 31 (0 dB),

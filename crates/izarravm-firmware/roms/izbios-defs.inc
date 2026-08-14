@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; izbios-defs.inc - foundation: shared constants for the Izarra 3000 BIOS.
+; izbios-defs.inc - foundation: shared constants for the Izarra3000 BIOS.
 ; This file emits NO bytes (only %define / equ), so reset: stays at ROM offset 0.
 ; Read-only contract: streams use these names and never redefine them.
 
@@ -149,7 +149,7 @@
 ; headless/test default) or 0 for the full GUI experience.
 %define PORT_FAST_POST   0xe2
 
-; Red "Izarra 3000" wordmark geometry (the bitmap bytes live in izbios-logo.inc,
+; Red "Izarra3000" wordmark geometry (the bitmap bytes live in izbios-logo.inc,
 ; emitted late; these defines let izbios-gfx.inc blit it). 195x21 px, 25 B/row.
 %define LOGO_W         195
 %define LOGO_H         21
@@ -159,7 +159,7 @@
 ; text lines and the RAM progress bar sit below it.
 %define LOGO_X         62            ; (320 - 195) / 2, centered
 %define LOGO_Y         8
-%define POST_TITLE_Y   40            ; "Izarra 3000 BIOS" + version
+%define POST_TITLE_Y   40            ; "Izarra3000 BIOS" + version
 %define POST_MEM_Y     112           ; "Testing memory: NNNNN KB"
 %define POST_BAR_X     32
 %define POST_BAR_Y     128

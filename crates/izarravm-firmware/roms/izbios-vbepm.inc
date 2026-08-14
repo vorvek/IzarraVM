@@ -197,4 +197,4 @@ vbe_pm_block_end:
 ; OUTSIDE the block, so a client that copies CX bytes does not carry it along --
 ; which is correct, because the pointer it is given is a ROM address.
 vbe_oem_string:
-    db  "Izarra 3000 VEGA/Margo VBE", 0
+    db  "Izarra3000 VEGA/Margo VBE", 0

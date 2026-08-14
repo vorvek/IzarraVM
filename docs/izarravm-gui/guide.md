@@ -3,287 +3,313 @@
 
 # IzarraVM GUI Guide
 
-IzarraVM's desktop application presents the emulated Izarra 3000 in a control
-panel: a display, a beige panel of controls below it, and a config modal for
-the settings not needed every session. This page covers the host
-application, not the emulated machine. See the [Izarra 3000 user
-manual](../izarra-3000/user-manual.md) for what happens inside the guest.
+The IzarraVM desktop application shows the emulated Izarra3000 in a control
+panel. The window has a display, a beige panel of controls below the display,
+and a config modal. The config modal holds the settings that you do not need
+in each session. This page describes the host application, and not the
+emulated machine. See the
+[Izarra3000 user manual](../izarra-3000/user-manual.md) for the guest.
 
-## Starting it
+## How to start it
 
 ```powershell
 cargo run -p izarravm -- --config examples/machine.toml
 ```
 
-See the README's Quick Start for the full set of headless and self-test
-flags (`--headless-config-check`, `--headless-test-rom`,
+The Quick Start section of the README gives the full set of headless flags and
+self-test flags (`--headless-config-check`, `--headless-test-rom`,
 `--headless-boot-suite`).
 
-## Where files live
+## Where the files are
 
-By default, the C: drive folder, `cmos.bin`, and `izarravm.conf` all live
-under the per-user `~/.izarravm` directory, so running the binary from any
-working directory leaves nothing behind there. Pass **`--portable`** to keep
-them beside the executable instead, in a `c_drive` folder next to it, for a
-self-contained install you can carry on a USB stick.
+By default, the C: drive folder, `cmos.bin`, and `izarravm.conf` are in the
+`~/.izarravm` directory of the user. Thus the program writes nothing into the
+working directory. Use **`--portable`** to keep these files beside the
+executable, in a `c_drive` folder. This gives an installation that you can
+carry on a USB stick.
 
 | File | What it holds | Location |
 | --- | --- | --- |
-| `c_drive/` | The Izarra 3000's C: hard disk, as a real host folder. | `~/.izarravm/` (or beside the executable with `--portable`) |
-| `cmos.bin` | The 64-byte RTC/NVRAM image: keyboard layout, CPU mode, and the rest of the settings the [setup panel](../izbios/configuration-panel.md) persists. | One level above `c_drive/` |
-| `izarravm.conf` | Host-side GUI preferences (below). | One level above `c_drive/`, alongside `cmos.bin` |
+| `c_drive/` | The C: hard disk of the Izarra3000, as a host folder. | `~/.izarravm/`, or beside the executable with `--portable` |
+| `cmos.bin` | The 64-byte RTC/NVRAM image: the keyboard layout, the CPU mode, and the other settings that the [setup panel](../izbios/configuration-panel.md) saves. | One level above `c_drive/` |
+| `izarravm.conf` | The host GUI preferences (below). | One level above `c_drive/`, with `cmos.bin` |
 
-`cmos.bin` is created fresh with defaults if it doesn't exist, and repaired
-automatically if its checksum doesn't match (the same checksum the
-[setup panel](../izbios/configuration-panel.md#what-persists-across-reboots)
-writes). The real-time clock inside it is seeded from your host clock every
-launch.
+If `cmos.bin` does not exist, IzarraVM makes a new one with the default
+values. If its checksum does not agree, IzarraVM repairs the file. This is the
+same checksum that the
+[setup panel](../izbios/configuration-panel.md#the-settings-that-cmos-keeps)
+writes. At each start, IzarraVM sets the real-time clock in the file from the
+host clock.
 
-The C: drive path itself is set at startup, not from inside the GUI: via
-`--c-drive`, `--dosroot`, or the `dos.c_drive` key in a `--config` TOML file
-such as `examples/machine.toml`. The GUI's "Open C: folder" control opens
-the host file manager on the path already configured. It is intended for
-copying files onto the guest's hard disk, and does not change which folder C:
-uses.
+You set the C: drive path at startup, and not in the GUI. Use `--c-drive`,
+`--dosroot`, or the `dos.c_drive` key in a `--config` TOML file, for example
+`examples/machine.toml`. The "Open C: folder" control in the GUI opens the
+host file manager at the configured path. Use it to copy files to the hard
+disk of the guest. It does not change the folder that C: uses.
 
 ## The two config files
 
-There are two, and they are not interchangeable:
+There are two config files, and they are not equivalent:
 
 | | `izarravm.conf` | The machine config |
 | --- | --- | --- |
-| What it holds | Host-side GUI preferences | The machine's hardware |
-| Who writes it | The GUI, automatically | You |
-| Where it lives | Next to `c_drive/`, alongside `cmos.bin` | Anywhere; you name the path |
-| How it is read | Always, on startup | Only when you pass `--config <path>` |
+| What it holds | The host GUI preferences | The hardware of the machine |
+| What writes it | The GUI, automatically | You |
+| Where it is | Beside `c_drive/`, with `cmos.bin` | Any path that you select |
+| When IzarraVM reads it | Always, at startup | Only with `--config <path>` |
 | Example | — | `examples/machine.toml` |
 
-Passing the GUI's own `izarravm.conf` to `--config` is refused with a message
-saying so, rather than a parse error about a key you did not know was
-significant.
+IzarraVM refuses an `izarravm.conf` file that you give to `--config`. It shows
+a message about the refusal. It does not show a parse error about a key that
+you did not know was significant.
 
-A third location also holds machine settings, and it takes precedence over both
-files: `cmos.bin`, the machine's NVRAM, which is what the machine boots from.
-The CPU speed and the sound card's resources are stored there and are set from
-inside the guest; see [GSWMODE](../toka-dos/commands.md#gswmode) and
-[SNDCTRL](../toka-dos/commands.md#sndctrl). A `--cpu` or `--sb-irq` flag sets
-the power-on value for a machine that has never been configured. After that the
-saved value takes precedence, and the emulator logs a warning naming the flags
-it ignored.
+A third location also holds machine settings, and it has priority over both
+files. It is `cmos.bin`, the NVRAM of the machine, and the machine boots from
+it. It holds the CPU speed and the resources of the sound card. You set these
+from inside the guest. See [GSWMODE](../toka-dos/commands.md#gswmode) and
+[SNDCTRL](../toka-dos/commands.md#sndctrl). A `--cpu` flag or a `--sb-irq`
+flag sets the power-on value for a machine with no configuration. After that,
+the saved value has priority, and the emulator writes a warning with the names
+of the flags that it ignored.
 
 ## izarravm.conf
 
-A TOML file holding GUI preferences that are meant to survive between runs:
+This is a TOML file with the GUI preferences that must stay between runs:
 
-- Master volume
+- The master volume
 - The CRT emulation style (below)
-- Your rebound hotkeys for input release and full screen
-- The optional host-controller UUID, two axis controls and polarity, and two buttons
-- The last floppy image, last CD image, and last CD folder you mounted
-- Whether the control panel is expanded or collapsed
-- The P330 receiver, exact host destination, P300 SoundFont, and MT-32 ROM paths
+- The hotkeys that you set for input release and for full screen
+- The optional host-controller UUID, two axis controls with their polarity,
+  and two buttons
+- The last floppy image, the last CD image, and the last CD folder that you
+  mounted
+- The state of the control panel: expanded or collapsed
+- The P330 receiver, the exact host destination, the P300 SoundFont, and the
+  MT-32 ROM paths
 
-Every field has a default, so an old or partial `izarravm.conf` still loads
-cleanly after an upgrade. Master volume is the only audio level kept here: it is
-the host's playback level, 0.0 to 5.0 with 1.0 as unity (see "The volume knob"
-below). `amp_gain`, `output_gain` and `pc_speaker_volume`
-named levels inside the machine's own mixer and are retired -- a file that still
-carries them loads, logs one line naming them, and drops them on the next save.
-Those levels are set from DOS with `SNDMIXER`, on the card's own registers,
-where the guest can read them back.
+Each field has a default. Thus an old or incomplete `izarravm.conf` continues
+to load after an upgrade. The master volume is the only audio level in this
+file. It is the playback level of the host, from 0.0 to 5.0, and 1.0 is unity.
+See "The volume knob" below.
+
+`amp_gain`, `output_gain`, and `pc_speaker_volume` are removed. They named
+levels in the mixer of the machine. A file that contains them loads, and
+IzarraVM writes one log line with their names. The next save removes them from
+the file. Set those levels from DOS with `SNDMIXER`, which writes the
+registers of the card. The guest can read those registers.
 
 ## The config modal
 
-Opened from the control panel, the config modal has three sections:
+The control panel opens the config modal. The modal has three sections.
 
-**Input**: rebind the "Input release" hotkey (the key combination that
-gives keyboard and mouse focus back to the host) and the "Full screen"
-toggle hotkey. **Set joystick buttons** opens a foreground setup window and
-temporarily disables the parent modal. Follow its prompts to center the stick,
-move X right, recenter, move Y down, then press Button 1 and Button 2. Cancel
-discards a partial capture. Completion changes only the staged modal settings;
-the parent Accept button persists and activates the binding without resetting
-the VM.
+**Input**: set the "Input release" hotkey and the "Full screen" hotkey. The
+"Input release" hotkey gives the keyboard focus and the mouse focus back to
+the host.
 
-The first accepted controller fixes the binding to its UUID. The wizard rejects
-duplicate axes or buttons and records axis polarity. Runtime input applies a
-rescaled 0.15 deadzone and sends only changed 8-bit samples. If that UUID is not
-connected, the gameport is detached; for identical controllers with one UUID,
-the first connected match is used. Setting `[input].joystick = false` in the
-machine config disables injection regardless of a saved GUI binding.
+**Set joystick buttons** opens a setup window in the foreground, and disables
+the modal below it. Obey its instructions: center the stick, move X to the
+right, center the stick again, move Y down, and then press Button 1 and Button
+2. Cancel discards an incomplete capture. At the end, the setup window changes
+only the staged settings in the modal. The Accept button of the modal saves
+the binding and makes it active, and the VM does not reset.
 
-**Display**: **CRT emulation**, a three-way choice:
+The first accepted controller sets the binding to its UUID. The setup window
+refuses a duplicate axis or a duplicate button, and it records the polarity of
+each axis. During operation, IzarraVM applies a deadzone of 0.15 and sends
+only the 8-bit samples that changed. If that UUID is not connected, the
+gameport is not connected. If two identical controllers have one UUID,
+IzarraVM uses the first connected controller. `[input].joystick = false` in
+the machine config disables the input, even with a saved GUI binding.
+
+**Display**: **CRT emulation**, with three values:
 
 | On-screen label | What it does |
 | --- | --- |
-| **No** | No CRT effect; a plain scaled image. |
+| **No** | No CRT effect. The image is scaled only. |
 | **Subtle** | A light shadow-mask CRT effect. This is the default. |
-| **Ye Olde Screene** | A heavier CRT effect for the full period look. |
+| **Ye Olde Screene** | A stronger CRT effect, for the full period appearance. |
 
-**Audio**: choose which synthesiser answers each MIDI port. Levels are not set
-here. The card's output stage, the PC speaker's level and the balance between
-sources are ReSonique 2 mixer registers, and `SNDMIXER` sets them from DOS; the
-volume knob on the machine panel is the host's playback level, the powered
-speakers the machine's line-out feeds.
+**Audio**: select the synthesizer for each MIDI port. This section does not
+set the levels. The output stage of the card, the level of the PC speaker, and
+the balance between the sources are ReSonique II mixer registers, and
+`SNDMIXER` sets them from DOS. The volume knob on the machine panel is the
+playback level of the host, which is equivalent to the powered speakers on the
+line-out of the machine.
 
-P300 represents a wavetable daughterboard fitted to the ReSonique 2's internal
-pin headers. IzarraVM emulates that board through FluidSynth with the embedded
-FluidR3Mono bank. You can select a custom SF2 or SF3 bank without changing the
+P300 is a wavetable daughterboard on the internal pin headers of the ReSonique
+2. IzarraVM emulates that board with FluidSynth and the embedded FluidR3Mono
+bank. You can select a different SF2 or SF3 bank. This does not change the
 P330 MIDI route.
 
-P330 represents the Izarra 3000's rear MPU-401/gameport. Its receiver selector
-contains these choices:
+P330 is the rear MPU-401/gameport of the Izarra3000. Its receiver selector has
+these values:
 
 | Receiver | What it uses |
 | --- | --- |
-| **Off** | Keeps the P330 MPU active without sending its messages anywhere. |
-| **Munt (MT-32)** | An emulator convenience using user-selected MT-32 control and PCM ROMs. IzarraVM does not include Roland ROMs. |
-| **Host device name and ordinal** | The exact operating-system MIDI destination. These entries represent the MIDI IN side of an external receiver. If the destination disappears, IzarraVM does not choose another one. |
+| **Off** | Keeps the P330 MPU active. It sends the messages to no destination. |
+| **Munt (MT-32)** | An emulator function that uses MT-32 control ROMs and PCM ROMs that you select. IzarraVM does not include Roland ROMs. |
+| **Host device name and ordinal** | The exact MIDI destination in the operating system. Each entry is the MIDI IN side of an external receiver. If the destination is no longer available, IzarraVM does not select a different one. |
 
-The host sound device is followed rather than latched. If the default output
-device changes, disappears, or was not there when IzarraVM started, the machine
-keeps playing into its own output queue and the stream is reopened on the
-current default device as soon as one is available, without interrupting the
-guest. This is unlike the P330 external destination above, which is a named
-choice and is not silently replaced.
+IzarraVM follows the host sound device. It does not hold one device. The
+default output device can change, or become unavailable, or be unavailable at
+the start. In each of those conditions, the machine continues to play into its
+own output queue. IzarraVM then opens the stream on the current default device
+when one is available, and the guest does not stop.
 
-The two MT-32 ROM boxes each accept either a ROM file or the folder the ROM set
-lives in, and the images are identified by content rather than by filename: a
-set named `MT32_CONTROL.ROM` / `MT32_PCM.ROM`, one named for its version, and
-one split into half-images all load. Which box you put which file in does not
-matter. When a set cannot be loaded the status line says what was missing -- a
-control image, a PCM image, or a control and PCM pair from different machines --
-and the log names every file that was tried.
+The P330 external destination above is different. It is a named choice, and
+IzarraVM does not replace it.
 
-P300 and P330 are independent. A P330 receiver change sends all-notes-off to
-the old receiver without interrupting FluidSynth. Each section has its own
-status line, so a missing host destination or missing ROMs cannot hide a failed
-custom SoundFont. Neither failure hides the corresponding guest MPU. Accept
-retries a failed synthesiser even when nothing was changed, so a problem fixed
-outside the emulator can be picked up without restarting the machine.
+Each of the two MT-32 ROM boxes accepts a ROM file, or the folder with the ROM
+set. IzarraVM identifies an image by its content, and not by its file name. A
+set with the names `MT32_CONTROL.ROM` and `MT32_PCM.ROM` loads. A set with
+version names loads. A set in half-images loads. The box that you put each
+file in is not important.
 
-Startup settings are resolved one field at a time. An explicit command-line
-option takes precedence, followed by an explicitly present `--config` TOML key,
-the saved GUI preference, and finally the built-in default.
+If a set does not load, the status line gives the cause: an absent control
+image, an absent PCM image, or a control image and a PCM image from different
+machines. The log gives the name of each file that IzarraVM tried.
 
-Accept applies your changes and closes the modal; Cancel discards them.
+P300 and P330 are independent. A change of the P330 receiver sends
+all-notes-off to the previous receiver, and does not interrupt FluidSynth.
+Each section has its own status line. Thus an absent host destination or an
+absent ROM cannot hide a failed SoundFont. A failure in one section does not
+hide the related guest MPU.
 
-For step-by-step procedures built on these settings -- routing P330 to a player
-on the host, or loading an MT-32 ROM set -- see the
-[recipes](../recipes/index.md).
+Accept tries a failed synthesizer again, even after no change. Thus IzarraVM
+can use a fix that you made outside the emulator, without a restart of the
+machine.
 
-## Mounting removable media
+IzarraVM resolves the startup settings one field at a time. The order of
+priority is: a command-line option, then a key in the `--config` TOML file,
+then the saved GUI preference, then the built-in default.
 
-**Floppy (A:)**: accepts `.img`, `.ima`, and `.flp` disk images through a
-file picker, opened by **Load Floppy Image**.
+Accept applies your changes and closes the modal. Cancel discards them.
 
-**CD-ROM (D:)** accepts three sources. **Load CD Image** opens a file picker for
-the first two, and **Load folder** opens a folder picker for the third:
+The [recipes](../recipes/index.md) give step-by-step procedures that use these
+settings. Two examples are a route from P330 to a player on the host, and a
+load of an MT-32 ROM set.
 
-- An **ISO** image, mounted as a single data track.
-- A **CUE** sheet with the files it names. Data tracks must be raw images
-  (`BINARY`, or `MOTOROLA` for big-endian samples). Audio tracks may be raw, or
-  encoded as Ogg Vorbis, MP3, WAV, or FLAC, one file per track. A sheet naming
-  no file at all is read against the `.bin` beside it.
-- A **host folder**, built into an ISO9660 image on the fly. Files are read
-  lazily from the folder as the guest requests sectors, rather than copied
-  up front, up to about 650 MB.
+## How to mount removable media
 
-An encoded audio track is decoded as it is played, and the track lengths in the
-table of contents come from the audio itself rather than from the file sizes. A
-sheet's `FILE` type token is not used to identify an encoded file; the contents
-are, because rippers commonly write a token that does not match what the file
-holds. Sample rates other than 44.1 kHz, and mono, are converted.
+**Floppy (A:)** accepts `.img`, `.ima`, and `.flp` disk images. **Load Floppy
+Image** opens the file picker.
 
-A file in a format the emulator does not decode -- Opus, AAC, and Monkey's Audio
-among others -- is refused when the disc is mounted, and the message names the
-file. A disc is not mounted with tracks that would play incorrectly. The same
-applies to a sheet whose layout cannot be represented: an encoded file carrying
-a data track, or named by more than one `TRACK`.
+**CD-ROM (D:)** accepts three sources. **Load CD Image** opens a file picker
+for the first two sources. **Load folder** opens a folder picker for the
+third:
 
-A CD image and a CD folder are mutually exclusive. Mounting one clears the
-other. There is no equivalent host-folder option for the floppy drive; A:
-only takes image files.
+- An **ISO** image. IzarraVM mounts it as one data track.
+- A **CUE** sheet, with the files that it names. A data track must be a raw
+  image (`BINARY`, or `MOTOROLA` for big-endian samples). An audio track can
+  be raw. It can also be Ogg Vorbis, MP3, WAV, or FLAC, with one file for each
+  track. If a sheet names no file, IzarraVM uses the `.bin` file beside it.
+- A **host folder**. IzarraVM makes an ISO9660 image from it. It reads a file
+  from the folder when the guest requests the sectors, and does not copy the
+  files first. The limit is approximately 650 MB.
+
+IzarraVM decodes an encoded audio track during the playback. The track lengths
+in the table of contents come from the audio, and not from the file sizes.
+IzarraVM does not use the `FILE` type token of the sheet to identify an
+encoded file. It uses the contents, because a ripper frequently writes a token
+that does not agree with the file. IzarraVM converts a sample rate that is not
+44.1 kHz, and it converts a mono track.
+
+The emulator does not decode some formats, for example Opus, AAC, and Monkey's
+Audio. It refuses a file in such a format at the mount, and the message gives
+the file name. IzarraVM does not mount a disc with a track that would play
+incorrectly. It also refuses a sheet with a layout that it cannot represent:
+an encoded file with a data track, or an encoded file that more than one
+`TRACK` names.
+
+A CD image and a CD folder cannot be mounted together. A mount of one clears
+the other. The floppy drive has no host-folder option. A: accepts image files
+only.
 
 ## The CD front panel
 
-The transport row in the D: bay is the drive's own front panel. It works on the
-mounted disc directly and issues no ATAPI packet command, so it plays a disc
-that no DOS program has opened. A guest that drives the disc itself is not
-locked out: the two share one transport, and whichever acted last holds it.
+The transport row in the D: bay is the front panel of the drive. It operates
+on the mounted disc directly, and it sends no ATAPI packet command. Thus it
+can play a disc that no DOS program opened. A guest can also control the disc.
+The two controls share one transport, and the control that operated last holds
+it.
 
-Four controls sit on the row, left to right:
+The row has four controls, from left to right:
 
-- **Play / pause.** One button. It shows the play triangle while the drive is
-  stopped or paused, and the pause bars while the disc plays. Play from a stop
-  starts at the first audio track and runs to the end of the disc. Play from a
-  pause resumes at the held position. The button is available whenever the
-  mounted disc holds at least one audio track, so a data-only disc leaves it
-  greyed.
-- **Next track.** Plays from the start of the first audio track after the play
-  head, through to the end of the disc. A paused drive resumes on the new
-  track. The button is greyed while the drive is stopped, and on the last audio
+- **Play / pause.** This is one button. It shows the play triangle while the
+  drive is stopped or paused, and the pause bars while the disc plays. Play
+  from a stop starts at the first audio track, and continues to the end of the
+  disc. Play from a pause continues at the held position. The button is
+  available when the disc has one audio track or more. On a data-only disc,
+  the button is grey.
+- **Next track.** This plays from the start of the first audio track after the
+  play head, to the end of the disc. A paused drive starts again on the new
+  track. The button is grey while the drive is stopped, and on the last audio
   track of the disc.
-- **Stop.** Ends playback and releases the position. It is available only while
-  the disc plays or is paused.
-- **The level fader.** The guest-visible CD line level on the ReSonique 2
-  mixer, the same pair of CT1745 registers `SNDMIXER` writes from DOS. It is a
-  machine mixer level, not the host playback level described under "The volume
-  knob" below. The filled part of the track reads the current level, the box on
-  the right reads and accepts it in percent, and a program inside the guest
-  that sets the CD level moves the fader.
+- **Stop.** This ends the playback and clears the position. It is available
+  only while the disc plays or is paused.
+- **The level fader.** This is the CD line level on the ReSonique II mixer,
+  which the guest can read. It is the pair of CT1745 registers that `SNDMIXER`
+  writes from DOS. It is a level in the machine mixer, and not the host
+  playback level in "The volume knob" below. The filled part of the track
+  shows the current level. The box on the right shows the level in percent,
+  and accepts a value in percent. A program in the guest that sets the CD
+  level also moves the fader.
 
-The CT1745 registers hold 32 steps, so the fader settles on the nearest one.
+The CT1745 registers have 32 steps. Thus the fader moves to the nearest step.
 
 ## The volume knob
 
-The slider on the control panel is the host's playback level: the powered
-speakers the machine's line-out feeds. It is applied to the finished mix on its
-way to the sound device, it covers the machine's own output and both MIDI
-synthesisers together, and it is the only audio level the emulator itself owns.
-Every level inside the machine -- the card's output stage, the PC speaker's leg,
-the balance between sources -- is a ReSonique 2 mixer register that `SNDMIXER`
-sets from DOS. The headless `IZARRAVM_AUDIO_WAV` capture records the machine's
-output and is deliberately taken ahead of this knob, so a recording does not
-change when you move the slider.
+The slider on the control panel is the playback level of the host. It is
+equivalent to the powered speakers on the line-out of the machine. IzarraVM
+applies it to the finished mix, before the mix goes to the sound device. It
+covers the output of the machine and both MIDI synthesizers together. It is
+the only audio level that the emulator owns.
 
-The travel runs from 0% to 500%, and the value box reads in percent. 100% is
-unity: the mix reaches the sound device exactly as the machine produced it, and
-the slider steps in whole percent so 100% can be set exactly. Below 100% the
-knob follows a perceptual taper. At and above 100% the reading is the
-multiplication factor -- 200% is twice line level, 500% is five times, +14 dB.
+Each level in the machine is a ReSonique II mixer register, and `SNDMIXER` sets
+it from DOS. Those levels are the output stage of the card, the PC-speaker
+leg, and the balance between the sources. The headless `IZARRAVM_AUDIO_WAV`
+capture records the output of the machine before this knob. Thus a recording
+does not change when you move the slider.
 
-The ceiling is chosen from the quietest well-behaved case. A title whose own
-setup program is at maximum still writes an output level of 27 to the card's
-CT1745 mixer, which is 8 dB of attenuation, and the mix reserves a further 6 dB
-of headroom below full scale. Its peaks therefore arrive 14 dB down, and 500%
-puts them back at the rail.
+The travel is from 0% to 500%, and the value box shows percent. 100% is unity:
+the mix reaches the sound device as the machine made it. The slider moves in
+steps of one percent, thus you can set 100% exactly. Below 100%, the knob
+follows a perceptual curve. At 100% and above it, the value is the
+multiplication factor. 200% is two times the line level, and 500% is five
+times, or +14 dB.
 
-Gain above 100% can drive samples past what the sound device can carry. Those
-samples are held at full scale rather than allowed to wrap, so an overdriven
-passage clips the way a driven amplifier clips. The knob is stored in
-`izarravm.conf` as `master_volume`, where 1.0 is unity; a file written by an
-earlier version, which could only save 0.0 to 1.0, loads to the level it always
-meant.
+The maximum comes from the quietest correct case. A game with its own setup
+program at maximum writes an output level of 27 to the CT1745 mixer of the
+card. That level is 8 dB of attenuation. The mix keeps a further 6 dB of
+headroom below full scale. Thus the peaks of that game arrive 14 dB down, and
+500% puts them at full scale.
+
+**Warning:** gain above 100% can make a sample larger than the sound device
+can carry. IzarraVM holds such a sample at full scale, and does not let it
+wrap. Thus a loud passage clips as a driven amplifier clips.
+
+`izarravm.conf` stores the knob as `master_volume`, where 1.0 is unity. An
+earlier version could save only 0.0 to 1.0. A file from that version loads to
+the level that it always meant.
 
 ## Other GUI features
 
-- A collapsible beige control panel below the display, with activity LEDs
-  for the floppy, the CD-ROM, and the C: drive.
+- A beige control panel below the display, which you can collapse. It has
+  activity LEDs for the floppy, the CD-ROM, and the C: drive.
 - A master volume slider (above).
 - A CD front panel: play/pause, next track, stop, and a level fader (above).
-- A COM1 serial log window: a floating, resizable panel showing what the
-  guest has written to the emulated serial port, useful for anything that
-  logs there instead of the screen.
-- An About window with license information.
+- A COM1 serial log window. This is a panel that floats, and that you can
+  resize. It shows the data that the guest wrote to the emulated serial port.
+  Use it for a program that writes its log there and not to the screen.
+- An About window with the license information.
 
-There is no drag-and-drop support for mounting media, and no built-in
-screenshot capture. Use your host OS's own screenshot tool against the
+The GUI has no drag-and-drop function for a mount, and it has no screenshot
+function. Use the screenshot tool of your host operating system on the
 IzarraVM window.
 
 ## Next
 
-- [Izarra 3000 user manual](../izarra-3000/user-manual.md): the emulated
-  machine this application drives.
-- [Using Toka-DOS](../toka-dos/using-toka-dos.md): what to expect once the
+- [Izarra3000 user manual](../izarra-3000/user-manual.md): the emulated
+  machine that this application controls.
+- [How to use Toka-DOS](../toka-dos/using-toka-dos.md): what occurs after the
   guest boots.

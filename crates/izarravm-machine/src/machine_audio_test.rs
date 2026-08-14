@@ -2745,7 +2745,7 @@ fn a_machine_with_no_card_keeps_its_beeper_outside_the_card_stage() {
 /// it from and the value is a function of canonical device state rather than of
 /// anything the host remembers separately.
 ///
-/// The register pair is the ReSonique 2's own extension. A real CT1745's
+/// The register pair is the ReSonique II's own extension. A real CT1745's
 /// "MIDI" registers (`0x34`/`0x35`) are the FM bus, and this asserts they stay
 /// that way: moving the wavetable must not move the OPL's level, or the tool's
 /// FMSYNTH and MIDI faders would be two handles on one leg.

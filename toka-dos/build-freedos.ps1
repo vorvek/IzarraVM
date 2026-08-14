@@ -349,7 +349,7 @@ if ($LASTEXITCODE) { throw "nasm gswmode failed" }
 if (-not (Test-Path $gswmodeOut)) { throw "GSWMODE not produced" }
 Write-Host "GSWMODE.COM: $((Get-Item $gswmodeOut).Length) bytes"
 
-# --- SNDMIXER (volume mixer for the ReSonique 2 card; sibling to SNDCTRL,
+# --- SNDMIXER (volume mixer for the ReSonique II card; sibling to SNDCTRL,
 # same committed-source-plus-binary arrangement as GSWMODE above) ---
 $sndmixerSrc = Join-Path $root '..\crates\izarravm-firmware\roms\dos\sndmixer.asm'
 $sndmixerOut = Join-Path $root '..\crates\izarravm-firmware\roms\dos\sndmixer.com'

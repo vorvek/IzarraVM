@@ -1587,7 +1587,7 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
 fn tokaemm_tool_batch_attrib_choice_find_smoke() {
     // A two-line text file so FIND's match is unambiguous against the
     // non-matching line right next to it.
-    let hello_txt = b"Hello from Toka-DOS\r\nWelcome to the IZARRA 3000\r\n".to_vec();
+    let hello_txt = b"Hello from Toka-DOS\r\nWelcome to the IZARRA3000\r\n".to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\n\
 ATTRIB +R HELLO.TXT\r\n\
 ATTRIB HELLO.TXT\r\n\
@@ -1615,7 +1615,7 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
             return false;
         }
         let upper = machine.screen_text().as_text().to_ascii_uppercase();
-        upper.contains("[---RA]") && upper.contains("CONTINUE") && upper.contains("IZARRA 3000")
+        upper.contains("[---RA]") && upper.contains("CONTINUE") && upper.contains("IZARRA3000")
     });
     let text = machine.screen_text().as_text();
     if let StopReason::CpuError(msg) = &stop {
@@ -1647,7 +1647,7 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
 
     // FIND: must print the matching line, not the non-matching one.
     assert!(
-        upper.contains("IZARRA 3000"),
+        upper.contains("IZARRA3000"),
         "FIND didn't print the matching line (stop={stop:?}).\n{text}"
     );
 }

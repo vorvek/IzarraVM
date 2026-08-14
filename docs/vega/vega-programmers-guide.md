@@ -3,50 +3,52 @@
 
 # VEGA for Programmers
 
-A working guide to drawing on the Izarra 3000 through the VEGA chipset. The
-companion volume, the VEGA Technical Reference, is the register-level contract.
-This guide shows how to use it.
+This guide tells you how to draw on the Izarra3000 through the VEGA chipset.
+The other volume, the VEGA Technical Reference, is the register-level
+contract. This guide shows you how to use that contract.
 
-Everything here targets **Margo**, the 2D engine. Distira, the 3D engine, has
-its own guide in a later revision.
+All of this guide is about **Margo**, the 2D engine. Distira, the 3D engine,
+gets its own guide in a later revision.
 
 ## How to read the examples
 
-Each example is tagged:
+Each example has a tag:
 
-- **(verified)** has been run on the machine and produces the result described.
-- **(target)** shows the documented interface ahead of its implementation. The
-  register sequence follows the Technical Reference, but the operation may not
-  be wired up in your build yet. Check `CAPS` (offset `0x0004`) to see what the
-  running build implements.
+- **(verified)** means that the example ran on the machine and gave the result
+  in the text.
+- **(target)** means that the example shows the documented interface before
+  the implementation. The register sequence obeys the Technical Reference, but
+  your build can be without the operation. Read `CAPS` (offset `0x0004`) to
+  find the operations of your build.
 
-As each operation lands, its example moves from (target) to (verified). Nothing
-in this guide claims a result the hardware does not produce.
+When an operation is complete, its example changes from (target) to
+(verified). No example in this guide claims a result that the hardware does
+not give.
 
 ## The shape of the hardware
 
 Margo gives you three things:
 
-1. A **linear frame buffer** at `0xE0000000`. Once you set a graphics mode, this
-   is your screen as a flat array of pixels. You can write pixels directly.
-2. A **256-color palette** for 8-bit modes, through the VGA DAC ports.
-3. A **blit engine**, reached through the register block at `0xE0400000`, that
-   fills, copies, draws text, and draws lines without the CPU touching each
-   pixel.
+1. A **linear frame buffer** at `0xE0000000`. After you set a graphics mode,
+   this buffer is the screen, as a flat array of pixels. You can write a pixel
+   to it directly.
+2. A **256-color palette** for the 8-bit modes, through the VGA DAC ports.
+3. A **blit engine**, at the register block `0xE0400000`. It fills, copies,
+   draws text, and draws lines. The CPU does not touch each pixel.
 
-The fast path for a desktop is the blit engine. The CPU sets up an operation by
-writing a handful of registers, then writes a command, and the engine does the
-work. On a slow CPU, in Izarra 1000 compatibility mode for example, this is the
-difference between a responsive desktop and a crawling one.
+The fast method for a desktop is the blit engine. The CPU writes a small
+number of registers, and then writes a command. The engine then does the work.
+On a slow CPU, for example in Izarra1000 compatibility mode, this is the
+difference between a fast desktop and a slow one.
 
-The engine runs while the CPU does other work. An operation takes real time, so a
-program issues it, goes off to prepare the next one, and only waits on `BUSY` when
-it actually needs the result. That overlap is where the speed comes from.
+The engine operates while the CPU does other work. An operation needs time.
+Thus a program starts the operation, prepares the next one, and waits on
+`BUSY` only when it needs the result. This overlap gives the speed.
 
 ## A convention for the examples
 
-The examples use these definitions. They assume a flat or protected-mode program
-that can reach the frame buffer and register block.
+The examples use these definitions. They assume a flat-mode or protected-mode
+program that can reach the frame buffer and the register block.
 
 ```c
 #define LFB        ((volatile unsigned char *)0xE0000000)
@@ -60,13 +62,13 @@ static void margo_wait(void) {
 }
 ```
 
-## Setting a mode
+## How to set a mode
 
-Modes are set through the VESA BIOS, `INT 10h` with `AX = 4F02h`. Set bit 14 of
-the mode number to ask for the linear frame buffer.
+Set a mode through the VESA BIOS, with `INT 10h` and `AX = 4F02h`. Set bit 14
+of the mode number to request the linear frame buffer.
 
-This example selects mode `0x101`, 640x480 at 8-bit color, with the linear frame
-buffer.
+This example selects mode `0x101`, which is 640x480 at 8-bit color, with the
+linear frame buffer.
 
 ```c
 /* (verified) */
@@ -81,15 +83,15 @@ void set_mode_640x480x8(void) {
 }
 ```
 
-After the mode is set, the display registers describe it. Read `DISP_WIDTH`,
-`DISP_HEIGHT`, `DISP_BPP`, and `DISP_PITCH` rather than assuming them, so the same
-drawing code works across modes.
+After you set the mode, the display registers describe it. Read `DISP_WIDTH`,
+`DISP_HEIGHT`, `DISP_BPP`, and `DISP_PITCH`. Do not assume these values. Then
+the same drawing code operates in each mode.
 
-## Loading the palette
+## How to load the palette
 
-In an 8-bit mode, pixel values are indices into the DAC. Load a color with one
-write to the index port and three to the data port, in red, green, blue order.
-Each component runs 0 to 63.
+In an 8-bit mode, a pixel value is an index into the DAC. To load a color,
+write one time to the index port, and then three times to the data port, in
+the order red, green, blue. Each component is from 0 to 63.
 
 ```c
 /* (target) */
@@ -103,9 +105,9 @@ void set_palette_entry(int index, int r, int g, int b) {
 }
 ```
 
-## Writing pixels directly
+## How to write pixels directly
 
-The linear frame buffer is just memory. The address of a pixel is its offset:
+The linear frame buffer is memory. The address of a pixel is its offset:
 `y * pitch + x * bytes_per_pixel`.
 
 ```c
@@ -115,13 +117,15 @@ void plot8(int x, int y, int pitch, unsigned char color) {
 }
 ```
 
-Direct writes are fine for a handful of pixels. For rectangles, text, and
-scrolling, the blit engine is far faster, and that is the rest of this guide.
+A direct write is sufficient for a small number of pixels. For a rectangle,
+for text, and for a scroll, the blit engine is much faster. The remainder of
+this guide is about the blit engine.
 
-## Writing pixels in a hi-color mode
+## How to write pixels in a hi-color mode
 
-A 16-bit mode stores each pixel as `R5G6B5`, two bytes, no palette. Set the mode,
-then pack 8-bit color components down to 5/6/5 and write the 16-bit value.
+A 16-bit mode holds each pixel as `R5G6B5`, in two bytes, with no palette. Set
+the mode. Then pack the 8-bit color components into 5/6/5, and write the
+16-bit value.
 
 ```c
 /* (verified) */
@@ -141,15 +145,15 @@ void plot16(int x, int y, int pitch, int red, int green, int blue) {
 }
 ```
 
-For a 15-bit mode (`0x110`), the layout is `X1R5G5B5`: pack as
-`((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3)`. Read `DISP_BPP` and the
-mode's color masks (VBE `4F01h`) rather than assuming the format.
+A 15-bit mode (`0x110`) has the layout `X1R5G5B5`. Pack it as
+`((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3)`. Read `DISP_BPP` and
+the color masks of the mode (VBE `4F01h`). Do not assume the format.
 
-## Filling a rectangle
+## How to fill a rectangle
 
-The engine model is the same for every operation: latch the parameters, write
-the command, wait for idle. A solid fill uses `FG_COLOR` and the `PATCOPY`
-raster op.
+The engine model is the same for each operation: write the parameters, write
+the command, and then wait for idle. A solid fill uses `FG_COLOR` and the
+`PATCOPY` raster operation.
 
 ```c
 /* (verified) */
@@ -169,11 +173,11 @@ void fill_rect(unsigned long base, int pitch, int bpp,
 }
 ```
 
-## Copying and scrolling
+## How to copy and scroll
 
-`COPY` moves a rectangle from one place in the frame store to another. Source and
-destination may overlap, so a screen can scroll by copying itself shifted by one
-text line. The engine handles overlap.
+`COPY` moves a rectangle from one position in the frame store to another. The
+source and the destination can overlap. Thus a screen can scroll: it copies
+itself, with an offset of one text line. The engine obeys the overlap.
 
 ```c
 /* (verified) */
@@ -195,19 +199,21 @@ void copy_rect(unsigned long base, int pitch, int bpp,
 }
 ```
 
-To blit an icon with a transparent color, set `COLORKEY` to that color and
-`COLORKEY_EN` in `FLAGS`. Source pixels of that value are left untouched.
+To blit an icon with a transparent color, set `COLORKEY` to that color, and
+set `COLORKEY_EN` in `FLAGS`. The engine does not write a source pixel with
+that value.
 
-## Drawing text
+## How to draw text
 
-Text is a monochrome bitmap expanded into two colors. Set `FG_COLOR` and
-`BG_COLOR`, issue `COLOR_EXPAND_DATA`, then stream the glyph bits through
-`MONO_DATA`, one 32-bit word at a time, most significant bit first. Each row
-starts on a word boundary.
+Text is a monochrome bitmap that the engine expands into two colors. Set
+`FG_COLOR` and `BG_COLOR`. Then write `COLOR_EXPAND_DATA`. Then send the glyph
+bits through `MONO_DATA`, one 32-bit word at a time, with the most significant
+bit first. Each row starts on a word boundary.
 
-For an 8x8 font, each glyph is eight bytes, one per row. Each row needs one word
-(8 bits, padded). Set `EXPAND_TRANSPARENT` to draw the glyph over whatever is
-already on screen, leaving the background untouched.
+An 8x8 font has eight bytes for each glyph, one for each row. Each row needs
+one word, with 8 bits and padding. Set `EXPAND_TRANSPARENT` to draw the glyph
+above the current screen contents. The engine then does not change the
+background.
 
 ```c
 /* (verified) */
@@ -231,11 +237,12 @@ void draw_glyph_8x8(unsigned long base, int pitch, int bpp,
 }
 ```
 
-## Drawing lines
+## How to draw lines
 
-`LINE` draws between two points in `FG_COLOR`. With ROP `0x5A` (`PATINVERT`) the
-line exclusive-ORs into the screen, which is the classic way to draw and erase a
-rubber-band selection without saving the background.
+`LINE` draws between two points, in `FG_COLOR`. With the ROP `0x5A`
+(`PATINVERT`), the line does an exclusive-OR into the screen. This is the
+classic method to draw and erase a rubber-band selection. You do not have to
+save the background.
 
 ```c
 /* (verified) */
@@ -254,11 +261,11 @@ void draw_line(unsigned long base, int pitch, int bpp,
 }
 ```
 
-## Clipping
+## How to clip
 
-Set `CLIP_TL` and `CLIP_BR` to a rectangle and set `CLIP_EN` in `FLAGS`, and
-every operation is confined to that rectangle. A window manager sets the clip to
-a window's visible area, then draws freely without checking edges itself.
+Set `CLIP_TL` and `CLIP_BR` to a rectangle, and set `CLIP_EN` in `FLAGS`. Each
+operation then stays in that rectangle. A window manager sets the clip to the
+visible area of a window. It can then draw without a check of the edges.
 
 ```c
 /* (verified) */
@@ -269,12 +276,12 @@ void set_clip(int x0, int y0, int x1, int y1) {
 }
 ```
 
-## Tiling a pattern
+## How to tile a pattern
 
-`PATTERN_FILL` tiles an 8x8 pattern across a rectangle instead of a solid color.
-Put the 8x8 tile somewhere in offscreen memory first, in the screen's pixel
-format, then point `PAT_BASE` at it. The tiling lines up to the surface origin,
-so two adjacent fills meet seamlessly.
+`PATTERN_FILL` tiles an 8x8 pattern across a rectangle, in place of a solid
+color. First put the 8x8 tile in offscreen memory, in the pixel format of the
+screen. Then set `PAT_BASE` to its address. The tiling aligns to the origin of
+the surface. Thus two adjacent fills join with no visible seam.
 
 ```c
 /* (verified) */
@@ -296,10 +303,10 @@ void pattern_fill(unsigned long base, int pitch, int bpp,
 
 ## The hardware cursor
 
-The cursor is a 64x64 two-plane bitmap in offscreen memory and a position. Point
-the engine at the bitmap, set the two colors, and enable it. From then on, moving
-the pointer is one register write per frame, and the CPU never touches the
-screen under it.
+The cursor is a 64x64 two-plane bitmap in offscreen memory, and a position.
+Set the engine to the bitmap, set the two colors, and enable the cursor. After
+that, a move of the pointer is one register write for each frame, and the CPU
+does not touch the screen below it.
 
 ```c
 /* (verified) */
@@ -316,12 +323,13 @@ void move_cursor(int x, int y) {
 }
 ```
 
-## Playing video through the overlay
+## How to play video through the overlay
 
-The overlay takes a YUV image, converts it to RGB, and scales it into a window,
-all in hardware. Decode each frame into a YUV buffer in offscreen memory, point
-the overlay at it, and key it through the desktop. To show the overlay, paint the
-color key into the window; to hide a region, draw over the key as usual.
+The overlay takes a YUV image, converts it to RGB, and scales it into a
+window. It does all of this in hardware. Decode each frame into a YUV buffer
+in offscreen memory. Set the overlay to that buffer, and key it through the
+desktop. To show the overlay, write the color key into the window. To hide a
+region, draw over the key in the usual way.
 
 ```c
 /* (verified) */
@@ -339,13 +347,13 @@ void show_overlay(unsigned long y_offset, int src_pitch, int sw, int sh,
 }
 ```
 
-## Driving the engine by DMA
+## How to drive the engine by DMA
 
-On a busy redraw, writing every register from the CPU is the slow part, not the
-drawing. The DMA pusher lets you build a batch of operations in a ring buffer in
-memory and hand the whole thing to Margo at once. Each command is a header word,
-`(count << 16) | method`, followed by `count` data words that land in consecutive
-registers.
+In a large redraw, the slow part is the register writes from the CPU, and not
+the drawing. With the DMA pusher, you can build a batch of operations in a
+ring buffer in memory, and give the full batch to Margo one time. Each command
+is a header word, `(count << 16) | method`. After the header come `count` data
+words, which go into consecutive registers.
 
 ```c
 /* (verified) */
@@ -380,19 +388,20 @@ void fill_via_pusher(int *put, unsigned long base, int pitch, int bpp,
 
 ## Dithering
 
-In a 15 or 16-bit mode, true-color images and the scaled video overlay can band.
-Set `DITHER_EN` in `CONTROL` once and Margo dithers them as it writes.
+In a 15-bit or 16-bit mode, a true-color image and the scaled video overlay
+can show bands. Set `DITHER_EN` in `CONTROL` one time, and Margo dithers them
+as it writes.
 
 ```c
 /* (verified) */
 REG(0x000C) = 0x02;     /* CONTROL: DITHER_EN */
 ```
 
-## Putting it together
+## A full redraw
 
-A desktop redraw is these primitives in sequence: fill the background, copy
-cached window contents up from offscreen memory, expand text into the title
-bars, and draw the frames as lines or thin filled rectangles. The CPU issues a
-few register writes per object and the engine moves the pixels. That is what
-keeps the Belunza desktop responsive even when the machine is throttled to its
-slowest compatibility mode.
+A desktop redraw uses these operations in sequence. It fills the background.
+It copies the cached window contents from offscreen memory. It expands the
+text into the title bars. It then draws the frames, as lines or as thin filled
+rectangles. The CPU writes a small number of registers for each object, and
+the engine moves the pixels. This is why TokaDesk stays fast, also at the
+slowest speed class of the machine.

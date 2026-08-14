@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; izarra-bios.asm - Izarra 3000 clean-room real-mode BIOS (POST, RAM test,
+; izarra-bios.asm - Izarra3000 clean-room real-mode BIOS (POST, RAM test,
 ; component/peripheral probes, mode-13h status + setup page).
 ; Assemble with: nasm -f bin izarra-bios.asm -o izarra-bios.bin
 ;
@@ -44,7 +44,7 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "izbios-boot.inc"           ; INT 19h bootstrap
 %include "izbios-bootbox.inc"        ; boot and speed menu
 %include "izbios-chime.inc"          ; power-on speaker chime
-%include "izbios-logo.inc"           ; Izarra 3000 wordmark
+%include "izbios-logo.inc"           ; Izarra3000 wordmark
 %include "izbios-tables.inc"    ; foundation: MUST be last (emits the step table)
 
 ; INT 13h ROM entry at ROM offset 0xF000 (linear 0xFF000, i.e. FF00:0000).

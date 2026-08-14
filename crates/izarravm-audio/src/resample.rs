@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! Band-limited resampler taking the OPL3's native 49716 Hz stereo output down
-//! to the Resonique 2 DAC rate (44100 Hz). A Blackman-windowed sinc low-pass is
+//! to the ReSonique II DAC rate (44100 Hz). A Blackman-windowed sinc low-pass is
 //! baked into a polyphase table, so each output frame is a 64-tap weighted sum
 //! of the input stream, band-limited to the output Nyquist to avoid aliasing on
 //! the downsample. The transition band here (22050..24858 Hz) is narrow, so a

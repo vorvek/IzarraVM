@@ -580,7 +580,7 @@ fn izarra_bios_mirrors_post_log_to_com1_when_enabled() {
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let serial = machine.serial_text();
     assert!(
-        serial.contains("Izarra 3000 POST"),
+        serial.contains("Izarra3000 POST"),
         "COM1 log missing the POST header: {serial:?}"
     );
     assert!(

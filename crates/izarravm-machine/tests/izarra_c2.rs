@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-// Integration test for the Izarra 3000 BIOS audio probes.
+// Integration test for the Izarra3000 BIOS audio probes.
 //
 // Boots the real izarra-bios ROM on a 386-class machine, runs POST to the idle
 // halt, and parses the VDTS result block the BIOS built in low memory. The audio

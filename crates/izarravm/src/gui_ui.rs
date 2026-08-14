@@ -741,7 +741,7 @@ impl GuiApp {
                             .strong(),
                     );
                     ui.label(
-                        egui::RichText::new("the Izarra 3000 virtual machine")
+                        egui::RichText::new("the Izarra3000 virtual machine")
                             .color(MUTED)
                             .size(12.0),
                     );

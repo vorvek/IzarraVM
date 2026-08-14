@@ -8,7 +8,7 @@
 //! register. Registers 0x00..0x0D are the clock and four status bytes; 0x0E..
 //! 0x3F are general-purpose battery-backed RAM.
 //!
-//! The Izarra 3000 keeps the clock in binary, 24-hour format (Register B bits
+//! The Izarra3000 keeps the clock in binary, 24-hour format (Register B bits
 //! DM=1 and 24/12=1) so the BIOS ASM does not have to unpack BCD. The host
 //! seeds the time once at startup and the device self-advances on the machine
 //! clock; there is no live host resync.

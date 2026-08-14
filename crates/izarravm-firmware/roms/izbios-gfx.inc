@@ -217,9 +217,9 @@ status_panel_draw:
     mov bh, COLOR_BG
     call gfx_text
     ret
-str_post_title: db 'IZARRA 3000 POST', 0
+str_post_title: db 'IZARRA3000 POST', 0
 
-; console_init: paint the graceful POST screen (white field, red Izarra 3000
+; console_init: paint the graceful POST screen (white field, red Izarra3000
 ; wordmark, black title and hint lines, empty progress bar). Called once at the
 ; start of POST. The per-step boot log moves to COM1; the on-screen experience is
 ; the graphical screen plus the RAM count-up, not a scrolling text log.
@@ -306,7 +306,7 @@ cs_streq:
 
 ; --- Graceful POST screen primitives ---------------------------------------
 ; The boot screen is an Amiga/Mac-style white field with black text, a red
-; "Izarra 3000" wordmark across the top, and a red progress bar for the RAM
+; "Izarra3000" wordmark across the top, and a red progress bar for the RAM
 ; test. The palette below repaints three DAC slots so gfx_clear/gfx_text/the
 ; blit all reach those exact colors regardless of the mode-13h defaults.
 

@@ -1364,7 +1364,7 @@ const MOUSE_GUEST_CENTER_Y: i32 = MOUSE_GUEST_MAX_Y / 2;
 
 /// Derive the DOS environment entries that advertise the Sound Blaster to
 /// auto-detecting games. `BLASTER` and `SETSOUND` carry the same value:
-/// `A220` (the fixed Resonique 2 base), `I`/`D`/`H` from the host config, `T6`
+/// `A220` (the fixed ReSonique II base), `I`/`D`/`H` from the host config, `T6`
 /// (the SB16 card type), and `P` for whichever MPU-401 port is advertised
 /// (`0x300` wavetable header or `0x330` rear connector -- both stay decoded
 /// either way). Returns an empty list when the card is disabled, so no `BLASTER`
@@ -2858,7 +2858,7 @@ impl Machine {
         // CD-Audio: pull the matching count of Red Book samples (44.1 kHz, the
         // DAC rate, so no resample) and attenuate by the CT1745 CD volume. A drive
         // that is not playing returns silence, so this is a no-op when no PLAY
-        // AUDIO is active. This realizes CD audio through the ReSonique 2 DAC.
+        // AUDIO is active. This realizes CD audio through the ReSonique II DAC.
         let cd = self.pull_cd_audio_samples(len);
         let mixed = (0..len)
             .map(|i| {
@@ -2979,7 +2979,7 @@ impl Machine {
         self.midi_mpu.take_message()
     }
 
-    /// (Left, Right) linear gain for the MIDI legs, from the ReSonique 2
+    /// (Left, Right) linear gain for the MIDI legs, from the ReSonique II
     /// wavetable volume registers `0x50`/`0x51`.
     ///
     /// Native MIDI synthesis is mixed by the frontend AFTER

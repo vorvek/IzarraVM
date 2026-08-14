@@ -410,7 +410,7 @@ pub fn unhalt_com() -> &'static [u8] {
     UNHALT_COM
 }
 
-/// SNDCTRL.COM: the ReSonique 2 sound-card setup tool, run from inside the
+/// SNDCTRL.COM: the ReSonique II sound-card setup tool, run from inside the
 /// guest.
 ///
 /// Moves the SB16 and AD1848 IRQ/DMA assignment with a text-mode interface (or

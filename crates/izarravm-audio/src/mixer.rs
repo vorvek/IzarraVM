@@ -11,13 +11,13 @@
 //! Status register (`0x82`), and the volume registers that attenuate host
 //! audio: master (`0x30`/`0x31`), voice (`0x32`/`0x33`), FM (`0x34`/`0x35`),
 //! CD (`0x36`/`0x37`), PC speaker (`0x3B`), output gain (`0x41`/`0x42`) and the
-//! ReSonique 2 wavetable extension (`0x50`/`0x51`). Other source, tone, and AGC
+//! ReSonique II wavetable extension (`0x50`/`0x51`). Other source, tone, and AGC
 //! registers retain guest writes but have no audio effect because their signal
 //! sources are not modeled (there is no line or microphone input).
 
 use std::sync::LazyLock;
 
-/// The SB16 base I/O address (fixed for the Resonique 2).
+/// The SB16 base I/O address (fixed for the ReSonique II).
 pub const MIXER_INDEX_PORT: u16 = 0x224;
 pub const MIXER_DATA_PORT: u16 = 0x225;
 
@@ -85,7 +85,7 @@ pub struct SbMixer {
     fm_r: u8,      // 0x35, 5-bit
     outgain_l: u8, // 0x41, 2-bit
     outgain_r: u8, // 0x42, 2-bit
-    wt_l: u8,      // 0x50, ReSonique 2 extension: the wavetable MIDI leg
+    wt_l: u8,      // 0x50, ReSonique II extension: the wavetable MIDI leg
     wt_r: u8,      // 0x51, ditto; both hold the register BYTE, not the level
     // Stored-but-inert registers at their datasheet defaults (round-trip only).
     inert: [u8; 256],
@@ -257,10 +257,10 @@ impl SbMixer {
 
     /// (Left, Right) linear wavetable-MIDI gain from registers `0x50`/`0x51`.
     ///
-    /// This pair is a ReSonique 2 extension, not a CT1745 register: a real
+    /// This pair is a ReSonique II extension, not a CT1745 register: a real
     /// CT1745 leaves `0x50`/`0x51` undecoded, and its `0x34`/`0x35` "MIDI" pair
     /// is the FM synthesiser bus (which is why [`fm_gain`](Self::fm_gain) owns
-    /// the OPL3). The Izarra 3000's card also carries a wavetable MPU whose
+    /// the OPL3). The Izarra3000's card also carries a wavetable MPU whose
     /// synthesis is mixed on-card, the way an AWE32 mixes its EMU8000, and that
     /// leg had no level control at all. It gets one here, on the card's own
     /// register file, at the card's own 5-bit level scale (D7-D3), so a guest
@@ -476,7 +476,7 @@ impl SbMixer {
             // 2-bit gain registers: level in D7-D6 (86Box `regs[0x41]>>6`).
             0x41 => self.outgain_l = value >> 6,
             0x42 => self.outgain_r = value >> 6,
-            // The ReSonique 2 wavetable leg (see `wavetable_gain`). The whole
+            // The ReSonique II wavetable leg (see `wavetable_gain`). The whole
             // byte is kept, not the level, because D0 carries the mute; the
             // reserved bits are dropped on the way in so a read-back never
             // reports a bit the card does not implement, the same normalising

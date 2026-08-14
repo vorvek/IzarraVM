@@ -21,7 +21,7 @@
 //!   image directly (`boot_hdd`, no overrides) and proves the shipped
 //!   screen itself: the rainbow TOKA art actually painted (attribute
 //!   diversity, not just characters), every owner's `/T`-styled tree line,
-//!   the two-row ReSonique2 summary, the closed double-line footer box, and
+//!   the two-row ReSonique II summary, the closed double-line footer box, and
 //!   the shell prompt landing on the last row with zero scroll -- exactly
 //!   what a user sees on a stock boot.
 
@@ -154,7 +154,7 @@ GOTO END\r\n\
 
 /// The styled stock boot end-to-end: rainbow art actually painted (attribute
 /// diversity, not just characters), every owner's tree line with its prefix,
-/// the two-row ReSonique2 block, the closed footer box, the prompt on the
+/// the two-row ReSonique II block, the closed footer box, the prompt on the
 /// last row with ZERO scroll. Boots the committed image with no overrides --
 /// exactly what a user sees.
 #[test]
@@ -230,7 +230,7 @@ fn stock_boot_paints_the_styled_init_screen() {
         "\u{C3}\u{C4}> TOKAEMM XMS/UMB/EMS memory manager; system running in V86.",
         "\u{C3}\u{C4}> IZCDEX installed. Assigned [1] drive(s): [TOKACD01 D:]",
         "\u{C3}\u{C4}> Toka-DOS mouse driver installed.",
-        "\u{C3}\u{C4}> ReSonique2 Configuration [Run SNDCTRL to change]",
+        "\u{C3}\u{C4}> ReSonique II Configuration [Run SNDCTRL to change]",
         "\u{B3}     SB16 220 I7 D1 H5   WSS 530 I11 D0   MIDI 300 I9",
     ];
     for needle in exact_needles {

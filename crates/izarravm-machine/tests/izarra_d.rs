@@ -141,7 +141,7 @@ fn setup_save_enables_debug_on_com1() {
     );
     assert_eq!(machine.cmos_byte(0x14), 1, "Save persisted Enabled");
     assert!(
-        machine.serial_text().contains("Izarra 3000 POST"),
+        machine.serial_text().contains("Izarra3000 POST"),
         "the reboot uses the saved COM1 debug setting"
     );
 
@@ -192,7 +192,7 @@ fn setup_menu_draws_the_title_on_the_lfb() {
         ActiveDisplay::MargoLfb,
         "the setup menu draws on the Margo LFB"
     );
-    // Title band y 4..12, x 8..152 ("IZARRA 3000 SETUP", red index ART_RED_INDEX
+    // Title band y 4..12, x 8..152 ("IZARRA3000 SETUP", red index ART_RED_INDEX
     // = 24): scan for red glyph pixels.
     let mut red = 0;
     for y in 4..12u32 {

@@ -572,7 +572,7 @@ fn psp_env_segment(machine: &Machine) -> u16 {
         .unwrap()
 }
 
-// --- Izarra 3000 BIOS foundation ---------------------------------------
+// --- Izarra3000 BIOS foundation ---------------------------------------
 
 // Boot the BIOS with the given CMOS 0x11 code-page index to its idle loop, then
 // return `rows` font bytes for `glyph` from the VGA character generator (table 0).

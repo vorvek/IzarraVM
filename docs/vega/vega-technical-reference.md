@@ -3,45 +3,49 @@
 
 # VEGA Technical Reference
 
-Visual Engine for Graphics Acceleration. This is the hardware reference for the
-VEGA chipset fitted to the Izarra 3000. It documents the programming interface:
-the memory map, the display modes, and the register set.
+VEGA is the Visual Engine for Graphics Acceleration. This is the hardware
+reference for the VEGA chipset in the Izarra3000. It describes the programming
+interface: the memory map, the display modes, and the register set.
 
-VEGA combines two graphics engines with separate memory:
+VEGA has two graphics engines, each with its own memory:
 
-- **Margo**, the 2D engine. Drives the desktop and all 2D display modes, and
-  owns a 4 MB frame store and a blit engine for accelerated fills, copies,
-  text, and lines.
-- **Distira**, the 3D engine. Owns a 2 MB framebuffer and two independent 2 MB
-  texture stores.
+- **Margo**, the 2D engine. It drives the desktop and all of the 2D display
+  modes. It has a 4 MB frame store, and a blit engine for accelerated fills,
+  copies, text, and lines.
+- **Distira**, the 3D engine. It has a 2 MB frame buffer and two independent
+  2 MB texture stores.
 
-VEGA presents the scanout from whichever engine is active. Margo and Distira
-do not alias each other's memory.
+VEGA shows the scanout of the active engine. Margo and Distira do not share
+memory addresses.
 
-This revision covers both engines. Margo starts below; Distira is in section 10.
+This revision describes both engines. Margo is below. Distira is in section
+10.
 
 ---
 
 ## 1. Margo overview
 
-Margo presents a flat frame store, a set of linear display modes reachable
-through the VESA BIOS interface, and a memory mapped register block that drives
-the blit engine. A driver sets a mode through the VBE software interface, then
-talks to the engine through the register block to move pixels without the CPU.
+Margo has a flat frame store, a set of linear display modes, and a
+memory-mapped register block. The VESA BIOS interface gives access to the
+display modes, and the register block operates the blit engine. A driver sets
+a mode through the VBE software interface. It then uses the register block to
+move pixels without the CPU.
 
-- 4 MB frame store, private to Margo, addressed as a flat byte space from
-  offset `0x000000` to `0x3FFFFF`.
-- Display modes up to 1024x768 at 32 bits per pixel.
-- 256-entry palette for 8-bit modes, through the standard VGA DAC ports.
-- A blit engine: solid fill, screen to screen copy, monochrome color expand
-  (text), and line draw, each with a raster operation, optional clipping, and
-  optional color key.
-- A tiled pattern fill, a 64x64 hardware cursor, and a scaled video overlay with
-  YUV color conversion, for desktop work and CD video playback.
-- VESA VBE 2.0 compatible, with a linear frame buffer.
+- A 4 MB frame store, private to Margo. It is a flat byte space, from offset
+  `0x000000` to `0x3FFFFF`.
+- Display modes to a maximum of 1024x768 at 32 bits for each pixel.
+- A palette of 256 entries for the 8-bit modes, through the standard VGA DAC
+  ports.
+- A blit engine with a solid fill, a screen-to-screen copy, a monochrome color
+  expand (text), and a line draw. Each operation has a raster operation,
+  optional clipping, and an optional color key.
+- A tiled pattern fill, a 64x64 hardware cursor, and a scaled video overlay
+  with YUV color conversion. Use them for desktop work and for CD video
+  playback.
+- VESA VBE 2.0 compatibility, with a linear frame buffer.
 
-The legacy VGA text mode and mode 13h remain available and are unchanged. They
-are documented with the rest of the VGA core, not here.
+The legacy VGA text mode and mode 13h continue to be available, with no
+change. The VGA core document describes them. This document does not.
 
 ### 1.1 Datasheet
 
@@ -58,9 +62,9 @@ are documented with the rest of the VGA core, not here.
 | Maximum mode | 1024x768 at 32-bit color |
 | Process | 350 nm |
 
-These are rated figures. The emulator does not model graphics timing
-cycle-for-cycle, so the fill and blit rates describe the part, not the emulated
-behavior (section 9).
+These are the rated figures. The emulator does not model the graphics timing
+cycle by cycle. Thus the fill rate and the blit rate describe the part, and
+not the emulated behavior. See section 9.
 
 ---
 
@@ -72,26 +76,28 @@ behavior (section 9).
 | `0xE0000000` to `0xE03FFFFF` | 4 MB | Margo linear frame buffer. Frame store offset 0 maps to `0xE0000000`. |
 | `0xE0400000` to `0xE040FFFF` | 64 KB | Margo register block (memory mapped) |
 
-The linear frame buffer exposes the whole 4 MB frame store. The visible surface
-starts at the offset in `DISP_START` (0 by default). Memory above the visible
-surface is free for offscreen work: blit sources, cached fonts, and saved screen
-regions.
+The linear frame buffer gives access to the full 4 MB frame store. The visible
+surface starts at the offset in `DISP_START`, which is 0 by default. The
+memory above the visible surface is free for offscreen work: blit sources,
+cached fonts, and saved screen regions.
 
-The frame buffer and register block sit above the 64 MB of system memory, so
-they are reached from protected or flat mode. Real mode code uses mode 13h or
-the legacy VGA aperture.
+The frame buffer and the register block are above the 64 MB of system memory.
+Thus a program reaches them from protected mode or flat mode. Real-mode code
+uses mode 13h or the legacy VGA aperture.
 
 ---
 
 ## 3. Display modes
 
-Modes are selected through the VBE interface (section 5). The standard VESA mode
-numbers are honored so existing VESA software finds them. The 32-bit modes use
-numbers in the OEM range, since VESA never assigned standard numbers for 32-bit
-color. Mode `0x150` is a VEGA OEM mode: 320x240 at 8bpp, line-doubled to the
-display by the monitor, used by the Izarra-BIOS graphical POST. The mode list
-returned by `4F00h` is ordered ascending, so the OEM entries follow the
-VESA-defined ones.
+A program selects a mode through the VBE interface (section 6). Margo supports
+the standard VESA mode numbers, thus existing VESA software finds them. The
+32-bit modes use numbers in the OEM range, because VESA assigned no standard
+numbers for 32-bit color.
+
+Mode `0x150` is a VEGA OEM mode: 320x240 at 8 bits for each pixel. The monitor
+doubles its lines. The graphical POST of the Izarra-BIOS uses it. Function
+`4F00h` returns the mode list in ascending order, thus the OEM entries come
+after the VESA entries.
 
 | Mode | Resolution | Depth | Pixel format | Bytes/pixel |
 |------|------------|-------|--------------|-------------|
@@ -110,15 +116,16 @@ VESA-defined ones.
 | `0x14E` | 1024x768 | 32 | X8R8G8B8 | 4 |
 | `0x150` | 320x240 | 8 | Indexed | 1 |
 
-Scanline pitch is the visible width times bytes per pixel, with no padding. The
-largest surface, 1024x768 at 32-bit, is 3 MB, which leaves 1 MB of the frame
-store for offscreen use.
+The scanline pitch is the visible width multiplied by the bytes for each
+pixel. There is no padding. The largest surface is 1024x768 at 32-bit, which
+is 3 MB. This leaves 1 MB of the frame store for offscreen use.
 
 ### 3.1 Scanout timing
 
-Every mode refreshes at 60.000 Hz. The pixel clock is not a free parameter: it
-is whatever drives the mode's total dots at that rate, so the refresh rate is the
-same number in every mode and does not vary with resolution or depth.
+Each mode refreshes at 60.000 Hz. The pixel clock is not an independent
+parameter. It is the clock that gives the total dots of the mode at that rate.
+Thus the refresh rate is the same in each mode. It does not change with the
+resolution or with the depth.
 
 | Displayed resolution | Total dots | Total lines | Sync start | Sync width | Pixel clock |
 |----------------------|------------|-------------|------------|------------|-------------|
@@ -127,24 +134,27 @@ same number in every mode and does not vary with resolution or depth.
 | 800x600 | 1056 | 628 | line 601 | 4 lines | 39.790 MHz |
 | 1024x768 | 1344 | 806 | line 771 | 6 lines | 64.996 MHz |
 
-The totals and sync positions are the standard ones for these resolutions, so a
-period monitor locks to them. The clocks differ from the usual published figures
-in the third or fourth digit, because those are quoted at 59.94 Hz for 640x480
-and 60.32 Hz for 800x600 rather than at a flat 60. The 640x400 signal is the
-exception in kind rather than in degree: it is normally driven at 70 Hz, and
-Margo drives it at 60 like every other mode, so its clock is correspondingly
-lower.
+The totals and the sync positions are the standard values for these
+resolutions. Thus a monitor of the period locks to them. The clocks are
+different from the usual published figures, in the third digit or the fourth
+digit. The published figures are for 59.94 Hz at 640x480, and for 60.32 Hz at
+800x600, and not for a flat 60 Hz.
 
-Mode `0x150` stores 320x240 but is line-doubled to the display, so it scans out
+The 640x400 signal is a different type of exception. Usually a card drives it
+at 70 Hz. Margo drives it at 60 Hz, as it drives each other mode. Thus its
+clock is lower.
+
+Mode `0x150` holds 320x240. The display doubles its lines. Thus it scans out
 on the 640x480 signal in the table.
 
-The vertical retrace interval is visible to software through Input Status 1
-(port `03DAh` bit 3) and Input Status 0 (port `03C2h` bit 7), the same two
-registers a VGA program polls. Reading `03DAh` still resets the attribute
-controller's address/data flip-flop, since that is a property of the port and
-not of the engine driving the display. Bits 1 and 2 of `03DAh` read 0 (no light
-pen is fitted) and so do the diagnostic DAC readback bits 4 and 5, which have no
-attribute-controller path to sample while Margo owns the display.
+Software can read the vertical retrace interval through Input Status 1 (port
+`03DAh` bit 3) and Input Status 0 (port `03C2h` bit 7). A VGA program reads
+the same two registers. A read of `03DAh` also resets the address/data
+flip-flop of the attribute controller, because that behavior belongs to the
+port and not to the engine that drives the display. Bits 1 and 2 of `03DAh`
+read 0, because the machine has no light pen. The diagnostic DAC readback bits
+4 and 5 also read 0, because they have no attribute-controller path to sample
+while Margo owns the display.
 
 ---
 
@@ -157,71 +167,72 @@ attribute-controller path to sample while Margo owns the display.
 | R5G6B5 | 16 | 5 red, 6 green, 5 blue |
 | X8R8G8B8 | 32 | 8 unused, 8 red, 8 green, 8 blue |
 
-Packed 24-bit color is not provided. The 32-bit format covers true color and
-avoids three-byte pixels.
+Margo has no packed 24-bit color. The 32-bit format gives true color, and it
+has no three-byte pixel.
 
 ---
 
 ## 5. VGA DAC (palette)
 
-The 8-bit indexed modes and mode 13h take their colors from the 256-entry DAC,
-through the standard VGA ports.
+The 8-bit indexed modes and mode 13h take their colors from the DAC, which has
+256 entries. They use the standard VGA ports.
 
 | Port | Access | Function |
 |------|--------|----------|
-| `0x03C8` | Write | Palette write index. Sets the entry that the next data writes target. |
-| `0x03C7` | Write | Palette read index. Sets the entry that the next data reads target. |
-| `0x03C9` | Read/Write | Palette data. Three accesses per entry, red then green then blue. |
+| `0x03C8` | Write | Palette write index. It sets the entry for the next data writes. |
+| `0x03C7` | Write | Palette read index. It sets the entry for the next data reads. |
+| `0x03C9` | Read/Write | Palette data. Each entry needs three accesses: red, green, then blue. |
 
-Each component is 6 bits (0 to 63). After three writes to `0x03C9` the index
-advances to the next entry, so a full palette load is one write to `0x03C8`
-followed by 768 writes to `0x03C9`.
+Each component is 6 bits, from 0 to 63. After three writes to `0x03C9`, the
+index moves to the next entry. Thus a full palette load is one write to
+`0x03C8`, and then 768 writes to `0x03C9`.
 
 ---
 
 ## 6. VBE software interface
 
-Mode setting and frame buffer information come through `INT 10h` with `AH = 4Fh`,
-the VESA BIOS Extensions interface. `AL` selects the function. On return,
-`AL = 4Fh` confirms the function is supported and `AH` is the status (0 on
-success).
+The mode set and the frame buffer information come through `INT 10h` with
+`AH = 4Fh`. This is the VESA BIOS Extensions interface. `AL` selects the
+function. On return, `AL = 4Fh` shows that the function is available, and `AH`
+is the status. A status of 0 is success.
 
 | Function | Name | Notes |
 |----------|------|-------|
 | `4F00h` | Return controller information | Fills a VbeInfoBlock at `ES:DI`. Signature `VESA`, version `0x0200`, total memory 64 (in 64 KB units), and a pointer to the mode list. |
 | `4F01h` | Return mode information | Fills a ModeInfoBlock at `ES:DI` for the mode in `CX`: resolution, depth, pitch, color masks, and `PhysBasePtr = 0xE0000000`. |
-| `4F02h` | Set mode | Mode number in `BX`. Bit 14 (`0x4000`) requests the linear frame buffer. Bit 15 (`0x8000`) preserves memory. |
+| `4F02h` | Set mode | Mode number in `BX`. Bit 14 (`0x4000`) requests the linear frame buffer. Bit 15 (`0x8000`) keeps the memory contents. |
 | `4F03h` | Return current mode | Current mode number in `BX`. |
-| `4F05h` | Set/get display window | Banked access to the frame store through the legacy aperture at `A000h`. `BH=00h` selects the bank in `DX`, `BH=01h` returns it. `BL` selects the window and must be `00h`: only window A exists. The granularity and the window size are both 64 KB, so bank `n` maps frame store offset `n * 64 KB` to `A0000h`. Fails with status `03h` in a mode set for the linear frame buffer. |
-| `4F07h` | Set/get display start | `BL=00h` queues an `(x,y)` origin, `BL=01h` returns the active origin, and `BL=80h` queues the origin and waits for the next 60 Hz frame boundary. Used for panning and page flips. |
-| `4F08h` | Set/get DAC palette width | `BL=00h` selects the width requested in `BH` and `BL=01h` returns the active width in `BH`. Six-bit and eight-bit entries are supported. |
-| `4F09h` | Set/get palette data | `BL=00h` loads, `BL=01h` reads, and `BL=80h` loads at the next frame boundary. Entries at `ES:DI` are four-byte B,G,R,alignment records. `CX` is the count and `DX` the first index. |
-| `4F0Ah` | Return protected-mode interface | `BL=00h` returns a table of protected-mode entry points at `ES:DI`, `CX` bytes long. The table holds far-callable routines for set window, set display start, and set primary palette data, followed by the list of I/O ports they touch, so a protected-mode driver reaches them without `INT 10h`. Other `BL` values are not defined. |
+| `4F05h` | Set/get display window | Banked access to the frame store, through the legacy aperture at `A000h`. `BH=00h` selects the bank in `DX`, and `BH=01h` returns it. `BL` selects the window, and it must be `00h`, because only window A exists. The granularity and the window size are both 64 KB. Thus bank `n` maps frame store offset `n * 64 KB` to `A0000h`. The function fails with status `03h` in a mode that uses the linear frame buffer. |
+| `4F07h` | Set/get display start | `BL=00h` queues an `(x,y)` origin. `BL=01h` returns the active origin. `BL=80h` queues the origin and waits for the next 60 Hz frame boundary. Use these for panning and for page flips. |
+| `4F08h` | Set/get DAC palette width | `BL=00h` selects the width in `BH`. `BL=01h` returns the active width in `BH`. The DAC supports six-bit and eight-bit entries. |
+| `4F09h` | Set/get palette data | `BL=00h` loads, `BL=01h` reads, and `BL=80h` loads at the next frame boundary. Each entry at `ES:DI` is a four-byte record: B, G, R, and alignment. `CX` is the count, and `DX` is the first index. |
+| `4F0Ah` | Return protected-mode interface | `BL=00h` returns a table of protected-mode entry points at `ES:DI`, with a length of `CX` bytes. The table holds far-callable routines for set window, set display start, and set primary palette data. After them comes the list of the I/O ports that they use. Thus a protected-mode driver reaches them without `INT 10h`. Other `BL` values are not defined. |
 
-Functions `4F00h` through `4F03h` are the mode-setting core. The rest extend it.
+Functions `4F00h` to `4F03h` are the core of the mode set. The other functions
+are extensions.
 
-A mode set through `4F02h` reprograms the display timing. While a VBE mode is
-active the CRT status registers report that timing and not the timing of
-whatever VGA mode preceded it; see section 3 and section 9.
+A mode set through `4F02h` programs the display timing again. While a VBE mode
+is active, the CRT status registers report that timing. They do not report the
+timing of the previous VGA mode. See section 3 and section 9.
 
 ---
 
 ## 7. Margo register block
 
-The register block is 64 KB at `0xE0400000`. All registers are 32 bits and are
-accessed with aligned 32-bit reads and writes. Byte and 16-bit access to the
-block is not defined.
+The register block is 64 KB at `0xE0400000`. Each register is 32 bits. Use
+aligned 32-bit reads and writes. A byte access or a 16-bit access to the block
+is not defined.
 
-Offsets below are relative to the block base.
+The offsets below are relative to the base of the block.
 
 ### 7.1 Identification and control
 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
-| `0x0000` | `ID` | R | Identity and interface version. Reads `0x4D470100`: `0x4D47` is the Margo signature, the low half is version 1.00. |
-| `0x0004` | `CAPS` | R | Feature bitmap. A driver reads it to learn which operations this build implements. See below. |
-| `0x0008` | `STATUS` | R | Bit 0 `BUSY`: an operation is in progress, set until its modeled completion time (section 9). Bit 1 `FIFO_FULL`: reserved, reads 0. |
-| `0x000C` | `CONTROL` | R/W | Bit 0 `RESET`: write 1 to abort the current operation and clear the engine, self-clearing. Bit 1 `DITHER_EN`: dither wherever color precision drops (section 7.10). Other bits reserved, write 0. |
+| `0x0000` | `ID` | R | Identity and interface version. It reads `0x4D470100`. `0x4D47` is the Margo signature, and the low half is version 1.00. |
+| `0x0004` | `CAPS` | R | Feature bitmap. A driver reads it to find the operations of this build. See below. |
+| `0x0008` | `STATUS` | R | Bit 0 `BUSY`: an operation is in progress. The bit stays set until the modeled completion time (section 9). Bit 1 `FIFO_FULL`: reserved, reads 0. |
+| `0x000C` | `CONTROL` | R/W | Bit 0 `RESET`: write 1 to stop the current operation and clear the engine. The bit clears itself. Bit 1 `DITHER_EN`: dither where the color precision decreases (section 7.10). The other bits are reserved. Write 0 to them. |
 
 `CAPS` bits:
 
@@ -231,94 +242,95 @@ Offsets below are relative to the block base.
 | 1 | `COPY` available |
 | 2 | `COLOR_EXPAND` available |
 | 3 | `LINE` available |
-| 4 | Full ROP3 set honored (beyond plain copy and fill) |
-| 5 | `CLIP` honored |
-| 6 | `COLORKEY` honored |
+| 4 | Full ROP3 set available (more than the plain copy and fill) |
+| 5 | `CLIP` available |
+| 6 | `COLORKEY` available |
 | 7 | `PATTERN_FILL` available |
 | 8 | Hardware cursor available |
 | 9 | Video overlay available |
 | 10 | DMA pusher available |
 | 11 | Hardware dithering available |
 
-The register map in this manual is fixed. `CAPS` reports which parts the running
-build implements, so a driver written against the full map degrades cleanly on
-an early build.
+The register map in this manual is fixed. `CAPS` gives the parts that the
+current build has. Thus a driver for the full map continues to operate
+correctly on an early build.
 
 ### 7.2 Display controller
 
-These describe the surface being scanned out. `4F02h` sets them. A driver may
-write `DISP_START` to pan or to flip pages.
+These registers describe the surface that Margo scans out. `4F02h` sets them.
+A driver can write `DISP_START` to pan the display or to flip pages.
 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | `0x0010` | `DISP_MODE` | R | Current VBE mode number. |
 | `0x0014` | `DISP_WIDTH` | R | Visible width in pixels. |
 | `0x0018` | `DISP_HEIGHT` | R | Visible height in pixels. |
-| `0x001C` | `DISP_BPP` | R | Bits per pixel (8, 15, 16, 32). |
-| `0x0020` | `DISP_PITCH` | R | Bytes per scanline of the visible surface. |
-| `0x0024` | `DISP_START` | R/W | Frame store byte offset of the top-left visible pixel. Default 0. Takes effect on the next frame. |
+| `0x001C` | `DISP_BPP` | R | Bits for each pixel (8, 15, 16, 32). |
+| `0x0020` | `DISP_PITCH` | R | Bytes for each scanline of the visible surface. |
+| `0x0024` | `DISP_START` | R/W | Frame store byte offset of the top-left visible pixel. The default is 0. It takes effect on the next frame. |
 
 ### 7.3 Blit engine
 
-Latch the parameters, then write `COMMAND` to run an operation.
+Write the parameters. Then write `COMMAND` to start an operation.
 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | `0x0100` | `DST_BASE` | R/W | Frame store byte offset of the destination surface origin. |
-| `0x0104` | `DST_PITCH` | R/W | Bytes per scanline of the destination surface. |
+| `0x0104` | `DST_PITCH` | R/W | Bytes for each scanline of the destination surface. |
 | `0x0108` | `SRC_BASE` | R/W | Frame store byte offset of the source surface origin. |
-| `0x010C` | `SRC_PITCH` | R/W | Bytes per scanline of the source surface. |
-| `0x0110` | `DEPTH` | R/W | Bytes per pixel the engine operates on (1, 2, or 4). Normally the surface format. |
+| `0x010C` | `SRC_PITCH` | R/W | Bytes for each scanline of the source surface. |
+| `0x0110` | `DEPTH` | R/W | Bytes for each pixel that the engine operates on (1, 2, or 4). This is usually the surface format. |
 | `0x0114` | `DST_XY` | R/W | Destination top-left. Y in bits 31..16, X in bits 15..0, in pixels. |
-| `0x0118` | `SRC_XY` | R/W | Source top-left, same packing. |
+| `0x0118` | `SRC_XY` | R/W | Source top-left, with the same packing. |
 | `0x011C` | `DIM` | R/W | Rectangle size. Height in bits 31..16, width in bits 15..0, in pixels. |
 | `0x0120` | `FG_COLOR` | R/W | Foreground or fill color, right-justified in the destination format. |
-| `0x0124` | `BG_COLOR` | R/W | Background color for color expand. |
-| `0x0128` | `ROP` | R/W | Raster operation, low 8 bits (ROP3 code). See section 7.6. |
-| `0x012C` | `COLORKEY` | R/W | Transparent color value, destination format. |
+| `0x0124` | `BG_COLOR` | R/W | Background color for a color expand. |
+| `0x0128` | `ROP` | R/W | Raster operation, in the low 8 bits (ROP3 code). See section 7.6. |
+| `0x012C` | `COLORKEY` | R/W | Transparent color value, in the destination format. |
 | `0x0130` | `FLAGS` | R/W | Bit 0 `COLORKEY_EN`, bit 1 `CLIP_EN`, bit 2 `EXPAND_TRANSPARENT`. See section 7.5. |
 | `0x0134` | `CLIP_TL` | R/W | Clip rectangle top-left (Y:X packed). Inclusive. |
 | `0x0138` | `CLIP_BR` | R/W | Clip rectangle bottom-right (Y:X packed). Exclusive. |
 | `0x013C` | `LINE_START` | R/W | Line start point (Y:X packed). |
 | `0x0140` | `LINE_END` | R/W | Line end point (Y:X packed). |
-| `0x0144` | `PAT_BASE` | R/W | Frame store offset of an 8x8 pattern in the destination format, row pitch `8 * DEPTH` bytes. Used by `PATTERN_FILL`. |
+| `0x0144` | `PAT_BASE` | R/W | Frame store offset of an 8x8 pattern in the destination format. The row pitch is `8 * DEPTH` bytes. `PATTERN_FILL` uses it. |
 | `0x0150` | `COMMAND` | W | Write a command code to start an operation. See section 7.4. |
 | `0x0160` | `MONO_DATA` | W | Monochrome data port for `COLOR_EXPAND_DATA`. See section 7.4. |
 
 ### 7.4 Commands
 
-Write one of these codes to `COMMAND`. The engine runs the operation against the
-latched registers, with `BUSY` set for the duration.
+Write one of these codes to `COMMAND`. The engine does the operation with the
+values in the registers. `BUSY` stays set until the operation is complete.
 
 | Code | Name | Operation |
 |------|------|-----------|
-| `0x01` | `FILL` | Fill the destination rectangle (`DST_XY`, `DIM`) with `FG_COLOR` through `ROP`. ROP `0xF0` is a solid fill; ROP `0x5A` exclusive-ORs `FG_COLOR` into the destination, for rubber-band boxes. |
-| `0x02` | `COPY` | Copy the source rectangle (`SRC_XY`, `DIM`) to `DST_XY` through `ROP`. The engine picks a safe traversal order when source and destination overlap. With `COLORKEY_EN`, source pixels equal to `COLORKEY` are skipped. |
-| `0x03` | `COLOR_EXPAND_DATA` | Expand a monochrome bitmap, streamed through `MONO_DATA`, into the destination rectangle. Set bits take `FG_COLOR`; clear bits take `BG_COLOR`, or are left untouched when `EXPAND_TRANSPARENT`. |
-| `0x04` | `COLOR_EXPAND_MEM` | As above, but the monochrome source is read from the frame store at `SRC_BASE` / `SRC_XY` with `SRC_PITCH`, 1 bit per pixel, most significant bit first. |
-| `0x05` | `LINE` | Draw a line from `LINE_START` to `LINE_END` in `FG_COLOR` through `ROP`. |
-| `0x06` | `PATTERN_FILL` | Fill the destination rectangle by tiling the 8x8 pattern at `PAT_BASE`, in the destination format. The pattern phase is aligned to the surface origin so adjacent fills tile seamlessly. `ROP` and color key apply, so a hatch pattern keys its background through. Monochrome GDI brushes are realized by expanding the brush once into an 8x8 color tile. |
+| `0x01` | `FILL` | Fill the destination rectangle (`DST_XY`, `DIM`) with `FG_COLOR`, through `ROP`. ROP `0xF0` gives a solid fill. ROP `0x5A` does an exclusive-OR of `FG_COLOR` into the destination, for a rubber-band box. |
+| `0x02` | `COPY` | Copy the source rectangle (`SRC_XY`, `DIM`) to `DST_XY`, through `ROP`. The engine selects a safe order when the source and the destination overlap. With `COLORKEY_EN`, the engine does not write a source pixel that is equal to `COLORKEY`. |
+| `0x03` | `COLOR_EXPAND_DATA` | Expand a monochrome bitmap into the destination rectangle. `MONO_DATA` carries the bitmap. A set bit gets `FG_COLOR`. A clear bit gets `BG_COLOR`, or stays unchanged with `EXPAND_TRANSPARENT`. |
+| `0x04` | `COLOR_EXPAND_MEM` | The same operation, but the engine reads the monochrome source from the frame store at `SRC_BASE` and `SRC_XY`, with `SRC_PITCH`, at 1 bit for each pixel, most significant bit first. |
+| `0x05` | `LINE` | Draw a line from `LINE_START` to `LINE_END` in `FG_COLOR`, through `ROP`. |
+| `0x06` | `PATTERN_FILL` | Fill the destination rectangle with tiles of the 8x8 pattern at `PAT_BASE`, in the destination format. The pattern phase aligns to the surface origin, thus adjacent fills join with no visible seam. `ROP` and the color key apply, thus a hatch pattern can key its background through. For a monochrome GDI brush, expand the brush one time into an 8x8 color tile. |
 
-`COLOR_EXPAND_DATA` streams its source. After writing the command, write the
-bitmap to `MONO_DATA` one 32-bit word at a time, most significant bit first. Each
-scanline starts on a word boundary, so a row of W pixels takes `ceil(W / 32)`
-words. The engine consumes `ceil(width / 32) * height` words and holds `BUSY`
-until the last one arrives.
+`COLOR_EXPAND_DATA` reads its source as a stream. After you write the command,
+write the bitmap to `MONO_DATA` one 32-bit word at a time, with the most
+significant bit first. Each scanline starts on a word boundary. Thus a row of
+W pixels needs `ceil(W / 32)` words. The engine reads
+`ceil(width / 32) * height` words, and it holds `BUSY` until the last word
+arrives.
 
 ### 7.5 Flags
 
 | Bit | Name | Effect |
 |-----|------|--------|
-| 0 | `COLORKEY_EN` | On `COPY`, source pixels equal to `COLORKEY` are not written. Used for transparent sprites and icons. |
-| 1 | `CLIP_EN` | All operations are clipped to the rectangle in `CLIP_TL` and `CLIP_BR`. Pixels outside it are discarded. |
-| 2 | `EXPAND_TRANSPARENT` | On color expand, clear bits are skipped instead of painted with `BG_COLOR`, so glyphs draw over existing pixels. |
+| 0 | `COLORKEY_EN` | On `COPY`, the engine does not write a source pixel that is equal to `COLORKEY`. Use it for a transparent sprite or icon. |
+| 1 | `CLIP_EN` | The engine clips each operation to the rectangle in `CLIP_TL` and `CLIP_BR`. It discards a pixel outside that rectangle. |
+| 2 | `EXPAND_TRANSPARENT` | On a color expand, the engine does not write a clear bit with `BG_COLOR`. Thus a glyph draws over the existing pixels. |
 
 ### 7.6 Raster operations
 
-`ROP` holds an 8-bit ROP3 code, the boolean function of source (S), destination
-(D), and pattern (P). For `FILL` and `LINE` the pattern is `FG_COLOR` and there
-is no source. For `COPY` and color expand the source is the moved or expanded
-pixel.
+`ROP` holds an 8-bit ROP3 code. The code is the boolean function of the source
+(S), the destination (D), and the pattern (P). For `FILL` and `LINE`, the
+pattern is `FG_COLOR`, and there is no source. For `COPY` and for a color
+expand, the source is the moved pixel or the expanded pixel.
 
 | Code | Name | Result |
 |------|------|--------|
@@ -332,216 +344,232 @@ pixel.
 | `0xF0` | `PATCOPY` | P |
 | `0xFF` | `WHITENESS` | all ones |
 
-The default is `0xCC` for `COPY` and color expand, and `0xF0` for `FILL`. Codes
-outside this table are reserved. `CAPS` bit 4 reports whether the build honors
-the full set or only plain copy and fill.
+The default is `0xCC` for `COPY` and for a color expand. It is `0xF0` for
+`FILL`. A code that is not in this table is reserved. `CAPS` bit 4 gives the
+set of the build: the full set, or the plain copy and fill only.
 
 ### 7.7 Hardware cursor
 
-A 64x64 two-plane cursor, composited by the display path so the CPU never blits
-the pointer. Its bitmap lives in the frame store as two 512-byte planes: the AND plane first,
-then the XOR plane at `CURSOR_ADDR + 512`. Each plane is 64x64 at 1 bit per pixel,
-8 bytes per row, packed most significant bit first, so every pixel draws one AND
-bit and one XOR bit (1024 bytes total).
+The cursor is a 64x64 two-plane bitmap. The display path composites it, thus
+the CPU does not blit the pointer. The bitmap is in the frame store, as two
+planes of 512 bytes. The AND plane is first, and the XOR plane follows at
+`CURSOR_ADDR + 512`. Each plane is 64x64 at 1 bit for each pixel, with 8 bytes
+for each row, and the most significant bit first. Thus each pixel has one AND
+bit and one XOR bit, and the total is 1024 bytes.
 
 | AND | XOR | Result |
 |-----|-----|--------|
 | 0 | 0 | Background color (`CURSOR_BG`) |
 | 0 | 1 | Foreground color (`CURSOR_FG`) |
-| 1 | 0 | Transparent, the screen shows through |
-| 1 | 1 | The screen pixel inverted |
+| 1 | 0 | Transparent. The screen is visible. |
+| 1 | 1 | The screen pixel, inverted |
 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
-| `0x0028` | `CURSOR_CTRL` | R/W | Bit 0 `ENABLE`. Other bits reserved. |
+| `0x0028` | `CURSOR_CTRL` | R/W | Bit 0 `ENABLE`. The other bits are reserved. |
 | `0x002C` | `CURSOR_ADDR` | R/W | Frame store offset of the 1024-byte cursor bitmap. |
-| `0x0030` | `CURSOR_POS` | R/W | Top-left screen position. Y in bits 31..16, X in bits 15..0, each a signed 16-bit value so the cursor can run off the top and left edges. The visible part is clipped to the screen. |
-| `0x0034` | `CURSOR_FG` | R/W | Foreground color, in the display format or a palette index in 8-bit modes. |
+| `0x0030` | `CURSOR_POS` | R/W | Top-left screen position. Y in bits 31..16, X in bits 15..0. Each value is a signed 16-bit value, thus the cursor can go off the top edge and the left edge. The engine clips the visible part to the screen. |
+| `0x0034` | `CURSOR_FG` | R/W | Foreground color, in the display format. In an 8-bit mode, it is a palette index. |
 | `0x0038` | `CURSOR_BG` | R/W | Background color. |
 
-Moving the pointer is one write to `CURSOR_POS` per frame, which is the point of
-the feature.
+A move of the pointer is one write to `CURSOR_POS` for each frame. This is the
+purpose of the hardware cursor.
 
 ### 7.8 Video overlay
 
-A scaled video window composited at scanout. The source is a YUV image in the
-frame store. The engine converts it to RGB by the BT.601 coefficients and scales
-it from its source size to a destination rectangle on screen, gated by a color
-key so desktop windows can occlude it. This is the path for CD video without
-spending the CPU on color conversion and scaling.
+The overlay is a scaled video window that the engine composites at scanout.
+The source is a YUV image in the frame store. The engine converts it to RGB
+with the BT.601 coefficients. It then scales it from the source size to a
+destination rectangle on the screen. A color key controls the overlay, thus a
+desktop window can cover it. Use this path for CD video, and keep the color
+conversion and the scaling off the CPU.
 
 Source formats:
 
-- **YUY2**: packed 4:2:2, 16 bits per pixel, byte order Y0, U, Y1, V.
-- **YV12**: planar 4:2:0, an 8-bit Y plane, then 8-bit V and U planes at half
-  width and half height.
+- **YUY2**: packed 4:2:2, 16 bits for each pixel, in the byte order Y0, U, Y1,
+  V.
+- **YV12**: planar 4:2:0, with an 8-bit Y plane, and then 8-bit V and U planes
+  at half width and half height.
 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | `0x0040` | `OVL_CTRL` | R/W | Bit 0 `ENABLE`. Bits 2..1 `FORMAT` (0 YUY2, 1 YV12). Bit 3 `KEY_EN`. |
 | `0x0044` | `OVL_SRC_Y` | R/W | Frame store offset of the Y plane, or of the packed surface for YUY2. |
-| `0x0048` | `OVL_SRC_PITCH` | R/W | Bytes per scanline of the Y or packed plane. |
+| `0x0048` | `OVL_SRC_PITCH` | R/W | Bytes for each scanline of the Y plane or the packed plane. |
 | `0x004C` | `OVL_SRC_DIM` | R/W | Source size. Height in bits 31..16, width in bits 15..0. |
 | `0x0050` | `OVL_SRC_U` | R/W | Frame store offset of the U plane (YV12 only). |
 | `0x0054` | `OVL_SRC_V` | R/W | Frame store offset of the V plane (YV12 only). |
-| `0x0058` | `OVL_DST_XY` | R/W | Destination top-left on screen (Y:X packed). |
-| `0x005C` | `OVL_DST_DIM` | R/W | Destination size. Height in bits 31..16, width in bits 15..0, the scaled size on screen. |
-| `0x0060` | `OVL_COLORKEY` | R/W | When `KEY_EN`, the overlay appears only where the primary surface equals this value. |
+| `0x0058` | `OVL_DST_XY` | R/W | Destination top-left on the screen (Y:X packed). |
+| `0x005C` | `OVL_DST_DIM` | R/W | Destination size. Height in bits 31..16, width in bits 15..0. This is the scaled size on the screen. |
+| `0x0060` | `OVL_COLORKEY` | R/W | With `KEY_EN`, the overlay appears only where the primary surface is equal to this value. |
 
-Within the destination rectangle the engine samples the source scaled to the
-destination size, converts YUV to RGB, and presents it. With `KEY_EN`, an
-application paints `OVL_COLORKEY` into its video window, and the overlay shows
-there, hidden wherever another window draws over the key. Chroma is upsampled for
-the 4:2:0 format.
+In the destination rectangle, the engine samples the source at the destination
+size, converts YUV to RGB, and shows the result. With `KEY_EN`, an application
+writes `OVL_COLORKEY` into its video window, and the overlay is visible there.
+Where another window draws over the key, the overlay is not visible. The
+engine upsamples the chroma for the 4:2:0 format.
 
 ### 7.9 DMA pusher
 
-The pusher is a bus-master command engine. Rather than write registers one at a
-time, a driver builds a stream of commands in a ring buffer in system memory and
-lets Margo read and run them. This keeps the CPU off the bus during long
-sequences of operations, which is what holds the desktop together on a throttled
-CPU.
+The pusher is a bus-master command engine. A driver does not have to write the
+registers one at a time. It builds a stream of commands in a ring buffer in
+system memory, and Margo reads the commands and does them. Thus the CPU stays
+off the bus during a long sequence of operations. This keeps the desktop fast
+on a slow CPU.
 
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | `0x0080` | `PUSH_CTRL` | R/W | Bit 0 `ENABLE`. |
-| `0x0084` | `PUSH_BASE` | R/W | System physical address of the command ring, 16-byte aligned. |
-| `0x0088` | `PUSH_SIZE` | R/W | Ring size in bytes, a power of two. |
-| `0x008C` | `PUSH_PUT` | R/W | Byte offset into the ring of the end of submitted commands. Writing it is the doorbell that runs the pusher. |
-| `0x0090` | `PUSH_GET` | R | The pusher's current read offset. Equals `PUSH_PUT` when the ring is drained. |
+| `0x0084` | `PUSH_BASE` | R/W | System physical address of the command ring, aligned to 16 bytes. |
+| `0x0088` | `PUSH_SIZE` | R/W | Ring size in bytes. It must be a power of two. |
+| `0x008C` | `PUSH_PUT` | R/W | Byte offset into the ring of the end of the submitted commands. A write to this register is the doorbell that starts the pusher. |
+| `0x0090` | `PUSH_GET` | R | The current read offset of the pusher. It is equal to `PUSH_PUT` when the ring is empty. |
 
 The ring holds 32-bit words. Each command starts with a header word:
 
     header = (count << 16) | method
 
-`method` (bits 15..0) is a byte offset into this register block, a multiple of 4.
-`count` (bits 31..16) is the number of data words that follow. The pusher writes
-the data words to `method`, `method + 4`, `method + 8`, and so on, exactly as if
-the CPU had written those registers in order. A write to `COMMAND` (offset
-`0x0150`) through the pusher starts an operation just like a direct write. The
-pusher advances `PUSH_GET` past each consumed word, wraps at `PUSH_SIZE`, and
-stops when `GET` reaches `PUT`. Scattered writes use one header per register, a
-`count` of 1; a contiguous run uses a single header.
+`method` (bits 15..0) is a byte offset into this register block, and it is a
+multiple of 4. `count` (bits 31..16) is the number of data words after the
+header. The pusher writes the data words to `method`, `method + 4`,
+`method + 8`, and so on. The result is the same as a write of those registers
+by the CPU, in the same order. A write to `COMMAND` (offset `0x0150`) through
+the pusher starts an operation, as a direct write does.
+
+The pusher moves `PUSH_GET` past each word that it reads. It returns to the
+start of the ring at `PUSH_SIZE`. It stops when `GET` reaches `PUT`. For
+separate registers, use one header for each register, with a `count` of 1. For
+a continuous run of registers, use one header.
 
 ### 7.10 Dithering
 
-When `CONTROL.DITHER_EN` is set, Margo applies an ordered 4x4 dither wherever it
-reduces color precision: higher-precision color written into a 15 or 16-bit
-surface by the blit engine, and the video overlay presented on a 15 or 16-bit
-display. Dithering trades a little spatial noise for the absence of banding. It
-has no effect on 32-bit surfaces, where no precision is lost.
+With `CONTROL.DITHER_EN` set, Margo applies an ordered 4x4 dither where it
+decreases the color precision. There are two such conditions. In the first,
+the blit engine writes a color of higher precision into a 15-bit or 16-bit
+surface. In the second, the video overlay goes to a 15-bit or 16-bit display.
+The dither adds a small quantity of spatial noise, and it removes the bands.
+It has no effect on a 32-bit surface, where the precision does not decrease.
 
 ---
 
 ## 8. Coordinates, colors, and bounds
 
-- Points are packed as `(Y << 16) | X`, both unsigned 16-bit, in pixels.
-- Colors are right-justified in the destination pixel format. An 8-bit fill uses
-  the low 8 bits of `FG_COLOR`, a 16-bit fill the low 16, a 32-bit fill all 32.
-- The engine works inside the 4 MB frame store. An operation whose source or
-  destination would fall outside the frame store is ignored rather than wrapped.
+- A point is packed as `(Y << 16) | X`. Both values are unsigned 16-bit
+  values, in pixels.
+- A color is right-justified in the destination pixel format. An 8-bit fill
+  uses the low 8 bits of `FG_COLOR`. A 16-bit fill uses the low 16 bits. A
+  32-bit fill uses all 32 bits.
+- The engine operates in the 4 MB frame store. If the source or the
+  destination of an operation is outside the frame store, the engine ignores
+  the operation. It does not wrap the address.
 
 ---
 
 ## 9. Timing and fidelity
 
-The Izarra 3000 is a fantasy machine. Where the emulator bends real hardware, it
-marks it here.
+The Izarra3000 is an invented machine. This section gives each difference
+between the emulator and real hardware.
 
 ### Timing
 
-Margo computes the result of an operation in one step rather than simulating its
-datapath cycle by cycle, but it stays faithful at the register interface. Each
-operation is given a duration from a cost model: a fixed setup overhead plus the
-work divided by the rated throughput (section 1.1). `STATUS.BUSY` stays set until
-that modeled completion time, and the pusher's `PUSH_GET` advances through the
-ring as it consumes commands. The result bytes are in the frame store at once,
-but software cannot observe the engine as idle until the modeled time has passed,
-measured on the machine's clock.
+Margo calculates the result of an operation in one step. It does not simulate
+its datapath cycle by cycle. But its register interface is correct. A cost
+model gives each operation a duration: a fixed setup time, and then the work
+divided by the rated throughput (section 1.1). `STATUS.BUSY` stays set until
+that time is complete. `PUSH_GET` of the pusher moves through the ring as the
+pusher reads the commands.
 
-Because Margo is defined here rather than measured from silicon, this timing is
-exact by construction: the cost model is the specification, and the emulator
-honors it. Software that polls `BUSY`, races the engine, or feeds the pusher as a
-producer to its consumer behaves as it would on the real part. That is a stronger
-guarantee than the CPU compatibility modes, which only approximate a real 386 or
-486.
+The result bytes go into the frame store immediately. But software cannot read
+the engine as idle before the modeled time is complete. The machine clock
+measures that time.
 
-The one part that stays approximate is memory contention. A running operation
-consumes frame-store and host-port bandwidth that could stall a CPU access to the
-same memory. That coupling is approximated, not modeled exactly.
+This document defines Margo, and no measurement of silicon defines it. Thus
+the timing is exact by construction: the cost model is the specification, and
+the emulator obeys it. Software behaves as it does on the real part. This
+includes software that reads `BUSY`, software that races the engine, and
+software that supplies the pusher as a producer to a consumer. This is a
+stronger guarantee than the CPU compatibility modes, which give only an
+approximation of a real 386 or 486.
+
+One part stays an approximation: the memory contention. An operation in
+progress uses frame-store bandwidth and host-port bandwidth. That use can stop
+a CPU access to the same memory. The emulator approximates this effect. It
+does not model it exactly.
 
 ### Display scanout
 
-Margo does not scan the frame store out pixel by pixel behind the CPU. It takes
-the whole visible surface in one step and presents that. A frame is therefore
-atomic: every pixel in it is read from the frame store at one instant, through
-one palette and one `DISP_START`, so no frame can be split between two display
-states. There is no partial frame, and no tearing.
+Margo does not scan the frame store out pixel by pixel behind the CPU. It
+takes the full visible surface in one step, and shows it. Thus a frame is
+atomic. Margo reads each pixel of a frame from the frame store at one moment,
+through one palette and one `DISP_START`. Thus no frame can contain two
+display states. There is no incomplete frame, and there is no tearing.
 
-The frame rate governs when the display registers latch, not when the surface is
-read. A write to the frame store is visible in the next frame taken after it
-lands, which is why a program that wants a complete picture on screen either
-finishes drawing into an offscreen surface and flips with `DISP_START` (which
-does latch on the frame boundary, below) or accepts that a frame may be taken
-part-way through its drawing.
+The frame rate controls the moment when the display registers latch. It does
+not control the moment when Margo reads the surface. A write to the frame
+store is visible in the next frame after the write. Thus a program with a
+complete picture has two methods. It can draw into an offscreen surface and
+then flip with `DISP_START`, which latches on the frame boundary (below). Or
+it can accept a frame that Margo takes in the middle of the drawing.
 
-This is the specified behavior of the part, not an approximation of something
-finer. It is what a driver may rely on, and it is why the display controller has
-no register describing where the beam is within the active area.
+This is the specified behavior of the part. It is not an approximation of a
+more exact behavior. A driver can depend on it. For this reason, the display
+controller has no register for the position of the beam in the active area.
 
-Three properties follow, and software may depend on all three.
+Three properties follow, and software can depend on all three.
 
-- **The frame rate is pollable.** The vertical retrace interval reported by
-  `03DAh` and `03C2h` runs at the frame rate of the active mode: 60.000 Hz in
-  every VBE mode (section 3.1), and the VGA mode's own rate when a VGA mode is
-  active. It is the same clock that advances the frame boundary below, so a
-  program that paces on retrace and flips pages is pacing on one clock, not two.
-- **`DISP_START` takes effect at a frame boundary.** A write to `DISP_START`, or
-  a `4F07h` call with `BL=00h` or `BL=80h`, queues the new origin. It is applied
-  at the next frame boundary and never before it, so the frame being scanned out
-  when the write lands is unaffected and the following frame is drawn entirely
-  from the new origin. `BL=80h` additionally holds the caller until that
-  boundary, so the origin is live when the call returns. A queued origin that is
-  overwritten before the boundary is simply replaced; only the last one applies.
-  The frame boundary follows the retrace interval within the same blanking
-  period, which is the order a program panning during retrace expects.
-- **The palette is latched once per frame.** The DAC state is sampled once when
-  the frame is taken and the whole frame is decoded through that one sample, so a
-  palette load cannot split a frame between two color sets. `4F09h` with
-  `BL=80h` additionally holds the caller until the frame boundary, so the load is
-  in force for the frame that follows it.
+- **The frame rate is readable.** The vertical retrace interval at `03DAh` and
+  `03C2h` runs at the frame rate of the active mode. That rate is 60.000 Hz in
+  each VBE mode (section 3.1), and the rate of the VGA mode when a VGA mode is
+  active. It is the same clock that moves the frame boundary below. Thus a
+  program that paces on the retrace and flips pages uses one clock, and not
+  two.
+- **`DISP_START` takes effect at a frame boundary.** A write to `DISP_START`,
+  or a `4F07h` call with `BL=00h` or `BL=80h`, queues the new origin. Margo
+  applies it at the next frame boundary, and never before it. Thus the frame
+  in progress does not change, and Margo draws the next frame fully from the
+  new origin. `BL=80h` also holds the caller until that boundary, thus the
+  origin is active when the call returns. A second queued origin replaces the
+  first one, and only the last one applies. The frame boundary follows the
+  retrace interval in the same blanking period, which is the order that a
+  program expects when it pans during the retrace.
+- **The palette latches one time for each frame.** Margo samples the DAC state
+  one time, when it takes the frame. It decodes the full frame through that
+  one sample. Thus a palette load cannot put two color sets in one frame.
+  `4F09h` with `BL=80h` also holds the caller until the frame boundary, thus
+  the load is active for the frame that follows.
 
 ### Other liberties
 
-- Mode changes take effect cleanly, without the analog settling of a real
-  RAMDAC and monitor.
-- The video overlay scales by point sampling. Real silicon interpolated, for a
-  smoother scaled image.
+- A mode change has an immediate effect. There is no analog settling time, as
+  on a real RAMDAC and monitor.
+- The video overlay scales with point sampling. Real silicon interpolated,
+  which gave a smoother scaled image.
 
 ---
 
 ## 10. Distira (3D)
 
-Distira is the second half of VEGA: a fixed-function 3D rasterizer with its own
-framebuffer, texture stores, and 60 Hz scanout. Where Margo speaks a
-chipset-specific register interface, Distira follows a real one. It
-targets the same PCI, MMIO, framebuffer, and register contract as the 3dfx
-Voodoo Graphics generation (the SST-1 chipset), so period Glide-based
-software can find and drive it the way it drives real Voodoo hardware. This
-is a compatibility target, not a licensed design; it is built from public
-documentation and behavioral study of that generation of hardware, in the
-same clean-room spirit as the rest of the Izarra 3000.
+Distira is the second half of VEGA. It is a fixed-function 3D rasterizer, with
+its own frame buffer, its own texture stores, and a 60 Hz scanout. Margo uses
+a register interface of its own, and Distira uses a real one. It obeys the
+same PCI, MMIO, frame buffer, and register contract as the 3dfx Voodoo
+Graphics generation, the SST-1 chipset. Thus Glide software of the period can
+find it and drive it, as it drives real Voodoo hardware.
+
+This is a compatibility target, and not a licensed design. It comes from
+public documentation and from a study of the behavior of that generation of
+hardware. The method is the clean-room method of the remainder of the
+Izarra3000.
 
 ### 10.1 The board: BigDistira and SmallDistira
 
-A Distira card carries two identical rendering chips, wired together the way
-a Voodoo Graphics board wires its 3D chip and texelFX units. Izarra's lab
-notes name them **BigDistira** and **SmallDistira**. These are the two chips
-on the board, not two products; a Distira card is always both of them working
-together, presented to software as one device with two texture mapping
-units (TMUs). There is no host-selectable "which Distira" choice, in the same
-way a Voodoo Graphics board is not sold as its 3D chip and its TMU chip
-separately.
+A Distira card has two identical rendering chips. The wiring is the wiring of
+a Voodoo Graphics board for its 3D chip and its texelFX units. The Izarra lab
+notes give them the names **BigDistira** and **SmallDistira**. These are the
+two chips on the board. They are not two products. A Distira card always has
+both chips, and software finds one device with two texture mapping units
+(TMUs). There is no selection between them, in the same way that a Voodoo
+Graphics board does not sell its 3D chip and its TMU chip separately.
 
 ### 10.2 Identification and memory
 
@@ -549,65 +577,68 @@ separately.
 |------|-------|
 | PCI vendor ID | `0x121A` |
 | PCI device ID | `0x0001` |
-| BAR0 size | 16 MB (MMIO and LFB windows within it) |
+| BAR0 size | 16 MB (MMIO and LFB windows in it) |
 | MMIO window | 64 KB, register-mapped |
-| Framebuffer | 2 MB, dedicated (not shared with Margo's 4 MB frame store) |
-| Texture memory | 2 MB per TMU |
+| Framebuffer | 2 MB, dedicated (not shared with the 4 MB frame store of Margo) |
+| Texture memory | 2 MB for each TMU |
 | TMU count | 2 |
 | Native ID register | `0x44540100` ("DT", version 1.00) |
 
-Unlike Margo, Distira does not share Margo's 4 MB frame store; it has its own
-framebuffer and its own per-TMU texture memory, reached through its own PCI
-base address register rather than a fixed physical range. A driver finds it
-by PCI configuration scan (ports `0x0CF8`/`0x0CFC`), reads the vendor and
-device IDs above to confirm it, and programs BAR0 to place the board's MMIO
-and framebuffer windows in the address space it wants, exactly as it would
+Distira does not share the 4 MB frame store of Margo. It has its own frame
+buffer, and its own texture memory for each TMU. A driver reaches them through
+the PCI base address register of the board, and not through a fixed physical
+range. The driver finds the board with a PCI configuration scan, on ports
+`0x0CF8` and `0x0CFC`. It reads the vendor ID and the device ID above to
+confirm the board. It then programs BAR0 to put the MMIO window and the frame
+buffer window at the addresses that it wants. This is the same procedure as
 for real Voodoo Graphics hardware.
 
 ### 10.3 Register interface
 
-Distira answers the real SST-1 register set at the offsets Voodoo Graphics
-software expects: status, the vertex and gradient registers (integer and
-floating point), `triangleCMD`/`fTriangleCMD`, the pixel pipeline controls
-(`fbzColorPath`, `fogMode`, `alphaMode`, `fbzMode`, `lfbMode`), clipping,
-`fastfillCMD`, `swapbufferCMD`, the `fbiInit0`-`fbiInit7` initialization
-registers, the DAC data port, and the per-TMU texture mode, LOD, base
-address, and NCC table registers. This is the same register contract real
-Glide 2.x drivers and DOS Glide software program directly; Distira does not
-invent a new API for it to speak.
+Distira answers the real SST-1 register set, at the offsets that Voodoo
+Graphics software expects. The set includes the status register, the vertex
+and gradient registers (integer and floating point), `triangleCMD` and
+`fTriangleCMD`, the pixel pipeline controls (`fbzColorPath`, `fogMode`,
+`alphaMode`, `fbzMode`, `lfbMode`), the clipping registers, `fastfillCMD`,
+`swapbufferCMD`, the `fbiInit0` to `fbiInit7` initialization registers, the
+DAC data port, and the texture mode, LOD, base address, and NCC table
+registers of each TMU. A real Glide 2.x driver and DOS Glide software program
+the same registers directly. Distira has no new API.
 
-Alongside the SST-1-compatible block, a small native front door at MMIO
-offset `0xF000` carries an `ID`, `CAPS`, `STATUS`, `CONTROL`, `MODEL`, and a
-handful of framebuffer-geometry and clear/command registers, in the same
-spirit as Margo's `ID`/`CAPS` pair: a place for Izarra-aware software to
-confirm the chip and its capabilities without walking the full SST-1 map.
+Distira also has a small native register block, at MMIO offset `0xF000`. It
+holds `ID`, `CAPS`, `STATUS`, `CONTROL`, `MODEL`, and some frame-buffer
+geometry, clear, and command registers. It has the same purpose as the `ID`
+and `CAPS` pair of Margo. Software that knows the Izarra3000 can confirm the
+chip and its capabilities there, and it does not have to read the full SST-1
+map.
 
-The pixel pipeline supports the common linear frame buffer pixel formats
-(RGB565, RGB555, ARGB1555, RGB888, ARGB8888) and combined depth/color LFB
-writes, and the rasterizer performs real triangle setup and edge functions,
-barycentric-interpolated color and texture coordinates, depth test, alpha
-test and blend, chroma key, fog, per-TMU texture sampling across the LIM
-formats DOS Glide 2.x software uses, and dithering.
+The pixel pipeline supports the usual linear frame buffer pixel formats:
+RGB565, RGB555, ARGB1555, RGB888, and ARGB8888. It also supports a combined
+depth and color LFB write. The rasterizer does the triangle setup and the edge
+functions. It interpolates the color and the texture coordinates with
+barycentric coordinates. It does the depth test, the alpha test, the alpha
+blend, the chroma key, the fog, and the dither. It samples a texture on each
+TMU, in the LIM formats of DOS Glide 2.x software.
 
 ### 10.4 Software status
 
-The register, PCI, MMIO, LFB, and texture-aperture contracts are in place, and
-the rasterizer draws triangles with depth, alpha, fog, chroma key, and textures.
-A direct SST-1 proof program exercises the device end to end as a regression
+The register, PCI, MMIO, LFB, and texture-aperture contracts are complete. The
+rasterizer draws triangles with depth, alpha, fog, chroma key, and textures. A
+direct SST-1 test program operates the device from end to end, as a regression
 check.
 
-The direct DOS Glide path is verified in-game:
+The direct DOS Glide path is verified in the game:
 
-- The original Voodoo Graphics Tomb Raider executable detects
-  Distira and renders in-game. Its Glide implementation is built into the
-  executable, so no emulator-provided `GLIDE2X.OVL` is involved.
+- The original Voodoo Graphics executable of Tomb Raider detects Distira and
+  renders in the game. Its Glide implementation is in the executable. Thus the
+  emulator supplies no `GLIDE2X.OVL`.
 
-The dynamic DOS Glide path is verified with `test00.exe` from the 3dfx Glide
-2.43 SDK. The program fails at DLL loading when the OVL is absent. With a local
-Voodoo Graphics `GLIDE2X.OVL`, it opens Distira at 640x480, renders its expected
-frame, and returns exit code 0. The current Carmageddon fixture renders without
-an OVL and has no LE import modules, so it is not evidence for this path. A
-dynamic in-game corpus run is still pending.
+The dynamic DOS Glide path is verified with `test00.exe`, from the 3dfx Glide
+2.43 SDK. Without the OVL, the program fails at the DLL load. With a local
+Voodoo Graphics `GLIDE2X.OVL`, it opens Distira at 640x480, renders its
+expected frame, and returns exit code 0. The current Carmageddon fixture
+renders without an OVL, and it has no LE import modules. Thus it is not
+evidence for this path. A dynamic in-game corpus run is not done yet.
 
-IzarraVM ships neither proprietary Glide binaries nor game data. Local OVLs
-and games remain untracked test fixtures.
+IzarraVM does not supply proprietary Glide binaries, and it does not supply
+game data. A local OVL and a local game are untracked test fixtures.

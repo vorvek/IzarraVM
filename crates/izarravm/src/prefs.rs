@@ -38,7 +38,7 @@ pub const MAX_VOLUME: f32 = 5.0;
 /// GUI preference keys that are no longer read or written.
 ///
 /// All three named a level INSIDE the machine's audio chain, and the machine's
-/// chain belongs to the guest: the ReSonique 2's output stage and the PC
+/// chain belongs to the guest: the ReSonique II's output stage and the PC
 /// speaker's leg are CT1745 registers, set from DOS with SNDMIXER.COM and read
 /// back by any program that asks. A second copy of those controls in the host
 /// GUI could not be seen by the guest, was not saved with the machine, and had

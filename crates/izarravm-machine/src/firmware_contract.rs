@@ -44,7 +44,7 @@ pub(crate) mod address {
     pub(crate) const CMOS_PRIMARY_BOOT_DEVICE: usize = 0x11;
     pub(crate) const CMOS_GSW_MODE: usize = 0x12;
 
-    /// ReSonique 2 resource assignment, owned by `SNDCTRL.COM` in the guest and
+    /// ReSonique II resource assignment, owned by `SNDCTRL.COM` in the guest and
     /// re-applied by the host at every boot. 0x10-0x14 are the BIOS's own bytes
     /// (keyboard layout, boot device, GSW mode, code page, COM1 debug) and
     /// 0x15-0x18 are the AT memory-size bytes, so this block starts at 0x1B and

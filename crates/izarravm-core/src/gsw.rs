@@ -24,7 +24,7 @@ pub enum CpuPersona {
 }
 
 impl CpuPersona {
-    /// Whether this fixed Izarra 3000 CPU persona includes an x87 unit.
+    /// Whether this fixed Izarra3000 CPU persona includes an x87 unit.
     pub const fn has_fpu(self) -> bool {
         matches!(self, Self::I486 | Self::I586)
     }

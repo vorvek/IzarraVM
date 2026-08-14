@@ -265,7 +265,7 @@ fn config_region_reports_id_version_and_irq_dma_jumpers() {
 
 #[test]
 fn writing_the_config_region_repoints_resources_and_reinitialises_the_codec() {
-    // ReSonique 2's config register is writable, so a guest can move the codec
+    // ReSonique II's config register is writable, so a guest can move the codec
     // without restarting the machine. Selecting resources must also quiesce it:
     // a transfer left running would keep driving the channel the board just gave
     // up. The board ID and the mirror offsets stay read-only.

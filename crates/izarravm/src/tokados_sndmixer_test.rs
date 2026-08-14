@@ -97,7 +97,7 @@ fn open_the_mixer(label: &str, commands: &str) -> (Machine, PathBuf) {
         machine
             .screen_text()
             .as_text()
-            .contains("ReSonique 2 Volume Mixer")
+            .contains("ReSonique II Volume Mixer")
     });
     if let StopReason::CpuError(message) = &stop {
         panic!(
@@ -251,7 +251,7 @@ fn sndmixer_cfg_restore_writes_the_registers_at_boot_and_says_nothing() {
         "the batch must have got past SNDMIXER\n{screen}"
     );
     for chatter in [
-        "ReSonique 2 volume levels",
+        "ReSonique II volume levels",
         "Volume levels restored",
         "Applied to the mixer",
     ] {
@@ -383,7 +383,7 @@ fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
         machine
             .screen_text()
             .as_text()
-            .contains("ReSonique 2 Volume Mixer")
+            .contains("ReSonique II Volume Mixer")
     });
     if let StopReason::CpuError(message) = &stop {
         panic!(
@@ -393,7 +393,7 @@ fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
     }
     let opened = machine.screen_text().as_text();
     assert!(
-        opened.contains("ReSonique 2 Volume Mixer"),
+        opened.contains("ReSonique II Volume Mixer"),
         "the full-screen mixer never opened\n{opened}"
     );
     assert!(
@@ -477,7 +477,7 @@ fn sndmixer_escape_restores_the_levels_the_mixer_opened_on() {
         machine
             .screen_text()
             .as_text()
-            .contains("ReSonique 2 Volume Mixer")
+            .contains("ReSonique II Volume Mixer")
     });
     if let StopReason::CpuError(message) = &stop {
         panic!(
@@ -771,7 +771,7 @@ fn sndmixer_speaker_set_to_three_saves_as_three() {
         machine
             .screen_text()
             .as_text()
-            .contains("ReSonique 2 Volume Mixer")
+            .contains("ReSonique II Volume Mixer")
     });
     if let StopReason::CpuError(message) = &stop {
         panic!(
@@ -924,7 +924,7 @@ fn sndmixer_usage_text_fits_an_eighty_by_twentyfive_screen() {
     let (machine, dir) = boot_with_sndmixer("sndmixer_usage", "SNDMIXER /?\r\n");
     let screen = machine.screen_text().as_text();
     assert!(
-        screen.contains("SNDMIXER - ReSonique 2 Volume Mixer"),
+        screen.contains("SNDMIXER - ReSonique II Volume Mixer"),
         "the title must not have scrolled off the top\n{screen}"
     );
     assert!(
@@ -1086,7 +1086,7 @@ fn sndmixer_silent_flag_works_from_any_position_on_the_line() {
     );
     let screen = machine.screen_text().as_text();
     assert!(screen.contains("MIXER-DONE"), "the batch ran\n{screen}");
-    for chatter in ["Level must be", "ReSonique 2 volume levels"] {
+    for chatter in ["Level must be", "ReSonique II volume levels"] {
         assert!(
             !screen.contains(chatter),
             "/S after the switch it silences must still silence it, found \

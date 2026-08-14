@@ -108,7 +108,7 @@ const LABEL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x62, 0x48);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x53, 0x40);
 const LED_ON: egui::Color32 = egui::Color32::from_rgb(0x46, 0xE0, 0x5A);
 const LED_OFF: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x4A, 0x2E);
-/// The Izarra 3000 logo's red, sampled from the wordmark. Used for the floating
+/// The Izarra3000 logo's red, sampled from the wordmark. Used for the floating
 /// window headers so they read as branded and contrast on the beige frame.
 const LOGO_RED: egui::Color32 = egui::Color32::from_rgb(0xC7, 0x44, 0x46);
 /// A darker blue for hyperlinks, legible on the beige panel (egui's default

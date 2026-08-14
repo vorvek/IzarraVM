@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; SNDMIXER.COM - ReSonique 2 Volume Mixer.
+; SNDMIXER.COM - ReSonique II Volume Mixer.
 ;
 ; Seven vertical faders over the card's mixer: MASTER, FMSYNTH, WAVE, CD-ROM,
 ; MIDI, PC-SPEAKER and AMP. Sibling to SNDCTRL.COM, which assigns the card's
@@ -117,9 +117,9 @@
 ; MIDI has no CT1745 register at all: on a real SB16 the pair at 0x34/0x35
 ; called "MIDI" is the FM synthesiser bus, which is this card's FMSYNTH fader.
 ; The wavetable MPU's synthesis is mixed on-card the way an AWE32 mixes its
-; EMU8000, and the ReSonique 2 gives it a register pair of its own at
+; EMU8000, and the ReSonique II gives it a register pair of its own at
 ; 0x50/0x51, on the card's own register file and at the card's own 5-bit level
-; scale. That is a ReSonique 2 extension, not a CT1745 register.
+; scale. That is a ReSonique II extension, not a CT1745 register.
 ;
 ; That pair alone has a mute BIT, D0, and this fader is the reason. The
 ; wavetable is the one source in the machine with no second control anywhere --
@@ -150,7 +150,7 @@ WSS_LEFT_DAC   equ 6                   ; I6 left output attenuation
 WSS_RIGHT_DAC  equ 7                   ; I7 right
 WSS_DAC_MUTE   equ 0x80
 
-; ---- Izarra 3000 palette ----------------------------------------------------
+; ---- Izarra3000 palette ----------------------------------------------------
 ; Identical to SNDCTRL.COM's, deliberately: the two tools are one setup screen
 ; split in half and must not look like two programs.
 A_BOX     equ 0xF0       ; black on bright white: body, borders, fixed values
@@ -210,7 +210,7 @@ CH_SIZE    equ 16
 K_CT5 equ 0               ; a CT1745 5-bit pair
 K_WAV equ 1               ; the CT1745 voice pair AND the AD1848 attenuators
 K_SPK equ 2               ; the CT1745 2-bit PC-speaker register
-K_MID equ 3               ; the ReSonique 2 wavetable pair, which has a mute bit
+K_MID equ 3               ; the ReSonique II wavetable pair, which has a mute bit
 K_AMP equ 4               ; the CT1745 2-bit output-gain PAIR, 0x41/0x42
 
 ; D0 of 0x50/0x51. The wavetable leg is the only source in the machine with no
@@ -2280,7 +2280,7 @@ key_midi:   db 'MIDI', 0
 key_spk:    db 'SPEAKER', 0
 key_amp:    db 'AMP', 0
 
-ds_master: db 'MASTER    all ReSonique 2 output', 0
+ds_master: db 'MASTER    all ReSonique II output', 0
 ds_fm:     db 'FMSYNTH   OPL3 FM synthesis (music bus)', 0
 ds_wave:   db 'WAVE      digital audio: SB16 DSP and WSS codec', 0
 ds_cd:     db 'CD-ROM    Red Book audio from the CD drive', 0
@@ -2406,7 +2406,7 @@ static_text:
     dw t_keys
     db 0xFF
 
-t_title:  db 'ReSonique 2 Volume Mixer', 0
+t_title:  db 'ReSonique II Volume Mixer', 0
 t_keys:   db 'Tab/Arrows  move    Up/Down  level    F10  save    Esc  cancel', 0
 t_accept: db 'Accept', 0
 t_cancel: db 'Cancel', 0
@@ -2416,7 +2416,7 @@ s_gap:         db '   ', 0
 s_default_cfg: db 'C:\VOLCONF.CFG', 0
 
 cfg_head:
-    db '; ReSonique 2 volume levels, written by SNDMIXER.COM.', 13, 10
+    db '; ReSonique II volume levels, written by SNDMIXER.COM.', 13, 10
     db '; One channel per line. 0 mutes, 10 is full volume.', 13, 10
     db '; Spaces around the = are permitted.', 13, 10
     db '; SPEAKER has four positions and reads back as 0, 3, 7 or 10.', 13, 10
@@ -2424,8 +2424,8 @@ cfg_head:
     db '; but it AMPLIFIES: 0 is 0 dB, 3 is +6, 7 is +12, 10 is +18 dB.', 13, 10
     db '; Above 0 dB a hot source can clip. 0 is the power-on setting.', 13, 10, 0
 
-msg_head:        db 'ReSonique 2 volume levels', 13, 10, 0
-msg_no_card:     db '  No ReSonique 2 card detected.', 13, 10, 0
+msg_head:        db 'ReSonique II volume levels', 13, 10, 0
+msg_no_card:     db '  No ReSonique II card detected.', 13, 10, 0
 msg_applied:     db 'Applied to the mixer.', 13, 10, 0
 msg_saved:       db 'Saved in ', 0
 msg_save_failed: db 'Could not write ', 0
@@ -2438,7 +2438,7 @@ msg_bad_value:   db 'Level must be 0 to 10: ', 0
 msg_dot:         db '.', 13, 10, 0
 msg_crlf:        db 13, 10, 0
 msg_usage:
-    db 'SNDMIXER - ReSonique 2 Volume Mixer', 13, 10, 13, 10
+    db 'SNDMIXER - ReSonique II Volume Mixer', 13, 10, 13, 10
     db '  SNDMIXER                full-screen mixer', 13, 10
     db '  SNDMIXER /L             list the current levels', 13, 10
     db '  SNDMIXER /CFG file      restore the levels saved in a file', 13, 10

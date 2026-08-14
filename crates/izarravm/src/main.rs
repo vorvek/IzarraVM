@@ -478,7 +478,7 @@ fn run_keyboard_demo(
     Ok(())
 }
 
-/// Boot the Izarra 3000 BIOS headless, run POST to halt, print the VDTS records.
+/// Boot the Izarra3000 BIOS headless, run POST to halt, print the VDTS records.
 /// Its own function because a Machine is a large inline value (combining the
 /// headless paths overflows main's stack frame).
 fn run_izarra_bios() -> Result<(), Box<dyn Error>> {

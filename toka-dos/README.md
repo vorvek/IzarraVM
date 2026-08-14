@@ -3,7 +3,7 @@
 
 # Toka-DOS
 
-The Izarra 3000's bundled operating system: a rebranded, real **FreeDOS**. The
+The Izarra3000's bundled operating system: a rebranded, real **FreeDOS**. The
 kernel and shell are vendored FreeDOS source (see `freedos/VENDOR.md` for exact
 tags/commits and the local rebrand patches), built from source and packaged
 into a bootable FAT32 hard-disk image. There is no custom DOS clone here; the

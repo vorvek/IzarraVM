@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Integration coverage for the Izarra 3000 BIOS Margo (VEGA 2D)
+//! Integration coverage for the Izarra3000 BIOS Margo (VEGA 2D)
 //! probe. Boots the real izarra-bios image on a gsw_386 machine, runs POST, and
 //! parses the live VDTS result block. Asserts the probe's two records by name:
 //! component.video_margo PASSes and video.margo_caps reports the low 16 bits of

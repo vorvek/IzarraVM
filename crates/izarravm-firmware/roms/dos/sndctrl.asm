@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; SNDCTRL.COM - ReSonique 2 Sound System Configuration.
+; SNDCTRL.COM - ReSonique II Sound System Configuration.
 ;
 ; A text-mode setup tool for the card's IRQ/DMA assignment, in the spirit of the
 ; Miles Audio / SBCONFIG setup screens of the era: pick a value from the list the
@@ -68,7 +68,7 @@ CM_SUM_LAST    equ 0x2D
 CM_SUM_HI      equ 0x2E
 CM_SUM_LO      equ 0x2F
 
-; ---- Izarra 3000 palette ----------------------------------------------------
+; ---- Izarra3000 palette ----------------------------------------------------
 ; Blink is turned off for the duration, so backgrounds 8-15 are real colours and
 ; the bright-white box and its dark-grey shadow render as intended.
 A_BOX     equ 0xF0       ; black on bright white: body, borders, fixed values
@@ -2476,7 +2476,7 @@ static_text:
     dw t_keys
     db 0xFF
 
-t_title:       db 'ReSonique 2 Sound System Configuration', 0
+t_title:       db 'ReSonique II Sound System Configuration', 0
 t_h_device:    db 'Device', 0
 t_h_port:      db 'Port', 0
 t_h_irq:       db 'IRQ', 0
@@ -2522,7 +2522,7 @@ s_rep_dmal:     db '   DMAL ', 0
 s_rep_dmah:     db '   DMAH ', 0
 s_rep_blaster:  db '  BLASTER=', 0
 
-msg_head:        db 'ReSonique 2 sound system', 13, 10, 0
+msg_head:        db 'ReSonique II sound system', 13, 10, 0
 msg_opl:         db '  OPL3 FM synthesis     port 388', 13, 10, 0
 msg_sb_absent:   db '  Sound Blaster 16      not installed', 13, 10, 0
 msg_wss_absent:  db '  Windows Sound System  not installed', 13, 10, 0
@@ -2533,7 +2533,7 @@ msg_wss_absent:  db '  Windows Sound System  not installed', 13, 10, 0
 ; family's deliberate per-tool policy rather than shared.
 msg_boot_tree:     db 0xC3, 0xC4, '>', ' ', 0
 msg_boot_gut:      db 0xB3, 0
-msg_boot_head:     db 'ReSonique2 Configuration [Run SNDCTRL to change]', 13, 10, 0
+msg_boot_head:     db 'ReSonique II Configuration [Run SNDCTRL to change]', 13, 10, 0
 msg_boot_ind:      times 5 db ' '     ; 5-space indent, per the /T spec
                    db 0
 msg_boot_sb:       db 'SB16 ', 0
@@ -2564,7 +2564,7 @@ msg_permitted:   db ': permitted values are ', 0
 msg_comma:       db ', ', 0
 msg_crlf:        db 13, 10, 0
 msg_usage:
-    db 'SNDCTRL - ReSonique 2 Sound System Configuration', 13, 10, 13, 10
+    db 'SNDCTRL - ReSonique II Sound System Configuration', 13, 10, 13, 10
     db '  SNDCTRL                 full-screen configuration', 13, 10
     db '  SNDCTRL /S              show the current assignment', 13, 10
     db '  SNDCTRL /B              two-row boot summary, then exit', 13, 10

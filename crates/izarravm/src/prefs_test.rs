@@ -131,7 +131,7 @@ fn retired_glide_render_threads_key_is_ignored_and_not_written() {
 /// The three retired audio keys are DROPPED, not clamped and carried over.
 ///
 /// Each named a level inside the machine's own audio chain, and that chain is
-/// the guest's: the ReSonique 2's output stage and the PC speaker's leg are
+/// the guest's: the ReSonique II's output stage and the PC speaker's leg are
 /// CT1745 registers that SNDMIXER.COM sets and any program can read back. A
 /// host-side second copy could not be seen by the guest and had to be kept in
 /// step with a mixer entitled to disagree with it.

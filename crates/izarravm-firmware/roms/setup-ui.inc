@@ -1581,7 +1581,7 @@ su_periph_page:
     ret
 
 ; ============================ Strings ============================
-su_str_title:        db 'IZARRA 3000 SETUP', 0
+su_str_title:        db 'IZARRA3000 SETUP', 0
 su_str_time:         db 'TIME', 0
 su_str_layout:       db 'KEYBOARD', 0
 su_str_gsw:          db 'CPU MODE', 0

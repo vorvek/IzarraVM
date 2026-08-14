@@ -47,7 +47,7 @@ const HEADS: u32 = 16;
 const SECTORS_PER_TRACK: u32 = 63;
 /// Fixed per-command overhead before the first byte moves.
 ///
-/// ZERO by design. The Izarra 3000's storage profile is "16.7 MB/s of data on
+/// ZERO by design. The Izarra3000's storage profile is "16.7 MB/s of data on
 /// command": the machine's disk is host-backed and has no platter, no head and no
 /// rotational position, so there is nothing for a seek-and-settle charge to
 /// model. It was 100 us, and that number dominated: 98.7% of the guest's
@@ -229,7 +229,7 @@ pub struct AtaDisk {
     irq_pending: bool,
     /// DMA command waiting for the PIIX4 bus-master engine.
     dma_request: Option<AtaDmaRequest>,
-    /// Transfer mode selected through SET FEATURES. Izarra 3000 powers on in
+    /// Transfer mode selected through SET FEATURES. Izarra3000 powers on in
     /// UDMA2, matching its 1997 storage profile.
     dma_mode: DmaMode,
     /// Bytes moved by the last data command, for the GUI access LED.

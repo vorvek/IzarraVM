@@ -51,7 +51,7 @@ and their provenance is in tools/msdos-keyboard/VENDOR.md.
 The Modern DOS fonts by Jayvee Enaguas are released under CC0-1.0. The
 generated CP437 and code-page font blobs retain that license. Provenance is
 in tools/fonts/README.md.
-The Izarra 3000 logo, chassis photograph, emulator screenshot, and firmware
+The Izarra3000 logo, chassis photograph, emulator screenshot, and firmware
 artwork are project assets distributed under GPL-3.0-only.
 Host audio output uses cpal 0.15.3 under Apache-2.0. External MIDI output uses
 midir 0.10.4, Copyright (c) 2015 Patrick Reisert and the RtMidi contributors,
@@ -67,7 +67,7 @@ adaptation: its VCPI 1.0 server and its V86 privileged-instruction emulation
 CLTS / LMSW emulation-vs-reflect surface) follow the mechanisms of 386MAX and
 its DPMIONE outgrowth (https://github.com/sudleyplace/386MAX, © 1987-98
 Qualitas, Inc. and © 1990-2012 Sudley Place Software / Bob Smith, GPLv3),
-adapted to the Izarra 3000's virtual hardware and reimplemented in NASM for
+adapted to the Izarra3000's virtual hardware and reimplemented in NASM for
 IzarraVM. The VCPI 1.0 interface follows the Virtual Control Program
 Interface specification (© 1987-89 Phar Lap Software, Inc. and Quarterdeck
 Office Systems).

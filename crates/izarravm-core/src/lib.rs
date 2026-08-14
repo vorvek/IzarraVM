@@ -718,7 +718,7 @@ impl Default for MachineConfig {
     fn default() -> Self {
         Self {
             cpu: GswMode::Gsw586,
-            memory_mib: 64, // Izarra 3000: 64 MB PC100 SDRAM, 2 x 32 MB DIMMs
+            memory_mib: 64, // Izarra3000: 64 MB PC100 SDRAM, 2 x 32 MB DIMMs
             video: VideoCard::Vega,
             emm386: None,
         }
@@ -789,7 +789,7 @@ impl Default for SoundBlasterConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct WssConfig {
     /// Whether the host constructs the Windows Sound System (AD1848 codec) path.
-    /// The codec is always present on the ReSonique 2 combo card, so this defaults
+    /// The codec is always present on the ReSonique II combo card, so this defaults
     /// to enabled.
     pub enabled: bool,
     /// I/O base port of the four-port WSS config region (the AD1848 codec sits at

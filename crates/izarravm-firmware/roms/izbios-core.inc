@@ -555,7 +555,7 @@ com1_puts:
     pop ax
     ret
 
-com1_str_header: db 'Izarra 3000 POST', 0x0d, 0x0a, 0
+com1_str_header: db 'Izarra3000 POST', 0x0d, 0x0a, 0
 com1_str_crlf:   db 0x0d, 0x0a, 0
 com1_str_space:  db ' ', 0
 ; HRES_PASS=0, HRES_FAIL=1, HRES_MEASURE=2 select these prefixes.

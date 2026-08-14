@@ -2,28 +2,28 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 site_name: IzarraVM
-site_description: A Rust emulator for the Izarra 3000, a DOS-era games computer.
+site_description: A Rust emulator for the Izarra3000, a DOS-era games computer.
 repo_url: https://github.com/vorvek/IzarraVM
 theme:
   name: readthedocs
 nav:
   - Home: index.md
-  - Izarra 3000 user manual: izarra-3000/user-manual.md
+  - Izarra3000 user manual: izarra-3000/user-manual.md
   - Toka-DOS:
-      - Using Toka-DOS: toka-dos/using-toka-dos.md
+      - How to use Toka-DOS: toka-dos/using-toka-dos.md
       - Command reference: toka-dos/commands.md
       - Licensing: toka-dos/licensing.md
   - TOKAEMM memory manager: tokaemm/manual.md
   - IZBIOS Configuration Panel: izbios/configuration-panel.md
-  - ReSonique 2 sound card: resonique2/manual.md
+  - ReSonique II sound card: resonique2/manual.md
   - IzarraVM GUI guide: izarravm-gui/guide.md
   - Recipes:
       - Overview: recipes/index.md
-      - Using your own MIDI player: recipes/host-midi-player.md
+      - How to use your own MIDI player: recipes/host-midi-player.md
       - The Roland Sound Canvas VSTi: recipes/sound-canvas-vsti.md
       - Nuked-SC55 for Sound Canvas playback: recipes/nuked-sc55.md
       - MT-32 ROMs with the P330 receiver: recipes/mt32-roms.md
-  - Troubleshooting & FAQ: troubleshooting.md
+  - Troubleshooting and FAQ: troubleshooting.md
   - VGA core: vga-core/README.md
   - VEGA (Margo / Distira):
       - Programmer's guide: vega/vega-programmers-guide.md

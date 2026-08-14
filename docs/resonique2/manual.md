@@ -1,13 +1,14 @@
 <!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 
-# ReSonique 2 Sound Card Manual
+# ReSonique II Sound Card Manual
 
-ReSonique 2 is the Izarra 3000's audio hardware: a combo card built around a
-Sound Blaster 16 compatible digital audio path and an OPL3 FM synthesizer.
-This manual describes what a DOS program finds when it probes the card.
+ReSonique II is the audio hardware of the Izarra3000. It is a combination card
+with a Sound Blaster 16 compatible digital audio path and an OPL3 FM
+synthesizer. This manual describes what a DOS program finds when it examines
+the card.
 
-## What's on the card
+## The parts of the card
 
 | Section | Compatibility | Base port | IRQ | DMA |
 | --- | --- | --- | --- | --- |
@@ -17,61 +18,62 @@ This manual describes what a DOS program finds when it probes the card.
 | Wavetable daughterboard header | MPU-401 | `0x300` | 9 | n/a |
 | Rear MIDI/game port | MPU-401 | `0x330` | 9 | n/a |
 
-Those are the power-on defaults, and the ones Toka-DOS advertises in
-`BLASTER`. The base ports are fixed. The IRQ and DMA columns are not; see
-[Changing the card's resources](#changing-the-cards-resources) for the tool that
-changes them.
+These are the power-on defaults. Toka-DOS puts the same values in `BLASTER`.
+The base ports are fixed. The IRQ and the DMA are not fixed. See
+[How to change the card resources](#how-to-change-the-card-resources) for the
+tool that changes them.
 
-The digital and FM sections use their standard, fixed Sound Blaster and
-AdLib addresses. ReSonique 2 assigns separate fixed ports to its internal
-wavetable header and rear MIDI connection, so software can select either path
-explicitly. The rear 15-pin connector also carries the usual joystick signals.
+The digital section and the FM section use the standard Sound Blaster and
+AdLib addresses, which are fixed. ReSonique II gives a different fixed port to
+the internal wavetable header and to the rear MIDI connection. Thus software
+can select one path or the other directly. The rear 15-pin connector also
+carries the usual joystick signals.
 
-### Why the Sound Blaster sits on IRQ 7
+### Why the Sound Blaster uses IRQ 7
 
-IRQ 5 is the Sound Blaster 16 factory setting, so it is the value you might
-expect here. ReSonique 2 ships on IRQ 7 instead, because DOS software falls
-into two groups and only 7 satisfies both:
+IRQ 5 is the factory setting of the Sound Blaster 16, thus you can expect IRQ
+5 here. But ReSonique II uses IRQ 7, because DOS software is in two groups, and
+only IRQ 7 is correct for both groups:
 
-- Programs that read `BLASTER` work on any line, since the variable always
-  describes the running configuration.
-- Programs that hardwire an IRQ almost always hardwire 7, because 7 was the
-  factory setting on the Sound Blaster 1.x and 2.0 that their drivers were
-  written against. Such a program on IRQ 5 never receives its interrupt: with
-  most drivers that means playback starts and then stops after the first DMA
-  block, giving a short click instead of sound.
+- A program that reads `BLASTER` operates on any line, because the variable
+  always gives the current configuration.
+- A program with a fixed IRQ in its code almost always uses 7. IRQ 7 was the
+  factory setting of the Sound Blaster 1.x and the Sound Blaster 2.0, and the
+  drivers were written for those cards. On IRQ 5, such a program receives no
+  interrupt. With most drivers, the playback starts and then stops after the
+  first DMA block. The result is a short click, and no more sound.
 
-Hardwiring 5 is rare, because 5 only became a default with SB16-class cards, by
-which time reading `BLASTER` was standard practice. If you do hit a title that
-insists on 5, run `SNDCTRL` before starting it.
+A fixed IRQ 5 is not frequent. IRQ 5 became a default only with the SB16-class
+cards, and at that time a program usually read `BLASTER`. If a game needs IRQ
+5, run `SNDCTRL` before you start the game.
 
-Because the AD1848 codec cannot share a line with the Sound Blaster, it takes
-IRQ 11 rather than the WSS standard IRQ 7. Real combo cards jumper the two
-apart in exactly this way.
+The AD1848 codec cannot share a line with the Sound Blaster. Thus it uses IRQ
+11, and not the WSS standard IRQ 7. A real combination card separates the two
+lines with jumpers in the same way.
 
 ## The BLASTER variable
 
-Toka-DOS sets it in `AUTOEXEC.BAT` so any Sound Blaster-aware program finds
-the card without probing:
+Toka-DOS sets this variable in `AUTOEXEC.BAT`. Thus a Sound Blaster program
+finds the card without a probe:
 
 ```
 SET BLASTER=A220 I7 D1 H5 P300 T6
 ```
 
-That's base address `0x220`, IRQ 7, 8-bit DMA channel 1, 16-bit DMA channel
-5, wavetable MPU port `0x300`, and card type 6 (Sound Blaster 16). These
-match the defaults above.
+The values are base address `0x220`, IRQ 7, 8-bit DMA channel 1, 16-bit DMA
+channel 5, wavetable MPU port `0x300`, and card type 6 (Sound Blaster 16).
+They agree with the defaults above.
 
-Toka-DOS regenerates this line from the machine's configuration, so it follows
-whatever you set. A hand-edited `AUTOEXEC.BAT` is left alone. In a customised
-file, `SNDCTRL` rewrites the `SET BLASTER` line in place and leaves the rest of
-the file unchanged.
+Toka-DOS makes this line from the configuration of the machine. Thus the line
+follows the values that you set. Toka-DOS does not change an `AUTOEXEC.BAT`
+that you edited. In an edited file, `SNDCTRL` writes the `SET BLASTER` line
+again in position, and does not change the remainder of the file.
 
-## Changing the card's resources
+## How to change the card resources
 
-The `SNDCTRL` utility is used to set your ReSonique 2 Sound Card's hardware
-parameters. It is the card's own setup utility, and it is installed in `C:\DOS`
-on every Toka-DOS disk. Run it from the DOS prompt:
+The `SNDCTRL` utility sets the hardware parameters of the ReSonique II sound
+card. It is the setup utility of the card, and it is in `C:\DOS` on each
+Toka-DOS disk. Run it from the DOS prompt:
 
 ```
 C:\> SNDCTRL
@@ -79,33 +81,35 @@ C:\> SNDCTRL
 
 ![The SNDCTRL configuration screen](sndctrl.png)
 
-Move between the values with the arrow keys or Tab, press Enter on one to
-choose from the list the hardware supports, then **F10** to apply. Esc leaves
-everything as it was. Values that do not apply to a device show as `*`.
+The arrow keys and Tab move between the values. Press Enter on a value to
+select from the list that the hardware supports. Press **F10** to apply the
+changes. Esc keeps the previous values. A value that does not apply to a
+device shows as `*`.
 
-The lists offer only values that are available. A line or channel the other
-device already holds is not shown, so the Sound Blaster and the codec cannot be
-assigned to the same resource. The emulator enforces the same rule at startup.
+The lists show only the available values. A line or a channel that the other
+device holds is not in the list. Thus you cannot give the same resource to the
+Sound Blaster and to the codec. The emulator obeys the same rule at startup.
 
-Applying does four things:
+The apply operation does four things:
 
-- The hardware moves immediately. Both devices are re-pointed live, with no
-  reboot: the mixer's Interrupt and DMA Setup registers for the Sound Blaster,
-  the config register for the codec.
-- The choice is saved in CMOS, so it survives a power cycle and comes back on
-  the next boot.
-- `BLASTER` is updated in the current environment, so a game started from that
-  same prompt uses the new routing.
-- The `SET BLASTER` line in `C:\AUTOEXEC.BAT` is rewritten, so the next boot
-  agrees.
+- The hardware changes immediately, and a restart is not necessary. SNDCTRL
+  writes the Interrupt and DMA Setup registers of the mixer for the Sound
+  Blaster, and the config register for the codec.
+- SNDCTRL saves the values in CMOS. Thus the machine uses them again at the
+  next boot.
+- SNDCTRL changes `BLASTER` in the current environment. Thus a game that you
+  start from the same prompt uses the new values.
+- SNDCTRL writes the `SET BLASTER` line in `C:\AUTOEXEC.BAT` again. Thus the
+  next boot uses the same values.
 
-Existing variables are updated, never created. If you deliberately removed the
-`BLASTER` line, `SNDCTRL` says so and leaves it removed.
+SNDCTRL changes an existing variable. It does not make a new one. If you
+removed the `BLASTER` line, SNDCTRL reports this and does not put the line
+back.
 
 ### From the command line
 
-Every setting can be given as a switch, in which case `SNDCTRL` applies it and
-exits without drawing anything, which is useful from a batch file:
+You can give each setting as a switch. `SNDCTRL` then applies the setting and
+exits, and it draws nothing. This form is useful in a batch file:
 
 ```
 SNDCTRL /SBIRQ:5              Sound Blaster IRQ        2, 5, 7, 10
@@ -118,31 +122,33 @@ SNDCTRL /S                    show the current assignment, change nothing
 SNDCTRL /?                    usage
 ```
 
-Switches combine: `SNDCTRL /SBIRQ:5 /MPU:330`. A value the hardware cannot
-select is refused with the list of ones it can, and a combination that would put
-both devices on one line or channel is refused outright, and nothing is written.
+You can use more than one switch: `SNDCTRL /SBIRQ:5 /MPU:330`. If the hardware
+cannot use a value, SNDCTRL refuses it and lists the values that the hardware
+can use. If a combination would put both devices on one line or on one
+channel, SNDCTRL refuses the combination and writes nothing.
 
-`SNDCTRL /S` reads the mixer and the codec back rather than reporting what was
-last saved, so it reports the card's current assignment even if another program
-changed it.
+`SNDCTRL /S` reads the mixer and the codec. It does not report the last saved
+values. Thus it gives the current values of the card, even after a different
+program changed them.
 
-### Why there is nothing to set in the machine config file
+### Why the machine config file has nothing to set
 
-There used to be. `[audio.sound_blaster] irq` and its neighbours were removed.
-The machine boots from CMOS, so once `SNDCTRL` had saved an assignment, editing
-those keys had no effect on the running machine.
+The file had these keys before. `[audio.sound_blaster] irq` and the related
+keys are now removed. The machine boots from CMOS. Thus, after `SNDCTRL` saved
+an assignment, a change to those keys had no effect on the machine.
 
-Old config files still load. The retired keys are ignored, with a note in the
-log naming them.
+An old config file continues to load. IzarraVM ignores the removed keys, and
+writes their names in the log.
 
-The file retains the settings CMOS does not hold: whether each device is fitted
-at all (`enabled`), and the codec's I/O base (`base`), which is fixed board
-wiring rather than a selectable resource.
+The file keeps the settings that CMOS does not hold. These are `enabled`,
+which says if the device is fitted, and `base`, which is the I/O base of the
+codec. The base is fixed wiring on the board, and not a selectable resource.
 
-`--sb-irq`, `--sb-dma` and `--sb-high-dma` still work on the command line. They
-set the power-on values for a machine with no saved CMOS, which includes every
-headless run, since headless runs do not load one. On a machine that has been
-configured, the saved assignment takes precedence, and the emulator reports it:
+`--sb-irq`, `--sb-dma`, and `--sb-high-dma` continue to operate on the command
+line. They set the power-on values for a machine with no saved CMOS. Each
+headless run is such a machine, because a headless run does not load CMOS. On
+a configured machine, the saved assignment has priority, and the emulator
+reports this:
 
 ```
 WARN the saved CMOS overrode these flags; it is what the machine boots from.
@@ -151,59 +157,65 @@ card with SNDCTRL, both inside DOS -- or delete cmos.bin to start from the
 flags again  flags=--sb-irq 5
 ```
 
-`--cpu` behaves the same way, for the same reason.
+`--cpu` behaves in the same way, for the same reason.
 
-## Setting the volume
+## How to set the volume
 
-Use the `SNDMIXER` utility to set the card's volume levels. It presents seven
-vertical faders over the card's own mixer: MASTER, FMSYNTH, WAVE, CD-ROM, MIDI,
-the PC speaker, and AMP. Each level is applied as the fader moves, saved to a
-file, and restored on the next boot from `AUTOEXEC.BAT`.
+Use the `SNDMIXER` utility to set the volume levels of the card. It shows
+seven vertical faders for the mixer of the card: MASTER, FMSYNTH, WAVE,
+CD-ROM, MIDI, the PC speaker, and AMP. SNDMIXER applies each level as you move
+the fader. It saves the levels to a file, and `AUTOEXEC.BAT` sets them again
+at the next boot.
 
 ```
 C:\> SNDMIXER
 ```
 
-Tab and the arrow keys move between the faders and, after them, the **Accept**
-and **Cancel** buttons along the bottom of the box; Enter or Space presses the
-one that is selected. Accept leaves with the levels in effect, Cancel puts back
-the levels the mixer opened on, and F10 saves them for the next boot.
+Tab and the arrow keys move between the faders. After the faders, they move to
+the **Accept** button and the **Cancel** button at the bottom of the box.
+Enter or Space operates the selected button. Accept exits and keeps the new
+levels. Cancel sets the levels that were in effect when the mixer opened. F10
+saves the levels for the next boot.
 
-There is no line-in or microphone fader. The machine models playback only, so
-those inputs have no source for a control to adjust.
+There is no line-in fader and no microphone fader. The machine emulates
+playback only. Thus those inputs have no signal, and a control has nothing to
+change.
 
-Every leg of the card powers on at 0 dB, and the mix reserves its headroom after
-the mixer, so nothing clips at the default settings and the faders cover the
-whole range below them. Each step is 4 dB, which spreads the ten positions
-evenly rather than crowding them into the top of a 62 dB scale. The full
-switch list is in [SNDMIXER](../toka-dos/commands.md#sndmixer).
+Each leg of the card starts at 0 dB, and the mix keeps its headroom after the
+mixer. Thus nothing clips at the default settings, and the faders cover the
+full range below the default. Each step is 4 dB. This puts the ten positions
+at equal distances, and not in the top part of a 62 dB scale. The full switch
+list is in [SNDMIXER](../toka-dos/commands.md#sndmixer).
 
-Two of the seven are not plain Sound Blaster registers:
+Two of the seven faders are not standard Sound Blaster registers:
 
-- **PC speaker** is the card's PC-SPK input (mixer register `0x3B`). That input
-  is two bits wide on the real chip, so the fader has four positions, not ten.
-  The beeper is mixed through the card, so MASTER affects it as well.
-- **MIDI** is the wavetable synthesiser. A real SB16 has no register for one;
-  its "MIDI" volume is the FM bus, which is this card's FMSYNTH fader. The
-  ReSonique 2 therefore adds a pair of its own at `0x50`/`0x51`, on the same
-  register file and the same 5-bit scale as everything else. That pair alone
-  carries a mute bit in D0, and a level of zero on it is the quietest audible
-  step rather than silence. The wavetable is the only source with no second
-  control elsewhere in the machine, so a program that cleared the mixer's
-  registers would otherwise silence it with no indication of the cause. Mute
-  the wavetable with the mute bit.
+- **PC speaker** is the PC-SPK input of the card (mixer register `0x3B`). On
+  the real chip, that input is two bits wide. Thus the fader has four
+  positions, and not ten. The card mixes the beeper, and MASTER thus changes
+  its level also.
+- **MIDI** is the wavetable synthesizer. A real SB16 has no register for a
+  wavetable. Its "MIDI" volume is the FM bus, which is the FMSYNTH fader on
+  this card. Thus the ReSonique II adds two registers of its own, at `0x50` and
+  `0x51`. They are in the same register file, and on the same 5-bit scale as
+  the others.
+
+  Only this pair has a mute bit, in D0. On this pair, a level of zero is the
+  quietest audible step, and not silence. The wavetable is the only source
+  with no second control in the machine. Without this behavior, a program that
+  cleared the mixer registers would make the wavetable silent, with no cause
+  on the screen. Use the mute bit to mute the wavetable.
 
 ### Output gain (AMP)
 
-The seventh fader is not a volume control. It is the card's output amplifier,
-and it is the only control on the card that adds level rather than taking it
-away.
+The seventh fader is not a volume control. It is the output amplifier of the
+card. It is the only control on the card that adds level.
 
-It sits on the card's internal bus, beside the master: it raises the FM
-synthesis, the digital audio the Sound Blaster DSP plays, and the PC-speaker
-input. CD audio and the Windows Sound System codec do not pass through it —
-those two legs reach the summing node carrying only their own attenuation — so
-the AMP fader does not lift a Red Book track or a WSS recording.
+The amplifier is on the internal bus of the card, beside the master. It
+increases the level of the FM synthesis, of the digital audio from the Sound
+Blaster DSP, and of the PC-speaker input. The CD audio and the Windows Sound
+System codec do not go through it. Those two legs reach the summing node with
+their own attenuation only. Thus the AMP fader does not increase the level of
+a Red Book track or of a WSS recording.
 
 | Register | Bits | Field | Positions |
 | --- | --- | --- | --- |
@@ -219,72 +231,78 @@ Each position is 6 dB:
 | 2 | +12 dB | 7 |
 | 3 | +18 dB | 10 |
 
-Position 0 is the power-on setting, and it is the bottom of the fader's travel
-rather than a mute: an amplifier at 0 dB is an amplifier passing its input
-through, and everything above it is gain the card was not applying before. The
-two registers are written together — `SNDMIXER` moves both from one fader,
-because a difference between them is a balance change and not a level.
+Position 0 is the power-on setting. It is the bottom of the fader travel, and
+it is not a mute. An amplifier at 0 dB sends its input through with no change,
+and each position above 0 adds gain. `SNDMIXER` writes the two registers
+together, from one fader. A difference between them is a change of balance,
+and not a change of level.
 
-**The gain can clip.** The mix reserves 6 dB of headroom where the card's legs
-are summed, which is exactly enough to absorb one of them driven to full scale.
-The amplifier is applied to its three legs before that sum, so position 1 spends
-the reserve. Positions 2 and 3 are past it, and a hot source — a full-scale DSP
-voice, or the FM and the voice playing together — will distort. The card offers
-the positions and the fader offers them; neither one refuses the setting or
-quietly limits it. Use them to lift a quiet game, not to make a loud one louder.
+**Warning: the gain can clip the signal.** The mix keeps 6 dB of headroom at
+the point where the card sums its legs. That is sufficient for one leg at full
+scale. The amplifier operates on its three legs before that sum. Thus position
+1 uses the full reserve. Positions 2 and 3 are more than the reserve, and a
+loud source will distort. Two examples of a loud source are a DSP voice at
+full scale, and the FM and the voice together.
+
+The card gives these positions, and the fader gives them. Neither one refuses
+the setting, and neither one decreases the level automatically. Use the
+positions to make a quiet game louder, and not to make a loud game louder.
 
 ## Digital audio (Sound Blaster 16 compatible)
 
-The CT1745-compatible mixer and DSP answer at `0x220`-`0x22F`, with the
-power-on IRQ and DMA defaults from the table above. Both are movable, from
-inside DOS with [`SNDCTRL`](#changing-the-cards-resources), in case a program
-insists on jumpering the card somewhere else. Toka-DOS's `BLASTER` line always
-matches the running configuration.
+The CT1745-compatible mixer and the DSP answer at `0x220` to `0x22F`. They use
+the power-on IRQ and DMA in the table above. You can move both from inside DOS
+with [`SNDCTRL`](#how-to-change-the-card-resources), for a program that needs
+different values. The `BLASTER` line of Toka-DOS always agrees with the
+current configuration.
 
-The mixer's Interrupt and DMA Setup registers (`0x80`/`0x81`) are writable by
-the guest, so a program that configures the card that way moves it as well,
-by the same path `SNDCTRL` uses.
+The guest can write the Interrupt and DMA Setup registers of the mixer
+(`0x80` and `0x81`). Thus a program that configures the card in that way also
+moves it. It uses the same path as `SNDCTRL`.
 
 ## FM synthesis (OPL3)
 
-The FM synthesizer is at `0x388`, the standard AdLib/OPL2/OPL3 address, and
-answers as a real OPL3 (Yamaha YMF262): the full four-operator instrument
-set on top of OPL2's two-operator patches, detected the same way real OPL3
-hardware is: by reading back its status and timer registers, the classic
-AdLib detection routine.
+The FM synthesizer is at `0x388`, the standard AdLib, OPL2, and OPL3 address.
+It answers as a real OPL3 (Yamaha YMF262). It has the full four-operator
+instrument set, and the two-operator patches of the OPL2. Software detects it
+as it detects real OPL3 hardware: it reads back the status register and the
+timer registers. This is the classic AdLib detection routine.
 
 ## Creative ADPCM
 
-The DSP decodes Creative ADPCM the way a real SB16 does, as part of the
-digital audio path rather than a separate device. The 4-bit, 2.6-bit, and
-2-bit playback commands (`0x74`-`0x77`, `0x16`/`0x17`, and their auto-init
-variants) expand the compressed DMA stream to 8-bit samples through the
-DSP's adaptive predictor, with one interrupt at each programmed block boundary,
-as in raw PCM playback. No additional detection or configuration is required for
-a program that issues the ADPCM DSP commands.
+The DSP decodes Creative ADPCM as a real SB16 does. The decoder is part of the
+digital audio path, and not a separate device. The playback commands are the
+4-bit, 2.6-bit, and 2-bit commands: `0x74` to `0x77`, `0x16`, `0x17`, and
+their auto-init forms. They expand the compressed DMA stream to 8-bit samples,
+through the adaptive predictor of the DSP. The DSP raises one interrupt at
+each programmed block boundary, as it does in raw PCM playback. A program that
+sends the ADPCM DSP commands needs no other detection and no other
+configuration.
 
 ## MIDI and wavetable
 
-The card exposes separate MPU-401 port pairs. Games configured for a wavetable
-daughterboard send music to `0x300`; Toka-DOS publishes this as `P300` in
-`BLASTER`. This path leads to the daughterboard pin headers inside the case.
-Games configured for an external MPU-401 send music to `0x330`, which leads to
-the rear MIDI/game connector. A breakout cable provides standard MIDI sockets.
+The card has two MPU-401 port pairs. A game that is configured for a wavetable
+daughterboard sends its music to `0x300`. Toka-DOS gives this port as `P300`
+in `BLASTER`. This path goes to the daughterboard pin headers in the case. A
+game that is configured for an external MPU-401 sends its music to `0x330`,
+which goes to the rear MIDI/game connector. A breakout cable gives the
+standard MIDI sockets.
 
-Both ports support UART output and the playback side of MPU-401 intelligent
-mode. Intelligent-mode software can use eight timed tracks, the conductor,
-tempo and timebase changes, and start or stop playback. The two ports share
-IRQ 9 for acknowledgements and data requests. Neither interface provides
-recording, external clock sync, metronome input, or MPU reference filters.
+Both ports supply UART output and the playback part of the MPU-401 intelligent
+mode. Software in intelligent mode can use eight timed tracks, the conductor,
+changes of tempo and timebase, and the start and the stop of playback. The two
+ports share IRQ 9 for the acknowledgements and the data requests. Neither
+interface supplies recording, external clock sync, metronome input, or MPU
+reference filters.
 
-IzarraVM supplies the fitted daughterboard and external receiver separately.
-See the [GUI guide](../izarravm-gui/guide.md#the-config-modal) for those
-host-side settings and status messages, and the [recipes](../recipes/index.md)
-for the procedures that use them.
+IzarraVM supplies the daughterboard and the external receiver separately. The
+[GUI guide](../izarravm-gui/guide.md#the-config-modal) describes those host
+settings and their status messages. The [recipes](../recipes/index.md) give
+the procedures that use them.
 
 ## Next
 
-- [Using Toka-DOS](../toka-dos/using-toka-dos.md): where `SET BLASTER` is
-  set and what else `AUTOEXEC.BAT` does.
-- [Troubleshooting](../troubleshooting.md): audio setup issues and
-  workarounds.
+- [How to use Toka-DOS](../toka-dos/using-toka-dos.md): where `SET BLASTER` is
+  set, and what else `AUTOEXEC.BAT` does.
+- [Troubleshooting](../troubleshooting.md): audio setup problems and their
+  solutions.

@@ -3,109 +3,111 @@
 
 # DOS Command Reference
 
-Toka-DOS commands come in two kinds. The **built-in commands** (`DIR`, `COPY`,
-`DEL`, and the rest) live inside `COMMAND.COM` and are always available. The
-**external commands** are the programs in `C:\DOS` (`XCOPY`, `MEM`, `ATTRIB`,
-and so on), each a real file, most carried over from FreeDOS with a Toka-DOS
-rebrand and a few written by General Simulation Works. This page lists the
-built-ins first, then documents each external command with the switches it
-implements. Where Toka-DOS diverges from a command's usual behavior,
-it says so.
+Toka-DOS has two types of command. The **internal commands** (`DIR`, `COPY`,
+`DEL`, and the others) are part of `COMMAND.COM`, and are always available.
+The **external commands** are the programs in `C:\DOS` (`XCOPY`, `MEM`,
+`ATTRIB`, and the others). Each external command is a file. Most of them come
+from FreeDOS with a Toka-DOS name, and General Simulation Works wrote some of
+them. This page lists the internal commands first. It then describes each
+external command and its switches. Where the behavior in Toka-DOS is different
+from the usual behavior, this page says so.
 
-## Built-in commands
+## Internal commands
 
-These are part of `COMMAND.COM` itself, not separate files on disk. They are
-available at the `C:\>` prompt and in batch files even before `PATH` is set or
-if `C:\DOS` is missing, because the shell carries them in memory. Add `/?` to
-any of them for its full built-in help.
+These commands are part of `COMMAND.COM`. They are not files on the disk. The
+shell holds them in memory. Thus they are available at the `C:\>` prompt and
+in a batch file, even before `PATH` is set, and even if `C:\DOS` is absent.
+Add `/?` to a command to see its full help.
 
-Some have a short and a long spelling that do the same thing: `MD`/`MKDIR`,
-`RD`/`RMDIR`, `CD`/`CHDIR`, `DEL`/`ERASE`, `REN`/`RENAME`, and `LH`/`LOADHIGH`.
+Some commands have a short name and a long name with the same function:
+`MD`/`MKDIR`, `RD`/`RMDIR`, `CD`/`CHDIR`, `DEL`/`ERASE`, `REN`/`RENAME`, and
+`LH`/`LOADHIGH`.
 
 ### Files and directories
 
 | Command | Syntax | What it does |
 | --- | --- | --- |
-| `COPY` | `COPY [/A\|/B] source [+ src ...] [dest] [/V] [/Y\|/-Y]` | Copy files, or join several into one with `src1+src2`. `/A` ASCII, `/B` binary, `/V` verify, `/Y` overwrite without asking, `/-Y` ask first. |
-| `DEL` / `ERASE` | `DEL [path]file [/P] [/V]` | Delete files (wildcards allowed). `/P` confirm each, `/V` list what was deleted. |
-| `REN` / `RENAME` | `REN [path]oldname newname` | Rename a file or directory. |
-| `TYPE` | `TYPE [path]file` | Print a text file to the screen. |
-| `DIR` | `DIR [path][file] [/P] [/W] [/A[:attrs]] [/O[:order]] [/S] [/B] [/L]` | List files. `/P` page, `/W` wide, `/S` recurse, `/B` bare names, `/A` filter by attribute, `/O` sort. Listings are sorted by name with directories first unless you say otherwise; `/O:U` gives the raw on-disk order. Defaults come from the `DIRCMD` variable. |
-| `MD` / `MKDIR` | `MD [drive:]path` | Create a directory. |
+| `COPY` | `COPY [/A\|/B] source [+ src ...] [dest] [/V] [/Y\|/-Y]` | Copy files. `src1+src2` joins two files into one. `/A` ASCII, `/B` binary, `/V` verify, `/Y` overwrite with no question, `/-Y` ask first. |
+| `DEL` / `ERASE` | `DEL [path]file [/P] [/V]` | Delete files. Wildcards are permitted. `/P` asks about each file. `/V` lists the deleted files. |
+| `REN` / `RENAME` | `REN [path]oldname newname` | Change the name of a file or a directory. |
+| `TYPE` | `TYPE [path]file` | Print a text file on the screen. |
+| `DIR` | `DIR [path][file] [/P] [/W] [/A[:attrs]] [/O[:order]] [/S] [/B] [/L]` | List the files. `/P` one page at a time, `/W` wide, `/S` include the subdirectories, `/B` names only, `/A` select by attribute, `/O` sort. `DIR` puts the directories first and sorts by name, unless you give a different order. `/O:U` gives the order on the disk. The `DIRCMD` variable sets the defaults. |
+| `MD` / `MKDIR` | `MD [drive:]path` | Make a directory. |
 | `RD` / `RMDIR` | `RD [drive:]path` | Remove an empty directory. |
-| `CD` / `CHDIR` | `CD [drive:][path]` | Show or change the current directory; `CD -` returns to the previous one. |
-| `CDD` | `CDD [drive:][path]` | Change the current directory and drive together. |
-| `TRUENAME` | `TRUENAME [path]` | Show the full, canonical path of a name. |
-| `VOL` | `VOL [drive:]` | Show a disk's volume label and serial number. |
+| `CD` / `CHDIR` | `CD [drive:][path]` | Show or change the current directory. `CD -` returns to the previous directory. |
+| `CDD` | `CDD [drive:][path]` | Change the current directory and the current drive together. |
+| `TRUENAME` | `TRUENAME [path]` | Show the full path of a name. |
+| `VOL` | `VOL [drive:]` | Show the volume label and the serial number of a disk. |
 
-### Batch and scripting
+### Batch files and scripts
 
 | Command | Syntax | What it does |
 | --- | --- | --- |
-| `ECHO` | `ECHO [ON\|OFF]` / `ECHO message` / `ECHO.` | Print a message, or turn command echo on/off. `ECHO.` prints a blank line. |
-| `REM` | `REM [comment]` | A comment line in a batch file or `CONFIG.SYS`. (`TITLE` is accepted as a synonym; DOS has no window title to set.) |
-| `IF` | `IF [NOT] ERRORLEVEL n cmd` / `IF [NOT] a==b cmd` / `IF [NOT] EXIST file cmd` | Run `cmd` when a condition holds. `IF /I` compares text case-insensitively. |
-| `FOR` | `FOR %v IN (set) DO cmd` | Repeat `cmd` for each item in `set` (write `%%v` in a batch file). |
-| `GOTO` | `GOTO label` | Jump to a `:label` line in a batch file. |
-| `CALL` | `CALL [path]file [args]` | Run another batch file and return afterward. |
-| `SHIFT` | `SHIFT [DOWN]` | Shift the `%1 %2 ...` batch parameters along. |
-| `PAUSE` | `PAUSE [message]` | Wait for a keypress ("Press any key to continue..."). |
-| `EXIT` | `EXIT` | Leave this shell. The boot shell starts with `/P`, so it ignores `EXIT`. |
+| `ECHO` | `ECHO [ON\|OFF]` / `ECHO message` / `ECHO.` | Print a message, or set the command echo to on or off. `ECHO.` prints an empty line. |
+| `REM` | `REM [comment]` | A comment line in a batch file or in `CONFIG.SYS`. (`TITLE` is a synonym. DOS has no window title.) |
+| `IF` | `IF [NOT] ERRORLEVEL n cmd` / `IF [NOT] a==b cmd` / `IF [NOT] EXIST file cmd` | Run `cmd` when the condition is true. `IF /I` ignores the letter case in a text comparison. |
+| `FOR` | `FOR %v IN (set) DO cmd` | Do `cmd` for each item in `set`. Write `%%v` in a batch file. |
+| `GOTO` | `GOTO label` | Go to a `:label` line in a batch file. |
+| `CALL` | `CALL [path]file [args]` | Run a different batch file, and then return. |
+| `SHIFT` | `SHIFT [DOWN]` | Move the `%1 %2 ...` batch parameters along by one. |
+| `PAUSE` | `PAUSE [message]` | Wait for a keypress. The message is "Press any key to continue...". |
+| `EXIT` | `EXIT` | Leave this shell. The boot shell starts with `/P`, thus it ignores `EXIT`. |
 
 ### Environment and shell
 
 | Command | Syntax | What it does |
 | --- | --- | --- |
-| `SET` | `SET [/P] [/C] [var[=value]]` | Show, set, or clear environment variables. `/P` reads the value from the user. `SET var` with no value removes it. |
+| `SET` | `SET [/P] [/C] [var[=value]]` | Show, set, or clear an environment variable. `/P` reads the value from the user. `SET var` with no value removes the variable. |
 | `PATH` | `PATH [dir[;...]]` | Show or set the program search path. |
-| `PROMPT` | `PROMPT [text]` | Change the prompt (the default is `$P$G`). |
-| `ALIAS` | `ALIAS [name[=]string]` | Show, set, or remove command aliases. |
-| `VER` | `VER [/R] [/W] [/D] [/C]` | Show the version. `/R` adds kernel details; `/W`, `/D`, `/C` show warranty, redistribution, and contributors. |
-| `DATE` | `DATE [/D] [date]` | Show or set the date. `/D` skips the interactive prompt. |
-| `TIME` | `TIME [/T] [time]` | Show or set the time. `/T` skips the prompt. |
+| `PROMPT` | `PROMPT [text]` | Change the prompt. The default is `$P$G`. |
+| `ALIAS` | `ALIAS [name[=]string]` | Show, set, or remove a command alias. |
+| `VER` | `VER [/R] [/W] [/D] [/C]` | Show the version. `/R` adds the kernel details. `/W`, `/D`, and `/C` show the warranty, the redistribution terms, and the contributors. |
+| `DATE` | `DATE [/D] [date]` | Show or set the date. `/D` does not ask for a value. |
+| `TIME` | `TIME [/T] [time]` | Show or set the time. `/T` does not ask for a value. |
 | `CHCP` | `CHCP [nnn]` | Show or set the active code page. |
-| `VERIFY` | `VERIFY [ON\|OFF]` | Turn write-after-verify on or off. |
-| `BREAK` | `BREAK [ON\|OFF]` | Turn extended Ctrl+C checking on or off. |
+| `VERIFY` | `VERIFY [ON\|OFF]` | Set the verify-after-write function to on or off. |
+| `BREAK` | `BREAK [ON\|OFF]` | Set the extended Ctrl+C check to on or off. |
 | `CLS` | `CLS` | Clear the screen. |
-| `BEEP` | `BEEP` | Beep the speaker. |
-| `CTTY` | `CTTY device` | Move console input and output to another device, such as `COM1`. |
+| `BEEP` | `BEEP` | Sound the speaker. |
+| `CTTY` | `CTTY device` | Move the console input and output to a different device, for example `COM1`. |
 
-### Loading programs high
+### How to load a program high
 
 | Command | Syntax | What it does |
 | --- | --- | --- |
-| `LH` / `LOADHIGH` | `LH [path]file [args]` | Load a program into an upper memory block. Needs [TOKAEMM](../tokaemm/manual.md) UMBs; falls back to a normal load if none are free. |
-| `LOADFIX` | `LOADFIX [path]file [args]` | Load a program above the first 64 KB, for old programs that fail there with "Packed file corrupt". |
+| `LH` / `LOADHIGH` | `LH [path]file [args]` | Load a program into an upper memory block. It needs [TOKAEMM](../tokaemm/manual.md) UMBs. If no block is free, it does a normal load. |
+| `LOADFIX` | `LOADFIX [path]file [args]` | Load a program above the first 64 KB. Use it for an old program that fails there with "Packed file corrupt". |
 
 ### History and the directory stack
 
 | Command | Syntax | What it does |
 | --- | --- | --- |
-| `DOSKEY` | `DOSKEY` | Command-line recall and editing, built into the shell: Up/Down recall previous lines, Tab completes filenames. |
-| `HISTORY` | `HISTORY [size]` | Show the command history, or resize its buffer. |
-| `PUSHD` | `PUSHD [path]` | Save the current directory on a stack, optionally changing to `path`. |
-| `POPD` | `POPD` | Return to the directory last saved by `PUSHD`. |
+| `DOSKEY` | `DOSKEY` | The command recall and edit functions in the shell. Up and Down recall a previous line. Tab completes a file name. |
+| `HISTORY` | `HISTORY [size]` | Show the command history, or change the size of its buffer. |
+| `PUSHD` | `PUSHD [path]` | Put the current directory on a stack. It can also change to `path`. |
+| `POPD` | `POPD` | Return to the directory that `PUSHD` put on the stack last. |
 | `DIRS` | `DIRS` | Show the directory stack. |
 
 ### Help and diagnostics
 
 | Command | Syntax | What it does |
 | --- | --- | --- |
-| `?` | `?` | List every built-in command. |
-| `WHICH` | `WHICH command...` | Show which program a command name would run. |
-| `LFNFOR` | `LFNFOR [ON\|OFF]` | Turn long-filename expansion in `FOR` on or off. |
-| `MEMORY` | `MEMORY` | Report the shell's own internal memory use. This is not [MEM](#mem), the external memory report. |
+| `?` | `?` | List each internal command. |
+| `WHICH` | `WHICH command...` | Show the program that a command name runs. |
+| `LFNFOR` | `LFNFOR [ON\|OFF]` | Set the long-filename expansion in `FOR` to on or off. |
+| `MEMORY` | `MEMORY` | Report the internal memory use of the shell. This is not [MEM](#mem), the external memory report. |
 
 ## External commands
 
-The rest of this page documents the programs in `C:\DOS`, one per section. They
-sit on the `PATH`, so you run them by name from any directory.
+The remainder of this page describes the programs in `C:\DOS`, one in each
+section. They are on the `PATH`. Thus you can run them by name from any
+directory.
 
 ## XCOPY
 
-Copies files and directory trees. Toka-DOS's XCOPY is original project code
-written to XCOPY's documented behavior, not a ported FreeDOS binary. It
-implements a deliberately smaller switch set than real MS-DOS XCOPY.
+XCOPY copies files and directory trees. The Toka-DOS XCOPY is project code,
+and not a FreeDOS binary. Its behavior agrees with the documented behavior of
+XCOPY. It has fewer switches than the MS-DOS XCOPY.
 
 ```
 XCOPY source [destination] [/S] [/E] [/P] [/V] [/W] [/Y] [/-Y]
@@ -113,62 +115,69 @@ XCOPY source [destination] [/S] [/E] [/P] [/V] [/W] [/Y] [/-Y]
 
 | Switch | Effect |
 | --- | --- |
-| `/S` | Copy directories and subdirectories, except empty ones. |
-| `/E` | Copy subdirectories even if empty. Implies `/S`. |
-| `/P` | Prompt `<file> (Y/N)?` before creating each destination file. |
-| `/V` | Verify each write (sets the DOS verify-after-write flag for the run). |
-| `/W` | Print "Press any key to begin copying..." and wait before starting. |
-| `/Y` | Overwrite existing destination files without prompting. |
-| `/-Y` | Prompt before overwriting an existing file (also the default). |
+| `/S` | Copy the directories and the subdirectories, but not the empty ones. |
+| `/E` | Copy the subdirectories, including the empty ones. This includes `/S`. |
+| `/P` | Ask `<file> (Y/N)?` before it makes each destination file. |
+| `/V` | Verify each write. It sets the DOS verify-after-write flag for the run. |
+| `/W` | Print "Press any key to begin copying..." and wait before the copy. |
+| `/Y` | Overwrite an existing destination file with no question. |
+| `/-Y` | Ask before it overwrites an existing file. This is also the default. |
 
-Not implemented: `/C`, `/D`, `/H`, `/K`, `/N`, `/O`, `/T`, `/U`, `/L`, `/Z`.
-Unlike real XCOPY, Toka-DOS's XCOPY never asks "(F = file, D = directory)?"
-for an ambiguous destination. It infers file-versus-directory from `/S`,
-`/E`, or a multi-file wildcard source instead of prompting.
+These switches are not available: `/C`, `/D`, `/H`, `/K`, `/N`, `/O`, `/T`,
+`/U`, `/L`, `/Z`.
 
-Exit codes: 0 success, 1 no files found, 4 initialization error (bad usage,
-out of memory, or a bad path), 5 disk write error.
+The MS-DOS XCOPY asks "(F = file, D = directory)?" when the type of the
+destination is not clear. The Toka-DOS XCOPY does not ask. It uses `/S`, `/E`,
+or a wildcard source with more than one file to select between a file and a
+directory.
+
+Exit codes: 0 success, 1 no file found, 4 initialization error (incorrect
+usage, insufficient memory, or an incorrect path), 5 disk write error.
 
 ## MEM
 
-Reports memory usage. Toka-DOS adds a category display and changes how `/P`
-works compared with stock FreeDOS MEM.
+MEM reports the memory use. Toka-DOS adds a category display. It also changes
+the function of `/P` from the FreeDOS MEM.
 
 ```
 MEM [/P] [/FULL] [/DEBUG] [/PAGE] [...]
 ```
 
-By default, `MEM` shows a four-line, 79-column memory map after its numeric
-summary. Conventional, upper, and extended memory appear consecutively in
-light blue, light cyan, and light green. Within each colored range, `▓`
-(CP437 `B2`) marks memory in use and `░` (CP437 `B0`) marks free memory.
+By default, `MEM` shows a memory map of four lines and 79 columns after the
+numeric summary. Conventional memory, upper memory, and extended memory come
+one after the other, in light blue, light cyan, and light green. In each
+colored range, `▓` (CP437 `B2`) is memory in use, and `░` (CP437 `B0`) is free
+memory.
 
-On the standard 64 MiB Izarra 3000, the map gives conventional memory 3
-cells, upper memory 2, and extended memory 311. Each of the 316 cells
-represents about 207 KiB. The exact summary categories are 640 KiB
-conventional memory, the full 384 KiB upper region, and 64,512 KiB in the row
-labelled `Extended (XMS)`. The upper category covers the whole `A0000` to
-`FFFFF` address region, including video memory and ROMs. TOKAEMM can allocate
-96 KiB there with its default EMS frame; under `NOEMS` the allocatable UMB
-space grows to 160 KiB.
+On the standard 64 MiB Izarra3000, the map gives 3 cells to conventional
+memory, 2 cells to upper memory, and 311 cells to extended memory. Each of the
+316 cells is approximately 207 KiB. The summary shows 640 KiB of conventional
+memory, the full 384 KiB upper region, and 64,512 KiB in the row with the name
+`Extended (XMS)`. The upper category covers the full address region from
+`A0000` to `FFFFF`, with the video memory and the ROMs. With its default EMS
+frame, TOKAEMM can allocate 96 KiB there. Under `NOEMS`, the UMB space
+increases to 160 KiB.
 
-There is no separate EMS row or partition: XMS blocks, VCPI pages, and EMS
-pages all draw from one shared extended pool, so the `Extended (XMS)` row is
-starred and a footnote explains that EMS is simulated from XMS as required,
-the same convention MS-DOS 6.22 uses with EMM386.
+There is no separate EMS row, and there is no EMS partition. XMS blocks, VCPI
+pages, and EMS pages all come from one extended pool. Thus the
+`Extended (XMS)` row has a star, and a footnote says that the manager
+simulates EMS from XMS as necessary. MS-DOS 6.22 with EMM386 uses the same
+convention.
 
-Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE`, which pauses
-after each screenful. The per-program size and segment listing normally needs
-`/FULL` or `/DEBUG`. In Toka-DOS, `MEM /P` pages through every program in
-memory with its size and segment. Separate `Conventional Memory Detail` and
-`Upper Memory Detail` headings show where each block resides. `/P` leaves out
-the default summary so the program table remains visible at the end. Use
-`MEM /P /SUMMARY` to append the numeric summary and memory map. `/FULL` and
-`/DEBUG` still work on their own.
+In the FreeDOS MEM, `/P` is only a prefix of `/PAGE`, which stops after each
+screen. That MEM needs `/FULL` or `/DEBUG` for the size and the segment of
+each program.
+
+In Toka-DOS, `MEM /P` shows each program in memory, with its size and its
+segment, one screen at a time. The headings `Conventional Memory Detail` and
+`Upper Memory Detail` show the position of each block. `/P` does not print the
+default summary, so that the program table stays on the screen at the end. Use
+`MEM /P /SUMMARY` to add the numeric summary and the memory map. `/FULL` and
+`/DEBUG` continue to operate alone.
 
 ## ATTRIB
 
-Displays or changes file attributes.
+ATTRIB shows or changes the file attributes.
 
 ```
 ATTRIB { options | [path\][file] | /@[list] }
@@ -176,21 +185,22 @@ ATTRIB { options | [path\][file] | /@[list] }
 
 | Option | Effect |
 | --- | --- |
-| `+H` / `-H` | Set/clear Hidden. |
-| `+S` / `-S` | Set/clear System. |
-| `+R` / `-R` | Set/clear Read-only. |
-| `+A` / `-A` | Set/clear Archive. |
-| `/S` | Process files in all directories under the given path. |
-| `/D` | Process directory names for wildcard arguments. |
-| `/@` | Process the files listed in the given file (or stdin). |
+| `+H` / `-H` | Set or clear the Hidden attribute. |
+| `+S` / `-S` | Set or clear the System attribute. |
+| `+R` / `-R` | Set or clear the Read-only attribute. |
+| `+A` / `-A` | Set or clear the Archive attribute. |
+| `/S` | Process the files in all of the directories below the given path. |
+| `/D` | Process the directory names for a wildcard argument. |
+| `/@` | Process the files in the given list file, or in the standard input. |
 
-A leading comma before a filename (`,file`) clears all attributes at once,
-an undocumented but real behavior carried over from real MS-DOS ATTRIB.
+A comma before a file name (`,file`) clears all of the attributes together.
+The MS-DOS ATTRIB has the same behavior, although its documentation does not
+give it.
 
 ## CHOICE
 
-Prompts for a keypress and returns it as an exit code, for use in batch
-files.
+CHOICE asks for a keypress and returns it as an exit code. Use it in a batch
+file.
 
 ```
 CHOICE [/B] [/C[:]choices] [/N] [/S] [/T[:]c,nn] [text]
@@ -198,15 +208,15 @@ CHOICE [/B] [/C[:]choices] [/N] [/S] [/T[:]c,nn] [text]
 
 | Switch | Effect |
 | --- | --- |
-| `/B` | Beep when the prompt appears. |
-| `/C[:]choices` | The allowed keys (default `yn`). |
-| `/N` | Don't print the choice list after the prompt text. |
-| `/S` | Case-sensitive matching. |
-| `/T[:]c,nn` | Auto-pick key `c` after `nn` seconds if nothing is pressed. |
+| `/B` | Sound the speaker when the prompt appears. |
+| `/C[:]choices` | The permitted keys. The default is `yn`. |
+| `/N` | Do not print the list of choices after the prompt text. |
+| `/S` | Obey the letter case in the comparison. |
+| `/T[:]c,nn` | Select key `c` automatically after `nn` seconds, if the user presses no key. |
 
 ## MORE
 
-Pages output a screen at a time.
+MORE shows text one screen at a time.
 
 ```
 command | MORE [/T4]
@@ -214,12 +224,12 @@ MORE [/T4] file...
 MORE [/T4] < file
 ```
 
-`/T1` through `/T9` set the tab width (default 4). While paging: Space shows
-the next page, N moves to the next file, Q quits.
+`/T1` to `/T9` set the tab width. The default is 4. Space shows the next
+screen. N moves to the next file. Q stops the program.
 
 ## FIND
 
-Searches text for a literal string.
+FIND looks for an exact string in text.
 
 ```
 FIND [/C] [/I] [/N] [/V] "string" [file ...]
@@ -227,41 +237,42 @@ FIND [/C] [/I] [/N] [/V] "string" [file ...]
 
 | Switch | Effect |
 | --- | --- |
-| `/C` | Print only the count of matching lines. |
-| `/I` | Case-insensitive match. |
-| `/N` | Show line numbers with each match. |
-| `/V` | Print lines that do *not* contain the string. |
+| `/C` | Print only the number of lines with a match. |
+| `/I` | Ignore the letter case. |
+| `/N` | Show the line number with each match. |
+| `/V` | Print the lines that do not contain the string. |
 
-Exit codes: 0 if at least one match was found, 1 if none was, 2 on a usage
-error.
+Exit codes: 0 if FIND found one match or more, 1 if it found no match, and 2
+for a usage error.
 
 ## DELTREE
 
-Deletes a directory and everything under it.
+DELTREE deletes a directory and all of its contents.
 
 ```
 DELTREE [/Y] [/V]
 ```
 
-`/Y` deletes without the usual per-item Y/N confirmation. `/V` reports item
-counts and totals when it finishes. Without `/Y`, DELTREE asks for
-confirmation before removing anything, matching real MS-DOS DELTREE rather
-than deleting silently.
+**Warning:** DELTREE deletes the files permanently. You cannot recover them.
+
+Without `/Y`, DELTREE asks Y/N for each item before it deletes anything. The
+MS-DOS DELTREE does the same. `/Y` deletes without the questions. `/V` reports
+the item counts and the totals at the end.
 
 ## LABEL
 
-Creates, changes, or deletes a disk volume label.
+LABEL makes, changes, or deletes the volume label of a disk.
 
 ```
 LABEL [drive:][label] [/?]
 ```
 
-Run with no label, LABEL prompts for one interactively. Entering an empty
-label over an existing one prompts to confirm deleting it.
+If you give no label, LABEL asks for one. If you then give an empty label,
+LABEL asks you to confirm the deletion of the existing label.
 
 ## MOVE
 
-Moves files, or renames directories.
+MOVE moves a file, or changes the name of a directory.
 
 ```
 MOVE [/Y | /-Y] source1[,source2[,...]] destination
@@ -269,17 +280,17 @@ MOVE [/Y | /-Y] source1[,source2[,...]] destination
 
 | Switch | Effect |
 | --- | --- |
-| `/Y` | Overwrite an existing destination file without prompting. |
-| `/-Y` | Prompt before overwriting (default, unless `COPYCMD` says otherwise). |
-| `/V` | Verify each file as it's written to the destination. |
-| `/S` | Treat the source as directory-shaped even without a wildcard, for moving whole trees. (Not listed in MOVE's own usage text, but implemented and working.) |
+| `/Y` | Overwrite an existing destination file with no question. |
+| `/-Y` | Ask before it overwrites a file. This is the default, unless `COPYCMD` gives a different value. |
+| `/V` | Verify each file as MOVE writes it to the destination. |
+| `/S` | Use the source as a directory, without a wildcard. Use it to move a full tree. The usage text of MOVE does not list this switch, but the switch operates. |
 
-The `COPYCMD` environment variable, if set to `/Y`, `/N`, or `/-Y`, changes
-the default overwrite behavior the same way it does for COPY and XCOPY.
+The `COPYCMD` environment variable can hold `/Y`, `/N`, or `/-Y`. It then
+changes the default overwrite behavior, as it does for COPY and XCOPY.
 
 ## SORT
 
-Sorts text, line by line, from stdin to stdout.
+SORT sorts text line by line, from the standard input to the standard output.
 
 ```
 SORT [/R] [/+num] [/A] [/?] [file]
@@ -288,41 +299,42 @@ SORT [/R] [/+num] [/A] [/?] [file]
 | Switch | Effect |
 | --- | --- |
 | `/R` | Reverse the sort order. |
-| `/+num` | Start sorting at column `num` (1-based). |
-| `/A` | Sort by raw ASCII order instead of the active country/collation table. |
-| `/N` | Force country-aware (NLS) collation, the default even without it. |
+| `/+num` | Start the sort at column `num`. The first column is 1. |
+| `/A` | Sort in ASCII order, and not with the active country table. |
+| `/N` | Sort with the country-aware (NLS) collation. This is the default. |
 
 ## GSWMODE
 
-General Simulation Works's own tool. It switches the GSW-586's CPU speed class
-from inside DOS, without rebooting.
+GSWMODE is a General Simulation Works tool. It changes the CPU speed class of
+the GSW-586 from inside DOS. A restart is not necessary.
 
 ```
 GSWMODE 386-slow | 386 | 486 | 586 [/T]
 ```
 
-Mode names are case-insensitive. Given a valid mode, GSWMODE writes the
-matching code to the Lotura chipset's mode port, saves it in CMOS, and
-confirms:
+The letter case of a mode name is not important. With a correct mode, GSWMODE
+writes the related code to the mode port of the Lotura chipset. It saves the
+code in CMOS. It then shows:
 
 ```
 GSWMODE: switched to <mode>, saved.
 ```
 
-The speed then survives a reboot, as though it had been set in the
+The speed stays after a restart, as if you set it in the
 [Del setup panel](../izbios/configuration-panel.md). Add `/T` to change the
-speed for this session only and leave the saved one unchanged:
+speed for this session only. `/T` does not change the saved speed:
 
 ```
 GSWMODE 386-slow /T
 GSWMODE: switched to 386-slow for this session only.
 ```
 
-Use `/T` to run one program at a different speed without changing the saved
-setting. Without it, the speed is saved, as the machine's other settings are.
+Use `/T` to run one program at a different speed. Without `/T`, GSWMODE saves
+the speed, as the machine saves its other settings.
 
-With no argument or an unrecognized one, GSWMODE prints usage and both speeds,
-and changes nothing. The two values differ only after a `/T`:
+With no argument, or with an unknown argument, GSWMODE prints the usage text
+and both speeds. It changes nothing. The two values are different only after a
+`/T`:
 
 ```
 Usage: GSWMODE 386-slow|386|486|586 [/T]
@@ -332,62 +344,63 @@ Current mode: 386-slow
 Saved mode:   486
 ```
 
-The retired `286` name is rejected with a migration hint:
+GSWMODE refuses the old `286` name. It shows this message:
 
 ```
 CPU mode '286' was removed; use '386-slow'.
 ```
 
 The [Tab boot menu](../izarra-3000/user-manual.md#the-tab-boot-menu) and the
-Del setup panel write the same CMOS byte, so all three agree about what the
-machine will start at next time.
+Del setup panel write the same CMOS byte. Thus all three controls agree about
+the speed at the next start.
 
 ## UNHALT
 
-General Simulation Works's own tool. It makes the BIOS keyboard wait spin
-instead of halting the CPU.
+UNHALT is a General Simulation Works tool. It makes the BIOS keyboard wait use
+a loop, and not a halt of the CPU.
 
 ```
-UNHALT      spin while waiting for a key
-UNHALT /H   halt while waiting (the default)
+UNHALT      use a loop while it waits for a key
+UNHALT /H   halt while it waits (the default)
 UNHALT /?   usage
 ```
 
-When a program asks the BIOS for a keystroke (INT 16h) and none is waiting,
-IzarraVM's BIOS halts the CPU until the next interrupt instead of spinning on
-the keyboard buffer. Pressing a key raises IRQ1 and wakes it immediately, so
-nothing responds any slower, but the emulator stops interpreting a busy loop
-that does nothing.
+A program can ask the BIOS for a keystroke (INT 16h) when no keystroke is
+available. The IzarraVM BIOS then halts the CPU until the next interrupt. It
+does not loop on the keyboard buffer. A keypress raises IRQ1 and starts the
+CPU immediately, thus the response is not slower. But the emulator does not
+interpret a loop that does no work.
 
-BIOSes of the era implemented both behaviours, so neither is unfaithful. A
-program can detect the difference in two situations:
+A BIOS of the period could do either of these two things, thus both are
+correct. A program can detect the difference in two conditions:
 
-- It masks the timer and keyboard interrupts and then waits for a key. No key
-  can arrive, so the program hangs either way, but a spin loops on the keyboard
-  buffer while a halt has no interrupt left to wake it.
-- It expects time to pass smoothly across the wait rather than in steps of about
-  1/18 second.
+- The program masks the timer interrupt and the keyboard interrupt, and then
+  waits for a key. No key can arrive, thus the program stops in both
+  conditions. But a loop continues to read the keyboard buffer, and a halt has
+  no interrupt to start the CPU again.
+- The program expects the time to increase smoothly during the wait, and not
+  in steps of approximately 1/18 second.
 
-Neither is common. If a program misbehaves while waiting for input, run `UNHALT`
-before it:
+These two conditions are not frequent. If a program operates incorrectly while
+it waits for input, run `UNHALT` first:
 
 ```
 UNHALT
 MYGAME
 ```
 
-`UNHALT /H` restores halting without a reboot. The setting is not saved, so
-every reset starts out halting; put `UNHALT` in `AUTOEXEC.BAT` if a program
-needs it every time.
+`UNHALT /H` sets the halt again, without a restart. The machine does not save
+this setting, and each reset starts with the halt. Put `UNHALT` in
+`AUTOEXEC.BAT` if a program needs the loop at each boot.
 
-This covers the BIOS keyboard wait only. Toka-DOS separately halts while DOS
-itself is waiting for input; to turn that off, put `IDLEHALT=0` in `CONFIG.SYS`
-and reboot.
+UNHALT changes the BIOS keyboard wait only. Toka-DOS does its own halt while
+DOS waits for input. To stop that halt, put `IDLEHALT=0` in `CONFIG.SYS` and
+restart the machine.
 
 ## SNDCTRL
 
-The [ReSonique 2](../resonique2/manual.md) sound card's own setup utility. It
-changes the card's IRQ and DMA assignment from inside DOS.
+SNDCTRL is the setup utility of the [ReSonique II](../resonique2/manual.md)
+sound card. It changes the IRQ and the DMA of the card from inside DOS.
 
 ```
 SNDCTRL                 full-screen configuration
@@ -403,35 +416,38 @@ SNDCTRL /MPU:nnn        MPU-401 port              300, 330
 SNDCTRL /?              usage
 ```
 
-With no arguments it draws a configuration screen. Arrow keys or Tab move
-between values, Enter opens the list of values that resource supports, F10
-applies, Esc cancels. A `*` marks a value that does not apply to that device.
-Any switch on the command line is applied without drawing anything.
+With no argument, SNDCTRL draws a configuration screen. The arrow keys or Tab
+move between the values. Enter opens the list of values that the resource
+supports. F10 applies the values, and Esc cancels. A `*` marks a value that
+does not apply to that device. With a switch on the command line, SNDCTRL
+applies the switch and draws nothing.
 
-`/B` prints a two-row boot summary, a heading followed by a BLASTER-style values
-line for both devices, and exits without writing the mixer, CMOS, the
-environment, or `AUTOEXEC.BAT`. `/T` adds the tree-styled connector used by
-the Toka-DOS boot screen in front of that summary. It has an effect only when
-paired with `/B`; `SNDCTRL /T` on its own opens the configuration screen.
+`/B` prints a two-row boot summary: a heading, and then a line of values for
+both devices in the BLASTER style. It then exits. It does not write the mixer,
+CMOS, the environment, or `AUTOEXEC.BAT`. `/T` puts the tree connector of the
+Toka-DOS boot screen in front of that summary. `/T` has an effect only with
+`/B`. `SNDCTRL /T` alone opens the configuration screen.
 
-Applying a change moves both devices live, without a reboot, then saves the
-assignment in CMOS, updates `BLASTER` in the current environment, and rewrites
-the `SET BLASTER` line in `C:\AUTOEXEC.BAT`. This is the same in the
-full-screen display and on the command line.
+A change moves both devices immediately, without a restart. SNDCTRL then saves
+the assignment in CMOS, changes `BLASTER` in the current environment, and
+writes the `SET BLASTER` line in `C:\AUTOEXEC.BAT` again. The full-screen
+display and the command line do the same operations.
 
 The Sound Blaster and the Windows Sound System codec cannot share an IRQ line
-or a DMA channel. The full-screen lists omit whatever the other device holds.
-The command line refuses such a combination and writes nothing.
+or a DMA channel. The full-screen lists do not show the resources that the
+other device holds. The command line refuses such a combination, and writes
+nothing.
 
-The usual reason to run this utility is a game that hardwires an IRQ instead of
-reading `BLASTER`. The card ships on IRQ 7 because that is what such games
-almost always assume, but a few require IRQ 5. See
-[Why the Sound Blaster sits on IRQ 7](../resonique2/manual.md#why-the-sound-blaster-sits-on-irq-7).
+The usual reason to run this utility is a game with a fixed IRQ in its code,
+which does not read `BLASTER`. The card uses IRQ 7 because almost all such
+games expect IRQ 7. But some of them need IRQ 5. See
+[Why the Sound Blaster uses IRQ 7](../resonique2/manual.md#why-the-sound-blaster-uses-irq-7).
 
 ## SNDMIXER
 
-Sets the volume levels on the [ReSonique 2](../resonique2/manual.md) card's
-mixer. The full-screen display presents seven vertical faders, one per source.
+SNDMIXER sets the volume levels on the mixer of the
+[ReSonique II](../resonique2/manual.md) card. The full-screen display has seven
+vertical faders, one for each source.
 
 ```
 SNDMIXER                full-screen mixer
@@ -448,118 +464,125 @@ SNDMIXER /S             suppress all output
 SNDMIXER /?             usage
 ```
 
-Tab and the arrow keys select a fader, Up and Down move it, Home and End send it
-to the top and the bottom of its travel, and the digit keys set a level directly.
-The bottom is a mute on the six faders that attenuate, and 0 dB — no gain — on
-`AMP`, which amplifies. Each level is applied to the hardware as it is set.
+Tab and the arrow keys select a fader. Up and Down move the fader. Home and
+End move it to the top and to the bottom of its travel. The digit keys set a
+level directly. On the six faders that decrease the level, the bottom is a
+mute. On `AMP`, which increases the level, the bottom is 0 dB, which is no
+gain. SNDMIXER writes each level to the hardware immediately.
 
-Two buttons sit along the bottom of the box, after the seven faders on the same
-Tab ring. **Accept** leaves the mixer with the levels that were set still in
-effect and prints `Settings applied.` **Cancel** restores the levels that were
-in effect when the mixer was opened, which is what **Esc** has always done.
-**Enter** or **Space** presses whichever button holds the selection, and does
-nothing while a fader holds it. **F10** saves the levels to `C:\VOLCONF.CFG`
-and exits; it is the only key that writes a file.
+Two buttons are at the bottom of the box, after the seven faders in the same
+Tab sequence:
 
-Each step is 4 dB. The card's own volume registers are 2 dB per step over a
-62 dB range, so ten fader positions spread evenly over the register values would
-place seven of them within the top 12 dB. Ten even 4 dB steps instead give ten
-distinguishable positions, with 10 the level the card powers on at and 0 a mute.
+- **Accept** closes the mixer and keeps the new levels. It prints
+  `Settings applied.`
+- **Cancel** sets the levels that were in effect when the mixer opened.
+  **Esc** does the same.
+- **Enter** or **Space** operates the selected button. It does nothing when a
+  fader is selected.
+- **F10** saves the levels to `C:\VOLCONF.CFG` and exits. It is the only key
+  that writes a file.
 
-The PC-speaker fader has four positions rather than ten, because the card gives
-that input two bits and not five. A value between two positions rounds up to the
-next one, so a low setting does not become silence.
+Each step is 4 dB. The volume registers of the card have 2 dB for each step,
+over a range of 62 dB. Ten fader positions at equal distances in the register
+range would put seven of them in the top 12 dB. Ten steps of 4 dB give ten
+positions that a listener can hear apart. Position 10 is the power-on level of
+the card, and position 0 is a mute.
 
-`AMP` is the card's output gain (mixer registers `0x41` and `0x42`), and it is
-the one fader that adds level instead of removing it. It has the same four
-positions as the PC speaker, for the same reason — the register is two bits
-wide — but they run upwards: step 0 is 0 dB, step 3 is +6 dB, step 7 is +12 dB
-and step 10 is +18 dB. Step 0 is the power-on setting and is not a mute; it is
-the amplifier turned off. A value between two positions rounds up, as the PC
-speaker's does.
+The PC-speaker fader has four positions, and not ten, because the card gives
+that input two bits and not five. A value between two positions goes up to the
+next position. Thus a low setting does not become silence.
 
-Gain above 0 dB can clip. The mix reserves 6 dB of headroom after the mixer,
-enough to absorb one leg driven to full scale, and step 3 spends it. Steps 7 and
-10 are past it, and a hot source will distort. The card offers those positions,
-so this fader offers them; raising the output gain is a choice, the same choice
-the hardware gives. To make a quiet game louder, try `AMP` after `MASTER` is
-already at 10, not before.
+`AMP` is the output gain of the card (mixer registers `0x41` and `0x42`). It
+is the one fader that adds level. It has the same four positions as the PC
+speaker, because that register is also two bits wide. But its positions
+increase the level: step 0 is 0 dB, step 3 is +6 dB, step 7 is +12 dB, and
+step 10 is +18 dB. Step 0 is the power-on setting. It is not a mute. It is the
+amplifier with no gain. A value between two positions goes up, as it does on
+the PC speaker.
 
-A MIDI level of 0 writes the wavetable mute bit rather than a level of zero. The
-card treats a level of zero on the wavetable as the quietest audible step, not
-as silence, because no other control in the machine reaches that leg. A program
-that cleared the mixer's registers would otherwise silence MIDI for the rest of
-the session with no indication on screen of the cause.
+**Warning:** gain above 0 dB can clip the signal. The mix keeps 6 dB of
+headroom after the mixer, which is sufficient for one leg at full scale. Step
+3 uses that headroom. Steps 7 and 10 are more than the headroom, and a loud
+source will distort. The card has these positions, thus the fader has them.
+To make a quiet game louder, use `AMP` after `MASTER` is at 10.
 
-`WAVE` sets both digital-audio paths together, the Sound Blaster DSP and the
-Windows Sound System codec. No program uses both at once, and they carry the
-same class of audio.
+A MIDI level of 0 writes the wavetable mute bit. It does not write a level of
+zero. On the wavetable, the card makes a level of zero the quietest audible
+step, and not silence. No other control in the machine reaches that leg.
+Without this behavior, a program that cleared the mixer registers would make
+MIDI silent for the remainder of the session, with no cause on the screen.
 
-Levels are saved to a file with `/CFG`, and the default `AUTOEXEC.BAT` restores
-them on the next boot:
+`WAVE` sets the two digital-audio paths together: the Sound Blaster DSP and
+the Windows Sound System codec. No program uses both at the same time, and
+they carry the same class of audio.
+
+`/CFG` saves the levels to a file. The default `AUTOEXEC.BAT` sets them again
+at the next boot:
 
 ```
 SNDMIXER /CFG C:\VOLCONF.CFG /S
 ```
 
-`/CFG` on its own reads the file and writes the card. `/CFG` together with any
-channel switch applies the switches and then writes them into the file. `/S`
-suppresses all output, which keeps the boot screen clear, and it may appear
-anywhere on the command line.
+`/CFG` alone reads the file and writes to the card. `/CFG` with a channel
+switch applies the switches, and then writes them into the file. `/S` stops
+all output, which keeps the boot screen clear. `/S` can be at any position on
+the command line.
 
-F10 in the full-screen mixer always saves to `C:\VOLCONF.CFG`, the file the
-boot line reads. `/CFG` is the boot-restore form and does not open the mixer,
-so to keep levels in some other file use the command-line form:
-`SNDMIXER /M 8 /F 6 /CFG C:\GAMES\QUIET.CFG`.
+F10 in the full-screen mixer always saves to `C:\VOLCONF.CFG`, which is the
+file that the boot line reads. `/CFG` is the boot-restore form, and it does
+not open the mixer. To keep the levels in a different file, use the
+command-line form: `SNDMIXER /M 8 /F 6 /CFG C:\GAMES\QUIET.CFG`.
 
-The file is plain text and may be edited with `TYPE` or TOKAEDIT. Lines are
-`CHANNEL=step`, with the channel one of `MASTER`, `FMSYNTH`, `WAVE`, `CD`,
-`MIDI`, `SPEAKER` or `AMP`. Spaces around the `=` are permitted, `;` and `#`
-start a comment, and a line the parser does not recognise is skipped rather than
-refused. A channel the file leaves out keeps whatever level the card is holding.
+The file is plain text. You can read it with `TYPE`, and you can change it
+with the `EDIT` editor. Each line has the form `CHANNEL=step`. The channel is
+`MASTER`, `FMSYNTH`, `WAVE`, `CD`, `MIDI`, `SPEAKER`, or `AMP`. Spaces around
+the `=` are permitted. A `;` or a `#` starts a comment. The parser ignores a
+line that it does not recognize, and does not refuse the file. A channel that
+the file does not name keeps its current level.
 
-The default file is in the root of `C:` rather than in `C:\DOS`, because `C:` is
-not always the Toka-DOS image. When IzarraVM is pointed at a folder of games,
-that folder becomes `C:` and contains no `DOS` directory. A save into a
-directory that does not exist fails. The root of a mounted drive always exists.
+The default file is in the root of `C:`, and not in `C:\DOS`, because `C:` is
+not always the Toka-DOS image. If you give IzarraVM a folder of games, that
+folder becomes `C:` and has no `DOS` directory. A save into a directory that
+does not exist fails. The root of a mounted drive always exists.
 
 ## TOKAMOUS
 
-General Simulation Works's PS/2 mouse driver: a terminate-and-stay-resident
-program implementing the standard `INT 33h` mouse API (Microsoft Mouse
-compatible, plus the CuteMouse wheel extension).
+TOKAMOUS is the General Simulation Works PS/2 mouse driver. It is a
+terminate-and-stay-resident (TSR) program. It supplies the standard `INT 33h`
+mouse interface, which is Microsoft Mouse compatible. It also supplies the
+CuteMouse wheel extension.
 
 ```
 TOKAMOUS [/T]
 ```
 
-It installs itself and returns to the prompt, or is loaded from
-`AUTOEXEC.BAT` with `LH TOKAMOUS` to load high into a
-[TOKAEMM](../tokaemm/manual.md) upper memory block when one is free. Once
-resident, it prints:
+The driver installs itself and returns to the prompt. `AUTOEXEC.BAT` loads it
+with `LH TOKAMOUS`, which puts it in a [TOKAEMM](../tokaemm/manual.md) upper
+memory block when one is free. After the installation, it prints:
 
 ```
 Toka-DOS mouse driver installed.
 ```
 
-and any mouse-aware DOS program talks to it through `INT 33h` from then on:
-cursor show/hide, position and button state, motion callbacks, and the
-wheel functions software checks for via CuteMouse's `AX=0x11` detection.
+A DOS program then uses `INT 33h` to reach the driver. The functions include
+show and hide of the cursor, the position and the button state, the motion
+callbacks, and the wheel functions. Software finds the wheel functions with
+the CuteMouse `AX=0x11` detection call.
 
-`/T` (or `-T`) prefixes the signon line with the tree-styled connector used
-by the Toka-DOS boot screen instead:
+`/T` (or `-T`) puts the tree connector of the Toka-DOS boot screen in front of
+the sign-on line:
 
 ```
 ├─> Toka-DOS mouse driver installed.
 ```
 
-Off by default.
+It is off by default.
 
 ## Next
 
-- [Using Toka-DOS](using-toka-dos.md): the shell, the disk layout, and what
-  boots by default.
-- [The TOKAEMM manual](../tokaemm/manual.md): the memory manager these
-  commands and the shell run on top of.
-- [Toka-DOS licensing](licensing.md): which of these commands came from
-  FreeDOS, and under what terms.
+- [How to use Toka-DOS](using-toka-dos.md): the shell, the disk layout, and
+  the default boot.
+- [The TOKAEMM manual](../tokaemm/manual.md): the memory manager below these
+  commands and the shell.
+- [Toka-DOS licensing](licensing.md): the commands that come from FreeDOS, and
+  their license terms.

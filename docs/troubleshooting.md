@@ -1,92 +1,99 @@
 <!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 
-# Troubleshooting & FAQ
+# Troubleshooting and FAQ
 
-## The machine is slow / a game feels sluggish
+## The machine is slow, or a game is slow
 
-Most games run at full speed, including in the top GSW-586 mode. Two causes
-should be separated before assuming a defect. The Izarra 3000 is a 166 MHz
-Pentium-class machine, so software that required more than that in period still
-requires more than that here. Demanding 3D at high resolutions and frame rates,
-and late titles that recommended a Pentium II or higher, are outside the
-machine's capability. If a game instead runs poorly on hardware sufficient for
-it, the cause is usually timing rather than throughput, since software written
-for a slower machine can misbehave on a faster one. Try the following:
+Most games run at full speed, also in the top GSW-586 mode. Before you report
+a defect, separate the two causes below.
 
-- **A slower CPU mode.** `GSWMODE 486` or `GSWMODE 386` from the DOS prompt
-  (see the [command
-  reference](toka-dos/commands.md#gswmode)) can produce steadier timing than
-  `586` for software that was tuned against a real 486-class machine and
-  misbehaves on a faster one. You can also set the boot-time
-  default from the [Tab boot menu](izarra-3000/user-manual.md#the-tab-boot-menu)
-  or the [Del setup panel](izbios/configuration-panel.md#cpu-mode).
-- Check whether the game is CPU-bound versus waiting on the emulated
-  hardware. See the [VGA core](vga-core/README.md#limitations) and [VEGA
-  technical reference, section 9](vega/vega-technical-reference.md#9-timing-and-fidelity)
-  for where the video timing model is and isn't cycle-exact.
+The Izarra3000 is a 166 MHz Pentium-class machine. Software that needed more
+than that in the period also needs more than that here. 3D at a high
+resolution and a high frame rate is more than the machine can do. A late game
+that recommended a Pentium II or a faster CPU is also more than the machine
+can do.
 
-## An old program hangs or behaves oddly while waiting for a key
+A game can also run badly on hardware that is sufficient for it. The cause is
+then usually the timing, and not the speed, because software for a slower
+machine can operate incorrectly on a faster machine. Do these steps:
 
-IzarraVM's BIOS halts the CPU when a program asks for a keystroke and none is
-ready, rather than spinning. That is invisible to almost everything, since a
-keypress wakes it immediately, but a program that masks the timer and keyboard
-interrupts before waiting, or that expects time to pass smoothly during the
-wait, can notice.
+- **Select a slower CPU mode.** Run `GSWMODE 486` or `GSWMODE 386` at the DOS
+  prompt. See the [command reference](toka-dos/commands.md#gswmode). Software
+  for a real 486-class machine can have more constant timing at these speeds
+  than at `586`. You can also set the boot-time default from the
+  [Tab boot menu](izarra-3000/user-manual.md#the-tab-boot-menu) or the
+  [Del setup panel](izbios/configuration-panel.md#cpu-mode).
+- **Find the limit.** The CPU can limit the game, or the game can wait for the
+  emulated hardware. See the [VGA core](vga-core/README.md#limitations) and
+  [VEGA technical reference, section 9](vega/vega-technical-reference.md#9-timing-and-fidelity).
+  They give the parts of the video timing model that are cycle-exact, and the
+  parts that are not.
 
-Run `UNHALT` before the program (see the [command
-reference](toka-dos/commands.md#unhalt)) to put the BIOS back to spinning, and
-`UNHALT /H` to restore the default. Toka-DOS's own idle halt is separate:
-`IDLEHALT=0` in `CONFIG.SYS` turns that one off.
+## An old program stops or operates incorrectly while it waits for a key
 
-## A game doesn't detect my sound card
+A program can ask for a keystroke when no keystroke is available. The IzarraVM
+BIOS then halts the CPU, and does not use a loop. Almost no program detects
+this, because a keypress starts the CPU immediately. But two types of program
+can detect it. The first type masks the timer interrupt and the keyboard
+interrupt before the wait. The second type expects the time to increase
+smoothly during the wait.
 
-Check what the game is probing for against the [ReSonique 2
-manual](resonique2/manual.md):
+Run `UNHALT` before the program to make the BIOS use a loop again. See the
+[command reference](toka-dos/commands.md#unhalt). Run `UNHALT /H` to set the
+default again. The idle halt of Toka-DOS is a different function.
+`IDLEHALT=0` in `CONFIG.SYS` stops that one.
 
-- **Digital audio / Sound Blaster**: should auto-detect via the `BLASTER`
-  environment variable Toka-DOS sets in `AUTOEXEC.BAT`. If a game insists on
-  manual configuration, use base `220`, IRQ `7`, 8-bit DMA `1`, 16-bit DMA
-  `5`. Run `SNDCTRL /S` at the prompt to confirm the card's current setting.
-- **FM music**: use the AdLib or OPL2/OPL3 option at port `388` if the game
-  offers a choice. This is fully modeled.
-- **Too loud, too quiet, or the music drowning the effects**: run `SNDMIXER`.
-  It provides a fader per source (music, digital audio, CD, MIDI, PC speaker),
-  and the levels are saved between sessions. If everything is quiet with MASTER
-  already at 10, the `AMP` fader adds output gain in 6 dB positions — at the
-  cost of headroom, so a loud game may then distort.
+## A game does not detect the sound card
+
+Compare the device that the game looks for with the
+[ReSonique II manual](resonique2/manual.md):
+
+- **Digital audio / Sound Blaster**: the game must find the card from the
+  `BLASTER` environment variable that Toka-DOS sets in `AUTOEXEC.BAT`. If a
+  game needs manual values, use base `220`, IRQ `7`, 8-bit DMA `1`, and 16-bit
+  DMA `5`. Run `SNDCTRL /S` at the prompt to see the current values of the
+  card.
+- **FM music**: select the AdLib or OPL2/OPL3 option at port `388`, if the
+  game gives a choice. IzarraVM emulates this hardware fully.
+- **The sound is too loud or too quiet, or the music is louder than the
+  effects**: run `SNDMIXER`. It has a fader for each source: music, digital
+  audio, CD, MIDI, and PC speaker. It keeps the levels between sessions. If
+  the sound stays quiet with MASTER at 10, the `AMP` fader adds output gain in
+  steps of 6 dB. That gain uses the headroom, thus a loud game can then
+  distort.
 - **General MIDI / wavetable**: select MPU-401 output at port `300`. Toka-DOS
-  advertises it as `P300` in `BLASTER`. This represents a daughterboard fitted
-  to the ReSonique 2's internal pin headers, which IzarraVM emulates through
+  gives this port as `P300` in `BLASTER`. This port is a daughterboard on the
+  internal pin headers of the ReSonique II, and IzarraVM emulates it with
   FluidSynth.
 - **External MIDI / MT-32**: select MPU-401 output at port `330`. This is the
-  Izarra 3000's rear MPU-401/gameport. In Settings, choose Munt as an emulator
-  convenience or select the exact host destination connected to the receiver's
-  MIDI IN side. See the [ReSonique 2 manual](resonique2/manual.md#midi-and-wavetable),
-  and the recipes for [using your own MIDI
-  player](recipes/host-midi-player.md) and [MT-32
-  ROMs](recipes/mt32-roms.md).
+  rear MPU-401/gameport of the Izarra3000. In Settings, select Munt, or select
+  the exact host destination on the MIDI IN side of the receiver. See the
+  [ReSonique II manual](resonique2/manual.md#midi-and-wavetable), and the
+  recipes for [your own MIDI player](recipes/host-midi-player.md) and for
+  [MT-32 ROMs](recipes/mt32-roms.md).
 
-### The game finds the card but plays a short click, then silence
+### The game finds the card, but it plays a short click and then silence
 
-This is the behaviour of a game that hardwires an IRQ rather than reading
-`BLASTER`. Its interrupt handler is on a line the card is not using, so nothing
-re-arms the DSP after the first DMA block finishes.
+This is the behavior of a game with a fixed IRQ in its code, which does not
+read `BLASTER`. Its interrupt handler is on a line that the card does not use.
+Thus nothing sets the DSP again after the first DMA block.
 
-The card ships on IRQ 7 because that is what such games nearly always assume,
-but a few require IRQ 5. Change the assignment and try again:
+The card uses IRQ 7, because almost all such games expect IRQ 7. But some of
+them need IRQ 5. Change the value and try again:
 
 ```
 SNDCTRL /SBIRQ:5
 ```
 
-The change takes effect immediately and is remembered across reboots. See
-[Changing the card's resources](resonique2/manual.md#changing-the-cards-resources)
+The change has an effect immediately, and the machine keeps it after a
+restart. See
+[How to change the card resources](resonique2/manual.md#how-to-change-the-card-resources)
 for the full-screen version and the other resources.
 
 ### Which ROM files does Munt need?
 
-Choose one control ROM and the PCM ROM from the same row:
+Select one control ROM and the PCM ROM from the same row:
 
 | Module | Control ROM | PCM ROM |
 | --- | --- | --- |
@@ -95,122 +102,129 @@ Choose one control ROM and the PCM ROM from the same row:
 | CM-32L | `ctrl_cm32l_1_00.rom` or `ctrl_cm32l_1_02.rom` | `pcm_cm32l.rom` |
 | CM-32LN | `ctrl_cm32ln_1_00.rom` | `pcm_cm32l.rom` |
 
-Settings accepts arbitrary control and PCM paths, so the archive filenames can
-be selected directly. For automatic discovery, copy and rename an MT-32 pair
-to `~/.izarravm/MT32_CONTROL.ROM` and `~/.izarravm/MT32_PCM.ROM`. Copy and
-rename a CM-32L or CM-32LN pair to `~/.izarravm/CM32L_CONTROL.ROM` and
-`~/.izarravm/CM32L_PCM.ROM`. Discovery is ASCII case-insensitive and is disabled
-under `--portable`; paths selected in Settings still work. The source names in
-the table match the `mt32pi` directory in the [Roland MT-32 ROMs
-archive](https://archive.org/details/Roland-MT-32-ROMs).
+The Settings window accepts any control path and any PCM path. Thus you can
+select the archive file names directly.
 
-## A 3D-accelerated game doesn't detect Distira
+For automatic discovery, copy an MT-32 pair and give the copies the names
+`~/.izarravm/MT32_CONTROL.ROM` and `~/.izarravm/MT32_PCM.ROM`. For a CM-32L or
+a CM-32LN pair, use the names `~/.izarravm/CM32L_CONTROL.ROM` and
+`~/.izarravm/CM32L_PCM.ROM`. The discovery ignores the letter case of ASCII
+characters. `--portable` disables the discovery, but a path in the Settings
+window continues to operate. The names in the table are the names in the
+`mt32pi` directory of the
+[Roland MT-32 ROMs archive](https://archive.org/details/Roland-MT-32-ROMs).
 
-Distira supports both DOS Glide linking models. A static build contains Glide
-inside the executable and needs no OVL; the original Voodoo Graphics Tomb
-Raider executable is verified this way. Many dynamic builds already include a
-compatible `GLIDE2X.OVL` beside the game. That game-local copy takes priority.
+## A 3D game does not detect Distira
 
-Make sure you are running the game's Voodoo Graphics build. For a dynamic
-build without its own OVL, place a compatible Voodoo Graphics file at
-`~/.izarravm/GLIDE2X.OVL`. The file-name check is ASCII case-insensitive.
-IzarraVM exposes it through `C:\DOS`, after the game's current directory in the
-normal DOS search order. When neither copy exists, IzarraVM does not inject a
-replacement or diagnostic OVL. A
+Distira supports both DOS Glide link models. A static build holds Glide in the
+executable and needs no OVL file. The original Voodoo Graphics executable of
+Tomb Raider is verified in this way. Many dynamic builds include a compatible
+`GLIDE2X.OVL` beside the game, and that local copy has priority.
+
+First, make sure that you run the Voodoo Graphics build of the game. For a
+dynamic build with no OVL file, put a compatible Voodoo Graphics file at
+`~/.izarravm/GLIDE2X.OVL`. The file-name check ignores the letter case of
+ASCII characters. IzarraVM makes the file available through `C:\DOS`, after
+the current directory of the game in the normal DOS search order. If neither
+copy exists, IzarraVM supplies no replacement OVL and no diagnostic OVL. A
 [3DBVoodoo2 driver-disc image](https://archive.org/details/3-dbvoodoo-2_202302)
-is archived for reference.
+is in an archive, for reference.
 
-IzarraVM neither downloads nor redistributes ROMs, Glide drivers, or game data.
-Archive item metadata is not a license. Use these files only when you have the
-lawful right to do so. See [VEGA technical reference, section
-10](vega/vega-technical-reference.md#10-distira-3d) for the emulated hardware
-contract.
+IzarraVM does not download ROMs, Glide drivers, or game data, and it does not
+distribute them. The metadata of an archive item is not a license. Use these
+files only if you have the legal right to use them. See
+[VEGA technical reference, section 10](vega/vega-technical-reference.md#10-distira-3d)
+for the contract of the emulated hardware.
 
-## Where are my files stored?
+## Where does IzarraVM keep the files?
 
-By default, everything IzarraVM writes (the C: drive contents, `cmos.bin`,
-and `izarravm.conf`) lives under `~/.izarravm`, not next to the executable
-or in your current directory. Pass `--portable` at launch to keep them
-beside the executable instead. See the [IzarraVM GUI
-guide](izarravm-gui/guide.md#where-files-live) for the full breakdown.
+By default, IzarraVM writes all of its files in `~/.izarravm`. These files are
+the contents of the C: drive, `cmos.bin`, and `izarravm.conf`. It does not
+write them beside the executable or in the current directory. Use
+`--portable` at the start to keep them beside the executable. See the
+[IzarraVM GUI guide](izarravm-gui/guide.md#where-the-files-are) for the full
+list.
 
-## My settings (keyboard layout, CPU mode) didn't stick
+## The settings (keyboard layout, CPU mode) were not saved
 
-Only **Save and Exit** from the [Del setup panel](izbios/configuration-panel.md)
-commits keyboard layout and CPU mode to CMOS. **Discard and Exit**, and
-pressing Esc from the main setup menu, both throw changes away on purpose.
-The [Tab boot menu](izarra-3000/user-manual.md#the-tab-boot-menu)'s Accept
-also saves the CPU mode and primary boot device independently. If you only
-used Tab, your keyboard layout choice (which only the Del panel edits)
-wasn't touched either way.
+Only **Save and Exit** in the
+[Del setup panel](izbios/configuration-panel.md) writes the keyboard layout
+and the CPU mode to CMOS. **Discard and Exit** discards the changes, and Esc
+on the main setup menu does the same. The Accept row of the
+[Tab boot menu](izarra-3000/user-manual.md#the-tab-boot-menu) saves the CPU
+mode and the primary boot device, independently of the panel. If you used only
+the Tab menu, the keyboard layout did not change, because only the Del panel
+edits the layout.
 
-## Toka-DOS won't boot / COMMAND.COM is missing
+## Toka-DOS does not boot, or COMMAND.COM is absent
 
-Use **Repair Toka-DOS** from the [Del setup panel](izbios/configuration-panel.md#repair-toka-dos).
-It reinstalls the Toka-DOS system files from the copy built into ROM,
-backing up your `CONFIG.SYS` and `AUTOEXEC.BAT` to `.OLD` files first rather
-than silently overwriting them. Anything else on your C: drive is left
-alone.
+Use **Repair Toka-DOS** in the
+[Del setup panel](izbios/configuration-panel.md#repair-toka-dos). It installs
+the Toka-DOS system files again, from the copy in the ROM. First it changes
+the names of your `CONFIG.SYS` and `AUTOEXEC.BAT` to `.OLD` files, and thus it
+does not write over them. It does not change the other files on your C: drive.
 
-You can also hold **F5** while the message
+You can also start the machine with neither startup file. Hold **F5** while
+this message is on the screen, for approximately two seconds:
 
 ```
 Press F8 to trace or F5 to skip CONFIG.SYS/AUTOEXEC.BAT
 ```
 
-is on screen, for about two seconds, to boot with neither file processed. That
-is the quickest way back in when a line you added to `CONFIG.SYS` stops the
-machine booting. **F8** steps through `CONFIG.SYS` one line at a time instead,
-asking about each.
+This is the fastest method when a line that you added to `CONFIG.SYS` stops
+the boot. **F8** processes `CONFIG.SYS` one line at a time, and asks about
+each line.
 
-Because F5 skips `AUTOEXEC.BAT` too, `PATH` is not set, so DOS tools need their
-full path: `C:\DOS\EDIT.COM CONFIG.SYS` rather than `EDIT CONFIG.SYS`.
+F5 also skips `AUTOEXEC.BAT`, thus `PATH` is not set. Give the full path of a
+DOS tool: `C:\DOS\EDIT.COM CONFIG.SYS`, and not `EDIT CONFIG.SYS`.
 
-## Where's the Distira / 3D programmer's guide?
+## Where is the Distira 3D programmer's guide?
 
-Not written yet. The [VEGA programmer's guide](vega/vega-programmers-guide.md)
-currently covers Margo (2D) only, and says so up front. The [technical
-reference's Distira section](vega/vega-technical-reference.md#10-distira-3d)
-is the current source of truth for what the 3D hardware answers.
+It does not exist yet. The
+[VEGA programmer's guide](vega/vega-programmers-guide.md) covers Margo (2D)
+only, and its first section says so. The
+[Distira section of the technical reference](vega/vega-technical-reference.md#10-distira-3d)
+is the authority on the answers of the 3D hardware.
 
-## Tracing a guest's `INT n` calls to a driver (development builds)
+## How to trace the `INT n` calls of a guest (development builds)
 
-This is a developer diagnostic, not something most players need. Like the
-`IZARRAVM_WATCH_WRITE` store watchpoint, it is compiled out of the default
-build, so a normal `cargo build` or release binary pays nothing for it.
-Build with the `int-trace` feature and set `IZARRAVM_INT_TRACE` to the
-vectors you want, in hex, comma separated:
+This is a developer diagnostic. Most players do not need it. The default build
+does not include it, as it does not include the `IZARRAVM_WATCH_WRITE` store
+watchpoint. Thus a normal `cargo build` and a release binary have no cost from
+it. Build with the `int-trace` feature. Then set `IZARRAVM_INT_TRACE` to the
+vectors that you want, in hexadecimal, separated by commas:
 
 ```
 cargo build --release -j8 -p izarravm --features int-trace
 IZARRAVM_INT_TRACE=67,21 ./target/release/izarravm --hdd-folder <path> --cpu gsw586 2>trace.log
 ```
 
-Every traced `INT n` prints its arguments -- the register file at the moment
-of the call -- as soon as it fires, then a `  -> ` line with the handler's
-answer once execution returns to the instruction after it. Read both halves:
-the arguments alone show only that a driver was called, not whether it
-answered correctly. This is how the TOKAEMM
-shared-pool defect was found. The arguments into `INT 67h` looked fine; the
-handler's answer carried `AH=88h`, where a reference EMM manager returns
-success.
+Each traced `INT n` prints its arguments immediately. The arguments are the
+register file at the moment of the call. When execution returns to the
+instruction after the `INT`, the trace prints a `  -> ` line with the answer
+of the handler. Read both halves. The arguments show only that a program
+called a driver. They do not show a correct answer.
 
-Two things to know before reading a log. The trace goes to stderr and runs
-to thousands of lines a second on a busy vector, so redirect it to a file as
-above rather than watching a console. And the address after `ret=` is the
-*return* site -- the instruction following the `INT`, not the `INT` itself --
-because that is what the answer half matches on, so subtract the
-instruction's length to find the call in a disassembly.
+This method found the TOKAEMM shared-pool defect. The arguments into `INT 67h`
+were correct. But the answer of the handler had `AH=88h`, and a reference EMM
+manager returns success.
 
-Only one call is outstanding at a time. A handler that issues its own traced
-`INT` takes over the pending slot, and the outer call's `  -> ` line never
-appears: `INT 21h` opening a file calls `INT 13h`, and the example above
-traces vectors that nest like that in real guests. A traced `INT` with no
-answer under it means the call nested or the handler never returned, not
-that the handler answered with nothing.
+Read these two notes before you read a log. First, the trace goes to stderr,
+and it can write thousands of lines each second on a busy vector. Send it to a
+file, as above, and do not watch it on a console. Second, the address after
+`ret=` is the return address. It is the instruction after the `INT`, and not
+the `INT` itself. The answer half of the trace uses that address. To find the
+call in a disassembly, subtract the length of the instruction.
+
+The trace holds one call at a time. If a handler makes its own traced `INT`,
+that call takes the slot, and the `  -> ` line of the first call does not
+appear. For example, `INT 21h` calls `INT 13h` when it opens a file, and the
+example above traces vectors that nest in this way. Thus a traced `INT` with
+no answer below it means one of two things: the call nested, or the handler
+did not return. It does not mean that the handler gave an empty answer.
 
 ## Next
 
-- [Izarra 3000 user manual](izarra-3000/user-manual.md)
-- [Using Toka-DOS](toka-dos/using-toka-dos.md)
+- [Izarra3000 user manual](izarra-3000/user-manual.md)
+- [How to use Toka-DOS](toka-dos/using-toka-dos.md)
 - [IzarraVM GUI guide](izarravm-gui/guide.md)

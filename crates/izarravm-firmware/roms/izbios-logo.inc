@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; izbios-logo.inc - the red "Izarra 3000" wordmark as a 1-bpp bitmap. Generated
+; izbios-logo.inc - the red "Izarra3000" wordmark as a 1-bpp bitmap. Generated
 ; from a block-cell font; do not edit by hand. Rows are packed MSB-first,
 ; LOGO_STRIDE bytes per row (defined in izbios-defs.inc so izbios-gfx.inc can
 ; reference the geometry before this data is emitted), top to bottom.
