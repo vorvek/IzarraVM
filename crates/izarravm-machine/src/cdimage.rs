@@ -259,7 +259,13 @@ impl CdImage {
             .first()
             .map(|(_name, file_type)| file_type.clone())
             .unwrap_or(CueFileType::Binary);
-        Self::build(tracks, &[bin.as_slice()], &[file_type])
+        Self::build(
+            tracks,
+            &[BuildFile {
+                bytes: bin.as_slice(),
+                file_type,
+            }],
+        )
     }
 
     /// Mount from a CUE sheet and the files it names. Each FILE opens a new
@@ -290,23 +296,28 @@ impl CdImage {
         // Resolve each FILE the sheet names to the bytes the caller supplied,
         // in sheet order. Borrowed slices, not owned copies: names are now
         // unique per section (checked above), so this is one lookup per file.
-        let mut file_bytes: Vec<&[u8]> = Vec::with_capacity(files_in_sheet.len());
-        let mut file_types: Vec<CueFileType> = Vec::with_capacity(files_in_sheet.len());
+        // What the sheet said about a file and what backs it are pushed as one
+        // value, so they cannot fall out of step on the way in.
+        let mut build_files: Vec<BuildFile<'_>> = Vec::with_capacity(files_in_sheet.len());
         for (name, file_type) in &files_in_sheet {
             let found = files
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
-            file_bytes.push(found.1.as_slice());
-            file_types.push(file_type.clone());
+            build_files.push(BuildFile {
+                bytes: found.1.as_slice(),
+                file_type: file_type.clone(),
+            });
         }
-        Self::build(tracks, &file_bytes, &file_types)
+        Self::build(tracks, &build_files)
     }
 
-    /// Shared track-table construction for both CUE entry points. `file_bytes`
-    /// is indexed by each track's `file_index`; `from_cue` stamps every track
-    /// to index 0 against its single-element slice before calling in, so this
-    /// function never needs to know which entry point built its input.
+    /// Shared track-table construction for both CUE entry points. `files` holds
+    /// one [`BuildFile`] per FILE the sheet named, in sheet order, so it is
+    /// indexed by each track's `file_index`; each entry carries that file's
+    /// bytes and its declared type token together. `from_cue` stamps every
+    /// track to index 0 against its single-element slice before calling in, so
+    /// this function never needs to know which entry point built its input.
     ///
     /// The INDEX addresses give each track's start in sectors (frames), so a
     /// track's sector count is the delta to the next track's start *within the
@@ -327,28 +338,24 @@ impl CdImage {
     /// erroring); a sheet that violates this, within one file, mounts with a
     /// track table and `total_sectors` that no longer match the on-disc
     /// reality.
-    fn build(
-        tracks_in: Vec<CueTrack>,
-        file_bytes: &[&[u8]],
-        file_types: &[CueFileType],
-    ) -> Result<Self, String> {
+    fn build(tracks_in: Vec<CueTrack>, files: &[BuildFile<'_>]) -> Result<Self, String> {
         if tracks_in.is_empty() {
             return Err("CUE sheet declared no tracks".to_string());
         }
-        if file_bytes.is_empty() {
+        if files.is_empty() {
             return Err("CUE sheet declared no FILE".to_string());
         }
 
         // Each file keeps its own byte cursor; `disc_lba` runs across all of them.
         // Size the backing up front: a disc's worth of bytes reallocated a few
         // times during the concatenation is copying nobody needs to pay for.
-        let mut cursors = vec![0usize; file_bytes.len()];
-        let total_bytes = file_bytes.iter().map(|b| b.len()).sum();
+        let mut cursors = vec![0usize; files.len()];
+        let total_bytes = files.iter().map(|f| f.bytes.len()).sum();
         let mut concatenated: Vec<u8> = Vec::with_capacity(total_bytes);
-        let mut file_base = Vec::with_capacity(file_bytes.len());
-        for bytes in file_bytes {
+        let mut file_base = Vec::with_capacity(files.len());
+        for file in files {
             file_base.push(concatenated.len());
-            concatenated.extend_from_slice(bytes);
+            concatenated.extend_from_slice(file.bytes);
         }
 
         let mut tracks = Vec::with_capacity(tracks_in.len());
@@ -356,14 +363,18 @@ impl CdImage {
         for (i, p) in tracks_in.iter().enumerate() {
             let fi = p.file_index;
             // `fi` is always in range here: `from_cue` stamps every track to
-            // index 0 against a one-element `file_bytes`, and
-            // `from_cue_files` builds one `file_bytes` entry per FILE that
-            // `parse_cue` drew `file_index` from, in the same order. This is
-            // a `.get()`-over-index habit, not a live ambiguity -- same as
-            // the bounds check in `read_data_sector`.
-            let bytes = *file_bytes
+            // index 0 against a one-element `files`, and `from_cue_files`
+            // builds one `files` entry per FILE that `parse_cue` drew
+            // `file_index` from, in the same order. This is a
+            // `.get()`-over-index habit, not a live ambiguity -- same as the
+            // bounds check in `read_data_sector`. It is also now the *only*
+            // per-file lookup in this loop: bytes and type token arrive
+            // together, so there is no second `.get()` left to answer a
+            // different question about the same index.
+            let file = files
                 .get(fi)
                 .ok_or_else(|| format!("track {} references an absent FILE", p.number))?;
+            let bytes = file.bytes;
             let raw = p.mode.raw_size();
             // The next track bounds this one only if it shares this file;
             // otherwise this track runs to its own file's end.
@@ -386,8 +397,7 @@ impl CdImage {
             // it describes the byte order of 16-bit samples, and a data track
             // has no samples. Resolving it here, once per track, keeps the read
             // path from having to reach back to the sheet.
-            let byte_swapped =
-                p.mode.is_audio() && file_types.get(fi) == Some(&CueFileType::Motorola);
+            let byte_swapped = p.mode.is_audio() && file.file_type == CueFileType::Motorola;
             tracks.push(Track {
                 number: p.number,
                 mode: p.mode,
@@ -606,6 +616,24 @@ impl CueFileType {
 /// `type_complexity` gate, which CI runs as `-D warnings`. The lint scores the
 /// signature as written, so any name would have satisfied it.
 type CueFile = (String, CueFileType);
+
+/// One FILE the sheet named, paired with the bytes standing behind it.
+///
+/// `build` needs several facts per file -- the bytes, the declared type token,
+/// and more to come as the audio formats land -- and the obvious way to pass
+/// them is one slice per fact, indexed in lockstep by a track's `file_index`.
+/// That shape cannot state its own invariant: nothing makes the slices the same
+/// length, and the two out-of-range readings disagreed in the dangerous
+/// direction. A missing entry in the bytes slice raised an error, while a
+/// missing entry in the type slice read as "not MOTOROLA" -- so a desync would
+/// not have failed the mount, it would have served a big-endian disc as noise
+/// without a complaint. Carrying one slice of *this* means a file's facts are
+/// one value that cannot come apart, and the next per-file fact is a field here
+/// rather than another slice the caller must keep aligned by hand.
+struct BuildFile<'a> {
+    bytes: &'a [u8],
+    file_type: CueFileType,
+}
 
 /// Parse a CUE sheet into its FILE list and track list. Recognizes
 /// `TRACK n MODE1/2048`, `MODE1/2352`, `MODE1/2448`, `MODE2/2048`,
