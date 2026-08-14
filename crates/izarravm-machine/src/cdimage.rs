@@ -142,6 +142,10 @@ pub struct Track {
     pub sectors: u32,
     /// Byte offset of this track's first sector within the backing image.
     pub image_offset: usize,
+    /// This track's 16-bit samples are stored big-endian, because its `FILE`
+    /// line said `MOTOROLA`. Audio tracks only: the byte order of a data
+    /// track's payload is the guest's business, not the drive's.
+    pub byte_swapped: bool,
 }
 
 impl Track {
@@ -192,6 +196,7 @@ impl CdImage {
             start_lba: 0,
             sectors,
             image_offset: 0,
+            byte_swapped: false,
         };
         Ok(Self {
             backing: Backing::Bytes(bytes),
@@ -217,6 +222,7 @@ impl CdImage {
             start_lba: 0,
             sectors: total_sectors,
             image_offset: 0,
+            byte_swapped: false,
         };
         Ok(Self {
             backing: Backing::Folder { meta, extents },
@@ -235,7 +241,12 @@ impl CdImage {
         for track in &mut tracks {
             track.file_index = 0;
         }
-        Self::build(tracks, &[bin.as_slice()])
+        // One BIN and no name to match it against, so the sheet's FILE lines
+        // cannot be trusted to describe it: this entry point is handed bytes
+        // directly by a caller who already decided what they are. BINARY is the
+        // reading that changes nothing, which is the right default for a file
+        // whose declared type may belong to some other FILE line entirely.
+        Self::build(tracks, &[bin.as_slice()], &[CueFileType::Binary])
     }
 
     /// Mount from a CUE sheet and the files it names. Each FILE opens a new
@@ -267,14 +278,16 @@ impl CdImage {
         // in sheet order. Borrowed slices, not owned copies: names are now
         // unique per section (checked above), so this is one lookup per file.
         let mut file_bytes: Vec<&[u8]> = Vec::with_capacity(files_in_sheet.len());
-        for (name, _type) in &files_in_sheet {
+        let mut file_types: Vec<CueFileType> = Vec::with_capacity(files_in_sheet.len());
+        for (name, file_type) in &files_in_sheet {
             let found = files
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
             file_bytes.push(found.1.as_slice());
+            file_types.push(file_type.clone());
         }
-        Self::build(tracks, &file_bytes)
+        Self::build(tracks, &file_bytes, &file_types)
     }
 
     /// Shared track-table construction for both CUE entry points. `file_bytes`
@@ -301,7 +314,11 @@ impl CdImage {
     /// erroring); a sheet that violates this, within one file, mounts with a
     /// track table and `total_sectors` that no longer match the on-disc
     /// reality.
-    fn build(tracks_in: Vec<CueTrack>, file_bytes: &[&[u8]]) -> Result<Self, String> {
+    fn build(
+        tracks_in: Vec<CueTrack>,
+        file_bytes: &[&[u8]],
+        file_types: &[CueFileType],
+    ) -> Result<Self, String> {
         if tracks_in.is_empty() {
             return Err("CUE sheet declared no tracks".to_string());
         }
@@ -352,12 +369,19 @@ impl CdImage {
                 ));
             }
             disc_lba += p.pregap_frames;
+            // MOTOROLA is declared per FILE but only means anything for audio:
+            // it describes the byte order of 16-bit samples, and a data track
+            // has no samples. Resolving it here, once per track, keeps the read
+            // path from having to reach back to the sheet.
+            let byte_swapped =
+                p.mode.is_audio() && file_types.get(fi) == Some(&CueFileType::Motorola);
             tracks.push(Track {
                 number: p.number,
                 mode: p.mode,
                 start_lba: disc_lba,
                 sectors,
                 image_offset: file_base[fi] + cursors[fi],
+                byte_swapped,
             });
             cursors[fi] += span;
             disc_lba += sectors;
@@ -445,6 +469,16 @@ impl CdImage {
         let slice = bytes.get(frame_off..frame_off + RAW_SECTOR)?;
         let mut out = [0u8; RAW_SECTOR];
         out.copy_from_slice(slice);
+        if track.byte_swapped {
+            // Big-endian samples: swap the two bytes of each 16-bit sample. The
+            // stereo pairing is unaffected -- L and R stay where they are, only
+            // each sample's own byte order changes. A Red Book frame is 588
+            // stereo pairs of two 16-bit samples, so 2352 bytes divide into
+            // exactly 1176 whole samples and no partial one can be left over.
+            for sample in out.chunks_exact_mut(2) {
+                sample.swap(0, 1);
+            }
+        }
         Some(out)
     }
 

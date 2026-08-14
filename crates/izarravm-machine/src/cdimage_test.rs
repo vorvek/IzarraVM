@@ -372,6 +372,55 @@ fn cue_recognizes_motorola_as_its_own_type() {
     assert_eq!(files[0].1, CueFileType::Motorola);
 }
 
+#[test]
+fn motorola_audio_track_swaps_each_sample_s_bytes() {
+    // MOTOROLA means big-endian 16-bit samples. The swap is within each sample,
+    // not between the left and right channels: bytes 0,1 are one sample and
+    // come back reversed, while the sample at bytes 2,3 stays the sample at
+    // bytes 2,3.
+    let cue = "FILE \"d.bin\" MOTOROLA\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; RAW_SECTOR];
+    bin[0] = 0x12;
+    bin[1] = 0x34;
+    bin[2] = 0x56;
+    bin[3] = 0x78;
+    let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
+    let frame = img.read_audio_frame(0).unwrap();
+    assert_eq!(&frame[0..4], &[0x34, 0x12, 0x78, 0x56]);
+}
+
+#[test]
+fn binary_audio_track_is_not_swapped() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; RAW_SECTOR];
+    bin[0] = 0x12;
+    bin[1] = 0x34;
+    let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
+    assert_eq!(&img.read_audio_frame(0).unwrap()[0..2], &[0x12, 0x34]);
+}
+
+#[test]
+fn motorola_data_track_payload_is_left_alone() {
+    // The endianness a MOTOROLA line declares is a property of Red Book audio
+    // samples, which the drive hands to a mixer that has to know which byte is
+    // which. A data track has no samples: its payload is a byte stream the
+    // guest interprets, and a drive that reordered those bytes would corrupt
+    // every file on the disc. So the token has to stop at the audio path even
+    // when the same sheet, or the same FILE, declares it.
+    let cue = "FILE \"d.bin\" MOTOROLA\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; DATA_SECTOR];
+    bin[0] = 0x12;
+    bin[1] = 0x34;
+    bin[2] = 0x56;
+    bin[3] = 0x78;
+    let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
+    assert!(!img.tracks()[0].byte_swapped);
+    assert_eq!(
+        &img.read_data_sector(0).unwrap()[0..4],
+        &[0x12, 0x34, 0x56, 0x78]
+    );
+}
+
 /// Build a one-FILE sheet around `file_line` and return the parsed FILE entry.
 /// Every case below needs a TRACK/INDEX pair after the FILE line for the sheet
 /// to be well-formed, and none of them care what that pair says.
