@@ -229,7 +229,7 @@ impl CdImage {
     /// [`CdImage::from_cue_files`] for the common one-file sheet: every track
     /// is bound to `bin` regardless of what the sheet's FILE lines name.
     pub fn from_cue(cue: &str, bin: Vec<u8>) -> Result<Self, String> {
-        let (_names, mut tracks) = parse_cue(cue)?;
+        let (_files, mut tracks) = parse_cue(cue)?;
         // One BIN: every track binds to it regardless of what the sheet's FILE
         // lines name, so flatten every track onto the single file up front.
         for track in &mut tracks {
@@ -243,7 +243,7 @@ impl CdImage {
     /// LBA timeline runs continuously across all of them. A track that is last
     /// in its file runs to that file's end.
     pub fn from_cue_files(cue: &str, files: Vec<(String, Vec<u8>)>) -> Result<Self, String> {
-        let (names, tracks) = parse_cue(cue)?;
+        let (files_in_sheet, tracks) = parse_cue(cue)?;
         // A repeated FILE name is not the "two tracks share one file" layout
         // (that is a single FILE section followed by multiple TRACK/INDEX
         // blocks, and file_index dedupes those naturally). It is a sheet
@@ -254,8 +254,8 @@ impl CdImage {
         // section's own INDEX 01 offset -- a wrong-data mount, not an error.
         // No mainstream ripper emits this layout, so reject it loudly instead
         // of trying to make it work.
-        let mut seen = std::collections::HashSet::with_capacity(names.len());
-        for name in &names {
+        let mut seen = std::collections::HashSet::with_capacity(files_in_sheet.len());
+        for (name, _type) in &files_in_sheet {
             if !seen.insert(name.to_ascii_lowercase()) {
                 return Err(format!(
                     "CUE names {name} in more than one FILE section; a file shared by \
@@ -266,8 +266,8 @@ impl CdImage {
         // Resolve each FILE the sheet names to the bytes the caller supplied,
         // in sheet order. Borrowed slices, not owned copies: names are now
         // unique per section (checked above), so this is one lookup per file.
-        let mut file_bytes: Vec<&[u8]> = Vec::with_capacity(names.len());
-        for name in &names {
+        let mut file_bytes: Vec<&[u8]> = Vec::with_capacity(files_in_sheet.len());
+        for (name, _type) in &files_in_sheet {
             let found = files
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -523,18 +523,55 @@ struct CueTrack {
     file_index: usize,
 }
 
+/// A `FILE` line's trailing type token.
+///
+/// The token is advisory everywhere except `Motorola`. Rippers routinely write
+/// `FILE "track02.ogg" WAVE`, or even `BINARY`, for a compressed file, so what
+/// a file actually contains is decided by sniffing its bytes and an unrecognized
+/// token is kept for diagnostics rather than rejected, upper-cased so a message
+/// quoting it reads the same however the ripper cased it. `MOTOROLA` is the
+/// exception because it is the only signal for big-endian sample order, which
+/// no amount of looking at the bytes can recover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CueFileType {
+    /// Raw little-endian bytes, and the default when a sheet omits the token.
+    Binary,
+    /// Raw big-endian 16-bit samples.
+    Motorola,
+    /// Anything else, upper-cased but otherwise kept as written.
+    Other(String),
+}
+
+impl CueFileType {
+    fn parse(token: Option<&str>) -> Self {
+        match token.map(str::to_ascii_uppercase).as_deref() {
+            None | Some("BINARY") => CueFileType::Binary,
+            Some("MOTOROLA") => CueFileType::Motorola,
+            Some(other) => CueFileType::Other(other.to_string()),
+        }
+    }
+}
+
+/// One entry of a sheet's FILE list: the name the line declares and the type
+/// token that followed it. A pair rather than a struct because callers here and
+/// downstream destructure it positionally; it is *named* because spelling the
+/// pair out inline makes `parse_cue`'s return type trip clippy's
+/// `type_complexity` gate, which CI runs as `-D warnings`. The lint scores the
+/// signature as written, so any name would have satisfied it.
+type CueFile = (String, CueFileType);
+
 /// Parse a CUE sheet into its FILE list and track list. Recognizes
 /// `TRACK n MODE1/2048`, `MODE1/2352`, `MODE1/2448`, `MODE2/2048`,
 /// `MODE2/2336`, `MODE2/2352`, `AUDIO`, and `CDG`, with each track's
 /// `INDEX 01 MM:SS:FF` start. Each `FILE` line opens a new byte origin, named
-/// in the returned file list in sheet order; every track records which FILE
-/// it belongs to. `PREGAP` and `INDEX 00` both mean different things: PREGAP
-/// is not stored in the file and advances the disc LBA timeline by itself
-/// (handled in `build`), while INDEX 00 addresses bytes that ARE in the file
-/// and are folded into the preceding track's span by only ever reading
-/// INDEX 01 here.
-fn parse_cue(cue: &str) -> Result<(Vec<String>, Vec<CueTrack>), String> {
-    let mut files: Vec<String> = Vec::new();
+/// in the returned file list in sheet order alongside its declared type token
+/// (see [`CueFileType`]); every track records which FILE it belongs to.
+/// `PREGAP` and `INDEX 00` both mean different things: PREGAP is not stored in
+/// the file and advances the disc LBA timeline by itself (handled in `build`),
+/// while INDEX 00 addresses bytes that ARE in the file and are folded into the
+/// preceding track's span by only ever reading INDEX 01 here.
+fn parse_cue(cue: &str) -> Result<(Vec<CueFile>, Vec<CueTrack>), String> {
+    let mut files: Vec<CueFile> = Vec::new();
     let mut tracks: Vec<CueTrack> = Vec::new();
     let mut pending: Option<(u8, TrackMode)> = None;
     let mut pending_pregap = 0u32;
@@ -548,15 +585,20 @@ fn parse_cue(cue: &str) -> Result<(Vec<String>, Vec<CueTrack>), String> {
         match keyword.to_ascii_uppercase().as_str() {
             "FILE" => {
                 let rest = trimmed[keyword.len()..].trim_start();
-                let name = if let Some(rest) = rest.strip_prefix('"') {
-                    rest.split('"').next()
+                let (name, after) = if let Some(rest) = rest.strip_prefix('"') {
+                    match rest.split_once('"') {
+                        Some((name, after)) => (Some(name), after),
+                        None => (None, ""),
+                    }
                 } else {
-                    rest.split_whitespace().next()
+                    let mut words = rest.splitn(2, char::is_whitespace);
+                    (words.next(), words.next().unwrap_or(""))
                 };
                 let name = name
                     .filter(|name| !name.is_empty())
                     .ok_or_else(|| format!("missing FILE name in '{line}'"))?;
-                files.push(name.to_string());
+                let file_type = CueFileType::parse(after.split_whitespace().next());
+                files.push((name.to_string(), file_type));
             }
             "TRACK" => {
                 let number: u8 = words

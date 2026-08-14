@@ -337,3 +337,109 @@ fn cue_shares_one_file_across_two_tracks_then_a_third_in_another() {
     assert_eq!(img.read_audio_frame(2).unwrap()[0], 0xA2);
     assert_eq!(img.read_audio_frame(5).unwrap()[0], 0xB3);
 }
+
+#[test]
+fn cue_keeps_the_file_type_token() {
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               FILE \"track02.ogg\" WAVE\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let (files, _tracks) = parse_cue(cue).unwrap();
+    assert_eq!(files[0].0, "disc.bin");
+    assert_eq!(files[0].1, CueFileType::Binary);
+    assert_eq!(files[1].0, "track02.ogg");
+    // WAVE is preserved rather than mapped to a format: the token is advisory
+    // and sniffing decides what the file really is.
+    assert_eq!(files[1].1, CueFileType::Other("WAVE".to_string()));
+}
+
+#[test]
+fn cue_file_type_defaults_to_binary_when_absent() {
+    // A sheet with no type token at all is legal and means BINARY.
+    let cue = "FILE \"disc.bin\"\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n";
+    let (files, _tracks) = parse_cue(cue).unwrap();
+    assert_eq!(files[0].1, CueFileType::Binary);
+}
+
+#[test]
+fn cue_recognizes_motorola_as_its_own_type() {
+    // MOTOROLA is the one token that carries information sniffing cannot: the
+    // file is raw frames, but big-endian.
+    let cue = "FILE \"d.bin\" MOTOROLA\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n";
+    let (files, _tracks) = parse_cue(cue).unwrap();
+    assert_eq!(files[0].1, CueFileType::Motorola);
+}
+
+/// Build a one-FILE sheet around `file_line` and return the parsed FILE entry.
+/// Every case below needs a TRACK/INDEX pair after the FILE line for the sheet
+/// to be well-formed, and none of them care what that pair says.
+///
+/// An empty file list is reported as an error rather than indexed into: a line
+/// `parse_cue` does not recognize as a FILE at all falls through its catch-all
+/// arm and parses fine, just with nothing in the list, and that case should
+/// reach the caller as a failed assertion naming the input rather than as a
+/// panic from the harness.
+fn parse_one_file_line(file_line: &str) -> Result<CueFile, String> {
+    let cue = format!("{file_line}\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n");
+    let (files, _tracks) = parse_cue(&cue)?;
+    files
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no FILE parsed".to_string())
+}
+
+#[test]
+fn cue_file_line_parsing_handles_quoting_and_whitespace() {
+    // The name and the type token share one line, so reading the token means
+    // resuming the scan at whatever follows the name. When the name is quoted,
+    // that is the text after the *closing* quote -- a position the earlier
+    // `rest.split('"').next()` could never report, because splitting on the
+    // quote and taking the first piece yields the name and discards the rest of
+    // the line by construction. It parsed names correctly and would keep doing
+    // so, which is exactly why nothing here can be inferred from the name
+    // assertions alone: each case below pins that the token was found too.
+
+    // A quoted name is quoted because it may contain spaces, which is what
+    // separates the two readings: the token is the first word past the closing
+    // quote, not the second word of the line.
+    let spaced = parse_one_file_line("FILE \"my disc 01.bin\" MOTOROLA").unwrap();
+    assert_eq!(
+        spaced,
+        ("my disc 01.bin".to_string(), CueFileType::Motorola)
+    );
+
+    // Unquoted, the name ends at the first space and the token is what remains.
+    let bare = parse_one_file_line("FILE d.bin BINARY").unwrap();
+    assert_eq!(bare, ("d.bin".to_string(), CueFileType::Binary));
+
+    // An unquoted name with nothing after it must not be mistaken for a name
+    // with an empty token: no token at all means BINARY.
+    let no_token = parse_one_file_line("FILE d.bin").unwrap();
+    assert_eq!(no_token, ("d.bin".to_string(), CueFileType::Binary));
+
+    // Sheets are written by rippers, not by a formatter: case and run-length of
+    // the whitespace around the token are both free.
+    let untidy = parse_one_file_line("FILE \"d.bin\"   wave  ").unwrap();
+    assert_eq!(
+        untidy,
+        ("d.bin".to_string(), CueFileType::Other("WAVE".to_string()))
+    );
+}
+
+#[test]
+fn cue_file_line_without_a_name_is_rejected() {
+    // Reaching past the closing quote gave the quoted branch a second way to
+    // come back empty-handed, so pin the message and not merely `is_err`: a
+    // FILE line that yields no name has to fail *as* a missing name, whichever
+    // branch consumed it. An unterminated quote lands here too -- there is no
+    // closing quote to end the name at, so the line names nothing.
+    for line in ["FILE \"\" BINARY", "FILE", "FILE \"unterminated"] {
+        let err = parse_one_file_line(line).unwrap_err();
+        assert!(
+            err.contains("missing FILE name"),
+            "'{line}' should fail as a missing name: {err}"
+        );
+    }
+}
