@@ -7,6 +7,7 @@ members = [
     "crates/izarravm",
     "crates/izarravm-audio",
     "crates/izarravm-bus",
+    "crates/izarravm-cdaudio",
     "crates/izarravm-core",
     "crates/izarravm-corpus",
     "crates/izarravm-cpu",
@@ -50,6 +51,18 @@ egui-wgpu = { version = "0.32", features = ["winit"] }
 pollster = "0.4"
 rfd = "0.15"
 softbuffer = "0.4.8"
+# Default features pull in Matroska, AIFF, ADPCM and more; this is only the
+# four containers a CUE sheet realistically names for a CD-DA track.
+symphonia = { version = "0.6.1", default-features = false, features = [
+    "flac",
+    "id3v1",
+    "id3v2",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
 tempfile = "3.10"
 thiserror = "2.0"
 toml = "0.8"
