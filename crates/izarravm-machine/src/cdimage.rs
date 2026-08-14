@@ -331,6 +331,10 @@ impl CdImage {
         Self::build(
             tracks,
             &[BuildFile {
+                // This entry point takes bytes, not a path, so there is no file
+                // name to report -- and the checks that would name one are the
+                // encoded-audio ones, which a `Raw` source cannot reach anyway.
+                name: "the CUE's BIN",
                 source: &source,
                 file_type,
             }],
@@ -390,6 +394,7 @@ impl CdImage {
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
             build_files.push(BuildFile {
+                name: name.as_str(),
                 source: &found.1,
                 file_type: file_type.clone(),
             });
@@ -530,6 +535,36 @@ impl CdImage {
 
             let (sectors, image_offset, byte_swapped) = match file.source {
                 CueSource::Audio(audio) => {
+                    // Two layouts an encoded file cannot represent, refused
+                    // here rather than mounted approximately. Both are checked
+                    // before the length is taken, so a sheet that trips either
+                    // never reaches the TOC at all.
+                    //
+                    // A data track needs bytes at a known offset with a known
+                    // sector geometry, and a decoder offers neither: it hands
+                    // back Red Book audio frames and nothing else. Mounting one
+                    // anyway gives a data track that reads back silence, which
+                    // is a game that starts and then cannot load.
+                    if !p.mode.is_audio() {
+                        return Err(format!(
+                            "{} is an encoded audio file, but the CUE declares track {} on it \
+                             as a data track; a data track must be raw",
+                            file.name, p.number
+                        ));
+                    }
+                    // The sector count comes from the whole file's duration, so
+                    // there is no byte offset at which a second track inside it
+                    // would begin and nothing to divide. This is asked of
+                    // encoded files alone: many tracks sharing one raw BIN is
+                    // an ordinary layout -- Tomb Raider Gold's sheet puts 60 on
+                    // one -- and it stays supported.
+                    if tracks_in.iter().filter(|t| t.file_index == fi).count() > 1 {
+                        return Err(format!(
+                            "{} is an encoded audio file named by more than one TRACK; \
+                             one encoded file holds exactly one track",
+                            file.name
+                        ));
+                    }
                     // A decoded file's length comes from the decoder, and the
                     // byte accounting is skipped entirely -- not as an
                     // optimization, but because the file has no bytes here. The
@@ -828,6 +863,10 @@ type CueFile = (String, CueFileType);
 /// one value that cannot come apart, and the next per-file fact is a field here
 /// rather than another slice the caller must keep aligned by hand.
 struct BuildFile<'a> {
+    /// What the sheet called this file, for the mount errors that have to name
+    /// it. `from_cue` is handed a blob rather than a named file, so it supplies
+    /// a description of that blob instead.
+    name: &'a str,
     source: &'a CueSource,
     file_type: CueFileType,
 }

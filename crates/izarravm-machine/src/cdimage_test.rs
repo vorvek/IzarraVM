@@ -895,3 +895,77 @@ fn from_cue_files_still_works_through_the_new_entry_point() {
     let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
     assert_eq!(img.read_data_sector(0).unwrap()[0], 0xDD);
 }
+
+#[test]
+fn a_decoded_file_cannot_back_a_data_track() {
+    // MODE1 data in an ogg is not a thing. Refuse it by name rather than
+    // mounting a data track that reads back silence.
+    let cue = "FILE \"t.ogg\" WAVE\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n";
+    let err =
+        CdImage::from_cue_sources(cue, vec![("t.ogg".to_string(), fake(10, 10))]).unwrap_err();
+    assert!(err.contains("t.ogg"), "message was: {err}");
+    assert!(err.contains("data track"), "message was: {err}");
+}
+
+#[test]
+fn a_decoded_file_cannot_be_split_across_two_tracks() {
+    // One compressed file is one song: the sector count comes from the whole
+    // file's duration, so there is no way to say where a second track would
+    // start inside it.
+    let cue = "FILE \"t.ogg\" WAVE\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:10\n";
+    let err =
+        CdImage::from_cue_sources(cue, vec![("t.ogg".to_string(), fake(20, 20))]).unwrap_err();
+    assert!(err.contains("t.ogg"), "message was: {err}");
+    assert!(err.contains("more than one"), "message was: {err}");
+}
+
+#[test]
+fn many_tracks_may_still_share_one_raw_file() {
+    // The rejection above is about encoded files alone. Tomb Raider Gold's
+    // sheet puts 60 tracks on one BIN and Quake's puts 11 on one; refusing
+    // those would break discs that work today, so the guard must be reachable
+    // only through CueSource::Audio.
+    let cue = "FILE \"d.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:02\n\
+               TRACK 03 AUDIO\n\
+               INDEX 01 00:00:04\n";
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![(
+            "d.bin".to_string(),
+            CueSource::Raw(vec![0u8; 6 * RAW_SECTOR]),
+        )],
+    )
+    .unwrap();
+    assert_eq!(img.track_count(), 3);
+    assert_eq!(img.total_sectors(), 6);
+}
+
+#[test]
+fn a_repeated_file_section_is_still_rejected_through_the_new_entry_point() {
+    // This guard used to live in from_cue_files. It has to be on the path the
+    // loader actually calls, or a sheet that repeats a FILE section mounts
+    // wrong data.
+    let cue = "FILE \"a.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               FILE \"a.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let err = CdImage::from_cue_sources(
+        cue,
+        vec![("a.bin".to_string(), CueSource::Raw(vec![0u8; DATA_SECTOR]))],
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("more than one FILE section"),
+        "message was: {err}"
+    );
+}
