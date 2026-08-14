@@ -256,8 +256,15 @@ impl CdImage {
                 files.len()
             ));
         }
-        // One BIN: every track binds to it regardless of what the sheet's FILE
-        // lines name, so flatten every track onto the single file up front.
+        // One BIN: every track binds to it, whatever the sheet's FILE line
+        // names it. Past the check above this loop cannot actually change a
+        // track -- `parse_cue` indexes tracks by `files.len().saturating_sub(1)`
+        // and a sheet with at most one FILE gives 0 for every track either
+        // way. It stays because that is a fact about a formula in another
+        // function, and what `build`'s contract needs is the property itself:
+        // this entry point hands in one file and every track pointing at it.
+        // Stating it here costs one pass over a handful of tracks and does not
+        // go stale if that formula ever changes.
         for track in &mut tracks {
             track.file_index = 0;
         }
