@@ -617,7 +617,14 @@ fn motorola_data_track_payload_is_left_alone() {
     bin[2] = 0x56;
     bin[3] = 0x78;
     let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
+    // This is the assertion that carries the test: it is what fails if the
+    // `is_audio()` guard on the swap is dropped.
     assert!(!img.tracks()[0].byte_swapped);
+    // The read below is a forward guard, not a second proof. `read_data_sector`
+    // never consults `byte_swapped`, so no change to the swap alone can make it
+    // fail -- it would take someone teaching the data path to swap as well. It
+    // stays because that is exactly the change worth catching, but do not read
+    // it as independent coverage of the line above.
     assert_eq!(
         &img.read_data_sector(0).unwrap()[0..4],
         &[0x12, 0x34, 0x56, 0x78]
