@@ -458,6 +458,59 @@ fn binary_audio_track_is_not_swapped() {
 }
 
 #[test]
+fn from_cue_takes_its_byte_order_from_the_first_file_line() {
+    // `from_cue` flattens every track onto the one blob its caller handed in,
+    // whatever the sheet's FILE lines name, and that flattening is why it used
+    // to hardcode BINARY: with several FILE lines there is no way to say which
+    // one describes the bytes. But a single-BIN sheet is the case this entry
+    // point exists for, and there the first FILE line describes exactly those
+    // bytes. Hardcoding BINARY through it meant a sheet that said MOTOROLA
+    // mounted with its samples in the wrong byte order and played as noise --
+    // silent wrong audio, mounted without a complaint, which is the same class
+    // of failure as a track bound to the wrong file.
+    let mut bin = vec![0u8; RAW_SECTOR];
+    bin[0] = 0x12;
+    bin[1] = 0x34;
+    bin[2] = 0x56;
+    bin[3] = 0x78;
+
+    let motorola = CdImage::from_cue(
+        "FILE \"d.bin\" MOTOROLA\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+        bin.clone(),
+    )
+    .unwrap();
+    assert!(motorola.tracks()[0].byte_swapped);
+    assert_eq!(
+        &motorola.read_audio_frame(0).unwrap()[0..4],
+        &[0x34, 0x12, 0x78, 0x56]
+    );
+
+    // BINARY is still BINARY: reading the token must not turn into swapping
+    // whenever a token is present at all.
+    let binary = CdImage::from_cue(
+        "FILE \"d.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+        bin.clone(),
+    )
+    .unwrap();
+    assert!(!binary.tracks()[0].byte_swapped);
+    assert_eq!(
+        &binary.read_audio_frame(0).unwrap()[0..4],
+        &[0x12, 0x34, 0x56, 0x78]
+    );
+
+    // A sheet with no FILE line at all is legal here and reaches `build` with
+    // an empty file list, so the fallback has to stay BINARY rather than index
+    // into nothing. The loader relies on this path when a sheet names no files
+    // and it substitutes the CUE's sibling .bin.
+    let no_file = CdImage::from_cue("TRACK 01 AUDIO\nINDEX 01 00:00:00\n", bin).unwrap();
+    assert!(!no_file.tracks()[0].byte_swapped);
+    assert_eq!(
+        &no_file.read_audio_frame(0).unwrap()[0..4],
+        &[0x12, 0x34, 0x56, 0x78]
+    );
+}
+
+#[test]
 fn motorola_data_track_payload_is_left_alone() {
     // The endianness a MOTOROLA line declares is a property of Red Book audio
     // samples, which the drive hands to a mixer that has to know which byte is

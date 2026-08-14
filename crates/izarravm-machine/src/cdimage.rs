@@ -233,20 +233,33 @@ impl CdImage {
 
     /// Mount from a CUE sheet and a single BIN. Convenience wrapper over
     /// [`CdImage::from_cue_files`] for the common one-file sheet: every track
-    /// is bound to `bin` regardless of what the sheet's FILE lines name.
+    /// is bound to `bin` regardless of what the sheet's FILE lines name. The
+    /// byte order still comes from the sheet -- the first FILE line's type
+    /// token, or BINARY when the sheet declares no FILE at all.
     pub fn from_cue(cue: &str, bin: Vec<u8>) -> Result<Self, String> {
-        let (_files, mut tracks) = parse_cue(cue)?;
+        let (files, mut tracks) = parse_cue(cue)?;
         // One BIN: every track binds to it regardless of what the sheet's FILE
         // lines name, so flatten every track onto the single file up front.
         for track in &mut tracks {
             track.file_index = 0;
         }
-        // One BIN and no name to match it against, so the sheet's FILE lines
-        // cannot be trusted to describe it: this entry point is handed bytes
-        // directly by a caller who already decided what they are. BINARY is the
-        // reading that changes nothing, which is the right default for a file
-        // whose declared type may belong to some other FILE line entirely.
-        Self::build(tracks, &[bin.as_slice()], &[CueFileType::Binary])
+        // The type comes from the *first* FILE line, which is the same
+        // flattening applied to the type token that the loop above applies to
+        // the bytes: this entry point already decided the sheet describes one
+        // file, so it reads the one type the sheet declares first. For the
+        // single-BIN sheet this wrapper exists to serve, that line describes
+        // precisely the bytes the caller handed in, and MOTOROLA there is the
+        // one token no amount of sniffing can recover -- hardcoding BINARY
+        // through it mounted a big-endian disc as noise, without a complaint.
+        // A sheet naming several files can still disagree with the blob, but
+        // its first line is a strictly better guess than a constant, and a
+        // sheet naming no file at all leaves nothing to read, so the fallback
+        // stays BINARY: the reading that changes nothing.
+        let file_type = files
+            .first()
+            .map(|(_name, file_type)| file_type.clone())
+            .unwrap_or(CueFileType::Binary);
+        Self::build(tracks, &[bin.as_slice()], &[file_type])
     }
 
     /// Mount from a CUE sheet and the files it names. Each FILE opens a new
