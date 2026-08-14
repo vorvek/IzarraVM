@@ -624,6 +624,42 @@ fn motorola_data_track_payload_is_left_alone() {
     );
 }
 
+#[test]
+fn motorola_swaps_the_audio_track_of_a_file_whose_data_track_it_leaves_alone() {
+    // MOTOROLA is declared per FILE, and a mixed-mode rip puts the data track
+    // and the audio tracks in the same file. So the guard on the swap has to
+    // be the *track's* mode, not the file's type: resolving it per file would
+    // read correctly on `motorola_data_track_payload_is_left_alone` (one data
+    // track, nothing to swap) and on
+    // `motorola_audio_track_swaps_each_sample_s_bytes` (one audio track, swap
+    // everything) and still corrupt every file on the disc here. Only a sheet
+    // that puts both kinds of track behind one MOTOROLA line can tell the two
+    // rules apart.
+    let cue = "FILE \"d.bin\" MOTOROLA\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:02\n";
+    let mut bin = vec![0u8; 2 * DATA_SECTOR + RAW_SECTOR];
+    bin[0..4].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    bin[2 * DATA_SECTOR..2 * DATA_SECTOR + 4].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+
+    let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
+
+    assert_eq!(img.track_count(), 2);
+    assert!(!img.tracks()[0].byte_swapped);
+    assert!(img.tracks()[1].byte_swapped);
+    // Identical bytes in the same file, read back two different ways.
+    assert_eq!(
+        &img.read_data_sector(0).unwrap()[0..4],
+        &[0x12, 0x34, 0x56, 0x78]
+    );
+    assert_eq!(
+        &img.read_audio_frame(2).unwrap()[0..4],
+        &[0x34, 0x12, 0x78, 0x56]
+    );
+}
+
 /// Build a one-FILE sheet around `file_line` and return the parsed FILE entry.
 /// Every case below needs a TRACK/INDEX pair after the FILE line for the sheet
 /// to be well-formed, and none of them care what that pair says.

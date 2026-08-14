@@ -161,6 +161,38 @@ fn cue_file_names_reads_a_line_whose_fourth_byte_is_mid_character() {
 }
 
 #[test]
+fn cue_file_names_drops_a_file_line_that_names_nothing() {
+    // A line that is the bare keyword is exactly the boundary the `get(..4)`
+    // fix moved: four bytes, so the prefix is taken and does compare equal to
+    // "FILE", and `trimmed[4..]` is then the empty string. It survives on the
+    // name extractor coming back empty-handed -- `split_whitespace` on an
+    // empty rest yields nothing at all, so this line is dropped before the
+    // emptiness filter is even consulted. `FILE ""` is the case that reaches
+    // that filter: the quoted branch does produce a name there, and it is the
+    // empty one.
+    //
+    // Neither may contribute a name. The loader joins every name it gets to
+    // the CUE's directory and reads it, so an empty name resolves to the
+    // directory itself and kills the mount over a line that named nothing.
+    // Both spellings are covered here because the two branches of the name
+    // extractor fail differently, and only one of them is filtered.
+    //
+    // `parse_cue` does not merely drop these lines, it refuses the sheet with
+    // "missing FILE name", so a sheet like this fails loudly at the mount
+    // either way. This pins the half of the answer that lives in this scanner.
+    let cue = concat!(
+        "FILE\n",
+        "FILE   \n",
+        "FILE \"\" BINARY\n",
+        "FILE \"track01.bin\" BINARY\n",
+        "  TRACK 01 AUDIO\n",
+        "    INDEX 01 00:00:00\n",
+    );
+
+    assert_eq!(cue_file_names(cue), vec!["track01.bin"]);
+}
+
+#[test]
 fn cue_file_names_is_empty_when_the_sheet_has_no_file_line() {
     let cue = concat!("  TRACK 01 MODE1/2352\n", "    INDEX 01 00:00:00\n",);
 
