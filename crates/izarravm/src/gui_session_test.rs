@@ -1335,9 +1335,28 @@ fn load_cd_image_from_path_mounts_a_cue_naming_an_ogg() {
     // the number this used to mount.
     assert_eq!(image.tracks()[1].sectors, 15);
     assert_eq!(image.total_sectors(), 17);
-    // Nothing decodes yet, so every frame of it is silence rather than the
-    // compressed bytes played as noise.
+
+    // And the whole chain end to end: the first read of an undecoded track is
+    // absent, which is the silence the mixer steps over while the worker gets
+    // going, and shortly afterwards the frame is real audio. This is the only
+    // place the loader, the disc model and the decoder are exercised together.
     assert!(image.read_audio_frame(2).is_none());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut frame = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(got) = image.read_audio_frame(4) {
+            frame = Some(got);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let frame = frame.expect("the ogg never decoded through the mounted image");
+    let peak = frame
+        .chunks_exact(2)
+        .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    assert!(peak > 1000, "the mounted ogg played back as near-silence");
 }
 
 #[test]

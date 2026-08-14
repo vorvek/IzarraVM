@@ -15,7 +15,7 @@ fn fixture(name: &str) -> PathBuf {
 fn decode_all(name: &str) -> (TrackInfo, Vec<u8>, u64) {
     let info = crate::probe_info(&fixture(name)).unwrap().unwrap();
     let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
-    let produced = decode_into(&fixture(name), info, &mut pcm, &mut |_ready| {}).unwrap();
+    let produced = decode_into(&fixture(name), info, &mut pcm, &mut |_ready, _new| {}).unwrap();
     (info, pcm, produced)
 }
 
@@ -100,7 +100,7 @@ fn a_decode_stops_at_the_length_the_mount_published() {
     info.sectors = crate::sectors_for(info.frames, info.sample_rate);
     let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
 
-    let produced = decode_into(&fixture("tone.wav"), info, &mut pcm, &mut |_| {}).unwrap();
+    let produced = decode_into(&fixture("tone.wav"), info, &mut pcm, &mut |_, _| {}).unwrap();
 
     assert_eq!(
         produced, info.frames,
@@ -140,7 +140,7 @@ fn a_decode_never_writes_past_the_buffer_the_mount_sized() {
     let info = crate::probe_info(&fixture("tone.wav")).unwrap().unwrap();
     let half = (info.sectors as usize / 2) * AUDIO_FRAME_BYTES;
     let mut pcm = vec![0u8; half];
-    let produced = decode_into(&fixture("tone.wav"), info, &mut pcm, &mut |_| {}).unwrap();
+    let produced = decode_into(&fixture("tone.wav"), info, &mut pcm, &mut |_, _| {}).unwrap();
     assert_eq!(pcm.len(), half);
     // It still reports everything it decoded, which is what the length
     // agreement is measured against; only the writing is bounded.
@@ -152,7 +152,7 @@ fn progress_is_reported_as_the_buffer_fills() {
     let info = crate::probe_info(&fixture("tone.ogg")).unwrap().unwrap();
     let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
     let mut reports = Vec::new();
-    decode_into(&fixture("tone.ogg"), info, &mut pcm, &mut |ready| {
+    decode_into(&fixture("tone.ogg"), info, &mut pcm, &mut |ready, _new| {
         reports.push(ready)
     })
     .unwrap();
@@ -171,7 +171,7 @@ fn a_cancelled_decode_stops_where_it_stands() {
         &fixture("tone.ogg"),
         info,
         &mut pcm,
-        &mut |ready| reports.push(ready),
+        &mut |ready, _new| reports.push(ready),
         // Cancel at the first opportunity.
         &mut || true,
     )
@@ -203,7 +203,7 @@ fn a_file_that_is_no_longer_a_container_fails_rather_than_decoding_noise() {
         sectors: 15,
     };
     let mut pcm = vec![0u8; 15 * AUDIO_FRAME_BYTES];
-    let err = decode_into(&swapped, info, &mut pcm, &mut |_| {}).unwrap_err();
+    let err = decode_into(&swapped, info, &mut pcm, &mut |_, _| {}).unwrap_err();
     assert!(err.to_string().contains("container"), "message was: {err}");
     std::fs::remove_file(&swapped).ok();
 }

@@ -32,7 +32,14 @@ const COARSE_PUBLISH: u32 = 64;
 const FINE_PUBLISH_UNTIL: u32 = 64;
 
 /// Decode `path` into `pcm`, calling `progress` with the number of whole
-/// sectors that are complete.
+/// sectors that are complete and the bytes that just became complete.
+///
+/// The callback is handed the new bytes rather than left to read them out of
+/// `pcm`, which it cannot do: `pcm` is borrowed mutably for the length of the
+/// decode. Handing them over also says exactly which bytes are new, so a caller
+/// republishing into a second buffer copies each byte once instead of recopying
+/// the whole prefix at every report -- quadratic in the length of a track, and
+/// a four-minute one reports some 280 times.
 ///
 /// Returns the output sample frames actually produced, before padding or
 /// truncation -- the quantity the length-agreement test compares against what
@@ -41,7 +48,7 @@ pub fn decode_into(
     path: &Path,
     info: TrackInfo,
     pcm: &mut [u8],
-    progress: &mut dyn FnMut(u32),
+    progress: &mut dyn FnMut(u32, &[u8]),
 ) -> Result<u64, CdAudioError> {
     decode_into_cancellable(path, info, pcm, progress, &mut || false)
 }
@@ -53,7 +60,7 @@ pub fn decode_into_cancellable(
     path: &Path,
     info: TrackInfo,
     pcm: &mut [u8],
-    progress: &mut dyn FnMut(u32),
+    progress: &mut dyn FnMut(u32, &[u8]),
     cancel: &mut dyn FnMut() -> bool,
 ) -> Result<u64, CdAudioError> {
     let container = container_of(path)?;
@@ -81,6 +88,7 @@ pub fn decode_into_cancellable(
     let mut produced = 0u64;
     let mut written = 0u64;
     let mut last_published = 0u32;
+    let mut published_bytes = 0usize;
     let total_sectors = (pcm.len() / AUDIO_FRAME_BYTES) as u32;
     let mut interleaved: Vec<i16> = Vec::new();
     let mut pairs: Vec<(i32, i32)> = Vec::new();
@@ -168,7 +176,9 @@ pub fn decode_into_cancellable(
         };
         if complete >= last_published + step {
             last_published = complete;
-            progress(complete);
+            let upto = (complete as usize * AUDIO_FRAME_BYTES).min(pcm.len());
+            progress(complete, &pcm[published_bytes..upto]);
+            published_bytes = upto;
             if cancel() {
                 return Ok(produced);
             }
@@ -177,8 +187,9 @@ pub fn decode_into_cancellable(
 
     // Whatever is left of `pcm` was never written, and a fresh buffer is zeros,
     // which is silence. Publishing the full count last is what tells the caller
-    // the track is whole.
-    progress(total_sectors);
+    // the track is whole, and the tail handed over with it carries that silence
+    // so a caller mirroring into its own buffer ends up with the same bytes.
+    progress(total_sectors, &pcm[published_bytes..]);
     Ok(produced)
 }
 
