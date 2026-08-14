@@ -26,6 +26,7 @@ enum KeyRoute {
         ctrl: bool,
         shift: bool,
         alt: bool,
+        super_key: bool,
     },
     ReleaseCapture,
     ToggleFullscreen,
@@ -38,6 +39,11 @@ struct KeyRouteContext<'a> {
     input_captured: bool,
     input_release: &'a KeyBinding,
     fullscreen: &'a KeyBinding,
+    // Super-key state the host reports outside winit. On Windows the keyboard
+    // hook can swallow a Super key before winit sees it, so the hook's own view
+    // is the only complete one; it is ORed with what the router tracked.
+    // Always false where no such hook exists.
+    host_super_down: bool,
 }
 
 #[derive(Default)]
@@ -46,6 +52,7 @@ struct HostKeyRouter {
     ctrl_down: bool,
     shift_down: bool,
     alt_down: bool,
+    super_down: bool,
     pressed: Vec<KeyCode>,
     swallowed: Vec<KeyCode>,
 }
@@ -62,6 +69,7 @@ impl HostKeyRouter {
             KeyCode::ControlLeft | KeyCode::ControlRight => self.ctrl_down = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.shift_down = pressed,
             KeyCode::AltLeft | KeyCode::AltRight => self.alt_down = pressed,
+            KeyCode::SuperLeft | KeyCode::SuperRight => self.super_down = pressed,
             _ => {}
         }
         if pressed {
@@ -89,9 +97,12 @@ impl HostKeyRouter {
                 | KeyCode::ShiftRight
                 | KeyCode::AltLeft
                 | KeyCode::AltRight
+                | KeyCode::SuperLeft
+                | KeyCode::SuperRight
         );
         let key = format!("{code:?}");
         let (ctrl, shift, alt) = (self.ctrl_down, self.shift_down, self.alt_down);
+        let super_key = self.super_down || context.host_super_down;
 
         if pressed && !repeat && !is_modifier && context.capturing_bind {
             self.swallow(code);
@@ -100,17 +111,25 @@ impl HostKeyRouter {
                 ctrl,
                 shift,
                 alt,
+                super_key,
             };
         }
         if pressed
             && !repeat
             && context.input_captured
-            && context.input_release.matches(&key, ctrl, shift, alt)
+            && context
+                .input_release
+                .matches(&key, ctrl, shift, alt, super_key)
         {
             self.swallow(code);
             return KeyRoute::ReleaseCapture;
         }
-        if pressed && !repeat && context.fullscreen.matches(&key, ctrl, shift, alt) {
+        if pressed
+            && !repeat
+            && context
+                .fullscreen
+                .matches(&key, ctrl, shift, alt, super_key)
+        {
             self.swallow(code);
             return KeyRoute::ToggleFullscreen;
         }
@@ -141,6 +160,7 @@ impl HostKeyRouter {
         self.ctrl_down = false;
         self.shift_down = false;
         self.alt_down = false;
+        self.super_down = false;
         self.pressed.clear();
         self.swallowed.clear();
         releases
@@ -272,6 +292,7 @@ impl WinitApp {
                 input_captured: self.gui.input_captured,
                 input_release: &self.gui.input_release,
                 fullscreen: &self.gui.fullscreen_key,
+                host_super_down: host_super_down(),
             },
         );
         match route {
@@ -293,7 +314,8 @@ impl WinitApp {
                 ctrl,
                 shift,
                 alt,
-            } => self.gui.record_bind(&key, ctrl, shift, alt),
+                super_key,
+            } => self.gui.record_bind(&key, ctrl, shift, alt, super_key),
             KeyRoute::ReleaseCapture => {
                 if let Some(window) = self.window.clone() {
                     self.gui.toggle_capture(&window, self.keys.keyboard_mut());
@@ -302,6 +324,19 @@ impl WinitApp {
             KeyRoute::ToggleFullscreen => self.toggle_fullscreen(),
             KeyRoute::Swallowed => {}
         }
+        self.sync_super_grab();
+    }
+
+    /// Take the Super keys from the host shell while this window owns the
+    /// keyboard, and give them back the moment it does not. Two states need
+    /// them: input capture, where a Start menu would steal the focus from the
+    /// guest, and a hotkey capture in the config modal, where the user has to
+    /// be able to press Super as a modifier. Both need the focus as well,
+    /// because the hook is global: an alt-tab away must return the keys even
+    /// though capture stays on.
+    fn sync_super_grab(&self) {
+        let owns_keyboard = self.gui.input_captured || self.gui.is_capturing_bind();
+        set_super_grabbed(self.focused && owns_keyboard);
     }
 
     /// Toggle borderless fullscreen on the window.
@@ -407,9 +442,18 @@ impl ApplicationHandler for WinitApp {
         }
         if let WindowEvent::Focused(focused) = &event {
             self.focused = *focused;
+            // Settle the grab on the same edge: losing the foreground hands the
+            // Super keys straight back to the shell, and regaining it takes
+            // them again if capture is still on.
+            self.sync_super_grab();
             if !*focused {
                 // Release everything held so a key down at the moment of an
-                // alt-tab (Shift, in a game) does not stick in the guest.
+                // alt-tab (Shift, in a game) does not stick in the guest. Clear
+                // the hook's Super state with them. The hook is global and
+                // normally sees the release, but Win+L reaches the secure
+                // desktop, which this process never observes; a Super left
+                // stuck down would arm a hotkey on the next plain key.
+                clear_host_super();
                 let releases = self.keys.focus_lost(self.gui.host_input);
                 self.gui.send_keys_to_guest(releases);
                 return;
@@ -530,6 +574,9 @@ impl ApplicationHandler for WinitApp {
             let hz = self.gui.guest_refresh_hz().max(1.0);
             self.next_frame = now + Duration::from_secs_f64(1.0 / hz);
         }
+        // The frame above is where a click enters capture and where the config
+        // modal starts a hotkey capture, so settle the Super grab after it.
+        self.sync_super_grab();
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
             self.next_frame
                 .min(self.next_mouse_flush)
@@ -537,6 +584,115 @@ impl ApplicationHandler for WinitApp {
         ));
     }
 }
+
+/// Holds the Super keys away from the Windows shell while the emulator owns the
+/// host input. A tap of either one opens the Start menu, which takes the focus
+/// off the guest, and the shell reads the key before any window sees it. A
+/// low-level keyboard hook is the one place that can stop that.
+///
+/// The hook also records whether a Super key is down. It has to: a key the hook
+/// discards never reaches the window, so the event loop cannot read the Super
+/// state from winit alone. `held` is what the hotkey matcher adds to its own
+/// view of the modifiers.
+///
+/// The hook runs on the thread that installed it, which is the event-loop
+/// thread. Windows removes a low-level hook whose thread does not answer within
+/// `LowLevelHooksTimeout` (300 ms by default). One frame is far shorter than
+/// that, and the callback itself only reads two atomics.
+#[cfg(windows)]
+mod super_grab {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing::warn;
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HC_ACTION, KBDLLHOOKSTRUCT, SetWindowsHookExW, WH_KEYBOARD_LL, WM_KEYDOWN,
+        WM_SYSKEYDOWN,
+    };
+
+    /// The left and right Windows keys.
+    const VK_LWIN: u32 = 0x5b;
+    const VK_RWIN: u32 = 0x5c;
+
+    /// True while the emulator owns the keyboard, so the hook discards the key.
+    static GRABBED: AtomicBool = AtomicBool::new(false);
+    /// True while a Super key is down, as the hook saw it.
+    static HELD: AtomicBool = AtomicBool::new(false);
+
+    /// Take the Super keys from the shell, or give them back.
+    pub(super) fn set_grabbed(grabbed: bool) {
+        GRABBED.store(grabbed, Ordering::Relaxed);
+    }
+
+    /// True while the hook sees a Super key down.
+    pub(super) fn held() -> bool {
+        HELD.load(Ordering::Relaxed)
+    }
+
+    /// Forget a held Super key. The next event from the hook sets the state
+    /// again; this only stops a stale `true` from arming a hotkey.
+    pub(super) fn clear_held() {
+        HELD.store(false, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            let event = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+            if event.vkCode == VK_LWIN || event.vkCode == VK_RWIN {
+                let message = wparam as u32;
+                HELD.store(
+                    message == WM_KEYDOWN || message == WM_SYSKEYDOWN,
+                    Ordering::Relaxed,
+                );
+                if GRABBED.load(Ordering::Relaxed) {
+                    return 1;
+                }
+            }
+        }
+        unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    }
+
+    /// Install the hook on the calling thread. A failure is not fatal: the
+    /// hotkeys keep working through winit and the Start menu keeps opening,
+    /// which is the behaviour before this hook existed. The hook stays for the
+    /// life of the process; Windows removes it when the process ends.
+    pub(super) fn install() {
+        let hook =
+            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), std::ptr::null_mut(), 0) };
+        if hook.is_null() {
+            warn!("could not install the keyboard hook; the Super keys still reach the shell");
+        }
+    }
+}
+
+/// True while the host reports a Super key down outside winit. See `super_grab`.
+#[cfg(windows)]
+fn host_super_down() -> bool {
+    super_grab::held()
+}
+
+#[cfg(not(windows))]
+fn host_super_down() -> bool {
+    false
+}
+
+/// Take the Super keys from the host shell, or give them back. Does nothing
+/// where no keyboard hook exists.
+#[cfg(windows)]
+fn set_super_grabbed(grabbed: bool) {
+    super_grab::set_grabbed(grabbed);
+}
+
+#[cfg(not(windows))]
+fn set_super_grabbed(_grabbed: bool) {}
+
+/// Forget a Super key the host hook saw go down. See `super_grab::clear_held`.
+#[cfg(windows)]
+fn clear_host_super() {
+    super_grab::clear_held();
+}
+
+#[cfg(not(windows))]
+fn clear_host_super() {}
 
 /// Accumulated raw mouse motion (relative counts) shared between the Windows
 /// WM_INPUT message hook and the event loop. On other platforms nothing writes it
@@ -655,6 +811,8 @@ fn build_event_loop(
 /// Open the window and run the emulator. Returns when the user closes it.
 pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     let raw_mouse = RawMouseAccum::default();
+    #[cfg(windows)]
+    super_grab::install();
     let host_input = launch.host_input;
     let event_loop = build_event_loop(raw_mouse.clone(), host_input.mouse_enabled())?;
     let gui = GuiApp::new(launch)?;

@@ -630,8 +630,9 @@ pub struct GuiApp {
     // Input-capture state, the single source of truth for routing. When true the
     // OS cursor is confined and hidden over the window, all keyboard input goes
     // to the guest (egui does not consume it, including TAB), and host mouse
-    // motion and buttons are forwarded to the VM. Ctrl+F2 releases it. Entered
-    // by clicking the framebuffer image.
+    // motion and buttons are forwarded to the VM. The input-release hotkey
+    // (Super+F2 by default) releases it. Entered by clicking the framebuffer
+    // image.
     input_captured: bool,
     // Guest NumLock/CapsLock/ScrollLock state, mirrored from the host. Parallel
     // to HOST_LOCK_KEYS; seeded false because the BIOS clears KB_FLAGS on boot.
@@ -1318,7 +1319,11 @@ impl GuiApp {
     /// Enter or leave input capture. While captured we lock and hide the OS cursor
     /// (winit Locked: pinned in place, cannot move on screen or leave the window)
     /// and route keyboard and mouse to the guest, which draws its own cursor.
-    /// Ctrl+F2 releases. Locked delivers motion as raw relative deltas, which we
+    /// The input-release hotkey (Super+F2 by default) releases it. The host
+    /// keyboard hook holds the Super keys away from the shell for as long as
+    /// capture lasts, so a stray Super press cannot open the Start menu and
+    /// take the focus off the guest.
+    /// Locked delivers motion as raw relative deltas, which we
     /// accumulate into the guest cursor position (clamped to the screen), so there
     /// is nothing for the OS cursor to escape and no warp to fight. On release we
     /// flush any held keys so nothing sticks down in the guest.

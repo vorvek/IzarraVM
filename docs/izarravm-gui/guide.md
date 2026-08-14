@@ -104,7 +104,29 @@ The control panel opens the config modal. The modal has three sections.
 
 **Input**: set the "Input release" hotkey and the "Full screen" hotkey. The
 "Input release" hotkey gives the keyboard focus and the mouse focus back to
-the host.
+the host. The default for "Input release" is Win+F2. The default for "Full
+screen" is Win+F4.
+
+The Win key is the key with the Windows logo. On Windows the modal writes it
+"Win". On Linux the modal writes it "Super", the name that the Linux desktops
+give the same key. The name in `izarravm.conf` is `super` on both. Thus one
+file reads correctly on either host. The left key and the right key give the
+same modifier.
+
+Click a hotkey button and then press the combination. Ctrl, Shift, Alt, and
+Win are modifiers. The key that you press with them completes the hotkey.
+
+A file that still holds the previous defaults, Ctrl+F2 and Ctrl+F11, moves to
+the new defaults at the next start. IzarraVM writes one log line for each
+move. Set a different combination in this section if you do not want the new
+default.
+
+While IzarraVM holds the input, and while this section waits for a hotkey, the
+two Win keys do not reach the Windows shell. Thus a press of a Win key does
+not open the Start menu and does not take the focus away from the guest. The
+Win keys work as usual again when you release the input or when the window
+loses the focus. Windows reserves Ctrl+Alt+Del and Win+L. No program can
+absorb those two.
 
 **Set joystick buttons** opens a setup window in the foreground, and disables
 the modal below it. Obey its instructions: center the stick, move X to the

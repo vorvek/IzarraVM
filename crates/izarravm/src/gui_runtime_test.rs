@@ -5,7 +5,11 @@ use super::*;
 use winit::keyboard::KeyCode;
 
 fn binding(ctrl: bool, key: &str) -> KeyBinding {
-    KeyBinding::new(ctrl, false, false, key)
+    KeyBinding::new(ctrl, false, false, false, key)
+}
+
+fn super_binding(key: &str) -> KeyBinding {
+    KeyBinding::new(false, false, false, true, key)
 }
 
 fn context<'a>(
@@ -19,6 +23,19 @@ fn context<'a>(
         input_captured,
         input_release,
         fullscreen,
+        host_super_down: false,
+    }
+}
+
+/// A context whose Super state comes from the host hook, not from winit.
+fn hook_context<'a>(
+    input_captured: bool,
+    input_release: &'a KeyBinding,
+    fullscreen: &'a KeyBinding,
+) -> KeyRouteContext<'a> {
+    KeyRouteContext {
+        host_super_down: true,
+        ..context(false, input_captured, input_release, fullscreen)
     }
 }
 
@@ -54,6 +71,7 @@ fn rebind_press_repeat_and_release_never_leak_to_the_guest() {
             ctrl: false,
             shift: false,
             alt: false,
+            super_key: false,
         }
     );
 
@@ -175,6 +193,7 @@ fn keyboard_off_keeps_fullscreen_rebind_and_input_release_host_side() {
             ctrl: true,
             shift: false,
             alt: false,
+            super_key: false,
         }
     );
     assert!(guest_bytes(&rebind, &mut router, policy).is_empty());
@@ -265,4 +284,125 @@ fn rebind_precedes_release_and_release_precedes_fullscreen() {
         ),
         KeyRoute::ReleaseCapture
     );
+}
+
+#[test]
+fn super_is_a_modifier_and_never_reaches_the_guest_or_a_rebind() {
+    let mut router = HostKeyRouter::default();
+    let policy = HostInputPolicy::new(true, true, true);
+    let input_release = super_binding("F2");
+    let fullscreen = super_binding("F4");
+
+    // A Super press while the modal waits for a hotkey stays a modifier: it
+    // does not close the capture, and the AT keyboard has no code for it.
+    let held = router.route(
+        KeyCode::SuperLeft,
+        true,
+        false,
+        context(true, true, &input_release, &fullscreen),
+    );
+    assert!(matches!(held, KeyRoute::Guest { .. }));
+    assert!(guest_bytes(&held, &mut router, policy).is_empty());
+    assert!(router.super_down);
+
+    assert_eq!(
+        router.route(
+            KeyCode::KeyA,
+            true,
+            false,
+            context(true, true, &input_release, &fullscreen),
+        ),
+        KeyRoute::Rebind {
+            key: "KeyA".into(),
+            ctrl: false,
+            shift: false,
+            alt: false,
+            super_key: true,
+        }
+    );
+
+    assert_eq!(
+        router.route(
+            KeyCode::F2,
+            true,
+            false,
+            context(false, true, &input_release, &fullscreen),
+        ),
+        KeyRoute::ReleaseCapture
+    );
+    assert_eq!(
+        router.route(
+            KeyCode::F4,
+            true,
+            false,
+            context(false, true, &input_release, &fullscreen),
+        ),
+        KeyRoute::ToggleFullscreen
+    );
+
+    // The right Super key is the same modifier, and focus loss clears it.
+    assert_eq!(
+        router.route(
+            KeyCode::SuperLeft,
+            false,
+            false,
+            context(false, true, &input_release, &fullscreen),
+        ),
+        KeyRoute::Guest {
+            code: KeyCode::SuperLeft,
+            pressed: false,
+            repeat: false,
+        }
+    );
+    assert!(!router.super_down);
+    let _ = router.route(
+        KeyCode::SuperRight,
+        true,
+        false,
+        context(false, true, &input_release, &fullscreen),
+    );
+    assert!(router.super_down);
+    assert!(router.focus_lost(policy).is_empty());
+    assert!(!router.super_down);
+}
+
+#[test]
+fn a_super_key_the_host_hook_swallowed_still_arms_the_hotkey() {
+    let mut router = HostKeyRouter::default();
+    let input_release = super_binding("F2");
+    let fullscreen = super_binding("F4");
+
+    // The hook discarded the Super press, so the router never saw it. The
+    // hotkeys must still fire, or capture could not be released at all.
+    assert!(!router.super_down);
+    assert_eq!(
+        router.route(
+            KeyCode::F4,
+            true,
+            false,
+            hook_context(true, &input_release, &fullscreen),
+        ),
+        KeyRoute::ToggleFullscreen
+    );
+    assert_eq!(
+        router.route(
+            KeyCode::F2,
+            true,
+            false,
+            hook_context(true, &input_release, &fullscreen),
+        ),
+        KeyRoute::ReleaseCapture
+    );
+
+    // Without the hook's Super state the same key is plain guest input.
+    let mut plain = HostKeyRouter::default();
+    assert!(matches!(
+        plain.route(
+            KeyCode::F2,
+            true,
+            false,
+            context(false, true, &input_release, &fullscreen),
+        ),
+        KeyRoute::Guest { .. }
+    ));
 }

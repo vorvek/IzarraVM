@@ -29,8 +29,8 @@ fn round_trips_through_toml() {
     let prefs = GuiPrefs {
         master_volume: 0.65,
         crt_style: CrtStyle::YeOlde,
-        input_release: KeyBinding::new(true, true, false, "F4"),
-        fullscreen: KeyBinding::new(false, false, true, "Enter"),
+        input_release: KeyBinding::new(true, true, false, true, "F4"),
+        fullscreen: KeyBinding::new(false, false, true, false, "Enter"),
         joystick_binding: Some(joystick_binding()),
         last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
         last_cd_image: Some(PathBuf::from("/tmp/game.iso")),
@@ -66,11 +66,11 @@ fn missing_keys_fall_back_to_defaults() {
     );
     assert_eq!(
         parsed.input_release,
-        KeyBinding::new(true, false, false, "F2")
+        KeyBinding::new(false, false, false, true, "F2")
     );
     assert_eq!(
         parsed.fullscreen,
-        KeyBinding::new(true, false, false, "F11")
+        KeyBinding::new(false, false, false, true, "F4")
     );
     assert_eq!(parsed.joystick_binding, None);
     assert!(parsed.panel_open, "panel defaults to open for older files");
@@ -93,16 +93,58 @@ fn joystick_binding_round_trips_with_named_controls_and_polarity() {
 #[test]
 fn key_binding_display_strips_winit_prefixes() {
     assert_eq!(
-        KeyBinding::new(true, false, false, "F2").display(),
-        "Ctrl+F2"
+        KeyBinding::new(false, false, false, true, "F2").display(),
+        format!("{SUPER_KEY_NAME}+F2")
     );
     assert_eq!(
-        KeyBinding::new(true, true, true, "KeyA").display(),
-        "Ctrl+Shift+Alt+A"
+        KeyBinding::new(true, true, true, true, "KeyA").display(),
+        format!("Ctrl+Shift+Alt+{SUPER_KEY_NAME}+A")
     );
     assert_eq!(
-        KeyBinding::new(false, false, false, "Digit5").display(),
+        KeyBinding::new(false, false, false, false, "Digit5").display(),
         "5"
+    );
+}
+
+#[test]
+fn the_super_key_takes_the_name_the_host_gives_it() {
+    // The label follows the key cap. The stored field does not: a file written
+    // on one host reads the same on the other.
+    #[cfg(windows)]
+    assert_eq!(SUPER_KEY_NAME, "Win");
+    #[cfg(not(windows))]
+    assert_eq!(SUPER_KEY_NAME, "Super");
+    let text = toml::to_string_pretty(&GuiPrefs::default()).expect("serialize");
+    assert!(text.contains("super = true"), "{text}");
+}
+
+#[test]
+fn a_binding_without_the_super_field_still_loads() {
+    // A file written before Super was a modifier has no `super` key in the
+    // table. It must parse, or one missing field would reset every preference.
+    let text = "[fullscreen]\nctrl = false\nshift = true\nalt = false\nkey = \"F9\"\n";
+    let parsed: GuiPrefs = toml::from_str(text).expect("deserialize");
+    assert_eq!(
+        parsed.fullscreen,
+        KeyBinding::new(false, true, false, false, "F9")
+    );
+}
+
+#[test]
+fn retired_hotkey_defaults_move_to_the_current_ones() {
+    let text = "[input_release]\nctrl = true\nshift = false\nalt = false\nkey = \"F2\"\n\
+                [fullscreen]\nctrl = true\nshift = false\nalt = false\nkey = \"F11\"\n";
+    let path = PathBuf::from("izarravm.conf");
+    let moved = GuiPrefs::load_with(&path, |_| Ok(text.to_string()));
+    assert_eq!(moved.input_release, GuiPrefs::default().input_release);
+    assert_eq!(moved.fullscreen, GuiPrefs::default().fullscreen);
+
+    // A combination the user chose is left alone, even on the same keys.
+    let chosen = "[input_release]\nctrl = true\nshift = true\nalt = false\nkey = \"F2\"\n";
+    let kept = GuiPrefs::load_with(&path, |_| Ok(chosen.to_string()));
+    assert_eq!(
+        kept.input_release,
+        KeyBinding::new(true, true, false, false, "F2")
     );
 }
 

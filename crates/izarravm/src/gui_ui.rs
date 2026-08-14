@@ -325,11 +325,18 @@ impl GuiApp {
 
     /// Record a captured combo into the staged binding the dialog is waiting on,
     /// then stop capturing. `key` is the winit `KeyCode` debug name.
-    pub(super) fn record_bind(&mut self, key: &str, ctrl: bool, shift: bool, alt: bool) {
+    pub(super) fn record_bind(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        super_key: bool,
+    ) {
         if let Some(dialog) = &mut self.config_dialog
             && let Some(target) = dialog.capturing.take()
         {
-            let binding = KeyBinding::new(ctrl, shift, alt, key);
+            let binding = KeyBinding::new(ctrl, shift, alt, super_key, key);
             match target {
                 BindTarget::InputRelease => dialog.input_release = binding,
                 BindTarget::Fullscreen => dialog.fullscreen = binding,

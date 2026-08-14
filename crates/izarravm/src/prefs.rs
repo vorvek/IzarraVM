@@ -59,34 +59,56 @@ pub const MAX_VOLUME: f32 = 5.0;
 /// answer from here.
 const RETIRED_KEYS: &[&str] = &["amp_gain", "output_gain", "pc_speaker_volume"];
 
+/// What a label calls the Super key. Windows names it after itself, and a
+/// Windows user looks for that name on the key cap; the Linux desktops name it
+/// Super. Only the label changes. The field, the `super` key in
+/// `izarravm.conf`, and the matcher are the same everywhere, so a preferences
+/// file stays portable between the two hosts.
+#[cfg(windows)]
+pub const SUPER_KEY_NAME: &str = "Win";
+#[cfg(not(windows))]
+pub const SUPER_KEY_NAME: &str = "Super";
+
 /// A host hotkey: modifier flags plus a key name. `key` is the winit `KeyCode`
 /// debug name (e.g. "F2", "KeyA"), which the GUI compares against the live key
 /// and renders prettily. Kept winit-free so prefs stays plain data.
+///
+/// `super_key` is the Super key. See `SUPER_KEY_NAME` for the name the label
+/// gives it. A file written before it became a modifier has no `super` in the
+/// table, so the field carries `serde(default)`: without it one missing key
+/// fails the whole parse and every preference falls back to its default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyBinding {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+    #[serde(rename = "super", default)]
+    pub super_key: bool,
     pub key: String,
 }
 
 impl KeyBinding {
-    pub fn new(ctrl: bool, shift: bool, alt: bool, key: &str) -> Self {
+    pub fn new(ctrl: bool, shift: bool, alt: bool, super_key: bool, key: &str) -> Self {
         Self {
             ctrl,
             shift,
             alt,
+            super_key,
             key: key.to_string(),
         }
     }
 
     /// True when the live key name and modifier state match this binding.
-    pub fn matches(&self, key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
-        self.ctrl == ctrl && self.shift == shift && self.alt == alt && self.key == key
+    pub fn matches(&self, key: &str, ctrl: bool, shift: bool, alt: bool, super_key: bool) -> bool {
+        self.ctrl == ctrl
+            && self.shift == shift
+            && self.alt == alt
+            && self.super_key == super_key
+            && self.key == key
     }
 
-    /// Human label like "Ctrl+F2". Strips the winit "Key"/"Digit" prefixes so a
-    /// letter or number reads naturally.
+    /// Human label like "Win+F2" on Windows and "Super+F2" on Linux. Strips the
+    /// winit "Key"/"Digit" prefixes so a letter or number reads naturally.
     pub fn display(&self) -> String {
         let mut s = String::new();
         if self.ctrl {
@@ -98,6 +120,10 @@ impl KeyBinding {
         if self.alt {
             s.push_str("Alt+");
         }
+        if self.super_key {
+            s.push_str(SUPER_KEY_NAME);
+            s.push('+');
+        }
         let key = self
             .key
             .strip_prefix("Key")
@@ -106,6 +132,35 @@ impl KeyBinding {
         s.push_str(key);
         s
     }
+}
+
+/// The hotkey that releases captured input.
+fn default_input_release() -> KeyBinding {
+    KeyBinding::new(false, false, false, true, "F2")
+}
+
+/// The hotkey that toggles fullscreen.
+fn default_fullscreen() -> KeyBinding {
+    KeyBinding::new(false, false, false, true, "F4")
+}
+
+/// The two defaults these replaced, as (retired, current) pairs. A file written
+/// before Super was a modifier carries the retired combination, which nobody
+/// picked: it was whatever the build shipped. `migrate_retired_hotkeys` moves
+/// such a binding to the current default, so a change of default reaches an
+/// existing installation. A user who chose the retired combination by hand
+/// loses it once and rebinds it in the config modal.
+fn retired_hotkey_defaults() -> [(KeyBinding, KeyBinding); 2] {
+    [
+        (
+            KeyBinding::new(true, false, false, false, "F2"),
+            default_input_release(),
+        ),
+        (
+            KeyBinding::new(true, false, false, false, "F11"),
+            default_fullscreen(),
+        ),
+    ]
 }
 
 /// CRT presentation style.
@@ -146,9 +201,9 @@ pub struct GuiPrefs {
     pub master_volume: f32,
     /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
     pub crt_style: CrtStyle,
-    /// Hotkey that releases captured input. Default Ctrl+F2.
+    /// Hotkey that releases captured input. Default Super+F2.
     pub input_release: KeyBinding,
-    /// Hotkey that toggles fullscreen. Default Ctrl+F11.
+    /// Hotkey that toggles fullscreen. Default Super+F4.
     pub fullscreen: KeyBinding,
     /// Optional host controller mapping for the Izarra gameport.
     pub joystick_binding: Option<JoystickBinding>,
@@ -173,8 +228,8 @@ impl Default for GuiPrefs {
         Self {
             master_volume: DEFAULT_VOLUME,
             crt_style: CrtStyle::Subtle,
-            input_release: KeyBinding::new(true, false, false, "F2"),
-            fullscreen: KeyBinding::new(true, false, false, "F11"),
+            input_release: default_input_release(),
+            fullscreen: default_fullscreen(),
             joystick_binding: None,
             last_floppy_image: None,
             last_cd_image: None,
@@ -231,11 +286,35 @@ impl GuiPrefs {
         match value.try_into::<Self>() {
             Ok(mut prefs) => {
                 prefs.master_volume = prefs.master_volume.clamp(0.0, MAX_VOLUME);
+                prefs.migrate_retired_hotkeys(path);
                 prefs
             }
             Err(err) => {
                 warn!(%err, path = %path.display(), "could not parse izarravm.conf; using defaults");
                 Self::default()
+            }
+        }
+    }
+
+    /// Move a hotkey that still holds a retired default to the current default.
+    /// See `retired_hotkey_defaults`. One log line names each move, because the
+    /// next save writes the new combination to the file.
+    fn migrate_retired_hotkeys(&mut self, path: &Path) {
+        let [release, fullscreen] = retired_hotkey_defaults();
+        let slots = [
+            (&mut self.input_release, release),
+            (&mut self.fullscreen, fullscreen),
+        ];
+        for (binding, (retired, current)) in slots {
+            if *binding == retired {
+                warn!(
+                    path = %path.display(),
+                    from = %retired.display(),
+                    to = %current.display(),
+                    "moving a hotkey off a retired default in izarravm.conf; \
+                     set another combination in the config modal if you want one"
+                );
+                *binding = current;
             }
         }
     }
