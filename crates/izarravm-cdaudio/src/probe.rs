@@ -43,6 +43,14 @@ pub enum CdAudioError {
 pub struct TrackInfo {
     pub sample_rate: u32,
     pub channels: u16,
+    /// Source sample frames of audio, with any encoder delay and trailing
+    /// padding already excluded.
+    ///
+    /// Carried so that the decode works from the number the TOC was built from
+    /// rather than deriving its own. The two agreeing is the invariant the
+    /// whole design rests on, and the cheapest way to guarantee it is to have
+    /// only one number.
+    pub frames: u64,
     /// Red Book frames this track occupies once converted to 44.1 kHz stereo.
     pub sectors: u32,
 }
@@ -156,6 +164,7 @@ fn measure(path: &Path, container: Container) -> Result<TrackInfo, CdAudioError>
     Ok(TrackInfo {
         sample_rate,
         channels,
+        frames: src_frames,
         sectors: sectors_for(src_frames, sample_rate),
     })
 }

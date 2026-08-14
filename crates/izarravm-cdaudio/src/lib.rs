@@ -8,9 +8,11 @@
 //!
 //! See `dev_docs/2026-08-14-cd-audio-decoding-design.md`.
 
+mod decode;
 mod probe;
 mod sniff;
 
+pub use decode::{decode_into, decode_into_cancellable};
 pub use probe::{
     CD_SAMPLE_RATE, CdAudioError, SAMPLES_PER_FRAME, TrackInfo, probe_info, sectors_for,
 };
