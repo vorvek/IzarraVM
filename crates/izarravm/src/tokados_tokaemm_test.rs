@@ -290,7 +290,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         let Some(io_base_physical) = machine.translate_linear_probe(io_base_linear) else {
             continue;
         };
-        let Some(io_base) = machine.peek_direct_ram(io_base_physical, izarravm_bus::BusWidth::Word)
+        let Some(io_base) =
+            machine.peek_direct_ram_for_probe(io_base_physical, izarravm_bus::BusWidth::Word)
         else {
             // Recorded as a refusal by leaving the sample out; the assertions below fail loudly
             // on an empty vector rather than passing vacuously.
@@ -301,7 +302,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             continue;
         };
         let Some(bitmap_byte) =
-            machine.peek_direct_ram(bitmap_physical, izarravm_bus::BusWidth::Byte)
+            machine.peek_direct_ram_for_probe(bitmap_physical, izarravm_bus::BusWidth::Byte)
         else {
             continue;
         };

@@ -157,7 +157,8 @@
 //! `direct_page_ram_bytes` inside the peek, so `read_memory_direct` takes its aligned direct-RAM
 //! arm and cannot fail. They are asserted, not handled.
 //!
-//! **Zero partial effects.** On every one of them, at the moment of return: `registers.gpr` is byte-identical
+//! **Zero partial effects.** On producers 1 and 2, and on producer 3 from the CPL0 arm, at the
+//! moment of return: `registers.gpr` is byte-identical
 //! to the pre-call state (AL is written only after a successful read), EFLAGS and `pending_flags`
 //! are untouched (IN writes no flags), EIP still holds the block-entry value, `elapsed_clocks`,
 //! `perf`, `timing_rem`, `written_pages` and `prefetch` are untouched, and no clocks are charged
@@ -165,6 +166,26 @@
 //! at the call-out, which is byte-for-byte the state the run loop sees TODAY when a block ends at
 //! an IN barrier -- so the interpreter re-executes the instruction and delivers exactly what it
 //! delivers today. FAIL-CLOSED: any status the helper cannot certify is negative.
+//!
+//! **The one exception, stated rather than hidden: producer 3 reached from the BITMAP arm.**
+//! There, C1 and C2 have already charged the two TSS data reads before `read_io` is called, so an
+//! `Err` returns after a charge. The interpreter then re-executes the whole instruction and
+//! charges those two reads again: the run is short by nothing and long by two data-read cycles.
+//! Nothing guest-visible other than timing moves -- no register, no flag, no guest memory, no
+//! device.
+//!
+//! It is unreachable on the production bus and OPT-IN everywhere else. `MachineBus::read_io` has
+//! exactly one `Err` producer, `self.open_bus.note(port, false)?`, reached only when nothing
+//! decoded the port; `note` errs only for a port in the fatal set, which is populated solely by
+//! `OpenBusPorts::from_env` reading `IZARRAVM_PORT_FATAL` and by a test-only `set_fatal`. `0x3DA`
+//! is decoded by the VGA status path and never reaches that fall-through at all. So a guest has
+//! to be run with `IZARRAVM_PORT_FATAL` naming the polled port before the discrepancy can occur,
+//! and it is bounded at two data-read cycles per occurrence.
+//!
+//! This is the price of putting `read_io` LAST, and charge identity is what requires that: the
+//! interpreter's `check_io_permission` reads the TSS before it addresses the device, so any
+//! ordering that hoisted `read_io` above C1/C2 would charge the three accesses in a different
+//! order than the interpreter and forfeit the whole claim of section 2 of the design.
 //!
 //! # Timing fidelity
 //!
@@ -606,8 +627,9 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // exactly the misaligned case, so C1 is guaranteed the ALIGNED arm of `read_memory_direct`
     // and `charge_direct_ram_split` is unreachable from here; C2 is a byte and cannot split at
     // all. An `Err` is likewise unreachable for the same reason -- the aligned arm returns `Ok`
-    // unconditionally -- and is asserted rather than handled; the return keeps the helper honest
-    // for a bus that violates the trait's promise.
+    // unconditionally -- and is asserted; the return and its attribution keep the helper honest
+    // for a bus that violates the trait's promise, and keep `attempts == callout_executed` true
+    // on the attribution snapshot whichever way this goes.
     match permission {
         None => {
             if cpu.check_io_permission(bus, port, BusWidth::Byte).is_err() {
@@ -627,6 +649,12 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                 BusAccessKind::DataRead,
             ) else {
                 debug_assert!(false, "phase C re-read of a peeked io_base word failed");
+                #[cfg(feature = "direct-callout-attribution")]
+                cpu.jit_direct.note_callout_attribution(
+                    CallOutHelper::PortReadAlDx,
+                    Some(original_port),
+                    CallOutOutcome::Abnormal,
+                );
                 return STATUS_ABNORMAL;
             };
             debug_assert_eq!(
@@ -639,6 +667,12 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                 BusAccessKind::DataRead,
             ) else {
                 debug_assert!(false, "phase C re-read of a peeked bitmap byte failed");
+                #[cfg(feature = "direct-callout-attribution")]
+                cpu.jit_direct.note_callout_attribution(
+                    CallOutHelper::PortReadAlDx,
+                    Some(original_port),
+                    CallOutOutcome::Abnormal,
+                );
                 return STATUS_ABNORMAL;
             };
             debug_assert_eq!(

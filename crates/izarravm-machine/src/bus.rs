@@ -214,7 +214,16 @@ impl Machine {
     /// test needs it for: asking whether a physical address is the aligned, page-local, A20-clean
     /// plain RAM that the call-out's phase P requires. Charges nothing, exactly as the trait
     /// method it forwards to. Not a data path -- see that method's doc.
-    pub fn peek_direct_ram(&mut self, physical: u32, width: BusWidth) -> Option<u32> {
+    ///
+    /// NAMED AND HIDDEN so it cannot be mistaken for one. A `pub` cross-crate forwarder to an
+    /// uncharged RAM read is exactly the hole the trait method's doc warns about: a caller that
+    /// reaches for the short name and silently deletes its access from `elapsed_clocks` and from
+    /// the bus trace, which are the currency every performance comparison in this project is
+    /// measured in. The `_for_probe` suffix makes the misuse read wrong at the call site, and
+    /// `#[doc(hidden)]` keeps it out of the crate's surface. The whole caller set is the section
+    /// 6.0 TSS-geometry test.
+    #[doc(hidden)]
+    pub fn peek_direct_ram_for_probe(&mut self, physical: u32, width: BusWidth) -> Option<u32> {
         let bus = self.make_bus();
         bus.peek_direct_ram(physical, width)
     }

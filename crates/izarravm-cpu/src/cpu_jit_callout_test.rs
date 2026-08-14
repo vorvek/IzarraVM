@@ -815,8 +815,14 @@ fn the_bitmap_arm_charges_exactly_what_the_interpreter_charges() {
     };
 
     let mut legs: Vec<Vec<(BusAccessKind, u32, BusWidth)>> = Vec::new();
+    // The DEVICE-VISIBLE TIMESTAMP, which the cycle list cannot see. 0x3DA is answered by the
+    // lazy status-port path, whose `predicted_beam` is a pure function of the clock the CPU hands
+    // it, so a helper that passed a different `now` would return a different retrace bit from the
+    // same guest state -- a guest-visible divergence with an identical charge.
+    let mut timestamps: Vec<Option<u64>> = Vec::new();
     for leg in 0..4 {
         bus.trace = BusTrace::default();
+        bus.last_read_io_core_clocks_so_far = None;
         cpu.registers.set_eax(0xdead_beef);
         cpu.registers.set_edx(u32::from(PORT));
         cpu.elapsed_clocks = 0;
@@ -834,6 +840,7 @@ fn the_bitmap_arm_charges_exactly_what_the_interpreter_charges() {
             "leg {leg}: both roles must land the port byte"
         );
         legs.push(interesting(&bus));
+        timestamps.push(bus.last_read_io_core_clocks_so_far);
     }
 
     assert_eq!(legs[0], legs[1], "interpreter/helper pair 1 disagreed");
@@ -853,6 +860,15 @@ fn the_bitmap_arm_charges_exactly_what_the_interpreter_charges() {
             (BusAccessKind::IoRead, u32::from(PORT), BusWidth::Byte),
         ],
         "the charge ORDER is the claim; this is what section 2 of the design pins"
+    );
+    assert!(
+        timestamps[0].is_some(),
+        "no leg reached the device, so the timestamp axis proves nothing"
+    );
+    assert_eq!(
+        timestamps,
+        vec![timestamps[0]; 4],
+        "the device saw a different clock from the two roles"
     );
 }
 
