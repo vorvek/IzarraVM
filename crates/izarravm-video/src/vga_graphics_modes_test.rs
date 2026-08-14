@@ -1046,6 +1046,47 @@ fn guest_crtc_bang_retunes_mode_x_to_320x240() {
 }
 
 #[test]
+fn guest_crtc_bang_retunes_mode_x_to_360x240() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06); // enter mode X, 320x200 base
+    assert_eq!(vga.raster_width(), 320);
+    // Abrash's wide mode X (Black Book ch.47): the 28.322 MHz dot clock with 90
+    // character clocks of active display. A 256-color pixel takes two dot
+    // clocks, so 90 * 8 / 2 = 360 pixels, and offset 45 gives the matching 90
+    // bytes per plane per row. DOS Quake's 360x240 mode is this register set.
+    vga.write_port(0x3C2, 0xE7); // Misc Output: 28.322 MHz dot clock
+    for (idx, val) in [
+        (0x00u8, 0x6Bu8), // horizontal total: 112 character clocks
+        (0x01, 0x59),     // horizontal display end: 90 character clocks
+        (0x02, 0x5A),
+        (0x03, 0x8E),
+        (0x04, 0x5E),
+        (0x05, 0x8A),
+        (0x06, 0x0D), // vertical total
+        (0x07, 0x3E), // overflow (high bits)
+        (0x09, 0x41), // max scan line: 2 scanlines per row
+        (0x10, 0xEA), // vretrace start
+        (0x11, 0xAC), // vretrace end + protect
+        (0x12, 0xDF), // vertical display end
+        (0x13, 0x2D), // offset 45: 90 bytes per plane per row
+        (0x15, 0xE7), // vblank start
+        (0x16, 0x06), // vblank end
+    ] {
+        vga.write_port(0x3D4, idx);
+        vga.write_port(0x3D5, val);
+    }
+    assert_eq!(vga.raster_width(), 360, "360 active pixels per row");
+    assert_eq!(vga.crtc.offset, 45, "90 bytes per plane per row");
+    assert_eq!(vga.crtc.vdisp_end, 480, "480 active scanlines");
+    assert_eq!(vga.raster_height(), 527);
+    assert!(vga.crtc.double_scan, "240 source rows over 480 scanlines");
+    // 112 * 8 dots * 527 lines at 28.322 MHz is the mode's 60 Hz refresh.
+    assert_eq!(vga.frame_dots(), 112 * 8 * 527);
+}
+
+#[test]
 fn planar_vertical_crtc_writes_recompute_ega_timing() {
     let mut vga = Vga::default();
     assert!(vga.set_mode(0x10));

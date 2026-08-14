@@ -1787,6 +1787,12 @@ impl Vga {
         {
             self.recompute_vertical_timing();
         }
+        // Mode X also honors the guest's horizontal group: a tweaked 256-color
+        // mode carries its width in 00h/01h (see recompute_horizontal_timing for
+        // why the other modes keep their table values).
+        if self.mode == VideoMode::ModeX && matches!(index, 0x00 | 0x01) {
+            self.recompute_horizontal_timing();
+        }
     }
 
     fn write_attr(&mut self, value: u8) {
@@ -2539,6 +2545,37 @@ impl Vga {
         self.resize_work();
     }
 
+    /// Derive the active pixel width and the horizontal total in `crtc` from the
+    /// raw register bytes in `crtc_regs`. Used only while unchained (mode X).
+    ///
+    /// Horizontal Total (00h, +5) and End Horizontal Display (01h, +1) count
+    /// CHARACTER clocks, and a 256-color pixel takes two dot clocks (ATC Mode
+    /// Control 10h bit 6, 8-bit color), so the active width is
+    /// `(r01 + 1) * char_width / 2`: the standard 80 characters give 320, and
+    /// Abrash's wide mode X (Black Book ch.47) gives 360 from 90 characters at
+    /// the 28.322 MHz clock. DOS Quake's 360x200/240/400/480 modes are that
+    /// register set. Without this decode a 360-wide guest kept the canonical
+    /// 320, so the scanout dropped the rightmost 40 columns of every row and the
+    /// host stretched the surviving 320 across the whole 4:3 screen.
+    ///
+    /// Scoped to mode X on purpose. Chained mode 13h cannot exceed 320 pixels in
+    /// its 64 KB aperture, and the planar and text modes run a Sequencer
+    /// dot-clock divide (Clocking Mode 01h bit 3) that their timing tables
+    /// already fold into `htotal_chars`, so decoding 00h there would halve
+    /// `frame_dots` and double their refresh rate. Widen the scope only behind a
+    /// fixture that needs it.
+    fn recompute_horizontal_timing(&mut self) {
+        let disp_chars = (u32::from(self.crtc_regs.r01) + 1).max(1);
+        let dots_per_pixel = if self.attr.mode_control & 0x40 != 0 {
+            2
+        } else {
+            1
+        };
+        self.crtc.htotal_chars = (u32::from(self.crtc_regs.r00) + 5).max(disp_chars);
+        self.crtc.hdisp_end = (disp_chars * self.crtc.char_width / dots_per_pixel).max(1);
+        self.resize_work();
+    }
+
     /// Register-banged 256-color entry. Real silicon has no mode numbers: writing
     /// the standard 256-color register set (ATC mode-control graphics bit 0 +
     /// 8-bit color bit 6) IS the mode change. The ATC mode-control write is the
@@ -2556,11 +2593,12 @@ impl Vga {
     ///   renders full height. The GC-256/graphics requirement keeps a stray ATC
     ///   write in a text-mode guest from spuriously flipping the personality.
     ///
-    /// Horizontal timing installs the canonical 320-wide values rather than
-    /// decoding the guest's CRTC horizontal registers because both families write
-    /// the standard ones. Decode them if a title uses a nonstandard-width
-    /// 256-color mode. The symmetric register-banged EXIT to text is also not
-    /// derived — every known title restores text via INT 10h.
+    /// Horizontal timing follows the same split: the chained family installs the
+    /// canonical 320-wide values (a 64 KB aperture cannot hold a wider chained
+    /// mode), while the unchained family decodes the guest's horizontal CRTC
+    /// registers, so a nonstandard-width mode X keeps its width. The symmetric
+    /// register-banged EXIT to text is not derived — every known title restores
+    /// text via INT 10h.
     fn maybe_enter_256color_from_registers(&mut self) {
         let graphics = self.attr.mode_control & 0x01 != 0;
         let eight_bit = self.attr.mode_control & 0x40 != 0;
@@ -2586,11 +2624,13 @@ impl Vga {
             if !gc_256_graphics {
                 return;
             }
-            // Keep the guest's captured vertical CRTC timing (recompute decodes it)
-            // so a 320x240 mode Y keeps its 240 lines instead of snapping to 200.
+            // Keep the guest's captured CRTC timing (the recomputes decode it) so
+            // a 320x240 mode Y keeps its 240 lines instead of snapping to 200, and
+            // a 360-wide mode keeps its width instead of snapping to 320.
             self.bump_content_gen();
             self.crtc = CrtcTiming::mode_x();
             self.recompute_vertical_timing();
+            self.recompute_horizontal_timing();
             self.mode = VideoMode::ModeX;
         }
         self.beam = 0;
