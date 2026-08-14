@@ -216,9 +216,50 @@ impl AtapiDevice {
         self.set_play_range(start, end);
     }
 
+    /// Pause playback from the drive's front panel without executing a CDB.
+    /// The position is held, so a later [`Self::front_panel_play`] resumes it.
+    /// The epoch does not change: a pause is not a new play range.
+    pub(crate) fn front_panel_pause(&mut self) {
+        if self.play.playing {
+            self.play.playing = false;
+            self.play.paused = true;
+        }
+    }
+
     /// Stop playback from the drive's front panel without executing a CDB.
     pub(crate) fn front_panel_stop(&mut self) {
         self.stop_playback();
+    }
+
+    /// Play the audio track after the play head, from its start to the end of
+    /// the disc, without executing a CDB. This starts a new range, so a paused
+    /// drive resumes on the new track. Does nothing when
+    /// [`Self::next_audio_track_start`] finds no track to skip to.
+    pub(crate) fn front_panel_next_track(&mut self) {
+        let Some(start) = self.next_audio_track_start() else {
+            return;
+        };
+        let end = self
+            .image
+            .as_ref()
+            .map_or(start, |image| image.total_sectors());
+        self.set_play_range(start, end);
+    }
+
+    /// The first LBA of the audio track after the play head. `None` when the
+    /// drive is neither playing nor paused, or when the head is already inside
+    /// the last audio track of the disc.
+    pub(crate) fn next_audio_track_start(&self) -> Option<u32> {
+        if !self.play.playing && !self.play.paused {
+            return None;
+        }
+        let lba = self.play.current_lba;
+        self.image
+            .as_ref()?
+            .tracks()
+            .iter()
+            .find(|track| track.mode.is_audio() && track.start_lba > lba)
+            .map(|track| track.start_lba)
     }
 
     fn bump_playback_epoch(&mut self) {

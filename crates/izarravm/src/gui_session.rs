@@ -155,7 +155,9 @@ pub(super) enum SessionRequest {
     MountCd(PreparedCd),
     EjectCd,
     CdPlay,
+    CdPause,
     CdStop,
+    CdNextTrack,
     CdLinkedLevel(u8),
     MidiConfig(MidiConfig),
 }
@@ -168,7 +170,9 @@ impl SessionRequest {
             Self::MountCd(_) => SessionRequestKind::MountCd,
             Self::EjectCd => SessionRequestKind::EjectCd,
             Self::CdPlay => SessionRequestKind::CdPlay,
+            Self::CdPause => SessionRequestKind::CdPause,
             Self::CdStop => SessionRequestKind::CdStop,
+            Self::CdNextTrack => SessionRequestKind::CdNextTrack,
             Self::CdLinkedLevel(_) => SessionRequestKind::CdLinkedLevel,
             Self::MidiConfig(_) => SessionRequestKind::MidiConfig,
         }
@@ -182,7 +186,9 @@ pub(super) enum SessionRequestKind {
     MountCd,
     EjectCd,
     CdPlay,
+    CdPause,
     CdStop,
+    CdNextTrack,
     CdLinkedLevel,
     MidiConfig,
 }
@@ -999,8 +1005,16 @@ impl MachineGeneration {
                 self.machine.cd_front_panel_play();
                 Ok(())
             }
+            SessionRequest::CdPause => {
+                self.machine.cd_front_panel_pause();
+                Ok(())
+            }
             SessionRequest::CdStop => {
                 self.machine.cd_front_panel_stop();
+                Ok(())
+            }
+            SessionRequest::CdNextTrack => {
+                self.machine.cd_front_panel_next_track();
                 Ok(())
             }
             SessionRequest::CdLinkedLevel(level) => {
@@ -1529,7 +1543,9 @@ fn applied_state(kind: SessionRequestKind, snapshot: &SessionSnapshot) -> Applie
         }
         SessionRequestKind::MidiConfig => AppliedState::Midi(snapshot.midi_config.clone()),
         SessionRequestKind::CdPlay
+        | SessionRequestKind::CdPause
         | SessionRequestKind::CdStop
+        | SessionRequestKind::CdNextTrack
         | SessionRequestKind::CdLinkedLevel => AppliedState::Other,
     }
 }

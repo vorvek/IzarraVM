@@ -595,6 +595,7 @@ impl Machine {
             audio_capable: self.ide.device().audio_capable(),
             playing: playback.playing,
             paused: playback.paused,
+            has_next_track: self.ide.device().next_audio_track_start().is_some(),
             left_level,
             right_level,
         }
@@ -607,9 +608,23 @@ impl Machine {
         self.invalidate_device_edge_cache();
     }
 
+    /// Pause CD audio, holding the position, without executing an ATAPI packet
+    /// command.
+    pub fn cd_front_panel_pause(&mut self) {
+        self.ide.device_mut().front_panel_pause();
+        self.invalidate_device_edge_cache();
+    }
+
     /// Stop CD audio without executing an ATAPI packet command.
     pub fn cd_front_panel_stop(&mut self) {
         self.ide.device_mut().front_panel_stop();
+        self.invalidate_device_edge_cache();
+    }
+
+    /// Play the audio track after the play head. This is a front-panel
+    /// mutation and does not execute an ATAPI packet command.
+    pub fn cd_front_panel_next_track(&mut self) {
+        self.ide.device_mut().front_panel_next_track();
         self.invalidate_device_edge_cache();
     }
 

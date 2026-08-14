@@ -175,9 +175,10 @@ on the host, or loading an MT-32 ROM set -- see the
 ## Mounting removable media
 
 **Floppy (A:)**: accepts `.img`, `.ima`, and `.flp` disk images through a
-file picker.
+file picker, opened by **Load Floppy Image**.
 
-**CD-ROM (D:)** accepts three sources:
+**CD-ROM (D:)** accepts three sources. **Load CD Image** opens a file picker for
+the first two, and **Load folder** opens a folder picker for the third:
 
 - An **ISO** image, mounted as a single data track.
 - A **CUE** sheet with the files it names. Data tracks must be raw images
@@ -203,6 +204,36 @@ a data track, or named by more than one `TRACK`.
 A CD image and a CD folder are mutually exclusive. Mounting one clears the
 other. There is no equivalent host-folder option for the floppy drive; A:
 only takes image files.
+
+## The CD front panel
+
+The transport row in the D: bay is the drive's own front panel. It works on the
+mounted disc directly and issues no ATAPI packet command, so it plays a disc
+that no DOS program has opened. A guest that drives the disc itself is not
+locked out: the two share one transport, and whichever acted last holds it.
+
+Four controls sit on the row, left to right:
+
+- **Play / pause.** One button. It shows the play triangle while the drive is
+  stopped or paused, and the pause bars while the disc plays. Play from a stop
+  starts at the first audio track and runs to the end of the disc. Play from a
+  pause resumes at the held position. The button is available whenever the
+  mounted disc holds at least one audio track, so a data-only disc leaves it
+  greyed.
+- **Next track.** Plays from the start of the first audio track after the play
+  head, through to the end of the disc. A paused drive resumes on the new
+  track. The button is greyed while the drive is stopped, and on the last audio
+  track of the disc.
+- **Stop.** Ends playback and releases the position. It is available only while
+  the disc plays or is paused.
+- **The level fader.** The guest-visible CD line level on the ReSonique 2
+  mixer, the same pair of CT1745 registers `SNDMIXER` writes from DOS. It is a
+  machine mixer level, not the host playback level described under "The volume
+  knob" below. The filled part of the track reads the current level, the box on
+  the right reads and accepts it in percent, and a program inside the guest
+  that sets the CD level moves the fader.
+
+The CT1745 registers hold 32 steps, so the fader settles on the nearest one.
 
 ## The volume knob
 
@@ -238,8 +269,9 @@ meant.
 ## Other GUI features
 
 - A collapsible beige control panel below the display, with activity LEDs
-  for the floppy and the C: drive.
+  for the floppy, the CD-ROM, and the C: drive.
 - A master volume slider (above).
+- A CD front panel: play/pause, next track, stop, and a level fader (above).
 - A COM1 serial log window: a floating, resizable panel showing what the
   guest has written to the emulated serial port, useful for anything that
   logs there instead of the screen.

@@ -391,6 +391,93 @@ fn eject_button(ui: &mut egui::Ui, enabled: bool) -> bool {
     enabled && resp.clicked()
 }
 
+/// Which glyph a [`transport_button`] paints: the four standard transport
+/// symbols, as solid shapes on the eject button's scale.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransportIcon {
+    Play,
+    Pause,
+    SkipNext,
+    Stop,
+}
+
+/// A CD front-panel transport button, wide enough for a glyph rather than for
+/// a word. Returns true on a click while `enabled`. Painted for the same reason
+/// [`eject_button`] is: the egui button theme cannot give a tiny glyph the
+/// plastic look of the drive bay around it.
+fn transport_button(ui: &mut egui::Ui, enabled: bool, icon: TransportIcon, tip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::click());
+    let held = enabled && resp.is_pointer_button_down_on();
+    bevel_rect(ui.painter(), rect, FACEPLATE, !held);
+    let c = rect.center();
+    let col = if enabled { INK } else { BEVEL_LO };
+    // Half the glyph height, set so the glyphs carry the same weight as the
+    // eject triangle one row above and the buttons read as one family.
+    const H: f32 = 4.5;
+    let bar = |x0: f32, x1: f32, half_h: f32| {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(c.x + x0, c.y - half_h),
+                egui::pos2(c.x + x1, c.y + half_h),
+            ),
+            0.0,
+            col,
+        );
+    };
+    let triangle = |x0: f32, tip_x: f32| {
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(c.x + x0, c.y - H),
+                egui::pos2(c.x + x0, c.y + H),
+                egui::pos2(c.x + tip_x, c.y),
+            ],
+            col,
+            egui::Stroke::NONE,
+        ));
+    };
+    match icon {
+        TransportIcon::Play => triangle(-4.25, 4.25),
+        TransportIcon::Pause => {
+            bar(-4.0, -1.0, H);
+            bar(1.0, 4.0, H);
+        }
+        TransportIcon::SkipNext => {
+            triangle(-4.5, 1.5);
+            bar(2.6, 4.5, H);
+        }
+        // A square of the full glyph height outweighs the other three, so the
+        // stop block takes the usual optical trim on both axes.
+        TransportIcon::Stop => bar(-4.0, 4.0, 4.0),
+    }
+    let clicked = enabled && resp.clicked();
+    resp.on_hover_text(tip);
+    clicked
+}
+
+/// The CD level fader. The same slider as the speaker level on the audio
+/// panel: a trailing fill so the travelled part of the track reads the level,
+/// and an editable value box in percent on the right.
+///
+/// The box is editable, so it needs a parser in the units it prints. The
+/// travel is already whole percent, so unlike the speaker knob the parser only
+/// has to accept the "%" the formatter writes.
+fn cd_fader(ui: &mut egui::Ui, enabled: bool, percent: u8) -> Option<u8> {
+    let mut level = percent;
+    // Leave the value box the same room the speaker row leaves it.
+    ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(40.0);
+    let moved = ui
+        .add_enabled(
+            enabled,
+            egui::Slider::new(&mut level, 0..=100)
+                .trailing_fill(true)
+                .custom_formatter(|value, _| format!("{value:.0}%"))
+                .custom_parser(|text| text.trim().trim_end_matches('%').trim().parse().ok()),
+        )
+        .on_hover_text("CD audio level")
+        .changed();
+    moved.then_some(level)
+}
+
 /// A small speaker icon (back box, flared cone, and two sound waves) drawn at
 /// the left of the volume row in place of a text label.
 fn volume_icon(ui: &mut egui::Ui) {
@@ -1458,7 +1545,7 @@ impl GuiApp {
             );
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(running, egui::Button::new("Load IMG"))
+                    .add_enabled(running, egui::Button::new("Load Floppy Image"))
                     .clicked()
                 {
                     self.load_floppy_img();
@@ -1504,9 +1591,47 @@ impl GuiApp {
                 .italics()
                 .size(11.0),
             );
+            // Transport first: the audio controls sit directly under the tray,
+            // and the media buttons below them.
+            ui.horizontal(|ui| {
+                // One button toggles play and pause, the way a drive's own
+                // front panel does, so playing no longer leaves a dead control.
+                let (icon, tip, request) = if cd_audio.playing {
+                    (TransportIcon::Pause, "Pause", SessionRequest::CdPause)
+                } else {
+                    (TransportIcon::Play, "Play", SessionRequest::CdPlay)
+                };
+                if transport_button(ui, cd_transport_enabled(running, cd_audio), icon, tip) {
+                    let _ = self.request_session(request);
+                }
+                if transport_button(
+                    ui,
+                    cd_skip_enabled(running, cd_audio),
+                    TransportIcon::SkipNext,
+                    "Next track",
+                ) {
+                    let _ = self.request_session(SessionRequest::CdNextTrack);
+                }
+                if transport_button(
+                    ui,
+                    cd_stop_enabled(running, cd_audio),
+                    TransportIcon::Stop,
+                    "Stop",
+                ) {
+                    let _ = self.request_session(SessionRequest::CdStop);
+                }
+                ui.add_space(2.0);
+                volume_icon(ui);
+                ui.add_space(4.0);
+                let percent = cd_level_percent(cd_audio.left_level, cd_audio.right_level);
+                if let Some(moved) = cd_fader(ui, running, percent) {
+                    let _ = self
+                        .request_session(SessionRequest::CdLinkedLevel(cd_percent_level(moved)));
+                }
+            });
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(running, egui::Button::new("Load ISO"))
+                    .add_enabled(running, egui::Button::new("Load CD Image"))
                     .clicked()
                 {
                     self.load_cd_image();
@@ -1516,42 +1641,6 @@ impl GuiApp {
                     .clicked()
                 {
                     self.load_cd_folder();
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        running
-                            && cd_audio.media_present
-                            && cd_audio.audio_capable
-                            && !cd_audio.playing,
-                        egui::Button::new("Play"),
-                    )
-                    .clicked()
-                {
-                    let _ = self.request_session(SessionRequest::CdPlay);
-                }
-                if ui
-                    .add_enabled(
-                        running && (cd_audio.playing || cd_audio.paused),
-                        egui::Button::new("Stop"),
-                    )
-                    .clicked()
-                {
-                    let _ = self.request_session(SessionRequest::CdStop);
-                }
-                let mut percent = cd_level_percent(cd_audio.left_level, cd_audio.right_level);
-                if ui
-                    .add_enabled(
-                        running,
-                        egui::Slider::new(&mut percent, 0..=100)
-                            .text("Volume")
-                            .show_value(false),
-                    )
-                    .changed()
-                {
-                    let _ = self
-                        .request_session(SessionRequest::CdLinkedLevel(cd_percent_level(percent)));
                 }
             });
         });
@@ -1668,6 +1757,22 @@ fn cd_level_percent(left: u8, right: u8) -> u8 {
 
 fn cd_eject_enabled(running: bool, state: CdAudioState) -> bool {
     running && state.media_present
+}
+
+/// Play/pause is live whenever the drive holds a disc with an audio track. It
+/// stays live while playing, because the same button then pauses.
+fn cd_transport_enabled(running: bool, state: CdAudioState) -> bool {
+    running && state.media_present && state.audio_capable
+}
+
+/// Skip needs a track to skip to, so it also waits on live playback.
+fn cd_skip_enabled(running: bool, state: CdAudioState) -> bool {
+    cd_transport_enabled(running, state) && state.has_next_track
+}
+
+/// Stop is live only while there is playback to stop.
+fn cd_stop_enabled(running: bool, state: CdAudioState) -> bool {
+    running && (state.playing || state.paused)
 }
 
 fn cd_percent_level(percent: u8) -> u8 {

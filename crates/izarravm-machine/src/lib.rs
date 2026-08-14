@@ -65,6 +65,9 @@ pub struct CdAudioState {
     pub audio_capable: bool,
     pub playing: bool,
     pub paused: bool,
+    /// An audio track starts after the play head, so a skip has somewhere to
+    /// go. False whenever the drive is neither playing nor paused.
+    pub has_next_track: bool,
     /// Raw CT1745 register `0x36` level (`0..=31`).
     pub left_level: u8,
     /// Raw CT1745 register `0x37` level (`0..=31`).

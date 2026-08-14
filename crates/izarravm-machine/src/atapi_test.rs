@@ -177,6 +177,96 @@ fn front_panel_play_uses_first_audio_track_and_epoch_skips_resume() {
     assert_ne!(dev.playback_epoch(), paused_epoch);
 }
 
+fn two_audio_track_disc() -> CdImage {
+    // 1 data sector, then two 50-frame audio tracks starting at LBA 1 and 51.
+    let cue = "TRACK 01 MODE1/2048\nINDEX 01 00:00:00\n\
+                   TRACK 02 AUDIO\nINDEX 01 00:00:01\n\
+                   TRACK 03 AUDIO\nINDEX 01 00:00:51\n";
+    let mut bin = vec![0u8; DATA_SECTOR + 100 * RAW_SECTOR];
+    for b in bin[DATA_SECTOR..].iter_mut() {
+        *b = 0x20;
+    }
+    CdImage::from_cue(cue, bin).unwrap()
+}
+
+#[test]
+fn front_panel_pause_holds_the_position_for_the_next_play() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(audio_disc());
+    dev.front_panel_play();
+    assert!(dev.next_audio_frame().is_some());
+    let held_lba = dev.playback().current_lba;
+    let playing_epoch = dev.playback_epoch();
+
+    dev.front_panel_pause();
+    let paused = dev.playback();
+    assert!(!paused.playing);
+    assert!(paused.paused);
+    assert_eq!(paused.current_lba, held_lba);
+    // A pause is not a new range, so the mixer must not restart its cursor.
+    assert_eq!(dev.playback_epoch(), playing_epoch);
+
+    dev.front_panel_play();
+    assert!(dev.playback().playing);
+    assert_eq!(dev.playback().current_lba, held_lba);
+    assert_eq!(dev.playback_epoch(), playing_epoch);
+}
+
+#[test]
+fn front_panel_pause_on_a_stopped_drive_does_nothing() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(audio_disc());
+    let epoch = dev.playback_epoch();
+    dev.front_panel_pause();
+    assert_eq!(dev.playback(), Playback::default());
+    assert_eq!(dev.playback_epoch(), epoch);
+}
+
+#[test]
+fn front_panel_next_track_moves_to_the_following_audio_track() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(two_audio_track_disc());
+    dev.front_panel_play();
+    assert_eq!(dev.playback().current_lba, 1);
+    assert_eq!(dev.next_audio_track_start(), Some(51));
+
+    dev.front_panel_next_track();
+    let skipped = dev.playback();
+    assert!(skipped.playing);
+    assert_eq!(skipped.current_lba, 51);
+    // The skip plays to the end of the disc, as a front-panel play does.
+    assert_eq!(skipped.end_lba, 101);
+
+    // The last audio track has nothing to skip to, so the head stays put.
+    assert_eq!(dev.next_audio_track_start(), None);
+    dev.front_panel_next_track();
+    assert_eq!(dev.playback(), skipped);
+}
+
+#[test]
+fn front_panel_next_track_resumes_a_paused_drive_on_the_new_track() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(two_audio_track_disc());
+    dev.front_panel_play();
+    dev.front_panel_pause();
+    assert!(dev.playback().paused);
+
+    dev.front_panel_next_track();
+    let skipped = dev.playback();
+    assert!(skipped.playing);
+    assert!(!skipped.paused);
+    assert_eq!(skipped.current_lba, 51);
+}
+
+#[test]
+fn next_audio_track_start_is_none_while_stopped() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(two_audio_track_disc());
+    assert_eq!(dev.next_audio_track_start(), None);
+    dev.front_panel_next_track();
+    assert_eq!(dev.playback(), Playback::default());
+}
+
 #[test]
 fn front_panel_play_ignores_data_only_media() {
     let mut dev = AtapiDevice::new();

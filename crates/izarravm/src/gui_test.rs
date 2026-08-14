@@ -201,6 +201,50 @@ fn cd_eject_uses_live_media_state_instead_of_a_host_label() {
 }
 
 #[test]
+fn cd_transport_buttons_follow_live_playback_state() {
+    let audio_disc = CdAudioState {
+        media_present: true,
+        audio_capable: true,
+        ..CdAudioState::default()
+    };
+    let data_disc = CdAudioState {
+        audio_capable: false,
+        ..audio_disc
+    };
+    let playing = CdAudioState {
+        playing: true,
+        has_next_track: true,
+        ..audio_disc
+    };
+    let last_track = CdAudioState {
+        has_next_track: false,
+        ..playing
+    };
+    let paused = CdAudioState {
+        playing: false,
+        paused: true,
+        ..playing
+    };
+
+    // Play/pause stays live while playing, because the button then pauses.
+    assert!(cd_transport_enabled(true, audio_disc));
+    assert!(cd_transport_enabled(true, playing));
+    assert!(!cd_transport_enabled(true, data_disc));
+    assert!(!cd_transport_enabled(false, playing));
+
+    // Skip needs a track after the play head, so a stopped drive cannot skip.
+    assert!(cd_skip_enabled(true, playing));
+    assert!(cd_skip_enabled(true, paused));
+    assert!(!cd_skip_enabled(true, last_track));
+    assert!(!cd_skip_enabled(true, audio_disc));
+
+    assert!(cd_stop_enabled(true, playing));
+    assert!(cd_stop_enabled(true, paused));
+    assert!(!cd_stop_enabled(true, audio_disc));
+    assert!(!cd_stop_enabled(false, playing));
+}
+
+#[test]
 fn initial_cd_source_preserves_explicit_image_precedence_without_fallback() {
     let dir =
         std::env::temp_dir().join(format!("izarravm-initial-cd-source-{}", std::process::id()));

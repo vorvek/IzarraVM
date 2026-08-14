@@ -249,6 +249,10 @@ impl GuiApp {
                         .add(
                             egui::Slider::new(&mut self.volume, 0.0..=MAX_VOLUME)
                                 .step_by(0.01)
+                                // The rail is the faceplate colour, so without
+                                // a trailing fill the travelled part of the
+                                // track reads no differently from the rest.
+                                .trailing_fill(true)
                                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
                                 .custom_parser(volume_percent_to_fraction),
                         )
