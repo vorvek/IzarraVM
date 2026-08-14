@@ -1771,7 +1771,11 @@ fn audio_capture_observes_every_advance_and_paces_by_cycles_run() {
     // Ten advances of one guest millisecond each -- shorter than the capture's
     // own 10 ms slice, which is what an injection burst looks like.
     let mut machine = build();
-    let mut capture = Some(AudioCapture::new(wav.clone(), &hardware));
+    let mut capture = Some(AudioCapture::new(
+        AudioSinkMode::Wav(wav.clone()),
+        &hardware,
+        AUDIO_CAPTURE_SLICE_MS,
+    ));
     let per_advance = clock_hz / 1_000;
     let mut spent = 0u64;
     for _ in 0..10 {
@@ -1883,35 +1887,11 @@ fn the_audio_wav_capture_records_the_machine_unscaled_by_the_host_volume_knob() 
     // The profile the capture is told about and the profile the machine is
     // actually built with have to be the same CPU, or the capture paces its
     // window off a clock the guest is not running at.
-    let hardware = HardwareProfile {
-        cpu: GswMode::Gsw386,
-        memory_mib: 16,
-        video: VideoCard::Vega,
-        sound_blaster: izarravm_core::SoundBlasterConfig::default(),
-        wss: izarravm_core::WssConfig::default(),
-    };
+    let hardware = audio_cost_hardware();
     let dir = munt_test_dir("audio-capture-no-host-gain");
     let clock_hz = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1);
     let ten_ms = clock_hz / 100;
-
-    // PIT channel 2 as a ~1 kHz square wave, then port 0x61 bits 0 (gate) and
-    // 1 (data enable): the beeper, driven from the guest the way a DOS program
-    // drives it. Then spin.
-    const BEEP: &[u8] = &[
-        0xB0, 0xB6, // mov al, 0xB6   -- channel 2, mode 3, lobyte/hibyte
-        0xE6, 0x43, // out 0x43, al
-        0xB0, 0xA9, // mov al, 0xA9   -- divisor 0x04A9 = 1193
-        0xE6, 0x42, // out 0x42, al
-        0xB0, 0x04, // mov al, 0x04
-        0xE6, 0x42, // out 0x42, al
-        0xB0, 0x03, // mov al, 0x03   -- gate + data enable
-        0xE6, 0x61, // out 0x61, al
-        0xEB, 0xFE, // jmp $
-    ];
-    let build = || {
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), BEEP)
-            .expect("build raw machine")
-    };
+    let build = audio_beep_machine;
     let peak = |pcm: &[(i16, i16)]| -> i32 {
         pcm.iter()
             .map(|(l, r)| (*l as i32).abs().max((*r as i32).abs()))
@@ -1921,7 +1901,11 @@ fn the_audio_wav_capture_records_the_machine_unscaled_by_the_host_volume_knob() 
 
     // Through the capture, the way a headless run records.
     let mut machine = build();
-    let mut capture = Some(AudioCapture::new(dir.join("beep.wav"), &hardware));
+    let mut capture = Some(AudioCapture::new(
+        AudioSinkMode::Wav(dir.join("beep.wav")),
+        &hardware,
+        AUDIO_CAPTURE_SLICE_MS,
+    ));
     for _ in 0..5 {
         run_sliced(&mut machine, ten_ms, &mut capture).unwrap();
     }
@@ -1946,6 +1930,337 @@ fn the_audio_wav_capture_records_the_machine_unscaled_by_the_host_volume_knob() 
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PIT channel 2 as a ~1 kHz square wave through port 0x61, then spin. Shared by
+/// the audio-cost tests: an entirely silent guest still pays full OPL synthesis,
+/// so a checksum assertion needs a guest that actually puts something on the
+/// line-out or it cannot tell "the mix ran" from "the mix was elided".
+const AUDIO_TEST_BEEP: &[u8] = &[
+    0xB0, 0xB6, // mov al, 0xB6   -- channel 2, mode 3, lobyte/hibyte
+    0xE6, 0x43, // out 0x43, al
+    0xB0, 0xA9, // mov al, 0xA9   -- divisor 0x04A9 = 1193
+    0xE6, 0x42, // out 0x42, al
+    0xB0, 0x04, // mov al, 0x04
+    0xE6, 0x42, // out 0x42, al
+    0xB0, 0x03, // mov al, 0x03   -- gate + data enable
+    0xE6, 0x61, // out 0x61, al
+    0xEB, 0xFE, // jmp $
+];
+
+fn audio_cost_hardware() -> HardwareProfile {
+    HardwareProfile {
+        cpu: GswMode::Gsw386,
+        memory_mib: 16,
+        video: VideoCard::Vega,
+        sound_blaster: izarravm_core::SoundBlasterConfig::default(),
+        wss: izarravm_core::WssConfig::default(),
+    }
+}
+
+fn audio_beep_machine() -> Machine {
+    Machine::new_raw_program(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        AUDIO_TEST_BEEP,
+    )
+    .expect("build raw machine")
+}
+
+/// Run the beeper for `slices` ten-millisecond advances under one sink mode and
+/// hand back the observer and the machine it observed. One `run_sliced` call per
+/// advance, i.e. the shape an injection path produces.
+fn run_audio_cost_leg(mode: AudioSinkMode, slices: u32) -> (AudioCapture, Machine) {
+    let hardware = audio_cost_hardware();
+    let ten_ms = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 100);
+    let mut machine = audio_beep_machine();
+    let mut capture = Some(AudioCapture::new(mode, &hardware, AUDIO_CAPTURE_SLICE_MS));
+    for _ in 0..slices {
+        run_sliced(&mut machine, ten_ms, &mut capture).unwrap();
+    }
+    (capture.unwrap(), machine)
+}
+
+/// The same guest work as [`run_audio_cost_leg`], but requested as ONE
+/// `run_sliced` call, so the subdivision happens INSIDE the run loop.
+fn run_audio_cost_leg_one_call(mode: AudioSinkMode, slices: u32) -> AudioCapture {
+    let hardware = audio_cost_hardware();
+    let mut machine = audio_beep_machine();
+    let mut capture = Some(AudioCapture::new(mode, &hardware, AUDIO_CAPTURE_SLICE_MS));
+    let cycles = capture.as_ref().unwrap().slice * u64::from(slices);
+    let (_, ran) = run_sliced(&mut machine, cycles, &mut capture).unwrap();
+    assert_eq!(ran, cycles, "the guest stopped short of the request");
+    capture.unwrap()
+}
+
+/// `IZARRAVM_AUDIO_COST` decides which of two legs of a measurement this run is,
+/// so a value it does not understand must FAIL rather than fall back.
+///
+/// The failure mode being closed off is silent and unfalsifiable from the
+/// results: a typo that quietly disarmed the observer would produce two identical
+/// legs, a wall ratio of 1.0, and the conclusion "audio is free" -- a wrong
+/// answer where a crash would have been a missing one. The empty string is the
+/// same hazard wearing house colours: in pwsh,
+/// `[Environment]::SetEnvironmentVariable(name, $null, "Process")` leaves the
+/// variable empty-but-set and children inherit it, so "cleared" and "set to
+/// nothing" must not mean different things here.
+#[test]
+fn audio_cost_mode_parse_is_pinned() {
+    assert_eq!(
+        parse_audio_cost_mode("count").unwrap(),
+        AudioSinkMode::Count
+    );
+    assert_eq!(
+        parse_audio_cost_mode("  COUNT \n").unwrap(),
+        AudioSinkMode::Count,
+        "a value that arrived with whitespace or in another case is still a mode"
+    );
+    assert_eq!(parse_audio_cost_mode("off").unwrap(), AudioSinkMode::Skip);
+    assert_eq!(
+        parse_audio_cost_mode("skip").unwrap(),
+        AudioSinkMode::Skip,
+        "`skip` names the sink, `off` names the leg; both must reach the control leg"
+    );
+    for typo in ["on", "1", "true", "counting", "wav", ""] {
+        assert!(
+            parse_audio_cost_mode(typo).is_err(),
+            "{typo:?} must not silently resolve to a mode"
+        );
+    }
+    // The label is what the ladder greps out of the report line.
+    assert_eq!(AudioSinkMode::Count.label(), "count");
+    assert_eq!(AudioSinkMode::Skip.label(), "off");
+
+    // An empty variable is an UNSET variable, in both directions, or the pwsh
+    // clear-by-null trap arms the observer on every row of a scoreboard.
+    assert_eq!(resolve_audio_sink_from(None, None).unwrap(), None);
+    assert_eq!(
+        resolve_audio_sink_from(Some(std::ffi::OsString::new()), Some(String::new())).unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_audio_sink_from(None, Some("count".into())).unwrap(),
+        Some(AudioSinkMode::Count)
+    );
+    assert_eq!(
+        resolve_audio_sink_from(Some("out.wav".into()), None).unwrap(),
+        Some(AudioSinkMode::Wav(PathBuf::from("out.wav")))
+    );
+    // Two observers of the same call, and one would silently win.
+    assert!(resolve_audio_sink_from(Some("out.wav".into()), Some("count".into())).is_err());
+
+    assert_eq!(parse_audio_cost_slice_ms(None).unwrap(), 10);
+    assert_eq!(
+        parse_audio_cost_slice_ms(Some(String::new())).unwrap(),
+        AUDIO_CAPTURE_SLICE_MS
+    );
+    assert_eq!(parse_audio_cost_slice_ms(Some("1".into())).unwrap(), 1);
+    assert!(parse_audio_cost_slice_ms(Some("0".into())).is_err());
+    assert!(parse_audio_cost_slice_ms(Some("ten".into())).is_err());
+}
+
+/// The armed leg has to actually mix, has to mix the SAME way twice, and has to
+/// leave nothing behind on disk.
+///
+/// All three are load-bearing for the instrument. A sink cheap enough to be
+/// elided would measure nothing; a non-deterministic mix would break the ladder's
+/// per-role determinism rule; and a file write would put ~29 MB of buffer growth
+/// and a serialize into the very wall being measured -- which is the whole reason
+/// the WAV path cannot be used as the cost proxy.
+#[test]
+fn audio_cost_count_leg_folds_a_deterministic_mix_and_writes_nothing() {
+    let dir = munt_test_dir("audio-cost-count");
+    let before: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert!(before.is_empty(), "the scratch dir starts empty");
+
+    let (first, _) = run_audio_cost_leg(AudioSinkMode::Count, 5);
+    assert!(first.windows > 0, "the observer never ran a window");
+    assert!(first.out_frames > 0, "the mix returned no frames");
+    assert_ne!(
+        first.checksum, 0,
+        "the beeper is on the line-out: a zero fold means the mix never happened"
+    );
+    assert!(
+        first.pcm.is_empty(),
+        "the counting sink must not retain one frame"
+    );
+
+    let (second, _) = run_audio_cost_leg(AudioSinkMode::Count, 5);
+    assert_eq!(
+        (second.windows, second.native_samples, second.out_frames),
+        (first.windows, first.native_samples, first.out_frames),
+        "the same guest work must ask for the same windows"
+    );
+    assert_eq!(
+        second.checksum, first.checksum,
+        "the mix must be deterministic, or armed observations are not comparable"
+    );
+
+    // POSITIVE CONTROL first, or "no file appeared" proves only that this test
+    // was looking at a directory nothing writes to. The WAV sink finishing into
+    // THIS directory must produce a file here.
+    let hardware = audio_cost_hardware();
+    let ten_ms = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 100);
+    let mut wav_machine = audio_beep_machine();
+    let mut wav_capture = Some(AudioCapture::new(
+        AudioSinkMode::Wav(dir.join("control.wav")),
+        &hardware,
+        AUDIO_CAPTURE_SLICE_MS,
+    ));
+    for _ in 0..5 {
+        run_sliced(&mut wav_machine, ten_ms, &mut wav_capture).unwrap();
+    }
+    wav_capture.as_ref().unwrap().finish().unwrap();
+    let control: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(
+        control.len(),
+        1,
+        "the WAV sink wrote no file, so the assertion below would be vacuous"
+    );
+
+    // Now the armed leg into the SAME directory: `finish()` is mode-aware, runs
+    // before the wall reading, and the cost modes have no path to write to.
+    first.finish().unwrap();
+    let after: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(
+        after, control,
+        "the counting sink added a file to a directory it must not write to"
+    );
+    let report = first.cost_report();
+    assert!(
+        report.starts_with("audio cost: mode=count pacing=guest slice_ms=10 windows="),
+        "unexpected report line: {report}"
+    );
+    assert!(report.contains(&format!("out_frames={}", first.out_frames)));
+    assert!(report.contains("render_ns="));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The counting sink must see the SAME mix the WAV capture records.
+///
+/// `Count` is the armed leg of a cost measurement, and the only evidence that it
+/// prices the real thing is that the frames it folded are the frames the shipped
+/// observer would have written. Same guest, same cadence, two sinks: the frame
+/// count has to match and the fold over the WAV's own PCM has to reproduce the
+/// counting sink's checksum exactly. A `Count` path that rendered a shorter
+/// window, or a different mix, would otherwise be measuring something cheaper
+/// than the thing the campaign is deciding about.
+#[test]
+fn audio_cost_count_leg_folds_exactly_what_the_wav_capture_records() {
+    let hardware = audio_cost_hardware();
+    let ten_ms = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 100);
+    let dir = munt_test_dir("audio-cost-wav-parity");
+
+    let mut wav_machine = audio_beep_machine();
+    let mut wav = Some(AudioCapture::new(
+        AudioSinkMode::Wav(dir.join("parity.wav")),
+        &hardware,
+        AUDIO_CAPTURE_SLICE_MS,
+    ));
+    for _ in 0..5 {
+        run_sliced(&mut wav_machine, ten_ms, &mut wav).unwrap();
+    }
+    let wav = wav.unwrap();
+
+    let (count, _) = run_audio_cost_leg(AudioSinkMode::Count, 5);
+
+    assert!(!wav.pcm.is_empty(), "the WAV leg captured nothing");
+    assert_eq!(
+        count.out_frames,
+        wav.pcm.len() as u64,
+        "the counting sink saw a different number of frames than the WAV capture"
+    );
+    assert_eq!(
+        (count.windows, count.native_samples),
+        (wav.windows, wav.native_samples),
+        "the two sinks did not ask for the same windows"
+    );
+    assert_eq!(
+        count.checksum,
+        fold_audio_frames(0, &wav.pcm),
+        "the counting sink folded a different mix than the WAV capture recorded"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The observer has to count windows the same way when the subdivision happens
+/// INSIDE one `run_sliced` call, which is the shape every fixture run takes.
+///
+/// The per-advance path is exercised elsewhere; this is the other one. A window
+/// count that came out right only when the caller happened to hand over exactly
+/// one slice at a time would make every fixture observation's `windows` -- and
+/// therefore the cross-role window equality the ladder asserts -- a coincidence
+/// of the harness rather than a property of the observer.
+#[test]
+fn audio_cost_counts_one_window_per_slice_inside_a_single_advance() {
+    let armed = run_audio_cost_leg_one_call(AudioSinkMode::Count, 5);
+    let control = run_audio_cost_leg_one_call(AudioSinkMode::Skip, 5);
+
+    assert_eq!(armed.windows, 5, "five slices must render five windows");
+    assert_eq!(
+        control.windows, 5,
+        "the control leg must subdivide identically, or the pair measures slicing"
+    );
+    assert_eq!(armed.native_samples, control.native_samples);
+    assert!(armed.out_frames > 0);
+    assert_eq!(control.out_frames, 0);
+}
+
+/// The disarmed leg is a CONTROL, not an absence: it slices the run at the same
+/// cadence and computes the same window, and only skips `render_audio`.
+///
+/// If it were an ordinary unsliced run, the pair would measure SLICING -- arming
+/// the observer moves where device events are serviced -- and the audio number
+/// would be whatever that confound happened to be. The equalities below are what
+/// prove the two legs simulated the same guest: `instructions` and
+/// `elapsed_clocks` are exact, not toleranced, because both legs subdivide
+/// identically. Any drift means the observer reached the guest.
+#[test]
+fn audio_cost_skip_leg_slices_identically_and_renders_nothing() {
+    let (count, count_machine) = run_audio_cost_leg(AudioSinkMode::Count, 5);
+    let (skip, skip_machine) = run_audio_cost_leg(AudioSinkMode::Skip, 5);
+
+    assert_eq!(
+        (skip.windows, skip.native_samples),
+        (count.windows, count.native_samples),
+        "the control leg must compute the identical window it declines to render"
+    );
+    assert_eq!(skip.out_frames, 0, "the control leg must not render");
+    assert_eq!(skip.checksum, 0);
+    assert_eq!(
+        skip.render_ns, 0,
+        "no render happened, so no render time can have been spent"
+    );
+    assert!(skip.pcm.is_empty());
+
+    assert_eq!(
+        skip_machine.cpu().perf_counters().instructions,
+        count_machine.cpu().perf_counters().instructions,
+        "guest-visible work differs between the legs -- the observer reached the guest"
+    );
+    assert_eq!(
+        skip_machine.elapsed_clocks(),
+        count_machine.elapsed_clocks(),
+        "the two legs did not simulate the same amount of guest time"
+    );
+
+    assert!(
+        skip.cost_report()
+            .starts_with("audio cost: mode=off pacing=guest slice_ms=10 windows="),
+        "unexpected report line: {}",
+        skip.cost_report()
+    );
+    assert!(
+        skip.cost_report()
+            .contains("out_frames=0 checksum=0x0000000000000000")
+    );
 }
 
 /// Every counter the open-area profiling protocol correlates against must actually reach the

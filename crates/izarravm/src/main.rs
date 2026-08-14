@@ -1098,6 +1098,131 @@ const AUDIO_CAPTURE_OPL_HZ: f64 = 49_716.0;
 /// Sample rate of the captured WAV, matching the machine's DAC rate.
 const AUDIO_CAPTURE_DAC_HZ: u32 = 44_100;
 
+/// Where the headless observer sends the mix it pulled.
+///
+/// `render_audio` -- OPL3 synthesis and its resample, the SB16 DSP drain, the
+/// AD1848/WSS leg, the CD pull, the speaker drain and the CT1745 sum -- is
+/// reached headlessly from exactly one place, and until now only when
+/// `IZARRAVM_AUDIO_WAV` named a file. That made every wall this project has ever
+/// recorded a wall with no audio mixing in it, and made the WAV path unusable as
+/// a cost proxy: it also grows a ~29 MB buffer and serializes it.
+///
+/// The two cost modes exist as a PAIR. Both slice the run at the same cadence and
+/// compute the same window; only one of them renders. Their wall difference is
+/// audio's share; either one alone would measure slicing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AudioSinkMode {
+    /// Today's behaviour, reached only via `IZARRAVM_AUDIO_WAV`. Unchanged.
+    Wav(PathBuf),
+    /// Armed leg: render, fold into a checksum, drop. No buffer, no file.
+    Count,
+    /// Disarmed control leg: slice and compute the window, render nothing.
+    Skip,
+}
+
+impl AudioSinkMode {
+    fn label(&self) -> &'static str {
+        match self {
+            AudioSinkMode::Wav(_) => "wav",
+            AudioSinkMode::Count => "count",
+            // `off` is the value the env var takes and the value the ladder
+            // greps for; keep the two spellings the same.
+            AudioSinkMode::Skip => "off",
+        }
+    }
+}
+
+/// Parse `IZARRAVM_AUDIO_COST`. Unknown values are an ERROR, not a default:
+/// a typo that silently disarmed the observer would produce a pair of identical
+/// legs and a share of zero, which is a wrong answer rather than a missing one.
+fn parse_audio_cost_mode(value: &str) -> Result<AudioSinkMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "count" => Ok(AudioSinkMode::Count),
+        "off" | "skip" => Ok(AudioSinkMode::Skip),
+        other => Err(format!(
+            "IZARRAVM_AUDIO_COST: unknown mode {other:?} (expected `count` or `off`)"
+        )),
+    }
+}
+
+/// Resolve the observer from the environment, once, before the run starts.
+///
+/// An EMPTY value counts as unset in both variables. That is not tidiness: in
+/// pwsh, `[Environment]::SetEnvironmentVariable(name, $null, "Process")` leaves
+/// the variable empty-but-set and children inherit it, so a rig that thought it
+/// had cleared the variable would otherwise arm an observer on every leg of every
+/// board. Setting BOTH variables is a hard error rather than a silent winner.
+fn resolve_audio_sink() -> Result<Option<AudioSinkMode>, String> {
+    resolve_audio_sink_from(
+        std::env::var_os("IZARRAVM_AUDIO_WAV"),
+        std::env::var("IZARRAVM_AUDIO_COST").ok(),
+    )
+}
+
+/// The whole of [`resolve_audio_sink`]'s decision, split from the environment
+/// read so it can be pinned by a test without mutating process environment.
+fn resolve_audio_sink_from(
+    wav: Option<std::ffi::OsString>,
+    cost: Option<String>,
+) -> Result<Option<AudioSinkMode>, String> {
+    let wav = wav.filter(|path| !path.is_empty());
+    let cost = cost.filter(|mode| !mode.trim().is_empty());
+    match (wav, cost) {
+        (Some(_), Some(_)) => Err(
+            "IZARRAVM_AUDIO_WAV and IZARRAVM_AUDIO_COST are both set; they are different \
+             observers of the same call and one would silently win"
+                .to_string(),
+        ),
+        (Some(path), None) => Ok(Some(AudioSinkMode::Wav(PathBuf::from(path)))),
+        (None, Some(mode)) => parse_audio_cost_mode(&mode).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Cadence of the observer, in guest milliseconds, from
+/// `IZARRAVM_AUDIO_COST_SLICE_MS`. The GUI renders about once per millisecond
+/// when it keeps up, so the cadence has to be a knob: if the measured share moves
+/// between 10 ms and 1 ms, the cost is per-call and the lever is batching.
+fn audio_capture_slice_ms() -> Result<u64, String> {
+    parse_audio_cost_slice_ms(std::env::var("IZARRAVM_AUDIO_COST_SLICE_MS").ok())
+}
+
+fn parse_audio_cost_slice_ms(value: Option<String>) -> Result<u64, String> {
+    let Some(raw) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(AUDIO_CAPTURE_SLICE_MS);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(ms) if ms > 0 => Ok(ms),
+        _ => Err(format!(
+            "IZARRAVM_AUDIO_COST_SLICE_MS: expected a positive integer, got {raw:?}"
+        )),
+    }
+}
+
+/// FNV-style fold over both channels of every frame, through `black_box` so LLVM
+/// cannot decide the mix is dead and sink it.
+///
+/// Two integer ops per frame over ~7M frames is single-digit milliseconds against
+/// a ~139 s run, i.e. below 0.01%, and it is paid by the armed leg only -- so it
+/// biases the measured share UPWARD. `S` is a conservative bound on the mix's own
+/// cost, which is the direction to err in; do not correct for it.
+///
+/// Free-standing rather than a method so a test can fold a WAV capture's frames
+/// with the identical arithmetic and prove the counting sink saw the same mix.
+fn fold_audio_frames(seed: u64, frames: &[(i16, i16)]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut fold = seed;
+    for (left, right) in frames {
+        fold = fold
+            .wrapping_mul(FNV_PRIME)
+            .wrapping_add(*left as u16 as u64);
+        fold = fold
+            .wrapping_mul(FNV_PRIME)
+            .wrapping_add(*right as u16 as u64);
+    }
+    std::hint::black_box(fold)
+}
+
 /// Nothing stages the machine for a headless capture any more, and that is the
 /// point: `render_audio` returns the machine's line-out, decided entirely by
 /// CT1745 registers the guest owns. `HostAudioGains` lived here because the GUI
@@ -1116,11 +1241,43 @@ const AUDIO_CAPTURE_DAC_HZ: u32 = 44_100;
 /// if/else, which silently discarded `--inject-keys`/`--inject-mouse`: the
 /// capture ran, the WAV was written, and the recorded audio was of a title that
 /// had never been given the input it was supposed to react to.
+///
+/// The sink is a MODE, not a path (see [`AudioSinkMode`]): the same observer
+/// either writes a WAV, folds the mix into a checksum and drops it, or renders
+/// nothing at all while slicing the run identically. That last mode is what makes
+/// the pair `count` vs `off` a measurement of AUDIO rather than a measurement of
+/// slicing.
 struct AudioCapture {
-    path: PathBuf,
+    /// What happens to the mix once it has been rendered -- and, for `Skip`,
+    /// whether it is rendered at all. Resolved ONCE at construction so the run
+    /// loop never reads an environment variable.
+    mode: AudioSinkMode,
+    /// Only ever non-empty under [`AudioSinkMode::Wav`]. The cost modes must not
+    /// retain a single frame: a duke3d-486 run is ~7.2M frames ≈ 29 MB of `Vec`
+    /// growth, pure instrument cost with no analogue in the GUI.
     pcm: Vec<(i16, i16)>,
     /// Guest cycles per `render_audio` call.
     slice: u64,
+    /// The `slice` in guest milliseconds, kept for the end-of-run report: the
+    /// per-window fixed cost scales with the cadence, so a cost number that does
+    /// not carry its cadence cannot be compared with another one.
+    slice_ms: u64,
+    /// Windows actually rendered (or, under `Skip`, that WOULD have been
+    /// rendered), and the OPL-native samples they asked for. Both are computed
+    /// identically in every mode, which is what lets the ladder assert them equal
+    /// across the armed and disarmed legs.
+    windows: u64,
+    native_samples: u64,
+    /// Frames the mix returned, and a fold over every one of them. The fold has
+    /// two jobs: it makes the mix un-elidable, and equality across observations
+    /// proves the mix is deterministic. Zero under `Skip`.
+    out_frames: u64,
+    checksum: u64,
+    /// Nanoseconds inside `render_audio` itself, one `Instant` pair per window
+    /// (not per sample). A CROSS-CHECK on the wall ladder, never its headline:
+    /// it is inclusive of the instrument and blind to the cache effects the audio
+    /// path imposes on the CPU path.
+    render_ns: u128,
     /// OPL-native samples per guest cycle. The window is derived from the cycles
     /// a slice actually ran rather than from a constant, because a composed run
     /// does not advance in fixed steps: an injection path runs 2 ms per scancode
@@ -1140,14 +1297,18 @@ struct AudioCapture {
 }
 
 impl AudioCapture {
-    fn new(path: PathBuf, hardware: &HardwareProfile) -> Self {
+    fn new(mode: AudioSinkMode, hardware: &HardwareProfile, slice_ms: u64) -> Self {
         let clock = hardware.cpu.clock_rate();
         Self {
-            path,
+            mode,
             pcm: Vec::new(),
-            slice: clock
-                .clocks_for_fraction_floor(AUDIO_CAPTURE_SLICE_MS, 1000)
-                .max(1_000),
+            slice: clock.clocks_for_fraction_floor(slice_ms, 1000).max(1_000),
+            slice_ms,
+            windows: 0,
+            native_samples: 0,
+            out_frames: 0,
+            checksum: 0,
+            render_ns: 0,
             // The GUI derives its OPL sample count from WALL time; pacing it from
             // GUEST time instead models a host that keeps up exactly, which is
             // the condition to test first -- a mix that is silent even there is
@@ -1173,15 +1334,71 @@ impl AudioCapture {
         let want = self.debt.floor() as usize;
         self.debt -= want as f64;
         let native_samples = want.min(AUDIO_CAPTURE_OPL_HZ as usize / 2);
-        if native_samples > 0 {
-            self.pcm.extend(machine.render_audio(native_samples));
+        if native_samples == 0 {
+            return;
+        }
+        // Counted BEFORE the mode split, and from the same arithmetic in every
+        // mode: the disarmed leg's whole job is to prove it performed the same
+        // slicing and computed the same window as the armed one.
+        self.windows += 1;
+        self.native_samples += native_samples as u64;
+        match self.mode {
+            // The disarmed control leg: the run is sliced identically, the window
+            // is computed identically, and the mix is not rendered. The pair
+            // therefore isolates audio instead of isolating slicing.
+            AudioSinkMode::Skip => {}
+            AudioSinkMode::Wav(_) => {
+                let frames = machine.render_audio(native_samples);
+                self.pcm.extend(frames);
+            }
+            AudioSinkMode::Count => {
+                // The `Instant` pair is TWO clock reads per window -- ~16k windows
+                // on a duke3d-486 run, a few hundred microseconds against ~139 s
+                // -- and only the ARMED leg pays them. Like the fold below, that
+                // biases the measured share UPWARD: `S` comes out a conservative
+                // bound on the mix's own cost rather than an under-statement.
+                let started = std::time::Instant::now();
+                let frames = machine.render_audio(native_samples);
+                self.render_ns += started.elapsed().as_nanos();
+                self.out_frames += frames.len() as u64;
+                self.checksum = fold_audio_frames(self.checksum, &frames);
+                drop(frames);
+            }
         }
     }
 
+    /// End of run. Mode-aware, and it must stay that way: this runs BEFORE the
+    /// wall reading, and the cost modes have no path to write to -- an earlier
+    /// shape would have serialized an empty WAV to a path it did not have.
     fn finish(&self) -> Result<(), Box<dyn Error>> {
-        write_wav(&self.path, &self.pcm, AUDIO_CAPTURE_DAC_HZ)?;
-        println!("audio capture: wrote {}", self.path.display());
+        match &self.mode {
+            AudioSinkMode::Wav(path) => {
+                write_wav(path, &self.pcm, AUDIO_CAPTURE_DAC_HZ)?;
+                println!("audio capture: wrote {}", path.display());
+            }
+            // Deliberately stderr and deliberately NOT a `--profile-json` field:
+            // no pinned artifact and no scoreboard parser moves for an
+            // instrument.
+            AudioSinkMode::Count | AudioSinkMode::Skip => eprintln!("{}", self.cost_report()),
+        }
         Ok(())
+    }
+
+    /// The one-line end-of-run report for the cost modes. Split out so a test can
+    /// read it without capturing stderr.
+    fn cost_report(&self) -> String {
+        format!(
+            "audio cost: mode={} pacing={} slice_ms={} windows={} native_samples={} \
+             out_frames={} checksum=0x{:016x} render_ns={}",
+            self.mode.label(),
+            if self.wall_paced { "wall" } else { "guest" },
+            self.slice_ms,
+            self.windows,
+            self.native_samples,
+            self.out_frames,
+            self.checksum,
+            self.render_ns,
+        )
     }
 }
 
@@ -1336,8 +1553,14 @@ fn run_boot_hdd_folder(
     // The capture is an OBSERVER, not a run mode: it composes with key and mouse
     // injection rather than replacing it, so `--inject-mouse ... IZARRAVM_AUDIO_WAV=x.wav`
     // records the audio of a title that actually received its input.
-    let mut capture = std::env::var_os("IZARRAVM_AUDIO_WAV")
-        .map(|path| AudioCapture::new(PathBuf::from(path), hardware));
+    //
+    // `IZARRAVM_AUDIO_COST=count|off` arms the same observer as a COST
+    // instrument instead: `count` renders and folds the mix away, `off` slices
+    // the run identically and renders nothing. Their wall difference is the audio
+    // share; neither leg writes a file.
+    let audio_slice_ms = audio_capture_slice_ms()?;
+    let mut capture =
+        resolve_audio_sink()?.map(|mode| AudioCapture::new(mode, hardware, audio_slice_ms));
     let start_wall = std::time::Instant::now();
     // The no-injection, no-capture path stays ONE `run_until_halt_or_cycles`
     // call, byte for byte what it was: slicing the run moves where the machine
