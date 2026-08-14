@@ -233,28 +233,45 @@ impl CdImage {
 
     /// Mount from a CUE sheet and a single BIN. Convenience wrapper over
     /// [`CdImage::from_cue_files`] for the common one-file sheet: every track
-    /// is bound to `bin` regardless of what the sheet's FILE lines name. The
-    /// byte order still comes from the sheet -- the first FILE line's type
-    /// token, or BINARY when the sheet declares no FILE at all.
+    /// is bound to `bin`, whatever the sheet's one FILE line names it. The
+    /// byte order comes from the sheet -- that FILE line's type token, or
+    /// BINARY when the sheet declares no FILE at all.
+    ///
+    /// A sheet naming two or more files is an error here, not a best effort:
+    /// its tracks are addressed from the head of their own files and cannot be
+    /// laid out against one blob. Use [`CdImage::from_cue_files`] for those.
     pub fn from_cue(cue: &str, bin: Vec<u8>) -> Result<Self, String> {
         let (files, mut tracks) = parse_cue(cue)?;
+        // A sheet naming two or more files is not something one blob can be a
+        // rough answer to. Each FILE opens its own byte origin, and the tracks
+        // after the first are addressed from the head of *their* file; laying
+        // them out sequentially against a single blob puts track 2 wherever
+        // track 1 happened to end. The result is not this disc read
+        // approximately, it is a different disc served without a word, so
+        // refuse instead and name the entry point that can honor the layout.
+        if files.len() > 1 {
+            return Err(format!(
+                "CUE names {} files but a single BIN was supplied; \
+                 use CdImage::from_cue_files with the files the sheet names",
+                files.len()
+            ));
+        }
         // One BIN: every track binds to it regardless of what the sheet's FILE
         // lines name, so flatten every track onto the single file up front.
         for track in &mut tracks {
             track.file_index = 0;
         }
-        // The type comes from the *first* FILE line, which is the same
-        // flattening applied to the type token that the loop above applies to
-        // the bytes: this entry point already decided the sheet describes one
-        // file, so it reads the one type the sheet declares first. For the
-        // single-BIN sheet this wrapper exists to serve, that line describes
-        // precisely the bytes the caller handed in, and MOTOROLA there is the
-        // one token no amount of sniffing can recover -- hardcoding BINARY
-        // through it mounted a big-endian disc as noise, without a complaint.
-        // A sheet naming several files can still disagree with the blob, but
-        // its first line is a strictly better guess than a constant, and a
-        // sheet naming no file at all leaves nothing to read, so the fallback
-        // stays BINARY: the reading that changes nothing.
+        // The type comes from the *first* FILE line, which after the check
+        // above is the only FILE line there is. This is not a fix for anything
+        // a user could have seen: on the loader's path this entry point is
+        // reached only when the sheet named no file at all, and a single-BIN
+        // `FILE "d.bin" MOTOROLA` sheet arrives through `from_cue_files`,
+        // which has read the token all along. It is the API surface that was
+        // wrong -- a caller handing this function a sheet and the bytes that
+        // sheet describes got BINARY imposed on it whatever the sheet said,
+        // and MOTOROLA is the one token no amount of sniffing can recover. A
+        // sheet naming no file leaves nothing to read, so the fallback stays
+        // BINARY: the reading that changes nothing.
         let file_type = files
             .first()
             .map(|(_name, file_type)| file_type.clone())

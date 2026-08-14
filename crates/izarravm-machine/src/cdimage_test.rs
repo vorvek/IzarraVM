@@ -460,14 +460,16 @@ fn binary_audio_track_is_not_swapped() {
 #[test]
 fn from_cue_takes_its_byte_order_from_the_first_file_line() {
     // `from_cue` flattens every track onto the one blob its caller handed in,
-    // whatever the sheet's FILE lines name, and that flattening is why it used
-    // to hardcode BINARY: with several FILE lines there is no way to say which
-    // one describes the bytes. But a single-BIN sheet is the case this entry
-    // point exists for, and there the first FILE line describes exactly those
-    // bytes. Hardcoding BINARY through it meant a sheet that said MOTOROLA
-    // mounted with its samples in the wrong byte order and played as noise --
-    // silent wrong audio, mounted without a complaint, which is the same class
-    // of failure as a track bound to the wrong file.
+    // whatever the sheet's FILE line names, and that flattening is why it used
+    // to hardcode BINARY: a sheet with several FILE lines gave no way to say
+    // which one described the bytes (such a sheet is now refused outright, see
+    // `from_cue_refuses_a_sheet_that_names_several_files`). The single-BIN
+    // sheet is the case this entry point exists for, and there the FILE line
+    // describes exactly those bytes, so imposing BINARY on it contradicted the
+    // sheet in the one respect no amount of sniffing can recover. No user
+    // could reach that: the loader calls this only for a sheet naming no file,
+    // and a single-BIN MOTOROLA sheet goes through `from_cue_files`, which has
+    // read the token all along. It is the API surface that is pinned here.
     let mut bin = vec![0u8; RAW_SECTOR];
     bin[0] = 0x12;
     bin[1] = 0x34;
@@ -507,6 +509,44 @@ fn from_cue_takes_its_byte_order_from_the_first_file_line() {
     assert_eq!(
         &no_file.read_audio_frame(0).unwrap()[0..4],
         &[0x12, 0x34, 0x56, 0x78]
+    );
+}
+
+#[test]
+fn from_cue_refuses_a_sheet_that_names_several_files() {
+    // Flattening every track onto one blob is a defensible reading of a sheet
+    // that names one file, and no reading at all of a sheet that names two.
+    // The tracks after the first belong to *other* files, with their own byte
+    // origins, and this entry point lays every track out sequentially against
+    // the single blob it was handed: track 2 would be read at track 1's end
+    // rather than at the head of its own file. That is not an approximation of
+    // the disc, it is a different disc -- served without an error, which is the
+    // failure mode this whole line of work exists to remove.
+    let cue = "FILE \"t1.bin\" BINARY\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"t2.bin\" BINARY\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+
+    let err = CdImage::from_cue(cue, vec![0u8; 5 * RAW_SECTOR]).unwrap_err();
+
+    assert!(
+        err.contains("from_cue_files"),
+        "the error should point at the entry point that can mount this: {err}"
+    );
+
+    // The one-file and no-file sheets this entry point does serve are
+    // untouched, so the guard cannot be satisfied by refusing everything.
+    assert!(
+        CdImage::from_cue(
+            "FILE \"t1.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+            vec![0u8; RAW_SECTOR],
+        )
+        .is_ok()
+    );
+    assert!(
+        CdImage::from_cue("TRACK 01 AUDIO\nINDEX 01 00:00:00\n", vec![0u8; RAW_SECTOR]).is_ok()
     );
 }
 
