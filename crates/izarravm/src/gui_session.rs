@@ -2306,6 +2306,9 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
         let mut seen = HashSet::with_capacity(names.len());
         let mut files = Vec::with_capacity(names.len());
         let mut folder = CueFolder::new(dir);
+        // One registry for the whole disc: it is what bounds how many of
+        // this sheet's tracks hold decoded audio at the same time.
+        let registry = izarravm_cdaudio::Registry::new();
         for name in names {
             if !seen.insert(name.to_ascii_lowercase()) {
                 // The sheet named this file again for another track; it was
@@ -2319,7 +2322,7 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
             // mount has no reason to hold any of it. A file that is not a
             // container at all comes back as None and takes the original path,
             // byte for byte as before.
-            let probed = izarravm_cdaudio::probe(&file_path).map_err(|err| {
+            let probed = izarravm_cdaudio::probe(&registry, &file_path).map_err(|err| {
                 SessionFailure::new(format!(
                     "could not use {} named by {}: {err}",
                     file_path.display(),

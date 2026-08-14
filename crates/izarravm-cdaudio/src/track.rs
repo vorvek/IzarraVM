@@ -43,6 +43,11 @@ struct Shared {
     started: AtomicBool,
     /// Set by `Drop` and checked by the worker at each publish point.
     cancel: AtomicBool,
+    /// Set by the worker on its way out, whether it succeeded or failed. Only a
+    /// track no worker is still writing into can have its buffer taken away,
+    /// and a failed one has to be evictable too or a scratched rip would pin
+    /// its buffer for the life of the mount.
+    finished: AtomicBool,
     /// Workers actually spawned for this track. `started` is meant to hold this
     /// at one for the track's whole life, and nothing about the audio would
     /// look wrong if it did not -- every worker decodes the same file to the
@@ -60,6 +65,9 @@ pub struct DecodedTrack {
     path: PathBuf,
     info: TrackInfo,
     shared: Arc<Shared>,
+    /// The mount's residency bookkeeping, if this track belongs to one. A track
+    /// built on its own keeps its buffer for as long as it lives.
+    registry: Option<Registry>,
 }
 
 impl DecodedTrack {
@@ -83,10 +91,12 @@ impl DecodedTrack {
         Self {
             path,
             info,
+            registry: None,
             shared: Arc::new(Shared {
                 filled: Mutex::new(Filled::default()),
                 started: AtomicBool::new(false),
                 cancel: AtomicBool::new(false),
+                finished: AtomicBool::new(false),
                 workers: AtomicU32::new(0),
             }),
         }
@@ -94,6 +104,17 @@ impl DecodedTrack {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Bytes this track currently holds decoded. Zero before its first touch
+    /// and after an eviction.
+    pub fn resident_bytes(&self) -> usize {
+        self.shared
+            .filled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pcm
+            .len()
     }
 
     /// Kick the worker off if it is not already running.
@@ -110,13 +131,20 @@ impl DecodedTrack {
             filled.pcm = vec![0u8; bytes];
             filled.ready = 0;
         }
+        // Admitted after the buffer exists and before the worker starts, so
+        // this track is the newest resident by the time anything is written
+        // into it and cannot evict itself.
+        if let Some(registry) = &self.registry {
+            registry.admit(&self.shared);
+        }
         let shared = Arc::clone(&self.shared);
         let path = self.path.clone();
         let info = self.info;
+        let registry = self.registry.clone();
         self.shared.workers.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new()
             .name("cd-audio-decode".to_string())
-            .spawn(move || decode_worker(&path, info, &shared));
+            .spawn(move || decode_worker(&path, info, &shared, registry.as_ref()));
         if spawned.is_err() {
             self.shared.workers.fetch_sub(1, Ordering::Relaxed);
             // The thread could not be created, so nothing will ever fill this
@@ -129,7 +157,7 @@ impl DecodedTrack {
 }
 
 /// Decode the whole file, publishing each newly finished run of sectors.
-fn decode_worker(path: &Path, info: TrackInfo, shared: &Shared) {
+fn decode_worker(path: &Path, info: TrackInfo, shared: &Arc<Shared>, registry: Option<&Registry>) {
     // Decode into a scratch buffer and copy under the lock. Holding the mutex
     // across a decode call would block the mixer pull for as long as a packet
     // takes to decode.
@@ -161,6 +189,94 @@ fn decode_worker(path: &Path, info: TrackInfo, shared: &Shared) {
         // device path stays up either way -- the same posture a folder mount
         // takes when a host file disappears under it.
         tracing::warn!("cd audio decode failed for {}: {err}", path.display());
+    }
+    // Last, and on both paths: this is what makes the buffer evictable, and a
+    // track whose decode failed has to become evictable too.
+    shared.finished.store(true, Ordering::SeqCst);
+    // Then ask again whether anything can now be given up. Eviction at
+    // admission alone is not enough: when the third track of a disc starts
+    // while the first two are still decoding, nothing is evictable at that
+    // moment, and without this the disc simply stays over its bound for the
+    // rest of the mount. Playback outruns decoding often enough that this is
+    // the ordinary path, not the unlucky one.
+    if let Some(registry) = registry {
+        registry.evict_excess();
+    }
+}
+
+/// How many tracks may hold decoded PCM at once.
+///
+/// Two, because that is what boundary prefetch needs -- the track being played
+/// and the one being read ahead of it -- not because two is a good cache size.
+/// A full CD is roughly 750 MB decoded and a front-panel play walks the whole
+/// disc, so something has to bound it, while a general LRU would be more
+/// machinery than this access pattern asks for.
+const MAX_RESIDENT: usize = 2;
+
+/// The residency bookkeeping shared by one mount's tracks.
+#[derive(Debug, Clone, Default)]
+pub struct Registry {
+    inner: Arc<Mutex<Vec<Arc<Shared>>>>,
+}
+
+impl Registry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Prepare a track that participates in this mount's residency.
+    pub fn track(&self, path: PathBuf) -> Result<DecodedTrack, CdAudioError> {
+        let mut track = DecodedTrack::new(path)?;
+        track.registry = Some(self.clone());
+        Ok(track)
+    }
+
+    /// As [`Registry::track`], from a measurement the mount already took.
+    pub fn track_with_info(&self, path: PathBuf, info: TrackInfo) -> DecodedTrack {
+        let mut track = DecodedTrack::with_info(path, info);
+        track.registry = Some(self.clone());
+        track
+    }
+
+    /// Note that `started` has just begun decoding, and take the buffer back
+    /// from the oldest track that is no longer among the most recent few.
+    fn admit(&self, started: &Arc<Shared>) {
+        {
+            let mut resident = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            resident.retain(|s| !Arc::ptr_eq(s, started));
+            resident.push(Arc::clone(started));
+        }
+        self.evict_excess();
+    }
+
+    /// Take the buffer back from the oldest tracks until no more than
+    /// [`MAX_RESIDENT`] hold one, skipping any a worker is still writing into.
+    fn evict_excess(&self) {
+        let mut resident = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        while resident.len() > MAX_RESIDENT {
+            // Only a track that has stopped decoding can be evicted. Taking the
+            // buffer from a live worker is safe in itself -- it copies under the
+            // same lock and checks the length -- but clearing `started`
+            // underneath one would let a second worker begin on the same track.
+            let Some(index) = resident
+                .iter()
+                .position(|s| s.finished.load(Ordering::SeqCst))
+            else {
+                // Nothing evictable. Decoding outruns playback by so wide a
+                // margin that two live workers do not arise in practice, and if
+                // they ever do, a third buffer is a better answer than a stall.
+                break;
+            };
+            let evicted = resident.remove(index);
+            let mut filled = evicted.filled.lock().unwrap_or_else(|e| e.into_inner());
+            filled.pcm = Vec::new();
+            filled.ready = 0;
+            // The track is now indistinguishable from one never touched, so the
+            // next `frame()` decodes it again rather than serving silence for
+            // the rest of the mount.
+            evicted.finished.store(false, Ordering::SeqCst);
+            evicted.started.store(false, Ordering::SeqCst);
+        }
     }
 }
 
