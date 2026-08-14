@@ -738,3 +738,160 @@ fn cue_file_line_without_a_name_is_rejected() {
         );
     }
 }
+
+/// A stand-in decoder: reports a fixed length and serves frames stamped with
+/// their index, with everything from `ready` on withheld the way an unfinished
+/// decode withholds its tail.
+#[derive(Debug)]
+struct FakeSource {
+    sectors: u32,
+    ready: u32,
+}
+
+impl izarravm_core::AudioTrackSource for FakeSource {
+    fn sectors(&self) -> u32 {
+        self.sectors
+    }
+
+    fn frame(&self, index: u32) -> Option<[u8; RAW_SECTOR]> {
+        (index < self.ready).then(|| {
+            let mut frame = [0u8; RAW_SECTOR];
+            frame[0] = 0xF0 | (index as u8 & 0x0F);
+            frame
+        })
+    }
+}
+
+fn fake(sectors: u32, ready: u32) -> CueSource {
+    CueSource::Audio(std::sync::Arc::new(FakeSource { sectors, ready }))
+}
+
+#[test]
+fn audio_source_track_takes_its_length_from_the_source() {
+    // The whole point: the ogg's byte length says nothing about its duration,
+    // so the sector count comes from the source and every following track's LBA
+    // follows from that.
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               FILE \"track02.ogg\" WAVE\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![
+            (
+                "disc.bin".to_string(),
+                CueSource::Raw(vec![0u8; 2 * DATA_SECTOR]),
+            ),
+            ("track02.ogg".to_string(), fake(9000, 9000)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(img.track_count(), 2);
+    assert_eq!((img.tracks()[0].start_lba, img.tracks()[0].sectors), (0, 2));
+    assert_eq!(
+        (img.tracks()[1].start_lba, img.tracks()[1].sectors),
+        (2, 9000)
+    );
+    assert_eq!(img.total_sectors(), 9002);
+}
+
+#[test]
+fn audio_source_frames_come_from_the_source() {
+    let cue = "FILE \"t.ogg\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n";
+    let img = CdImage::from_cue_sources(cue, vec![("t.ogg".to_string(), fake(4, 4))]).unwrap();
+    assert_eq!(img.read_audio_frame(0).unwrap()[0], 0xF0);
+    assert_eq!(img.read_audio_frame(3).unwrap()[0], 0xF3);
+    // Past the track, nothing.
+    assert!(img.read_audio_frame(4).is_none());
+    // A data read of an audio track fails, source-backed or not.
+    assert!(img.read_data_sector(0).is_none());
+}
+
+#[test]
+fn frames_the_source_has_not_decoded_yet_read_as_absent() {
+    // The mixer renders these as silence and steps past them.
+    let cue = "FILE \"t.ogg\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n";
+    let img = CdImage::from_cue_sources(cue, vec![("t.ogg".to_string(), fake(8, 2))]).unwrap();
+    assert!(img.read_audio_frame(0).is_some());
+    assert!(img.read_audio_frame(2).is_none());
+    // The TOC still covers the whole track even though most of it is undecoded.
+    assert_eq!(img.tracks()[0].sectors, 8);
+}
+
+#[test]
+fn an_audio_sourced_track_is_addressed_from_its_own_start_not_the_discs() {
+    // The index handed to the source is relative to the track, so a source
+    // preceded by other tracks -- and by a PREGAP, which advances the disc
+    // timeline with no bytes behind it -- still starts at its own frame 0.
+    let cue = "FILE \"a.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               FILE \"b.ogg\" WAVE\n\
+               TRACK 02 AUDIO\n\
+               PREGAP 00:00:02\n\
+               INDEX 01 00:00:00\n";
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![
+            ("a.bin".to_string(), CueSource::Raw(vec![0u8; DATA_SECTOR])),
+            ("b.ogg".to_string(), fake(4, 4)),
+        ],
+    )
+    .unwrap();
+    // One data sector, then two pregap frames: the audio starts at LBA 3.
+    assert_eq!(img.tracks()[1].start_lba, 3);
+    assert_eq!(img.read_audio_frame(3).unwrap()[0], 0xF0);
+    assert_eq!(img.read_audio_frame(4).unwrap()[0], 0xF1);
+}
+
+#[test]
+fn a_raw_file_after_an_audio_source_still_addresses_its_own_bytes() {
+    // An audio-sourced file contributes no bytes to the backing at all, and a
+    // raw file after one has to be unaffected by that: same base offset, same
+    // bytes, and a track table that still lines up with the disc timeline the
+    // source lengthened. Reserving space for the ogg would push c.bin's base
+    // forward, and deriving the ogg's length from its (zero) bytes would
+    // collapse track 3 onto track 2's LBA.
+    let cue = "FILE \"a.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               FILE \"b.ogg\" WAVE\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"c.bin\" BINARY\n\
+               TRACK 03 AUDIO\n\
+               INDEX 01 00:00:00\n";
+    let mut a = vec![0u8; DATA_SECTOR];
+    a[0] = 0xA1;
+    let mut c = vec![0u8; RAW_SECTOR];
+    c[0] = 0xC1;
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![
+            ("a.bin".to_string(), CueSource::Raw(a)),
+            ("b.ogg".to_string(), fake(100, 100)),
+            ("c.bin".to_string(), CueSource::Raw(c)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xA1);
+    assert_eq!(img.read_audio_frame(1).unwrap()[0], 0xF0);
+    // Track 3 starts at LBA 101 and its bytes are its own.
+    assert_eq!(img.tracks()[2].start_lba, 101);
+    assert_eq!(img.read_audio_frame(101).unwrap()[0], 0xC1);
+    // c.bin's bytes begin directly after a.bin's, with nothing reserved in
+    // between for the 100 sectors the ogg contributes to the timeline.
+    assert_eq!(img.tracks()[2].image_offset, DATA_SECTOR);
+}
+
+#[test]
+fn from_cue_files_still_works_through_the_new_entry_point() {
+    // The wrapper must not change behavior for a sheet with no compressed audio.
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; DATA_SECTOR];
+    bin[0] = 0xDD;
+    let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
+    assert_eq!(img.read_data_sector(0).unwrap()[0], 0xDD);
+}

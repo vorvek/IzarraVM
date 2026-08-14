@@ -170,11 +170,50 @@ enum Backing {
     },
 }
 
+/// Where one CUE `FILE`'s frames come from.
+///
+/// Cloning an [`Audio`](CueSource::Audio) shares the one decode rather than
+/// starting a second: two mounts of the same sheet describe the same file, and
+/// a decode in flight is the thing both of them want.
+#[derive(Clone)]
+pub enum CueSource {
+    /// The file's bytes are on-disc frames, laid out exactly as the sheet's
+    /// track modes describe. This is every BINARY file and the only thing that
+    /// existed before compressed audio was supported.
+    Raw(Vec<u8>),
+    /// The file is an encoded audio container. It contributes no bytes to the
+    /// disc backing at all: its length comes from the source and so do its
+    /// frames.
+    Audio(std::sync::Arc<dyn izarravm_core::AudioTrackSource>),
+}
+
+/// Written by hand rather than derived. A derived `Debug` on the `Raw` arm
+/// prints every byte of a disc the first time anything formats one, which for
+/// the images this mounts is hundreds of megabytes into a log line.
+impl std::fmt::Debug for CueSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CueSource::Raw(bytes) => f.debug_tuple("Raw").field(&bytes.len()).finish(),
+            CueSource::Audio(source) => f.debug_tuple("Audio").field(source).finish(),
+        }
+    }
+}
+
 /// A mounted CD image: the backing bytes plus the parsed track table.
 #[derive(Debug, Clone)]
 pub struct CdImage {
     backing: Backing,
     tracks: Vec<Track>,
+    /// Tracks whose frames come from a decoder rather than from `backing`,
+    /// keyed by track number.
+    ///
+    /// A map rather than a field on [`Track`] because `Track` is a `Copy` TOC
+    /// record that the ATAPI TOC path iterates by value, and an `Arc` in it
+    /// would end that. Keyed by track number rather than by index so that the
+    /// key means the same thing as the number in the message when a mount
+    /// refuses a layout.
+    audio_sources:
+        std::collections::HashMap<u8, std::sync::Arc<dyn izarravm_core::AudioTrackSource>>,
     /// Total user sectors across all tracks (the disc capacity).
     total_sectors: u32,
 }
@@ -201,6 +240,7 @@ impl CdImage {
         Ok(Self {
             backing: Backing::Bytes(bytes),
             tracks: vec![track],
+            audio_sources: Default::default(),
             total_sectors: sectors,
         })
     }
@@ -227,6 +267,7 @@ impl CdImage {
         Ok(Self {
             backing: Backing::Folder { meta, extents },
             tracks: vec![track],
+            audio_sources: Default::default(),
             total_sectors,
         })
     }
@@ -283,26 +324,40 @@ impl CdImage {
             .first()
             .map(|(_name, file_type)| file_type.clone())
             .unwrap_or(CueFileType::Binary);
+        // The one BIN is raw by construction: this entry point takes bytes, and
+        // an encoded file reaches the disc model only through
+        // [`CdImage::from_cue_sources`], which is where sniffing happens.
+        let source = CueSource::Raw(bin);
         Self::build(
             tracks,
             &[BuildFile {
-                bytes: bin.as_slice(),
+                source: &source,
                 file_type,
             }],
         )
     }
 
-    /// Mount from a CUE sheet and the files it names. Each FILE opens a new
-    /// byte origin: a track's offsets are relative to its own file, while the
-    /// LBA timeline runs continuously across all of them. A track that is last
-    /// in its file runs to that file's end.
+    /// Mount from a CUE sheet and the sources its FILEs resolve to. Each FILE
+    /// opens a new byte origin: a track's offsets are relative to its own file,
+    /// while the LBA timeline runs continuously across all of them. A track
+    /// that is last in its file runs to that file's end.
+    ///
+    /// A [`CueSource::Audio`] file is the exception to all of that. It has no
+    /// bytes here at all: its length comes from the decoder and so do its
+    /// frames, so it neither occupies space in the backing nor bounds a track
+    /// by a byte span.
     ///
     /// `files` must correspond exactly to the sheet's FILE lines, in any
     /// order. A name the sheet declares and `files` omits is an error, and so
     /// is the reverse -- a file supplied that the sheet never named means the
     /// caller and this parser disagree about what the sheet says, which is not
     /// a disagreement to resolve by mounting one side's reading in silence.
-    pub fn from_cue_files(cue: &str, files: Vec<(String, Vec<u8>)>) -> Result<Self, String> {
+    ///
+    /// This is the general entry point and the one the loader calls;
+    /// [`CdImage::from_cue_files`] is the all-raw case expressed through it.
+    /// Guards belong here rather than in that wrapper, or they sit off the
+    /// production path.
+    pub fn from_cue_sources(cue: &str, files: Vec<(String, CueSource)>) -> Result<Self, String> {
         let (files_in_sheet, tracks) = parse_cue(cue)?;
         // A repeated FILE name is not the "two tracks share one file" layout
         // (that is a single FILE section followed by multiple TRACK/INDEX
@@ -335,7 +390,7 @@ impl CdImage {
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
             build_files.push(BuildFile {
-                bytes: found.1.as_slice(),
+                source: &found.1,
                 file_type: file_type.clone(),
             });
         }
@@ -385,6 +440,20 @@ impl CdImage {
         Self::build(tracks, &build_files)
     }
 
+    /// Mount from a CUE sheet and the raw bytes its FILEs name -- the all-raw
+    /// case of [`CdImage::from_cue_sources`], which see for the rules on how
+    /// `files` must line up with the sheet.
+    ///
+    /// Kept as its own name because a sheet with no compressed audio is still
+    /// the common case and every caller of it predates decoding.
+    pub fn from_cue_files(cue: &str, files: Vec<(String, Vec<u8>)>) -> Result<Self, String> {
+        let files = files
+            .into_iter()
+            .map(|(name, bytes)| (name, CueSource::Raw(bytes)))
+            .collect();
+        Self::from_cue_sources(cue, files)
+    }
+
     /// Shared track-table construction for both CUE entry points. `files` holds
     /// one [`BuildFile`] per FILE the sheet named, in sheet order, so it is
     /// indexed by each track's `file_index`; each entry carries that file's
@@ -422,16 +491,22 @@ impl CdImage {
         // Each file keeps its own byte cursor; `disc_lba` runs across all of them.
         // Size the backing up front: a disc's worth of bytes reallocated a few
         // times during the concatenation is copying nobody needs to pay for.
+        //
+        // Only raw files have bytes to concatenate. An audio-sourced file
+        // occupies no space in the backing, so its `file_base` entry is the
+        // same offset as its successor's -- harmless, because nothing ever
+        // reads a source-backed track's `image_offset`.
         let mut cursors = vec![0usize; files.len()];
-        let total_bytes = files.iter().map(|f| f.bytes.len()).sum();
+        let total_bytes = files.iter().map(|f| f.raw_bytes().len()).sum();
         let mut concatenated: Vec<u8> = Vec::with_capacity(total_bytes);
         let mut file_base = Vec::with_capacity(files.len());
         for file in files {
             file_base.push(concatenated.len());
-            concatenated.extend_from_slice(file.bytes);
+            concatenated.extend_from_slice(file.raw_bytes());
         }
 
         let mut tracks = Vec::with_capacity(tracks_in.len());
+        let mut audio_sources = std::collections::HashMap::new();
         let mut disc_lba = 0u32;
         for (i, p) in tracks_in.iter().enumerate() {
             let fi = p.file_index;
@@ -447,45 +522,82 @@ impl CdImage {
             let file = files
                 .get(fi)
                 .ok_or_else(|| format!("track {} references an absent FILE", p.number))?;
-            let bytes = file.bytes;
-            let raw = p.mode.raw_size();
-            // The next track bounds this one only if it shares this file;
-            // otherwise this track runs to its own file's end.
-            let next_in_file = tracks_in.get(i + 1).filter(|n| n.file_index == fi);
-            let sectors = match next_in_file {
-                Some(n) => n.start_frame.saturating_sub(p.start_frame),
-                None => ((bytes.len().saturating_sub(cursors[fi])) / raw) as u32,
-            };
-            let span = sectors as usize * raw;
-            if cursors[fi] + span > bytes.len() {
-                return Err(format!(
-                    "track {} (offset {}, {span} bytes) runs past its file ({} bytes)",
-                    p.number,
-                    cursors[fi],
-                    bytes.len()
-                ));
-            }
+            // PREGAP advances the guest's timeline with no bytes behind it, so
+            // it applies whichever way this track's frames are produced. It is
+            // hoisted above the split so both branches share one statement
+            // rather than each remembering to do it.
             disc_lba += p.pregap_frames;
-            // MOTOROLA is declared per FILE but only means anything for audio:
-            // it describes the byte order of 16-bit samples, and a data track
-            // has no samples. Resolving it here, once per track, keeps the read
-            // path from having to reach back to the sheet.
-            let byte_swapped = p.mode.is_audio() && file.file_type == CueFileType::Motorola;
+
+            let (sectors, image_offset, byte_swapped) = match file.source {
+                CueSource::Audio(audio) => {
+                    // A decoded file's length comes from the decoder, and the
+                    // byte accounting is skipped entirely -- not as an
+                    // optimization, but because the file has no bytes here. The
+                    // span, the "runs past its file" bounds check and the cursor
+                    // advance would all be measured against a length of zero:
+                    // the check would reject every decoded mount, and the usual
+                    // sector derivation would make the track zero-length,
+                    // collapsing every later track onto one LBA.
+                    if audio_sources.insert(p.number, audio.clone()).is_some() {
+                        // Unreachable through either entry point today --
+                        // `parse_cue` would have to emit two tracks with one
+                        // number -- but silently replacing a source is a
+                        // wrong-data mount, which is the class this whole
+                        // change exists to remove. Say so instead.
+                        return Err(format!("CUE declares track {} twice", p.number));
+                    }
+                    (audio.sectors(), 0usize, false)
+                }
+                CueSource::Raw(bytes) => {
+                    let raw = p.mode.raw_size();
+                    // The next track bounds this one only if it shares this
+                    // file; otherwise this track runs to its own file's end.
+                    let next_in_file = tracks_in.get(i + 1).filter(|n| n.file_index == fi);
+                    let sectors = match next_in_file {
+                        Some(n) => n.start_frame.saturating_sub(p.start_frame),
+                        None => ((bytes.len().saturating_sub(cursors[fi])) / raw) as u32,
+                    };
+                    let span = sectors as usize * raw;
+                    if cursors[fi] + span > bytes.len() {
+                        return Err(format!(
+                            "track {} (offset {}, {span} bytes) runs past its file ({} bytes)",
+                            p.number,
+                            cursors[fi],
+                            bytes.len()
+                        ));
+                    }
+                    let offset = file_base[fi] + cursors[fi];
+                    cursors[fi] += span;
+                    // MOTOROLA is declared per FILE but only means anything for
+                    // audio: it describes the byte order of 16-bit samples, and
+                    // a data track has no samples. Resolving it here, once per
+                    // track, keeps the read path from having to reach back to
+                    // the sheet.
+                    //
+                    // It is asked of raw files alone. A decoder hands back
+                    // frames already in host order, so there is no stored byte
+                    // order left to correct, and a sheet that says MOTOROLA
+                    // over an Ogg is describing a file it does not have.
+                    let swapped = p.mode.is_audio() && file.file_type == CueFileType::Motorola;
+                    (sectors, offset, swapped)
+                }
+            };
+
             tracks.push(Track {
                 number: p.number,
                 mode: p.mode,
                 start_lba: disc_lba,
                 sectors,
-                image_offset: file_base[fi] + cursors[fi],
+                image_offset,
                 byte_swapped,
             });
-            cursors[fi] += span;
             disc_lba += sectors;
         }
 
         Ok(Self {
             backing: Backing::Bytes(concatenated),
             tracks,
+            audio_sources,
             total_sectors: disc_lba,
         })
     }
@@ -554,6 +666,18 @@ impl CdImage {
         let track = self.track_at_lba(lba)?;
         if !track.mode.is_audio() {
             return None;
+        }
+        // A decoded track's frames never live in the backing. The index is
+        // relative to the track's own start, so the pregap that `build` counted
+        // into `start_lba` is already off the number by the time the decoder
+        // sees it -- an encoded file holds the audio alone and knows nothing
+        // about gaps.
+        //
+        // None from here is not an error: it is a frame the worker has not
+        // reached yet, and the mixer renders it as silence and moves on, which
+        // is also what a real drive does rather than stall the disc.
+        if let Some(source) = self.audio_sources.get(&track.number) {
+            return source.frame(lba - track.start_lba);
         }
         let Backing::Bytes(bytes) = &self.backing else {
             return None;
@@ -704,8 +828,21 @@ type CueFile = (String, CueFileType);
 /// one value that cannot come apart, and the next per-file fact is a field here
 /// rather than another slice the caller must keep aligned by hand.
 struct BuildFile<'a> {
-    bytes: &'a [u8],
+    source: &'a CueSource,
     file_type: CueFileType,
+}
+
+impl BuildFile<'_> {
+    /// The bytes this file contributes to the concatenated backing. An encoded
+    /// audio file contributes none: its frames come from its decoder, and the
+    /// empty slice here is the literal truth about the backing rather than a
+    /// stand-in for absent data.
+    fn raw_bytes(&self) -> &[u8] {
+        match self.source {
+            CueSource::Raw(bytes) => bytes,
+            CueSource::Audio(_) => &[],
+        }
+    }
 }
 
 /// Parse a CUE sheet into its FILE list and track list. Recognizes
