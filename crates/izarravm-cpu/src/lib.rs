@@ -20,6 +20,8 @@ mod fpu;
 mod fpu_exec;
 #[cfg(feature = "int-trace")]
 mod int_trace;
+mod ipe_entry_tally;
+pub use ipe_entry_tally::IpeEntryTargets;
 #[cfg(feature = "jit")]
 mod jit;
 /// The unit simulator's headline report, returned by `CpuGsw::take_unit_sim_report` (a diagnostic

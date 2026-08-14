@@ -863,6 +863,57 @@ impl CpuGsw {
         &self.perf
     }
 
+    /// Arm or disarm the per-window direct-entry target tally that backs the v2 windowed IPE
+    /// trace. Armed by `Machine::arm_ipe_window_trace` and by nothing else.
+    ///
+    /// Read `crate::ipe_entry_tally`'s module comment before arming this from anywhere new: the
+    /// armed leg pays a hash-map probe on the backend's hottest path, so an armed run maps the
+    /// workload and must never be used as a wall measurement of it. Disarming frees the map.
+    ///
+    /// The signature is UNCONDITIONAL and the body is `jit`-gated, the shape
+    /// `note_direct_map_changed` uses: `jit_direct` does not exist in a `--no-default-features`
+    /// build, and the machine calls this from code that is not itself gated. Without the JIT
+    /// there are no direct entries to tally, so the jit-off leg is correctly a no-op rather than
+    /// a missing feature.
+    pub fn set_ipe_entry_targets_armed(&mut self, armed: bool) {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.ipe_entry_targets = if armed { Some(Box::default()) } else { None };
+        }
+        let _ = armed;
+    }
+
+    /// The current window's entry targets, or `None` when disarmed. Does NOT clear the tally, so
+    /// the still-open trailing window can be read after the run returns. Always `None` without
+    /// the `jit` feature, which is the same answer "disarmed" gives.
+    pub fn ipe_entry_targets(&self, top_n: usize) -> Option<crate::IpeEntryTargets> {
+        self.ipe_entry_targets_inner(top_n)
+    }
+
+    /// The `jit` arm of `ipe_entry_targets`. Split into a gated pair of private functions rather
+    /// than a gated block INSIDE one function so that neither leg needs an early `return`, which
+    /// `clippy::needless_return` rejects on the arm where it is the tail.
+    #[cfg(feature = "jit")]
+    fn ipe_entry_targets_inner(&self, top_n: usize) -> Option<crate::IpeEntryTargets> {
+        self.jit_direct
+            .ipe_entry_targets
+            .as_ref()
+            .map(|tally| tally.snapshot(top_n))
+    }
+
+    #[cfg(not(feature = "jit"))]
+    fn ipe_entry_targets_inner(&self, _top_n: usize) -> Option<crate::IpeEntryTargets> {
+        None
+    }
+
+    /// Start the next entry-target window. No-op when disarmed, and no-op without the JIT.
+    pub fn reset_ipe_entry_targets(&mut self) {
+        #[cfg(feature = "jit")]
+        if let Some(tally) = self.jit_direct.ipe_entry_targets.as_mut() {
+            tally.reset();
+        }
+    }
+
     /// Where the last fatal `CpuError` was raised. Read this ONLY when the run
     /// actually stopped on one: nothing clears it, and a fatal error leaves the
     /// machine resumable, so on any other stop it describes an older fault.

@@ -1284,8 +1284,14 @@ pub struct Machine {
     ipe_window_entries: u64,
     ipe_window_start_entries: u64,
     ipe_window_start_insns: u64,
+    ipe_window_start_retired: u64,
     ipe_windows: Vec<IpeWindow>,
 }
+
+/// How many entry targets a window's `top_targets` list carries. Eight: the question it answers
+/// is "is this window re-entering a handful of blocks or a crowd", and eight rows fit one CSV
+/// field a person can read. Truncation never touches `distinct_targets`.
+pub const IPE_TOP_TARGETS: usize = 8;
 
 /// One window of the windowed instructions-per-entry (IPE) trace: how many direct-JIT
 /// entries closed the window and how many guest instructions those entries retired.
@@ -1295,7 +1301,7 @@ pub struct Machine {
 /// can carry many entries past the boundary). Consumers wanting a min-window IPE are
 /// tolerant of that jitter; consumers wanting exact window arithmetic are not, and must not
 /// use this instrument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpeWindow {
     /// 0-based index in the order the windows closed.
     pub index: u64,
@@ -1303,6 +1309,19 @@ pub struct IpeWindow {
     pub entries: u64,
     /// Guest instructions retired by those entries.
     pub direct_insns: u64,
+    /// TOTAL guest instructions retired inside this window, native and interpreted
+    /// (`PerfCounters::instructions`). `direct_insns / retired` is the window's native COVERAGE,
+    /// which is what separates a low-IPE window that is barely compiled from one that is fully
+    /// compiled into very short stints -- two different problems that a bare IPE column cannot
+    /// tell apart.
+    pub retired: u64,
+    /// Distinct direct-entry linears seen in this window. `0` when the entry-target tally was
+    /// not armed. Never reduced by the `top_targets` truncation.
+    pub distinct_targets: u64,
+    /// The heaviest `IPE_TOP_TARGETS` entry linears in this window, `(linear, count)`,
+    /// descending by count. Shorter than `distinct_targets` whenever the window saw more
+    /// targets than the list holds.
+    pub top_targets: Vec<(u32, u64)>,
     /// True for the trailing window, which the run ended before it reached the armed size.
     pub partial: bool,
 }
@@ -1315,6 +1334,20 @@ impl IpeWindow {
             return 0.0;
         }
         self.direct_insns as f64 / self.entries as f64
+    }
+
+    /// Native coverage for this window: the share of the guest instructions retired inside it
+    /// that the direct backend executed. Zero retired reads as 0.0, for `ipe`'s reason.
+    ///
+    /// Cannot exceed 1.0 by construction -- the direct entry path adds the SAME `instructions`
+    /// to `perf.instructions` and `perf.jit_direct_insns`, two adjacent lines -- and is not
+    /// clamped, deliberately: a value above 1.0 would mean those two counters had diverged, and
+    /// hiding that behind a `min` would turn a counter bug into a plausible-looking number.
+    pub fn coverage(&self) -> f64 {
+        if self.retired == 0 {
+            return 0.0;
+        }
+        self.direct_insns as f64 / self.retired as f64
     }
 }
 
@@ -1487,6 +1520,7 @@ impl Machine {
             ipe_window_entries: 0,
             ipe_window_start_entries: 0,
             ipe_window_start_insns: 0,
+            ipe_window_start_retired: 0,
             ipe_windows: Vec::new(),
             pending_toka_service: None,
             toka_service_status: 0,
@@ -2056,11 +2090,17 @@ impl Machine {
     /// Arm the windowed IPE trace: every `window_entries` direct-JIT entries, close a window
     /// recording the entries and the guest instructions they retired. `0` disarms.
     ///
-    /// A pure OBSERVER. It reads two counters the run loop already maintains
-    /// (`jit_direct_entries` / `jit_direct_insns`, incremented unconditionally in the direct
-    /// backend), records nothing else, and never slices a run: no `run_until_*` call boundary
-    /// moves, no device schedule is touched, and nothing is written to disk from inside the
-    /// loop. The host reads `ipe_windows`/`ipe_window_tail` after the run returns.
+    /// An OBSERVER. It never slices a run: no `run_until_*` call boundary moves, no device
+    /// schedule is touched, and nothing is written to disk from inside the loop, so an armed run
+    /// executes the same guest instruction stream as a disarmed one. The host reads
+    /// `ipe_windows`/`ipe_window_tail` after the run returns.
+    ///
+    /// Three of the four recorded quantities are FREE: `jit_direct_entries`, `jit_direct_insns`
+    /// and `instructions` are counters the run loop already maintains unconditionally, and this
+    /// only subtracts window starts from them. The fourth, the per-window distinct entry-target
+    /// tally, is NOT free while armed -- it costs a hash-map probe per direct entry, on the
+    /// backend's hottest path. See `izarravm_cpu::IpeEntryTargets`. Arming this therefore MAPS a
+    /// workload; it does not time one, and no wall number may be taken from an armed run.
     ///
     /// APPROXIMATION, by design: the boundary is tested once per batch, so a window closes at
     /// the first batch boundary at or past its entry target and carries however many entries
@@ -2072,13 +2112,19 @@ impl Machine {
         if window_entries == 0 {
             self.ipe_window_entries = 0;
             self.next_ipe_window_entries = u64::MAX;
+            self.cpu.set_ipe_entry_targets_armed(false);
             return;
         }
         let perf = self.cpu.perf_counters();
         self.ipe_window_start_entries = perf.jit_direct_entries;
         self.ipe_window_start_insns = perf.jit_direct_insns;
+        self.ipe_window_start_retired = perf.instructions;
         self.ipe_window_entries = window_entries;
         self.next_ipe_window_entries = self.ipe_window_start_entries.saturating_add(window_entries);
+        // The one part of this instrument that is NOT free when armed: see
+        // `izarravm_cpu::IpeEntryTargets` and its module comment. An armed run maps the
+        // workload's entry concentration and is not a wall measurement of it.
+        self.cpu.set_ipe_entry_targets_armed(true);
     }
 
     /// The windows closed so far, in the order they closed.
@@ -2088,6 +2134,13 @@ impl Machine {
 
     /// The still-open trailing window, computed from the live counters. `None` when the trace
     /// is disarmed or the tail is empty. Meant to be read once, after the run returns.
+    ///
+    /// v2 widened "empty" from "no entries" to "no entries AND nothing retired". A trailing
+    /// stretch that retired guest instructions without taking a single direct entry is a
+    /// zero-coverage phase -- precisely what the `coverage` column exists to find -- and
+    /// dropping it would also break the file's own arithmetic, since the per-window `retired`
+    /// values are meant to sum to the instructions retired SINCE ARMING -- not to the run's
+    /// whole `perf.instructions`, which also covers everything retired before the arm.
     pub fn ipe_window_tail(&self) -> Option<IpeWindow> {
         if self.next_ipe_window_entries == u64::MAX {
             return None;
@@ -2096,15 +2149,25 @@ impl Machine {
         let entries = perf
             .jit_direct_entries
             .saturating_sub(self.ipe_window_start_entries);
-        if entries == 0 {
+        let retired = perf
+            .instructions
+            .saturating_sub(self.ipe_window_start_retired);
+        if entries == 0 && retired == 0 {
             return None;
         }
+        let targets = self
+            .cpu
+            .ipe_entry_targets(IPE_TOP_TARGETS)
+            .unwrap_or_default();
         Some(IpeWindow {
             index: self.ipe_windows.len() as u64,
             entries,
             direct_insns: perf
                 .jit_direct_insns
                 .saturating_sub(self.ipe_window_start_insns),
+            retired,
+            distinct_targets: targets.distinct,
+            top_targets: targets.top,
             partial: true,
         })
     }
@@ -2121,15 +2184,43 @@ impl Machine {
     #[inline(never)]
     fn close_ipe_window(&mut self) {
         let perf = self.cpu.perf_counters();
-        let (entries_now, insns_now) = (perf.jit_direct_entries, perf.jit_direct_insns);
+        let (entries_now, insns_now, retired_now) = (
+            perf.jit_direct_entries,
+            perf.jit_direct_insns,
+            perf.instructions,
+        );
+        let targets = self
+            .cpu
+            .ipe_entry_targets(IPE_TOP_TARGETS)
+            .unwrap_or_default();
+        let entries = entries_now.saturating_sub(self.ipe_window_start_entries);
+        // The tally and the counter must have counted the SAME entries. This is the one place
+        // the two independent mechanisms meet -- the counter is incremented by the backend and
+        // windowed by subtraction here, the tally is filled per entry and cleared below -- and
+        // until now their agreement was argued rather than checked. A missed `reset`, a hook
+        // that fires on a path the counter does not, or a window boundary taken between the two
+        // reads all show up here, in every debug test and every debug fixture run.
+        debug_assert_eq!(
+            targets.total,
+            entries,
+            "entry-target tally disagrees with the entry counter for window {}",
+            self.ipe_windows.len()
+        );
         self.ipe_windows.push(IpeWindow {
             index: self.ipe_windows.len() as u64,
-            entries: entries_now.saturating_sub(self.ipe_window_start_entries),
+            entries,
             direct_insns: insns_now.saturating_sub(self.ipe_window_start_insns),
+            retired: retired_now.saturating_sub(self.ipe_window_start_retired),
+            distinct_targets: targets.distinct,
+            top_targets: targets.top,
             partial: false,
         });
+        // Snapshotted above, cleared here: the next window must start from empty or every window
+        // after the first would report the run's cumulative target set as its own.
+        self.cpu.reset_ipe_entry_targets();
         self.ipe_window_start_entries = entries_now;
         self.ipe_window_start_insns = insns_now;
+        self.ipe_window_start_retired = retired_now;
         // Measured from the entries seen NOW, not from the previous target: a batch that
         // overshot the boundary must not leave the next window short by the overshoot.
         self.next_ipe_window_entries = entries_now.saturating_add(self.ipe_window_entries.max(1));

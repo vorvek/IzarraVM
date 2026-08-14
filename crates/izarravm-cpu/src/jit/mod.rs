@@ -164,6 +164,12 @@ pub(crate) struct JitState {
     ///     admitted key rather than quietly changing what compiles.
     pub(crate) native_keys_admitted: bool,
     pub(crate) direct_barrier_census: Option<Box<direct::DirectBarrierCensus>>,
+    /// Per-window entry-target tally for the v2 windowed IPE trace. `None` is DISARMED and is the
+    /// only state a normal build reaches; see `crate::ipe_entry_tally` for the cost statement.
+    /// It lives here, next to `direct_barrier_census`, for that field's reason: the direct entry
+    /// path already loads and writes `JitState`, so the disarmed null test costs no extra cache
+    /// line and the pinned `CpuGsw` field offsets do not move.
+    pub(crate) ipe_entry_targets: Option<Box<crate::ipe_entry_tally::IpeEntryTally>>,
     pub(crate) smc_heat: direct::SmcHeatMap,
     /// The native code watch, HOISTED out of `BlockCache` (Track C C1c-pre, design decision
     /// D-C1c.1, mirroring the C1a-pre `SmcHeatMap` hoist): "watched" is a property of what
@@ -232,6 +238,9 @@ impl JitState {
             // computation in one place.
             native_keys_admitted: false,
             direct_barrier_census: direct::barrier_census_default(),
+            // No env-var default arm, unlike the census: this instrument is armed only by
+            // `Machine::arm_ipe_window_trace`, so a plain `CpuGsw` never pays for it.
+            ipe_entry_targets: None,
             smc_heat: direct::SmcHeatMap::default(),
             code_watch: Box::default(),
             fast_map_audit: Box::default(),
@@ -264,6 +273,9 @@ impl Clone for JitState {
             // the cached answer stays correct, and a reset would refuse every key.
             native_keys_admitted: self.native_keys_admitted,
             direct_barrier_census: None,
+            // Dropped by clone, exactly as the census is: a diagnostic tally belongs to the run
+            // that armed it, and a lockstep clone must not double-count its parent's entries.
+            ipe_entry_targets: None,
             smc_heat: self.smc_heat.clone(),
             // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone
             // produced (its clone built a new cache with a new watch).

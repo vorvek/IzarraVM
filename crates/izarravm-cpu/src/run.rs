@@ -2431,6 +2431,19 @@ impl CpuGsw {
             u64::from(block.is_segment_write_block()),
             instructions,
         );
+        // v2 IPE-trace observer, DISARMED in every normal build. A disarmed entry pays one null
+        // test and nothing else; the field is EXPECTED to share a cache line with the other
+        // `Option<Box<..>>` diagnostics `JitState` already carries and that the line above
+        // touches, but `JitState` is `repr(Rust)` and source adjacency guarantees no layout, so
+        // that is an expectation and not a measurement. `note_entry` is `#[inline(never)]` so
+        // the armed body stays out of
+        // this function. The armed leg's cost is stated in `crate::ipe_entry_tally`. Keyed on the
+        // ENTRY block's linear -- a chained transfer runs successor blocks without returning
+        // here, which is the property that makes this "where did the dispatcher re-enter", not
+        // "which blocks ran".
+        if let Some(tally) = self.jit_direct.ipe_entry_targets.as_mut() {
+            tally.note_entry(span.key.linear);
+        }
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
         match exit.unresolved_reason {
             jit::direct::UnresolvedReason::None => {}
