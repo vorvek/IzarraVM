@@ -1652,6 +1652,7 @@ dependencies = [
  "egui-winit",
  "izarravm-audio",
  "izarravm-bus",
+ "izarravm-cdaudio",
  "izarravm-core",
  "izarravm-cpu",
  "izarravm-firmware",

@@ -3,9 +3,11 @@
 
 use izarravm_audio::{AudioDebugSnapshot, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiConfig, MidiStatus};
-use izarravm_machine::{CdAudioState, CdImage, JoystickState, Machine, MachineProfile, StopReason};
+use izarravm_machine::{
+    CdAudioState, CdImage, CueSource, JoystickState, Machine, MachineProfile, StopReason,
+};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -2276,7 +2278,15 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
             SessionFailure::new(format!("could not read CUE {}: {err}", path.display()))
         })?;
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let names = cue_file_names(&cue);
+        // One scanner, shared with the mount. See `cue_file_list` for why this
+        // is not a second reading of the sheet done locally.
+        let names: Vec<String> = izarravm_machine::cue_file_list(&cue)
+            .map_err(|err| {
+                SessionFailure::new(format!("could not read CUE {}: {err}", path.display()))
+            })?
+            .into_iter()
+            .map(|(name, _file_type)| name)
+            .collect();
         if names.is_empty() {
             // No FILE line: the sibling .bin is the whole disc.
             let bin_path = path.with_extension("bin");
@@ -2295,23 +2305,43 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
         // image before `from_cue_files` ever sees the list.
         let mut seen = HashSet::with_capacity(names.len());
         let mut files = Vec::with_capacity(names.len());
+        let mut folder = CueFolder::new(dir);
         for name in names {
             if !seen.insert(name.to_ascii_lowercase()) {
                 // The sheet named this file again for another track; it was
                 // already read once above.
                 continue;
             }
-            let file_path = dir.join(&name);
-            let bytes = std::fs::read(&file_path).map_err(|err| {
+            let file_path = folder.resolve(&name);
+            // Look at the file before reading it. An encoded audio track is
+            // measured here, never loaded: Betrayal at Krondor names 62 Ogg
+            // files totalling 155 MB, which decode to about 1.5 GB, and the
+            // mount has no reason to hold any of it. A file that is not a
+            // container at all comes back as None and takes the original path,
+            // byte for byte as before.
+            let probed = izarravm_cdaudio::probe(&file_path).map_err(|err| {
                 SessionFailure::new(format!(
-                    "could not read {} named by {}: {err}",
+                    "could not use {} named by {}: {err}",
                     file_path.display(),
                     path.display()
                 ))
             })?;
-            files.push((name, bytes));
+            let source = match probed {
+                Some(source) => CueSource::Audio(source),
+                None => {
+                    let bytes = std::fs::read(&file_path).map_err(|err| {
+                        SessionFailure::new(format!(
+                            "could not read {} named by {}: {err}",
+                            file_path.display(),
+                            path.display()
+                        ))
+                    })?;
+                    CueSource::Raw(bytes)
+                }
+            };
+            files.push((name, source));
         }
-        CdImage::from_cue_files(&cue, files).map_err(SessionFailure::new)
+        CdImage::from_cue_sources(&cue, files).map_err(SessionFailure::new)
     } else {
         let bytes = std::fs::read(path).map_err(|err| {
             SessionFailure::new(format!("could not read CD image {}: {err}", path.display()))
@@ -2320,46 +2350,83 @@ fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFailure> {
     }
 }
 
-/// Every file a CUE names, in sheet order. A name is returned as written; the
-/// caller resolves it against the CUE's own directory. An empty result means
-/// the sheet has no FILE line at all, which the caller treats as a single-BIN
-/// sheet named after the CUE.
-fn cue_file_names(cue: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    // The same UTF-8 BOM that `parse_cue` has to strip reaches here first, and
-    // this scanner is blind to it in its own way: the four bytes it compares
-    // against "FILE" on a BOM'd first line are the BOM's three plus a single
-    // 'F'. Fixing only `parse_cue` would not repair the mount, it would just
-    // move the damage -- the parser would list both files while this loop read
-    // only the second one off disk, and `from_cue_files` would refuse the mount
-    // for a file the user did in fact supply. Both scanners have to see the
-    // line, so both strip the marker once at the head of the stream.
-    for line in cue.strip_prefix('\u{feff}').unwrap_or(cue).lines() {
-        let trimmed = line.trim();
-        // `get` rather than a length check and a slice: the four bytes wanted
-        // here are bytes, and a line that reaches four of them still need not
-        // have a character boundary at byte 4 -- a REM comment opening with an
-        // em-dash or a smart quote puts a multi-byte sequence across that
-        // position, and slicing through it panics. A comment line the loader
-        // was going to ignore anyway must not be able to abort a mount, so ask
-        // for the prefix and let a mid-character answer be `None`.
-        let Some(keyword) = trimmed.get(..4) else {
-            continue;
-        };
-        if !keyword.eq_ignore_ascii_case("FILE") {
-            continue;
-        }
-        let rest = trimmed[4..].trim_start();
-        let name = if let Some(rest) = rest.strip_prefix('"') {
-            rest.split('"').next()
-        } else {
-            rest.split_whitespace().next()
-        };
-        if let Some(name) = name.filter(|name| !name.is_empty()) {
-            names.push(name.to_string());
+/// Resolves the names a CUE sheet writes against the files that are actually on
+/// disk, tolerating a difference in case.
+///
+/// Rippers do not preserve case between the sheet and the files beside it, and
+/// they do not have to: the sheets in circulation were written on Windows,
+/// where the filesystem does not care. Betrayal at Krondor's CD1.cue names
+/// `CD1.iso` and `track02.ogg` for files stored as `cd1.iso` and `Track02.ogg`
+/// -- both of its shapes differ, so on any case-sensitive filesystem the disc
+/// does not mount at all. `from_cue_sources` already matches sheet names to
+/// supplied names case-insensitively; this is the same tolerance one layer
+/// down, where the name meets the host.
+///
+/// The directory is listed at most once, and only if a literal name misses, so
+/// a well-formed disc pays nothing. Betrayal at Krondor names 63 files, and a
+/// listing per name would be 63 scans of a folder that never changes.
+struct CueFolder<'a> {
+    dir: &'a Path,
+    /// Lowercased file name to the entry's real name. Built on the first miss.
+    by_lowercase: Option<HashMap<String, std::ffi::OsString>>,
+}
+
+impl<'a> CueFolder<'a> {
+    fn new(dir: &'a Path) -> Self {
+        Self {
+            dir,
+            by_lowercase: None,
         }
     }
-    names
+
+    /// The path `name` refers to. Falls back to the literal join when nothing
+    /// in the directory matches, so the error a caller raises afterwards names
+    /// the file the sheet asked for rather than one nobody wrote down.
+    ///
+    /// On a case-insensitive host the first line answers everything and the
+    /// rest is unreachable, which is why the matching below is a function of
+    /// its own: it is the half that cannot be reached from a test on Windows,
+    /// and the half where a mistake costs a Linux user the whole disc.
+    fn resolve(&mut self, name: &str) -> PathBuf {
+        let literal = self.dir.join(name);
+        if literal.exists() {
+            return literal;
+        }
+        let index = self
+            .by_lowercase
+            .get_or_insert_with(|| index_by_lowercase(self.dir));
+        match spelled_as(index, name) {
+            Some(real) => self.dir.join(real),
+            None => literal,
+        }
+    }
+}
+
+/// A directory's entries, keyed by their lowercased names and valued by the
+/// spelling actually on disk.
+///
+/// An unreadable directory indexes as empty rather than failing: the caller's
+/// next step is to open the file it resolved, and the error from that names the
+/// file the user is missing, which is more use than one naming its folder.
+fn index_by_lowercase(dir: &Path) -> HashMap<String, std::ffi::OsString> {
+    let mut index = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let real = entry.file_name();
+            index.insert(real.to_string_lossy().to_lowercase(), real);
+        }
+    }
+    index
+}
+
+/// How `name` is spelled among `entries`, ignoring case. Both sides are
+/// lowercased by the same rule, which is the whole of the matching and the only
+/// place it can go wrong.
+fn spelled_as<'a>(
+    entries: &'a HashMap<String, std::ffi::OsString>,
+    name: &str,
+) -> Option<&'a std::ffi::OsString> {
+    entries.get(&name.to_lowercase())
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {

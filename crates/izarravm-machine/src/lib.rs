@@ -161,7 +161,7 @@ pub use katea_tree::KateaStorageCounters;
 pub use storage::Int13Profile;
 pub use vga_wipe_census::{VgaWipeCensusSnapshot, VgaWipeKeyRow};
 
-pub use cdimage::CdImage;
+pub use cdimage::{CdImage, CueFileType, CueSource, cue_file_list};
 pub use iso9660::{MAX_IMAGE_BYTES as CD_FOLDER_MAX_BYTES, build as build_cd_folder};
 pub use memmap::{
     CONVENTIONAL_TOP, HMA_BASE, HMA_TOP, MemRegion, SYSTEM_ROM_BASE, UPPER_MEMORY_BASE,

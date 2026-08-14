@@ -884,6 +884,23 @@ impl BuildFile<'_> {
     }
 }
 
+/// Every file a CUE names, in sheet order, each with the type token its `FILE`
+/// line declared. A name is returned as written; the caller resolves it against
+/// the sheet's own directory. An empty list means the sheet has no `FILE` line
+/// at all, which a loader may treat as a single-BIN sheet named after the CUE.
+///
+/// This exists so that a caller which must know the sheet's files *before* it
+/// can supply them -- a loader deciding what to read off disk, and what to
+/// merely measure -- asks the same scanner the mount will use rather than
+/// writing a second one. Two scanners is how the UTF-8 BOM bug survived: the
+/// loader's own four-byte prefix test read a BOM'd `FILE` as three marker bytes
+/// and an `F`, so it handed over one file while `parse_cue` listed two, and a
+/// track bound to the wrong file's bytes. Neither scanner was wrong about its
+/// own input; they simply never had to agree.
+pub fn cue_file_list(cue: &str) -> Result<Vec<(String, CueFileType)>, String> {
+    parse_cue(cue).map(|(files, _tracks)| files)
+}
+
 /// Parse a CUE sheet into its FILE list and track list. Recognizes
 /// `TRACK n MODE1/2048`, `MODE1/2352`, `MODE1/2448`, `MODE2/2048`,
 /// `MODE2/2336`, `MODE2/2352`, `AUDIO`, and `CDG`, with each track's

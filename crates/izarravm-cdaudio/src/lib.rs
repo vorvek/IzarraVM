@@ -15,3 +15,45 @@ pub use probe::{
     CD_SAMPLE_RATE, CdAudioError, SAMPLES_PER_FRAME, TrackInfo, probe_info, sectors_for,
 };
 pub use sniff::{Container, SNIFF_BYTES, sniff};
+
+use std::path::Path;
+use std::sync::Arc;
+
+/// A track that knows its length but has no decoder behind it yet.
+///
+/// Temporary, for the stage that lands the mount path before the decoder
+/// exists. The TOC is correct and the audio is silent, which is already
+/// strictly better than what it replaces: an encoded file mounted as raw bytes
+/// gives a track of the wrong length that plays its own compressed data as
+/// noise, and pushes every later track off its LBA besides.
+#[derive(Debug)]
+struct SilentTrack {
+    sectors: u32,
+}
+
+impl izarravm_core::AudioTrackSource for SilentTrack {
+    fn sectors(&self) -> u32 {
+        self.sectors
+    }
+
+    fn frame(&self, _index: u32) -> Option<[u8; izarravm_core::AUDIO_FRAME_BYTES]> {
+        None
+    }
+}
+
+/// Measure `path` and return a source for it, or None when it is not an audio
+/// container at all and should be mounted as raw bytes exactly as before.
+///
+/// The file is measured, never read into memory: Betrayal at Krondor is 155 MB
+/// of Ogg across 62 tracks, and holding the decode of all of them would be
+/// about 1.5 GB.
+pub fn probe(
+    path: &Path,
+) -> Result<Option<Arc<dyn izarravm_core::AudioTrackSource>>, CdAudioError> {
+    let Some(info) = probe_info(path)? else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(SilentTrack {
+        sectors: info.sectors,
+    })))
+}

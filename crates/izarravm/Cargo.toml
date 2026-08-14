@@ -44,6 +44,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 izarravm-audio = { path = "../izarravm-audio" }
 izarravm-bus = { path = "../izarravm-bus" }
+izarravm-cdaudio = { path = "../izarravm-cdaudio" }
 izarravm-core = { path = "../izarravm-core" }
 izarravm-cpu = { path = "../izarravm-cpu", default-features = false }
 izarravm-firmware = { path = "../izarravm-firmware" }

@@ -97,6 +97,15 @@ fn prepared_floppy_rejects_an_unknown_geometry_before_submission() {
     assert!(error.to_string().contains("unsupported floppy image size"));
 }
 
+/// The names the loader will hand to the mount, from the one scanner both use.
+fn cue_file_names(cue: &str) -> Vec<String> {
+    izarravm_machine::cue_file_list(cue)
+        .expect("sheet parses")
+        .into_iter()
+        .map(|(name, _file_type)| name)
+        .collect()
+}
+
 #[test]
 fn cue_file_names_returns_every_file_in_sheet_order() {
     let cue = concat!(
@@ -120,16 +129,17 @@ fn cue_file_names_returns_every_file_in_sheet_order() {
 
 #[test]
 fn cue_file_names_sees_the_first_file_line_behind_a_utf8_bom() {
-    // This loader has its own FILE scanner, independent of `parse_cue`, and it
-    // was blind to a BOM in its own way: `trimmed[..4]` over a BOM'd first line
-    // is the three BOM bytes plus one 'F', which is not "FILE", so the line is
-    // skipped and the file it names is never read from disk.
+    // The loader used to run its own FILE scanner, and it was blind to a BOM in
+    // its own way: `trimmed[..4]` over a BOM'd first line is the three marker
+    // bytes plus one 'F', which is not "FILE", so the line was skipped and the
+    // file it names never read from disk -- while `parse_cue`, which strips the
+    // marker, listed it. Two readings of one sheet, and only the quieter one
+    // decided what got read.
     //
-    // Fixing `parse_cue` alone does not make the mount right, it only changes
-    // the failure's shape: the parser would then correctly list both files
-    // while this scanner still handed over only the second one, and the mount
-    // would die with "CUE names a file that was not supplied". Both scanners
-    // have to see the line.
+    // There is one scanner now, so the two cannot come apart. The case is still
+    // pinned from the loader's side because it is the loader's bug this
+    // prevents: the mount died with "CUE names a file that was not supplied"
+    // for a file the user did in fact supply.
     let cue = concat!(
         "\u{feff}FILE \"track01.bin\" BINARY\n",
         "  TRACK 01 MODE1/2352\n",
@@ -144,12 +154,12 @@ fn cue_file_names_sees_the_first_file_line_behind_a_utf8_bom() {
 
 #[test]
 fn cue_file_names_reads_a_line_whose_fourth_byte_is_mid_character() {
-    // `trimmed[..4]` slices *bytes*, and the length guard above it only proves
-    // there are four bytes to take, not that byte 4 begins a character. A REM
-    // comment written with an em-dash right after the keyword puts a
-    // three-byte sequence at bytes 3..6, so byte 4 lands inside it and the
-    // slice panics -- taking the whole mount down over a comment line that
-    // carries no information the loader wanted.
+    // The retired scanner matched a four-byte prefix, and a REM comment written
+    // with an em-dash right after the keyword puts a three-byte sequence across
+    // byte 4 -- slicing there panicked and took the whole mount down over a
+    // comment carrying nothing the loader wanted. The shared scanner splits on
+    // whitespace and compares whole words, so there is no byte index left to
+    // land inside a character.
     let cue = concat!(
         "REM\u{2014}ripped by some tool\n",
         "FILE \"track01.bin\" BINARY\n",
@@ -161,35 +171,15 @@ fn cue_file_names_reads_a_line_whose_fourth_byte_is_mid_character() {
 }
 
 #[test]
-fn cue_file_names_drops_a_file_line_that_names_nothing() {
-    // A line that is the bare keyword is exactly the boundary the `get(..4)`
-    // fix moved: four bytes, so the prefix is taken and does compare equal to
-    // "FILE", and `trimmed[4..]` is then the empty string. It survives on the
-    // name extractor coming back empty-handed -- `split_whitespace` on an
-    // empty rest yields nothing at all, so this line is dropped before the
-    // emptiness filter is even consulted. `FILE ""` is the case that reaches
-    // that filter: the quoted branch does produce a name there, and it is the
-    // empty one.
-    //
-    // Neither may contribute a name. The loader joins every name it gets to
-    // the CUE's directory and reads it, so an empty name resolves to the
-    // directory itself and kills the mount over a line that named nothing.
-    // Both spellings are covered here because the two branches of the name
-    // extractor fail differently, and only one of them is filtered.
-    //
-    // `parse_cue` does not merely drop these lines, it refuses the sheet with
-    // "missing FILE name", so a sheet like this fails loudly at the mount
-    // either way. This pins the half of the answer that lives in this scanner.
-    let cue = concat!(
-        "FILE\n",
-        "FILE   \n",
-        "FILE \"\" BINARY\n",
-        "FILE \"track01.bin\" BINARY\n",
-        "  TRACK 01 AUDIO\n",
-        "    INDEX 01 00:00:00\n",
-    );
-
-    assert_eq!(cue_file_names(cue), vec!["track01.bin"]);
+fn a_file_line_that_names_nothing_refuses_the_sheet() {
+    // The retired scanner dropped these lines silently and the mount then died
+    // in `parse_cue` anyway, so the sheet always failed -- just twice over, with
+    // the loader's half of the answer never visible. One scanner means one
+    // refusal, raised where the sheet is read.
+    for cue in ["FILE\n", "FILE   \n", "FILE \"\" BINARY\n"] {
+        let err = izarravm_machine::cue_file_list(cue).unwrap_err();
+        assert!(err.contains("FILE name"), "message was: {err}");
+    }
 }
 
 #[test]
@@ -1310,4 +1300,171 @@ fn the_pump_applies_the_knob_after_the_midi_legs_have_been_added() {
         "the buffer the engines rendered into is what the knob then scales, \
          saturating"
     );
+}
+
+/// Copy a fixture from izarravm-cdaudio's test data next to a CUE we write.
+fn copy_fixture(dir: &std::path::Path, name: &str, as_name: &str) {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../izarravm-cdaudio/tests/fixtures")
+        .join(name);
+    std::fs::copy(src, dir.join(as_name)).unwrap();
+}
+
+#[test]
+fn load_cd_image_from_path_mounts_a_cue_naming_an_ogg() {
+    let scratch = TestScratch::new("cue-ogg-mount");
+    copy_fixture(scratch.path(), "tone.ogg", "tone.ogg");
+    std::fs::write(scratch.path().join("data.bin"), vec![0u8; 2 * 2048]).unwrap();
+    let cue_path = scratch.path().join("disc.cue");
+    std::fs::write(
+        &cue_path,
+        "FILE \"data.bin\" BINARY\n\
+         TRACK 01 MODE1/2048\n\
+         INDEX 01 00:00:00\n\
+         FILE \"tone.ogg\" WAVE\n\
+         TRACK 02 AUDIO\n\
+         INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+
+    let image = load_cd_image_from_path(&cue_path).unwrap();
+
+    assert_eq!(image.track_count(), 2);
+    // The ogg is a 0.2 s tone: 15 Red Book sectors, taken from its duration and
+    // not from its byte length, which is 5114 bytes -- two sectors' worth, and
+    // the number this used to mount.
+    assert_eq!(image.tracks()[1].sectors, 15);
+    assert_eq!(image.total_sectors(), 17);
+    // Nothing decodes yet, so every frame of it is silence rather than the
+    // compressed bytes played as noise.
+    assert!(image.read_audio_frame(2).is_none());
+}
+
+#[test]
+fn load_cd_image_from_path_resolves_a_file_whose_case_differs_from_the_sheet() {
+    // Betrayal at Krondor's CD1.cue names CD1.iso and track02.ogg for files
+    // stored as cd1.iso and Track02.ogg. Sheets are written on Windows, where
+    // that costs nothing; on a case-sensitive filesystem the disc would not
+    // mount at all. Both of that disc's shapes are reproduced here.
+    let scratch = TestScratch::new("cue-case-mismatch");
+    copy_fixture(scratch.path(), "tone.ogg", "Track02.ogg");
+    std::fs::write(scratch.path().join("cd1.iso"), vec![0u8; 2 * 2048]).unwrap();
+    let cue_path = scratch.path().join("disc.cue");
+    std::fs::write(
+        &cue_path,
+        "FILE \"CD1.iso\" BINARY\n\
+         TRACK 01 MODE1/2048\n\
+         INDEX 01 00:00:00\n\
+         FILE \"track02.ogg\" MP3\n\
+         TRACK 02 AUDIO\n\
+         INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+
+    let image = load_cd_image_from_path(&cue_path).unwrap();
+
+    assert_eq!(image.track_count(), 2);
+    assert_eq!(image.tracks()[1].sectors, 15);
+}
+
+#[test]
+fn the_case_insensitive_match_is_what_resolves_a_differently_spelled_name() {
+    // The test above cannot fail on Windows: NTFS answers `CD1.iso` with
+    // `cd1.iso` before any of this code runs, so the whole fallback can be
+    // deleted and it still passes. What that test pins is the disc mounting;
+    // this pins the part that does the work, on any host.
+    let scratch = TestScratch::new("cue-case-index");
+    std::fs::write(scratch.path().join("cd1.iso"), b"x").unwrap();
+    std::fs::write(scratch.path().join("Track02.ogg"), b"x").unwrap();
+
+    let index = index_by_lowercase(scratch.path());
+
+    // The two spellings Betrayal at Krondor's sheet actually uses.
+    assert_eq!(
+        spelled_as(&index, "CD1.iso").map(|n| n.to_string_lossy().into_owned()),
+        Some("cd1.iso".to_string())
+    );
+    assert_eq!(
+        spelled_as(&index, "track02.ogg").map(|n| n.to_string_lossy().into_owned()),
+        Some("Track02.ogg".to_string())
+    );
+    // A name nothing matches stays unmatched, so the caller reports the file
+    // the sheet asked for rather than an unrelated neighbour.
+    assert!(spelled_as(&index, "absent.bin").is_none());
+}
+
+#[test]
+fn an_unresolvable_name_is_reported_as_the_sheet_wrote_it() {
+    let scratch = TestScratch::new("cue-case-miss");
+    let mut folder = CueFolder::new(scratch.path());
+
+    let resolved = folder.resolve("Nowhere.bin");
+
+    assert_eq!(resolved, scratch.path().join("Nowhere.bin"));
+}
+
+#[test]
+fn load_cd_image_from_path_believes_the_bytes_over_the_file_token() {
+    // Three of the five real sheets tested against declare MP3 for files whose
+    // first four bytes are OggS. Honoring the token is the reading faithful to
+    // the CUE spec and it fails on every disc the owner has, so the bytes
+    // decide and the token is kept for diagnostics.
+    let scratch = TestScratch::new("cue-lying-token");
+    copy_fixture(scratch.path(), "tone.ogg", "02 Whiplash.ogg");
+    let cue_path = scratch.path().join("disc.cue");
+    std::fs::write(
+        &cue_path,
+        "FILE \"02 Whiplash.ogg\" MP3\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+    )
+    .unwrap();
+
+    let image = load_cd_image_from_path(&cue_path).unwrap();
+
+    assert_eq!(image.tracks()[0].sectors, 15);
+}
+
+#[test]
+fn load_cd_image_from_path_refuses_an_undecodable_container_by_name() {
+    let scratch = TestScratch::new("cue-opus");
+    copy_fixture(scratch.path(), "tone-opus.ogg", "tone-opus.ogg");
+    let cue_path = scratch.path().join("disc.cue");
+    std::fs::write(
+        &cue_path,
+        "FILE \"tone-opus.ogg\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+    )
+    .unwrap();
+
+    let error = load_cd_image_from_path(&cue_path).unwrap_err();
+
+    let message = error.to_string();
+    assert!(message.contains("tone-opus.ogg"), "message was: {message}");
+    assert!(message.contains("Opus"), "message was: {message}");
+}
+
+#[test]
+fn a_raw_bin_still_mounts_as_bytes_after_the_sniff() {
+    // The regression that matters most here: a sheet with no compressed audio
+    // must take exactly the path it did before, byte for byte. Quake's sheet is
+    // this shape at 624 MB.
+    let scratch = TestScratch::new("cue-still-raw");
+    let cue_path = scratch.path().join("disc.cue");
+    std::fs::write(
+        &cue_path,
+        "FILE \"d.bin\" BINARY\n\
+         TRACK 01 MODE1/2048\n\
+         INDEX 01 00:00:00\n\
+         TRACK 02 AUDIO\n\
+         INDEX 01 00:00:01\n",
+    )
+    .unwrap();
+    let mut bin = vec![0u8; 2048 + 2 * 2352];
+    bin[0] = 0xD1;
+    bin[2048] = 0xA2;
+    std::fs::write(scratch.path().join("d.bin"), &bin).unwrap();
+
+    let image = load_cd_image_from_path(&cue_path).unwrap();
+
+    assert_eq!(image.track_count(), 2);
+    assert_eq!(image.read_data_sector(0).unwrap()[0], 0xD1);
+    assert_eq!(image.read_audio_frame(1).unwrap()[0], 0xA2);
 }
