@@ -55,7 +55,12 @@ The Izarra 3000 logo, chassis photograph, emulator screenshot, and firmware
 artwork are project assets distributed under GPL-3.0-only.
 Host audio output uses cpal 0.15.3 under Apache-2.0. External MIDI output uses
 midir 0.10.4, Copyright (c) 2015 Patrick Reisert and the RtMidi contributors,
-under MIT. Exact license texts are in third_party/licenses.
+under MIT. CD-ROM audio track decoding uses symphonia 0.6.1, Copyright (c)
+2019-2026 The Project Symphonia Developers, under the Mozilla Public License
+2.0; the MPL's Exhibit B notice is attached to none of those sources, so
+section 3.3 permits distributing them as part of this project under its
+GPL-3.0-only terms, and only the ogg, vorbis, mp3, wav, pcm, flac, and ID3
+features are enabled. Exact license texts are in third_party/licenses.
 TOKAEMM.SYS (the XMS/UMB/EMS memory manager and V86 monitor) is a 386MAX
 adaptation: its VCPI 1.0 server and its V86 privileged-instruction emulation
 (the INT 67h AH=DEh handlers, the DE0C mode switch, and the MOV CRn/DRn /
