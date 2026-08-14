@@ -21,11 +21,11 @@ use crate::decode::decode_into_cancellable;
 use crate::probe::{CdAudioError, TrackInfo, probe_info};
 use izarravm_core::{AUDIO_FRAME_BYTES, AudioTrackSource};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The buffer and how much of it is real, together under one lock.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Filled {
     pcm: Vec<u8>,
     /// Whole sectors at the front of `pcm` that hold decoded audio. Everything
@@ -33,6 +33,19 @@ struct Filled {
     /// track that is about to arrive would be indistinguishable from silence
     /// the composer wrote.
     ready: u32,
+}
+
+/// Written by hand for the reason the `AudioTrackSource` contract gives: a
+/// derived one prints every byte of the buffer the first time anything formats
+/// a track, and a track is tens of megabytes of samples. `CdImage` derives
+/// `Debug`, so a single `{:?}` of a mounted disc would reach this.
+impl std::fmt::Debug for Filled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Filled")
+            .field("bytes", &self.pcm.len())
+            .field("ready", &self.ready)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -57,7 +70,21 @@ struct Shared {
     /// decoding the same file, not a sound anyone can hear. Counted so a test
     /// can see it.
     workers: AtomicU32,
+    /// When this track was last asked for a frame, on [`TOUCH_CLOCK`]'s scale.
+    ///
+    /// Eviction takes the least recently touched track, and "touched" has to
+    /// mean every read rather than every decode start. A track being played
+    /// from a buffer it already holds serves nothing but hits, so it would
+    /// never refresh its place, and the next admission would find it looking
+    /// like the oldest resident and take the buffer out from under the mixer --
+    /// which then re-decodes the song from its beginning, mid-play.
+    last_touch: AtomicU64,
 }
+
+/// Source of the ordering [`Shared::last_touch`] records. A counter rather than
+/// a clock because only the order matters, and a monotonic integer cannot step
+/// backwards the way a wall clock can.
+static TOUCH_CLOCK: AtomicU64 = AtomicU64::new(0);
 
 /// A CUE audio track backed by an encoded file on the host.
 #[derive(Debug)]
@@ -98,6 +125,7 @@ impl DecodedTrack {
                 cancel: AtomicBool::new(false),
                 finished: AtomicBool::new(false),
                 workers: AtomicU32::new(0),
+                last_touch: AtomicU64::new(0),
             }),
         }
     }
@@ -260,7 +288,10 @@ impl Registry {
             // underneath one would let a second worker begin on the same track.
             let Some(index) = resident
                 .iter()
-                .position(|s| s.finished.load(Ordering::SeqCst))
+                .enumerate()
+                .filter(|(_, s)| s.finished.load(Ordering::SeqCst))
+                .min_by_key(|(_, s)| s.last_touch.load(Ordering::Relaxed))
+                .map(|(index, _)| index)
             else {
                 // Nothing evictable. Decoding outruns playback by so wide a
                 // margin that two live workers do not arise in practice, and if
@@ -298,6 +329,14 @@ impl AudioTrackSource for DecodedTrack {
         if index >= self.info.sectors {
             return None;
         }
+        // Before the read, and on the hit path too: this is what keeps a track
+        // the mixer is currently drawing from out of the eviction candidate
+        // set. One relaxed increment, on a path that is about to take a mutex
+        // anyway.
+        self.shared.last_touch.store(
+            TOUCH_CLOCK.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         let frame = {
             let filled = self.shared.filled.lock().unwrap_or_else(|e| e.into_inner());
             if index < filled.ready {

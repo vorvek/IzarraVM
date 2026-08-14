@@ -207,3 +207,37 @@ fn a_file_that_is_no_longer_a_container_fails_rather_than_decoding_noise() {
     assert!(err.to_string().contains("container"), "message was: {err}");
     std::fs::remove_file(&swapped).ok();
 }
+
+#[test]
+fn a_decode_that_ends_early_does_not_republish_its_silent_tail() {
+    // A file replaced or truncated between mount and play stops far short of
+    // the length the TOC promised. The bytes past that point were never written
+    // and are already zero in both buffers, so handing them to the callback
+    // copies zeros onto zeros -- and `DecodedTrack` does that copy while
+    // holding the lock the mixer pull takes, which for a long track is hundreds
+    // of megabytes of memcpy stalling the emulation thread.
+    let mut info = crate::probe_info(&fixture("tone.wav")).unwrap().unwrap();
+    let real_bytes = info.sectors as usize * AUDIO_FRAME_BYTES;
+    // Claim ten times the length; the file ends long before it.
+    info.frames *= 10;
+    info.sectors = crate::sectors_for(info.frames, info.sample_rate);
+    let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
+
+    let mut handed_over = 0usize;
+    let mut last_ready = 0u32;
+    decode_into(&fixture("tone.wav"), info, &mut pcm, &mut |ready, new| {
+        handed_over += new.len();
+        last_ready = ready;
+    })
+    .unwrap();
+
+    // The whole track is still declared ready -- the tail is silence, not
+    // pending -- but only the sectors carrying audio were passed along.
+    assert_eq!(last_ready, info.sectors);
+    assert!(
+        handed_over <= real_bytes + AUDIO_FRAME_BYTES,
+        "handed over {handed_over} bytes for {real_bytes} bytes of audio in a \
+         {} byte buffer",
+        pcm.len()
+    );
+}

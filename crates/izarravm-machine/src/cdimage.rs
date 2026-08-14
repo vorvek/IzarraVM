@@ -660,18 +660,26 @@ impl CdImage {
     /// Cheap and idempotent -- a source already decoding ignores the touch --
     /// so the mixer can call it on every frame it renders.
     pub fn warm_upcoming(&self, lba: u32) {
-        let Some(track) = self.track_at_lba(lba) else {
+        // The next track by position, which is not the same as the track after
+        // the one the head is in. A PREGAP belongs to no track at all: `build`
+        // counts its frames into the following track's `start_lba` without
+        // giving them to either neighbour, so during a pregap `track_at_lba`
+        // finds nothing, and afterwards the next track does not begin where the
+        // previous one ended. Matching on exact adjacency made this function
+        // inert for any sheet with a pregap -- which is the ordinary layout,
+        // and includes Fatal Racing's, one of the discs this was written for.
+        //
+        // Tracks are in ascending `start_lba` order, so the first one starting
+        // past the head is the one about to be reached. Taking only that one is
+        // what keeps a disc of tracks shorter than the window from warming all
+        // of them at once, which is the residency the decoder's bound exists to
+        // prevent.
+        let Some(next) = self.tracks.iter().find(|t| t.start_lba > lba) else {
             return;
         };
-        if track.end_lba().saturating_sub(lba) > PREFETCH_FRAMES {
+        if next.start_lba.saturating_sub(lba) > PREFETCH_FRAMES {
             return;
         }
-        // Only the track that begins exactly where this one ends, so a disc of
-        // tracks shorter than the window warms one ahead rather than all of
-        // them -- which is the residency the decoder's bound exists to prevent.
-        let Some(next) = self.tracks.iter().find(|t| t.start_lba == track.end_lba()) else {
-            return;
-        };
         if let Some(source) = self.audio_sources.get(&next.number) {
             // Asking for frame 0 is what starts a decode, and the frame itself
             // is thrown away. There is no separate "start" on the contract

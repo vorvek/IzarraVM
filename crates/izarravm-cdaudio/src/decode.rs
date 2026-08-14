@@ -69,7 +69,11 @@ pub fn decode_into_cancellable(
         .make_audio_decoder(&source.params, &Default::default())
         .map_err(|err| decode_error(path, err))?;
 
-    let mut resampler = (info.sample_rate != CD_SAMPLE_RATE)
+    // The zero check is not redundant with the probe's refusal: this function
+    // takes a `TrackInfo` from its caller, and a zero rate here is a step of
+    // 0.0 in the resampler, which emits output forever without consuming input.
+    // A loop that cannot end is worse than a track at the wrong pitch.
+    let mut resampler = (info.sample_rate != CD_SAMPLE_RATE && info.sample_rate != 0)
         .then(|| Resampler::new(info.sample_rate, CD_SAMPLE_RATE));
 
     // Counted in source sample frames, and from the probe. Nothing is skipped
@@ -186,10 +190,22 @@ pub fn decode_into_cancellable(
     }
 
     // Whatever is left of `pcm` was never written, and a fresh buffer is zeros,
-    // which is silence. Publishing the full count last is what tells the caller
-    // the track is whole, and the tail handed over with it carries that silence
-    // so a caller mirroring into its own buffer ends up with the same bytes.
-    progress(total_sectors, &pcm[published_bytes..]);
+    // which is silence. Only the sectors that actually hold audio are handed
+    // over: a caller mirroring into its own zeroed buffer would be copying
+    // zeros onto zeros for the rest, and on a decode that ended far short of
+    // the promise -- a file replaced or truncated between mount and play --
+    // that is hundreds of megabytes of memcpy, which `DecodedTrack` performs
+    // while holding the lock the mixer pull takes.
+    //
+    // The full sector count still goes out, because it is what tells the caller
+    // the track is whole and the tail is silence rather than pending.
+    let audio_bytes = (written as usize * 4).min(pcm.len());
+    let covered = audio_bytes
+        .div_ceil(AUDIO_FRAME_BYTES)
+        .saturating_mul(AUDIO_FRAME_BYTES)
+        .min(pcm.len())
+        .max(published_bytes);
+    progress(total_sectors, &pcm[published_bytes..covered]);
     Ok(produced)
 }
 

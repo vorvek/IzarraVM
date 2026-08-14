@@ -1091,3 +1091,43 @@ fn warming_leaves_a_raw_track_alone() {
     img.warm_upcoming(0);
     img.warm_upcoming(1);
 }
+
+#[test]
+fn a_pregap_between_tracks_does_not_stop_the_next_one_being_warmed() {
+    // A PREGAP belongs to no track: `build` counts its frames into the
+    // following track's start_lba without giving them to either neighbour. So
+    // the next track does not begin where the previous one ended, and while
+    // the head crosses the gap it is inside no track at all.
+    //
+    // Matching the next track on exact adjacency made warming inert for every
+    // sheet with a pregap, which is the ordinary layout -- Fatal Racing's real
+    // sheet opens its audio with PREGAP 00:02:00.
+    let cue = "FILE \"a.ogg\" WAVE\n\
+               TRACK 01 AUDIO\n\
+               INDEX 01 00:00:00\n\
+               FILE \"b.ogg\" WAVE\n\
+               TRACK 02 AUDIO\n\
+               PREGAP 00:02:00\n\
+               INDEX 01 00:00:00\n";
+    let (first, _first) = fake_pair(1000, 1000);
+    let (second, second_handle) = fake_pair(1000, 1000);
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![("a.ogg".to_string(), first), ("b.ogg".to_string(), second)],
+    )
+    .unwrap();
+    // Track 1 ends at 1000; the 150-frame pregap puts track 2 at 1150.
+    assert_eq!(img.tracks()[0].end_lba(), 1000);
+    assert_eq!(img.tracks()[1].start_lba, 1150);
+
+    // Still outside the window, measured to the next track's start.
+    img.warm_upcoming(900);
+    assert!(!second_handle.was_touched());
+
+    // Inside the window, and inside the pregap, where no track covers the head.
+    img.warm_upcoming(1010);
+    assert!(
+        second_handle.was_touched(),
+        "the track after a pregap was never warmed"
+    );
+}

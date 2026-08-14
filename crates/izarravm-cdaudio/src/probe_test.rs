@@ -120,3 +120,77 @@ fn a_raw_binary_file_is_not_an_audio_container() {
     assert!(probe_info(&raw).unwrap().is_none());
     std::fs::remove_file(&raw).ok();
 }
+
+#[test]
+fn an_absurd_frame_count_is_refused_rather_than_sized() {
+    // The frame count comes from the container and nothing upstream constrains
+    // it. A corrupt final granule position in an Ogg hands back a number near
+    // u64::MAX; the sector count derived from it sizes the TOC, and on first
+    // touch a `vec![0u8; sectors * 2352]` runs on the emulation thread. That
+    // allocation fails, and this build aborts on panic.
+    assert_eq!(sectors_for(u64::MAX, 44100), u32::MAX);
+    // Saturating, not wrapping. This count is the one just past the u64 wrap:
+    // multiplied by 44100 it comes back as 25184, which divides down to a
+    // single sector. A wrapping multiply would mount a 418-trillion-frame
+    // track as one sector long and raise nothing.
+    assert_eq!(sectors_for(418_293_516_410_648, 44100), u32::MAX);
+    // A 74-minute track is still measured.
+    assert!(sectors_for(74 * 60 * 44100, 44100) < MAX_TRACK_SECTORS);
+}
+
+#[test]
+fn a_zero_sample_rate_is_refused() {
+    // Not a legal stream, and symphonia's RIFF parser does not validate the
+    // field, so a WAV with a zeroed fmt chunk reaches the probe. Its duration
+    // is undefined and it drives the resampler at a step of 0.0 -- a loop that
+    // emits output forever without consuming input.
+    let path = std::env::temp_dir().join(format!(
+        "izarravm-cdaudio-zero-rate-{}.wav",
+        std::process::id()
+    ));
+    let mut wav = std::fs::read(fixture("tone.wav")).unwrap();
+    // Located rather than assumed: ffmpeg writes a LIST chunk ahead of the
+    // data, so the sample rate is not at the canonical offset 24. Within the
+    // fmt chunk it is 12 bytes in, past the id, the size, the format tag and
+    // the channel count.
+    let fmt = wav
+        .windows(4)
+        .position(|w| w == b"fmt ")
+        .expect("fixture has no fmt chunk");
+    wav[fmt + 12..fmt + 16].copy_from_slice(&0u32.to_le_bytes());
+    std::fs::write(&path, &wav).unwrap();
+
+    let err = probe_info(&path).unwrap_err();
+
+    assert!(
+        err.to_string().contains("sample rate of zero"),
+        "message was: {err}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_container_claiming_an_impossible_length_fails_the_mount() {
+    // The refusal has to be reached through `probe_info`, not just proved of
+    // `sectors_for`: a sector count that survives to the TOC is a buffer of
+    // `sectors * 2352` bytes allocated on the emulation thread at first touch.
+    let path =
+        std::env::temp_dir().join(format!("izarravm-cdaudio-huge-{}.flac", std::process::id()));
+    let mut flac = std::fs::read(fixture("tone.flac")).unwrap();
+    // STREAMINFO's total_samples is 36 bits ending at byte 26. Filling it is
+    // what a corrupt or crafted stream does.
+    let huge = 0x0F_FFFF_FFFFu64;
+    let packed = u64::from_be_bytes([0, 0, 0, flac[21], flac[22], flac[23], flac[24], flac[25]]);
+    let cleared = packed & !0xF_FFFF_FFFFu64;
+    let bytes = (cleared | huge).to_be_bytes();
+    flac[21..26].copy_from_slice(&bytes[3..8]);
+    std::fs::write(&path, &flac).unwrap();
+
+    let err = probe_info(&path).unwrap_err();
+
+    assert!(
+        err.to_string().contains("not believable"),
+        "message was: {err}"
+    );
+    std::fs::remove_file(&path).ok();
+}

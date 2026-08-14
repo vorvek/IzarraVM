@@ -55,14 +55,33 @@ pub struct TrackInfo {
     pub sectors: u32,
 }
 
+/// The longest track this will measure, in Red Book frames: 100 minutes.
+///
+/// Longer than any disc a drive will accept -- a 99-minute CD-R is the extreme
+/// of what was ever pressed -- so nothing legitimate is turned away. It exists
+/// because the frame count arrives from a container and nothing upstream
+/// constrains it: an Ogg whose final granule position is corrupt hands back a
+/// number near `u64::MAX`, and the sector count derived from it would size both
+/// the TOC and, on first touch, a `vec![0u8; sectors * 2352]` on the emulation
+/// thread. An allocation that large fails, and this build aborts on panic.
+pub const MAX_TRACK_SECTORS: u32 = 100 * 60 * 75;
+
 /// Sector count for `src_frames` samples at `src_rate`, converted to CD-DA.
 ///
 /// Ceiling at both steps: a partial output sample still has to be carried, and
 /// a partial frame still occupies a whole sector on the disc. The decode pads
 /// the tail with silence to match.
+///
+/// Saturating rather than wrapping, because `src_frames` is whatever the
+/// container said: the multiply overflows `u64` above about 4.2e14 frames,
+/// which panics in a debug build and silently wraps to a plausible-looking
+/// small number in a release one. Saturating sends it to `u32::MAX` instead,
+/// where [`MAX_TRACK_SECTORS`] refuses it by name.
 pub fn sectors_for(src_frames: u64, src_rate: u32) -> u32 {
     let rate = u64::from(src_rate.max(1));
-    let out_samples = (src_frames * u64::from(CD_SAMPLE_RATE)).div_ceil(rate);
+    let out_samples = src_frames
+        .saturating_mul(u64::from(CD_SAMPLE_RATE))
+        .div_ceil(rate);
     out_samples
         .div_ceil(SAMPLES_PER_FRAME)
         .try_into()
@@ -120,6 +139,15 @@ fn read_up_to(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
 
 fn measure(path: &Path, container: Container) -> Result<TrackInfo, CdAudioError> {
     let mut open = open(path, container)?;
+    // A declared rate of zero is refused rather than defaulted. It is not a
+    // legal stream, its duration is undefined, and it reaches the resampler as
+    // a step of 0.0 -- a loop that emits output forever without consuming
+    // input, on a worker thread, until the allocation fails and takes the
+    // process with it. symphonia's RIFF parser does not validate the field, so
+    // a WAV with a zeroed fmt chunk gets this far.
+    if open.params.sample_rate == Some(0) {
+        return Err(decode_error(path, "declares a sample rate of zero"));
+    }
     let sample_rate = open.params.sample_rate.unwrap_or(CD_SAMPLE_RATE);
     let channels = open
         .params
@@ -161,11 +189,22 @@ fn measure(path: &Path, container: Container) -> Result<TrackInfo, CdAudioError>
         (_, None) => walk_packets(&mut open.reader, open.track_id, path)?,
     };
 
+    let sectors = sectors_for(src_frames, sample_rate);
+    if sectors > MAX_TRACK_SECTORS {
+        return Err(decode_error(
+            path,
+            format!(
+                "measures {sectors} Red Book frames, longer than the {MAX_TRACK_SECTORS} \
+                 a disc can hold; the container's length is not believable"
+            ),
+        ));
+    }
+
     Ok(TrackInfo {
         sample_rate,
         channels,
         frames: src_frames,
-        sectors: sectors_for(src_frames, sample_rate),
+        sectors,
     })
 }
 

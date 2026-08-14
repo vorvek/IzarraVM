@@ -347,3 +347,62 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
         "the backlog outlived the worker that could have cleared it"
     );
 }
+
+#[test]
+fn a_track_being_replayed_is_not_the_one_evicted() {
+    // Recency has to count reads, not decode starts. A track played from a
+    // buffer it already holds serves nothing but hits, so if only a miss
+    // refreshed its place it would sit at the bottom of the order however long
+    // it had been playing -- and the next admission would take its buffer away
+    // mid-song, sending the mixer back to a decode from sector 0.
+    let registry = Registry::new();
+    let played = registry.track(fixture("tone.wav")).unwrap();
+    let other = registry.track(fixture("tone.ogg")).unwrap();
+    played.frame(0);
+    other.frame(0);
+    assert!(wait_for(|| played.frame(played.sectors() - 1).is_some()));
+    assert!(wait_for(|| other.frame(other.sectors() - 1).is_some()));
+
+    // `played` was admitted first, so it is the oldest by admission order. Now
+    // read it the way the mixer would -- every one of these is a hit.
+    for index in 0..played.sectors() {
+        assert!(played.frame(index).is_some());
+    }
+
+    // A third track arrives, as boundary prefetch would bring it.
+    let arriving = registry.track(fixture("tone.flac")).unwrap();
+    arriving.frame(0);
+
+    assert!(
+        wait_for(|| other.resident_bytes() == 0),
+        "the track nobody was reading should have been the one evicted"
+    );
+    assert!(
+        played.resident_bytes() > 0,
+        "the track being played was evicted out from under the mixer"
+    );
+}
+
+#[test]
+fn formatting_a_track_does_not_print_its_audio() {
+    // `CdImage` derives `Debug` and holds these behind an `Arc`, so one `{:?}`
+    // of a mounted disc reaches the decoded buffer. A derived `Debug` on it
+    // prints every sample byte -- tens of megabytes into a single log line --
+    // which is the hazard the `AudioTrackSource` contract tells implementors to
+    // hand-write `Debug` around.
+    let track = DecodedTrack::new(fixture("tone.wav")).unwrap();
+    track.frame(0);
+    assert!(wait_for(|| track.frame(track.sectors() - 1).is_some()));
+    assert!(
+        track.resident_bytes() > 30_000,
+        "nothing was decoded to print"
+    );
+
+    let rendered = format!("{track:?}");
+
+    assert!(
+        rendered.len() < 500,
+        "formatting a track produced {} characters; it is printing the buffer",
+        rendered.len()
+    );
+}
