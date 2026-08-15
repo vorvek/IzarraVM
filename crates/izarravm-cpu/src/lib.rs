@@ -1727,6 +1727,139 @@ pub struct DirectCallOutAttributionSnapshot {
     pub totals: DirectCallOutOutcomeCounts,
 }
 
+/// Stage A of the SMC census. See `jit::direct::smc_census` for the measurement rules, and
+/// `dev_docs/smc-census-design.md` §3/§4/§8 for what each rule decides.
+///
+/// Every unit below is a WORK-UNIT count, never a timer: design §8's opening rule bans per-call
+/// `Instant::now` because 52M scan calls times six timer pairs would BE the subject.
+#[cfg(feature = "smc-census")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectSmcCensusUnits {
+    // The write choke's 2x2 (design §4). Block scans and narrow decode kills are separate
+    // populations with separate denominators; this is the only licensed way to relate them.
+    pub choke_calls: u64,
+    pub choke_block_only: u64,
+    pub choke_narrow_only: u64,
+    pub choke_both: u64,
+    pub choke_neither: u64,
+    /// Choke calls that fell back to the wholesale decode flush. Reported beside the 2x2, not
+    /// inside it: a wholesale flush is also a narrow-kill-arm event.
+    pub choke_wholesale: u64,
+
+    // Per `invalidate_physical_range` call (design §4, Q2).
+    pub scan_calls: u64,
+    pub scan_calls_no_kill: u64,
+    pub scan_calls_lane_only: u64,
+    pub scan_calls_kill: u64,
+    /// Calls where every visited page had no `physical_keys` entry at all.
+    pub scan_calls_absent_page: u64,
+    pub keys_no_kill: u64,
+    pub keys_lane_only: u64,
+    pub keys_kill: u64,
+    /// Review finding M7: surviving keys scanned INSIDE a killing call. A presence filter would
+    /// elide these too, so `keys_no_kill` alone understates the waste.
+    pub keys_surviving_in_kill_calls: u64,
+
+    // Phase (a) / (a') — the `physical_keys` remove-then-insert round trip.
+    pub page_visits: u64,
+    pub page_removes: u64,
+    pub page_absent: u64,
+    pub page_reinserts: u64,
+    pub page_dropped_empty: u64,
+
+    // Phase (b) — the two `partition_point`s. Review finding M10: BOTH the per-call window
+    // occupancy and the page key count, or the binary-search question is unanswerable.
+    pub window_searches: u64,
+    pub page_keys_len_sum: u64,
+    pub window_len_sum: u64,
+
+    // Phase (c) — the key scan.
+    pub keys_scanned: u64,
+    pub entries_get_misses: u64,
+    pub keys_killed: u64,
+    pub keys_surviving: u64,
+    pub lane_accept_keys: u64,
+
+    // Phase (d) — survivor compaction and drain.
+    pub survivors_moved: u64,
+    pub drain_calls: u64,
+    pub drain_elements: u64,
+
+    // Phase (e) — `remove_waiting_sources`, which retains over the WHOLE waiting map and runs
+    // twice per effective unlink.
+    pub waiting_retain_calls: u64,
+    pub waiting_map_len_sum: u64,
+    pub waiting_sources_visited: u64,
+    pub waiting_entries_dropped: u64,
+
+    // Phase (f) — retirement work OUTSIDE `remove_waiting_sources` (review finding M8: (e) and
+    // (f) nest, so these rows are disjoint by construction and R6 may add them).
+    pub retire_calls: u64,
+    pub retire_calls_effective: u64,
+    pub unlink_calls: u64,
+    pub unlink_calls_effective: u64,
+    pub inbound_links_walked: u64,
+    pub inbound_links_reparked: u64,
+    pub decode_dependency_slots: u64,
+    pub release_range_bytes: u64,
+}
+
+/// The seven per-page accumulators, used both for a row's counts and for its inherited
+/// Space-Saving error (review finding M1: one error field for eight counters is unsound, so
+/// every column carries its own).
+#[cfg(feature = "smc-census")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectSmcCensusPageCounts {
+    pub page_visits: u64,
+    pub keys_scanned: u64,
+    pub keys_killed: u64,
+    pub keys_surviving: u64,
+    pub lane_accepts: u64,
+    pub no_kill_visits: u64,
+    pub page_keys_len_sum: u64,
+}
+
+/// One Space-Saving row. The true value of every column lies in `[count - error, count]`.
+#[cfg(feature = "smc-census")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectSmcCensusPageRow {
+    /// `physical >> BLOCK_PAGE_SHIFT`, i.e. the 4 KiB key `physical_keys` itself uses.
+    pub page: u32,
+    pub counts: DirectSmcCensusPageCounts,
+    pub error: DirectSmcCensusPageCounts,
+}
+
+/// One reporting phase: the whole run, or the pinned instruction window. Design §9.6 reports both
+/// and makes the pinned window authoritative for the decision rules, because boot, loader fixups
+/// and level loads all write code and would otherwise own the top rows (§12.2).
+#[cfg(feature = "smc-census")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectSmcCensusPhase {
+    pub label: &'static str,
+    pub units: DirectSmcCensusUnits,
+    /// EXACT page totals, unaffected by Space-Saving displacement. The closure asserts run
+    /// against these; a sum over rows is not a closure, because Space-Saving counters sum to at
+    /// least the true total.
+    pub page_totals: DirectSmcCensusPageCounts,
+    /// Ranked by `keys_killed`, descending.
+    pub pages: Vec<DirectSmcCensusPageRow>,
+    pub page_slot_claims: u64,
+    pub page_displacements: u64,
+    pub page_rows_capacity: u32,
+}
+
+#[cfg(feature = "smc-census")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectSmcCensusSnapshot {
+    /// `IZARRAVM_SMC_CENSUS_WINDOW`, in retired instructions. `None` leaves the windowed phase
+    /// empty rather than silently aliasing the whole run.
+    pub window: Option<(u64, u64)>,
+    /// Last retired-instruction clock the write choke stashed.
+    pub clock: u64,
+    pub whole_run: DirectSmcCensusPhase,
+    pub windowed: DirectSmcCensusPhase,
+}
+
 /// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here
 /// used to fold into a state (`Dormant`), a bool (`try_link_inner` returning false) or one
 /// catch-all counter (`SideExitReason::Other`), which is why the three largest unattributed exit

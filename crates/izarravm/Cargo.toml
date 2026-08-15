@@ -26,6 +26,9 @@ barrier-census-closure = ["jit", "izarravm-cpu/barrier-census-closure"]
 poll-head-probe = ["jit", "izarravm-cpu/poll-head-probe", "izarravm-machine/poll-head-probe"]
 # Passthrough for the Direct call-out attribution diagnostic; see izarravm-cpu.
 direct-callout-attribution = ["jit", "izarravm-cpu/direct-callout-attribution"]
+# Passthrough for stage A of the SMC census; see izarravm-cpu. No izarravm-machine passthrough:
+# every hook is in izarravm-cpu and the only reader is this crate's profile JSON.
+smc-census = ["jit", "izarravm-cpu/smc-census"]
 # Passthrough for the store watchpoint; see izarravm-cpu.
 watch-write = ["izarravm-cpu/watch-write"]
 # Passthrough for the guest INT n tracer; see izarravm-cpu.
