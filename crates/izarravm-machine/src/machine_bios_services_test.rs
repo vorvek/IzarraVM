@@ -600,7 +600,7 @@ fn int15_84_reports_absent_joystick() {
     m.cpu.registers.set_eax(0x84FF);
     m.cpu.registers.set_edx(0x0000);
     m.handle_int15();
-    assert_eq!(m.cpu.registers.eax() as u8, 0xf0, "switches open");
+    assert_eq!(m.cpu.registers.eax() as u8, 0xff, "connector open");
     assert_eq!(dos_int_flags(&m) & 1, 0, "switch read CF clear");
 
     prime_dos_int_frame(&mut m);
@@ -2080,19 +2080,20 @@ fn lpt2_data_round_trips_through_the_bus() {
 #[test]
 fn game_port_reports_no_joystick() {
     // Port 0x201: a routine joystick probe (OUT to fire the one-shots, then
-    // IN) must see the absent-joystick byte -- axis bits 0-3 clear (timers
-    // already expired), button bits 4-7 set (open switches, active-low) --
-    // not an UnsupportedPort fault that halts the machine.
+    // IN) must see the absent-joystick byte -- an open connector, so every
+    // line floats high and the whole byte reads 0xFF, exactly as 86Box and
+    // DOSBox-X report it -- not an UnsupportedPort fault that halts the
+    // machine. The probe's wait-for-clear loop is then supposed to time out.
     let mut m = int15_machine(16);
     let mut bus = m.make_bus();
-    assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xf0);
+    assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xff);
     bus.write_io(0x0201, BusWidth::Byte, 0xff, false).unwrap();
-    assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xf0);
+    assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xff);
     // The ISA gameport decodes 0x200-0x207 as aliases of the one register;
     // TSUMERA probes 0x200. Both ends of the range answer, IN and OUT.
     for port in [0x0200, 0x0207] {
         bus.write_io(port, BusWidth::Byte, 0xff, false).unwrap();
-        assert_eq!(bus.read_io(port, BusWidth::Byte, 0, false).unwrap(), 0xf0);
+        assert_eq!(bus.read_io(port, BusWidth::Byte, 0, false).unwrap(), 0xff);
     }
 }
 
@@ -2109,8 +2110,13 @@ fn game_port_aliases_share_joystick_state_and_charge_deadlines() {
         bus.write_io(port, BusWidth::Byte, 0, false).unwrap();
         let value = bus.read_io(port, BusWidth::Byte, 0, false).unwrap() as u8;
         assert_eq!(value & 0x03, 0x03, "axis timers at {port:#06x}");
-        assert_eq!(value & 0xf0, 0xd0, "switches at {port:#06x}");
+        // Mid-pulse, so the 86Box button-masking compatibility rule applies and
+        // the pressed button 2 is hidden until both one-shots expire. The BIOS
+        // switch service is not gated on the one-shots and still sees it.
+        assert_eq!(value & 0xf0, 0xf0, "switches at {port:#06x}");
     }
+    drop(bus);
+    assert_eq!(m.gameport.bios_switches(), 0xd0, "INT 15h sees the press");
 }
 
 #[test]

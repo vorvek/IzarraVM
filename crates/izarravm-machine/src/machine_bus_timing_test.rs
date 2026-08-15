@@ -3299,7 +3299,7 @@ fn a_lazy_gameport_read_matches_a_real_advance_devices_of_the_same_clocks() {
 fn a_lazy_gameport_read_moves_with_the_in_batch_offset() {
     // Non-vacuity for the test above: the RC one-shots must actually discharge
     // across the swept range, or the differential test would pass on a
-    // constant. 0x80 on X is ~1.4 ms, far more than one 386 batch, so the bit
+    // constant. 0x80 on X is ~0.58 ms, far more than one 386 batch, so the bit
     // is still SET early in the batch and CLEAR once the batch is long enough.
     let mut machine = accurate_machine_with_joystick();
     with_bus(&mut machine, |bus| {
