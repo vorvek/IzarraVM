@@ -2072,12 +2072,13 @@ fn direct_barrier_census_json(
     #[cfg(feature = "barrier-census-closure")]
     let report = {
         let mut report = report;
-        let class = |targets: &[(&'static str, u64)]| {
+        let class_of = |targets: &[(&'static str, u64)], want: &str| {
             targets
                 .iter()
-                .find(|(label, _)| *label == "dormant_heat")
+                .find(|(label, _)| *label == want)
                 .map_or(0, |(_, count)| *count)
         };
+        let class = |targets: &[(&'static str, u64)]| class_of(targets, "dormant_heat");
         let head_static: u64 = snapshot
             .dormant_heat_sites
             .iter()
@@ -2109,6 +2110,39 @@ fn direct_barrier_census_json(
             // file, a disassembly or the SMC shape table, all of which are hex, and 141.7M exits'
             // worth of addresses is not a place to make them convert by hand.
             "sites": snapshot.dormant_heat_sites.iter().map(|site| json!({
+                "linear": format!("0x{:08X}", site.linear),
+                "static_exits": site.static_exits,
+                "dynamic_exits": site.dynamic_exits,
+                "compile_walked": site.compile_walked,
+                "imm_lane_matched": site.imm_lane_matched,
+                "disp_lane_matched": site.disp_lane_matched,
+            })).collect::<Vec<_>>(),
+        });
+        // The `Rejected` twin. Same block shape, same closure identity, and it locates the largest
+        // pool on the board that still had no addresses.
+        let rejected_head_static: u64 = snapshot
+            .rejected_sites
+            .iter()
+            .map(|site| site.static_exits)
+            .sum();
+        let rejected_head_dynamic: u64 = snapshot
+            .rejected_sites
+            .iter()
+            .map(|site| site.dynamic_exits)
+            .sum();
+        report["rejected_sites"] = json!({
+            "class_static": class_of(&snapshot.unbound_targets, "rejected"),
+            "class_dynamic": class_of(&snapshot.dynamic_miss_targets, "rejected"),
+            "head_static": rejected_head_static,
+            "head_dynamic": rejected_head_dynamic,
+            "truncated_static": snapshot.rejected_truncated_static,
+            "truncated_dynamic": snapshot.rejected_truncated_dynamic,
+            "unattributed_static": class_of(&snapshot.unbound_targets, "rejected")
+                .saturating_sub(rejected_head_static + snapshot.rejected_truncated_static),
+            "unattributed_dynamic": class_of(&snapshot.dynamic_miss_targets, "rejected")
+                .saturating_sub(rejected_head_dynamic + snapshot.rejected_truncated_dynamic),
+            "distinct_sites": snapshot.rejected_distinct_sites,
+            "sites": snapshot.rejected_sites.iter().map(|site| json!({
                 "linear": format!("0x{:08X}", site.linear),
                 "static_exits": site.static_exits,
                 "dynamic_exits": site.dynamic_exits,

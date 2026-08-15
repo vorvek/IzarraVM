@@ -1647,6 +1647,23 @@ pub struct DirectBarrierCensusSnapshot {
     /// with a top-heavy head says targeted lane work, a large flat one says the policy sweep.
     #[cfg(feature = "barrier-census-closure")]
     pub dormant_heat_distinct_sites: u64,
+    /// The `Rejected` twin of the four fields above, same columns and same closure identity:
+    /// `sum(rejected_sites.static_exits) + rejected_truncated_static` equals the `rejected` entry
+    /// of `unbound_targets` exactly, at any head size.
+    ///
+    /// It locates the largest pool on the board that still has no addresses — 33.64% of
+    /// duke-586's static-unbound exits and 40.1% of duke-486's. `rejected_barrier` already
+    /// attributes those exits to an opcode SHAPE and carries a residual when it cannot; this says
+    /// how many distinct ADDRESSES the class covers, which is the question that decided the
+    /// dormant-heat fork and the one that comes before any knob aimed here.
+    #[cfg(feature = "barrier-census-closure")]
+    pub rejected_sites: Vec<DirectDormantHeatSite>,
+    #[cfg(feature = "barrier-census-closure")]
+    pub rejected_truncated_static: u64,
+    #[cfg(feature = "barrier-census-closure")]
+    pub rejected_truncated_dynamic: u64,
+    #[cfg(feature = "barrier-census-closure")]
+    pub rejected_distinct_sites: u64,
     /// How many distinct block entries a compile walk started from ANYWHERE IN THE RUN, which is
     /// the set the per-site `compile_walked` column is looked up in.
     ///

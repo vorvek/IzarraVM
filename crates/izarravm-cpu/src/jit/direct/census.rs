@@ -1160,6 +1160,22 @@ pub(crate) struct DirectBarrierCensus {
     /// ways is one site.
     #[cfg(feature = "barrier-census-closure")]
     dormant_heat_sites: HashMap<u32, DormantHeatStats>,
+    /// The `Rejected` twin of `dormant_heat_sites`, and it locates the largest pool on the board
+    /// that still has no addresses: `rejected` is 33.64% of duke-586's static-unbound exits and
+    /// 40.1% of duke-486's, against `dormant_heat`'s 46.04%.
+    ///
+    /// `rejected_barrier` already attributes those exits to the BARRIER that refused the block —
+    /// an opcode shape — and `rejected_unattributed` counts the ones it could not resolve. Neither
+    /// says how many distinct addresses the class covers, which is the question that decided the
+    /// dormant-heat fork (7 addresses carried 80% there) and the one that has to be asked before
+    /// any knob is swept at this class. Unlike `rejected_barrier` this histogram cannot miss: it
+    /// IS the map, so its closure against `unbound_targets[rejected]` is exact and carries no
+    /// residual.
+    ///
+    /// Same key, same two columns, same caveat as its sibling — two rejected spans sharing a
+    /// linear across mode or physical merge into one row.
+    #[cfg(feature = "barrier-census-closure")]
+    rejected_sites: HashMap<u32, DormantHeatStats>,
     /// B.3's lane-match export: block entry linear -> `LaneProbe` bits, recorded by the compile
     /// walk itself.
     ///
@@ -1265,7 +1281,19 @@ impl DirectBarrierCensus {
     /// it resolves a linear through a map that may not hold it; this histogram IS the map.
     #[cfg(feature = "barrier-census-closure")]
     fn note_dormant_heat_at(&mut self, linear: u32, dynamic: bool) {
-        let site = self.dormant_heat_sites.entry(linear).or_default();
+        Self::note_site(&mut self.dormant_heat_sites, linear, dynamic);
+    }
+
+    /// The `Rejected` twin, with the same unconditional-and-therefore-exact property. See
+    /// `rejected_sites`.
+    #[cfg(feature = "barrier-census-closure")]
+    fn note_rejected_site_at(&mut self, linear: u32, dynamic: bool) {
+        Self::note_site(&mut self.rejected_sites, linear, dynamic);
+    }
+
+    #[cfg(feature = "barrier-census-closure")]
+    fn note_site(sites: &mut HashMap<u32, DormantHeatStats>, linear: u32, dynamic: bool) {
+        let site = sites.entry(linear).or_default();
         if dynamic {
             site.dynamic_exits = site.dynamic_exits.saturating_add(1);
         } else {
@@ -1373,8 +1401,22 @@ impl DirectBarrierCensus {
     /// turned out to be.
     #[cfg(feature = "barrier-census-closure")]
     fn dormant_heat_snapshot(&self) -> (Vec<crate::DirectDormantHeatSite>, u64, u64, u64) {
-        let mut sites: Vec<_> = self
-            .dormant_heat_sites
+        self.site_snapshot(&self.dormant_heat_sites)
+    }
+
+    /// The `Rejected` twin, closing against `unbound_targets[rejected]` and
+    /// `dynamic_miss_targets[rejected]` by the same identity.
+    #[cfg(feature = "barrier-census-closure")]
+    fn rejected_site_snapshot(&self) -> (Vec<crate::DirectDormantHeatSite>, u64, u64, u64) {
+        self.site_snapshot(&self.rejected_sites)
+    }
+
+    #[cfg(feature = "barrier-census-closure")]
+    fn site_snapshot(
+        &self,
+        map: &HashMap<u32, DormantHeatStats>,
+    ) -> (Vec<crate::DirectDormantHeatSite>, u64, u64, u64) {
+        let mut sites: Vec<_> = map
             .iter()
             .map(|(&linear, &stats)| (linear, stats))
             .collect();
@@ -1414,6 +1456,13 @@ impl DirectBarrierCensus {
             dormant_heat_truncated_dynamic,
             dormant_heat_distinct_sites,
         ) = self.dormant_heat_snapshot();
+        #[cfg(feature = "barrier-census-closure")]
+        let (
+            rejected_sites,
+            rejected_truncated_static,
+            rejected_truncated_dynamic,
+            rejected_distinct_sites,
+        ) = self.rejected_site_snapshot();
         let mut keyed_rows: Vec<_> = self
             .rows
             .iter()
@@ -1466,6 +1515,14 @@ impl DirectBarrierCensus {
             dormant_heat_truncated_dynamic,
             #[cfg(feature = "barrier-census-closure")]
             dormant_heat_distinct_sites,
+            #[cfg(feature = "barrier-census-closure")]
+            rejected_sites,
+            #[cfg(feature = "barrier-census-closure")]
+            rejected_truncated_static,
+            #[cfg(feature = "barrier-census-closure")]
+            rejected_truncated_dynamic,
+            #[cfg(feature = "barrier-census-closure")]
+            rejected_distinct_sites,
             #[cfg(feature = "barrier-census-closure")]
             walked_entries_run_wide: self.lane_probes.len() as u64,
             #[cfg(feature = "direct-admission-census")]
@@ -1557,6 +1614,10 @@ impl crate::jit::JitState {
             census.note_unbound(kind);
             if kind == UnboundTarget::Rejected {
                 census.note_unbound_rejected_at(linear);
+                // The sibling histogram. `note_unbound_rejected_at` resolves this linear to an
+                // opcode SHAPE and may fail to; this records the ADDRESS and cannot.
+                #[cfg(feature = "barrier-census-closure")]
+                census.note_rejected_site_at(linear, false);
             }
             // B.3. The linear was already in hand and already discarded for this class; recording
             // it is one more `if kind ==` arm and one more map, which is the smallest change that
@@ -1633,6 +1694,8 @@ impl crate::jit::JitState {
             census.note_unbound_dynamic(kind);
             if kind == UnboundTarget::Rejected {
                 census.note_dynamic_rejected_at(linear);
+                #[cfg(feature = "barrier-census-closure")]
+                census.note_rejected_site_at(linear, true);
             }
             #[cfg(feature = "barrier-census-closure")]
             if kind == UnboundTarget::DormantHeat {

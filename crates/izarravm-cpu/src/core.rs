@@ -1284,12 +1284,34 @@ impl CpuGsw {
     /// cannot tell a carried site list from a hard-coded empty one.
     #[cfg(all(feature = "jit", feature = "barrier-census-closure"))]
     pub fn note_dormant_heat_exit_for_test(&mut self, linear: u32, dynamic: bool) {
+        self.note_unbound_exit_for_test(
+            crate::jit::direct::UnboundTarget::DormantHeat,
+            linear,
+            dynamic,
+        );
+    }
+
+    /// The `Rejected` twin, for the same reason and the same downstream fixtures.
+    #[cfg(all(feature = "jit", feature = "barrier-census-closure"))]
+    pub fn note_rejected_exit_for_test(&mut self, linear: u32, dynamic: bool) {
+        self.note_unbound_exit_for_test(
+            crate::jit::direct::UnboundTarget::Rejected,
+            linear,
+            dynamic,
+        );
+    }
+
+    #[cfg(all(feature = "jit", feature = "barrier-census-closure"))]
+    fn note_unbound_exit_for_test(
+        &mut self,
+        kind: crate::jit::direct::UnboundTarget,
+        linear: u32,
+        dynamic: bool,
+    ) {
         if dynamic {
-            self.jit_direct
-                .note_dynamic_miss_target(crate::jit::direct::UnboundTarget::DormantHeat, linear);
+            self.jit_direct.note_dynamic_miss_target(kind, linear);
         } else {
-            self.jit_direct
-                .note_unbound_target(crate::jit::direct::UnboundTarget::DormantHeat, linear);
+            self.jit_direct.note_unbound_target(kind, linear);
         }
     }
 
