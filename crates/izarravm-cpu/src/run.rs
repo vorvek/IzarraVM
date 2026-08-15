@@ -2040,10 +2040,19 @@ impl CpuGsw {
         // classified from that trial's whole outcome; `Lazy` is then admitted at full quota and
         // everything else is refused exactly as before.
         //
-        // Classification is TRIAL-ONLY. Demoting a `Lazy` block on a later step-breaking serve is
-        // not implementable: `NativeExit` carries no block id, so once a chain is running the exit
-        // reports the chain's outcome and not which hop produced it. Re-classification happens by
-        // re-trial when the epoch rolls, and by nothing else.
+        // Classification is TRIAL-ONLY, with ONE exception below. Demoting a `Lazy` block on a
+        // later STEP-BREAKING serve is not implementable: `NativeExit` carries no block id, so
+        // once a chain is running the exit reports the chain's outcome and not which hop produced
+        // it. And a classification is TERMINAL for the block's lifetime -- the epoch key is a
+        // safety key against a persona change, not a refresh: it is `active_mode + 1`, its only
+        // writer clears every compiled block first, so it cannot roll inside a run and bounds
+        // nothing. The only reclassification that exists is a fresh compile into a recycled slot.
+        //
+        // The exception is the ABNORMAL demotion after the trial, taken below. It is a
+        // one-way `Lazy -> Denied` edge, and it is worth the unattributability that the
+        // step-break case is not: a `Lazy` block that later meets a DENIED port pays
+        // spill/call/refuse/side-exit per IN forever, and this bounds that residual at one
+        // abnormal per block instead of leaving it unbounded in count.
         //
         // No timing skew is possible from a misclassification. The step-break side exit is emitted
         // per SLOT from the helper's bit 32 and is entirely governor-independent, so a block
@@ -2053,6 +2062,7 @@ impl CpuGsw {
         // The epoch read stays INSIDE the slot test, so a block with no port call-out still pays
         // exactly the one compare it paid before.
         let mut callout_trial = false;
+        let mut callout_lazy_entry = false;
         if block.callout_port_slots() != 0
             && (self.is_v86_mode() || self.current_privilege_level() > self.iopl())
         {
@@ -2060,7 +2070,7 @@ impl CpuGsw {
                 .jit_direct
                 .callout_admission(block.id(), bus.jit_cost_dial_epoch())
             {
-                jit::direct::CallOutAdmission::Lazy => {}
+                jit::direct::CallOutAdmission::Lazy => callout_lazy_entry = true,
                 jit::direct::CallOutAdmission::Untried(_) => callout_trial = true,
                 jit::direct::CallOutAdmission::IoTouching
                 | jit::direct::CallOutAdmission::Denied
@@ -2213,9 +2223,6 @@ impl CpuGsw {
             self.perf.jit_direct_reject_zero_budget += 1;
             return Ok(DirectBlockOutcome::NotRun);
         }
-        if callout_trial {
-            self.jit_direct.note_callout_governor_trial();
-        }
         // Read either side of the entry below: a block whose call-out sits behind an untaken
         // branch serves nothing, and must not be classified from a trial that observed nothing.
         let callout_executed_before = if callout_trial {
@@ -2248,6 +2255,12 @@ impl CpuGsw {
         let Some(current_block) = self.jit_direct.block(block.id()) else {
             return Ok(DirectBlockOutcome::NotRun);
         };
+        // BELOW the last refusal, so the counter counts trials RUN and not trials gated. Section
+        // 1.5 bar 6 divides it by the number of call-out-bearing blocks compiled in the leg, and a
+        // trial that never entered native code has bought no classification to pay for.
+        if callout_trial {
+            self.jit_direct.note_callout_governor_trial();
+        }
         self.begin_instruction();
         self.core_clocks_so_far = total;
         let flags = self.materialized_eflags();
@@ -2287,6 +2300,28 @@ impl CpuGsw {
         let side_exit = exit.side_exit != 0;
         if callout_trial {
             self.classify_callout_trial(bus, block.id(), side_exit, &exit, callout_executed_before);
+        } else if callout_lazy_entry
+            && side_exit
+            && exit.side_exit_reason == jit::direct::SideExitReason::CallOutAbnormal as u32
+        {
+            // The one post-trial transition, and it is deliberately one-way. A block classified
+            // `Lazy` that later meets a DENIED or undecoded port -- a V86 task whose monitor
+            // revoked the bitmap bit, most plainly -- would otherwise pay
+            // spill/call/refuse/side-exit on every execution of that IN, unbounded in count. This
+            // bounds it at one.
+            //
+            // HONESTLY UNATTRIBUTABLE, and shipped anyway: `NativeExit` carries no block id, so
+            // inside a chain the abnormal may have come from a HOP rather than from this head
+            // block, and the head is then demoted for its successor's port. The false direction
+            // is toward `Denied`, which is refusal at head -- today's behaviour, and the safe
+            // resting state. That asymmetry is the whole argument for taking this edge while the
+            // step-break one, whose false direction would COST fidelity nothing but would churn
+            // classifications, stays unimplemented.
+            self.jit_direct.set_callout_admission(
+                block.id(),
+                bus.jit_cost_dial_epoch(),
+                jit::direct::CallOutAdmission::Denied,
+            );
         }
 
         let final_eip = self.registers.eip;

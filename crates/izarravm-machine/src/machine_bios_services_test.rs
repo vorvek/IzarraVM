@@ -609,8 +609,13 @@ fn int15_84_reports_absent_joystick() {
     m.cpu.registers.set_ecx(0xFFFF);
     m.cpu.registers.set_edx(0x0001);
     m.handle_int15();
-    assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "joy A X");
-    assert_eq!(m.cpu.registers.ebx() as u16, 0x0000, "joy A Y");
+    // An absent stick times out rather than reading centred at zero: the one-shot never fires,
+    // so the resistance-timing loop runs to its terminal count. A guest that range-checks the
+    // result sees "out of range", which is the point.
+    assert_eq!(m.cpu.registers.eax() as u16, 0xffff, "joy A X");
+    assert_eq!(m.cpu.registers.ebx() as u16, 0xffff, "joy A Y");
+    // Joystick B is unpopulated on this board whether or not A is plugged in, so it keeps its
+    // own zero convention.
     assert_eq!(m.cpu.registers.ecx() as u16, 0x0000, "joy B X");
     assert_eq!(m.cpu.registers.edx() as u16, 0x0000, "joy B Y");
     assert_eq!(dos_int_flags(&m) & 1, 0, "position read CF clear");

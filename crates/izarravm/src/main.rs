@@ -2429,6 +2429,9 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_callout_executed": snapshot.callout_executed,
         "jit_direct_callout_port_v86_served": snapshot.callout_port_v86_served,
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
+        // Unprefixed, unlike their `jit_direct_` neighbours, and deliberately: these are the
+        // names the round-2 acceptance gate pre-registered for its bars, and a reader diffing a
+        // JSON leg against the design doc should find them spelled the same way.
         "callout_governor_trials": snapshot.callout_governor_trials,
         "callout_governor_lazy": snapshot.callout_governor_lazy,
         "callout_governor_io_touching": snapshot.callout_governor_io_touching,

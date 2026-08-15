@@ -816,9 +816,15 @@ pub(crate) struct BlockCache {
     /// `MOV DX,imm` that sets it is usually in another block, so nothing at compile time knows
     /// which port a call-out slot will read. See `run_direct_block`'s G2 for the whole rule.
     callout_admission: Vec<CallOutAdmission>,
-    /// The `jit_cost_dial_epoch()` `callout_admission` was learned under; see
-    /// `iteration_upper_epoch`. Rolling the epoch retries every classification, which is what
-    /// bounds how stale one can get.
+    /// The `jit_cost_dial_epoch()` `callout_admission` was learned under.
+    ///
+    /// A SAFETY KEY against a persona change, not a refresh mechanism, and the difference is
+    /// worth stating because the first draft of this comment got it wrong. The epoch is
+    /// `active_mode + 1`, its only writer is `Machine::set_mode`, and that calls `CpuGsw::set_mode`
+    /// first, which clears every compiled block along with this array. So the epoch cannot roll
+    /// inside a run and it bounds nothing: a classification is TERMINAL for the block's lifetime,
+    /// and the only reclassification that exists is a fresh compile into a recycled slot. The
+    /// demotion arm in `run_direct_block` is the one exception, and it is deliberately one-way.
     callout_admission_epoch: u64,
     /// The shared x87 re-entry pad, in its OWN executable mapping rather than in the arena.
     /// Deliberately not a block: `reset_storage` sets `arena = None` and frees it, which would
@@ -1387,25 +1393,6 @@ impl BlockCache {
         if let Some(slot) = self.callout_admission.get_mut(index) {
             *slot = state;
         }
-    }
-
-    pub(crate) fn note_callout_governor_trial(&mut self) {
-        self.stalls.callout_governor_trials += 1;
-    }
-
-    pub(crate) fn note_callout_governor_lazy(&mut self) {
-        self.stalls.callout_governor_lazy += 1;
-    }
-
-    pub(crate) fn note_callout_governor_io_touching(&mut self) {
-        self.stalls.callout_governor_io_touching += 1;
-    }
-
-    /// Every call-out the helper has entered so far. The governor reads it either side of one
-    /// trial entry to learn whether the trial served anything at all; a block whose call-out sits
-    /// behind an untaken branch serves nothing and must not classify from that.
-    pub(crate) fn callout_executed_count(&self) -> u64 {
-        self.stalls.callout_executed
     }
 
     pub(crate) fn set_iteration_upper_cached(&mut self, id: BlockId, epoch: u64, value: u64) {

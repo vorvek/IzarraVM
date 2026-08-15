@@ -59,8 +59,14 @@ fn an_absent_stick_reads_open_on_every_line() {
     assert_eq!(port.read(0), 0xff);
     assert_eq!(port.read(u64::MAX), 0xff);
     // The BIOS switch service answers the same question and must not contradict
-    // the port it reports on.
+    // the port it reports on, and the axis service reports the timeout its
+    // one-shot never ends rather than a centred stick at zero.
     assert_eq!(port.bios_switches(), 0xff);
+    assert_eq!(
+        port.bios_axes(),
+        (BIOS_AXIS_TIMEOUT, BIOS_AXIS_TIMEOUT),
+        "an absent axis must read as a timed-out count, not as centre"
+    );
     // An attached stick still reports its own state, so the arm above is not
     // simply "always 0xFF".
     let mut port = port;
@@ -71,6 +77,11 @@ fn an_absent_stick_reads_open_on_every_line() {
     }));
     assert_eq!(port.read(0), 0xc0);
     assert_eq!(port.bios_switches(), 0xc0);
+    assert_eq!(
+        port.bios_axes(),
+        (0, 0),
+        "an attached stick at the origin reads zero -- the timeout above is not a constant"
+    );
 }
 
 /// 86Box's compatibility behaviour: while an axis one-shot is discharging the

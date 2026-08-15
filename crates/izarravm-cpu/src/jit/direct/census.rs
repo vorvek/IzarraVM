@@ -1654,6 +1654,27 @@ impl crate::jit::JitState {
         self.stalls.reject_callout_privileged += 1;
     }
 
+    /// The admission governor's three counters. Here rather than beside the governor's storage in
+    /// `direct.rs` so every `note_*` in the call-out family lives in one place.
+    pub(crate) fn note_callout_governor_trial(&mut self) {
+        self.stalls.callout_governor_trials += 1;
+    }
+
+    pub(crate) fn note_callout_governor_lazy(&mut self) {
+        self.stalls.callout_governor_lazy += 1;
+    }
+
+    pub(crate) fn note_callout_governor_io_touching(&mut self) {
+        self.stalls.callout_governor_io_touching += 1;
+    }
+
+    /// Every call-out the helper has entered so far. The governor reads it either side of one
+    /// trial entry to learn whether the trial served anything at all; a block whose call-out sits
+    /// behind an untaken branch serves nothing and must not classify from that.
+    pub(crate) fn callout_executed_count(&self) -> u64 {
+        self.stalls.callout_executed
+    }
+
     /// BRANCHLESS, and on purpose: this sits beside `jit_direct_entries` on the hottest path in
     /// the backend, next to the sixteen-bit split that is written the same way for the same
     /// reason. The caller passes the predicate already widened, so both lanes are an unconditional

@@ -14,6 +14,10 @@ const RC_BASE_NS: u64 = 24_200;
 /// 2,750 us here implied a 250 kOhm pot and stretched every pulse 2.5x.
 const RC_SPAN_NS: u64 = 1_100_000;
 
+/// What INT 15h AH=84h BX=1 reports for an axis whose one-shot never fires.
+/// See `GamePort::bios_axes`.
+pub(crate) const BIOS_AXIS_TIMEOUT: u16 = u16::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JoystickState {
     pub x: u8,
@@ -104,10 +108,22 @@ impl GamePort {
             || (now >= self.discharge_deadlines[0] && now >= self.discharge_deadlines[1])
     }
 
+    /// INT 15h AH=84h BX=1 reports each axis as the count a resistance-timing
+    /// loop reached. With no stick attached the one-shot never fires, so a real
+    /// BIOS's loop runs to its terminal count and returns that -- it does NOT
+    /// report a centred stick at zero, which is what this used to do and what
+    /// let calibration code accept a phantom joystick.
+    ///
+    /// The count is `BIOS_AXIS_TIMEOUT`. This service is high-level emulation
+    /// with no timing loop of its own to run out, so the number is chosen
+    /// rather than measured: it is where a 16-bit counter saturates, which is
+    /// both what an AT-class BIOS's word-sized loop leaves in AX and a value no
+    /// real pot can produce, so software that range-checks sees "out of range"
+    /// exactly as it would on hardware.
     pub(crate) fn bios_axes(&self) -> (u16, u16) {
         self.state
             .map(|state| (u16::from(state.x), u16::from(state.y)))
-            .unwrap_or((0, 0))
+            .unwrap_or((BIOS_AXIS_TIMEOUT, BIOS_AXIS_TIMEOUT))
     }
 
     pub(crate) fn canonical_projection(&self) -> CanonicalGamePort<'_> {

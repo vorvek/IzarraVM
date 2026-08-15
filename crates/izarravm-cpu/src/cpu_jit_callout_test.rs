@@ -1102,7 +1102,8 @@ fn a_call_out_block_is_not_entered_at_all_in_the_privileged_port_state() {
         assert_eq!(stalls.reject_callout_privileged, entry, "entry {entry}");
         assert_eq!(
             stalls.callout_executed, executed,
-            "entry {entry}: the helper must never be reached, so nothing pays for the              spill/call/reload"
+            "entry {entry}: the helper must never be reached, so nothing pays for the spill, \
+             the call and the reload"
         );
     }
 }
@@ -1703,10 +1704,13 @@ const GOVERNOR_TSS_BASE: u32 = 0x4800;
 const GOVERNOR_TSS_LIMIT: u32 = 0x200;
 
 /// `slot_block`'s block, generalised over its instruction list and compiled in the state G2
-/// governs. `insns` is the exact set primed into the decode cache and therefore the exact set the
-/// compile walk takes; a `HLT` is appended as the terminator and left unprimed.
+/// governs. `insns` is the exact set primed into the decode cache; a `HLT` is appended as the
+/// terminator and left unprimed. `head_instructions` is how many of them the compile walk is
+/// expected to take -- fewer than all of them when a terminal instruction ends the head block and
+/// the rest are a successor the caller compiles separately.
 fn governor_block(
     insns: &[&[u8]],
+    head_instructions: usize,
     configure: impl Fn(&mut TestBus),
     configure_cpu: impl Fn(&mut CpuGsw),
 ) -> Fixture {
@@ -1752,8 +1756,8 @@ fn governor_block(
     };
     assert_eq!(
         usize::from(compilation.span.instructions),
-        insns.len(),
-        "the block must cover exactly the primed instructions"
+        head_instructions,
+        "the head block must cover exactly the instructions it is supposed to"
     );
     assert_eq!(compilation.callout_slots, 1);
     let id = cpu
@@ -1787,7 +1791,12 @@ fn rearm_governor_block(fixture: &mut Fixture) {
 
 /// The three-slot block of `slot_block`, in the governed state.
 fn governed_slot_block(configure: impl Fn(&mut TestBus)) -> Fixture {
-    governor_block(&[&[0x89, 0xf6], &[0xec], &[0x89, 0xff]], configure, |_| {})
+    governor_block(
+        &[&[0x89, 0xf6], &[0xec], &[0x89, 0xff]],
+        3,
+        configure,
+        |_| {},
+    )
 }
 
 fn admission(fixture: &Fixture) -> jit::direct::CallOutAdmission {
@@ -1914,6 +1923,7 @@ fn an_abnormal_trial_denies_the_block() {
     // the residual Q3 item 4 records as an accepted price.
     let mut fixture = governor_block(
         &[&[0x89, 0xf6], &[0xec], &[0x89, 0xff]],
+        3,
         |bus| {
             bus.lazy_io_reads = true;
             bus.io_read_value = Some(0x5a);
@@ -1960,6 +1970,7 @@ fn a_trial_that_never_reaches_its_call_out_gives_up_after_the_cap() {
     // real regression for its OTHER instructions.
     let mut fixture = governor_block(
         &[&[0x89, 0xf6], &[0xf7, 0xf1], &[0xec], &[0x89, 0xff]],
+        4,
         |bus| {
             bus.lazy_io_reads = true;
             bus.io_read_value = Some(0x5a);
@@ -2068,8 +2079,11 @@ fn a_recycled_block_slot_reads_untried_rather_than_its_predecessors_class() {
 
 #[test]
 fn a_classification_does_not_survive_the_cost_dial_epoch() {
-    // The other half of the memo key, and the bound on how stale a trial-only classification can
-    // get: rolling the epoch re-tries everything.
+    // The other half of the memo key, and it is a SAFETY key, not a refresh mechanism. The epoch
+    // is `active_mode + 1` and its only writer clears every compiled block first, so it cannot
+    // roll inside a run and it bounds nothing: what this pins is that a class learned under one
+    // persona can never be read under another. A classification is otherwise terminal for the
+    // block's lifetime.
     let mut fixture = governed_slot_block(|bus| {
         bus.lazy_io_reads = true;
         bus.io_read_value = Some(0x5a);
@@ -2103,5 +2117,217 @@ fn a_classification_does_not_survive_the_cost_dial_epoch() {
     assert_eq!(
         fixture.cpu.jit_direct.callout_admission(id, epoch),
         jit::direct::CallOutAdmission::Untried(0)
+    );
+}
+
+/// Set the TSS I/O bitmap bit for `PORT`, turning the fixture's permitting TSS into a denying
+/// one without recompiling anything. `io_base` is zero in the zeroed TSS, so the bitmap byte is
+/// at `base + PORT / 8`.
+/// `(jit_direct_insns, jit_direct_linked_transfers)`, copied out so the borrow ends here.
+fn counters(fixture: &Fixture) -> (u64, u64) {
+    let perf = fixture.cpu.perf_counters();
+    (perf.jit_direct_insns, perf.jit_direct_linked_transfers)
+}
+
+fn deny_the_port_in_the_bitmap(fixture: &mut Fixture) {
+    let byte = (GOVERNOR_TSS_BASE + u32::from(PORT) / 8) as usize;
+    fixture.bus.memory[byte] |= 1 << (PORT % 8);
+}
+
+#[test]
+fn a_lazy_block_that_later_meets_a_denied_port_is_demoted_once() {
+    // The ONE post-trial transition. Without it, a block classified `Lazy` whose port is later
+    // revoked -- a V86 monitor rewriting the bitmap under a running task -- pays
+    // spill/call/refuse/side-exit on every execution of that IN, unbounded in count. With it the
+    // residual is one abnormal per block.
+    let mut fixture = governed_slot_block(|bus| {
+        bus.lazy_io_reads = true;
+        bus.io_read_value = Some(0x5a);
+    });
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    assert_eq!(admission(&fixture), jit::direct::CallOutAdmission::Lazy);
+
+    // The monitor revokes the port. The next entry is NOT a trial -- the block is already
+    // classified -- so this is the demotion arm and nothing else.
+    deny_the_port_in_the_bitmap(&mut fixture);
+    let trials = fixture.cpu.direct_stall_snapshot().callout_governor_trials;
+    rearm_governor_block(&mut fixture);
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap(),
+        "the demoting entry is a normal Lazy entry: it runs and the helper refuses"
+    );
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(
+        stalls.callout_governor_trials, trials,
+        "the demoting entry must not be counted as a trial"
+    );
+    assert_eq!(stalls.side_exit_callout_abnormal, 1);
+    assert_eq!(
+        admission(&fixture),
+        jit::direct::CallOutAdmission::Denied,
+        "an abnormal serve outside the trial must demote the block"
+    );
+
+    // And the demotion has to reach the gate: every later entry is refused at head, so the
+    // abnormal is paid exactly once.
+    let executed = fixture.cpu.direct_stall_snapshot().callout_executed;
+    for entry in 1..4 {
+        rearm_governor_block(&mut fixture);
+        assert!(
+            !fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap(),
+            "entry {entry}: a demoted block must be refused at head"
+        );
+        let stalls = fixture.cpu.direct_stall_snapshot();
+        assert_eq!(stalls.reject_callout_privileged, entry, "entry {entry}");
+        assert_eq!(
+            stalls.callout_executed, executed,
+            "entry {entry}: the abnormal must be paid once, not once per entry"
+        );
+    }
+}
+
+#[test]
+fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
+    // THE CLAMP, and it needs a block that would otherwise chain or it proves nothing. Block A
+    // carries the call-out and ends at a NOT-TAKEN `jz`, so it falls through into block B and
+    // publishes a static successor; the trial must still retire A alone.
+    //
+    // The link is warmed with IOPL 3 first. That is not scaffolding: at IOPL 3 a CPL-3 task
+    // reaches ports without the bitmap, G2's privilege predicate is false, and the governor never
+    // sees the entry -- so the warm pass both binds the edge and establishes that this block DOES
+    // chain when nothing clamps it. Without that leg a broken clamp and an unbound link look the
+    // same.
+    let mut fixture = governor_block(
+        &[
+            &[0x89, 0xf6], // mov esi,esi
+            &[0xec],       // in al,dx
+            &[0x85, 0xc0], // test eax,eax
+            &[0x74, 0x06], // jz +6, never taken: EAX keeps its high bytes
+            &[0x89, 0xff], // block B: mov edi,edi
+            &[0x89, 0xf6], // block B: mov esi,esi
+            &[0x89, 0xff], // block B: mov edi,edi
+        ],
+        4,
+        |bus| {
+            bus.lazy_io_reads = true;
+            bus.io_read_value = Some(0x5a);
+        },
+        |_| {},
+    );
+    // `governor_block` compiled and installed block A only -- the walk stops at the `jz`. Install
+    // B so the fall-through edge has somewhere to resolve to.
+    // 2 + 1 + 2 + 2 bytes of block A. The `jz +6` measures from the end of the branch, so its
+    // TAKEN target is the HLT past block B and its fall-through is block B's first byte. Block B
+    // is three instructions because a two-slot non-terminal block does not compile.
+    let b = ENTRY + 7;
+    // Re-prime B's line: compiling A consumed the decode slots the builder primed, and a stale
+    // line is what `CompileOutcome::Retry` means.
+    for linear in [b, b + 2, b + 4] {
+        fixture.cpu.set_eip(linear);
+        fixture.cpu.fetch_decoded(&mut fixture.bus, linear).unwrap();
+    }
+    let key_b = jit::direct::key_for(&fixture.cpu, b, true).expect("block B key");
+    assert!(matches!(
+        fixture.cpu.jit_direct.probe(key_b),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = match jit::direct::compile(&mut fixture.cpu, b, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("block B structurally rejected")
+        }
+        jit::direct::CompileOutcome::Retry => panic!("block B asked for a retry"),
+    };
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.callout_slots, 0);
+    fixture
+        .cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("block B installs");
+
+    // Warm the edge, ungoverned. Two passes: the first exits unbound and binds, the second takes
+    // the hop.
+    let mut warm_insns = 0;
+    for pass in 0..2 {
+        rearm_governor_block(&mut fixture);
+        fixture.cpu.registers.eflags |= 3 << 12;
+        let before = fixture.cpu.perf_counters().jit_direct_insns;
+        assert!(
+            fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap(),
+            "warm pass {pass}: the block must run"
+        );
+        warm_insns = fixture.cpu.perf_counters().jit_direct_insns - before;
+    }
+    assert_eq!(
+        warm_insns, 7,
+        "the warmed edge must carry the run through both blocks, or the clamp has nothing to clamp"
+    );
+    assert_eq!(
+        fixture.cpu.direct_stall_snapshot().callout_governor_trials,
+        0,
+        "an IOPL-3 entry is not governed at all"
+    );
+
+    // The trial: same bound edge, IOPL back to 0, quota clamped to one block.
+    rearm_governor_block(&mut fixture);
+    let before = counters(&fixture);
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    let after = counters(&fixture);
+    assert_eq!(
+        fixture.cpu.direct_stall_snapshot().callout_governor_trials,
+        1
+    );
+    assert_eq!(
+        after.1 - before.1,
+        0,
+        "a trial entry must take no chain hop"
+    );
+    assert_eq!(
+        after.0 - before.0,
+        4,
+        "a trial entry must retire the head block alone"
+    );
+    assert_eq!(admission(&fixture), jit::direct::CallOutAdmission::Lazy);
+
+    // And the classification restores the full quota on the very next entry.
+    rearm_governor_block(&mut fixture);
+    let before = counters(&fixture);
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    let after = counters(&fixture);
+    assert_eq!(after.1 - before.1, 1, "a Lazy entry must chain");
+    assert_eq!(
+        after.0 - before.0,
+        7,
+        "a Lazy entry must retire both blocks"
+    );
+    assert_eq!(
+        fixture.cpu.direct_stall_snapshot().callout_governor_trials,
+        1,
+        "and it must not be a second trial"
     );
 }
