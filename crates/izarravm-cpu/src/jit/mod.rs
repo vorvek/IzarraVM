@@ -320,6 +320,11 @@ impl JitState {
             .retire_key_for_recompile(&mut self.code_watch, key)
     }
 
+    pub(crate) fn retire_key_for_top_mismatch(&mut self, key: direct::BlockKey) -> bool {
+        self.direct
+            .retire_key_for_top_mismatch(&mut self.code_watch, key)
+    }
+
     pub(crate) fn clear(&mut self) {
         self.direct.clear(&mut self.code_watch);
     }

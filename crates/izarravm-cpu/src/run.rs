@@ -1983,7 +1983,10 @@ impl CpuGsw {
             .is_some_and(|expected| self.fpu.top() != expected)
         {
             self.perf.jit_direct_reject_x87_top += 1;
-            self.jit_direct.retire_key_for_recompile(span.key);
+            // The refusal above is unconditional and is the correctness half: the emitter bakes
+            // `physical(top, logical)` as constant XMM numbers, so entering at the wrong TOP reads
+            // the wrong registers. Only the RE-SPECIALIZATION bet is capped, and per key.
+            self.jit_direct.retire_key_for_top_mismatch(span.key);
             return Ok(DirectBlockOutcome::NotRun);
         }
         // Fetched once and held in a local across all three descriptor checks. It used to ride

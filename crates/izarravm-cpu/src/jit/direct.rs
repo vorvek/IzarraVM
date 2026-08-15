@@ -774,6 +774,17 @@ pub(crate) struct BlockCache {
     /// entry per key that has EVER been hot — thousands on a Build-engine fixture, cleared with
     /// the rest of the cache storage.
     lane_trial_epochs: HashMap<BlockKey, u32>,
+    /// Per-key x87 TOP-mismatch retire count, capped at `X87_TOP_RETIRE_CAP`. A key that has
+    /// spent its budget is TOP-STICKY: the entry refusal in `run_direct_block` still fires and the
+    /// instruction still interprets, but the block is no longer demoted for another
+    /// re-specialization. See `retire_key_for_top_mismatch`.
+    ///
+    /// The key set is a SUBSET of `entries`': the count is only written on the `Compiled` path,
+    /// and both sites that drop a key from `entries` (`invalidate_physical_range`,
+    /// `reset_storage`) drop it here too. That containment is what bounds the map at
+    /// `DEFAULT_ENTRY_CAP` without an eviction policy, and it is why a rewritten page hands the
+    /// new code at that address a fresh budget instead of its predecessor's stickiness.
+    top_mismatch_retires: HashMap<BlockKey, u8, PodKeyBuildHasher>,
     /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
     lane_trial_override: Option<bool>,
@@ -916,6 +927,7 @@ impl BlockCache {
             segment_layouts: Vec::new(),
             block_imm_lanes: Vec::new(),
             lane_trial_epochs: HashMap::default(),
+            top_mismatch_retires: HashMap::default(),
             lane_trial_override: None,
             block_portals: Vec::new(),
             link_cells: Vec::new(),
@@ -1486,6 +1498,50 @@ impl BlockCache {
         true
     }
 
+    /// How many times one key may be retired for an x87 TOP mismatch before it goes TOP-STICKY.
+    ///
+    /// The two bracketing measurements: 0 is the falsification arm
+    /// (`.bench/results/tomb-turnover-falsify-20260815/`, +8.9% wall on `tombraid-586` with every
+    /// guest counter and the frame hash identical), and `u8::MAX` is pre-slice `main`, whose
+    /// 4.77M TOP-mismatch recompiles on that row bought zero native execution. 2 gives every key
+    /// one re-specialization plus one spare, which is what a one-time TOP shift -- the only shape
+    /// where the retire pays -- actually needs, and it is bounded per key by construction for
+    /// every entry sequence. Not an env knob.
+    const X87_TOP_RETIRE_CAP: u8 = 2;
+
+    /// The x87 TOP-mismatch half of `retire_key_for_recompile`, capped per key.
+    ///
+    /// The entry REFUSAL is the caller's and is unconditional -- this decides only whether the
+    /// block is also demoted so the next encounter re-specializes it at the then-live TOP. A key
+    /// that has already spent its budget keeps its block and keeps refusing, so the worst case is
+    /// permanent interpretation of that block: slow, never wrong. On a guest that cycles TOPs
+    /// through one key the uncapped form recompiles forever and enters natively never.
+    pub(crate) fn retire_key_for_top_mismatch(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        key: BlockKey,
+    ) -> bool {
+        // Mirror `retire_key_for_recompile`'s own state check BEFORE touching the map: a key that
+        // is not `Compiled` cannot be retired, and writing a count for it would leave the map
+        // holding a key `entries` does not, breaking the containment the memory bound rests on.
+        if !matches!(self.entries.get(&key), Some(BlockState::Compiled(_))) {
+            return false;
+        }
+        // One lookup on the sticky path -- the one a churning guest takes millions of times. The
+        // second lookup below is paid only by a retire that is actually about to happen, beside a
+        // hot-table clear and a `retire_block`.
+        let spent = *self.top_mismatch_retires.entry(key).or_insert(0);
+        if spent >= Self::X87_TOP_RETIRE_CAP {
+            self.stalls.x87_top_retires_suppressed += 1;
+            return false;
+        }
+        self.top_mismatch_retires.insert(key, spent + 1);
+        if spent + 1 == Self::X87_TOP_RETIRE_CAP {
+            self.stalls.x87_top_sticky_crossings += 1;
+        }
+        self.retire_key_for_recompile(watch, key)
+    }
+
     pub(crate) fn clear(&mut self, watch: &mut NativeCodeWatch) {
         // Unconditionally, and above the early return below. The one event that invalidates this
         // cache is a persona change, which arrives here through `CpuGsw::set_mode`, and an empty
@@ -1499,6 +1555,13 @@ impl BlockCache {
         // direct cache is unused. Avoid clearing the 65,536-entry hot table when it is already
         // empty.
         if self.entries.is_empty() && self.blocks.is_empty() && self.arena.is_none() {
+            // No second clear for `top_mismatch_retires`: its key set is a subset of `entries`'
+            // (see the field), so an empty `entries` implies an empty map. One invariant, one
+            // mechanism -- assert it here rather than papering over a violation.
+            debug_assert!(
+                self.top_mismatch_retires.is_empty(),
+                "TOP-mismatch budgets outlived their entries"
+            );
             if watch.has_resident_pages() {
                 watch.clear();
             }
@@ -1730,6 +1793,11 @@ impl BlockCache {
                     }
 
                     self.entries.remove(&key);
+                    // Below the lane `continue` above deliberately: a patched imm32 lane keeps
+                    // its block and its `entries` row, so it must keep its budget too. A genuine
+                    // kill drops all three -- the code at this address is NEW and inheriting the
+                    // previous occupant's stickiness would pin it out of specialization silently.
+                    self.top_mismatch_retires.remove(&key);
                     let hot_index = key.hot_index();
                     if self.hot[hot_index].is_some_and(|hot| hot.key == key) {
                         self.hot[hot_index] = None;
@@ -2253,6 +2321,7 @@ impl BlockCache {
         self.segment_layouts.clear();
         self.block_imm_lanes.clear();
         self.lane_trial_epochs.clear();
+        self.top_mismatch_retires.clear();
         self.link_cells.clear();
         self.link_sources.clear();
         self.outbound.clear();
