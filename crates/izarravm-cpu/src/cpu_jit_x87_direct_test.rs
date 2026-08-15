@@ -2969,3 +2969,165 @@ fn fild_m64_followed_by_another_x87_slot_addresses_the_pushed_stack_correctly() 
         );
     }
 }
+
+// The x87 TOP-mismatch retire cap.
+//
+// A block whose baked entry TOP no longer matches the live TOP must not be entered -- that half is
+// unconditional and is asserted below on every round. What the cap governs is the RE-SPECIALIZATION
+// that used to follow every refusal: on a guest that cycles TOPs through one key it recompiles
+// forever and buys nothing, so each key gets `X87_TOP_RETIRE_CAP` retires and then goes sticky.
+//
+// The x87 opcode sits eleven instructions into the block, past the entry slot, so the block really
+// does execute natively before the mismatch (`jit-fixture-entry-position-trap`), and every round
+// asserts the native run happened before it asserts anything about the refusal that follows.
+const TOP_CAP_END: u32 = ENTRY + 24;
+
+fn top_cap_memory() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let program = [
+        0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89,
+        0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, // eleven mov eax,eax
+        0xd9, 0xe8, // fld1 -- lowers TOP from 0 to 7
+    ];
+    memory[ENTRY as usize..TOP_CAP_END as usize].copy_from_slice(&program);
+    memory[TOP_CAP_END as usize] = 0xf4;
+    memory
+}
+
+/// Compile and install the block at TOP = 0, run it natively (which leaves TOP = 7), then re-enter
+/// it at the mismatched TOP. Returns nothing: every invariant is asserted here so each round of the
+/// callers' loops is non-vacuous.
+fn run_then_mismatch(native: &mut CpuGsw, bus: &mut TestBus, memory: &[u8], round: usize) {
+    arm(native, 0x0f7f);
+    native.registers.eip = ENTRY;
+    bus.memory.copy_from_slice(memory);
+    assert_eq!(native.fpu.top(), 0, "round {round}");
+    // `install` only accepts a key the cache has already observed, and the first probe is what
+    // marks it `Seen`.
+    let key = jit::direct::key_for(native, ENTRY, true).expect("block key");
+    let _ = native.jit_direct.probe(key);
+    let compilation = jit::direct::compile(native, ENTRY, true).expect("x87 block compiles");
+    assert_eq!(compilation.x87_entry_top, 0, "round {round}");
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("x87 block installs");
+    let block = native
+        .jit_direct
+        .block(id)
+        .expect("installed block is live");
+
+    let insns = native.perf_counters().jit_direct_insns;
+    assert!(
+        native.try_run_direct_block_for_test(bus, block).unwrap(),
+        "round {round}: the block must run NATIVELY at its baked TOP, or the refusal below proves \
+         nothing"
+    );
+    assert!(
+        native.perf_counters().jit_direct_insns > insns,
+        "round {round}: native run retired no instructions"
+    );
+    assert_eq!(
+        native.fpu.top(),
+        7,
+        "round {round}: fld1 must have moved TOP"
+    );
+
+    // Same key, live TOP 7 against a baked 0.
+    let rejects = native.perf_counters().jit_direct_reject_x87_top;
+    native.registers.eip = ENTRY;
+    assert!(
+        !native.try_run_direct_block_for_test(bus, block).unwrap(),
+        "round {round}: entry at a mismatched TOP must be refused"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_reject_x87_top - rejects,
+        1,
+        "round {round}: the refusal itself is never capped"
+    );
+}
+
+#[test]
+fn x87_top_mismatch_retires_are_capped_per_key() {
+    let memory = top_cap_memory();
+    let mut native = x87_cpu(GswMode::Gsw586);
+    let mut bus = direct_memory(memory.clone());
+    arm(&mut native, 0x0f7f);
+    run_to_halt(&mut native, &mut bus);
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("block key");
+
+    for round in 0..2 {
+        run_then_mismatch(&mut native, &mut bus, &memory, round);
+        assert!(
+            matches!(
+                native.jit_direct.probe(key),
+                jit::direct::BlockProbe::Compile
+            ),
+            "round {round}: a within-budget mismatch must retire the key for recompilation"
+        );
+        let stalls = native.direct_stall_snapshot();
+        assert_eq!(stalls.x87_top_retires_suppressed, 0, "round {round}");
+        assert_eq!(
+            stalls.x87_top_sticky_crossings,
+            u64::from(round == 1),
+            "round {round}: the cap is crossed exactly once, on the last retire it allows"
+        );
+    }
+
+    // Third mismatch on the same key: the budget is spent.
+    run_then_mismatch(&mut native, &mut bus, &memory, 2);
+    let stalls = native.direct_stall_snapshot();
+    assert_eq!(stalls.x87_top_retires_suppressed, 1);
+    assert_eq!(
+        stalls.x87_top_sticky_crossings, 1,
+        "the crossing counter fires on the edge, not on every suppression"
+    );
+    assert!(
+        matches!(
+            native.jit_direct.probe(key),
+            jit::direct::BlockProbe::Ready(_)
+        ),
+        "a sticky key keeps its compiled block -- only the demotion is suppressed"
+    );
+}
+
+#[test]
+fn x87_top_retire_budget_is_fresh_after_the_page_is_rewritten() {
+    let memory = top_cap_memory();
+    let mut native = x87_cpu(GswMode::Gsw586);
+    let mut bus = direct_memory(memory.clone());
+    arm(&mut native, 0x0f7f);
+    run_to_halt(&mut native, &mut bus);
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("block key");
+
+    for round in 0..3 {
+        run_then_mismatch(&mut native, &mut bus, &memory, round);
+    }
+    assert_eq!(native.direct_stall_snapshot().x87_top_retires_suppressed, 1);
+
+    // The code at this address is now NEW: it must not inherit its predecessor's stickiness.
+    let invalidation = native.jit_direct.invalidate_physical_range(ENTRY, 4, false);
+    assert!(
+        invalidation.blocks > 0,
+        "the rewrite must actually have killed the block"
+    );
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+
+    run_then_mismatch(&mut native, &mut bus, &memory, 3);
+    let stalls = native.direct_stall_snapshot();
+    assert_eq!(
+        stalls.x87_top_retires_suppressed, 1,
+        "the post-rewrite mismatch must be retired, not suppressed"
+    );
+    assert!(
+        matches!(
+            native.jit_direct.probe(key),
+            jit::direct::BlockProbe::Compile
+        ),
+        "the rewritten key spends a fresh budget"
+    );
+}
