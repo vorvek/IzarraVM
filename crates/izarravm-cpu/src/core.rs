@@ -455,8 +455,19 @@ impl CpuGsw {
         // no block died. That is the case whose heat contribution is dropped below.
         #[cfg(feature = "jit")]
         let mut lane_only = false;
+        // The census window clock (design §7's plumbing rule): `BlockCache` cannot reach
+        // `PerfCounters`, so the choke stashes the retired-instruction count here. One
+        // `cfg`-gated statement, no signature change anywhere below it.
+        #[cfg(feature = "smc-census")]
+        self.jit_direct.smc_census_set_clock(self.perf.instructions);
+        #[cfg(feature = "smc-census")]
+        let mut census_block_scan = false;
         #[cfg(feature = "jit")]
         if self.jit_direct.range_hits_compiled_code(physical, width) {
+            #[cfg(feature = "smc-census")]
+            {
+                census_block_scan = true;
+            }
             let outcome = self
                 .jit_direct
                 .invalidate_physical_range(physical, width, lanes);
@@ -536,6 +547,15 @@ impl CpuGsw {
         }
         #[cfg(not(feature = "jit"))]
         let _ = heat_hit;
+        // The 2x2 of design §4, placed where `action` is readable and UNCONDITIONAL (the heat
+        // block above it is inside `heat_hit && !lane_only`). Duke's scan calls and its narrow
+        // kills do not share a denominator; this is the only licensed way to relate them.
+        #[cfg(feature = "smc-census")]
+        self.jit_direct.note_smc_census_choke(
+            census_block_scan,
+            action.narrow_kills != 0,
+            action.wholesale,
+        );
         if let Some(pre) = traced
             && let Some(trace) = self.smc_trace.0.as_mut()
         {
@@ -1304,6 +1324,11 @@ impl CpuGsw {
     #[cfg(feature = "direct-callout-attribution")]
     pub fn direct_callout_attribution_snapshot(&self) -> Option<DirectCallOutAttributionSnapshot> {
         self.jit_direct.direct_callout_attribution_snapshot()
+    }
+
+    #[cfg(feature = "smc-census")]
+    pub fn direct_smc_census_snapshot(&self) -> Option<crate::DirectSmcCensusSnapshot> {
+        self.jit_direct.smc_census_snapshot()
     }
 
     pub fn is_paging_enabled(&self) -> bool {

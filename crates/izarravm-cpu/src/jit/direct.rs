@@ -10,6 +10,8 @@ pub(crate) mod census;
 mod classify;
 mod emit;
 mod native_exit;
+#[cfg(feature = "smc-census")]
+mod smc_census;
 
 /// Re-exported rather than moved-and-repathed: every one of these names is referenced as
 /// `jit::direct::X` from `run.rs`, `lib.rs` and the emitter, and the extraction is pure motion,
@@ -30,6 +32,8 @@ pub(crate) use callout::{
 pub(crate) use callout_attribution::{
     CallOutAttribution, CallOutOutcome, direct_callout_attribution_default,
 };
+#[cfg(feature = "smc-census")]
+pub(crate) use smc_census::{SmcCensus, smc_census_default};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -890,6 +894,15 @@ pub(crate) struct BlockCache {
     stalls: DirectStallTally,
     #[cfg(feature = "direct-link-refusal-census")]
     direct_link_refusal_census: Option<Box<DirectLinkRefusalCensus>>,
+    /// SMC census stage A. It lives on the CACHE rather than on `JitState` (which is where the
+    /// design put it) for one reason: every stage-A increment site is a `BlockCache` method
+    /// reached through `&mut self`, and `invalidate_physical_range` cannot see a `JitState` field
+    /// without a signature change the design explicitly forbids. The layout argument is unchanged
+    /// — `CpuGsw` owns `Box<JitState>`, which owns this cache, so the field costs zero bytes on
+    /// `CpuGsw` and the pinned `pending_flags` offset does not move. A clone drops it, exactly as
+    /// the link-refusal census above does: a lockstep clone must not double-count its parent.
+    #[cfg(feature = "smc-census")]
+    smc_census: Option<Box<SmcCensus>>,
     #[cfg(test)]
     defer_short_for_test: bool,
     #[cfg(test)]
@@ -971,6 +984,8 @@ impl BlockCache {
             stalls: DirectStallTally::default(),
             #[cfg(feature = "direct-link-refusal-census")]
             direct_link_refusal_census: direct_link_refusal_census_default(),
+            #[cfg(feature = "smc-census")]
+            smc_census: smc_census_default(),
             #[cfg(test)]
             defer_short_for_test: false,
             #[cfg(test)]
@@ -1701,7 +1716,13 @@ impl BlockCache {
         lanes: bool,
     ) -> RangeInvalidation {
         let mut result = RangeInvalidation::default();
+        #[cfg(feature = "smc-census")]
+        let mut census_call = smc_census::CallAccum::default();
         if width == 0 || self.entries.is_empty() {
+            // Classified too: the choke bumps `perf.smc_scan_calls` for this call, so leaving it
+            // out would break the `scan_calls == perf.smc_scan_calls` closure.
+            #[cfg(feature = "smc-census")]
+            self.note_smc_census_call(0, 0, 0, &census_call);
             return result;
         }
 
@@ -1713,6 +1734,8 @@ impl BlockCache {
             let page_remaining =
                 (1u32 << BLOCK_PAGE_SHIFT) - (cursor & ((1u32 << BLOCK_PAGE_SHIFT) - 1));
             let step = remaining.min(page_remaining);
+            #[cfg(feature = "smc-census")]
+            let mut census_page = smc_census::PageAccum::default();
             if let Some(mut page_keys) = self.physical_keys.remove(&page) {
                 // Only keys whose `physical` lies in
                 // `[write_start - (max_span - 1), write_end)` can overlap the
@@ -1723,6 +1746,13 @@ impl BlockCache {
                 let window_low = physical.saturating_sub(page_keys.max_span.saturating_sub(1));
                 let window_high = physical.saturating_add(width);
                 let keys = &mut page_keys.keys;
+                // Captured BEFORE the drain: this is the page occupancy design §12.6 says nothing
+                // records today, and "24.2 keys/call" is the window length, not this.
+                #[cfg(feature = "smc-census")]
+                {
+                    census_page.counts.page_visits = 1;
+                    census_page.counts.page_keys_len_sum = keys.len() as u64;
+                }
                 let window_start = keys.partition_point(|tracked| tracked.physical < window_low);
                 let window_end = window_start
                     + keys[window_start..]
@@ -1731,9 +1761,17 @@ impl BlockCache {
                 result.keys_scanned = result
                     .keys_scanned
                     .saturating_add(u32::try_from(window_end - window_start).unwrap_or(u32::MAX));
+                #[cfg(feature = "smc-census")]
+                {
+                    census_page.counts.keys_scanned = (window_end - window_start) as u64;
+                }
                 for index in window_start..window_end {
                     let key = keys[index];
                     let Some(state) = self.entries.get(&key).copied() else {
+                        #[cfg(feature = "smc-census")]
+                        {
+                            census_page.entries_get_misses += 1;
+                        }
                         continue;
                     };
                     let overlaps = match state {
@@ -1756,6 +1794,13 @@ impl BlockCache {
                         }),
                     };
                     if !overlaps {
+                        // Review finding M7: THIS is the quantity a per-page presence filter would
+                        // elide, and it is the denominator R2's W is defined against.
+                        #[cfg(feature = "smc-census")]
+                        {
+                            census_page.counts.keys_surviving += 1;
+                            census_page.survivors_moved += 1;
+                        }
                         keys[survivor_count] = key;
                         survivor_count += 1;
                         continue;
@@ -1776,6 +1821,11 @@ impl BlockCache {
                             && block_lanes.contains(&physical)
                         {
                             result.lane_accepts += 1;
+                            #[cfg(feature = "smc-census")]
+                            {
+                                census_page.counts.lane_accepts += 1;
+                                census_page.survivors_moved += 1;
+                            }
                             keys[survivor_count] = key;
                             survivor_count += 1;
                             continue;
@@ -1810,21 +1860,50 @@ impl BlockCache {
                         BlockState::Seen | BlockState::Dormant(_) => {}
                     }
                     invalidated += 1;
+                    #[cfg(feature = "smc-census")]
+                    {
+                        census_page.counts.keys_killed += 1;
+                    }
                 }
                 // Survivors compacted into [window_start, survivor_count);
                 // close the kill hole so the untouched tail keeps the sorted
                 // order the window search depends on.
                 if survivor_count != window_end {
+                    #[cfg(feature = "smc-census")]
+                    {
+                        census_page.drain_calls += 1;
+                        census_page.drain_elements += (window_end - survivor_count) as u64;
+                    }
                     keys.drain(survivor_count..window_end);
                 }
                 if !keys.is_empty() {
+                    #[cfg(feature = "smc-census")]
+                    {
+                        census_page.reinserted = true;
+                    }
                     self.physical_keys.insert(page, page_keys);
                 }
+                #[cfg(feature = "smc-census")]
+                {
+                    census_call.pages_present += 1;
+                    census_call.keys_surviving += census_page.counts.keys_surviving;
+                    self.note_smc_census_page(page, &census_page);
+                }
+            } else {
+                #[cfg(feature = "smc-census")]
+                self.note_smc_census_absent_page();
             }
             cursor = cursor.wrapping_add(step);
             remaining -= step;
         }
         result.blocks = invalidated;
+        #[cfg(feature = "smc-census")]
+        self.note_smc_census_call(
+            invalidated as u64,
+            u64::from(result.lane_accepts),
+            u64::from(result.keys_scanned),
+            &census_call,
+        );
         result
     }
 
@@ -2518,8 +2597,14 @@ impl BlockCache {
 
     fn unlink_block(&mut self, id: BlockId) {
         let Some(index) = self.active_index(id) else {
+            #[cfg(feature = "smc-census")]
+            self.note_smc_census_unlink(false, 0, 0);
             return;
         };
+        #[cfg(feature = "smc-census")]
+        let mut census_walked = 0u64;
+        #[cfg(feature = "smc-census")]
+        let mut census_reparked = 0u64;
         self.remove_waiting_sources(id);
         let target_key = LinkTarget {
             linear: self.blocks[index].span.key.linear,
@@ -2530,12 +2615,24 @@ impl BlockCache {
         }
         if let Some(inbound) = self.inbound.remove(&id) {
             for link in inbound {
+                #[cfg(feature = "smc-census")]
+                {
+                    census_walked += 1;
+                }
                 let source_index = link.block.index();
                 if self.active_index(link.block) == Some(source_index) {
                     let slot = usize::from(link.slot);
                     self.link_cells[source_index][slot].clear();
                     self.outbound[source_index][slot] = None;
                     if let Some(successor) = self.blocks[source_index].successors[slot] {
+                        // Review finding M9: `link.block` is the SOURCE, so a self-linking block
+                        // re-parks a waiting entry naming `id` right here. That is why the second
+                        // `remove_waiting_sources` below is load-bearing and R6's "drop the second
+                        // pass" arm cannot be proved. This counter measures how often it happens.
+                        #[cfg(feature = "smc-census")]
+                        if link.block == id {
+                            census_reparked += 1;
+                        }
                         self.waiting.entry(successor).or_default().push(link);
                     }
                     self.stats.unlinks += 1;
@@ -2549,20 +2646,45 @@ impl BlockCache {
             self.unlink_outbound(id, slot, LinkClearCause::Retired);
         }
         self.remove_waiting_sources(id);
+        #[cfg(feature = "smc-census")]
+        self.note_smc_census_unlink(true, census_walked, census_reparked);
     }
 
     fn remove_waiting_sources(&mut self, id: BlockId) {
+        #[cfg(feature = "smc-census")]
+        let census_map_len = self.waiting.len() as u64;
+        #[cfg(feature = "smc-census")]
+        let mut census_visited = 0u64;
         self.waiting.retain(|_, sources| {
+            #[cfg(feature = "smc-census")]
+            {
+                census_visited += sources.len() as u64;
+            }
             sources.retain(|source| source.block != id);
             !sources.is_empty()
         });
+        // Phase (e). `retain` walks the WHOLE waiting map, not this block's sources, and
+        // `unlink_block` calls it twice — so `waiting_map_len_sum` is what prices the pass, not
+        // the call count.
+        #[cfg(feature = "smc-census")]
+        self.note_smc_census_waiting_retain(
+            census_map_len,
+            census_visited,
+            census_map_len - self.waiting.len() as u64,
+        );
     }
 
     fn retire_block(&mut self, watch: &mut NativeCodeWatch, id: BlockId) {
         let Some(index) = self.active_index(id) else {
+            // §12.9: a second key naming the same block finds it already retired. Counted, so the
+            // per-key kill count and the per-block death count stay separately visible.
+            #[cfg(feature = "smc-census")]
+            self.note_smc_census_retire(false, 0, 0);
             return;
         };
         let span = self.blocks[index].span;
+        #[cfg(feature = "smc-census")]
+        let census_decode_slots = self.block_decode_slots[index].len() as u64;
         self.block_portals[index].clear();
         self.block_link_epochs[index] = 0;
         self.unregister_decode_dependencies(id, index);
@@ -2581,6 +2703,8 @@ impl BlockCache {
             .push(u16::try_from(index).expect("block slot index must fit its ID"));
         self.live_blocks -= 1;
         watch.release_range(span.key.physical, u32::from(span.guest_len));
+        #[cfg(feature = "smc-census")]
+        self.note_smc_census_retire(true, u64::from(span.guest_len), census_decode_slots);
     }
 
     fn track_physical_key(&mut self, key: BlockKey) {
@@ -2668,6 +2792,10 @@ impl Clone for BlockCache {
         #[cfg(feature = "direct-link-refusal-census")]
         {
             cache.direct_link_refusal_census = None;
+        }
+        #[cfg(feature = "smc-census")]
+        {
+            cache.smc_census = None;
         }
         cache.backend_enabled = self.backend_enabled;
         cache.admission_heat = self.admission_heat;

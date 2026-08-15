@@ -1407,6 +1407,98 @@ fn physical_invalidation_window_skips_far_keys_and_reaches_span_tails() {
     assert!(matches!(cache.probe(high), BlockProbe::Ready(_)));
 }
 
+/// Non-vacuity guard for the stage-A SMC census. Every assert here would still pass against a
+/// census that counted nothing, EXCEPT the four that demand non-zero rows and the one that demands
+/// the window filter exclude a call — which is the point (see the "fixtures that cannot fail"
+/// rule: prove the new guard fires).
+#[cfg(all(
+    feature = "smc-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
+    let mut cache = BlockCache::default();
+    assert!(
+        cache.smc_census_snapshot().is_none(),
+        "an unarmed census must not exist"
+    );
+    cache.enable_smc_census_for_test(Some((100, 200)));
+    let low = BlockKey::new(0x1000, 0x70_010, 7);
+    let high = BlockKey::new(0x2000, 0x70_800, 7);
+    install_trivial(&mut cache, low, 16);
+    install_trivial(&mut cache, high, 16);
+
+    // Outside the pinned window: the whole-run phase counts it, the windowed phase must not.
+    cache.smc_census_set_clock(10);
+    assert_eq!(
+        cache.invalidate_physical_range(0x70_400, 4, false).blocks,
+        0
+    );
+    // Inside it, and killing.
+    cache.smc_census_set_clock(150);
+    assert_eq!(
+        cache.invalidate_physical_range(0x70_01f, 1, false).blocks,
+        1
+    );
+
+    let snapshot = cache.smc_census_snapshot().expect("the census is armed");
+    let whole = snapshot.whole_run.units;
+    let windowed = snapshot.windowed.units;
+    assert_eq!(snapshot.window, Some((100, 200)));
+    assert_eq!(whole.scan_calls, 2);
+    assert_eq!(
+        windowed.scan_calls, 1,
+        "the window filter must have excluded the first call"
+    );
+    assert_eq!(whole.scan_calls_no_kill, 1);
+    assert_eq!(whole.scan_calls_kill, 1);
+    assert_eq!(whole.keys_killed, 1);
+    assert_eq!(whole.retire_calls_effective, 1);
+    assert_eq!(whole.waiting_retain_calls, 2 * whole.unlink_calls_effective);
+
+    // The closure set the profile JSON asserts, checked here so a break shows up in `cargo test`
+    // rather than only after a multi-minute fixture run.
+    assert_eq!(
+        whole.keys_scanned,
+        whole.entries_get_misses
+            + whole.keys_surviving
+            + whole.lane_accept_keys
+            + whole.keys_killed
+    );
+    assert_eq!(whole.keys_scanned, whole.window_len_sum);
+    assert_eq!(whole.page_visits, whole.page_removes + whole.page_absent);
+    assert_eq!(
+        whole.page_removes,
+        whole.page_reinserts + whole.page_dropped_empty
+    );
+    assert_eq!(whole.window_searches, whole.page_removes);
+    assert_eq!(
+        whole.survivors_moved,
+        whole.keys_surviving + whole.lane_accept_keys
+    );
+    // Page occupancy is NOT the window length, which is the whole reason `page_keys_len_sum`
+    // exists (design §12.6). Two keys sit on the page; the two windows saw zero and one.
+    assert_eq!(whole.page_keys_len_sum, 4);
+    assert_eq!(whole.window_len_sum, 1);
+
+    let top = &snapshot.whole_run.pages[0];
+    assert_eq!(top.page, 0x70);
+    assert_eq!(top.counts.keys_killed, 1);
+    assert_eq!(
+        top.error.keys_killed, 0,
+        "a table with free slots displaces nothing, so its bound is exact"
+    );
+    assert_eq!(snapshot.whole_run.page_displacements, 0);
+    assert_eq!(snapshot.whole_run.page_totals.keys_killed, 1);
+    assert!(
+        cache.clone().smc_census_snapshot().is_none(),
+        "a lockstep clone must not double-count its parent"
+    );
+}
+
 #[test]
 fn physical_invalidation_window_survives_a_middle_kill_in_sorted_order() {
     let mut cache = BlockCache::default();
