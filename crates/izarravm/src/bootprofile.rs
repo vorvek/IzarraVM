@@ -262,9 +262,8 @@ pub fn run(
     // "" | "0" count as unset on both variables: a pwsh harness that assigns
     // an empty string intending "cleared" leaves the variable set, and a bare
     // is_some()/map() would arm the instrument (measured 2026-08-15).
-    let machine_profile = crate::machine_profile_requested(
-        std::env::var("IZARRAVM_MACHINE_PROFILE").ok().as_deref(),
-    );
+    let machine_profile =
+        crate::machine_profile_requested(std::env::var("IZARRAVM_MACHINE_PROFILE").ok().as_deref());
     if let Some(stride) = cpu_profile_stride {
         machine.enable_host_profiling(stride);
     } else if machine_profile {

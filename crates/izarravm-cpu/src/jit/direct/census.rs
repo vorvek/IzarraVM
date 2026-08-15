@@ -1108,7 +1108,9 @@ pub(crate) struct DirectBarrierCensus {
     /// census's analogue of the link census's `missing_id`, and without it the row-attribution
     /// identity
     ///
-    ///     sum(row.unbound_exits) + rejected_unattributed == unbound[Rejected]
+    /// ```text
+    /// sum(row.unbound_exits) + rejected_unattributed == unbound[Rejected]
+    /// ```
     ///
     /// cannot be evaluated on a fixture run at all. A nonzero value is not automatically a defect:
     /// a block rejected before the census was armed, a rejection installed by an arm that does not
@@ -1353,7 +1355,9 @@ impl DirectBarrierCensus {
     /// Returns `(rows, truncated_static, truncated_dynamic, distinct_sites)`. The two truncated
     /// sums are what keeps the C3-style closure identity
     ///
-    ///     sum(rows.static_exits) + truncated_static == unbound[DormantHeat]
+    /// ```text
+    /// sum(rows.static_exits) + truncated_static == unbound[DormantHeat]
+    /// ```
     ///
     /// true independently of the head size, which is the whole reason the tail is summed rather
     /// than dropped: a truncated head would make the histogram silently under-report the class it

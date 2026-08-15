@@ -321,7 +321,10 @@ fn machine_profile_environment_gate_is_explicit() {
 #[test]
 fn rip_profile_environment_gate_is_explicit() {
     for value in [None, Some(""), Some("0")] {
-        assert_eq!(rip_profile_path_from(value.map(std::ffi::OsString::from)), None);
+        assert_eq!(
+            rip_profile_path_from(value.map(std::ffi::OsString::from)),
+            None
+        );
     }
     assert_eq!(
         rip_profile_path_from(Some(std::ffi::OsString::from("rip.json"))),
