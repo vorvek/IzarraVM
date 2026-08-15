@@ -259,14 +259,19 @@ pub fn run(
     let cpu_profile_stride = std::env::var("IZARRAVM_CPU_PROFILE")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
-    let machine_profile = std::env::var_os("IZARRAVM_MACHINE_PROFILE").is_some();
+    // "" | "0" count as unset on both variables: a pwsh harness that assigns
+    // an empty string intending "cleared" leaves the variable set, and a bare
+    // is_some()/map() would arm the instrument (measured 2026-08-15).
+    let machine_profile = crate::machine_profile_requested(
+        std::env::var("IZARRAVM_MACHINE_PROFILE").ok().as_deref(),
+    );
     if let Some(stride) = cpu_profile_stride {
         machine.enable_host_profiling(stride);
     } else if machine_profile {
         machine.enable_machine_profiling();
     }
     #[cfg(windows)]
-    let rip_sampler = std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| {
+    let rip_sampler = crate::rip_profile_path().map(|path| {
         let sampler = crate::riprofile::Sampler::start();
         (sampler, path)
     });

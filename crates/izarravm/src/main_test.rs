@@ -314,6 +314,21 @@ fn machine_profile_environment_gate_is_explicit() {
     }
 }
 
+/// A set-but-empty IZARRAVM_RIP_PROFILE must NOT arm the sampler: pwsh writes
+/// exactly that when a harness assigns `= ""` intending OFF, and the sampler
+/// suspends the emulator thread every 500 us (armed on every board row,
+/// measured 2026-08-15).
+#[test]
+fn rip_profile_environment_gate_is_explicit() {
+    for value in [None, Some(""), Some("0")] {
+        assert_eq!(rip_profile_path_from(value.map(std::ffi::OsString::from)), None);
+    }
+    assert_eq!(
+        rip_profile_path_from(Some(std::ffi::OsString::from("rip.json"))),
+        Some(std::ffi::OsString::from("rip.json"))
+    );
+}
+
 #[test]
 fn cli_rejects_multiple_run_modes() {
     for arguments in [

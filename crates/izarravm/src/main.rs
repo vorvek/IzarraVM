@@ -1321,7 +1321,11 @@ impl AudioCapture {
             // broken independently of how fast the emulator runs.
             opl_samples_per_cycle: AUDIO_CAPTURE_OPL_HZ
                 / clock.clocks_for_fraction_floor(1, 1).max(1) as f64,
-            wall_paced: std::env::var_os("IZARRAVM_AUDIO_WAV_WALL").is_some(),
+            // "" | "0" count as unset for the same pwsh reason as
+            // `resolve_audio_sink`: an empty assignment must not flip pacing.
+            wall_paced: machine_profile_requested(
+                std::env::var("IZARRAVM_AUDIO_WAV_WALL").ok().as_deref(),
+            ),
             debt: 0.0,
             last_wall: std::time::Instant::now(),
         }
@@ -1523,8 +1527,7 @@ fn run_boot_hdd_folder(
     }
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     #[cfg(windows)]
-    let rip_sampler =
-        std::env::var_os("IZARRAVM_RIP_PROFILE").map(|path| (riprofile::Sampler::start(), path));
+    let rip_sampler = rip_profile_path().map(|path| (riprofile::Sampler::start(), path));
     let injections = merged_injections(inject_keys, inject_mouse)?;
     // Periodic phase sampling, off unless IZARRAVM_PHASE_INTERVAL_MS names a guest-millisecond
     // interval. Armed BEFORE the run and closed after it: the two host-placed edges below are
@@ -2756,6 +2759,20 @@ fn direct_barrier_census_row_json(row: &izarravm_cpu::DirectBarrierCensusRow) ->
 
 fn machine_profile_requested(value: Option<&str>) -> bool {
     value.is_some_and(|value| !matches!(value, "" | "0"))
+}
+
+/// The RIP-sampler output path from `IZARRAVM_RIP_PROFILE`, with `""` and `"0"`
+/// counting as unset. `var_os` returns `Some("")` for a set-but-empty variable,
+/// and pwsh writes exactly that when a harness assigns `= ""` intending OFF, so
+/// a bare `var_os(..).map(..)` arms the sampler - which suspends the emulator
+/// thread every 500 us - on every leg of a board (measured 2026-08-15).
+fn rip_profile_path_from(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    value.filter(|path| !path.is_empty() && path.as_os_str() != std::ffi::OsStr::new("0"))
+}
+
+#[cfg(windows)]
+fn rip_profile_path() -> Option<std::ffi::OsString> {
+    rip_profile_path_from(std::env::var_os("IZARRAVM_RIP_PROFILE"))
 }
 
 /// True when IZARRAVM_UNIT_SIM requests the trace-driven unit-growth simulator (any value other
