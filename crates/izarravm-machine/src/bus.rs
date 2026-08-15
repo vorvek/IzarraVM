@@ -42,7 +42,9 @@ fn lazy_port_reads_386_enabled() -> bool {
 ///
 /// The `!uses_approximate_timing()` term is the load-bearing half: it is what
 /// makes the switch structurally unable to move 486/586, which already have the
-/// 3DA and 0x61 arms from `lazy_port_reads` and have never had the gameport arm.
+/// 3DA and 0x61 arms from `lazy_port_reads`. The gameport is no longer one of
+/// this switch's ports at all: its arm keys on the RC one-shots being idle, a
+/// device-state question that is the same on every persona.
 pub(super) const fn lazy_ports_386_composed(mode: GswMode, env_enabled: bool) -> bool {
     !mode.uses_approximate_timing() && env_enabled
 }
@@ -2118,12 +2120,24 @@ impl CpuBus for MachineBus<'_> {
             // two RC discharge deadlines and `guest_tick_now()`, the SAME
             // in-batch instant both timing classes already sample it at. Nothing
             // in `advance_devices` touches those deadlines -- their only writers
-            // are `charge` (the 0x201 WRITE, which sets io_touched in write_io
-            // and so ends the batch before any later read in the same batch) and
-            // `set_state` (host-side injection, which runs between run calls).
-            // So the batch boundary moves and the sampled function does not,
-            // which is exactly the "same value at the same instant" contract.
-            if self.lazy_ports_386 && !io_touched_before_read {
+            // are `charge` (the 0x201 WRITE) and `set_state` (host-side
+            // injection, which the worker drains BETWEEN `machine.run` slices, a
+            // coarser boundary than a batch, so no batch boundary can reorder a
+            // button edge).
+            //
+            // The arm keys on DEVICE STATE, not on the persona switch, because
+            // the persona is not what makes the read time-independent -- an idle
+            // monostable is. `charge(now)` writes deadlines at least
+            // `now + RC_BASE_NS`, so any read later in the same batch is still
+            // before them, `is_idle` is false, and a charged axis takes today's
+            // batch-ending path by construction. A mid-pulse read with a stick
+            // attached is genuinely time-dependent and is served exactly as
+            // before. What is left -- no stick, or both one-shots long expired --
+            // is a constant function of state that no device advance can move.
+            //
+            // `!io_touched_before_read` stays: it is what stops this read from
+            // clearing a flag that some EARLIER access in the same batch set.
+            if self.gameport.is_idle(self.guest_tick_now()) && !io_touched_before_read {
                 *self.io_touched = false;
             }
             return Ok(u32::from(self.gameport.read(self.guest_tick_now())));

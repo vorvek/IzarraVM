@@ -91,6 +91,19 @@ impl GamePort {
             .map_or(0xff, |state| 0xf0 & !((state.buttons & 0x03) << 4))
     }
 
+    /// True when nothing about a `read` at `now` is time-dependent: either no
+    /// stick is attached (so the one-shots can never fire and the deadlines are
+    /// held at zero by `set_state`/`charge`) or both monostables have already
+    /// discharged. The button lines are host-event state, not time state, so
+    /// they are not part of this question.
+    ///
+    /// This is the whole precondition for serving a gameport read without
+    /// ending the CPU batch; see the caller in `MachineBus::read_io`.
+    pub(crate) fn is_idle(&self, now: u64) -> bool {
+        self.state.is_none()
+            || (now >= self.discharge_deadlines[0] && now >= self.discharge_deadlines[1])
+    }
+
     pub(crate) fn bios_axes(&self) -> (u16, u16) {
         self.state
             .map(|state| (u16::from(state.x), u16::from(state.y)))

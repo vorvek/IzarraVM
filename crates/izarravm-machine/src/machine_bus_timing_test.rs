@@ -3211,7 +3211,10 @@ fn the_386_lazy_switch_stops_the_poll_ports_ending_the_batch() {
     // its batch on EVERY read, which is why a PoP-386 run spent 1.16M batch
     // entries to answer 934k 3DA polls. Each arm is checked for both states of
     // the switch in the same test, so neither direction can rot into vacuity.
-    for port in [0x3DA_u16, 0x61, 0x201] {
+    // 0x201 is deliberately NOT in this list. The gameport arm was moved off
+    // the persona switch and onto the RC one-shots' own state; both of its
+    // directions are pinned by the `a_gameport_read_*` tests below.
+    for port in [0x3DA_u16, 0x61] {
         for lazy in [false, true] {
             let mut machine = accurate_machine_with_joystick();
             let touched = with_bus(&mut machine, |bus| {
@@ -3227,6 +3230,96 @@ fn the_386_lazy_switch_stops_the_poll_ports_ending_the_batch() {
             );
         }
     }
+}
+
+/// Q2b, both directions of the one gate that decides them. A charged one-shot
+/// is genuinely time-dependent, so its read must keep ending the batch; an idle
+/// one is a constant function of state, so its read must not. The gate is
+/// device state, so the assertion is made on BOTH personas -- the Approximate
+/// class is where wolf3d runs and the Accurate class must not diverge.
+#[test]
+fn a_gameport_read_ends_the_batch_only_while_a_one_shot_is_charged() {
+    for mode in [GswMode::Gsw386, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        machine.set_joystick_state(Some(JoystickState {
+            x: 0x80,
+            y: 0x40,
+            buttons: 0,
+        }));
+        machine.run_cycles(5_000).unwrap();
+        let (mid_pulse, mid_touched, late, late_touched) = with_bus(&mut machine, |bus| {
+            // The guest arms the one-shots, then samples. Clear the flag the
+            // WRITE set so the reads below are the only thing under test.
+            bus.write_io(0x201, BusWidth::Byte, 0, false).unwrap();
+            *bus.io_touched = false;
+            let mid_pulse = bus.read_io(0x201, BusWidth::Byte, 0, false).unwrap();
+            let mid_touched = *bus.io_touched;
+            *bus.io_touched = false;
+            // Far past both deadlines: 0x80 on X is ~0.58 ms, and 4M clocks at
+            // either tier is well beyond that.
+            let late = bus
+                .read_io(0x201, BusWidth::Byte, 4_000_000, false)
+                .unwrap();
+            (mid_pulse, mid_touched, late, *bus.io_touched)
+        });
+        assert_eq!(
+            mid_pulse & 0x03,
+            0x03,
+            "{mode:?}: the sampled value must still be time-dependent mid-pulse"
+        );
+        assert!(
+            mid_touched,
+            "{mode:?}: a mid-pulse gameport read must end the batch"
+        );
+        assert_eq!(
+            late & 0x03,
+            0x00,
+            "{mode:?}: both one-shots have discharged by 4M clocks"
+        );
+        assert!(
+            !late_touched,
+            "{mode:?}: an idle gameport read must not end the batch"
+        );
+    }
+}
+
+/// The `!io_touched_before_read` half of the guard, which the lazy arm shares
+/// with every other lazy port: going lazy may only take back a flag THIS read
+/// set, never one an earlier access in the same batch set.
+#[test]
+fn an_idle_gameport_read_never_clears_an_earlier_accesss_batch_end() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    let touched = with_bus(&mut machine, |bus| {
+        // An earlier device access in this batch. No stick is attached, so the
+        // gameport read that follows is idle and would otherwise go lazy.
+        bus.write_io(0x43, BusWidth::Byte, 0x36, false).unwrap();
+        assert!(*bus.io_touched, "the PIT write must end the batch");
+        bus.read_io(0x201, BusWidth::Byte, 0, false).unwrap();
+        *bus.io_touched
+    });
+    assert!(
+        touched,
+        "an idle gameport read must not take back the PIT write's batch end"
+    );
+}
+
+/// The absent-stick case, which is what every headless fixture actually runs:
+/// no stick means no one-shot can ever charge, so every read is idle.
+#[test]
+fn a_gameport_read_with_no_stick_attached_is_always_idle() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    let (value, touched) = with_bus(&mut machine, |bus| {
+        // Even after an arming write, which cannot charge what is not there.
+        bus.write_io(0x201, BusWidth::Byte, 0, false).unwrap();
+        *bus.io_touched = false;
+        let value = bus.read_io(0x201, BusWidth::Byte, 0, false).unwrap();
+        (value, *bus.io_touched)
+    });
+    assert_eq!(value, 0xff, "an open connector floats every line high");
+    assert!(!touched, "an absent stick is idle, so the read goes lazy");
 }
 
 #[test]
