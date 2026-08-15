@@ -1937,6 +1937,10 @@ fn write_hdd_profile_json(
         report["direct_callout_attribution"] =
             direct_callout_attribution_json(machine.cpu().direct_callout_attribution_snapshot());
     }
+    #[cfg(feature = "smc-census")]
+    {
+        report["smc_census"] = smc_census_json(machine.cpu().direct_smc_census_snapshot(), perf);
+    }
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
 }
@@ -2158,6 +2162,273 @@ fn direct_link_refusal_census_json(
                 "count": count,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
+    })
+}
+
+/// Stage A of the SMC census. Design `dev_docs/smc-census-design.md` §3/§4/§8 layer 1, cut by the
+/// adversarial review of 2026-08-15.
+///
+/// The closure asserts below are the instrument's Gate D: an instrument that does not close is
+/// not evidence, so a mismatch panics rather than warning. They are `assert!`, not
+/// `debug_assert!`, and they run on the release binary that produces the census.
+#[cfg(feature = "smc-census")]
+fn smc_census_json(
+    snapshot: Option<izarravm_cpu::DirectSmcCensusSnapshot>,
+    perf: &izarravm_cpu::PerfCounters,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    let whole = &snapshot.whole_run;
+    let units = whole.units;
+
+    // Closures against the always-on production counters. These are the four the design names.
+    assert_eq!(
+        units.scan_calls, perf.smc_scan_calls,
+        "SMC census scan calls did not close against perf.smc_scan_calls"
+    );
+    assert_eq!(
+        units.keys_scanned, perf.smc_scan_keys,
+        "SMC census scanned keys did not close against perf.smc_scan_keys"
+    );
+    assert_eq!(
+        units.lane_accept_keys, perf.smc_lane_accepts,
+        "SMC census lane accepts did not close against perf.smc_lane_accepts"
+    );
+    assert_eq!(
+        units.choke_block_only + units.choke_both,
+        perf.smc_scan_calls,
+        "SMC census 2x2 block-scan column did not close against perf.smc_scan_calls"
+    );
+
+    smc_census_assert_phase_closed(whole);
+    smc_census_assert_phase_closed(&snapshot.windowed);
+
+    json!({
+        "schema": "izarravm-smc-census-v1",
+        "stage": "A",
+        "window": snapshot.window.map(|(start, end)| json!([start, end])),
+        "clock_instructions": snapshot.clock,
+        // Review finding M11: R0's SMC_wall is NOT derivable from this instrument. Stage A carries
+        // no sampled timer, so the only source is an external RIP-sample profile of a census-OFF
+        // build. R6's shares are shares of measured WORK UNITS inside the invalidation choke; the
+        // two are multiplied, never equated.
+        "r0_smc_wall_source": "external RIP-sample profile (samply) of a census-off release build",
+        "phases": [
+            smc_census_phase_json(whole),
+            smc_census_phase_json(&snapshot.windowed),
+        ],
+    })
+}
+
+#[cfg(feature = "smc-census")]
+fn smc_census_assert_phase_closed(phase: &izarravm_cpu::DirectSmcCensusPhase) {
+    let units = phase.units;
+    assert_eq!(
+        units.choke_calls,
+        units.choke_block_only + units.choke_narrow_only + units.choke_both + units.choke_neither,
+        "SMC census choke 2x2 did not close"
+    );
+    assert_eq!(
+        units.scan_calls,
+        units.scan_calls_no_kill + units.scan_calls_lane_only + units.scan_calls_kill,
+        "SMC census scan-call split did not close"
+    );
+    assert_eq!(
+        units.keys_scanned,
+        units.keys_no_kill + units.keys_lane_only + units.keys_kill,
+        "SMC census scan-key split did not close"
+    );
+    assert_eq!(
+        units.keys_scanned, units.window_len_sum,
+        "SMC census window lengths did not sum to the scanned keys"
+    );
+    // Every key in the window took exactly one of four exits: the `entries` lookup missed, it did
+    // not overlap, it was claimed by a lane, or it died.
+    assert_eq!(
+        units.keys_scanned,
+        units.entries_get_misses
+            + units.keys_surviving
+            + units.lane_accept_keys
+            + units.keys_killed,
+        "SMC census per-key exits did not close"
+    );
+    assert_eq!(
+        units.survivors_moved,
+        units.keys_surviving + units.lane_accept_keys,
+        "SMC census survivor moves did not close"
+    );
+    assert_eq!(
+        units.page_visits,
+        units.page_removes + units.page_absent,
+        "SMC census page visits did not close"
+    );
+    assert_eq!(
+        units.page_removes,
+        units.page_reinserts + units.page_dropped_empty,
+        "SMC census page round trip did not close"
+    );
+    assert_eq!(
+        units.window_searches, units.page_removes,
+        "SMC census window searches did not match present pages"
+    );
+    // `remove_waiting_sources` runs exactly twice per effective unlink (direct.rs, both call
+    // sites in `unlink_block`), and `unlink_block` has exactly one caller, `retire_block`.
+    assert_eq!(
+        units.waiting_retain_calls,
+        2 * units.unlink_calls_effective,
+        "SMC census waiting-retain passes did not close against effective unlinks"
+    );
+    assert_eq!(
+        units.unlink_calls, units.retire_calls_effective,
+        "SMC census unlink calls did not close against effective retires"
+    );
+    assert_eq!(
+        units.unlink_calls_effective, units.unlink_calls,
+        "SMC census saw an ineffective unlink, which retire_block cannot produce"
+    );
+
+    // Exact page totals, not the Space-Saving row sum: displacement makes the row sum an upper
+    // bound, so only these close.
+    let totals = phase.page_totals;
+    assert_eq!(totals.page_visits, units.page_removes);
+    assert_eq!(totals.keys_scanned, units.keys_scanned);
+    assert_eq!(totals.keys_killed, units.keys_killed);
+    assert_eq!(totals.keys_surviving, units.keys_surviving);
+    assert_eq!(totals.lane_accepts, units.lane_accept_keys);
+    assert_eq!(totals.page_keys_len_sum, units.page_keys_len_sum);
+
+    let mut previous = u64::MAX;
+    let mut lower_sum = 0u64;
+    for row in &phase.pages {
+        assert!(
+            row.counts.keys_killed <= previous,
+            "SMC census page rows are not ranked by keys_killed"
+        );
+        previous = row.counts.keys_killed;
+        assert!(row.error.keys_killed <= row.counts.keys_killed);
+        assert!(row.error.keys_scanned <= row.counts.keys_scanned);
+        assert!(row.error.page_visits <= row.counts.page_visits);
+        lower_sum += row.counts.keys_killed - row.error.keys_killed;
+    }
+    assert!(
+        lower_sum <= totals.keys_killed,
+        "SMC census page lower bounds exceeded the exact kill total"
+    );
+    assert!(phase.pages.len() as u64 <= u64::from(phase.page_rows_capacity));
+    assert_eq!(
+        phase.page_slot_claims,
+        phase.pages.len() as u64 + phase.page_displacements,
+        "SMC census slot claims did not close against rows plus displacements"
+    );
+}
+
+#[cfg(feature = "smc-census")]
+fn smc_census_page_counts_json(
+    counts: izarravm_cpu::DirectSmcCensusPageCounts,
+) -> serde_json::Value {
+    json!({
+        "page_visits": counts.page_visits,
+        "keys_scanned": counts.keys_scanned,
+        "keys_killed": counts.keys_killed,
+        "keys_surviving": counts.keys_surviving,
+        "lane_accepts": counts.lane_accepts,
+        "no_kill_visits": counts.no_kill_visits,
+        "page_keys_len_sum": counts.page_keys_len_sum,
+    })
+}
+
+#[cfg(feature = "smc-census")]
+fn smc_census_phase_json(phase: &izarravm_cpu::DirectSmcCensusPhase) -> serde_json::Value {
+    let u = phase.units;
+    let totals = phase.page_totals;
+    // R1's input: the top-four share, computed from LOWER bounds (design §9.5).
+    let top4_lower: u64 = phase
+        .pages
+        .iter()
+        .take(4)
+        .map(|row| row.counts.keys_killed - row.error.keys_killed)
+        .sum();
+    let kills = totals.keys_killed;
+    let ratio = |numerator: u64, denominator: u64| {
+        if denominator == 0 {
+            serde_json::Value::Null
+        } else {
+            json!(numerator as f64 / denominator as f64)
+        }
+    };
+    json!({
+        "label": phase.label,
+        "units": {
+            "choke_calls": u.choke_calls,
+            "choke_block_only": u.choke_block_only,
+            "choke_narrow_only": u.choke_narrow_only,
+            "choke_both": u.choke_both,
+            "choke_neither": u.choke_neither,
+            "choke_wholesale": u.choke_wholesale,
+            "scan_calls": u.scan_calls,
+            "scan_calls_no_kill": u.scan_calls_no_kill,
+            "scan_calls_lane_only": u.scan_calls_lane_only,
+            "scan_calls_kill": u.scan_calls_kill,
+            "scan_calls_absent_page": u.scan_calls_absent_page,
+            "keys_no_kill": u.keys_no_kill,
+            "keys_lane_only": u.keys_lane_only,
+            "keys_kill": u.keys_kill,
+            "keys_surviving_in_kill_calls": u.keys_surviving_in_kill_calls,
+            "page_visits": u.page_visits,
+            "page_removes": u.page_removes,
+            "page_absent": u.page_absent,
+            "page_reinserts": u.page_reinserts,
+            "page_dropped_empty": u.page_dropped_empty,
+            "window_searches": u.window_searches,
+            "page_keys_len_sum": u.page_keys_len_sum,
+            "window_len_sum": u.window_len_sum,
+            "keys_scanned": u.keys_scanned,
+            "entries_get_misses": u.entries_get_misses,
+            "keys_killed": u.keys_killed,
+            "keys_surviving": u.keys_surviving,
+            "lane_accept_keys": u.lane_accept_keys,
+            "survivors_moved": u.survivors_moved,
+            "drain_calls": u.drain_calls,
+            "drain_elements": u.drain_elements,
+            "waiting_retain_calls": u.waiting_retain_calls,
+            "waiting_map_len_sum": u.waiting_map_len_sum,
+            "waiting_sources_visited": u.waiting_sources_visited,
+            "waiting_entries_dropped": u.waiting_entries_dropped,
+            "retire_calls": u.retire_calls,
+            "retire_calls_effective": u.retire_calls_effective,
+            "unlink_calls": u.unlink_calls,
+            "unlink_calls_effective": u.unlink_calls_effective,
+            "inbound_links_walked": u.inbound_links_walked,
+            "inbound_links_reparked": u.inbound_links_reparked,
+            "decode_dependency_slots": u.decode_dependency_slots,
+            "release_range_bytes": u.release_range_bytes,
+        },
+        "page_totals": smc_census_page_counts_json(totals),
+        "page_rows_capacity": phase.page_rows_capacity,
+        "page_slot_claims": phase.page_slot_claims,
+        "page_displacements": phase.page_displacements,
+        "pages": phase.pages.iter().map(|row| json!({
+            "page": row.page,
+            "physical_base": u64::from(row.page) << 12,
+            "counts": smc_census_page_counts_json(row.counts),
+            "error": smc_census_page_counts_json(row.error),
+        })).collect::<Vec<_>>(),
+        "derived": {
+            // R1. Lower-bound top-four share. Review finding M2: the worst-case per-row deflation
+            // is kills / 64, so an S4 landing inside [0.60, 0.66] is INSIDE the error band and
+            // must be read as R1's middle arm, not the licensing arm.
+            "r1_s4_lower": ratio(top4_lower, kills),
+            "r1_space_saving_error_bound": ratio(kills, u64::from(phase.page_rows_capacity)),
+            // R2. Review finding M7: W is surviving keys over scanned keys, not the no-kill call
+            // key sum, because a killing call also scans survivors a presence filter would elide.
+            "r2_w_surviving": ratio(u.keys_surviving, u.keys_scanned),
+            "r2_w_no_kill_calls": ratio(u.keys_no_kill, u.keys_scanned),
+            // R6 inputs are unit counts, not shares; the report converts them.
+            "mean_page_occupancy": ratio(u.page_keys_len_sum, u.page_removes),
+            "mean_window_length": ratio(u.window_len_sum, u.page_removes),
+            "mean_waiting_map_len": ratio(u.waiting_map_len_sum, u.waiting_retain_calls),
+        },
     })
 }
 
