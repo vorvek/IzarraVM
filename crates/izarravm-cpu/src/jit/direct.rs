@@ -724,6 +724,20 @@ struct HotEntry {
     generation: u32,
 }
 
+/// What `lift_cold_smc_dormant` found. `StillDormant` is the sticky-decline memo's exact
+/// predicate: the entry was Dormant and the recovery lift did NOT fire, so the census class was
+/// `DormantProbe` and nothing about the run changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DormantLift {
+    /// The key was not Dormant at all (a plain `Rejected` span, or the cache is disabled and
+    /// synthesised the probe result).
+    NotDormant,
+    /// The entry chunk's heat stamp had aged out; the key is back to `Seen`.
+    Lifted,
+    /// Dormant, stamp still current: parked, and provably parked for the rest of this epoch.
+    StillDormant,
+}
+
 /// Result of observing a block entry. A new key is interpreted once, then becomes eligible for
 /// compilation on its next observation.
 #[derive(Debug)]
@@ -1480,16 +1494,25 @@ impl BlockCache {
     /// returns to Seen, so the next probe walks the normal admission path (both heat gates
     /// re-check). Seen rather than a remove keeps the key tracked exactly once in `physical_keys`
     /// (the `retire_key_for_recompile` transition); the stamp is consumed, one recovery per demotion.
+    ///
+    /// Returns which of the three shapes this call took. `StillDormant` is EXACTLY the predicate
+    /// the sticky-decline memo encodes — "was Dormant, did not lift"
+    /// (`dev_docs/sticky-decline-memo-design.md` §1.4) — and the entry-state test it needs is one
+    /// this function already performs, so reporting it costs nothing.
     pub(crate) fn lift_cold_smc_dormant(
         &mut self,
         heat: &mut SmcHeatMap,
         key: BlockKey,
         epoch: u32,
-    ) {
-        if matches!(self.entries.get(&key), Some(BlockState::Dormant(_)))
-            && heat.take_stale_stamp(key.physical, epoch)
-        {
+    ) -> DormantLift {
+        if !matches!(self.entries.get(&key), Some(BlockState::Dormant(_))) {
+            return DormantLift::NotDormant;
+        }
+        if heat.take_stale_stamp(key.physical, epoch) {
             self.entries.insert(key, BlockState::Seen);
+            DormantLift::Lifted
+        } else {
+            DormantLift::StillDormant
         }
     }
 

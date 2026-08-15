@@ -1697,6 +1697,63 @@ fn smc_heat_ages_out_across_epochs_and_reenables_admission() {
     assert!(!heat.chunk_hot(phys, 8));
 }
 
+/// `DormantLift` is the seam the sticky-decline memo's write site reads, and `StillDormant` is
+/// the ONLY shape it may write a memo for. This pins why, which is the part a CPU-level fixture
+/// cannot show: the loop programs those fixtures drive carry no SMC heat, so `Lifted` never
+/// arises in them and a write site widened to `!= NotDormant` would pass the whole battery.
+///
+/// A memo written after a `Lifted` would be flatly wrong: the key is `Seen` by then, so the full
+/// chain's next verdict is `BlockProbe::Compile`, not a decline at all.
+#[test]
+fn lift_cold_smc_dormant_reports_which_of_its_three_shapes_it_took() {
+    let mut cache = BlockCache::default();
+    let mut heat = SmcHeatMap::default();
+
+    // Absent, then Seen: not Dormant either way, so there is nothing to memoise.
+    let seen = key(0x2000);
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, seen, 0),
+        DormantLift::NotDormant
+    );
+    assert!(matches!(cache.probe(seen), BlockProbe::Interpret));
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, seen, 0),
+        DormantLift::NotDormant
+    );
+
+    // Dormant with no heat stamp (compile Retry, G4 cover failure): parked, and parked again.
+    cache.dormant(seen, DormantReason::CompileRetry);
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, seen, 0),
+        DormantLift::StillDormant
+    );
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, seen, 0),
+        DormantLift::StillDormant,
+        "a failing lift must not mutate, or the memo's zero-staleness proof loses its footing"
+    );
+
+    // Dormant WITH a heat stamp: still parked inside the stamping epoch, lifted in the next one.
+    let hot = key(0x3000);
+    assert!(matches!(cache.probe(hot), BlockProbe::Interpret));
+    cache.demote_smc_hot(&mut heat, hot, 7);
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, hot, 7),
+        DormantLift::StillDormant,
+        "inside the stamping epoch the lift provably cannot fire; that is what the memo replays"
+    );
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, hot, 8),
+        DormantLift::Lifted,
+        "a later epoch ages the stamp out and the key returns to Seen"
+    );
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, hot, 8),
+        DormantLift::NotDormant,
+        "and the key is Seen now — which is exactly why no memo may be written for a Lifted"
+    );
+}
+
 #[test]
 fn smc_heat_span_hot_only_flags_overlapping_chunks() {
     let mut heat = SmcHeatMap::default();
