@@ -1815,11 +1815,19 @@ pub struct DirectSmcCensusPageCounts {
     pub keys_killed: u64,
     pub keys_surviving: u64,
     pub lane_accepts: u64,
+    /// Page visits whose key scan killed nothing — Q2's per-page question, which the per-call
+    /// split cannot answer because one call can span two pages and kill on only one of them.
     pub no_kill_visits: u64,
     pub page_keys_len_sum: u64,
 }
 
 /// One Space-Saving row. The true value of every column lies in `[count - error, count]`.
+///
+/// `keys_killed` is the RANKED column and is the only one Space-Saving's guarantee covers end to
+/// end. The other six are CONTEXT: they accumulate only while the page is resident in the table,
+/// and the stream admits a page on its first killing visit, so any visit before that is missing
+/// from them. Never compute a per-page rate from a row; the phase's `page_totals` is the complete
+/// figure and is what the closure asserts run against.
 #[cfg(feature = "smc-census")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectSmcCensusPageRow {

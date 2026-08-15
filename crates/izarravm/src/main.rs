@@ -2297,6 +2297,23 @@ fn smc_census_assert_phase_closed(phase: &izarravm_cpu::DirectSmcCensusPhase) {
     assert_eq!(totals.keys_surviving, units.keys_surviving);
     assert_eq!(totals.lane_accepts, units.lane_accept_keys);
     assert_eq!(totals.page_keys_len_sum, units.page_keys_len_sum);
+    // `no_kill_visits` has no independent counter to close against, which is exactly how it sat
+    // dead — declared, summed and exported as a false zero — through the first review. Bound it
+    // on both sides instead. Killing page VISITS are `page_removes - no_kill_visits`; every
+    // killing CALL contains at least one of them, and each one kills at least one key. A dead
+    // counter reads `page_removes - 0`, which blows the upper bound by orders of magnitude.
+    let killing_visits = units
+        .page_removes
+        .checked_sub(totals.no_kill_visits)
+        .expect("SMC census counted more no-kill page visits than page visits");
+    assert!(
+        killing_visits >= units.scan_calls_kill,
+        "SMC census found fewer killing page visits than killing calls"
+    );
+    assert!(
+        killing_visits <= units.keys_killed,
+        "SMC census found more killing page visits than killed keys"
+    );
 
     let mut previous = u64::MAX;
     let mut lower_sum = 0u64;

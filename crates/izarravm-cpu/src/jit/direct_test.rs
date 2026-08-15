@@ -1493,10 +1493,58 @@ fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
     );
     assert_eq!(snapshot.whole_run.page_displacements, 0);
     assert_eq!(snapshot.whole_run.page_totals.keys_killed, 1);
+    // Two page visits, one of which killed nothing. Pinned to the exact value, not to a range: a
+    // never-incremented `no_kill_visits` reads zero and every range assert would have passed.
+    assert_eq!(snapshot.whole_run.page_totals.no_kill_visits, 1);
+    assert_eq!(snapshot.whole_run.page_totals.page_visits, 2);
+    // ...and the ROW says zero, which is correct and is the trap this assert exists to pin. The
+    // Space-Saving stream is kill events, so page 0x70 was not admitted until the visit that
+    // killed; its context columns count only visits made WHILE RESIDENT. Only `page_totals` is
+    // complete. Never compute a per-page rate from a row's context columns.
+    assert_eq!(top.counts.no_kill_visits, 0);
+    assert_eq!(top.counts.page_visits, 1);
+    // The windowed phase saw only the killing visit, so there both agree.
+    assert_eq!(snapshot.windowed.page_totals.no_kill_visits, 0);
+    assert_eq!(snapshot.windowed.page_totals.page_visits, 1);
     assert!(
         cache.clone().smc_census_snapshot().is_none(),
         "a lockstep clone must not double-count its parent"
     );
+}
+
+/// An armed census with NO pinned window has no windowed phase, and events that arrive before the
+/// write choke has ever stashed a clock must not invent one. `set_clock` is reachable only from
+/// the choke, so the initial `in_window` is the only thing standing between a pre-choke retire and
+/// a phase the run never asked for.
+#[cfg(all(
+    feature = "smc-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn smc_census_without_a_window_leaves_its_windowed_phase_empty() {
+    let mut cache = BlockCache::default();
+    cache.enable_smc_census_for_test(None);
+    let key = BlockKey::new(0x1000, 0x90_010, 7);
+    install_trivial(&mut cache, key, 16);
+    // Deliberately NO `smc_census_set_clock` before this: that is the pre-choke case.
+    assert_eq!(
+        cache.invalidate_physical_range(0x90_010, 4, false).blocks,
+        1
+    );
+
+    let snapshot = cache.smc_census_snapshot().expect("the census is armed");
+    assert_eq!(snapshot.window, None);
+    assert_eq!(snapshot.whole_run.units.keys_killed, 1);
+    assert_eq!(snapshot.whole_run.units.retire_calls_effective, 1);
+    assert_eq!(
+        snapshot.windowed.units,
+        Default::default(),
+        "an unpinned run must report no windowed phase at all"
+    );
+    assert!(snapshot.windowed.pages.is_empty());
 }
 
 #[test]

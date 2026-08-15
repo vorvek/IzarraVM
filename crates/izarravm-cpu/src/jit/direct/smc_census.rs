@@ -288,8 +288,12 @@ impl SmcCensus {
         Self {
             window,
             // A window that starts at 0 is live from the first write; anything else waits for the
-            // choke's first clock stash.
-            in_window: window.is_none_or(|(start, _)| start == 0),
+            // choke's first clock stash. With NO window pinned there is no windowed phase at all,
+            // so this must start FALSE: `set_clock` can only run from the write choke, and a
+            // retire or unlink reached before the first guest code write (an `install` eviction,
+            // `invalidate_translation`, `reset_storage`) would otherwise land in a phase the run
+            // never asked for.
+            in_window: window.is_some_and(|(start, _)| start == 0),
             clock: 0,
             whole: Phase::default(),
             windowed: Phase::default(),

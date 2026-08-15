@@ -1887,6 +1887,10 @@ impl BlockCache {
                 {
                     census_call.pages_present += 1;
                     census_call.keys_surviving += census_page.counts.keys_surviving;
+                    // Q2's PER-PAGE question, which the per-call split cannot answer: a call
+                    // spanning two pages can kill on one and scan the other for nothing.
+                    census_page.counts.no_kill_visits =
+                        u64::from(census_page.counts.keys_killed == 0);
                     self.note_smc_census_page(page, &census_page);
                 }
             } else {
