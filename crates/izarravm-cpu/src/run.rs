@@ -2025,11 +2025,50 @@ impl CpuGsw {
         // privilege-sensitive decision is page protection, which `call_out_stack_frame_resident`
         // makes against the LIVE CPL inside the helper and fails closed on. Refusing a PUSHAD block
         // here would cost every ring-3 protected-mode guest the lowering for nothing.
+        //
+        // GOVERNED, as of the round-2 slice. The refusal above is right for the class it was
+        // written against -- a serve that touches device state ends the run at the serving
+        // instruction anyway, so the whole spill/call/reload is bought for nothing -- but it is
+        // wrong for the class that does not: a LAZY serve (0x3DA on wolf3d, the gameport once its
+        // one-shots are idle) lets the block complete and take its static link, and refusing it
+        // costs a dispatcher round trip per poll iteration.
+        //
+        // Which class a slot is in cannot be known at compile time: `IN AL,DX` takes its port from
+        // live DX and the `MOV DX,imm` is usually in another block. So it is LEARNED, per
+        // `disp-lanes-heat-gate` and `write-side-shape-prices-admissions`: admit by measured
+        // history, never by static shape. An `Untried` block is admitted once at quota 1 and
+        // classified from that trial's whole outcome; `Lazy` is then admitted at full quota and
+        // everything else is refused exactly as before.
+        //
+        // Classification is TRIAL-ONLY. Demoting a `Lazy` block on a later step-breaking serve is
+        // not implementable: `NativeExit` carries no block id, so once a chain is running the exit
+        // reports the chain's outcome and not which hop produced it. Re-classification happens by
+        // re-trial when the epoch rolls, and by nothing else.
+        //
+        // No timing skew is possible from a misclassification. The step-break side exit is emitted
+        // per SLOT from the helper's bit 32 and is entirely governor-independent, so a block
+        // wrongly left `Lazy` still ends its run at the serving instruction. The residual is pure
+        // host cost.
+        //
+        // The epoch read stays INSIDE the slot test, so a block with no port call-out still pays
+        // exactly the one compare it paid before.
+        let mut callout_trial = false;
         if block.callout_port_slots() != 0
             && (self.is_v86_mode() || self.current_privilege_level() > self.iopl())
         {
-            self.jit_direct.note_reject_callout_privileged();
-            return Ok(DirectBlockOutcome::NotRun);
+            match self
+                .jit_direct
+                .callout_admission(block.id(), bus.jit_cost_dial_epoch())
+            {
+                jit::direct::CallOutAdmission::Lazy => {}
+                jit::direct::CallOutAdmission::Untried(_) => callout_trial = true,
+                jit::direct::CallOutAdmission::IoTouching
+                | jit::direct::CallOutAdmission::Denied
+                | jit::direct::CallOutAdmission::Unclassified => {
+                    self.jit_direct.note_reject_callout_privileged();
+                    return Ok(DirectBlockOutcome::NotRun);
+                }
+            }
         }
         let has_link = self.jit_direct.has_linked_successor(block.id());
         let data_descriptors_match = if has_link {
@@ -2164,10 +2203,26 @@ impl CpuGsw {
                 1 + additional.min(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1)
             }
         };
+        // The governor's trial runs ONE block, whatever the budget would have allowed: the point
+        // is to buy a classification at the smallest possible price, and a chain would also make
+        // the outcome unattributable (see G2). Clamping after the fact rather than short-circuiting
+        // the computation keeps `jit_direct_chain_quota_entries` and the memo reads identical to
+        // an ungoverned entry, so the trial cannot perturb the counters the gate reads.
+        let quota = if callout_trial { quota.min(1) } else { quota };
         if quota == 0 {
             self.perf.jit_direct_reject_zero_budget += 1;
             return Ok(DirectBlockOutcome::NotRun);
         }
+        if callout_trial {
+            self.jit_direct.note_callout_governor_trial();
+        }
+        // Read either side of the entry below: a block whose call-out sits behind an untaken
+        // branch serves nothing, and must not be classified from a trial that observed nothing.
+        let callout_executed_before = if callout_trial {
+            self.jit_direct.callout_executed_count()
+        } else {
+            0
+        };
 
         let uniform_fetches = bus.native_fetches_are_uniform();
         let trace_capacity = if uniform_fetches {
@@ -2230,6 +2285,9 @@ impl CpuGsw {
         );
         debug_assert!(exit.side_exit_reason <= jit::direct::SideExitReason::MAX);
         let side_exit = exit.side_exit != 0;
+        if callout_trial {
+            self.classify_callout_trial(bus, block.id(), side_exit, &exit, callout_executed_before);
+        }
 
         let final_eip = self.registers.eip;
         let cs_base = self.registers.cs().base;
@@ -2541,6 +2599,62 @@ impl CpuGsw {
         } else {
             Ok(DirectBlockOutcome::Complete(outcome))
         }
+    }
+
+    /// Leave the governor's trial: turn one quota-1 entry's outcome into this block's admission
+    /// class. See `run_direct_block`'s G2 for why the classification is trial-only.
+    ///
+    /// The rule is WHOLE-TRIAL, not per-slot, and that is load-bearing. One block may hold up to
+    /// `MAX_BLOCK_CALLOUT_SLOTS` call-outs at different ports -- nascar reads 0x201 and COM1 0x3FD
+    /// in the same loop -- so a lazy first serve followed by an io-touching second one must NOT
+    /// read as `Lazy`. It cannot: the second slot's step break is the exit reason for the whole
+    /// entry, and that is what this reads.
+    ///
+    /// A trial cut short by any OTHER side exit learned nothing about the slots it never reached,
+    /// so it stays `Untried` and spends one of its attempts, as does a trial that served nothing
+    /// at all.
+    #[cfg(feature = "jit")]
+    fn classify_callout_trial<B: CpuBus>(
+        &mut self,
+        bus: &B,
+        id: jit::direct::BlockId,
+        side_exit: bool,
+        exit: &jit::direct::NativeExit,
+        executed_before: u64,
+    ) {
+        use jit::direct::CallOutAdmission;
+        let epoch = bus.jit_cost_dial_epoch();
+        let reason = exit.side_exit_reason;
+        let state = if side_exit && reason == jit::direct::SideExitReason::CallOutAbnormal as u32 {
+            CallOutAdmission::Denied
+        } else if side_exit && reason == jit::direct::SideExitReason::CallOutStepBreak as u32 {
+            self.jit_direct.note_callout_governor_io_touching();
+            CallOutAdmission::IoTouching
+        } else if !side_exit && self.jit_direct.callout_executed_count() > executed_before {
+            self.jit_direct.note_callout_governor_lazy();
+            CallOutAdmission::Lazy
+        } else {
+            // Nothing learned. Spend an attempt, and give up after `MAX_UNTRIED_TRIALS` so the
+            // block's other instructions stop paying quota 1 for a call-out that never serves.
+            match self.jit_direct.callout_admission(id, epoch) {
+                CallOutAdmission::Untried(spent) if spent + 1 < jit::direct::MAX_UNTRIED_TRIALS => {
+                    CallOutAdmission::Untried(spent + 1)
+                }
+                _ => CallOutAdmission::Unclassified,
+            }
+        };
+        self.jit_direct.set_callout_admission(id, epoch, state);
+    }
+
+    /// The governor's learned class for one block, at the bus's live cost-dial epoch.
+    #[cfg(all(feature = "jit", test))]
+    pub(crate) fn callout_admission_for_test<B: CpuBus>(
+        &self,
+        bus: &B,
+        id: jit::direct::BlockId,
+    ) -> jit::direct::CallOutAdmission {
+        self.jit_direct
+            .callout_admission(id, bus.jit_cost_dial_epoch())
     }
 
     /// The memoised `iteration_upper` for one block, at the live persona. Pairs with

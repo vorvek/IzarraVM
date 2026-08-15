@@ -834,16 +834,17 @@ fn a_denied_port_delivers_the_same_general_protection_fault_with_the_block_insta
     assert_eq!(native_outcome.core_clocks, interp_outcome.core_clocks);
     assert_eq!(native_outcome.halted, interp_outcome.halted);
 
+    // GOVERNED as of round 2: this first pass is the governor's TRIAL, so the helper is entered
+    // once and refuses in phase P with nothing charged and nothing traced -- which is why the
+    // guest-visible identity above still holds byte for byte.
     let stalls = roles.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_governor_trials, 1);
+    assert_eq!(stalls.callout_executed, 1, "the trial reached the helper");
+    assert_eq!(stalls.side_exit_callout_abnormal, 1);
     assert_eq!(
-        stalls.reject_callout_privileged, 1,
-        "the dispatch gate must have refused the block"
+        stalls.reject_callout_privileged, 0,
+        "the trial entry itself is not a refusal"
     );
-    assert_eq!(
-        stalls.callout_executed, 0,
-        "nothing may pay for the spill, the call and the reload"
-    );
-    assert_eq!(stalls.side_exit_callout_abnormal, 0);
     // Non-vacuity: the fault really was delivered, and no device was ever addressed.
     assert_eq!(
         roles.native.registers.eip, GP_HANDLER,
@@ -858,6 +859,32 @@ fn a_denied_port_delivers_the_same_general_protection_fault_with_the_block_insta
         0xdead_beef,
         "AL must be untouched"
     );
+
+    // The steady state the dispatch gate exists for: the trial classified the block `Denied`, so
+    // every later pass is refused at head and the fault is delivered identically with nothing
+    // paying for the spill, the call and the reload.
+    for pass in 1..3 {
+        arm(&mut roles, ENTRY - 1);
+        let (native_outcome, interp_outcome) = run_loop_once(&mut roles, u64::MAX);
+        assert_eq!(
+            native_outcome.core_clocks, interp_outcome.core_clocks,
+            "pass {pass}: core clocks"
+        );
+        let stalls = roles.native.direct_stall_snapshot();
+        assert_eq!(
+            stalls.reject_callout_privileged, pass,
+            "pass {pass}: the dispatch gate must have refused the block"
+        );
+        assert_eq!(
+            stalls.callout_executed, 1,
+            "pass {pass}: nothing may pay for the spill, the call and the reload"
+        );
+        assert_eq!(stalls.callout_governor_trials, 1, "pass {pass}");
+        assert_eq!(
+            roles.native.registers.eip, GP_HANDLER,
+            "pass {pass}: the #GP must still be delivered"
+        );
+    }
     assert_eq!(
         roles.native.registers.esp(),
         STACK_TOP - 16,

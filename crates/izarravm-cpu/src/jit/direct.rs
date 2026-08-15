@@ -104,6 +104,36 @@ pub(crate) const MAX_X87_SLOTS: u8 = 8;
 /// carries; `brk_cap` byte-identity on the no-call-out fixture is the isolation that this bound
 /// does not leak into blocks that hold none.
 pub(crate) const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
+
+/// Untried entries a call-out block may spend at trial quota before the governor gives up on
+/// classifying it. A call-out behind a rarely-taken branch would otherwise sit at quota 1
+/// forever, which is a real regression for the block's OTHER instructions.
+pub(crate) const MAX_UNTRIED_TRIALS: u8 = 8;
+
+/// What the governor has learned about one block's port call-outs. See `run_direct_block`'s G2
+/// for the transitions and why classification is trial-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallOutAdmission {
+    /// Nothing learned yet, and `u8` entries already spent trying. Admitted at quota 1.
+    Untried(u8),
+    /// Every serve in the trial left the bus untouched, so the block completes and takes its
+    /// static link. Admitted at the full chain quota.
+    Lazy,
+    /// Some serve in the trial touched device state and step-broke. Refused at head, exactly as
+    /// before the governor existed.
+    IoTouching,
+    /// Some serve in the trial returned abnormal -- a denied or undecoded port. Refused at head.
+    Denied,
+    /// `MAX_UNTRIED_TRIALS` entries produced no serve at all. Normal quota, call-out still
+    /// refused at head: today's behaviour, which is the safe resting state.
+    Unclassified,
+}
+
+impl Default for CallOutAdmission {
+    fn default() -> Self {
+        Self::Untried(0)
+    }
+}
 /// Instruction bound for a block that holds ANY memory-ALU slot. It is a CODE SIZE bound, not a
 /// timing one, and it is the second half of a pair with `MAX_MEMORY_ALU_SLOTS`.
 ///
@@ -657,6 +687,14 @@ impl BlockId {
         usize::from(self.0 as u16)
     }
 
+    /// The slot this id occupies, for the one test that has to prove a slot was RECYCLED rather
+    /// than appended. Nothing outside the module may key on it: the generational identity is the
+    /// whole point of `BlockId`.
+    #[cfg(test)]
+    pub(crate) fn index_for_test(self) -> usize {
+        self.index()
+    }
+
     #[cfg(feature = "direct-link-refusal-census")]
     fn generation(self) -> u64 {
         self.0 >> Self::INDEX_BITS
@@ -769,6 +807,19 @@ pub(crate) struct BlockCache {
     /// bus cost dials `global_block_upper` reads, so it carries the same epoch key. A recycled
     /// slot is zeroed by `install`, so a stale entry cannot outlive its block.
     iteration_upper_cache: Vec<u64>,
+    /// The call-out admission governor's learned class per block, parallel to `blocks` and keyed
+    /// exactly like `iteration_upper_cache` above -- same `BlockId::index()`, same epoch, same
+    /// `install`-zeroes-a-recycled-slot discipline, and deliberately no clear in `retire_block`:
+    /// one invariant, one mechanism.
+    ///
+    /// Why it is learned and not compiled in: `IN AL,DX` takes its port from live DX, and the
+    /// `MOV DX,imm` that sets it is usually in another block, so nothing at compile time knows
+    /// which port a call-out slot will read. See `run_direct_block`'s G2 for the whole rule.
+    callout_admission: Vec<CallOutAdmission>,
+    /// The `jit_cost_dial_epoch()` `callout_admission` was learned under; see
+    /// `iteration_upper_epoch`. Rolling the epoch retries every classification, which is what
+    /// bounds how stale one can get.
+    callout_admission_epoch: u64,
     /// The shared x87 re-entry pad, in its OWN executable mapping rather than in the arena.
     /// Deliberately not a block: `reset_storage` sets `arena = None` and frees it, which would
     /// dangle every `integer_entry` published at a float block, and `compact_arena` relocates
@@ -866,6 +917,8 @@ impl BlockCache {
             outbound: Vec::new(),
             global_block_upper_cache: [0; 2],
             iteration_upper_cache: Vec::new(),
+            callout_admission: Vec::new(),
+            callout_admission_epoch: 0,
             x87_pad: None,
             store_stub_pad: None,
             read_stub_pad: None,
@@ -1111,6 +1164,7 @@ impl BlockCache {
             self.block_link_epochs.push(0);
             self.block_active.push(true);
             self.iteration_upper_cache.push(0);
+            self.callout_admission.push(CallOutAdmission::default());
             if index == self.block_decode_slots.len() {
                 self.block_decode_slots.push(Vec::new());
             } else {
@@ -1131,6 +1185,8 @@ impl BlockCache {
             self.block_active[index] = true;
             // A recycled slot must not serve the retired occupant's cost bound to its successor.
             self.iteration_upper_cache[index] = 0;
+            // Nor its learned call-out class, for the same reason.
+            self.callout_admission[index] = CallOutAdmission::default();
         }
         #[cfg(feature = "direct-link-refusal-census")]
         self.register_direct_link_refusal_cells(id, compilation.emitted_static_targets);
@@ -1303,6 +1359,55 @@ impl BlockCache {
             .unwrap_or(0)
     }
 
+    /// The governor's class for one block, valid only under `epoch`. A stale epoch, a block that
+    /// was never installed and a recycled slot all read `Untried(0)` -- the same miss-means-retry
+    /// default `iteration_upper_cached` uses, and the reason no clear belongs in `retire_block`.
+    pub(crate) fn callout_admission(&self, id: BlockId, epoch: u64) -> CallOutAdmission {
+        if self.callout_admission_epoch != epoch {
+            return CallOutAdmission::default();
+        }
+        self.active_index(id)
+            .and_then(|index| self.callout_admission.get(index).copied())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_callout_admission(
+        &mut self,
+        id: BlockId,
+        epoch: u64,
+        state: CallOutAdmission,
+    ) {
+        if self.callout_admission_epoch != epoch {
+            self.callout_admission.fill(CallOutAdmission::default());
+            self.callout_admission_epoch = epoch;
+        }
+        let Some(index) = self.active_index(id) else {
+            return;
+        };
+        if let Some(slot) = self.callout_admission.get_mut(index) {
+            *slot = state;
+        }
+    }
+
+    pub(crate) fn note_callout_governor_trial(&mut self) {
+        self.stalls.callout_governor_trials += 1;
+    }
+
+    pub(crate) fn note_callout_governor_lazy(&mut self) {
+        self.stalls.callout_governor_lazy += 1;
+    }
+
+    pub(crate) fn note_callout_governor_io_touching(&mut self) {
+        self.stalls.callout_governor_io_touching += 1;
+    }
+
+    /// Every call-out the helper has entered so far. The governor reads it either side of one
+    /// trial entry to learn whether the trial served anything at all; a block whose call-out sits
+    /// behind an untaken branch serves nothing and must not classify from that.
+    pub(crate) fn callout_executed_count(&self) -> u64 {
+        self.stalls.callout_executed
+    }
+
     pub(crate) fn set_iteration_upper_cached(&mut self, id: BlockId, epoch: u64, value: u64) {
         if self.iteration_upper_epoch != epoch {
             self.iteration_upper_cache.fill(0);
@@ -1402,6 +1507,7 @@ impl BlockCache {
         // miscompiled quota.
         self.global_block_upper_cache = [0; 2];
         self.iteration_upper_cache.fill(0);
+        self.callout_admission.fill(CallOutAdmission::default());
         // CS reloads and monitor transitions can invalidate code millions of times while the
         // direct cache is unused. Avoid clearing the 65,536-entry hot table when it is already
         // empty.
@@ -2175,6 +2281,7 @@ impl BlockCache {
         }
         self.block_link_epochs.clear();
         self.iteration_upper_cache.clear();
+        self.callout_admission.clear();
         watch.clear();
         // Every storage reset drops heat; the owner of the hoisted map observes this counter.
         self.heat_resets = self.heat_resets.wrapping_add(1);

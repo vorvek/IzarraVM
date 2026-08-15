@@ -434,6 +434,17 @@ pub(crate) struct DirectStallTally {
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
     pub reject_callout_privileged: u64,
+    /// The call-out admission governor, three counters that price it without a new instrument.
+    ///
+    /// `trials` is entries admitted at trial quota 1 -- the governor's whole cost, one
+    /// spill/call/serve/reload/side-exit per call-out block per epoch. `lazy` and `io_touching`
+    /// are the classifications those trials reached. `trials - lazy - io_touching` is the rest:
+    /// abnormal serves (`Denied`), trials that served nothing, and the truncated ones that
+    /// learned nothing; the abnormal share is already visible in
+    /// `side_exit_callout_abnormal`.
+    pub callout_governor_trials: u64,
+    pub callout_governor_lazy: u64,
+    pub callout_governor_io_touching: u64,
     /// Dispatcher entries whose HEAD block was barred from publishing successors because it
     /// overwrites a segment register, and the instructions those entries retired.
     ///
@@ -1575,6 +1586,9 @@ impl crate::jit::JitState {
             callout_executed: self.stalls.callout_executed,
             callout_port_v86_served: self.stalls.callout_port_v86_served,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
+            callout_governor_trials: self.stalls.callout_governor_trials,
+            callout_governor_lazy: self.stalls.callout_governor_lazy,
+            callout_governor_io_touching: self.stalls.callout_governor_io_touching,
             segment_write_block_head_entries: self.stalls.segment_write_block_head_entries,
             segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
             lane_trials: self.stalls.lane_trials,

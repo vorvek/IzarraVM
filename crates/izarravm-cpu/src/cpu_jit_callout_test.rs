@@ -1051,6 +1051,10 @@ fn a_call_out_block_is_not_entered_at_all_in_the_privileged_port_state() {
     //
     // `NotRun`, not an abnormal exit: nothing native runs, no call-out is executed, no side exit
     // is recorded.
+    //
+    // GOVERNED as of round 2, which moves the boundary by exactly ONE entry: the first entry is
+    // the governor's trial, and it is what LEARNS that this port is denied. From the second entry
+    // on the gate is the pre-governor refusal, and that is the steady state this pins.
     let (mut fixture, _, _) = slot_block_with(
         |bus| {
             bus.lazy_io_reads = true;
@@ -1063,30 +1067,44 @@ fn a_call_out_block_is_not_entered_at_all_in_the_privileged_port_state() {
             cpu.tr.limit = 0;
         },
     );
-
-    let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    // Spend the trial. `an_abnormal_trial_denies_the_block` is what asserts its outcome.
     assert!(
-        !fixture
+        fixture
             .cpu
             .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
-            .unwrap(),
-        "the block must not be entered at all"
+            .unwrap()
     );
+    rearm_governor_block(&mut fixture);
 
-    assert_eq!(
-        fixture.cpu.perf_counters().jit_direct_insns - retired,
-        0,
-        "nothing may retire natively"
-    );
-    assert_eq!(fixture.cpu.registers.eax(), 0xdead_beef, "AL untouched");
-    assert_eq!(fixture.cpu.elapsed_clocks, 0);
-    let stalls = fixture.cpu.direct_stall_snapshot();
-    assert_eq!(stalls.reject_callout_privileged, 1);
-    assert_eq!(
-        stalls.callout_executed, 0,
-        "the helper must never be reached, so nothing pays for the spill/call/reload"
-    );
-    assert_eq!(stalls.side_exit_callout_abnormal, 0);
+    let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    let executed = fixture.cpu.direct_stall_snapshot().callout_executed;
+    for entry in 1..4 {
+        rearm_governor_block(&mut fixture);
+        assert!(
+            !fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap(),
+            "entry {entry}: the block must not be entered at all"
+        );
+        assert_eq!(
+            fixture.cpu.perf_counters().jit_direct_insns - retired,
+            0,
+            "entry {entry}: nothing may retire natively"
+        );
+        assert_eq!(
+            fixture.cpu.registers.eax(),
+            0xdead_beef,
+            "entry {entry}: AL untouched"
+        );
+        assert_eq!(fixture.cpu.elapsed_clocks, 0, "entry {entry}");
+        let stalls = fixture.cpu.direct_stall_snapshot();
+        assert_eq!(stalls.reject_callout_privileged, entry, "entry {entry}");
+        assert_eq!(
+            stalls.callout_executed, executed,
+            "entry {entry}: the helper must never be reached, so nothing pays for the              spill/call/reload"
+        );
+    }
 }
 
 #[test]
@@ -1104,6 +1122,14 @@ fn a_call_out_block_runs_again_once_the_privilege_state_clears() {
             cpu.tr.limit = 0;
         },
     );
+    // The trial, then the governed refusal it earns.
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    rearm_governor_block(&mut fixture);
     assert!(
         !fixture
             .cpu
@@ -1112,7 +1138,9 @@ fn a_call_out_block_runs_again_once_the_privilege_state_clears() {
     );
 
     // IOPL 3 lets a CPL-3 task reach ports without the bitmap, which is the interpreter's own
-    // early-return condition.
+    // early-return condition -- and it is checked BEFORE the governor, so a `Denied` class does
+    // not follow the block into a privilege state the gate does not govern.
+    rearm_governor_block(&mut fixture);
     fixture.cpu.registers.eflags |= 3 << 12;
     assert!(
         fixture
@@ -1123,7 +1151,10 @@ fn a_call_out_block_runs_again_once_the_privilege_state_clears() {
     );
     let stalls = fixture.cpu.direct_stall_snapshot();
     assert_eq!(stalls.reject_callout_privileged, 1);
-    assert_eq!(stalls.callout_executed, 1);
+    assert_eq!(
+        stalls.callout_executed, 2,
+        "the trial's refused call-out and the permitted one"
+    );
     assert_eq!(fixture.cpu.registers.eax() & 0xff, 0x5a);
 }
 
@@ -1656,4 +1687,421 @@ fn an_esp_wrap_pushad_is_refused_with_zero_partial_effects() {
 
     assert!(status < 0, "a wrapping frame must be refused");
     assert_no_partial_effects(&cpu, &bus, &before, "ESP wrap");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The call-out admission governor (run.rs G2). Each transition of the state machine is driven
+// through `run_direct_block` on a real compiled block, and each one is asserted to CHANGE what
+// the next entry does -- a governor whose classifications never reached the gate would pass a
+// test that only read the counters.
+// ---------------------------------------------------------------------------------------------
+
+/// A TSS placed above the fixture's stack, inside the fixture's zeroed RAM. `io_base` reads 0 and
+/// every bitmap byte reads 0, so the bitmap PERMITS `PORT` -- which is what lets a CPL-3 / IOPL-0
+/// block reach a real serve instead of the `#GP` the zero-limit TSS produces.
+const GOVERNOR_TSS_BASE: u32 = 0x4800;
+const GOVERNOR_TSS_LIMIT: u32 = 0x200;
+
+/// `slot_block`'s block, generalised over its instruction list and compiled in the state G2
+/// governs. `insns` is the exact set primed into the decode cache and therefore the exact set the
+/// compile walk takes; a `HLT` is appended as the terminator and left unprimed.
+fn governor_block(
+    insns: &[&[u8]],
+    configure: impl Fn(&mut TestBus),
+    configure_cpu: impl Fn(&mut CpuGsw),
+) -> Fixture {
+    let mut code = Vec::new();
+    let mut starts = Vec::new();
+    for insn in insns {
+        starts.push(ENTRY + code.len() as u32);
+        code.extend_from_slice(insn);
+    }
+    code.push(0xf4);
+
+    let mut memory = vec![0u8; 0x5000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    configure(&mut bus);
+
+    // Privilege state is sealed into the block at compile time (`memory_cpl3`), so it has to be
+    // set before the compile and not merely before the run.
+    cpu.cpl = 3;
+    cpu.tr.base = GOVERNOR_TSS_BASE;
+    cpu.tr.limit = GOVERNOR_TSS_LIMIT;
+    configure_cpu(&mut cpu);
+    cpu.registers.set_esp(STACK_TOP);
+    for &linear in &starts {
+        cpu.set_eip(linear);
+        cpu.fetch_decoded(&mut bus, linear).unwrap();
+    }
+
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("entry key");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = match jit::direct::compile(&mut cpu, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => panic!("structurally rejected"),
+        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+    };
+    assert_eq!(
+        usize::from(compilation.span.instructions),
+        insns.len(),
+        "the block must cover exactly the primed instructions"
+    );
+    assert_eq!(compilation.callout_slots, 1);
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("block installs");
+    let block = cpu.jit_direct.block(id).expect("live block");
+
+    let mut fixture = Fixture { cpu, bus, block };
+    rearm_governor_block(&mut fixture);
+    fixture
+}
+
+/// Put the CPU back at the block's head with the same architectural state. The governor is about
+/// what the SECOND and later entries do, so every one of these tests re-enters.
+fn rearm_governor_block(fixture: &mut Fixture) {
+    let cpu = &mut fixture.cpu;
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.registers.set_edx(u32::from(PORT));
+    cpu.registers.set_eax(0xdead_beef);
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+}
+
+/// The three-slot block of `slot_block`, in the governed state.
+fn governed_slot_block(configure: impl Fn(&mut TestBus)) -> Fixture {
+    governor_block(&[&[0x89, 0xf6], &[0xec], &[0x89, 0xff]], configure, |_| {})
+}
+
+fn admission(fixture: &Fixture) -> jit::direct::CallOutAdmission {
+    fixture
+        .cpu
+        .callout_admission_for_test(&fixture.bus, fixture.block.id())
+}
+
+#[test]
+fn a_lazy_trial_promotes_the_block_and_every_later_entry_runs_it() {
+    // THE TRANSITION THE SLICE EXISTS FOR. A serve that leaves the bus untouched lets the block
+    // complete, so refusing it at head buys nothing and costs a dispatcher round trip per poll.
+    let mut fixture = governed_slot_block(|bus| {
+        bus.lazy_io_reads = true;
+        bus.io_read_value = Some(0x5a);
+    });
+    assert_eq!(
+        admission(&fixture),
+        jit::direct::CallOutAdmission::Untried(0)
+    );
+
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap(),
+        "an Untried block must be ADMITTED for its trial, not refused"
+    );
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_governor_trials, 1, "one trial entry");
+    assert_eq!(stalls.callout_executed, 1, "the trial reached the helper");
+    assert_eq!(
+        stalls.callout_port_v86_served, 1,
+        "the bitmap arm served it -- otherwise this is measuring the CPL0 arm"
+    );
+    assert_eq!(stalls.side_exit_callout_step_break, 0);
+    assert_eq!(stalls.side_exit_callout_abnormal, 0);
+    assert_eq!(stalls.callout_governor_lazy, 1);
+    assert_eq!(stalls.reject_callout_privileged, 0);
+    assert_eq!(admission(&fixture), jit::direct::CallOutAdmission::Lazy);
+    assert_eq!(fixture.cpu.registers.eax() & 0xff, 0x5a);
+
+    // The classification has to CHANGE the gate, not merely be stored: three more entries, none
+    // of them a trial and none of them refused.
+    for entry in 1..4 {
+        rearm_governor_block(&mut fixture);
+        assert!(
+            fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap(),
+            "entry {entry}: a Lazy block must run"
+        );
+        let stalls = fixture.cpu.direct_stall_snapshot();
+        assert_eq!(
+            stalls.callout_governor_trials, 1,
+            "entry {entry}: a classified block must never be re-tried"
+        );
+        assert_eq!(stalls.reject_callout_privileged, 0, "entry {entry}");
+        assert_eq!(stalls.callout_executed, entry + 1, "entry {entry}");
+    }
+}
+
+#[test]
+fn an_io_touching_trial_leaves_the_block_refused_at_head() {
+    // The other side of the same fixture, one bus knob apart: a serve that touches device state
+    // step-breaks, so admitting the block buys a spill/call/reload/side-exit where a free barrier
+    // used to be. Pre-governor behaviour is the right answer here, and the trial is what pays for
+    // learning that.
+    let mut fixture = governed_slot_block(|bus| {
+        bus.lazy_io_reads = false;
+        bus.io_read_value = Some(0x5a);
+    });
+
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap(),
+        "the trial itself must run"
+    );
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_governor_trials, 1);
+    assert_eq!(
+        stalls.side_exit_callout_step_break, 1,
+        "the serve step-broke"
+    );
+    assert_eq!(stalls.callout_governor_io_touching, 1);
+    assert_eq!(stalls.callout_governor_lazy, 0);
+    assert_eq!(
+        admission(&fixture),
+        jit::direct::CallOutAdmission::IoTouching
+    );
+
+    let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    for entry in 1..4 {
+        rearm_governor_block(&mut fixture);
+        assert!(
+            !fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap(),
+            "entry {entry}: an IoTouching block must be refused at head"
+        );
+        let stalls = fixture.cpu.direct_stall_snapshot();
+        assert_eq!(stalls.reject_callout_privileged, entry, "entry {entry}");
+        assert_eq!(
+            stalls.callout_executed, 1,
+            "entry {entry}: nothing may pay for the spill, the call and the reload"
+        );
+        assert_eq!(stalls.callout_governor_trials, 1, "entry {entry}");
+    }
+    assert_eq!(
+        fixture.cpu.perf_counters().jit_direct_insns - retired,
+        0,
+        "nothing may retire natively once the block is refused"
+    );
+}
+
+#[test]
+fn an_abnormal_trial_denies_the_block() {
+    // A permanently trapped port: the zero-limit TSS denies every one, so the helper refuses and
+    // the run ends at the instruction. The trial bounds that cost to once per epoch -- exactly
+    // the residual Q3 item 4 records as an accepted price.
+    let mut fixture = governor_block(
+        &[&[0x89, 0xf6], &[0xec], &[0x89, 0xff]],
+        |bus| {
+            bus.lazy_io_reads = true;
+            bus.io_read_value = Some(0x5a);
+        },
+        |cpu| cpu.tr.limit = 0,
+    );
+
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_governor_trials, 1);
+    assert_eq!(stalls.side_exit_callout_abnormal, 1);
+    assert_eq!(stalls.callout_governor_lazy, 0);
+    assert_eq!(stalls.callout_governor_io_touching, 0);
+    assert_eq!(admission(&fixture), jit::direct::CallOutAdmission::Denied);
+    assert_eq!(
+        fixture.cpu.registers.eax(),
+        0xdead_beef,
+        "a denied port must never reach AL"
+    );
+
+    rearm_governor_block(&mut fixture);
+    assert!(
+        !fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap(),
+        "a Denied block must be refused at head from the second entry on"
+    );
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.reject_callout_privileged, 1);
+    assert_eq!(stalls.callout_executed, 1);
+}
+
+#[test]
+fn a_trial_that_never_reaches_its_call_out_gives_up_after_the_cap() {
+    // The trial cap, and the block it exists for: a call-out the run never reaches. `DIV ECX`
+    // with ECX zero side-exits on its emitted guard, so the slot behind it never serves and the
+    // trial learns nothing. Without the cap this block would sit at quota 1 forever, which is a
+    // real regression for its OTHER instructions.
+    let mut fixture = governor_block(
+        &[&[0x89, 0xf6], &[0xf7, 0xf1], &[0xec], &[0x89, 0xff]],
+        |bus| {
+            bus.lazy_io_reads = true;
+            bus.io_read_value = Some(0x5a);
+        },
+        |_| {},
+    );
+
+    for entry in 1..=u64::from(jit::direct::MAX_UNTRIED_TRIALS) {
+        rearm_governor_block(&mut fixture);
+        // EDX:EAX / 0 -- the guard refuses and the run ends AT the divide.
+        fixture.cpu.registers.set_ecx(0);
+        assert!(
+            fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap(),
+            "entry {entry}: an Untried block is admitted for its trial"
+        );
+        let stalls = fixture.cpu.direct_stall_snapshot();
+        assert_eq!(
+            stalls.side_exit_divide_guard, entry,
+            "entry {entry}: the guard is what must end this run"
+        );
+        assert_eq!(
+            stalls.callout_executed, 0,
+            "entry {entry}: the call-out must never be reached"
+        );
+        assert_eq!(stalls.callout_governor_trials, entry, "entry {entry}");
+        let expected = if entry < u64::from(jit::direct::MAX_UNTRIED_TRIALS) {
+            jit::direct::CallOutAdmission::Untried(entry as u8)
+        } else {
+            jit::direct::CallOutAdmission::Unclassified
+        };
+        assert_eq!(admission(&fixture), expected, "entry {entry}");
+    }
+
+    // Unclassified is today's behaviour exactly: refused at head, no further trials.
+    for entry in 1..3 {
+        rearm_governor_block(&mut fixture);
+        fixture.cpu.registers.set_ecx(0);
+        assert!(
+            !fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap(),
+            "entry {entry}: an Unclassified block is refused at head"
+        );
+        let stalls = fixture.cpu.direct_stall_snapshot();
+        assert_eq!(stalls.reject_callout_privileged, entry);
+        assert_eq!(
+            stalls.callout_governor_trials,
+            u64::from(jit::direct::MAX_UNTRIED_TRIALS),
+            "entry {entry}: the cap must stop the trials"
+        );
+    }
+}
+
+#[test]
+fn a_recycled_block_slot_reads_untried_rather_than_its_predecessors_class() {
+    // The storage discipline, copied from `iteration_upper_cache` rather than invented: the
+    // protection against a recycled slot is `active_index` generational identity plus the
+    // install-time reset, NOT a clear in `retire_block`. One invariant, one mechanism.
+    let mut fixture = governed_slot_block(|bus| {
+        bus.lazy_io_reads = true;
+        bus.io_read_value = Some(0x5a);
+    });
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    assert_eq!(admission(&fixture), jit::direct::CallOutAdmission::Lazy);
+    let old_id = fixture.block.id();
+
+    let key = jit::direct::key_for(&fixture.cpu, ENTRY, true).expect("entry key");
+    assert!(fixture.cpu.jit_direct.retire_key_for_recompile(key));
+    let compilation = match jit::direct::compile(&mut fixture.cpu, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        _ => panic!("the same bytes must recompile"),
+    };
+    let new_id = fixture
+        .cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("block installs");
+    assert_eq!(
+        new_id.index_for_test(),
+        old_id.index_for_test(),
+        "the fixture needs the freed slot back or it proves nothing"
+    );
+    assert_ne!(new_id, old_id, "a recycled slot must take a new generation");
+
+    let epoch = fixture.bus.jit_cost_dial_epoch();
+    assert_eq!(
+        fixture.cpu.jit_direct.callout_admission(new_id, epoch),
+        jit::direct::CallOutAdmission::Untried(0),
+        "the new occupant must not inherit its predecessor's class"
+    );
+    assert_eq!(
+        fixture.cpu.jit_direct.callout_admission(old_id, epoch),
+        jit::direct::CallOutAdmission::Untried(0),
+        "the retired id must read as a miss, not as its successor's class"
+    );
+}
+
+#[test]
+fn a_classification_does_not_survive_the_cost_dial_epoch() {
+    // The other half of the memo key, and the bound on how stale a trial-only classification can
+    // get: rolling the epoch re-tries everything.
+    let mut fixture = governed_slot_block(|bus| {
+        bus.lazy_io_reads = true;
+        bus.io_read_value = Some(0x5a);
+    });
+    let id = fixture.block.id();
+    let epoch = fixture.bus.jit_cost_dial_epoch();
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    assert_eq!(
+        fixture.cpu.jit_direct.callout_admission(id, epoch),
+        jit::direct::CallOutAdmission::Lazy
+    );
+    assert_eq!(
+        fixture
+            .cpu
+            .jit_direct
+            .callout_admission(id, epoch.wrapping_add(1)),
+        jit::direct::CallOutAdmission::Untried(0),
+        "a class learned under one dial epoch must not be read under another"
+    );
+    // And storing under the new epoch drops the old epoch's entry rather than leaving it live.
+    fixture.cpu.jit_direct.set_callout_admission(
+        id,
+        epoch.wrapping_add(1),
+        jit::direct::CallOutAdmission::IoTouching,
+    );
+    assert_eq!(
+        fixture.cpu.jit_direct.callout_admission(id, epoch),
+        jit::direct::CallOutAdmission::Untried(0)
+    );
 }

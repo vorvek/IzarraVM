@@ -1754,6 +1754,11 @@ pub struct DirectStallSnapshot {
     pub callout_port_v86_served: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.
     pub reject_callout_privileged: u64,
+    /// The call-out admission governor: entries spent at trial quota, and the two classifications
+    /// those trials reached. See `BlockCacheStats`.
+    pub callout_governor_trials: u64,
+    pub callout_governor_lazy: u64,
+    pub callout_governor_io_touching: u64,
     /// Dispatcher entries whose HEAD block overwrites a segment register and is therefore barred
     /// from publishing successors, plus the instructions they retired. Such a block can never
     /// chain, so its quota is clamped to 1.

@@ -87,7 +87,10 @@ fn buttons_read_released_while_an_axis_is_still_discharging() {
     port.charge(10_000);
     let x_deadline = 10_000 + axis_ticks(128);
     let y_deadline = 10_000 + axis_ticks(200);
-    assert!(x_deadline < y_deadline, "the test needs staggered deadlines");
+    assert!(
+        x_deadline < y_deadline,
+        "the test needs staggered deadlines"
+    );
 
     // Both discharging: axis bits set, buttons masked out of the answer.
     assert_eq!(port.read(10_000), 0xf3);
