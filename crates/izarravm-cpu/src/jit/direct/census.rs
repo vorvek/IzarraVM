@@ -466,6 +466,15 @@ pub(crate) struct DirectStallTally {
     /// global figure says directly whether these blocks are short because they cannot chain.
     pub segment_write_block_head_entries: u64,
     pub segment_write_block_head_insns: u64,
+    /// The x87 TOP-mismatch retire cap (`retire_key_for_top_mismatch`). `suppressed` counts every
+    /// retire the cap refused -- one per mismatch on an already-capped key, so on a churning guest
+    /// it approaches `jit_direct_reject_x87_top`. The identity
+    /// `reject_x87_top == x87_top_retires_suppressed + retires taken` closes across the run.
+    pub x87_top_retires_suppressed: u64,
+    /// Cap CROSSINGS, not live keys: a key whose page is rewritten loses its count and can cross
+    /// again. Exact on a guest with no SMC and one cache generation; an over-report on an
+    /// SMC-heavy one. Named for what it counts.
+    pub x87_top_sticky_crossings: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -1595,6 +1604,8 @@ impl crate::jit::JitState {
             lane_trial_installs: self.stalls.lane_trial_installs,
             disp_lane_registrations: self.stalls.disp_lane_registrations,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
+            x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
+            x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
         }
     }
 

@@ -1779,6 +1779,10 @@ pub struct DirectStallSnapshot {
     /// Continuations the packed decode first touch screened and then could not materialise a line
     /// for. Expected identically zero; see `DirectStallTally`.
     pub decode_pack_late_view_miss: u64,
+    /// x87 TOP-mismatch retires refused by the per-key cap, and the number of times a key crossed
+    /// that cap. See `DirectStallTally`.
+    pub x87_top_retires_suppressed: u64,
+    pub x87_top_sticky_crossings: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

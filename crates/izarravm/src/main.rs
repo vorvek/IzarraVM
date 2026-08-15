@@ -2441,6 +2441,8 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_lane_trial_installs": snapshot.lane_trial_installs,
         "smc_disp_lane_registrations": snapshot.disp_lane_registrations,
         "decode_pack_late_view_miss": snapshot.decode_pack_late_view_miss,
+        "x87_top_retires_suppressed": snapshot.x87_top_retires_suppressed,
+        "x87_top_sticky_crossings": snapshot.x87_top_sticky_crossings,
     })
 }
 
