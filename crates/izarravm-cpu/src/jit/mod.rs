@@ -137,6 +137,38 @@ pub(crate) struct JitState {
     /// so a fixture cannot exercise both arms, and the level-0 early-out in `try_direct_continuation`
     /// would have lost its only cover the moment the default moved off 0.
     pub(crate) sixteen_bit_level: u8,
+    /// Sticky-decline memo era state (`dev_docs/sticky-decline-memo-design.md` §1.5 plus review
+    /// BLOCKER B1). The memo byte in each `DecodePack` carries a 6-bit era stamp; a memo answers
+    /// only while `decline_memo_stamp` still reads the value it was written under, so one advance
+    /// invalidates all 65,536 of them at once.
+    ///
+    /// The era TERM is the pair `(heat epoch, BlockCache::heat_resets())`, observed lazily on the
+    /// paths that read or write a memo:
+    ///
+    ///   * the heat epoch, because that is exactly when `take_stale_stamp` can start returning
+    ///     true and the dormant lift must be re-attempted (§2.4). It is compared for INEQUALITY in
+    ///     both directions, per review M3: `reset_perf_counters` restarts the instruction count,
+    ///     so epoch numbers repeat and the monotonicity §2.4 originally claimed does not hold;
+    ///   * `heat_resets`, because `BlockCache::clear` and `BlockCache::reset_storage` empty
+    ///     `entries` — every Dormant key vanishes and the true next verdict becomes
+    ///     `BlockProbe::Interpret` with a `lookup_misses` bump and a `Seen` insert — and neither
+    ///     has a site a `JitState` field could be advanced at. `heat_resets` is bumped by both
+    ///     (`reset_storage`, and `clear`'s empty fast path), which is why `sync_smc_heat` already
+    ///     reads it. It also covers `sync_native_fetch_trace`'s `jit_direct.clear()` (review M2),
+    ///     which sits upstream of the memo site.
+    ///
+    /// On `JitState` rather than `CpuGsw`/`PerfCounters`/`CompiledBlock`, so all four layout pins
+    /// are untouched by construction.
+    pub(crate) decline_memo_stamp: u8,
+    pub(crate) decline_memo_epoch: u32,
+    pub(crate) decline_memo_resets: u64,
+    /// TEST-ONLY memo kill switch. The census-identity fixture has to run the SAME program with
+    /// and without the memo and compare `admission_declines[dormant_probe]` byte for byte;
+    /// without a way to turn the memo off it could only assert the arm is non-zero, which a memo
+    /// that double-counts would satisfy too. `#[cfg(test)]`, so the shipped read path carries no
+    /// extra branch and no extra field.
+    #[cfg(test)]
+    pub(crate) decline_memo_disabled_for_test: bool,
     /// Cached mirror of `direct::native_keys_admitted(cpu.mode())` — the host-capability and
     /// persona screen `key_for_phys` opens with. A hoisted CONSTANT, not a policy dial: nothing
     /// sets it directly, and `CpuGsw::set_native_key_admission_for_test` does not exist.
@@ -232,6 +264,12 @@ impl JitState {
             one_lookup_load: one_lookup_load_default(),
             native_fetch_trace: true,
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
+            // 1, never 0: 0 is the "no memo" encoding, so a fresh pack can never hit.
+            decline_memo_stamp: 1,
+            decline_memo_epoch: 0,
+            decline_memo_resets: 0,
+            #[cfg(test)]
+            decline_memo_disabled_for_test: false,
             // A `JitState` does not know the CPU's mode; `CpuGsw::default` refreshes this to the
             // real answer for `GswMode::Gsw586` before it hands the CPU out, and `set_mode` owns
             // it from then on. Seeding `false` here rather than guessing a mode keeps the one
@@ -269,6 +307,13 @@ impl Clone for JitState {
             one_lookup_load: self.one_lookup_load,
             native_fetch_trace: self.native_fetch_trace,
             sixteen_bit_level: self.sixteen_bit_level,
+            // A clone gets a fresh era: it also gets a fresh decode cache, so no pack in it
+            // carries a memo written under the parent's stamp.
+            decline_memo_stamp: 1,
+            decline_memo_epoch: 0,
+            decline_memo_resets: 0,
+            #[cfg(test)]
+            decline_memo_disabled_for_test: false,
             // CARRIED, for the reason spelled out on the field: the clone copies `mode` too, so
             // the cached answer stays correct, and a reset would refuse every key.
             native_keys_admitted: self.native_keys_admitted,

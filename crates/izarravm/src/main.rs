@@ -2734,6 +2734,12 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "decode_pack_late_view_miss": snapshot.decode_pack_late_view_miss,
         "x87_top_retires_suppressed": snapshot.x87_top_retires_suppressed,
         "x87_top_sticky_crossings": snapshot.x87_top_sticky_crossings,
+        // Sticky-decline memo, always on. `decline_memo_hits / admission_declines[dormant_probe]`
+        // is the acceptance instrument; a census-gated counter would leave the wall build unable
+        // to say whether the memo fired.
+        "decline_memo_hits": snapshot.decline_memo_hits,
+        "decline_memo_advances": snapshot.decline_memo_advances,
+        "decline_memo_sweeps": snapshot.decline_memo_sweeps,
     })
 }
 

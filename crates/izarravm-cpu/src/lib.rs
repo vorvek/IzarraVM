@@ -1924,6 +1924,19 @@ pub struct DirectStallSnapshot {
     /// that cap. See `DirectStallTally`.
     pub x87_top_retires_suppressed: u64,
     pub x87_top_sticky_crossings: u64,
+    /// Sticky-decline memo (`dev_docs/sticky-decline-memo-design.md`), always on. `hits` is the
+    /// number of declines the memo answered without running the admission chain; `advances` and
+    /// `sweeps` are era-stamp advances and the 63-wrap sweeps among them. The design predicts
+    /// ~21,986 advances and ~349 sweeps on duke3d-586; an order of magnitude more means an era
+    /// choke is firing far harder than §1.5 models and the incremental sweep is owed.
+    ///
+    /// Always on rather than census-gated, deliberately, against the standing "default-off
+    /// instruments tax the hot path" rule: one `u64` increment sits on a path that just saved the
+    /// whole admission chain, and a census-gated counter would leave the WALL build unable to say
+    /// whether the memo fired at all — exactly the vacuity trap the campaign keeps paying for.
+    pub decline_memo_hits: u64,
+    pub decline_memo_advances: u64,
+    pub decline_memo_sweeps: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3309,7 +3322,16 @@ struct DecodePack {
     /// `direct_hot_at` runs on every admitted continuation, and a counter left behind on the line
     /// would fault in the exact cache line this array exists to avoid touching.
     jit_direct_hotness: u8,
-    _pad: u8,
+    /// The sticky-decline memo byte (`dev_docs/sticky-decline-memo-design.md` §1.2):
+    /// `[stamp:6][v86:1][ss_d:1]`, stamp 0 meaning "no memo". Renamed from `_pad` in the commit
+    /// that first reads it, per that design's review NIT N4 — a `_`-prefixed field that is
+    /// load-bearing is a defect waiting to be re-used by the next slice.
+    ///
+    /// Every writer of a whole `DecodePack` (`publish_line`, and `DecodePack::default` through
+    /// `clear_lines`) zeroes it, which is what makes 0 an unforgeable "no memo" and why the memo
+    /// needs no validity bit of its own. `kill_line_at` zeroes the generation instead, so a
+    /// narrow SMC kill is never reached with a slot in hand.
+    decline_memo: u8,
 }
 
 /// `DecodePack::flags` bit 0: the CS D bit the line was decoded under, part of the hit condition.
@@ -3892,7 +3914,10 @@ impl DecodeCache {
                 len: line.insn.map_or(0, |insn| insn.len),
                 flags,
                 jit_direct_hotness: 0,
-                _pad: 0,
+                // A republished slot carries no memo: this is the same statement that already
+                // zeroes the hotness, and it is what makes the decode-line lifecycle the memo's
+                // primary invalidation (design §2.1).
+                decline_memo: 0,
             };
         }
         self.lines[index] = line;
@@ -4173,6 +4198,35 @@ impl DecodeCache {
             pack.jit_direct_hotness += 1;
         }
         pack.jit_direct_hotness == threshold
+    }
+
+    /// Read the sticky-decline memo byte of a slot the caller already holds a live view for.
+    /// Same argument as `direct_hot_at`'s: the slot came out of this cache in the same loop
+    /// iteration, so no generation/tag retest is owed, and the pack is live whenever the line is
+    /// (`publish_line`/`kill_line_at` write both arrays; `assert_packs_consistent` pins the
+    /// equivalence). It is also the same 16 bytes `direct_hot_at` just touched, so this load is
+    /// free on the shipped default arm.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn decline_memo_at(&self, slot: u32) -> u8 {
+        self.packs[slot as usize].decline_memo
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn set_decline_memo_at(&mut self, slot: u32, value: u8) {
+        self.packs[slot as usize].decline_memo = value;
+    }
+
+    /// Zero every memo byte. The 6-bit era stamp wraps 63 -> 1, and this is what stops it aliasing
+    /// back onto a stamp a long-dormant pack still carries (design §1.5). A sweep can never be
+    /// WRONG — clearing a memo only means the full chain runs, which is the reference behaviour —
+    /// so its only cost is 65,536 byte stores, ~349 times over a duke3d-586 run.
+    #[cfg(feature = "jit")]
+    fn sweep_decline_memos(&mut self) {
+        for pack in self.packs.iter_mut() {
+            pack.decline_memo = 0;
+        }
     }
 
     /// Invalidate every cached line and drop every matching code watch. The generation advance and

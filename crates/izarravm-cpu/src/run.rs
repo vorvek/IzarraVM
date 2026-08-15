@@ -1177,6 +1177,83 @@ impl CpuGsw {
         }
     }
 
+    /// Sticky-decline memo read side (`dev_docs/sticky-decline-memo-design.md`).
+    ///
+    /// Answers "is this slot's decline provably repeatable in this era", and answers it out of
+    /// one byte of the 16-byte `DecodePack` the line above already brought into L1.
+    ///
+    /// Review M1's LAZY form. `direct_hot_at` saturates at the threshold and returns true at
+    /// exact equality forever after, so EVERY `BlockProbe::Ready` ask reaches this site too —
+    /// roughly 6.1 G asks on duke3d-586, of which about 2.6 G collect nothing. Building the
+    /// comparand needs `is_v86_mode()` (CR0 plus EFLAGS) and SS's B bit, three loads from three
+    /// structures; testing the already-loaded byte against zero first keeps all of that off the
+    /// miss path, and the "stamp 0 = no memo" encoding is what makes the short test exact rather
+    /// than a heuristic.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn decline_memo_hit(&mut self, slot: u32) -> bool {
+        #[cfg(test)]
+        if self.jit_direct.decline_memo_disabled_for_test {
+            return false;
+        }
+        let memo = self.decode_cache.decline_memo_at(slot);
+        if memo == 0 {
+            return false;
+        }
+        // An advance invalidates every memo in the array at once, so an ask that triggers one is
+        // a miss by construction — including the wrap case, where the sweep the advance performs
+        // has just zeroed the byte read above. Returning here rather than comparing is what makes
+        // that ordering unobservable instead of a one-in-63-eras alias.
+        if self.advance_decline_memo_era() {
+            return false;
+        }
+        memo == self.decline_memo_comparand()
+    }
+
+    /// Advance the era stamp if the era term moved, and report whether it did. See
+    /// `JitState::decline_memo_stamp` for what the term is and why it is those two things.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn advance_decline_memo_era(&mut self) -> bool {
+        let epoch = self.smc_heat_epoch();
+        let resets = self.jit_direct.direct.heat_resets();
+        if epoch == self.jit_direct.decline_memo_epoch
+            && resets == self.jit_direct.decline_memo_resets
+        {
+            return false;
+        }
+        self.jit_direct.decline_memo_epoch = epoch;
+        self.jit_direct.decline_memo_resets = resets;
+        // 6 bits, value 0 reserved for "no memo": the counter wraps 63 -> 1, and the wrap must
+        // sweep or a long-dormant pack still carrying stamp 1 would alias back into life.
+        let stamp = self.jit_direct.decline_memo_stamp;
+        let swept = stamp == 63;
+        if swept {
+            self.decode_cache.sweep_decline_memos();
+        }
+        self.jit_direct.decline_memo_stamp = if swept { 1 } else { stamp + 1 };
+        self.jit_direct.direct.note_decline_memo_advance(swept);
+        true
+    }
+
+    /// The live memo byte for the current era and mode, `[stamp:6][v86:1][ss_d:1]` (design §1.2).
+    ///
+    /// `stack_is_32bit` is the same field read `jit_mode_key` bit 3 performs
+    /// (`registers.segment(Ss).default_size_32`), and `is_v86_mode` is bit 2. Those two are the
+    /// ONLY `jit_mode_key` inputs no existing invalidation covers: CS.D is in the pack's own hit
+    /// condition, CR0.PE/PG bump the decode generation, and a persona change reaches
+    /// `BlockCache::clear`. Folding them in makes the mode check exact rather than probabilistic,
+    /// for two bits of stamp — and V86 in particular is load-bearing rather than paranoia,
+    /// because V86 forces CS.D = 0, so a V86 key and a non-V86 16-bit key at one linear address
+    /// share one decode line and one pack that `PACK_FLAG_D` cannot separate.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn decline_memo_comparand(&self) -> u8 {
+        (self.jit_direct.decline_memo_stamp << 2)
+            | (u8::from(self.is_v86_mode()) << 1)
+            | u8::from(self.stack_is_32bit())
+    }
+
     #[cfg(feature = "jit")]
     fn try_direct_continuation<B: CpuBus>(
         &mut self,
@@ -1234,6 +1311,29 @@ impl CpuGsw {
             }
             return Ok(DirectContinuation::Interpret);
         }
+        // Sticky-decline memo (`dev_docs/sticky-decline-memo-design.md`). Exactly where §1.3 puts
+        // it: AFTER `direct_hot_at`, so the pack load is shared and the hotness byte still
+        // increments, and BEFORE `key_for_phys`, which is the first of the six symbols a hit
+        // removes — `key_for_phys`, both `probe` entry points and `probe`'s closure,
+        // `BlockKey::eq`, `sync_smc_heat` and `lift_cold_smc_dormant`, plus the two hashbrown
+        // lookups those drive.
+        //
+        // A hit replays the verdict the full chain is PROVEN to reach in this era, so it must
+        // replay the counters too. `jit_direct_dispatch_declines` needs nothing here: returning
+        // `Interpret` makes `dispatch_continuation` yield `ContinuationDispatch::Declined` and the
+        // run loop folds it, byte for byte as before. The census arm does need the explicit
+        // increment, behind the identical call-site gate the full chain uses — and note the full
+        // chain classifies BEFORE it lifts, so `DormantProbe` is the class a still-Dormant entry
+        // produces whether or not the lift would have fired.
+        if self.decline_memo_hit(screen.slot) {
+            #[cfg(feature = "direct-admission-census")]
+            if self.jit_direct.barrier_census_active() {
+                self.jit_direct
+                    .note_admission_decline(jit::direct::AdmissionDecline::DormantProbe);
+            }
+            self.jit_direct.direct.note_decline_memo_hit();
+            return Ok(DirectContinuation::Interpret);
+        }
         let Some(key) = jit::direct::key_for_phys(self, lin, d, screen.phys_start) else {
             #[cfg(feature = "direct-admission-census")]
             if self.jit_direct.barrier_census_active() {
@@ -1259,8 +1359,26 @@ impl CpuGsw {
                 let heat_epoch = self.smc_heat_epoch();
                 self.sync_smc_heat();
                 let jit = &mut *self.jit_direct;
-                jit.direct
+                let lift = jit
+                    .direct
                     .lift_cold_smc_dormant(&mut jit.smc_heat, key, heat_epoch);
+                // Sticky-decline memo write side (design §1.4). The memo's exact claim is "the
+                // entry WAS Dormant and the recovery lift did NOT fire", which is one of the
+                // three shapes the call above already had to distinguish.
+                //
+                // The `disabled` exclusion is required for IDENTITY, not for correctness: `probe`
+                // synthesises `Rejected` for every key while disabled and
+                // `classify_rejected_probe` deliberately counts no class there, so a memo written
+                // in that state would later replay `DormantProbe` and break the census closure.
+                if lift == jit::direct::DormantLift::StillDormant
+                    && !self.jit_direct.direct.cache_disabled()
+                {
+                    // Advance FIRST: an advance that wraps sweeps the whole pack array, and a
+                    // sweep after the store would erase the memo this decline just earned.
+                    let _ = self.advance_decline_memo_era();
+                    let live = self.decline_memo_comparand();
+                    self.decode_cache.set_decline_memo_at(screen.slot, live);
+                }
                 return Ok(DirectContinuation::Interpret);
             }
             jit::direct::BlockProbe::Ready(id) => self

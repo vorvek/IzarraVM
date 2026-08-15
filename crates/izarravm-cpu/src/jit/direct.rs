@@ -1480,6 +1480,27 @@ impl BlockCache {
         self.stalls.decode_pack_late_view_miss += 1;
     }
 
+    /// Whether the cache is in its self-disabled state, in which `probe` synthesises `Rejected`
+    /// for every key and `classify_rejected_probe` deliberately reports NO census class. A memo
+    /// must not be written there or it would replay `DormantProbe` and break the census closure
+    /// (design §1.4). The review's B1 remedy prefers reading this bool at the write site to
+    /// advancing the era stamp on the `disabled` transitions, which have no site a `JitState`
+    /// field could be advanced at.
+    pub(crate) fn cache_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// One decline the sticky-decline memo answered without running the admission chain.
+    pub(crate) fn note_decline_memo_hit(&mut self) {
+        self.stalls.decline_memo_hits += 1;
+    }
+
+    /// One era-stamp advance, and whether it wrapped 63 -> 1 and therefore swept the pack array.
+    pub(crate) fn note_decline_memo_advance(&mut self, swept: bool) {
+        self.stalls.decline_memo_advances += 1;
+        self.stalls.decline_memo_sweeps += u64::from(swept);
+    }
+
     #[cfg(test)]
     pub(crate) fn set_lane_trial_for_test(&mut self, on: bool) {
         self.lane_trial_override = Some(on);

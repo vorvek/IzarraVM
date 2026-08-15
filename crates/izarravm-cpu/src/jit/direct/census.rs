@@ -475,6 +475,14 @@ pub(crate) struct DirectStallTally {
     /// again. Exact on a guest with no SMC and one cache generation; an over-report on an
     /// SMC-heavy one. Named for what it counts.
     pub x87_top_sticky_crossings: u64,
+    /// Sticky-decline memo instruments, always on. Here for this struct's stated reason:
+    /// `PerfCounters` sits ahead of `pending_flags` in `CpuGsw` at an offset emitted code bakes,
+    /// and `BlockCacheStats` is drained per dispatcher exit — these have to accumulate for the
+    /// whole run and be read by `stall_snapshot`. See `DirectStallSnapshot` for why they are not
+    /// census-gated.
+    pub decline_memo_hits: u64,
+    pub decline_memo_advances: u64,
+    pub decline_memo_sweeps: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -1610,6 +1618,9 @@ impl crate::jit::JitState {
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
+            decline_memo_hits: self.stalls.decline_memo_hits,
+            decline_memo_advances: self.stalls.decline_memo_advances,
+            decline_memo_sweeps: self.stalls.decline_memo_sweeps,
         }
     }
 
