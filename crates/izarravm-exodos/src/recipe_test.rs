@@ -68,3 +68,45 @@ fn round_trips_through_the_recipe_file_format() {
     let back: Recipe = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.keys.len(), Recipe::generic().keys.len());
 }
+
+#[test]
+fn a_recipe_written_before_mouse_steps_existed_still_reads() {
+    let back: Recipe =
+        serde_json::from_str(r#"{"keys":[{"guest_ms":1000,"text":"\\r"}]}"#).expect("deserialize");
+    assert!(back.mouse.is_empty());
+    assert!(back.to_inject_mouse_within(166_000_000, u64::MAX).is_none());
+}
+
+#[test]
+fn only_the_actions_the_emulator_parses_are_accepted() {
+    for good in ["home", "click", "down", "up", "move:320,544", "move:-5, 12"] {
+        assert!(is_valid_mouse_action(good), "{good}");
+    }
+    for bad in ["move 320 544", "move:320", "move:a,b", "wiggle", ""] {
+        assert!(!is_valid_mouse_action(bad), "{bad}");
+    }
+}
+
+#[test]
+fn mouse_steps_render_as_their_own_offset_ordered_schedule() {
+    let recipe = Recipe {
+        notes: String::new(),
+        keys: Vec::new(),
+        mouse: vec![
+            MouseStep {
+                guest_ms: 21_000,
+                action: "click".to_string(),
+            },
+            MouseStep {
+                guest_ms: 20_000,
+                action: "home".to_string(),
+            },
+        ],
+    };
+    let spec = recipe
+        .to_inject_mouse_within(166_000_000, u64::MAX)
+        .expect("a schedule");
+    assert_eq!(spec, "3320000000:home;3486000000:click");
+    // The budget bound applies to mouse steps too.
+    assert!(recipe.to_inject_mouse_within(166_000_000, 1000).is_none());
+}

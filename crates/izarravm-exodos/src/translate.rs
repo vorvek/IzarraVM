@@ -39,6 +39,10 @@ pub enum ConfigShape {
     B,
     /// No memory manager: the title brings its own DPMI or EMM host.
     C,
+    /// No memory manager, but the CD driver still has to load: 25 of the 106
+    /// own-manager confs also mount a disc, and shape C would have taken their
+    /// CD away along with TOKAEMM.
+    D,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +64,7 @@ pub struct TranslateResult {
     pub persona: String,
     pub cycle_budget: u64,
     pub inject_keys: Option<String>,
+    pub inject_mouse: Option<String>,
     pub recipe_notes: String,
     pub tree_max_depth: usize,
     pub tree_oversize_files: Vec<String>,
@@ -117,24 +122,42 @@ pub fn translate(
         reasons.push("reserved-root-name".to_string());
     }
 
-    let cd_image = resolve_cd_image(&options.extract_root, conf);
+    let mut walk = walk_autoexec(conf, &tree, &mut flags);
+    // The disc can be named in `[autoexec]` or inside the launcher BAT the
+    // flattener just walked -- MechWarrior 2 mounts MECH2.CUE inside the CHOICE
+    // branch, and reading only the conf left a 749 MB disc unmounted.
+    let cd_image = resolve_cd_image(&options.extract_root, conf)
+        .or_else(|| resolve_flattened_cd_image(&options.extract_root, &walk.flattened, &mut flags));
     let autoexec_lower = conf.autoexec_raw.join("\n").to_ascii_lowercase();
-    let own_manager = autoexec_lower.contains("jemmex") || autoexec_lower.contains("jemm386") || {
-        autoexec_lower.contains("cwsdpmi")
-    };
+    // eXo sets `[dos] ems=false` on the 106 confs whose titles host their own
+    // memory manager, which is the conf SAYING what the name-sniff was guessing
+    // at. It is read first, and the name list stays as the fallback for the
+    // confs that say nothing.
+    let ems_off = conf
+        .get("dos", "ems")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"));
+    let own_manager = ems_off
+        || autoexec_lower.contains("jemmex")
+        || autoexec_lower.contains("jemm386")
+        || autoexec_lower.contains("cwsdpmi");
     let shape = if own_manager {
         flags.insert("OWN-MEMORY-MANAGER".to_string());
+        if ems_off {
+            flags.insert("CONF-EMS-FALSE".to_string());
+        }
         // Real mode with no memory manager never takes the V86 port path, so
         // the port-polling bucket is blind on these rows.
         flags.insert("B6-BLIND".to_string());
-        ConfigShape::C
+        if cd_image.is_some() {
+            ConfigShape::D
+        } else {
+            ConfigShape::C
+        }
     } else if cd_image.is_some() {
         ConfigShape::A
     } else {
         ConfigShape::B
     };
-
-    let mut walk = walk_autoexec(conf, &tree, &mut flags);
     if verdict.wants_gus {
         flags.insert("WANTS-GUS".to_string());
     }
@@ -182,6 +205,13 @@ pub fn translate(
         }
     }
 
+    // A mouse action the emulator would reject must fail the translation, not
+    // the run: `--inject-mouse` is parsed before the machine is built, so a typo
+    // would otherwise cost a whole extraction and a whole boot to discover.
+    if !options.recipe.invalid_mouse_actions().is_empty() {
+        reasons.push("recipe-mouse-invalid".to_string());
+    }
+
     let class = if reasons.iter().any(|r| is_hard_reason(r)) {
         Class::Untranslatable
     } else if reasons.is_empty() {
@@ -203,6 +233,9 @@ pub fn translate(
     let inject_keys = options
         .recipe
         .to_inject_keys_within(options.clock_hz, options.cycle_budget);
+    let inject_mouse = options
+        .recipe
+        .to_inject_mouse_within(options.clock_hz, options.cycle_budget);
 
     if options.write && class != Class::Untranslatable {
         std::fs::write(hdd_folder.join("CONFIG.SYS"), render_config_sys(shape))?;
@@ -239,6 +272,10 @@ pub fn translate(
         invocation.push("--inject-keys".to_string());
         invocation.push(keys.clone());
     }
+    if let Some(mouse) = &inject_mouse {
+        invocation.push("--inject-mouse".to_string());
+        invocation.push(mouse.clone());
+    }
 
     reasons.sort();
     reasons.dedup();
@@ -260,6 +297,7 @@ pub fn translate(
         persona: options.persona.clone(),
         cycle_budget: options.cycle_budget,
         inject_keys,
+        inject_mouse,
         recipe_notes: options.recipe.notes.clone(),
         tree_max_depth: tree.max_depth,
         tree_oversize_files: tree.oversize_files.clone(),
@@ -294,6 +332,8 @@ fn is_hard_reason(reason: &str) -> bool {
             | "file-over-4gib"
             | "cd-image-unsupported"
             | "cd-mount-unsupported"
+            | "errorlevel-branch-after-program"
+            | "recipe-mouse-invalid"
     )
 }
 
@@ -306,7 +346,10 @@ struct Walk {
 
 fn walk_autoexec(conf: &DosboxConf, tree: &Tree, flags: &mut BTreeSet<String>) -> Walk {
     let flattener = Flattener::new(tree);
-    let mut flattened = Flattened::default();
+    let mut flattened = Flattened {
+        vars: seed_environment(),
+        ..Flattened::default()
+    };
     let mut prelude: Vec<String> = Vec::new();
     let mut cwd = String::new();
     let mut drive = 'c';
@@ -359,16 +402,10 @@ fn walk_autoexec(conf: &DosboxConf, tree: &Tree, flags: &mut BTreeSet<String>) -
                     prelude.push(format!("call {target}"));
                     continue;
                 }
-                let name = target
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(".bat")
-                    .trim_end_matches(".BAT");
-                match find_bat(tree, &cwd, name) {
-                    Some(rel) => flattener.flatten_bat(&cwd, &rel, 1, &mut flattened),
-                    None => flattened.failure = Some("call-target-unresolved".to_string()),
-                }
+                // One resolver for `call run`, `run.bat` and a bare `border`,
+                // so a conf-level CALL to a .EXE reaches the same answer a
+                // BAT-level one does.
+                flattener.run_line_program(&format!("call {target}\n"), &mut cwd, &mut flattened);
             }
             AutoexecStep::Command(text) => {
                 let lower = text.to_ascii_lowercase();
@@ -386,7 +423,10 @@ fn walk_autoexec(conf: &DosboxConf, tree: &Tree, flags: &mut BTreeSet<String>) -
                     prelude.push(text.clone());
                     continue;
                 }
-                let mut single = Flattened::default();
+                let mut single = Flattened {
+                    vars: flattened.vars.clone(),
+                    ..Flattened::default()
+                };
                 let mut command_cwd = cwd.clone();
                 flattener.run_line_program(
                     &format!(
@@ -399,6 +439,8 @@ fn walk_autoexec(conf: &DosboxConf, tree: &Tree, flags: &mut BTreeSet<String>) -
                 prelude.extend(single.lines.clone());
                 flattened.flags.extend(single.flags);
                 flattened.choices.extend(single.choices);
+                flattened.imgmounts.extend(single.imgmounts);
+                flattened.vars = single.vars;
                 if single.launch.is_some() {
                     flattened.launch = single.launch;
                 }
@@ -422,38 +464,37 @@ fn walk_autoexec(conf: &DosboxConf, tree: &Tree, flags: &mut BTreeSet<String>) -
     }
 }
 
-fn find_bat(tree: &Tree, cwd: &str, name: &str) -> Option<String> {
-    let mut dirs = vec![cwd.to_string()];
-    if !cwd.is_empty() {
-        dirs.push(String::new());
-    }
-    for dir in tree.dirs_breadth_first() {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-    for dir in dirs {
-        if let Some(actual) = tree.file_in(&dir, &format!("{name}.bat")) {
-            return Some(crate::tree::join_rel(&dir, actual));
-        }
-    }
-    None
-}
-
 fn render_config_sys(shape: ConfigShape) -> String {
     let mut lines = vec!["FILES=40".to_string(), "LASTDRIVE=D".to_string()];
     match shape {
         ConfigShape::A => lines.push("DEVICE=C:\\DOS\\TOKAEMM.SYS RAM /T".to_string()),
         ConfigShape::B => lines.push("DEVICE=C:\\DOS\\TOKAEMM.SYS".to_string()),
-        ConfigShape::C => {}
+        ConfigShape::C | ConfigShape::D => {}
     }
     lines.push("DOS=HIGH,UMB".to_string());
-    if shape == ConfigShape::A {
-        lines.push("DEVICEHIGH=C:\\DOS\\TOKACD.SYS".to_string());
+    match shape {
+        ConfigShape::A => lines.push("DEVICEHIGH=C:\\DOS\\TOKACD.SYS".to_string()),
+        // No memory manager means no upper memory to load high into, so the
+        // driver goes in conventional memory rather than not at all.
+        ConfigShape::D => lines.push("DEVICE=C:\\DOS\\TOKACD.SYS".to_string()),
+        ConfigShape::B | ConfigShape::C => {}
     }
     lines.push("SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT".to_string());
     lines.join("\r\n") + "\r\n"
 }
+
+/// The environment the generated AUTOEXEC has already set by the time the
+/// flattened launcher runs. The walker expands `%VAR%` against this, so it has
+/// to agree with `render_autoexec` line for line.
+fn seed_environment() -> std::collections::BTreeMap<String, String> {
+    let mut vars = std::collections::BTreeMap::new();
+    vars.insert("PATH".to_string(), "C:\\DOS".to_string());
+    vars.insert("COMSPEC".to_string(), "C:\\DOS\\COMMAND.COM".to_string());
+    vars.insert("BLASTER".to_string(), BLASTER_LINE.to_string());
+    vars
+}
+
+const BLASTER_LINE: &str = "A220 I7 D1 H5 P300 T6";
 
 fn render_autoexec(walk: &Walk, shape: ConfigShape) -> Vec<String> {
     let mut lines = vec![
@@ -461,9 +502,17 @@ fn render_autoexec(walk: &Walk, shape: ConfigShape) -> Vec<String> {
         "PATH C:\\DOS".to_string(),
         // `ensure_user_config` only injects a BLASTER line into an
         // emulator-stock AUTOEXEC; a generated one is user-owned and gets none.
-        "SET BLASTER=A220 I7 D1 H5 P300 T6".to_string(),
+        format!("SET BLASTER={BLASTER_LINE}"),
     ];
-    if shape == ConfigShape::A {
+    // The mouse driver is loaded for every title, not only the ones known to
+    // want one. Blood's launcher runs the game through `bmouse`, which aborts
+    // when its INT 33h probe finds no driver, and a game that ignores INT 33h
+    // pays only TOKAMOUS's residency for it.
+    match shape {
+        ConfigShape::A | ConfigShape::B => lines.push("LH TOKAMOUS".to_string()),
+        ConfigShape::C | ConfigShape::D => lines.push("TOKAMOUS".to_string()),
+    }
+    if matches!(shape, ConfigShape::A | ConfigShape::D) {
         lines.push("IZCDEX /I /D:TOKACD01 /L:D /T".to_string());
     }
     lines.extend(walk.prelude.iter().cloned());
@@ -510,6 +559,32 @@ fn resolve_cd_image(extract_root: &Path, conf: &DosboxConf) -> Option<PathBuf> {
         }
         _ => None,
     })
+}
+
+/// The first usable disc an `imgmount` inside the flattened BAT named. The path
+/// is written the way the conf writes it -- relative to DOSBox's own working
+/// directory, not to the guest -- so it resolves through the same mapping.
+fn resolve_flattened_cd_image(
+    extract_root: &Path,
+    flattened: &crate::bat::Flattened,
+    flags: &mut BTreeSet<String>,
+) -> Option<PathBuf> {
+    for mount in &flattened.imgmounts {
+        if !(mount.kind.is_empty() || mount.kind == "cdrom" || mount.kind == "iso") {
+            continue;
+        }
+        if !crate::classify::is_supported_cd_extension(&mount.image) {
+            flags.insert("BAT-CD-UNSUPPORTED".to_string());
+            continue;
+        }
+        if let Some(path) = resolve_corpus_path(extract_root, &mount.image).filter(|p| p.is_file())
+        {
+            flags.insert("CD-FROM-BAT".to_string());
+            return Some(path);
+        }
+        flags.insert("BAT-CD-MISSING".to_string());
+    }
+    None
 }
 
 /// Strip the `.\eXoDOS\` prefix a conf path carries and walk the remainder

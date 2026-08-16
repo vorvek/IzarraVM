@@ -52,7 +52,7 @@ fn translates_a_call_recipe_end_to_end() {
 
     let autoexec = result.autoexec.join("\n");
     assert!(autoexec.starts_with("@echo off\nPATH C:\\DOS\nSET BLASTER=A220 I7 D1 H5 P300 T6"));
-    assert!(autoexec.contains("copy .\\sb16\\*.*"));
+    assert!(autoexec.contains("copy /Y .\\sb16\\*.*"));
     assert!(!autoexec.contains("copy .\\gus"));
     assert!(autoexec.ends_with("DOOM\nC:\\EXITVM.COM"));
 
@@ -127,6 +127,125 @@ fn a_title_with_its_own_memory_manager_gets_no_tokaemm() {
     assert_eq!(result.config_sys_shape, ConfigShape::C);
     assert!(result.flags.contains(&"OWN-MEMORY-MANAGER".to_string()));
     assert!(result.flags.contains(&"B6-BLIND".to_string()));
+}
+
+#[test]
+fn the_confs_own_ems_key_names_the_titles_that_host_their_own_manager() {
+    // eXo writes `[dos] ems=false` on 106 confs -- ultima71 among them -- which
+    // is the conf SAYING what the jemm/cwsdpmi name-sniff was guessing at.
+    let dir = doom_extraction();
+    let conf = DosboxConf::parse(
+        "[dosbox]\nmachine=svga_s3\n[dos]\nems=false\n\
+         [autoexec]\nmount c .\\eXoDOS\\DOOM\nc:\ncall run\nexit\n",
+    );
+    let result = translate(&conf, &options(&dir, false)).expect("translate");
+    assert_eq!(result.config_sys_shape, ConfigShape::C);
+    assert!(result.flags.contains(&"CONF-EMS-FALSE".to_string()));
+    assert!(result.flags.contains(&"OWN-MEMORY-MANAGER".to_string()));
+    assert!(!result.autoexec.iter().any(|l| l.contains("TOKAEMM")));
+    // A CD title that hosts its own manager keeps the CD driver: 25 of the 106
+    // also mount a disc, and shape C would have taken it away with TOKAEMM.
+    let game = dir.path().join("DOOM");
+    std::fs::create_dir_all(game.join("cd")).unwrap();
+    std::fs::write(game.join("cd/DISC.cue"), b"FILE").unwrap();
+    let with_cd = DosboxConf::parse(
+        "[dosbox]\nmachine=svga_s3\n[dos]\nems=false\n\
+         [autoexec]\nmount c .\\eXoDOS\\DOOM\n\
+         imgmount d \".\\eXoDOS\\DOOM\\cd\\DISC.cue\" -t cdrom\nc:\ncall run\nexit\n",
+    );
+    let result = translate(&with_cd, &options(&dir, false)).expect("translate");
+    assert_eq!(result.config_sys_shape, ConfigShape::D);
+    assert!(result.autoexec.iter().any(|l| l.starts_with("IZCDEX")));
+    assert!(result.cd_image.is_some());
+}
+
+#[test]
+fn a_disc_named_only_inside_the_launcher_bat_still_mounts() {
+    // MechWarrior 2's conf mounts no disc at all; run.bat mounts MECH2.CUE
+    // inside the CHOICE branch, and reading only [autoexec] left 749 MB behind.
+    let dir = TempDir::new();
+    let game = dir.path().join("MechW2");
+    std::fs::create_dir_all(game.join("cd")).unwrap();
+    std::fs::write(game.join("cd/MECH2.CUE"), b"FILE").unwrap();
+    std::fs::write(game.join("MECH2.EXE"), b"x").unwrap();
+    std::fs::write(
+        game.join("RUN.BAT"),
+        "imgmount d .\\eXoDOS\\MechW2\\cd\\MECH2.CUE -t cdrom \r\ncls\r\n@MECH2\r\n",
+    )
+    .unwrap();
+    let conf = DosboxConf::parse(
+        "[dosbox]\nmachine=svga_s3\n[autoexec]\nmount c .\\eXoDOS\\MechW2\nc:\n@call run\nexit\n",
+    );
+    let mut opts = options(&dir, false);
+    opts.short = "MechW2".to_string();
+    let result = translate(&conf, &opts).expect("translate");
+    assert_eq!(result.cd_image, Some(game.join("cd").join("MECH2.CUE")));
+    assert_eq!(result.config_sys_shape, ConfigShape::A);
+    assert!(result.flags.contains(&"CD-FROM-BAT".to_string()));
+    assert!(result.invocation.windows(2).any(|w| w[0] == "--cd-image"));
+}
+
+#[test]
+fn every_generated_autoexec_loads_the_mouse_driver() {
+    // Blood runs the game through `bmouse`, which aborts when its INT 33h probe
+    // finds nothing. A game that ignores INT 33h pays only TOKAMOUS's residency.
+    let dir = doom_extraction();
+    let conf = DosboxConf::parse(DOOM_CONF);
+    let result = translate(&conf, &options(&dir, false)).expect("translate");
+    assert!(result.autoexec.contains(&"LH TOKAMOUS".to_string()));
+
+    // With no memory manager there is no upper memory to load high into.
+    let own = DosboxConf::parse(
+        "[dosbox]\nmachine=svga_s3\n[dos]\nems=false\n\
+         [autoexec]\nmount c .\\eXoDOS\\DOOM\nc:\ncall run\nexit\n",
+    );
+    let result = translate(&own, &options(&dir, false)).expect("translate");
+    assert!(result.autoexec.contains(&"TOKAMOUS".to_string()));
+}
+
+#[test]
+fn a_recipe_mouse_step_reaches_the_invocation_and_a_bad_one_refuses_the_row() {
+    let dir = doom_extraction();
+    let conf = DosboxConf::parse(DOOM_CONF);
+    let mut opts = options(&dir, false);
+    opts.recipe = Recipe {
+        notes: "GPrix2 startup menu is mouse-only".to_string(),
+        keys: Vec::new(),
+        mouse: vec![
+            crate::recipe::MouseStep {
+                guest_ms: 20_000,
+                action: "home".to_string(),
+            },
+            crate::recipe::MouseStep {
+                guest_ms: 20_500,
+                action: "move:320,544".to_string(),
+            },
+            crate::recipe::MouseStep {
+                guest_ms: 21_000,
+                action: "click".to_string(),
+            },
+        ],
+    };
+    let result = translate(&conf, &opts).expect("translate");
+    assert_eq!(result.class, Class::Translatable);
+    let spec = result.inject_mouse.expect("a mouse schedule");
+    // 20,000 guest ms at 166 MHz, then the two later steps, in order.
+    assert!(spec.starts_with("3320000000:home;"), "{spec}");
+    assert!(spec.ends_with(":click"), "{spec}");
+    assert!(result.inject_keys.is_none());
+    let at = result
+        .invocation
+        .iter()
+        .position(|a| a == "--inject-mouse")
+        .expect("the flag");
+    assert_eq!(result.invocation[at + 1], spec);
+
+    // A typo fails the translation, not the run: --inject-mouse is parsed before
+    // the machine is built, so the cost of finding it late is a whole boot.
+    opts.recipe.mouse[1].action = "move 320 544".to_string();
+    let result = translate(&conf, &opts).expect("translate");
+    assert_eq!(result.class, Class::Untranslatable);
+    assert!(result.reasons.contains(&"recipe-mouse-invalid".to_string()));
 }
 
 #[test]

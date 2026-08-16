@@ -24,12 +24,46 @@ pub struct KeyStep {
     pub text: String,
 }
 
+/// One timed mouse action. `action` is `--inject-mouse` payload syntax:
+/// `home`, `move:<dx>,<dy>`, `down`, `up` or `click`.
+///
+/// The deltas are MICKEYS, not pixels, and the emulator's flag documents why
+/// the harness cannot convert between them: the ratio belongs to the INT 33h
+/// driver and the guest may change it. A recipe is therefore derived once
+/// against a screenshot -- `home` to drive the pointer into the driver's own
+/// minimum corner, then a `move` from that known origin -- and replays exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MouseStep {
+    pub guest_ms: u64,
+    pub action: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipe {
     /// Free text naming where the schedule came from.
     #[serde(default)]
     pub notes: String,
     pub keys: Vec<KeyStep>,
+    /// Timed mouse actions. Grand Prix 2's startup menu has no keyboard path at
+    /// all, so a key-only schedule can never get past it.
+    #[serde(default)]
+    pub mouse: Vec<MouseStep>,
+}
+
+/// Is this a `--inject-mouse` action the emulator will accept? Checked here so a
+/// typo in a recipe fails the translation instead of the run.
+pub fn is_valid_mouse_action(action: &str) -> bool {
+    let action = action.trim();
+    if matches!(action, "home" | "down" | "up" | "click") {
+        return true;
+    }
+    let Some(deltas) = action.strip_prefix("move:") else {
+        return false;
+    };
+    let Some((dx, dy)) = deltas.split_once(',') else {
+        return false;
+    };
+    dx.trim().parse::<i32>().is_ok() && dy.trim().parse::<i32>().is_ok()
 }
 
 impl Recipe {
@@ -75,6 +109,7 @@ impl Recipe {
                     text: "\\r".to_string(),
                 },
             ],
+            mouse: Vec::new(),
         }
     }
 
@@ -89,15 +124,39 @@ impl Recipe {
     /// Steps past `budget_clocks` are dropped: they never fire, and they only
     /// widen the region the injection schedule slices the run into.
     pub fn to_inject_keys_within(&self, clock_hz: u64, budget_clocks: u64) -> Option<String> {
-        let mut steps: Vec<(u64, &str)> = self
+        let steps: Vec<(u64, &str)> = self
             .keys
             .iter()
-            .map(|step| {
-                (
-                    (step.guest_ms.saturating_mul(clock_hz) / 1000).max(1),
-                    step.text.as_str(),
-                )
-            })
+            .map(|step| (step.guest_ms, step.text.as_str()))
+            .collect();
+        Self::render(&steps, clock_hz, budget_clocks)
+    }
+
+    /// The same rendering for `--inject-mouse`. The two flags carry separate
+    /// schedules and the emulator merges them, so each is offset-ordered on its
+    /// own.
+    pub fn to_inject_mouse_within(&self, clock_hz: u64, budget_clocks: u64) -> Option<String> {
+        let steps: Vec<(u64, &str)> = self
+            .mouse
+            .iter()
+            .map(|step| (step.guest_ms, step.action.as_str()))
+            .collect();
+        Self::render(&steps, clock_hz, budget_clocks)
+    }
+
+    /// Every mouse action this recipe names that the emulator would reject.
+    pub fn invalid_mouse_actions(&self) -> Vec<String> {
+        self.mouse
+            .iter()
+            .filter(|step| !is_valid_mouse_action(&step.action))
+            .map(|step| step.action.clone())
+            .collect()
+    }
+
+    fn render(steps: &[(u64, &str)], clock_hz: u64, budget_clocks: u64) -> Option<String> {
+        let mut steps: Vec<(u64, &str)> = steps
+            .iter()
+            .map(|(guest_ms, text)| ((guest_ms.saturating_mul(clock_hz) / 1000).max(1), *text))
             .collect();
         steps.sort_by_key(|(cycles, _)| *cycles);
         let mut rendered: Vec<String> = Vec::new();

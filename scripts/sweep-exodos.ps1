@@ -50,14 +50,18 @@ param(
     [int]$PhaseIntervalMs = 2000,
     # Guest ms between screen samples.
     [int]$ScreenIntervalMs = 5000,
-    # Host seconds before a run is killed as HUNG-HOST. Sized against the
-    # slowest fixture (duke3d-586 at rt 0.29 needs ~414 s for 120 guest
-    # seconds) plus the screen-sampling overhead.
-    [int]$WatchdogSeconds = 900,
+    # Host seconds before a run is killed as HUNG-HOST. This is the BACKSTOP,
+    # not the primary kill: MEASURED 2026-08-16, kq1vga runs at rt 0.138 and
+    # reached only 112 of its 120 guest seconds before the old 900 s ceiling cut
+    # it off, so the wall clock was deciding rows that were working. 1500 s
+    # covers 120 guest seconds down to about rt 0.08. The stall detector below
+    # is what ends a wedged run, and it ends one in a quarter of the time.
+    [int]$WatchdogSeconds = 1500,
     # Host seconds with no growth in the screen index (or stdout/stderr) before
-    # a run is killed as STALLED. A 586 run at rt 0.29 samples the screen about
-    # every 17 host seconds, so this is many missed samples, not a close call.
-    # 0 disables the detector and leaves only the wall-clock watchdog.
+    # a run is killed as STALLED. THE PRIMARY KILL. A 586 run at rt 0.29 samples
+    # the screen about every 17 host seconds, so this is many missed samples,
+    # not a close call. 0 disables the detector and leaves only the wall-clock
+    # watchdog, which is a much blunter instrument.
     [int]$StallSeconds = 300,
     # Refuse a game whose extraction would exceed this, rather than filling the
     # volume. The corpus maximum extracts to about 7 GB.
@@ -146,23 +150,36 @@ function Clear-ObserverEnvironment {
     }
 }
 
+# Non-title .bat names inside `!dos\<short>\`. MEASURED over the whole corpus
+# 2026-08-16: 7666 directories ship `install.bat` and 108 also ship
+# `exception.bat`; every other .bat name in the corpus occurs exactly once and
+# is a title marker. `exception.bat` sorts before most titles under the NTFS
+# upcased ordering (EXCEPTION < KING'S < PRINCE), so taking the first .bat
+# derived `exception.zip` for Ppersia and kq1vga and the row died as
+# "no zip resolved".
+$nonTitleBatNames = @('install.bat', 'exception.bat')
+
 # Find `<Title (Year)>.zip` for a corpus short. The mapping runs through the
 # `<Full Title (Year)>.bat` file inside `!dos\<short>\`; the corpus is dense
 # with near neighbours (DOOM / DOOMII / DOOM2D / DOOM4), so the short is
 # matched EXACTLY and never fuzzily.
+#
+# The name list is not the only guard: every candidate is checked against the
+# zip that must sit beside it, and the first candidate WITH a zip wins. A future
+# non-title marker therefore costs nothing as long as no zip is named after it.
 function Resolve-GameZip {
-    param([string]$DosRoot, [string]$CorpusRoot, [string]$Short)
+    param([string]$DosRoot, [string]$CorpusRoot, [string]$Short, [string[]]$Excluded)
     $confDir = Join-Path $DosRoot $Short
     if (-not (Test-Path -LiteralPath $confDir)) { return $null }
     $leaf = Split-Path -Leaf ((Get-Item -LiteralPath $confDir).FullName)
     if ($leaf -cne $Short) { return $null }
-    $marker = Get-ChildItem -LiteralPath $confDir -Filter '*.bat' -File |
-        Where-Object { $_.Name -ne 'install.bat' } |
-        Select-Object -First 1
-    if (-not $marker) { return $null }
-    $zip = Join-Path $CorpusRoot ($marker.BaseName + '.zip')
-    if (-not (Test-Path -LiteralPath $zip)) { return $null }
-    return $zip
+    $candidates = @(Get-ChildItem -LiteralPath $confDir -Filter '*.bat' -File |
+        Where-Object { $Excluded -notcontains $_.Name.ToLowerInvariant() })
+    foreach ($marker in $candidates) {
+        $zip = Join-Path $CorpusRoot ($marker.BaseName + '.zip')
+        if (Test-Path -LiteralPath $zip) { return $zip }
+    }
+    return $null
 }
 
 function Expand-GameZip {
@@ -197,6 +214,29 @@ function Expand-GameZip {
 # at all and the stall detector has nothing to read; it then degrades to the
 # plain wall-clock watchdog, which is why the caller passes the screens index
 # and why the sweep always arms screen dumps.
+# Quote one argument the way CommandLineToArgvW reads it back: wrap when the
+# text is empty or carries whitespace or a quote, double every backslash run
+# that touches the closing quote, and escape embedded quotes.
+function ConvertTo-WindowsArgument {
+    param([string]$Value)
+    if ($Value -ne '' -and $Value -notmatch '[\s"]') { return $Value }
+    $out = '"'
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($ch -eq '"') {
+            $out += '\' * (2 * $backslashes + 1) + '"'
+        } else {
+            $out += '\' * $backslashes + $ch
+        }
+        $backslashes = 0
+    }
+    return $out + ('\' * (2 * $backslashes)) + '"'
+}
+
 function Invoke-EmulatorRun {
     param(
         [string]$Exe,
@@ -215,7 +255,14 @@ function Invoke-EmulatorRun {
     }
     # An empty command line is the failure mode that once ran a whole leg
     # against the owner's real drive, hence the argument-count refusal above.
-    $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -NoNewWindow -PassThru `
+    #
+    # -ArgumentList joins an array with spaces and quotes NOTHING, so a corpus
+    # path with a space in it ("Death Rallye.cue", "UFO Enemy Unknown.iso")
+    # arrives at the emulator as two arguments and clap rejects the row. Each
+    # element is quoted here, to the CommandLineToArgvW rules the Rust runtime
+    # parses back.
+    $quoted = @($Arguments | ForEach-Object { ConvertTo-WindowsArgument $_ })
+    $process = Start-Process -FilePath $Exe -ArgumentList $quoted -NoNewWindow -PassThru `
         -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
     $watched = @($StdoutPath, $StderrPath) + $ProgressPaths
     $started = Get-Date
@@ -384,6 +431,7 @@ foreach ($short in $Games) {
         resolved_by_search           = $false
         config_sys_shape             = $null
         cd_image                     = $null
+        inject_mouse                 = $null
         memory_mib                   = 0
         choices                      = @()
         exit_code                    = $null
@@ -419,7 +467,8 @@ foreach ($short in $Games) {
 
         $conf = Join-Path (Join-Path $dosRoot $short) 'dosbox.conf'
         if (-not (Test-Path -LiteralPath $conf)) { throw "no dosbox.conf for $short" }
-        $zip = Resolve-GameZip -DosRoot $dosRoot -CorpusRoot $Corpus -Short $short
+        $zip = Resolve-GameZip -DosRoot $dosRoot -CorpusRoot $Corpus -Short $short `
+            -Excluded $nonTitleBatNames
         if (-not $zip) { throw "no zip resolved for $short" }
 
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
@@ -454,6 +503,7 @@ foreach ($short in $Games) {
         $row.resolved_by_search = $plan.resolved_by_search
         $row.config_sys_shape = $plan.config_sys_shape
         $row.cd_image = $plan.cd_image
+        $row.inject_mouse = $plan.inject_mouse
         $row.memory_mib = $plan.memory_mib
         $row.choices = @($plan.choices)
 

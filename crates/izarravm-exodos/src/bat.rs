@@ -34,26 +34,37 @@
 //! COMMAND.COM, and each is recorded here rather than fixed because the corpus
 //! sweep has to name the frequency before the fix is worth its risk:
 //!
-//! - Call-depth asymmetry. `call FOO` and a bare `FOO` that resolves to
-//!   `FOO.BAT` both descend, but they arrive at the depth counter by different
-//!   routes, so the two chains are not budgeted identically against
-//!   `MAX_CALL_DEPTH`. The bound holds either way; only the exact chain length
-//!   at which a title is refused moves.
 //! - `del <directory>` prompts in real DOS ("All files in directory will be
 //!   deleted!"), and only the `*.*` and bare-`*` forms are dropped here. A
 //!   directory-form `del` would be emitted and would block the guest shell.
 //! - `if exist` is answered against the tree as EXTRACTED, not as it stands
 //!   after the flattened lines above it have run. A branch guarded on a file an
 //!   earlier `copy` creates is therefore read in its pre-copy state.
+//!
+//! ENVIRONMENT. `%VAR%` is expanded from the SET lines the walk has already
+//! seen, seeded with the variables the generated AUTOEXEC sets before the
+//! launcher runs. A name nothing has set expands to nothing, which is what DOS
+//! does and is the whole reason `XCOMUF`'s `ArchFile.Bat` picks its 16-bit
+//! branch (`%PROCESSOR_ARCHITECTURE%` and `%OS%` do not exist in DOS). The one
+//! way this can read a variable wrongly is a variable a PROGRAM sets, which the
+//! walk cannot see; `VAR-UNSET-EXPANDED` marks every row where an unset name was
+//! expanded so those rows are auditable rather than silent.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tree::{Tree, guest_path, join_rel};
 
 /// How deep a `call` chain may go before the title is refused. The autoexec's
-/// own `call run` is depth 1; `MillAlDe` has a second-level call and is the
-/// reason this is 2 rather than 1.
-pub const MAX_CALL_DEPTH: u32 = 2;
+/// own `call run` is depth 1. `SWXWCD` needs four: autoexec -> `run.bat` ->
+/// `XWINGCD.BAT` -> `XWINGCD2.BAT`, and `MAX_STEPS` is what actually bounds the
+/// walk, so this only has to be past the deepest real chain.
+pub const MAX_CALL_DEPTH: u32 = 4;
+
+/// How many `if errorlevel` ladders after a program invocation may be probed
+/// for convergence before the title is refused outright. Each probe re-walks
+/// the rest of the program once per branch, so this is a cost bound, not a
+/// correctness one.
+const MAX_ERRORLEVEL_PROBES: u32 = 4;
 
 /// A guard against a BAT whose control flow we mis-model. Real launchers are
 /// well under a hundred steps.
@@ -73,6 +84,16 @@ pub struct Launch {
     pub by_search: bool,
 }
 
+/// An `imgmount` the walk reached inside a BAT. `conf.rs` only sees the ones in
+/// `[autoexec]`, and `MechW2` mounts its 749 MB disc inside the CHOICE branch
+/// the flattener picks, so the disc has to travel out of here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImgMount {
+    pub drive: char,
+    pub image: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Flattened {
     /// Commands to write into AUTOEXEC.BAT, in order, before the launch.
@@ -83,6 +104,14 @@ pub struct Flattened {
     pub flags: BTreeSet<String>,
     /// One entry per `CHOICE` resolved, for the audit trail.
     pub choices: Vec<String>,
+    /// The shell environment as the walk has built it. Seeded by the caller
+    /// with what the generated AUTOEXEC sets before the launcher runs.
+    pub vars: BTreeMap<String, String>,
+    /// `imgmount` lines reached inside the BAT, in order.
+    pub imgmounts: Vec<ImgMount>,
+    /// How many errorlevel ladders have already been probed, so a program that
+    /// is nothing but ladders cannot make the walk exponential.
+    pub errorlevel_probes: u32,
 }
 
 /// Commands the guest shell either does not have or must not be given. `pause`
@@ -159,7 +188,7 @@ impl<'a> Flattener<'a> {
         };
         let program = Program::parse(&String::from_utf8_lossy(&bytes));
         let mut cwd = cwd.to_string();
-        self.run(&program, &mut cwd, depth, out);
+        self.run_from(&program, 0, &mut cwd, depth, out);
     }
 
     /// Run a short synthetic program (a single autoexec payload command, most
@@ -167,11 +196,18 @@ impl<'a> Flattener<'a> {
     /// reach one resolver.
     pub fn run_line_program(&self, text: &str, cwd: &mut String, out: &mut Flattened) {
         let program = Program::parse(text);
-        self.run(&program, cwd, 1, out);
+        self.run_from(&program, 0, cwd, 1, out);
     }
 
-    fn run(&self, program: &Program, cwd: &mut String, depth: u32, out: &mut Flattened) {
-        let mut pc = 0usize;
+    fn run_from(
+        &self,
+        program: &Program,
+        start: usize,
+        cwd: &mut String,
+        depth: u32,
+        out: &mut Flattened,
+    ) {
+        let mut pc = start;
         let mut steps = 0usize;
         while pc < program.lines.len() {
             steps += 1;
@@ -179,7 +215,8 @@ impl<'a> Flattener<'a> {
                 out.failure = Some("bat-step-limit".to_string());
                 return;
             }
-            let line = program.lines[pc].clone();
+            let raw = program.lines[pc].clone();
+            let line = expand_vars(&raw, out);
             let stripped = line.trim_start_matches('@').trim().to_string();
             let lower = stripped.to_ascii_lowercase();
 
@@ -220,7 +257,8 @@ impl<'a> Flattener<'a> {
                             }
                             continue;
                         }
-                        if self.emit(&rest, cwd, depth, out) == Emit::Stop {
+                        if self.emit(&rest, cwd, depth, out, false) == Emit::Stop {
+                            self.settle_launch(program, pc, cwd, depth, out);
                             return;
                         }
                         pc += 1;
@@ -252,10 +290,81 @@ impl<'a> Flattener<'a> {
                 }
                 continue;
             }
-            if self.emit(&stripped, cwd, depth, out) == Emit::Stop {
+            if self.emit(&stripped, cwd, depth, out, false) == Emit::Stop {
+                self.settle_launch(program, pc, cwd, depth, out);
                 return;
             }
             pc += 1;
+        }
+    }
+
+    /// A program invocation is only the launch when nothing reads its exit
+    /// code. `ecstatic` runs `testmem` and then branches on `ERRORLEVEL 18` into
+    /// `ecst4meg` or `ecst8meg`; taking `testmem` as the launch produces a run
+    /// that measures a memory-sizing utility and then falls off the end of the
+    /// AUTOEXEC. The exit code is unknowable here, so this does not guess: it
+    /// walks every branch of the ladder, keeps the launch only when they all
+    /// agree, and otherwise refuses the title by name.
+    fn settle_launch(
+        &self,
+        program: &Program,
+        pc: usize,
+        cwd: &str,
+        depth: u32,
+        out: &mut Flattened,
+    ) {
+        if out.launch.is_none() || out.failure.is_some() {
+            return;
+        }
+        let Some(ladder) = errorlevel_ladder(program, pc + 1) else {
+            return;
+        };
+        out.errorlevel_probes += 1;
+        if ladder.unresolved || out.errorlevel_probes > MAX_ERRORLEVEL_PROBES {
+            out.launch = None;
+            out.flags.insert("ERRORLEVEL-BRANCH".to_string());
+            out.failure = Some("errorlevel-branch-after-program".to_string());
+            return;
+        }
+        let mut agreed: Option<Flattened> = None;
+        for target in &ladder.continuations {
+            let mut probe = Flattened {
+                vars: out.vars.clone(),
+                errorlevel_probes: out.errorlevel_probes,
+                ..Flattened::default()
+            };
+            let mut probe_cwd = cwd.to_string();
+            self.run_from(program, *target, &mut probe_cwd, depth, &mut probe);
+            let diverges = match (&agreed, &probe.launch) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some(first), Some(next)) => {
+                    let first = first.launch.as_ref().expect("agreed carries a launch");
+                    first.command != next.command || first.dir != next.dir
+                }
+            };
+            if diverges {
+                out.launch = None;
+                out.flags.insert("ERRORLEVEL-BRANCH".to_string());
+                out.failure = Some("errorlevel-branch-after-program".to_string());
+                return;
+            }
+            if agreed.is_none() {
+                agreed = Some(probe);
+            }
+        }
+        // Every branch ran the same program, so the utility above the ladder was
+        // a probe and the agreed program is the launch. The utility itself still
+        // has to run in the guest: it is what the game's own launcher runs.
+        if let Some(mut probe) = agreed {
+            out.flags.insert("ERRORLEVEL-BRANCH-CONVERGED".to_string());
+            let utility = out.launch.take().expect("checked above");
+            out.lines.push(utility.command);
+            out.lines.append(&mut probe.lines);
+            out.flags.extend(probe.flags);
+            out.choices.append(&mut probe.choices);
+            out.imgmounts.append(&mut probe.imgmounts);
+            out.launch = probe.launch;
         }
     }
 
@@ -266,12 +375,27 @@ impl<'a> Flattener<'a> {
         Some(forward_label(program, target, pc)? + 1)
     }
 
-    fn emit(&self, command: &str, cwd: &mut String, depth: u32, out: &mut Flattened) -> Emit {
+    fn emit(
+        &self,
+        command: &str,
+        cwd: &mut String,
+        depth: u32,
+        out: &mut Flattened,
+        via_call: bool,
+    ) -> Emit {
         let tokens = crate::conf::tokenize(command);
         let Some(first) = tokens.first() else {
             return Emit::Continue;
         };
         let verb = first.to_ascii_lowercase();
+        // An `echo` with a redirect is not screen noise, it WRITES a file the
+        // game then reads: `kq1vga` rebuilds RESOURCE.CFG out of eight of them
+        // and starts in the wrong video mode without it.
+        if verb.starts_with("echo") && command.contains('>') {
+            out.flags.insert("ECHO-REDIRECT-KEPT".to_string());
+            out.lines.push(command.trim().to_string());
+            return Emit::Continue;
+        }
         if is_dropped(&verb) || verb.starts_with("echo") {
             if verb == "pause" {
                 out.flags.insert("PAUSE-DROPPED".to_string());
@@ -279,6 +403,22 @@ impl<'a> Flattener<'a> {
             if verb == "config" {
                 out.flags.insert("CONFIG-SET-DROPPED".to_string());
             }
+            return Emit::Continue;
+        }
+        // `imgmount` is a DOSBox internal, but it is also the only place some
+        // titles name their disc, so it leaves as data rather than as a line.
+        if verb == "imgmount" {
+            match parse_imgmount(&tokens) {
+                Some(mount) => out.imgmounts.push(mount),
+                None => {
+                    out.flags.insert("IMGMOUNT-UNPARSED".to_string());
+                }
+            }
+            return Emit::Continue;
+        }
+        if verb == "set" {
+            record_set(command, out);
+            out.lines.push(command.trim().to_string());
             return Emit::Continue;
         }
         if verb == "cd" || verb == "chdir" || verb.starts_with("cd\\") || verb.starts_with("cd.") {
@@ -300,30 +440,16 @@ impl<'a> Flattener<'a> {
             }
             return Emit::Continue;
         }
+        // `CALL` names a BAT most of the time, but DOS lets it name any program,
+        // and `ultimau1` ends its chosen branch on `call UW` -- UW.EXE, the
+        // game. Treating CALL as BAT-only refused the title outright. Handing
+        // the tail back to the ordinary resolver makes `call FOO` and a bare
+        // `FOO` the same decision, which is what COMMAND.COM does.
         if verb == "call" && tokens.len() >= 2 {
-            let target = tokens[1].trim_end_matches(".bat").trim_end_matches(".BAT");
-            match self.resolve_bat(cwd, target) {
-                Some(rel) => {
-                    let mut nested = Flattened::default();
-                    self.flatten_bat(cwd, &rel, depth + 1, &mut nested);
-                    out.lines.extend(nested.lines);
-                    out.flags.extend(nested.flags);
-                    out.choices.extend(nested.choices);
-                    if let Some(failure) = nested.failure {
-                        out.failure = Some(failure);
-                        return Emit::Stop;
-                    }
-                    if let Some(launch) = nested.launch {
-                        out.launch = Some(launch);
-                        return Emit::Stop;
-                    }
-                    return Emit::Continue;
-                }
-                None => {
-                    out.failure = Some("call-target-unresolved".to_string());
-                    return Emit::Stop;
-                }
-            }
+            let Some(rest) = command.trim().split_once(char::is_whitespace) else {
+                return Emit::Continue;
+            };
+            return self.emit(rest.1.trim(), cwd, depth, out, true);
         }
         if is_kept_builtin(&verb) {
             // `del *.*` is the one DOS builtin that stops and asks. A deleted
@@ -343,7 +469,8 @@ impl<'a> Flattener<'a> {
                 out.flags.insert("LINE-TOO-LONG-DROPPED".to_string());
                 return Emit::Continue;
             }
-            out.lines.push(command.trim().to_string());
+            let line = force_overwrite(command.trim(), &verb, out);
+            out.lines.push(line);
             return Emit::Continue;
         }
         // `loadfix` is a DOSBox internal that prefixes the real command.
@@ -361,22 +488,39 @@ impl<'a> Flattener<'a> {
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
-            return self.emit(&rebuilt, cwd, depth, out);
+            return self.emit(&rebuilt, cwd, depth, out, via_call);
         }
         // Everything left is a program. The first one that resolves in the tree
         // is the launch, and the walk stops there.
         match self.resolve_program(cwd, first) {
             Some((resolved, by_search, dir)) => {
                 if resolved.to_ascii_lowercase().ends_with(".bat") {
-                    let mut nested = Flattened::default();
+                    // The child inherits the environment and hands it back: a
+                    // BAT that sets a variable and returns is how XCOMUF's
+                    // ArchFile.Bat decides which branch RUNXCOM.BAT takes.
+                    let mut nested = Flattened {
+                        vars: std::mem::take(&mut out.vars),
+                        errorlevel_probes: out.errorlevel_probes,
+                        ..Flattened::default()
+                    };
                     self.flatten_bat(&dir, &resolved, depth + 1, &mut nested);
+                    out.vars = std::mem::take(&mut nested.vars);
+                    out.errorlevel_probes = nested.errorlevel_probes;
                     out.lines.extend(nested.lines);
                     out.flags.extend(nested.flags);
                     out.choices.extend(nested.choices);
+                    out.imgmounts.extend(nested.imgmounts);
                     if let Some(failure) = nested.failure {
                         out.failure = Some(failure);
-                    } else {
-                        out.launch = nested.launch;
+                        return Emit::Stop;
+                    }
+                    out.launch = nested.launch;
+                    // A BAT reached by CALL returns to its caller; a bare BAT
+                    // invocation transfers control and never comes back. Getting
+                    // this wrong stopped XCOMUF's launcher dead at the helper
+                    // BAT that only sets a variable.
+                    if out.launch.is_none() && via_call {
+                        return Emit::Continue;
                     }
                     return Emit::Stop;
                 }
@@ -399,20 +543,29 @@ impl<'a> Flattener<'a> {
         }
     }
 
-    fn resolve_bat(&self, cwd: &str, name: &str) -> Option<String> {
-        let candidates = self.search_dirs(cwd);
-        for dir in &candidates {
-            if let Some(actual) = self.tree.file_in(dir, &format!("{name}.bat")) {
-                return Some(join_rel(dir, actual));
-            }
-        }
-        None
-    }
-
     /// Resolve a command token to `(tree-relative path, by_search, directory)`.
     /// Real COMMAND.COM order is COM, EXE, BAT within a directory.
     fn resolve_program(&self, cwd: &str, token: &str) -> Option<(String, bool, String)> {
         let token = token.trim_matches('"');
+        // A token that carries a path is resolved against that path alone, the
+        // way DOS does: `call XcomUtil\Batch\ArchFile.Bat` must not be answered
+        // by some other `ArchFile.Bat` elsewhere in the tree.
+        if token.contains(['\\', '/']) {
+            let cut = token.rfind(['\\', '/'])?;
+            let dir = self.tree.resolve_dir(cwd, &token[..cut])?;
+            let name = &token[cut + 1..];
+            if name.contains('.')
+                && let Some(actual) = self.tree.file_in(&dir, name)
+            {
+                return Some((join_rel(&dir, actual), false, dir));
+            }
+            for ext in ["com", "exe", "bat"] {
+                if let Some(actual) = self.tree.file_in(&dir, &format!("{name}.{ext}")) {
+                    return Some((join_rel(&dir, actual), false, dir.clone()));
+                }
+            }
+            return None;
+        }
         let named_ext = token.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
         let dirs = self.search_dirs(cwd);
         for (index, dir) in dirs.iter().enumerate() {
@@ -473,8 +626,20 @@ impl<'a> Flattener<'a> {
             }
             return IfOutcome::NotTaken;
         }
-        // `if errorlevel` outside a resolved CHOICE, and string comparisons on
-        // environment variables, are both unknowable here.
+        // A string comparison. `%var%` was already expanded on the way in, so
+        // both sides are literals and the test is decidable -- which is the
+        // whole point: `Ppersia` guards its launch on `if %cheats%==no`, and an
+        // undecided test dropped the only line that runs the game.
+        if let Some((left, right, tail)) = split_comparison(rest) {
+            if (left == right) != negated {
+                if tail.trim_start().to_ascii_lowercase().starts_with("if ") {
+                    return self.eval_if(tail.trim(), cwd);
+                }
+                return IfOutcome::Taken(tail);
+            }
+            return IfOutcome::NotTaken;
+        }
+        // `if errorlevel` outside a resolved CHOICE is unknowable here.
         IfOutcome::Unknown
     }
 
@@ -581,6 +746,173 @@ enum IfOutcome {
     Unknown,
 }
 
+/// Expand `%VAR%` from the walk's environment. An unset name expands to
+/// nothing, which is what DOS does; `%1`-style batch arguments expand to
+/// nothing too, since a flattened launcher is never called with any.
+fn expand_vars(text: &str, out: &mut Flattened) -> String {
+    if !text.contains('%') {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '%' {
+            if let Some(next) = chars.get(index + 1).filter(|c| c.is_ascii_digit()) {
+                let _ = next;
+                index += 2;
+                continue;
+            }
+            if let Some(offset) = chars[index + 1..].iter().position(|c| *c == '%') {
+                let name: String = chars[index + 1..index + 1 + offset].iter().collect();
+                if !name.is_empty() && !name.contains(char::is_whitespace) {
+                    match out.vars.get(&name.to_ascii_uppercase()) {
+                        Some(value) => result.push_str(value),
+                        None => {
+                            out.flags.insert("VAR-UNSET-EXPANDED".to_string());
+                        }
+                    }
+                    index += offset + 2;
+                    continue;
+                }
+            }
+        }
+        result.push(chars[index]);
+        index += 1;
+    }
+    result
+}
+
+/// Record a `set NAME=VALUE` in the walk's environment. `set NAME=` clears it,
+/// and a bare `set` (which prints the environment) changes nothing.
+fn record_set(command: &str, out: &mut Flattened) {
+    let Some((_, tail)) = command.trim().split_once(char::is_whitespace) else {
+        return;
+    };
+    let Some((name, value)) = tail.split_once('=') else {
+        return;
+    };
+    let name = name.trim().to_ascii_uppercase();
+    if name.is_empty() {
+        return;
+    }
+    if value.trim().is_empty() {
+        out.vars.remove(&name);
+    } else {
+        out.vars.insert(name, value.trim().to_string());
+    }
+}
+
+/// Split `a==b rest` (or `a == b rest`, which the corpus also writes) into its
+/// two operands and whatever follows.
+fn split_comparison(rest: &str) -> Option<(String, String, String)> {
+    let at = rest.find("==")?;
+    let left = rest[..at].trim().to_string();
+    let tail = rest[at + 2..].trim_start();
+    let cut = tail.find(char::is_whitespace).unwrap_or(tail.len());
+    let right = tail[..cut].trim().to_string();
+    Some((left, right, tail[cut..].trim().to_string()))
+}
+
+/// Give `copy` and `xcopy` an explicit overwrite switch. Without it the guest
+/// stops on "Overwrite (Yes/No/All)?" and eats the injected keys that were meant
+/// for the game: `SMCivili`'s whole schedule shifted about two seconds.
+fn force_overwrite(command: &str, verb: &str, out: &mut Flattened) -> String {
+    if !matches!(verb, "copy" | "xcopy") {
+        return command.to_string();
+    }
+    let has_switch = crate::conf::tokenize(command)
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("/y") || token.eq_ignore_ascii_case("-y"));
+    if has_switch {
+        return command.to_string();
+    }
+    out.flags.insert("COPY-FORCED-OVERWRITE".to_string());
+    match command.split_once(char::is_whitespace) {
+        Some((head, tail)) => format!("{head} /Y {}", tail.trim_start()),
+        None => command.to_string(),
+    }
+}
+
+/// Read an `imgmount <drive> <image> [-t <kind>]` line. `imgmount -u d` (the
+/// unmount form `Blood` opens its menu with) names no image and is not one.
+fn parse_imgmount(tokens: &[String]) -> Option<ImgMount> {
+    if tokens.len() < 3 || tokens[1].starts_with('-') || tokens[1].starts_with('/') {
+        return None;
+    }
+    let kind = tokens
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("-t"))
+        .and_then(|at| tokens.get(at + 1))
+        .map(|t| t.to_ascii_lowercase())
+        .unwrap_or_default();
+    Some(ImgMount {
+        drive: tokens[1].chars().next().unwrap_or('d').to_ascii_lowercase(),
+        image: tokens[2].clone(),
+        kind,
+    })
+}
+
+/// The `if errorlevel N goto LABEL` ladder starting at `from`, and every place
+/// control can end up after it: each forward branch target, plus the line the
+/// ladder falls through to.
+struct ErrorlevelLadder {
+    continuations: Vec<usize>,
+    /// A ladder line whose `goto` target the walker cannot follow (a backward
+    /// jump, or a label that is not there). Such a branch must count as a
+    /// divergence rather than quietly leaving the candidate set.
+    unresolved: bool,
+}
+
+fn errorlevel_ladder(program: &Program, from: usize) -> Option<ErrorlevelLadder> {
+    let mut scan = from;
+    let mut targets: Vec<usize> = Vec::new();
+    let mut saw_ladder = false;
+    let mut unresolved = false;
+    while scan < program.lines.len() {
+        let line = program.lines[scan].trim().trim_start_matches('@').trim();
+        let lower = line.to_ascii_lowercase();
+        if line.is_empty() || lower.starts_with("rem ") || line.starts_with(':') {
+            // A label between the program and its ladder would mean control can
+            // arrive here from elsewhere; only blank and comment lines are skipped.
+            if line.starts_with(':') {
+                break;
+            }
+            scan += 1;
+            continue;
+        }
+        if !lower.starts_with("if errorlevel") && !lower.starts_with("if not errorlevel") {
+            break;
+        }
+        saw_ladder = true;
+        if lower.contains(" goto ") {
+            match lower
+                .split_whitespace()
+                .next_back()
+                .and_then(|label| forward_label(program, label, scan))
+            {
+                Some(index) => targets.push(index + 1),
+                None => unresolved = true,
+            }
+        } else {
+            // `if errorlevel N <command>` runs a command on one branch only, so
+            // the two branches cannot be compared by continuation index.
+            unresolved = true;
+        }
+        scan += 1;
+    }
+    if !saw_ladder {
+        return None;
+    }
+    targets.push(scan);
+    targets.sort_unstable();
+    targets.dedup();
+    Some(ErrorlevelLadder {
+        continuations: targets,
+        unresolved,
+    })
+}
+
 /// The line a label sits on, when the label exists and is strictly AFTER `pc`.
 /// Only forward targets are taken: a backward one is a loop, and the fixture
 /// AUTOEXECs' own `:loop` / `goto loop` shape is exactly what must never be
@@ -657,6 +989,12 @@ fn has_word(text: &str, needle: &str) -> bool {
 /// game's own config was baked for.
 pub fn branch_score(text: &str) -> i32 {
     let text = text.to_ascii_lowercase();
+    // A "Game Blaster" is a Creative CMS card, not a Sound Blaster, and we
+    // present neither it nor a Gravis. It has to stop matching `blaster` before
+    // anything else is scored, or `Ppersia` and `kq1vga` both pick the CMS
+    // branch on a tie and write CMS.DRV into the config the game then reads.
+    let game_blaster = text.contains("game blaster") || text.contains("gameblaster");
+    let text = text.replace("game blaster", "").replace("gameblaster", "");
     let has = |needle: &str| text.contains(needle);
     // Whole-word for the short English words, substring for the rest: `setup`
     // legitimately appears as `setup.exe` and `install` as `installer`, but
@@ -696,6 +1034,24 @@ pub fn branch_score(text: &str) -> i32 {
     }
     if has("canvas") || has("sc55") || has("roland") || has("mt-32") || has("mt32") {
         score -= 40;
+    }
+    if game_blaster {
+        score -= 40;
+    }
+    // The machine is a VGA, so a menu that offers a video mode should be taken
+    // at the best one it offers. Without this `kq1vga`'s CGA and EGA branches
+    // tie at zero and the CGA one wins on branch order.
+    //
+    // WHOLE WORDS ONLY, and this one is not theoretical: a substring test reads
+    // "Ghost Bear's Legacy" as an EGA branch (l-EGA-cy) and MechWarrior 2's
+    // menu picks the expansion over the game.
+    if word("vga") {
+        score += 30;
+    } else if word("ega") {
+        score += 20;
+    }
+    if word("cga") || word("hercules") || word("monochrome") {
+        score -= 20;
     }
     score
 }
