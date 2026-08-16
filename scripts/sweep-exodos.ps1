@@ -89,7 +89,16 @@ $benignStderrPatterns = @(
     '^\[DMA\] ',
     '^\s*$',
     '^\s*(INFO|WARN|DEBUG|TRACE)\b',
-    '^\d{4}-\d{2}-\d{2}T\S*\s+(INFO|WARN|DEBUG|TRACE)\b'
+    '^\d{4}-\d{2}-\d{2}T\S*\s+(INFO|WARN|DEBUG|TRACE)\b',
+    # Open-bus port diagnostics are DATA, not failures: a corpus title probing
+    # for sound cards or hypervisors touches unclaimed ports as a matter of
+    # course, and the emulator's answer (float, log, count) is the hardware
+    # answer. The lines stay archived in the row's stderr file and the port
+    # set is in the profile; failing rows on them would kill half a corpus of
+    # perfectly healthy detection sweeps (first seen: Cataco3D strobing the
+    # AT coprocessor latch at 0xF0, 2026-08-16).
+    '^open-bus: ',
+    '^port-fatal: '
 )
 
 # A corpus short names a directory under `!dos` and a directory under the

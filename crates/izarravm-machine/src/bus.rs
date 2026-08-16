@@ -2489,6 +2489,17 @@ impl CpuBus for MachineBus<'_> {
         {
             return Ok(());
         }
+        // AT coprocessor latch strobes. OUT 0xF0 clears the motherboard's FERR
+        // busy latch (the flip-flop behind the IRQ13 error path), OUT 0xF1
+        // resets the x87; the BIOS INT 75h handler and guest FPU error/detect
+        // paths write them as a matter of course (Catacomb 3-D strobes 0xF0 at
+        // startup). Both are write-only strobes: the board claims the write and
+        // drives nothing on a read, so reads deliberately fall through to open
+        // bus below. No FERR->IRQ13 latch is modeled yet, so there is no state
+        // to clear -- claiming the write IS the hardware behaviour.
+        if matches!(port, 0x00f0 | 0x00f1) {
+            return Ok(());
+        }
         // Nothing decoded it, so the write goes nowhere -- which is what happens
         // on real hardware and is why Prince of Persia's OUT to 0x7421 must not
         // stop the machine. See `OpenBusPorts`.

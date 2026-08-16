@@ -2857,3 +2857,30 @@ fn lotura_code_3_selects_386_slow_mode() {
     assert_eq!(GswMode::Gsw386Slow.register_code(), 3);
     assert_eq!(GswMode::Gsw386Slow.persona(), CpuPersona::I386);
 }
+
+#[test]
+fn coprocessor_latch_strobes_are_claimed_writes_and_floating_reads() {
+    // OUT 0xF0 (clear the FERR busy latch) and OUT 0xF1 (coprocessor reset)
+    // are motherboard write-only strobes on every AT: the BIOS INT 75h path
+    // and guest FPU error/detect code write them routinely (Catacomb 3-D
+    // strobes 0xF0 at startup). The write must be claimed, not an open-bus
+    // diagnostic. The read side is genuinely undriven on the board, so it
+    // floats and lands in the open-bus set like any unclaimed port.
+    let mut m = int15_machine(16);
+    let mut bus = m.make_bus();
+    bus.write_io(0x00f0, BusWidth::Byte, 0x00, false).unwrap();
+    bus.write_io(0x00f1, BusWidth::Byte, 0x00, false).unwrap();
+    assert!(
+        !bus.open_bus.floated(0x00f0),
+        "the 0xF0 latch-clear write must be claimed"
+    );
+    assert!(
+        !bus.open_bus.floated(0x00f1),
+        "the 0xF1 coprocessor-reset write must be claimed"
+    );
+    assert_eq!(bus.read_io(0x00f0, BusWidth::Byte, 0, false), Ok(0xff));
+    assert!(
+        bus.open_bus.floated(0x00f0),
+        "a 0xF0 read is undriven and floats like open bus"
+    );
+}
