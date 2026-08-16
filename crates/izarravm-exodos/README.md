@@ -96,3 +96,66 @@ Steps land inside the first 55 guest seconds on purpose: the classification
 window is the last 60 seconds of a 120-second run, and an injection schedule
 slices the run into one short call per scancode, so a schedule reaching into the
 window would put a knee inside it.
+
+## classify
+
+Turn archived sweep rows into structural-bucket verdicts. The orchestrator
+collects; this decides.
+
+    izarravm-exodos classify --input <sweep-dir> --output <dir> [--tsv]
+
+`--input` takes one game's archive directory (`profile.json` plus
+`screens/screens.jsonl`), a whole sweep output directory (game subdirectories,
+with `rows.jsonl` read for the host-side outcomes the archive cannot carry), a
+directory of bare profile JSONs, or a single profile JSON. Writes
+`classify.jsonl` and `classify.tsv`.
+
+### The window
+
+Marks are guest-clock driven. Measured on the smoke archive: across 60 periodic
+marks the guest spacing holds 1999.25-2000.84 ms while the wall spacing between
+the same marks ranges 615 ms to 5,114 ms. The window is the delta between the
+last mark and the mark nearest 60 guest seconds earlier, and it is a
+guest-deterministic input.
+
+Only B1, B2 and B3 can use it. The mark subset carries neither the callout
+family, the x87 counters nor `jit_direct_callout_port_v86_served`, so B4, B5a,
+B5b and B6 read whole-run totals and say so in their `windowed` field.
+
+A profile with an EMPTY mark series is a run where `IZARRAVM_PHASE_INTERVAL_MS`
+was never armed, which is not a short run: it keeps its counter-derived outcome
+and carries `NO-MARKS`. `SHORT-RUN` means marks were armed and there were fewer
+than 31 of them.
+
+### The buckets
+
+The repaired rules of the design's §9.2, each carrying the measured value that
+put the row there:
+
+| bucket | rule | fires on |
+|---|---|---|
+| B1 | `insns/entry < 4` and `entries/I > 0.05` | prince-486 |
+| B2 | `1 - jit_direct_insns/I > 0.15` | duke3d x2 |
+| B3 | `smc_heat_demotions/I > 1e-7` | duke3d x2, nascar, wolf3d x2 |
+| B4 | `(callout_executed + step_break + abnormal)/I > 0.015` | gp2, wolf3d x2 |
+| B5a | `side_exit_x87_eligibility/I > 1e-3` | tombraid |
+| B5b | `jit_direct_x87_pad_bails/I > 1e-5` | duke3d x2 |
+| B6 | `callout_port_v86_served/I > 0.01` | wolf3d x2 |
+
+B7-B10 were cut and survive as reported columns only. The eleven-row fixture
+table is the acceptance gate and lives in `bucket_test.rs`; the numbers there
+are read off the scoreboard board and no threshold may be moved to make a row
+pass.
+
+### Idle detection
+
+The design proposed `device_write_bytes` as the frame proxy and a flat window
+delta as the idle signal. That is refuted and the code records the refutation:
+DOOM runs the full 120 guest seconds in mode X with its frame hash changing 11
+distinct times inside the window, and its window `device_write_bytes` delta is
+exactly zero, because the counter stops accruing once the VGA aperture goes
+through the direct-data path. The frame-hash index from `screens.jsonl` is the
+flatness test instead — one distinct hash across at least three in-window
+samples — and the counters serve as the corroborating polling signature. A flat
+picture with no polling term stays `RAN` and carries `FLAT-PICTURE-NOT-IDLE`
+rather than disappearing into an idle bucket.

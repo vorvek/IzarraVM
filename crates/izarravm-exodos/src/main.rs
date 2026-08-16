@@ -12,6 +12,7 @@
 //! extracted.
 
 mod bat;
+mod bucket;
 mod classify;
 mod conf;
 mod recipe;
@@ -79,6 +80,21 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Turn archived sweep rows into structural-bucket verdicts.
+    ///
+    /// `--input` takes one game's archive directory, a whole sweep output
+    /// directory, a directory of bare profile JSONs (the fixture board), or a
+    /// single profile JSON.
+    Classify {
+        #[arg(long)]
+        input: PathBuf,
+        /// Directory for `classify.jsonl` and `classify.tsv`.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Print the TSV table instead of the JSON records.
+        #[arg(long)]
+        tsv: bool,
+    },
     /// Print the built-in generic key schedule, as a recipe-file template.
     DefaultRecipe,
 }
@@ -119,11 +135,36 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("{json}");
             Ok(())
         }
+        Command::Classify { input, output, tsv } => run_classify(&input, output.as_deref(), tsv),
         Command::DefaultRecipe => {
             println!("{}", serde_json::to_string_pretty(&Recipe::generic())?);
             Ok(())
         }
     }
+}
+
+fn run_classify(input: &Path, output: Option<&Path>, tsv: bool) -> Result<(), Box<dyn Error>> {
+    let archives = bucket::load_input(input)?;
+    let rows: Vec<bucket::ClassifiedRow> = archives.iter().map(bucket::classify_archive).collect();
+
+    let mut jsonl = String::new();
+    for row in &rows {
+        jsonl.push_str(&serde_json::to_string(row)?);
+        jsonl.push('\n');
+    }
+    let table = bucket::rows_to_tsv(&rows);
+
+    if let Some(dir) = output {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("classify.jsonl"), &jsonl)?;
+        std::fs::write(dir.join("classify.tsv"), &table)?;
+    }
+    if tsv {
+        print!("{table}");
+    } else {
+        print!("{jsonl}");
+    }
+    Ok(())
 }
 
 fn load_recipe(
