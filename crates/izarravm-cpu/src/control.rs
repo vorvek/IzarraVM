@@ -113,6 +113,8 @@ impl CpuGsw {
             .join(" ");
         let name = match vector {
             6 => "#UD",
+            11 => "#NP",
+            12 => "#SS",
             13 => "#GP",
             other => return eprintln!("fault trace: unexpected trace vector {other}"),
         };
@@ -151,6 +153,29 @@ impl CpuGsw {
                 "fault trace: {table} base={base:#010x} desc[{index:#x}]={desc:02x?} gdtr={:#010x}/{:#06x}",
                 self.gdtr.base, self.gdtr.limit
             );
+            // Neighborhood dump: stale-mapping garbage shows as a whole run of
+            // non-descriptor bytes, a single clobbered entry as one bad row.
+            for row in 0..4u32 {
+                let addr = base + index + row * 8 - 8;
+                let mut d = [0u8; 8];
+                let mut phys0 = 0;
+                for (i, b) in d.iter_mut().enumerate() {
+                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false) {
+                        if i == 0 {
+                            phys0 = phys;
+                        }
+                        if let Ok(v) =
+                            bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
+                        {
+                            *b = v as u8;
+                        }
+                    }
+                }
+                eprintln!(
+                    "fault trace: {table}[{:#x}] @lin {addr:#010x} phys {phys0:#010x} = {d:02x?}",
+                    index + row * 8 - 8
+                );
+            }
             let cs_sel = u32::from(self.registers.cs().selector);
             let (tb, tag) = if cs_sel & 4 != 0 {
                 (self.ldtr.base, "LDT")
@@ -159,6 +184,8 @@ impl CpuGsw {
             };
             let targets = [
                 ("IDT gate 13", self.idtr.base + 13 * 8),
+                ("IDT gate 12", self.idtr.base + 12 * 8),
+                ("IDT gate 11", self.idtr.base + 11 * 8),
                 ("CS desc", tb + (cs_sel & 0xFFF8)),
             ];
             for (label, addr) in targets {
@@ -173,13 +200,19 @@ impl CpuGsw {
                 }
                 eprintln!("fault trace: {label} ({tag}) @{addr:#010x} = {d:02x?}");
             }
+            let ss_reg = self.registers.segment(SegmentIndex::Ss);
             eprintln!(
-                "fault trace: ldtr sel={:#06x} base={:#010x} tr sel={:#06x} ss={:#06x} esp={:#010x}",
+                "fault trace: ldtr sel={:#06x} base={:#010x} tr sel={:#06x} ss={:#06x} esp={:#010x} \
+                 ss.base={:#010x} ss.limit={:#010x} ss.acc={:02x} ss.b32={}",
                 self.ldtr.selector,
                 self.ldtr.base,
                 self.tr.selector,
-                self.registers.segment(SegmentIndex::Ss).selector,
+                ss_reg.selector,
                 self.registers.esp(),
+                ss_reg.base,
+                ss_reg.limit,
+                ss_reg.access,
+                ss_reg.default_size_32,
             );
             let ss_base = self.registers.segment(SegmentIndex::Ss).base;
             let start = ss_base + (self.registers.esp() & !0xF).saturating_sub(16);
@@ -221,13 +254,47 @@ impl CpuGsw {
         // #GP deliveries bound for a protected-mode guest handler (the V86 ones
         // are the monitor's routine trap traffic - hundreds of thousands per
         // second - so only trace when the guest is NOT in V86).
-        if vector == 13 && !is_external && !self.is_v86_mode() {
-            self.trace_fault_if_enabled(bus, 13, error_code);
+        if (vector == 13 || vector == 11 || vector == 12) && !is_external && !self.is_v86_mode() {
+            self.trace_fault_if_enabled(bus, vector, error_code);
         }
         if !self.is_protected_mode() {
             return self.software_interrupt(bus, vector);
         }
 
+        self.deliver_exception_inner(bus, vector, error_code, is_external)
+    }
+
+    /// Guard around the delivery body: a fault raised while the frame is being
+    /// built unwinds with `self.cpl` already set to the target level (see the
+    /// PRM-transition-point note in the body) and, for a V86 source, VM already
+    /// dropped. The nested exception then re-enters delivery from the restored
+    /// interrupted state; without this restore the retried delivery sees the
+    /// target CPL, skips the ring cross, and builds the handler frame on the
+    /// interrupted ring's stack (the Tyrian / DPMI16BI corruption).
+    fn deliver_exception_inner<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+        error_code: Option<u32>,
+        is_external: bool,
+    ) -> ExecResult<()> {
+        let entry_cpl = self.cpl;
+        let entry_vm = self.registers.eflags & FLAG_VM;
+        let result = self.deliver_exception_body(bus, vector, error_code, is_external);
+        if result.is_err() {
+            self.cpl = entry_cpl;
+            self.registers.eflags = (self.registers.eflags & !FLAG_VM) | entry_vm;
+        }
+        result
+    }
+
+    fn deliver_exception_body<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+        error_code: Option<u32>,
+        is_external: bool,
+    ) -> ExecResult<()> {
         let gate_address = self.idtr.base + u32::from(vector) * 8;
         if u32::from(self.idtr.limit) < u32::from(vector) * 8 + 7 {
             return Err(CpuError::IdtLimit { vector }.into());
@@ -236,8 +303,23 @@ impl CpuGsw {
         let gate_low = self.read_system_linear_u32(bus, gate_address)?;
         let gate_high = self.read_system_linear_u32(bus, gate_address + 4)?;
         let selector = ((gate_low >> 16) & 0xffff) as u16;
-        let offset = (gate_low & 0x0000_ffff) | (gate_high & 0xffff_0000);
-        let is_interrupt_gate = (gate_high >> 8) & 0x0f == 0x0e; // 0x0e int gate, 0x0f trap gate
+        // Gate types: 0x6/0xe are interrupt gates (IF-clearing), 0x7/0xf trap
+        // gates; bit 3 is the gate width. A 16-bit gate (Borland DPMI16BI hangs
+        // its whole IDT off type 6) builds a WORD frame, and its high-offset
+        // word is reserved: only the low word reaches EIP.
+        let gate_type = (gate_high >> 8) & 0x0f;
+        let is_interrupt_gate = gate_type & 0x07 == 0x06;
+        let gate_is_32 = gate_type & 0x08 != 0;
+        let frame_size = if gate_is_32 {
+            OperandSize::Dword
+        } else {
+            OperandSize::Word
+        };
+        let offset = if gate_is_32 {
+            (gate_low & 0x0000_ffff) | (gate_high & 0xffff_0000)
+        } else {
+            gate_low & 0x0000_ffff
+        };
 
         // Settle deferred arithmetic flags so the eflags image pushed for the handler is live.
         self.materialize_flags();
@@ -287,17 +369,17 @@ impl CpuGsw {
             );
             let (old_ss, old_esp) = self.switch_to_inner_stack(bus, target_dpl)?;
             if source_v86 {
-                self.push(bus, u32::from(gs), OperandSize::Dword)?;
-                self.push(bus, u32::from(fs), OperandSize::Dword)?;
-                self.push(bus, u32::from(ds), OperandSize::Dword)?;
-                self.push(bus, u32::from(es), OperandSize::Dword)?;
+                self.push(bus, u32::from(gs), frame_size)?;
+                self.push(bus, u32::from(fs), frame_size)?;
+                self.push(bus, u32::from(ds), frame_size)?;
+                self.push(bus, u32::from(es), frame_size)?;
             }
-            self.push(bus, u32::from(old_ss), OperandSize::Dword)?;
-            self.push(bus, old_esp, OperandSize::Dword)?;
+            self.push(bus, u32::from(old_ss), frame_size)?;
+            self.push(bus, old_esp, frame_size)?;
         }
-        self.push(bus, saved_eflags, OperandSize::Dword)?;
-        self.push(bus, u32::from(saved_cs), OperandSize::Dword)?;
-        self.push(bus, saved_eip, OperandSize::Dword)?;
+        self.push(bus, saved_eflags, frame_size)?;
+        self.push(bus, u32::from(saved_cs), frame_size)?;
+        self.push(bus, saved_eip, frame_size)?;
         // The error code is pushed only for a CPU exception on a vector that carries one
         // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
         // hardware interrupt or software `INT n`, even when it lands on such a vector.
@@ -318,7 +400,7 @@ impl CpuGsw {
                 "V86-origin vector-13 #GP with a nonzero error code ({error_code:?}) \
                  breaks the TOKAEMM vec13 frame-shape discriminator"
             );
-            self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
+            self.push(bus, error_code.unwrap_or(0), frame_size)?;
         }
 
         // Entering the handler clears VM/NT/TF; an interrupt gate (not a trap gate) also
@@ -469,14 +551,48 @@ impl CpuGsw {
                 let ip = self.pop(bus, OperandSize::Word)?;
                 let cs = self.pop(bus, OperandSize::Word)? as u16;
                 let flags = self.pop(bus, OperandSize::Word)?;
+                if self.is_protected_mode()
+                    && !self.is_v86_mode()
+                    && (cs & 3) as u8 > self.current_privilege_level()
+                {
+                    // Inter-privilege word return: the 16-bit mirror of the dword
+                    // arm below. Borland's DPMI16BI returns its ring-0 INT 31h
+                    // handler to the ring-3 client this way; without the SS:SP pop
+                    // the client keeps the host's ring-0 SS and its first
+                    // PUSH SS / POP ES faults #GP (the exodos Tyrian crash). The
+                    // V86 guard mirrors the dword arm's: a V86 CS has arbitrary
+                    // low bits, and real mode never reaches this ring check.
+                    let sp = self.pop(bus, OperandSize::Word)?;
+                    let ss = self.pop(bus, OperandSize::Word)? as u16;
+                    self.load_segment(bus, SegmentIndex::Cs, cs)?;
+                    // Mechanical SS load under the pre-IRET CPL; see the dword arm
+                    // and `load_segment_system`.
+                    self.load_segment_system(bus, SegmentIndex::Ss, ss)?;
+                    self.set_eip(ip & 0xffff);
+                    // A word frame carries no ESP high half: a B=0 outer stack
+                    // takes the popped value into SP only; a B=1 outer stack
+                    // zero-extends it (the inner stack's high word never leaks
+                    // through a word-sized frame).
+                    if self.stack_is_32bit() {
+                        self.registers.set_esp(sp & 0xffff);
+                    } else {
+                        self.write_gpr16(4, sp as u16);
+                    }
+                    self.load_flags(flags, OperandSize::Word, false);
+                    // PRM transition point: the target RPL (non-V86, checked
+                    // above) is the new CPL.
+                    self.cpl = (cs & 3) as u8;
+                    self.invalidate_data_segments_below_cpl();
+                    return Ok(());
+                }
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.set_eip(ip & 0xffff);
                 self.load_flags(flags, OperandSize::Word, false);
-                // The 16-bit form only implements a same-privilege / real-mode / V86
-                // return (no inter-privilege stack pop); the target level is exactly the
-                // just-loaded CS's RPL, or 3 if that load landed in V86 -- but real mode
-                // is unconditionally CPL 0 regardless of the selector's low bits (a real-
-                // mode CS is not a descriptor selector, so those bits carry no RPL).
+                // Same-privilege / real-mode / V86 word return; the target level is
+                // exactly the just-loaded CS's RPL, or 3 if that load landed in V86
+                // -- but real mode is unconditionally CPL 0 regardless of the
+                // selector's low bits (a real-mode CS is not a descriptor selector,
+                // so those bits carry no RPL).
                 self.cpl = if !self.is_protected_mode() {
                     0
                 } else if self.is_v86_mode() {
@@ -672,12 +788,40 @@ impl CpuGsw {
         // occupies four stack bytes; the high two are discarded on load.
         let offset = self.pop(bus, operand_size)?;
         let selector = self.pop(bus, operand_size)? as u16;
+        if self.is_protected_mode()
+            && !self.is_v86_mode()
+            && (selector & 3) as u8 > self.current_privilege_level()
+        {
+            // 386 PRM RET (far, RPL > CPL): an inter-privilege return pops the
+            // outer SS:eSP after CS:IP and nulls inner-ring data segments. DPMI
+            // hosts enter ring-3 client exception handlers with exactly this
+            // frame; the V86 guard mirrors `iret`'s (a V86 CS has arbitrary low
+            // bits, and real mode never reaches this ring check).
+            let sp = self.pop(bus, operand_size)?;
+            let ss = self.pop(bus, operand_size)? as u16;
+            self.load_segment(bus, SegmentIndex::Cs, selector)?;
+            // Mechanical SS load under the pre-RET CPL; see `load_segment_system`.
+            self.load_segment_system(bus, SegmentIndex::Ss, ss)?;
+            self.set_eip(offset & operand_size.mask());
+            // B-keyed outer eSP load, same rule as `iret`'s inter-privilege arm:
+            // a B=0 outer stack takes SP only (ESP high word carries over); a
+            // B=1 stack takes the popped value at the operand width.
+            if self.stack_is_32bit() {
+                self.registers.set_esp(sp & operand_size.mask());
+            } else {
+                self.write_gpr16(4, sp as u16);
+            }
+            // PRM transition point: the target RPL (non-V86, checked above) is
+            // the new CPL.
+            self.cpl = (selector & 3) as u8;
+            self.invalidate_data_segments_below_cpl();
+            return Ok(());
+        }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset & operand_size.mask());
-        // RETF here only implements a same-privilege return (no ring-crossing SS:ESP
-        // pop, a pre-existing limitation out of scope); the cache tracks the loaded
-        // CS's RPL, or 3 if this landed back in V86 -- real mode forces CPL 0 (see
-        // `far_call`'s comment on why the selector's low bits don't apply there).
+        // Same-privilege return; the cache tracks the loaded CS's RPL, or 3 if this
+        // landed back in V86 -- real mode forces CPL 0 (see `far_call`'s comment on
+        // why the selector's low bits don't apply there).
         self.cpl = if !self.is_protected_mode() {
             0
         } else if self.is_v86_mode() {
@@ -985,9 +1129,22 @@ impl CpuGsw {
     ) -> ExecResult<(u16, u32)> {
         let old_ss = self.registers.segment(SegmentIndex::Ss).selector;
         let old_esp = self.registers.esp();
-        let esp_addr = self.tr.base + 4 + 8 * u32::from(target_dpl);
-        let new_esp = self.read_system_linear_u32(bus, esp_addr)?;
-        let new_ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
+        // TR names either a 386 TSS (types 0x9/0xB: ESP0 dword at +4, SS0 word
+        // at +8, 8 bytes per ring) or a 286 TSS (types 0x1/0x3: SP0 word at +2,
+        // SS0 word at +4, 4 bytes per ring). Borland's DPMI16BI runs off a 286
+        // TSS; reading the 386 offsets from it yields SS0=0 and the delivery
+        // dies on the null SS load.
+        let (new_esp, new_ss) = if self.tr.access & 0x08 == 0 {
+            let sp_addr = self.tr.base + 2 + 4 * u32::from(target_dpl);
+            let sp = self.read_system_linear(bus, sp_addr, BusWidth::Word)?;
+            let ss = self.read_system_linear(bus, sp_addr + 2, BusWidth::Word)? as u16;
+            (sp, ss)
+        } else {
+            let esp_addr = self.tr.base + 4 + 8 * u32::from(target_dpl);
+            let esp = self.read_system_linear_u32(bus, esp_addr)?;
+            let ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
+            (esp, ss)
+        };
         // The TSS-supplied SS for `target_dpl` is validated by the gate's own privilege
         // rules (the gate/target DPL check already run in `far_call_gate`), not the
         // plain-path CPL check: `self.cpl` here is still the outer (higher) level, since
@@ -1620,9 +1777,9 @@ impl CpuGsw {
 
     pub(super) fn descriptor_accessible(&self, selector: u16, high: u32) -> bool {
         let access = (high >> 8) & 0xff;
-        if access & 0x80 == 0 {
-            return false; // not present
-        }
+        // No present-bit check: LAR/LSL (the only callers) validate type and
+        // privilege ONLY, and return the rights with P as stored. Borland RTM
+        // probes its not-present swap descriptors with LAR from its #NP handler.
         let dpl = ((access >> 5) & 3) as u8;
         let rpl = (selector & 3) as u8;
         let is_segment = access & 0x10 != 0;

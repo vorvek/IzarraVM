@@ -1253,6 +1253,41 @@ fn lar_and_lsl_read_descriptor_fields() {
     assert_eq!(cpu.read_reg16(Reg16::Ax), 0xffff);
 }
 
+#[test]
+fn lar_and_lsl_succeed_on_a_not_present_descriptor() {
+    // 386 PRM: LAR and LSL check descriptor TYPE and privilege, never the
+    // present bit -- the returned access rights carry P as stored. Borland's
+    // RTM keeps unloaded segments as not-present descriptors and its #NP
+    // handler probes them with LAR before servicing the fault; ZF=0 here made
+    // it declare the exception unhandled (the Tyrian loader abort).
+    // Not-present data segment: access 0x72 (P=0, DPL 3, data, writable).
+    let (mut cpu, memory) = protected_cpu(&[0x0f, 0x02, 0xc1], 0x0000_ffff, 0x0000_7200);
+    cpu.write_reg16(Reg16::Cx, 0x000b); // RPL 3 to match the DPL-3 descriptor
+    cpu.cpl = 0;
+    let mut bus = TestBus::with_memory(memory);
+    cpu.cycle(&mut bus).unwrap();
+    assert!(
+        cpu.flag(FLAG_ZF),
+        "LAR must succeed on a not-present segment"
+    );
+    assert_eq!(
+        cpu.read_reg16(Reg16::Ax),
+        0x7200,
+        "the returned rights carry P=0 as stored"
+    );
+
+    let (mut cpu, memory) = protected_cpu(&[0x0f, 0x03, 0xc1], 0x0000_ffff, 0x0000_7200);
+    cpu.write_reg16(Reg16::Cx, 0x000b);
+    cpu.cpl = 0;
+    let mut bus = TestBus::with_memory(memory);
+    cpu.cycle(&mut bus).unwrap();
+    assert!(
+        cpu.flag(FLAG_ZF),
+        "LSL must succeed on a not-present segment"
+    );
+    assert_eq!(cpu.read_reg16(Reg16::Ax), 0xffff);
+}
+
 // ---- Exception error codes and FPU #MF ----
 
 #[test]
@@ -1411,6 +1446,7 @@ fn call_gate_inter_privilege_switches_stack() {
     memory[0xc4..0xc8].copy_from_slice(&0x2222u32.to_le_bytes());
     // TSS at 0x300 with the ring-0 stack: ESP0 at +4, SS0 at +8.
     cpu.tr.base = 0x300;
+    cpu.tr.access = 0x8b; // busy 386 TSS: the inner-stack read is layout-keyed on this type
     memory[0x304..0x308].copy_from_slice(&0x00f0u32.to_le_bytes());
     memory[0x308..0x30a].copy_from_slice(&0x0010u16.to_le_bytes());
     let mut bus = TestBus::with_memory(memory);
@@ -1479,6 +1515,7 @@ fn call_gate_inter_privilege_reads_params_from_a_16bit_outer_stack_with_esp_high
     cpu.cpl = 3;
     memory[0xfffe..0x1_0002].copy_from_slice(&0x1111u32.to_le_bytes());
     cpu.tr.base = 0x300;
+    cpu.tr.access = 0x8b; // busy 386 TSS: the inner-stack read is layout-keyed on this type
     memory[0x304..0x308].copy_from_slice(&0x00f0u32.to_le_bytes());
     memory[0x308..0x30a].copy_from_slice(&0x0010u16.to_le_bytes());
     let mut bus = TestBus::with_memory(memory);
@@ -1537,6 +1574,7 @@ fn cpl_transition_call_gate_inter_privilege_call_lowers_cpl_to_target_dpl() {
     cpu.registers.set_esp(0xc0);
     cpu.cpl = 3;
     cpu.tr.base = 0x300;
+    cpu.tr.access = 0x8b; // busy 386 TSS: the inner-stack read is layout-keyed on this type
     memory[0x304..0x308].copy_from_slice(&0x00f0u32.to_le_bytes());
     memory[0x308..0x30a].copy_from_slice(&0x0010u16.to_le_bytes());
     let mut bus = TestBus::with_memory(memory);

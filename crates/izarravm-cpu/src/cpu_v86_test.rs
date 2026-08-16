@@ -330,6 +330,290 @@ fn iret_inter_privilege_return_to_a_16bit_stack_wraps_sp_and_preserves_high_esp(
 }
 
 #[test]
+fn iret_word_inter_privilege_return_pops_ss_sp_and_nulls_ring0_data_segments() {
+    // The Tyrian / Borland DPMI16BI shape: the host's 16-bit ring-0 INT 31h
+    // handler returns to its ring-3 client with a WORD IRET over the frame
+    // [ip, cs, flags, sp, ss]. The word form must pop SS:SP on the ring
+    // change and null ring-0 data segments, exactly like the dword form;
+    // leaving the ring-0 SS live at CPL 3 is the exodos-smoke-20260816
+    // Tyrian crash (PUSH SS / POP ES then faults #GP on the DPL-0 selector).
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    let r3_cs = 0x23u16;
+    let r3_ss = 0x2Bu16;
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ds, R0_SS).unwrap(); // ring-0 data
+    cpu.registers.set_esp(0x6800);
+    // Word frame, pushed high-to-low: SS, SP, FLAGS, CS, IP.
+    for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+
+    cpu.iret(&mut bus, OperandSize::Word).unwrap();
+
+    assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
+    assert!(!cpu.is_v86_mode());
+    assert_eq!(cpu.registers.eip, 0x1234);
+    assert_eq!(cpu.registers.cs().selector, r3_cs);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ss).selector,
+        r3_ss,
+        "the word IRET's ring change must pop the outer SS"
+    );
+    assert_eq!(
+        cpu.registers.esp(),
+        0x2000,
+        "outer SP popped from the frame"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        0,
+        "ring-0 DS must be nulled on the return to ring 3"
+    );
+}
+
+#[test]
+fn iret_word_same_privilege_return_stays_on_the_current_stack() {
+    // Guard for the fix above: a word IRET whose popped CS has RPL == CPL is a
+    // same-privilege return and must NOT pop SS:SP.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    for v in [0x2u32, u32::from(R0_CS), 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+
+    cpu.iret(&mut bus, OperandSize::Word).unwrap();
+
+    assert_eq!(cpu.current_privilege_level(), 0);
+    assert_eq!(cpu.registers.eip, 0x1234);
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, R0_SS);
+    assert_eq!(cpu.registers.esp(), 0x6800, "three word pops, nothing more");
+}
+
+#[test]
+fn deliver_exception_through_a_16bit_interrupt_gate_pushes_a_word_frame() {
+    // A 16-bit interrupt gate (type 6, here access 0xe6: present, DPL 3) must
+    // build a WORD frame -- [ss, sp, flags, cs, ip, err] on a ring cross --
+    // and clear IF exactly like its 32-bit sibling. The Borland DPMI16BI host
+    // (Tyrian) hangs its whole IDT off type-6 gates; dword pushes through them
+    // desynchronize the host's word-sized IRET frames. The gate's high dword
+    // is reserved for the 16-bit types: the offset is ONLY the low word.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    let r3_cs = 0x23u16;
+    let r3_ss = 0x2Bu16;
+    // Vector 13 as a 16-bit interrupt gate to the ring-0 monitor. Poison the
+    // reserved high-offset word to prove it is ignored.
+    let base = (IDT + 13 * 8) as usize;
+    put16(&mut bus.memory, base as u32, MON_CODE as u16);
+    put16(&mut bus.memory, base as u32 + 2, R0_CS);
+    bus.memory[base + 4] = 0;
+    bus.memory[base + 5] = 0xe6; // present, DPL3, 16-bit interrupt gate
+    put16(&mut bus.memory, base as u32 + 6, 0xdead);
+    // Enter ring 3 through the proven dword IRET path.
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+    }
+    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    assert_eq!(cpu.current_privilege_level(), 3);
+    cpu.set_flag(FLAG_IF, true);
+
+    cpu.deliver_exception(&mut bus, 13, Some(0x18), false)
+        .unwrap();
+
+    assert_eq!(cpu.current_privilege_level(), 0);
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    assert_eq!(
+        cpu.registers.eip, MON_CODE,
+        "a 16-bit gate's offset is the low word only; the reserved high \
+         word (0xdead) must not reach EIP"
+    );
+    assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, R0_SS);
+    assert_eq!(
+        cpu.registers.esp(),
+        ESP0 - 12,
+        "six WORD pushes (ss, sp, flags, cs, ip, err), not six dwords"
+    );
+    assert_eq!(
+        cpu.registers.eflags & FLAG_IF,
+        0,
+        "a type-6 gate is an INTERRUPT gate: IF must be cleared"
+    );
+    let rd16 = |o: u32| {
+        u16::from_le_bytes([
+            bus.memory[(ESP0 - 12 + o) as usize],
+            bus.memory[(ESP0 - 12 + o) as usize + 1],
+        ])
+    };
+    assert_eq!(rd16(0), 0x18, "error code, word-sized");
+    assert_eq!(rd16(2), 0x1234, "interrupted IP");
+    assert_eq!(rd16(4), r3_cs, "interrupted CS");
+    assert_eq!(
+        rd16(6) & 0x200,
+        0x200,
+        "pushed FLAGS carries the pre-clear IF"
+    );
+    assert_eq!(rd16(8), 0x2000, "outer SP");
+    assert_eq!(rd16(10), r3_ss, "outer SS");
+}
+
+#[test]
+fn deliver_exception_reads_the_ring0_stack_from_a_286_tss() {
+    // Borland's DPMI16BI hangs TR off a 16-bit (286) TSS: SP0 is a WORD at
+    // offset +2 and SS0 a WORD at +4 (vs the 386 TSS's ESP0 dword at +4 /
+    // SS0 at +8). Reading 386 offsets from a 286 TSS returns SS0=0 and the
+    // null SS load kills the delivery with #GP(0) -- the second stage of the
+    // exodos-smoke-20260816 Tyrian crash.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    let r3_cs = 0x23u16;
+    let r3_ss = 0x2Bu16;
+    // Re-shape the TSS as a 286 one: busy 16-bit TSS type (0x3) in TR's cached
+    // access, SP0/SS0 at the 286 offsets. Zero the 386 slots to prove they are
+    // not read.
+    cpu.tr.access = 0x83;
+    put32(&mut bus.memory, TSS + 4, 0);
+    put16(&mut bus.memory, TSS + 8, 0);
+    put16(&mut bus.memory, TSS + 2, 0x6f00); // SP0
+    put16(&mut bus.memory, TSS + 4, R0_SS); // SS0
+    // 16-bit interrupt gate for vector 0x21, DPL 3, like the DPMI host's IDT.
+    let base = IDT + 0x21 * 8;
+    put16(&mut bus.memory, base, MON_CODE as u16);
+    put16(&mut bus.memory, base + 2, R0_CS);
+    bus.memory[base as usize + 4] = 0;
+    bus.memory[base as usize + 5] = 0xe6;
+    put16(&mut bus.memory, base + 6, 0);
+    // Enter ring 3 through the proven dword IRET path.
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+    }
+    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    assert_eq!(cpu.current_privilege_level(), 3);
+
+    cpu.deliver_exception(&mut bus, 0x21, None, true).unwrap();
+
+    assert_eq!(cpu.current_privilege_level(), 0);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ss).selector,
+        R0_SS,
+        "SS0 comes from the 286 TSS word at +4"
+    );
+    assert_eq!(
+        cpu.registers.esp(),
+        0x6f00 - 10,
+        "SP0 comes from the 286 TSS word at +2; five word pushes follow"
+    );
+}
+
+#[test]
+fn a_delivery_that_faults_midway_restores_the_interrupted_cpl() {
+    // If the frame build faults (here: a null SS0 in a 386 TSS), the CPU
+    // re-enters fault delivery for the nested exception. `deliver_exception`
+    // sets `self.cpl` to the target level before the frame pushes; leaving it
+    // there on the error path makes the retried delivery believe no ring
+    // cross is needed, so the handler runs on the interrupted ring-3 stack.
+    // That desync is what turned Tyrian's recoverable #GP into stack
+    // corruption. The error path must restore the interrupted CPL.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    for v in [0x2Bu32, 0x2000, 0x2, 0x23, 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+    }
+    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    assert_eq!(cpu.current_privilege_level(), 3);
+    // Poison SS0: the inner-stack switch must fault on the null selector.
+    put16(&mut bus.memory, TSS + 8, 0);
+
+    let result = cpu.deliver_exception(&mut bus, 0x21, None, true);
+
+    assert!(
+        result.is_err(),
+        "null SS0 must fault the delivery: {result:?}"
+    );
+    assert_eq!(
+        cpu.current_privilege_level(),
+        3,
+        "a faulted delivery must restore the interrupted CPL so the nested \
+         exception delivers with a correct ring-cross decision"
+    );
+}
+
+#[test]
+fn retf_word_inter_privilege_return_pops_ss_sp_and_nulls_ring0_data_segments() {
+    // 386 PRM RET (far, RPL > CPL): an inter-privilege far return pops SS:SP
+    // from the stack after CS:IP and nulls data segments inaccessible at the
+    // new CPL. DPMI hosts transfer to ring-3 client exception handlers with
+    // exactly this shape (frame [ip, cs, sp, ss], words).
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    let r3_cs = 0x23u16;
+    let r3_ss = 0x2Bu16;
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ds, R0_SS).unwrap(); // ring-0 data
+    cpu.registers.set_esp(0x6800);
+    // Word frame, pushed high-to-low: SS, SP, CS, IP.
+    for v in [u32::from(r3_ss), 0x2000, u32::from(r3_cs), 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+
+    cpu.return_far(&mut bus, OperandSize::Word).unwrap();
+
+    assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
+    assert_eq!(cpu.registers.eip, 0x1234);
+    assert_eq!(cpu.registers.cs().selector, r3_cs);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ss).selector,
+        r3_ss,
+        "the far return's ring change must pop the outer SS"
+    );
+    assert_eq!(
+        cpu.registers.esp(),
+        0x2000,
+        "outer SP popped from the frame"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        0,
+        "ring-0 DS must be nulled on the return to ring 3"
+    );
+}
+
+#[test]
 fn v86_out_consults_the_io_permission_bitmap() {
     // Guest at 0x0A00:0 does `OUT 0x21, AL` (E6 21). Bitmap traps port 0x21.
     let mut bitmap = vec![0u8; 0x20 + 1]; // ports 0..0x100 + terminator byte
