@@ -22,6 +22,34 @@ fn vbe_set_mode_selects_a_margo_mode() {
 }
 
 #[test]
+fn vbe_set_mode_clears_display_memory_unless_bit15_says_keep() {
+    // VBE 4F02, BX bit 15: 0 = clear display memory (the default every mode
+    // set relies on), 1 = preserve it. The graphical POST leaves its frame in
+    // Margo VRAM; without the clear, Descent II's VESA menu scans out stale
+    // POST pixels around its own drawing (seen as re-tinted POST bands in the
+    // stage-0 sweep screens). The legacy INT 10h path already models its
+    // equivalent (mode number bit 7); this pins the VBE side.
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    machine.vega.margo_mut().vram_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
+
+    // Bit 15 set: memory survives the mode set.
+    assert!(machine.vega.set_vbe_mode(0x8105));
+    assert_eq!(&machine.vega.margo_mut().vram()[..4], &[1, 2, 3, 4]);
+
+    // Bit 15 clear: memory is cleared.
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    assert!(
+        machine.vega.margo_mut().vram()[..4].iter().all(|&b| b == 0),
+        "4F02 without BX bit 15 must clear display memory"
+    );
+}
+
+#[test]
 fn vbe_set_mode_then_vga_mode_follows_the_display() {
     let rom = rom_with_code(&[
         0xb8, 0x02, 0x4f, // mov ax, 4F02h
