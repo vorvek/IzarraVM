@@ -1630,9 +1630,10 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(23K)"),
-        "TokaEMM should retain only its ~23 KiB low core: code, state, the \
-         8,304-byte TSS and the monitor stack. Nothing left in the core scales \
+        tokaemm.contains("(24K)"),
+        "TokaEMM should retain only its ~24 KiB low core: code, state, the \
+         8,304-byte TSS and the monitor stack (EMS function 50h pushed the \
+         rounded figure from 23K to 24K). Nothing left in the core scales \
          with installed RAM -- all three tables that did are in the system \
          window -- so this figure is now the same on a 64 MB machine and a \
          256 MB one.\n{}",

@@ -3,6 +3,16 @@
 
 use super::*;
 
+/// Which control transfer drives a hardware task switch. The three differ in
+/// busy-bit handling, back-link/NT writing, and the incoming TSS type they
+/// accept (SDM table 8-2); see `task_switch`.
+#[derive(Clone, Copy, PartialEq)]
+enum TaskSwitchKind {
+    Jump,
+    Call,
+    Return,
+}
+
 impl CpuGsw {
     pub(super) fn software_interrupt<B: CpuBus>(
         &mut self,
@@ -349,6 +359,21 @@ impl CpuGsw {
             gate_low & 0x0000_ffff
         };
 
+        // Task gate (type 0x5): the gate's selector names a TSS, not a code
+        // segment, and delivery is a CALL-style hardware task switch (386 PRM
+        // 9.5): back-link written, NT set, the interrupted TSS stays busy. No
+        // frame is pushed -- the outgoing state, VM flag included, is saved
+        // into the outgoing TSS by the switch -- so this branch runs BEFORE the
+        // V86 drop below. Only the error code lands on the NEW task's stack.
+        // DOS/4GW 1.97 points #PF at one of these.
+        if (gate_high >> 8) & 0x1f == 0x05 {
+            self.task_switch(bus, selector, TaskSwitchKind::Call)?;
+            if !is_external && vector_pushes_error_code(vector) {
+                self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
+            }
+            return Ok(());
+        }
+
         // Settle deferred arithmetic flags so the eflags image pushed for the handler is live.
         self.materialize_flags();
         let saved_eflags = self.registers.eflags;
@@ -445,7 +470,21 @@ impl CpuGsw {
             self.load_segment_real(SegmentIndex::Fs, 0);
             self.load_segment_real(SegmentIndex::Gs, 0);
         }
-        self.load_segment(bus, SegmentIndex::Cs, selector)?;
+        if let Err(fault) = self.load_segment(bus, SegmentIndex::Cs, selector) {
+            if ud_trace_enabled() {
+                eprintln!(
+                    "fault trace: deliver v{vector}: handler CS load failed: {fault:?} \
+                     gate={gate_high:#010x}:{gate_low:#010x} sel={selector:#06x} off={offset:#010x} \
+                     gdtr={:#010x}/{:#06x} ldtr sel={:#06x} base={:#010x} limit={:#06x}",
+                    self.gdtr.base,
+                    self.gdtr.limit,
+                    self.ldtr.selector,
+                    self.ldtr.base,
+                    self.ldtr.limit,
+                );
+            }
+            return Err(fault);
+        }
         self.set_eip(offset);
         // Count each vector-13 delivery from V86 as one TOKAEMM monitor trip.
         // Sensitive-instruction #GP faults and real IRQ5 both use this vector.
@@ -574,6 +613,18 @@ impl CpuGsw {
         bus: &mut B,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
+        // NT set in protected mode: this IRET ends a nested TASK, not an
+        // interrupt frame (386 PRM 9.5). Return through the current TSS's
+        // back-link; nothing is popped. The outgoing image is saved with NT=0
+        // (SDM table 8-2), so NT clears before the switch saves state. V86 is
+        // excluded: a V86 IRET at IOPL 3 is a plain frame pop (the monitor
+        // never hands a V86 task NT=1), and below IOPL 3 it trapped upstream.
+        if self.is_protected_mode() && !self.is_v86_mode() && self.registers.eflags & FLAG_NT != 0 {
+            let back_link = self.read_system_linear(bus, self.tr.base, BusWidth::Word)? as u16;
+            // NT is cleared inside `task_switch`, after the back-link validates:
+            // a #TS on a bad back-link must leave NT set for restartability.
+            return self.task_switch(bus, back_link, TaskSwitchKind::Return);
+        }
         match operand_size {
             OperandSize::Word => {
                 let ip = self.pop(bus, OperandSize::Word)?;
@@ -943,15 +994,20 @@ impl CpuGsw {
         high: u32,
         is_call: bool,
     ) -> ExecResult<()> {
+        let kind = if is_call {
+            TaskSwitchKind::Call
+        } else {
+            TaskSwitchKind::Jump
+        };
         match (high >> 8) & 0x0f {
             0x04 | 0x0c if is_call => self.far_call_gate(bus, selector, low, high),
             0x04 | 0x0c => self.far_jump_gate(bus, selector, low, high),
             // Available 386 TSS: a direct task switch.
-            0x09 => self.task_switch(bus, selector, is_call),
+            0x09 => self.task_switch(bus, selector, kind),
             // Task gate: switch to the TSS the gate names.
             0x05 => {
                 let tss_selector = ((low >> 16) & 0xffff) as u16;
-                self.task_switch(bus, tss_selector, is_call)
+                self.task_switch(bus, tss_selector, kind)
             }
             _ => Err(InternalFault::Exception {
                 vector: 13,
@@ -1234,14 +1290,49 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         new_selector: u16,
-        is_call: bool,
+        kind: TaskSwitchKind,
     ) -> ExecResult<()> {
-        let (low, high) = self.read_transfer_descriptor(bus, new_selector)?;
-        let access = (high >> 8) & 0xff;
-        // Present, available 386 TSS (type 0x09). Busy or wrong type is #GP.
-        if access & 0x80 == 0 || access & 0x1f != 0x09 {
+        // An IRET task return faults with #TS, not #GP, on every back-link
+        // malformation (386 PRM 9.5): a null or out-of-limit selector comes back
+        // from `read_transfer_descriptor` as #GP and is re-vectored here.
+        let fault_vector = match kind {
+            TaskSwitchKind::Return => 10,
+            _ => 13,
+        };
+        // A TSS selector must name the GDT: TI=1 faults before any descriptor
+        // read. This also keeps `set_tss_busy`, which computes a GDT address
+        // unconditionally, from writing through an LDT selector's index into
+        // whatever sits at that GDT offset.
+        if new_selector & 0x4 != 0 {
             return Err(InternalFault::Exception {
+                vector: fault_vector,
+                error_code: Some(selector_error_code(new_selector, true, false)),
+            });
+        }
+        let (low, high) = match self.read_transfer_descriptor(bus, new_selector) {
+            Err(InternalFault::Exception {
                 vector: 13,
+                error_code,
+            }) if kind == TaskSwitchKind::Return => {
+                return Err(InternalFault::Exception {
+                    vector: 10,
+                    error_code,
+                });
+            }
+            other => other?,
+        };
+        let access = (high >> 8) & 0xff;
+        // JMP/CALL (and a gate-borne exception) need a present, AVAILABLE 386 TSS
+        // (type 0x09); busy or wrong type is #GP. An IRET task return goes the other
+        // way: the back-link must name a present, BUSY 386 TSS (type 0x0b), anything
+        // else is #TS (386 PRM 9.5's back-link validation).
+        let wanted_type = match kind {
+            TaskSwitchKind::Return => 0x0b,
+            _ => 0x09,
+        };
+        if access & 0x80 == 0 || access & 0x1f != wanted_type {
+            return Err(InternalFault::Exception {
+                vector: fault_vector,
                 error_code: Some(selector_error_code(
                     new_selector,
                     new_selector & 0x4 != 0,
@@ -1252,12 +1343,21 @@ impl CpuGsw {
         let new_tss = self.descriptor_to_segment(new_selector, low, high);
         let old_selector = self.tr.selector;
 
+        // The outgoing image of an IRET task return carries NT=0 (SDM table
+        // 8-2). Cleared only NOW, after every fault the back-link validation can
+        // raise: a #TS/#GP above must leave NT set so the faulting IRET stays
+        // restartable and the #TS handler's own nested IRET still task-returns.
+        if kind == TaskSwitchKind::Return {
+            self.registers.eflags &= !FLAG_NT;
+        }
         self.save_task_state(bus)?;
-        if !is_call {
+        // SDM table 8-2 busy-bit rules: JMP and IRET free the outgoing TSS; CALL
+        // leaves it busy so the nested task's IRET can come back through it.
+        if kind != TaskSwitchKind::Call {
             self.set_tss_busy(bus, old_selector, false)?;
         }
         self.load_task_state(bus, new_tss.base)?;
-        if is_call {
+        if kind == TaskSwitchKind::Call {
             // Write the back-link and set NT so the inner IRET returns to the caller.
             self.write_system_linear(bus, new_tss.base, BusWidth::Word, u32::from(old_selector))?;
             self.registers.eflags |= FLAG_NT;
