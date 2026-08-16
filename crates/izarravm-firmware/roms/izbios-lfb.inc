@@ -56,11 +56,15 @@ margo_dst_setup:
     ret
 
 ; lfb_set_mode: install the proprietary 320x240x8 mode via VBE 4F02h.
+; BX bit 15 asks the VBE to PRESERVE display memory: POST draws the whole art
+; frame first and activates the mode last, and setup relies on lfb_clear for
+; its own wipes. Without the bit, a spec-faithful 4F02 clears VRAM and the
+; just-drawn frame is lost.
 lfb_set_mode:
     push ax
     push bx
     mov ax, 0x4f02
-    mov bx, LFB_MODE
+    mov bx, LFB_MODE | 0x8000
     int 0x10
     pop bx
     pop ax

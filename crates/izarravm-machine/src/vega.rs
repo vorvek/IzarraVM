@@ -159,6 +159,13 @@ impl Vega {
         if !self.margo.set_mode(mode) {
             return false;
         }
+        // VBE 4F02, BX bit 15: display memory is cleared on a mode set unless
+        // the caller asks to keep it. Without this, whatever the previous
+        // owner left in VRAM (the graphical POST frame, most visibly) scans
+        // out through the new mode's palette and pitch as stale garbage.
+        if request & 0x8000 == 0 {
+            self.margo.vram_mut().fill(0);
+        }
         self.margo_active = true;
         self.margo_linear = request & 0x4000 != 0;
         self.margo_bank = 0;
