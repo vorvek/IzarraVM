@@ -1684,6 +1684,276 @@ fn jmp_to_tss_performs_a_task_switch() {
     assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x89);
 }
 
+#[test]
+fn exception_through_an_idt_task_gate_switches_tasks_and_pushes_the_error_code() {
+    // DOS/4GW 1.97 points IDT vector 14 (#PF) at a TASK GATE (type 0x5) whose
+    // selector names a 386 TSS. Delivery must be a CALL-style task switch --
+    // back-link written, NT set, the old TSS stays busy -- and the error code
+    // is pushed on the NEW task's stack. Loading the TSS selector into CS
+    // (the pre-fix behavior) is #GP(sel) and killed Descent II in DOS/4GW init.
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) =
+        protected_cpu_with_gdt(&[0xf4], &[RING0_CODE, ring0_data, new_tss, old_tss]);
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.idtr = DescriptorTable {
+        base: 0x200,
+        limit: 0xff,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    // IDT gate 14: task gate (access 0x85), TSS selector 0x18. The offset
+    // fields of a task gate are ignored; 0x4343 proves they are not consumed.
+    put32(&mut memory, 0x270, 0x0018_4343);
+    put32(&mut memory, 0x274, 0x0000_8500);
+    put32(&mut memory, 0x380 + 32, 0x90); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x10); // ES
+    put16(&mut memory, 0x380 + 76, 0x08); // CS
+    put16(&mut memory, 0x380 + 80, 0x10); // SS
+    put16(&mut memory, 0x380 + 84, 0x10); // DS
+    // Poison the old TSS's EIP slot so the saved-state assertion below can
+    // only pass if `save_task_state` really wrote it.
+    put32(&mut memory, 0x300 + 32, 0xdead_beef);
+    let mut bus = TestBus::with_memory(memory);
+    cpu.registers.eip = 0x1234;
+
+    cpu.deliver_exception(&mut bus, 14, Some(0x4), false)
+        .unwrap();
+
+    assert_eq!(cpu.tr.selector, 0x18, "task register points at the new TSS");
+    assert_eq!(cpu.registers.cs().selector, 0x08);
+    assert_eq!(cpu.registers.eip, 0x90);
+    assert_ne!(
+        cpu.registers.eflags & FLAG_NT,
+        0,
+        "NT set for a nested task"
+    );
+    // Back-link at the new TSS base names the interrupted task.
+    assert_eq!(
+        u16::from_le_bytes(bus.memory[0x380..0x382].try_into().unwrap()),
+        0x20
+    );
+    // CALL-style switch: the old TSS stays busy, the new one becomes busy.
+    assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x8b, "old TSS still busy");
+    assert_eq!(bus.memory[0x100 + 0x18 + 5], 0x8b, "new TSS marked busy");
+    // The #PF error code lands on the NEW task's stack.
+    assert_eq!(cpu.registers.esp(), 0xf0 - 4);
+    assert_eq!(
+        u32::from_le_bytes(bus.memory[0xec..0xf0].try_into().unwrap()),
+        0x4
+    );
+    // The interrupted task's EIP was saved into the old TSS.
+    assert_eq!(
+        u32::from_le_bytes(bus.memory[0x300 + 32..0x300 + 36].try_into().unwrap()),
+        0x1234
+    );
+}
+
+#[test]
+fn hardware_interrupt_through_a_task_gate_pushes_no_error_code() {
+    // `is_external` (a hardware IRQ or software INT n landing on the gate):
+    // the task switch still happens, but nothing is pushed on the new task's
+    // stack -- only a genuine CPU exception carries an error code.
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) =
+        protected_cpu_with_gdt(&[0xf4], &[RING0_CODE, ring0_data, new_tss, old_tss]);
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.idtr = DescriptorTable {
+        base: 0x200,
+        limit: 0xff,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x270, 0x0018_0000); // gate 14: task gate -> TSS 0x18
+    put32(&mut memory, 0x274, 0x0000_8500);
+    put32(&mut memory, 0x380 + 32, 0x90); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x10); // ES
+    put16(&mut memory, 0x380 + 76, 0x08); // CS
+    put16(&mut memory, 0x380 + 80, 0x10); // SS
+    put16(&mut memory, 0x380 + 84, 0x10); // DS
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.deliver_exception(&mut bus, 14, None, true).unwrap();
+
+    assert_eq!(cpu.tr.selector, 0x18, "task switch still happens");
+    assert_eq!(
+        cpu.registers.esp(),
+        0xf0,
+        "no error code lands on the new task's stack for an external vector"
+    );
+}
+
+#[test]
+fn iret_with_nt_and_a_non_busy_backlink_raises_ts_and_keeps_nt() {
+    // Back-link names an AVAILABLE (type 0x09) TSS: #TS(sel), and NT must
+    // still be set afterwards so the faulting IRET stays restartable (the
+    // outgoing image of the #TS handler's frame must keep NT=1).
+    let handler_tss = (0x18u16, 0x0380_0067, 0x0000_8b00); // current, busy
+    let back_tss = (0x20u16, 0x0300_0067, 0x0000_8900); // NOT busy: stale link
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) =
+        protected_cpu_with_gdt(&[0xcf], &[RING0_CODE, ring0_data, handler_tss, back_tss]);
+    cpu.tr = SegmentRegister {
+        selector: 0x18,
+        base: 0x380,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.registers.eflags |= FLAG_NT;
+    memory[0x380..0x382].copy_from_slice(&0x20u16.to_le_bytes()); // back-link
+    let mut bus = TestBus::with_memory(memory);
+
+    let fault = cpu.iret(&mut bus, OperandSize::Dword).unwrap_err();
+
+    assert!(
+        matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 10,
+                error_code: Some(0x20)
+            }
+        ),
+        "expected #TS(0x20), got {fault:?}"
+    );
+    assert_ne!(
+        cpu.registers.eflags & FLAG_NT,
+        0,
+        "NT stays set across the fault"
+    );
+    assert_eq!(cpu.tr.selector, 0x18, "no switch happened");
+}
+
+#[test]
+fn task_gate_delivery_from_v86_saves_vm_in_the_outgoing_eflags_image() {
+    // A task-gate exception taken while in V86: the outgoing TSS image must
+    // keep VM=1 (the task-gate branch runs before deliver_exception's V86
+    // drop), and the incoming task's own EFLAGS (VM=0) takes over.
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) =
+        protected_cpu_with_gdt(&[0xf4], &[RING0_CODE, ring0_data, new_tss, old_tss]);
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.idtr = DescriptorTable {
+        base: 0x200,
+        limit: 0xff,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x270, 0x0018_0000); // gate 14: task gate -> TSS 0x18
+    put32(&mut memory, 0x274, 0x0000_8500);
+    put32(&mut memory, 0x380 + 32, 0x90); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS: VM=0 pmode task
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x10); // ES
+    put16(&mut memory, 0x380 + 76, 0x08); // CS
+    put16(&mut memory, 0x380 + 80, 0x10); // SS
+    put16(&mut memory, 0x380 + 84, 0x10); // DS
+    let mut bus = TestBus::with_memory(memory);
+    // Enter V86: set VM and rebuild the segments as real-mode style.
+    cpu.registers.eflags |= FLAG_VM;
+    cpu.load_segment_real(SegmentIndex::Cs, 0x100);
+    cpu.load_segment_real(SegmentIndex::Ss, 0x200);
+    cpu.cpl = 3;
+
+    cpu.deliver_exception(&mut bus, 14, Some(0x4), false)
+        .unwrap();
+
+    assert_eq!(cpu.tr.selector, 0x18);
+    assert!(
+        !cpu.is_v86_mode(),
+        "incoming task's EFLAGS (VM=0) took over"
+    );
+    // The old TSS's saved EFLAGS image keeps VM=1.
+    let saved = u32::from_le_bytes(bus.memory[0x300 + 36..0x300 + 40].try_into().unwrap());
+    assert_ne!(saved & FLAG_VM, 0, "outgoing image must keep VM=1");
+}
+
+#[test]
+fn iret_with_nt_set_returns_to_the_backlink_task() {
+    // The other half of task-gate exception delivery: the handler task ends
+    // with IRET while NT=1, which is a task RETURN through the current TSS's
+    // back-link (386 PRM 9.5 / SDM table 8-2): the back-link TSS must be BUSY
+    // and stays busy; the outgoing task's busy bit is cleared and its saved
+    // EFLAGS image carries NT=0. No stack pop happens.
+    let handler_tss = (0x18u16, 0x0380_0067, 0x0000_8b00); // current, busy
+    let back_tss = (0x20u16, 0x0300_0067, 0x0000_8b00); // interrupted, busy
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+        &[0xcf], // IRET (16-bit form unused; iret() is called directly below)
+        &[RING0_CODE, ring0_data, handler_tss, back_tss],
+    );
+    cpu.tr = SegmentRegister {
+        selector: 0x18,
+        base: 0x380,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.registers.eflags |= FLAG_NT;
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put16(&mut memory, 0x380, 0x20); // back-link -> interrupted task
+    put32(&mut memory, 0x300 + 32, 0x60); // EIP
+    put32(&mut memory, 0x300 + 36, 0x0000_0002); // EFLAGS (NT clear)
+    put32(&mut memory, 0x300 + 56, 0x00d0); // ESP
+    put16(&mut memory, 0x300 + 72, 0x10); // ES
+    put16(&mut memory, 0x300 + 76, 0x08); // CS
+    put16(&mut memory, 0x300 + 80, 0x10); // SS
+    put16(&mut memory, 0x300 + 84, 0x10); // DS
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+
+    assert_eq!(cpu.tr.selector, 0x20, "returned to the back-link task");
+    assert_eq!(cpu.registers.cs().selector, 0x08);
+    assert_eq!(cpu.registers.eip, 0x60);
+    assert_eq!(cpu.registers.esp(), 0xd0, "no frame was popped");
+    assert_eq!(cpu.registers.eflags & FLAG_NT, 0, "incoming image has NT=0");
+    // The handler task's busy bit clears; the resumed task stays busy.
+    assert_eq!(bus.memory[0x100 + 0x18 + 5], 0x89, "handler TSS freed");
+    assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x8b, "resumed TSS still busy");
+    // The handler's saved EFLAGS image must carry NT=0.
+    assert_eq!(
+        u32::from_le_bytes(bus.memory[0x380 + 36..0x380 + 40].try_into().unwrap()) & FLAG_NT,
+        0
+    );
+}
+
 // ---- BOUND and INS/OUTS ----
 
 #[test]
