@@ -591,7 +591,7 @@ fn retf_word_inter_privilege_return_pops_ss_sp_and_nulls_ring0_data_segments() {
         cpu.push(&mut bus, v, OperandSize::Word).unwrap();
     }
 
-    cpu.return_far(&mut bus, OperandSize::Word).unwrap();
+    cpu.return_far(&mut bus, OperandSize::Word, 0).unwrap();
 
     assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
     assert_eq!(cpu.registers.eip, 0x1234);
@@ -610,6 +610,259 @@ fn retf_word_inter_privilege_return_pops_ss_sp_and_nulls_ring0_data_segments() {
         cpu.registers.segment(SegmentIndex::Ds).selector,
         0,
         "ring-0 DS must be nulled on the return to ring 3"
+    );
+}
+
+/// Install the shared ring-3 code/data descriptor pair at GDT 0x20/0x28 and
+/// enter ring 3 through the proven dword IRET path (CS=0x23, SS=0x2B,
+/// EIP=0x1234, ESP=0x2000).
+fn enter_ring3(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    for v in [0x2Bu32, 0x2000, 0x2, 0x23, 0x1234] {
+        cpu.push(bus, v, OperandSize::Dword).unwrap();
+    }
+    cpu.iret(bus, OperandSize::Dword).unwrap();
+    assert_eq!(cpu.current_privilege_level(), 3);
+}
+
+/// Write a 16-bit gate (type in `access`, e.g. 0xe6 interrupt / 0xe7 trap)
+/// for `vector`, targeting R0_CS:offset. Poisons the reserved high word.
+fn gate16(m: &mut [u8], vector: u8, offset: u16, access: u8) {
+    let base = IDT + u32::from(vector) * 8;
+    put16(m, base, offset);
+    put16(m, base + 2, R0_CS);
+    m[base as usize + 4] = 0;
+    m[base as usize + 5] = access;
+    put16(m, base + 6, 0xdead);
+}
+
+#[test]
+fn iret_word_inter_privilege_to_a_16bit_stack_takes_sp_only_and_keeps_high_esp() {
+    // B-keying pin for the WORD arm: the outer SS has B=0, the inner stack's
+    // ESP carries a nonzero high word (0x0001). The popped SP must land in SP
+    // only, with the inner high word carried over -- a swapped branch
+    // (zero-extending set_esp) yields 0x0000_0010 instead.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data_b0 = descriptor(0, 0xffff, 0xf3, 0x00); // B=0 16-bit stack
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data_b0);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x0001_6800);
+    for v in [0x2Bu32, 0x0010, 0x2, 0x23, 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+
+    cpu.iret(&mut bus, OperandSize::Word).unwrap();
+
+    assert_eq!(cpu.current_privilege_level(), 3);
+    assert!(!cpu.stack_is_32bit(), "the loaded outer SS must carry B=0");
+    assert_eq!(
+        cpu.registers.esp(),
+        0x0001_0010,
+        "SP takes the popped word; ESP's high word carries over from the \
+         inner stack (0x0001), not zero"
+    );
+}
+
+#[test]
+fn iret_word_inter_privilege_with_mismatched_ss_rpl_faults_gp() {
+    // 386 PRM IRET (outer level): the popped SS selector's RPL must equal the
+    // return CS's RPL, else #GP(SS selector).
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    // SS selector 0x28 = the ring-3 data descriptor with RPL 0 (CS RPL is 3).
+    for v in [0x28u32, 0x2000, 0x2, 0x23, 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+
+    let result = cpu.iret(&mut bus, OperandSize::Word);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0x28),
+            })
+        ),
+        "SS RPL != CS RPL must fault #GP(SS selector): {result:?}"
+    );
+}
+
+#[test]
+fn retf_word_with_release_skips_the_inner_parameter_block_before_ss_sp() {
+    // 386 PRM RET n (outer level): the immediate releases the parameter block
+    // on the INNER stack before SS:eSP are popped, and again on the outer
+    // stack after (the caller's release_stack). Reading SS:SP from inside the
+    // parameter area loads garbage into SS.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+    let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+    bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+    bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    // Frame, pushed high-to-low: SS, SP, param2, param1, CS, IP -- the two
+    // parameter words sit between CS:IP and the saved SS:SP, exactly as a
+    // call gate with param_count=2 leaves them.
+    for v in [0x2Bu32, 0x2000, 0xbead, 0xbeef, 0x23, 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+
+    // Mirror the 0xCA opcode handler: return_far with the release, then the
+    // caller's outer release.
+    cpu.return_far(&mut bus, OperandSize::Word, 4).unwrap();
+    cpu.release_stack(4);
+
+    assert_eq!(cpu.current_privilege_level(), 3);
+    assert_eq!(cpu.registers.cs().selector, 0x23);
+    assert_eq!(cpu.registers.eip, 0x1234);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ss).selector,
+        0x2B,
+        "SS must come from beyond the parameter block, not from inside it"
+    );
+    assert_eq!(
+        cpu.registers.esp(),
+        0x2000 + 4,
+        "the immediate is applied to the OUTER stack as well"
+    );
+}
+
+#[test]
+fn a_16bit_trap_gate_delivers_a_word_frame_without_clearing_if() {
+    // Type 7 is a 16-bit TRAP gate: word frame like type 6, but IF survives.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    gate16(&mut bus.memory, 0x21, MON_CODE as u16, 0xe7);
+    enter_ring3(&mut cpu, &mut bus);
+    cpu.set_flag(FLAG_IF, true);
+
+    cpu.deliver_exception(&mut bus, 0x21, None, true).unwrap();
+
+    assert_eq!(cpu.current_privilege_level(), 0);
+    assert_eq!(cpu.registers.eip, MON_CODE);
+    assert_eq!(
+        cpu.registers.esp(),
+        ESP0 - 10,
+        "five WORD pushes (ss, sp, flags, cs, ip), no error code"
+    );
+    assert_ne!(
+        cpu.registers.eflags & FLAG_IF,
+        0,
+        "a trap gate must NOT clear IF"
+    );
+}
+
+#[test]
+fn a_v86_source_through_a_16bit_gate_still_builds_the_dword_frame() {
+    // 386 PRM INTERRUPT-FROM-V86-MODE has no 16-bit variant: every push is
+    // "padded to two words" regardless of the gate width. A word frame would
+    // truncate the guest's ESP.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    gate16(&mut bus.memory, 13, MON_CODE as u16, 0xe6);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+
+    assert!(!cpu.is_v86_mode());
+    assert_eq!(cpu.registers.eip, MON_CODE);
+    assert_eq!(
+        cpu.registers.esp(),
+        ESP0 - 40,
+        "ten DWORD pushes (gs fs ds es ss esp efl cs eip ec), not words"
+    );
+    let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, cpu.registers.esp() + o));
+    assert_eq!(rd(0), 0, "error code");
+    assert_eq!(rd(4), 0x10, "V86 EIP");
+    assert_eq!(rd(16), 0x1000, "V86 ESP, full dword");
+}
+
+#[test]
+fn an_uninitialized_tr_access_byte_keeps_the_386_tss_read() {
+    // The 286/386 TSS discriminator keys on the full type (1/3), so an
+    // uninitialized TR cache (access 0) stays on the 386 layout it always had.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    cpu.tr.access = 0;
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+
+    assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, R0_SS);
+    assert_eq!(
+        cpu.registers.esp(),
+        ESP0 - 40,
+        "386 ESP0/SS0 fields were read"
+    );
+}
+
+#[test]
+fn a_delivery_that_faults_after_the_stack_switch_restores_ss_esp() {
+    // The frame build faults AFTER `switch_to_inner_stack` committed the inner
+    // SS:ESP (here: a ring-0 stack whose limit cannot hold the frame). The
+    // retried delivery must capture the ORIGINAL ring-3 SS:ESP as the
+    // interrupted context, so the error path must restore them.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    // Ring-0 data descriptor with an 8-byte limit at GDT 0x38: the six word
+    // pushes (12 bytes) cannot fit.
+    let tiny = descriptor(0, 0x8, 0x93, 0x00);
+    bus.memory[(GDT + 0x38) as usize..(GDT + 0x38) as usize + 8].copy_from_slice(&tiny);
+    put16(&mut bus.memory, TSS + 8, 0x38);
+    put32(&mut bus.memory, TSS + 4, 0x8);
+    gate16(&mut bus.memory, 13, MON_CODE as u16, 0xe6);
+    enter_ring3(&mut cpu, &mut bus);
+    let esp_before = cpu.registers.esp();
+
+    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+
+    assert!(result.is_err(), "the frame push must fault: {result:?}");
+    assert_eq!(cpu.current_privilege_level(), 3);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ss).selector,
+        0x2B,
+        "the interrupted ring-3 SS must be restored after the faulted delivery"
+    );
+    assert_eq!(cpu.registers.esp(), esp_before, "and its ESP with it");
+}
+
+#[test]
+fn a_v86_delivery_that_faults_on_the_cs_load_restores_the_v86_state() {
+    // The V86 tail: pushes succeed, the data segments are nulled, then the CS
+    // load faults (#NP on a not-present monitor CS). The restore must bring
+    // back VM, the real-mode data segments, and SS:ESP.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    bus.memory[(GDT + 0x08 + 5) as usize] = 0x1b; // R0_CS: present bit off
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+
+    assert!(result.is_err(), "the CS load must fault: {result:?}");
+    assert!(cpu.is_v86_mode(), "VM must be restored");
+    assert_eq!(cpu.current_privilege_level(), 3);
+    assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x0900);
+    assert_eq!(cpu.registers.esp(), 0x1000);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        0x0A00,
+        "the nulled V86 data segments must be restored"
     );
 }
 

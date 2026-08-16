@@ -1288,6 +1288,49 @@ fn lar_and_lsl_succeed_on_a_not_present_descriptor() {
     assert_eq!(cpu.read_reg16(Reg16::Ax), 0xffff);
 }
 
+#[test]
+fn lar_and_lsl_reject_an_empty_descriptor_slot() {
+    // With the present-bit check gone, the TYPE check is what rejects a
+    // zeroed in-limit slot: type 0 is invalid for both LAR and LSL, at any
+    // CPL/RPL (386 PRM type tables). Without it, ring-0 descriptor walks see
+    // every unused slot as a valid DPL-0 descriptor.
+    let (mut cpu, memory) = protected_cpu(&[0x0f, 0x02, 0xc1], 0x0000_ffff, 0x0000_0000);
+    cpu.write_reg16(Reg16::Cx, 0x0008);
+    cpu.set_flag(FLAG_ZF, true);
+    let mut bus = TestBus::with_memory(memory);
+    cpu.cycle(&mut bus).unwrap();
+    assert!(!cpu.flag(FLAG_ZF), "LAR must reject a type-0 descriptor");
+
+    let (mut cpu, memory) = protected_cpu(&[0x0f, 0x03, 0xc1], 0x0000_ffff, 0x0000_0000);
+    cpu.write_reg16(Reg16::Cx, 0x0008);
+    cpu.set_flag(FLAG_ZF, true);
+    let mut bus = TestBus::with_memory(memory);
+    cpu.cycle(&mut bus).unwrap();
+    assert!(!cpu.flag(FLAG_ZF), "LSL must reject a type-0 descriptor");
+}
+
+#[test]
+fn lar_accepts_a_call_gate_but_lsl_rejects_it() {
+    // The LAR and LSL type tables differ: a 386 call gate (type 0xC) has
+    // access rights but no limit. Access 0x8c: present, DPL 0, type C.
+    let (mut cpu, memory) = protected_cpu(&[0x0f, 0x02, 0xc1], 0x0000_ffff, 0x0000_8c00);
+    cpu.write_reg16(Reg16::Cx, 0x0008);
+    let mut bus = TestBus::with_memory(memory);
+    cpu.cycle(&mut bus).unwrap();
+    assert!(cpu.flag(FLAG_ZF), "LAR accepts a call gate");
+    assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8c00);
+
+    let (mut cpu, memory) = protected_cpu(&[0x0f, 0x03, 0xc1], 0x0000_ffff, 0x0000_8c00);
+    cpu.write_reg16(Reg16::Cx, 0x0008);
+    cpu.set_flag(FLAG_ZF, true);
+    let mut bus = TestBus::with_memory(memory);
+    cpu.cycle(&mut bus).unwrap();
+    assert!(
+        !cpu.flag(FLAG_ZF),
+        "LSL rejects a call gate (no limit to load)"
+    );
+}
+
 // ---- Exception error codes and FPU #MF ----
 
 #[test]

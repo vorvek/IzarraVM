@@ -451,7 +451,7 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let selector = self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
                 match self.try_read_descriptor(bus, selector)? {
-                    Some((_, high)) if self.descriptor_accessible(selector, high) => {
+                    Some((_, high)) if self.descriptor_accessible(selector, high, false) => {
                         let mask = match operand_size {
                             OperandSize::Word => 0x0000_ff00,
                             OperandSize::Dword => 0x00f0_ff00,
@@ -474,7 +474,7 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let selector = self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
                 match self.try_read_descriptor(bus, selector)? {
-                    Some((low, high)) if self.descriptor_accessible(selector, high) => {
+                    Some((low, high)) if self.descriptor_accessible(selector, high, true) => {
                         let mut limit = (low & 0xffff) | (high & 0x000f_0000);
                         if high & 0x0080_0000 != 0 {
                             limit = (limit << 12) | 0x0fff;
@@ -853,12 +853,12 @@ impl CpuGsw {
                 // RETF, release imm16 bytes. `decode` fetched the count into `imm`; pop CS:IP via the
                 // far-return helper THEN release.
                 let release = insn.imm as u16;
-                self.return_far(bus, operand_size)?;
+                self.return_far(bus, operand_size, release)?;
                 self.release_stack(release);
                 Ok(clocks(17))
             }
             0xcb => {
-                self.return_far(bus, operand_size)?;
+                self.return_far(bus, operand_size, 0)?;
                 Ok(clocks(17))
             }
             0xcc => {

@@ -278,12 +278,35 @@ impl CpuGsw {
         error_code: Option<u32>,
         is_external: bool,
     ) -> ExecResult<()> {
+        // Snapshot everything the body mutates before its final CS:EIP commit:
+        // CPL, EFLAGS (VM drop, NT/TF/IF clears), the inner SS:ESP installed by
+        // `switch_to_inner_stack`, and the V86 data segments nulled on monitor
+        // entry. A partial restore (CPL alone) leaves the retried delivery
+        // capturing the inner ring-0 stack as the "interrupted" SS:ESP.
+        // Settle deferred arithmetic flags FIRST so the EFLAGS snapshot below is
+        // the live image; the body's own materialize call is then a no-op. A
+        // pre-materialization snapshot would restore a stale image after the
+        // lazy-flag state has been consumed.
+        self.materialize_flags();
         let entry_cpl = self.cpl;
-        let entry_vm = self.registers.eflags & FLAG_VM;
+        let entry_eflags = self.registers.eflags;
+        let entry_esp = self.registers.esp();
+        let entry_segments = [
+            SegmentIndex::Ss,
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Fs,
+            SegmentIndex::Gs,
+        ]
+        .map(|segment| (segment, self.registers.segment(segment)));
         let result = self.deliver_exception_body(bus, vector, error_code, is_external);
         if result.is_err() {
             self.cpl = entry_cpl;
-            self.registers.eflags = (self.registers.eflags & !FLAG_VM) | entry_vm;
+            self.registers.eflags = entry_eflags;
+            self.registers.set_esp(entry_esp);
+            for (segment, register) in entry_segments {
+                self.registers.set_segment(segment, register);
+            }
         }
         result
     }
@@ -310,7 +333,12 @@ impl CpuGsw {
         let gate_type = (gate_high >> 8) & 0x0f;
         let is_interrupt_gate = gate_type & 0x07 == 0x06;
         let gate_is_32 = gate_type & 0x08 != 0;
-        let frame_size = if gate_is_32 {
+        // The V86-source frame is ALWAYS dword-sized: the PRM's
+        // INTERRUPT-FROM-V86-MODE arm has no 16-bit variant (every push is
+        // "padded to two words"), unlike the inner/same-privilege arms, which
+        // fork on the gate width. A word frame here would truncate the guest's
+        // ESP with no way back on IRET.
+        let frame_size = if gate_is_32 || self.is_v86_mode() {
             OperandSize::Dword
         } else {
             OperandSize::Word
@@ -564,6 +592,15 @@ impl CpuGsw {
                     // low bits, and real mode never reaches this ring check.
                     let sp = self.pop(bus, OperandSize::Word)?;
                     let ss = self.pop(bus, OperandSize::Word)? as u16;
+                    // The outer SS's RPL must equal the return CS's RPL (386 PRM
+                    // IRET, outer level: "Selector RPL must be equal to the RPL
+                    // of the return CS selector ELSE #GP(SS selector)").
+                    if (ss & 3) != (cs & 3) {
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(selector_error_code(ss, ss & 0x4 != 0, false)),
+                        });
+                    }
                     self.load_segment(bus, SegmentIndex::Cs, cs)?;
                     // Mechanical SS load under the pre-IRET CPL; see the dword arm
                     // and `load_segment_system`.
@@ -653,10 +690,14 @@ impl CpuGsw {
                     return Ok(());
                 }
 
-                if (cs & 3) as u8 > self.current_privilege_level() {
-                    // V86 is handled above; a returned V86 CS has arbitrary low bits, so this
-                    // ring check must not see it. Inter-privilege return to a less-privileged
-                    // (non-V86) ring: pop SS:ESP.
+                if self.is_protected_mode()
+                    && !self.is_v86_mode()
+                    && (cs & 3) as u8 > self.current_privilege_level()
+                {
+                    // V86 is handled above; a returned V86 CS has arbitrary low bits, and a
+                    // real-mode CS is not a selector at all, so this ring check must see
+                    // neither. Inter-privilege return to a less-privileged (non-V86) ring:
+                    // pop SS:ESP.
                     let esp = self.pop(bus, OperandSize::Dword)?;
                     let ss = self.pop(bus, OperandSize::Dword)? as u16;
                     self.load_segment(bus, SegmentIndex::Cs, cs)?;
@@ -779,10 +820,17 @@ impl CpuGsw {
         Ok(())
     }
 
+    /// `release` is the RETF imm16 count. The caller still applies it to the
+    /// OUTER stack after this returns (the PRM's second increment); the
+    /// inter-privilege arm below additionally applies it to the INNER stack
+    /// before popping SS:eSP (386 PRM RET, outer level: "Increment eSP by 8
+    /// plus the immediate offset" -- the parameter block copied by the call
+    /// gate sits between CS:IP and the saved SS:eSP).
     pub(super) fn return_far<B: CpuBus>(
         &mut self,
         bus: &mut B,
         operand_size: OperandSize,
+        release: u16,
     ) -> ExecResult<()> {
         // Pop the offset then CS, mirroring iret's pop order. On the 32-bit form CS
         // occupies four stack bytes; the high two are discarded on load.
@@ -797,8 +845,18 @@ impl CpuGsw {
             // hosts enter ring-3 client exception handlers with exactly this
             // frame; the V86 guard mirrors `iret`'s (a V86 CS has arbitrary low
             // bits, and real mode never reaches this ring check).
+            self.release_stack(release);
             let sp = self.pop(bus, operand_size)?;
             let ss = self.pop(bus, operand_size)? as u16;
+            // The outer SS's RPL must equal the return CS's RPL (386 PRM RET,
+            // outer level: "Selector RPL must equal the RPL of the return CS
+            // selector ELSE #GP(selector)").
+            if (ss & 3) != (selector & 3) {
+                return Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(selector_error_code(ss, ss & 0x4 != 0, false)),
+                });
+            }
             self.load_segment(bus, SegmentIndex::Cs, selector)?;
             // Mechanical SS load under the pre-RET CPL; see `load_segment_system`.
             self.load_segment_system(bus, SegmentIndex::Ss, ss)?;
@@ -1134,7 +1192,9 @@ impl CpuGsw {
         // SS0 word at +4, 4 bytes per ring). Borland's DPMI16BI runs off a 286
         // TSS; reading the 386 offsets from it yields SS0=0 and the delivery
         // dies on the null SS load.
-        let (new_esp, new_ss) = if self.tr.access & 0x08 == 0 {
+        // Keyed on the full 286 type pair, not just bit 3, so an uninitialized
+        // TR (access 0) keeps the 386 read it always had.
+        let (new_esp, new_ss) = if matches!(self.tr.access & 0x1f, 0x01 | 0x03) {
             let sp_addr = self.tr.base + 2 + 4 * u32::from(target_dpl);
             let sp = self.read_system_linear(bus, sp_addr, BusWidth::Word)?;
             let ss = self.read_system_linear(bus, sp_addr + 2, BusWidth::Word)? as u16;
@@ -1775,15 +1835,37 @@ impl CpuGsw {
         Ok(ok)
     }
 
-    pub(super) fn descriptor_accessible(&self, selector: u16, high: u32) -> bool {
+    /// Shared LAR/LSL descriptor gate. No present-bit check: both instructions
+    /// validate TYPE and privilege only, and return the rights/limit with P as
+    /// stored (386 PRM LAR/LSL pages). Borland RTM probes its not-present swap
+    /// descriptors with LAR from its #NP handler. The type check is what keeps
+    /// an empty (all-zero) descriptor slot rejected now that P no longer
+    /// incidentally rejects it: type 0 is invalid for both instructions.
+    ///
+    /// `wants_limit` selects the LSL table (only the memory-resident system
+    /// types 1/2/3/9/B have a limit) over the LAR one (every system type
+    /// except 0, 8, 0xA, 0xD).
+    pub(super) fn descriptor_accessible(
+        &self,
+        selector: u16,
+        high: u32,
+        wants_limit: bool,
+    ) -> bool {
         let access = (high >> 8) & 0xff;
-        // No present-bit check: LAR/LSL (the only callers) validate type and
-        // privilege ONLY, and return the rights with P as stored. Borland RTM
-        // probes its not-present swap descriptors with LAR from its #NP handler.
         let dpl = ((access >> 5) & 3) as u8;
         let rpl = (selector & 3) as u8;
         let is_segment = access & 0x10 != 0;
         let descriptor_type = access & 0x0f;
+        if !is_segment {
+            let type_ok = if wants_limit {
+                matches!(descriptor_type, 0x01 | 0x02 | 0x03 | 0x09 | 0x0b)
+            } else {
+                !matches!(descriptor_type, 0x00 | 0x08 | 0x0a | 0x0d)
+            };
+            if !type_ok {
+                return false;
+            }
+        }
         let conforming_code =
             is_segment && descriptor_type & 0x8 != 0 && descriptor_type & 0x4 != 0;
         // Conforming code is reachable from any privilege; everything else needs
