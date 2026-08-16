@@ -155,6 +155,27 @@ fn a_root_level_dos_folder_is_refused() {
 }
 
 #[test]
+fn a_cd_the_translator_cannot_mount_is_refused_not_translated() {
+    // The conf imgmounts a CUE that is not in the extraction, so no
+    // `--cd-image` resolves. The `D:` prelude would then run on a drive that
+    // does not exist, and there is no launch command either.
+    let dir = doom_extraction();
+    let conf = DosboxConf::parse(
+        "[dosbox]\nmachine=svga_s3\n[autoexec]\nmount c .\\eXoDOS\\DOOM\n\
+         imgmount d .\\eXoDOS\\DOOM\\cd\\MISSING.cue -t cdrom\nd:\n@GAME\nexit\n",
+    );
+    let result = translate(&conf, &options(&dir, true)).expect("translate");
+    assert!(result.cd_image.is_none());
+    assert_eq!(result.class, Class::Untranslatable);
+    assert!(
+        result.reasons.contains(&"cd-mount-unsupported".to_string()),
+        "{:?}",
+        result.reasons
+    );
+    assert!(!dir.path().join("DOOM/AUTOEXEC.BAT").exists());
+}
+
+#[test]
 fn an_untranslatable_title_writes_nothing() {
     let dir = doom_extraction();
     let conf = DosboxConf::parse(

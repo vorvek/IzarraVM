@@ -213,6 +213,116 @@ fn scores_a_sound_blaster_branch_above_the_cards_we_do_not_have() {
 }
 
 #[test]
+fn a_choice_branch_pointing_backwards_is_dropped_and_the_rest_re_scored() {
+    // `:sb` sits ABOVE the choice, which is a menu loop: taking it would walk
+    // the ladder again until the step limit and refuse a title that runs. The
+    // remaining forward branch wins even though it scores lower.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("SB.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("SPK.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("RUN.BAT"),
+        ":sb\r\necho Press 1 for SoundBlaster\r\necho Press 2 for PC Speaker\r\n\
+         choice /C:12\r\nif errorlevel 2 goto spk\r\nif errorlevel 1 goto sb\r\n\
+         :spk\r\n@SPK\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    assert!(out.failure.is_none(), "{:?}", out.failure);
+    assert_eq!(out.launch.expect("a launch").resolved, "SPK.EXE");
+    assert!(out.flags.contains("MENU-FLATTENED"));
+}
+
+#[test]
+fn a_menu_with_no_safe_branch_is_key_injected_rather_than_installed() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("INSTALL.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("SETUP.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("GAME.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("RUN.BAT"),
+        "echo Press 1 to Install\r\necho Press 2 to run Setup\r\necho Press 3 to Quit\r\n\
+         choice /C:123\r\nif errorlevel 3 goto quit\r\nif errorlevel 2 goto setup\r\n\
+         if errorlevel 1 goto inst\r\n@GAME\r\n:inst\r\n@INSTALL\r\n:setup\r\n@SETUP\r\n\
+         :quit\r\nexit\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    assert!(out.flags.contains("MENU-KEY-INJECTED"), "{:?}", out.flags);
+    assert!(out.choices.is_empty(), "{:?}", out.choices);
+    // Falling through past the ladder is what a real un-answered CHOICE does.
+    assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
+}
+
+#[test]
+fn order_is_scored_as_a_word_so_border_is_not_refused() {
+    assert_eq!(branch_score("border 1 for Borderwo w/ SoundBlaster"), 100);
+    assert_eq!(branch_score("recorder 1 w/ SoundBlaster"), 100);
+    assert_eq!(
+        branch_score("order 4 to Order the full version"),
+        REFUSED_BRANCH_SCORE
+    );
+    assert_eq!(
+        branch_score("info 4 for an order form"),
+        REFUSED_BRANCH_SCORE
+    );
+    assert_eq!(branch_score("help 5 for Help"), REFUSED_BRANCH_SCORE);
+    // `helper` is not `help`.
+    assert_eq!(branch_score("helper 1 w/ Adlib"), 40);
+}
+
+#[test]
+fn a_chained_if_is_evaluated_rather_than_dropped() {
+    // `if exist X if not exist Y goto Z`: the INNER test owns the jump. Handing
+    // the whole tail to the command emitter would resolve nothing and carry on
+    // down a branch the guest never takes.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("HERE.DAT"), b"x").unwrap();
+    std::fs::write(dir.path().join("GAME.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("OTHER.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("RUN.BAT"),
+        "if exist HERE.DAT if not exist GONE.DAT goto ok\r\n@OTHER\r\n:ok\r\n@GAME\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
+    assert!(!out.flags.contains("COMMAND-UNRESOLVED"), "{:?}", out.flags);
+
+    // And the inner test failing means the jump is NOT taken.
+    std::fs::write(dir.path().join("GONE.DAT"), b"x").unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    assert_eq!(out.launch.expect("a launch").resolved, "OTHER.EXE");
+}
+
+#[test]
+fn a_choice_named_with_its_extension_is_still_a_menu() {
+    // The game ships its own CHOICE.COM. Without stripping the extension the
+    // walker resolves it as a program and records the MENU as the launch.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("CHOICE.COM"), b"x").unwrap();
+    std::fs::write(dir.path().join("GAME.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("RUN.BAT"),
+        "choice.com /c:12 /n Pick:\r\n@GAME\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
+    assert!(out.flags.contains("MENU-KEY-INJECTED"));
+}
+
+#[test]
 fn a_second_level_call_is_inlined_and_a_third_is_refused() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("GAME.EXE"), b"x").unwrap();

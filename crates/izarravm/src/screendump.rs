@@ -143,6 +143,10 @@ fn fnv1a(pixels: &[u32]) -> u64 {
     hash
 }
 
+#[cfg(test)]
+#[path = "screendump_test.rs"]
+mod tests;
+
 fn write_ppm(path: &Path, pixels: &[u32], width: usize, height: usize) -> std::io::Result<()> {
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     write!(out, "P6\n{width} {height}\n255\n")?;

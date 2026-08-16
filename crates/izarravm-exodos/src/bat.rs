@@ -28,6 +28,23 @@
 //! whose menu text names a Sound Blaster. What comes out has no labels, no
 //! `goto` and no `choice`, which is also the cheapest thing to ask of the
 //! guest shell.
+//!
+//! KNOWN AND DEFERRED, reviewed 2026-08-16. None of these is a wrong answer the
+//! census hides; each is a shape the walker models more coarsely than
+//! COMMAND.COM, and each is recorded here rather than fixed because the corpus
+//! sweep has to name the frequency before the fix is worth its risk:
+//!
+//! - Call-depth asymmetry. `call FOO` and a bare `FOO` that resolves to
+//!   `FOO.BAT` both descend, but they arrive at the depth counter by different
+//!   routes, so the two chains are not budgeted identically against
+//!   `MAX_CALL_DEPTH`. The bound holds either way; only the exact chain length
+//!   at which a title is refused moves.
+//! - `del <directory>` prompts in real DOS ("All files in directory will be
+//!   deleted!"), and only the `*.*` and bare-`*` forms are dropped here. A
+//!   directory-form `del` would be emitted and would block the guest shell.
+//! - `if exist` is answered against the tree as EXTRACTED, not as it stands
+//!   after the flattened lines above it have run. A branch guarded on a file an
+//!   earlier `copy` creates is therefore read in its pre-copy state.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -156,7 +173,6 @@ impl<'a> Flattener<'a> {
     fn run(&self, program: &Program, cwd: &mut String, depth: u32, out: &mut Flattened) {
         let mut pc = 0usize;
         let mut steps = 0usize;
-        let mut jumped_to: BTreeSet<usize> = BTreeSet::new();
         while pc < program.lines.len() {
             steps += 1;
             if steps > MAX_STEPS {
@@ -175,7 +191,7 @@ impl<'a> Flattener<'a> {
                 return;
             }
             if let Some(target) = lower.strip_prefix("goto ") {
-                match self.jump(program, target.trim(), pc, &mut jumped_to) {
+                match self.jump(program, target.trim(), pc) {
                     Some(next) => pc = next,
                     None => {
                         out.failure = Some("bat-backward-goto".to_string());
@@ -195,7 +211,7 @@ impl<'a> Flattener<'a> {
                         // and a taken `if not exist *.sel goto menu` both work.
                         let rest_lower = rest.trim().to_ascii_lowercase();
                         if let Some(target) = rest_lower.strip_prefix("goto ") {
-                            match self.jump(program, target.trim(), pc, &mut jumped_to) {
+                            match self.jump(program, target.trim(), pc) {
                                 Some(next) => pc = next,
                                 None => {
                                     out.failure = Some("bat-backward-goto".to_string());
@@ -216,7 +232,12 @@ impl<'a> Flattener<'a> {
                 }
                 continue;
             }
-            if lower == "choice" || lower.starts_with("choice ") {
+            // `choice.com /c:12` and `CHOICE.EXE` are the same command as a bare
+            // `choice`, and the extension has to come off before the test: a
+            // fall-through here reaches `resolve_program`, which happily
+            // resolves the game directory's own CHOICE.COM and records the
+            // menu program as the title's launch.
+            if verb_of(&lower).is_some_and(|verb| verb == "choice") {
                 match self.resolve_choice(program, pc, out) {
                     Some(next) => {
                         out.flags.insert("MENU-FLATTENED".to_string());
@@ -241,19 +262,8 @@ impl<'a> Flattener<'a> {
     /// Jump to a label. Only forward jumps are taken: a backward `goto` is a
     /// loop, and the fixture AUTOEXECs' own `:loop` / `goto loop` shape is
     /// exactly what must never be emitted.
-    fn jump(
-        &self,
-        program: &Program,
-        target: &str,
-        pc: usize,
-        jumped_to: &mut BTreeSet<usize>,
-    ) -> Option<usize> {
-        let index = *program.labels.get(&target.to_ascii_lowercase())?;
-        if index <= pc {
-            return None;
-        }
-        jumped_to.insert(index);
-        Some(index + 1)
+    fn jump(&self, program: &Program, target: &str, pc: usize) -> Option<usize> {
+        Some(forward_label(program, target, pc)? + 1)
     }
 
     fn emit(&self, command: &str, cwd: &mut String, depth: u32, out: &mut Flattened) -> Emit {
@@ -451,7 +461,15 @@ impl<'a> Flattener<'a> {
             let target = parts.remove(0);
             let present = self.tree.exists_pattern(cwd, &target);
             if present != negated {
-                return IfOutcome::Taken(parts.join(" "));
+                let rest = parts.join(" ");
+                // `if exist X if not exist Y goto Z` is one line in the corpus
+                // and its inner test decides the jump. Handing the whole tail
+                // to `emit` would drop the inner `if` on the floor, resolve
+                // nothing, and carry on down a branch the guest never takes.
+                if rest.trim_start().to_ascii_lowercase().starts_with("if ") {
+                    return self.eval_if(rest.trim(), cwd);
+                }
+                return IfOutcome::Taken(rest);
             }
             return IfOutcome::NotTaken;
         }
@@ -503,36 +521,50 @@ impl<'a> Flattener<'a> {
         // an ascending ladder means every key lands on the same branch, and
         // choosing by equality would pick one the guest never reaches.
         let highest = branches.iter().map(|(level, _)| *level).max().unwrap_or(1);
-        let mut reachable: Vec<(u32, String)> = Vec::new();
+        let mut reachable: Vec<(u32, String, usize)> = Vec::new();
         for key in 1..=highest {
             if let Some((_, label)) = branches.iter().find(|(level, _)| *level <= key) {
-                reachable.push((key, label.clone()));
+                // Only a FORWARD branch is a branch we can take. A label above
+                // the `choice` line is a menu loop: taking it walks the ladder
+                // again, burns MAX_STEPS and refuses a title that runs. Such a
+                // branch leaves the reachable set entirely and the rest are
+                // re-scored without it, which is not the same as scoring it
+                // last -- a dropped branch must never win on a tie.
+                if let Some(index) = forward_label(program, label, pc) {
+                    reachable.push((key, label.clone(), index));
+                }
             }
         }
         if reachable.is_empty() {
             return None;
         }
         let descriptions = menu_descriptions(program, pc);
-        let mut best: Option<(i32, u32, String)> = None;
-        for (level, label) in &reachable {
+        let mut best: Option<(i32, u32, String, usize)> = None;
+        for (level, label, index) in &reachable {
             let text = format!(
                 "{} {}",
                 label,
                 descriptions.get(level).cloned().unwrap_or_default()
             );
             let score = branch_score(&text);
-            let candidate = (score, *level, label.clone());
+            let candidate = (score, *level, label.clone(), *index);
             if best
                 .as_ref()
-                .is_none_or(|(bs, bl, _)| score > *bs || (score == *bs && level < bl))
+                .is_none_or(|(bs, bl, _, _)| score > *bs || (score == *bs && level < bl))
             {
                 best = Some(candidate);
             }
         }
-        let (score, level, label) = best?;
+        let (score, level, label, index) = best?;
+        // A menu whose every reachable branch is refused (Setup / Install /
+        // Quit and nothing else) has no branch worth taking. Running the best
+        // of them means running an installer over the game. Refusing here
+        // sends the row to MENU-KEY-INJECTED, where a real keypress decides.
+        if score <= REFUSED_BRANCH_SCORE {
+            return None;
+        }
         out.choices
             .push(format!("errorlevel {level} -> :{label} (score {score})"));
-        let index = *program.labels.get(&label.to_ascii_lowercase())?;
         Some(index + 1)
     }
 }
@@ -547,6 +579,28 @@ enum IfOutcome {
     Taken(String),
     NotTaken,
     Unknown,
+}
+
+/// The line a label sits on, when the label exists and is strictly AFTER `pc`.
+/// Only forward targets are taken: a backward one is a loop, and the fixture
+/// AUTOEXECs' own `:loop` / `goto loop` shape is exactly what must never be
+/// emitted.
+fn forward_label(program: &Program, target: &str, pc: usize) -> Option<usize> {
+    let index = *program.labels.get(&target.trim().to_ascii_lowercase())?;
+    (index > pc).then_some(index)
+}
+
+/// The command verb of a line, lowercased and stripped of the executable
+/// extension COMMAND.COM would have supplied.
+fn verb_of(lower_line: &str) -> Option<&str> {
+    let token = lower_line.split_whitespace().next()?;
+    Some(
+        token
+            .strip_suffix(".com")
+            .or_else(|| token.strip_suffix(".exe"))
+            .or_else(|| token.strip_suffix(".bat"))
+            .unwrap_or(token),
+    )
 }
 
 /// Read the `echo Press 2 for <game> w/ SoundBlaster` block above a `CHOICE`
@@ -575,12 +629,39 @@ fn menu_descriptions(program: &Program, pc: usize) -> BTreeMap<u32, String> {
     out
 }
 
+/// The score of a branch that must not be taken. `resolve_choice` refuses a
+/// menu whose best reachable branch scores this low rather than picking the
+/// least bad destructive option.
+pub const REFUSED_BRANCH_SCORE: i32 = -1000;
+
+/// Does `text` contain `needle` as a whole word? A branch label is scored
+/// alongside the menu text, and the labels are game words: `Border` (the label
+/// `border` and the title `Borderwo`) contains "order", `recorder` contains it
+/// too, and a substring test refuses the only branch that runs the game.
+fn has_word(text: &str, needle: &str) -> bool {
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
+    let mut from = 0;
+    while let Some(at) = text[from..].find(needle) {
+        let start = from + at;
+        let end = start + needle.len();
+        if boundary(text[..start].chars().next_back()) && boundary(text[end..].chars().next()) {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// Rank a menu branch. We present a Sound Blaster 16 and have neither a Gravis
 /// nor a Sound Canvas, so the SB branch is both the working one and the one the
 /// game's own config was baked for.
 pub fn branch_score(text: &str) -> i32 {
     let text = text.to_ascii_lowercase();
     let has = |needle: &str| text.contains(needle);
+    // Whole-word for the short English words, substring for the rest: `setup`
+    // legitimately appears as `setup.exe` and `install` as `installer`, but
+    // `order` and `help` are inside ordinary game words.
+    let word = |needle: &str| has_word(&text, needle);
     if has("quit")
         || has("exit")
         || has("network")
@@ -590,11 +671,12 @@ pub fn branch_score(text: &str) -> i32 {
         || has("modem")
         || has("serial")
         || has("ipx")
-        || has("order")
-        || has("help")
+        || word("order")
+        || word("orders")
+        || word("help")
         || has("readme")
     {
-        return -1000;
+        return REFUSED_BRANCH_SCORE;
     }
     let mut score = 0;
     if has("soundblaster") || has("sound blaster") || has("sb16") || has("blaster") {

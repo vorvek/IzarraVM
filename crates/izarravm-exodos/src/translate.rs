@@ -100,7 +100,7 @@ pub fn translate(
 
     let hdd_folder = resolve_mount_root(&options.extract_root, conf, &options.short);
     let tree = Tree::index(&hdd_folder)?;
-    if tree.max_depth > 32 {
+    if tree.max_depth > crate::tree::MAX_TREE_DEPTH {
         reasons.push("tree-too-deep".to_string());
     }
     if !tree.oversize_files.is_empty() {
@@ -150,6 +150,15 @@ pub fn translate(
     }
     if walk.flattened.launch.is_none() && !walk.runs_from_cd {
         reasons.push("launch-target-unresolved".to_string());
+    }
+    // The `D:` prelude line is only a real instruction when a disc is actually
+    // mounted there. Without `--cd-image` the guest is told to switch to a
+    // drive that does not exist, the launch never resolves against the tree
+    // (so there is no launch command either), and the run dies at the first
+    // guest line. Refuse it here rather than emitting an AUTOEXEC that cannot
+    // work: a directory-mounted CD is not something this machine can serve.
+    if walk.runs_from_cd && cd_image.is_none() {
+        reasons.push("cd-mount-unsupported".to_string());
     }
     // Every path component the generated AUTOEXEC names has to survive FAT
     // folding unchanged, or the guest is told to `cd` somewhere that does not
@@ -283,6 +292,8 @@ fn is_hard_reason(reason: &str) -> bool {
             | "tree-too-deep"
             | "reserved-root-name"
             | "file-over-4gib"
+            | "cd-image-unsupported"
+            | "cd-mount-unsupported"
     )
 }
 
@@ -490,8 +501,9 @@ fn resolve_cd_image(extract_root: &Path, conf: &DosboxConf) -> Option<PathBuf> {
         AutoexecStep::ImgMount { image, kind, .. }
             if kind.is_empty() || kind == "cdrom" || kind == "iso" =>
         {
-            let lower = image.to_ascii_lowercase();
-            if !(lower.ends_with(".cue") || lower.ends_with(".iso")) {
+            // One list, shared with the census, so a conf the census counted as
+            // a CD title cannot silently lose its disc here.
+            if !crate::classify::is_supported_cd_extension(image) {
                 return None;
             }
             resolve_corpus_path(extract_root, image).filter(|path| path.is_file())

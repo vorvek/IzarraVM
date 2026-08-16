@@ -54,6 +54,11 @@ param(
     # slowest fixture (duke3d-586 at rt 0.29 needs ~414 s for 120 guest
     # seconds) plus the screen-sampling overhead.
     [int]$WatchdogSeconds = 900,
+    # Host seconds with no growth in the screen index (or stdout/stderr) before
+    # a run is killed as STALLED. A 586 run at rt 0.29 samples the screen about
+    # every 17 host seconds, so this is many missed samples, not a close call.
+    # 0 disables the detector and leaves only the wall-clock watchdog.
+    [int]$StallSeconds = 300,
     # Refuse a game whose extraction would exceed this, rather than filling the
     # volume. The corpus maximum extracts to about 7 GB.
     [int]$MaxExtractGib = 8,
@@ -66,17 +71,34 @@ $ErrorActionPreference = "Stop"
 # Guest clock per persona, for turning guest seconds into a --cycles budget.
 $personaClockHz = @{ "586" = 166000000; "486" = 66000000; "386" = 22000000 }
 
-# Stderr lines the emulator emits on a healthy run. Katea reports a failed
-# materialize or a skipped entry on stderr, and a game that writes a savegame
-# can legitimately produce one. Anything NOT matched here fails the row loudly,
-# which is the point: an unknown stderr line is a finding.
+# Stderr lines the emulator emits on a healthy run. Anything NOT matched here
+# fails the row loudly, which is the point: an unknown stderr line is a finding.
+#
+# Katea does NOT get a blanket prefix. Almost everything it writes is a failure
+# or a data-loss hold -- a failed materialize, a held rename, a sector that
+# could not be read back -- and swallowing those as routine is exactly how a
+# corpus row would report RAN while the guest's writes went nowhere. Only the
+# one genuinely routine line is allowed, and it is allowed by its whole text.
+# The timestamped form carries its level too: an ISO-stamped ERROR is an error.
 $benignStderrPatterns = @(
-    '^katea: ',
+    '^katea: skipping .+ \(>= 4 GiB, not FAT32-representable\)\s*$',
     '^\[DMA\] ',
     '^\s*$',
     '^\s*(INFO|WARN|DEBUG|TRACE)\b',
-    '^\d{4}-\d{2}-\d{2}T'
+    '^\d{4}-\d{2}-\d{2}T\S*\s+(INFO|WARN|DEBUG|TRACE)\b'
 )
+
+# A corpus short names a directory under `!dos` and a directory under the
+# scratch root, and the scratch one is DELETED with -Recurse -Force. A list line
+# is caller input; `..\..\Windows` would derive a path outside the scratch root
+# and delete it. Validate the shape BEFORE any path is built from it: the corpus
+# shorts are plain alphanumeric names.
+function Test-CorpusShort {
+    param([string]$Short)
+    if ([string]::IsNullOrWhiteSpace($Short)) { return $false }
+    if ($Short -eq '.' -or $Short -eq '..') { return $false }
+    return $Short -match '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+}
 
 # Reboot detection. The design proposed scraping stdout for a repeated POST
 # banner; MEASURED 2026-08-16, the --hdd-folder path prints NO banner at all,
@@ -160,27 +182,46 @@ function Expand-GameZip {
     }
 }
 
-# Run the emulator with a watchdog that watches the PROCESS and the profile
-# file's modification time, so a silent death is visible rather than merely
-# absent from a log.
+# Run the emulator with a watchdog that watches the PROCESS and the files the
+# run writes as it goes, so a silent death is visible rather than merely absent
+# from a log.
+#
+# WHAT THE PROGRESS SIGNAL IS. MEASURED 2026-08-16: the --hdd-folder path prints
+# nothing to stdout during a run, and --profile-json is written ONCE, at exit.
+# Neither can carry liveness. `screens.jsonl` can: the dumper flushes an index
+# line per sample, so its length grows on the sweep's own screen-sampling
+# schedule. That is the signal, with stdout and the stderr file watched
+# alongside for the runs that do write them.
+#
+# THE LIMITATION, STATED. With screen dumping off there is no periodic writer
+# at all and the stall detector has nothing to read; it then degrades to the
+# plain wall-clock watchdog, which is why the caller passes the screens index
+# and why the sweep always arms screen dumps.
 function Invoke-EmulatorRun {
     param(
         [string]$Exe,
         [string[]]$Arguments,
         [string]$StdoutPath,
         [string]$StderrPath,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        # Files whose growth means the run is still working.
+        [string[]]$ProgressPaths = @(),
+        # Host seconds of no growth in ANY progress path before the run is
+        # called stalled. Zero disables the stall detector.
+        [int]$StallSeconds = 0
     )
     if ($Arguments.Count -lt 8) {
         throw "refusing to launch with a short argument list ($($Arguments.Count))"
     }
+    # An empty command line is the failure mode that once ran a whole leg
+    # against the owner's real drive, hence the argument-count refusal above.
     $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -NoNewWindow -PassThru `
         -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
-    # An empty command line is the failure mode that once ran a whole leg
-    # against the owner's real drive. Verify the child got its arguments.
+    $watched = @($StdoutPath, $StderrPath) + $ProgressPaths
     $started = Get-Date
     $timedOut = $false
-    $lastSize = -1L
+    $stalled = $false
+    $lastTotal = -1L
     $lastProgress = Get-Date
     while (-not $process.HasExited) {
         Start-Sleep -Milliseconds 500
@@ -188,23 +229,30 @@ function Invoke-EmulatorRun {
             $timedOut = $true
             break
         }
-        # Liveness: stdout must keep growing. A process that is alive but has
-        # stopped producing output for a third of the watchdog is dead enough.
-        $size = if (Test-Path -LiteralPath $StdoutPath) { (Get-Item -LiteralPath $StdoutPath).Length } else { 0L }
-        if ($size -ne $lastSize) {
-            $lastSize = $size
+        $total = 0L
+        foreach ($path in $watched) {
+            if ($path -and (Test-Path -LiteralPath $path)) {
+                $total += (Get-Item -LiteralPath $path).Length
+            }
+        }
+        if ($total -ne $lastTotal) {
+            $lastTotal = $total
             $lastProgress = Get-Date
+        } elseif ($StallSeconds -gt 0 -and ((Get-Date) - $lastProgress).TotalSeconds -gt $StallSeconds) {
+            $stalled = $true
+            break
         }
     }
-    if ($timedOut) {
+    if ($timedOut -or $stalled) {
         try { $process.Kill($true) } catch { Write-Warning "kill failed: $_" }
         $process.WaitForExit(30000) | Out-Null
     }
     return [pscustomobject]@{
-        ExitCode    = if ($process.HasExited) { $process.ExitCode } else { -1 }
-        TimedOut    = $timedOut
-        WallSeconds = ((Get-Date) - $started).TotalSeconds
-        LastOutput  = $lastProgress
+        ExitCode        = if ($process.HasExited) { $process.ExitCode } else { -1 }
+        TimedOut        = $timedOut
+        Stalled         = $stalled
+        WallSeconds     = ((Get-Date) - $started).TotalSeconds
+        QuietSeconds    = [math]::Round(((Get-Date) - $lastProgress).TotalSeconds, 1)
     }
 }
 
@@ -243,8 +291,12 @@ function Measure-ScreenRecurrence {
 # --hdd-folder does not propagate the guest's fate and a cpu_error run still
 # exits 0 unless --expect-test-exit was passed, which this sweep does not pass.
 function Get-Outcome {
-    param($Profile, $Screens, [int]$ScreenRecurrences, [bool]$TimedOut, [int]$MinMarks, [int]$RebootThreshold)
+    param($Profile, $Screens, [int]$ScreenRecurrences, [bool]$TimedOut, [bool]$Stalled,
+        [int]$MinMarks, [int]$RebootThreshold)
     if ($TimedOut) { return "HUNG-HOST" }
+    # Killed for writing nothing at all, which the wall watchdog would only have
+    # caught much later, and a crashed-and-wedged run not at all.
+    if ($Stalled) { return "STALLED" }
     if ($null -eq $Profile) { return "NO-PROFILE" }
     $kind = $Profile.stop.kind
     if ($kind -eq "cpu_error") { return "CRASHED" }
@@ -274,15 +326,41 @@ function Get-Outcome {
 Clear-ObserverEnvironment
 $env:IZARRAVM_PHASE_INTERVAL_MS = "$PhaseIntervalMs"
 
+# Delete a scratch tree, retrying a bounded number of times. A game that just
+# exited can still hold a handle open for a moment (Katea's reconcile writes,
+# the antivirus filter, an Explorer preview), and a single SilentlyContinue
+# leaves a multi-gigabyte tree behind that nothing ever cleans up. Returns the
+# error text when the tree is still there afterwards, so the caller can say so
+# instead of filling the volume quietly.
+function Remove-ScratchTree {
+    param([string]$Path, [int]$Attempts = 5)
+    $last = $null
+    for ($try = 1; $try -le $Attempts; $try++) {
+        if (-not (Test-Path -LiteralPath $Path)) { return $null }
+        try {
+            Remove-Item -Recurse -Force -LiteralPath $Path -ErrorAction Stop
+            return $null
+        } catch {
+            $last = "$_"
+            Start-Sleep -Milliseconds (500 * $try)
+        }
+    }
+    if (Test-Path -LiteralPath $Path) { return $last }
+    return $null
+}
+
+function Get-FreeGib {
+    param([string]$Path)
+    $root = [IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $Path).Path)
+    return [math]::Round(([IO.DriveInfo]::new($root)).AvailableFreeSpace / 1GB, 2)
+}
+
 $rows = @()
 $index = 0
 foreach ($short in $Games) {
     $index++
     Write-Host "[$index/$($Games.Count)] $short"
-    $gameOut = Join-Path $OutDir $short
-    New-Item -ItemType Directory -Force -Path $gameOut | Out-Null
-    $scratch = Join-Path $ScratchRoot $short
-    if (Test-Path -LiteralPath $scratch) { Remove-Item -Recurse -Force -LiteralPath $scratch }
+    $scratch = $null
 
     # Every column is declared here. Set-StrictMode makes reading an absent
     # property a terminating error, and a row that took an early exit would
@@ -320,6 +398,25 @@ foreach ($short in $Games) {
     }
 
     try {
+        # Validate BEFORE deriving any path. `$short` comes from a caller-
+        # supplied list and the scratch path built from it is deleted with
+        # -Recurse -Force; a line of `..\..\Windows` must never reach Join-Path.
+        if (-not (Test-CorpusShort $short)) {
+            throw "refusing a corpus short that is not a plain name: '$short'"
+        }
+        $gameOut = Join-Path $OutDir $short
+        New-Item -ItemType Directory -Force -Path $gameOut | Out-Null
+        $scratch = Join-Path $ScratchRoot $short
+        $stale = Remove-ScratchTree -Path $scratch
+        if ($stale) { throw "could not clear a stale scratch tree at ${scratch}: $stale" }
+
+        # Refuse to start a game that cannot fit. The extract guard bounds ONE
+        # game; this bounds the volume, which is what a leftover tree eats into.
+        $freeGib = Get-FreeGib -Path $ScratchRoot
+        if ($freeGib -lt ($MaxExtractGib + 2)) {
+            throw "only $freeGib GiB free under ${ScratchRoot}; need $($MaxExtractGib + 2) GiB"
+        }
+
         $conf = Join-Path (Join-Path $dosRoot $short) 'dosbox.conf'
         if (-not (Test-Path -LiteralPath $conf)) { throw "no dosbox.conf for $short" }
         $zip = Resolve-GameZip -DosRoot $dosRoot -CorpusRoot $Corpus -Short $short
@@ -330,7 +427,6 @@ foreach ($short in $Games) {
         if (-not $extract.Ok) {
             $row.outcome = "UNTRANSLATABLE"
             $row.reasons = @($extract.Reason)
-            $rows += [pscustomobject]$row
             continue
         }
         $row.zip_bytes = $extract.Bytes
@@ -363,7 +459,6 @@ foreach ($short in $Games) {
 
         if ($plan.class -eq 'UNTRANSLATABLE') {
             $row.outcome = "UNTRANSLATABLE"
-            $rows += [pscustomobject]$row
             continue
         }
 
@@ -384,10 +479,15 @@ foreach ($short in $Games) {
             '--screen-dump-interval-ms', "$ScreenIntervalMs"
         )
 
+        $screenIndex = Join-Path $screensDir 'screens.jsonl'
         Clear-ObserverEnvironment
         $env:IZARRAVM_PHASE_INTERVAL_MS = "$PhaseIntervalMs"
+        # The screens index is the run's only periodic writer: stdout does not
+        # grow on the --hdd-folder path and the profile JSON is written once, at
+        # exit. See the note on Invoke-EmulatorRun.
         $run = Invoke-EmulatorRun -Exe $Executable -Arguments $runArgs -StdoutPath $stdoutPath `
-            -StderrPath $stderrPath -TimeoutSeconds $WatchdogSeconds
+            -StderrPath $stderrPath -TimeoutSeconds $WatchdogSeconds `
+            -ProgressPaths @($screenIndex) -StallSeconds $StallSeconds
         $row.wall_seconds = [math]::Round($run.WallSeconds, 3)
         $row.exit_code = $run.ExitCode
 
@@ -404,7 +504,6 @@ foreach ($short in $Games) {
             catch { Write-Warning "$short profile JSON will not parse: $_" }
         }
         $screens = @()
-        $screenIndex = Join-Path $screensDir 'screens.jsonl'
         if (Test-Path -LiteralPath $screenIndex) {
             $screens = @(Get-Content -LiteralPath $screenIndex |
                 Where-Object { $_.Trim() } |
@@ -423,22 +522,30 @@ foreach ($short in $Games) {
             $row.machine_phase_timing_enabled = $profile.machine_phase_timing_enabled
         }
         $row.outcome = Get-Outcome -Profile $profile -Screens $screens -ScreenRecurrences $recurrences `
-            -TimedOut $run.TimedOut -MinMarks 31 -RebootThreshold $rebootRecurrenceThreshold
+            -TimedOut $run.TimedOut -Stalled $run.Stalled -MinMarks 31 `
+            -RebootThreshold $rebootRecurrenceThreshold
+        if ($run.Stalled) {
+            Write-Error "row $short wrote nothing for $($run.QuietSeconds)s and was killed" -ErrorAction Continue
+        }
     } catch {
         $row.outcome = "HARNESS-ERROR"
         $row.error = "$_"
         Write-Error "row $short failed: $_" -ErrorAction Continue
     } finally {
         # Delete the GAME FILES, never the collected data.
-        if (-not $KeepScratch -and (Test-Path -LiteralPath $scratch)) {
-            Remove-Item -Recurse -Force -LiteralPath $scratch -ErrorAction SilentlyContinue
+        if (-not $KeepScratch -and $scratch -and (Test-Path -LiteralPath $scratch)) {
+            $left = Remove-ScratchTree -Path $scratch
+            if ($left) { Write-Error "row ${short}: scratch tree survives at ${scratch}: $left" -ErrorAction Continue }
         }
+        # THE ONE EMIT POINT. Every outcome leaves through here, including the
+        # `continue`s above (PowerShell runs `finally` on the way out of a try),
+        # so a sweep killed mid-corpus still has every row it finished on disk.
+        $emitted = [pscustomobject]$row
+        $rows += $emitted
+        ($emitted | ConvertTo-Json -Depth 6 -Compress) |
+            Add-Content -LiteralPath (Join-Path $OutDir 'rows.jsonl')
+        Write-Host "    $($row.outcome) wall=$($row.wall_seconds)s marks=$($row.phase_mark_count) screens=$($row.screen_samples)/$($row.screen_distinct)"
     }
-
-    $rows += [pscustomobject]$row
-    ($rows[-1] | ConvertTo-Json -Depth 6 -Compress) |
-        Add-Content -LiteralPath (Join-Path $OutDir 'rows.jsonl')
-    Write-Host "    $($row.outcome) wall=$($row.wall_seconds)s marks=$($row.phase_mark_count) screens=$($row.screen_samples)/$($row.screen_distinct)"
 }
 
 $rows | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutDir 'sweep.json')

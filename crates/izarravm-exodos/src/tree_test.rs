@@ -50,6 +50,22 @@ fn sample_tree() -> (tempdir::TempDir, Tree) {
 }
 
 #[test]
+fn the_walk_stops_at_the_depth_bound_and_reports_it() {
+    // The bound is enforced INSIDE the walk: checking `max_depth` afterwards
+    // means the recursion has already happened.
+    let dir = tempdir::TempDir::new();
+    let mut deep = dir.path().to_path_buf();
+    for level in 0..(MAX_TREE_DEPTH + 8) {
+        deep = deep.join(format!("D{level}"));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("GAME.EXE"), b"x").unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    assert_eq!(tree.max_depth, MAX_TREE_DEPTH + 1);
+    assert!(tree.dirs.len() <= MAX_TREE_DEPTH + 1);
+}
+
+#[test]
 fn indexes_case_insensitively_and_resolves_relative_paths() {
     let (_guard, tree) = sample_tree();
     assert_eq!(tree.file_in("", "run.bat"), Some("RUN.BAT"));

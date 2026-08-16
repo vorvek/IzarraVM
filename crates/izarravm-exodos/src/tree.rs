@@ -34,6 +34,14 @@ pub struct Tree {
     pub non_83_names: Vec<String>,
 }
 
+/// Deepest directory nesting the index walks. FAT itself has no depth limit and
+/// the DOS path buffer runs out long before this, so a tree past it is one the
+/// translator refuses anyway (`tree-too-deep`). The bound is enforced INSIDE the
+/// walk rather than checked after it: the walk is recursive, and a junction
+/// loop on the host would otherwise blow the stack before anyone could refuse
+/// the title.
+pub const MAX_TREE_DEPTH: usize = 32;
+
 impl Tree {
     pub fn index(root: &Path) -> std::io::Result<Tree> {
         let mut tree = Tree {
@@ -46,6 +54,12 @@ impl Tree {
 
     fn walk(&mut self, dir: &Path, rel: &str, depth: usize) -> std::io::Result<()> {
         self.max_depth = self.max_depth.max(depth);
+        if depth > MAX_TREE_DEPTH {
+            // Stop here and leave `max_depth` past the limit, which is what
+            // makes the caller refuse the title. Nothing below this point can
+            // be reached by a DOS path anyway.
+            return Ok(());
+        }
         let mut index = DirEntryIndex::default();
         let mut subdirs = Vec::new();
         for entry in std::fs::read_dir(dir)? {

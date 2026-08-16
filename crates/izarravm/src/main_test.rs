@@ -227,6 +227,53 @@ fn empty_dosroot_parses_and_is_not_a_c_drive() {
     );
 }
 
+/// `--screen-dump-interval-ms` carries both a `default_value_t` and a
+/// `requires`, and the two interact: a default is NOT a supplied value, so the
+/// requirement fires only when the interval is written out. The sweep passes
+/// both, and a `--screen-dump-dir` on its own must still be refused for want of
+/// `--hdd-folder`.
+#[test]
+fn screen_dump_requires_an_hdd_folder_and_defaults_its_interval() {
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--hdd-folder",
+        "fixture",
+        "--screen-dump-dir",
+        "s",
+    ])
+    .expect("a dump directory with an hdd folder must parse");
+    assert_eq!(cli.screen_dump_dir.as_deref(), Some(Path::new("s")));
+    assert_eq!(cli.screen_dump_interval_ms, 5_000);
+
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--hdd-folder",
+        "fixture",
+        "--screen-dump-dir",
+        "s",
+        "--screen-dump-interval-ms",
+        "2000",
+    ])
+    .expect("an explicit interval alongside the directory must parse");
+    assert_eq!(cli.screen_dump_interval_ms, 2000);
+
+    assert!(
+        Cli::try_parse_from(["izarravm", "--screen-dump-dir", "s"]).is_err(),
+        "a dump directory without --hdd-folder must be refused"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "izarravm",
+            "--hdd-folder",
+            "f",
+            "--screen-dump-interval-ms",
+            "2000"
+        ])
+        .is_err(),
+        "an interval without a dump directory must be refused"
+    );
+}
+
 #[test]
 fn cli_accepts_explicit_interpreter_backend() {
     let cli = Cli::try_parse_from(["izarravm", "--interpreter"]).unwrap();

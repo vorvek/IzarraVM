@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # izarravm-exodos
 
 Classify and translate the eXoDOS corpus. Read-only against the corpus: nothing
@@ -22,10 +25,27 @@ summary. Three classes:
   several launch commands, a second directory mount, a composed `cd`, a
   `memsize` above 64.
 - `UNTRANSLATABLE` — a hard blocker with a reason code: a non-VGA `machine`, a
-  floppy image, a booter disk, no launch command, a multi-CD swap, BASIC.
+  floppy image, a booter disk, no launch command, a multi-CD swap, BASIC, or a
+  CD this machine cannot serve (see below).
 
-Measured over all 7,666 confs on 2026-08-16: 79.36% translatable, 9.35%
-recoverable, 11.28% untranslatable.
+Measured over all 7,666 confs on 2026-08-16: 79.36% translatable (6,084), 9.20%
+recoverable (705), 11.44% untranslatable (877).
+
+### CDs the machine cannot serve
+
+There is one CD in this machine and it comes from `--cd-image`, which reads a
+`.cue` as a sheet and hands anything else to the ISO reader. Two conf shapes are
+therefore refused outright rather than translated into an AUTOEXEC that dies at
+its first line:
+
+- `cd-mount-unsupported` — the guest switches off C: (`d:`) with no image the
+  translator can mount, which is what a conf that mounts a host DIRECTORY as its
+  CD looks like. 54 confs, all of which already carried another reason; 12 of
+  them moved out of `RECOVERABLE` when this was added.
+- `cd-image-unsupported` — an `imgmount` naming a bare `.bin`. A `.bin` is
+  2352-byte raw sectors and is only readable through its sheet, so counting it
+  as a working CD would overstate the census. No conf in the collection does
+  this today; the reason exists so a silent drop cannot reappear.
 
 ## translate
 
@@ -53,7 +73,15 @@ linear AUTOEXEC with no labels, no `goto` and no `choice`.
 
 A backward `goto` is a loop and demotes the title to `UNTRANSLATABLE` rather
 than being emitted; the fixture AUTOEXECs' own `:loop` shape is exactly what
-must never come out of here.
+must never come out of here. The same rule governs a `CHOICE` branch: a branch
+label ABOVE the choice line is a menu loop, so it leaves the reachable set and
+the remaining branches are re-scored without it.
+
+Two refusals bound what a flattened menu may do. A menu whose every reachable
+branch scores as refused — Setup, Install, Quit and nothing else — takes no
+branch at all and falls through to key injection, because the alternative is
+running an installer over the game. And branch scoring reads `order` and `help`
+as whole words, so the `Border` in a title is not read as an order form.
 
 ### Recipes
 

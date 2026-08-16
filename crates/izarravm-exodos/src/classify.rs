@@ -58,12 +58,27 @@ pub fn is_vga_family(machine: &str) -> bool {
         || machine == "vesa_noflb"
 }
 
+/// Image extensions `izarravm --cd-image` mounts. MEASURED against
+/// `load_cd_image_from_path`: a `.cue` is parsed as a sheet and its FILE lines
+/// (including the sibling `.bin`) are read through it; ANY other extension is
+/// handed to `CdImage::from_iso`, which assumes 2048-byte data sectors. A bare
+/// `.bin` is normally 2352-byte raw sectors, so it either fails the
+/// multiple-of-2048 check or, when the length happens to divide, mounts
+/// garbage. `.bin` is therefore supported only THROUGH its `.cue`, and an
+/// imgmount naming one directly is refused rather than silently dropped.
+pub fn is_supported_cd_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".cue") || lower.ends_with(".iso")
+}
+
 fn image_kind(path: &str) -> &'static str {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".cue") {
         "cue"
-    } else if lower.ends_with(".iso") || lower.ends_with(".bin") {
+    } else if lower.ends_with(".iso") {
         "iso"
+    } else if lower.ends_with(".bin") {
+        "bin"
     } else if lower.ends_with(".img")
         || lower.ends_with(".ima")
         || lower.ends_with(".dsk")
@@ -88,10 +103,12 @@ pub fn classify_conf(conf: &DosboxConf) -> ConfVerdict {
     let mut cd_images: Vec<String> = Vec::new();
     let mut floppy_images = 0usize;
     let mut unknown_images = 0usize;
+    let mut unsupported_cd_images = 0usize;
     let mut cd_steps = 0usize;
     let mut payload = 0usize;
     let mut has_call = false;
     let mut seen_mount = false;
+    let mut switched_off_c = false;
 
     for step in &conf.autoexec {
         match step {
@@ -109,6 +126,7 @@ pub fn classify_conf(conf: &DosboxConf) -> ConfVerdict {
                 match (file, cdrom) {
                     ("floppy", _) | (_, false) => floppy_images += 1,
                     ("unknown", _) => unknown_images += 1,
+                    ("bin", _) => unsupported_cd_images += 1,
                     _ => cd_images.push(image.clone()),
                 }
             }
@@ -137,7 +155,12 @@ pub fn classify_conf(conf: &DosboxConf) -> ConfVerdict {
                     _ => payload += 1,
                 }
             }
-            AutoexecStep::Noise | AutoexecStep::Drive(_) | AutoexecStep::Exit => {}
+            AutoexecStep::Drive(letter) => {
+                if *letter != 'c' {
+                    switched_off_c = true;
+                }
+            }
+            AutoexecStep::Noise | AutoexecStep::Exit => {}
         }
     }
 
@@ -155,6 +178,20 @@ pub fn classify_conf(conf: &DosboxConf) -> ConfVerdict {
     }
     if cd_images.len() > 1 {
         hard.push("multi-cd-swap".to_string());
+    }
+    if unsupported_cd_images > 0 {
+        // A `.bin` named without its sheet. See `is_supported_cd_extension`:
+        // the emulator would mount it as a 2048-byte ISO, and counting it as a
+        // working CD is the census lying about a title that cannot boot.
+        hard.push("cd-image-unsupported".to_string());
+    }
+    // The guest leaves C: for a drive nothing mounts. There is exactly one CD
+    // in this machine and it comes from `--cd-image`; a conf that mounts a host
+    // DIRECTORY as its CD, or imgmounts nothing at all, still writes `d:` and
+    // its launch line then runs on a drive that does not exist. That is a boot
+    // failure, not a recoverable translation.
+    if switched_off_c && cd_images.is_empty() {
+        hard.push("cd-mount-unsupported".to_string());
     }
     if payload == 0 {
         hard.push("no-launch-command".to_string());

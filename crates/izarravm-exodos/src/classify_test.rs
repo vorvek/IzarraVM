@@ -93,6 +93,41 @@ fn host_side_navigation_before_the_mount_is_not_a_guest_cd() {
 }
 
 #[test]
+fn a_bare_bin_image_is_refused_rather_than_counted_as_a_cd() {
+    // `--cd-image` reads a `.bin` only through its `.cue`; alone it is handed
+    // to the ISO reader, which assumes 2048-byte sectors. Counting it as a
+    // working CD is the census overstating what runs.
+    let out = verdict(
+        "mount c .\\eXoDOS\\X\nimgmount d .\\eXoDOS\\X\\cd\\GAME.bin -t cdrom\nc:\ngame\n",
+        VGA,
+    );
+    assert_eq!(out.class, Class::Untranslatable);
+    assert!(out.reasons.contains(&"cd-image-unsupported".to_string()));
+    assert!(out.cd_image.is_none());
+    assert!(is_supported_cd_extension("a\\B.CUE"));
+    assert!(is_supported_cd_extension("a\\b.iso"));
+    assert!(!is_supported_cd_extension("a\\b.bin"));
+}
+
+#[test]
+fn a_directory_mounted_cd_the_guest_switches_to_is_refused() {
+    // `mount d <dir> -t cdrom` has no `--cd-image` analogue, so the generated
+    // `D:` would land on a drive that does not exist.
+    let out = verdict(
+        "mount c .\\eXoDOS\\X\nmount d .\\eXoDOS\\X\\cd -t cdrom\nd:\ngame\n",
+        VGA,
+    );
+    assert_eq!(out.class, Class::Untranslatable);
+    assert!(out.reasons.contains(&"cd-mount-unsupported".to_string()));
+    // With a real image the same shape is fine.
+    let out = verdict(
+        "mount c .\\eXoDOS\\X\nimgmount d .\\eXoDOS\\X\\cd\\GAME.iso -t cdrom\nd:\ngame\n",
+        VGA,
+    );
+    assert!(!out.reasons.contains(&"cd-mount-unsupported".to_string()));
+}
+
+#[test]
 fn a_low_cycles_title_is_flagged_speed_sensitive() {
     let out = verdict(
         "mount c .\\eXoDOS\\X\nc:\ngame\n",
