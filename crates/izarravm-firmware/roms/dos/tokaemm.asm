@@ -804,6 +804,8 @@ init:
 ; implemented set return 84h like a real manager that lacks them.
 ; ============================================================================
 ems_int67:
+    cmp ah, 0x50                  ; 50h sits past the 40h-4Dh table
+    je ef_map_multi
     cmp ah, 0x40
     jb ef_undef
     cmp ah, 0x4D
@@ -1020,6 +1022,106 @@ ef_map:
 .badphys:
     mov ah, 0x8B                  ; physical page out of range
     iret
+
+; 50h map/unmap multiple handle pages (LIM 4.0). AL = 00 (physical page
+; NUMBERS) or 01 (physical page SEGMENTS); DX = handle; CX = entry count;
+; DS:SI = array of (logical, physical) word pairs, caller's DS. Logical
+; 0xFFFF unmaps the slot. The WHOLE array is validated before any slot is
+; touched, so a bad entry maps nothing (the LIM error contract). UW.EXE maps
+; its frame with one 5000h call at startup and aborts with its error C003
+; when the function answers 84h, which is how 50h earned its slot here.
+ef_map_multi:
+    cmp al, 1
+    ja .badsub
+    push si
+    push cx
+    push dx
+    push bx
+    push di
+    push bp
+    mov bp, cx                    ; entry count for the apply pass
+    mov di, si                    ; array cursor (caller's DS)
+    call ems_slot_of              ; DX -> SI = slot offset, or CF + AH=83h
+    jc .out
+    mov dx, di                    ; remember the array start (DX is free now)
+    jcxz .done                    ; zero entries: a successful no-op
+.validate:
+    mov bx, [di+2]
+    call .phys_to_slot
+    jc .badphys
+    mov bx, [di]
+    cmp bx, 0xFFFF
+    je .v_next
+    cmp bx, [cs:si+2]             ; logical >= npages?
+    jae .badlog
+.v_next:
+    add di, 4
+    loop .validate
+    mov di, dx                    ; rewind for the apply pass
+.apply:
+    mov bx, [di]
+    cmp bx, 0xFFFF
+    je .a_unmap
+    call ems_backing_of           ; logical BX, slot SI -> CX = backing page
+    jmp .a_slot
+.a_unmap:
+    mov cx, 0xFFFF
+.a_slot:
+    mov bx, [di+2]
+    call .phys_to_slot            ; -> BL = frame slot (validated above)
+    push si
+    movzx si, bl
+    add si, si
+    mov [cs:ems_frame_map + si], cx
+    pop si
+    push ax
+    mov al, bl
+    call ems_remap_slot           ; AL=slot, CX=page|0xFFFF (preserves regs)
+    pop ax
+    add di, 4
+    dec bp
+    jnz .apply
+.done:
+    xor ah, ah
+.out:
+    pop bp
+    pop di
+    pop bx
+    pop dx
+    pop cx
+    pop si
+    iret
+.badsub:
+    mov ah, 0x8F                  ; undefined subfunction
+    iret
+.badphys:
+    mov ah, 0x8B                  ; physical page out of range
+    jmp .out
+.badlog:
+    mov ah, 0x8A                  ; logical page out of range
+    jmp .out
+; BX = raw physical field, AL = subfunction -> BL = slot 0-3, or CF set.
+; The segment form only accepts the four exact frame-window segments.
+.phys_to_slot:
+    test al, al
+    jnz .p_seg
+    cmp bx, 3
+    ja .p_bad
+    clc
+    ret
+.p_seg:
+    sub bx, EMS_FRAME_SEG
+    jb .p_bad
+    test bx, 0x03FF               ; 16 KB windows are 0x400 paragraphs apart
+    jnz .p_bad
+    shr bx, 10
+    cmp bx, 3
+    ja .p_bad
+    clc
+    ret
+.p_bad:
+    stc
+    ret
 
 ; 45h release: DX = handle. Walks the handle's page chain (backing is no
 ; longer contiguous, so there is no [first,first+npages) range to reason

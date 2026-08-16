@@ -8,9 +8,11 @@
 ; pages through the frame slots, writing distinct patterns and reading them
 ; back through OTHER slots (the runtime-remap proof: the same backing page is
 ; visible wherever it is mapped) -> save context -> unmap -> restore context
-; (the mapping comes back) -> free and watch the counts recover -> then signal
-; 0xA5 (success) via the unit-tester exit port. Any other code names the step
-; that broke (0xEn).
+; (the mapping comes back) -> map/unmap multiple pages in one call (50h, both
+; the page-number and the segment form, plus its error answers) -> free and
+; watch the counts recover -> then signal 0xA5 (success) via the unit-tester
+; exit port. Any other code names the step that broke (0xEn, 0xDn for the 50h
+; steps).
 ;
 ; Build: nasm -f bin emstest.asm -o emstest.com
 cpu 386
@@ -140,6 +142,98 @@ start:
     cmp dword [es:0], PAT_B
     jne f_restore
 
+    ; 11a. map/unmap multiple (50h subfn 0, physical page NUMBERS): one call
+    ;      maps logical 0 -> slot 2 and logical 1 -> slot 3. UW.EXE maps its
+    ;      whole frame with one 5000h call at startup and aborts with its
+    ;      error C003 when the function answers 84h.
+    mov ax, 0x5000
+    mov cx, 2
+    mov dx, [handle]
+    mov si, map50
+    int 0x67
+    or ah, ah
+    jnz f_mmap
+    mov ax, 0xE800
+    mov es, ax
+    cmp dword [es:0], PAT_A
+    jne f_mmap
+    mov ax, 0xEC00
+    mov es, ax
+    cmp dword [es:0], PAT_B
+    jne f_mmap
+
+    ; 11b. one 5000h call unmaps both (logical 0xFFFF): the patterns fall out
+    ;      of the frame windows again
+    mov ax, 0x5000
+    mov cx, 2
+    mov dx, [handle]
+    mov si, unmap50
+    int 0x67
+    or ah, ah
+    jnz f_mmapu
+    mov ax, 0xE800
+    mov es, ax
+    cmp dword [es:0], PAT_A
+    je f_mmapu
+    mov ax, 0xEC00
+    mov es, ax
+    cmp dword [es:0], PAT_B
+    je f_mmapu
+
+    ; 11c. segment form (50h subfn 1): map logical 0 -> segment E800h, see
+    ;      pattern A, then unmap it again
+    mov ax, 0x5001
+    mov cx, 1
+    mov dx, [handle]
+    mov si, map51
+    int 0x67
+    or ah, ah
+    jnz f_mseg
+    mov ax, 0xE800
+    mov es, ax
+    cmp dword [es:0], PAT_A
+    jne f_mseg
+    mov ax, 0x5001
+    mov cx, 1
+    mov dx, [handle]
+    mov si, unmap51
+    int 0x67
+    or ah, ah
+    jnz f_mseg
+    cmp dword [es:0], PAT_A
+    je f_mseg
+
+    ; 11d. error answers: subfunction 2 -> 8Fh, physical page 4 -> 8Bh,
+    ;      logical past the allocation -> 8Ah, segment off the frame -> 8Bh
+    mov ax, 0x5002
+    mov cx, 1
+    mov dx, [handle]
+    mov si, map50
+    int 0x67
+    cmp ah, 0x8F
+    jne f_merr
+    mov ax, 0x5000
+    mov cx, 1
+    mov dx, [handle]
+    mov si, badphys50
+    int 0x67
+    cmp ah, 0x8B
+    jne f_merr
+    mov ax, 0x5000
+    mov cx, 1
+    mov dx, [handle]
+    mov si, badlog50
+    int 0x67
+    cmp ah, 0x8A
+    jne f_merr
+    mov ax, 0x5001
+    mov cx, 1
+    mov dx, [handle]
+    mov si, badseg51
+    int 0x67
+    cmp ah, 0x8B
+    jne f_merr
+
     ; 12. counts reflect the allocation (42h): free dropped by exactly the 4
     ; pages this program holds, from the baseline step 3 recorded.
     mov ah, 0x42
@@ -211,6 +305,14 @@ f_counts2: mov al, 0xEC
 f_pages:  mov al, 0xED
           jmp sig
 f_free:   mov al, 0xEE
+          jmp sig
+f_mmap:   mov al, 0xD1
+          jmp sig
+f_mmapu:  mov al, 0xD2
+          jmp sig
+f_mseg:   mov al, 0xD3
+          jmp sig
+f_merr:   mov al, 0xD4
 
 sig:
     mov ah, al
@@ -224,3 +326,11 @@ sig:
 
 handle: dw 0
 ems_free0: dw 0
+; 50h arrays: (logical, physical) word pairs
+map50:     dw 0, 2, 1, 3
+unmap50:   dw 0xFFFF, 2, 0xFFFF, 3
+map51:     dw 0, 0xE800
+unmap51:   dw 0xFFFF, 0xE800
+badphys50: dw 0, 4
+badlog50:  dw 7, 2
+badseg51:  dw 0, 0xE123
