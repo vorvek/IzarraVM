@@ -613,6 +613,97 @@ fn retf_word_inter_privilege_return_pops_ss_sp_and_nulls_ring0_data_segments() {
     );
 }
 
+#[test]
+fn retf_to_a_not_present_code_segment_restores_sp_for_the_restart() {
+    // Borland RTM's overlay core: RETF into a swapped-out (P=0) code segment
+    // raises #NP, RTM's handler loads the segment, and the RETF re-executes.
+    // The pops must be undone on the fault or the restarted RETF pops 4 bytes
+    // above the real frame -- on RTM's tight thunk stack that is past the SS
+    // limit, and the retry dies #SS (the Tyrian swap-resume abort).
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    // Not-present ring-0 code descriptor at GDT 0x30 (access 0x18: P=0, code).
+    let np_code = descriptor(0, 0xfffff, 0x18, 0xc0);
+    bus.memory[(GDT + 0x30) as usize..(GDT + 0x30) as usize + 8].copy_from_slice(&np_code);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    for v in [0x30u32, 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+    let esp_before = cpu.registers.esp();
+
+    let result = cpu.return_far(&mut bus, OperandSize::Word, 0);
+
+    assert!(result.is_err(), "P=0 target CS must fault: {result:?}");
+    assert_eq!(
+        cpu.registers.esp(),
+        esp_before,
+        "a faulted RETF must leave (E)SP exactly pre-instruction so the \
+         restart after the segment swap-in re-pops the same frame"
+    );
+    assert_eq!(cpu.registers.cs().selector, R0_CS, "CS untouched");
+}
+
+#[test]
+fn iret_word_to_a_not_present_code_segment_restores_sp_for_the_restart() {
+    // Same restartability rule for IRET: RTM interrupt returns into
+    // swapped-out segments too.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let np_code = descriptor(0, 0xfffff, 0x18, 0xc0);
+    bus.memory[(GDT + 0x30) as usize..(GDT + 0x30) as usize + 8].copy_from_slice(&np_code);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+    for v in [0x2u32, 0x30, 0x1234] {
+        cpu.push(&mut bus, v, OperandSize::Word).unwrap();
+    }
+    let esp_before = cpu.registers.esp();
+
+    let result = cpu.iret(&mut bus, OperandSize::Word);
+
+    assert!(result.is_err(), "P=0 target CS must fault: {result:?}");
+    assert_eq!(
+        cpu.registers.esp(),
+        esp_before,
+        "a faulted IRET must leave (E)SP exactly pre-instruction"
+    );
+}
+
+#[test]
+fn far_call_to_a_not_present_code_segment_faults_before_pushing() {
+    // 386 PRM CALL: the target descriptor is validated (present bit included,
+    // #NP) BEFORE the return address is pushed. RTM far-calls into
+    // swapped-out overlay segments; a committed push pair before the #NP
+    // would leak 4 bytes of stack per swap-in once the call restarts.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    let np_code = descriptor(0, 0xfffff, 0x18, 0xc0);
+    bus.memory[(GDT + 0x30) as usize..(GDT + 0x30) as usize + 8].copy_from_slice(&np_code);
+    cpu.registers.eflags = 0x2;
+    cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+    cpu.registers.set_esp(0x6800);
+
+    let result = cpu.far_call(&mut bus, 0x30, 0x10, OperandSize::Word);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 11,
+                error_code: Some(0x30),
+            })
+        ),
+        "P=0 target CS must raise #NP(selector) before any push: {result:?}"
+    );
+    assert_eq!(
+        cpu.registers.esp(),
+        0x6800,
+        "no return-address bytes may be committed by the faulted call"
+    );
+}
+
 /// Install the shared ring-3 code/data descriptor pair at GDT 0x20/0x28 and
 /// enter ring 3 through the proven dword IRET path (CS=0x23, SS=0x2B,
 /// EIP=0x1234, ESP=0x2000).

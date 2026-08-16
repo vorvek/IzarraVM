@@ -608,11 +608,25 @@ impl CpuGsw {
         self.recompute_alignment_armed();
     }
 
+    /// Restartability wrapper: a fault raised after the frame pops committed
+    /// (typically #NP on the target CS -- Borland RTM returns into swapped-out
+    /// overlay segments and re-executes after its handler loads them) must
+    /// leave (E)SP exactly pre-instruction, or the restarted pop reads above
+    /// the real frame. `finish_instruction` rewinds only EIP/CS.
     pub(super) fn iret<B: CpuBus>(
         &mut self,
         bus: &mut B,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
+        let esp_before = self.registers.esp();
+        let result = self.iret_body(bus, operand_size);
+        if result.is_err() {
+            self.registers.set_esp(esp_before);
+        }
+        result
+    }
+
+    fn iret_body<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<()> {
         // NT set in protected mode: this IRET ends a nested TASK, not an
         // interrupt frame (386 PRM 9.5). Return through the current TSS's
         // back-link; nothing is popped. The outgoing image is saved with NT=0
@@ -834,16 +848,26 @@ impl CpuGsw {
             if (high >> 8) & 0x10 == 0 {
                 return self.far_system_transfer(bus, selector, low, high, true);
             }
+            // 386 PRM CALL: the target descriptor's present bit is checked
+            // (#NP(selector)) BEFORE the return address is pushed. Borland RTM
+            // far-calls into swapped-out overlay segments and restarts the CALL
+            // after its #NP handler loads them; pushes committed ahead of the
+            // fault would leak 4 bytes of stack per swap-in on the restart.
+            if (high >> 8) & 0x80 == 0 {
+                return Err(InternalFault::Exception {
+                    vector: 11,
+                    error_code: Some(selector_error_code(selector, selector & 0x4 != 0, false)),
+                });
+            }
         }
         // Direct far call (real mode, or a protected-mode code segment). Push CS first
         // (higher stack address), then the return offset. RETF pops offset then CS.
         // self.registers.eip already points past the instruction.
         // A fault on the SECOND push restores (E)SP past the committed first
         // one, so a PUSH-fault restarts from the pre-instruction stack pointer
-        // (same atomicity as `push` itself). Limit: a fault in the CS load
-        // BELOW still leaves both pushes committed - real silicon validates
-        // the target segment before pushing, a pre-existing ordering
-        // divergence this change does not touch.
+        // (same atomicity as `push` itself). The present bit is validated above,
+        // ahead of the pushes; a fault in the CS load below for any OTHER reason
+        // still leaves both pushes committed (pre-existing ordering divergence).
         let esp_before = self.registers.esp();
         self.push(bus, u32::from(self.registers.cs().selector), operand_size)?;
         if let Err(fault) = self.push(bus, self.registers.eip, operand_size) {
@@ -878,6 +902,25 @@ impl CpuGsw {
     /// plus the immediate offset" -- the parameter block copied by the call
     /// gate sits between CS:IP and the saved SS:eSP).
     pub(super) fn return_far<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand_size: OperandSize,
+        release: u16,
+    ) -> ExecResult<()> {
+        // Same restartability wrapper as `iret`: RTM's overlay thunks RETF into
+        // not-present segments and restart after the #NP swap-in; the committed
+        // pops must be undone on the fault (this was the Tyrian swap-resume
+        // abort: the restarted thunk RETF popped 4 bytes past its frame, off
+        // the top of the thunk stack, and died #SS).
+        let esp_before = self.registers.esp();
+        let result = self.return_far_body(bus, operand_size, release);
+        if result.is_err() {
+            self.registers.set_esp(esp_before);
+        }
+        result
+    }
+
+    fn return_far_body<B: CpuBus>(
         &mut self,
         bus: &mut B,
         operand_size: OperandSize,
