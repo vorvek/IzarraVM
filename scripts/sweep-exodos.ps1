@@ -1,0 +1,449 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+#Requires -Version 7.4
+#
+# eXoDOS corpus sweep: extract, translate, run headless, archive, delete.
+#
+# WHY THIS EXISTS. Every perf campaign so far has ranked levers against eight
+# fixtures, which cannot say what fraction of the DOS library a lever covers.
+# This runs corpus titles one at a time and archives everything each run
+# produced, so the classification can be recomputed later without running
+# anything again. Design: dev_docs/exodos-sweep-design.md.
+#
+# WHAT IT IS NOT. No wall figure from this sweep may enter an A/B or a
+# scoreboard claim. It runs under variable load, with phase marks armed, with
+# the run sliced by key injection and screen sampling, against fixtures that
+# have no pinned invariants. .bench/PROTOCOL.md owns every performance claim.
+#
+# Rules paid for in earlier campaigns and encoded here:
+#   - The corpus is READ-ONLY. Nothing under -Corpus is ever opened for write.
+#   - Extract-run-delete. Mounting a folder writes into it, and Katea
+#     reconciles guest writes to the host during the run, so a run always gets
+#     a fresh scratch copy and never reuses a killed run's tree.
+#   - Observer variables are REMOVED with $null, never blanked. A set-but-empty
+#     variable is not "off": readers using var_os().is_some() arm on "".
+#   - No $args assignment inside a function. One battery leg once launched the
+#     emulator with an empty argument list, fell back to the owner's real
+#     c_drive, and died without a trace.
+#   - Liveness, not log greps. A silent death is invisible to a grep-only
+#     monitor, so the watchdog watches the process and the output file's
+#     modification time.
+
+param(
+    # Corpus root. Read-only.
+    [string]$Corpus = "E:\eXo\eXo\eXoDOS",
+    # Corpus shorts to run, or a file with one per line.
+    [string[]]$Games,
+    [string]$GameListFile,
+    [Parameter(Mandatory)][string]$OutDir,
+    [string]$Executable = "D:\dev\IzarraVM\target\release\izarravm.exe",
+    [string]$Translator = "D:\dev\IzarraVM\target\release\izarravm-exodos.exe",
+    # Scratch lives on D:, which has the free space; C: does not.
+    [string]$ScratchRoot = "D:\exo-scratch",
+    # Per-game key schedules, `<short>.json`. Missing files fall back to the
+    # translator's generic sequence.
+    [string]$RecipeDir,
+    [string]$Persona = "586",
+    [int]$GuestSeconds = 120,
+    # Guest ms between phase marks. The classification window is the last 60
+    # guest seconds and 2000 ms yields about 30 marks in it.
+    [int]$PhaseIntervalMs = 2000,
+    # Guest ms between screen samples.
+    [int]$ScreenIntervalMs = 5000,
+    # Host seconds before a run is killed as HUNG-HOST. Sized against the
+    # slowest fixture (duke3d-586 at rt 0.29 needs ~414 s for 120 guest
+    # seconds) plus the screen-sampling overhead.
+    [int]$WatchdogSeconds = 900,
+    # Refuse a game whose extraction would exceed this, rather than filling the
+    # volume. The corpus maximum extracts to about 7 GB.
+    [int]$MaxExtractGib = 8,
+    [switch]$KeepScratch
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# Guest clock per persona, for turning guest seconds into a --cycles budget.
+$personaClockHz = @{ "586" = 166000000; "486" = 66000000; "386" = 22000000 }
+
+# Stderr lines the emulator emits on a healthy run. Katea reports a failed
+# materialize or a skipped entry on stderr, and a game that writes a savegame
+# can legitimately produce one. Anything NOT matched here fails the row loudly,
+# which is the point: an unknown stderr line is a finding.
+$benignStderrPatterns = @(
+    '^katea: ',
+    '^\[DMA\] ',
+    '^\s*$',
+    '^\s*(INFO|WARN|DEBUG|TRACE)\b',
+    '^\d{4}-\d{2}-\d{2}T'
+)
+
+# Reboot detection. The design proposed scraping stdout for a repeated POST
+# banner; MEASURED 2026-08-16, the --hdd-folder path prints NO banner at all,
+# so that detector has no signal and this does not pretend otherwise. The
+# screen index is the substitute: a machine that resets redraws its first
+# screen, so a run whose opening frame hash recurs after having changed away
+# from it has been round the loop. Reported as a count, and only two or more
+# recurrences call the row a REBOOT-LOOP.
+$rebootRecurrenceThreshold = 2
+
+foreach ($required in @($Executable, $Translator)) {
+    if (-not (Test-Path -LiteralPath $required)) { throw "Missing executable: $required" }
+}
+if (-not (Test-Path -LiteralPath $Corpus)) { throw "Missing corpus: $Corpus" }
+$dosRoot = Join-Path $Corpus '!dos'
+if (-not (Test-Path -LiteralPath $dosRoot)) { throw "Missing corpus !dos directory: $dosRoot" }
+
+if ($GameListFile) {
+    if (-not (Test-Path -LiteralPath $GameListFile)) { throw "Missing game list: $GameListFile" }
+    $Games = @(Get-Content -LiteralPath $GameListFile |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('#') })
+}
+if (-not $Games -or $Games.Count -eq 0) { throw "No games given. Use -Games or -GameListFile." }
+if (-not $personaClockHz.ContainsKey($Persona)) { throw "Unknown persona: $Persona" }
+
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+New-Item -ItemType Directory -Force -Path $ScratchRoot | Out-Null
+$cycleBudget = [int64]$personaClockHz[$Persona] * [int64]$GuestSeconds
+
+# Set every observer explicitly to OFF by REMOVING it. The barrier census is
+# the one that matters most: it only does work when the JIT is active, so it
+# taxes exactly the runs this is trying to time, and a first attempt at using
+# it in a timing pass once read +72%.
+function Clear-ObserverEnvironment {
+    $observers = @(
+        'IZARRAVM_DIRECT_BARRIER_CENSUS', 'IZARRAVM_CPU_PROFILE', 'IZARRAVM_MACHINE_PROFILE',
+        'IZARRAVM_RIP_PROFILE', 'IZARRAVM_AUDIO_WAV', 'IZARRAVM_AUDIO_COST',
+        'IZARRAVM_SMC_CENSUS', 'IZARRAVM_VGA_WIPE_CENSUS', 'IZARRAVM_INT13_PROFILE',
+        'IZARRAVM_IPE_WINDOW_TRACE', 'IZARRAVM_WATCH_WRITE', 'IZARRAVM_DIFF_TRACE',
+        'IZARRAVM_SMC_TRACE', 'IZARRAVM_DUMP_LINEAR', 'IZARRAVM_DOSROOT'
+    )
+    foreach ($name in $observers) {
+        Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+    }
+}
+
+# Find `<Title (Year)>.zip` for a corpus short. The mapping runs through the
+# `<Full Title (Year)>.bat` file inside `!dos\<short>\`; the corpus is dense
+# with near neighbours (DOOM / DOOMII / DOOM2D / DOOM4), so the short is
+# matched EXACTLY and never fuzzily.
+function Resolve-GameZip {
+    param([string]$DosRoot, [string]$CorpusRoot, [string]$Short)
+    $confDir = Join-Path $DosRoot $Short
+    if (-not (Test-Path -LiteralPath $confDir)) { return $null }
+    $leaf = Split-Path -Leaf ((Get-Item -LiteralPath $confDir).FullName)
+    if ($leaf -cne $Short) { return $null }
+    $marker = Get-ChildItem -LiteralPath $confDir -Filter '*.bat' -File |
+        Where-Object { $_.Name -ne 'install.bat' } |
+        Select-Object -First 1
+    if (-not $marker) { return $null }
+    $zip = Join-Path $CorpusRoot ($marker.BaseName + '.zip')
+    if (-not (Test-Path -LiteralPath $zip)) { return $null }
+    return $zip
+}
+
+function Expand-GameZip {
+    param([string]$Zip, [string]$Destination, [int]$MaxGib)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($Zip)
+    try {
+        $bytes = 0L
+        foreach ($entry in $archive.Entries) { $bytes += $entry.Length }
+        if ($bytes -gt ([int64]$MaxGib * 1GB)) {
+            return [pscustomobject]@{ Ok = $false; Reason = "extract-too-large"; Bytes = $bytes }
+        }
+        [IO.Compression.ZipFileExtensions]::ExtractToDirectory($archive, $Destination)
+        return [pscustomobject]@{ Ok = $true; Reason = ""; Bytes = $bytes }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+# Run the emulator with a watchdog that watches the PROCESS and the profile
+# file's modification time, so a silent death is visible rather than merely
+# absent from a log.
+function Invoke-EmulatorRun {
+    param(
+        [string]$Exe,
+        [string[]]$Arguments,
+        [string]$StdoutPath,
+        [string]$StderrPath,
+        [int]$TimeoutSeconds
+    )
+    if ($Arguments.Count -lt 8) {
+        throw "refusing to launch with a short argument list ($($Arguments.Count))"
+    }
+    $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -NoNewWindow -PassThru `
+        -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
+    # An empty command line is the failure mode that once ran a whole leg
+    # against the owner's real drive. Verify the child got its arguments.
+    $started = Get-Date
+    $timedOut = $false
+    $lastSize = -1L
+    $lastProgress = Get-Date
+    while (-not $process.HasExited) {
+        Start-Sleep -Milliseconds 500
+        if (((Get-Date) - $started).TotalSeconds -gt $TimeoutSeconds) {
+            $timedOut = $true
+            break
+        }
+        # Liveness: stdout must keep growing. A process that is alive but has
+        # stopped producing output for a third of the watchdog is dead enough.
+        $size = if (Test-Path -LiteralPath $StdoutPath) { (Get-Item -LiteralPath $StdoutPath).Length } else { 0L }
+        if ($size -ne $lastSize) {
+            $lastSize = $size
+            $lastProgress = Get-Date
+        }
+    }
+    if ($timedOut) {
+        try { $process.Kill($true) } catch { Write-Warning "kill failed: $_" }
+        $process.WaitForExit(30000) | Out-Null
+    }
+    return [pscustomobject]@{
+        ExitCode    = if ($process.HasExited) { $process.ExitCode } else { -1 }
+        TimedOut    = $timedOut
+        WallSeconds = ((Get-Date) - $started).TotalSeconds
+        LastOutput  = $lastProgress
+    }
+}
+
+function Test-StderrIsBenign {
+    param([string]$Path, [string[]]$Patterns)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $offending = @()
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line.Trim().Length -eq 0) { continue }
+        $matched = $false
+        foreach ($pattern in $Patterns) {
+            if ($line -match $pattern) { $matched = $true; break }
+        }
+        if (-not $matched) { $offending += $line }
+    }
+    # A bare `return @()` unrolls to $null, and a caller reading .Count on it
+    # dies under Set-StrictMode. Comma-wrap keeps the array an array.
+    return ,$offending
+}
+
+# Count returns to the opening frame. See the reboot note above.
+function Measure-ScreenRecurrence {
+    param($Screens)
+    if ($Screens.Count -lt 3) { return 0 }
+    $first = $Screens[0].hash
+    $returns = 0
+    $left = $false
+    foreach ($sample in $Screens) {
+        if ($sample.hash -ne $first) { $left = $true; continue }
+        if ($left) { $returns++; $left = $false }
+    }
+    return $returns
+}
+
+# Read `stop.kind` from the PROFILE, never from the process exit code:
+# --hdd-folder does not propagate the guest's fate and a cpu_error run still
+# exits 0 unless --expect-test-exit was passed, which this sweep does not pass.
+function Get-Outcome {
+    param($Profile, $Screens, [int]$ScreenRecurrences, [bool]$TimedOut, [int]$MinMarks, [int]$RebootThreshold)
+    if ($TimedOut) { return "HUNG-HOST" }
+    if ($null -eq $Profile) { return "NO-PROFILE" }
+    $kind = $Profile.stop.kind
+    if ($kind -eq "cpu_error") { return "CRASHED" }
+    if ($ScreenRecurrences -ge $RebootThreshold) { return "REBOOT-LOOP" }
+    $marks = 0
+    if ($Profile.PSObject.Properties.Name -contains 'phase_marks' -and $Profile.phase_marks) {
+        $marks = @($Profile.phase_marks).Count
+    }
+    if ($marks -lt $MinMarks) { return "SHORT-RUN" }
+    if ($kind -eq "halted") { return "HALTED" }
+    if ($kind -eq "test_exit" -or $kind -eq "dos_exit") { return "EXITED" }
+    # The screen index answers the question no counter does: did the picture
+    # ever change. A run whose last two thirds of samples share one hash is
+    # parked, however busy its counters look.
+    if ($Screens.Count -ge 6) {
+        $tail = @($Screens[[int]($Screens.Count / 3)..($Screens.Count - 1)])
+        $distinct = @($tail | Select-Object -ExpandProperty hash -Unique).Count
+        if ($distinct -le 1) {
+            $mode = $tail[-1].video_mode
+            if ($null -eq $mode -or $mode -eq "text") { return "IDLE-TEXT" }
+            return "IDLE-AT-MENU"
+        }
+    }
+    return "RAN"
+}
+
+Clear-ObserverEnvironment
+$env:IZARRAVM_PHASE_INTERVAL_MS = "$PhaseIntervalMs"
+
+$rows = @()
+$index = 0
+foreach ($short in $Games) {
+    $index++
+    Write-Host "[$index/$($Games.Count)] $short"
+    $gameOut = Join-Path $OutDir $short
+    New-Item -ItemType Directory -Force -Path $gameOut | Out-Null
+    $scratch = Join-Path $ScratchRoot $short
+    if (Test-Path -LiteralPath $scratch) { Remove-Item -Recurse -Force -LiteralPath $scratch }
+
+    # Every column is declared here. Set-StrictMode makes reading an absent
+    # property a terminating error, and a row that took an early exit would
+    # otherwise take the whole sweep down at the summary line.
+    $row = [ordered]@{
+        short                        = $short
+        persona                      = $Persona
+        guest_budget                 = $GuestSeconds
+        cycle_budget                 = $cycleBudget
+        outcome                      = "UNKNOWN"
+        reasons                      = @()
+        flags                        = @()
+        wall_seconds                 = 0.0
+        stderr_lines                 = 0
+        stderr_sample                = $null
+        error                        = $null
+        zip_bytes                    = 0
+        translate_class              = $null
+        launch                       = $null
+        launch_resolved              = $null
+        resolved_by_search           = $false
+        config_sys_shape             = $null
+        cd_image                     = $null
+        memory_mib                   = 0
+        choices                      = @()
+        exit_code                    = $null
+        screen_recurrences           = 0
+        phase_mark_count             = 0
+        screen_samples               = 0
+        screen_distinct              = 0
+        stop_kind                    = $null
+        real_time_factor             = $null
+        guest_seconds                = $null
+        machine_phase_timing_enabled = $null
+    }
+
+    try {
+        $conf = Join-Path (Join-Path $dosRoot $short) 'dosbox.conf'
+        if (-not (Test-Path -LiteralPath $conf)) { throw "no dosbox.conf for $short" }
+        $zip = Resolve-GameZip -DosRoot $dosRoot -CorpusRoot $Corpus -Short $short
+        if (-not $zip) { throw "no zip resolved for $short" }
+
+        New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+        $extract = Expand-GameZip -Zip $zip -Destination $scratch -MaxGib $MaxExtractGib
+        if (-not $extract.Ok) {
+            $row.outcome = "UNTRANSLATABLE"
+            $row.reasons = @($extract.Reason)
+            $rows += [pscustomobject]$row
+            continue
+        }
+        $row.zip_bytes = $extract.Bytes
+
+        $translateJson = Join-Path $gameOut 'translate.json'
+        $translateArgs = @(
+            'translate',
+            '--conf', $conf,
+            '--extract-root', $scratch,
+            '--short', $short,
+            '--persona', $Persona,
+            '--cycles', "$cycleBudget",
+            '--output', $translateJson
+        )
+        if ($RecipeDir) { $translateArgs += @('--recipe-dir', $RecipeDir) }
+        & $Translator @translateArgs | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "translator exited $LASTEXITCODE" }
+        $plan = Get-Content -LiteralPath $translateJson -Raw | ConvertFrom-Json
+
+        $row.reasons = @($plan.reasons)
+        $row.flags = @($plan.flags)
+        $row.translate_class = $plan.class
+        $row.launch = $plan.launch_command
+        $row.launch_resolved = $plan.launch_resolved
+        $row.resolved_by_search = $plan.resolved_by_search
+        $row.config_sys_shape = $plan.config_sys_shape
+        $row.cd_image = $plan.cd_image
+        $row.memory_mib = $plan.memory_mib
+        $row.choices = @($plan.choices)
+
+        if ($plan.class -eq 'UNTRANSLATABLE') {
+            $row.outcome = "UNTRANSLATABLE"
+            $rows += [pscustomobject]$row
+            continue
+        }
+
+        # Archive the exact configuration the run used, so the row can be
+        # re-read without the scratch tree it came from.
+        Copy-Item -LiteralPath (Join-Path $plan.hdd_folder 'AUTOEXEC.BAT') -Destination $gameOut -Force
+        Copy-Item -LiteralPath (Join-Path $plan.hdd_folder 'CONFIG.SYS') -Destination $gameOut -Force
+
+        $profileJson = Join-Path $gameOut 'profile.json'
+        $screensDir = Join-Path $gameOut 'screens'
+        $stdoutPath = Join-Path $gameOut 'run.stdout'
+        $stderrPath = Join-Path $gameOut 'run.stderr'
+        $runArgs = @($plan.invocation)
+        $runArgs += @(
+            '--profile-json', $profileJson,
+            '--result-ppm', (Join-Path $gameOut 'final.ppm'),
+            '--screen-dump-dir', $screensDir,
+            '--screen-dump-interval-ms', "$ScreenIntervalMs"
+        )
+
+        Clear-ObserverEnvironment
+        $env:IZARRAVM_PHASE_INTERVAL_MS = "$PhaseIntervalMs"
+        $run = Invoke-EmulatorRun -Exe $Executable -Arguments $runArgs -StdoutPath $stdoutPath `
+            -StderrPath $stderrPath -TimeoutSeconds $WatchdogSeconds
+        $row.wall_seconds = [math]::Round($run.WallSeconds, 3)
+        $row.exit_code = $run.ExitCode
+
+        $offending = Test-StderrIsBenign -Path $stderrPath -Patterns $benignStderrPatterns
+        $row.stderr_lines = $offending.Count
+        if ($offending.Count -gt 0) {
+            $row.stderr_sample = $offending[0]
+            Write-Error "row $short wrote unrecognised stderr: $($offending[0])" -ErrorAction Continue
+        }
+
+        $profile = $null
+        if (Test-Path -LiteralPath $profileJson) {
+            try { $profile = Get-Content -LiteralPath $profileJson -Raw | ConvertFrom-Json }
+            catch { Write-Warning "$short profile JSON will not parse: $_" }
+        }
+        $screens = @()
+        $screenIndex = Join-Path $screensDir 'screens.jsonl'
+        if (Test-Path -LiteralPath $screenIndex) {
+            $screens = @(Get-Content -LiteralPath $screenIndex |
+                Where-Object { $_.Trim() } |
+                ForEach-Object { $_ | ConvertFrom-Json })
+        }
+        $recurrences = Measure-ScreenRecurrence -Screens $screens
+        $row.screen_recurrences = $recurrences
+        $row.phase_mark_count = if ($profile -and $profile.PSObject.Properties.Name -contains 'phase_marks' -and $profile.phase_marks) { @($profile.phase_marks).Count } else { 0 }
+        $row.screen_samples = $screens.Count
+        $row.screen_distinct = @($screens | Select-Object -ExpandProperty hash -Unique).Count
+        if ($profile) {
+            $row.stop_kind = $profile.stop.kind
+            $row.real_time_factor = $profile.real_time_factor
+            $row.guest_seconds = $profile.guest_seconds
+            # A contaminated row: arming marks must not arm phase timing.
+            $row.machine_phase_timing_enabled = $profile.machine_phase_timing_enabled
+        }
+        $row.outcome = Get-Outcome -Profile $profile -Screens $screens -ScreenRecurrences $recurrences `
+            -TimedOut $run.TimedOut -MinMarks 31 -RebootThreshold $rebootRecurrenceThreshold
+    } catch {
+        $row.outcome = "HARNESS-ERROR"
+        $row.error = "$_"
+        Write-Error "row $short failed: $_" -ErrorAction Continue
+    } finally {
+        # Delete the GAME FILES, never the collected data.
+        if (-not $KeepScratch -and (Test-Path -LiteralPath $scratch)) {
+            Remove-Item -Recurse -Force -LiteralPath $scratch -ErrorAction SilentlyContinue
+        }
+    }
+
+    $rows += [pscustomobject]$row
+    ($rows[-1] | ConvertTo-Json -Depth 6 -Compress) |
+        Add-Content -LiteralPath (Join-Path $OutDir 'rows.jsonl')
+    Write-Host "    $($row.outcome) wall=$($row.wall_seconds)s marks=$($row.phase_mark_count) screens=$($row.screen_samples)/$($row.screen_distinct)"
+}
+
+$rows | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutDir 'sweep.json')
+$rows | Select-Object short, outcome, translate_class, wall_seconds, real_time_factor,
+    phase_mark_count, screen_samples, screen_distinct, stderr_lines |
+    Export-Csv -LiteralPath (Join-Path $OutDir 'sweep.csv') -NoTypeInformation
+$rows | Group-Object outcome | Sort-Object Count -Descending |
+    ForEach-Object { "{0,-18} {1}" -f $_.Name, $_.Count }

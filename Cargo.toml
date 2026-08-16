@@ -11,6 +11,7 @@ members = [
     "crates/izarravm-core",
     "crates/izarravm-corpus",
     "crates/izarravm-cpu",
+    "crates/izarravm-exodos",
     "crates/izarravm-firmware",
     "crates/izarravm-input",
     "crates/izarravm-machine",

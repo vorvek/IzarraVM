@@ -16,6 +16,7 @@ mod ipe_trace;
 mod prefs;
 #[cfg(windows)]
 mod riprofile;
+mod screendump;
 mod startup;
 
 use clap::Parser;
@@ -151,6 +152,17 @@ struct Cli {
     /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
     #[arg(long, requires = "hdd_folder")]
     expect_test_exit: bool,
+    /// With --hdd-folder, sample the screen every --screen-dump-interval-ms
+    /// GUEST milliseconds into this directory, plus a `screens.jsonl` index.
+    /// For headless runs nobody watches: the index says whether the picture is
+    /// still changing, which is how a corpus sweep tells a running game from
+    /// one parked on a menu. Default off. Slices the run, so it is a
+    /// diagnostic, not a benchmark path.
+    #[arg(long, requires = "hdd_folder")]
+    screen_dump_dir: Option<PathBuf>,
+    /// Guest milliseconds between screen samples.
+    #[arg(long, requires = "screen_dump_dir", default_value_t = 5_000)]
+    screen_dump_interval_ms: u64,
     /// With --hdd-folder, mount a CD image (ISO or CUE/BIN, the formats the GUI
     /// mount accepts) before boot. For fixtures whose game reads data, FMV or
     /// CD audio from the disc.
@@ -358,6 +370,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             cli.inject_keys.as_deref(),
             cli.inject_mouse.as_deref(),
             cli.cd_image.as_deref(),
+            cli.screen_dump_dir
+                .as_deref()
+                .map(|dir| (dir, cli.screen_dump_interval_ms)),
         );
     }
 
@@ -1423,17 +1438,34 @@ fn run_sliced(
     machine: &mut Machine,
     cycles: u64,
     capture: &mut Option<AudioCapture>,
+    dumper: &mut Option<screendump::ScreenDumper>,
 ) -> Result<(StopReason, u64), Box<dyn Error>> {
-    let Some(capture) = capture.as_mut() else {
+    // The unobserved path stays ONE `run_until_halt_or_cycles` call, byte for
+    // byte what it was. Slicing moves where the machine services device events,
+    // so the shipped fixtures must never take a sliced branch.
+    if capture.is_none() && dumper.is_none() {
         return Ok((machine.run_until_halt_or_cycles(cycles)?, cycles));
-    };
+    }
+    let slice = capture
+        .as_ref()
+        .map(|capture| capture.slice)
+        .into_iter()
+        .chain(dumper.as_ref().map(|dumper| dumper.slice))
+        .min()
+        .unwrap_or(cycles)
+        .max(1);
     let mut spent = 0u64;
     let mut stop = StopReason::CycleLimit { requested: cycles };
     while spent < cycles {
-        let step = capture.slice.min(cycles - spent);
+        let step = slice.min(cycles - spent);
         let reason = machine.run_until_halt_or_cycles(step)?;
         spent += step;
-        capture.after_slice(machine, step);
+        if let Some(capture) = capture.as_mut() {
+            capture.after_slice(machine, step);
+        }
+        if let Some(dumper) = dumper.as_mut() {
+            dumper.after_slice(machine);
+        }
         if non_cycle_stop(&reason).is_some() {
             stop = reason;
             break;
@@ -1483,6 +1515,7 @@ fn run_boot_hdd_folder(
     inject_keys: Option<&str>,
     inject_mouse: Option<&str>,
     cd_image: Option<&Path>,
+    screen_dump: Option<(&Path, u64)>,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(path) = profile_json {
         validate_profile_json_parent(path)?;
@@ -1576,13 +1609,24 @@ fn run_boot_hdd_folder(
     let audio_slice_ms = audio_capture_slice_ms()?;
     let mut capture =
         resolve_audio_sink()?.map(|mode| AudioCapture::new(mode, hardware, audio_slice_ms));
+    // Periodic headless screen sampling, off unless --screen-dump-dir is given.
+    let mut dumper = match screen_dump {
+        Some((dir, interval_ms)) => Some(screendump::ScreenDumper::new(
+            dir,
+            hardware
+                .cpu
+                .clock_rate()
+                .clocks_for_fraction_floor(interval_ms, 1000),
+        )?),
+        None => None,
+    };
     let start_wall = std::time::Instant::now();
     // The no-injection, no-capture path stays ONE `run_until_halt_or_cycles`
     // call, byte for byte what it was: slicing the run moves where the machine
     // services device events, so the shipped Doom and Quake fixtures must not
     // take a sliced branch.
     let stop_reason = if injections.is_empty() {
-        run_sliced(&mut machine, budget, &mut capture)?.0
+        run_sliced(&mut machine, budget, &mut capture, &mut dumper)?.0
     } else {
         let guest_ms = |ms: u64| {
             hardware
@@ -1607,13 +1651,14 @@ fn run_boot_hdd_folder(
                        spent: &mut u64,
                        reason: &mut Option<StopReason>,
                        capture: &mut Option<AudioCapture>,
+                       dumper: &mut Option<screendump::ScreenDumper>,
                        slice: u64|
          -> Result<bool, Box<dyn Error>> {
             let slice = slice.min(budget.saturating_sub(*spent));
             if slice == 0 {
                 return Ok(false);
             }
-            let (stop, ran) = run_sliced(machine, slice, capture)?;
+            let (stop, ran) = run_sliced(machine, slice, capture, dumper)?;
             *spent += ran;
             if let Some(terminal) = non_cycle_stop(&stop) {
                 *reason = Some(terminal);
@@ -1623,7 +1668,16 @@ fn run_boot_hdd_folder(
         };
         for step in &injections {
             let gap = step.at_cycles.saturating_sub(spent);
-            if gap > 0 && !advance(&mut machine, &mut spent, &mut reason, &mut capture, gap)? {
+            if gap > 0
+                && !advance(
+                    &mut machine,
+                    &mut spent,
+                    &mut reason,
+                    &mut capture,
+                    &mut dumper,
+                    gap,
+                )?
+            {
                 break;
             }
             match &step.event {
@@ -1636,6 +1690,7 @@ fn run_boot_hdd_folder(
                                 &mut spent,
                                 &mut reason,
                                 &mut capture,
+                                &mut dumper,
                                 per_key,
                             )? {
                                 break;
@@ -1647,7 +1702,14 @@ fn run_boot_hdd_folder(
                     for packet in mouse_action_packets(action, &mut buttons) {
                         machine.inject_mouse_relative(packet.dx, packet.dy, packet.buttons);
                         let dwell = guest_ms(packet.dwell_ms);
-                        if !advance(&mut machine, &mut spent, &mut reason, &mut capture, dwell)? {
+                        if !advance(
+                            &mut machine,
+                            &mut spent,
+                            &mut reason,
+                            &mut capture,
+                            &mut dumper,
+                            dwell,
+                        )? {
                             break;
                         }
                     }
@@ -1659,11 +1721,22 @@ fn run_boot_hdd_folder(
         }
         match reason {
             Some(terminal) => terminal,
-            None => run_sliced(&mut machine, budget.saturating_sub(spent), &mut capture)?.0,
+            None => {
+                run_sliced(
+                    &mut machine,
+                    budget.saturating_sub(spent),
+                    &mut capture,
+                    &mut dumper,
+                )?
+                .0
+            }
         }
     };
     if let Some(capture) = &capture {
         capture.finish()?;
+    }
+    if let Some(dumper) = dumper.take() {
+        dumper.finish();
     }
     // The wall reading comes FIRST. `record_host_phase_mark` routes to the full mark, which
     // takes a `cpu_profile` snapshot when profiling is armed -- the untruncated hot-address sort

@@ -1817,7 +1817,7 @@ fn audio_capture_observes_every_advance_and_paces_by_cycles_run() {
     let per_advance = clock_hz / 1_000;
     let mut spent = 0u64;
     for _ in 0..10 {
-        let (_, ran) = run_sliced(&mut machine, per_advance, &mut capture).unwrap();
+        let (_, ran) = run_sliced(&mut machine, per_advance, &mut capture, &mut None).unwrap();
         spent += ran;
     }
     assert_eq!(spent, per_advance * 10);
@@ -1839,7 +1839,7 @@ fn audio_capture_observes_every_advance_and_paces_by_cycles_run() {
     // boundaries.
     let mut bare = build();
     let mut none = None;
-    let (_, ran) = run_sliced(&mut bare, per_advance * 10, &mut none).unwrap();
+    let (_, ran) = run_sliced(&mut bare, per_advance * 10, &mut none, &mut None).unwrap();
     assert_eq!(ran, per_advance * 10);
     assert!(none.is_none());
 
@@ -1945,7 +1945,7 @@ fn the_audio_wav_capture_records_the_machine_unscaled_by_the_host_volume_knob() 
         AUDIO_CAPTURE_SLICE_MS,
     ));
     for _ in 0..5 {
-        run_sliced(&mut machine, ten_ms, &mut capture).unwrap();
+        run_sliced(&mut machine, ten_ms, &mut capture, &mut None).unwrap();
     }
     let captured = peak(&capture.as_ref().unwrap().pcm);
 
@@ -2013,7 +2013,7 @@ fn run_audio_cost_leg(mode: AudioSinkMode, slices: u32) -> (AudioCapture, Machin
     let mut machine = audio_beep_machine();
     let mut capture = Some(AudioCapture::new(mode, &hardware, AUDIO_CAPTURE_SLICE_MS));
     for _ in 0..slices {
-        run_sliced(&mut machine, ten_ms, &mut capture).unwrap();
+        run_sliced(&mut machine, ten_ms, &mut capture, &mut None).unwrap();
     }
     (capture.unwrap(), machine)
 }
@@ -2025,7 +2025,7 @@ fn run_audio_cost_leg_one_call(mode: AudioSinkMode, slices: u32) -> AudioCapture
     let mut machine = audio_beep_machine();
     let mut capture = Some(AudioCapture::new(mode, &hardware, AUDIO_CAPTURE_SLICE_MS));
     let cycles = capture.as_ref().unwrap().slice * u64::from(slices);
-    let (_, ran) = run_sliced(&mut machine, cycles, &mut capture).unwrap();
+    let (_, ran) = run_sliced(&mut machine, cycles, &mut capture, &mut None).unwrap();
     assert_eq!(ran, cycles, "the guest stopped short of the request");
     capture.unwrap()
 }
@@ -2145,7 +2145,7 @@ fn audio_cost_count_leg_folds_a_deterministic_mix_and_writes_nothing() {
         AUDIO_CAPTURE_SLICE_MS,
     ));
     for _ in 0..5 {
-        run_sliced(&mut wav_machine, ten_ms, &mut wav_capture).unwrap();
+        run_sliced(&mut wav_machine, ten_ms, &mut wav_capture, &mut None).unwrap();
     }
     wav_capture.as_ref().unwrap().finish().unwrap();
     let control: Vec<_> = std::fs::read_dir(&dir)
@@ -2202,7 +2202,7 @@ fn audio_cost_count_leg_folds_exactly_what_the_wav_capture_records() {
         AUDIO_CAPTURE_SLICE_MS,
     ));
     for _ in 0..5 {
-        run_sliced(&mut wav_machine, ten_ms, &mut wav).unwrap();
+        run_sliced(&mut wav_machine, ten_ms, &mut wav, &mut None).unwrap();
     }
     let wav = wav.unwrap();
 
