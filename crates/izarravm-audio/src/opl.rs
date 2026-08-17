@@ -634,10 +634,26 @@ impl OplChip {
     fn write_bank(&mut self, bank: usize, index: u8, value: u8) {
         if bank == 0 && index == 0x04 {
             // bit0/bit1: start timer 1/2 (rising edge reloads from preset).
-            // bit7: reset both overflow flags.
+            // bit5/bit6: mask timer 2/1, gating the IRQ line only.
+            // bit7: IRQ-RESET, which clears both overflow flags.
+            //
+            // Bit7 is exclusive. The YM3812 and YMF262 register maps both
+            // state that when IRQ-RESET is set the remaining bits of the
+            // write are ignored, so such a write neither starts nor stops a
+            // timer and leaves the mask bits at their prior value. Returning
+            // before the store below is what preserves them: register 0x04 is
+            // write-only on the part, and `status_bits` reads the stored byte
+            // for the masks, so storing 0x80 verbatim would unmask both timers
+            // as a side effect of clearing a flag.
+            //
+            // This is load-bearing for detection. Period probes clear the
+            // overflow flag between polls to time successive overflows; if
+            // that write also cleared the start bits, the timer would stop
+            // after the first overflow and every later poll would read clear.
             if value & 0x80 != 0 {
                 self.timer1.expired = false;
                 self.timer2.expired = false;
+                return;
             }
             let start1 = value & 0x01 != 0;
             let start2 = value & 0x02 != 0;

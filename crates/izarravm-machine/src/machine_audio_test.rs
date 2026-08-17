@@ -1289,11 +1289,16 @@ fn opl_start_timer1(machine: &mut Machine) {
     });
 }
 
-/// Stop both OPL timers and clear the overflow flags (the probe's cleanup).
+/// Stop both OPL timers, then clear the overflow flags (the probe's
+/// cleanup). Two writes, per the OPL3 reference: an IRQ-RESET write ignores
+/// its other bits, so 0x80 alone clears the flags but stops nothing. Write
+/// the mask-only byte first to stop the timers, then 0x80 to clear.
 fn opl_stop_timers(machine: &mut Machine) {
     with_bus(machine, |bus| {
         bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap();
-        bus.write_io(0x389, BusWidth::Byte, 0x80, false).unwrap(); // IRQ RESET, no start bits
+        bus.write_io(0x389, BusWidth::Byte, 0x60, false).unwrap(); // mask both, stop both
+        bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap();
+        bus.write_io(0x389, BusWidth::Byte, 0x80, false).unwrap(); // IRQ RESET
     });
 }
 
