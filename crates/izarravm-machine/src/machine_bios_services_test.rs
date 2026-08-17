@@ -2884,3 +2884,36 @@ fn coprocessor_latch_strobes_are_claimed_writes_and_floating_reads() {
         "a 0xF0 read is undriven and floats like open bus"
     );
 }
+
+/// INT 14h AH=1Bh returns the FOSSIL driver information block at ES:DI. The
+/// service is dispatched for any caller that is not in ring-0 protected mode,
+/// so a communications program running in V86 under a memory manager reaches it
+/// with a buffer its page tables put outside the identity map -- the same
+/// defect the VBE information blocks had.
+#[test]
+fn fossil_driver_info_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut machine = super::margo::umb_paged_machine();
+    assert_eq!(
+        machine.read_physical_u32(super::margo::UMB_BUFFER_PHYSICAL),
+        0,
+        "precondition: the mapped frame must be clear"
+    );
+
+    machine.cpu.registers.set_edi(0);
+    machine.cpu.registers.set_edx(0); // COM1
+    machine.cpu.registers.set_ecx(21); // the whole block
+    machine.cpu.registers.set_eax(0x1b00);
+    machine.handle_int14();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 21);
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_BUFFER_PHYSICAL, 3),
+        vec![21, 0, 5],
+        "structure size and FOSSIL level must arrive at the mapped frame"
+    );
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_BUFFER_PHYSICAL + 16, 2),
+        vec![80, 25],
+        "the screen geometry fields must arrive at the mapped frame"
+    );
+}

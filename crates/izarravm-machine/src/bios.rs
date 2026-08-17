@@ -234,6 +234,15 @@ impl Machine {
         self.set_ax(count);
     }
 
+    /// FOSSIL AH=1Bh driver information block at ES:DI.
+    ///
+    /// ES:DI is the caller's LINEAR address. A communications program that asks
+    /// for it can be running in V86 under a memory manager, and its block can
+    /// then be in upper memory the manager maps non-identity; see
+    /// `write_guest_linear_block`. The byte-at-a-time FOSSIL read and write
+    /// block services above still address ES:DI physically and have the same
+    /// defect, but they are left for a change that can measure a guest against
+    /// them -- nothing in the corpus drives them.
     fn int14_fossil_driver_info(&mut self) {
         let max = self.cpu.registers.ecx() as usize;
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
@@ -245,7 +254,7 @@ impl Machine {
         info[16] = 80;
         info[17] = 25;
         let count = max.min(info_len);
-        self.write_guest_block(es + u32::from(di), &info[..count]);
+        self.write_guest_linear_block(es.wrapping_add(u32::from(di)), &info[..count]);
         self.set_ax(count as u16);
     }
 

@@ -2016,3 +2016,181 @@ fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
     drop(machine);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// --- INT 13h buffers under a paged caller -----------------------------------
+//
+// `run.rs` dispatches the INT 13h HLE for any caller that is not in ring-0
+// protected mode, which includes a V86 task under TOKAEMM. DOS loaded with
+// DOS=HIGH,UMB puts drivers and their buffers in upper memory that TOKAEMM
+// supplies out of extended memory, so a Disk Address Packet, an EDD result
+// buffer or a sector transfer target can all sit outside the identity map --
+// the same defect the VBE information blocks had. The fixture is the one from
+// the VBE fix: guest pages C8h and C9h mapped to two non-adjacent frames.
+
+/// The identity address of the fixture's caller buffer, and a decoy laid over
+/// it so a handler that treats a caller pointer as physical reads something
+/// recognisably wrong instead of the real packet.
+const UMB_IDENTITY: u32 = 0x000c_8c60;
+
+fn poison_identity_range(machine: &mut Machine, len: usize) {
+    for offset in 0..len {
+        machine.write_physical_u8(UMB_IDENTITY + offset as u32, 0x5a);
+    }
+}
+
+/// EDD AH=42h with both the Disk Address Packet and its transfer buffer in
+/// non-identity-mapped upper memory. The packet is read, the sector is
+/// delivered, and the packet's block count is rewritten -- all three have to
+/// address the caller's pages.
+#[test]
+fn int13_edd_transfer_uses_the_non_identity_mapped_packet_and_buffer() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+
+    // DAP at DS:SI = C8C6:0000, transfer buffer at C8C6:0200, both inside the
+    // first mapped page. LBA 7 carries the marker 7 + 10h.
+    let dap = super::margo::UMB_BUFFER_PHYSICAL;
+    m.write_physical_u8(dap, 16); // packet size
+    m.write_physical_u8(dap + 2, 1); // block count
+    m.write_physical_u8(dap + 4, 0x00); // buffer offset 0200h
+    m.write_physical_u8(dap + 5, 0x02);
+    m.write_physical_u8(dap + 6, 0xc6); // buffer segment C8C6h
+    m.write_physical_u8(dap + 7, 0xc8);
+    m.write_physical_u8(dap + 8, 7); // LBA
+    poison_identity_range(&mut m, 16);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0);
+    m.cpu.registers.set_eax(0x4200);
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0 success");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e60),
+        7u8.wrapping_add(0x10),
+        "the sector must land in the frame the caller's page is mapped to"
+    );
+    assert_eq!(
+        m.read_physical_u8(dap + 2),
+        1,
+        "the packet's block count must be rewritten in the mapped frame"
+    );
+}
+
+/// El Torito AH=02h reads the emulated floppy into ES:BX.
+#[test]
+fn el_torito_emulated_read_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut m = int15_machine(16);
+    m.mount_cd(el_torito_iso(2));
+    m.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, 2);
+    m.handle_int19();
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    assert_eq!(
+        m.read_physical_u32(super::margo::UMB_BUFFER_PHYSICAL),
+        0,
+        "precondition: the mapped frame must be clear"
+    );
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(0);
+    m.cpu.registers.set_eax(0x0201);
+    m.cpu.registers.set_ecx(0x0002); // cylinder 0, sector 2
+    m.cpu.registers.set_edx(0);
+    m.handle_int13();
+
+    assert_eq!(dos_int_flags(&m) & 1, 0, "the read must succeed");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL),
+        0xA5,
+        "the emulated sector must land in the mapped frame"
+    );
+}
+
+/// El Torito AH=42h: the packet, the 2048-byte transfer and the rewritten block
+/// count all address the caller's pages. The transfer starts at C8C6:0200 and
+/// runs 2048 bytes, so it crosses into the second frame, which the fixture maps
+/// well away from the first.
+#[test]
+fn el_torito_cd_extended_read_uses_the_non_identity_mapped_packet_and_buffer() {
+    let mut m = int15_machine(16);
+    m.mount_cd(el_torito_iso(2));
+    m.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, 2);
+    m.handle_int19();
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+
+    let dap = super::margo::UMB_BUFFER_PHYSICAL;
+    let mut packet = [0u8; 16];
+    packet[0] = 16;
+    packet[2..4].copy_from_slice(&1u16.to_le_bytes());
+    packet[4..6].copy_from_slice(&0x0200u16.to_le_bytes());
+    packet[6..8].copy_from_slice(&0xc8c6u16.to_le_bytes());
+    packet[8..16].copy_from_slice(&20u64.to_le_bytes());
+    m.write_guest_block(dap, &packet);
+    poison_identity_range(&mut m, 16);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0);
+    m.cpu.registers.set_eax(0x4200);
+    m.cpu.registers.set_edx(0xE0);
+    m.handle_int13();
+
+    assert_eq!(dos_int_flags(&m) & 1, 0, "the extended read must succeed");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e60),
+        0xFA,
+        "the head of the sector must follow the first page's mapping"
+    );
+    // Guest linear C8E60h + 512 is C9060h, in the second page.
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_HIGH + 0x60),
+        0xA5,
+        "the tail of the sector must follow the second page's mapping"
+    );
+    assert_eq!(
+        m.read_physical_u8(dap + 2),
+        1,
+        "the packet's block count must be rewritten in the mapped frame"
+    );
+}
+
+/// El Torito AH=4Bh returns its 19-byte specification packet at DS:SI.
+#[test]
+fn el_torito_status_packet_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut m = int15_machine(16);
+    m.mount_cd(el_torito_iso(2));
+    m.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, 2);
+    m.handle_int19();
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    assert_eq!(
+        m.read_physical_u32(super::margo::UMB_BUFFER_PHYSICAL),
+        0,
+        "precondition: the mapped frame must be clear"
+    );
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0);
+    m.cpu.registers.set_eax(0x4B00);
+    m.cpu.registers.set_edx(0);
+    m.handle_int13();
+
+    assert_eq!(
+        m.read_guest_block(super::margo::UMB_BUFFER_PHYSICAL, 3),
+        vec![19, 2, 0],
+        "packet size, floppy-emulation media and emulated drive must arrive \
+         at the mapped frame"
+    );
+    assert!(m.eltorito_emulation.is_none());
+}

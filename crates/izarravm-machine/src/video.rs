@@ -357,6 +357,11 @@ impl Machine {
     /// live mode, geometry, CGA latch shadows, and display-combination fields, plus
     /// a static functionality table pointer. Limit: only the commonly-read fields
     /// are populated; the VGA-present check that programs run only tests AL == 0x1B.
+    ///
+    /// ES:DI is the caller's LINEAR address, not a physical one: detection code
+    /// calls this beside VBE 4F00h and out of the same DPMI transfer buffer, so
+    /// it reaches this service from a UMB that a memory manager maps
+    /// non-identity. See `write_guest_linear_block`.
     fn int10_state_info(&mut self) {
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
         let di = self.cpu.registers.edi() as u16;
@@ -390,7 +395,7 @@ impl Machine {
         block[0x27..0x29].copy_from_slice(&Self::video_color_count(mode).to_le_bytes());
         block[0x29] = self.video_page_count(mode); // pages
         block[0x2A] = self.video_scanline_code(mode);
-        self.write_guest_block(addr, &block);
+        self.write_guest_linear_block(addr, &block);
         self.set_eax_al(0x1B);
     }
 
@@ -1119,11 +1124,11 @@ impl Machine {
             block.extend_from_slice(&[0; 4]); // VGA latches are not CPU-readable.
         }
         debug_assert_eq!(block.len(), INT10_STATE_HARDWARE_LEN);
-        self.write_guest_block(dst, &block);
+        self.write_guest_linear_block(dst, &block);
     }
 
     fn restore_video_hardware_state(&mut self, src: u32) {
-        let block = self.read_guest_block(src, INT10_STATE_HARDWARE_LEN);
+        let block = self.read_guest_linear_block(src, INT10_STATE_HARDWARE_LEN);
         if block.len() != INT10_STATE_HARDWARE_LEN {
             return;
         }
@@ -1209,11 +1214,11 @@ impl Machine {
         block.extend(self.vega.legacy_mut().dac_block_bytes(0, 256));
         block.push(self.vega.legacy_mut().attr_register(0x14));
         debug_assert_eq!(block.len(), INT10_STATE_DAC_LEN);
-        self.write_guest_block(dst, &block);
+        self.write_guest_linear_block(dst, &block);
     }
 
     fn restore_video_dac_state(&mut self, src: u32) {
-        let block = self.read_guest_block(src, INT10_STATE_DAC_LEN);
+        let block = self.read_guest_linear_block(src, INT10_STATE_DAC_LEN);
         if block.len() != INT10_STATE_DAC_LEN {
             return;
         }
@@ -1242,6 +1247,13 @@ impl Machine {
     /// 64-byte blocks (BX), AL=01 saves the requested state into ES:BX, AL=02 restores
     /// it. CX is the requested-state bitmap: bit 0 hardware registers, bit 1 BDA,
     /// bit 2 DAC/palette.
+    ///
+    /// ES:BX is a LINEAR address, the caller's own. The BDA end of the copy is
+    /// not: 0449h is the BIOS data area, which this service owns and addresses
+    /// physically the way every other BDA access in this file does. Only the
+    /// caller's side of each copy goes through the page walk. Requesting all
+    /// three states saves over 900 bytes, so the caller's block straddles a page
+    /// boundary for most placements and the per-page split matters here.
     fn int10_save_restore_state(&mut self, al: u8) {
         const BDA_VIDEO_START: u32 = 0x449;
         match al {
@@ -1262,7 +1274,7 @@ impl Machine {
                 }
                 if cx & 0x0002 != 0 {
                     let block = self.read_guest_block(BDA_VIDEO_START, INT10_STATE_BDA_LEN);
-                    self.write_guest_block(dst, &block);
+                    self.write_guest_linear_block(dst, &block);
                     dst = dst.wrapping_add(INT10_STATE_BDA_LEN as u32);
                 }
                 if cx & 0x0004 != 0 {
@@ -1281,7 +1293,7 @@ impl Machine {
                     from = from.wrapping_add(INT10_STATE_HARDWARE_LEN as u32);
                 }
                 if cx & 0x0002 != 0 {
-                    let block = self.read_guest_block(from, INT10_STATE_BDA_LEN);
+                    let block = self.read_guest_linear_block(from, INT10_STATE_BDA_LEN);
                     self.write_guest_block(BDA_VIDEO_START, &block);
                     from = from.wrapping_add(INT10_STATE_BDA_LEN as u32);
                 }
@@ -1610,6 +1622,11 @@ impl Machine {
     /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. Covers the
     /// set/get forms for the attribute palette (00/01/02/03/07/08/09) and the DAC
     /// (10/12/13/15/17/18/19/1A/1B). Register conventions per RBIL (INT 10/AH=10h).
+    ///
+    /// The ES:DX block of the 02/09/12/17 forms is the caller's LINEAR address:
+    /// a palette or DAC block loaded by a program running in V86 under a memory
+    /// manager can sit in non-identity-mapped upper memory. See
+    /// `write_guest_linear_block`.
     fn handle_int10_palette(&mut self, al: u8) {
         let bx = self.cpu.registers.ebx() as u16;
         let bl = bx as u8;
@@ -1620,7 +1637,7 @@ impl Machine {
         let dx = self.cpu.registers.edx() as u16;
         let dh = (dx >> 8) as u8;
         let es_base = self.cpu.registers.segment(SegmentIndex::Es).base;
-        let es_dx = es_base + u32::from(dx);
+        let es_dx = es_base.wrapping_add(u32::from(dx));
         match al {
             // AL=00: set individual Attribute register. BL=index, BH=value.
             0x00 => {
@@ -1638,7 +1655,7 @@ impl Machine {
             }
             // AL=02: set all 16 palette registers and overscan from ES:DX (17 bytes).
             0x02 => {
-                let block = self.read_guest_block(es_dx, 17);
+                let block = self.read_guest_linear_block(es_dx, 17);
                 for i in 0..16u8 {
                     self.vega
                         .legacy_mut()
@@ -1677,13 +1694,13 @@ impl Machine {
                     *slot = self.vega.legacy_mut().attr_palette_reg(i as u8);
                 }
                 block[16] = self.vega.legacy_mut().overscan();
-                self.write_guest_block(es_dx, &block);
+                self.write_guest_linear_block(es_dx, &block);
             }
             // AL=10: set individual DAC register. BX=index, DH=R, CH=G, CL=B.
             0x10 => self.vega.legacy_mut().set_dac_entry(bx as u8, dh, ch, cl),
             // AL=12: set a block of DAC registers. BX=start, CX=count, ES:DX -> RGB triples.
             0x12 => {
-                let bytes = self.read_guest_block(es_dx, cx as usize * 3);
+                let bytes = self.read_guest_linear_block(es_dx, cx as usize * 3);
                 let entries: Vec<[u8; 3]> =
                     bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
                 self.vega.legacy_mut().set_dac_block(bx as u8, &entries);
@@ -1723,7 +1740,7 @@ impl Machine {
             // AL=17: get a block of DAC registers. BX=start, CX=count -> ES:DX.
             0x17 => {
                 let bytes = self.vega.legacy_mut().dac_block_bytes(bx as u8, cx);
-                self.write_guest_block(es_dx, &bytes);
+                self.write_guest_linear_block(es_dx, &bytes);
             }
             // AL=18: set PEL mask. BL=value.
             0x18 => {
@@ -1777,6 +1794,11 @@ impl Machine {
     /// requested font pointer (BH=00..07) plus the live BDA font height/rows.
     /// Text-font register conventions verified against the LGPL VGABios
     /// `biosfn_load_text_*`; graphics-font register conventions follow RBIL.
+    ///
+    /// The user-font source at ES:BP (AL=00/10 and AL=21) is the caller's
+    /// LINEAR address; the INT 43h font image this service publishes is not,
+    /// because that lives in the video BIOS image the emulator owns. See
+    /// `read_guest_linear_block`.
     fn handle_int10_font(&mut self, al: u8) {
         let bx = self.cpu.registers.ebx() as u16;
         let bl = bx as u8;
@@ -1794,7 +1816,10 @@ impl Machine {
                 // from stalling the emulator with up to ~16 million
                 // byte-at-a-time bus reads plus a multi-megabyte allocation.
                 let count = (cx as usize).min(256);
-                let bytes = self.read_guest_block(es_base + u32::from(bp), count * bh as usize);
+                let bytes = self.read_guest_linear_block(
+                    es_base.wrapping_add(u32::from(bp)),
+                    count * bh as usize,
+                );
                 self.vega
                     .legacy_mut()
                     .load_font_table(table, dx, bh, &bytes);
@@ -1842,8 +1867,10 @@ impl Machine {
                 let bp = self.cpu.registers.ebp() as u16;
                 let es_base = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let bytes_per_char = cx.clamp(1, 32) as u8;
-                let bytes = self
-                    .read_guest_block(es_base + u32::from(bp), 256 * usize::from(bytes_per_char));
+                let bytes = self.read_guest_linear_block(
+                    es_base.wrapping_add(u32::from(bp)),
+                    256 * usize::from(bytes_per_char),
+                );
                 self.vega.legacy_mut().set_char_map_select(0);
                 self.vega
                     .legacy_mut()

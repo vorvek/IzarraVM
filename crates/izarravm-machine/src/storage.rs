@@ -647,8 +647,20 @@ impl Machine {
             .is_some_and(|cd_drive| drive == u16::from(cd_drive))
     }
 
+    /// The caller's `ES:BX` MSCDEX block, as a guest LINEAR address.
+    ///
+    /// Linear, not physical: INT 2Fh is dispatched for any caller outside ring-0
+    /// protected mode, so a program in V86 under a memory manager reaches
+    /// IZCDEX with a block wherever its page tables put it, and a DJGPP client
+    /// calls MSCDEX through DPMI with a transfer buffer DOS took from upper
+    /// memory. Every use of this must go through `write_guest_linear_block` /
+    /// `read_guest_linear_block`.
     pub(super) fn icdex_es_bx(&self) -> u32 {
-        self.cpu.registers.segment(SegmentIndex::Es).base + (self.cpu.registers.ebx() as u16) as u32
+        self.cpu
+            .registers
+            .segment(SegmentIndex::Es)
+            .base
+            .wrapping_add(u32::from(self.cpu.registers.ebx() as u16))
     }
 
     pub(super) fn icdex_fail(&mut self, code: u16) {
@@ -1055,7 +1067,11 @@ impl Machine {
                     let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                     let bx = self.cpu.registers.ebx() as u16;
                     for (index, bytes) in blocks.iter().enumerate() {
-                        self.write_guest_block(es + u32::from(bx) + index as u32 * 512, bytes);
+                        self.write_guest_linear_block(
+                            es.wrapping_add(u32::from(bx))
+                                .wrapping_add(index as u32 * 512),
+                            bytes,
+                        );
                     }
                 }
                 self.cd_accesses += 1;
@@ -1111,11 +1127,13 @@ impl Machine {
         }
     }
 
+    /// El Torito AH=42h/44h. The packet at DS:SI and the seg:off transfer buffer
+    /// inside it are both guest LINEAR addresses; see `int13_edd_transfer`.
     fn int13_cd_extended(&mut self, ah: u8) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
-        let dap = ds + u32::from(si);
-        let packet = self.read_guest_block(dap, 16);
+        let dap = ds.wrapping_add(u32::from(si));
+        let packet = self.read_guest_linear_block(dap, 16);
         let count = u16::from_le_bytes([packet[2], packet[3]]);
         let off = u16::from_le_bytes([packet[4], packet[5]]);
         let seg = u16::from_le_bytes([packet[6], packet[7]]);
@@ -1142,9 +1160,12 @@ impl Machine {
             );
         }
         if ah == 0x42 {
-            let dst = (u32::from(seg) << 4) + u32::from(off);
+            let dst = (u32::from(seg) << 4).wrapping_add(u32::from(off));
             for (index, sector) in sectors.iter().enumerate() {
-                self.write_guest_block(dst + index as u32 * cdimage::DATA_SECTOR as u32, sector);
+                self.write_guest_linear_block(
+                    dst.wrapping_add(index as u32 * cdimage::DATA_SECTOR as u32),
+                    sector,
+                );
             }
         }
         self.set_dap_blocks(dap, count);
@@ -1194,7 +1215,7 @@ impl Machine {
         packet[4..8].copy_from_slice(&boot.image_lba.to_le_bytes());
         packet[12..14].copy_from_slice(&boot.load_segment.to_le_bytes());
         packet[14..16].copy_from_slice(&boot.sector_count.to_le_bytes());
-        self.write_guest_block(ds + u32::from(si), &packet);
+        self.write_guest_linear_block(ds.wrapping_add(u32::from(si)), &packet);
         if subfunction == 0 {
             self.eltorito_emulation = None;
             self.refresh_bios_drive_counts();
@@ -2018,11 +2039,18 @@ impl Machine {
     /// Packet at DS:SI holds the block count and the 64-bit starting LBA; reads
     /// and writes use the seg:off transfer buffer inside the packet. The optional
     /// 64-bit flat-buffer pointer is not supported.
+    ///
+    /// Both DS:SI and the packet's seg:off buffer are guest LINEAR addresses.
+    /// This service is dispatched for any caller outside ring-0 protected mode,
+    /// so a V86 caller under a memory manager reaches it, and DOS=HIGH,UMB puts
+    /// drivers and their buffers in upper memory that TOKAEMM supplies out of
+    /// extended memory. That memory is not identity mapped. See
+    /// `read_guest_linear_block`.
     fn int13_edd_transfer(&mut self, ah: u8) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
         let dap = ds.wrapping_add(u32::from(si));
-        let packet = self.read_guest_block(dap, 16);
+        let packet = self.read_guest_linear_block(dap, 16);
         // Byte 0 = packet size (16 or 24). Byte 2 = block count. Bytes 4-7 = the
         // transfer buffer as offset (4-5) then segment (6-7). Bytes 8-15 = the
         // starting LBA, little-endian.
@@ -2070,12 +2098,12 @@ impl Machine {
                 0x42 => {
                     let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
                     match data {
-                        Some(bytes) => self.write_guest_block(addr, &bytes),
+                        Some(bytes) => self.write_guest_linear_block(addr, &bytes),
                         None => break,
                     }
                 }
                 0x43 => {
-                    let bytes = self.read_guest_block(addr, 512);
+                    let bytes = self.read_guest_linear_block(addr, 512);
                     let wrote = self
                         .ata
                         .as_mut()
@@ -2119,9 +2147,12 @@ impl Machine {
 
     /// Rewrite the Disk Address Packet block-count field (offset 2) with the
     /// sectors actually transferred, the way EDD reports partial completion.
+    ///
+    /// `dap` is the guest LINEAR address both callers read the packet from, so
+    /// the rewrite has to reach the same place the read came from.
     fn set_dap_blocks(&mut self, dap: u32, blocks: u16) {
         let bytes = blocks.to_le_bytes();
-        self.write_guest_block(dap + 2, &bytes);
+        self.write_guest_linear_block(dap.wrapping_add(2), &bytes);
     }
 
     /// EDD AH=48h get extended drive parameters. The result buffer at DS:SI takes

@@ -355,7 +355,7 @@ impl Machine {
                     self.icdex_fail(0x000F);
                     return true;
                 }
-                self.write_guest_block(self.icdex_es_bx(), &[0u8; 38]);
+                self.write_guest_linear_block(self.icdex_es_bx(), &[0u8; 38]);
                 self.set_int_frame_carry(false);
                 true
             }
@@ -374,7 +374,7 @@ impl Machine {
                 {
                     Some(sector) => {
                         let descriptor_type = sector[0];
-                        self.write_guest_block(self.icdex_es_bx(), &sector);
+                        self.write_guest_linear_block(self.icdex_es_bx(), &sector);
                         self.set_ax(u16::from(descriptor_type));
                         self.set_int_frame_carry(false);
                     }
@@ -402,7 +402,7 @@ impl Machine {
                         .and_then(|img| img.read_data_sector(lba + sector_index))
                     {
                         Some(sector) => {
-                            self.write_guest_block(addr, &sector);
+                            self.write_guest_linear_block(addr, &sector);
                             addr = addr.wrapping_add(cdimage::DATA_SECTOR as u32);
                         }
                         None => {
