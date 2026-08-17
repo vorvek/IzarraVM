@@ -700,10 +700,11 @@ impl Machine {
         Ok(record)
     }
 
+    /// `dst` is the guest LINEAR SI:DI destination of IZCDEX AX=150Fh.
     pub(super) fn write_icdex_canonical_dir_record(&mut self, dst: u32, record: &[u8]) {
         let mut out = [0u8; 285];
         if record.len() < 34 {
-            self.write_guest_block(dst, &out);
+            self.write_guest_linear_block(dst, &out);
             return;
         }
         let lba = u32::from_le_bytes(record[2..6].try_into().unwrap());
@@ -733,7 +734,7 @@ impl Machine {
             out[0x40] = sys_len as u8;
             out[0x41..0x41 + sys_len].copy_from_slice(&sys[..sys_len]);
         }
-        self.write_guest_block(dst, &out);
+        self.write_guest_linear_block(dst, &out);
     }
 
     /// Execute one CD-ROM device driver request whose header begins at linear

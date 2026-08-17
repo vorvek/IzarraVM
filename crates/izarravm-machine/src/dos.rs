@@ -340,10 +340,8 @@ impl Machine {
             // drive; the header is informational for our HLE path).
             0x1501 => {
                 if self.icdex_cd_drive_number().is_some() {
-                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-                    let bx = self.cpu.registers.ebx() as u16;
-                    let addr = es.wrapping_add(u32::from(bx));
-                    self.write_guest_block(addr, &[0u8; 5]); // subunit 0, header 0:0
+                    let addr = self.icdex_es_bx();
+                    self.write_guest_linear_block(addr, &[0u8; 5]); // subunit 0, header 0:0
                 }
                 true
             }
@@ -433,10 +431,8 @@ impl Machine {
             // drive number (0 = A:). One CD drive.
             0x150D => {
                 if let Some(cd_drive) = self.icdex_cd_drive_number() {
-                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-                    let bx = self.cpu.registers.ebx() as u16;
-                    let addr = es.wrapping_add(u32::from(bx));
-                    self.write_guest_block(addr, &[cd_drive]);
+                    let addr = self.icdex_es_bx();
+                    self.write_guest_linear_block(addr, &[cd_drive]);
                 }
                 true
             }
@@ -498,18 +494,24 @@ impl Machine {
                 }
                 true
             }
-            // Get an ISO9660 directory entry for the ASCIZ path at ES:BX. CH bit 0
-            // selects MSCDEX's canonical structure; clear means a direct raw
-            // directory-record copy.
+            // Get an ISO9660 directory entry. CH bit 0 selects MSCDEX's canonical
+            // structure; clear means a direct raw directory-record copy.
+            //
+            // TWO caller pointers with two different conventions. The ASCIZ path
+            // comes IN at ES:BX, the same block address the rest of this handler
+            // uses. The record goes OUT at SI:DI, which is a real-mode
+            // segment:offset pair held in registers that are not segment
+            // registers, so it is built by shifting SI rather than from a
+            // descriptor base. Both are guest LINEAR addresses; see
+            // `icdex_es_bx`.
             0x150F => {
                 let drive = self.cpu.registers.ecx() as u8;
                 if !self.icdex_drive_matches(u16::from(drive)) {
                     self.icdex_fail(0x000F);
                     return true;
                 }
-                let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
-                let bx = self.cpu.registers.ebx() as u16;
-                let path = self.read_guest_asciiz_lossy(es, bx, 255);
+                let path_at = self.icdex_es_bx();
+                let path = self.read_guest_linear_asciiz_lossy(path_at, 255);
                 let copy_canonical = (self.cpu.registers.ecx() as u16 >> 8) & 1 != 0;
                 let dst = (u32::from(self.cpu.registers.esi() as u16) << 4)
                     + u32::from(self.cpu.registers.edi() as u16);
@@ -521,7 +523,7 @@ impl Machine {
                             let mut out = [0u8; 255];
                             let len = usize::from(record[0]).min(record.len()).min(out.len());
                             out[..len].copy_from_slice(&record[..len]);
-                            self.write_guest_block(dst, &out);
+                            self.write_guest_linear_block(dst, &out);
                         }
                         self.set_ax(0x0001);
                         self.set_int_frame_carry(false);
@@ -727,17 +729,15 @@ impl Machine {
         0
     }
 
-    fn read_guest_asciiz_lossy(&mut self, segment: u16, offset: u16, max: usize) -> String {
-        let base = u32::from(segment) * 16 + u32::from(offset);
-        let mut bytes = Vec::new();
-        for i in 0..max {
-            let byte = self.read_physical_u8(base + i as u32);
-            if byte == 0 {
-                break;
-            }
-            bytes.push(byte);
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
+    /// An ASCIZ string at a guest LINEAR address, stopping at the terminator or
+    /// after `max` bytes.
+    ///
+    /// Read a page at a time rather than byte at a time: a caller string can
+    /// cross a page boundary, and one translation does not cover both sides.
+    fn read_guest_linear_asciiz_lossy(&mut self, linear: u32, max: usize) -> String {
+        let block = self.read_guest_linear_block(linear, max);
+        let end = block.iter().position(|&byte| byte == 0).unwrap_or(max);
+        String::from_utf8_lossy(&block[..end]).into_owned()
     }
 
     /// Mirror any console output produced since the last call onto the VGA

@@ -1544,3 +1544,170 @@ fn icdex_blocks_use_the_non_identity_mapped_caller_buffer() {
         "the descriptor tail must follow the second page's mapping"
     );
 }
+
+/// An ISO whose root directory holds one file, and the file's own directory
+/// record, for the AX=150Fh fixtures.
+fn icdex_directory_iso() -> (CdImage, Vec<u8>) {
+    let mut bytes = vec![0u8; 20 * cdimage::DATA_SECTOR];
+    let pvd = 16 * cdimage::DATA_SECTOR;
+    bytes[pvd] = 0x01;
+    bytes[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    let root = iso_dir_record(18, cdimage::DATA_SECTOR as u32, 0x02, &[0]);
+    bytes[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+    let file = iso_dir_record(19, 1234, 0x00, b"README.TXT;1");
+    let root_sector = 18 * cdimage::DATA_SECTOR;
+    bytes[root_sector..root_sector + root.len()].copy_from_slice(&root);
+    bytes[root_sector + root.len()..root_sector + root.len() + file.len()].copy_from_slice(&file);
+    (CdImage::from_iso(bytes).unwrap(), file)
+}
+
+/// AX=1501h, the drive device list at ES:BX. It was one of three ES:BX blocks
+/// 8edf30d0 left on the physical path beside the ones it converted.
+#[test]
+fn icdex_drive_device_list_uses_the_non_identity_mapped_caller_buffer() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(4));
+    super::margo::install_umb_paging(&mut machine);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    machine.write_guest_block(super::margo::UMB_BUFFER_PHYSICAL, &[0xee; 5]);
+
+    prime_dos_int_frame(&mut machine);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_eax(0x1501);
+    assert!(machine.handle_int2f(), "AX=1501h handled");
+
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_BUFFER_PHYSICAL, 5),
+        vec![0; 5],
+        "the device-list entry must reach the frame the caller's page is mapped to"
+    );
+}
+
+/// AX=150Dh, the CD drive-letter list at ES:BX.
+#[test]
+fn icdex_drive_letters_use_the_non_identity_mapped_caller_buffer() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(4));
+    super::margo::install_umb_paging(&mut machine);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    machine.write_guest_block(super::margo::UMB_BUFFER_PHYSICAL, &[0xee]);
+
+    prime_dos_int_frame(&mut machine);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_eax(0x150D);
+    assert!(machine.handle_int2f(), "AX=150Dh handled");
+
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL),
+        CD_DRIVE_NUMBER,
+        "the drive letter must reach the frame the caller's page is mapped to"
+    );
+}
+
+/// AX=150Fh carries TWO caller pointers with two different conventions: the
+/// ASCIZ path comes IN at ES:BX, and the directory record goes OUT at SI:DI --
+/// a real-mode segment:offset pair in registers that are not segment registers,
+/// so it is built by shifting SI, not from a descriptor base. Each is a
+/// separate address and each needs its own proof; this one puts the path in the
+/// mapped page and leaves the destination on an identity address, so only the
+/// input side can be responsible for the result.
+#[test]
+fn icdex_directory_entry_reads_a_non_identity_mapped_path() {
+    let (image, file) = icdex_directory_iso();
+    let mut machine = test_machine();
+    machine.mount_cd(image);
+    super::margo::install_umb_paging(&mut machine);
+    machine.write_guest_block(super::margo::UMB_BUFFER_PHYSICAL, b"\\README.TXT\0");
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+
+    prime_dos_int_frame(&mut machine);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+    machine.cpu.registers.set_esi(0x3000);
+    machine.cpu.registers.set_edi(0x0100);
+    machine.cpu.registers.set_eax(0x150F);
+    assert!(machine.handle_int2f(), "AX=150Fh handled");
+
+    assert_eq!(
+        dos_int_flags(&machine) & 1,
+        0,
+        "the path must be read through the caller's mapping, or the lookup \
+         fails on bytes that are not the caller's"
+    );
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+    assert_eq!(
+        machine.read_guest_block((0x3000u32 << 4) + 0x0100, file.len()),
+        file,
+        "the record found must be the file the caller named"
+    );
+}
+
+/// The other half of AX=150Fh: the SI:DI destination. The path stays on an
+/// identity address and the record goes to guest linear C8FF0h, which straddles
+/// the two mapped frames, so only the output side can be responsible.
+#[test]
+fn icdex_directory_entry_writes_a_non_identity_mapped_destination() {
+    let (image, file) = icdex_directory_iso();
+    let mut machine = test_machine();
+    machine.mount_cd(image);
+    super::margo::install_umb_paging(&mut machine);
+    machine.write_guest_block(0x5100, b"\\README.TXT\0");
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+
+    prime_dos_int_frame(&mut machine);
+    machine.cpu.registers.set_ebx(0x5100);
+    machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+    machine.cpu.registers.set_esi(0xc8ff); // C8FF:0000 = guest linear C8FF0h
+    machine.cpu.registers.set_edi(0);
+    machine.cpu.registers.set_eax(0x150F);
+    assert!(machine.handle_int2f(), "AX=150Fh direct handled");
+
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "directory entry clears CF");
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_FRAME_LOW + 0xff0, 16),
+        file[..16],
+        "the head of the record must follow the first page's mapping"
+    );
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_FRAME_HIGH, file.len() - 16),
+        file[16..],
+        "the tail of the record must follow the second page's mapping"
+    );
+
+    // CH bit 0 selects MSCDEX's canonical structure, which is built and
+    // deposited by a different function against the same pointer.
+    prime_dos_int_frame(&mut machine);
+    machine.cpu.registers.set_ebx(0x5100);
+    machine
+        .cpu
+        .registers
+        .set_ecx((1u32 << 8) | u32::from(CD_DRIVE_NUMBER));
+    machine.cpu.registers.set_esi(0xc8ff);
+    machine.cpu.registers.set_edi(0);
+    machine.cpu.registers.set_eax(0x150F);
+    assert!(machine.handle_int2f(), "AX=150Fh canonical handled");
+
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_FRAME_LOW + 0xff1, 4),
+        19u32.to_le_bytes(),
+        "the canonical record's LBA must follow the first page's mapping"
+    );
+    // Guest linear C8FF0h + 18h is C9008h, in the second page.
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_FRAME_HIGH + 8, 10),
+        b"README.TXT",
+        "the canonical record's name must follow the second page's mapping"
+    );
+}
