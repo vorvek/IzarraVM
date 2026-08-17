@@ -1103,6 +1103,56 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
+/// A ring-0 #GP inside the monitor itself must end in the monitor's named
+/// diagnostic exit (0xD3), never in a fault storm. GPSTORM is a minimal
+/// VCPI client whose PM->V86 DE0C return frame carries an EIP above
+/// 0xFFFF: the monitor's own IRETD then faults #GP(0) at ring 0 -- the
+/// stage-1 corpus triage's finding G1, iteration 0 (baroll, SpacPlum,
+/// MontyNrm). The unfixed vec13_entry classified that frame by error-code
+/// VALUE, misparsed it, and re-faulted 615 times while ESP walked through
+/// the driver's own structures. GPSTORM itself signals only failure codes
+/// (0xE1/0xE2 setup, 0xE5 = the poisoned IRETD returned to V86, so the
+/// trigger never fired and this test proved nothing).
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_vcpi_m7_ring0_gp_reports_instead_of_storming() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGPSTORM\r\n".to_vec();
+
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-vcpi7",
+        profile,
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "GPSTORM.COM".to_string(),
+                izarravm_firmware::gpstorm_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xD3 },
+        "the monitor did not report the ring-0 #GP through its diagnostic \
+             exit (stop={stop:?}); a CpuError here is the G1 fault storm, and \
+             0xE5 means the poisoned frame was accepted.\n{text}"
+    );
+}
+
 /// A fresh empty user folder gets the current defaults seeded
 /// (`ensure_user_config`): DEVICE=TOKAEMM.SYS RAM + DOS=HIGH,UMB + LH
 /// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
