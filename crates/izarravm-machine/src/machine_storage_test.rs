@@ -2103,7 +2103,7 @@ fn int13_edd_short_transfer_rewrites_the_straddling_packet_count() {
     m.write_physical_u8(low + 0xffd, 16); // packet size
     m.write_physical_u8(low + 0xffe, 0); // reserved
     m.write_physical_u8(low + 0xfff, 4); // block count, low byte
-    m.write_physical_u8(high, 0); // block count, high byte
+    m.write_physical_u8(high, 0xa5); // block count, high byte
     m.write_physical_u8(high + 1, 0x00); // buffer offset 0200h
     m.write_physical_u8(high + 2, 0x02);
     m.write_physical_u8(high + 3, 0xc6); // buffer segment C8C6h
@@ -2130,7 +2130,10 @@ fn int13_edd_short_transfer_rewrites_the_straddling_packet_count() {
     assert_eq!(
         m.read_physical_u8(high),
         0,
-        "the count's high byte must be rewritten through the high frame"
+        "the count's high byte must be rewritten through the high frame: the \
+         planted A5h is the marked tail of the straddle, so a rewrite that \
+         stops at the page boundary -- or one that lands at the identity \
+         address -- leaves it standing here"
     );
 }
 
