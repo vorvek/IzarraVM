@@ -1958,6 +1958,47 @@ fn a_fault_after_a_task_gate_switch_commits_is_terminal_not_escalated() {
 }
 
 #[test]
+fn a_task_gate_fault_before_the_switch_commits_still_escalates() {
+    // The lower half of the same boundary. A task gate naming a BUSY TSS is
+    // rejected by `task_switch`'s type check, which runs before anything is
+    // saved or loaded, so the outgoing task is untouched and the #GP(sel) is an
+    // ordinary contributory fault. Paired with the #GP being delivered, the table
+    // says double fault, and the guest's #DF handler must run. This fails loudly
+    // if a future refactor widens the terminal region upward past the checks.
+    let busy_tss = (0x18u16, 0x0380_0067, 0x0000_8b00); // type 0x0b: BUSY
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) =
+        protected_cpu_with_gdt(&[0xf4], &[RING0_CODE, ring0_data, busy_tss, old_tss]);
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.idtr = DescriptorTable {
+        base: 0x200,
+        limit: 0xff,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x268, 0x0018_0000); // gate 13: task gate -> the busy TSS
+    put32(&mut memory, 0x26c, 0x0000_8500);
+    // Gate 8 (#DF): an ordinary ring-0 32-bit interrupt gate to 0x08:0x1234.
+    put32(&mut memory, 0x240, 0x0008_1234);
+    put32(&mut memory, 0x244, 0x0000_8e00);
+    let mut bus = TestBus::with_memory(memory);
+
+    let result = cpu.deliver_exception_escalating(&mut bus, 13, Some(0), false);
+
+    assert!(result.is_ok(), "the #DF must be delivered: {result:?}");
+    assert_eq!(cpu.registers.eip, 0x1234, "the #DF handler runs");
+    assert_eq!(cpu.registers.cs().selector, 0x08);
+    assert_eq!(cpu.tr.selector, 0x20, "no task switch committed");
+}
+
+#[test]
 fn iret_with_nt_and_a_non_busy_backlink_raises_ts_and_keeps_nt() {
     // Back-link names an AVAILABLE (type 0x09) TSS: #TS(sel), and NT must
     // still be set afterwards so the faulting IRET stays restartable (the

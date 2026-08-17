@@ -1188,13 +1188,13 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     // handler nests #GP once more and the processor shuts down. The reported
     // nested vector is therefore that third fault, and `original_vector` is the
     // one the chain started from.
-    let (mut cpu2, mut bus2) = v86_world(&[0xf4], &[0xf4], &[0x00]);
-    put32(&mut bus2.memory, 0x2000 + 6 * 4, 0x6000 | 0x6);
-    enter_v86_direct(&mut cpu2, 0x10, 0x1000);
-    let start_eip = cpu2.registers.eip;
-    let start_cs = cpu2.registers.cs().selector;
-    let result: Result<CycleOutcome, CpuError> = cpu2.finish_instruction(
-        &mut bus2,
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    put32(&mut bus.memory, 0x2000 + 6 * 4, 0x6000 | 0x6);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+    let start_eip = cpu.registers.eip;
+    let start_cs = cpu.registers.cs().selector;
+    let result: Result<CycleOutcome, CpuError> = cpu.finish_instruction(
+        &mut bus,
         Err(InternalFault::Exception {
             vector: 13,
             error_code: Some(0),
@@ -1222,7 +1222,7 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     // the live registers instead would report whatever delivery had reached.
     // This one has been watched failing: deleting the record call on the nested
     // path drops it to None.
-    let site = cpu2
+    let site = cpu
         .fault_site()
         .expect("a nested delivery fault must record its raise site");
     // These two have NOT been watched failing, and the honest reason is worth

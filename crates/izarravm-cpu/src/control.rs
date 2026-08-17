@@ -297,19 +297,25 @@ impl CpuGsw {
     /// - An IDT that does not cover the vector (`CpuError::IdtLimit`).
     ///   Architecturally that is a contributory `#GP(vector*8+2)` and would
     ///   escalate, but this core reports it as a named stop at every level, which
-    ///   an existing test pins for the first-level case. Escalating it would only
-    ///   change the outcome for a guest whose IDT covers vector 8 but not the
-    ///   vector being delivered -- every other layout still ends in a stop -- and
-    ///   it would trade the precise "IDT does not cover vector N" diagnostic for a
-    ///   generic triple fault. Revisit together with the missing gate-P-bit check.
+    ///   an existing test pins for the first-level case. An IDT limit is one
+    ///   contiguous bound and every escalation target is vector 8 or higher, so
+    ///   "the IDT covers the target" implies "it covers vector 8": escalating
+    ///   would change the outcome only for a guest that keeps a short IDT AND a
+    ///   real #DF handler, which would then get its #DF delivered instead of a
+    ///   stop. No DOS-era guest does that, and every other layout ends in a stop
+    ///   either way -- with the precise "IDT does not cover vector N" diagnostic
+    ///   instead of a generic triple fault. Revisit together with the missing
+    ///   gate-P-bit check.
     ///
     /// One known wart, inherited rather than introduced: in REAL mode
     /// `deliver_exception` routes through `software_interrupt`, which posts
     /// `bus.interrupt_acknowledge` -- the software-`INT n` device hook. An
     /// escalated re-delivery therefore posts an acknowledge that `hardware_interrupt`
-    /// deliberately suppresses for the first attempt. Only vectors 0x20/0x21 have
-    /// HLE side effects on that hook, and no escalation target is one of them, so
-    /// the cost is a spurious device access and its I/O wait states on a cold path.
+    /// deliberately suppresses for the first attempt. What keeps that harmless is
+    /// the vector range, not the hook's contents: the machine's side-effecting set
+    /// spans 0x10-0x1A, 0x20, 0x21, 0x40, 0x42 and the absent-resident-API list,
+    /// while every escalation target is 0x0E or below. So the cost is a spurious
+    /// device access and its I/O wait states on a cold path.
     fn escalate_delivery<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -334,6 +340,25 @@ impl CpuGsw {
                 Err(InternalFault::Cpu(error)) => return Err(error),
                 Err(InternalFault::Exception { vector, error_code }) => (vector, error_code),
             };
+            // A nested fault is always a processor exception raised by the frame
+            // build itself, never an external interrupt, so `is_external` is
+            // false both when classifying it and when delivering it below.
+            let nested_class = fault_class(nested_vector, false);
+            // Traced BEFORE the shutdown check, so the step that ENDS a chain is
+            // in the log too and the trace reads as a complete story. Without any
+            // of this an escalation that ends in a delivered handler leaves no
+            // trace at all: a guest that faults, escalates and IRETs straight back
+            // into the same fault presents as a silent full-speed hang, where the
+            // pre-escalation core stopped with a named error. Same env gate as the
+            // rest of the fault tracing.
+            if ud_trace_enabled() {
+                eprintln!(
+                    "fault trace: vector {nested_vector} ({nested_class:?}) raised while \
+                     delivering vector {vector} ({class:?}); \
+                     calling_double_fault_handler={calling_double_fault_handler} \
+                     escalations={escalations}"
+                );
+            }
             // "If any other exception occurs while attempting to call the
             // double-fault handler, the processor enters shutdown mode." The
             // emulator's equivalent of shutdown is the hard stop: the machine
@@ -346,22 +371,7 @@ impl CpuGsw {
                 });
             }
             escalations += 1;
-            // A nested fault is always a processor exception raised by the frame
-            // build itself, never an external interrupt, so `is_external` is
-            // false both when classifying it and when delivering it below.
-            let nested_class = fault_class(nested_vector, false);
             let escalation = escalate_fault(class, nested_class);
-            // Without this, an escalation that ends in a delivered handler leaves
-            // no trace at all: a guest that faults, escalates and IRETs straight
-            // back into the same fault presents as a silent full-speed hang, where
-            // the pre-escalation core stopped with a named error. Same env gate as
-            // the rest of the fault tracing.
-            if ud_trace_enabled() {
-                eprintln!(
-                    "fault trace: vector {nested_vector} ({nested_class:?}) raised while \
-                     delivering vector {vector} ({class:?}) -> {escalation:?}"
-                );
-            }
             let error_code = match escalation {
                 FaultEscalation::Serial => {
                     vector = nested_vector;
@@ -448,6 +458,19 @@ impl CpuGsw {
         // a state belonging to no task at all. That failure is terminal (see
         // `commit_task_switch`), so the committed state is both the honest thing
         // to leave behind and what a post-mortem needs to read.
+        //
+        // Keyed on the label, which covers every PROCESSOR EXCEPTION out of the
+        // commit but not a `CpuError` from a bus access inside it -- that one
+        // still gets the restore and still leaves a hybrid dump. Narrower than it
+        // looks, and deliberately left: inside `load_task_state` the highest
+        // address touched is the LDTR selector at TSS+96, read before anything is
+        // committed, so under a contiguous mapping an out-of-range read there
+        // always precedes the commit. Only the back-link write and the busy-bit
+        // write could bus-fault post-commit, and both address LOWER memory than
+        // the reads that already succeeded. No fixture in this harness can reach
+        // it, so a fix would be an untested behavior change on an already-fatal
+        // path, and threading a commit flag through `CpuGsw` to key on instead
+        // moves a measured cache-layout pin (see `pending_flags_offset`).
         if matches!(
             result,
             Err(InternalFault::Cpu(
@@ -1574,6 +1597,21 @@ impl CpuGsw {
 
     /// The committing tail of `task_switch`. See the comment at its only call
     /// site for why every fault in here is terminal.
+    ///
+    /// Two things this costs, both recorded rather than fixed. It consumes the
+    /// deliverable half of PRM 9.9.10's #TS family: the "invalid TSS" cases that
+    /// come from the INCOMING TSS's contents (a bad SS, CS or LDT selector) are
+    /// raised by `load_task_state`'s own segment loads, so a JMP/CALL/IRET to a
+    /// malformed TSS now stops instead of vectoring #TS the way a 386 does. The
+    /// honest fix is Intel's order -- validate every incoming selector, then load
+    /// any of them -- which would move those checks back above this boundary.
+    /// (The descriptor-level #TS/#GP checks in `task_switch` itself are still
+    /// pre-commit and still deliverable; a further pre-existing gap is that these
+    /// loads raise #GP/#NP rather than #TS at all.) And the boundary is one read
+    /// wider than it needs to be: `load_task_state`'s first act is to read the
+    /// incoming CR3, which mutates nothing, so a #PF on a not-present incoming
+    /// TSS page is reported terminal despite being perfectly restartable. That
+    /// needs a demand-paged TSS, which no DOS-era guest has.
     fn commit_task_switch<B: CpuBus>(
         &mut self,
         bus: &mut B,
