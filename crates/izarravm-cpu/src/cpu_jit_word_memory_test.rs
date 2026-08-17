@@ -591,6 +591,62 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Form 3 memory word -- the sixteen-bit memory-SOURCE ALU (the B2 peachdrm row)
+// ---------------------------------------------------------------------------------------------
+
+/// Every admitted opcode of the form-3 family at Word operand size, memory source.
+///
+/// This is "the pair" the form-3 classify comment names: Word width AND a register write-back
+/// after a memory read. The read lane (`movzx_r32_word_disp8`) and the write-back lane
+/// (`emit_alu_preloaded`'s `mov_r16_r16`) are each certified elsewhere; nothing exercises them
+/// together until this row. `0x3b` CMP is in the loop and writes nothing, which is the control
+/// that says a register failure on the other five is the write-back and not the read.
+///
+/// The seed poisons every high half with 0xdead, so a write-back that widens to 32 bits is a
+/// distinguishable register failure, not a coincidence.
+#[test]
+fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
+    for (opcode, name) in [
+        (0x03u8, "add"),
+        (0x0b, "or"),
+        (0x23, "and"),
+        (0x2b, "sub"),
+        (0x33, "xor"),
+        (0x3b, "cmp"),
+    ] {
+        // dst 4 is ESP: `build` overwrites it with STACK_TOP after seeding, so its poisoned
+        // high half is NOT a witness there (cpu_jit_word_memory_test.rs:295-296). The row runs
+        // for coverage of the home; the other three carry the write-back witness. The subset
+        // keeps the row count at 480 where 0..8 would be 1,920 compile+run cycles.
+        for dst in [0u8, 3, 4, 7] {
+            for operand in [0x1234u16, 0xffff, 0x8000, 0x7fff, 0x0000] {
+                for reg_low in [0x0001u16, 0x7fff, 0x8000, 0xffff] {
+                    for (eflags, pending) in [(0x202u32, false), (0x8d5, true)] {
+                        let mut body = vec![0x66u8];
+                        body.extend_from_slice(&disp32(&[opcode], dst, OPERAND));
+                        let mut seed = Seed::new()
+                            .gpr(usize::from(dst), 0xdead_0000 | u32::from(reg_low))
+                            .operand(operand)
+                            .flags(eflags);
+                        if pending {
+                            seed = seed.pending();
+                        }
+                        lowered(
+                            &body,
+                            seed,
+                            &format!(
+                                "{name} r16 dst={dst} reg={reg_low:#06x}, word [{OPERAND:#x}] \
+                                 operand={operand:#06x} pending={pending}"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The two guards, at two-byte width
 // ---------------------------------------------------------------------------------------------
 
