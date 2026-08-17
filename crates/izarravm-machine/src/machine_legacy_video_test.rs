@@ -59,7 +59,9 @@ fn video_facade_preserves_presented_and_headless_scanout_behavior() {
 
     machine.advance_devices(600_000);
     assert!(machine.frame_sequence() > initial_sequence);
-    let (presented, presented_width, presented_height) = machine.presented_frame_argb();
+    let (presented, presented_width, presented_height) = machine
+        .presented_frame_argb()
+        .expect("a raster completed during the 600 000-clock advance");
     assert_eq!((presented_width, presented_height), (320, 400));
     assert_eq!(presented[0], 0x00ff_0000);
 
@@ -1099,6 +1101,89 @@ fn presented_frame_generation_waits_for_the_matching_completed_raster() {
         Some(presented_before),
         "the generation moves when the matching raster completes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Defect E8, at its source.
+//
+// `presented_frame_argb` answers "the most recently completed display frame".
+// There are two moments when there is none: before the first frame of the run,
+// and between a mode set and the first raster of the new mode — every mode set
+// drops the presented frame on purpose, so a consumer is never handed a frame
+// with the previous mode's geometry.
+//
+// It used to answer both with a hardcoded one-pixel black image. The stage-1
+// sweep archived 30 of them, one in each of 30 games, and they read as data:
+// a 1x1 frame is vacuously "one solid colour", which is the blank-screen
+// signature the classifier looks for. `None` is the only honest answer, and it
+// is the one `presented_frame_generation` beside it has always given.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_machine_that_has_completed_no_frame_presents_nothing() {
+    let machine = test_machine();
+    assert!(
+        machine.presented_frame_argb().is_none(),
+        "a frame that does not exist must not be substituted"
+    );
+}
+
+#[test]
+fn a_mode_set_leaves_no_presented_frame_until_the_next_raster_completes() {
+    let mut machine = test_machine();
+    machine.video_mut().set_mode13h_with_clear(true);
+    let frame_dots = machine.video().frame_dots();
+    machine.video_mut().advance(frame_dots);
+
+    let (words, width, height) = machine
+        .presented_frame_argb()
+        .expect("the first mode 13h raster completed");
+    assert_eq!((width, height), (320, 400));
+    assert_eq!(words.len(), width * height);
+
+    // The mode set drops it. Until the beam finishes a frame there is nothing
+    // to present, and that window is up to a whole frame period. Mode 12h is
+    // 640x480, so the frame that eventually arrives also proves the geometry
+    // followed the mode instead of a stale raster surviving the switch.
+    assert!(machine.set_vga_mode(0x12));
+    assert!(
+        machine.presented_frame_argb().is_none(),
+        "the frame from the previous mode is gone and the new one is not drawn"
+    );
+
+    let frame_dots = machine.video().frame_dots();
+    machine.video_mut().advance(frame_dots);
+    let (words, width, height) = machine
+        .presented_frame_argb()
+        .expect("the first mode 12h raster completed");
+    assert_eq!((width, height), (640, 480));
+    assert_eq!(words.len(), width * height);
+}
+
+/// The guard that names the defect. Whatever `presented_frame_argb` returns, it
+/// is never a frame too small to be a screen: the smallest mode the Vega BIOS
+/// presents is 320x200, and the archived defect was 1x1.
+#[test]
+fn a_presented_frame_is_never_smaller_than_a_real_video_mode() {
+    let mut machine = test_machine();
+    for mode in [0x13u8, 0x0D, 0x12, 0x10] {
+        assert!(machine.set_vga_mode(mode), "mode {mode:#04x}");
+        // Sample across the whole frame, including the window right after the
+        // mode set where the old code substituted a one-pixel image.
+        let frame_dots = machine.video().frame_dots();
+        for step in 0..8 {
+            if step > 0 {
+                machine.video_mut().advance(frame_dots / 4);
+            }
+            if let Some((words, width, height)) = machine.presented_frame_argb() {
+                assert!(
+                    width * height >= 320 * 200,
+                    "mode {mode:#04x} presented a {width}x{height} frame"
+                );
+                assert_eq!(words.len(), width * height);
+            }
+        }
+    }
 }
 
 #[test]

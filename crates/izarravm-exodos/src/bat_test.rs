@@ -67,6 +67,13 @@ goto quit
 exit
 "#;
 
+/// Walk a launcher BAT and then choose its launch, which is what the
+/// translator's own entry point does in two steps.
+fn flatten(tree: &Tree, cwd: &str, bat_rel: &str, out: &mut Flattened) {
+    Flattener::new(tree).flatten_bat(cwd, bat_rel, 1, &[], out);
+    out.finish();
+}
+
 fn doom_tree() -> (TempDir, Tree) {
     let dir = TempDir::new();
     std::fs::create_dir_all(dir.path().join("SB16")).unwrap();
@@ -83,7 +90,7 @@ fn doom_tree() -> (TempDir, Tree) {
 fn takes_the_sound_blaster_branch_and_ends_at_the_game() {
     let (_guard, tree) = doom_tree();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
 
     assert!(out.failure.is_none(), "{:?}", out.failure);
     let launch = out.launch.expect("a launch command");
@@ -100,7 +107,7 @@ fn takes_the_sound_blaster_branch_and_ends_at_the_game() {
 fn the_flattened_output_carries_the_branch_body_and_no_control_flow() {
     let (_guard, tree) = doom_tree();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
 
     // The overwrite switch is forced on: without it the guest stops on
     // "Overwrite (Yes/No/All)?" and eats the keys meant for the game.
@@ -128,7 +135,7 @@ fn only_the_prompting_del_wildcard_is_dropped() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert!(out.flags.contains("DEL-WILDCARD-DROPPED"));
     assert_eq!(out.lines, vec!["del *.cfg".to_string()]);
 }
@@ -144,7 +151,7 @@ fn a_backward_goto_refuses_rather_than_looping() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     // The launch is found before the loop closes, which is the useful answer:
     // one run of the game, no relaunch.
     assert!(out.launch.is_some());
@@ -156,7 +163,7 @@ fn a_leading_backward_goto_is_untranslatable() {
     std::fs::write(dir.path().join("RUN.BAT"), ":loop\r\ngoto loop\r\n").unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.failure.as_deref(), Some("bat-backward-goto"));
 }
 
@@ -172,7 +179,7 @@ fn tracks_cd_so_the_launch_resolves_in_the_right_directory() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     let launch = out.launch.expect("a launch command");
     assert_eq!(launch.dir, "DUKE3D");
     assert_eq!(launch.resolved, "DUKE3D/DUKE3D.EXE");
@@ -196,7 +203,7 @@ fn an_ascending_errorlevel_ladder_picks_the_branch_the_guest_would_reach() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "FIRST.EXE");
 }
 
@@ -231,7 +238,7 @@ fn a_choice_branch_pointing_backwards_is_dropped_and_the_rest_re_scored() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert!(out.failure.is_none(), "{:?}", out.failure);
     assert_eq!(out.launch.expect("a launch").resolved, "SPK.EXE");
     assert!(out.flags.contains("MENU-FLATTENED"));
@@ -253,7 +260,7 @@ fn a_menu_with_no_safe_branch_is_key_injected_rather_than_installed() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert!(out.flags.contains("MENU-KEY-INJECTED"), "{:?}", out.flags);
     assert!(out.choices.is_empty(), "{:?}", out.choices);
     // Falling through past the ladder is what a real un-answered CHOICE does.
@@ -282,18 +289,23 @@ fn a_chained_if_is_evaluated_rather_than_dropped() {
     // `if exist X if not exist Y goto Z`: the INNER test owns the jump. Handing
     // the whole tail to the command emitter would resolve nothing and carry on
     // down a branch the guest never takes.
+    //
+    // The not-taken body ends on its own `goto`, the way a real launcher writes
+    // one. Without that line COMMAND.COM runs BOTH programs and the walk ends
+    // at the same launch either way, which would prove nothing.
     let dir = TempDir::new();
     std::fs::write(dir.path().join("HERE.DAT"), b"x").unwrap();
     std::fs::write(dir.path().join("GAME.EXE"), b"x").unwrap();
     std::fs::write(dir.path().join("OTHER.EXE"), b"x").unwrap();
     std::fs::write(
         dir.path().join("RUN.BAT"),
-        "if exist HERE.DAT if not exist GONE.DAT goto ok\r\n@OTHER\r\n:ok\r\n@GAME\r\n",
+        "if exist HERE.DAT if not exist GONE.DAT goto ok\r\n@OTHER\r\ngoto done\r\n\
+         :ok\r\n@GAME\r\n:done\r\n",
     )
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
     assert!(!out.flags.contains("COMMAND-UNRESOLVED"), "{:?}", out.flags);
 
@@ -301,7 +313,7 @@ fn a_chained_if_is_evaluated_rather_than_dropped() {
     std::fs::write(dir.path().join("GONE.DAT"), b"x").unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "OTHER.EXE");
 }
 
@@ -319,7 +331,7 @@ fn a_choice_named_with_its_extension_is_still_a_menu() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
     assert!(out.flags.contains("MENU-KEY-INJECTED"));
 }
@@ -336,14 +348,14 @@ fn a_nested_call_chain_is_inlined_until_the_depth_bound() {
     std::fs::write(dir.path().join("DEEPEST.BAT"), "@GAME\r\n").unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
 
     std::fs::write(dir.path().join("DEEPEST.BAT"), "call TOOFAR\r\n").unwrap();
     std::fs::write(dir.path().join("TOOFAR.BAT"), "@GAME\r\n").unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.failure.as_deref(), Some("bat-call-too-deep"));
 }
 
@@ -364,7 +376,7 @@ fn a_set_variable_decides_the_guard_on_the_launch_line() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     let launch = out.launch.expect("a launch");
     assert_eq!(launch.command, "prince1 gblast");
     assert_eq!(launch.resolved, "PRINCE11/PRINCE1.EXE");
@@ -384,7 +396,7 @@ fn an_unset_variable_reads_as_empty_the_way_dos_reads_it() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
     assert!(out.flags.contains("VAR-UNSET-EXPANDED"), "{:?}", out.flags);
 }
@@ -405,7 +417,7 @@ fn an_echo_with_a_redirect_is_a_file_the_game_reads_and_is_kept() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert!(
         out.lines
             .iter()
@@ -430,7 +442,7 @@ fn a_call_to_a_program_is_a_launch_like_any_other_invocation() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     let launch = out.launch.expect("a launch");
     assert_eq!(launch.resolved, "UW.EXE");
     assert_eq!(launch.command, "UW");
@@ -453,7 +465,7 @@ fn a_called_bat_returns_to_its_caller_and_hands_back_its_variables() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "GAME16.EXE");
 }
 
@@ -470,7 +482,7 @@ fn an_imgmount_inside_the_bat_leaves_as_a_disc_not_as_a_line() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.imgmounts.len(), 1);
     assert_eq!(out.imgmounts[0].image, ".\\eXoDOS\\MechW2\\cd\\MECH2.CUE");
     assert_eq!(out.imgmounts[0].kind, "cdrom");
@@ -497,7 +509,7 @@ fn an_errorlevel_branch_after_a_program_refuses_rather_than_guesses() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert!(out.launch.is_none(), "{:?}", out.launch);
     assert_eq!(
         out.failure.as_deref(),
@@ -521,10 +533,314 @@ fn an_errorlevel_ladder_whose_branches_agree_keeps_the_launch() {
     .unwrap();
     let tree = Tree::index(dir.path()).unwrap();
     let mut out = Flattened::default();
-    Flattener::new(&tree).flatten_bat("", "RUN.BAT", 1, &mut out);
+    flatten(&tree, "", "RUN.BAT", &mut out);
     assert_eq!(out.launch.expect("a launch").resolved, "GAME.EXE");
     assert!(out.lines.iter().any(|l| l == "testmem"), "{:?}", out.lines);
     assert!(out.flags.contains("ERRORLEVEL-BRANCH-CONVERGED"));
+}
+
+#[test]
+fn a_driver_before_the_game_is_a_prelude_and_the_game_is_the_launch() {
+    // PlanSieg's START.BAT loads UniVBE and then runs the game. Taking the
+    // FIRST resolvable program made UNIVBE.EXE the title's launch: the run
+    // measured a video driver and ended in seconds.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("UNIVBE.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("ISO.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("START.BAT"), "univbe\r\niso\r\n").unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "", "START.BAT", &mut out);
+
+    assert!(out.failure.is_none(), "{:?}", out.failure);
+    assert_eq!(out.launch.expect("a launch").resolved, "ISO.EXE");
+    // The driver still has to run: it is what the game's own launcher runs.
+    assert_eq!(out.lines, vec!["univbe".to_string()]);
+}
+
+#[test]
+fn a_prelude_in_another_directory_runs_by_its_full_path() {
+    // DKonK's KIDKEYS.BAT runs `DRIVERS\SOUNDBST` from KIDKEYS, then the game,
+    // then a driver that turns the sound back off. The old walker took
+    // SOUNDBST as the launch, emitted `cd \KIDKEYS\DRIVERS` and KEPT the
+    // `DRIVERS\` prefix, so the guest could not find the file either.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("KIDKEYS/DRIVERS")).unwrap();
+    std::fs::write(dir.path().join("KIDKEYS/KK.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("KIDKEYS/DRIVERS/SOUNDBST.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("KIDKEYS/DRIVERS/NOSOUND.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("KIDKEYS/KIDKEYS.BAT"),
+        "@ECHO OFF\r\nCLS\r\nDRIVERS\\SOUNDBST /P220 /I7 /D1\r\nKK.EXE\r\n\
+         DRIVERS\\NOSOUND.EXE\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "KIDKEYS", "KIDKEYS/KIDKEYS.BAT", &mut out);
+
+    let launch = out.launch.expect("a launch");
+    assert_eq!(launch.resolved, "KIDKEYS/KK.EXE");
+    assert_eq!(launch.dir, "KIDKEYS");
+    assert_eq!(
+        out.lines,
+        vec!["\\KIDKEYS\\DRIVERS\\SOUNDBST.EXE /P220 /I7 /D1".to_string()]
+    );
+    // The teardown driver runs after the game and is not the launch.
+    assert!(!out.lines.iter().any(|line| line.contains("NOSOUND")));
+}
+
+#[test]
+fn a_launch_command_drops_a_directory_prefix_the_walk_has_cd_ed_into() {
+    // The other half of the same defect: when the launch itself carries the
+    // prefix, the emitted `cd` makes the prefix wrong.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("BIN")).unwrap();
+    std::fs::write(dir.path().join("BIN/GAME.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("RUN.BAT"), "BIN\\GAME /S\r\n").unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "", "RUN.BAT", &mut out);
+
+    let launch = out.launch.expect("a launch");
+    assert_eq!(launch.dir, "BIN");
+    assert_eq!(launch.command, "GAME.EXE /S");
+    assert_eq!(out.lines, vec!["cd \\BIN".to_string()]);
+}
+
+#[test]
+fn a_driver_unloaded_after_the_game_is_not_the_launch() {
+    // simon1's SIMON.BAT: `Soundrv`, the game, then `Soundrv u`. The unload
+    // runs the SAME program, so only its argument tells the two apart.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("SIMON")).unwrap();
+    std::fs::write(dir.path().join("SIMON/SOUNDRV.COM"), b"x").unwrap();
+    std::fs::write(dir.path().join("SIMON/RUNVGA.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("SIMON/SIMON.BAT"),
+        "@Echo Off\r\nif not exist Soundrv.Com goto end\r\nSoundrv\r\n\
+         Runvga /D /1 simon.gme\r\nSoundrv u\r\n:end\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "SIMON", "SIMON/SIMON.BAT", &mut out);
+
+    let launch = out.launch.expect("a launch");
+    assert_eq!(launch.resolved, "SIMON/RUNVGA.EXE");
+    assert_eq!(launch.command, "Runvga /D /1 simon.gme");
+    assert_eq!(out.lines, vec!["Soundrv".to_string()]);
+}
+
+#[test]
+fn the_same_program_is_still_the_launch_when_its_argument_is_not_an_unload() {
+    // StarFit4 runs MENU.EXE twice: `menu MEMCHK` is a memory probe and
+    // `MENU GO` is the game. Reading every repeat as a teardown would drop the
+    // launch line and refuse a title that runs.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("SF4")).unwrap();
+    std::fs::write(dir.path().join("SF4/MENU.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("SF4/SF4.BAT"),
+        "@ECHO OFF\r\nmenu MEMCHK\r\nif exist error.$$$ goto end\r\nMENU GO\r\n:end\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "SF4", "SF4/SF4.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "MENU GO");
+    assert_eq!(out.lines, vec!["menu MEMCHK".to_string()]);
+}
+
+#[test]
+fn a_menu_loop_after_the_game_ends_the_walk_instead_of_refusing_it() {
+    // ThunderO's THUNDER.BAT returns to its own menu label once the game
+    // exits. Before the launch a backward `goto` is a shape the walker cannot
+    // model; after it, it is just the end of the interesting path.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("THUNDER")).unwrap();
+    for name in ["SETENV.EXE", "MENUS.EXE", "JUEGO.EXE"] {
+        std::fs::write(dir.path().join("THUNDER").join(name), b"x").unwrap();
+    }
+    std::fs::write(
+        dir.path().join("THUNDER/THUNDER.BAT"),
+        "@echo off\r\nset dos4g=quiet\r\nsetenv\r\n:main\r\nmenus.exe 1\r\n\
+         juego.exe 1\r\ngoto main\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "THUNDER", "THUNDER/THUNDER.BAT", &mut out);
+
+    assert!(out.failure.is_none(), "{:?}", out.failure);
+    assert_eq!(out.launch.expect("a launch").command, "juego.exe 1");
+    assert_eq!(
+        out.lines,
+        vec![
+            "set dos4g=quiet".to_string(),
+            "setenv".to_string(),
+            "menus.exe 1".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_teardown_utility_after_the_game_is_not_the_launch() {
+    // spellasa's EX.BAT installs a shell and a speech driver, runs the game,
+    // and then tears both down. Neither teardown line is the launch.
+    let dir = TempDir::new();
+    for name in ["METASHEL.EXE", "SPEECH.EXE", "DINO.EXE", "REMOVE.EXE"] {
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    std::fs::write(
+        dir.path().join("EX.BAT"),
+        "Echo off\r\nmetashel /I \r\nspeech\r\ndino sas.con\r\nRemove\r\nmetashel /K \r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "", "EX.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "dino sas.con");
+    assert_eq!(
+        out.lines,
+        vec!["metashel /I".to_string(), "speech".to_string()]
+    );
+}
+
+/// spellasa's `EX.BAT`, which takes every argument it uses from its caller.
+/// `SAS.BAT` is the one line `Ex /dBLASTER /p220h VGA /i7`.
+const EX_BAT: &str = "Echo off\r\nIf NOT .%1 == ./dIbmACPA Goto L1\r\ndac\r\n:L1\r\n\
+                      metashel /I \r\nspeech %1 %2 %4 \r\ndino %3 sas.con\r\nRemove\r\n\
+                      metashel /K \r\nIf NOT .%1 == ./dIbmACPA Goto L2\r\ndac /r\r\n:L2\r\n";
+
+fn spellasa_tree(sas_line: &str) -> (TempDir, Tree) {
+    let dir = TempDir::new();
+    for name in [
+        "METASHEL.EXE",
+        "SPEECH.EXE",
+        "DINO.EXE",
+        "REMOVE.EXE",
+        "DAC.EXE",
+    ] {
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    std::fs::write(dir.path().join("EX.BAT"), EX_BAT).unwrap();
+    std::fs::write(dir.path().join("SAS.BAT"), sas_line).unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    (dir, tree)
+}
+
+#[test]
+fn a_batch_argument_reaches_the_line_that_runs_the_game() {
+    // spellasa's launcher passes the video mode as `%3`. Expanding a numbered
+    // argument to nothing dropped it, and the game started in whatever mode it
+    // defaults to.
+    let (_guard, tree) = spellasa_tree("Ex /dBLASTER /p220h VGA /i7\r\n");
+    let mut out = Flattened::default();
+    flatten(&tree, "", "SAS.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "dino VGA sas.con");
+    assert_eq!(
+        out.lines,
+        vec![
+            "metashel /I".to_string(),
+            "speech /dBLASTER /p220h /i7".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_batch_argument_decides_a_guard_inside_the_called_batch() {
+    // The same BAT guards its ACPA sound driver on `%1`. With the argument the
+    // caller actually passes, the guard is decidable and `dac` runs.
+    let (_guard, tree) = spellasa_tree("Ex /dIbmACPA /p220h VGA /i7\r\n");
+    let mut out = Flattened::default();
+    flatten(&tree, "", "SAS.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "dino VGA sas.con");
+    assert!(out.lines.contains(&"dac".to_string()), "{:?}", out.lines);
+    // `dac /r` restores what `dac` set and runs after the game, so it is a
+    // teardown rather than a second launch.
+    assert!(
+        !out.lines.iter().any(|line| line == "dac /r"),
+        "{:?}",
+        out.lines
+    );
+}
+
+#[test]
+fn an_argument_the_caller_never_passed_expands_to_nothing() {
+    // DOS reads `%4` as empty when the caller gave three arguments, and the
+    // named-variable audit flag is not what reports that.
+    let (_guard, tree) = spellasa_tree("Ex /dBLASTER /p220h VGA\r\n");
+    let mut out = Flattened::default();
+    flatten(&tree, "", "SAS.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "dino VGA sas.con");
+    assert!(
+        out.lines.contains(&"speech /dBLASTER /p220h".to_string()),
+        "{:?}",
+        out.lines
+    );
+    assert!(!out.flags.contains("VAR-UNSET-EXPANDED"), "{:?}", out.flags);
+}
+
+#[test]
+fn a_called_batch_that_runs_the_game_hands_control_back_to_its_caller() {
+    // MDTheif's run.bat CALLs THIEF.BAT, which loads a hint TSR, runs the game
+    // and unloads the TSR. Treating the called BAT as the end of the walk left
+    // the TSR as the launch.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("POPHINT.EXE"), b"x").unwrap();
+    std::fs::write(dir.path().join("RUNF.EXE"), b"x").unwrap();
+    std::fs::write(
+        dir.path().join("THIEF.BAT"),
+        "pophint thief\r\npause\r\nrunf thief\r\npophint /u\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("RUN.BAT"),
+        ":menu\r\ncall thief\r\ngoto menu\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "", "RUN.BAT", &mut out);
+
+    assert!(out.failure.is_none(), "{:?}", out.failure);
+    assert_eq!(out.launch.expect("a launch").command, "runf thief");
+    assert_eq!(out.lines, vec!["pophint thief".to_string()]);
+    assert!(out.flags.contains("PAUSE-DROPPED"));
+}
+
+#[test]
+fn a_menu_program_whose_branches_run_different_games_is_still_refused() {
+    // explorat plays a logo, then MENUE.EXE returns the user's choice and each
+    // branch runs a different program. Walking past the logo now reaches the
+    // real shape, which is the errorlevel ladder the walker refuses by name
+    // rather than guessing a branch.
+    let dir = TempDir::new();
+    for name in ["PLAYLOGO.EXE", "MENUE.EXE", "EXP.EXE", "SCHIFFE.EXE"] {
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    std::fs::write(
+        dir.path().join("EXPLORE.BAT"),
+        "@ECHO OFF\r\nplaylogo imlogo.ani I\r\n:START\r\nmenue\r\n\
+         if ERRORLEVEL 2 goto SHIPS\r\nif ERRORLEVEL 1 goto EXPLORATION\r\n\
+         :SHIPS\r\nschiffe\r\ngoto START\r\n:EXPLORATION\r\nexp /F\r\ngoto start\r\n",
+    )
+    .unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    let mut out = Flattened::default();
+    flatten(&tree, "", "EXPLORE.BAT", &mut out);
+
+    assert!(out.launch.is_none(), "{:?}", out.launch);
+    assert_eq!(
+        out.failure.as_deref(),
+        Some("errorlevel-branch-after-program")
+    );
 }
 
 #[test]
