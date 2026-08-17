@@ -15,6 +15,17 @@ fn driver_dword(request: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(request[at..at + 4].try_into().expect("four bytes"))
 }
 
+/// The INT 13h status every sector-moving service ends on. A complete transfer
+/// is 0; a short one blames the caller's buffer or the media, and never the
+/// media for something the buffer caused.
+fn transfer_status(complete: bool, unreachable_buffer: bool) -> u8 {
+    match (complete, unreachable_buffer) {
+        (true, _) => 0x00,
+        (false, true) => BUFFER_UNREACHABLE_STATUS,
+        (false, false) => 0x04, // sector not found / read error
+    }
+}
+
 /// INT 13h status 09h, "data boundary error": the transfer could not be carried
 /// out across the whole of the caller's buffer. On real hardware that is a DMA
 /// segment crossing; here it is a page the caller's own tables do not map, which
@@ -1458,6 +1469,7 @@ impl Machine {
         self.floppy_accesses += 1;
 
         let mut done: u8 = 0;
+        let mut unreachable_buffer = false;
         for i in 0..count {
             // Multi-sector transfers advance within the current track only. A
             // booter that crosses a track boundary in one call would need
@@ -1473,6 +1485,7 @@ impl Machine {
                 match data {
                     Some(bytes) => {
                         if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            unreachable_buffer = true;
                             break;
                         }
                     }
@@ -1480,6 +1493,7 @@ impl Machine {
                 }
             } else {
                 if self.linear_present_prefix(addr, 512) < 512 {
+                    unreachable_buffer = true;
                     break;
                 }
                 let bytes = self.read_guest_linear_block(addr, 512);
@@ -1524,16 +1538,10 @@ impl Machine {
 
         // AL returns the number of sectors actually transferred.
         self.set_eax_al(done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            // Sector not found / read error.
-            self.set_eax_ah(0x04);
-            self.set_disk_status(0x04);
-            self.set_int_frame_carry(true);
-        }
+        let status = transfer_status(done == count, unreachable_buffer);
+        self.set_eax_ah(status);
+        self.set_disk_status(status);
+        self.set_int_frame_carry(status != 0);
     }
 
     /// Carry out the AH=08 read-drive-parameters half of INT 13h.
@@ -1869,6 +1877,7 @@ impl Machine {
         };
         self.c_accesses += 1;
         let mut done: u8 = 0;
+        let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
         for i in 0..count {
@@ -1879,6 +1888,7 @@ impl Machine {
                 match data {
                     Some(bytes) => {
                         if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            unreachable_buffer = true;
                             break;
                         }
                     }
@@ -1886,6 +1896,7 @@ impl Machine {
                 }
             } else {
                 if self.linear_present_prefix(addr, 512) < 512 {
+                    unreachable_buffer = true;
                     break;
                 }
                 let bytes = self.read_guest_linear_block(addr, 512);
@@ -1924,15 +1935,10 @@ impl Machine {
         }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_fixed_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            self.set_eax_ah(0x04);
-            self.set_fixed_disk_status(0x04);
-            self.set_int_frame_carry(true);
-        }
+        let status = transfer_status(done == count, unreachable_buffer);
+        self.set_eax_ah(status);
+        self.set_fixed_disk_status(status);
+        self.set_int_frame_carry(status != 0);
     }
 
     /// AH=0Ah/0Bh read/write long. A classic BIOS moves sector data followed by
@@ -1960,6 +1966,7 @@ impl Machine {
 
         self.c_accesses += 1;
         let mut done: u8 = 0;
+        let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
         for i in 0..count {
@@ -1970,17 +1977,23 @@ impl Machine {
                 match data {
                     Some(bytes) => {
                         if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            unreachable_buffer = true;
                             break;
                         }
-                        self.write_guest_linear_block(
-                            addr.wrapping_add(ata::SECTOR as u32),
-                            &ZERO_ECC,
-                        );
+                        // The ECC trailer is part of the same sector as far as
+                        // the caller is concerned, so a trailer that cannot be
+                        // placed shortens the transfer exactly as the data does.
+                        let ecc_at = addr.wrapping_add(ata::SECTOR as u32);
+                        if self.write_guest_linear_block(ecc_at, &ZERO_ECC) < ZERO_ECC.len() {
+                            unreachable_buffer = true;
+                            break;
+                        }
                     }
                     None => break,
                 }
             } else {
                 if self.linear_present_prefix(addr, ata::SECTOR) < ata::SECTOR {
+                    unreachable_buffer = true;
                     break;
                 }
                 let bytes = self.read_guest_linear_block(addr, ata::SECTOR);
@@ -2007,12 +2020,9 @@ impl Machine {
         }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_fixed_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            self.int13_hdd_error(0x04);
+        match transfer_status(done == count, unreachable_buffer) {
+            0 => self.int13_hdd_ok(),
+            status => self.int13_hdd_error(status),
         }
     }
 
@@ -2233,11 +2243,7 @@ impl Machine {
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
-        let status = match (done == count, unreachable_buffer) {
-            (true, _) => 0x00,
-            (false, true) => BUFFER_UNREACHABLE_STATUS,
-            (false, false) => 0x04,
-        };
+        let status = transfer_status(done == count, unreachable_buffer);
         self.set_eax_ah(status);
         self.set_fixed_disk_status(status);
         self.set_int_frame_carry(status != 0);

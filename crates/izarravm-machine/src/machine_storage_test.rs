@@ -2542,6 +2542,89 @@ fn int13_cd_drive_parameters_land_in_a_non_identity_mapped_caller_buffer() {
 // 512-byte block ends exactly on the C9000h page boundary and blocks two and
 // three fall in page C9h, which these tests unmap.
 
+/// INT 13h AH=02h whose second sector has no translation. AL is this service's
+/// count field, and 04h is its "the media was at fault" code; neither may be
+/// used to describe a caller buffer the BIOS could only partly reach.
+#[test]
+fn int13_hdd_chs_read_counts_only_the_sectors_that_reached_the_caller() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    super::margo::unmap_guest_page(&mut m, 0xc9);
+    prime_dos_int_frame(&mut m);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(0x01a0); // guest linear C8E00h
+    m.cpu.registers.set_eax(0x0202);
+    m.cpu.registers.set_ecx(0x0002); // cylinder 0, head 0, sector 2 = LBA 1
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e00),
+        0x11,
+        "the one reachable sector must still be delivered"
+    );
+    assert_eq!(m.cpu.registers.eax() as u8, 1, "AL = sectors that LANDED");
+    assert_eq!(
+        (m.cpu.registers.eax() >> 8) as u8,
+        0x09,
+        "an unreachable buffer page is a data-boundary error, not 04h"
+    );
+    assert_ne!(dos_int_flags(&m) & 1, 0, "a short transfer sets CF");
+}
+
+/// INT 13h AH=03h out of a source whose second sector has no translation. The
+/// R5 hazard on the classic CHS path: read_guest_linear_block fills an
+/// untranslatable page with 0xFF, and a sector write is persistent.
+#[test]
+fn int13_hdd_chs_write_never_commits_filler_for_an_unreachable_source_page() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    super::margo::unmap_guest_page(&mut m, 0xc9);
+    prime_dos_int_frame(&mut m);
+    for offset in 0..512u32 {
+        m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e00 + offset, 0xc1);
+    }
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(0x01a0); // guest linear C8E00h
+    m.cpu.registers.set_eax(0x0302);
+    m.cpu.registers.set_ecx(0x0015); // cylinder 0, head 0, sector 21 = LBA 20
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    // The result registers are read out BEFORE the disk is inspected, because
+    // int13_read_at issues its own INT 13h and overwrites them. The disk
+    // assertions come first so that a probe that never fires is reported as the
+    // data loss it is, rather than as a wrong count.
+    let (al, ah, carry) = (
+        m.cpu.registers.eax() as u8,
+        (m.cpu.registers.eax() >> 8) as u8,
+        dos_int_flags(&m) & 1,
+    );
+    assert_eq!(
+        int13_read_at(&mut m, 20, 1),
+        vec![0xc1],
+        "the reachable sector is written normally"
+    );
+    assert_eq!(
+        int13_read_at(&mut m, 21, 1),
+        vec![21u8.wrapping_add(0x10)],
+        "the sector behind the unreachable page must keep its own bytes: 0xFF \
+         fill is the walker's, not the guest's, and this write is persistent"
+    );
+    assert_eq!(al, 1, "AL = sectors that LANDED");
+    assert_eq!(
+        ah, 0x09,
+        "an unreachable source page is a data-boundary error, not 04h"
+    );
+    assert_ne!(carry, 0, "a short transfer sets CF");
+}
+
 /// EDD AH=42h into a buffer whose second and third blocks have no translation.
 /// One block reaches the caller, so the packet must say one.
 #[test]
@@ -2584,6 +2667,41 @@ fn int13_edd_read_counts_only_the_blocks_that_reached_the_caller() {
         "an unreachable buffer page is a data-boundary error, not a success"
     );
     assert_ne!(dos_int_flags(&m) & 1, 0, "a short transfer sets CF");
+
+    // A block that resumes on the far side of the hole must not be delivered
+    // either: the count says the transfer stopped at the hole, so any byte
+    // written past it is a byte the caller was told did not arrive. Guest page
+    // 30h is unmapped and 31h is identity RAM, so a delivery that skipped the
+    // hole and kept going would show up at physical 31000h.
+    super::margo::unmap_guest_page(&mut m, 0x30);
+    for offset in 0..0x100u32 {
+        m.write_physical_u8(0x3_1000 + offset, 0x5a);
+    }
+    m.write_physical_u8(dap + 2, 1); // one block
+    m.write_physical_u8(dap + 4, 0x00); // buffer offset 0000h
+    m.write_physical_u8(dap + 5, 0x00);
+    m.write_physical_u8(dap + 6, 0xf0); // buffer segment 30F0h: linear 30F00h
+    m.write_physical_u8(dap + 7, 0x30);
+    prime_dos_int_frame(&mut m);
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0);
+    m.cpu.registers.set_eax(0x4200);
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!(
+        m.read_physical_u8(dap + 2),
+        0,
+        "nothing landed: the block begins in the unmapped page"
+    );
+    assert_eq!(
+        m.read_guest_block(0x3_1000, 4),
+        vec![0x5a; 4],
+        "the tail of the block must not be written past the hole the count \
+         already reported"
+    );
 }
 
 /// EDD AH=43h out of a buffer whose second and third blocks have no
