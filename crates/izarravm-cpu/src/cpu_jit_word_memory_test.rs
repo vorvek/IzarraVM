@@ -95,6 +95,30 @@
 //! emitted code was CORRECT and only unmeasured, so that file is a pure test addition and no
 //! emitted byte moved. The same mutation now fails four tests and passes 1324, the exact
 //! pre-addition baseline.
+//!
+//! Two more mutations, applied against the B2 form-3 memory-SOURCE row
+//! (`the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op`) and restored:
+//!
+//! | mutation | caught by | assertion |
+//! |---|---|---|
+//! | `emit_alu_preloaded`'s Word write-back -> `mov_r32_r32(home(dst), RDX)` | the memory-SOURCE row | registers: EAX `0x0000_3435` against the interpreter's `0xdead_3435`, at `add r16 dst=0 reg=0x0001, word [0x3010] operand=0x1234` |
+//! | `emit_alu_preloaded`'s source mask `and_r32_imm32(RCX, 0xffff)` -> `0xffff_ffff` | NOT this row -- `word_alu_register_forms_*` and `word_alu_immediate_forms_*` | lazy flags: `b: 3203334145` against `1`, at `0x01 /0 add cx,ax` |
+//!
+//! The first is the miscompile the old form-3 refusal existed to prevent, and it fails on the
+//! poisoned high half, which is why the seed carries one.
+//!
+//! The second is recorded for the SHAPE of its escape rather than for the catch. It survives this
+//! row for the same reason the review gave for not mutating the READ: at a memory source RCX is
+//! filled by `movzx_r32_word_disp8` and is ALREADY zero-extended, so masking it again is a no-op
+//! here. It is the register and immediate forms -- where RCX carries a full 32-bit register or a
+//! sign-extended imm8 -- that the mask is load-bearing for, and they catch it immediately.
+//!
+//! For the same reason, mutating the row's own read (`movzx_r32_word_disp8` -> `load_r32_disp8`)
+//! canNOT fail and was not attempted: the `and RAX, 0xffff` / `and RCX, 0xffff` pair discards the
+//! extra bytes, the bus charge is static from `word_reads` rather than from the host load's width,
+//! and a wider host load cannot fault at these operands. Recorded so nobody retries it as the
+//! "stronger" mutation.
+//!
 
 use super::*;
 
