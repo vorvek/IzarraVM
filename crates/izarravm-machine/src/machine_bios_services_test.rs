@@ -2917,3 +2917,52 @@ fn fossil_driver_info_lands_in_a_non_identity_mapped_caller_buffer() {
         "the screen geometry fields must arrive at the mapped frame"
     );
 }
+
+/// INT 14h AH=18h reads a block of received bytes into ES:DI. `ES:DI` = C8C6:
+/// 03A0 is guest linear C9000h, the start of the second mapped page: a handler
+/// that treats it as physical deposits the byte in the unbacked upper-memory
+/// hole and the caller reads back 0xFF.
+#[test]
+fn fossil_read_block_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut machine = super::margo::umb_paged_machine();
+    machine.write_physical_u8(super::margo::UMB_FRAME_HIGH, 0x5a);
+    machine.serial.write_port(0x03fc, 0x10); // loopback
+    machine.serial.write_port(0x03f8, b'R');
+    machine.advance_devices_ticks(machine.serial.ticks_until_idle());
+
+    machine.cpu.registers.set_edi(0x03a0);
+    machine.cpu.registers.set_ecx(1);
+    machine.cpu.registers.set_eax(0x1800);
+    machine.cpu.registers.set_edx(0); // COM1
+    machine.handle_int14();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 1, "one byte received");
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_FRAME_HIGH),
+        b'R',
+        "the received byte must arrive at the frame the caller's page is mapped to"
+    );
+}
+
+/// INT 14h AH=19h sends a block from ES:DI. The source here starts at guest
+/// linear C8FFFh, so its two bytes come from two different frames.
+#[test]
+fn fossil_write_block_reads_a_non_identity_mapped_caller_buffer() {
+    let mut machine = super::margo::umb_paged_machine();
+    machine.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xfff, b'y');
+    machine.write_physical_u8(super::margo::UMB_FRAME_HIGH, b'z');
+
+    machine.cpu.registers.set_edi(0x039f);
+    machine.cpu.registers.set_ecx(2);
+    machine.cpu.registers.set_eax(0x1900);
+    machine.cpu.registers.set_edx(0); // COM1
+    machine.handle_int14();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 2, "two bytes sent");
+    assert_eq!(
+        machine.serial.output(),
+        b"yz",
+        "both source bytes must come from the frames the caller's pages are \
+         mapped to, across the boundary between them"
+    );
+}

@@ -207,31 +207,45 @@ impl Machine {
         self.set_ax(word);
     }
 
+    /// FOSSIL AH=18h block read into ES:DI, a guest LINEAR address; see
+    /// `int14_fossil_driver_info`.
+    ///
+    /// The buffer is measured before a single byte is dequeued. A received byte
+    /// that has left the UART cannot be put back, so a caller whose buffer runs
+    /// into a page its tables do not map must lose no data to a write that
+    /// would be dropped: the request shortens to what the buffer can hold and
+    /// AX reports it.
     fn int14_fossil_read_block(&mut self, second: bool) {
-        let max = self.cpu.registers.ecx() as u16;
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
         let di = self.cpu.registers.edi() as u16;
-        let mut dst = es + u32::from(di);
-        let mut count = 0u16;
-        while count < max && self.uart_read(second, 5) & 0x01 != 0 {
+        let dst = es.wrapping_add(u32::from(di));
+        let requested = usize::from(self.cpu.registers.ecx() as u16);
+        let max = self.linear_present_prefix(dst, requested);
+        let mut data = Vec::with_capacity(max);
+        while data.len() < max && self.uart_read(second, 5) & 0x01 != 0 {
             let byte = self.uart_read(second, 0);
-            self.write_physical_u8(dst, byte);
-            dst = dst.wrapping_add(1);
-            count += 1;
+            data.push(byte);
         }
-        self.set_ax(count);
+        self.write_guest_linear_block(dst, &data);
+        self.set_ax(data.len() as u16);
     }
 
+    /// FOSSIL AH=19h block write from ES:DI, a guest LINEAR address.
+    ///
+    /// An untranslatable page reads back as the walker's 0xFF fill, and a byte
+    /// put on the wire cannot be recalled, so the send stops at the page the
+    /// caller's tables do not map and AX reports what was sent.
     fn int14_fossil_write_block(&mut self, second: bool) {
-        let count = self.cpu.registers.ecx() as u16;
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
         let di = self.cpu.registers.edi() as u16;
-        for index in 0..count {
-            let byte = self.read_physical_u8(es + u32::from(di.wrapping_add(index)));
+        let src = es.wrapping_add(u32::from(di));
+        let requested = usize::from(self.cpu.registers.ecx() as u16);
+        let count = self.linear_present_prefix(src, requested);
+        for byte in self.read_guest_linear_block(src, count) {
             self.uart_write(second, 0, byte);
             self.finish_uart_transmit(second);
         }
-        self.set_ax(count);
+        self.set_ax(count as u16);
     }
 
     /// FOSSIL AH=1Bh driver information block at ES:DI.
@@ -239,10 +253,7 @@ impl Machine {
     /// ES:DI is the caller's LINEAR address. A communications program that asks
     /// for it can be running in V86 under a memory manager, and its block can
     /// then be in upper memory the manager maps non-identity; see
-    /// `write_guest_linear_block`. The byte-at-a-time FOSSIL read and write
-    /// block services above still address ES:DI physically and have the same
-    /// defect, but they are left for a change that can measure a guest against
-    /// them -- nothing in the corpus drives them.
+    /// `write_guest_linear_block`.
     fn int14_fossil_driver_info(&mut self) {
         let max = self.cpu.registers.ecx() as usize;
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
