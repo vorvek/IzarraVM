@@ -2582,7 +2582,11 @@ impl MachineBus<'_> {
     /// 67h is never intercepted (the TOKAEMM guest driver owns the EMS API).
     fn soft_int_intercepted(&mut self, vector: u8) -> Result<bool, BusError> {
         let dos_multiplex = vector == 0x2F && self.vector_points_at_rom_iret(vector)?;
-        let absent_resident_api = matches!(vector, 0x5C | 0x60 | 0x68 | 0x6F | 0x7A | 0x86 | 0xE4)
+        // 60h/68h/6Fh left this set when POST stopped seeding 60h-6Fh (defect
+        // E2): a null vector never lands on the ROM stub, so those arms were
+        // dead code. A guest that wants those APIs answered installs its own
+        // handler, as on real hardware.
+        let absent_resident_api = matches!(vector, 0x5C | 0x7A | 0x86 | 0xE4)
             && self.vector_points_at_rom_iret(vector)?;
         // A `new_raw_program` machine keeps INT 20h/21h/27h intercepted so the run
         // loop's guarded raw-program arm (`handle_raw_program_int`) services them.
