@@ -2153,3 +2153,218 @@ fn vbe_pm_stub_set_palette_writes_the_dac() {
     // assertions above while quietly overwriting the low entries.
     assert_eq!(machine.video().dac_entry(4), [42, 0, 0]);
 }
+
+/// Physical frames the fixture's two upper-memory pages are mapped to, and the
+/// physical address the caller's block therefore occupies. A page-walking
+/// handler writes there; the broken one wrote at the identity address
+/// 000C8C60h, which is the unbacked upper-memory hole.
+const UMB_FRAME_LOW: u32 = 0x0011_0000;
+const UMB_FRAME_HIGH: u32 = 0x0012_0000;
+const UMB_BUFFER_PHYSICAL: u32 = UMB_FRAME_LOW + 0x0c60;
+
+/// A V86 machine whose upper-memory pages 000C8000h and 000C9000h are mapped to
+/// `UMB_FRAME_LOW` and `UMB_FRAME_HIGH`, with ES = C8C6h so ES:DI addresses a
+/// caller block inside them: the shape TOKAEMM leaves a DPMI transfer buffer in.
+/// The two frames are deliberately not adjacent, so a block that spans the page
+/// boundary cannot be written correctly by one translation. Everything else in
+/// the first 4 MB is identity mapped, so nothing in a fixture faults for an
+/// unrelated reason.
+fn umb_paged_machine() -> Machine {
+    const PD: u32 = 0x1000;
+    const PT: u32 = 0x2000;
+
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4]).unwrap();
+    machine.write_physical_u32(PD, PT | 7);
+    for page in 0u32..1024 {
+        let pte = match page {
+            0xc8 => UMB_FRAME_LOW | 7,
+            0xc9 => UMB_FRAME_HIGH | 7,
+            _ => (page << 12) | 7,
+        };
+        machine.write_physical_u32(PT + page * 4, pte);
+    }
+    machine.cpu.control.cr3 = PD;
+    machine.cpu.control.cr0 |= 0x8000_0001;
+    machine.cpu.registers.eflags |= 0x0002_0000; // VM: a V86 task, as under TOKAEMM
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    machine
+}
+
+/// Corpus row MonikaTT (eXoDOS "Monika's Tic Tac Toe", stage-1 pass B): a DJGPP
+/// program that asks for 640x480 in 65536 colours -- VBE mode 111h -- and gave
+/// up with "The video card isn't handling 640x480x16, or haven't VESA 1.2
+/// support" before it ever issued a 4F02h. The row was filed as a refused mode;
+/// mode 111h has been in the Margo table all along. What failed is one address.
+///
+/// The program is a DPMI client. CWSDPMI takes its transfer buffer from DOS,
+/// TOKAEMM supplies upper memory out of extended memory, and the buffer landed
+/// in a UMB at segment C8C6h. Guest linear 000C8C60h is not physical 000C8C60h
+/// there -- the measured run mapped it to 00110C60h -- and the VBE handler
+/// deposited the 4F00h controller block at the linear address as though it were
+/// physical. That address is the unbacked upper-memory hole, so the write went
+/// nowhere and the program read back 0xFF where the "VESA" signature belongs.
+/// Every mode the card offers was invisible to it.
+///
+/// The fixture cannot pass by accident: the destination frame is asserted clear
+/// first, so the bytes can only have arrived through the page walk.
+#[test]
+fn vbe_controller_info_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut machine = umb_paged_machine();
+
+    assert_eq!(
+        machine.read_physical_u32(UMB_BUFFER_PHYSICAL),
+        0,
+        "precondition: the mapped frame must be clear, or this test cannot tell \
+         a page-walking write from an identity-assuming one"
+    );
+
+    machine.cpu.registers.set_edi(0);
+    machine.cpu.registers.set_eax(0x4f00);
+    machine.handle_int10();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x004f);
+    assert_eq!(
+        machine.read_guest_block(UMB_BUFFER_PHYSICAL, 4),
+        b"VESA".to_vec(),
+        "the signature must arrive at the frame the caller's page is mapped to"
+    );
+    assert_eq!(read_u16(&mut machine, UMB_BUFFER_PHYSICAL + 0x04), 0x0200);
+
+    // VideoModePtr is a far pointer built from the caller's own ES:DI, so it
+    // still reads back as C8C6:0022 and the mode list follows it at the same
+    // frame. 111h is what the row asked for.
+    assert_eq!(
+        read_u32(&mut machine, UMB_BUFFER_PHYSICAL + 0x0e),
+        (0xc8c6u32 << 16) | 0x22
+    );
+    let mut modes = Vec::new();
+    let mut at = UMB_BUFFER_PHYSICAL + 0x22;
+    loop {
+        let mode = read_u16(&mut machine, at);
+        if mode == 0xffff {
+            break;
+        }
+        modes.push(mode);
+        at += 2;
+    }
+    assert!(
+        modes.contains(&0x111),
+        "the enumeration must offer 640x480x16, got {modes:#06x?}"
+    );
+}
+
+/// The 4F01h half of the same address defect: the caller asks for mode 111h's
+/// ModeInfoBlock into a non-identity page and must get it, with the
+/// direct-colour fields a VBE 1.2 client checks before it commits to a mode.
+#[test]
+fn vbe_mode_info_for_111h_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut machine = umb_paged_machine();
+    machine.cpu.registers.set_edi(0);
+    machine.cpu.registers.set_eax(0x4f01);
+    machine.cpu.registers.set_ecx(0x0111);
+    machine.handle_int10();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x004f);
+    assert_eq!(read_u16(&mut machine, UMB_BUFFER_PHYSICAL + 0x10), 1280); // BytesPerScanLine
+    assert_eq!(read_u16(&mut machine, UMB_BUFFER_PHYSICAL + 0x12), 640); // XResolution
+    assert_eq!(read_u16(&mut machine, UMB_BUFFER_PHYSICAL + 0x14), 480); // YResolution
+    assert_eq!(machine.read_physical_u8(UMB_BUFFER_PHYSICAL + 0x19), 16); // BitsPerPixel
+    assert_eq!(machine.read_physical_u8(UMB_BUFFER_PHYSICAL + 0x1b), 6); // MemoryModel
+    assert_eq!(machine.read_physical_u8(UMB_BUFFER_PHYSICAL + 0x1f), 5); // RedMaskSize
+    assert_eq!(machine.read_physical_u8(UMB_BUFFER_PHYSICAL + 0x20), 11); // RedFieldPosition
+    assert_eq!(machine.read_physical_u8(UMB_BUFFER_PHYSICAL + 0x21), 6); // GreenMaskSize
+    assert_eq!(machine.read_physical_u8(UMB_BUFFER_PHYSICAL + 0x23), 5); // BlueMaskSize
+}
+
+/// The 256-byte block is longer than the distance from ES:DI to the end of its
+/// page whenever the caller's buffer sits near a page boundary, and the two
+/// pages need not be mapped to adjacent frames. One translation of the block's
+/// first byte would scatter the tail; the per-page split is what keeps it whole.
+///
+/// ES:DI = C8C6:0370 puts the split at block offset 30h, inside the mode list:
+/// the signature and the first seven mode numbers are in the low frame, the
+/// eighth onwards in the high one.
+#[test]
+fn vbe_controller_info_spanning_a_page_boundary_follows_both_mappings() {
+    let mut machine = umb_paged_machine();
+    machine.cpu.registers.set_edi(0x0370);
+    machine.cpu.registers.set_eax(0x4f00);
+    machine.handle_int10();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x004f);
+    let head = UMB_FRAME_LOW + 0x0fd0; // linear 000C8FD0
+    assert_eq!(machine.read_guest_block(head, 4), b"VESA".to_vec());
+    assert_eq!(read_u16(&mut machine, head + 0x22), 0x100);
+    // Block offset 30h is the first byte of the next page, mapped elsewhere.
+    assert_eq!(
+        read_u16(&mut machine, UMB_FRAME_HIGH),
+        0x114,
+        "the tail of the mode list must follow the second page's mapping"
+    );
+}
+
+/// A VBE 1.2 client reads MemoryModel to tell an indexed mode from a
+/// direct-colour one; the RGB mask fields are only defined for model 06h. The
+/// handler reported 04h (packed pixel) for every mode, including the 15/16/32bpp
+/// ones, which is the answer a 256-colour mode gives. Pinned per depth so the two
+/// families cannot be given one answer again.
+#[test]
+fn vbe_mode_info_reports_the_memory_model_for_the_depth() {
+    for (mode, expected) in [
+        (0x0101u16, 4u8), // 640x480x8, packed pixel
+        (0x0110, 6),      // 640x480x15, direct colour
+        (0x0111, 6),      // 640x480x16, direct colour
+        (0x014a, 6),      // 640x480x32, direct colour
+    ] {
+        let mut code = vec![
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x00, 0x00, // mov cx, mode (patched below)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ];
+        code[12] = mode as u8;
+        code[13] = (mode >> 8) as u8;
+        let rom = rom_with_code(&code);
+        let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+        assert_eq!(
+            machine.read_physical_u8(0x40000 + 0x1b),
+            expected,
+            "MemoryModel for mode {mode:#06x}"
+        );
+    }
+}
+
+/// The row's own request, end to end in real mode: 4F02h with BX=0111h must be
+/// accepted and must leave the display 640x480 at 16bpp.
+#[test]
+fn vbe_set_mode_accepts_111h_and_selects_640x480x16() {
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x11, 0x01, // mov bx, 0111h (banked window, clear memory)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+    let display = machine.margo().display();
+    assert_eq!(display.mode, 0x111);
+    assert_eq!((display.width, display.height, display.bpp), (640, 480, 16));
+    assert_eq!(display.pitch, 1280);
+}

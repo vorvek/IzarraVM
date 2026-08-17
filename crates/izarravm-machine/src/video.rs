@@ -2137,9 +2137,9 @@ impl Machine {
         // is them holding 0x0100, 0x0101, 0x0103.
         //
         // VideoModePtr is a real-mode far pointer the guest decodes as seg:off,
-        // so it carries the ES selector, not the linear base. vbe_block_ptr()
-        // uses the base for the write-side physical address; in real mode the
-        // two agree (base = selector << 4).
+        // so it carries the ES selector, not the linear base. vbe_block_linear()
+        // uses the base for the write-side address, which the page walk then
+        // resolves; in real mode base = selector << 4.
         let list_offset = di.wrapping_add(0x22);
         let video_mode_ptr = (u32::from(es) << 16) | u32::from(list_offset);
         block[0x0e..0x12].copy_from_slice(&video_mode_ptr.to_le_bytes());
@@ -2151,8 +2151,8 @@ impl Machine {
         }
         block[pos..pos + 2].copy_from_slice(&0xffffu16.to_le_bytes());
 
-        let addr = self.vbe_block_ptr();
-        self.write_guest_block(addr, &block);
+        let addr = self.vbe_block_linear();
+        self.write_guest_linear_block(addr, &block);
         self.set_vbe_status(0x004f);
     }
 
@@ -2276,10 +2276,10 @@ impl Machine {
             self.set_vbe_status(0x014f);
             return;
         }
-        let address = self.vbe_block_ptr();
+        let address = self.vbe_block_linear();
         match self.cpu.registers.ebx() as u8 {
             0x00 | 0x80 => {
-                let entries = self.read_guest_block(address, usize::from(count) * 4);
+                let entries = self.read_guest_linear_block(address, usize::from(count) * 4);
                 if self.cpu.registers.ebx() as u8 == 0x80 {
                     self.stall_until_margo_frame();
                 }
@@ -2299,18 +2299,23 @@ impl Machine {
                     let [r, g, b] = self.vega.legacy_mut().dac_entry((start + offset) as u8);
                     entries.extend_from_slice(&[b, g, r, 0]);
                 }
-                self.write_guest_block(address, &entries);
+                self.write_guest_linear_block(address, &entries);
                 self.set_vbe_status(0x004f);
             }
             _ => self.set_vbe_status(0x014f),
         }
     }
 
-    /// Real-mode `ES:DI` of the caller's info block, as a physical address.
-    fn vbe_block_ptr(&self) -> u32 {
+    /// `ES:DI` of the caller's info block, as a guest LINEAR address.
+    ///
+    /// Linear, not physical: the caller may be a DPMI client whose transfer
+    /// buffer was allocated out of upper memory, and a memory manager maps that
+    /// region non-identity. Every use of this must go through
+    /// `write_guest_linear_block` / `read_guest_linear_block`.
+    fn vbe_block_linear(&self) -> u32 {
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
         let di = self.cpu.registers.edi() as u16;
-        es + u32::from(di)
+        es.wrapping_add(u32::from(di))
     }
 
     fn vbe_mode_info(&mut self) {
@@ -2334,7 +2339,16 @@ impl Machine {
         block[0x18] = 1; // NumberOfPlanes
         block[0x19] = info.bpp as u8; // BitsPerPixel
         block[0x1a] = 1; // NumberOfBanks for packed-pixel modes
-        block[0x1b] = 4; // MemoryModel: packed pixel
+        // MemoryModel: 04h packed pixel for the indexed modes, 06h direct colour
+        // for 15/16/32bpp. The RGB mask fields below are only defined for 06h,
+        // so a client that trusts the model reads an 8bpp mode's masks as absent
+        // and a hi-colour mode's masks as meaningful. Reporting 04h throughout
+        // told a VBE 1.2 client the card had no direct-colour mode at all.
+        block[0x1b] = if pixel_format(info.bpp).is_some() {
+            6
+        } else {
+            4
+        };
         if let Some(fmt) = pixel_format(info.bpp) {
             block[0x1f] = fmt.r.size as u8; // RedMaskSize
             block[0x20] = fmt.r.pos as u8; // RedFieldPosition
@@ -2346,8 +2360,8 @@ impl Machine {
             block[0x26] = fmt.x.pos as u8; // RsvdFieldPosition
         }
         block[0x28..0x2c].copy_from_slice(&MARGO_LFB_BASE.to_le_bytes()); // PhysBasePtr
-        let addr = self.vbe_block_ptr();
-        self.write_guest_block(addr, &block);
+        let addr = self.vbe_block_linear();
+        self.write_guest_linear_block(addr, &block);
         self.set_vbe_status(0x004f);
     }
 
