@@ -2935,6 +2935,14 @@ vcpi_dispatch:
 ; spec relies on exactly this), so the monitor stack and flat reads keep
 ; working until the far jump hands the client its own world.
 .de0c:
+    ; The monitor is about to stop being reachable: from the far jump below the
+    ; client owns the IDT and the PIC, and its V86 excursions come back through
+    ; vcpi_pm_to_v86 with VIF forced 0, so `maybe_deliver` will never drain
+    ; `vip` again. Disclaim any line held there before handing over -- see
+    ; vip_release_to_chip for the invariant and why metal never reaches here.
+    ; Safe this early: the spec contract lets DE0C destroy EAX, and ECX/EDX are
+    ; reloaded for the client from the pushad block after the switch.
+    call vip_release_to_chip
     mov eax, [esi+4]              ; guest ESI = switch-structure linear
     mov ecx, [eax]
     mov cr3, ecx                  ; client paging context
@@ -3694,11 +3702,85 @@ vcpi_pm_to_v86:
     add esp, 8                    ; drop the far-call return address
     iretd                         ; EIP,CS,EFLAGS,ESP,SS,ES,DS,FS,GS -> V86
 
-; The monitor issues no EOI of its own: every hardware line it takes is
-; reflected to a guest IVT handler, immediately (.go) or once VIF is set
-; (.hold -> maybe_deliver), and that handler owns the EOI exactly as it does
-; on bare hardware. `irq_eoi` used to serve the .hold path and is gone with
-; it; see the note there.
+; The monitor issues no EOI of its own IN THE COURSE OF SERVICING A LINE:
+; every hardware line it takes is reflected to a guest IVT handler,
+; immediately (.go) or once VIF is set (.hold -> maybe_deliver), and that
+; handler owns the EOI exactly as it does on bare hardware. `irq_eoi` used to
+; serve the .hold path and is gone with it; see the note there. The one EOI
+; the monitor does issue is `vip_release_to_chip` below, and it is not a
+; service EOI -- it is the monitor DISCLAIMING lines it can no longer deliver.
+
+; Release every line held in `vip` back to the 8259A and empty `vip`.
+;   in: FS = driver data.  clobbers eax, ecx, edx.
+;
+; THE OWNERSHIP INVARIANT: the monitor must not hold an in-service line across
+; a boundary it cannot be re-entered through. `.hold` acknowledges a line (the
+; INTA has happened, the ISR bit is set) and parks it in `vip` for delivery by
+; `maybe_deliver` -- but `maybe_deliver` runs only from a V86 sensitive-op trap
+; with VIF set. A VCPI client that switches to protected mode leaves that world
+; entirely: it owns the IDT and the PIC from then on, and its V86 excursions
+; come back through `vcpi_pm_to_v86`, which forces VIF=0. So a line held across
+; a DE0C switch is held FOREVER, and per the 8259A's fully nested rule
+; ("While the IS bit is set all further interrupts of the same or lower
+; priority are inhibited", 8259A datasheet, Fully Nested Mode) a stuck IS0
+; inhibits the whole chip: the client's own timer handler never fires again and
+; the guest wedges with its clock stopped. That is E10's regression -- Tomb
+; Raider froze on the FMV's first frame, Grand Prix 2 mid-race at LAP 0.
+;
+; ON METAL THIS SITE IS UNREACHABLE. A period V86 manager runs its client at
+; IOPL=3 -- 386MAX states it outright (QMAX_DTE.INC: "@VMIOPL equ 3 ; Use this
+; IOPL for VM clients to avoid GP Faults on CLI/STI/HLT/INT/IRET/PUSHF/POPF")
+; -- so a guest CLI clears the REAL IF and no INTA happens at all while the
+; guest has interrupts off. The request stays latched in the IRR and is taken
+; later, by the V86 guest after its STI or by the PM client after the switch.
+; This monitor instead keeps the real IF open and virtualizes IF as VIF, so it
+; acknowledges lines at moments metal would not have, and must hand back what
+; it cannot deliver. Dropping the delivery is the pre-E10 behaviour and costs
+; nothing a periodic source does not re-raise: the released line's request
+; re-latches in the IRR and the client's handler takes it right after the
+; switch, which is the metal outcome.
+;
+; SPECIFIC EOIs, not non-specific: with more than one line held, or with a
+; rotation the guest set through OCW2, a non-specific EOI clears the highest
+; in-service level rather than the one being disclaimed. Slave lines first,
+; then ONE cascade EOI to the master (its IS2 is a single bit however many
+; slave INTAs stacked behind it), then the master's own lines.
+vip_release_to_chip:
+    movzx edx, word [fs:vip]
+    test dx, dx
+    jz .done
+    mov ecx, 8                    ; slave lines 8..15 -> specific EOI to 0xA0
+.slave:
+    bt edx, ecx
+    jnc .slave_next
+    lea eax, [ecx-8]
+    or al, 0x60                   ; OCW2: specific EOI, level = line-8
+    out 0xA0, al
+.slave_next:
+    inc ecx
+    cmp ecx, 16
+    jb .slave
+    test dx, 0xFF00               ; any slave line at all -> one cascade EOI
+    jz .master_lines
+    mov al, 0x62                  ; OCW2: specific EOI, level 2 (the cascade)
+    out 0x20, al
+.master_lines:
+    xor ecx, ecx                  ; master lines 0..7; 2 is the cascade pin and
+.master:                          ; can never be held as a line of its own
+    cmp ecx, 2
+    je .master_next
+    bt edx, ecx
+    jnc .master_next
+    mov eax, ecx
+    or al, 0x60                   ; OCW2: specific EOI, level = line
+    out 0x20, al
+.master_next:
+    inc ecx
+    cmp ecx, 8
+    jb .master
+    mov word [fs:vip], 0          ; last: nothing above may see a stale hold
+.done:
+    ret
 
 ; A default-gate vector can be a software INT or a hardware IRQ after a VCPI
 ; client remaps the PIC away from the DOS defaults. If EBX is inside the current

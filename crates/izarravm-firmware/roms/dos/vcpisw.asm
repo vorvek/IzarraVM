@@ -192,7 +192,27 @@ start:
     ; descriptor to available and make the second trip prove nothing.
 do_switch:
     mov ebp, 0x1BADB002           ; marker: must survive BOTH switches
-    cli
+    cli                           ; virtualized: VIF := 0, real IF stays 1
+    ; ---- 4a. force a HELD line across the switch (the E10 regression) ----
+    ; With VIF clear the monitor's irq_body takes its `.hold` path: the INTA has
+    ; already happened (this monitor keeps the real IF open and virtualizes IF
+    ; as VIF), so the 8259A's IS bit is set, and the line is parked in `vip` for
+    ; a later `maybe_deliver`. Wait here until the chip actually shows IS0 set,
+    ; so the switch below is guaranteed to cross the boundary with a line held
+    ; -- a fixture that switched before the tick landed would prove nothing.
+    ; The PIC ports are not in the monitor's TSS I/O bitmap (only 0x92 is), so
+    ; this reads the real chip.
+    mov ecx, 8000000              ; bound: ~one 54.9 ms tick with room to spare
+.wait_hold:
+    mov al, 0x0B                  ; OCW3: select ISR for the next read
+    out 0x20, al
+    in al, 0x20
+    test al, 0x01                 ; IS0: the timer line, acknowledged and held
+    jnz .held
+    dec ecx
+    jnz .wait_hold
+    jmp f_nohold                  ; never held: the precondition never happened
+.held:
     mov esi, [lin_base]
     add esi, swst                 ; ESI = switch-structure linear
     mov ax, 0xDE0C
@@ -220,6 +240,43 @@ pm_landing:
     smsw ax                       ; PE must be set
     test al, 1
     jz pm_f_pe
+
+    ; ---- 5a. the monitor must not have carried the held line in here ----
+    ; From the far jump that landed us here the client owns the IDT and the
+    ; PIC, and its V86 excursions come back through the server's PM->V86 path
+    ; with VIF forced 0, so `maybe_deliver` will never drain `vip` again. A line
+    ; still in service is therefore in service forever, and per the 8259A's
+    ; fully nested rule ("While the IS bit is set all further interrupts of the
+    ; same or lower priority are inhibited") a stuck IS0 -- the highest level --
+    ; inhibits the whole chip: this client's clock stops. That was E10's
+    ; regression in the field (Tomb Raider frozen on the FMV's first frame,
+    ; Grand Prix 2 frozen mid-race at LAP 0).
+    mov al, 0x0B                  ; OCW3: select ISR
+    out 0x20, al
+    in al, 0x20
+    test al, 0x01
+    jnz pm_f_held                 ; IS0 survived the switch: the chip is wedged
+    ; Not merely clear -- still ALIVE. Interrupts are off here (DE0C hands over
+    ; with IF=0 and we never STI), so poll the chip by hand: OCW3 P=1 performs
+    ; the acknowledge a real INTA would. On a monitor that stranded the line
+    ; this spins out; on a correct one the re-latched timer request is taken
+    ; within a tick.
+    mov ecx, 8000000
+.pm_poll:
+    mov al, 0x0C                  ; OCW3: poll command
+    out 0x20, al
+    in al, 0x20
+    test al, 0x80                 ; bit 7: an interrupt was pending and acked
+    jnz .pm_polled
+    dec ecx
+    jnz .pm_poll
+    jmp pm_f_dead                 ; nothing acknowledgeable within a tick
+.pm_polled:
+    and al, 0x07                  ; the poll left that level in service; give it
+    or al, 0x60                   ; back with a SPECIFIC EOI so the rest of the
+    out 0x20, al                  ; fixture (and trip 2) runs on a clean chip.
+                                  ; Level 2 would owe the slave an EOI too, but
+                                  ; IR0 at 18.2 Hz always wins this poll.
 
     ; far-call the server entry: DE03 must match the V86 baseline
     mov ax, 0xDE03
@@ -286,6 +343,12 @@ pm_f_alloc:
     jmp pm_sig
 pm_f_free:
     mov al, 0xEC
+    jmp pm_sig
+pm_f_held:                        ; E10: a line held in `vip` crossed DE0C
+    mov al, 0xED
+    jmp pm_sig
+pm_f_dead:                        ; E10: the chip acknowledges nothing any more
+    mov al, 0xEE
     jmp pm_sig
 pm_sig:                           ; signal from PM: the exit ports are wide
     mov ah, al                    ; open (I/O bitmap governs V86 only; PM
@@ -358,6 +421,9 @@ f_bal:    mov al, 0xE6
 f_busy:   mov al, 0xD0        ; trip 1 left the client TSS descriptor available,
           jmp sig               ; so the monitor's busy-bit clear is untested
 f_xms:    mov al, 0xE7
+          jmp sig
+f_nohold: mov al, 0xD1        ; no line was ever held with VIF clear, so the
+                              ; switch below would not have tested anything
 
 sig:
     mov ah, al

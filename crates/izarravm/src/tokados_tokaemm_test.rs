@@ -971,6 +971,18 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// with marker registers proving the spec's register-preservation
 /// contract across both switches and the pool balanced at the end.
 /// VCPISW signals 0xA5 / 0xEn.
+///
+/// It also pins E10's regression, and this is the discriminating half: each
+/// switch is made from a CLI'd V86 stub that first WAITS until the 8259A shows
+/// IR0 in service, so the monitor is certainly carrying a line held in `vip`
+/// across the DE0C boundary. The client then requires, on the far side, that
+/// IS0 is clear and that the chip still acknowledges (an OCW3 poll, since the
+/// PM leg runs with IF=0). A monitor that strands the held line fails here with
+/// 0xED (`pm_f_held`) -- the state Tomb Raider and Grand Prix 2 froze in, their
+/// clocks stopped by a stuck highest-priority ISR bit. 0xEE (`pm_f_dead`) is
+/// the softer variant: IS0 cleared, but nothing is acknowledgeable any more.
+/// 0xD1 says the wait never saw a hold at all, so the fixture would have proved
+/// nothing -- a guard against the test silently becoming vacuous.
 #[test]
 #[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
