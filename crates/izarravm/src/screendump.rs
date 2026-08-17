@@ -11,12 +11,15 @@
 //! glyph count in text mode. A run whose hash never moves is parked on a menu
 //! or hung, however busy its counters look.
 //!
-//! Two deliberate choices. It reads `presented_frame_argb`, which borrows the
+//! Three deliberate choices. It reads `presented_frame_argb`, which borrows the
 //! machine immutably and leaves the in-progress raster alone;
 //! `capture_frame_argb` re-renders the whole frame at capture-time register
-//! state and would corrupt the next presented frame's top rows. And it writes a
+//! state and would corrupt the next presented frame's top rows. It writes a
 //! PPM only when the hash moves, because 60 samples of a 640x480 frame is 55 MB
-//! per game and almost all of it is the same picture twice.
+//! per game and almost all of it is the same picture twice. And when there is no
+//! completed frame at all it writes an index line saying so and no PPM: a
+//! sample that reports a picture nobody drew is worse than a missing sample,
+//! because it looks like a measurement.
 //!
 //! It slices the run, so a dumping run is a diagnostic and not a benchmark row.
 
@@ -33,6 +36,8 @@ pub struct ScreenDumper {
     index: std::io::BufWriter<std::fs::File>,
     samples: usize,
     last_hash: u64,
+    /// Samples that found no completed frame. Reported once at `finish`.
+    unpresented: usize,
 }
 
 impl ScreenDumper {
@@ -48,6 +53,7 @@ impl ScreenDumper {
             index: std::io::BufWriter::new(index),
             samples: 0,
             last_hash: u64::MAX,
+            unpresented: 0,
         })
     }
 
@@ -60,8 +66,7 @@ impl ScreenDumper {
     }
 
     fn sample(&mut self, machine: &Machine) -> std::io::Result<()> {
-        let (pixels, width, height) = machine.presented_frame_argb();
-        let hash = fnv1a(&pixels);
+        let frame = machine.presented_frame_argb();
         let display = machine.active_display();
         let mode = (display == ActiveDisplay::VgaRaster).then(|| machine.active_video_mode());
         let glyphs = (mode == Some(VideoMode::Text)).then(|| {
@@ -72,17 +77,29 @@ impl ScreenDumper {
                 .filter(|c| !c.is_whitespace())
                 .count()
         });
-        let changed = hash != self.last_hash;
+        // No completed frame: the run has not drawn its first raster, or a mode
+        // set just dropped the last one. The sample still reports itself, so the
+        // index keeps growing at the sampling cadence -- it is the sweep's only
+        // liveness signal -- but it reports the absence rather than inventing a
+        // picture. `last_hash` is untouched, so the frame that comes back is
+        // compared against the last one that actually existed.
+        let hash = frame.as_ref().map(|(pixels, _, _)| fnv1a(pixels));
+        let changed = hash.is_some_and(|hash| hash != self.last_hash);
         let name = format!("{:04}.ppm", self.samples);
         if changed {
-            write_ppm(&self.dir.join(&name), &pixels, width, height)?;
-            self.last_hash = hash;
+            let (pixels, width, height) = frame.as_ref().expect("changed implies a frame");
+            write_ppm(&self.dir.join(&name), pixels, *width, *height)?;
+            self.last_hash = hash.expect("changed implies a hash");
+        }
+        if frame.is_none() {
+            self.unpresented += 1;
         }
         let master_ticks = machine.master_ticks();
         writeln!(
             self.index,
             "{{\"i\":{},\"master_ticks\":{},\"guest_ms\":{},\"display\":\"{}\",\
-             \"video_mode\":{},\"hash\":\"{:016x}\",\"changed\":{},\"ppm\":{},\"text_glyphs\":{}}}",
+             \"video_mode\":{},\"presented\":{},\"hash\":{},\"changed\":{},\"ppm\":{},\
+             \"text_glyphs\":{}}}",
             self.samples,
             master_ticks,
             master_ticks.saturating_mul(1000) / MASTER_CLOCK_HZ,
@@ -91,7 +108,11 @@ impl ScreenDumper {
                 Some(mode) => format!("\"{}\"", mode_name(mode)),
                 None => "null".to_string(),
             },
-            hash,
+            frame.is_some(),
+            match hash {
+                Some(hash) => format!("\"{hash:016x}\""),
+                None => "null".to_string(),
+            },
             changed,
             if changed {
                 format!("\"{name}\"")
@@ -110,6 +131,14 @@ impl ScreenDumper {
 
     pub fn finish(mut self) {
         let _ = self.index.flush();
+        if self.unpresented != 0 {
+            // Say it once, on the run's stdout, so a sweep that starts seeing a
+            // lot of these has the number without re-reading every index.
+            eprintln!(
+                "screen-dump: {} of {} samples had no completed frame",
+                self.unpresented, self.samples
+            );
+        }
     }
 }
 

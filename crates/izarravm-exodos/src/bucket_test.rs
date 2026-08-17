@@ -817,7 +817,8 @@ fn screen(index: u64, hash: &str, mode: Option<&str>) -> Screen {
         guest_ms: index * 5_000,
         display: "vga".to_string(),
         video_mode: mode.map(str::to_string),
-        hash: hash.to_string(),
+        presented: true,
+        hash: Some(hash.to_string()),
         changed: false,
         ppm: None,
         text_glyphs: None,
@@ -975,7 +976,7 @@ fn a_margo_display_is_flagged_no_mode_line() {
         .map(|index| Screen {
             master_ticks: end - index * DOOM_HZ,
             display: "margo".to_string(),
-            hash: format!("h{index}"),
+            hash: Some(format!("h{index}")),
             ..screen(index, "unused", None)
         })
         .collect();
@@ -1560,7 +1561,7 @@ fn boot_banner_entries_count_arrivals_at_the_boot_screen_not_samples_of_it() {
             .iter()
             .enumerate()
             .map(|(index, present)| Screen {
-                hash: banner(*present),
+                hash: Some(banner(*present)),
                 ..screen(index as u64, "unused", Some("text"))
             })
             .collect()
@@ -1599,7 +1600,7 @@ fn two_arrivals_at_the_boot_banner_are_a_reboot_loop() {
         .iter()
         .enumerate()
         .map(|(index, boot)| Screen {
-            hash: if *boot { "boot" } else { "game" }.to_string(),
+            hash: Some(if *boot { "boot" } else { "game" }.to_string()),
             ..screen(index as u64, "unused", Some("text"))
         })
         .collect();
@@ -1706,7 +1707,7 @@ fn frame_classes_never_chain_two_far_apart_pictures() {
         .iter()
         .enumerate()
         .map(|(index, hash)| Screen {
-            hash: hash.to_string(),
+            hash: Some(hash.to_string()),
             ..screen(index as u64, "unused", Some("text"))
         })
         .collect();
@@ -1720,7 +1721,7 @@ fn frame_classes_never_chain_two_far_apart_pictures() {
 fn identical_hashes_are_one_picture_without_any_pixel_evidence() {
     let screens: Vec<Screen> = (0..4)
         .map(|index| Screen {
-            hash: "same".to_string(),
+            hash: Some("same".to_string()),
             ..screen(index, "unused", Some("text"))
         })
         .collect();
@@ -1744,7 +1745,7 @@ fn a_blinking_cursor_at_a_dos_prompt_is_idle_text_not_a_bucketable_row() {
     let screens: Vec<Screen> = (0..4)
         .map(|index| Screen {
             master_ticks: end - index * DOOM_HZ,
-            hash: if index % 2 == 0 { "on" } else { "off" }.to_string(),
+            hash: Some(if index % 2 == 0 { "on" } else { "off" }.to_string()),
             ..screen(index, "unused", Some("text"))
         })
         .collect();
@@ -1790,7 +1791,7 @@ fn idle_blind_now_names_a_blank_picture() {
     let screens: Vec<Screen> = (0..4)
         .map(|index| Screen {
             master_ticks: end - index * DOOM_HZ,
-            hash: "black".to_string(),
+            hash: Some("black".to_string()),
             ..screen(index, "unused", Some("text"))
         })
         .collect();
@@ -1834,6 +1835,120 @@ fn blankness_is_one_colour_across_the_whole_frame() {
     assert!(!painted.blank());
 }
 
+// -- samples with no frame at all -------------------------------------------
+
+/// The dumper emits a sample whose frame is absent when the guest has not
+/// completed one: before the first raster, and for up to a frame period after
+/// every mode set. Such a line carries `"presented": false` and a null hash.
+///
+/// It is NOT an observation of a blank screen; it is the absence of an
+/// observation. Before the dumper was fixed it wrote a one-pixel black image
+/// instead, and 30 of the archive's frames are that image.
+#[test]
+fn a_sample_with_no_frame_is_not_an_observation() {
+    let line = r#"{"i":3,"master_ticks":100,"guest_ms":1,"display":"vga",
+        "video_mode":"text","presented":false,"hash":null,"changed":false,
+        "ppm":null,"text_glyphs":null}"#;
+    let sample: Screen = serde_json::from_str(&line.replace('\n', "")).expect("parses");
+    assert!(!sample.presented);
+    assert_eq!(sample.frame_hash(), None);
+
+    // And an archive written before the field existed reads as an observation,
+    // because every line it wrote had a frame behind it.
+    let old = r#"{"i":0,"master_ticks":1,"guest_ms":0,"display":"vga",
+        "video_mode":"text","hash":"abc","changed":true,"ppm":"0000.ppm",
+        "text_glyphs":12}"#;
+    let sample: Screen = serde_json::from_str(&old.replace('\n', "")).expect("parses");
+    assert!(sample.presented);
+    assert_eq!(sample.frame_hash(), Some("abc"));
+}
+
+fn unobserved(index: u64) -> Screen {
+    Screen {
+        presented: false,
+        hash: None,
+        ..screen(index, "unused", Some("text"))
+    }
+}
+
+/// A gap in the samples must not break a run of banner samples into two
+/// arrivals. A reboot loop is two BOOTS, and a sample the dumper could not take
+/// is not a departure from the boot screen.
+#[test]
+fn a_sample_with_no_frame_does_not_manufacture_a_boot_arrival() {
+    let facts = FrameFacts {
+        banner: [("boot".to_string(), true)].into_iter().collect(),
+        ..FrameFacts::default()
+    };
+    let banner = |index: u64| Screen {
+        hash: Some("boot".to_string()),
+        ..screen(index, "unused", Some("text"))
+    };
+    let screens = vec![
+        banner(0),
+        unobserved(1),
+        banner(2),
+        unobserved(3),
+        banner(4),
+    ];
+    assert_eq!(
+        boot_banner_entries(&screens, &facts),
+        1,
+        "one boot, sampled across two gaps"
+    );
+    assert_eq!(
+        decide_outcome(
+            Some(&ran_profile(31)),
+            &screens,
+            &facts,
+            HostVerdict::default()
+        ),
+        Outcome::IdleText,
+        "and it is certainly not a reboot loop"
+    );
+}
+
+/// Nor can a gap count as a picture, in either direction: it must not add a
+/// distinct picture to a flat window, and it must not fill the three samples
+/// flatness needs.
+#[test]
+fn a_sample_with_no_frame_counts_as_neither_a_picture_nor_a_sample() {
+    let profile = ran_profile(31);
+    let end = profile.master_ticks;
+    let at = |index: u64, sample: Screen| Screen {
+        master_ticks: end - index * DOOM_HZ,
+        ..sample
+    };
+    let still = |index: u64| Screen {
+        hash: Some("same".to_string()),
+        ..screen(index, "unused", Some("text"))
+    };
+
+    // Three real samples of one picture, with two gaps mixed in: still flat.
+    let screens: Vec<Screen> = vec![
+        at(0, still(0)),
+        at(1, unobserved(1)),
+        at(2, still(2)),
+        at(3, unobserved(3)),
+        at(4, still(4)),
+    ];
+    let picture = screen_window(&screens, &profile, &FrameFacts::default());
+    assert_eq!(picture.samples_in_window, 3, "gaps are not samples");
+    assert_eq!(picture.distinct_pictures_in_window, 1);
+    assert!(picture.flat);
+
+    // Two real samples and two gaps: not enough to assert flatness.
+    let thin: Vec<Screen> = vec![
+        at(0, still(0)),
+        at(1, unobserved(1)),
+        at(2, still(2)),
+        at(3, unobserved(3)),
+    ];
+    let picture = screen_window(&thin, &profile, &FrameFacts::default());
+    assert_eq!(picture.samples_in_window, 2);
+    assert!(!picture.flat);
+}
+
 /// A row whose frames could not be read says so rather than guessing. Without
 /// pixels the delta is unknown, so no pair collapses and the row keeps its v1
 /// hash-count behaviour.
@@ -1844,7 +1959,7 @@ fn unreadable_frames_are_flagged_and_never_collapsed() {
     let screens: Vec<Screen> = (0..4)
         .map(|index| Screen {
             master_ticks: end - index * DOOM_HZ,
-            hash: if index % 2 == 0 { "on" } else { "off" }.to_string(),
+            hash: Some(if index % 2 == 0 { "on" } else { "off" }.to_string()),
             ..screen(index, "unused", Some("text"))
         })
         .collect();

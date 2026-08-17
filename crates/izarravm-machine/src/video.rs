@@ -2412,8 +2412,14 @@ impl Machine {
     }
 
     /// The most recently completed display frame, cropped exactly as the GUI
-    /// presents it and converted to native `0x00RRGGBB` words.
-    pub fn presented_frame_argb(&self) -> (Vec<u32>, usize, usize) {
+    /// presents it and converted to native `0x00RRGGBB` words, or `None` when no
+    /// frame has completed yet.
+    ///
+    /// `None` happens before the run's first raster and for up to one frame
+    /// period after every mode set. Pair it with
+    /// [`Self::presented_frame_generation`], which has always returned `None` in
+    /// the same situations.
+    pub fn presented_frame_argb(&self) -> Option<(Vec<u32>, usize, usize)> {
         let start = self.host_profile.start();
         let frame = self.vega.presented_frame_argb();
         self.host_profile

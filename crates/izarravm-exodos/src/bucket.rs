@@ -305,7 +305,7 @@ pub struct Profile {
 }
 
 /// One screen sample from `screens/screens.jsonl`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Screen {
     pub i: u64,
@@ -313,12 +313,49 @@ pub struct Screen {
     pub guest_ms: u64,
     pub display: String,
     pub video_mode: Option<String>,
-    pub hash: String,
+    /// Whether the guest had completed a frame when the sample was taken.
+    ///
+    /// False means the dumper found no frame at all: the run had not drawn its
+    /// first raster, or a mode set had just dropped the last one. Such a sample
+    /// is the ABSENCE of an observation, not an observation of a blank screen,
+    /// and every rule here skips it. Defaults to true so an archive written
+    /// before the field existed still reads correctly — every line it wrote had
+    /// a frame behind it, because the dumper substituted a one-pixel image
+    /// rather than admitting there was none.
+    pub presented: bool,
+    pub hash: Option<String>,
     pub changed: bool,
     /// The PPM file beside the index, present only when the hash moved. A sample
     /// with no file shows the same picture as the last one that had one.
     pub ppm: Option<String>,
     pub text_glyphs: Option<u64>,
+}
+
+impl Default for Screen {
+    fn default() -> Self {
+        Screen {
+            i: 0,
+            master_ticks: 0,
+            guest_ms: 0,
+            display: String::new(),
+            video_mode: None,
+            presented: true,
+            hash: None,
+            changed: false,
+            ppm: None,
+            text_glyphs: None,
+        }
+    }
+}
+
+impl Screen {
+    /// The frame this sample observed, or `None` when it observed none.
+    pub fn frame_hash(&self) -> Option<&str> {
+        if !self.presented {
+            return None;
+        }
+        self.hash.as_deref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,11 +545,13 @@ impl FrameFacts {
 /// when it is the same picture as every member. Transitive closure would let a
 /// slow pan across thirteen samples collapse into "the picture never changed",
 /// one small step at a time.
+/// One class index per OBSERVED sample, in sample order. A sample that observed
+/// no frame contributes nothing: it is a gap in the record, not a picture.
 pub fn frame_classes(screens: &[Screen], facts: &FrameFacts) -> Vec<usize> {
     let mut order: Vec<&str> = Vec::new();
-    for sample in screens {
-        if !order.contains(&sample.hash.as_str()) {
-            order.push(sample.hash.as_str());
+    for hash in screens.iter().filter_map(Screen::frame_hash) {
+        if !order.contains(&hash) {
+            order.push(hash);
         }
     }
     let mut classes: Vec<Vec<&str>> = Vec::new();
@@ -537,7 +576,8 @@ pub fn frame_classes(screens: &[Screen], facts: &FrameFacts) -> Vec<usize> {
     }
     screens
         .iter()
-        .map(|sample| class_of[sample.hash.as_str()])
+        .filter_map(Screen::frame_hash)
+        .map(|hash| class_of[hash])
         .collect()
 }
 
@@ -559,11 +599,15 @@ pub fn distinct_count(classes: &[usize]) -> usize {
 /// boot screen, so a run parked at the DOS prompt carries it in EVERY sample and
 /// scores ONE arrival, not many; `billted` and `rogclon`, two of the eight v1
 /// false positives, are exactly that shape.
+/// A sample that observed no frame is SKIPPED rather than read as "no banner":
+/// a gap in the record is not a departure from the boot screen, and treating it
+/// as one would split a single boot into two arrivals and manufacture the very
+/// verdict this rule exists to stop inventing.
 pub fn boot_banner_entries(screens: &[Screen], facts: &FrameFacts) -> u32 {
     let mut entries = 0;
     let mut previous = false;
-    for sample in screens {
-        let present = facts.banner.get(&sample.hash).copied().unwrap_or(false);
+    for hash in screens.iter().filter_map(Screen::frame_hash) {
+        let present = facts.banner.get(hash).copied().unwrap_or(false);
         if present && !previous {
             entries += 1;
         }
@@ -734,14 +778,15 @@ impl Outcome {
 
 /// Count returns to the opening frame — the merged reboot detector.
 pub fn screen_recurrences(screens: &[Screen]) -> u32 {
-    if screens.len() < 3 {
+    let observed: Vec<&str> = screens.iter().filter_map(Screen::frame_hash).collect();
+    if observed.len() < 3 {
         return 0;
     }
-    let first = &screens[0].hash;
+    let first = observed[0];
     let mut returns = 0;
     let mut left = false;
-    for sample in screens {
-        if &sample.hash != first {
+    for hash in observed {
+        if hash != first {
             left = true;
         } else if left {
             returns += 1;
@@ -791,16 +836,18 @@ pub fn screen_window(screens: &[Screen], profile: &Profile, facts: &FrameFacts) 
         .max(profile.master_ticks);
     let span = (WINDOW_GUEST_SECONDS * hz) as u64;
     let low = end.saturating_sub(span);
-    // Classes are computed over the WHOLE index so a class index means the same
-    // thing throughout the run, then counted inside the window.
+    // Classes are computed over the whole index so a class index means the same
+    // thing throughout the run, then counted inside the window. Both series skip
+    // samples that observed no frame, so their positions line up.
     let classes = frame_classes(screens, facts);
     let inside: Vec<(usize, &Screen)> = screens
         .iter()
+        .filter(|s| s.frame_hash().is_some())
         .enumerate()
         .filter(|(_, s)| s.master_ticks >= low)
         .collect();
     out.samples_in_window = inside.len();
-    let mut hashes: Vec<&str> = inside.iter().map(|(_, s)| s.hash.as_str()).collect();
+    let mut hashes: Vec<&str> = inside.iter().filter_map(|(_, s)| s.frame_hash()).collect();
     hashes.sort_unstable();
     hashes.dedup();
     out.distinct_in_window = hashes.len();
@@ -809,7 +856,11 @@ pub fn screen_window(screens: &[Screen], profile: &Profile, facts: &FrameFacts) 
     if let Some((_, last)) = inside.last() {
         out.video_mode = last.video_mode.clone();
         out.display = last.display.clone();
-        out.blank = facts.blank.get(&last.hash).copied().unwrap_or(false);
+        out.blank = last
+            .frame_hash()
+            .and_then(|hash| facts.blank.get(hash))
+            .copied()
+            .unwrap_or(false);
     }
     out.flat = out.samples_in_window >= IDLE_MIN_WINDOW_SAMPLES
         && out.distinct_pictures_in_window <= IDLE_MAX_WINDOW_DISTINCT
@@ -1512,13 +1563,17 @@ fn frame_sources(screens: &[Screen], profile: &Profile) -> (BTreeMap<String, Str
         if let Some(name) = &sample.ppm {
             carried = Some(name.as_str());
         }
+        let Some(hash) = sample.frame_hash() else {
+            // No frame, so no picture to carry forward and nothing to compare.
+            continue;
+        };
         if let Some(name) = carried {
             sources
-                .entry(sample.hash.clone())
+                .entry(hash.to_string())
                 .or_insert_with(|| name.to_string());
         }
-        if sample.master_ticks >= low && !compare.contains(&sample.hash) {
-            compare.push(sample.hash.clone());
+        if sample.master_ticks >= low && !compare.iter().any(|seen| seen == hash) {
+            compare.push(hash.to_string());
         }
     }
     (sources, compare)
@@ -1566,20 +1621,20 @@ pub fn read_frames(
     let (sources, compare) = frame_sources(screens, profile.unwrap_or(&blank_profile));
     let mut images: BTreeMap<String, FrameImage> = BTreeMap::new();
     let mut unreadable: BTreeSet<String> = BTreeSet::new();
-    for sample in screens {
-        if images.contains_key(&sample.hash) || unreadable.contains(&sample.hash) {
+    for hash in screens.iter().filter_map(Screen::frame_hash) {
+        if images.contains_key(hash) || unreadable.contains(hash) {
             continue;
         }
         let decoded = sources
-            .get(&sample.hash)
+            .get(hash)
             .and_then(|name| std::fs::read(screens_dir.join(name)).ok())
             .and_then(|bytes| read_ppm(&bytes));
         match decoded.filter(FrameImage::usable) {
             Some(image) => {
-                images.insert(sample.hash.clone(), image);
+                images.insert(hash.to_string(), image);
             }
             None => {
-                unreadable.insert(sample.hash.clone());
+                unreadable.insert(hash.to_string());
             }
         }
     }

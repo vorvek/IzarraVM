@@ -1435,7 +1435,13 @@ fn run_worker(
         let backpressured = seq != published_seq && consumed_seq != published_seq;
         let new_frame =
             should_publish_frame(seq, published_seq, consumed_seq, frame_gen, last_frame_gen);
-        let rendered = new_frame.then(|| generation.machine.presented_frame_argb());
+        // `presented_frame_argb` is empty for up to a frame period after every
+        // mode set. Publishing then would put a frame nobody drew on the screen
+        // -- before this was an Option it was a single black pixel, which the
+        // window stretched to full size -- so the publication waits instead.
+        let rendered = new_frame
+            .then(|| generation.machine.presented_frame_argb())
+            .flatten();
         let frame_produced = rendered.is_some();
         let serial = new_frame.then(|| generation.machine.serial_text());
         let mode = generation.machine.active_mode();

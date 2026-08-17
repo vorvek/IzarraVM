@@ -331,14 +331,28 @@ function Test-StderrIsBenign {
     return ,$offending
 }
 
+# Samples that actually saw a frame. A sample taken before the guest completed
+# its first raster, or inside the frame-long window a mode set opens, carries
+# `presented=false` and a null hash: it is a gap in the record, not a picture.
+# Counting one as a picture would invent both a recurrence and a distinct frame.
+# An archive written before the field existed has no `presented` key and every
+# line of it saw a frame, so a missing key reads as true.
+function Select-ObservedScreens {
+    param($Screens)
+    return ,@($Screens | Where-Object {
+        $_.hash -and ($null -eq $_.presented -or $_.presented)
+    })
+}
+
 # Count returns to the opening frame. See the reboot note above.
 function Measure-ScreenRecurrence {
     param($Screens)
-    if ($Screens.Count -lt 3) { return 0 }
-    $first = $Screens[0].hash
+    $observed = Select-ObservedScreens -Screens $Screens
+    if ($observed.Count -lt 3) { return 0 }
+    $first = $observed[0].hash
     $returns = 0
     $left = $false
-    foreach ($sample in $Screens) {
+    foreach ($sample in $observed) {
         if ($sample.hash -ne $first) { $left = $true; continue }
         if ($left) { $returns++; $left = $false }
     }
@@ -374,8 +388,9 @@ function Get-Outcome {
     # The screen index answers the question no counter does: did the picture
     # ever change. A run whose last two thirds of samples share one hash is
     # parked, however busy its counters look.
-    if ($Screens.Count -ge 6) {
-        $tail = @($Screens[[int]($Screens.Count / 3)..($Screens.Count - 1)])
+    $observed = Select-ObservedScreens -Screens $Screens
+    if ($observed.Count -ge 6) {
+        $tail = @($observed[[int]($observed.Count / 3)..($observed.Count - 1)])
         $distinct = @($tail | Select-Object -ExpandProperty hash -Unique).Count
         if ($distinct -le 1) {
             $mode = $tail[-1].video_mode
