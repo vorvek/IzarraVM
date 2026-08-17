@@ -2460,6 +2460,75 @@ fn int13_hdd_write_long_reads_a_non_identity_mapped_caller_buffer() {
     );
 }
 
+/// INT 13h AH=48h, the EDD result buffer at DS:SI. A caller that asks for the
+/// disk's geometry before it issues an AH=42h has the same buffer placement
+/// problem as the transfer that follows.
+#[test]
+fn int13_edd_drive_parameters_land_in_a_non_identity_mapped_caller_buffer() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    poison_straddle_frames(&mut m);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x4800);
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0),
+        26,
+        "the buffer size must follow the first page's mapping"
+    );
+    // Byte 16 of the result is the low byte of the total-sector qword, and the
+    // straddle puts it at the start of the second frame.
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_HIGH),
+        64,
+        "the total-sector count must follow the second page's mapping"
+    );
+}
+
+/// INT 13h AH=48h on the El Torito CD unit. Its result buffer is read for the
+/// caller's requested size before it is written, so both directions have to
+/// address the caller's pages.
+#[test]
+fn int13_cd_drive_parameters_land_in_a_non_identity_mapped_caller_buffer() {
+    let mut m = int15_machine(16);
+    m.mount_cd(CdImage::from_iso(vec![0u8; 4 * cdimage::DATA_SECTOR]).unwrap());
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    poison_straddle_frames(&mut m);
+    // The caller's requested buffer size, planted through the mapping. A
+    // handler that reads it physically sees the unbacked hole's 0xFFFF.
+    m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0, 26);
+    m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff1, 0);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x4800);
+    m.cpu.registers.set_edx(0x00E0);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0xff2),
+        0x04,
+        "the removable flag must follow the first page's mapping"
+    );
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_HIGH),
+        4,
+        "the total-sector count must follow the second page's mapping"
+    );
+}
+
 // --- short transfers into and out of a partly unmapped caller buffer --------
 //
 // A caller buffer whose pages are not all present is the case the transferred

@@ -1199,18 +1199,22 @@ impl Machine {
         self.int13_class_result(ELTORITO_CD_DRIVE, status);
     }
 
+    /// El Torito AH=48h drive parameters. DS:SI is a guest LINEAR address in
+    /// both directions: the caller's requested buffer size is read back out of
+    /// it before the result is deposited.
     fn int13_cd_parameters(&mut self) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
         let dst = ds + u32::from(si);
-        let requested = self.read_guest_word(dst).max(2) as usize;
+        let size = self.read_guest_linear_block(dst, 2);
+        let requested = u16::from_le_bytes([size[0], size[1]]).max(2) as usize;
         let total = u64::from(self.ide.device().image().unwrap().total_sectors());
         let mut out = [0u8; 26];
         out[0..2].copy_from_slice(&26u16.to_le_bytes());
         out[2..4].copy_from_slice(&0x0004u16.to_le_bytes()); // removable
         out[16..24].copy_from_slice(&total.to_le_bytes());
         out[24..26].copy_from_slice(&(cdimage::DATA_SECTOR as u16).to_le_bytes());
-        self.write_guest_block(dst, &out[..requested.min(out.len())]);
+        self.write_guest_linear_block(dst, &out[..requested.min(out.len())]);
         self.int13_class_result(ELTORITO_CD_DRIVE, 0);
     }
 
@@ -2228,6 +2232,9 @@ impl Machine {
     /// EDD AH=48h get extended drive parameters. The result buffer at DS:SI takes
     /// the EDD 1.x layout: word 0 = buffer size, word 2 = info flags, dwords for
     /// the CHS geometry, qword 16 = total sectors, word 24 = bytes per sector.
+    ///
+    /// DS:SI is a guest LINEAR address, the same as the transfer packet a caller
+    /// sends next; see `int13_edd_transfer`.
     fn int13_edd_drive_params(&mut self) {
         let Some(disk) = self.ata.as_ref() else {
             self.set_eax_ah(0x01);
@@ -2251,7 +2258,7 @@ impl Machine {
         buf[12..16].copy_from_slice(&spt.to_le_bytes()); // sectors per track
         buf[16..24].copy_from_slice(&total.to_le_bytes()); // total sectors (qword)
         buf[24..26].copy_from_slice(&(ata::SECTOR as u16).to_le_bytes()); // bytes/sector
-        self.write_guest_block(dst, &buf);
+        self.write_guest_linear_block(dst, &buf);
         self.set_eax_ah(0x00);
         self.set_fixed_disk_status(0x00);
         self.set_int_frame_carry(false);
