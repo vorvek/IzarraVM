@@ -2081,6 +2081,59 @@ fn int13_edd_transfer_uses_the_non_identity_mapped_packet_and_buffer() {
     );
 }
 
+/// The packet's block-count rewrite, on a packet that straddles the page
+/// boundary with the count field split across the two frames. The planted
+/// count is 4 and the LBA is out of range, so the handler must rewrite the
+/// count to 0 THROUGH THE MAPPING: byte dap+2 in the low frame's last byte,
+/// byte dap+3 in the high frame's first. A rewrite through the physical
+/// address leaves the planted 4 in the mapped frame, which is exactly the
+/// vacuity the first version of this suite had -- the success-path fixtures
+/// rewrote the same value the test planted.
+#[test]
+fn int13_edd_short_transfer_rewrites_the_straddling_packet_count() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+
+    // DAP at DS:SI = C8C6:039D -> guest linear C8FFDh: bytes +0..+2 end the
+    // low page, +3.. start the high page. Write the packet through the
+    // mapped frames, not the identity addresses.
+    let low = super::margo::UMB_FRAME_LOW;
+    let high = super::margo::UMB_FRAME_HIGH;
+    m.write_physical_u8(low + 0xffd, 16); // packet size
+    m.write_physical_u8(low + 0xffe, 0); // reserved
+    m.write_physical_u8(low + 0xfff, 4); // block count, low byte
+    m.write_physical_u8(high, 0); // block count, high byte
+    m.write_physical_u8(high + 1, 0x00); // buffer offset 0200h
+    m.write_physical_u8(high + 2, 0x02);
+    m.write_physical_u8(high + 3, 0xc6); // buffer segment C8C6h
+    m.write_physical_u8(high + 4, 0xc8);
+    for i in 0..8 {
+        // LBA far past the 64-sector disk, so the transfer shortens to 0.
+        m.write_physical_u8(high + 5 + i, if i < 2 { 0xff } else { 0 });
+    }
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0x39d);
+    m.cpu.registers.set_eax(0x4200);
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_ne!(dos_int_flags(&m) & 1, 0, "an out-of-range LBA must fail");
+    assert_eq!(
+        m.read_physical_u8(low + 0xfff),
+        0,
+        "the count's low byte must be rewritten through the low frame"
+    );
+    assert_eq!(
+        m.read_physical_u8(high),
+        0,
+        "the count's high byte must be rewritten through the high frame"
+    );
+}
+
 /// El Torito AH=02h reads the emulated floppy into ES:BX.
 #[test]
 fn el_torito_emulated_read_lands_in_a_non_identity_mapped_caller_buffer() {
