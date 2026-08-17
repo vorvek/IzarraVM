@@ -1104,6 +1104,108 @@ fn icdex_send_request_read_long_loads_a_sector() {
     assert_ne!(status & 0x0100, 0, "done bit set");
 }
 
+/// A data ISO whose LBA 2 is marked at byte 0 and at byte 0x200, so a 2048-byte
+/// transfer can be checked on both sides of a page boundary 0x200 bytes in.
+fn marked_data_cd() -> CdImage {
+    let mut bytes = vec![0u8; 8 * cdimage::DATA_SECTOR];
+    bytes[2 * cdimage::DATA_SECTOR] = 0x99;
+    bytes[2 * cdimage::DATA_SECTOR + 0x200] = 0x9a;
+    bytes[3 * cdimage::DATA_SECTOR] = 0x9b;
+    CdImage::from_iso(bytes).unwrap()
+}
+
+/// Plant a READ LONG (0x80) device-driver request at guest linear `header`,
+/// through the caller's own mapping.
+fn plant_read_long_request(machine: &mut Machine, header: u32, xfer: u32, lba: u32, count: u16) {
+    let mut request = [0u8; 0x18];
+    request[2] = 0x80; // READ LONG
+    request[0x0D] = 0x00; // HSG addressing
+    request[0x0E..0x12].copy_from_slice(&xfer.to_le_bytes());
+    request[0x12..0x14].copy_from_slice(&count.to_le_bytes());
+    request[0x14..0x18].copy_from_slice(&lba.to_le_bytes());
+    machine.write_guest_linear_block(header, &request);
+}
+
+/// AX=1510h sends a CD-ROM device-driver request whose header is at ES:BX and
+/// whose transfer address is a field INSIDE that header. Both were read and
+/// written as physical addresses: the header fields, the sector data, and the
+/// status word the caller polls.
+#[test]
+fn icdex_device_request_uses_the_non_identity_mapped_header_and_buffer() {
+    let mut machine = test_machine();
+    machine.mount_cd(marked_data_cd());
+    super::margo::install_umb_paging(&mut machine);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+
+    // Header at guest linear C8C60h, transfer buffer at C8E00h: the 2048-byte
+    // sector runs 0x200 bytes into the first page and the rest into the second.
+    plant_read_long_request(&mut machine, 0x000c_8c60, 0x000c_8e00, 2, 1);
+
+    machine.cpu.registers.set_eax(0x1510);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+    assert!(machine.handle_int2f());
+
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e00),
+        0x99,
+        "the head of the sector must follow the first page's mapping"
+    );
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_FRAME_HIGH),
+        0x9a,
+        "the tail of the sector must follow the second page's mapping"
+    );
+    let status = u16::from_le_bytes([
+        machine.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL + 3),
+        machine.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL + 4),
+    ]);
+    assert_eq!(status & 0x8000, 0, "no error bit");
+    assert_ne!(status & 0x0100, 0, "done bit, written through the mapping");
+}
+
+/// The request header's count field is what a driver returns the transferred
+/// count in, so it owes the caller the same truth the EDD packet does.
+#[test]
+fn icdex_device_request_counts_only_the_sectors_that_reached_the_caller() {
+    let mut machine = test_machine();
+    machine.mount_cd(marked_data_cd());
+    super::margo::install_umb_paging(&mut machine);
+    super::margo::unmap_guest_page(&mut machine, 0xc9);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+
+    // Two sectors from C8800h: the first ends exactly on the C9000h boundary
+    // and the second falls entirely in the page this fixture unmaps.
+    plant_read_long_request(&mut machine, 0x000c_8c60, 0x000c_8800, 2, 2);
+
+    machine.cpu.registers.set_eax(0x1510);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+    assert!(machine.handle_int2f());
+
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x800),
+        0x99,
+        "the one reachable sector must still be delivered"
+    );
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL + 0x12),
+        1,
+        "the header must report the sectors that LANDED"
+    );
+    let status = u16::from_le_bytes([
+        machine.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL + 3),
+        machine.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL + 4),
+    ]);
+    assert_ne!(status & 0x8000, 0, "a short transfer is an error");
+}
+
 #[test]
 fn atapi_read10_on_a_folder_mount_returns_a_known_files_bytes() {
     // Mount a small host folder as a CD (the ISO9660 metadata is

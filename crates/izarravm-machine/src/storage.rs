@@ -6,6 +6,15 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
+/// Header bytes a CD-ROM device driver request occupies, through the last field
+/// any supported command reads (the READ LONG starting sector at offset 0x14).
+const DRIVER_REQUEST_BYTES: usize = 0x18;
+
+/// One little-endian dword out of a device-driver request header.
+fn driver_dword(request: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(request[at..at + 4].try_into().expect("four bytes"))
+}
+
 /// INT 13h status 09h, "data boundary error": the transfer could not be carried
 /// out across the whole of the caller's buffer. On real hardware that is a DMA
 /// segment crossing; here it is a page the caller's own tables do not map, which
@@ -743,19 +752,27 @@ impl Machine {
     /// transfer address and the status word back into the header. Supports the
     /// CD commands a game uses: READ LONG (0x80), SEEK (0x83), PLAY AUDIO (0x84),
     /// STOP (0x85), RESUME (0x88), and IOCTL INPUT (0x03) device-status queries.
+    ///
+    /// `header` is a guest LINEAR address, and so is the transfer address held
+    /// in the header: a request header reaches this from a caller's ES:BX, and
+    /// the buffer it names belongs to that same caller. The header is taken in
+    /// one page-split read so a request that straddles a page boundary is
+    /// decoded from the caller's bytes on both sides of it.
     pub(super) fn icdex_device_request(&mut self, header: u32) {
-        let command = self.read_physical_u8(header + 2);
+        let request = self.read_guest_linear_block(header, DRIVER_REQUEST_BYTES);
+        let command = request[2];
         // Status word at offset 3: bit 8 = done, bit 15 = error, low byte = code.
         let mut status: u16 = 0x0100; // done
         match command {
             // READ LONG: read `count` sectors starting at the given sector into
             // the transfer address. Addressing mode 0 = HSG (LBA), 1 = Red Book.
             0x80 => {
-                let addr_mode = self.read_physical_u8(header + 0x0D);
-                let xfer = self.read_guest_dword(header + 0x0E);
-                let count = self.read_guest_word(header + 0x12);
-                let start = self.read_guest_dword(header + 0x14);
+                let addr_mode = request[0x0D];
+                let xfer = driver_dword(&request, 0x0E);
+                let count = u16::from_le_bytes([request[0x12], request[0x13]]);
+                let start = driver_dword(&request, 0x14);
                 let lba = self.driver_addr_to_lba(addr_mode, start);
+                let mut done = 0u16;
                 let mut ok = true;
                 for i in 0..u32::from(count) {
                     match self
@@ -765,18 +782,24 @@ impl Machine {
                         .and_then(|img| img.read_data_sector(lba + i))
                     {
                         Some(sector) => {
-                            self.write_guest_block(
-                                xfer.wrapping_add(i * cdimage::DATA_SECTOR as u32),
-                                &sector,
-                            );
+                            let at = xfer.wrapping_add(i * cdimage::DATA_SECTOR as u32);
+                            if self.write_guest_linear_block(at, &sector) < sector.len() {
+                                ok = false;
+                                break;
+                            }
                         }
                         None => {
                             ok = false;
                             break;
                         }
                     }
+                    done += 1;
                 }
                 self.cd_accesses += 1;
+                // The count field is where a block driver returns what it
+                // actually moved, so a short transfer has to be visible there
+                // and not only in the status word.
+                self.write_guest_linear_block(header + 0x12, &done.to_le_bytes());
                 if !ok {
                     status = 0x8000 | 0x0100 | 0x000F; // error + done, sector not found
                 }
@@ -785,9 +808,9 @@ impl Machine {
             0x83 => {}
             // PLAY AUDIO: start playback at the given sector for `count` sectors.
             0x84 => {
-                let addr_mode = self.read_physical_u8(header + 0x0D);
-                let start = self.read_guest_dword(header + 0x0E);
-                let count = self.read_guest_dword(header + 0x12);
+                let addr_mode = request[0x0D];
+                let start = driver_dword(&request, 0x0E);
+                let count = driver_dword(&request, 0x12);
                 let lba = self.driver_addr_to_lba(addr_mode, start);
                 let mut cdb = [0u8; 12];
                 cdb[0] = 0x45; // PLAY AUDIO(10)
@@ -817,7 +840,7 @@ impl Machine {
             _ => {}
         }
         // Write the status word back into the header (offset 3).
-        let _ = self.write_guest_ram_u16(header as usize + 3, status);
+        self.write_guest_linear_block(header + 3, &status.to_le_bytes());
     }
 
     /// Convert a CD device-driver address (HSG LBA when `addr_mode` == 0, packed
