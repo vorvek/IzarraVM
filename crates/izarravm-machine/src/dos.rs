@@ -734,10 +734,27 @@ impl Machine {
     ///
     /// Read a page at a time rather than byte at a time: a caller string can
     /// cross a page boundary, and one translation does not cover both sides.
+    /// The scan stops at the first terminator, so a short name costs one page
+    /// read rather than the whole bound -- and, more to the point, a name that
+    /// ends before a page the caller's tables do not map is not turned into a
+    /// walk of that page.
     fn read_guest_linear_asciiz_lossy(&mut self, linear: u32, max: usize) -> String {
-        let block = self.read_guest_linear_block(linear, max);
-        let end = block.iter().position(|&byte| byte == 0).unwrap_or(max);
-        String::from_utf8_lossy(&block[..end]).into_owned()
+        let mut bytes = Vec::new();
+        while bytes.len() < max {
+            let at = linear.wrapping_add(bytes.len() as u32);
+            let run = usize::try_from(0x1000 - (at & 0xfff))
+                .expect("a page-tail length fits usize")
+                .min(max - bytes.len());
+            let block = self.read_guest_linear_block(at, run);
+            match block.iter().position(|&byte| byte == 0) {
+                Some(end) => {
+                    bytes.extend_from_slice(&block[..end]);
+                    break;
+                }
+                None => bytes.extend_from_slice(&block),
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Mirror any console output produced since the last call onto the VGA

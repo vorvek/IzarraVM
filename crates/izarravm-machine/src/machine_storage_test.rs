@@ -2332,6 +2332,9 @@ fn int13_hdd_chs_write_reads_a_non_identity_mapped_caller_buffer() {
 
     assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
     assert_eq!(int13_read_at(&mut m, 5, 1), vec![0xc1], "head byte written");
+    // int13_read_at just read the sector back into ITS scratch buffer at
+    // 2000:0000, so byte 16 of that buffer is byte 16 of the sector. This
+    // depends on the read above having run first.
     assert_eq!(
         m.read_physical_u8(0x2_0000 + 16),
         0xc2,
@@ -2453,6 +2456,9 @@ fn int13_hdd_write_long_reads_a_non_identity_mapped_caller_buffer() {
 
     assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
     assert_eq!(int13_read_at(&mut m, 6, 1), vec![0xc1], "head byte written");
+    // int13_read_at just read the sector back into ITS scratch buffer at
+    // 2000:0000, so byte 16 of that buffer is byte 16 of the sector. This
+    // depends on the read above having run first.
     assert_eq!(
         m.read_physical_u8(0x2_0000 + 16),
         0xc2,
@@ -2494,8 +2500,8 @@ fn int13_edd_drive_parameters_land_in_a_non_identity_mapped_caller_buffer() {
 }
 
 /// INT 13h AH=48h on the El Torito CD unit. Its result buffer is read for the
-/// caller's requested size before it is written, so both directions have to
-/// address the caller's pages.
+/// caller's requested size before it is written; both directions are converted,
+/// but see the note below on which of them this fixture can actually prove.
 #[test]
 fn int13_cd_drive_parameters_land_in_a_non_identity_mapped_caller_buffer() {
     let mut m = int15_machine(16);
@@ -2503,8 +2509,11 @@ fn int13_cd_drive_parameters_land_in_a_non_identity_mapped_caller_buffer() {
     super::margo::install_umb_paging(&mut m);
     prime_dos_int_frame(&mut m);
     poison_straddle_frames(&mut m);
-    // The caller's requested buffer size, planted through the mapping. A
-    // handler that reads it physically sees the unbacked hole's 0xFFFF.
+    // The caller's requested buffer size, planted through the mapping. Only the
+    // WRITE half of this fixture discriminates: a physical read of the size
+    // sees the unbacked hole's FFFFh, which the handler clamps to the reply's
+    // own 26 bytes, so the same reply comes out either way. The size is planted
+    // here to keep the request well formed, not as a second proof.
     m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0, 26);
     m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff1, 0);
 
