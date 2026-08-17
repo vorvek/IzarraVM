@@ -72,6 +72,8 @@ pub const GPREFLCT_COM: &[u8] = include_bytes!("../roms/dos/gpreflct.com");
 pub const GPREFLCT_COM_SOURCE: &str = include_str!("../roms/dos/gpreflct.asm");
 pub const GPEMUL_COM: &[u8] = include_bytes!("../roms/dos/gpemul.com");
 pub const GPEMUL_COM_SOURCE: &str = include_str!("../roms/dos/gpemul.asm");
+pub const GPSTORM_COM: &[u8] = include_bytes!("../roms/dos/gpstorm.com");
+pub const GPSTORM_COM_SOURCE: &str = include_str!("../roms/dos/gpstorm.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const TOKACD_SYS: &[u8] = include_bytes!("../roms/dos/tokacd.sys");
@@ -305,9 +307,10 @@ pub fn sndtst_com() -> &'static [u8] {
 
 /// The IRQ5-at-IP==0 discriminator regression fixture (V86 trap tax): arms SB16
 /// auto-init DMA for a continuous IRQ5 stream, then parks on a `jmp $` at
-/// seg:0000 so those IRQ5 frames carry return-IP 0 -- the one case the vec13
-/// frame-shape check cannot decide alone. RED on the buggy slot-only monitor,
-/// GREEN on the three-layer fix.
+/// seg:0000 so those IRQ5 frames carry return-IP 0. Under the old
+/// error-code-VALUE discriminator this was the ambiguous case (opcode peek +
+/// PIC probe); the frame-ORIGIN basis decides it from the EFLAGS.VM slot at
+/// any IP, and this fixture pins that.
 pub fn irq5ip0_com() -> &'static [u8] {
     IRQ5IP0_COM
 }
@@ -384,6 +387,15 @@ pub fn gpreflct_com() -> &'static [u8] {
 /// instead of reflecting a fault. Signals 0xA5 / 0xEn.
 pub fn gpemul_com() -> &'static [u8] {
     GPEMUL_COM
+}
+
+/// The ring-0 #GP diagnostic fixture: a minimal VCPI client whose PM->V86
+/// DE0C return frame carries an EIP above 0xFFFF, so the monitor's own
+/// IRETD faults #GP(0) at ring 0 (the stage-1 G1 fault-storm iteration 0).
+/// The monitor must exit through its ring-0 #GP diagnostic (0xD3), not
+/// storm. The fixture itself signals only failure codes (0xE1/0xE2/0xE5).
+pub fn gpstorm_com() -> &'static [u8] {
+    GPSTORM_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at

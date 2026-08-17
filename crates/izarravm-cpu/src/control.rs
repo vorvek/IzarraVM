@@ -551,8 +551,25 @@ impl CpuGsw {
         self.materialize_flags();
         let saved_eflags = self.registers.eflags;
         let saved_cs = self.registers.cs().selector;
-        let saved_eip = self.registers.eip;
         let source_v86 = self.is_v86_mode();
+        // In 16-bit code -- V86, real-derived, or a 16-bit protected segment
+        // (CS.D = 0) -- the instruction pointer is the 16-bit IP at every
+        // architectural point, so real silicon can never push a frame EIP with
+        // a nonzero high word from such a source. Emulator-side EIP arithmetic
+        // can still leak one (an o32 transfer target past the limit is only
+        // caught at the NEXT fetch, with the oversize target live), and a
+        // monitor's word-sized frame writes then preserve the high half:
+        // TOKAEMM reflected such a frame until its own return IRETD #GP(0)'d
+        // at ring 0 (the stage-1 G1 storm, fed by exactly this push). Mask to
+        // the only image silicon could produce. Keyed on the SOURCE CS width
+        // -- the same predicate `wrap_16bit_sequential_run_off` uses -- so a
+        // 16-bit pmode client's monitor (DPMI16 hosts do the same word-sized
+        // frame arithmetic) is protected identically.
+        let saved_eip = if source_v86 || !self.registers.cs().default_size_32 {
+            self.registers.eip & 0xffff
+        } else {
+            self.registers.eip
+        };
         let cpl = self.current_privilege_level();
 
         // Drop V86 up front so every segment loaded from here on (the inner SS from the

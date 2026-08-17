@@ -1670,3 +1670,124 @@ fn a_fatal_fault_delivering_an_irq_reports_the_boundary_it_was_taken_at() {
     );
     assert_eq!(site.cs.selector, boundary_cs);
 }
+
+/// Stage-1 defect E7 (SpacPlum/baroll/MontyNrm): straight-line V86 code
+/// running up to the top of its 64K segment must #GP(0) at the instruction
+/// whose bytes straddle the CS limit, before that instruction executes. The
+/// 386 PRM applies the code-segment limit to instruction fetch; a V86 (or
+/// real-mode) CS always carries limit 0xFFFF, so EIP can never silently
+/// pass 0x10000. Before the fix the fetch path had no code-limit check at
+/// all: EIP kept climbing (SpacPlum's monitor frame carried 0x0001006b),
+/// and the TOKAEMM monitor's IRETD back to V86 then faulted at ring 0.
+#[test]
+fn v86_code_fetch_straddling_the_cs_limit_raises_gp0_before_executing() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0x00]);
+    // mov ax, 0x1234 (3 bytes) at CS:0xFFFE: its last byte lies past the
+    // 0xFFFF limit. Guest CS is 0x0A00, so the bytes sit at linear 0x19FFE.
+    bus.memory[0x19FFE] = 0xB8;
+    bus.memory[0x19FFF] = 0x34;
+    bus.memory[0x1A000] = 0x12;
+    enter_v86_direct(&mut cpu, 0xFFFE, 0x1000);
+    cpu.write_reg16(Reg16::Ax, 0xDEAD);
+
+    cpu.run_straight_line(&mut bus, 10_000).unwrap();
+
+    assert!(
+        !cpu.is_v86_mode(),
+        "the straddling fetch must deliver #GP(0) into the monitor; EIP ran \
+         past the limit instead (eip={:#x})",
+        cpu.registers.eip
+    );
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    assert_eq!(
+        cpu.read_reg16(Reg16::Ax),
+        0xDEAD,
+        "the straddling instruction must not execute"
+    );
+    let esp = cpu.registers.esp();
+    let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, esp + o));
+    assert_eq!(rd(0), 0, "error code");
+    assert_eq!(
+        rd(4),
+        0xFFFE,
+        "fault semantics: the frame EIP points AT the straddling instruction"
+    );
+    assert_eq!(rd(8) & 0xffff, 0x0A00, "V86 CS");
+    assert_eq!(rd(12) & FLAG_VM, FLAG_VM, "pushed EFLAGS carries VM=1");
+}
+
+/// Companion boundary case: EIP already past the limit (a wild o32 transfer
+/// can leave it there; 0x1006b is SpacPlum's own leaked value). The next
+/// instruction boundary must #GP(0) instead of fetching from beyond the
+/// segment.
+#[test]
+fn v86_code_fetch_with_eip_beyond_the_cs_limit_raises_gp0() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0x00]);
+    // A NOP at linear CS.base + 0x1006b: reachable only through the defect.
+    bus.memory[0x1A06B] = 0x90;
+    enter_v86_direct(&mut cpu, 0x1006b, 0x1000);
+
+    cpu.run_straight_line(&mut bus, 10_000).unwrap();
+
+    assert!(
+        !cpu.is_v86_mode(),
+        "a fetch at EIP {:#x} (past the 0xFFFF limit) must deliver #GP(0)",
+        0x1006b
+    );
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    let esp = cpu.registers.esp();
+    let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, esp + o));
+    assert_eq!(rd(0), 0, "error code");
+    // The stage-1 G1 storm was fed by exactly this frame: a V86 EIP with a
+    // nonzero high word. Real silicon cannot push one (V86 IP is 16-bit at
+    // every architectural point), and a monitor's word-sized frame writes
+    // (TOKAEMM reflect_vector) leave the high half in place, so its return
+    // IRETD then faults at ring 0. The pushed image must carry only the low
+    // 16 bits, whatever emulator-side arithmetic leaked into live EIP.
+    assert_eq!(
+        rd(4),
+        0x006b,
+        "the V86 frame EIP must be masked to 16 bits (got {:#x})",
+        rd(4)
+    );
+}
+
+/// The wrap half of E7 (what the fault trace actually showed: delivery at
+/// EIP exactly 0x10000): an instruction whose LAST byte sits at offset
+/// 0xFFFF is legal, and the 16-bit IP then wraps to 0 -- real-mode .COM
+/// wrap tricks depend on it, and no fault is raised. Before the fix the
+/// interpreter left the unwrapped 0x10000 in EIP and the fetch guard
+/// #GP(0)'d a legal program.
+#[test]
+fn v86_sequential_run_off_at_the_64k_boundary_wraps_ip_to_zero() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0x00]);
+    // inc ax; inc ax at 0xFFFE: the second ends exactly at the limit.
+    bus.memory[0x19FFE] = 0x40;
+    bus.memory[0x19FFF] = 0x40;
+    // The wrap target CS:0000 (linear 0xA000): mov bx,0xBEEF then a HLT,
+    // which traps to the monitor (CPL 3) and halts there.
+    bus.memory[0xA000..0xA004].copy_from_slice(&[0xbb, 0xef, 0xbe, 0xf4]);
+    enter_v86_direct(&mut cpu, 0xFFFE, 0x1000);
+    cpu.write_reg16(Reg16::Ax, 0);
+    cpu.write_reg16(Reg16::Bx, 0x1111);
+
+    for _ in 0..64 {
+        if cpu.run_straight_line(&mut bus, 10_000).unwrap().halted {
+            break;
+        }
+    }
+
+    assert_eq!(
+        cpu.read_reg16(Reg16::Ax),
+        2,
+        "both boundary instructions must execute"
+    );
+    assert_eq!(
+        cpu.read_reg16(Reg16::Bx),
+        0xBEEF,
+        "execution must continue at CS:0000 after the wrap (eip={:#x}, \
+         v86={})",
+        cpu.registers.eip,
+        cpu.is_v86_mode()
+    );
+}

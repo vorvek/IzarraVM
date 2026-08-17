@@ -5,14 +5,15 @@
 ; interrupted code's IP is EXACTLY 0. Runs in V86 under the TOKAEMM monitor
 ; (default-payload config).
 ;
-; IRQ5 shares vector 13 with #GP. The monitor's discriminator reads the frame
-; slot that holds a #GP's error code (always 0) or an IRQ frame's interrupted
-; EIP. An IRQ arriving at IP == 0 makes that slot 0 either way -- the one case
-; the frame shape cannot decide. The buggy slot-only discriminator mis-routed
-; it into the #GP path and, finding the non-sensitive byte at CS:0, hard-killed
-; the VM (the review probe; `signal32` = TestExit 144). The three-layer fix
-; peeks the CS:0 byte (non-sensitive) and falls to the cold PIC probe, which
-; finds IRQ5 in service and routes it correctly.
+; IRQ5 shares vector 13 with #GP. The monitor's OLD discriminator read the
+; frame slot that holds a #GP's error code (always 0) or an IRQ frame's
+; interrupted EIP; an IRQ arriving at IP == 0 made that slot 0 either way,
+; and a slot-only build mis-routed it into the #GP path and hard-killed the
+; VM (`signal32` = TestExit 144). An opcode-peek + PIC-probe fallback fixed
+; it then; the current frame-ORIGIN basis (vec13_entry TEST 1, the no-error
+; frame's EFLAGS.VM bit) decides it at any IP with no peek and no probe.
+; This fixture stays as the regression pin for the historically hostile
+; IP == 0 shape.
 ;
 ; To make IP == 0 the COMMON case deterministically, we use SB16 auto-init DMA
 ; playback (NOT the one-shot DSP 0xF2): once armed, the DMA block boundary

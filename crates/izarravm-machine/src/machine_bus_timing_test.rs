@@ -669,7 +669,7 @@ fn lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accura
 #[test]
 fn ring0_monitor_port_access_does_not_set_io_touched_in_approximate_class() {
     // V86 trap tax, Part 1: a port access made by the ring-0 monitor
-    // (cpu_is_ring0_pm = true, the TOKAEMM vec13 discriminator's PIC OCW3
+    // (cpu_is_ring0_pm = true, the TOKAEMM monitor's remapped_pic_line PIC OCW3
     // probe being the motivating case) must NOT end the batch in the
     // Approximate class (486/586) -- the io_touched flag stays false on
     // both the read AND the write half of the OCW3 select-then-read idiom.
