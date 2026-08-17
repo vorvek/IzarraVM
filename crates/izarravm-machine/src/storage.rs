@@ -6,6 +6,14 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
+/// INT 13h status 09h, "data boundary error": the transfer could not be carried
+/// out across the whole of the caller's buffer. On real hardware that is a DMA
+/// segment crossing; here it is a page the caller's own tables do not map, which
+/// is the same thing from the caller's side -- the BIOS could reach part of the
+/// buffer and not the rest. Reported with the count that actually moved, never
+/// as a success and never as 04h, which claims the MEDIA was at fault.
+const BUFFER_UNREACHABLE_STATUS: u8 = 0x09;
+
 /// What the BIOS fixed-disk (INT 13h, DL>=0x80) service did, for the load-time
 /// profile. OFF unless `IZARRAVM_INT13_PROFILE=1`, and gated AT THE CALL SITE:
 /// this project has measured default-on instruments taxing paths they only meant
@@ -1063,23 +1071,33 @@ impl Machine {
                     };
                     blocks.push(bytes);
                 }
+                let mut done = count;
                 if ah == 0x02 {
                     let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                     let bx = self.cpu.registers.ebx() as u16;
                     for (index, bytes) in blocks.iter().enumerate() {
-                        self.write_guest_linear_block(
-                            es.wrapping_add(u32::from(bx))
-                                .wrapping_add(index as u32 * 512),
-                            bytes,
-                        );
+                        let at = es
+                            .wrapping_add(u32::from(bx))
+                            .wrapping_add(index as u32 * 512);
+                        if self.write_guest_linear_block(at, bytes) < bytes.len() {
+                            done = index as u8;
+                            break;
+                        }
                     }
                 }
                 self.cd_accesses += 1;
                 self.stall_for_master_ticks(
-                    ide::sector_transfer_ticks() * u64::from(count).div_ceil(4),
+                    ide::sector_transfer_ticks() * u64::from(done).div_ceil(4),
                 );
-                self.set_eax_al(count);
-                self.int13_class_result(drive, 0);
+                self.set_eax_al(done);
+                self.int13_class_result(
+                    drive,
+                    if done == count {
+                        0
+                    } else {
+                        BUFFER_UNREACHABLE_STATUS
+                    },
+                );
             }
             0x03 | 0x05 => self.int13_class_result(drive, 0x03),
             0x08 => {
@@ -1159,19 +1177,26 @@ impl Machine {
                     .unwrap(),
             );
         }
+        let mut done = count;
         if ah == 0x42 {
             let dst = (u32::from(seg) << 4).wrapping_add(u32::from(off));
             for (index, sector) in sectors.iter().enumerate() {
-                self.write_guest_linear_block(
-                    dst.wrapping_add(index as u32 * cdimage::DATA_SECTOR as u32),
-                    sector,
-                );
+                let at = dst.wrapping_add(index as u32 * cdimage::DATA_SECTOR as u32);
+                if self.write_guest_linear_block(at, sector) < sector.len() {
+                    done = index as u16;
+                    break;
+                }
             }
         }
-        self.set_dap_blocks(dap, count);
+        self.set_dap_blocks(dap, done);
         self.cd_accesses += 1;
-        self.stall_for_master_ticks(ide::sector_transfer_ticks() * u64::from(count));
-        self.int13_class_result(ELTORITO_CD_DRIVE, 0);
+        self.stall_for_master_ticks(ide::sector_transfer_ticks() * u64::from(done));
+        let status = if done == count {
+            0
+        } else {
+            BUFFER_UNREACHABLE_STATUS
+        };
+        self.int13_class_result(ELTORITO_CD_DRIVE, status);
     }
 
     fn int13_cd_parameters(&mut self) {
@@ -2120,6 +2145,7 @@ impl Machine {
         }
         self.c_accesses += 1;
         let mut done: u16 = 0;
+        let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
         for i in 0..count {
@@ -2130,12 +2156,24 @@ impl Machine {
                     let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
                     match data {
                         Some(bytes) => {
-                            self.write_guest_linear_block(addr, &bytes);
+                            if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                                unreachable_buffer = true;
+                                break;
+                            }
                         }
                         None => break,
                     }
                 }
                 0x43 => {
+                    // The source has to be readable in full BEFORE anything is
+                    // committed. An untranslatable page reads back as the
+                    // walker's 0xFF fill, and a sector is persistent: writing
+                    // that fill would destroy guest data on the strength of
+                    // bytes the guest never supplied.
+                    if self.linear_present_prefix(addr, 512) < 512 {
+                        unreachable_buffer = true;
+                        break;
+                    }
                     let bytes = self.read_guest_linear_block(addr, 512);
                     let wrote = self
                         .ata
@@ -2167,15 +2205,14 @@ impl Machine {
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_fixed_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            self.set_eax_ah(0x04);
-            self.set_fixed_disk_status(0x04);
-            self.set_int_frame_carry(true);
-        }
+        let status = match (done == count, unreachable_buffer) {
+            (true, _) => 0x00,
+            (false, true) => BUFFER_UNREACHABLE_STATUS,
+            (false, false) => 0x04,
+        };
+        self.set_eax_ah(status);
+        self.set_fixed_disk_status(status);
+        self.set_int_frame_carry(status != 0);
     }
 
     /// Rewrite the Disk Address Packet block-count field (offset 2) with the

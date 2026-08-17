@@ -2456,3 +2456,207 @@ fn int13_hdd_write_long_reads_a_non_identity_mapped_caller_buffer() {
         "the source bytes past the page boundary must come from the second frame"
     );
 }
+
+// --- short transfers into and out of a partly unmapped caller buffer --------
+//
+// A caller buffer whose pages are not all present is the case the transferred
+// count exists to describe. The page walk skips what it cannot translate, so
+// without a report from the walker every one of these services claimed the
+// whole transfer: a read said three blocks when one arrived, and a write took
+// the walker's 0xFF fill for the missing pages and committed it to the disk as
+// though the guest had asked for it.
+//
+// The fixture buffer is at C8C6:01A0 = guest linear C8E00h, so its first
+// 512-byte block ends exactly on the C9000h page boundary and blocks two and
+// three fall in page C9h, which these tests unmap.
+
+/// EDD AH=42h into a buffer whose second and third blocks have no translation.
+/// One block reaches the caller, so the packet must say one.
+#[test]
+fn int13_edd_read_counts_only_the_blocks_that_reached_the_caller() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    super::margo::unmap_guest_page(&mut m, 0xc9);
+    prime_dos_int_frame(&mut m);
+
+    let dap = super::margo::UMB_BUFFER_PHYSICAL;
+    m.write_physical_u8(dap, 16); // packet size
+    m.write_physical_u8(dap + 2, 3); // block count
+    m.write_physical_u8(dap + 4, 0xa0); // buffer offset 01A0h
+    m.write_physical_u8(dap + 5, 0x01);
+    m.write_physical_u8(dap + 6, 0xc6); // buffer segment C8C6h
+    m.write_physical_u8(dap + 7, 0xc8);
+    m.write_physical_u8(dap + 8, 1); // LBA 1
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0);
+    m.cpu.registers.set_eax(0x4200);
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e00),
+        0x11,
+        "the one reachable block must still be delivered"
+    );
+    assert_eq!(
+        m.read_physical_u8(dap + 2),
+        1,
+        "the packet must report the blocks that LANDED, not the blocks asked for"
+    );
+    assert_eq!(
+        (m.cpu.registers.eax() >> 8) as u8,
+        0x09,
+        "an unreachable buffer page is a data-boundary error, not a success"
+    );
+    assert_ne!(dos_int_flags(&m) & 1, 0, "a short transfer sets CF");
+}
+
+/// EDD AH=43h out of a buffer whose second and third blocks have no
+/// translation. The walker fills an untranslatable page with 0xFF; writing
+/// that to a sector destroys guest data that the caller never asked to
+/// overwrite, and it is persistent.
+#[test]
+fn int13_edd_write_never_commits_filler_for_an_unreachable_source_page() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    super::margo::unmap_guest_page(&mut m, 0xc9);
+    prime_dos_int_frame(&mut m);
+    for offset in 0..512u32 {
+        m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e00 + offset, 0xc1);
+    }
+
+    let dap = super::margo::UMB_BUFFER_PHYSICAL;
+    m.write_physical_u8(dap, 16); // packet size
+    m.write_physical_u8(dap + 2, 3); // block count
+    m.write_physical_u8(dap + 4, 0xa0); // buffer offset 01A0h
+    m.write_physical_u8(dap + 5, 0x01);
+    m.write_physical_u8(dap + 6, 0xc6); // buffer segment C8C6h
+    m.write_physical_u8(dap + 7, 0xc8);
+    m.write_physical_u8(dap + 8, 20); // LBA 20
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0);
+    m.cpu.registers.set_eax(0x4300);
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!(
+        m.read_physical_u8(dap + 2),
+        1,
+        "the packet must report the one block whose source was readable"
+    );
+    assert_eq!(
+        (m.cpu.registers.eax() >> 8) as u8,
+        0x09,
+        "an unreachable source page is a data-boundary error"
+    );
+    assert_ne!(dos_int_flags(&m) & 1, 0, "a short transfer sets CF");
+    assert_eq!(
+        int13_read_at(&mut m, 20, 1),
+        vec![0xc1],
+        "the reachable block is written normally"
+    );
+    assert_eq!(
+        int13_read_at(&mut m, 21, 1),
+        vec![21u8.wrapping_add(0x10)],
+        "the sector behind the unreachable page must keep its own bytes: 0xFF \
+         fill is the walker's, not the guest's, and this write is persistent"
+    );
+    assert_eq!(
+        int13_read_at(&mut m, 22, 1),
+        vec![22u8.wrapping_add(0x10)],
+        "and the transfer stops at the hole rather than skipping past it"
+    );
+}
+
+/// El Torito AH=42h has the same packet field and the same duty. Its blocks are
+/// 2048 bytes, so the buffer here starts at guest linear C8800h: the first
+/// block fills the rest of page C8h and the second one lands in the page this
+/// fixture unmaps.
+#[test]
+fn el_torito_cd_extended_read_counts_only_the_blocks_that_reached_the_caller() {
+    let mut m = int15_machine(16);
+    m.mount_cd(el_torito_iso(2));
+    m.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, 2);
+    m.handle_int19();
+    super::margo::install_umb_paging(&mut m);
+    super::margo::unmap_guest_page(&mut m, 0xc9);
+    prime_dos_int_frame(&mut m);
+
+    let dap = super::margo::UMB_BUFFER_PHYSICAL;
+    let mut packet = [0u8; 16];
+    packet[0] = 16;
+    packet[2..4].copy_from_slice(&2u16.to_le_bytes());
+    packet[6..8].copy_from_slice(&0xc880u16.to_le_bytes()); // buffer C880:0000
+    packet[8..16].copy_from_slice(&20u64.to_le_bytes());
+    m.write_guest_block(dap, &packet);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_esi(0);
+    m.cpu.registers.set_eax(0x4200);
+    m.cpu.registers.set_edx(0xE0);
+    m.handle_int13();
+
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x800),
+        0xFA,
+        "the one reachable block must still be delivered"
+    );
+    assert_eq!(
+        m.read_physical_u8(dap + 2),
+        1,
+        "the packet must report the blocks that LANDED"
+    );
+    assert_eq!(
+        (m.cpu.registers.eax() >> 8) as u8,
+        0x09,
+        "an unreachable buffer page is a data-boundary error"
+    );
+    assert_ne!(dos_int_flags(&m) & 1, 0, "a short transfer sets CF");
+}
+
+/// The El Torito emulated drive's AH=02h reports its count in AL, and owes the
+/// caller the same truth.
+#[test]
+fn el_torito_emulated_read_counts_only_the_sectors_that_reached_the_caller() {
+    let mut m = int15_machine(16);
+    m.mount_cd(el_torito_iso(2));
+    m.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, 2);
+    m.handle_int19();
+    super::margo::install_umb_paging(&mut m);
+    super::margo::unmap_guest_page(&mut m, 0xc9);
+    prime_dos_int_frame(&mut m);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(0x01a0); // guest linear C8E00h
+    m.cpu.registers.set_eax(0x0202);
+    m.cpu.registers.set_ecx(0x0002); // cylinder 0, head 0, sector 2
+    m.cpu.registers.set_edx(0);
+    m.handle_int13();
+
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0x0e00),
+        0xA5,
+        "the one reachable sector must still be delivered"
+    );
+    assert_eq!(
+        m.cpu.registers.eax() as u8,
+        1,
+        "AL must report the sectors that LANDED"
+    );
+    assert_eq!(
+        (m.cpu.registers.eax() >> 8) as u8,
+        0x09,
+        "an unreachable buffer page is a data-boundary error"
+    );
+    assert_ne!(dos_int_flags(&m) & 1, 0, "a short emulated read sets CF");
+}

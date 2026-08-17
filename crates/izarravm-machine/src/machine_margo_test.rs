@@ -2186,7 +2186,6 @@ pub(super) fn umb_paged_machine() -> Machine {
 /// table occupy physical 1000h and 2000h.
 pub(super) fn install_umb_paging(machine: &mut Machine) {
     const PD: u32 = 0x1000;
-    const PT: u32 = 0x2000;
 
     machine.write_physical_u32(PD, PT | 7);
     for page in 0u32..1024 {
@@ -2201,6 +2200,17 @@ pub(super) fn install_umb_paging(machine: &mut Machine) {
     machine.cpu.control.cr0 |= 0x8000_0001;
     machine.cpu.registers.eflags |= 0x0002_0000; // VM: a V86 task, as under TOKAEMM
 }
+
+/// Clear the present bit on one guest page of `install_umb_paging`'s table, so
+/// a caller buffer that runs into it cannot be translated at all. A block
+/// straddling into it is the shape a short transfer has to report truthfully:
+/// part of the caller's buffer exists and part of it does not.
+pub(super) fn unmap_guest_page(machine: &mut Machine, page: u32) {
+    machine.write_physical_u32(PT + page * 4, 0);
+}
+
+/// Physical address of the page table `install_umb_paging` builds.
+const PT: u32 = 0x2000;
 
 /// Corpus row MonikaTT (eXoDOS "Monika's Tic Tac Toe", stage-1 pass B): a DJGPP
 /// program that asks for 640x480 in 65536 colours -- VBE mode 111h -- and gave
