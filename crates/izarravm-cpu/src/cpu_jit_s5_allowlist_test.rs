@@ -85,10 +85,13 @@ fn word_size_byte_forms_are_lowered() {
 /// `0x01` and `0x31` were here and have gone, with the rest of the ALU register forms 1 and 3.
 /// The reason they stayed was that nothing had measured them, not that they would miscompile; a
 /// 16-bit workload now ranks the ten rows near 19% of block-stopping hits. What replaced them is
-/// `word_size_alu_register_forms_are_lowered` plus two negative tests, because this slice moved
-/// its boundary INTO the classifier arm: `word_size_alu_carry_forms_stay_refused` and
-/// `word_size_alu_memory_shapes_stay_refused` would both keep passing if the allowlist entries
-/// were reverted, so they cannot live in this table.
+/// `word_size_alu_register_forms_are_lowered` plus two tests that carry the arm's own boundary,
+/// because this slice moved that boundary INTO the classifier arm:
+/// `word_size_alu_carry_forms_stay_refused` and `word_size_alu_memory_shapes_split_by_site`. The
+/// carry test is purely negative and would keep passing if the allowlist entries were reverted, so
+/// it cannot live in this table; the memory test is mixed since the B2 slice — its form-1 row is
+/// negative for the same reason, and its lowered rows belong with the other positive fixtures
+/// rather than in a list of opcodes held OUT.
 ///
 /// Two opcodes have moved OUT of this list as the rejected-row campaign measured them, and each
 /// left a differently-shaped remainder behind:
@@ -608,7 +611,7 @@ fn word_size_alu_carry_forms_stay_refused() {
 /// `quake_word_renderer_families_match_interpreter_state_flags_memory_and_timing`, which is what
 /// caught it.
 #[test]
-fn word_size_alu_memory_shapes_stay_refused() {
+fn word_size_alu_memory_shapes_split_by_site() {
     let cases: &[(&str, &[u8], &[u8])] = &[(
         "0x01 add m,r",
         &[0x66, 0x01, 0x0d, 0x00, 0x20, 0x00, 0x00],

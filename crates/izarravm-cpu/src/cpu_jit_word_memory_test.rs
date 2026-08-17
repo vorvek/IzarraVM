@@ -114,10 +114,17 @@
 //! sign-extended imm8 -- that the mask is load-bearing for, and they catch it immediately.
 //!
 //! For the same reason, mutating the row's own read (`movzx_r32_word_disp8` -> `load_r32_disp8`)
-//! canNOT fail and was not attempted: the `and RAX, 0xffff` / `and RCX, 0xffff` pair discards the
-//! extra bytes, the bus charge is static from `word_reads` rather than from the host load's width,
-//! and a wider host load cannot fault at these operands. Recorded so nobody retries it as the
-//! "stronger" mutation.
+//! canNOT fail HERE and was not attempted: the `and RAX, 0xffff` / `and RCX, 0xffff` pair discards
+//! the extra bytes, and the bus charge is static from `word_reads` rather than from the host load's
+//! width. Recorded so nobody retries it as the "stronger" mutation.
+//!
+//! That is a statement about THIS FIXTURE'S OPERANDS, not about the lane. Every address these rows
+//! read is page-INTERIOR, so the two extra bytes a four-byte host load would touch are inside the
+//! same mapped page. A guest Word read of the last two bytes of a FastMap page is a different
+//! matter entirely -- the widened host load would read past the page the entry covers -- and the
+//! emitted guard that keeps it from doing so is the page-CROSSING bound, which
+//! `cpu_jit_misaligned_memory_test.rs` pins at the page edge on this very slot. Nobody should read
+//! the paragraph above as "the read's width does not matter".
 //!
 
 use super::*;
@@ -628,6 +635,13 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
 ///
 /// The seed poisons every high half with 0xdead, so a write-back that widens to 32 bits is a
 /// distinguishable register failure, not a coincidence.
+///
+/// Two ADDRESSING shapes ride along at one row each per opcode and destination, because the matrix
+/// itself is `[disp32]` throughout and that is one addressing mode out of many: a base-plus-
+/// displacement form whose base is EBP (so the default segment is SS, not DS) and a segment-
+/// OVERRIDE form through ES. Both share their address path with shipping Dword forms, so they are
+/// expected green; what they close is the "only one addressing mode was ever exercised" gap, at
+/// 240 rows rather than the 1,440 a third inner axis would have cost.
 #[test]
 fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
     for (opcode, name) in [
@@ -638,12 +652,39 @@ fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
         (0x33, "xor"),
         (0x3b, "cmp"),
     ] {
-        // dst 4 is ESP: `build` overwrites it with STACK_TOP after seeding, so its poisoned
-        // high half is NOT a witness there (cpu_jit_word_memory_test.rs:295-296). The row runs
+        // dst 4 is ESP: `build`'s seed block overwrites it with `set_esp(STACK_TOP)` after
+        // installing `seed.gpr`, so its poisoned high half is NOT a witness there. The row runs
         // for coverage of the home; the other three carry the write-back witness. The subset
         // keeps the row count at 480 where 0..8 would be 1,920 compile+run cycles.
         for dst in [0u8, 3, 4, 7] {
             for operand in [0x1234u16, 0xffff, 0x8000, 0x7fff, 0x0000] {
+                // The two addressing shapes, once per (opcode, dst, operand) rather than on the
+                // inner axes: the read they certify does not interact with the register seed or
+                // the incoming flags, so repeating them there would buy nothing.
+                //
+                // `[ebp+0x10]` is ModRM mod 01 / rm 101, whose DEFAULT segment is SS rather than
+                // DS. The fixture's SS is flat with base 0, so it resolves to the same operand --
+                // which is the point: an address path that silently used the wrong segment base
+                // would still land here, and what this row actually pins is that the base-plus-
+                // displacement form compiles and reads the same two bytes.
+                let base_disp = vec![0x66u8, opcode, 0x40 | (dst << 3) | 0b101, 0x10];
+                // `es:` override on the plain [disp32] form. ES is flat here too.
+                let mut es_override = vec![0x26u8, 0x66];
+                es_override.extend_from_slice(&disp32(&[opcode], dst, OPERAND));
+                for (body, shape) in [
+                    (base_disp, "[ebp+0x10] (SS default)"),
+                    (es_override, "es:[disp32]"),
+                ] {
+                    let seed = Seed::new()
+                        .gpr(usize::from(dst), 0xdead_8000)
+                        .gpr(5, OPERAND - 0x10)
+                        .operand(operand);
+                    lowered(
+                        &body,
+                        seed,
+                        &format!("{name} r16 dst={dst}, word {shape} operand={operand:#06x}"),
+                    );
+                }
                 for reg_low in [0x0001u16, 0x7fff, 0x8000, 0xffff] {
                     for (eflags, pending) in [(0x202u32, false), (0x8d5, true)] {
                         let mut body = vec![0x66u8];
