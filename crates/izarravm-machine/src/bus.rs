@@ -2349,8 +2349,10 @@ impl CpuBus for MachineBus<'_> {
         if !matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {
             // A reset armed mid-batch counts its settle from the write, not
             // from the batch start; fold the already-pending span in. See
-            // `SbDsp::arm_reset_at`.
-            if self.lazy_port_reads && port & 0xFFF0 == 0x0220 {
+            // `SbDsp::arm_reset_at`. Only the reset port: nothing on the
+            // silicon moves the settle except the reset line, and a command
+            // write (0x22C) during a live settle must not restart it.
+            if self.lazy_port_reads && port == 0x226 {
                 let pending = self.pending_device_micros();
                 self.sb16.arm_reset_at(pending);
             }
