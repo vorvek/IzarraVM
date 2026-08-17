@@ -167,6 +167,11 @@ fn peak_tracking() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_DEBUG").is_some())
 }
 
+/// Reset-settle time in microseconds. The programming guide's bound is
+/// 100 us; the silicon typically answers in a fraction of that, and probe
+/// loops with bounded poll counts size themselves against the part.
+pub const DSP_RESET_SETTLE_MICROS: u64 = 20;
+
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
 #[derive(Debug, Clone, PartialEq)]
@@ -918,6 +923,35 @@ impl SbDsp {
         self.data_available
     }
 
+    /// Service the reset-settle countdown against `pending_micros`, the
+    /// un-applied batch time a lazy port access is taken at. The batch-end
+    /// `advance_micros` applies the same span again, but the countdown is
+    /// gone by then, so nothing double-counts. The Accurate class passes 0
+    /// and keeps its advance-driven cadence byte-identically.
+    ///
+    /// Without this, the acknowledge depends on a device advance landing
+    /// inside the probe's poll window. A tight reset probe (OuterRid polls
+    /// 0x22E one hundred times) runs between advances, and the countdown
+    /// never moves while the guest is looking at it.
+    pub fn service_reset_at(&mut self, pending_micros: u64) {
+        if let Some(remaining) = self.reset_micros
+            && pending_micros >= remaining
+        {
+            self.queue_read(0xAA);
+            self.reset_micros = None;
+        }
+    }
+
+    /// The write twin: a reset armed mid-batch must not have the whole
+    /// batch's time (including the part BEFORE the write) counted against
+    /// its settle, so the arm folds the already-pending span into the
+    /// countdown. `service_reset_at` and the batch-end advance then agree.
+    pub fn arm_reset_at(&mut self, pending_micros: u64) {
+        if self.reset_micros.is_some() {
+            self.reset_micros = Some(DSP_RESET_SETTLE_MICROS + pending_micros);
+        }
+    }
+
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
             0x22A => {
@@ -948,11 +982,18 @@ impl SbDsp {
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         match port {
             0x226 => {
-                // Write 1 arms the reset; write 0 starts the ~100us settle.
+                // Write 1 arms the reset; write 0 starts the settle. The
+                // programming guide bounds the acknowledge at 100 us; the
+                // silicon answers well under that, and a probe that polls
+                // exactly 100 times at one ISA period a poll (OuterRid)
+                // needs the margin between the bound and the typical time.
+                // The constant models the part, not the bound. A lazy-class
+                // caller follows this write with `arm_reset_at` so the
+                // countdown starts at the write, not at the batch.
                 if value == 0x01 {
                     self.reset_micros = Some(0);
                 } else {
-                    self.reset_micros = Some(100);
+                    self.reset_micros = Some(DSP_RESET_SETTLE_MICROS);
                     self.read_data.clear();
                     self.data_available = false;
                     // Real hardware halts playback and clears the interrupt

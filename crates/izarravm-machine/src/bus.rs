@@ -2069,11 +2069,25 @@ impl CpuBus for MachineBus<'_> {
         if fdc::Fdc::owns_port(port) {
             return Ok(u32::from(self.fdc.read_port(port).unwrap_or(0xff)));
         }
-        if !matches!(port, 0x224 | 0x225)
-            && let Some(value) = self.sb16.read_port(port)
-        {
-            self.opl_probe.record_sb(port, false, value);
-            return Ok(u32::from(value));
+        if !matches!(port, 0x224 | 0x225) {
+            // An ISA port read costs about a microsecond of bus time on the
+            // metal. Charge it in the fast modes for the same reason the OPL
+            // polls charge it above, then service the reset-settle countdown
+            // at the predicted point in the batch (the DSP analogue of
+            // `predicted_opl_status`): the countdown otherwise moves only on
+            // a device advance, and a tight probe loop (OuterRid polls 0x22E
+            // one hundred times) runs entirely between advances. Gate on the
+            // DSP's own ports: the charge must not leak to unrelated ports
+            // that merely fall through this arm unclaimed.
+            if self.lazy_port_reads && matches!(port, 0x226 | 0x22A | 0x22C | 0x22E | 0x22F) {
+                *self.isa_io_clocks += isa_io_clocks(self.active_mode);
+                let pending = self.pending_device_micros();
+                self.sb16.service_reset_at(pending);
+            }
+            if let Some(value) = self.sb16.read_port(port) {
+                self.opl_probe.record_sb(port, false, value);
+                return Ok(u32::from(value));
+            }
         }
         // A counter read is time-derived: devices only advance at batch END, so the
         // CE must be peeked at THIS instant or the guest reads the value the counter
@@ -2333,6 +2347,13 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if !matches!(port, 0x224 | 0x225) && self.sb16.write_port(port, value as u8) {
+            // A reset armed mid-batch counts its settle from the write, not
+            // from the batch start; fold the already-pending span in. See
+            // `SbDsp::arm_reset_at`.
+            if self.lazy_port_reads && port & 0xFFF0 == 0x0220 {
+                let pending = self.pending_device_micros();
+                self.sb16.arm_reset_at(pending);
+            }
             self.opl_probe.record_sb(port, true, value as u8);
             return Ok(());
         }

@@ -277,6 +277,21 @@ impl Sb16Path {
         Some(value)
     }
 
+    /// Lazy-class settle service: see `SbDsp::service_reset_at`. A no-op
+    /// with no active card or no armed reset.
+    pub(crate) fn service_reset_at(&mut self, pending_micros: u64) {
+        if let Some(active) = self.active.as_mut() {
+            active.dsp.service_reset_at(pending_micros);
+        }
+    }
+
+    /// Lazy-class arm compensation: see `SbDsp::arm_reset_at`.
+    pub(crate) fn arm_reset_at(&mut self, pending_micros: u64) {
+        if let Some(active) = self.active.as_mut() {
+            active.dsp.arm_reset_at(pending_micros);
+        }
+    }
+
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
         let Some(active) = self.active.as_mut() else {
             return false;

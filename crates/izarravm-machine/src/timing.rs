@@ -1579,6 +1579,14 @@ impl MachineBus<'_> {
         (self.opl.status_after(micros), micros)
     }
 
+    /// The un-applied batch time at the current instant, in microseconds —
+    /// the same quantity `predicted_opl_status` predicts with, exposed for
+    /// the SB DSP's reset-settle service (`SbDsp::service_reset_at`).
+    pub(super) fn pending_device_micros(&self) -> u64 {
+        let clocks = self.in_batch_clocks().saturating_add(*self.isa_io_clocks);
+        self.timeline_at_batch_start.preview_microseconds(clocks)
+    }
+
     /// Batch-scoped CPU clocks elapsed so far. Beam and PIT predictions share
     /// this conversion so they use the same core total, bus scaling, and carry.
     fn in_batch_clocks(&self) -> u64 {
