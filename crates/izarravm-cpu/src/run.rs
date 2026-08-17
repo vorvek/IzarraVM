@@ -166,24 +166,16 @@ impl CpuGsw {
             // an asynchronous interrupt taken at an instruction boundary, so the
             // boundary itself IS the right answer and must not be rewound.
             let boundary_eip = self.registers.eip;
-            if let Err(fault) = self.hardware_interrupt(bus, vector) {
+            // A fault raised while the IRQ's own frame was being built escalates
+            // per the PRM's contributory-fault table (see
+            // `hardware_interrupt_escalating`): the guest gets the nested vector
+            // or #DF, and only a fault during the double-fault handler's call
+            // stops the machine.
+            if let Err(error) = self.hardware_interrupt_escalating(bus, vector) {
                 // cs_moved is false by construction: an IRQ is taken at a
                 // boundary, so no instruction was mid-flight to move CS.
                 self.record_fault_site(boundary_eip, false);
-                return Err(match fault {
-                    InternalFault::Cpu(error) => error,
-                    // A fault raised while `hardware_interrupt` (which calls
-                    // `deliver_exception`) was building the IRQ's own frame is a
-                    // genuinely nested fault, not an IDT-limit violation on `vector`
-                    // itself -- report it truthfully instead of relabeling it.
-                    InternalFault::Exception {
-                        vector: nested_vector,
-                        ..
-                    } => CpuError::NestedFaultDuringDelivery {
-                        original_vector: vector,
-                        nested_vector,
-                    },
-                });
+                return Err(error);
             }
             let charged = self.scale_clocks(61);
             self.elapsed_clocks += charged;
@@ -486,21 +478,16 @@ impl CpuGsw {
                 // Caveat for whoever reads the report: cpl and SS:ESP have moved
                 // by then, so the surrounding ring0/stack context is the inner
                 // stack mid-delivery, not the faulting code's.
-                if let Err(fault) = self.deliver_exception(bus, vector, error_code, false) {
+                // A fault raised while building `vector`'s own frame (e.g. the
+                // ring-0 stack access that was the actual dossier bug) escalates
+                // per the PRM's contributory-fault table, so the guest sees the
+                // nested vector or #DF; only a fault during the double-fault
+                // handler's call reaches the caller as a stop.
+                if let Err(error) =
+                    self.deliver_exception_escalating(bus, vector, error_code, false)
+                {
                     self.record_fault_site(start_eip, cs_was_moved);
-                    return Err(match fault {
-                        InternalFault::Cpu(error) => error,
-                        // As above: a fault raised while building `vector`'s own frame
-                        // (e.g. the ring-0 stack access that was the actual dossier bug)
-                        // is a nested fault, not an IDT-limit violation on `vector`.
-                        InternalFault::Exception {
-                            vector: nested_vector,
-                            ..
-                        } => CpuError::NestedFaultDuringDelivery {
-                            original_vector: vector,
-                            nested_vector,
-                        },
-                    });
+                    return Err(error);
                 }
                 CycleOutcome {
                     core_clocks: 59,

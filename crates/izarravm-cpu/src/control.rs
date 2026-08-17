@@ -248,6 +248,94 @@ impl CpuGsw {
         }
     }
 
+    /// Deliver an exception, and if the delivery itself faults, escalate the way
+    /// a 386 does (PRM 9.9.8) instead of stopping the emulator. This is the entry
+    /// point every run-loop call site uses; `deliver_exception` below is the
+    /// single attempt it drives.
+    pub(super) fn deliver_exception_escalating<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+        error_code: Option<u32>,
+        is_external: bool,
+    ) -> Result<(), CpuError> {
+        let attempt = self.deliver_exception(bus, vector, error_code, is_external);
+        self.escalate_delivery(bus, attempt, vector, is_external)
+    }
+
+    /// `hardware_interrupt` with the same escalation as
+    /// `deliver_exception_escalating`. An external interrupt is benign whatever
+    /// vector it lands on, which is what `is_external = true` carries into the
+    /// class table.
+    pub(super) fn hardware_interrupt_escalating<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+    ) -> Result<(), CpuError> {
+        let attempt = self.hardware_interrupt(bus, vector);
+        self.escalate_delivery(bus, attempt, vector, true)
+    }
+
+    /// The escalation loop shared by the two entry points above. `attempt` is the
+    /// result of the first delivery; on a nested exception this decides, from the
+    /// PRM's class table, whether to hand the guest the nested vector instead
+    /// (handle the two serially), to abandon both and raise #DF, or -- when the
+    /// fault landed while the double-fault handler was being called -- to stop.
+    ///
+    /// Handling two faults serially needs no bookkeeping here: the aborted
+    /// delivery unwound to the interrupted state (see `deliver_exception_inner`)
+    /// and the run loop had already rewound CS:EIP to the faulting instruction,
+    /// so the nested handler's frame names that instruction and its IRET restarts
+    /// it. The first fault is then raised again, in order, exactly as the PRM's
+    /// "handled in succession" requires.
+    fn escalate_delivery<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        attempt: ExecResult<()>,
+        original_vector: u8,
+        original_is_external: bool,
+    ) -> Result<(), CpuError> {
+        let mut attempt = attempt;
+        let mut class = fault_class(original_vector, original_is_external);
+        let mut calling_double_fault_handler = false;
+        let mut escalations = 0u32;
+        loop {
+            let (nested_vector, nested_error_code) = match attempt {
+                Ok(()) => return Ok(()),
+                Err(InternalFault::Cpu(error)) => return Err(error),
+                Err(InternalFault::Exception { vector, error_code }) => (vector, error_code),
+            };
+            // "If any other exception occurs while attempting to call the
+            // double-fault handler, the processor enters shutdown mode." The
+            // emulator's equivalent of shutdown is the hard stop: the machine
+            // reports the error and executes nothing further. The cap arm lands
+            // in the same terminal state -- see MAX_FAULT_ESCALATIONS.
+            if calling_double_fault_handler || escalations == MAX_FAULT_ESCALATIONS {
+                return Err(CpuError::TripleFault {
+                    original_vector,
+                    nested_vector,
+                });
+            }
+            escalations += 1;
+            // A nested fault is always a processor exception raised by the frame
+            // build itself, never an external interrupt, so `is_external` is
+            // false both when classifying it and when delivering it below.
+            let (vector, error_code) =
+                match escalate_fault(class, fault_class(nested_vector, false)) {
+                    FaultEscalation::Serial => (nested_vector, nested_error_code),
+                    FaultEscalation::DoubleFault => {
+                        calling_double_fault_handler = true;
+                        // "The processor always pushes an error code onto the
+                        // stack of the double-fault handler; however, the error
+                        // code is always 0."
+                        (DOUBLE_FAULT_VECTOR, Some(0))
+                    }
+                };
+            class = fault_class(vector, false);
+            attempt = self.deliver_exception(bus, vector, error_code, false);
+        }
+    }
+
     pub(super) fn deliver_exception<B: CpuBus>(
         &mut self,
         bus: &mut B,

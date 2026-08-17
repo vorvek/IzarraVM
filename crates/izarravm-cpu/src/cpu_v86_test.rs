@@ -1152,11 +1152,18 @@ fn deliver_exception_from_v86_with_cs_rpl3_does_not_fault_the_monitors_own_pushe
 
 #[test]
 fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
-    // Companion to the reproduction above: when delivery genuinely nests a fault
-    // (here, ESP0's page is marked NOT PRESENT, so the frame push itself raises
-    // #PF), `cycle`'s error mapping must surface `NestedFaultDuringDelivery` with
-    // both vectors, not relabel it as a fabricated `IdtLimit` on the ORIGINAL vector
-    // (the pre-fix behavior, which discarded the nested vector entirely).
+    // Companion to the reproduction above: delivery genuinely nests a fault here,
+    // because ESP0's page is marked NOT PRESENT and the frame push itself raises
+    // #PF. `deliver_exception` must report that nested vector truthfully, not a
+    // fabricated `IdtLimit` on the ORIGINAL vector (the pre-fix behavior, which
+    // discarded the nested vector entirely).
+    //
+    // This world escalates all the way to shutdown, so it also pins the terminal
+    // case. The chain, from the PRM's class table: #GP (contributory) nests #PF
+    // (page fault), which is handled serially; vector 14's gate is zeroed in this
+    // world, so its null selector nests #GP (contributory) on a page fault, which
+    // escalates to #DF; vector 8's gate is zeroed too, so calling the
+    // double-fault handler nests #GP again and the processor shuts down.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     // The frame's pushes land on page 6 (0x6000..0x6FFF), just below ESP0: clear
     // that page's present bit entirely.
@@ -1174,9 +1181,9 @@ fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
     };
     assert_eq!(nested_vector, 14, "the nested fault is the write's own #PF");
 
-    // Drive the same scenario through `cycle`'s public error mapping (the call site
-    // this bug actually lived in) by raising vector 13 as the guest's own delivered
-    // exception via a HLT that is not privileged in V86 IOPL<3 -- reuse
+    // Drive the same scenario through the run loop's own error mapping (the call
+    // site this bug actually lived in) by raising vector 13 as the guest's own
+    // delivered exception via a HLT that is not privileged in V86 IOPL<3 -- reuse
     // deliver_exception directly through the same `finish_instruction` tail instead,
     // since that IS the call site under test (see `finish_instruction`).
     let (mut cpu2, mut bus2) = v86_world(&[0xf4], &[0xf4], &[0x00]);
@@ -1198,9 +1205,9 @@ fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
     );
     assert_eq!(
         result,
-        Err(CpuError::NestedFaultDuringDelivery {
+        Err(CpuError::TripleFault {
             original_vector: 13,
-            nested_vector: 14,
+            nested_vector: 13,
         }),
         "{result:?}"
     );
@@ -1230,6 +1237,263 @@ fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
         "the site must be the faulting instruction, not a point inside delivery"
     );
     assert_eq!(site.cs.selector, start_cs);
+}
+
+/// Two distinct handler entry points, so a test can name which vector the core
+/// actually delivered. Only the addresses matter: no code runs at either.
+const MON_DF: u32 = MON_CODE + 0x100;
+const MON_PF: u32 = MON_CODE + 0x200;
+
+/// An IDT base chosen so vector 13's gate occupies the last 8 bytes of page 12
+/// (0xCFF8) and vector 14's the first 8 bytes of page 13 (0xD000), with vector
+/// 8's gate at 0xCFD0 on page 12. Clearing one of the two pages' present bits
+/// then makes exactly one gate read fault, which is how these tests raise a
+/// nested fault at a chosen step of the delivery chain.
+const SPLIT_IDT: u32 = 0xD000 - 14 * 8;
+
+/// Write a present 32-bit ring-0 interrupt gate at an absolute linear address.
+/// The `int_gate` helper is fixed to the default IDT base, so the relocated-IDT
+/// tests need this form.
+fn write_gate(m: &mut [u8], at: u32, offset: u32) {
+    put16(m, at, offset as u16);
+    put16(m, at + 2, R0_CS);
+    m[at as usize + 4] = 0;
+    m[at as usize + 5] = 0x8e;
+    put16(m, at + 6, (offset >> 16) as u16);
+}
+
+/// Clear page `page`'s present bit in the identity page table `v86_world` built.
+fn unmap_page(m: &mut [u8], page: u32) {
+    put32(m, 0x2000 + page * 4, (page << 12) | 0x6);
+}
+
+/// Deliver `vector` through the real call site (`finish_instruction`, the tail
+/// every faulting instruction runs) and return both its result and the CS:EIP
+/// the fault was raised at.
+fn deliver_through_finish_instruction(
+    cpu: &mut CpuGsw,
+    bus: &mut TestBus,
+    vector: u8,
+    error_code: Option<u32>,
+) -> (Result<CycleOutcome, CpuError>, u32, u16) {
+    let start_eip = cpu.registers.eip;
+    let start_cs = cpu.registers.cs().selector;
+    let result = cpu.finish_instruction(
+        bus,
+        Err(InternalFault::Exception { vector, error_code }),
+        start_eip,
+        start_cs,
+        0,
+        None,
+        None,
+    );
+    (result, start_eip, start_cs)
+}
+
+#[test]
+fn the_fault_class_table_matches_the_prm() {
+    // 386 PRM Table 9-3, transcribed vector by vector. Written from the manual,
+    // not from observed behavior: the delivery tests below reach four cells of
+    // the matrix, and this pins the rest of the table with them.
+    use FaultClass::{Benign, Contributory, PageFault};
+    for vector in [1, 2, 3, 4, 5, 6, 7, 16] {
+        assert_eq!(fault_class(vector, false), Benign, "vector {vector}");
+    }
+    for vector in [0, 9, 10, 11, 12, 13] {
+        assert_eq!(fault_class(vector, false), Contributory, "vector {vector}");
+    }
+    assert_eq!(fault_class(14, false), PageFault);
+    // The PRM's first class is "Benign Exceptions AND INTERRUPTS": an external
+    // interrupt or a software INT n is benign on every vector, including the ones
+    // an exception would make contributory.
+    for vector in [0, 8, 13, 14, 0x21] {
+        assert_eq!(fault_class(vector, true), Benign, "vector {vector}");
+    }
+
+    let cell = |first, second| escalate_fault(first, second);
+    assert_eq!(cell(Benign, Benign), FaultEscalation::Serial);
+    assert_eq!(cell(Benign, Contributory), FaultEscalation::Serial);
+    assert_eq!(cell(Benign, PageFault), FaultEscalation::Serial);
+    assert_eq!(cell(Contributory, Benign), FaultEscalation::Serial);
+    assert_eq!(
+        cell(Contributory, Contributory),
+        FaultEscalation::DoubleFault
+    );
+    assert_eq!(cell(Contributory, PageFault), FaultEscalation::Serial);
+    assert_eq!(cell(PageFault, Benign), FaultEscalation::Serial);
+    assert_eq!(cell(PageFault, Contributory), FaultEscalation::DoubleFault);
+    assert_eq!(cell(PageFault, PageFault), FaultEscalation::DoubleFault);
+}
+
+#[test]
+fn two_contributory_faults_escalate_to_a_double_fault() {
+    // 386 PRM 9.9.8: "When two contributory events occur, they cannot be
+    // handled, and a double-fault exception is generated." The first event is a
+    // #GP (13, contributory). Its gate names a selector whose index is past the
+    // GDTR limit, so building the frame raises a second #GP (contributory). The
+    // core must deliver #DF (vector 8) to the guest instead of stopping the
+    // machine.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    put16(&mut bus.memory, IDT + 13 * 8 + 2, 0x0108);
+    int_gate(&mut bus.memory, 8, MON_DF);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+    let (result, start_eip, start_cs) =
+        deliver_through_finish_instruction(&mut cpu, &mut bus, 13, Some(0));
+
+    assert!(
+        result.is_ok(),
+        "the double fault must be delivered to the guest, not reported as a \
+         host-fatal error: {result:?}"
+    );
+    assert_eq!(cpu.registers.eip, MON_DF, "the #DF handler runs");
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+    let esp = cpu.registers.esp();
+    let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, esp + o));
+    assert_eq!(
+        rd(0),
+        0,
+        "the #DF error code is always 0, whatever the two faults carried"
+    );
+    assert_eq!(rd(4), start_eip, "the frame names the faulting instruction");
+    assert_eq!(rd(8) & 0xffff, u32::from(start_cs));
+}
+
+#[test]
+fn a_page_fault_during_a_contributory_delivery_is_handled_serially() {
+    // 386 PRM 9.9.8: "If a benign or contributory exception is followed by a
+    // page fault, the two events can be handled in succession." The first event
+    // is a #GP (13, contributory) whose gate sits on a page with the present bit
+    // cleared, so reading the gate raises #PF (14). The core must deliver the
+    // #PF handler; the #GP is left to be raised again when that handler's IRET
+    // restarts the faulting instruction.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    cpu.idtr.base = SPLIT_IDT;
+    write_gate(&mut bus.memory, SPLIT_IDT + 13 * 8, MON_CODE);
+    write_gate(&mut bus.memory, SPLIT_IDT + 14 * 8, MON_PF);
+    unmap_page(&mut bus.memory, 12);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+    let (result, start_eip, start_cs) =
+        deliver_through_finish_instruction(&mut cpu, &mut bus, 13, Some(0));
+
+    assert!(
+        result.is_ok(),
+        "a page fault during a contributory delivery is handled serially: {result:?}"
+    );
+    assert_eq!(
+        cpu.control.cr2,
+        SPLIT_IDT + 13 * 8,
+        "the nested fault is the #GP gate read, not a stack access"
+    );
+    assert_eq!(cpu.registers.eip, MON_PF, "the #PF handler runs");
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    let esp = cpu.registers.esp();
+    let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, esp + o));
+    assert_eq!(
+        rd(0),
+        0,
+        "the nested #PF's own error code: not present, read, supervisor"
+    );
+    assert_eq!(
+        rd(4),
+        start_eip,
+        "the #PF frame returns to the faulting instruction, which raises the \
+         #GP again -- that is what handling the two serially means"
+    );
+    assert_eq!(rd(8) & 0xffff, u32::from(start_cs));
+}
+
+#[test]
+fn a_page_fault_during_a_page_fault_delivery_escalates_to_a_double_fault() {
+    // 386 PRM 9.9.8: "if a page fault is followed by a contributory exception or
+    // another page fault, a double-fault abort is generated." Vector 14's gate
+    // is on the missing page, so delivering a guest #PF raises a second #PF.
+    // Vector 8's gate stays on the present page and must be the one entered.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    cpu.idtr.base = SPLIT_IDT;
+    write_gate(&mut bus.memory, SPLIT_IDT + 8 * 8, MON_DF);
+    write_gate(&mut bus.memory, SPLIT_IDT + 14 * 8, MON_PF);
+    unmap_page(&mut bus.memory, 13);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+    let (result, ..) = deliver_through_finish_instruction(&mut cpu, &mut bus, 14, Some(0x7));
+
+    assert!(
+        result.is_ok(),
+        "the double fault must be delivered to the guest: {result:?}"
+    );
+    assert_eq!(
+        cpu.registers.eip, MON_DF,
+        "the #DF handler runs, not the #PF one"
+    );
+    let esp = cpu.registers.esp();
+    let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, esp + o));
+    assert_eq!(
+        rd(0),
+        0,
+        "the #DF error code is 0, not the original #PF's 0x7"
+    );
+}
+
+#[test]
+fn a_fault_while_calling_the_double_fault_handler_stops_the_machine() {
+    // 386 PRM 9.9.8: "If any other exception occurs while attempting to call the
+    // double-fault handler, the processor enters shutdown mode." Same layout as
+    // the double-fault case above, except vector 8's gate is left zeroed: its
+    // null selector raises #GP while the #DF frame is being built. This is the
+    // one case that still stops the emulator.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    cpu.idtr.base = SPLIT_IDT;
+    write_gate(&mut bus.memory, SPLIT_IDT + 14 * 8, MON_PF);
+    unmap_page(&mut bus.memory, 13);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+    let (result, ..) = deliver_through_finish_instruction(&mut cpu, &mut bus, 14, Some(0x7));
+
+    assert_eq!(
+        result,
+        Err(CpuError::TripleFault {
+            original_vector: 14,
+            nested_vector: 13,
+        }),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn an_external_interrupt_on_vector_8_is_not_a_double_fault_in_progress() {
+    // IRQ0 lands on vector 8 whenever the PIC is left at base 0x08, which is
+    // where a real DOS boot leaves it. The PRM's benign class is titled "Benign
+    // Exceptions and Interrupts", so the vector number alone must not put the
+    // core in "calling the double-fault handler" state: a page fault raised
+    // while calling this IRQ's handler is handled serially, not as a shutdown.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    cpu.idtr.base = SPLIT_IDT;
+    write_gate(&mut bus.memory, SPLIT_IDT + 8 * 8, MON_DF);
+    write_gate(&mut bus.memory, SPLIT_IDT + 14 * 8, MON_PF);
+    unmap_page(&mut bus.memory, 12);
+    enter_v86_direct(&mut cpu, 0x10, 0x1000);
+    cpu.registers.eflags |= FLAG_IF;
+    bus.pending_irq = Some(8);
+
+    let result = cpu.service_pending_interrupt(&mut bus);
+
+    assert!(
+        result.is_ok(),
+        "an external vector-8 interrupt whose gate read faults must escalate \
+         like any benign event, not shut down: {result:?}"
+    );
+    assert_eq!(
+        cpu.control.cr2,
+        SPLIT_IDT + 8 * 8,
+        "the nested fault is the IRQ's own gate read"
+    );
+    assert_eq!(
+        cpu.registers.eip, MON_PF,
+        "the #PF handler runs; vector 8 here was an interrupt, not a #DF"
+    );
 }
 
 #[test]
