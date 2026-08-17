@@ -300,6 +300,23 @@ impl CpuGsw {
         lin: u32,
     ) -> ExecResult<DecodedInsn> {
         let cs = self.registers.cs();
+        // 16-bit sequential run-off (stage-1 defect E7, SpacPlum): IP
+        // arithmetic is mod 65536, so an instruction whose last byte sits
+        // exactly at offset 0xFFFF resumes at IP 0 -- real-mode .COM wrap
+        // tricks depend on it, and a 386 raises no fault for it (only an
+        // instruction STRADDLING the limit #GPs). The interpreter's advance
+        // and a native block's exit both leave the unwrapped 0x10000 in EIP;
+        // 0x10000 is the ONLY over-limit value a legal advance can produce
+        // (start <= 0xFFFF and last byte <= 0xFFFF bound the sum), so
+        // anything larger stays on the #GP path below. Scoped to the
+        // canonical real/V86 16-bit CS shape; a flat-limit CS (big real
+        // mode) keeps its wide fetch.
+        let mut lin = lin;
+        if self.registers.eip == 0x1_0000 && !cs.default_size_32 && cs.limit == 0xffff {
+            self.set_eip(0);
+            lin = cs.base;
+        }
+        let lin = lin;
         if let Some(insn) = self.decode_cache.get(lin, cs.default_size_32) {
             // Live fetch-limit recheck: the line may have been cached under a larger CS limit
             // (CS loads no longer flush the cache). A violation falls through to `decode`,

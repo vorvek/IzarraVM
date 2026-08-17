@@ -378,8 +378,20 @@ impl CpuGsw {
         self.materialize_flags();
         let saved_eflags = self.registers.eflags;
         let saved_cs = self.registers.cs().selector;
-        let saved_eip = self.registers.eip;
         let source_v86 = self.is_v86_mode();
+        // A V86 IP is 16-bit at every architectural point, so real silicon can
+        // never push a frame EIP with a nonzero high word. Emulator-side EIP
+        // arithmetic can still leak one (an o32 transfer target past the limit
+        // is only caught at the NEXT fetch, with the oversize target live), and
+        // a V86 monitor's word-sized frame writes then preserve the high half:
+        // TOKAEMM reflected such a frame until its own return IRETD #GP(0)'d at
+        // ring 0 (the stage-1 G1 storm, fed by exactly this push). Mask to the
+        // only image silicon could produce.
+        let saved_eip = if source_v86 {
+            self.registers.eip & 0xffff
+        } else {
+            self.registers.eip
+        };
         let cpl = self.current_privilege_level();
 
         // Drop V86 up front so every segment loaded from here on (the inner SS from the

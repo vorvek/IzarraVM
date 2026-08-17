@@ -7400,3 +7400,238 @@ fn the_aperture_never_yields_a_block_key() {
         "the ROM half must be admitted at level 2, or this pin is testing the wrong gate"
     );
 }
+
+/// Stage-1 defect E7 (SpacPlum/baroll/MontyNrm): the fast map is keyed by
+/// LINEAR address so a compiled block is deliberately shared across CS
+/// views of the same bytes -- but entering one must still respect the LIVE
+/// CS limit. Interpreter fetch enforces the limit per byte and per cached
+/// line, and block admission polls its slots against the live CS; the
+/// dispatch of an already-installed block was the one unguarded door. A
+/// 16-bit guest whose EIP passed 0xFFFF (impossible on real hardware: the
+/// 386 faults the fetch) kept executing natively, and the monitor frame
+/// that eventually carried EIP=0x0001006b killed TOKAEMM's return IRETD.
+///
+/// Phase 1 compiles a 16-bit loop at linear 0x10700 under CS=0x1000 (EIP
+/// 0x700, legal). Phase 2 re-enters the same linear bytes with CS=0 and
+/// EIP=0x10700 -- past the 0xFFFF real-mode limit. The dispatch must
+/// refuse the native block and let the fetch path raise #GP(0), which
+/// real-mode delivery reflects through IVT[13] to the halting handler.
+#[test]
+fn a_native_block_entry_past_the_live_cs_limit_raises_gp_instead_of_running() {
+    let mut memory = vec![0u8; 0x20000];
+    // IVT[13] -> 0x0900:0000; the handler is a lone HLT at linear 0x9000.
+    memory[0x34..0x38].copy_from_slice(&[0x00, 0x00, 0x00, 0x09]);
+    memory[0x9000] = 0xf4;
+    // 16-bit hot loop at linear 0x10700, then HLT.
+    memory[0x10700..0x1070b].copy_from_slice(&[
+        0x05, 0x03, 0x00, // add ax,3
+        0x89, 0xc2, // mov dx,ax
+        0x83, 0xe9, 0x01, // sub cx,1 (o16: sub cx / a 16-bit world decodes 83/5)
+        0x75, 0xf6, // jnz back to 0x10700
+        0xf4, // hlt
+    ]);
+    let mut cpu = fresh();
+    // 16-bit code: keep the real-mode default (fresh() flips CS to 32-bit).
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    cpu.set_jit_auto_admit(true);
+
+    // Phase 1: compile under CS=0x1000 (entry EIP 0x700, in-limit).
+    let run_hot = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        cpu.halted = false;
+        cpu.load_segment_real(SegmentIndex::Cs, 0x1000);
+        cpu.registers.eip = 0x700;
+        cpu.write_reg16(Reg16::Cx, 0x40);
+        drive(cpu, bus);
+    };
+    run_hot(&mut cpu, &mut bus);
+    run_hot(&mut cpu, &mut bus);
+    run_hot(&mut cpu, &mut bus);
+    assert!(
+        cpu.jit_direct.len() > 0,
+        "phase 1 must install a native block at linear 0x10700, or phase 2 \
+         exercises nothing"
+    );
+
+    // Phase 2: same linear entry, but the live CS makes it EIP 0x10700.
+    cpu.halted = false;
+    cpu.load_segment_real(SegmentIndex::Cs, 0x0000);
+    cpu.registers.eip = 0x10700;
+    cpu.write_reg16(Reg16::Ax, 0x1111);
+    cpu.write_reg16(Reg16::Cx, 0x40);
+    drive(&mut cpu, &mut bus);
+
+    assert_eq!(
+        cpu.registers.cs().selector,
+        0x0900,
+        "the out-of-limit entry must #GP(0) through IVT[13], not run the \
+         cached native block (eip={:#x})",
+        cpu.registers.eip
+    );
+    assert_eq!(
+        cpu.read_reg16(Reg16::Ax),
+        0x1111,
+        "no instruction past the CS limit may execute"
+    );
+}
+
+/// E7: sequential 16-bit code whose last instruction ends exactly at the
+/// 64K boundary wraps to CS:0000 (real IP arithmetic is mod 65536) -- it
+/// must not run on into the next linear bytes, even when those bytes are
+/// warm compiled blocks under ANOTHER CS view.
+#[test]
+fn e7_native_run_off_at_the_64k_boundary_wraps_instead_of_running_on() {
+    let mut memory = vec![0u8; 0x20000];
+    // The 16-bit wrap landing at CS:0000 = linear 0: mov dx,0x0A11; hlt.
+    memory[0..4].copy_from_slice(&[0xba, 0x11, 0x0a, 0xf4]);
+    // A: sixteen `inc ax` filling 0xFFF0..0xFFFF (page-end block), with a
+    // NOP in front so the warm run reaches A as a CONTINUATION (a run
+    // entry itself is never marked Seen; see the linked-chain test above).
+    memory[0xFFEF] = 0x90;
+    for b in memory[0xFFF0..0x10000].iter_mut() {
+        *b = 0x40;
+    }
+    // B: `mov bx,0xBEEF` and padding work, then HLT, at linear 0x10000.
+    memory[0x10000..0x10003].copy_from_slice(&[0xbb, 0xef, 0xbe]);
+    for b in memory[0x10003..0x1000b].iter_mut() {
+        *b = 0x43; // inc bx
+    }
+    memory[0x1000b] = 0xf4;
+    let mut cpu = fresh();
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    cpu.set_jit_auto_admit(true);
+
+    // Warm A and B under ONE legal view: CS=0x0800 maps A at EIP
+    // 0x7FF0..0x7FFF and B at 0x8000, all inside the 64K limit, so the
+    // interpreter runs A straight into B and every continuation is Seen.
+    for _ in 0..4 {
+        cpu.halted = false;
+        cpu.load_segment_real(SegmentIndex::Cs, 0x0800);
+        cpu.registers.eip = 0x7FEF;
+        drive(&mut cpu, &mut bus);
+    }
+    // Auto-admission during the warm loop is expected to have compiled the
+    // hot entries already; assert it so phase 2 exercises native code.
+    assert!(
+        cpu.jit_direct.len() > 0,
+        "warm-up must leave at least one native block installed \
+         (len={}, entries={})",
+        cpu.jit_direct.len(),
+        cpu.perf_counters().jit_direct_entries
+    );
+
+    // The probe: enter A under CS=0, where A's last inc ends exactly at
+    // offset 0xFFFF. Real 16-bit IP arithmetic then wraps to CS:0000 -- it
+    // does NOT run on into B's bytes at linear 0x10000, natively or
+    // otherwise, and it does not fault (only a STRADDLING fetch #GPs).
+    let entries_before = cpu.perf_counters().jit_direct_entries;
+    cpu.halted = false;
+    cpu.load_segment_real(SegmentIndex::Cs, 0x0000);
+    cpu.registers.eip = 0xFFF0;
+    cpu.write_reg16(Reg16::Ax, 0);
+    cpu.write_reg16(Reg16::Bx, 0x1111);
+    cpu.write_reg16(Reg16::Dx, 0x2222);
+    drive(&mut cpu, &mut bus);
+    assert!(
+        cpu.perf_counters().jit_direct_entries > entries_before,
+        "the probe run must enter native code, or this test pins nothing"
+    );
+
+    assert_eq!(
+        cpu.read_reg16(Reg16::Ax),
+        16,
+        "all sixteen boundary instructions must execute"
+    );
+    assert_eq!(
+        cpu.read_reg16(Reg16::Bx),
+        0x1111,
+        "code past the CS limit executed (eip={:#x}, cs={:#x}, \
+         linked_transfers={})",
+        cpu.registers.eip,
+        cpu.registers.cs().selector,
+        cpu.perf_counters().jit_direct_linked_transfers
+    );
+    assert_eq!(
+        cpu.read_reg16(Reg16::Dx),
+        0x0A11,
+        "the run-off must wrap to CS:0000 (eip={:#x})",
+        cpu.registers.eip
+    );
+}
+
+/// E7 probe 2: a 16-bit near jump whose target wraps around the 64K IP
+/// boundary. The interpreter masks the target (`relative_jump` applies the
+/// operand-size mask); the Direct classifier computes `taken_delta` in
+/// LINEAR space, so a wrapped target points 64K above where real hardware
+/// lands.
+#[test]
+fn e7_native_16bit_jmp_wrap_target_lands_at_the_wrapped_ip() {
+    let mut memory = vec![0u8; 0x20000];
+    // CS=0x0100 (base 0x1000). Wrapped target eip 0 = linear 0x1000:
+    // the CORRECT landing: mov bx,0xBEEF; hlt.
+    memory[0x1000..0x1004].copy_from_slice(&[0xbb, 0xef, 0xbe, 0xf4]);
+    // The WRONG (unwrapped linear) landing at 0x11000: mov dx,0xDEAD; hlt.
+    memory[0x11000..0x11004].copy_from_slice(&[0xba, 0xad, 0xde, 0xf4]);
+    // Block near the top of the segment: NOP lead-in (continuation marker),
+    // then inc ax x5 at eip 0xFFF0.., then jmp short +8: end eip 0xFFF7,
+    // target (0xFFF7 + 9... rel8 = 0x07) -> 0xFFFE+...
+    // Compute exactly: jmp at eip 0xFFF5, len 2, rel8 = +0x09:
+    // target = (0xFFF7 + 9) & 0xFFFF = 0x0000.
+    memory[0x10FEF] = 0x90; // eip 0xFFEF: nop
+    for b in memory[0x10FF0..0x10FF5].iter_mut() {
+        *b = 0x40; // inc ax
+    }
+    memory[0x10FF5] = 0xeb; // jmp short
+    memory[0x10FF6] = 0x09; // +9 -> 16-bit target wraps to 0x0000
+    let mut cpu = fresh();
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    cpu.set_jit_auto_admit(true);
+
+    let run_once = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        cpu.halted = false;
+        cpu.load_segment_real(SegmentIndex::Cs, 0x0100);
+        cpu.registers.eip = 0xFFEF;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.write_reg16(Reg16::Bx, 0x1111);
+        cpu.write_reg16(Reg16::Dx, 0x2222);
+        drive(cpu, bus);
+    };
+    for _ in 0..6 {
+        run_once(&mut cpu, &mut bus);
+    }
+    assert!(
+        cpu.jit_direct.len() > 0,
+        "warm-up must leave a native block installed"
+    );
+
+    let entries_before = cpu.perf_counters().jit_direct_entries;
+    run_once(&mut cpu, &mut bus);
+    assert!(
+        cpu.perf_counters().jit_direct_entries > entries_before,
+        "the probe run must enter native code, or this test pins nothing"
+    );
+    assert_eq!(
+        cpu.read_reg16(Reg16::Dx),
+        0x2222,
+        "the wrapped 16-bit jump ran at its UNWRAPPED linear target \
+         (eip={:#x})",
+        cpu.registers.eip
+    );
+    assert_eq!(
+        cpu.read_reg16(Reg16::Bx),
+        0xBEEF,
+        "the wrapped 16-bit jump must land at CS:0000 (eip={:#x})",
+        cpu.registers.eip
+    );
+}
