@@ -185,7 +185,16 @@ impl Machine {
 
     /// The linear-to-physical half of `read_linear_u8`, on its own. Same probe discipline: it
     /// walks the guest's own tables with uncharged byte reads, sets no CR2, writes no accessed
-    /// bit, and returns `None` for an unmapped address. Host-side diagnostics only.
+    /// bit, and returns `None` for an unmapped address.
+    ///
+    /// No longer diagnostics-only: the HLE BIOS block writers
+    /// (`write_guest_linear_block` / `read_guest_linear_block`) deliver
+    /// caller-visible data through this walk, because a BIOS service handed
+    /// an ES:DI block must honor the caller's paging. The probe discipline
+    /// stands regardless -- a BIOS writing a reply is not an instruction, so
+    /// it must not set CR2, dirty a page, or check R/W and U/S. The known
+    /// consequences (no accessed/dirty bits for a paging-to-disk host; no
+    /// permission check) are recorded on those helpers.
     pub fn translate_linear_probe(&mut self, linear: u32) -> Option<u32> {
         if self.cpu.control.cr0 & 0x8000_0000 == 0 {
             return Some(linear);
