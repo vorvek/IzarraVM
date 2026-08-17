@@ -42,6 +42,18 @@ fn fresh_flat() -> CpuGsw {
     cpu
 }
 
+/// `fresh()` with the CS flipped back to the real-mode 16-bit shape
+/// (`fresh()` deliberately sets D=1 for the 32-bit fixtures). The E7 tests
+/// below depend on a genuine 16-bit CS with limit 0xFFFF; naming the shape
+/// here keeps them honest if `fresh()` ever grows another 32-bit-only field.
+fn fresh_real16() -> CpuGsw {
+    let mut cpu = fresh();
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    cpu
+}
+
 pub(super) fn drive(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
     let mut outcomes = Vec::new();
     for _ in 0..64 {
@@ -7401,21 +7413,23 @@ fn the_aperture_never_yields_a_block_key() {
     );
 }
 
-/// Stage-1 defect E7 (SpacPlum/baroll/MontyNrm): the fast map is keyed by
-/// LINEAR address so a compiled block is deliberately shared across CS
-/// views of the same bytes -- but entering one must still respect the LIVE
-/// CS limit. Interpreter fetch enforces the limit per byte and per cached
-/// line, and block admission polls its slots against the live CS; the
-/// dispatch of an already-installed block was the one unguarded door. A
-/// 16-bit guest whose EIP passed 0xFFFF (impossible on real hardware: the
-/// 386 faults the fetch) kept executing natively, and the monitor frame
-/// that eventually carried EIP=0x0001006b killed TOKAEMM's return IRETD.
+/// E7 pin: the fast map is keyed by LINEAR address so a compiled block is
+/// deliberately shared across CS views of the same bytes -- but entering
+/// one must still respect the LIVE CS limit. This pins a PRE-EXISTING
+/// guard: every boundary passes through the fetch path, whose per-line
+/// limit recheck (`fetch_within_limit`, and decode's per-byte check on the
+/// miss) raises #GP(0) before the dispatch can consult the fast map, so
+/// the cross-CS block at the out-of-limit entry never runs. It was written
+/// while hunting E7's mechanism (which turned out to be the sequential
+/// run-off wrap, not this door) and stays as the regression pin for the
+/// cross-CS reuse rule.
 ///
 /// Phase 1 compiles a 16-bit loop at linear 0x10700 under CS=0x1000 (EIP
 /// 0x700, legal). Phase 2 re-enters the same linear bytes with CS=0 and
-/// EIP=0x10700 -- past the 0xFFFF real-mode limit. The dispatch must
-/// refuse the native block and let the fetch path raise #GP(0), which
-/// real-mode delivery reflects through IVT[13] to the halting handler.
+/// EIP=0x10700 -- past the 0xFFFF real-mode limit (and not the wrap value
+/// 0x10000, so the run-off wrap stays out of the way). The fetch path must
+/// raise #GP(0), which real-mode delivery reflects through IVT[13] to the
+/// halting handler.
 #[test]
 fn a_native_block_entry_past_the_live_cs_limit_raises_gp_instead_of_running() {
     let mut memory = vec![0u8; 0x20000];
@@ -7430,11 +7444,7 @@ fn a_native_block_entry_past_the_live_cs_limit_raises_gp_instead_of_running() {
         0x75, 0xf6, // jnz back to 0x10700
         0xf4, // hlt
     ]);
-    let mut cpu = fresh();
-    // 16-bit code: keep the real-mode default (fresh() flips CS to 32-bit).
-    let mut cs = cpu.registers.cs();
-    cs.default_size_32 = false;
-    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut cpu = fresh_real16();
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     cpu.set_jit_auto_admit(true);
@@ -7500,10 +7510,7 @@ fn e7_native_run_off_at_the_64k_boundary_wraps_instead_of_running_on() {
         *b = 0x43; // inc bx
     }
     memory[0x1000b] = 0xf4;
-    let mut cpu = fresh();
-    let mut cs = cpu.registers.cs();
-    cs.default_size_32 = false;
-    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut cpu = fresh_real16();
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     cpu.set_jit_auto_admit(true);
@@ -7590,10 +7597,7 @@ fn e7_native_16bit_jmp_wrap_target_lands_at_the_wrapped_ip() {
     }
     memory[0x10FF5] = 0xeb; // jmp short
     memory[0x10FF6] = 0x09; // +9 -> 16-bit target wraps to 0x0000
-    let mut cpu = fresh();
-    let mut cs = cpu.registers.cs();
-    cs.default_size_32 = false;
-    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut cpu = fresh_real16();
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     cpu.set_jit_auto_admit(true);

@@ -149,6 +149,12 @@ impl CpuGsw {
             }
         }
 
+        // A 16-bit run-off must wrap BEFORE an interrupt frame can capture the
+        // boundary: the frame's saved EIP is architectural state the guest's
+        // handler IRETs back through. See `wrap_16bit_sequential_run_off`.
+        if self.registers.eip == 0x1_0000 {
+            self.wrap_16bit_sequential_run_off();
+        }
         // Test the one-instruction shadow set by STI without consuming it. While the
         // shadow is active the interrupt check is skipped so the instruction after STI
         // always executes before an interrupt can be taken; the consume happens in
@@ -227,6 +233,13 @@ impl CpuGsw {
             return self.resume_rep_instruction(bus, rep_budget);
         }
 
+        // Upstream of the start_eip/lin snapshots on purpose: every consumer
+        // of this boundary (the fault rewind, the fault dossier, the profile
+        // and unit-sim keys) must see the wrapped IP, never 0x10000. See
+        // `wrap_16bit_sequential_run_off`.
+        if self.registers.eip == 0x1_0000 {
+            self.wrap_16bit_sequential_run_off();
+        }
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs_register = self.registers.cs();
@@ -442,6 +455,33 @@ impl CpuGsw {
         );
     }
 
+    /// Retire-time IP wrap for 16-bit code (stage-1 defect E7, SpacPlum). In
+    /// a CS with D=0 the instruction pointer is the 16-bit IP in EVERY mode
+    /// -- real, V86, and 16-bit protected alike -- so an instruction whose
+    /// last byte sits exactly at offset 0xFFFF resumes at IP 0 (real-mode
+    /// .COM wrap tricks depend on it) and raises no fault; only an
+    /// instruction that STRADDLES the limit #GPs, at its own fetch. The
+    /// interpreter's advance and a native block's exit both produce the
+    /// unwrapped 0x10000, and 0x10000 is the ONLY over-limit value a legal
+    /// advance can produce (the start and the last byte are both bounded by
+    /// the 0xFFFF limit), so every call site guards on that exact value and
+    /// anything larger -- an o32 transfer target -- stays on the fetch-limit
+    /// #GP path. The wrap runs at the retire/boundary seams, never inside
+    /// `fetch_decoded`: placed there it fired AFTER the boundary snapshots
+    /// (`start_eip`/`lin`), so the fault rewind, the fault dossier, the
+    /// profile and unit-sim keys, and an interrupt frame taken at the
+    /// boundary all still observed the impossible 0x10000. Scoped to
+    /// `limit == 0xFFFF`: a flat-limit (unreal/big real) CS keeps its wide
+    /// fetch, because EIP past 64K is reachable and meaningful there.
+    #[cold]
+    #[inline(never)]
+    fn wrap_16bit_sequential_run_off(&mut self) {
+        let cs = self.registers.cs();
+        if !cs.default_size_32 && cs.limit == 0xffff {
+            self.set_eip(0);
+        }
+    }
+
     /// The shared rewind / deliver / scale tail of a single instruction's execution. It owns ONLY
     /// what happens after `result` is produced: on a delivered exception it rewinds eip (and CS, if a
     /// far transfer moved it) to the faulting instruction and delivers the fault through
@@ -523,6 +563,12 @@ impl CpuGsw {
             }
         };
 
+        // Retire seam: an instruction whose last byte sat at offset 0xFFFF
+        // advanced EIP to the unwrapped 0x10000; wrap it before anything can
+        // observe it. See `wrap_16bit_sequential_run_off`.
+        if self.registers.eip == 0x1_0000 {
+            self.wrap_16bit_sequential_run_off();
+        }
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += 1;
@@ -2445,6 +2491,13 @@ impl CpuGsw {
             );
         }
 
+        // Native exit seam: a block whose final slot ended exactly at offset
+        // 0xFFFF exits with the unwrapped 0x10000, same as the interpreter's
+        // advance. Wrap before final_eip feeds the dynamic-successor binding.
+        // See `wrap_16bit_sequential_run_off`.
+        if self.registers.eip == 0x1_0000 {
+            self.wrap_16bit_sequential_run_off();
+        }
         let final_eip = self.registers.eip;
         let cs_base = self.registers.cs().base;
         if exit.dynamic_link_cell != 0 {

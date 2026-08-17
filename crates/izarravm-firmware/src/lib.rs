@@ -307,9 +307,10 @@ pub fn sndtst_com() -> &'static [u8] {
 
 /// The IRQ5-at-IP==0 discriminator regression fixture (V86 trap tax): arms SB16
 /// auto-init DMA for a continuous IRQ5 stream, then parks on a `jmp $` at
-/// seg:0000 so those IRQ5 frames carry return-IP 0 -- the one case the vec13
-/// frame-shape check cannot decide alone. RED on the buggy slot-only monitor,
-/// GREEN on the three-layer fix.
+/// seg:0000 so those IRQ5 frames carry return-IP 0. Under the old
+/// error-code-VALUE discriminator this was the ambiguous case (opcode peek +
+/// PIC probe); the frame-ORIGIN basis decides it from the EFLAGS.VM slot at
+/// any IP, and this fixture pins that.
 pub fn irq5ip0_com() -> &'static [u8] {
     IRQ5IP0_COM
 }

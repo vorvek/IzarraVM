@@ -55,6 +55,11 @@ k_cs: dw 0                        ; EXECRH far-return CS
 k_ip: dw 0                        ; EXECRH far-return IP
 
 vif: db 1                         ; virtual IF (guest's view; DOS boots with IF=1)
+r0_hlt: db 0                      ; 1 only inside monitor_body .hlt's sti;hlt
+                                  ; window -- the sole ring-0 stretch with IF
+                                  ; open. vec13_entry and irq_body read it to
+                                  ; tell a waking IRQ's no-error ring-0 frame
+                                  ; from a ring-0 exception's error-code frame
 va20: db 1                        ; virtual A20 (guest's view). The REAL gate is
                                   ; forced on at INIT and never drops under V86:
                                   ; the monitor and the paged UMB/EMS backing
@@ -69,11 +74,6 @@ va20: db 1                        ; virtual A20 (guest's view). The REAL gate is
 align 2
 vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
                                   ; line N, master 0-7 + slave 8-15)
-r0_hlt: db 0                      ; 1 only inside monitor_body .hlt's sti;hlt
-                                  ; window -- the sole ring-0 stretch with IF
-                                  ; open. vec13_entry reads it to tell the
-                                  ; waking IRQ5's no-error frame from a ring-0
-                                  ; #GP's error-code frame (TEST 2)
 
 ; ---- XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
@@ -106,6 +106,8 @@ xms_table: times XMS_HANDLES*XMS_SLOT db 0
 ; system ROM), 160 KB, page-mapped at INIT to extended RAM just above the HMA. The
 ; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, umb_win_end)
 ; The window ends at 0xF000, or 0xE000 when the EMS page frame is enabled.
+FLAGS_VM      equ 0x00020000      ; EFLAGS bit 17: the frame-origin bit every
+                                  ; monitor-entry discriminator forks on
 UMB_LIN_BASE  equ 0x000C8000      ; first upper-hole linear byte
 UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
 UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
@@ -1526,7 +1528,8 @@ align 8
 ; EMM glue does this during MEM runs) stops trapping CLI/STI/PUSHF/POPF/INT/
 ; IRET as sensitive ops (check_v86_iopl correctly waves them through, matching
 ; real silicon) -- so a bare `INT n` now dispatches through THIS static IDT
-; directly, at ring 0, instead of through vec13_entry's opcode-peek emulation.
+; directly, at ring 0, instead of through vec13_entry and monitor_body's
+; sensitive-instruction emulation.
 ; Every previously-null slot below was safe only because IOPL was pinned at 0;
 ; it no longer is. A null gate's selector field is 0x0000: deliver_exception's
 ; final `load_segment(bus, Cs, 0)` raises a fatal CpuError::GeneralProtection
@@ -1752,7 +1755,8 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; the no-error frame's CS slot ([esp+36]) == our 0x08 -> IRQ5 that woke the
 ; halt; irq_body's own VM check then holds the line. A ring-0 #GP raised
 ; INSIDE the flagged window cannot take this arm: its frame carries the
-; faulting EIP at [esp+36], and offset 8 is GDT bytes, not code.
+; faulting EIP at [esp+36], and offset 8 is the DOS device-driver header
+; (dh_next), never executed code.
 ;
 ; TEST 3 (remaining = error-code frame): bit 17 of [esp+44], the frame's
 ; real EFLAGS. Set -> a genuine V86 #GP -> monitor_body (whose dispatch
@@ -1763,9 +1767,10 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; ESP marching through the driver's own tables until exception delivery
 ; itself died (baroll, SpacPlum, MontyNrm). Any handling here that touches
 ; the frame re-faults the same way; the only correct move is the named
-; diagnostic exit. reflect_vector carries the matching backstop (0xD4) so
-; a future ring-0-origin storm through any OTHER vector still reports on
-; its first reflected iteration instead of iterating.
+; diagnostic exit. The same fork guards the OTHER PIC-base-8 collisions:
+; irq_body classifies error-code frames on vectors 8/10/11/12/14 (0xD5 for
+; a ring-0 origin), and reflect_vector refuses ring-0 frames outright
+; (0xD4) as the backstop for the exc_*/deflt_* reflect paths.
 ;
 ; EMULATOR-CONTRACT NOTE: TEST 1 is airtight because deliver_exception
 ; pushes CS zero-extended and never pushes an error code for an external
@@ -1781,14 +1786,14 @@ vec13_entry:
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
-    test dword [esp+40], 0x00020000 ; TEST 1: no-error frame's EFLAGS.VM
+    test dword [esp+40], FLAGS_VM ; TEST 1: no-error frame's EFLAGS.VM
     jnz .irq5                     ; (an error-code frame holds 16-bit CS here)
     cmp byte [fs:r0_hlt], 0       ; TEST 2: the ring-0 halt window is the only
     je .ec_frame                  ; IF-open ring-0 code
     cmp dword [esp+36], 8         ; no-error ring-0 frame: CS slot = our 0x08
     je .irq5                      ; -> the IRQ5 that woke the hlt
 .ec_frame:
-    test dword [esp+44], 0x00020000 ; TEST 3: error-code frame's EFLAGS.VM
+    test dword [esp+44], FLAGS_VM ; TEST 3: error-code frame's EFLAGS.VM
     jnz monitor_body              ; V86 #GP -> emulate/reflect as ever
     mov al, 0xD3                  ; ring-0 #GP: the monitor faulted on itself
     jmp signal32                  ; (G1 storm iteration 0) -- report, stop
@@ -2386,16 +2391,10 @@ irq_common:                       ; pushad done, EBX = IRQ line
     mov fs, ax
 irq_body:                         ; vec13_entry joins here (segs already set)
     lea ebp, [esp + 32]
-    test dword [ebp+8], 0x00020000 ; real EFLAGS VM bit of the INTERRUPTED
-    jz .hold                       ; frame: clear means ring 0 (the monitor's
-                                    ; own .hlt sti;hlt window is the only place
-                                    ; this can happen), so reflect_vector must
-                                    ; never run against that 3-dword ring-0
-                                    ; IRETD frame (no V86 SS:SP to scribble
-                                    ; into), regardless of vif. Hold the line
-                                    ; exactly like the VIF=0 coalesce path;
-                                    ; .hlt drains it via maybe_deliver once
-                                    ; back in V86.
+    test dword [ebp+8], FLAGS_VM  ; no-error frame's EFLAGS.VM; an ERROR-CODE
+    jz .not_v86_irq               ; frame holds a 16-bit CS here (bit 17
+                                  ; never set), so set can only be the V86
+                                  ; IRQ frame
     cmp byte [fs:vif], 0
     jne .go
 .hold:
@@ -2410,6 +2409,38 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     call irq_reflect_line
     popad
     iretd
+; Bit 17 clear: either the IRQ that woke the ring-0 sti;hlt window (a
+; no-error frame, CS slot = our 0x08, only under the r0_hlt bracket --
+; reflect_vector must never run against that 3-dword frame, so hold the
+; line like the VIF=0 coalesce path and let .hlt drain it), or an
+; ERROR-CODE frame: vectors 8/10/11/12/14 on the master gates are also
+; #DF/#TS/#NP/#SS/#PF, the same PIC-base-8 collision vector 13 has with
+; IRQ5, and the same frame-shape fork decides it. The old code fell into
+; .hold for every bit-17-clear frame; for an error-code frame that EOI'd a
+; line that never fired and IRETD'd three pops off a longer frame -- the
+; G1 storm mechanism on the OTHER collision vectors.
+.not_v86_irq:
+    cmp byte [fs:r0_hlt], 0
+    je .ec_frame
+    cmp dword [ebp+4], 8          ; no-error ring-0 frame: CS slot = monitor CS
+    je .hold                      ; -> the hlt wake
+.ec_frame:
+    test dword [ebp+12], FLAGS_VM ; error-code frame's EFLAGS.VM
+    jz .ring0_exc
+    ; A V86-origin CPU exception collided onto this IRQ gate: reflect it to
+    ; the guest IVT entry for the EXCEPTION vector (master line N sits on
+    ; vector N+8), fault semantics, and no EOI -- no PIC line is in service.
+    ; Only master lines can carry one (the slave gates at 0x70-0x77 and
+    ; remapped deflt bases are not CPU-exception vectors).
+    lea ebp, [ebp+4]              ; &frame.eip of the error-code frame
+    add ebx, 8
+    call reflect_vector
+    popad
+    add esp, 4                    ; discard the error code
+    iretd
+.ring0_exc:
+    mov al, 0xD5                  ; a ring-0 CPU exception landed on an IRQ
+    jmp signal32                  ; gate: the monitor faulted on itself
 
 ; ---- CPU exceptions raised by V86 guest code (#DE 0, #UD 6, #NM 7 — the
 ; no-error-code faults a real-mode program can produce). Reflect to the guest
@@ -2442,7 +2473,7 @@ exc_common:
 ; for (1-5, 16, 18-0x6F, 0x78-0xFF -- see the idt: comment above). Before the
 ; PRM-correct load_flags IOPL fix these slots were unreachable: IOPL was
 ; pinned at 0, so every guest INT/IRET/PUSHF/POPF trapped as a sensitive
-; instruction through vec13_entry's opcode-peek emulation first. A guest that
+; instruction through vec13_entry into monitor_body's emulation first. A guest that
 ; legitimately raises its own IOPL to 3 (Watcom-compiled Toka-DOS kernel/EMM
 ; glue, observed during MEM runs) makes these dispatch for real, straight
 ; through this IDT. Reflect exactly like exc_de/exc_ud/exc_nm: bounce to the
@@ -2505,9 +2536,12 @@ deflt_common:
     popad
     iretd
 .irq:
-    call irq_reflect_line
-    popad
-    iretd
+    jmp irq_body                  ; the remapped-PIC lines get the same
+                                  ; frame-origin classification, VIF hold,
+                                  ; and ring-0-wake hold the fixed gates get
+                                  ; (a remapped IRQ waking the .hlt window
+                                  ; used to reflect against the 3-dword
+                                  ; ring-0 frame here)
 
 ; ---- Vector 17 (#AC alignment check): the ONLY newly-covered vector whose
 ; CPU-exception form carries an error code. This emulator never sets CR0.AM
@@ -3719,11 +3753,11 @@ irq_reflect_line:
     movzx eax, word [fs:vcpi_pic_slave]
     add ebx, eax
     sub ebx, 8
-    jmp reflect_vector
+    jmp reflect_vector_v86        ; every caller sits behind a VM test
 .master:
     movzx eax, word [fs:vcpi_pic_master]
     add ebx, eax
-    jmp reflect_vector
+    jmp reflect_vector_v86
 
 ; Reflect an interrupt into the guest's real-mode IVT handler.
 ;   in: EBX = vector, EBP = &frame.eip, FS = driver data.  clobbers eax,ecx,edx,edi
@@ -3731,14 +3765,17 @@ irq_reflect_line:
 ; The frame MUST be a V86 one: [ebp+12]/[ebp+16] (guest SS:SP) only exist on
 ; a V86 trap frame, and rewriting a ring-0 frame's EIP/CS to real-mode IVT
 ; values makes the next IRETD re-fault -- one reflected ring-0 frame is what
-; turned the G1 storm self-sustaining. vec13_entry classifies its own frames,
-; but exc_de/exc_ud/exc_nm and every deflt_N gate reflect unconditionally, so
-; a future ring-0-origin fault through ANY of those vectors lands here on its
-; first iteration. The VM check makes that iteration report (0xD4) instead
-; of iterating: the bounded-storm backstop.
+; turned the G1 storm self-sustaining. vec13_entry and irq_body classify
+; their own frames and enter at reflect_vector_v86, past the check; the
+; exc_de/exc_ud/exc_nm gates reflect unconditionally, so a future
+; ring-0-origin fault through any of those vectors lands on the VM check and
+; reports (0xD4) on its first iteration: the bounded-storm backstop.
 reflect_vector:
-    test dword [ebp+8], 0x00020000 ; frame EFLAGS.VM
-    jz .ring0_frame
+    test dword [ebp+8], FLAGS_VM   ; frame EFLAGS.VM
+    jz reflect_ring0_frame
+reflect_vector_v86:               ; entry for callers that already proved the
+                                  ; frame's origin (monitor_body via TEST 3,
+                                  ; irq_body/maybe_deliver via their VM tests)
     mov edx, [ebp+16]            ; guest SS
     shl edx, 4                   ; edx = guest stack base (linear)
     mov ax, [ebp+8]             ; guest flags, IF := VIF, virtual IOPL = 3
@@ -3767,7 +3804,7 @@ reflect_vector:
     mov word [ebp+4], ax        ; guest CS = IVT[vec] segment
     mov byte [fs:vif], 0        ; entering the ISR clears VIF
     ret
-.ring0_frame:
+reflect_ring0_frame:
     mov al, 0xD4                ; reflection asked against a ring-0 frame:
     jmp signal32                ; a storm's first bounced iteration -- report
 
@@ -3905,7 +3942,8 @@ banner: db 'TOKAEMM XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0
 ; machine with the code as the exit status, so a monitor defect names
 ; itself on a game run instead of wedging or storming. Codes in use:
 ; the trapped-I/O opcode byte (monitor_body .unhandled_io), 0xD3 (ring-0
-; #GP, vec13_entry TEST 3), 0xD4 (reflect_vector on a ring-0 frame).
+; #GP, vec13_entry TEST 3), 0xD4 (reflect_vector on a ring-0 frame), 0xD5
+; (a ring-0 CPU exception on an IRQ gate, irq_body .ring0_exc).
 signal32:
     mov ah, al
     mov al, 12

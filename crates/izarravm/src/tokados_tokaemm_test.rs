@@ -2036,12 +2036,13 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
 }
 
 /// V86 trap tax regression: IRQ5 delivered while the interrupted code sits
-/// at IP == 0. The vec13 frame-shape check cannot decide this case alone --
-/// the error-code slot reads 0 for a #GP AND for an IRQ frame whose return
-/// EIP is 0 -- so the monitor must fall through to its opcode-peek + cold
-/// PIC-probe layers. A slot-only discriminator mis-routed such a delivery
-/// into the #GP path, hit the non-sensitive byte at CS:0, and hard-killed
-/// the VM (the review probe); this pins the three-layer scheme.
+/// at IP == 0. Under the OLD error-code-VALUE discriminator this was the
+/// ambiguous case (the slot read 0 for a #GP and for an IRQ frame whose
+/// return EIP was 0), decided by an opcode peek plus a cold PIC probe; a
+/// slot-only build mis-routed it and hard-killed the VM. The frame-ORIGIN
+/// basis (vec13_entry TEST 1: the no-error frame's EFLAGS.VM bit) decides
+/// it at ANY interrupted IP with no peek and no probe; this fixture pins
+/// that, with IP == 0 as the historically hostile case.
 ///
 /// IRQ5IP0 makes IP == 0 the common case with SB16 auto-init DMA (NOT the
 /// one-shot DSP 0xF2, whose re-arm races the ISR -- see the fixture header):
@@ -2049,7 +2050,7 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
 /// own schedule while the guest simply parks on a `jmp $` at offset 0 of a
 /// segment, so deliveries land at IP == 0 with no re-arm. This test is RED
 /// on the buggy slot-only monitor (the VM dies, a foreign TestExit code) and
-/// GREEN only on the three-layer fix.
+/// GREEN on any discriminator that classifies the frame correctly.
 #[test]
 #[ignore = "boots a full FreeDOS image (slow); run with --ignored"]
 fn tokaemm_irq5_at_ip0_discriminated_under_v86() {

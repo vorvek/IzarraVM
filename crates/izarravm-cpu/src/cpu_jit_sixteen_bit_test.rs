@@ -692,15 +692,16 @@ fn a_thirty_two_bit_stack_in_a_sixteen_bit_segment_keeps_its_full_pointer() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn a_sixteen_bit_block_ending_at_the_segment_top_faults_identically() {
+fn a_sixteen_bit_block_ending_at_the_segment_top_wraps_identically() {
     const TOP_ENTRY: u32 = 0xfffc;
 
     fn program() -> Vec<u8> {
         let mut memory = vec![0u8; 0x1_0000];
         // Four one-byte register ops occupying 0xFFFC through 0xFFFF exactly.
         memory[0xfffc..0x1_0000].copy_from_slice(&[0x40, 0x41, 0x42, 0x43]);
-        // The real-mode #GP vector is all zeroes, so the fault lands at 0000:0000. A HLT there
-        // makes both CPUs stop in the same place instead of running away through zero bytes.
+        // The 16-bit run-off wraps IP to 0 (stage-1 E7: real IP arithmetic is
+        // mod 65536; the old build #GP'd here instead). A HLT at 0000:0000
+        // stops both CPUs at the wrap landing.
         memory[0] = 0xf4;
         memory
     }
@@ -746,12 +747,12 @@ fn a_sixteen_bit_block_ending_at_the_segment_top_faults_identically() {
             .unwrap()
     );
     assert_eq!(
-        native.registers.eip, 0x1_0000,
-        "the native block leaves EIP unmasked, exactly as the interpreter does"
+        native.registers.eip, 0,
+        "the native exit seam wraps the run-off to IP 0, exactly as the          interpreter's retire seam does"
     );
 
-    // Now drive both from the same start and compare the whole architectural result, fault
-    // included. The native CPU re-enters through the interpreter, which takes the #GP.
+    // Now drive both from the same start and compare the whole architectural
+    // result: both wrap to 0000:0000 and halt there.
     arm(&mut interp);
     arm(&mut native);
     drive(&mut interp, &mut interp_bus);

@@ -1727,7 +1727,7 @@ impl CpuBus for MachineBus<'_> {
         // Publish the current run offset for lazy time-dependent reads.
         self.core_clocks_so_far = core_clocks_so_far;
         // Ring-0-monitor port-time exemption (V86 trap tax, Part 1): the TOKAEMM
-        // monitor's own device pokes (the vec13 discriminator's PIC OCW3 probe,
+        // monitor's own device pokes (remapped_pic_line's PIC OCW3 probe,
         // chiefly) are chipset-side bookkeeping done on the guest's behalf, not
         // guest-visible device activity in their own right. Ending the CPU batch
         // around them (the normal io_touched contract) triples the guest-visible
@@ -1976,7 +1976,7 @@ impl CpuBus for MachineBus<'_> {
         if let Some(resolved) = opl_port(port) {
             // Always end the batch on an OPL status read, even under the ring-0 PM
             // monitor. The skip_io_touched exemption exists for the monitor's OWN
-            // chipset pokes (the vec13 PIC OCW3 probe), but an OPL poll reflected
+            // chipset pokes (remapped_pic_line's PIC OCW3 probe), but an OPL poll reflected
             // from a V86 guest is real guest device I/O: it must end the batch so the
             // OPL timer advances BETWEEN polls. Without this the whole AdLib
             // detection loop runs inside one batch, the timer only advances at batch
@@ -2177,7 +2177,7 @@ impl CpuBus for MachineBus<'_> {
     ) -> Result<(), BusError> {
         self.core_clocks_so_far = core_clocks_so_far;
         // See read_io's matching comment (V86 trap tax, Part 1): the ring-0
-        // monitor's own device pokes (e.g. the vec13 discriminator's PIC OCW3
+        // monitor's own device pokes (e.g. remapped_pic_line's PIC OCW3
         // select write) are chipset bookkeeping, not guest-visible activity, so
         // they are exempted from ending the batch in the Approximate class only.
         //
