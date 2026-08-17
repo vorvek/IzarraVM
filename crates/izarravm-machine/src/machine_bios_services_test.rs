@@ -2966,3 +2966,60 @@ fn fossil_write_block_reads_a_non_identity_mapped_caller_buffer() {
          mapped to, across the boundary between them"
     );
 }
+
+// A FOSSIL driver is 16-bit code and its buffer pointer is ES:DI, so a run that
+// passes offset FFFFh continues at ES:0000 rather than at the next linear byte.
+// Both fixtures below start at DI=FFFFh with CX=2: the head byte is at ES:FFFF
+// and the tail byte has to be the one at ES:0000. Guest linear D8C5Fh, where
+// the head lands, is the unbacked upper-memory hole, so only the tail is
+// assertable -- but the tail is the whole question here, and without the wrap
+// it would be taken from D8C60h, which is unbacked as well.
+
+/// INT 14h AH=18h: the received tail lands at ES:0000, through the caller's
+/// mapping.
+#[test]
+fn fossil_read_block_wraps_at_the_end_of_the_caller_segment() {
+    let mut machine = super::margo::umb_paged_machine();
+    machine.write_physical_u8(super::margo::UMB_BUFFER_PHYSICAL, 0x5a);
+    machine.serial.write_port(0x03fa, 0x01); // FIFO on: the 16450 holds one byte
+    machine.serial.write_port(0x03fc, 0x10); // loopback
+    machine.serial.write_port(0x03f8, b'y');
+    machine.advance_devices_ticks(machine.serial.ticks_until_idle());
+    machine.serial.write_port(0x03f8, b'z');
+    machine.advance_devices_ticks(machine.serial.ticks_until_idle());
+
+    machine.cpu.registers.set_edi(0xffff);
+    machine.cpu.registers.set_ecx(2);
+    machine.cpu.registers.set_eax(0x1800);
+    machine.cpu.registers.set_edx(0); // COM1
+    machine.handle_int14();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 2, "two bytes received");
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_BUFFER_PHYSICAL),
+        b'z',
+        "the byte past offset FFFFh belongs at ES:0000, in the frame that \
+         page is mapped to"
+    );
+}
+
+/// INT 14h AH=19h: the source tail comes from ES:0000.
+#[test]
+fn fossil_write_block_wraps_at_the_end_of_the_caller_segment() {
+    let mut machine = super::margo::umb_paged_machine();
+    machine.write_physical_u8(super::margo::UMB_BUFFER_PHYSICAL, b'z');
+
+    machine.cpu.registers.set_edi(0xffff);
+    machine.cpu.registers.set_ecx(2);
+    machine.cpu.registers.set_eax(0x1900);
+    machine.cpu.registers.set_edx(0); // COM1
+    machine.handle_int14();
+
+    assert_eq!(machine.cpu.registers.eax() as u16, 2, "two bytes sent");
+    assert_eq!(
+        machine.serial.output(),
+        &[0xff, b'z'],
+        "the second byte must be sourced from ES:0000; without the wrap it \
+         comes from the unbacked byte after ES:FFFF and reads 0xFF"
+    );
+}

@@ -207,6 +207,40 @@ impl Machine {
         self.set_ax(word);
     }
 
+    /// The caller's `ES:DI` FOSSIL buffer, as guest LINEAR runs.
+    ///
+    /// A FOSSIL driver is 16-bit code, so its buffer offset wraps at the end of
+    /// the segment: the byte after `ES:FFFF` is `ES:0000`, not the next linear
+    /// byte. A run that passes that point is therefore two runs, and `CX` is a
+    /// word, so it is never more than two.
+    fn fossil_buffer_runs(&self, len: usize) -> Vec<(u32, usize)> {
+        let base = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let mut runs = Vec::new();
+        let mut offset = self.cpu.registers.edi() as u16;
+        let mut placed = 0usize;
+        while placed < len {
+            let chunk = (0x1_0000 - usize::from(offset)).min(len - placed);
+            runs.push((base.wrapping_add(u32::from(offset)), chunk));
+            placed += chunk;
+            offset = 0;
+        }
+        runs
+    }
+
+    /// How much of `runs` the guest's tables reach, stopping at the first run
+    /// that is not translatable to its end.
+    fn fossil_reachable(&mut self, runs: &[(u32, usize)]) -> usize {
+        let mut total = 0;
+        for &(at, len) in runs {
+            let present = self.linear_present_prefix(at, len);
+            total += present;
+            if present < len {
+                break;
+            }
+        }
+        total
+    }
+
     /// FOSSIL AH=18h block read into ES:DI, a guest LINEAR address; see
     /// `int14_fossil_driver_info`.
     ///
@@ -216,17 +250,23 @@ impl Machine {
     /// would be dropped: the request shortens to what the buffer can hold and
     /// AX reports it.
     fn int14_fossil_read_block(&mut self, second: bool) {
-        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-        let di = self.cpu.registers.edi() as u16;
-        let dst = es.wrapping_add(u32::from(di));
         let requested = usize::from(self.cpu.registers.ecx() as u16);
-        let max = self.linear_present_prefix(dst, requested);
+        let runs = self.fossil_buffer_runs(requested);
+        let max = self.fossil_reachable(&runs);
         let mut data = Vec::with_capacity(max);
         while data.len() < max && self.uart_read(second, 5) & 0x01 != 0 {
             let byte = self.uart_read(second, 0);
             data.push(byte);
         }
-        self.write_guest_linear_block(dst, &data);
+        let mut placed = 0usize;
+        for (at, len) in runs {
+            if placed >= data.len() {
+                break;
+            }
+            let chunk = len.min(data.len() - placed);
+            self.write_guest_linear_block(at, &data[placed..placed + chunk]);
+            placed += chunk;
+        }
         self.set_ax(data.len() as u16);
     }
 
@@ -236,12 +276,18 @@ impl Machine {
     /// put on the wire cannot be recalled, so the send stops at the page the
     /// caller's tables do not map and AX reports what was sent.
     fn int14_fossil_write_block(&mut self, second: bool) {
-        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-        let di = self.cpu.registers.edi() as u16;
-        let src = es.wrapping_add(u32::from(di));
         let requested = usize::from(self.cpu.registers.ecx() as u16);
-        let count = self.linear_present_prefix(src, requested);
-        for byte in self.read_guest_linear_block(src, count) {
+        let runs = self.fossil_buffer_runs(requested);
+        let count = self.fossil_reachable(&runs);
+        let mut data = Vec::with_capacity(count);
+        for (at, len) in runs {
+            if data.len() >= count {
+                break;
+            }
+            let chunk = len.min(count - data.len());
+            data.extend(self.read_guest_linear_block(at, chunk));
+        }
+        for byte in data {
             self.uart_write(second, 0, byte);
             self.finish_uart_transmit(second);
         }
