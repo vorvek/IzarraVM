@@ -1646,6 +1646,74 @@ fn opl_status_poll_charges_isa_bus_time_only_in_approximate_class() {
 }
 
 #[test]
+fn sb_dsp_status_poll_charges_isa_bus_time_only_in_approximate_class() {
+    // The SB DSP reset probe is the same idiom as AdLib detection: arm the
+    // reset, then poll the read-status port a bounded number of times for
+    // the 0xAA acknowledge. OuterRid polls 0x22E one hundred times; at 586
+    // an uncharged iteration costs ~60 ns, so the whole loop spans ~6 us
+    // against the 100 us settle and the probe fails where hardware
+    // succeeds. Each DSP port read must charge one ISA bus period in the
+    // Approximate class, exactly as the OPL status poll does above.
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        machine.isa_io_batch_clocks = 0;
+        with_bus(&mut machine, |bus| {
+            let _ = bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
+        });
+        let expected = (mode.clock_hz() / 1_000_000).max(1);
+        assert_eq!(
+            machine.isa_io_batch_clocks, expected,
+            "{mode:?}: one DSP status poll charges one ISA bus period"
+        );
+    }
+
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw386);
+    machine.isa_io_batch_clocks = 0;
+    with_bus(&mut machine, |bus| {
+        let _ = bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
+    });
+    assert_eq!(
+        machine.isa_io_batch_clocks, 0,
+        "the Accurate class must not charge ISA I/O time (byte-identical cadence)"
+    );
+}
+
+#[test]
+fn sb_dsp_reset_probe_sees_the_ack_within_a_hundred_polls_at_586() {
+    // End-to-end shape of the OuterRid probe: reset the DSP, then poll
+    // 0x22E a bounded number of times for data-available and read the
+    // acknowledge off 0x22A. The whole loop runs inside one batch with no
+    // device advance, so the acknowledge must come from the read-time
+    // settle service plus the charged ISA time — exactly what the guest's
+    // loop provides on the metal.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    machine.isa_io_batch_clocks = 0;
+    with_bus(&mut machine, |bus| {
+        let _ = bus.write_io(0x226, BusWidth::Byte, 1, false);
+        let _ = bus.write_io(0x226, BusWidth::Byte, 0, false);
+        let mut acked = None;
+        for poll in 0..100 {
+            let status = bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
+            if status & 0x80 != 0 {
+                acked = Some(poll);
+                break;
+            }
+        }
+        let acked = acked.expect("the reset acknowledge never became available in 100 polls");
+        assert!(
+            acked >= 5,
+            "the settle must not be instantaneous (poll {acked}); the arm \
+             compensation keeps the countdown anchored at the write"
+        );
+        let data = bus.read_io(0x22A, BusWidth::Byte, 0, false).unwrap();
+        assert_eq!(data, 0xAA, "the acknowledge byte");
+    });
+}
+
+#[test]
 fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
     // Pins the `end < 0xA0000` guard in charge_physical_instruction_fetch_run: a run whose
     // last byte is 0x9FFFF takes the conventional-RAM fast path (one collapsed
