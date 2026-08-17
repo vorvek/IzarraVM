@@ -29,6 +29,21 @@
 //! `goto` and no `choice`, which is also the cheapest thing to ask of the
 //! guest shell.
 //!
+//! THE LAUNCH IS THE LAST PROGRAM ON THE PATH, not the first. A launcher
+//! routinely loads a sound driver, a TSR or a logo player before the game, and
+//! stopping at the first program that resolved made the driver the title's
+//! launch: nine of the stage-1 sweep's 200 rows measured SOUNDRV, UNIVBE,
+//! POPHINT, METASHEL, DOSJP, SETENV, SOUNDBST, PLAYLOGO or MENU and ended in
+//! seconds. So the walk records every invocation and picks at the end. What
+//! comes before the launch is a prelude the guest runs in order; what comes
+//! after it is dropped, because it only runs once the game has exited.
+//!
+//! Two shapes end the walk once a program has run, and neither is more work
+//! the title means to do: a backward `goto`, which is the menu loop a launcher
+//! returns to when the game quits, and a label an `if errorlevel` ladder
+//! named, which is another branch's body. COMMAND.COM falls into that body;
+//! the launcher only reaches it because the ladder could not be read here.
+//!
 //! KNOWN AND DEFERRED, reviewed 2026-08-16. None of these is a wrong answer the
 //! census hides; each is a shape the walker models more coarsely than
 //! COMMAND.COM, and each is recorded here rather than fixed because the corpus
@@ -40,6 +55,12 @@
 //! - `if exist` is answered against the tree as EXTRACTED, not as it stands
 //!   after the flattened lines above it have run. A branch guarded on a file an
 //!   earlier `copy` creates is therefore read in its pre-copy state.
+//! - A flag can describe a line BELOW the launch, which is a line the guest
+//!   never runs. The walk sets flags as it goes and only learns which
+//!   invocation is the launch at the end, so `COMMAND-UNRESOLVED`,
+//!   `MENU-KEY-INJECTED` and `IF-UNRESOLVED` over-report by a little. Measured
+//!   over the stage-1 draw: 5 rows of 200, none of them with a changed
+//!   AUTOEXEC.
 //!
 //! ENVIRONMENT. `%VAR%` is expanded from the SET lines the walk has already
 //! seen, seeded with the variables the generated AUTOEXEC sets before the
@@ -94,11 +115,31 @@ pub struct ImgMount {
     pub kind: String,
 }
 
+/// One program invocation the walk reached. The launch is chosen from these
+/// when the walk ends; every earlier one becomes a prelude line.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub launch: Launch,
+    /// How many lines the walk had emitted when this invocation ran, so the
+    /// prelude line goes back in at the place it ran.
+    pub prefix_len: usize,
+    /// The walk's directory on this line. The launch needs a `cd` when the
+    /// program lives somewhere else; a prelude never changes the directory,
+    /// which is what COMMAND.COM does.
+    pub cwd: String,
+    /// The line to emit when this invocation turns out to be a prelude.
+    pub prelude_line: String,
+    /// The argument tail, lowercased, for the unload test.
+    pub args: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Flattened {
     /// Commands to write into AUTOEXEC.BAT, in order, before the launch.
     pub lines: Vec<String>,
     pub launch: Option<Launch>,
+    /// Every program invocation the walk reached, in order.
+    pub candidates: Vec<Candidate>,
     /// Reason code when the BAT could not be flattened.
     pub failure: Option<String>,
     pub flags: BTreeSet<String>,
@@ -112,6 +153,103 @@ pub struct Flattened {
     /// How many errorlevel ladders have already been probed, so a program that
     /// is nothing but ladders cannot make the walk exponential.
     pub errorlevel_probes: u32,
+}
+
+impl Flattened {
+    /// Choose the launch and settle the prelude. Every invocation before the
+    /// launch is spliced back into `lines` at the place it ran, and everything
+    /// after it is dropped: those lines only run once the game has exited.
+    pub fn finish(&mut self) {
+        if self.launch.is_some() {
+            return;
+        }
+        let candidates = std::mem::take(&mut self.candidates);
+        let Some(index) = launch_index(&candidates) else {
+            return;
+        };
+        let mut lines = Vec::new();
+        let mut from = 0;
+        for candidate in &candidates[..index] {
+            lines.extend_from_slice(&self.lines[from..candidate.prefix_len]);
+            lines.push(candidate.prelude_line.clone());
+            from = candidate.prefix_len;
+        }
+        let chosen = &candidates[index];
+        lines.extend_from_slice(&self.lines[from..chosen.prefix_len]);
+        if chosen.launch.dir != chosen.cwd {
+            lines.push(format!("cd \\{}", guest_path(&chosen.launch.dir)));
+        }
+        self.lines = lines;
+        self.launch = Some(chosen.launch.clone());
+    }
+}
+
+/// Fold a nested walk into its caller. A candidate's `prefix_len` counts lines
+/// in its own walk, so it moves with them.
+fn absorb(out: &mut Flattened, mut nested: Flattened) {
+    let offset = out.lines.len();
+    out.lines.append(&mut nested.lines);
+    for mut candidate in nested.candidates {
+        candidate.prefix_len += offset;
+        out.candidates.push(candidate);
+    }
+    out.flags.extend(nested.flags);
+    out.choices.append(&mut nested.choices);
+    out.imgmounts.append(&mut nested.imgmounts);
+}
+
+/// Which invocation is the launch: the last one that is not a teardown. The
+/// first invocation is always eligible, so a path of nothing but teardown
+/// names still names a launch rather than none.
+fn launch_index(candidates: &[Candidate]) -> Option<usize> {
+    (0..candidates.len())
+        .rev()
+        .find(|index| *index == 0 || !is_teardown(&candidates[*index], &candidates[..*index]))
+}
+
+/// Programs whose whole job is to undo an earlier line. `NOSOUND` (DKonK) and
+/// `REMOVE` (spellasa) are the two the corpus proves; the rest are the same
+/// DOS idiom. A name only counts once another program has already run, so a
+/// title whose only program carries one of these names still launches.
+const TEARDOWN_NAMES: [&str; 6] = [
+    "nosound",
+    "remove",
+    "unload",
+    "uninstal",
+    "uninstall",
+    "killtsr",
+];
+
+/// Does this invocation undo an earlier one? A TSR is usually removed by
+/// running it again with a single unload switch (`Soundrv u`, `pophint /u`,
+/// `metashel /K`), which is what tells it apart from a second real invocation
+/// like StarFit4's `menu MEMCHK` and `MENU GO`.
+fn is_teardown(candidate: &Candidate, earlier: &[Candidate]) -> bool {
+    if earlier.is_empty() {
+        return false;
+    }
+    let file = candidate
+        .launch
+        .resolved
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    if TEARDOWN_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
+        return true;
+    }
+    is_unload_argument(&candidate.args)
+        && earlier
+            .iter()
+            .any(|first| first.launch.resolved == candidate.launch.resolved)
+}
+
+/// Is the whole argument tail one switch that means "unload"?
+fn is_unload_argument(args: &str) -> bool {
+    matches!(
+        args.trim().trim_start_matches(['/', '-']),
+        "u" | "k" | "r" | "x" | "off" | "unload" | "uninstall" | "kill"
+    )
 }
 
 /// Commands the guest shell either does not have or must not be given. `pause`
@@ -174,9 +312,12 @@ impl<'a> Flattener<'a> {
         Flattener { tree }
     }
 
-    /// Read `<dir>/<name>.BAT` from the tree and flatten it. `cwd` is where the
-    /// caller's shell was standing, which the BAT inherits.
-    pub fn flatten_bat(&self, cwd: &str, bat_rel: &str, depth: u32, out: &mut Flattened) {
+    /// Read `<dir>/<name>.BAT` from the tree and walk it. `cwd` is where the
+    /// caller's shell was standing, which the BAT inherits. The walk only
+    /// collects invocations; `Flattened::finish` chooses the launch once the
+    /// outermost walk ends, because a BAT another BAT runs may hand control
+    /// back and the game may sit below the return.
+    fn flatten_bat(&self, cwd: &str, bat_rel: &str, depth: u32, out: &mut Flattened) {
         if depth > MAX_CALL_DEPTH {
             out.failure = Some("bat-call-too-deep".to_string());
             return;
@@ -197,6 +338,7 @@ impl<'a> Flattener<'a> {
     pub fn run_line_program(&self, text: &str, cwd: &mut String, out: &mut Flattened) {
         let program = Program::parse(text);
         self.run_from(&program, 0, cwd, 1, out);
+        out.finish();
     }
 
     fn run_from(
@@ -209,6 +351,10 @@ impl<'a> Flattener<'a> {
     ) {
         let mut pc = start;
         let mut steps = 0usize;
+        // Labels an `if errorlevel` ladder named. Reaching one of these after a
+        // program has run means the branch that was taken has ended and another
+        // branch's body begins.
+        let mut branch_labels: BTreeSet<String> = BTreeSet::new();
         while pc < program.lines.len() {
             steps += 1;
             if steps > MAX_STEPS {
@@ -220,7 +366,19 @@ impl<'a> Flattener<'a> {
             let stripped = line.trim_start_matches('@').trim().to_string();
             let lower = stripped.to_ascii_lowercase();
 
-            if stripped.is_empty() || stripped.starts_with(':') {
+            if stripped.is_empty() {
+                pc += 1;
+                continue;
+            }
+            if let Some(name) = stripped.strip_prefix(':') {
+                let name = name
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if !out.candidates.is_empty() && branch_labels.contains(&name) {
+                    return;
+                }
                 pc += 1;
                 continue;
             }
@@ -231,7 +389,7 @@ impl<'a> Flattener<'a> {
                 match self.jump(program, target.trim(), pc) {
                     Some(next) => pc = next,
                     None => {
-                        out.failure = Some("bat-backward-goto".to_string());
+                        stop_at_backward_goto(out);
                         return;
                     }
                 }
@@ -251,20 +409,28 @@ impl<'a> Flattener<'a> {
                             match self.jump(program, target.trim(), pc) {
                                 Some(next) => pc = next,
                                 None => {
-                                    out.failure = Some("bat-backward-goto".to_string());
+                                    stop_at_backward_goto(out);
                                     return;
                                 }
                             }
                             continue;
                         }
-                        if self.emit(&rest, cwd, depth, out, false) == Emit::Stop {
-                            self.settle_launch(program, pc, cwd, depth, out);
-                            return;
+                        match self.emit(&rest, cwd, depth, out, false) {
+                            Emit::Stop => return,
+                            Emit::Program => {
+                                if self.settle_launch(program, pc, cwd, depth, out) == Emit::Stop {
+                                    return;
+                                }
+                                pc += 1;
+                            }
+                            Emit::Continue => pc += 1,
                         }
-                        pc += 1;
                     }
                     IfOutcome::Unknown => {
                         out.flags.insert("IF-UNRESOLVED".to_string());
+                        if let Some(label) = goto_target(&lower) {
+                            branch_labels.insert(label);
+                        }
                         pc += 1;
                     }
                 }
@@ -276,6 +442,7 @@ impl<'a> Flattener<'a> {
             // resolves the game directory's own CHOICE.COM and records the
             // menu program as the title's launch.
             if verb_of(&lower).is_some_and(|verb| verb == "choice") {
+                branch_labels.extend(ladder_labels(program, pc));
                 match self.resolve_choice(program, pc, out) {
                     Some(next) => {
                         out.flags.insert("MENU-FLATTENED".to_string());
@@ -290,11 +457,16 @@ impl<'a> Flattener<'a> {
                 }
                 continue;
             }
-            if self.emit(&stripped, cwd, depth, out, false) == Emit::Stop {
-                self.settle_launch(program, pc, cwd, depth, out);
-                return;
+            match self.emit(&stripped, cwd, depth, out, false) {
+                Emit::Stop => return,
+                Emit::Program => {
+                    if self.settle_launch(program, pc, cwd, depth, out) == Emit::Stop {
+                        return;
+                    }
+                    pc += 1;
+                }
+                Emit::Continue => pc += 1,
             }
-            pc += 1;
         }
     }
 
@@ -312,19 +484,16 @@ impl<'a> Flattener<'a> {
         cwd: &str,
         depth: u32,
         out: &mut Flattened,
-    ) {
-        if out.launch.is_none() || out.failure.is_some() {
-            return;
+    ) -> Emit {
+        if out.failure.is_some() {
+            return Emit::Stop;
         }
         let Some(ladder) = errorlevel_ladder(program, pc + 1) else {
-            return;
+            return Emit::Continue;
         };
         out.errorlevel_probes += 1;
         if ladder.unresolved || out.errorlevel_probes > MAX_ERRORLEVEL_PROBES {
-            out.launch = None;
-            out.flags.insert("ERRORLEVEL-BRANCH".to_string());
-            out.failure = Some("errorlevel-branch-after-program".to_string());
-            return;
+            return refuse_errorlevel_branch(out);
         }
         let mut agreed: Option<Flattened> = None;
         for target in &ladder.continuations {
@@ -335,19 +504,18 @@ impl<'a> Flattener<'a> {
             };
             let mut probe_cwd = cwd.to_string();
             self.run_from(program, *target, &mut probe_cwd, depth, &mut probe);
-            let diverges = match (&agreed, &probe.launch) {
+            let reached = launch_index(&probe.candidates).map(|at| &probe.candidates[at].launch);
+            let diverges = match (&agreed, reached) {
                 (_, None) => true,
                 (None, Some(_)) => false,
                 (Some(first), Some(next)) => {
-                    let first = first.launch.as_ref().expect("agreed carries a launch");
+                    let at = launch_index(&first.candidates).expect("agreed reached a program");
+                    let first = &first.candidates[at].launch;
                     first.command != next.command || first.dir != next.dir
                 }
             };
             if diverges {
-                out.launch = None;
-                out.flags.insert("ERRORLEVEL-BRANCH".to_string());
-                out.failure = Some("errorlevel-branch-after-program".to_string());
-                return;
+                return refuse_errorlevel_branch(out);
             }
             if agreed.is_none() {
                 agreed = Some(probe);
@@ -356,16 +524,11 @@ impl<'a> Flattener<'a> {
         // Every branch ran the same program, so the utility above the ladder was
         // a probe and the agreed program is the launch. The utility itself still
         // has to run in the guest: it is what the game's own launcher runs.
-        if let Some(mut probe) = agreed {
+        if let Some(probe) = agreed {
             out.flags.insert("ERRORLEVEL-BRANCH-CONVERGED".to_string());
-            let utility = out.launch.take().expect("checked above");
-            out.lines.push(utility.command);
-            out.lines.append(&mut probe.lines);
-            out.flags.extend(probe.flags);
-            out.choices.append(&mut probe.choices);
-            out.imgmounts.append(&mut probe.imgmounts);
-            out.launch = probe.launch;
+            absorb(out, probe);
         }
+        Emit::Stop
     }
 
     /// Jump to a label. Only forward jumps are taken: a backward `goto` is a
@@ -490,8 +653,8 @@ impl<'a> Flattener<'a> {
                 .join(" ");
             return self.emit(&rebuilt, cwd, depth, out, via_call);
         }
-        // Everything left is a program. The first one that resolves in the tree
-        // is the launch, and the walk stops there.
+        // Everything left is a program. The walk records it and carries on: the
+        // launch is chosen from the whole path once the walk ends.
         match self.resolve_program(cwd, first) {
             Some((resolved, by_search, dir)) => {
                 if resolved.to_ascii_lowercase().ends_with(".bat") {
@@ -506,35 +669,57 @@ impl<'a> Flattener<'a> {
                     self.flatten_bat(&dir, &resolved, depth + 1, &mut nested);
                     out.vars = std::mem::take(&mut nested.vars);
                     out.errorlevel_probes = nested.errorlevel_probes;
-                    out.lines.extend(nested.lines);
-                    out.flags.extend(nested.flags);
-                    out.choices.extend(nested.choices);
-                    out.imgmounts.extend(nested.imgmounts);
-                    if let Some(failure) = nested.failure {
+                    let failure = nested.failure.take();
+                    absorb(out, nested);
+                    if let Some(failure) = failure {
                         out.failure = Some(failure);
                         return Emit::Stop;
                     }
-                    out.launch = nested.launch;
                     // A BAT reached by CALL returns to its caller; a bare BAT
                     // invocation transfers control and never comes back. Getting
                     // this wrong stopped XCOMUF's launcher dead at the helper
-                    // BAT that only sets a variable.
-                    if out.launch.is_none() && via_call {
+                    // BAT that only sets a variable, and left MDTheif's hint TSR
+                    // as the launch of the BAT that runs the game after it.
+                    if via_call {
                         return Emit::Continue;
                     }
                     return Emit::Stop;
                 }
-                if dir != *cwd {
-                    out.lines.push(format!("cd \\{}", guest_path(&dir)));
-                    *cwd = dir.clone();
-                }
-                out.launch = Some(Launch {
-                    dir,
-                    command: command.trim().to_string(),
-                    resolved,
-                    by_search,
+                let file = resolved.rsplit('/').next().unwrap_or_default().to_string();
+                let args = command
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim().to_string())
+                    .unwrap_or_default();
+                // A command that names its own directory must not keep that
+                // prefix once the launch line has `cd`-ed into the directory:
+                // DKonK's `DRIVERS\SOUNDBST` under `cd \KIDKEYS\DRIVERS` names
+                // a path the guest cannot resolve.
+                let launch_command = match (first.trim_matches('"').contains(['\\', '/']), &args) {
+                    (false, _) => command.trim().to_string(),
+                    (true, args) if args.is_empty() => file.clone(),
+                    (true, args) => format!("{file} {args}"),
+                };
+                // A prelude does not change the directory, the way COMMAND.COM
+                // does not, so a program somewhere else runs by its full path.
+                let prelude_line = match (dir == *cwd, &args) {
+                    (true, _) => command.trim().to_string(),
+                    (false, args) if args.is_empty() => format!("\\{}", guest_path(&resolved)),
+                    (false, args) => format!("\\{} {args}", guest_path(&resolved)),
+                };
+                out.candidates.push(Candidate {
+                    prefix_len: out.lines.len(),
+                    cwd: cwd.clone(),
+                    prelude_line,
+                    args: args.to_ascii_lowercase(),
+                    launch: Launch {
+                        dir,
+                        command: launch_command,
+                        resolved,
+                        by_search,
+                    },
                 });
-                Emit::Stop
+                Emit::Program
             }
             None => {
                 out.flags.insert("COMMAND-UNRESOLVED".to_string());
@@ -737,7 +922,32 @@ impl<'a> Flattener<'a> {
 #[derive(PartialEq, Eq)]
 enum Emit {
     Continue,
+    /// A program invocation was recorded. The caller still has to read whatever
+    /// `if errorlevel` ladder follows it.
+    Program,
     Stop,
+}
+
+/// A `goto` that points backwards is a loop. Before any program has run it is a
+/// shape the walker cannot model; after one, it is the launcher returning to
+/// its menu once the game exits, and the walk simply ends.
+fn stop_at_backward_goto(out: &mut Flattened) {
+    if out.candidates.is_empty() {
+        out.failure = Some("bat-backward-goto".to_string());
+    } else {
+        out.flags.insert("LOOP-AFTER-LAUNCH".to_string());
+    }
+}
+
+/// The exit code is unknowable here and the branches disagree about what runs,
+/// so the title is refused by name rather than measured down a branch the guest
+/// might never take.
+fn refuse_errorlevel_branch(out: &mut Flattened) -> Emit {
+    out.candidates.clear();
+    out.launch = None;
+    out.flags.insert("ERRORLEVEL-BRANCH".to_string());
+    out.failure = Some("errorlevel-branch-after-program".to_string());
+    Emit::Stop
 }
 
 enum IfOutcome {
@@ -911,6 +1121,40 @@ fn errorlevel_ladder(program: &Program, from: usize) -> Option<ErrorlevelLadder>
         continuations: targets,
         unresolved,
     })
+}
+
+/// Every label the `if errorlevel N goto LABEL` ladder at `pc` names.
+fn ladder_labels(program: &Program, pc: usize) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut scan = pc + 1;
+    while scan < program.lines.len() {
+        let line = program.lines[scan].trim().trim_start_matches('@').trim();
+        let lower = line.to_ascii_lowercase();
+        if line.is_empty() || lower.starts_with("rem ") {
+            scan += 1;
+            continue;
+        }
+        if !lower.starts_with("if errorlevel") && !lower.starts_with("if not errorlevel") {
+            break;
+        }
+        if let Some(label) = goto_target(&lower) {
+            labels.push(label);
+        }
+        scan += 1;
+    }
+    labels
+}
+
+/// The label a `... goto LABEL` line jumps to. Every ladder line ends in its
+/// `goto`, so the last token is the label.
+fn goto_target(lower_line: &str) -> Option<String> {
+    if !lower_line.contains(" goto ") {
+        return None;
+    }
+    lower_line
+        .split_whitespace()
+        .next_back()
+        .map(str::to_string)
 }
 
 /// The line a label sits on, when the label exists and is strictly AFTER `pc`.
