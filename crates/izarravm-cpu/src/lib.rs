@@ -358,6 +358,11 @@ pub enum CpuError {
         original_vector: u8,
         nested_vector: u8,
     },
+    #[error(
+        "vector {nested_vector} raised after a task switch had committed: the incoming \
+         task is live and the interrupted task's state cannot be restored"
+    )]
+    FaultAfterTaskSwitchCommit { nested_vector: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4695,6 +4700,21 @@ const DOUBLE_FAULT_VECTOR: u8 = 8;
 /// the same `TripleFault` stop, because the state is the same: delivery cannot
 /// complete and the machine must not keep running.
 const MAX_FAULT_ESCALATIONS: u32 = 8;
+
+/// Convert a fault raised after a task switch has committed into the terminal
+/// error. A `CpuError` is already terminal and passes straight through; a
+/// processor exception is converted, because there is no interrupted task left
+/// to deliver it from.
+fn fault_after_task_switch_commit(fault: InternalFault) -> InternalFault {
+    match fault {
+        InternalFault::Cpu(error) => InternalFault::Cpu(error),
+        InternalFault::Exception { vector, .. } => {
+            InternalFault::Cpu(CpuError::FaultAfterTaskSwitchCommit {
+                nested_vector: vector,
+            })
+        }
+    }
+}
 
 /// The three classes the 386 sorts interrupts and exceptions into when it
 /// decides whether two of them can be handled one after the other (386 PRM

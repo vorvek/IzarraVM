@@ -1888,6 +1888,76 @@ fn hardware_interrupt_through_a_task_gate_pushes_no_error_code() {
 }
 
 #[test]
+fn a_fault_after_a_task_gate_switch_commits_is_terminal_not_escalated() {
+    // A task switch commits the WHOLE incoming task inside `load_task_state`:
+    // CR3, LDTR, TR, CS:EIP, every GPR. `deliver_exception_inner`'s unwind can
+    // only put back five fields of the OUTGOING task, so a fault after that
+    // commit must not be escalated -- re-delivering from the mixture would hand
+    // the guest a state belonging to no task at all. Here the incoming task's SS
+    // has a 0xff limit and its ESP is 0, so the error-code push runs off the
+    // stack segment. The core must stop, and must leave the committed state
+    // alone rather than half-restore it.
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    // A 32-bit ring-0 stack with a 0xff byte limit: a push at ESP 0 wraps below
+    // zero and lands outside it.
+    let tiny_stack = (0x28u16, 0x0000_00ff, 0x0040_9300);
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+        &[0xf4],
+        &[RING0_CODE, ring0_data, new_tss, old_tss, tiny_stack],
+    );
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.idtr = DescriptorTable {
+        base: 0x200,
+        limit: 0xff,
+    };
+    cpu.registers.set_esp(0x1234);
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    // Gate 13 (#GP, a vector that carries an error code) as a task gate -> TSS 0x18.
+    put32(&mut memory, 0x268, 0x0018_0000);
+    put32(&mut memory, 0x26c, 0x0000_8500);
+    put32(&mut memory, 0x380 + 32, 0x90); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS
+    put32(&mut memory, 0x380 + 56, 0x0000_0000); // ESP: the push runs off the stack
+    put16(&mut memory, 0x380 + 72, 0x10); // ES
+    put16(&mut memory, 0x380 + 76, 0x08); // CS
+    put16(&mut memory, 0x380 + 80, 0x28); // SS: the 0xff-limit segment
+    put16(&mut memory, 0x380 + 84, 0x10); // DS
+    let mut bus = TestBus::with_memory(memory);
+
+    let result = cpu.deliver_exception_escalating(&mut bus, 13, Some(0), false);
+
+    assert_eq!(
+        result,
+        Err(CpuError::FaultAfterTaskSwitchCommit { nested_vector: 12 }),
+        "{result:?}"
+    );
+    assert_eq!(
+        cpu.tr.selector, 0x18,
+        "the switch committed; it must not be half-unwound"
+    );
+    assert_eq!(
+        cpu.registers.eip, 0x90,
+        "the incoming task's EIP stays live"
+    );
+    assert_ne!(
+        cpu.registers.esp(),
+        0x1234,
+        "the outgoing task's ESP must NOT be restored over the committed task"
+    );
+}
+
+#[test]
 fn iret_with_nt_and_a_non_busy_backlink_raises_ts_and_keeps_nt() {
     // Back-link names an AVAILABLE (type 0x09) TSS: #TS(sel), and NT must
     // still be set afterwards so the faulting IRET stays restartable (the
