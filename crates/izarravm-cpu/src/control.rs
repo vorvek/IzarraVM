@@ -248,6 +248,148 @@ impl CpuGsw {
         }
     }
 
+    /// Deliver an exception, and if the delivery itself faults, escalate the way
+    /// a 386 does (PRM 9.9.8) instead of stopping the emulator. This is the entry
+    /// point every run-loop call site uses; `deliver_exception` below is the
+    /// single attempt it drives.
+    pub(super) fn deliver_exception_escalating<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+        error_code: Option<u32>,
+        is_external: bool,
+    ) -> Result<(), CpuError> {
+        let attempt = self.deliver_exception(bus, vector, error_code, is_external);
+        self.escalate_delivery(bus, attempt, vector, is_external)
+    }
+
+    /// `hardware_interrupt` with the same escalation as
+    /// `deliver_exception_escalating`. An external interrupt is benign whatever
+    /// vector it lands on, which is what `is_external = true` carries into the
+    /// class table.
+    pub(super) fn hardware_interrupt_escalating<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+    ) -> Result<(), CpuError> {
+        let attempt = self.hardware_interrupt(bus, vector);
+        self.escalate_delivery(bus, attempt, vector, true)
+    }
+
+    /// The escalation loop shared by the two entry points above. `attempt` is the
+    /// result of the first delivery; on a nested exception this decides, from the
+    /// PRM's class table, whether to hand the guest the nested vector instead
+    /// (handle the two serially), to abandon both and raise #DF, or -- when the
+    /// fault landed while the double-fault handler was being called -- to stop.
+    ///
+    /// Handling two faults serially needs no bookkeeping here: the aborted
+    /// delivery unwound to the interrupted state (see `deliver_exception_inner`)
+    /// and the run loop had already rewound CS:EIP to the faulting instruction,
+    /// so the nested handler's frame names that instruction and its IRET restarts
+    /// it. The first fault is then raised again, in order, exactly as the PRM's
+    /// "handled in succession" requires.
+    ///
+    /// Two faults deliberately stay outside the table, both of them raised as
+    /// `InternalFault::Cpu` and so returned to the caller as a stop:
+    ///
+    /// - A committed task switch (`CpuError::FaultAfterTaskSwitchCommit`). There
+    ///   is no interrupted state left to escalate from; see `commit_task_switch`.
+    /// - An IDT that does not cover the vector (`CpuError::IdtLimit`).
+    ///   Architecturally that is a contributory `#GP(vector*8+2)` and would
+    ///   escalate, but this core reports it as a named stop at every level, which
+    ///   an existing test pins for the first-level case. An IDT limit is one
+    ///   contiguous bound and every escalation target is vector 8 or higher, so
+    ///   "the IDT covers the target" implies "it covers vector 8": escalating
+    ///   would change the outcome only for a guest that keeps a short IDT AND a
+    ///   real #DF handler, which would then get its #DF delivered instead of a
+    ///   stop. No DOS-era guest does that, and every other layout ends in a stop
+    ///   either way -- with the precise "IDT does not cover vector N" diagnostic
+    ///   instead of a generic triple fault. Revisit together with the missing
+    ///   gate-P-bit check.
+    ///
+    /// One known wart, inherited rather than introduced: in REAL mode
+    /// `deliver_exception` routes through `software_interrupt`, which posts
+    /// `bus.interrupt_acknowledge` -- the software-`INT n` device hook. An
+    /// escalated re-delivery therefore posts an acknowledge that `hardware_interrupt`
+    /// deliberately suppresses for the first attempt. What keeps that harmless is
+    /// the vector range, not the hook's contents: the machine's side-effecting set
+    /// spans 0x10-0x1A, 0x20, 0x21, 0x40, 0x42 and the absent-resident-API list,
+    /// while every escalation target is 0x0E or below. So the cost is a spurious
+    /// device access and its I/O wait states on a cold path.
+    fn escalate_delivery<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        attempt: ExecResult<()>,
+        original_vector: u8,
+        original_is_external: bool,
+    ) -> Result<(), CpuError> {
+        let mut attempt = attempt;
+        let mut vector = original_vector;
+        let mut class = fault_class(original_vector, original_is_external);
+        // A non-external vector-8 delivery IS the double-fault handler's call, so
+        // a fault during it is the PRM's shutdown rather than a second #DF.
+        // Seeding the flag from the vector keeps that structural instead of
+        // resting on "nothing raises vector 8 as an exception today". An EXTERNAL
+        // vector 8 is IRQ0 on a PIC left at base 0x08 and stays benign.
+        let mut calling_double_fault_handler =
+            original_vector == DOUBLE_FAULT_VECTOR && !original_is_external;
+        let mut escalations = 0u32;
+        loop {
+            let (nested_vector, nested_error_code) = match attempt {
+                Ok(()) => return Ok(()),
+                Err(InternalFault::Cpu(error)) => return Err(error),
+                Err(InternalFault::Exception { vector, error_code }) => (vector, error_code),
+            };
+            // A nested fault is always a processor exception raised by the frame
+            // build itself, never an external interrupt, so `is_external` is
+            // false both when classifying it and when delivering it below.
+            let nested_class = fault_class(nested_vector, false);
+            // Traced BEFORE the shutdown check, so the step that ENDS a chain is
+            // in the log too and the trace reads as a complete story. Without any
+            // of this an escalation that ends in a delivered handler leaves no
+            // trace at all: a guest that faults, escalates and IRETs straight back
+            // into the same fault presents as a silent full-speed hang, where the
+            // pre-escalation core stopped with a named error. Same env gate as the
+            // rest of the fault tracing.
+            if ud_trace_enabled() {
+                eprintln!(
+                    "fault trace: vector {nested_vector} ({nested_class:?}) raised while \
+                     delivering vector {vector} ({class:?}); \
+                     calling_double_fault_handler={calling_double_fault_handler} \
+                     escalations={escalations}"
+                );
+            }
+            // "If any other exception occurs while attempting to call the
+            // double-fault handler, the processor enters shutdown mode." The
+            // emulator's equivalent of shutdown is the hard stop: the machine
+            // reports the error and executes nothing further. The cap arm lands
+            // in the same terminal state -- see MAX_FAULT_ESCALATIONS.
+            if calling_double_fault_handler || escalations == MAX_FAULT_ESCALATIONS {
+                return Err(CpuError::TripleFault {
+                    original_vector,
+                    nested_vector,
+                });
+            }
+            escalations += 1;
+            let escalation = escalate_fault(class, nested_class);
+            let error_code = match escalation {
+                FaultEscalation::Serial => {
+                    vector = nested_vector;
+                    nested_error_code
+                }
+                FaultEscalation::DoubleFault => {
+                    calling_double_fault_handler = true;
+                    vector = DOUBLE_FAULT_VECTOR;
+                    // "The processor always pushes an error code onto the stack of
+                    // the double-fault handler; however, the error code is always 0."
+                    Some(0)
+                }
+            };
+            class = fault_class(vector, false);
+            attempt = self.deliver_exception(bus, vector, error_code, false);
+        }
+    }
+
     pub(super) fn deliver_exception<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -310,6 +452,33 @@ impl CpuGsw {
         ]
         .map(|segment| (segment, self.registers.segment(segment)));
         let result = self.deliver_exception_body(bus, vector, error_code, is_external);
+        // A committed task switch is the one failure this restore must NOT run
+        // for. By then the incoming task's CR3, LDTR, TR, CS:EIP and GPRs are
+        // live, and putting five fields of the OUTGOING task back would assemble
+        // a state belonging to no task at all. That failure is terminal (see
+        // `commit_task_switch`), so the committed state is both the honest thing
+        // to leave behind and what a post-mortem needs to read.
+        //
+        // Keyed on the label, which covers every PROCESSOR EXCEPTION out of the
+        // commit but not a `CpuError` from a bus access inside it -- that one
+        // still gets the restore and still leaves a hybrid dump. Narrower than it
+        // looks, and deliberately left: inside `load_task_state` the highest
+        // address touched is the LDTR selector at TSS+96, read before anything is
+        // committed, so under a contiguous mapping an out-of-range read there
+        // always precedes the commit. Only the back-link write and the busy-bit
+        // write could bus-fault post-commit, and both address LOWER memory than
+        // the reads that already succeeded. No fixture in this harness can reach
+        // it, so a fix would be an untested behavior change on an already-fatal
+        // path, and threading a commit flag through `CpuGsw` to key on instead
+        // moves a measured cache-layout pin (see `pending_flags_offset`).
+        if matches!(
+            result,
+            Err(InternalFault::Cpu(
+                CpuError::FaultAfterTaskSwitchCommit { .. }
+            ))
+        ) {
+            return result;
+        }
         if result.is_err() {
             self.cpl = entry_cpl;
             self.registers.eflags = entry_eflags;
@@ -369,7 +538,11 @@ impl CpuGsw {
         if (gate_high >> 8) & 0x1f == 0x05 {
             self.task_switch(bus, selector, TaskSwitchKind::Call)?;
             if !is_external && vector_pushes_error_code(vector) {
-                self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
+                // The switch has committed, and this push lands on the NEW task's
+                // stack, so a fault here is terminal for the same reason it is
+                // inside `commit_task_switch`.
+                self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)
+                    .map_err(fault_after_task_switch_commit)?;
             }
             return Ok(());
         }
@@ -448,6 +621,16 @@ impl CpuGsw {
             // `source_v86`: a V86-origin #GP must still push exactly 0, but a pmode
             // selector #GP is free to carry a real code. Update tokaemm.asm's
             // vec13_entry BEFORE relaxing the V86-origin half of this.
+            //
+            // One caveat the raise-site argument in tokaemm.asm does not cover:
+            // `escalate_delivery` is a DELIVERY site that forwards an error code it
+            // did not raise. A benign first event (an IRQ, or #UD/#BP/#OF/#BR/#NM/#MF)
+            // whose delivery nests a #GP(selector) is handled serially, and that
+            // re-delivery reaches here with a nonzero code and `source_v86` restored.
+            // It needs a malformed gate or CS descriptor in the ACTIVE monitor's own
+            // tables, which TOKAEMM's are not, so this has never been observed -- but
+            // the invariant now rests on the monitor's tables being well formed, not
+            // on an enumeration of raise sites.
             debug_assert!(
                 !source_v86 || vector != 13 || error_code.unwrap_or(0) == 0,
                 "V86-origin vector-13 #GP with a nonzero error code ({error_code:?}) \
@@ -1399,6 +1582,44 @@ impl CpuGsw {
         if kind != TaskSwitchKind::Call {
             self.set_tss_busy(bus, old_selector, false)?;
         }
+        // Everything above still leaves the outgoing task whole, so its faults are
+        // ordinary restartable exceptions. The tail below is not: it commits the
+        // incoming task piece by piece -- CR3 first, then LDTR, the GPRs, EFLAGS
+        // and every segment including CS -- and nothing snapshots what it
+        // overwrites. A fault past that point therefore cannot be delivered from
+        // the interrupted task, because there is no interrupted task left, so it
+        // is reported as terminal instead of being handed to a caller that would
+        // retry (exception delivery's escalation) or rewind (an instruction's own
+        // fault path) from a state belonging to no task.
+        self.commit_task_switch(bus, kind, new_tss, old_selector, new_selector)
+            .map_err(fault_after_task_switch_commit)
+    }
+
+    /// The committing tail of `task_switch`. See the comment at its only call
+    /// site for why every fault in here is terminal.
+    ///
+    /// Two things this costs, both recorded rather than fixed. It consumes the
+    /// deliverable half of PRM 9.9.10's #TS family: the "invalid TSS" cases that
+    /// come from the INCOMING TSS's contents (a bad SS, CS or LDT selector) are
+    /// raised by `load_task_state`'s own segment loads, so a JMP/CALL/IRET to a
+    /// malformed TSS now stops instead of vectoring #TS the way a 386 does. The
+    /// honest fix is Intel's order -- validate every incoming selector, then load
+    /// any of them -- which would move those checks back above this boundary.
+    /// (The descriptor-level #TS/#GP checks in `task_switch` itself are still
+    /// pre-commit and still deliverable; a further pre-existing gap is that these
+    /// loads raise #GP/#NP rather than #TS at all.) And the boundary is one read
+    /// wider than it needs to be: `load_task_state`'s first act is to read the
+    /// incoming CR3, which mutates nothing, so a #PF on a not-present incoming
+    /// TSS page is reported terminal despite being perfectly restartable. That
+    /// needs a demand-paged TSS, which no DOS-era guest has.
+    fn commit_task_switch<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        kind: TaskSwitchKind,
+        new_tss: SegmentRegister,
+        old_selector: u16,
+        new_selector: u16,
+    ) -> ExecResult<()> {
         self.load_task_state(bus, new_tss.base)?;
         if kind == TaskSwitchKind::Call {
             // Write the back-link and set NT so the inner IRET returns to the caller.

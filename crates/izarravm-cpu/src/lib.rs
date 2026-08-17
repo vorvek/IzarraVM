@@ -350,13 +350,19 @@ pub enum CpuError {
     #[error("divide error (#DE): divide by zero or quotient overflow")]
     DivideError,
     #[error(
-        "nested fault delivering vector {original_vector}: vector {nested_vector} \
-         raised while building the exception frame"
+        "triple fault: delivery of vector {original_vector} escalated to a double fault, \
+         then vector {nested_vector} was raised while calling the double-fault handler; \
+         the processor enters shutdown"
     )]
-    NestedFaultDuringDelivery {
+    TripleFault {
         original_vector: u8,
         nested_vector: u8,
     },
+    #[error(
+        "vector {nested_vector} raised after a task switch had committed: the incoming \
+         task is live and the interrupted task's state cannot be restored"
+    )]
+    FaultAfterTaskSwitchCommit { nested_vector: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4681,6 +4687,97 @@ fn parity(value: u8) -> bool {
 /// vector (including the software INT n forms) pushes no error code.
 const fn vector_pushes_error_code(vector: u8) -> bool {
     matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17)
+}
+
+/// Vector 8, #DF.
+const DOUBLE_FAULT_VECTOR: u8 = 8;
+
+/// How many times one delivery may escalate before the core reports shutdown.
+/// This is not an architectural number. Every fault a frame build can raise is
+/// contributory or a page fault, so a real chain reaches a delivered handler or
+/// #DF within two steps and shutdown within three; the cap only bounds a chain
+/// that a future change to the class table could make cycle. Hitting it reports
+/// the same `TripleFault` stop, because the state is the same: delivery cannot
+/// complete and the machine must not keep running.
+const MAX_FAULT_ESCALATIONS: u32 = 8;
+
+/// Convert a fault raised after a task switch has committed into the terminal
+/// error. A `CpuError` is already terminal and passes straight through; a
+/// processor exception is converted, because there is no interrupted task left
+/// to deliver it from.
+fn fault_after_task_switch_commit(fault: InternalFault) -> InternalFault {
+    match fault {
+        InternalFault::Cpu(error) => InternalFault::Cpu(error),
+        InternalFault::Exception { vector, .. } => {
+            InternalFault::Cpu(CpuError::FaultAfterTaskSwitchCommit {
+                nested_vector: vector,
+            })
+        }
+    }
+}
+
+/// The three classes the 386 sorts interrupts and exceptions into when it
+/// decides whether two of them can be handled one after the other (386 PRM
+/// 9.9.8, Table 9-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultClass {
+    Benign,
+    Contributory,
+    PageFault,
+}
+
+/// Classify one delivery. `is_external` is set for an external hardware
+/// interrupt and for a software `INT n`: the PRM's first class is titled "Benign
+/// Exceptions and Interrupts", so those are benign whatever vector they land on.
+/// That is what keeps IRQ0 on a PIC still at base 0x08 (vector 8, the #DF slot)
+/// from being read as a double fault in progress.
+const fn fault_class(vector: u8, is_external: bool) -> FaultClass {
+    if is_external {
+        return FaultClass::Benign;
+    }
+    match vector {
+        // #DE 0, coprocessor segment overrun 9, #TS 10, #NP 11, #SS 12, #GP 13.
+        0 | 9 | 10 | 11 | 12 | 13 => FaultClass::Contributory,
+        14 => FaultClass::PageFault,
+        // Table 9-3 has no row for #DF itself: the PRM handles a fault during
+        // the double-fault handler's call with the separate shutdown rule, which
+        // `escalate_delivery` tracks directly. Classing 8 as contributory is the
+        // safe fallback if that tracking is ever lost -- the pair then escalates
+        // rather than looping.
+        8 => FaultClass::Contributory,
+        // #DB 1, NMI 2, #BP 3, #OF 4, #BR 5, #UD 6, #NM 7, #MF 16, and every
+        // vector the 386 leaves to software.
+        _ => FaultClass::Benign,
+    }
+}
+
+/// What the 386 does when `second` is raised while it is calling `first`'s
+/// handler: handle the two in succession, or abandon both and signal #DF (386
+/// PRM 9.9.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultEscalation {
+    Serial,
+    DoubleFault,
+}
+
+const fn escalate_fault(first: FaultClass, second: FaultClass) -> FaultEscalation {
+    use FaultClass::{Benign, Contributory, PageFault};
+    match (first, second) {
+        // "When two benign exceptions or interrupts occur, or one benign and one
+        // contributory, the two events can be handled in succession", and "This
+        // is also true if a page fault is followed by a benign exception."
+        (Benign, _) | (_, Benign) => FaultEscalation::Serial,
+        // "If a benign or contributory exception is followed by a page fault,
+        // the two events can be handled in succession."
+        (Contributory, PageFault) => FaultEscalation::Serial,
+        // "When two contributory events occur, they cannot be handled, and a
+        // double-fault exception is generated", and "if a page fault is followed
+        // by a contributory exception or another page fault, a double-fault
+        // abort is generated."
+        (Contributory, Contributory) | (PageFault, Contributory | PageFault) => {
+            FaultEscalation::DoubleFault
+        }
+    }
 }
 
 fn page_fault_code(present: bool, write: bool, user: bool) -> u32 {
