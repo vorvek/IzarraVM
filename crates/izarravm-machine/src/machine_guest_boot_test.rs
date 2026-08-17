@@ -1156,12 +1156,14 @@ fn dos_reserved_vectors_point_at_a_valid_iret_handler() {
     )
     .unwrap();
 
+    // 60h-6Fh are NOT in this list: the AT BIOS leaves the user/unused range
+    // null so a free-vector scan can claim a slot. See
+    // `user_reserved_vectors_60_to_6f_are_left_null`.
     for vector in [
         0x2bu32, 0x2c, 0x2d, 0x2e, 0x32, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
-        0x3d, 0x3e, 0x3f, 0x45, 0x48, 0x49, 0x4a, 0x59, 0x5a, 0x5b, 0x5c, 0x60, 0x61, 0x62, 0x63,
-        0x64, 0x65, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x78, 0x79, 0x7a, 0x7b, 0x7c,
-        0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xe0, 0xe4, 0xef, 0xf0, 0xf1,
-        0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+        0x3d, 0x3e, 0x3f, 0x45, 0x48, 0x49, 0x4a, 0x59, 0x5a, 0x5b, 0x5c, 0x78, 0x79, 0x7a, 0x7b,
+        0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xe0, 0xe4, 0xef, 0xf0,
+        0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
     ] {
         let off = read_u16(&mut m, vector * 4);
         let seg = read_u16(&mut m, vector * 4 + 2);
@@ -1176,6 +1178,33 @@ fn dos_reserved_vectors_point_at_a_valid_iret_handler() {
             m.read_physical_u8(target + 1),
             0xcf,
             "INT {vector:02X}h stub ends in an IRET"
+        );
+    }
+}
+
+#[test]
+fn user_reserved_vectors_60_to_6f_are_left_null() {
+    // IBM PC AT Technical Reference, System BIOS 5-5: vectors 60h-67h are
+    // "Reserved for user program interrupts" and 68h-6Fh are "Not used". The
+    // system BIOS initializes neither group, so both read 0000:0000 after POST.
+    // Resident software claims a slot by scanning for the first null entry; a
+    // ROM IRET stub in any of the sixteen makes that scan report no free
+    // vector. INT 67h is included: the EMS manager (TOKAEMM) writes its own
+    // handler there at install time and never reads the prior value, so the
+    // firmware must leave the slot null.
+    let mut m = Machine::new(
+        MachineProfile::gsw_386(4, VideoCard::Vega),
+        rom_with_code(&[]),
+    )
+    .unwrap();
+
+    for vector in 0x60u32..=0x6f {
+        let off = read_u16(&mut m, vector * 4);
+        let seg = read_u16(&mut m, vector * 4 + 2);
+        assert_eq!(
+            (seg, off),
+            (0, 0),
+            "INT {vector:02X}h is left 0000:0000 by POST"
         );
     }
 }

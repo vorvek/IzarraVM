@@ -1343,7 +1343,23 @@ fn program_runtime_reintercepts_dos_vectors_for_the_raw_program_loader() {
 fn absent_resident_api_vectors_intercept_only_default_iret() {
     let mut m = int15_machine(16);
 
-    for vector in [0x5C, 0x60, 0x68, 0x6F, 0x7A, 0x86, 0xE4] {
+    // 0x5C, 0x7A, 0x86 and 0xE4 carry their per-vector ROM stub out of POST.
+    for vector in [0x5C, 0x7A, 0x86, 0xE4] {
+        ack_and_dispatch(&mut m, vector);
+        assert_eq!(m.pending_soft_int, Some(vector), "INT {vector:02X}h");
+        m.pending_soft_int = None;
+    }
+
+    // 0x60, 0x68 and 0x6F sit in the user/unused range the AT BIOS leaves at
+    // 0000:0000, so POST no longer seeds them and an `INT n` on the default
+    // vector runs off into low memory exactly as it does on the metal. The
+    // interception predicate still recognises the ROM stub, which is what a
+    // guest that saved and restored the pre-hook vector puts back; point the
+    // three at their stubs by hand to pin that arm.
+    for vector in [0x60u8, 0x68, 0x6F] {
+        let base = usize::from(vector) * 4;
+        m.memory.write_u16(base, bios_int_stub_off(vector)).unwrap();
+        m.memory.write_u16(base + 2, BIOS_ROM_IRET_SEG).unwrap();
         ack_and_dispatch(&mut m, vector);
         assert_eq!(m.pending_soft_int, Some(vector), "INT {vector:02X}h");
         m.pending_soft_int = None;
@@ -1356,6 +1372,15 @@ fn absent_resident_api_vectors_intercept_only_default_iret() {
     assert_eq!(
         m.pending_soft_int, None,
         "guest-owned INT 60h is not stolen"
+    );
+
+    // And the POST default - a null vector - is not intercepted either.
+    m.memory.write_u16(0x60 * 4, 0).unwrap();
+    m.memory.write_u16(0x60 * 4 + 2, 0).unwrap();
+    ack_and_dispatch(&mut m, 0x60);
+    assert_eq!(
+        m.pending_soft_int, None,
+        "a null INT 60h vector is not intercepted"
     );
 }
 
