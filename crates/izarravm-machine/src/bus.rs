@@ -185,7 +185,16 @@ impl Machine {
 
     /// The linear-to-physical half of `read_linear_u8`, on its own. Same probe discipline: it
     /// walks the guest's own tables with uncharged byte reads, sets no CR2, writes no accessed
-    /// bit, and returns `None` for an unmapped address. Host-side diagnostics only.
+    /// bit, and returns `None` for an unmapped address.
+    ///
+    /// No longer diagnostics-only: the HLE BIOS block writers
+    /// (`write_guest_linear_block` / `read_guest_linear_block`) deliver
+    /// caller-visible data through this walk, because a BIOS service handed
+    /// an ES:DI block must honor the caller's paging. The probe discipline
+    /// stands regardless -- a BIOS writing a reply is not an instruction, so
+    /// it must not set CR2, dirty a page, or check R/W and U/S. The known
+    /// consequences (no accessed/dirty bits for a paging-to-disk host; no
+    /// permission check) are recorded on those helpers.
     pub fn translate_linear_probe(&mut self, linear: u32) -> Option<u32> {
         if self.cpu.control.cr0 & 0x8000_0000 == 0 {
             return Some(linear);
@@ -324,6 +333,62 @@ impl Machine {
             let _ = bus.write_memory_byte_recorded(at, value, &mut footprint);
         }
         footprint.notify(&mut self.cpu);
+    }
+
+    /// `write_guest_block` against a guest LINEAR address, walking the guest's
+    /// own page tables for every page the block touches.
+    ///
+    /// An HLE BIOS service never issues the guest's memory writes, so nothing
+    /// else applies the page tables on its behalf: whatever address the service
+    /// computes from the caller's `ES:DI` goes straight onto the bus. That is
+    /// correct only while linear equals physical. It stops being correct under
+    /// a memory manager that maps upper memory from extended memory, which
+    /// TOKAEMM does, and a DPMI transfer buffer allocated out of a UMB lands
+    /// exactly there. The block is then deposited at the unbacked physical
+    /// address of the same number and the caller reads back 0xFF, with no error
+    /// reported anywhere. The same mistake was made once before, in the fault
+    /// dump; `machine_fault_site_test.rs` records it.
+    ///
+    /// An unmapped page is skipped rather than faulted on. A BIOS service is
+    /// not an instruction: it has no faulting frame to deliver, and the guest's
+    /// own read of the buffer will take the page fault in its place.
+    pub(super) fn write_guest_linear_block(&mut self, linear: u32, bytes: &[u8]) {
+        for (offset, chunk) in Self::linear_pages(linear, bytes.len()) {
+            if let Some(physical) = self.translate_linear_probe(linear.wrapping_add(offset)) {
+                self.write_guest_block(physical, &bytes[offset as usize..][..chunk]);
+            }
+        }
+    }
+
+    /// `read_guest_block` against a guest LINEAR address. Same walk and the same
+    /// reasons as `write_guest_linear_block`; an unmapped page reads as 0xFF,
+    /// which is what the bus returns for unbacked memory anyway.
+    pub(super) fn read_guest_linear_block(&mut self, linear: u32, len: usize) -> Vec<u8> {
+        let mut out = vec![0xffu8; len];
+        for (offset, chunk) in Self::linear_pages(linear, len) {
+            if let Some(physical) = self.translate_linear_probe(linear.wrapping_add(offset)) {
+                for index in 0..chunk {
+                    out[offset as usize + index] =
+                        self.read_physical_u8(physical.wrapping_add(index as u32));
+                }
+            }
+        }
+        out
+    }
+
+    /// Split `[linear, linear + len)` into `(offset_from_linear, length)` runs
+    /// that each stay inside one 4 KB page, so one translation covers each run.
+    fn linear_pages(linear: u32, len: usize) -> Vec<(u32, usize)> {
+        let mut runs = Vec::new();
+        let mut offset = 0usize;
+        while offset < len {
+            let at = linear.wrapping_add(offset as u32);
+            let to_page_end = (0x1000 - (at & 0xfff)) as usize;
+            let chunk = to_page_end.min(len - offset);
+            runs.push((offset as u32, chunk));
+            offset += chunk;
+        }
+        runs
     }
 
     pub fn bus_trace(&self) -> &BusTrace {
