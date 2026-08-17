@@ -950,6 +950,101 @@ fn masked_timer_overflow_sets_flag_but_not_irq() {
 }
 
 #[test]
+fn timer_control_bit7_reset_leaves_a_running_timer_running() {
+    // Register 0x04 bit7 is IRQ-RESET, and the YM3812/YMF262 register map
+    // states that when it is set the remaining bits of the write are ignored.
+    // A detection routine that clears the overflow flag between polls must
+    // therefore find timer 1 still counting afterwards.
+    let mut opl = OplChip::default();
+
+    opl.write_register(0x02, 0xff); // timer 1 preset: overflow in one step
+    opl.write_register(0x04, 0x21); // start timer 1, mask timer 2
+    opl.advance_micros(80);
+    assert_eq!(
+        opl.status() & 0xe0,
+        0xc0,
+        "first overflow raises IRQ + flag"
+    );
+
+    opl.write_register(0x04, 0x80); // IRQ-RESET only
+    assert_eq!(opl.status() & 0xe0, 0x00, "bit7 clears both overflow flags");
+    assert!(
+        opl.timers_running(),
+        "an IRQ-RESET write must not stop a running timer"
+    );
+
+    opl.advance_micros(80);
+    assert_eq!(
+        opl.status() & 0xe0,
+        0xc0,
+        "timer 1 kept counting across the flag reset"
+    );
+}
+
+#[test]
+fn timer_control_bit7_reset_preserves_the_start_and_mask_bits() {
+    // The other half of "all other bits are ignored": the mask bits the
+    // status byte gates its IRQ on must survive an IRQ-RESET write. Storing
+    // 0x80 verbatim would clear both masks and turn a deliberately masked
+    // timer into one that asserts IRQ.
+    let mut opl = OplChip::default();
+
+    opl.write_register(0x03, 0xff); // timer 2 preset
+    opl.write_register(0x04, 0x22); // start timer 2 with timer 2 masked (bit5)
+    opl.advance_micros(320);
+    assert_eq!(
+        opl.status() & 0xa0,
+        0x20,
+        "flag set, IRQ suppressed by mask"
+    );
+
+    opl.write_register(0x04, 0x80); // IRQ-RESET only
+    assert_eq!(
+        opl.register(0x04),
+        0x22,
+        "an IRQ-RESET write leaves the start/mask bits at their prior value"
+    );
+
+    opl.advance_micros(320);
+    let status = opl.status();
+    assert_eq!(status & 0x20, 0x20, "timer 2 overflowed again");
+    assert_eq!(
+        status & 0x80,
+        0x00,
+        "timer 2 is still masked after the flag reset"
+    );
+}
+
+#[test]
+fn adlib_detection_poll_loop_measures_the_timer_1_period() {
+    // A detection-style probe: preset timer 1, start it, then poll the status
+    // port in short slices and clear the flag after each sighting, the way
+    // period software measures the interval between overflows. Timer 1 counts
+    // in 80 us steps and reloads from the preset, so with a preset of 0xff the
+    // overflows must land on an exact 80 us cadence.
+    let mut opl = OplChip::default();
+    opl.write_register(0x02, 0xff);
+    opl.write_register(0x04, 0x21);
+
+    let mut overflow_micros = Vec::new();
+    let mut elapsed = 0u64;
+    while overflow_micros.len() < 3 && elapsed < 1_000 {
+        opl.advance_micros(5);
+        elapsed += 5;
+        if opl.status() & 0x40 != 0 {
+            overflow_micros.push(elapsed);
+            opl.write_register(0x04, 0x80); // clear the flag, keep timing
+        }
+    }
+
+    assert_eq!(
+        overflow_micros,
+        vec![80, 160, 240],
+        "timer 1 must keep its 80 us period across mid-loop flag resets"
+    );
+}
+
+#[test]
 fn address_data_ports_store_registers() {
     let mut opl = OplChip::default();
     assert!(opl.write_port(0x388, 0x20)); // latch register address 0x20
