@@ -2398,11 +2398,29 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     cmp byte [fs:vif], 0
     jne .go
 .hold:
-    mov ecx, ebx                  ; hold the line, EOI now so the PIC keeps
-    mov ax, 1                     ; delivering
+    ; Hold the line in vip and RETURN WITH THE ISR BIT STILL SET. The EOI
+    ; belongs to whoever services the interrupt, and under this monitor that
+    ; is always the guest's own IVT handler -- the .go path below already
+    ; relies on exactly that. EOIing here instead handed the guest handler a
+    ; state the 8259A cannot produce: its own line no longer in service while
+    ; its handler runs. DJGPP's shared hardware-IRQ wrapper probes that
+    ; (OCW3 0x0B + IN 0x20) to tell a real IRQ from a spurious entry, read
+    ; the 0 this path left behind, took its not-my-line branch, indexed its
+    ; 16-entry per-IRQ old-vector table with 16, and RETF'd through the
+    ; garbage pair it found there -- E10, the MonikaTT #GP(0) at 0xAF:78A3.
+    ;
+    ; Cost of the honest behaviour: while the guest sits with VIF clear, the
+    ; held line stays highest-in-service, so the 8259A blocks equal- and
+    ; lower-priority lines until the guest's handler EOIs. Requests are not
+    ; lost (they sit in the IRR and are taken by priority once the EOI
+    ; lands), and that IS what a 386 with a real EMM sees: the PIC does not
+    ; move on until the interrupt is acknowledged. The one behaviour this
+    ; gives up is masking a guest whose IVT handler never EOIs at all; on
+    ; real hardware that guest wedges its PIC too.
+    mov ecx, ebx
+    mov ax, 1
     shl ax, cl
     or [fs:vip], ax
-    call irq_eoi
     popad
     iretd
 .go:
@@ -3675,18 +3693,11 @@ vcpi_pm_to_v86:
     add esp, 8                    ; drop the far-call return address
     iretd                         ; EIP,CS,EFLAGS,ESP,SS,ES,DS,FS,GS -> V86
 
-; EOI the chip(s) for line EBX. The just-delivered line is the highest in
-; service on its chip, so the non-specific EOI clears the right bit; slave
-; lines also EOI the master's cascade. Clobbers AL.
-irq_eoi:
-    cmp ebx, 8
-    jb .master
-    mov al, 0x20
-    out 0xA0, al
-.master:
-    mov al, 0x20
-    out 0x20, al
-    ret
+; The monitor issues no EOI of its own: every hardware line it takes is
+; reflected to a guest IVT handler, immediately (.go) or once VIF is set
+; (.hold -> maybe_deliver), and that handler owns the EOI exactly as it does
+; on bare hardware. `irq_eoi` used to serve the .hold path and is gone with
+; it; see the note there.
 
 ; A default-gate vector can be a software INT or a hardware IRQ after a VCPI
 ; client remaps the PIC away from the DOS defaults. If EBX is inside the current
