@@ -15,6 +15,25 @@ use super::*;
 // Columns: short, rt, instructions, jit_direct_insns, jit_direct_entries,
 // smc_heat_demotions, callouts, side_exit_x87_eligibility, x87_pad_bails,
 // callout_port_v86_served, expected buckets, expected health.
+//
+// ## v2, 2026-08-17: what changed in the expected column, and why
+//
+// Two v2 changes touch this table, and NEITHER is a threshold nudge:
+//
+// 1. **B4 and B6 are one bucket.** Stage 1 measured `port_v86_served` at >=98%
+//    of all callouts on 35 of 51 callout rows, so the two rules were reading
+//    one mechanism twice and double-counting it into class mass. The merged
+//    bucket keeps the id `B4`. The wolf rows therefore read `B3|B4` where v1
+//    read `B3|B4|B6`; nothing else about them moved, and
+//    `the_b4_b6_merge_is_a_rename_not_a_re_bar` proves the firing SET is
+//    identical.
+// 2. **B11 (V86-monitor residency) is new**, and it fires on gp2, nascar and
+//    tombraid. That is not a regression: those three were already NON-HEALTHY
+//    and the new bucket names a cost their existing buckets do not. Their
+//    health is unchanged, which is what the acceptance gate is about.
+//
+// The `monitor`/`core_clocks`/`vec13_trips`/`decode_*` columns are read off the
+// same board as the rest of the row.
 // ---------------------------------------------------------------------------
 struct Fixture {
     short: &'static str,
@@ -27,6 +46,11 @@ struct Fixture {
     x87_eligibility: u64,
     x87_pad_bails: u64,
     port_v86_served: u64,
+    monitor_clocks: u64,
+    core_clocks: u64,
+    vec13_trips: u64,
+    decode_misses: u64,
+    decode_probes: u64,
     expected_buckets: &'static str,
     expected_health: &'static str,
 }
@@ -43,6 +67,11 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 0,
         port_v86_served: 0,
+        monitor_clocks: 471_287_454,
+        core_clocks: 486_118_346,
+        vec13_trips: 1_251,
+        decode_misses: 20_585_569,
+        decode_probes: 157_841_045,
         expected_buckets: "",
         expected_health: "HEALTHY",
     },
@@ -57,6 +86,11 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 0,
         port_v86_served: 0,
+        monitor_clocks: 597_243_071,
+        core_clocks: 611_921_090,
+        vec13_trips: 337,
+        decode_misses: 12_498_503,
+        decode_probes: 122_801_180,
         expected_buckets: "",
         expected_health: "HEALTHY",
     },
@@ -71,6 +105,11 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 785_923,
         x87_pad_bails: 0,
         port_v86_served: 0,
+        monitor_clocks: 59_219,
+        core_clocks: 3_320_147_944,
+        vec13_trips: 0,
+        decode_misses: 9_693_882,
+        decode_probes: 123_647_035,
         expected_buckets: "",
         expected_health: "HEALTHY",
     },
@@ -85,6 +124,11 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 0,
         port_v86_served: 5_669_463,
+        monitor_clocks: 1_541_187,
+        core_clocks: 685_475_807,
+        vec13_trips: 73_437,
+        decode_misses: 263_347,
+        decode_probes: 1_319_480_877,
         expected_buckets: "B1",
         expected_health: "NON-HEALTHY",
     },
@@ -99,6 +143,11 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 551_451,
         port_v86_served: 0,
+        monitor_clocks: 1_077_467_670,
+        core_clocks: 1_292_062_044,
+        vec13_trips: 21,
+        decode_misses: 92_195_454,
+        decode_probes: 1_825_706_403,
         expected_buckets: "B2|B3|B5b",
         expected_health: "HEALTHY-WITH-FINDINGS",
     },
@@ -113,6 +162,11 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 2_166_477,
         port_v86_served: 0,
+        monitor_clocks: 4_393_811_398,
+        core_clocks: 4_605_681_426,
+        vec13_trips: 21,
+        decode_misses: 169_324_787,
+        decode_probes: 7_005_668_257,
         expected_buckets: "B2|B3|B5b",
         expected_health: "NON-HEALTHY",
     },
@@ -127,7 +181,12 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 0,
         port_v86_served: 0,
-        expected_buckets: "B3",
+        monitor_clocks: 1_312_536_125,
+        core_clocks: 1_322_652_954,
+        vec13_trips: 262_769,
+        decode_misses: 64_492_273,
+        decode_probes: 589_946_294,
+        expected_buckets: "B3|B11",
         expected_health: "NON-HEALTHY",
     },
     Fixture {
@@ -141,7 +200,12 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 0,
         port_v86_served: 0,
-        expected_buckets: "B4",
+        monitor_clocks: 4_955_753_152,
+        core_clocks: 4_966_342_835,
+        vec13_trips: 220_123,
+        decode_misses: 52_151_157,
+        decode_probes: 1_950_509_004,
+        expected_buckets: "B4|B11",
         expected_health: "NON-HEALTHY",
     },
     Fixture {
@@ -155,7 +219,12 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 71_330_054,
         x87_pad_bails: 0,
         port_v86_served: 3_055,
-        expected_buckets: "B5a",
+        monitor_clocks: 14_185_031_068,
+        core_clocks: 15_096_983_694,
+        vec13_trips: 325_809,
+        decode_misses: 239_130_114,
+        decode_probes: 4_012_246_769,
+        expected_buckets: "B5a|B11",
         expected_health: "NON-HEALTHY",
     },
     Fixture {
@@ -169,7 +238,16 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 0,
         port_v86_served: 91_246_311,
-        expected_buckets: "B3|B4|B6",
+        monitor_clocks: 7_401_634,
+        core_clocks: 1_019_289_245,
+        vec13_trips: 300_216,
+        decode_misses: 10_899_180,
+        decode_probes: 277_675_773,
+        // v1 read `B3|B4|B6`. B4 and B6 are one bucket in v2; see the table's
+        // header note. wolf's vec13 rate is high but its monitor residency is
+        // 0.7%, so B11 correctly does NOT fire: wolf's cost is the port itself,
+        // not time spent inside the monitor.
+        expected_buckets: "B3|B4",
         expected_health: "HEALTHY-WITH-FINDINGS",
     },
     Fixture {
@@ -183,7 +261,12 @@ const FIXTURES: &[Fixture] = &[
         x87_eligibility: 0,
         x87_pad_bails: 0,
         port_v86_served: 364_743_472,
-        expected_buckets: "B3|B4|B6",
+        monitor_clocks: 5_378_649,
+        core_clocks: 3_713_417_593,
+        vec13_trips: 232_825,
+        decode_misses: 4_573_694,
+        decode_probes: 598_214_121,
+        expected_buckets: "B3|B4",
         // rt 0.85 even after its lever landed: still short of the persona.
         expected_health: "NON-HEALTHY",
     },
@@ -196,6 +279,7 @@ fn fixture_profile(fixture: &Fixture) -> Profile {
         guest_seconds: 120.0,
         wall_seconds: 120.0 / fixture.rt,
         master_ticks: 657_360_000_000,
+        executed_cpu_core_clocks: fixture.core_clocks,
         stop: Stop {
             kind: "cycle_limit".to_string(),
             ..Stop::default()
@@ -206,6 +290,10 @@ fn fixture_profile(fixture: &Fixture) -> Profile {
             jit_direct_entries: fixture.jit_direct_entries,
             smc_heat_demotions: fixture.smc_heat_demotions,
             jit_direct_x87_pad_bails: fixture.x87_pad_bails,
+            monitor_resident_core_clocks: fixture.monitor_clocks,
+            monitor_trips_vec13: fixture.vec13_trips,
+            decode_misses: fixture.decode_misses,
+            decode_probes: fixture.decode_probes,
             ..Perf::default()
         },
         direct_stalls: DirectStalls {
@@ -254,15 +342,118 @@ fn no_bucket_fires_on_a_healthy_anchor() {
     }
 }
 
+/// Which buckets the fixture board can prove, and which it cannot.
+///
+/// v1 asserted that EVERY bucket fires on some fixture. v2 cannot: B7 is
+/// restored on corpus evidence alone (`decode_misses/instructions` tops out at
+/// 0.0148 on the board, below the 0.05 bar, but reads 0.678 on Drilling — 13.6x
+/// over the bar). Splitting the assertion keeps the board's guarantee exact
+/// instead of weakening it to "most buckets".
 #[test]
-fn every_surviving_bucket_fires_on_at_least_one_fixture() {
+fn the_fixture_board_proves_every_bucket_except_the_corpus_only_ones() {
     let mut seen: Vec<String> = FIXTURES
         .iter()
         .flat_map(|fixture| fixture_row(fixture).buckets)
         .collect();
     seen.sort();
     seen.dedup();
-    assert_eq!(seen, ["B1", "B2", "B3", "B4", "B5a", "B5b", "B6"]);
+    // Lexically sorted, so B11 sorts before B2.
+    assert_eq!(seen, ["B1", "B11", "B2", "B3", "B4", "B5a", "B5b"]);
+
+    // And B7 really is unreachable from the board, which is why it needs the
+    // corpus. If a future fixture DOES trip it, this fails and the split above
+    // stops being necessary.
+    let worst = FIXTURES
+        .iter()
+        .map(|f| f.decode_misses as f64 / f.instructions as f64)
+        .fold(0.0f64, f64::max);
+    assert!(
+        worst < B7_DECODE_MISSES_PER_INSN_MIN,
+        "a fixture now trips B7 at {worst}"
+    );
+    assert!(
+        (0.014..0.015).contains(&worst),
+        "board's worst B7 is {worst}"
+    );
+}
+
+/// The B4/B6 merge must be a RENAME, not a re-bar: exactly the rows that fired
+/// B4 or B6 in v1 fire the merged bucket in v2, and no other row gains it.
+#[test]
+fn the_b4_b6_merge_is_a_rename_not_a_re_bar() {
+    for fixture in FIXTURES {
+        let v1_would_fire = fixture.callouts as f64 / fixture.instructions as f64
+            > B4_CALLOUTS_PER_INSN_MIN
+            || fixture.port_v86_served as f64 / fixture.instructions as f64
+                > B6_PORT_V86_SERVED_PER_INSN_MIN;
+        let fires = fixture_row(fixture).buckets.iter().any(|id| id == "B4");
+        assert_eq!(
+            fires, v1_would_fire,
+            "{} changed membership under the merge",
+            fixture.short
+        );
+    }
+}
+
+/// B11's separation is carried entirely by the vec13 rate, not by the residency
+/// share, and that must be stated where a future campaign will read it.
+///
+/// `monitor_resident_core_clocks` charges clocks to any instruction that retires
+/// while ring-0-protected, so a DOS/4GW game running flat in ring 0 reads ~0.97
+/// with no monitor involved at all: doom-486 0.9695 and doom-586 0.9760 sit
+/// ABOVE five of the six corpus rows the bucket exists for. The residency share
+/// therefore cannot separate healthy from non-healthy, and it is kept only to
+/// give the class its meaning. `monitor_trips_vec13/instructions` does the
+/// separating: a V86 guest reaches ring 0 only through vector 13.
+#[test]
+fn b11_separates_on_the_vec13_rate_and_not_on_residency() {
+    let vec13 = |short: &str| {
+        let f = FIXTURES.iter().find(|f| f.short == short).unwrap();
+        f.vec13_trips as f64 / f.instructions as f64
+    };
+    let share = |short: &str| {
+        let f = FIXTURES.iter().find(|f| f.short == short).unwrap();
+        f.monitor_clocks as f64 / f.core_clocks as f64
+    };
+
+    // The residency share does NOT separate: both doom rows clear the bar.
+    assert!(share("doom-486") > B11_MONITOR_SHARE_MIN);
+    assert!(share("doom-586") > B11_MONITOR_SHARE_MIN);
+
+    // The vec13 rate does. doom-486 is the highest excluded fixture.
+    let highest_excluded = vec13("doom-486");
+    assert!(highest_excluded < B11_VEC13_TRIPS_PER_INSN_MIN);
+    let margin = B11_VEC13_TRIPS_PER_INSN_MIN / highest_excluded;
+    assert!(
+        (3.5..4.0).contains(&margin),
+        "doom-486 sits {margin}x below the B11 vec13 bar"
+    );
+
+    // And the lowest corpus row the bucket exists for, conqstND, clears the bar
+    // by a matching margin: 175_038 trips over 23_951_973_632 instructions.
+    let conqstnd = 175_038.0 / 23_951_973_632.0;
+    let corpus_margin = conqstnd / B11_VEC13_TRIPS_PER_INSN_MIN;
+    assert!(
+        (3.5..4.0).contains(&corpus_margin),
+        "conqstND sits {corpus_margin}x above the B11 vec13 bar"
+    );
+}
+
+/// prince and the wolf rows have HIGH vec13 rates and must still not enter B11:
+/// their monitor residency is under 1%, so the trips are cheap.
+#[test]
+fn b11_excludes_prince_and_wolf_on_the_residency_clause() {
+    for short in ["prince-486", "wolf3d-486", "wolf3d-586"] {
+        let f = FIXTURES.iter().find(|f| f.short == short).unwrap();
+        let vec13 = f.vec13_trips as f64 / f.instructions as f64;
+        let share = f.monitor_clocks as f64 / f.core_clocks as f64;
+        assert!(
+            vec13 > B11_VEC13_TRIPS_PER_INSN_MIN,
+            "{short} vec13 {vec13}"
+        );
+        assert!(share < B11_MONITOR_SHARE_MIN, "{short} share {share}");
+        assert!(!fixture_row(f).buckets.iter().any(|id| id == "B11"));
+    }
 }
 
 /// The tightest margin in the repaired set, called out in §9.2 so the next
@@ -562,12 +753,22 @@ fn ran_profile(mark_count: usize) -> Profile {
 fn short_run_boundary_is_exactly_thirty_one_marks() {
     let thirty = ran_profile(30);
     assert_eq!(
-        decide_outcome(Some(&thirty), &[], HostVerdict::default()),
+        decide_outcome(
+            Some(&thirty),
+            &[],
+            &FrameFacts::default(),
+            HostVerdict::default()
+        ),
         Outcome::ShortRun
     );
     let thirty_one = ran_profile(31);
     assert_eq!(
-        decide_outcome(Some(&thirty_one), &[], HostVerdict::default()),
+        decide_outcome(
+            Some(&thirty_one),
+            &[],
+            &FrameFacts::default(),
+            HostVerdict::default()
+        ),
         Outcome::Ran
     );
 }
@@ -592,7 +793,12 @@ fn an_unarmed_mark_series_is_not_a_short_run() {
     let mut profile = ran_profile(31);
     profile.phase_marks.clear();
     assert_eq!(
-        decide_outcome(Some(&profile), &[], HostVerdict::default()),
+        decide_outcome(
+            Some(&profile),
+            &[],
+            &FrameFacts::default(),
+            HostVerdict::default()
+        ),
         Outcome::Ran
     );
     let row = classify_archive(&Archive {
@@ -613,6 +819,7 @@ fn screen(index: u64, hash: &str, mode: Option<&str>) -> Screen {
         video_mode: mode.map(str::to_string),
         hash: hash.to_string(),
         changed: false,
+        ppm: None,
         text_glyphs: None,
     }
 }
@@ -622,41 +829,42 @@ fn a_crash_beats_every_other_signal() {
     let mut profile = ran_profile(31);
     profile.stop.kind = "cpu_error".to_string();
     assert_eq!(
-        decide_outcome(Some(&profile), &[], HostVerdict::default()),
+        decide_outcome(
+            Some(&profile),
+            &[],
+            &FrameFacts::default(),
+            HostVerdict::default()
+        ),
         Outcome::Crashed
     );
 }
 
+/// **The v1 REBOOT-LOOP defect, pinned as a test.**
+///
+/// v1 called a row a reboot loop when the OPENING FRAME HASH recurred twice.
+/// Stage 1 measured that rule at 0/8 true positives: a blinking text cursor, an
+/// attract cycle and a black fade frame all return to `screens[0]`, and the
+/// check ran first in `decide_outcome`, so it also excluded four rows that were
+/// otherwise fine. The recurrence count survives as a reported column; it no
+/// longer decides anything.
 #[test]
-fn two_returns_to_the_opening_frame_are_a_reboot_loop() {
-    let screens = vec![
-        screen(0, "aaa", Some("text")),
-        screen(1, "bbb", Some("modex")),
-        screen(2, "aaa", Some("text")),
-        screen(3, "bbb", Some("modex")),
-        screen(4, "aaa", Some("text")),
-    ];
-    assert_eq!(screen_recurrences(&screens), 2);
-    let profile = ran_profile(31);
-    assert_eq!(
-        decide_outcome(Some(&profile), &screens, HostVerdict::default()),
-        Outcome::RebootLoop
-    );
-}
-
-#[test]
-fn one_return_to_the_opening_frame_is_not_a_reboot_loop() {
+fn a_recurring_opening_frame_is_no_longer_a_reboot_loop() {
     let screens = vec![
         screen(0, "aaa", Some("modex")),
         screen(1, "bbb", Some("modex")),
         screen(2, "aaa", Some("modex")),
-        screen(3, "ccc", Some("modex")),
-        screen(4, "ddd", Some("modex")),
-        screen(5, "eee", Some("modex")),
+        screen(3, "bbb", Some("modex")),
+        screen(4, "aaa", Some("modex")),
     ];
-    assert_eq!(screen_recurrences(&screens), 1);
+    // The v1 detector still reads 2 — the count is kept, the verdict is not.
+    assert_eq!(screen_recurrences(&screens), 2);
     assert_eq!(
-        decide_outcome(Some(&ran_profile(31)), &screens, HostVerdict::default()),
+        decide_outcome(
+            Some(&ran_profile(31)),
+            &screens,
+            &FrameFacts::default(),
+            HostVerdict::default()
+        ),
         Outcome::Ran
     );
 }
@@ -675,10 +883,15 @@ fn a_flat_graphics_picture_with_a_polling_signature_is_idle_at_menu() {
             ..screen(index, "same", Some("modex"))
         })
         .collect();
-    let picture = screen_window(&screens, &profile);
+    let picture = screen_window(&screens, &profile, &FrameFacts::default());
     assert!(picture.flat, "{picture:?}");
     assert_eq!(
-        decide_outcome(Some(&profile), &screens, HostVerdict::default()),
+        decide_outcome(
+            Some(&profile),
+            &screens,
+            &FrameFacts::default(),
+            HostVerdict::default()
+        ),
         Outcome::IdleAtMenu
     );
 }
@@ -696,7 +909,12 @@ fn a_flat_text_picture_is_idle_text_not_idle_at_menu() {
         })
         .collect();
     assert_eq!(
-        decide_outcome(Some(&profile), &screens, HostVerdict::default()),
+        decide_outcome(
+            Some(&profile),
+            &screens,
+            &FrameFacts::default(),
+            HostVerdict::default()
+        ),
         Outcome::IdleText
     );
 }
@@ -742,13 +960,15 @@ fn flatness_needs_at_least_three_in_window_samples() {
             ..screen(index, "same", Some("modex"))
         })
         .collect();
-    assert!(!screen_window(&screens, &profile).flat);
+    assert!(!screen_window(&screens, &profile, &FrameFacts::default()).flat);
 }
 
-/// A Margo-framebuffer title has no mode line at all: it is flagged blind
-/// rather than being called text.
+/// A Margo-framebuffer title has no mode line at all. v1 called that
+/// `IDLE-BLIND`; v2 calls it `NO-MODE-LINE`, because it is a statement about the
+/// DISPLAY PATH and stage 1 read the name as a statement about the picture. See
+/// `idle_blind_now_names_a_blank_picture`.
 #[test]
-fn a_margo_display_is_flagged_idle_blind() {
+fn a_margo_display_is_flagged_no_mode_line() {
     let profile = ran_profile(31);
     let end = profile.master_ticks;
     let screens: Vec<Screen> = (0..4)
@@ -765,7 +985,8 @@ fn a_margo_display_is_flagged_idle_blind() {
         screens,
         ..Archive::default()
     });
-    assert!(row.flags.iter().any(|flag| flag == "IDLE-BLIND"));
+    assert!(row.flags.iter().any(|flag| flag == "NO-MODE-LINE"));
+    assert!(!row.flags.iter().any(|flag| flag == "IDLE-BLIND"));
     assert_eq!(row.outcome, "RAN");
 }
 
@@ -776,6 +997,7 @@ fn host_side_verdicts_win_over_the_profile() {
         decide_outcome(
             Some(&profile),
             &[],
+            &FrameFacts::default(),
             HostVerdict {
                 stalled: true,
                 ..HostVerdict::default()
@@ -787,6 +1009,7 @@ fn host_side_verdicts_win_over_the_profile() {
         decide_outcome(
             Some(&profile),
             &[],
+            &FrameFacts::default(),
             HostVerdict {
                 timed_out: true,
                 ..HostVerdict::default()
@@ -795,7 +1018,7 @@ fn host_side_verdicts_win_over_the_profile() {
         Outcome::HungHost
     );
     assert_eq!(
-        decide_outcome(None, &[], HostVerdict::default()),
+        decide_outcome(None, &[], &FrameFacts::default(), HostVerdict::default()),
         Outcome::NoProfile
     );
 }
@@ -809,7 +1032,12 @@ fn halted_and_dos_exit_are_bucketable_outcomes() {
     ] {
         let mut profile = ran_profile(31);
         profile.stop.kind = kind.to_string();
-        let outcome = decide_outcome(Some(&profile), &[], HostVerdict::default());
+        let outcome = decide_outcome(
+            Some(&profile),
+            &[],
+            &FrameFacts::default(),
+            HostVerdict::default(),
+        );
         assert_eq!(outcome, expected);
         assert!(outcome.bucketable());
     }
@@ -826,11 +1054,15 @@ fn edge_inputs() -> BucketInputs {
         windowed_jit_direct_insns: 1_000_000_000,
         windowed_jit_direct_entries: 10_000_000,
         windowed_smc_heat_demotions: 0,
+        windowed_decode_misses: 0,
         instructions: 1_000_000_000,
         callouts: 0,
         side_exit_x87_eligibility: 0,
         x87_pad_bails: 0,
         callout_port_v86_served: 0,
+        monitor_resident_core_clocks: 0,
+        monitor_trips_vec13: 0,
+        core_clocks: 1_000_000_000,
         real_time_factor: 1.0,
         windowed: true,
     }
@@ -967,23 +1199,126 @@ fn b5b_is_strict_at_one_e_minus_five() {
     assert!(ids(&inputs).contains(&"B5b"));
 }
 
+/// B7, restored. The bar is the design's original 0.05; nothing about it was
+/// re-derived. See `the_fixture_board_proves_every_bucket_except_the_corpus_only_ones`
+/// for why the board cannot prove it.
 #[test]
-fn b6_is_strict_at_one_hundredth() {
+fn b7_is_restored_and_strict_at_five_hundredths() {
     let mut inputs = edge_inputs();
-    inputs.callout_port_v86_served = 10_000_000;
-    assert!(!ids(&inputs).contains(&"B6"));
-    inputs.callout_port_v86_served = 10_000_001;
-    assert!(ids(&inputs).contains(&"B6"));
+    inputs.windowed_decode_misses = 50_000_000;
+    assert!(!ids(&inputs).contains(&"B7"));
+    inputs.windowed_decode_misses = 50_000_001;
+    assert!(ids(&inputs).contains(&"B7"));
 }
 
-/// prince sits 3.7x below B6's bar and must not be pulled into the polling
-/// bucket by it.
+/// The corpus row that earns B7 its restoration: Drilling reads 0.678, which is
+/// 13.6x the bar, and it is a RAN row at rt 0.11 — a slow row whose only other
+/// bucket is B2.
 #[test]
-fn b6_excludes_prince_by_three_point_seven_times() {
+fn b7_fires_on_the_corpus_row_that_earned_its_restoration() {
+    let mut inputs = edge_inputs();
+    inputs.instructions = 11_784_504_924;
+    inputs.windowed_instructions = 11_784_504_924;
+    inputs.windowed_jit_direct_insns = 11_784_504_924;
+    inputs.windowed_decode_misses = 7_991_683_066;
+    let value = inputs.windowed_decode_misses as f64 / inputs.instructions as f64;
+    let margin = value / B7_DECODE_MISSES_PER_INSN_MIN;
+    assert!(
+        (13.5..13.7).contains(&margin),
+        "Drilling's B7 margin is {margin}x, §2 recorded 13.6x"
+    );
+    assert!(ids(&inputs).contains(&"B7"));
+}
+
+/// B11 is a conjunction and strict on each clause.
+#[test]
+fn b11_is_a_conjunction_and_strict_on_each_clause() {
+    let mut inputs = edge_inputs();
+    inputs.core_clocks = 1_000_000_000;
+
+    // Residency exactly on the bar: the clause is `>`, so no.
+    inputs.monitor_resident_core_clocks = 500_000_000;
+    inputs.monitor_trips_vec13 = 1_000_000; // 1e-3 per instruction, far over
+    assert!(!ids(&inputs).contains(&"B11"));
+    inputs.monitor_resident_core_clocks = 500_000_001;
+    assert!(ids(&inputs).contains(&"B11"));
+
+    // Trips exactly on the bar with residency clear: still no.
+    inputs.monitor_trips_vec13 = 2_000; // 2_000 / 1e9 = 2e-6 exactly
+    assert!(!ids(&inputs).contains(&"B11"));
+    inputs.monitor_trips_vec13 = 2_001;
+    assert!(ids(&inputs).contains(&"B11"));
+
+    // Neither clause alone is enough.
+    let mut residency_only = edge_inputs();
+    residency_only.core_clocks = 1_000_000_000;
+    residency_only.monitor_resident_core_clocks = 999_000_000;
+    residency_only.monitor_trips_vec13 = 0;
+    assert!(!ids(&residency_only).contains(&"B11"));
+}
+
+/// A profile with no core-clock total cannot claim a residency share.
+#[test]
+fn b11_never_divides_by_a_missing_core_clock_total() {
+    let mut inputs = edge_inputs();
+    inputs.core_clocks = 0;
+    inputs.monitor_resident_core_clocks = 1_000_000;
+    inputs.monitor_trips_vec13 = 1_000_000;
+    assert!(!ids(&inputs).contains(&"B11"));
+}
+
+/// B4's v86 clause — formerly bucket B6 — keeps its own bar and its own
+/// strictness after the merge, and a row that trips only that clause reports the
+/// v86 metric rather than the callout one.
+#[test]
+fn the_v86_clause_of_b4_is_strict_at_one_hundredth() {
+    let mut inputs = edge_inputs();
+    inputs.callout_port_v86_served = 10_000_000;
+    assert!(!ids(&inputs).contains(&"B4"));
+    inputs.callout_port_v86_served = 10_000_001;
+    assert!(ids(&inputs).contains(&"B4"));
+
+    // No B6 survives the merge, whatever the counters say.
+    assert!(!ids(&inputs).contains(&"B6"));
+
+    let hit = buckets(&inputs)
+        .into_iter()
+        .find(|hit| hit.id == "B4")
+        .unwrap();
+    assert_eq!(
+        hit.metric, "jit_direct_callout_port_v86_served/instructions",
+        "the dominant clause names itself"
+    );
+    assert!((hit.threshold - B6_PORT_V86_SERVED_PER_INSN_MIN).abs() < 1e-12);
+}
+
+/// And a row over the callout bar with no v86 traffic reports the callout
+/// metric, so the merged bucket never hides which end to pull.
+#[test]
+fn the_callout_clause_of_b4_reports_itself_when_it_dominates() {
+    let mut inputs = edge_inputs();
+    inputs.callouts = 100_000_000;
+    inputs.callout_port_v86_served = 0;
+    let hit = buckets(&inputs)
+        .into_iter()
+        .find(|hit| hit.id == "B4")
+        .unwrap();
+    assert_eq!(
+        hit.metric,
+        "(callout_executed + step_break + abnormal)/instructions"
+    );
+    assert!((hit.threshold - B4_CALLOUTS_PER_INSN_MIN).abs() < 1e-12);
+}
+
+/// prince sits 3.7x below the v86 bar and must not be pulled into the merged
+/// polling bucket by it.
+#[test]
+fn the_v86_clause_excludes_prince_by_three_point_seven_times() {
     let prince = FIXTURES.iter().find(|f| f.short == "prince-486").unwrap();
     let value = prince.port_v86_served as f64 / prince.instructions as f64;
     let margin = B6_PORT_V86_SERVED_PER_INSN_MIN / value;
-    assert!((3.5..4.0).contains(&margin), "prince B6 margin {margin}x");
+    assert!((3.5..4.0).contains(&margin), "prince v86 margin {margin}x");
+    assert_eq!(fixture_row(prince).buckets.join("|"), "B1");
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1423,448 @@ fn the_tsv_has_one_header_and_one_line_per_row() {
 }
 
 // ---------------------------------------------------------------------------
+// Frame evidence: the pixels behind the reboot rule and the flatness rule.
+//
+// v1 decided both from the frame HASH alone, and one blinking text cursor
+// defeated both at once — it manufactured a reboot loop out of a DOS prompt and
+// it hid eight idle rows inside the bucketable set by making their window read
+// "two distinct pictures". Both rules now read the pixels the archive kept.
+// ---------------------------------------------------------------------------
+
+/// A solid frame of one colour.
+fn solid(width: usize, height: usize, colour: [u8; 3]) -> FrameImage {
+    FrameImage {
+        width,
+        height,
+        rgb: colour
+            .iter()
+            .copied()
+            .cycle()
+            .take(width * height * 3)
+            .collect(),
+    }
+}
+
+/// Paint one pixel a different colour.
+fn poke(image: &mut FrameImage, x: usize, y: usize, colour: [u8; 3]) {
+    let offset = (y * image.width + x) * 3;
+    image.rgb[offset..offset + 3].copy_from_slice(&colour);
+}
+
+fn ppm_bytes(image: &FrameImage) -> Vec<u8> {
+    let mut out = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+    out.extend_from_slice(&image.rgb);
+    out
+}
+
+#[test]
+fn a_screendump_ppm_round_trips_through_the_reader() {
+    let mut image = solid(8, 4, [0, 0, 0]);
+    poke(&mut image, 3, 2, [255, 128, 64]);
+    let read = read_ppm(&ppm_bytes(&image)).expect("parses");
+    assert_eq!((read.width, read.height), (8, 4));
+    assert_eq!(read.rgb, image.rgb);
+}
+
+#[test]
+fn a_truncated_or_foreign_ppm_is_refused_rather_than_guessed() {
+    assert!(read_ppm(b"P3\n8 4\n255\n").is_none());
+    assert!(read_ppm(b"P6\n8 4\n255\n\x00\x00").is_none());
+    assert!(read_ppm(b"").is_none());
+    // E8 in the stage-1 ledger: the dumper emitted a degenerate 1x1 PPM once.
+    // It parses, and it must not be mistaken for anything.
+    let tiny = read_ppm(b"P6\n1 1\n255\n\x00\x00\x00").expect("1x1 parses");
+    assert_eq!((tiny.width, tiny.height), (1, 1));
+    assert!(tiny.banner_digest().is_none());
+}
+
+/// **Defect E8, guarded.** A one-pixel frame is vacuously "one colour", so a
+/// degenerate capture would otherwise report a blank screen and raise
+/// `IDLE-BLIND` on a title whose screen was fine. No Vega mode is smaller than
+/// 320x200, so a frame below `MIN_FRAME_PIXELS` is a capture defect and is
+/// treated as unreadable evidence rather than as evidence of blankness.
+#[test]
+fn a_degenerate_capture_is_not_evidence_of_a_blank_screen() {
+    let degenerate = solid(1, 1, [0, 0, 0]);
+    assert!(degenerate.blank(), "one pixel is vacuously one colour");
+    assert!(
+        !degenerate.usable(),
+        "and it must not count as usable evidence"
+    );
+    // The smallest mode the Vega BIOS presents does.
+    assert!(solid(320, 200, [0, 0, 0]).usable());
+}
+
+// -- the boot banner ---------------------------------------------------------
+
+/// The banner region is the TOP TEN TEXT ROWS of the 720x400 boot screen, and
+/// nothing below them.
+///
+/// MEASURED 2026-08-17 by booting `--hdd-folder` with a 200 ms screen dump: the
+/// Toka-DOS boot screen paints a fixed ASCII logo across text rows 0-9 (160
+/// pixel rows at 16 px per row), then the kernel's build-date box, then the
+/// per-game CONFIG.SYS and AUTOEXEC echo. Only the logo is invariant, so only
+/// the logo is hashed: the build-date box moves whenever the image is rebuilt
+/// and the echo differs per game.
+#[test]
+fn the_banner_digest_covers_the_top_ten_text_rows_and_nothing_below() {
+    let base = solid(BOOT_BANNER_WIDTH, BOOT_BANNER_HEIGHT, [0, 0, 0]);
+    let reference = base.banner_digest().expect("720x400 has a digest");
+
+    // A change BELOW the banner region does not move the digest. This is what
+    // lets one reference match 14 different games' boot screens.
+    let mut below = base.clone();
+    poke(&mut below, 0, BOOT_BANNER_ROWS, [255, 255, 255]);
+    assert_eq!(below.banner_digest(), Some(reference));
+
+    // A change INSIDE it does.
+    let mut inside = base.clone();
+    poke(&mut inside, 0, BOOT_BANNER_ROWS - 1, [255, 255, 255]);
+    assert_ne!(inside.banner_digest(), Some(reference));
+}
+
+/// Only the boot screen's own geometry can carry the banner. A 640x480 graphics
+/// frame has no banner digest at all, so no graphics frame can ever be mistaken
+/// for a boot screen however its bytes happen to hash.
+#[test]
+fn only_the_boot_screens_geometry_carries_a_banner_digest() {
+    assert!(solid(640, 480, [0, 0, 0]).banner_digest().is_none());
+    assert!(solid(320, 200, [0, 0, 0]).banner_digest().is_none());
+    assert!(solid(720, 400, [0, 0, 0]).banner_digest().is_some());
+}
+
+/// The pinned reference, with its provenance. This constant is DATA, measured
+/// once and cross-checked against the corpus; it is not a tunable.
+///
+/// Provenance: `izarravm --hdd-folder <bare C:> --cpu 586 --cycles 1660000000
+/// --screen-dump-dir <dir> --screen-dump-interval-ms 200`, binary main
+/// `7ca814ee`, 2026-08-17. All 44 sampled frames of that boot share this digest.
+/// Cross-check: it matches 29 frames across 14 of the 203 archived stage-1 games
+/// (`the_banner_reference_still_matches_the_archive`).
+#[test]
+fn the_banner_reference_digest_is_the_measured_one() {
+    assert_eq!(BOOT_BANNER_DIGEST, 0x9b44_c208_87b4_8025);
+}
+
+#[test]
+fn boot_banner_entries_count_arrivals_at_the_boot_screen_not_samples_of_it() {
+    let banner = |present: bool| if present { "boot" } else { "game" }.to_string();
+    let facts = FrameFacts {
+        banner: [("boot".to_string(), true), ("game".to_string(), false)]
+            .into_iter()
+            .collect(),
+        ..FrameFacts::default()
+    };
+    let series = |states: &[bool]| -> Vec<Screen> {
+        states
+            .iter()
+            .enumerate()
+            .map(|(index, present)| Screen {
+                hash: banner(*present),
+                ..screen(index as u64, "unused", Some("text"))
+            })
+            .collect()
+    };
+
+    // The banner is on screen for the whole run and never leaves: ONE boot. This
+    // is `billted` and `rogclon`, two of the eight v1 false positives — their
+    // whole run sits at the DOS prompt under the banner.
+    assert_eq!(boot_banner_entries(&series(&[true; 6]), &facts), 1);
+
+    // A game that never shows it: no boot observed after the sampler started.
+    assert_eq!(boot_banner_entries(&series(&[false; 6]), &facts), 0);
+
+    // Booted, ran, booted again, ran again: TWO arrivals. This is a reboot loop.
+    assert_eq!(
+        boot_banner_entries(&series(&[true, false, false, true, false]), &facts),
+        2
+    );
+
+    // Three arrivals.
+    assert_eq!(
+        boot_banner_entries(&series(&[false, true, false, true, false, true]), &facts),
+        3
+    );
+}
+
+#[test]
+fn two_arrivals_at_the_boot_banner_are_a_reboot_loop() {
+    let facts = FrameFacts {
+        banner: [("boot".to_string(), true), ("game".to_string(), false)]
+            .into_iter()
+            .collect(),
+        ..FrameFacts::default()
+    };
+    let screens: Vec<Screen> = [true, false, false, true, false]
+        .iter()
+        .enumerate()
+        .map(|(index, boot)| Screen {
+            hash: if *boot { "boot" } else { "game" }.to_string(),
+            ..screen(index as u64, "unused", Some("text"))
+        })
+        .collect();
+    assert_eq!(
+        decide_outcome(
+            Some(&ran_profile(31)),
+            &screens,
+            &facts,
+            HostVerdict::default()
+        ),
+        Outcome::RebootLoop
+    );
+}
+
+// -- the pixel-delta floor --------------------------------------------------
+
+#[test]
+fn differing_pixels_counts_pixels_and_refuses_a_geometry_mismatch() {
+    let base = solid(10, 10, [0, 0, 0]);
+    let mut one = base.clone();
+    poke(&mut one, 5, 5, [1, 0, 0]);
+    assert_eq!(base.differing_pixels(&one), Some(1));
+    assert_eq!(base.differing_pixels(&base), Some(0));
+    assert_eq!(base.differing_pixels(&solid(10, 11, [0, 0, 0])), None);
+}
+
+/// **The measurement that sets the floor.**
+///
+/// MEASURED over all 203 archived stage-1 rows, pairwise between every distinct
+/// in-window frame. A blinking text cursor in 720x400 text mode differs by
+/// exactly **18 pixels** of 288,000 — the 9x2 underline cell — and that one
+/// number accounts for eleven of the corpus's two-frame rows. The widest pair
+/// the floor absorbs is TSpaFarm at 464 px (0.161%, 1.55x below the bar); the
+/// narrowest it rejects is TGinRum at 1,035 px (0.359%, 1.44x above). The bar
+/// sits at 0.25% of the frame, which is five 9x16 character cells.
+#[test]
+fn the_pixel_delta_floor_sits_between_the_measured_corpus_pairs() {
+    let frame = 288_000.0;
+    let cursor_blink = 18.0 / frame;
+    let widest_absorbed = 464.0 / frame;
+    let narrowest_rejected = 1_035.0 / frame;
+
+    assert!(cursor_blink < PIXEL_DELTA_FLOOR);
+    assert!(widest_absorbed < PIXEL_DELTA_FLOOR);
+    assert!(narrowest_rejected > PIXEL_DELTA_FLOOR);
+
+    let below = PIXEL_DELTA_FLOOR / widest_absorbed;
+    let above = narrowest_rejected / PIXEL_DELTA_FLOOR;
+    assert!((1.5..1.6).contains(&below), "margin below the bar {below}x");
+    assert!((1.4..1.5).contains(&above), "margin above the bar {above}x");
+
+    // And the cursor itself sits 40x below the bar, so no plausible cursor shape
+    // comes near it: 18 px against the bar's 720.
+    let cursor_margin = PIXEL_DELTA_FLOOR / cursor_blink;
+    assert!(
+        (39.9..40.1).contains(&cursor_margin),
+        "the cursor sits {cursor_margin}x below the bar"
+    );
+}
+
+fn blink_facts(a: &str, b: &str, differing: usize, frame: usize) -> FrameFacts {
+    FrameFacts {
+        delta: [(
+            (a.to_string(), b.to_string()),
+            differing as f64 / frame as f64,
+        )]
+        .into_iter()
+        .collect(),
+        ..FrameFacts::default()
+    }
+}
+
+#[test]
+fn a_cursor_blink_pair_is_one_picture_and_a_real_change_is_two() {
+    let blink = blink_facts("a", "b", 18, 288_000);
+    assert!(blink.same_picture("a", "b"));
+    assert!(blink.same_picture("b", "a"), "the relation is symmetric");
+
+    let change = blink_facts("a", "b", 1_035, 288_000);
+    assert!(!change.same_picture("a", "b"));
+
+    // An unmeasured pair is never asserted to be the same picture.
+    assert!(!FrameFacts::default().same_picture("a", "b"));
+    // A frame is always the same picture as itself, measured or not.
+    assert!(FrameFacts::default().same_picture("a", "a"));
+}
+
+/// Classes must not CHAIN. Two frames that are each within the floor of a middle
+/// frame, but far from each other, are two pictures and not one — otherwise a
+/// slow pan across 13 samples would collapse into "the picture never changed".
+#[test]
+fn frame_classes_never_chain_two_far_apart_pictures() {
+    let facts = FrameFacts {
+        delta: [
+            (("a".to_string(), "b".to_string()), 0.0001),
+            (("b".to_string(), "c".to_string()), 0.0001),
+            (("a".to_string(), "c".to_string()), 0.02),
+        ]
+        .into_iter()
+        .collect(),
+        ..FrameFacts::default()
+    };
+    let screens: Vec<Screen> = ["a", "b", "c"]
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| Screen {
+            hash: hash.to_string(),
+            ..screen(index as u64, "unused", Some("text"))
+        })
+        .collect();
+    let classes = frame_classes(&screens, &facts);
+    assert_eq!(classes[0], classes[1], "a and b are one picture");
+    assert_ne!(classes[0], classes[2], "a and c are not");
+    assert_eq!(distinct_count(&classes), 2);
+}
+
+#[test]
+fn identical_hashes_are_one_picture_without_any_pixel_evidence() {
+    let screens: Vec<Screen> = (0..4)
+        .map(|index| Screen {
+            hash: "same".to_string(),
+            ..screen(index, "unused", Some("text"))
+        })
+        .collect();
+    let classes = frame_classes(&screens, &FrameFacts::default());
+    assert_eq!(distinct_count(&classes), 1);
+}
+
+/// **The second half of the v1 defect, pinned.** Eight rows sat at a DOS prompt
+/// for the whole window with a blinking cursor. Their window held two distinct
+/// HASHES, so v1's `distinct <= 1` flatness test failed, the rows were called
+/// `RAN`, and they entered the bucketable set — where seven of them fired B2 on
+/// boot-phase-shaped counters. With the pixel-delta floor the two hashes are one
+/// picture, the window is flat, and a flat TEXT picture is `IDLE-TEXT`.
+#[test]
+fn a_blinking_cursor_at_a_dos_prompt_is_idle_text_not_a_bucketable_row() {
+    let mut profile = ran_profile(31);
+    let last = profile.phase_marks.len() - 1;
+    profile.phase_marks[last].halted_ticks = profile.phase_marks[last].master_ticks;
+    let end = profile.master_ticks;
+    // Four in-window samples alternating between the two cursor phases.
+    let screens: Vec<Screen> = (0..4)
+        .map(|index| Screen {
+            master_ticks: end - index * DOOM_HZ,
+            hash: if index % 2 == 0 { "on" } else { "off" }.to_string(),
+            ..screen(index, "unused", Some("text"))
+        })
+        .collect();
+    let facts = blink_facts("off", "on", 18, 288_000);
+
+    // v1's view: two distinct hashes, therefore not flat, therefore RAN.
+    let v1 = screen_window(&screens, &profile, &FrameFacts::default());
+    assert_eq!(v1.distinct_in_window, 2);
+    assert!(!v1.flat);
+
+    // v2's view: one picture, flat, and excluded from every bucket.
+    let v2 = screen_window(&screens, &profile, &facts);
+    assert_eq!(v2.distinct_in_window, 2, "the hash count is still reported");
+    assert_eq!(v2.distinct_pictures_in_window, 1);
+    assert!(v2.flat);
+
+    let row = classify_archive(&Archive {
+        short: "prompt".to_string(),
+        profile: Some(profile),
+        screens,
+        frames: facts,
+        ..Archive::default()
+    });
+    assert_eq!(row.outcome, "IDLE-TEXT");
+    assert_eq!(row.health, "EXCLUDED");
+    assert!(row.buckets.is_empty());
+}
+
+// -- blankness --------------------------------------------------------------
+
+/// `IDLE-BLIND` now means the picture really is blank.
+///
+/// v1 raised it whenever the sample carried no `video_mode` line, which is a
+/// fact about the DISPLAY PATH (the Margo framebuffer) and not about the
+/// picture. Stage 1 read the flag as "the screen is blank" and needed that
+/// signal for real — defect E6 is a title showing a blank text screen while
+/// 29.2 billion instructions spin on port reads. The display-path fact keeps its
+/// own flag, `NO-MODE-LINE`.
+#[test]
+fn idle_blind_now_names_a_blank_picture() {
+    let profile = ran_profile(31);
+    let end = profile.master_ticks;
+    let screens: Vec<Screen> = (0..4)
+        .map(|index| Screen {
+            master_ticks: end - index * DOOM_HZ,
+            hash: "black".to_string(),
+            ..screen(index, "unused", Some("text"))
+        })
+        .collect();
+    let facts = FrameFacts {
+        blank: [("black".to_string(), true)].into_iter().collect(),
+        ..FrameFacts::default()
+    };
+    let row = classify_archive(&Archive {
+        short: "blank".to_string(),
+        profile: Some(profile.clone()),
+        screens: screens.clone(),
+        frames: facts,
+        ..Archive::default()
+    });
+    assert!(row.flags.iter().any(|flag| flag == "IDLE-BLIND"));
+    assert!(!row.flags.iter().any(|flag| flag == "NO-MODE-LINE"));
+
+    // A picture with content in the same display path is not blind.
+    let painted = classify_archive(&Archive {
+        short: "painted".to_string(),
+        profile: Some(profile),
+        screens,
+        frames: FrameFacts {
+            blank: [("black".to_string(), false)].into_iter().collect(),
+            ..FrameFacts::default()
+        },
+        ..Archive::default()
+    });
+    assert!(!painted.flags.iter().any(|flag| flag == "IDLE-BLIND"));
+}
+
+#[test]
+fn blankness_is_one_colour_across_the_whole_frame() {
+    assert!(solid(8, 8, [0, 0, 0]).blank());
+    assert!(
+        solid(8, 8, [17, 34, 51]).blank(),
+        "one colour, not just black"
+    );
+    let mut painted = solid(8, 8, [0, 0, 0]);
+    poke(&mut painted, 4, 4, [1, 0, 0]);
+    assert!(!painted.blank());
+}
+
+/// A row whose frames could not be read says so rather than guessing. Without
+/// pixels the delta is unknown, so no pair collapses and the row keeps its v1
+/// hash-count behaviour.
+#[test]
+fn unreadable_frames_are_flagged_and_never_collapsed() {
+    let profile = ran_profile(31);
+    let end = profile.master_ticks;
+    let screens: Vec<Screen> = (0..4)
+        .map(|index| Screen {
+            master_ticks: end - index * DOOM_HZ,
+            hash: if index % 2 == 0 { "on" } else { "off" }.to_string(),
+            ..screen(index, "unused", Some("text"))
+        })
+        .collect();
+    let facts = FrameFacts {
+        unreadable: ["on".to_string()].into_iter().collect(),
+        ..FrameFacts::default()
+    };
+    let row = classify_archive(&Archive {
+        short: "unreadable".to_string(),
+        profile: Some(profile),
+        screens,
+        frames: facts,
+        ..Archive::default()
+    });
+    assert!(row.flags.iter().any(|flag| flag == "FRAMES-UNREADABLE"));
+    assert_eq!(row.screens.distinct_pictures_in_window, 2);
+    assert!(!row.screens.flat);
+}
+
+// ---------------------------------------------------------------------------
 // The on-disk board, when it happens to be there. `.bench/` is git-ignored, so
 // this cannot be the gate — it is a cross-check that the embedded table above
 // still equals the files it was read from.
@@ -1124,5 +1901,116 @@ fn the_real_fixture_board_still_matches_the_embedded_table() {
         let profile = archive.profile.as_ref().unwrap();
         assert_eq!(profile.perf.instructions, fixture.instructions);
         assert_eq!(profile.perf.smc_heat_demotions, fixture.smc_heat_demotions);
+        assert_eq!(profile.perf.monitor_trips_vec13, fixture.vec13_trips);
+        assert_eq!(
+            profile.perf.monitor_resident_core_clocks,
+            fixture.monitor_clocks
+        );
+        assert_eq!(profile.executed_cpu_core_clocks, fixture.core_clocks);
+        assert_eq!(profile.perf.decode_misses, fixture.decode_misses);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The archived stage-1 corpus, when it happens to be there. `D:\exo-stage1` is
+// not in the repo, so these cannot be gates either; they pin two claims that
+// only real data can settle.
+// ---------------------------------------------------------------------------
+
+fn stage1_archive() -> Option<PathBuf> {
+    let root = PathBuf::from(r"D:\exo-stage1\passB-20260816");
+    root.is_dir().then_some(root)
+}
+
+/// The banner reference is a pinned constant, so it can go stale silently when
+/// the Toka-DOS image is rebuilt. This is the alarm: it must still match the
+/// archive it was cross-checked against.
+#[test]
+fn the_banner_reference_still_matches_the_archive() {
+    let Some(root) = stage1_archive() else {
+        eprintln!("skipped: no stage-1 archive on disk");
+        return;
+    };
+    let mut frames = 0usize;
+    let mut games = 0usize;
+    for entry in std::fs::read_dir(&root)
+        .expect("archive reads")
+        .filter_map(Result::ok)
+    {
+        let screens = entry.path().join("screens");
+        if !screens.is_dir() {
+            continue;
+        }
+        let mut hits = 0usize;
+        for frame in std::fs::read_dir(&screens)
+            .expect("screens read")
+            .filter_map(Result::ok)
+        {
+            let path = frame.path();
+            if path.extension().is_some_and(|ext| ext == "ppm") {
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                if read_ppm(&bytes).is_some_and(|image| image.is_boot_banner()) {
+                    hits += 1;
+                }
+            }
+        }
+        if hits > 0 {
+            frames += hits;
+            games += 1;
+        }
+    }
+    assert_eq!(
+        (frames, games),
+        (29, 14),
+        "the pinned boot-banner digest no longer matches the archive it was \
+         measured against. Either the Toka-DOS boot logo changed, in which case \
+         re-measure the constant and say so, or the crop geometry moved."
+    );
+}
+
+/// **§2 item 4 is REFUTED, and this records the refutation.**
+///
+/// The triage reported that B5b's counter is "never emitted into profile.json",
+/// so the bucket could not fire. MEASURED: `jit_direct_x87_pad_bails` IS emitted
+/// — the `--hdd-folder` path and the scoreboard path share
+/// `bench::perf_counters_json` — and it reads exactly 0 on all 184 profiled
+/// stage-1 rows. Nothing needs wiring. B5b fired 0 times because these games do
+/// not bail, which the neighbouring x87 counters corroborate: only 5 of 184 rows
+/// take any x87 eligibility exit at all.
+#[test]
+fn the_b5b_counter_is_emitted_and_the_corpus_genuinely_reads_zero() {
+    let Some(root) = stage1_archive() else {
+        eprintln!("skipped: no stage-1 archive on disk");
+        return;
+    };
+    let mut profiles = 0usize;
+    let mut present = 0usize;
+    let mut nonzero_bails = 0usize;
+    let mut with_x87_work = 0usize;
+    for entry in std::fs::read_dir(&root)
+        .expect("archive reads")
+        .filter_map(Result::ok)
+    {
+        let path = entry.path().join("profile.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        profiles += 1;
+        if text.contains("\"jit_direct_x87_pad_bails\"") {
+            present += 1;
+        }
+        let profile: Profile = serde_json::from_str(&text).expect("profile parses");
+        if profile.perf.jit_direct_x87_pad_bails > 0 {
+            nonzero_bails += 1;
+        }
+        if profile.direct_stalls.side_exit_x87_eligibility > 0 {
+            with_x87_work += 1;
+        }
+    }
+    assert_eq!(profiles, 184);
+    assert_eq!(present, 184, "the counter is emitted on every row");
+    assert_eq!(nonzero_bails, 0, "and every row reads zero");
+    assert_eq!(with_x87_work, 5, "only five rows do any x87 work at all");
 }

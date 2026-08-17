@@ -113,13 +113,15 @@ function Test-CorpusShort {
     return $Short -match '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 }
 
-# Reboot detection. The design proposed scraping stdout for a repeated POST
-# banner; MEASURED 2026-08-16, the --hdd-folder path prints NO banner at all,
-# so that detector has no signal and this does not pretend otherwise. The
-# screen index is the substitute: a machine that resets redraws its first
-# screen, so a run whose opening frame hash recurs after having changed away
-# from it has been round the loop. Reported as a count, and only two or more
-# recurrences call the row a REBOOT-LOOP.
+# Reboot detection, and where it now lives. The design proposed scraping stdout
+# for a repeated POST banner; MEASURED 2026-08-16, the --hdd-folder path prints
+# NO banner at all, so that detector has no signal. v1 substituted opening-frame
+# recurrence here, and stage 1 measured THAT at 0 true positives in 8 fires.
+#
+# The working detector needs the boot banner, which is only visible in the kept
+# PPM frames, and reading 900 KB frames inside this loop would slice every run.
+# So the count stays a REPORTED column and the verdict moves to the classifier
+# (`izarravm-exodos classify`), which reads the frames once, afterwards.
 $rebootRecurrenceThreshold = 2
 
 foreach ($required in @($Executable, $Translator)) {
@@ -356,7 +358,12 @@ function Get-Outcome {
     if ($null -eq $Profile) { return "NO-PROFILE" }
     $kind = $Profile.stop.kind
     if ($kind -eq "cpu_error") { return "CRASHED" }
-    if ($ScreenRecurrences -ge $RebootThreshold) { return "REBOOT-LOOP" }
+    # The recurrence count is REPORTED and no longer decides. Stage 1 measured
+    # the opening-frame rule at 0 true positives in 8 fires: a blinking text
+    # cursor, an attract cycle and a black fade frame all return to the first
+    # frame's hash. The reboot verdict needs the boot banner, which needs the
+    # kept PPMs, which the classifier reads and this loop cannot afford to.
+    $null = $RebootThreshold
     $marks = 0
     if ($Profile.PSObject.Properties.Name -contains 'phase_marks' -and $Profile.phase_marks) {
         $marks = @($Profile.phase_marks).Count
