@@ -2087,7 +2087,7 @@ monitor_body:
     ; same table in both V86 and ring 0 (idt/idtr above), so any interrupt that
     ; fires during this real HLT vectors straight into irq_m*/irq_s*/vec13_entry
     ; exactly as it would have for the guest -- VIF=0 holds the line in vip (the
-    ; existing irq_body coalesce) and VIF=1 reflects it into the guest's IVT
+    ; existing irq_body hold path) and VIF=1 reflects it into the guest's IVT
     ; (irq_reflect_line), same as any other interrupt arriving mid-V86.
     ;
     ; Guest VIF=0 (interrupts virtually disabled): a real 386 hangs forever on
@@ -2114,10 +2114,11 @@ monitor_body:
                                 ; real IRQ. This hlt runs at ring 0 (VM=0), so
                                 ; irq_body's real-frame check (below) cannot
                                 ; treat the waking IRQ's 3-dword IRETD frame as
-                                ; a V86 frame; it holds the line in vip and
-                                ; EOIs, same as the VIF=0 coalesce path, then
-                                ; IRETDs straight back here. Drain it into the
-                                ; guest now that we're about to return to V86:
+                                ; a V86 frame; it holds the line in vip,
+                                ; leaving it in service, same as the VIF=0
+                                ; path, then IRETDs straight back here. Drain
+                                ; it into the guest now that we're about to
+                                ; return to V86:
                                 ; maybe_deliver reflects the highest-priority
                                 ; held line through EBP's real V86 frame.
     cli                         ; close the window BEFORE dropping the flag:
@@ -2364,8 +2365,8 @@ monitor_body:
 
 ; ---- Hardware IRQs (no error code). Per-line stubs load the 8259 line number
 ; and share one body: reflect to the guest IVT when VIF is set, else hold the
-; line in the vip mask and EOI immediately (coalesce; deliver on the next
-; STI/POPF/IRET). Master lines 0-7 (vectors 8-15, 5 via vec13_entry), slave
+; line in the vip mask, leaving it in service, and deliver it on the next
+; STI/POPF/IRET. Master lines 0-7 (vectors 8-15, 5 via vec13_entry), slave
 ; lines 8-15 (vectors 0x70-0x77). ----
 %assign line 0
 %rep 8
