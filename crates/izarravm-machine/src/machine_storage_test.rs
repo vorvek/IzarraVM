@@ -2247,3 +2247,212 @@ fn el_torito_status_packet_lands_in_a_non_identity_mapped_caller_buffer() {
     );
     assert!(m.eltorito_emulation.is_none());
 }
+
+/// Guest linear address of the straddling caller buffer the CHS fixtures use:
+/// `ES:BX` = C8C6:0390, which puts the first 16 bytes of a sector at the end of
+/// page C8h and the remaining 496 in page C9h. The two frames are not adjacent,
+/// so one translation cannot cover the sector.
+const UMB_STRADDLE_BX: u32 = 0x0390;
+
+/// Lay a decoy over the two frames the straddling buffer maps to, so "the
+/// sector arrived" is distinguishable from "nothing happened".
+fn poison_straddle_frames(machine: &mut Machine) {
+    for offset in 0..0x10u32 {
+        machine.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0 + offset, 0x5a);
+        machine.write_physical_u8(super::margo::UMB_FRAME_HIGH + offset, 0x5a);
+    }
+}
+
+/// A 1.44 MB image whose LBA 1 carries a marker at byte 0 and another at byte
+/// 16, so a straddling read can be checked on both sides of the page boundary.
+fn marked_floppy() -> Vec<u8> {
+    let mut image = vec![0u8; 1_474_560];
+    image[512] = 0x11;
+    image[512 + 16] = 0x22;
+    image
+}
+
+/// INT 13h AH=02h against the fixed disk, into a caller buffer that straddles
+/// the two non-identity-mapped pages. The classic CHS transfer is the buffer
+/// most likely to be hit in practice: DOS=HIGH,UMB puts BUFFERS in upper
+/// memory, and every DOS read of a file passes through one.
+#[test]
+fn int13_hdd_chs_read_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    poison_straddle_frames(&mut m);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x0201);
+    m.cpu.registers.set_ecx(0x0002); // cylinder 0, head 0, sector 2 = LBA 1
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    assert_eq!(m.cpu.registers.eax() as u8, 1, "AL = sectors transferred");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0),
+        0x11,
+        "the head of the sector must follow the first page's mapping"
+    );
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_HIGH),
+        0,
+        "the tail of the sector must follow the second page's mapping"
+    );
+}
+
+/// INT 13h AH=03h against the fixed disk: the source bytes are gathered from
+/// the caller's pages, not from the identity addresses.
+#[test]
+fn int13_hdd_chs_write_reads_a_non_identity_mapped_caller_buffer() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    for offset in 0..0x10u32 {
+        m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0 + offset, 0xc1);
+        m.write_physical_u8(super::margo::UMB_FRAME_HIGH + offset, 0xc2);
+    }
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x0301);
+    m.cpu.registers.set_ecx(0x0006); // cylinder 0, head 0, sector 6 = LBA 5
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    assert_eq!(int13_read_at(&mut m, 5, 1), vec![0xc1], "head byte written");
+    assert_eq!(
+        m.read_physical_u8(0x2_0000 + 16),
+        0xc2,
+        "the source bytes past the page boundary must come from the second frame"
+    );
+}
+
+/// INT 13h AH=02h against floppy A:, the other CHS transfer path.
+#[test]
+fn int13_floppy_chs_read_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut m = int15_machine(16);
+    m.mount_floppy(marked_floppy()).unwrap();
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    poison_straddle_frames(&mut m);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x0201);
+    m.cpu.registers.set_ecx(0x0002); // cylinder 0, head 0, sector 2 = LBA 1
+    m.cpu.registers.set_edx(0x0000);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0),
+        0x11,
+        "the head of the sector must follow the first page's mapping"
+    );
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_HIGH),
+        0x22,
+        "the tail of the sector must follow the second page's mapping"
+    );
+}
+
+/// INT 13h AH=03h against floppy A:.
+#[test]
+fn int13_floppy_chs_write_reads_a_non_identity_mapped_caller_buffer() {
+    let mut m = int15_machine(16);
+    m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    for offset in 0..0x10u32 {
+        m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0 + offset, 0xc1);
+        m.write_physical_u8(super::margo::UMB_FRAME_HIGH + offset, 0xc2);
+    }
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x0301);
+    m.cpu.registers.set_ecx(0x0002); // cylinder 0, head 0, sector 2 = LBA 1
+    m.cpu.registers.set_edx(0x0000);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    let written = m.floppy.as_ref().unwrap().read_sector(0, 0, 2).unwrap();
+    assert_eq!(written[0], 0xc1, "head byte written");
+    assert_eq!(
+        written[16], 0xc2,
+        "the source bytes past the page boundary must come from the second frame"
+    );
+}
+
+/// INT 13h AH=0Ah read long, whose 516-byte stride puts a sector's ECC trailer
+/// in a different page from its head.
+#[test]
+fn int13_hdd_read_long_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    poison_straddle_frames(&mut m);
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x0A01);
+    m.cpu.registers.set_ecx(0x0002); // LBA 1
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0),
+        0x11,
+        "the head of the sector must follow the first page's mapping"
+    );
+    assert_eq!(
+        m.read_physical_u8(super::margo::UMB_FRAME_HIGH),
+        0,
+        "the tail of the sector must follow the second page's mapping"
+    );
+}
+
+/// INT 13h AH=0Bh write long: the caller's data comes from its own pages.
+#[test]
+fn int13_hdd_write_long_reads_a_non_identity_mapped_caller_buffer() {
+    let mut m = machine_with_hdd(64);
+    super::margo::install_umb_paging(&mut m);
+    prime_dos_int_frame(&mut m);
+    for offset in 0..0x10u32 {
+        m.write_physical_u8(super::margo::UMB_FRAME_LOW + 0xff0 + offset, 0xc1);
+        m.write_physical_u8(super::margo::UMB_FRAME_HIGH + offset, 0xc2);
+    }
+
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    m.cpu.registers.set_ebx(UMB_STRADDLE_BX);
+    m.cpu.registers.set_eax(0x0B01);
+    m.cpu.registers.set_ecx(0x0007); // LBA 6
+    m.cpu.registers.set_edx(0x0080);
+    m.handle_int13();
+
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0, "AH=0 success");
+    assert_eq!(int13_read_at(&mut m, 6, 1), vec![0xc1], "head byte written");
+    assert_eq!(
+        m.read_physical_u8(0x2_0000 + 16),
+        0xc2,
+        "the source bytes past the page boundary must come from the second frame"
+    );
+}

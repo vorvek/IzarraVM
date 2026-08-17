@@ -1367,6 +1367,10 @@ impl Machine {
     }
 
     /// Carry out the AH=02 read / AH=03 write half of INT 13h.
+    ///
+    /// ES:BX is a guest LINEAR address; see `int13_hdd_transfer` for why the
+    /// classic CHS buffer is the one most likely to sit outside the identity
+    /// map.
     fn int13_transfer(&mut self, ah: u8, dl: u8) {
         let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
             // No media backs the request: report a timeout the way an empty
@@ -1414,11 +1418,18 @@ impl Machine {
                     .and_then(|f| f.read_sector(cyl, head, sec))
                     .map(<[u8]>::to_vec);
                 match data {
-                    Some(bytes) => self.write_guest_block(addr, &bytes),
+                    Some(bytes) => {
+                        if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            break;
+                        }
+                    }
                     None => break,
                 }
             } else {
-                let bytes = self.read_guest_block(addr, 512);
+                if self.linear_present_prefix(addr, 512) < 512 {
+                    break;
+                }
+                let bytes = self.read_guest_linear_block(addr, 512);
                 let wrote = self
                     .floppy
                     .as_mut()
@@ -1779,6 +1790,11 @@ impl Machine {
 
     /// AH=02/03 CHS read/write against the mounted hard disk. ES:BX is the buffer;
     /// AL is the sector count. AL returns the count actually moved.
+    ///
+    /// ES:BX is a guest LINEAR address. This is the highest-traffic caller
+    /// buffer in the file: DOS=HIGH,UMB puts BUFFERS in upper memory that
+    /// TOKAEMM supplies out of extended memory, and every file read DOS serves
+    /// from a cache miss passes through one. See `read_guest_linear_block`.
     fn int13_hdd_transfer(&mut self, ah: u8) {
         let count = self.cpu.registers.eax() as u8;
         let (cyl, head, sector) = self.int13_chs();
@@ -1808,11 +1824,18 @@ impl Machine {
             if ah == 0x02 {
                 let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
-                    Some(bytes) => self.write_guest_block(addr, &bytes),
+                    Some(bytes) => {
+                        if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            break;
+                        }
+                    }
                     None => break,
                 }
             } else {
-                let bytes = self.read_guest_block(addr, 512);
+                if self.linear_present_prefix(addr, 512) < 512 {
+                    break;
+                }
+                let bytes = self.read_guest_linear_block(addr, 512);
                 let wrote = self
                     .ata
                     .as_mut()
@@ -1831,8 +1854,8 @@ impl Machine {
         // falls back to the HLE C: shim, which needs the HLE live, so leave it set.
         // Unlike the floppy, INT 13h stays intercepted so Katea keeps serving I/O.
         if ah == 0x02 && done > 0 && start_lba == 0 && buffer == BOOT_SECTOR_ADDRESS as u32 {
-            let signed = self.read_physical_u8(buffer + 510) == 0x55
-                && self.read_physical_u8(buffer + 511) == 0xAA;
+            let signature = self.read_guest_linear_block(buffer + 510, 2);
+            let signed = signature == [0x55, 0xAA];
             if signed {
                 self.booter_inert = true;
             }
@@ -1893,13 +1916,21 @@ impl Machine {
                 let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
                     Some(bytes) => {
-                        self.write_guest_block(addr, &bytes);
-                        self.write_guest_block(addr.wrapping_add(ata::SECTOR as u32), &ZERO_ECC);
+                        if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            break;
+                        }
+                        self.write_guest_linear_block(
+                            addr.wrapping_add(ata::SECTOR as u32),
+                            &ZERO_ECC,
+                        );
                     }
                     None => break,
                 }
             } else {
-                let bytes = self.read_guest_block(addr, ata::SECTOR);
+                if self.linear_present_prefix(addr, ata::SECTOR) < ata::SECTOR {
+                    break;
+                }
+                let bytes = self.read_guest_linear_block(addr, ata::SECTOR);
                 let wrote = self
                     .ata
                     .as_mut()
@@ -2098,7 +2129,9 @@ impl Machine {
                 0x42 => {
                     let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
                     match data {
-                        Some(bytes) => self.write_guest_linear_block(addr, &bytes),
+                        Some(bytes) => {
+                            self.write_guest_linear_block(addr, &bytes);
+                        }
                         None => break,
                     }
                 }

@@ -352,12 +352,46 @@ impl Machine {
     /// An unmapped page is skipped rather than faulted on. A BIOS service is
     /// not an instruction: it has no faulting frame to deliver, and the guest's
     /// own read of the buffer will take the page fault in its place.
-    pub(super) fn write_guest_linear_block(&mut self, linear: u32, bytes: &[u8]) {
+    ///
+    /// Returns how many bytes from `linear` landed BEFORE the first skipped
+    /// page, which is `bytes.len()` when every page translated. A skip is not
+    /// reported anywhere else, so a service that reports a transferred count --
+    /// AL for INT 13h AH=02h, the block-count field of a Disk Address Packet --
+    /// has to take that count from here or it reports bytes that never arrived.
+    /// Pages past the first skipped one are still delivered; only the reported
+    /// prefix stops there, because a caller whose buffer has a hole in the
+    /// middle is already broken and this is not the place to decide how.
+    pub(super) fn write_guest_linear_block(&mut self, linear: u32, bytes: &[u8]) -> usize {
+        let mut delivered = None;
         for (offset, chunk) in Self::linear_pages(linear, bytes.len()) {
             if let Some(physical) = self.translate_linear_probe(linear.wrapping_add(offset)) {
                 self.write_guest_block(physical, &bytes[offset as usize..][..chunk]);
+            } else if delivered.is_none() {
+                delivered = Some(offset as usize);
             }
         }
+        delivered.unwrap_or(bytes.len())
+    }
+
+    /// How many bytes from `linear`, up to `len`, lie in pages the guest's
+    /// tables currently translate. `len` means the whole range is reachable.
+    ///
+    /// The read side of the same problem `write_guest_linear_block` reports:
+    /// `read_guest_linear_block` fills an untranslatable page with 0xFF, which
+    /// is indistinguishable from real bus fill, so a service that takes guest
+    /// bytes and COMMITS them somewhere persistent -- a disk sector, a serial
+    /// port -- must ask this first and shorten the transfer instead of
+    /// committing filler.
+    pub(super) fn linear_present_prefix(&mut self, linear: u32, len: usize) -> usize {
+        for (offset, _) in Self::linear_pages(linear, len) {
+            if self
+                .translate_linear_probe(linear.wrapping_add(offset))
+                .is_none()
+            {
+                return offset as usize;
+            }
+        }
+        len
     }
 
     /// `read_guest_block` against a guest LINEAR address. Same walk and the same
