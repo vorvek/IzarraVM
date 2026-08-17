@@ -1343,10 +1343,23 @@ fn program_runtime_reintercepts_dos_vectors_for_the_raw_program_loader() {
 fn absent_resident_api_vectors_intercept_only_default_iret() {
     let mut m = int15_machine(16);
 
-    for vector in [0x5C, 0x60, 0x68, 0x6F, 0x7A, 0x86, 0xE4] {
+    // 0x5C, 0x7A, 0x86 and 0xE4 carry their per-vector ROM stub out of POST.
+    for vector in [0x5C, 0x7A, 0x86, 0xE4] {
         ack_and_dispatch(&mut m, vector);
         assert_eq!(m.pending_soft_int, Some(vector), "INT {vector:02X}h");
         m.pending_soft_int = None;
+    }
+
+    // 0x60, 0x68 and 0x6F sit in the user/unused range the AT BIOS leaves at
+    // 0000:0000. POST no longer seeds them (defect E2) and the predicate no
+    // longer lists them, so even a vector pointed at the ROM stub by hand is
+    // not intercepted: the range belongs to the guest outright.
+    for vector in [0x60u8, 0x68, 0x6F] {
+        let base = usize::from(vector) * 4;
+        m.memory.write_u16(base, bios_int_stub_off(vector)).unwrap();
+        m.memory.write_u16(base + 2, BIOS_ROM_IRET_SEG).unwrap();
+        ack_and_dispatch(&mut m, vector);
+        assert_eq!(m.pending_soft_int, None, "INT {vector:02X}h is guest-owned");
     }
 
     m.memory.write_u16(0x60 * 4, 0x1234).unwrap();
@@ -1356,6 +1369,15 @@ fn absent_resident_api_vectors_intercept_only_default_iret() {
     assert_eq!(
         m.pending_soft_int, None,
         "guest-owned INT 60h is not stolen"
+    );
+
+    // And the POST default - a null vector - is not intercepted either.
+    m.memory.write_u16(0x60 * 4, 0).unwrap();
+    m.memory.write_u16(0x60 * 4 + 2, 0).unwrap();
+    ack_and_dispatch(&mut m, 0x60);
+    assert_eq!(
+        m.pending_soft_int, None,
+        "a null INT 60h vector is not intercepted"
     );
 }
 
@@ -1371,34 +1393,6 @@ fn absent_resident_api_vectors_report_not_installed() {
     m.handle_absent_resident_api(0x5C);
     assert_eq!(m.cpu.registers.eax() as u8, 0xFB);
     assert_eq!(m.read_physical_u8(0x30020 + 1), 0xFB);
-
-    prime_dos_int_frame(&mut m);
-    m.cpu.registers.set_eax(0xCAFE_01FF);
-    m.handle_absent_resident_api(0x60);
-    assert_eq!(m.cpu.registers.eax(), 0xCAFE_01FF);
-    assert_eq!(dos_int_flags(&m) & 1, 0, "driver-info clears CF");
-
-    prime_dos_int_frame(&mut m);
-    m.cpu.registers.set_eax(0xCAFE_0400);
-    m.cpu.registers.set_edx(0x1111_2222);
-    m.handle_absent_resident_api(0x60);
-    assert_eq!((m.cpu.registers.edx() >> 8) as u8, 0x0B);
-    assert_ne!(dos_int_flags(&m) & 1, 0, "packet send sets CF");
-
-    m.cpu
-        .registers
-        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x4000));
-    m.cpu.registers.set_edx(0x0100);
-    m.cpu.registers.set_eax(0x0500);
-    m.write_guest_block(0x40100, &[0; 0x18]);
-    m.handle_absent_resident_api(0x68);
-    assert_eq!(&m.read_guest_block(0x40114, 4), &[0xF0, 0x01, 0x00, 0x00]);
-
-    prime_dos_int_frame(&mut m);
-    m.cpu.registers.set_eax(0x0200);
-    m.handle_absent_resident_api(0x6F);
-    assert_eq!(m.cpu.registers.eax() as u16, 0x08FF);
-    assert_ne!(dos_int_flags(&m) & 1, 0, "10NET node status sets CF");
 
     m.cpu.registers.set_eax(0x0001);
     m.cpu.registers.set_ebx(0x1111_2222);

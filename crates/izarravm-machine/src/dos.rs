@@ -143,61 +143,13 @@ impl Machine {
                 self.write_physical_u8(ncb + 1, 0xFB);
                 self.set_eax_al(0xFB);
             }
-            0x60 => self.handle_absent_int60(),
-            0x68 => self.handle_absent_int68(),
-            0x6F => self.handle_absent_int6f(),
+            // 60h/68h/6Fh had absent-API answers here until POST stopped
+            // seeding their vectors (defect E2). With the vectors null the
+            // stub landing that posts them cannot happen, so the arms were
+            // dead code and are gone.
             0x7A => self.handle_absent_int7a(),
             0x86 | 0xE4 => {}
             _ => {}
-        }
-    }
-
-    fn handle_absent_int60(&mut self) {
-        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
-        match ah {
-            0x01 => {
-                self.set_eax_al(0xFF);
-                self.set_int_frame_carry(false);
-            }
-            0x11..=0x13 => {
-                self.set_eax_al(0x07);
-            }
-            _ => {
-                let edx = (self.cpu.registers.edx() & !0xFF00) | (0x0B << 8);
-                self.cpu.registers.set_edx(edx);
-                self.set_int_frame_carry(true);
-            }
-        }
-    }
-
-    fn handle_absent_int68(&mut self) {
-        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
-        if matches!(ah, 0x01..=0x07 | 0xFB) {
-            let block = self.cpu.registers.segment(SegmentIndex::Ds).base
-                + (self.cpu.registers.edx() as u16) as u32;
-            self.write_guest_block(block + 0x14, &[0xF0, 0x01, 0x00, 0x00]);
-        }
-    }
-
-    fn handle_absent_int6f(&mut self) {
-        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
-        match ah {
-            0x03 => {
-                self.set_bx(0);
-                self.cpu
-                    .registers
-                    .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
-            }
-            0x0B | 0x0C => {
-                self.set_eax_al(0x07);
-            }
-            0x0D => {
-                self.set_cl(0);
-            }
-            _ => {
-                self.set_ax(0x08FF);
-                self.set_int_frame_carry(true);
-            }
         }
     }
 
