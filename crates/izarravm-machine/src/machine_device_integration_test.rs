@@ -1483,3 +1483,64 @@ fn dsp_dc_playback_has_no_per_pump_dropouts_slightly_behind_real_time() {
         out.len()
     );
 }
+
+/// The MSCDEX blocks IZCDEX returns at ES:BX have the same address defect the
+/// VBE information blocks had: the segment base plus BX went onto the bus as a
+/// physical address. `run.rs` dispatches INT 2Fh for any caller outside ring-0
+/// protected mode, so a program running in V86 under TOKAEMM reaches this with
+/// a buffer its page tables put outside the identity map -- and a DJGPP program
+/// calls MSCDEX through DPMI with a transfer buffer DOS took from upper memory.
+///
+/// The fixture is the VBE one: guest pages C8h and C9h mapped to two
+/// non-adjacent frames, ES = C8C6h. A volume descriptor is 2048 bytes, so it
+/// crosses the page boundary and the per-page split has to hold it together.
+#[test]
+fn icdex_blocks_use_the_non_identity_mapped_caller_buffer() {
+    let mut machine = test_machine();
+    let mut bytes = vec![0u8; 20 * cdimage::DATA_SECTOR];
+    let pvd = 16 * cdimage::DATA_SECTOR;
+    bytes[pvd] = 0x01;
+    bytes[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    bytes[pvd + 0x400] = 0x7e; // a marker past the caller's first page
+    machine.mount_cd(CdImage::from_iso(bytes).unwrap());
+    super::margo::install_umb_paging(&mut machine);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+
+    // AX=1502h writes 38 zero bytes. Fill the mapped frame with a marker first,
+    // so "the block arrived" is distinguishable from "nothing happened".
+    machine.write_guest_block(super::margo::UMB_BUFFER_PHYSICAL, &[0xee; 38]);
+    prime_dos_int_frame(&mut machine);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+    machine.cpu.registers.set_eax(0x1502);
+    assert!(machine.handle_int2f(), "AX=1502h handled");
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "metadata clears CF");
+    assert_eq!(
+        machine.read_guest_block(super::margo::UMB_BUFFER_PHYSICAL, 38),
+        vec![0; 38],
+        "the metadata block must reach the frame the caller's page is mapped to"
+    );
+
+    // AX=1505h reads a 2048-byte volume descriptor at ES:BX.
+    prime_dos_int_frame(&mut machine);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+    machine.cpu.registers.set_edx(0);
+    machine.cpu.registers.set_eax(0x1505);
+    assert!(machine.handle_int2f(), "AX=1505h handled");
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "VTOC clears CF");
+    assert_eq!(
+        &machine.read_guest_block(super::margo::UMB_BUFFER_PHYSICAL + 1, 5),
+        b"CD001",
+        "the descriptor head must follow the first page's mapping"
+    );
+    // Guest linear C8C60h + 400h is C9060h, in the second page.
+    assert_eq!(
+        machine.read_physical_u8(super::margo::UMB_FRAME_HIGH + 0x60),
+        0x7e,
+        "the descriptor tail must follow the second page's mapping"
+    );
+}

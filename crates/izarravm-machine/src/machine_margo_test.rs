@@ -2158,9 +2158,9 @@ fn vbe_pm_stub_set_palette_writes_the_dac() {
 /// physical address the caller's block therefore occupies. A page-walking
 /// handler writes there; the broken one wrote at the identity address
 /// 000C8C60h, which is the unbacked upper-memory hole.
-const UMB_FRAME_LOW: u32 = 0x0011_0000;
-const UMB_FRAME_HIGH: u32 = 0x0012_0000;
-const UMB_BUFFER_PHYSICAL: u32 = UMB_FRAME_LOW + 0x0c60;
+pub(super) const UMB_FRAME_LOW: u32 = 0x0011_0000;
+pub(super) const UMB_FRAME_HIGH: u32 = 0x0012_0000;
+pub(super) const UMB_BUFFER_PHYSICAL: u32 = UMB_FRAME_LOW + 0x0c60;
 
 /// A V86 machine whose upper-memory pages 000C8000h and 000C9000h are mapped to
 /// `UMB_FRAME_LOW` and `UMB_FRAME_HIGH`, with ES = C8C6h so ES:DI addresses a
@@ -2169,12 +2169,25 @@ const UMB_BUFFER_PHYSICAL: u32 = UMB_FRAME_LOW + 0x0c60;
 /// boundary cannot be written correctly by one translation. Everything else in
 /// the first 4 MB is identity mapped, so nothing in a fixture faults for an
 /// unrelated reason.
-fn umb_paged_machine() -> Machine {
+pub(super) fn umb_paged_machine() -> Machine {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4]).unwrap();
+    install_umb_paging(&mut machine);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
+    machine
+}
+
+/// The paging half of `umb_paged_machine`, on its own, so a fixture that must
+/// start from a fully furnished machine (a mounted disc, a booted BIOS) can be
+/// put into the same V86-with-paging shape afterwards. The page directory and
+/// table occupy physical 1000h and 2000h.
+pub(super) fn install_umb_paging(machine: &mut Machine) {
     const PD: u32 = 0x1000;
     const PT: u32 = 0x2000;
 
-    let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4]).unwrap();
     machine.write_physical_u32(PD, PT | 7);
     for page in 0u32..1024 {
         let pte = match page {
@@ -2187,11 +2200,6 @@ fn umb_paged_machine() -> Machine {
     machine.cpu.control.cr3 = PD;
     machine.cpu.control.cr0 |= 0x8000_0001;
     machine.cpu.registers.eflags |= 0x0002_0000; // VM: a V86 task, as under TOKAEMM
-    machine
-        .cpu
-        .registers
-        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xc8c6));
-    machine
 }
 
 /// Corpus row MonikaTT (eXoDOS "Monika's Tic Tac Toe", stage-1 pass B): a DJGPP
@@ -2367,4 +2375,269 @@ fn vbe_set_mode_accepts_111h_and_selects_640x480x16() {
     assert_eq!(display.mode, 0x111);
     assert_eq!((display.width, display.height, display.bpp), (640, 480, 16));
     assert_eq!(display.pitch, 1280);
+}
+
+// --- The same address defect in the rest of the INT 10h HLE -----------------
+//
+// 4F00h/4F01h/4F09h were corrected in isolation, but every other INT 10h
+// service that deposits a block at a caller's `ES:`-relative pointer made the
+// same mistake: the segment base plus the offset went onto the bus as a
+// physical address. `run.rs` dispatches these services for any caller that is
+// not in ring-0 protected mode, which includes a V86 task under TOKAEMM with
+// paging on, so the caller's buffer can be wherever its page tables say.
+
+/// The identity address the fixture's caller buffer occupies -- the unbacked
+/// upper-memory hole a handler that ignores paging writes to and reads from.
+const UMB_BUFFER_IDENTITY: u32 = 0x000c_8c60;
+
+/// Lay a decoy over the identity-addressed range under the caller's buffer, so
+/// a read-side handler that treats the caller's pointer as physical returns
+/// something recognisably wrong whether or not that range happens to be backed.
+/// Without this, a fixture that plants a block and reads it back could pass on
+/// the broken code by using the same wrong address twice.
+fn poison_umb_identity_range(machine: &mut Machine, len: usize) {
+    for offset in 0..len {
+        machine.write_physical_u8(UMB_BUFFER_IDENTITY + offset as u32, 0x5a);
+    }
+}
+
+/// Assert the fixture's destination frames are clear before a write-side
+/// service runs, so bytes found there afterwards can only have arrived through
+/// the page walk.
+fn assert_umb_frames_clear(machine: &mut Machine) {
+    assert_eq!(
+        machine.read_physical_u32(UMB_BUFFER_PHYSICAL),
+        0,
+        "precondition: the mapped frame must be clear"
+    );
+    assert_eq!(
+        machine.read_physical_u32(UMB_FRAME_HIGH),
+        0,
+        "precondition: the second mapped frame must be clear"
+    );
+}
+
+/// INT 10h AH=1Bh is the highest-value of the remaining sites: detection code
+/// calls it right beside 4F00h to confirm a VGA BIOS, and a DPMI client's
+/// transfer buffer is the same UMB for both. The block must reach the frame the
+/// caller's page is mapped to.
+#[test]
+fn int10_state_info_lands_in_a_non_identity_mapped_caller_buffer() {
+    let mut machine = umb_paged_machine();
+    assert_umb_frames_clear(&mut machine);
+    machine.write_physical_u8(0x449, 0x12); // BDA video mode, echoed at block+4
+
+    machine.cpu.registers.set_edi(0);
+    machine.cpu.registers.set_eax(0x1b00);
+    machine.handle_int10();
+
+    assert_eq!(machine.cpu.registers.eax() as u8, 0x1b);
+    assert_eq!(
+        read_u16(&mut machine, UMB_BUFFER_PHYSICAL),
+        crate::firmware_contract::address::INT10_FUNCTIONALITY_TABLE_OFFSET,
+        "the static functionality table pointer must arrive at the mapped frame"
+    );
+    assert_eq!(
+        read_u16(&mut machine, UMB_BUFFER_PHYSICAL + 2),
+        crate::firmware_contract::address::VGA_BIOS_SEGMENT
+    );
+    assert_eq!(
+        machine.read_physical_u8(UMB_BUFFER_PHYSICAL + 4),
+        0x12,
+        "the live video mode must arrive at the mapped frame"
+    );
+}
+
+/// INT 10h AH=1Ch AL=01h with all three state bits saves more than 900 bytes at
+/// ES:BX, which is longer than the distance from the fixture's buffer to the end
+/// of its page: the DAC tail belongs to the second frame, which is deliberately
+/// not adjacent to the first. One translation of the block's first byte would
+/// scatter that tail.
+#[test]
+fn int10_save_video_state_lands_in_the_non_identity_mapped_caller_buffer() {
+    const HARDWARE_LEN: u32 = crate::video_params::INT10_STATE_HARDWARE_LEN as u32;
+    const BDA_LEN: u32 = crate::video_params::INT10_STATE_BDA_LEN as u32;
+
+    let mut machine = umb_paged_machine();
+    assert_umb_frames_clear(&mut machine);
+    prime_dos_int_frame(&mut machine);
+    machine.write_physical_u8(0x449, 0x34); // first BDA byte the save copies
+    machine.vega.legacy_mut().set_dac_entry(253, 11, 22, 33);
+
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(0x0007);
+    machine.cpu.registers.set_eax(0x1c01);
+    machine.handle_int10();
+
+    assert_eq!(machine.cpu.registers.eax() as u8, 0x1c);
+    assert_eq!(
+        machine.read_physical_u8(UMB_BUFFER_PHYSICAL + HARDWARE_LEN),
+        0x34,
+        "the BDA copy must follow the first page's mapping"
+    );
+    // DAC block layout: three port bytes, then 256 RGB triples. Entry 253 falls
+    // past the end of the caller's first page, in the frame mapped elsewhere.
+    let dac_block = UMB_BUFFER_IDENTITY + HARDWARE_LEN + BDA_LEN;
+    let entry_253 = dac_block + 3 + 253 * 3;
+    assert!(
+        entry_253 >= 0x000c_9000,
+        "fixture must place entry 253 in the second page, got {entry_253:#x}"
+    );
+    let tail = UMB_FRAME_HIGH + (entry_253 - 0x000c_9000);
+    assert_eq!(
+        machine.read_guest_block(tail, 3),
+        vec![11, 22, 33],
+        "the DAC tail must follow the second page's mapping"
+    );
+}
+
+/// The read direction of the same service. The saved block is planted in the
+/// mapped frame only and the identity range under it is poisoned, so a restore
+/// that ignores paging cannot recover the values by accident.
+#[test]
+fn int10_restore_video_state_reads_the_non_identity_mapped_caller_buffer() {
+    const BDA_LEN: usize = crate::video_params::INT10_STATE_BDA_LEN;
+    const DAC_LEN: usize = crate::video_params::INT10_STATE_DAC_LEN;
+
+    let mut machine = umb_paged_machine();
+    prime_dos_int_frame(&mut machine);
+
+    // CX=0006h: BDA then DAC, skipping the hardware-register block so the
+    // fixture drives no CRTC/ATC programming it would then have to model.
+    let mut block = vec![0u8; BDA_LEN + DAC_LEN];
+    block[0] = 0x56; // BDA 0449h, the live video mode
+    block[BDA_LEN + 3] = 0x0a; // DAC entry 0: red
+    block[BDA_LEN + 4] = 0x14; // green
+    block[BDA_LEN + 5] = 0x1e; // blue
+    machine.write_guest_block(UMB_BUFFER_PHYSICAL, &block);
+    poison_umb_identity_range(&mut machine, block.len());
+
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(0x0006);
+    machine.cpu.registers.set_eax(0x1c02);
+    machine.handle_int10();
+
+    assert_eq!(machine.cpu.registers.eax() as u8, 0x1c);
+    assert_eq!(
+        machine.read_physical_u8(0x449),
+        0x56,
+        "the BDA block must be restored from the mapped frame"
+    );
+    assert_eq!(
+        machine.video().dac_entry(0),
+        [0x0a, 0x14, 0x1e],
+        "the DAC block must be restored from the mapped frame"
+    );
+}
+
+/// INT 10h AH=10h AL=09h and AL=17h read the palette and the DAC out to ES:DX.
+#[test]
+fn int10_palette_block_reads_land_in_the_non_identity_mapped_caller_buffer() {
+    let mut machine = umb_paged_machine();
+    assert_umb_frames_clear(&mut machine);
+    for index in 0..16u8 {
+        machine
+            .vega
+            .legacy_mut()
+            .set_attr_palette_reg(index, index + 0x20);
+    }
+    machine.vega.legacy_mut().set_overscan(0x39);
+    machine.vega.legacy_mut().set_dac_entry(5, 1, 2, 3);
+    machine.vega.legacy_mut().set_dac_entry(6, 4, 5, 6);
+
+    // AL=09h: sixteen palette registers plus overscan at ES:DX.
+    machine.cpu.registers.set_edx(0);
+    machine.cpu.registers.set_eax(0x1009);
+    machine.handle_int10();
+    let expected: Vec<u8> = (0..16u8).map(|i| i + 0x20).chain([0x39]).collect();
+    assert_eq!(
+        machine.read_guest_block(UMB_BUFFER_PHYSICAL, 17),
+        expected,
+        "the palette block must reach the mapped frame"
+    );
+
+    // AL=17h: a DAC run at ES:DX, placed elsewhere in the same page.
+    machine.cpu.registers.set_edx(0x0100);
+    machine.cpu.registers.set_ebx(5);
+    machine.cpu.registers.set_ecx(2);
+    machine.cpu.registers.set_eax(0x1017);
+    machine.handle_int10();
+    assert_eq!(
+        machine.read_guest_block(UMB_BUFFER_PHYSICAL + 0x100, 6),
+        vec![1, 2, 3, 4, 5, 6],
+        "the DAC run must reach the mapped frame"
+    );
+}
+
+/// INT 10h AH=10h AL=02h and AL=12h take the palette and the DAC in from ES:DX.
+#[test]
+fn int10_palette_block_writes_come_from_the_non_identity_mapped_caller_buffer() {
+    let mut machine = umb_paged_machine();
+
+    let mut palette: Vec<u8> = (0..16u8).map(|i| i + 0x11).collect();
+    palette.push(0x2f); // overscan
+    machine.write_guest_block(UMB_BUFFER_PHYSICAL, &palette);
+    machine.write_guest_block(UMB_BUFFER_PHYSICAL + 0x100, &[7, 8, 9, 10, 11, 12]);
+    poison_umb_identity_range(&mut machine, 0x106);
+
+    machine.cpu.registers.set_edx(0);
+    machine.cpu.registers.set_eax(0x1002);
+    machine.handle_int10();
+    for index in 0..16u8 {
+        assert_eq!(
+            machine.video().attr_palette_reg(index),
+            index + 0x11,
+            "palette register {index} must come from the mapped frame"
+        );
+    }
+    assert_eq!(machine.video().overscan(), 0x2f);
+
+    machine.cpu.registers.set_edx(0x0100);
+    machine.cpu.registers.set_ebx(200);
+    machine.cpu.registers.set_ecx(2);
+    machine.cpu.registers.set_eax(0x1012);
+    machine.handle_int10();
+    assert_eq!(machine.video().dac_entry(200), [7, 8, 9]);
+    assert_eq!(machine.video().dac_entry(201), [10, 11, 12]);
+}
+
+/// INT 10h AH=11h AL=10h (user text font) and AL=21h (user graphics font) both
+/// take their glyph bytes from ES:BP.
+#[test]
+fn int10_font_load_reads_the_non_identity_mapped_caller_buffer() {
+    let mut machine = umb_paged_machine();
+
+    // AL=10h: one 16-row glyph for 'A'.
+    let glyph: Vec<u8> = (0..16u8).map(|row| row | 0x80).collect();
+    machine.write_guest_block(UMB_BUFFER_PHYSICAL, &glyph);
+    poison_umb_identity_range(&mut machine, 0x200);
+
+    machine.cpu.registers.set_ebp(0);
+    machine.cpu.registers.set_ebx(0x1000); // BH=16 bytes/char, BL=0 block
+    machine.cpu.registers.set_ecx(1);
+    machine.cpu.registers.set_edx(u32::from(b'A'));
+    machine.cpu.registers.set_eax(0x1110);
+    machine.handle_int10();
+    for (row, expected) in glyph.iter().enumerate() {
+        assert_eq!(
+            machine.video().active_font_glyph_row(b'A', row),
+            *expected,
+            "text-font row {row} must come from the mapped frame"
+        );
+    }
+
+    // AL=21h: a one-row-per-character graphics font, 256 bytes at ES:BP.
+    let graphics: Vec<u8> = (0..=255u8).collect();
+    machine.write_guest_block(UMB_BUFFER_PHYSICAL, &graphics);
+    machine.cpu.registers.set_ebp(0);
+    machine.cpu.registers.set_ebx(0);
+    machine.cpu.registers.set_ecx(1);
+    machine.cpu.registers.set_edx(0);
+    machine.cpu.registers.set_eax(0x1121);
+    machine.handle_int10();
+    assert_eq!(
+        machine.video().active_font_glyph_row(b'A', 0),
+        b'A',
+        "graphics-font glyph must come from the mapped frame"
+    );
 }
