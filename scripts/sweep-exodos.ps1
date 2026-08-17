@@ -113,13 +113,15 @@ function Test-CorpusShort {
     return $Short -match '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 }
 
-# Reboot detection. The design proposed scraping stdout for a repeated POST
-# banner; MEASURED 2026-08-16, the --hdd-folder path prints NO banner at all,
-# so that detector has no signal and this does not pretend otherwise. The
-# screen index is the substitute: a machine that resets redraws its first
-# screen, so a run whose opening frame hash recurs after having changed away
-# from it has been round the loop. Reported as a count, and only two or more
-# recurrences call the row a REBOOT-LOOP.
+# Reboot detection, and where it now lives. The design proposed scraping stdout
+# for a repeated POST banner; MEASURED 2026-08-16, the --hdd-folder path prints
+# NO banner at all, so that detector has no signal. v1 substituted opening-frame
+# recurrence here, and stage 1 measured THAT at 0 true positives in 8 fires.
+#
+# The working detector needs the boot banner, which is only visible in the kept
+# PPM frames, and reading 900 KB frames inside this loop would slice every run.
+# So the count stays a REPORTED column and the verdict moves to the classifier
+# (`izarravm-exodos classify`), which reads the frames once, afterwards.
 $rebootRecurrenceThreshold = 2
 
 foreach ($required in @($Executable, $Translator)) {
@@ -329,14 +331,28 @@ function Test-StderrIsBenign {
     return ,$offending
 }
 
+# Samples that actually saw a frame. A sample taken before the guest completed
+# its first raster, or inside the frame-long window a mode set opens, carries
+# `presented=false` and a null hash: it is a gap in the record, not a picture.
+# Counting one as a picture would invent both a recurrence and a distinct frame.
+# An archive written before the field existed has no `presented` key and every
+# line of it saw a frame, so a missing key reads as true.
+function Select-ObservedScreens {
+    param($Screens)
+    return ,@($Screens | Where-Object {
+        $_.hash -and ($null -eq $_.presented -or $_.presented)
+    })
+}
+
 # Count returns to the opening frame. See the reboot note above.
 function Measure-ScreenRecurrence {
     param($Screens)
-    if ($Screens.Count -lt 3) { return 0 }
-    $first = $Screens[0].hash
+    $observed = Select-ObservedScreens -Screens $Screens
+    if ($observed.Count -lt 3) { return 0 }
+    $first = $observed[0].hash
     $returns = 0
     $left = $false
-    foreach ($sample in $Screens) {
+    foreach ($sample in $observed) {
         if ($sample.hash -ne $first) { $left = $true; continue }
         if ($left) { $returns++; $left = $false }
     }
@@ -356,7 +372,12 @@ function Get-Outcome {
     if ($null -eq $Profile) { return "NO-PROFILE" }
     $kind = $Profile.stop.kind
     if ($kind -eq "cpu_error") { return "CRASHED" }
-    if ($ScreenRecurrences -ge $RebootThreshold) { return "REBOOT-LOOP" }
+    # The recurrence count is REPORTED and no longer decides. Stage 1 measured
+    # the opening-frame rule at 0 true positives in 8 fires: a blinking text
+    # cursor, an attract cycle and a black fade frame all return to the first
+    # frame's hash. The reboot verdict needs the boot banner, which needs the
+    # kept PPMs, which the classifier reads and this loop cannot afford to.
+    $null = $RebootThreshold
     $marks = 0
     if ($Profile.PSObject.Properties.Name -contains 'phase_marks' -and $Profile.phase_marks) {
         $marks = @($Profile.phase_marks).Count
@@ -367,8 +388,9 @@ function Get-Outcome {
     # The screen index answers the question no counter does: did the picture
     # ever change. A run whose last two thirds of samples share one hash is
     # parked, however busy its counters look.
-    if ($Screens.Count -ge 6) {
-        $tail = @($Screens[[int]($Screens.Count / 3)..($Screens.Count - 1)])
+    $observed = Select-ObservedScreens -Screens $Screens
+    if ($observed.Count -ge 6) {
+        $tail = @($observed[[int]($observed.Count / 3)..($observed.Count - 1)])
         $distinct = @($tail | Select-Object -ExpandProperty hash -Unique).Count
         if ($distinct -le 1) {
             $mode = $tail[-1].video_mode

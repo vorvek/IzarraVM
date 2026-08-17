@@ -705,6 +705,15 @@ impl Vega {
         self.vga.palette_argb()
     }
 
+    /// The whole beam raster, borders and all, for CRC comparison.
+    ///
+    /// This keeps the one-pixel stand-in that
+    /// [`Self::presented_frame_argb`] gave up, and the difference is deliberate:
+    /// nothing that records observations reads this. Its callers are the unit
+    /// tester's `frame_crc32` and in-tree tests, all of which set a mode before
+    /// looking, so the stand-in is unreachable rather than merely unlikely. Do
+    /// not route an observer through here — use `presented_frame_argb`, which
+    /// says `None` when there is no frame.
     pub(crate) fn frame_argb(&self) -> (Vec<u32>, usize, usize) {
         match self.active_display() {
             ActiveDisplay::VgaRaster => {
@@ -738,22 +747,37 @@ impl Vega {
         }
     }
 
-    pub(crate) fn presented_frame_argb(&self) -> (Vec<u32>, usize, usize) {
+    /// The most recently completed display frame, or `None` when there is not
+    /// one yet.
+    ///
+    /// **`None` is a real answer and callers must handle it.** Two moments have
+    /// no completed frame: before the first raster of the run, and between a
+    /// mode set and the first raster of the new mode — every mode set drops the
+    /// presented frame on purpose, so nobody is handed a frame carrying the
+    /// previous mode's geometry. The second window is up to a whole frame
+    /// period, about 14 ms at 70 Hz, and a DOS title crosses it on every
+    /// menu-to-gameplay transition.
+    ///
+    /// This used to answer both with a one-pixel black image. Stage 1 of the
+    /// eXoDOS sweep archived 30 of them, one in each of 30 different games, and
+    /// they read as data all the way through the classifier: a 1x1 frame is
+    /// vacuously one solid colour, which is the blank-screen signature. A
+    /// substitute frame is worse than no frame, because it looks like a
+    /// measurement.
+    pub(crate) fn presented_frame_argb(&self) -> Option<(Vec<u32>, usize, usize)> {
         if self.active_display() != ActiveDisplay::VgaRaster {
-            return self.frame_argb();
+            return Some(self.frame_argb());
         }
 
         if let Some((mut words, width, _, display_height)) =
             self.vga.cached_mode13h_presented_argb()
         {
             words.truncate(width.saturating_mul(display_height));
-            return (words, width, display_height);
+            return Some((words, width, display_height));
         }
 
         let palette = self.palette_argb();
-        let Some(raster) = self.vga.last_presented() else {
-            return (vec![0], 1, 1);
-        };
+        let raster = self.vga.last_presented()?;
         let width = raster.width as usize;
         let height = if raster.display_height == 0 {
             raster.height as usize
@@ -761,11 +785,17 @@ impl Vega {
             raster.display_height as usize
         };
         let visible = &raster.pixels[..width.saturating_mul(height).min(raster.pixels.len())];
-        let words = visible
+        let words: Vec<u32> = visible
             .iter()
             .map(|&index| palette[usize::from(index)])
             .collect();
-        (words, width, height)
+        // A raster with no pixels is not a picture either. The un-programmed
+        // CRTC reads back zero dimensions, and a zero-sized frame would reach a
+        // consumer as an empty image rather than as the absence of one.
+        if words.is_empty() {
+            return None;
+        }
+        Some((words, width, height))
     }
 
     pub(crate) fn capture_frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
