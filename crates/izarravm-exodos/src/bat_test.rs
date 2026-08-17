@@ -70,7 +70,7 @@ exit
 /// Walk a launcher BAT and then choose its launch, which is what the
 /// translator's own entry point does in two steps.
 fn flatten(tree: &Tree, cwd: &str, bat_rel: &str, out: &mut Flattened) {
-    Flattener::new(tree).flatten_bat(cwd, bat_rel, 1, out);
+    Flattener::new(tree).flatten_bat(cwd, bat_rel, 1, &[], out);
     out.finish();
 }
 
@@ -707,6 +707,84 @@ fn a_teardown_utility_after_the_game_is_not_the_launch() {
         out.lines,
         vec!["metashel /I".to_string(), "speech".to_string()]
     );
+}
+
+/// spellasa's `EX.BAT`, which takes every argument it uses from its caller.
+/// `SAS.BAT` is the one line `Ex /dBLASTER /p220h VGA /i7`.
+const EX_BAT: &str = "Echo off\r\nIf NOT .%1 == ./dIbmACPA Goto L1\r\ndac\r\n:L1\r\n\
+                      metashel /I \r\nspeech %1 %2 %4 \r\ndino %3 sas.con\r\nRemove\r\n\
+                      metashel /K \r\nIf NOT .%1 == ./dIbmACPA Goto L2\r\ndac /r\r\n:L2\r\n";
+
+fn spellasa_tree(sas_line: &str) -> (TempDir, Tree) {
+    let dir = TempDir::new();
+    for name in [
+        "METASHEL.EXE",
+        "SPEECH.EXE",
+        "DINO.EXE",
+        "REMOVE.EXE",
+        "DAC.EXE",
+    ] {
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    std::fs::write(dir.path().join("EX.BAT"), EX_BAT).unwrap();
+    std::fs::write(dir.path().join("SAS.BAT"), sas_line).unwrap();
+    let tree = Tree::index(dir.path()).unwrap();
+    (dir, tree)
+}
+
+#[test]
+fn a_batch_argument_reaches_the_line_that_runs_the_game() {
+    // spellasa's launcher passes the video mode as `%3`. Expanding a numbered
+    // argument to nothing dropped it, and the game started in whatever mode it
+    // defaults to.
+    let (_guard, tree) = spellasa_tree("Ex /dBLASTER /p220h VGA /i7\r\n");
+    let mut out = Flattened::default();
+    flatten(&tree, "", "SAS.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "dino VGA sas.con");
+    assert_eq!(
+        out.lines,
+        vec![
+            "metashel /I".to_string(),
+            "speech /dBLASTER /p220h /i7".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_batch_argument_decides_a_guard_inside_the_called_batch() {
+    // The same BAT guards its ACPA sound driver on `%1`. With the argument the
+    // caller actually passes, the guard is decidable and `dac` runs.
+    let (_guard, tree) = spellasa_tree("Ex /dIbmACPA /p220h VGA /i7\r\n");
+    let mut out = Flattened::default();
+    flatten(&tree, "", "SAS.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "dino VGA sas.con");
+    assert!(out.lines.contains(&"dac".to_string()), "{:?}", out.lines);
+    // `dac /r` restores what `dac` set and runs after the game, so it is a
+    // teardown rather than a second launch.
+    assert!(
+        !out.lines.iter().any(|line| line == "dac /r"),
+        "{:?}",
+        out.lines
+    );
+}
+
+#[test]
+fn an_argument_the_caller_never_passed_expands_to_nothing() {
+    // DOS reads `%4` as empty when the caller gave three arguments, and the
+    // named-variable audit flag is not what reports that.
+    let (_guard, tree) = spellasa_tree("Ex /dBLASTER /p220h VGA\r\n");
+    let mut out = Flattened::default();
+    flatten(&tree, "", "SAS.BAT", &mut out);
+
+    assert_eq!(out.launch.expect("a launch").command, "dino VGA sas.con");
+    assert!(
+        out.lines.contains(&"speech /dBLASTER /p220h".to_string()),
+        "{:?}",
+        out.lines
+    );
+    assert!(!out.flags.contains("VAR-UNSET-EXPANDED"), "{:?}", out.flags);
 }
 
 #[test]

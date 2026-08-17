@@ -70,6 +70,13 @@
 //! way this can read a variable wrongly is a variable a PROGRAM sets, which the
 //! walk cannot see; `VAR-UNSET-EXPANDED` marks every row where an unset name was
 //! expanded so those rows are auditable rather than silent.
+//!
+//! ARGUMENTS. `%0`-`%9` come from the invocation that ran the BAT, `%0` being
+//! the command that named it. An argument the caller never passed expands to
+//! nothing, the way DOS reads it, and that is not what the unset-name flag
+//! reports. `spellasa`'s entire launcher is one line, `Ex /dBLASTER /p220h VGA
+//! /i7`, and `EX.BAT` reads the game's video mode out of `%3`: expanding the
+//! numbered arguments to nothing launched the game without it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -313,11 +320,19 @@ impl<'a> Flattener<'a> {
     }
 
     /// Read `<dir>/<name>.BAT` from the tree and walk it. `cwd` is where the
-    /// caller's shell was standing, which the BAT inherits. The walk only
-    /// collects invocations; `Flattened::finish` chooses the launch once the
-    /// outermost walk ends, because a BAT another BAT runs may hand control
-    /// back and the game may sit below the return.
-    fn flatten_bat(&self, cwd: &str, bat_rel: &str, depth: u32, out: &mut Flattened) {
+    /// caller's shell was standing, which the BAT inherits, and `args` is what
+    /// the invocation passed it. The walk only collects invocations;
+    /// `Flattened::finish` chooses the launch once the outermost walk ends,
+    /// because a BAT another BAT runs may hand control back and the game may
+    /// sit below the return.
+    fn flatten_bat(
+        &self,
+        cwd: &str,
+        bat_rel: &str,
+        depth: u32,
+        args: &[String],
+        out: &mut Flattened,
+    ) {
         if depth > MAX_CALL_DEPTH {
             out.failure = Some("bat-call-too-deep".to_string());
             return;
@@ -329,15 +344,15 @@ impl<'a> Flattener<'a> {
         };
         let program = Program::parse(&String::from_utf8_lossy(&bytes));
         let mut cwd = cwd.to_string();
-        self.run_from(&program, 0, &mut cwd, depth, out);
+        self.run_from(&program, 0, &mut cwd, depth, args, out);
     }
 
     /// Run a short synthetic program (a single autoexec payload command, most
     /// often) through the same walker, so a bare `border` and a `call run`
-    /// reach one resolver.
+    /// reach one resolver. An autoexec line carries no batch arguments.
     pub fn run_line_program(&self, text: &str, cwd: &mut String, out: &mut Flattened) {
         let program = Program::parse(text);
-        self.run_from(&program, 0, cwd, 1, out);
+        self.run_from(&program, 0, cwd, 1, &[], out);
         out.finish();
     }
 
@@ -347,6 +362,7 @@ impl<'a> Flattener<'a> {
         start: usize,
         cwd: &mut String,
         depth: u32,
+        args: &[String],
         out: &mut Flattened,
     ) {
         let mut pc = start;
@@ -362,7 +378,7 @@ impl<'a> Flattener<'a> {
                 return;
             }
             let raw = program.lines[pc].clone();
-            let line = expand_vars(&raw, out);
+            let line = expand_vars(&raw, args, out);
             let stripped = line.trim_start_matches('@').trim().to_string();
             let lower = stripped.to_ascii_lowercase();
 
@@ -418,7 +434,9 @@ impl<'a> Flattener<'a> {
                         match self.emit(&rest, cwd, depth, out, false) {
                             Emit::Stop => return,
                             Emit::Program => {
-                                if self.settle_launch(program, pc, cwd, depth, out) == Emit::Stop {
+                                if self.settle_launch(program, pc, cwd, depth, args, out)
+                                    == Emit::Stop
+                                {
                                     return;
                                 }
                                 pc += 1;
@@ -460,7 +478,7 @@ impl<'a> Flattener<'a> {
             match self.emit(&stripped, cwd, depth, out, false) {
                 Emit::Stop => return,
                 Emit::Program => {
-                    if self.settle_launch(program, pc, cwd, depth, out) == Emit::Stop {
+                    if self.settle_launch(program, pc, cwd, depth, args, out) == Emit::Stop {
                         return;
                     }
                     pc += 1;
@@ -483,6 +501,7 @@ impl<'a> Flattener<'a> {
         pc: usize,
         cwd: &str,
         depth: u32,
+        args: &[String],
         out: &mut Flattened,
     ) -> Emit {
         if out.failure.is_some() {
@@ -503,7 +522,7 @@ impl<'a> Flattener<'a> {
                 ..Flattened::default()
             };
             let mut probe_cwd = cwd.to_string();
-            self.run_from(program, *target, &mut probe_cwd, depth, &mut probe);
+            self.run_from(program, *target, &mut probe_cwd, depth, args, &mut probe);
             let reached = launch_index(&probe.candidates).map(|at| &probe.candidates[at].launch);
             let diverges = match (&agreed, reached) {
                 (_, None) => true,
@@ -666,7 +685,13 @@ impl<'a> Flattener<'a> {
                         errorlevel_probes: out.errorlevel_probes,
                         ..Flattened::default()
                     };
-                    self.flatten_bat(&dir, &resolved, depth + 1, &mut nested);
+                    // `%0` is the command that named the BAT and `%1` onwards
+                    // are its arguments. spellasa's whole launcher is one line,
+                    // `Ex /dBLASTER /p220h VGA /i7`, and `EX.BAT` reads the
+                    // game's video mode out of `%3`.
+                    let mut child_args = vec![first.trim_matches('"').to_string()];
+                    child_args.extend(tokens[1..].iter().cloned());
+                    self.flatten_bat(&dir, &resolved, depth + 1, &child_args, &mut nested);
                     out.vars = std::mem::take(&mut nested.vars);
                     out.errorlevel_probes = nested.errorlevel_probes;
                     let failure = nested.failure.take();
@@ -956,10 +981,10 @@ enum IfOutcome {
     Unknown,
 }
 
-/// Expand `%VAR%` from the walk's environment. An unset name expands to
-/// nothing, which is what DOS does; `%1`-style batch arguments expand to
-/// nothing too, since a flattened launcher is never called with any.
-fn expand_vars(text: &str, out: &mut Flattened) -> String {
+/// Expand `%VAR%` from the walk's environment and `%0`-`%9` from the arguments
+/// the BAT was invoked with. An unset name expands to nothing, which is what
+/// DOS does, and so does an argument the caller never passed.
+fn expand_vars(text: &str, args: &[String], out: &mut Flattened) -> String {
     if !text.contains('%') {
         return text.to_string();
     }
@@ -968,8 +993,10 @@ fn expand_vars(text: &str, out: &mut Flattened) -> String {
     let mut index = 0;
     while index < chars.len() {
         if chars[index] == '%' {
-            if let Some(next) = chars.get(index + 1).filter(|c| c.is_ascii_digit()) {
-                let _ = next;
+            if let Some(number) = chars.get(index + 1).and_then(|c| c.to_digit(10)) {
+                if let Some(value) = args.get(number as usize) {
+                    result.push_str(value);
+                }
                 index += 2;
                 continue;
             }
