@@ -582,47 +582,51 @@ fn word_size_alu_carry_forms_stay_refused() {
     }
 }
 
-/// The MEMORY shapes of forms 1 and 3 stay refused at Word size while their Dword shapes ship.
+/// Form 1's MEMORY shape stays refused at Word size while its Dword shape ships, and form 3's
+/// memory shape is now LOWERED at both sizes.
 ///
-/// A missed lowering rather than a hazard, and the reason is economics rather than semantics:
-/// 16-bit DOS code has no alignment discipline, and these forms lower through the read-modify-write
-/// memory site, one of the eleven that still refuse a misaligned access outright. (Guard 3 relaxed
-/// only the two lean one-lookup sites, so the refusal is the SITE's rather than the guard's --
-/// this comment used to name `emit_wide_page_guard` and would now be wrong.) Refused, an odd
-/// operand ends the block. Admitted, it sits inside the block and side-exits at that slot on every
-/// execution, so nothing after it retires natively. The Dword rows in the same arms must keep
-/// compiling, which is the second half of what this asserts.
+/// The two arms part company on the SITE, not on the opcode, and that is the whole content of this
+/// test since the B2 slice:
 ///
-/// CMP is the exception and it is load-bearing rather than an inconsistency: `0x39` and `0x3b`
-/// have been compiling word memory in quake's renderer since before this slice, and they do not
-/// write back, so they are not the new combination. A blanket refusal here regressed
+/// * Form 1 (`0x01 add m,r`) is `AluMemDest`, a read-modify-write through site 6, which still
+///   refuses a misaligned access outright — guard 3 relaxed only the two lean one-lookup sites.
+///   16-bit DOS code has no alignment discipline, so admitted, an odd operand would sit inside the
+///   block and side-exit at that slot on every execution, and nothing after it would retire
+///   natively. Refused, it ends the block instead. Its Dword row must keep compiling, which is the
+///   second half of what this asserts. (An earlier version of this comment said "these forms lower
+///   through the read-modify-write memory site" of forms 1 AND 3; that was form-1-only and was
+///   already wrong for form 3, which never writes memory.)
+/// * Form 3 (`0x03 add r,m`, `0x33 xor r,m`) is `AluMemSource`, a pure READ through the relaxed
+///   lean one-lookup read site, so the alignment economics that hold form 1 out do not apply. The
+///   B2 peachdrm census ranked `0x2B` word memory at 99.0% of barrier runtime_hits and the slice
+///   admitted the whole non-carry set; these rows now assert the lowering with the same three
+///   numbers the CMP control uses, and `cpu_jit_word_memory_test.rs` carries the state comparison.
+///
+/// CMP was the exception before the slice and is the control after it: `0x39` and `0x3b` have been
+/// compiling word memory in quake's renderer since before either change, and `0x39` is the row that
+/// says form 1's refusal is still `op != 7` rather than blanket. A blanket refusal there regressed
 /// `quake_word_renderer_families_match_interpreter_state_flags_memory_and_timing`, which is what
 /// caught it.
 #[test]
 fn word_size_alu_memory_shapes_stay_refused() {
-    let cases: &[(&str, &[u8], &[u8])] = &[
-        (
-            "0x01 add m,r",
-            &[0x66, 0x01, 0x0d, 0x00, 0x20, 0x00, 0x00],
-            &[0x01, 0x0d, 0x00, 0x20, 0x00, 0x00],
-        ),
-        (
-            "0x03 add r,m",
-            &[0x66, 0x03, 0x0d, 0x00, 0x20, 0x00, 0x00],
-            &[0x03, 0x0d, 0x00, 0x20, 0x00, 0x00],
-        ),
-        (
-            "0x33 xor r,m",
-            &[0x66, 0x33, 0x0d, 0x00, 0x20, 0x00, 0x00],
-            &[0x33, 0x0d, 0x00, 0x20, 0x00, 0x00],
-        ),
-    ];
-    // The CMP pair is the control: word memory, no write-back, admitted before this slice and
-    // still admitted after it. If a future edit turns the `op != 7` guard into a blanket refusal
-    // these two fail here rather than only in the quake renderer fixture.
+    let cases: &[(&str, &[u8], &[u8])] = &[(
+        "0x01 add m,r",
+        &[0x66, 0x01, 0x0d, 0x00, 0x20, 0x00, 0x00],
+        &[0x01, 0x0d, 0x00, 0x20, 0x00, 0x00],
+    )];
+    // The CMP pair is the control: word memory, no write-back, admitted before the 16-bit memory
+    // slices and still admitted after them. If a future edit turns form 1's `op != 7` guard into a
+    // blanket refusal `0x39` fails here rather than only in the quake renderer fixture.
+    //
+    // The two form-3 writing rows below it are the B2 admission, asserted with the same three
+    // numbers: the block covers all four slots, the slot counts ONE word read, and it stores
+    // nothing — `AluMemSource` never writes guest memory, so a `word_stores` of 1 would mean the
+    // slot had been classified as the read-modify-write shape.
     for (label, form) in [
         ("0x39 cmp m,r", [0x66, 0x39, 0x0d, 0x00, 0x20, 0x00, 0x00]),
         ("0x3b cmp r,m", [0x66, 0x3b, 0x0d, 0x00, 0x20, 0x00, 0x00]),
+        ("0x03 add r,m", [0x66, 0x03, 0x0d, 0x00, 0x20, 0x00, 0x00]),
+        ("0x33 xor r,m", [0x66, 0x33, 0x0d, 0x00, 0x20, 0x00, 0x00]),
     ] {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(&form);
@@ -637,7 +641,7 @@ fn word_size_alu_memory_shapes_stay_refused() {
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
         assert_eq!(
             compilation.span.instructions, 4,
-            "{label}: word memory CMP must stay admitted"
+            "{label}: this word memory form must be admitted"
         );
         assert_eq!(compilation.word_reads, 1, "{label}: word reads");
         assert_eq!(compilation.word_stores, 0, "{label}: word stores");
