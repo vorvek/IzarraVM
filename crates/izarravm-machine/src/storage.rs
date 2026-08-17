@@ -6,6 +6,34 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
+/// Header bytes a CD-ROM device driver request occupies, through the last field
+/// any supported command reads (the READ LONG starting sector at offset 0x14).
+const DRIVER_REQUEST_BYTES: usize = 0x18;
+
+/// One little-endian dword out of a device-driver request header.
+fn driver_dword(request: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(request[at..at + 4].try_into().expect("four bytes"))
+}
+
+/// The INT 13h status every sector-moving service ends on. A complete transfer
+/// is 0; a short one blames the caller's buffer or the media, and never the
+/// media for something the buffer caused.
+fn transfer_status(complete: bool, unreachable_buffer: bool) -> u8 {
+    match (complete, unreachable_buffer) {
+        (true, _) => 0x00,
+        (false, true) => BUFFER_UNREACHABLE_STATUS,
+        (false, false) => 0x04, // sector not found / read error
+    }
+}
+
+/// INT 13h status 09h, "data boundary error": the transfer could not be carried
+/// out across the whole of the caller's buffer. On real hardware that is a DMA
+/// segment crossing; here it is a page the caller's own tables do not map, which
+/// is the same thing from the caller's side -- the BIOS could reach part of the
+/// buffer and not the rest. Reported with the count that actually moved, never
+/// as a success and never as 04h, which claims the MEDIA was at fault.
+const BUFFER_UNREACHABLE_STATUS: u8 = 0x09;
+
 /// What the BIOS fixed-disk (INT 13h, DL>=0x80) service did, for the load-time
 /// profile. OFF unless `IZARRAVM_INT13_PROFILE=1`, and gated AT THE CALL SITE:
 /// this project has measured default-on instruments taxing paths they only meant
@@ -692,10 +720,11 @@ impl Machine {
         Ok(record)
     }
 
+    /// `dst` is the guest LINEAR SI:DI destination of IZCDEX AX=150Fh.
     pub(super) fn write_icdex_canonical_dir_record(&mut self, dst: u32, record: &[u8]) {
         let mut out = [0u8; 285];
         if record.len() < 34 {
-            self.write_guest_block(dst, &out);
+            self.write_guest_linear_block(dst, &out);
             return;
         }
         let lba = u32::from_le_bytes(record[2..6].try_into().unwrap());
@@ -725,7 +754,7 @@ impl Machine {
             out[0x40] = sys_len as u8;
             out[0x41..0x41 + sys_len].copy_from_slice(&sys[..sys_len]);
         }
-        self.write_guest_block(dst, &out);
+        self.write_guest_linear_block(dst, &out);
     }
 
     /// Execute one CD-ROM device driver request whose header begins at linear
@@ -734,19 +763,27 @@ impl Machine {
     /// transfer address and the status word back into the header. Supports the
     /// CD commands a game uses: READ LONG (0x80), SEEK (0x83), PLAY AUDIO (0x84),
     /// STOP (0x85), RESUME (0x88), and IOCTL INPUT (0x03) device-status queries.
+    ///
+    /// `header` is a guest LINEAR address, and so is the transfer address held
+    /// in the header: a request header reaches this from a caller's ES:BX, and
+    /// the buffer it names belongs to that same caller. The header is taken in
+    /// one page-split read so a request that straddles a page boundary is
+    /// decoded from the caller's bytes on both sides of it.
     pub(super) fn icdex_device_request(&mut self, header: u32) {
-        let command = self.read_physical_u8(header + 2);
+        let request = self.read_guest_linear_block(header, DRIVER_REQUEST_BYTES);
+        let command = request[2];
         // Status word at offset 3: bit 8 = done, bit 15 = error, low byte = code.
         let mut status: u16 = 0x0100; // done
         match command {
             // READ LONG: read `count` sectors starting at the given sector into
             // the transfer address. Addressing mode 0 = HSG (LBA), 1 = Red Book.
             0x80 => {
-                let addr_mode = self.read_physical_u8(header + 0x0D);
-                let xfer = self.read_guest_dword(header + 0x0E);
-                let count = self.read_guest_word(header + 0x12);
-                let start = self.read_guest_dword(header + 0x14);
+                let addr_mode = request[0x0D];
+                let xfer = driver_dword(&request, 0x0E);
+                let count = u16::from_le_bytes([request[0x12], request[0x13]]);
+                let start = driver_dword(&request, 0x14);
                 let lba = self.driver_addr_to_lba(addr_mode, start);
+                let mut done = 0u16;
                 let mut ok = true;
                 for i in 0..u32::from(count) {
                     match self
@@ -756,18 +793,24 @@ impl Machine {
                         .and_then(|img| img.read_data_sector(lba + i))
                     {
                         Some(sector) => {
-                            self.write_guest_block(
-                                xfer.wrapping_add(i * cdimage::DATA_SECTOR as u32),
-                                &sector,
-                            );
+                            let at = xfer.wrapping_add(i * cdimage::DATA_SECTOR as u32);
+                            if self.write_guest_linear_block(at, &sector) < sector.len() {
+                                ok = false;
+                                break;
+                            }
                         }
                         None => {
                             ok = false;
                             break;
                         }
                     }
+                    done += 1;
                 }
                 self.cd_accesses += 1;
+                // The count field is where a block driver returns what it
+                // actually moved, so a short transfer has to be visible there
+                // and not only in the status word.
+                self.write_guest_linear_block(header + 0x12, &done.to_le_bytes());
                 if !ok {
                     status = 0x8000 | 0x0100 | 0x000F; // error + done, sector not found
                 }
@@ -776,9 +819,9 @@ impl Machine {
             0x83 => {}
             // PLAY AUDIO: start playback at the given sector for `count` sectors.
             0x84 => {
-                let addr_mode = self.read_physical_u8(header + 0x0D);
-                let start = self.read_guest_dword(header + 0x0E);
-                let count = self.read_guest_dword(header + 0x12);
+                let addr_mode = request[0x0D];
+                let start = driver_dword(&request, 0x0E);
+                let count = driver_dword(&request, 0x12);
                 let lba = self.driver_addr_to_lba(addr_mode, start);
                 let mut cdb = [0u8; 12];
                 cdb[0] = 0x45; // PLAY AUDIO(10)
@@ -808,7 +851,7 @@ impl Machine {
             _ => {}
         }
         // Write the status word back into the header (offset 3).
-        let _ = self.write_guest_ram_u16(header as usize + 3, status);
+        self.write_guest_linear_block(header + 3, &status.to_le_bytes());
     }
 
     /// Convert a CD device-driver address (HSG LBA when `addr_mode` == 0, packed
@@ -1063,23 +1106,33 @@ impl Machine {
                     };
                     blocks.push(bytes);
                 }
+                let mut done = count;
                 if ah == 0x02 {
                     let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                     let bx = self.cpu.registers.ebx() as u16;
                     for (index, bytes) in blocks.iter().enumerate() {
-                        self.write_guest_linear_block(
-                            es.wrapping_add(u32::from(bx))
-                                .wrapping_add(index as u32 * 512),
-                            bytes,
-                        );
+                        let at = es
+                            .wrapping_add(u32::from(bx))
+                            .wrapping_add(index as u32 * 512);
+                        if self.write_guest_linear_block(at, bytes) < bytes.len() {
+                            done = index as u8;
+                            break;
+                        }
                     }
                 }
                 self.cd_accesses += 1;
                 self.stall_for_master_ticks(
-                    ide::sector_transfer_ticks() * u64::from(count).div_ceil(4),
+                    ide::sector_transfer_ticks() * u64::from(done).div_ceil(4),
                 );
-                self.set_eax_al(count);
-                self.int13_class_result(drive, 0);
+                self.set_eax_al(done);
+                self.int13_class_result(
+                    drive,
+                    if done == count {
+                        0
+                    } else {
+                        BUFFER_UNREACHABLE_STATUS
+                    },
+                );
             }
             0x03 | 0x05 => self.int13_class_result(drive, 0x03),
             0x08 => {
@@ -1159,33 +1212,44 @@ impl Machine {
                     .unwrap(),
             );
         }
+        let mut done = count;
         if ah == 0x42 {
             let dst = (u32::from(seg) << 4).wrapping_add(u32::from(off));
             for (index, sector) in sectors.iter().enumerate() {
-                self.write_guest_linear_block(
-                    dst.wrapping_add(index as u32 * cdimage::DATA_SECTOR as u32),
-                    sector,
-                );
+                let at = dst.wrapping_add(index as u32 * cdimage::DATA_SECTOR as u32);
+                if self.write_guest_linear_block(at, sector) < sector.len() {
+                    done = index as u16;
+                    break;
+                }
             }
         }
-        self.set_dap_blocks(dap, count);
+        self.set_dap_blocks(dap, done);
         self.cd_accesses += 1;
-        self.stall_for_master_ticks(ide::sector_transfer_ticks() * u64::from(count));
-        self.int13_class_result(ELTORITO_CD_DRIVE, 0);
+        self.stall_for_master_ticks(ide::sector_transfer_ticks() * u64::from(done));
+        let status = if done == count {
+            0
+        } else {
+            BUFFER_UNREACHABLE_STATUS
+        };
+        self.int13_class_result(ELTORITO_CD_DRIVE, status);
     }
 
+    /// El Torito AH=48h drive parameters. DS:SI is a guest LINEAR address in
+    /// both directions: the caller's requested buffer size is read back out of
+    /// it before the result is deposited.
     fn int13_cd_parameters(&mut self) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
         let dst = ds + u32::from(si);
-        let requested = self.read_guest_word(dst).max(2) as usize;
+        let size = self.read_guest_linear_block(dst, 2);
+        let requested = u16::from_le_bytes([size[0], size[1]]).max(2) as usize;
         let total = u64::from(self.ide.device().image().unwrap().total_sectors());
         let mut out = [0u8; 26];
         out[0..2].copy_from_slice(&26u16.to_le_bytes());
         out[2..4].copy_from_slice(&0x0004u16.to_le_bytes()); // removable
         out[16..24].copy_from_slice(&total.to_le_bytes());
         out[24..26].copy_from_slice(&(cdimage::DATA_SECTOR as u16).to_le_bytes());
-        self.write_guest_block(dst, &out[..requested.min(out.len())]);
+        self.write_guest_linear_block(dst, &out[..requested.min(out.len())]);
         self.int13_class_result(ELTORITO_CD_DRIVE, 0);
     }
 
@@ -1367,6 +1431,10 @@ impl Machine {
     }
 
     /// Carry out the AH=02 read / AH=03 write half of INT 13h.
+    ///
+    /// ES:BX is a guest LINEAR address; see `int13_hdd_transfer` for why the
+    /// classic CHS buffer is the one most likely to sit outside the identity
+    /// map.
     fn int13_transfer(&mut self, ah: u8, dl: u8) {
         let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
             // No media backs the request: report a timeout the way an empty
@@ -1401,6 +1469,7 @@ impl Machine {
         self.floppy_accesses += 1;
 
         let mut done: u8 = 0;
+        let mut unreachable_buffer = false;
         for i in 0..count {
             // Multi-sector transfers advance within the current track only. A
             // booter that crosses a track boundary in one call would need
@@ -1414,11 +1483,20 @@ impl Machine {
                     .and_then(|f| f.read_sector(cyl, head, sec))
                     .map(<[u8]>::to_vec);
                 match data {
-                    Some(bytes) => self.write_guest_block(addr, &bytes),
+                    Some(bytes) => {
+                        if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            unreachable_buffer = true;
+                            break;
+                        }
+                    }
                     None => break,
                 }
             } else {
-                let bytes = self.read_guest_block(addr, 512);
+                if self.linear_present_prefix(addr, 512) < 512 {
+                    unreachable_buffer = true;
+                    break;
+                }
+                let bytes = self.read_guest_linear_block(addr, 512);
                 let wrote = self
                     .floppy
                     .as_mut()
@@ -1460,16 +1538,10 @@ impl Machine {
 
         // AL returns the number of sectors actually transferred.
         self.set_eax_al(done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            // Sector not found / read error.
-            self.set_eax_ah(0x04);
-            self.set_disk_status(0x04);
-            self.set_int_frame_carry(true);
-        }
+        let status = transfer_status(done == count, unreachable_buffer);
+        self.set_eax_ah(status);
+        self.set_disk_status(status);
+        self.set_int_frame_carry(status != 0);
     }
 
     /// Carry out the AH=08 read-drive-parameters half of INT 13h.
@@ -1779,6 +1851,11 @@ impl Machine {
 
     /// AH=02/03 CHS read/write against the mounted hard disk. ES:BX is the buffer;
     /// AL is the sector count. AL returns the count actually moved.
+    ///
+    /// ES:BX is a guest LINEAR address. This is the highest-traffic caller
+    /// buffer in the file: DOS=HIGH,UMB puts BUFFERS in upper memory that
+    /// TOKAEMM supplies out of extended memory, and every file read DOS serves
+    /// from a cache miss passes through one. See `read_guest_linear_block`.
     fn int13_hdd_transfer(&mut self, ah: u8) {
         let count = self.cpu.registers.eax() as u8;
         let (cyl, head, sector) = self.int13_chs();
@@ -1800,6 +1877,7 @@ impl Machine {
         };
         self.c_accesses += 1;
         let mut done: u8 = 0;
+        let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
         for i in 0..count {
@@ -1808,11 +1886,20 @@ impl Machine {
             if ah == 0x02 {
                 let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
-                    Some(bytes) => self.write_guest_block(addr, &bytes),
+                    Some(bytes) => {
+                        if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            unreachable_buffer = true;
+                            break;
+                        }
+                    }
                     None => break,
                 }
             } else {
-                let bytes = self.read_guest_block(addr, 512);
+                if self.linear_present_prefix(addr, 512) < 512 {
+                    unreachable_buffer = true;
+                    break;
+                }
+                let bytes = self.read_guest_linear_block(addr, 512);
                 let wrote = self
                     .ata
                     .as_mut()
@@ -1831,8 +1918,8 @@ impl Machine {
         // falls back to the HLE C: shim, which needs the HLE live, so leave it set.
         // Unlike the floppy, INT 13h stays intercepted so Katea keeps serving I/O.
         if ah == 0x02 && done > 0 && start_lba == 0 && buffer == BOOT_SECTOR_ADDRESS as u32 {
-            let signed = self.read_physical_u8(buffer + 510) == 0x55
-                && self.read_physical_u8(buffer + 511) == 0xAA;
+            let signature = self.read_guest_linear_block(buffer + 510, 2);
+            let signed = signature == [0x55, 0xAA];
             if signed {
                 self.booter_inert = true;
             }
@@ -1848,15 +1935,10 @@ impl Machine {
         }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_fixed_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            self.set_eax_ah(0x04);
-            self.set_fixed_disk_status(0x04);
-            self.set_int_frame_carry(true);
-        }
+        let status = transfer_status(done == count, unreachable_buffer);
+        self.set_eax_ah(status);
+        self.set_fixed_disk_status(status);
+        self.set_int_frame_carry(status != 0);
     }
 
     /// AH=0Ah/0Bh read/write long. A classic BIOS moves sector data followed by
@@ -1884,6 +1966,7 @@ impl Machine {
 
         self.c_accesses += 1;
         let mut done: u8 = 0;
+        let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
         for i in 0..count {
@@ -1893,13 +1976,27 @@ impl Machine {
                 let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
                     Some(bytes) => {
-                        self.write_guest_block(addr, &bytes);
-                        self.write_guest_block(addr.wrapping_add(ata::SECTOR as u32), &ZERO_ECC);
+                        if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                            unreachable_buffer = true;
+                            break;
+                        }
+                        // The ECC trailer is part of the same sector as far as
+                        // the caller is concerned, so a trailer that cannot be
+                        // placed shortens the transfer exactly as the data does.
+                        let ecc_at = addr.wrapping_add(ata::SECTOR as u32);
+                        if self.write_guest_linear_block(ecc_at, &ZERO_ECC) < ZERO_ECC.len() {
+                            unreachable_buffer = true;
+                            break;
+                        }
                     }
                     None => break,
                 }
             } else {
-                let bytes = self.read_guest_block(addr, ata::SECTOR);
+                if self.linear_present_prefix(addr, ata::SECTOR) < ata::SECTOR {
+                    unreachable_buffer = true;
+                    break;
+                }
+                let bytes = self.read_guest_linear_block(addr, ata::SECTOR);
                 let wrote = self
                     .ata
                     .as_mut()
@@ -1923,12 +2020,9 @@ impl Machine {
         }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_fixed_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            self.int13_hdd_error(0x04);
+        match transfer_status(done == count, unreachable_buffer) {
+            0 => self.int13_hdd_ok(),
+            status => self.int13_hdd_error(status),
         }
     }
 
@@ -2089,6 +2183,7 @@ impl Machine {
         }
         self.c_accesses += 1;
         let mut done: u16 = 0;
+        let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
         for i in 0..count {
@@ -2098,11 +2193,25 @@ impl Machine {
                 0x42 => {
                     let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
                     match data {
-                        Some(bytes) => self.write_guest_linear_block(addr, &bytes),
+                        Some(bytes) => {
+                            if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
+                                unreachable_buffer = true;
+                                break;
+                            }
+                        }
                         None => break,
                     }
                 }
                 0x43 => {
+                    // The source has to be readable in full BEFORE anything is
+                    // committed. An untranslatable page reads back as the
+                    // walker's 0xFF fill, and a sector is persistent: writing
+                    // that fill would destroy guest data on the strength of
+                    // bytes the guest never supplied.
+                    if self.linear_present_prefix(addr, 512) < 512 {
+                        unreachable_buffer = true;
+                        break;
+                    }
                     let bytes = self.read_guest_linear_block(addr, 512);
                     let wrote = self
                         .ata
@@ -2134,15 +2243,10 @@ impl Machine {
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
-        if done == count {
-            self.set_eax_ah(0x00);
-            self.set_fixed_disk_status(0x00);
-            self.set_int_frame_carry(false);
-        } else {
-            self.set_eax_ah(0x04);
-            self.set_fixed_disk_status(0x04);
-            self.set_int_frame_carry(true);
-        }
+        let status = transfer_status(done == count, unreachable_buffer);
+        self.set_eax_ah(status);
+        self.set_fixed_disk_status(status);
+        self.set_int_frame_carry(status != 0);
     }
 
     /// Rewrite the Disk Address Packet block-count field (offset 2) with the
@@ -2158,6 +2262,9 @@ impl Machine {
     /// EDD AH=48h get extended drive parameters. The result buffer at DS:SI takes
     /// the EDD 1.x layout: word 0 = buffer size, word 2 = info flags, dwords for
     /// the CHS geometry, qword 16 = total sectors, word 24 = bytes per sector.
+    ///
+    /// DS:SI is a guest LINEAR address, the same as the transfer packet a caller
+    /// sends next; see `int13_edd_transfer`.
     fn int13_edd_drive_params(&mut self) {
         let Some(disk) = self.ata.as_ref() else {
             self.set_eax_ah(0x01);
@@ -2181,7 +2288,7 @@ impl Machine {
         buf[12..16].copy_from_slice(&spt.to_le_bytes()); // sectors per track
         buf[16..24].copy_from_slice(&total.to_le_bytes()); // total sectors (qword)
         buf[24..26].copy_from_slice(&(ata::SECTOR as u16).to_le_bytes()); // bytes/sector
-        self.write_guest_block(dst, &buf);
+        self.write_guest_linear_block(dst, &buf);
         self.set_eax_ah(0x00);
         self.set_fixed_disk_status(0x00);
         self.set_int_frame_carry(false);
