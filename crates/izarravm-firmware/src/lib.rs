@@ -74,6 +74,16 @@ pub const GPEMUL_COM: &[u8] = include_bytes!("../roms/dos/gpemul.com");
 pub const GPEMUL_COM_SOURCE: &str = include_str!("../roms/dos/gpemul.asm");
 pub const GPSTORM_COM: &[u8] = include_bytes!("../roms/dos/gpstorm.com");
 pub const GPSTORM_COM_SOURCE: &str = include_str!("../roms/dos/gpstorm.asm");
+pub const NOINTA_COM: &[u8] = include_bytes!("../roms/dos/nointa.com");
+pub const NOINTA_COM_SOURCE: &str = include_str!("../roms/dos/nointa.asm");
+pub const ISRSET_COM: &[u8] = include_bytes!("../roms/dos/isrset.com");
+pub const ISRSET_COM_SOURCE: &str = include_str!("../roms/dos/isrset.asm");
+pub const INT0DRFL_COM: &[u8] = include_bytes!("../roms/dos/int0drfl.com");
+pub const INT0DRFL_COM_SOURCE: &str = include_str!("../roms/dos/int0drfl.asm");
+pub const INT88RMP_COM: &[u8] = include_bytes!("../roms/dos/int88rmp.com");
+pub const INT88RMP_COM_SOURCE: &str = include_str!("../roms/dos/int88rmp.asm");
+pub const PICSTALE_COM: &[u8] = include_bytes!("../roms/dos/picstale.com");
+pub const PICSTALE_COM_SOURCE: &str = include_str!("../roms/dos/picstale.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const TOKACD_SYS: &[u8] = include_bytes!("../roms/dos/tokacd.sys");
@@ -396,6 +406,48 @@ pub fn gpemul_com() -> &'static [u8] {
 /// storm. The fixture itself signals only failure codes (0xE1/0xE2/0xE5).
 pub fn gpstorm_com() -> &'static [u8] {
     GPSTORM_COM
+}
+
+/// The no-INTA-under-a-guest-CLI fixture: a V86 guest CLIs, polls the master
+/// IRR through OCW3 0x0A until IR0 is REQUESTED (so the read below cannot be
+/// early), then reads the ISR. Signals 0xA5 when the ISR is empty -- the
+/// request outstanding, unacknowledged -- 0xE1 when something INTA'd on the
+/// guest's behalf, 0xD1 when no request ever appeared.
+pub fn nointa_com() -> &'static [u8] {
+    NOINTA_COM
+}
+
+/// The E10 rule as a regression guard: the guest's own IVT[8] handler must see
+/// its line IN SERVICE (master ISR bit 0 set) when it runs, before any EOI --
+/// the state DJGPP's shared IRQ wrapper probes. Signals 0xA5 / 0xE1, with
+/// 0xD1/0xD2 for the two setup steps.
+pub fn isrset_com() -> &'static [u8] {
+    ISRSET_COM
+}
+
+/// Routing row 1: a guest `INT 0Dh` reaches IVT[0x0D] as a software interrupt
+/// both at the DOS-default PIC bases and after a VCPI DE0B moves the master off
+/// base 8 (where vector 13 stops being IRQ5). Signals 0xA5 / 0xE1 / 0xE2, with
+/// 0xD1/0xD2 for setup.
+pub fn int0drfl_com() -> &'static [u8] {
+    INT0DRFL_COM
+}
+
+/// Routing row 2: with the master remapped to 0x88 and IRQ0 genuinely in
+/// service, a guest `INT 88h` reaches IVT[0x88] as a software interrupt and
+/// nothing EOIs the in-service line for it. Signals 0xA5 / 0xE1 / 0xE2, with
+/// 0xD1/0xD2 for setup.
+pub fn int88rmp_com() -> &'static [u8] {
+    INT88RMP_COM
+}
+
+/// Routing row 3, the stale-bookkeeping construction: DE0B the master to 0x88,
+/// then put the CHIP back to base 8 through a direct (untrapped) ICW sequence,
+/// then let a real IRQ0 fire. The arriving vector must decide, so IVT[8] runs.
+/// Signals 0xA5 / 0xE1 (IVT[0x88] ran through the stale cache), with 0xD1/0xD2
+/// for setup.
+pub fn picstale_com() -> &'static [u8] {
+    PICSTALE_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at

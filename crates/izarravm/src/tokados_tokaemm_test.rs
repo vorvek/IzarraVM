@@ -38,8 +38,8 @@ impl TokaEmmScenario {
 }
 
 /// Run the machine in fine bursts, reporting every sample point that lands with
-/// the CPU in V86, and stopping early once `done` is satisfied. Returns
-/// (samples in V86, whether `done` was reached).
+/// the CPU in V86, and stopping early once `done` is satisfied or the guest
+/// exits.
 ///
 /// Sampling `in_v86()` is the only way to observe V86 residency -- nothing
 /// counts it -- and it has two biases that make a coarse sample useless:
@@ -55,14 +55,23 @@ impl TokaEmmScenario {
 /// Together those mean a handful of samples taken after the boot has settled
 /// will never see V86, however healthy the machine is. Sample finely, sample
 /// while the guest is busy, and judge on the accumulated count.
+///
+/// Returns (samples in V86, whether the loop ended because `done` fired or the
+/// guest exited, and the last stop reason).
+/// A `TestExit` ends the loop: the guest has signalled its verdict and every
+/// further burst would re-run an already-halted machine, so callers that assert
+/// on an exit code get it from the third element rather than running the
+/// machine again afterwards.
 fn sample_v86_while_busy(
     machine: &mut Machine,
     max_samples: u32,
     mut on_v86_sample: impl FnMut(&Machine),
     mut done: impl FnMut(&Machine) -> bool,
-) -> (u32, bool) {
+) -> (u32, bool, StopReason) {
     const BURST: u64 = 200_000;
+    debug_assert!(max_samples > 0, "a zero sample budget samples nothing");
     let mut in_v86_samples = 0;
+    let mut last_stop = StopReason::CycleLimit { requested: 0 };
     for _ in 0..max_samples {
         let stop = machine
             .run_until_halt_or_cycles(BURST)
@@ -73,15 +82,20 @@ fn sample_v86_while_busy(
                 machine.screen_text().as_text()
             );
         }
+        let exited = matches!(stop, StopReason::TestExit { .. });
+        last_stop = stop;
         if machine.in_v86() {
             in_v86_samples += 1;
             on_v86_sample(machine);
         }
+        if exited {
+            return (in_v86_samples, true, last_stop);
+        }
         if done(machine) {
-            return (in_v86_samples, true);
+            return (in_v86_samples, true, last_stop);
         }
     }
-    (in_v86_samples, false)
+    (in_v86_samples, false, last_stop)
 }
 
 /// Enough V86 sample points to prove the guest really ran there, with room for
@@ -89,6 +103,13 @@ fn sample_v86_while_busy(
 /// clears this by an order of magnitude, and a machine that stopped entering
 /// V86 at all fails loudly rather than passing an invariant vacuously.
 const MIN_V86_SAMPLES: u32 = 5;
+
+/// Sample budget for a whole-boot row. At `sample_v86_while_busy`'s 200k-cycle
+/// burst this is ~800M emulated cycles, which is the same ceiling the
+/// non-sampled boot rows pass to `run_until_halt_or_cycles` — enough for
+/// `LH TOKAMOUS + MEM` (or a VCPISW round trip) to reach its verdict with room
+/// to spare, and bounded so a wedged machine fails instead of hanging.
+const SAMPLE_BUDGET: u32 = 4_000;
 
 #[test]
 #[should_panic(expected = "expected exactly one TOKAEMM.SYS override")]
@@ -974,15 +995,24 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 ///
 /// It also pins E10's regression, and this is the discriminating half: each
 /// switch is made from a CLI'd V86 stub that first WAITS until the 8259A shows
-/// IR0 in service, so the monitor is certainly carrying a line held in `vip`
-/// across the DE0C boundary. The client then requires, on the far side, that
-/// IS0 is clear and that the chip still acknowledges (an OCW3 poll, since the
-/// PM leg runs with IF=0). A monitor that strands the held line fails here with
-/// 0xED (`pm_f_held`) -- the state Tomb Raider and Grand Prix 2 froze in, their
-/// clocks stopped by a stuck highest-priority ISR bit. 0xEE (`pm_f_dead`) is
-/// the softer variant: IS0 cleared, but nothing is acknowledgeable any more.
-/// 0xD1 says the wait never saw a hold at all, so the fixture would have proved
-/// nothing -- a guard against the test silently becoming vacuous.
+/// IR0 REQUESTED (OCW3 0x0A), so the DE0C boundary is certainly crossed with a
+/// timer interrupt outstanding and undelivered. Under the IOPL-3 monitor that
+/// guest `CLI` clears the real IF, so the chip is never acknowledged while the
+/// stub waits: the request latches in the IRR and the ISR stays empty. The
+/// client then requires, on the far side, that IS0 is clear and that the chip
+/// still acknowledges (an OCW3 poll, since the PM leg runs with IF=0). A
+/// monitor that strands the interrupt fails here with 0xED (`pm_f_held`) -- the
+/// state Tomb Raider and Grand Prix 2 froze in, their clocks stopped by a stuck
+/// highest-priority ISR bit. 0xEE (`pm_f_dead`) is the softer variant: IS0
+/// cleared, but nothing is acknowledgeable any more. 0xD1 says no request ever
+/// became visible, so the fixture would have proved nothing -- a guard against
+/// the test silently becoming vacuous.
+///
+/// The precondition used to be read from the ISR (OCW3 0x0B) instead: the
+/// pre-IOPL-3 monitor pinned the real IF open and virtualized IF as VIF, so it
+/// acknowledged the line immediately and parked it in `vip`, making IS0 the
+/// observable. The wedge assertions after the switch are unchanged; only the
+/// way the precondition is established moved.
 #[test]
 #[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
@@ -1013,15 +1043,43 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             ],
         );
         let machine = &mut scenario.machine;
-        let stop = machine
-            .run_until_halt_or_cycles(800_000_000)
-            .expect("machine run");
+
+        // Sampled rather than run straight through, because this is the ONLY
+        // row that observes V86 residency on the far side of a DE0C round trip.
+        // `vcpi_pm_to_v86`'s `mov dword [esp+0x10], 0x00023002` is the second
+        // of tokaemm.asm's two
+        // sites that stamp IOPL into a V86 EFLAGS image, and the boot-sampling
+        // rows never reach it -- a plain `LH TOKAMOUS + MEM` boot only ever
+        // enters V86 through `pm_init`. Asserting IOPL 3 here is what closes
+        // that gap: a regression that dropped IOPL only on the VCPI re-entry
+        // path would leave every other row in the suite green.
+        let (in_v86_samples, _, stop) = sample_v86_while_busy(
+            machine,
+            SAMPLE_BUDGET,
+            |machine| {
+                let eflags = machine.cpu().registers.eflags;
+                assert_eq!(
+                    (eflags >> 12) & 3,
+                    3,
+                    "V86 IOPL was not 3 (eflags={eflags:#010x}) with \
+                     {memory_mib} MiB {emm_arg}; a V86 entry point built a \
+                     frame without it"
+                );
+            },
+            |_| false,
+        );
         let text = machine.screen_text().as_text();
         assert_eq!(
             stop,
             StopReason::TestExit { code: 0xA5 },
             "VCPI switch round-trip failed with {memory_mib} MiB {emm_arg} \
              (stop={stop:?}); a 0xEn code names the failed step.\n{text}"
+        );
+        assert!(
+            in_v86_samples >= MIN_V86_SAMPLES,
+            "the VCPI client never ran in V86 with {memory_mib} MiB {emm_arg}, \
+             so the IOPL check above was vacuous ({in_v86_samples} samples, \
+             needed {MIN_V86_SAMPLES}).\n{text}"
         );
     }
 }
@@ -1191,9 +1249,9 @@ fn tokaemm_m4_default_boot_runs_v86() {
     // work; once the prompt is up the guest halts and the CPU parks in the
     // monitor, so a sample taken then reads false no matter how healthy the
     // machine is. See sample_v86_while_busy.
-    let (in_v86_samples, reached) = sample_v86_while_busy(
+    let (in_v86_samples, reached, _) = sample_v86_while_busy(
         &mut machine,
-        4_000,
+        SAMPLE_BUDGET,
         |_| {},
         |machine| {
             current_root_prompt(machine)
@@ -1497,13 +1555,17 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("598K"),
+        Some("599K"),
         "all three RAM-scaled tables -- the arena bitmap, the VCPI ownership \
          bitmap and the EMS chain table -- moved out of the resident core into \
          the system window at SYS_LIN_BASE, which took conventional free from \
          582 KiB to 598 KiB (past the 593 KiB the machine had before it grew to \
          64 MB). In the core they cost ~18 KiB AND grew at ~288 bytes per \
-         megabyte of arena; in extended memory they cost neither.\n{text}"
+         megabyte of arena; in extended memory they cost neither. The last \
+         KiB, 598 -> 599, came from the IOPL-3 rewrite: deleting the \
+         sensitive-op emulation, the vif/vip hold machinery, maybe_deliver \
+         and the VCPI boundary EOI release shrank the driver by 800 \
+         bytes.\n{text}"
     );
     assert_extended_category(&screen, "23,552K", "23,141K");
 
@@ -1692,12 +1754,16 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(24K)"),
-        "TokaEMM should retain only its ~24 KiB low core: code, state, the \
-         8,304-byte TSS and the monitor stack (EMS function 50h pushed the \
-         rounded figure from 23K to 24K). Nothing left in the core scales \
-         with installed RAM -- all three tables that did are in the system \
-         window -- so this figure is now the same on a 64 MB machine and a \
+        tokaemm.contains("(23K)"),
+        "TokaEMM should retain only its ~23 KiB low core: code, state, the \
+         8,304-byte TSS and the monitor stack. EMS function 50h once pushed \
+         the rounded figure from 23K to 24K; the IOPL-3 rewrite took it back \
+         down, because deleting the sensitive-op emulation arms, the vif/vip \
+         hold machinery, maybe_deliver and the VCPI boundary EOI release \
+         shrank the driver by 800 bytes (24,288 -> 23,488). Nothing left in \
+         the core scales with installed RAM -- all three tables that did are \
+         in the system window -- so this figure is now the same on a 64 MB \
+         machine and a \
          256 MB one.\n{}",
         screen.text
     );
@@ -1708,8 +1774,9 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(598K)"),
-        "MEM /CLASSIFY should report about 598 KiB conventional free.\n{}",
+        Some("(599K)"),
+        "MEM /CLASSIFY should report about 599 KiB conventional free (598 KiB \
+         before the IOPL-3 rewrite shrank the resident core by 800 bytes).\n{}",
         screen.text
     );
 }
@@ -1737,26 +1804,118 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
     );
 }
 
-/// Regression for the V86 IRET/IOPL gate (vorvek/v86-iret-iopl): TOKAEMM
-/// virtualizes IF by trapping CLI/STI/PUSHF/POPF/INT n/IRET to the monitor
-/// and stamping the guest IRET frame's image-IF from its own VIF (often 0 in
-/// ISR context). If IRET is not IOPL-gated like its siblings, a V86 guest's
-/// own IRET pops that monitor-stamped image straight into REAL EFLAGS via
-/// load_flags (no IOPL gating) -- killing real IF inside V86 so interrupts
-/// never deliver again (this was the Prince of Persia livelock root cause).
-/// This test samples real IF at several points across a real TOKAEMM boot
-/// and asserts it is never 0 while the guest is in V86 mode -- the invariant
-/// that would have caught this whole class of bug. Cheap: reuses the MEM
-/// harness's boot (LH TOKAMOUS + MEM reaches a prompt in ~200-350M cycles),
-/// split into small bursts so the sample points fall throughout the run
-/// rather than only at the very end.
+/// THE V86 ENTRY INVARIANT: every EFLAGS image the monitor IRETDs into V86
+/// carries IOPL 3. This replaces `tokaemm_real_if_never_zero_in_v86_across_a_boot`
+/// (vorvek/v86-iret-iopl), and the swap is deliberate rather than a deletion.
+///
+/// What the original guarded: the Prince of Persia livelock. The pre-IOPL-3
+/// monitor virtualized IF by trapping CLI/STI/PUSHF/POPF/INT n/IRET and
+/// stamping the guest IRET frame's image-IF from its own VIF (often 0 in ISR
+/// context). If IRET were not IOPL-gated like its siblings, a V86 guest's own
+/// IRET popped that monitor-stamped image straight into REAL EFLAGS via
+/// load_flags, killing real IF inside V86 so interrupts never delivered again.
+///
+/// Why that class is now impossible: there is no monitor-stamped image. The
+/// guest runs at real IOPL 3, its CLI/STI/PUSHF/POPF/IRET execute for real, and
+/// real IF simply IS the guest's IF -- so IF=0 in V86 is the CORRECT state
+/// whenever the guest has disabled interrupts, and the old assertion would now
+/// fire on healthy behaviour. Deleting it outright is how the PoP class comes
+/// back, though, so it is replaced rather than removed.
+///
+/// What THIS guards: any V86 entry point that forgets to put IOPL 3 in the
+/// frame. If one does, the sensitive set silently starts trapping again and the
+/// monitor quietly reverts to emulating what it no longer has code to emulate.
+/// `signal32 0xD6` catches that loudly -- but only on a path the guest actually
+/// executes; this catches it on every path the sampler observes, whether or not
+/// the guest happens to run a CLI there.
+///
+/// COVERAGE BOUNDARY, stated because it is not obvious: tokaemm.asm stamps IOPL
+/// into a V86 EFLAGS image at exactly two sites -- `pm_init`'s
+/// `push dword 0x00023202` and `vcpi_pm_to_v86`'s
+/// `mov dword [esp+0x10], 0x00023002` (both unique on grep, which is how to
+/// find them; line numbers here have gone stale twice) -- and this row's
+/// `LH TOKAMOUS +
+/// MEM` boot only ever enters V86 through the first, so it cannot see a
+/// regression confined to the VCPI re-entry path. That second site is covered
+/// by `tokaemm_vcpi_m3_de0c_switch_round_trip`, which samples the same
+/// assertion across a real DE0C round trip; between them both sites are
+/// sampled. Keep it that way -- dropping the sampling from either row reopens
+/// half the invariant.
+///
+/// Cheap: reuses the MEM harness's boot (LH TOKAMOUS + MEM reaches a prompt in
+/// ~200-350M cycles), split into small bursts so the sample points fall
+/// throughout the run rather than only at the very end.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
-fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
+fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut scenario = TokaEmmScenario::new(
-        "tokaemm-ifinvariant",
+        "tokaemm-iopl3invariant",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+
+    // Every sample point that lands in V86 is one check of the invariant, so
+    // the fine sampling is not only what makes the test reliable -- it is what
+    // gives it teeth. The old 20M-cycle bursts got roughly one V86 sample per
+    // run, when they got one at all.
+    let (in_v86_samples, _, _) = sample_v86_while_busy(
+        machine,
+        SAMPLE_BUDGET,
+        |machine| {
+            let eflags = machine.cpu().registers.eflags;
+            assert_eq!(
+                (eflags >> 12) & 3,
+                3,
+                "V86 IOPL was not 3 (eflags={eflags:#010x}); some entry point \
+                 built a frame without it, and the sensitive set is trapping \
+                 again"
+            );
+        },
+        |_| false,
+    );
+    let text = machine.screen_text().as_text();
+
+    assert!(
+        in_v86_samples >= MIN_V86_SAMPLES,
+        "the boot never entered V86 mode; the invariant was never exercised \
+         ({in_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
+    );
+}
+
+/// The non-vacuity partner to `tokaemm_v86_iopl_is_always_three_across_a_boot`,
+/// and the row that makes the IOPL-3 claim mean something. IOPL 3 is only
+/// interesting because it hands the guest the REAL interrupt flag: assert that
+/// real IF actually moves with the guest, by requiring at least one V86 sample
+/// with IF=0 and at least one with IF=1 across a boot.
+///
+/// Without this, a monitor that regressed to pinning real IF open forever --
+/// exactly the pre-IOPL-3 behaviour this design removed -- would still satisfy
+/// every other row in the suite, including the IOPL-3 invariant above. DOS
+/// brackets its IRQ-sensitive regions with CLI/STI constantly, so both states
+/// are reached many times over during a normal boot; seeing only one of them is
+/// evidence the flag is stuck, not evidence of a quiet boot.
+///
+/// This boots a second time rather than folding into the IOPL row above, and
+/// the duplication is deliberate: the two assertions fail for entirely
+/// different reasons (a frame built without IOPL 3, versus a flag that stopped
+/// tracking the guest), and keeping them in separate rows means the failing
+/// row names the cause on its own.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_real_if_tracks_the_guest_across_a_boot() {
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-iftracks",
         profile,
         vec![
             ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -1770,28 +1929,38 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
 
     const FLAG_IF: u32 = 0x0000_0200;
 
-    // Every sample point that lands in V86 is one check of the invariant, so
-    // the fine sampling is not only what makes the test reliable -- it is what
-    // gives it teeth. The old 20M-cycle bursts got roughly one V86 sample per
-    // run, when they got one at all.
-    let (saw_v86_samples, _) = sample_v86_while_busy(
+    let mut saw_if_clear = 0u32;
+    let mut saw_if_set = 0u32;
+    let (in_v86_samples, _, _) = sample_v86_while_busy(
         machine,
-        4_000,
+        SAMPLE_BUDGET,
         |machine| {
-            assert_ne!(
-                machine.cpu().registers.eflags & FLAG_IF,
-                0,
-                "real IF was 0 while the guest was in V86 mode"
-            );
+            if machine.cpu().registers.eflags & FLAG_IF == 0 {
+                saw_if_clear += 1;
+            } else {
+                saw_if_set += 1;
+            }
         },
         |_| false,
     );
     let text = machine.screen_text().as_text();
 
     assert!(
-        saw_v86_samples >= MIN_V86_SAMPLES,
+        in_v86_samples >= MIN_V86_SAMPLES,
         "the boot never entered V86 mode; the invariant was never exercised \
-         ({saw_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
+         ({in_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
+    );
+    assert!(
+        saw_if_clear > 0,
+        "real IF was never 0 in V86 across {in_v86_samples} samples \
+         (0 clear, {saw_if_set} set): the guest's CLI is not reaching the real \
+         flag, so the monitor is pinning IF open again.\n{text}"
+    );
+    assert!(
+        saw_if_set > 0,
+        "real IF was never 1 in V86 across {in_v86_samples} samples \
+         ({saw_if_clear} clear, 0 set): the guest never runs with interrupts \
+         enabled, which a booting DOS must do.\n{text}"
     );
 }
 
@@ -2207,5 +2376,290 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
          mean EMS granted the pages but mapped one of them wrong -- read \
          the failure-label block in emsfrag.asm before trusting any \
          particular story.\n{text}"
+    );
+}
+
+/// Run one guest .COM from AUTOEXEC under a bare `DEVICE=C:\DOS\TOKAEMM.SYS`
+/// and return the stop reason and the screen text. Every fixture in the
+/// INTA-invariant block below has the same shape -- one COM, one exit code --
+/// and differs only in which COM it runs and what its codes mean.
+fn run_tokaemm_com(label: &str, name: &str, com: &[u8]) -> (StopReason, String) {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = format!("@ECHO OFF\r\nPATH C:\\DOS\r\n{name}\r\n").into_bytes();
+
+    let mut scenario = TokaEmmScenario::new(
+        label,
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (format!("{name}.COM"), com.to_vec()),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    (stop, text)
+}
+
+/// THE INTA INVARIANT: while the V86 guest has interrupts disabled, nothing may
+/// acknowledge the 8259A on its behalf. An INTA is the guest's to issue, through
+/// its own IVT handler, once it re-enables.
+///
+/// There is no crate-external PIC API to read the ISR with (pic.rs is
+/// `pub(crate)` and the ISR has no accessor), and promoting one would be the
+/// wrong seam anyway: the thing under test is what the GUEST sees, and the guest
+/// reads the chip through OCW3 like every DOS program does. So the probe is
+/// guest-side, which is also the exact shape E10 arrived in.
+///
+/// NOINTA.COM is self-proving, which matters more here than usual: a CLI'd guest
+/// that reads the ISR too early reads 00 because nothing has happened yet, not
+/// because the invariant holds. So it first polls the IRR (OCW3 0x0A) until IR0
+/// is REQUESTED and only then reads the ISR (OCW3 0x0B); reaching the ISR read
+/// at all means a timer request demonstrably exists. 0xD1 is the exhausted poll,
+/// kept distinct so it can never be read as either answer.
+///
+/// What it pins: across a guest CLI window the master ISR stays EMPTY. The
+/// guest runs at real IOPL 3, so its `CLI` clears the real IF; the CPU stops
+/// accepting, `service_pending_interrupt` never reaches the INTA, and the
+/// timer's request sits unacknowledged in the IRR until the guest re-enables.
+/// The acknowledge is the guest's to issue, through its own IVT handler.
+///
+/// History: this row was RED when it landed. The pre-IOPL-3 monitor pinned the
+/// real IF open and virtualized IF as VIF, so the first tick was INTA'd and
+/// parked in `vip` the instant it appeared and the ISR read returned 01 ->
+/// 0xE1. It went green with the IOPL-3 monitor, and that flip is what the
+/// design's whole INTA argument rests on.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_pic_isr_is_empty_while_the_v86_guest_has_interrupts_disabled() {
+    let (stop, text) = run_tokaemm_com("tokaemm-nointa", "NOINTA", izarravm_firmware::nointa_com());
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "the master ISR must be empty while the V86 guest holds interrupts \
+         disabled (stop={stop:?}). 0xE1 = something acknowledged the chip on \
+         the guest's behalf; 0xD1 = no request ever became visible in the IRR, \
+         so the fixture proved nothing and needs its bound looked at, not its \
+         assertion.\n{text}"
+    );
+}
+
+/// The other half of the E10 rule, and a REGRESSION GUARD rather than a red
+/// fixture: whatever the monitor does while the guest has interrupts disabled,
+/// once the guest's own IVT[8] handler is running the chip must show IS0 SET --
+/// the state a real 8259A is in between INTA and EOI. DJGPP's shared
+/// hardware-IRQ wrapper probes exactly that (OCW3 0x0B + IN 0x20) to tell a real
+/// IRQ from a spurious entry; the 0 the old early-EOI path left there sent it
+/// down its not-my-line branch, indexed a 16-entry table with 16, and RETF'd
+/// through the pair it found -- MonikaTT's #GP(0) at 0xAF:78A3.
+///
+/// What it guards now that the rebuild has happened: the monitor issues no EOI
+/// of its own, anywhere. Under IOPL 3 the INTA is real (the guest had IF=1, or
+/// the line would never have been taken) and the EOI is the guest handler's, so
+/// the handler necessarily finds its own line in service. Two deleted
+/// revisions each broke that -- the early EOI-then-hold, and
+/// `vip_release_to_chip`'s specific EOIs at the VCPI DE0C boundary -- and this
+/// row is what makes a third attempt fail loudly instead of silently
+/// reproducing MonikaTT.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_guest_irq_handler_runs_with_its_own_line_in_service() {
+    let (stop, text) = run_tokaemm_com("tokaemm-isrset", "ISRSET", izarravm_firmware::isrset_com());
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "the guest's own IRQ0 handler must find IS0 set before it EOIs \
+         (stop={stop:?}). 0xE1 = it ran with its line not in service (the E10 \
+         mechanism); 0xD1/0xD2 are setup -- no request appeared, or the handler \
+         never ran.\n{text}"
+    );
+}
+
+/// Routing row 1 (design section 3.5). A guest `INT 0Dh` is a SOFTWARE
+/// interrupt and must reach the guest's IVT[0x0D] whatever the 8259A's vector
+/// bases are. Vector 13 is doubly loaded on this monitor -- it is the #GP a
+/// V86 `INT n` traps through, and, while the master sits at the DOS-default
+/// base 8, it is also IRQ5 -- so a discriminator lives there.
+///
+/// The discriminating half moves the master off base 8 with a VCPI DE0B first
+/// (with the chip masked and the guest CLI'd, so no tick can be reflected at a
+/// vector DOS has not hooked) and requires INT 0Dh to still land on IVT[0x0D].
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_guest_int0d_reflects_vector_13_not_irq5() {
+    let (stop, text) = run_tokaemm_com(
+        "tokaemm-int0drfl",
+        "INT0DRFL",
+        izarravm_firmware::int0drfl_com(),
+    );
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "a guest INT 0Dh must reach IVT[0x0D] at both PIC base settings \
+         (stop={stop:?}). 0xE1 = it missed at the DOS defaults; 0xE2 = it \
+         missed once the master moved off base 8 (reflected as IRQ5 at the new \
+         base); 0xD1/0xD2 are DE0B setup.\n{text}"
+    );
+}
+
+/// Routing row 2 (design section 3.5), written as a PIN of the round-trip
+/// identity rather than as a red fixture. Once a client has moved the master to
+/// 0x88, vector 0x88 means two things: where IRQ0 now arrives, and an ordinary
+/// software-interrupt vector the guest may still call. A guest `INT 88h` must
+/// reach IVT[0x88] as a software interrupt, and nothing may EOI the chip for it.
+///
+/// The monitor's default-gate arm re-derives the line by consulting the chip's
+/// own ISR, so it is self-correcting for the software-INT case, and the software
+/// INT itself is reflected straight out of the #GP body without consulting the
+/// PIC bookkeeping at all -- so this is expected to pass today. It is here to
+/// hold the identity down while the routing around it is rebuilt.
+///
+/// The precondition that makes it non-vacuous is that IRQ0 is genuinely IN
+/// SERVICE when the INT 88h executes: that is the only state in which a
+/// line-number derivation could plausibly claim the vector. Two things
+/// constrain how INT88RMP gets there, and both are worth knowing before editing
+/// it.
+///
+/// It must obtain that state THE LEGAL WAY -- from inside the guest's own
+/// interrupt handler, where the chip really has IS0 set because the guest's own
+/// tick was acknowledged for it (0xD3 if the handler looks and it is not). A
+/// fixture that instead CLI'd and spun waiting for IS0 to appear would be
+/// relying on the monitor pinning the real IF open and acknowledging early,
+/// which is exactly what this campaign deletes: it would start failing on its
+/// own setup step the moment the monitor is fixed.
+///
+/// And the remap has to come FIRST. DE0B reprograms the 8259A with a full ICW
+/// sequence, and ICW1 resets the chip, in-service state included -- so there is
+/// no "hold a line in service, then remap". The only reachable form of the
+/// state is "remap, then take a tick at the new base", which is also the shape a
+/// real VCPI client's clock lives in. That leaves IVT[0x88] serving both the
+/// hardware entry and the software one, so a phase byte tells them apart; the
+/// ambiguity cannot bite, because the hardware entry runs with IF clear and with
+/// IS0 inhibiting the chip until the chained DOS handler EOIs on the way out.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_guest_int88_after_remap_is_not_converted_to_irq0() {
+    let (stop, text) = run_tokaemm_com(
+        "tokaemm-int88rmp",
+        "INT88RMP",
+        izarravm_firmware::int88rmp_com(),
+    );
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "a guest INT 88h with the master remapped to 0x88 must reach IVT[0x88] \
+         as a software interrupt (stop={stop:?}). 0xE1 = it did not; 0xE2 = the \
+         in-service line was EOI'd by something other than the guest; \
+         0xD1/0xD2/0xD3 are setup (DE0B refused, the timer handler never ran, \
+         or IS0 was not in service when the handler looked).\n{text}"
+    );
+}
+
+/// Routing row 3 (design section 3.5), the stale-bookkeeping construction and
+/// the red one of the three. The monitor caches the PIC's vector bases in its
+/// own words and reflects a hardware IRQ to `cache_base + line`; the cache is
+/// written only by VCPI DE0Ah/DE0Bh, but the PIC ports are NOT trapped in the
+/// monitor's TSS I/O-permission bitmap (only 0x92 is), so a guest can reprogram
+/// the chip straight through an ICW sequence and leave the cache lying.
+///
+/// PICSTALE.COM: DE0B the master to 0x88 (cache and chip both move), then a
+/// direct `OUT 0x20/0x21` ICW sequence puts the CHIP back to base 8 (cache now
+/// stale), then let a real IRQ0 fire. The right answer is that the ARRIVING
+/// VECTOR decides -- a request that entered through IDT vector 8 is IVT[8]'s.
+/// IVT[0x88] carries a decoy handler so the wrong answer is reported rather
+/// than crashing the guest through whatever was in that slot.
+///
+/// RED on today's monitor: `irq_m0` reflects to `vcpi_pic_master` (0x88) + 0,
+/// so the decoy at IVT[0x88] runs and IVT[8] never does -> 0xE1.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_hardware_irq_after_a_direct_port_remap_reflects_the_arriving_vector() {
+    let (stop, text) = run_tokaemm_com(
+        "tokaemm-picstale",
+        "PICSTALE",
+        izarravm_firmware::picstale_com(),
+    );
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "an IRQ0 arriving on IDT vector 8 must reflect to the guest's IVT[8], \
+         whatever the monitor last recorded as the master base (stop={stop:?}). \
+         0xE1 = it reflected through the stale cache to IVT[0x88]; 0xD2 = no \
+         timer interrupt arrived at all, so the fixture proved nothing.\n{text}"
+    );
+}
+
+/// The VCPI CLI-excursion shape, and the guard that REPLACES the interim
+/// boundary release merged at 203efaae ("release held lines at the VCPI
+/// V86->PM boundary"). A client that CLIs in V86, lets a timer tick arrive
+/// while it is disabled, and then DE0Cs to protected mode must not carry a
+/// wedged master ISR across with it: IS0 is the highest priority level, and a
+/// stuck IS0 inhibits the whole chip, which is how Tomb Raider froze on the
+/// FMV's first frame and Grand Prix 2 froze mid-race at LAP 0.
+///
+/// VCPISW.COM is exactly that client, and its own step codes keep this from
+/// going vacuous: it WAITS until the chip shows IR0 REQUESTED before switching
+/// (OCW3 0x0A; 0xD1 if that never happened, so the switch would have crossed
+/// the boundary with nothing outstanding), requires IS0 clear on the far side
+/// (0xED), and then requires the chip to still be ALIVE by hand-polling it with
+/// OCW3 P=1 (0xEE) -- "clear" alone is also what a dead chip looks like.
+///
+/// The precondition reads the IRR because under the IOPL-3 monitor the client's
+/// own `CLI` clears the real IF, so nothing acknowledges the chip while it
+/// waits: the tick latches in the IRR and the ISR stays empty. It used to read
+/// the ISR, back when the monitor pinned the real IF open, acknowledged the
+/// line immediately and parked it in `vip` -- that queue is what could strand a
+/// line across DE0C, and the interim release at 203efaae existed to hand it
+/// back. Both the queue and the release are deleted; there is nothing to
+/// release once the guest's CLI drives the real IF, and this fixture is what
+/// holds that claim honest. Bounded by the same cycle budget as the rest of the
+/// suite.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_vcpi_client_that_clis_in_v86_then_switches_does_not_wedge() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-vcpi-cli-excursion",
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            (
+                "AUTOEXEC.BAT".to_string(),
+                b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec(),
+            ),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "VCPISW.COM".to_string(),
+                izarravm_firmware::vcpisw_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "a VCPI client that CLIs in V86 and then switches to protected mode \
+         must not leave the master PIC wedged (stop={stop:?}). 0xED = IS0 \
+         survived the switch; 0xEE = IS0 cleared but the chip acknowledges \
+         nothing any more; 0xD1 = no line was ever held, so the fixture proved \
+         nothing.\n{text}"
     );
 }
