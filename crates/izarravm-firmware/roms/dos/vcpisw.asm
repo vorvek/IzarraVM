@@ -217,17 +217,17 @@ do_switch:
     ; The PIC ports are not in the monitor's TSS I/O bitmap (only 0x92 is), so
     ; this reads the real chip.
     mov ecx, 8000000              ; bound: ~one 54.9 ms tick with room to spare
-.wait_hold:
+.wait_req:
     mov al, 0x0A                  ; OCW3: select IRR for the next read
     out 0x20, al
     in al, 0x20
     test al, 0x01                 ; IR0: the timer line, REQUESTED but not
-    jnz .held                     ; acknowledged (the ISR stays empty)
+    jnz .requested                ; acknowledged (the ISR stays empty)
     dec ecx
-    jnz .wait_hold
-    jmp f_nohold                  ; no request ever appeared: the precondition
-                                  ; never happened
-.held:
+    jnz .wait_req
+    jmp f_noreq                   ; no request ever appeared: the
+                                  ; precondition never happened
+.requested:
     mov esi, [lin_base]
     add esi, swst                 ; ESI = switch-structure linear
     mov ax, 0xDE0C
@@ -359,7 +359,7 @@ pm_f_alloc:
 pm_f_free:
     mov al, 0xEC
     jmp pm_sig
-pm_f_held:                        ; E10: a line held in `vip` crossed DE0C
+pm_f_held:                        ; E10: an in-service line survived DE0C
     mov al, 0xED
     jmp pm_sig
 pm_f_dead:                        ; E10: the chip acknowledges nothing any more
@@ -437,10 +437,10 @@ f_busy:   mov al, 0xD0        ; trip 1 left the client TSS descriptor available,
           jmp sig               ; so the monitor's busy-bit clear is untested
 f_xms:    mov al, 0xE7
           jmp sig
-f_nohold: mov al, 0xD1        ; no timer request ever became visible in the IRR
-                              ; under the CLI, so the switch below would not
-                              ; have carried anything across the boundary and
-                              ; the wedge assertions would prove nothing
+f_noreq:  mov al, 0xD1        ; no timer request ever became visible in the
+                              ; IRR under the CLI, so the switch below would
+                              ; not have carried anything across the boundary
+                              ; and the wedge assertions would prove nothing
 
 sig:
     mov ah, al

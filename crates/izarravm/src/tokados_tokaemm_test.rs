@@ -974,15 +974,24 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 ///
 /// It also pins E10's regression, and this is the discriminating half: each
 /// switch is made from a CLI'd V86 stub that first WAITS until the 8259A shows
-/// IR0 in service, so the monitor is certainly carrying a line held in `vip`
-/// across the DE0C boundary. The client then requires, on the far side, that
-/// IS0 is clear and that the chip still acknowledges (an OCW3 poll, since the
-/// PM leg runs with IF=0). A monitor that strands the held line fails here with
-/// 0xED (`pm_f_held`) -- the state Tomb Raider and Grand Prix 2 froze in, their
-/// clocks stopped by a stuck highest-priority ISR bit. 0xEE (`pm_f_dead`) is
-/// the softer variant: IS0 cleared, but nothing is acknowledgeable any more.
-/// 0xD1 says the wait never saw a hold at all, so the fixture would have proved
-/// nothing -- a guard against the test silently becoming vacuous.
+/// IR0 REQUESTED (OCW3 0x0A), so the DE0C boundary is certainly crossed with a
+/// timer interrupt outstanding and undelivered. Under the IOPL-3 monitor that
+/// guest `CLI` clears the real IF, so the chip is never acknowledged while the
+/// stub waits: the request latches in the IRR and the ISR stays empty. The
+/// client then requires, on the far side, that IS0 is clear and that the chip
+/// still acknowledges (an OCW3 poll, since the PM leg runs with IF=0). A
+/// monitor that strands the interrupt fails here with 0xED (`pm_f_held`) -- the
+/// state Tomb Raider and Grand Prix 2 froze in, their clocks stopped by a stuck
+/// highest-priority ISR bit. 0xEE (`pm_f_dead`) is the softer variant: IS0
+/// cleared, but nothing is acknowledgeable any more. 0xD1 says no request ever
+/// became visible, so the fixture would have proved nothing -- a guard against
+/// the test silently becoming vacuous.
+///
+/// The precondition used to be read from the ISR (OCW3 0x0B) instead: the
+/// pre-IOPL-3 monitor pinned the real IF open and virtualized IF as VIF, so it
+/// acknowledged the line immediately and parked it in `vip`, making IS0 the
+/// observable. The wedge assertions after the switch are unchanged; only the
+/// way the precondition is established moved.
 #[test]
 #[ignore = "boots four full DOS images in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
@@ -2267,9 +2276,17 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// at all means a timer request demonstrably exists. 0xD1 is the exhausted poll,
 /// kept distinct so it can never be read as either answer.
 ///
-/// RED on today's monitor: it pins the real IF open and virtualizes IF as VIF,
-/// so the first tick is INTA'd and parked in `vip` the instant it appears, and
-/// the ISR read returns 01 -> 0xE1.
+/// What it pins: across a guest CLI window the master ISR stays EMPTY. The
+/// guest runs at real IOPL 3, so its `CLI` clears the real IF; the CPU stops
+/// accepting, `service_pending_interrupt` never reaches the INTA, and the
+/// timer's request sits unacknowledged in the IRR until the guest re-enables.
+/// The acknowledge is the guest's to issue, through its own IVT handler.
+///
+/// History: this row was RED when it landed. The pre-IOPL-3 monitor pinned the
+/// real IF open and virtualized IF as VIF, so the first tick was INTA'd and
+/// parked in `vip` the instant it appeared and the ISR read returned 01 ->
+/// 0xE1. It went green with the IOPL-3 monitor, and that flip is what the
+/// design's whole INTA argument rests on.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_pic_isr_is_empty_while_the_v86_guest_has_interrupts_disabled() {
@@ -2294,8 +2311,14 @@ fn tokaemm_pic_isr_is_empty_while_the_v86_guest_has_interrupts_disabled() {
 /// down its not-my-line branch, indexed a 16-entry table with 16, and RETF'd
 /// through the pair it found -- MonikaTT's #GP(0) at 0xAF:78A3.
 ///
-/// The current `.hold` path already satisfies this, so it passes on main today,
-/// and it is here to keep passing while the monitor is rebuilt around it.
+/// What it guards now that the rebuild has happened: the monitor issues no EOI
+/// of its own, anywhere. Under IOPL 3 the INTA is real (the guest had IF=1, or
+/// the line would never have been taken) and the EOI is the guest handler's, so
+/// the handler necessarily finds its own line in service. Two deleted
+/// revisions each broke that -- the early EOI-then-hold, and
+/// `vip_release_to_chip`'s specific EOIs at the VCPI DE0C boundary -- and this
+/// row is what makes a third attempt fail loudly instead of silently
+/// reproducing MonikaTT.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_guest_irq_handler_runs_with_its_own_line_in_service() {
